@@ -1772,22 +1772,24 @@ fn queue_rows_and_spawn_requests_carry_story_points() {
 
 // #14888's queue: 15 eligible Doctor PRs in one repo — issues 20..=34
 // (`loom:building`), each joined to a `loom:changes-requested` PR
-// 120..=134. Issue 30's PR #130 is the inherited-main-red fixture: a
-// red-main fix on a red repo, so the draw weighs it `itemWeightRedMain`
-// (50x) and it heads the queue. Every other row is fixable.
+// 120..=134. PR #130 has failing CI inherited from main. The remaining
+// PRs have actionable review feedback.
 fn doctor_rows() -> Vec<RestIssue> {
     let mut rows = Vec::new();
     for n in 20u32..=34 {
         rows.push(row(n, &["loom:building"], "", false));
-        rows.push(row(100 + n, &["loom:changes-requested"], &format!("Closes #{n}"), true));
+        let labels: &[&str] = if n == 30 {
+            &["loom:changes-requested", "loom:ci-failure"]
+        } else {
+            &["loom:changes-requested"]
+        };
+        rows.push(row(100 + n, labels, &format!("Closes #{n}"), true));
     }
     rows
 }
 
-/// [`doctor_rows`] weighed as #14888's queue: the repo's main is red and
-/// issue 30 carries the red-main-fix fact (the classifier's inputs), and
-/// `cooldowns` reach the draw's query — the ledger's snapshot after a step
-/// ends, empty before the first tick.
+/// Main is red and every PR is ordinary work in the normal lane.
+/// The second tick receives the cooldown recorded by the first Doctor.
 fn doctor_workspace(
     idx: usize,
     repo: &str,
@@ -1799,12 +1801,13 @@ fn doctor_workspace(
         .filter(|r| r.is_pull_request)
         .map(|r| pull_from_row(r, PullMarkers::default()))
         .collect();
-    let facts = IssueFacts {
-        red_fix: std::collections::HashSet::from([30]),
-        ..IssueFacts::default()
-    };
-    let inputs =
-        build_inputs(rows, pulls, &facts, RepoInput { main_red: true }, HostInput::default());
+    let inputs = build_inputs(
+        rows,
+        pulls,
+        &IssueFacts::default(),
+        RepoInput { main_red: true },
+        HostInput::default(),
+    );
     let items = draw_inputs(step_item::classify(&inputs), rows, |_, _| None);
     let ctx = WeighContext {
         now: now(),
@@ -1850,8 +1853,8 @@ fn doctor_seed(tick_counter: u64) -> SeedBase {
 fn a_tick_walks_past_an_inherited_red_doctor_row_and_the_cooldown_keeps_it_out() {
     let rows = doctor_rows();
     let ws = doctor_workspace(0, "acme/one", &rows, Default::default());
-    // All 15 PRs reach the eligible pool before the first draw, the
-    // inherited-red one among them, in the red-main lane.
+    // All 15 PRs reach the eligible pool before the first draw. A CI
+    // failure inherited from main still leaves PR #130 in the normal lane.
     let doctor_steps = ws
         .weighing
         .pool
@@ -1865,29 +1868,22 @@ fn a_tick_walks_past_an_inherited_red_doctor_row_and_the_cooldown_keeps_it_out()
         .iter()
         .find(|c| c.target() == 130)
         .expect("the inherited-red PR is pooled");
-    assert_eq!(red.item.lane, step_item::Lane::RedMain);
+    assert_eq!(red.item.lane, step_item::Lane::Normal);
 
     // Tick 1: capacity for the inherited-red and a fixable step. Available
     // slots, budget, ordered dispatches, stop reason.
     let mut spawner = FakeSpawner::default();
-    let tick = run(
-        vec![doctor_workspace(0, "acme/one", &rows, Default::default())],
-        limits(2),
-        &doctor_seed(3),
-        &PoolKnobs::default(),
-        &mut spawner,
-    );
+    let tick = run(vec![ws], limits(2), &doctor_seed(0), &PoolKnobs::default(), &mut spawner);
     assert_eq!(tick.budget, 2);
     assert_eq!(tick.report.dispatched, 2);
     assert_eq!(tick.stop, TickStop::Filled);
-    assert!(spawner.asked.iter().all(|a| a.2 == StepRole::Doctor));
-    let order: Vec<u32> = spawner.asked.iter().map(|a| a.1).collect();
-    assert_eq!(order[0], 130, "the first actual draw is the inherited-red PR");
-    let fixable = order[1];
-    assert_ne!(fixable, 130, "the tick reached fixable work: drew {order:?}");
-    // The inherited-red row is the heaviest of the first draw (the red-main
-    // priority factor), which is why it is drawn first; that draw saw the
-    // full 15-row pool, the second the 14 rows left.
+    let order: Vec<_> = spawner
+        .asked
+        .iter()
+        .map(|&(_, pr, role, _)| (pr, role))
+        .collect();
+    assert_eq!(order, [(130, StepRole::Doctor), (134, StepRole::Doctor)]);
+    // The first draw sees the full pool. The second sees the 14 rows left.
     assert_eq!(spawner.terms[0].as_ref().unwrap().repo_items, 15);
     assert_eq!(spawner.terms[1].as_ref().unwrap().repo_items, 14);
 
@@ -1946,17 +1942,17 @@ fn a_tick_walks_past_an_inherited_red_doctor_row_and_the_cooldown_keeps_it_out()
     assert_eq!(ws2.weighing.pool.len(), 14);
 
     let mut spawner2 = FakeSpawner::default();
-    let tick2 = run(vec![ws2], limits(1), &doctor_seed(4), &PoolKnobs::default(), &mut spawner2);
-    assert!(
-        !spawner2.asked.iter().any(|a| a.1 == 130),
-        "the inherited-red PR took the slot again: {:?}",
-        spawner2.asked
-    );
+    let tick2 = run(vec![ws2], limits(1), &doctor_seed(1), &PoolKnobs::default(), &mut spawner2);
     assert_eq!(tick2.report.dispatched, 1);
     assert_eq!(tick2.budget, 1);
     assert_eq!(tick2.stop, TickStop::Filled);
     assert_eq!(tick2.report.skipped_noop_cooldown, 1);
-    assert_ne!(spawner2.asked[0].1, 130);
+    let order: Vec<_> = spawner2
+        .asked
+        .iter()
+        .map(|&(_, pr, role, _)| (pr, role))
+        .collect();
+    assert_eq!(order, [(121, StepRole::Doctor)]);
 }
 
 /// The one-slot boundary of #14888: with capacity for exactly one step, the
@@ -1970,12 +1966,16 @@ fn a_one_slot_tick_draws_only_the_inherited_red_row() {
     let tick = run(
         vec![doctor_workspace(0, "acme/one", &rows, Default::default())],
         limits(1),
-        &doctor_seed(3),
+        &doctor_seed(0),
         &PoolKnobs::default(),
         &mut spawner,
     );
-    let order: Vec<u32> = spawner.asked.iter().map(|a| a.1).collect();
-    assert_eq!(order, vec![130]);
+    let order: Vec<_> = spawner
+        .asked
+        .iter()
+        .map(|&(_, pr, role, _)| (pr, role))
+        .collect();
+    assert_eq!(order, [(130, StepRole::Doctor)]);
     assert_eq!(tick.budget, 1);
     assert_eq!(tick.report.dispatched, 1);
     assert_eq!(tick.stop, TickStop::Filled);
