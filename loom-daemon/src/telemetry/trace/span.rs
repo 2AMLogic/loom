@@ -134,6 +134,12 @@ pub enum SpanName {
     /// bytes reclaimed. Never a path or the gate's free-text wording.
     #[serde(rename = "reaper.pass")]
     ReaperPass,
+    /// One item a seat-reclaim pass removed (Issue #14889): an instant span,
+    /// its own root, naming the seat and the item's volume-relative path,
+    /// plus the worktree's branch and full pre-removal tip SHA or the
+    /// scratch entry's byte count.
+    #[serde(rename = "reaper.removal")]
+    ReaperRemoval,
     /// One EC2 spot interruption or rebalance notice (#12876): an instant
     /// span, its own root, naming the kind, the host and the sweeps it ended.
     #[serde(rename = "loom.host.interruption_notice")]
@@ -185,6 +191,7 @@ impl SpanName {
             Self::MainRedAutofile => "main_red.autofile",
             Self::FleetDispatchCall => "loom.fleet_dispatch.call",
             Self::ReaperPass => "reaper.pass",
+            Self::ReaperRemoval => "reaper.removal",
             Self::HostInterruptionNotice => "loom.host.interruption_notice",
             Self::WorkspaceResyncLanding => "workspace_resync.landing",
             Self::WorkspaceResyncVerify => "workspace_resync.verify",
