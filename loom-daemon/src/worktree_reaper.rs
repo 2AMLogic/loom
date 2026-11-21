@@ -732,7 +732,7 @@ pub fn reap_worktrees_only(repo_root: &Path, config: &WorktreeReaperConfig) -> R
     // instead — see [`stuck_worktree_removals`].
     let remover = |path: &Path, issue: u32| {
         remove_with_backoff(repo_root, WorktreeKind::Issue, issue, path, || {
-            clean::cleanup_worktree(repo_root, path, issue, false, "worktree_reaper").map(|_| ())
+            clean::cleanup_worktree(repo_root, path, issue, &opts, "worktree_reaper").map(|_| ())
         })
     };
     // #6653: pushes a `loom-quarantine:` stash for a dirty, past-grace,

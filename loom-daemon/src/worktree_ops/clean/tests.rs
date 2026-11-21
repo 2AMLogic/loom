@@ -542,7 +542,7 @@ fn cleanup_worktree_removes_untracked_orphan_directory() {
     std::fs::write(orphan.join("some-build-artifact"), "junk").unwrap();
     assert!(orphan.is_dir());
 
-    let result = cleanup_worktree(&repo_root, &orphan, 999, false, "test");
+    let result = cleanup_worktree(&repo_root, &orphan, 999, &CleanOptions::default(), "test");
     assert_eq!(
         result,
         Ok(CleanupOutcome::Removed),
@@ -636,7 +636,7 @@ fn cleanup_worktree_reclaims_a_redirected_cargo_target_dir() {
         return;
     }
 
-    let result = cleanup_worktree(&repo_root, &worktree, 7239, false, "test");
+    let result = cleanup_worktree(&repo_root, &worktree, 7239, &CleanOptions::default(), "test");
     assert_eq!(result, Ok(CleanupOutcome::Removed), "{result:?}");
     assert!(!worktree.exists(), "worktree should be gone");
     assert!(
@@ -726,7 +726,7 @@ fn cleanup_worktree_keeps_a_target_dir_a_live_worktree_still_shares() {
         return;
     }
 
-    let result = cleanup_worktree(&repo_root, &made[0], 7239, false, "test");
+    let result = cleanup_worktree(&repo_root, &made[0], 7239, &CleanOptions::default(), "test");
     assert_eq!(result, Ok(CleanupOutcome::Removed), "{result:?}");
     assert!(!made[0].exists(), "the removed worktree should be gone");
     assert!(
@@ -758,7 +758,7 @@ fn cleanup_worktree_treats_missing_directory_as_already_gone() {
     let gone = crate::worktree_root::worktree_root(&repo_root).join("issue-4525");
     assert!(!gone.exists(), "fixture must not exist on disk");
 
-    let result = cleanup_worktree(&repo_root, &gone, 4525, false, "test");
+    let result = cleanup_worktree(&repo_root, &gone, 4525, &CleanOptions::default(), "test");
     assert_eq!(
         result,
         Ok(CleanupOutcome::AlreadyGone),
@@ -888,7 +888,7 @@ fn cleanup_worktree_does_not_force_remove_on_other_errors() {
     std::fs::create_dir_all(&managed).unwrap();
     std::fs::write(managed.join(".loom-managed"), "test").unwrap();
 
-    let result = cleanup_worktree(&repo_root, &managed, 1000, false, "test");
+    let result = cleanup_worktree(&repo_root, &managed, 1000, &CleanOptions::default(), "test");
     assert!(result.is_err(), "non-orphan failure must propagate");
     assert!(managed.exists(), "directory must be left in place on a non-orphan failure");
 }
