@@ -781,7 +781,7 @@ pub struct ProcessContainerRunner;
 impl ProcessContainerRunner {
     /// Bounded by [`super::docker_cli::timeout_for`] (issue #10453): a hung
     /// Docker daemon fails the call instead of stalling the caller forever.
-    fn run_capture(args: &[&str]) -> Result<(bool, String, String)> {
+    pub(super) fn run_capture(args: &[&str]) -> Result<(bool, String, String)> {
         super::docker_cli::run_bounded("docker", args, super::docker_cli::timeout_for(args))
     }
 
