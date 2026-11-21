@@ -16,6 +16,28 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 ### 2026-11-21
 
+- **Issue #14891** (closed): Fix red main CI in the Guide work-log debounce fixture
+- **PR #14893**: test: isolate the Guide work-log debounce decision
+- **Issue #14862** (closed): Doctor queue mistakes discussion of a legacy cycle cap for a terminal cap
+- **PR #14863**: fix: match legacy Doctor-cycle caps as whole terminal lines
+- **Issue #13760** (closed): Guide WORK_LOG backfill wrote another repo's history; docs-only fast path approved it
+- **PR #14532**: fix: verify WORK_LOG records against the target repo before Guide writes and Judge fast-paths
+- **PR #14796**: fix: keep queue disposition responsive during stage scans
+- **Issue #14757** (closed): private_workspace reap test asserts a non-canonical worktree path, failing where TMPDIR holds a symlink
+- **PR #14760**: test: compare the canonical path of a reaped worktree
+- **Issue #14735** (closed): private seat: a reaped worktree is unreported when preparation then refuses
+- **PR #14752**: fix: report worktrees reaped before preparation refuses
+- **Issue #14822** (closed): session_reconcile waits out a long back-off after the seat it was waiting for appears
+- **PR #14828**: fix: retry private clone bindings when the waiting seat appears
+- **Issue #14678** (closed): Private-clone Codex seat volumes grow without bound: a full clone per repo per seat, and nothing reclaims them
+- **PR #14776**: feat(daemon): reclaim private-seat scratch and merged-PR worktrees via a leased idle pass
+- **Issue #14101** (closed): merge-pr.sh --release-hold strips the hold then cannot merge where loom/merge-authorization is required
+- **PR #14366**: fix: defer merge-pr --release-hold writes until required checks pass
+- **Issue #14732** (closed): Champion routes an issue to the operator for a dependency cycle it is not on (a Part-of parent link read as an edge)
+- **PR #14736**: fix: scope cycle escalation to issues on the loop and drop Part-of parent refs
+- **Issue #14125** (closed): champion-hold ratification: --help advertises a verdict=unreadable the verb can no longer emit; tick's defer row says 'no hold standing'
+- **PR #14253**: fix: drop dead unreadable verdict from ratification help and defer row
+- **Issue #14802** (closed): [ci-daily] Session and Private-Workspace Docker Fixtures (unfiltered)
 - **Issue #14877** (closed): clean --safe fails deleting branches whose %(refname:short) is disambiguated to heads/prNNN
 - **Issue #14874** (closed): Bound outcome reads to the dispatch that produced them
 - **PR #14875**: Bound step outcome reads to their own dispatch section
