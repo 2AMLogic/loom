@@ -1895,6 +1895,12 @@ jobs:
       - name: merge-pr --release-hold (#13517)
         if: ${{ !cancelled() && steps.daemon-bin.outcome == 'success' }}
         run: bash defaults/scripts/tests/test-merge-pr-release-hold.sh
+      # #14833: the merge-risk hold-writer suite's release-decision leg runs
+      # only where a build of this checkout exists, so the suite runs a second
+      # time here (its hermetic legs run again unchanged in the shell job).
+      - name: merge-risk hold writer -> release decision (#14833)
+        if: ${{ !cancelled() && steps.daemon-bin.outcome == 'success' }}
+        run: bash defaults/scripts/tests/test-champion-pr-merge-hold-release.sh
       # #9657 (#9548 slice): this suite pins the working-tree binary for the
       # real `forge trusted-comments` filter, so it needs this job's shared
       # build.
