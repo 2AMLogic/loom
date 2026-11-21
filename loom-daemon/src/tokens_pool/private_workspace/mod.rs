@@ -22,6 +22,7 @@ mod read_authority_tests;
 #[cfg(test)]
 mod recover_tests;
 mod repository;
+pub(crate) mod seat_reclaim;
 #[cfg(test)]
 mod tests;
 pub mod transport;
