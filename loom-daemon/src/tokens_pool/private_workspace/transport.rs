@@ -555,6 +555,11 @@ mod tests {
         let stale = forge_auth::published_owner_workspace(owner);
         let fresh_dir =
             crate::credential_preflight::github_app_gh_config_dir_for_owner(primary.path(), owner);
+        let stale_dir =
+            crate::credential_preflight::github_app_gh_config_dir_for_owner(stale.path(), owner);
+        let stale_time = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
+        forge_auth::stamp_hosts_yml(&stale_dir, stale_time);
+        forge_auth::stamp_hosts_yml(&fresh_dir, stale_time + std::time::Duration::from_secs(60));
         let checkout = primary.path().as_os_str().to_owned();
         let seen = std::cell::RefCell::new(None);
         let resolve = |root: &Path, repository: &str| {

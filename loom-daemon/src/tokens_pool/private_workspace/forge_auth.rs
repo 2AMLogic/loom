@@ -198,6 +198,16 @@ pub(super) fn published_owner_workspace(owner: &str) -> tempfile::TempDir {
     ws
 }
 
+/// Pins the fixture publication time used to select between owner directories.
+#[cfg(test)]
+pub(super) fn stamp_hosts_yml(dir: &Path, at: SystemTime) {
+    let file = std::fs::OpenOptions::new()
+        .append(true)
+        .open(dir.join("hosts.yml"))
+        .expect("open fixture hosts.yml");
+    file.set_modified(at).expect("stamp fixture hosts.yml");
+}
+
 /// The `owner/repo` of a GitHub repository URL, or `None` for any other forge
 /// (a Gitea under a sub-path, a different host).
 pub(super) fn github_slug(repository: &str, gh_host: &str) -> Option<String> {
@@ -511,15 +521,6 @@ mod tests {
     }
     fn t1() -> SystemTime {
         SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_060)
-    }
-
-    /// Pins `dir`'s `hosts.yml` mtime, the signal `config_dir_for` compares.
-    fn stamp_hosts_yml(dir: &Path, at: SystemTime) {
-        let file = std::fs::OpenOptions::new()
-            .append(true)
-            .open(dir.join("hosts.yml"))
-            .unwrap();
-        file.set_modified(at).unwrap();
     }
 
     fn env_of(vars: &[(&str, &str)]) -> impl Fn(&str) -> Option<OsString> {
