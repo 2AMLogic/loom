@@ -136,7 +136,9 @@ impl RepoFixture {
     }
 
     fn prepare(&self) -> Result<String> {
-        repository::prepare(&self.root, &self.args).map(|outcome| outcome.revision)
+        repository::prepare(&self.root, &self.args)
+            .map(|outcome| outcome.revision)
+            .map_err(Into::into)
     }
 }
 
@@ -1364,6 +1366,61 @@ fn repository_bound_job_keeps_the_account_wide_exclusive_lease() {
     assert_eq!(lease::read(root.path()).unwrap().unwrap().repository, "");
 }
 
+/// #14678: the seat-reclaim exec drives the in-volume verb directly — same
+/// protocol envelope as `recover`, the account's resolved auth forwarded by
+/// name on the child, and **no `prepare` step anywhere in argv**: the pass
+/// must reach a dirty seat, which preparation would refuse.
+#[test]
+fn seat_reclaim_exec_drives_the_verb_without_any_preparation() {
+    const SECRET: &str = "ghs_seatTESTONLY14678";
+    let mut config = config();
+    config.repository = "https://github.com/acme/widget".into();
+    let argv = std::rc::Rc::new(std::cell::RefCell::new(Vec::<String>::new()));
+    let seen = argv.clone();
+    let _fake = docker::fake::install(Box::new(move |args| {
+        *seen.borrow_mut() = args.iter().map(|a| (*a).to_owned()).collect();
+        Ok(serde_json::json!({
+            "protocol": PROTOCOL,
+            "outcome": {
+                "worktrees_scanned": 1,
+                "worktrees_removed": 0,
+                "worktrees_failed": 0,
+                "preserved": ["PR still open"],
+                "bytes": 0,
+                "scratch_removed": 0,
+                "scratch_scanned": 0,
+                "scratch_bytes": 0,
+            }
+        })
+        .to_string())
+    }));
+    let ws = forge_auth::published_owner_workspace("acme");
+    let resolved =
+        forge_auth::ExecAuth::resolve_with(ws.path(), &config.repository, &|_| None, &|_| {
+            Some(SECRET.into())
+        });
+    let outcome = docker::seat_reclaim(&config, 86_400, 3_600, &resolved).unwrap();
+    assert_eq!(outcome.worktrees_scanned, 1);
+    assert_eq!(outcome.preserved, vec!["PR still open".to_string()]);
+
+    let args = argv.borrow().clone();
+    let joined = args.join(" ");
+    assert!(joined.contains("private-workspace seat-reclaim"), "{args:?}");
+    assert!(joined.contains("--account account"), "{args:?}");
+    assert!(joined.contains("--max-age-secs 86400"), "{args:?}");
+    assert!(joined.contains("--grace-secs 3600"), "{args:?}");
+    assert!(
+        !joined.contains("prepare"),
+        "the seat pass must not prepare the target ({args:?})"
+    );
+    assert!(
+        args.windows(2)
+            .any(|w| w[0] == "--env" && w[1] == "GH_TOKEN"),
+        "{args:?}"
+    );
+    assert!(!args.iter().any(|a| a.contains(SECRET)), "token leaked into argv");
+}
+
 /// #13916: on an App-only host the prepare exec names `GH_TOKEN` as a bare
 /// `--env` and the resolved value rides on the `docker` child alone — never
 /// in argv. A token already in the process env adds nothing to the child.
@@ -1778,6 +1835,7 @@ fn preparation_reaps_published_finished_prs_independent_of_merge_method() {
         let fresh = repository::prepare(&f.root, &f.args).unwrap();
         assert!(fresh.reaped.is_empty(), "a no-reap preparation reports none");
         let worktree = linked_worktree(&f, "finished");
+        let expected_path = worktree.canonicalize().unwrap().display().to_string();
         for text in ["first", "second"] {
             std::fs::write(worktree.join("fixture"), text).unwrap();
             git(&worktree, &["commit", "-am", text]);
@@ -1811,14 +1869,40 @@ fn preparation_reaps_published_finished_prs_independent_of_merge_method() {
         };
         let outcome = repository::prepare_with_pr_lookup(&f.root, &f.args, &evidence).unwrap();
         assert!(!worktree.exists(), "{state} leftover removed");
-        assert_eq!(
-            outcome.reaped,
-            vec![worktree.display().to_string()],
-            "{state} reaped worktree is reported"
-        );
+        assert_eq!(outcome.reaped, vec![expected_path], "{state} reaped worktree is reported");
         assert_eq!(git(&repo, &["rev-parse", "refs/heads/finished"]), tip);
         assert_eq!(git(&f.remote, &["rev-parse", "refs/heads/finished"]), tip);
     }
+}
+
+#[test]
+fn preparation_reports_a_reaped_worktree_when_another_refuses_reuse() {
+    let _fork = fork_guard();
+    let f = RepoFixture::new();
+    f.prepare().unwrap();
+    let finished = linked_worktree(&f, "finished");
+    git(&finished, &["push", "origin", "finished"]);
+    let tip = git(&finished, &["rev-parse", "HEAD"]);
+    let expected = finished.canonicalize().unwrap().display().to_string();
+    std::fs::write(finished.join("leftover"), "abandoned").unwrap();
+
+    let dirty = linked_worktree(&f, "still-active");
+    std::fs::write(dirty.join("retained.txt"), "keep me").unwrap();
+    let evidence =
+        |_: &Path, _: &str, branch: &str, revision: &str| branch == "finished" && revision == tip;
+    let refusal = repository::prepare_response(repository::prepare_with_pr_lookup(
+        &f.root, &f.args, &evidence,
+    ));
+    assert!(refusal["error"].as_str().unwrap().contains("seat_dirty"), "{refusal}");
+    assert!(!finished.exists());
+    assert_eq!(std::fs::read_to_string(dirty.join("retained.txt")).unwrap(), "keep me");
+    assert_eq!(refusal["reaped_worktrees"], serde_json::json!([expected]));
+
+    let refused_again = repository::prepare_response(repository::prepare_with_pr_lookup(
+        &f.root, &f.args, &evidence,
+    ));
+    assert_eq!(refused_again["error"], refusal["error"]);
+    assert_eq!(refused_again["reaped_worktrees"], serde_json::json!([]));
 }
 
 #[test]
