@@ -100,6 +100,27 @@ fn champion_lines_are_read_per_mode_and_folded_onto_the_classes() {
     assert_eq!(champion_outcome(false, "triaged"), None, "a PR triage is --pr only");
 }
 
+/// #14168: the shared framing-tolerant tokenizer — a JSON text event wraps
+/// both line shapes, the prefix sits mid-line, and the wrapper's framing
+/// (`"}`, a literal `\n` escape) glues onto the last value without riding
+/// in it, identically to `step_spawn::capture`'s parser.
+#[test]
+fn a_json_wrapped_outcome_line_parses_like_a_bare_one() {
+    let step_line = concat!(
+        r#"{"type":"result","text":"LOOM_STEP_OUTCOME role=judge target=5 "#,
+        r#"class=noop reason=ci-pending\n"}"#,
+    );
+    assert_eq!(
+        parse_outcome_line(step_line, StepRole::Judge, 5),
+        Some(out(OutcomeClass::Noop, "ci_pending"))
+    );
+    let champion_line = r#"{"text":"CHAMPION-STEP mode=pr item=30 outcome=head-moved"}"#;
+    assert_eq!(
+        parse_outcome_line(champion_line, StepRole::ChampionMerge, 30),
+        Some(out(OutcomeClass::Refused, "head_moved"))
+    );
+}
+
 // ---------------------------------------------------------- the post-state
 
 #[test]
@@ -853,6 +874,76 @@ fn a_repeated_merged_pr_or_triage_builder_refusal_arms_the_cooldown() {
     );
 }
 
+/// #14032: a standing admission refusal (`runtime_rejected`,
+/// `model_runtime_mismatch`, `admission_refused`) reaches the ledger through
+/// `step_end::ledger_reason` as `admission` and rides the state-refusal
+/// streak: the first only reclassifies, a repeat arms the refusal cooldown
+/// doubling to 24 h, and a different reason, another outcome or a verdict
+/// resets the streak.
+#[test]
+fn a_repeated_admission_refusal_arms_a_doubling_cooldown() {
+    let mut l = OutcomeLedger::default();
+    let now = t0();
+    let refuse = |reason: &str| out(OutcomeClass::Refused, reason);
+    let step = StepRole::Builder;
+    for spawn in [
+        "runtime_rejected",
+        "model_runtime_mismatch",
+        "admission_refused",
+    ] {
+        assert_eq!(
+            crate::step_dispatch::step_end::ledger_reason(spawn),
+            Some("admission"),
+            "{spawn}"
+        );
+    }
+    let admission = crate::step_dispatch::step_end::ledger_reason("runtime_rejected").unwrap();
+
+    let first = l.record(80, step, &refuse(admission), SLOW, now);
+    assert_eq!(
+        (first.effect, first.cooling_until),
+        (Effect::Reclassify, None),
+        "the first refusal only reclassifies"
+    );
+    let mut lengths = Vec::new();
+    for k in 1..12 {
+        let at = now + chrono::Duration::days(k);
+        // The diagnostic for a dirty private seat keeps the original
+        // admission grouping and therefore the same mixed-refusal backoff.
+        let reason = if k % 2 == 1 { SEAT_DIRTY } else { admission };
+        let rec = l.record(80, step, &refuse(reason), SLOW, at);
+        assert_eq!(rec.effect, Effect::Reclassify);
+        lengths.push((rec.cooling_until.expect("cooling") - at).num_seconds());
+    }
+    assert_eq!(&lengths[..3], &[600, 1200, 2400], "10 min, doubling");
+    assert!(lengths.iter().all(|s| *s <= 24 * 3600), "{lengths:?}");
+    assert_eq!(*lengths.last().unwrap(), 24 * 3600, "capped at 24 h");
+    assert_eq!(
+        l.cooling_cause(80, step, now + chrono::Duration::days(11)),
+        Some(CooldownCause::Refused)
+    );
+
+    // A different reason in between resets the streak (`pool_gate` would
+    // also clear it, but arms its own window, so a state refusal is the
+    // clean probe).
+    l.record(81, step, &refuse(admission), SLOW, now);
+    l.record(81, step, &refuse("open_pr"), SLOW, now);
+    assert_eq!(
+        l.record(81, step, &refuse(admission), SLOW, now)
+            .cooling_until,
+        None
+    );
+
+    // So does any other outcome on the pair, a verdict included.
+    l.record(82, step, &refuse(admission), SLOW, now);
+    l.record(82, step, &out(OutcomeClass::Verdict, "rejected"), SLOW, now);
+    assert_eq!(
+        l.record(82, step, &refuse(admission), SLOW, now)
+            .cooling_until,
+        None
+    );
+}
+
 /// #11909: the reaper prunes every tick. A prune just before each draw must
 /// not drop a refusal streak whose cooldown reached the 24 h cap (the same
 /// length as the prune window): the next identical refusal keeps the 24 h
@@ -955,4 +1046,43 @@ fn the_pre_12524_fallback_cause_still_restores() {
         l.cooling_cause(4, StepRole::ChampionMerge, now + mins(1)),
         Some(CooldownCause::ForgeLadderFallback)
     );
+}
+
+// ------------------------------------------------- the dispatch section
+
+/// #14874: the section selector bounds a dispatch's own text by the next
+/// dispatch header, matches the complete `sweep_id=` field, ignores a
+/// transcript mention of one, and tells a headerless log from a log of other
+/// dispatches.
+#[test]
+fn the_section_selector_bounds_a_dispatch_by_the_next_header() {
+    use DispatchSection::{Absent, Headerless, Section};
+    let log = "\
+==== loom-daemon dispatch: t sweep_id=j-1 item=4 step=judge ====
+first run: sweep_id=j-2 mentioned in transcript
+LOOM_STEP_OUTCOME role=judge target=4 class=failed reason=crash
+==== loom-daemon dispatch: t sweep_id=j-2 item=4 step=judge ====
+LOOM_STEP_OUTCOME role=judge target=4 class=noop reason=ci_pending
+==== loom-daemon dispatch: t sweep_id=j-21 item=4 step=judge ====
+LOOM_STEP_OUTCOME role=judge target=4 class=verdict reason=reviewed
+";
+    assert_eq!(dispatch_section(log, "j-1"), Section("first run: sweep_id=j-2 mentioned in transcript\nLOOM_STEP_OUTCOME role=judge target=4 class=failed reason=crash\n"));
+    assert_eq!(
+        dispatch_section(log, "j-2"),
+        Section("LOOM_STEP_OUTCOME role=judge target=4 class=noop reason=ci_pending\n")
+    );
+    // `j-2` is a prefix of `j-21`: each matches only its own header.
+    assert_eq!(
+        dispatch_section(log, "j-21"),
+        Section("LOOM_STEP_OUTCOME role=judge target=4 class=verdict reason=reviewed\n")
+    );
+    assert_eq!(dispatch_section(log, "j-3"), Absent);
+    assert_eq!(dispatch_section(log, "j"), Absent);
+    // A log that never carried a header is launch-time text, not absence.
+    let refusal = "Error: private workspace preparation refused: seat_dirty: dirty\n";
+    assert_eq!(dispatch_section(refusal, "j-1"), Headerless(refusal));
+    // A header must start its line; the marker indented or mid-line is
+    // transcript, not a header.
+    let indented = "  ==== loom-daemon dispatch: t sweep_id=j-1 ====\noutcome line\n";
+    assert_eq!(dispatch_section(indented, "j-1"), Headerless(indented));
 }

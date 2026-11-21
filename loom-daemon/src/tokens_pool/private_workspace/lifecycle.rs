@@ -4,11 +4,94 @@ use super::super::session_lifecycle::{
 };
 use super::*;
 
+/// An unattended registration found the recorded seat absent. Only a fresh
+/// observation of that same seat can make its binding retry early.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) struct ConfiguredSeatMissing {
+    account: String,
+    profile: PathBuf,
+    container: String,
+    engine: String,
+    volume: String,
+}
+
+impl ConfiguredSeatMissing {
+    pub(crate) fn of(config: &Config) -> Self {
+        Self {
+            account: config.account.clone(),
+            profile: config.profile.clone(),
+            container: config.container.clone(),
+            engine: config.engine.clone(),
+            volume: config.volume.clone(),
+        }
+    }
+
+    pub(crate) fn observe(
+        &self,
+        account: &super::super::account_registry::AccountDescriptor,
+        snapshot: &super::super::session_state::BindingSnapshot,
+    ) -> BindingReadiness {
+        use super::super::session_state::container_running;
+
+        if self.account != account.id.name
+            || account.credential_reference.canonicalize().ok().as_ref() != Some(&self.profile)
+        {
+            return BindingReadiness::Unverified;
+        }
+        let Some(current) = registrations(&self.profile).filter(|config| Self::of(config) == *self)
+        else {
+            return BindingReadiness::Unverified;
+        };
+        match snapshot.listed(&self.engine, &self.container) {
+            Some(false) => return BindingReadiness::Missing,
+            Some(true) => {}
+            None => return BindingReadiness::Unverified,
+        }
+        let Some(inspection) = snapshot.snapshot.inspect_of(&self.container) else {
+            return BindingReadiness::Unverified;
+        };
+        let state = &inspection["State"];
+        if !state["Running"].is_boolean()
+            || !state["Restarting"].is_boolean()
+            || docker::validate_settings(&current, inspection).is_err()
+        {
+            BindingReadiness::Unverified
+        } else if container_running(inspection) {
+            BindingReadiness::Ready
+        } else {
+            BindingReadiness::Missing
+        }
+    }
+}
+
+impl std::fmt::Display for ConfiguredSeatMissing {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("private session container is missing; refusing to recreate it with a default image (the reconcile recovery restores it with the recorded one)")
+    }
+}
+
+impl std::error::Error for ConfiguredSeatMissing {}
+
 pub fn configured(workspace: &Path, name: &str) -> Result<bool> {
     let account = account(workspace, name)?;
     Ok(state_dir(&account.credential_reference)?
         .join("workspace.json")
         .exists())
+}
+
+/// The profile's private-workspace registration, read tolerantly for
+/// `accounts list` (issue #14298): a local `workspace.json` read only — no
+/// docker, no lease, no engine or ownership validation — because a list of
+/// every account must not fail on state one broken session left behind.
+/// `None` when the profile has no private workspace, and also when the
+/// state exists but cannot be read; surfacing that failure is the dedicated
+/// `session status` / `session recover` path's job, not a list's.
+pub fn registrations(profile: &Path) -> Option<Config> {
+    let dir = state_dir(profile).ok()?;
+    if !dir.join("workspace.json").is_file() {
+        return None;
+    }
+    load(&dir).ok()
 }
 
 pub(super) fn resolve(workspace: &Path, name: &str) -> Result<(Config, PathBuf)> {
@@ -73,12 +156,109 @@ pub(super) fn check_firewall(workspace: &Path, id: &RepoId) -> Result<()> {
     Ok(())
 }
 
+/// Validate a declared binding without touching Docker or any state (#14111):
+/// a credential-free HTTPS forge URL and a safe base. Returns the repository's
+/// canonical key, the identity two spellings of one repository share.
+pub fn check_binding(repository: &str, base: &str) -> Result<String> {
+    let url = repository_url(repository)?;
+    valid_base(base)?;
+    Ok(identify(&url)?.key)
+}
+
+/// The repositories an account's private workspace holds — the primary first,
+/// then every registered one — as `(url, canonical key)`. `None`: the account
+/// is not in private-clone mode (no `workspace.json`).
+pub fn registered_repositories(
+    workspace: &Path,
+    name: &str,
+) -> Result<Option<Vec<(String, String)>>> {
+    let account = account(workspace, name)?;
+    let dir = state_dir(&account.credential_reference)?;
+    if !dir.join("workspace.json").exists() {
+        return Ok(None);
+    }
+    let config = load(&dir)?;
+    let key = |url: &str| identify(url).map_or_else(|_| url.to_owned(), |id| id.key);
+    let mut out = vec![(config.repository.clone(), key(&config.repository))];
+    out.extend(
+        config
+            .repositories
+            .iter()
+            .map(|r| (r.repository.clone(), key(&r.repository))),
+    );
+    Ok(Some(out))
+}
+
+/// What [`converge`] found or did.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Converged {
+    /// The repository was already registered with this base; nothing was touched.
+    Present,
+    /// The repository is now registered (the first one also prepared the workspace).
+    Registered,
+}
+
+/// Make a declared binding true without an operator (#14111): register
+/// `repository` on the account, by the same path as repeating
+/// `session start --private-clone` while it is idle — so a busy account fails
+/// with [`AccountBusy`] (retry later, never interrupted) and nothing existing
+/// is ever deleted or reset.
+///
+/// Unlike an operator start it never lifts an operator hold (`check_hold` is
+/// consulted under the account lease, before the first mutation), never
+/// substitutes an image for a container that went missing (that is
+/// [`recover`]'s job), and refuses an account that runs a host-mounted session
+/// rather than convert it. A firewalled repository, an unknown account and a
+/// base that conflicts with the registered one are refused before any Docker call.
+pub fn converge(
+    workspace: &Path,
+    name: &str,
+    repository: &str,
+    base: &str,
+    check_hold: &dyn Fn() -> Result<()>,
+) -> Result<Converged> {
+    let repository = repository_url(repository)?;
+    valid_base(base)?;
+    let id = identify(&repository)?;
+    let account = account(workspace, name)?;
+    check_firewall(workspace, &id)?;
+    let profile = account.credential_reference.canonicalize()?;
+    let dir = state_dir(&profile)?;
+    if dir.join("workspace.json").exists() {
+        if let Ok(known) = load(&dir)?.target(Some(&repository)) {
+            if known.base != base {
+                bail!("private repository {} is already configured with base {}; retain its clone and resolve unfinished work before changing the base", known.repository, known.base);
+            }
+            return Ok(Converged::Present);
+        }
+    } else if super::super::session_lifecycle::is_session_managed(&profile) {
+        bail!("account runs a host-mounted session; a binding does not convert it (stop it, recover its work, then run session start --private-clone once)");
+    }
+    start_with(workspace, name, &repository, base, None, Some(check_hold))?;
+    Ok(Converged::Registered)
+}
+
 pub fn start(
     workspace: &Path,
     name: &str,
     repository: &str,
     base: &str,
     image: Option<&str>,
+) -> Result<Status> {
+    start_with(workspace, name, repository, base, image, None)
+}
+
+/// `start`, optionally unattended: `unattended` is the caller's hold probe. An
+/// operator start (`None`) lifts the hold an operator `stop` left; an
+/// unattended one honours it, checked under the lease before the first
+/// mutation, and recreates nothing the recorded identity says is gone.
+fn start_with(
+    workspace: &Path,
+    name: &str,
+    repository: &str,
+    base: &str,
+    image: Option<&str>,
+    unattended: Option<&dyn Fn() -> Result<()>>,
 ) -> Result<Status> {
     let repository = repository_url(repository)?;
     valid_base(base)?;
@@ -87,7 +267,8 @@ pub fn start(
     let dir = state_dir(&profile)?;
     let lease = lease::Lease::acquire(&dir)?;
     let engine = docker::engine()?;
-    let config = if dir.join("workspace.json").exists() {
+    let existed = dir.join("workspace.json").exists();
+    let mut config = if existed {
         let mut existing = load(&dir)?;
         if existing.account != account.id.name
             || existing.profile != profile
@@ -98,19 +279,7 @@ pub fn start(
         register(workspace, &mut existing, &repository, base)?;
         existing
     } else {
-        let gh_config = std::env::var_os("GH_CONFIG_DIR")
-            .map(PathBuf::from)
-            .or_else(|| dirs::home_dir().map(|home| home.join(".config/gh")))
-            .filter(|path| path.is_dir())
-            .map(|path| path.canonicalize())
-            .transpose()?;
-        if let Some(path) = &gh_config {
-            for parent in path.ancestors() {
-                if parent.join(".git").exists() {
-                    bail!("forge credentials must be outside every repository/worktree");
-                }
-            }
-        }
+        let gh_config = resolve_gh_config(workspace)?;
         Config {
             schema_version: 1,
             account: account.id.name.clone(),
@@ -120,9 +289,11 @@ pub fn start(
             repository,
             base: base.to_owned(),
             repositories: Vec::new(),
-            volume: format!("loom-codex-workspace-{}", account.id.name),
+            volume: workspace_volume_name(&account.id.name),
             profile,
             gh_config,
+            session_image: None,
+            extra_mounts: Vec::new(),
         }
     };
     let state = docker::inspect(&config.container)?;
@@ -134,17 +305,59 @@ pub fn start(
     }
     lease.recover(&config, state.as_ref())?;
     if !docker::idle(state.as_ref(), &config.container)? {
-        bail!("session has an unleased worker; stop it before preparing the workspace");
+        return Err(lease::AccountBusy(
+            "session has an unleased worker; stop it before preparing the workspace",
+        )
+        .into());
+    }
+    if let Some(check_hold) = unattended {
+        if session_hold::held_across(std::slice::from_ref(&config.profile)) {
+            return Err(OperatorHeld.into());
+        }
+        check_hold()?;
+        if existed && state.is_none() {
+            return Err(ConfiguredSeatMissing::of(&config).into());
+        }
+    }
+    // The image and read-only mounts a NEW container gets are decided here,
+    // once, and recorded in `workspace.json` (#14451): `validate_settings`,
+    // `recover` and `status` all read the record, never the live config, so a
+    // config edit cannot reshape a seat behind an unattended restart. A
+    // container that already exists keeps what it was created with; the
+    // configured values apply from the next stop + start. The host tier decides
+    // for a seat serving several repositories — `workspace` is the same root
+    // the reconciler reads the keys from.
+    let mut start_image = image.map(str::to_owned);
+    if state.is_none() {
+        let configured = super::super::session_image::read_session_image_config(workspace)?;
+        let configured_image = configured.image.clone();
+        if start_image.is_none() {
+            start_image.clone_from(&configured_image);
+        }
+        config.session_image = if start_image == configured_image {
+            configured_image
+        } else {
+            None
+        };
+        config.extra_mounts = configured.extra_mounts;
+        check_extra_mounts(workspace, &config)?;
+        if let Some(configured) = &config.session_image {
+            docker::verify_image(configured)?;
+        }
+    } else if image.is_none() {
+        warn_if_config_drifted(workspace, &config);
     }
     save(&dir.join("workspace.json"), &config)?;
-    // An operator start lifts the hold an operator `stop` left, before the
-    // first mutation, so a failure past this point leaves the session down
-    // and unheld — which the reconciler then recovers on its backoff, the
-    // operator's stated intent — never running and held (#10453, #12772).
-    session_hold::lift_holds(std::slice::from_ref(&config.profile))?;
+    if unattended.is_none() {
+        // An operator start lifts the hold an operator `stop` left, before the
+        // first mutation, so a failure past this point leaves the session down
+        // and unheld — which the reconciler then recovers on its backoff, the
+        // operator's stated intent — never running and held (#10453, #12772).
+        session_hold::lift_holds(std::slice::from_ref(&config.profile))?;
+    }
     match state {
         None => {
-            let image = image.unwrap_or(DEFAULT_SESSION_IMAGE);
+            let image = start_image.as_deref().unwrap_or(DEFAULT_SESSION_IMAGE);
             // The account profile's hook registration, Codex trust state and
             // readiness receipt are established HERE, in a throwaway container
             // carrying nothing but the profile — because the session created on
@@ -173,6 +386,81 @@ pub fn start(
     docker::setup(&config)?;
     docker::control(&config, id)?;
     snapshot(config, &dir)
+}
+
+/// The forge configuration directory a NEW private workspace records and
+/// binds read-only at [`GH_CONFIG`], or `None` when none may be mounted.
+///
+/// The daemon-owned GitHub App directories under the workspace root's own
+/// `.loom/` are deliberately not recorded ([`daemon_owned_gh_config`]): an
+/// App-only host delivers its installation token per exec as `GH_TOKEN`
+/// (`forge_auth`, #13916), so binding the directory would only re-expose
+/// the credential inside the seat — and it lives inside the daemon's own
+/// checkout, which the ancestor check below rightly refuses. Before #14744
+/// that refusal kept unattended `session_reconcile` from ever creating a
+/// seat on an App-only host, because the daemon activates that directory
+/// as its process-global `GH_CONFIG_DIR` at startup. Every other directory
+/// at or under a git checkout keeps the refusal.
+fn resolve_gh_config(workspace: &Path) -> Result<Option<PathBuf>> {
+    resolve_gh_config_with(
+        workspace,
+        std::env::var_os("GH_CONFIG_DIR"),
+        dirs::home_dir().map(|home| home.join(".config/gh")),
+        crate::credential_preflight::primary_workspace_root(),
+    )
+}
+
+/// [`resolve_gh_config`] over an injected `GH_CONFIG_DIR` value and
+/// home-default directory (tests): the same resolution and the same
+/// ancestor refusal for every directory the daemon does not own.
+pub(super) fn resolve_gh_config_with(
+    workspace: &Path,
+    gh_config_dir: Option<std::ffi::OsString>,
+    home_default: Option<PathBuf>,
+    primary_root: Option<PathBuf>,
+) -> Result<Option<PathBuf>> {
+    let resolved = gh_config_dir
+        .map(PathBuf::from)
+        .or(home_default)
+        .filter(|path| path.is_dir())
+        .map(|path| path.canonicalize())
+        .transpose()?
+        .filter(|path| !daemon_owned_gh_config(workspace, primary_root.as_deref(), path));
+    if let Some(path) = &resolved {
+        for parent in path.ancestors() {
+            if parent.join(".git").exists() {
+                bail!("forge credentials must be outside every repository/worktree");
+            }
+        }
+    }
+    Ok(resolved)
+}
+
+/// `true` when `path` (already canonicalized) is one of the daemon-owned
+/// GitHub App credential directories: the process-global `GH_CONFIG_DIR` the
+/// daemon activates at startup
+/// ([`crate::credential_preflight::github_app_gh_config_dir`]) or a per-owner
+/// sibling ([`github_app_gh_config_dir_for_owner`]), under either the daemon's
+/// primary workspace root (the credential owner: startup config belongs to it,
+/// whichever registered checkout acts) or the acting `workspace`.
+///
+/// Both sides are compared canonicalized: `path` already is, so each expected
+/// location is canonicalized too (an aliased `.loom` or `gh-config` resolves
+/// to the same place). A root that cannot be resolved owns nothing, so the
+/// caller's refusal stands.
+fn daemon_owned_gh_config(workspace: &Path, primary_root: Option<&Path>, path: &Path) -> bool {
+    std::iter::once(workspace)
+        .chain(primary_root)
+        .filter_map(|root| root.canonicalize().ok())
+        .any(|root| {
+            let canon = |p: PathBuf| p.canonicalize().unwrap_or(p);
+            if path == canon(crate::credential_preflight::github_app_gh_config_dir(&root)) {
+                return true;
+            }
+            let owners = canon(root.join(".loom").join("gh-config-by-owner"));
+            path.strip_prefix(&owners)
+                .is_ok_and(|rest| rest.components().count() == 1)
+        })
 }
 
 /// Unattended recovery of an already-configured private session whose
@@ -228,11 +516,23 @@ pub fn recover(
                     config.volume
                 );
             }
-            let image = image.context(
-                "recorded session image is unknown; refusing to substitute one (start the \
-                 session by hand with --image)",
-            )?;
+            // The image an operator `start` recorded from the configuration wins
+            // over the last one the reconciler saw, and is re-verified: a
+            // daemon roll that changed the sealed bundle refuses a
+            // not-yet-rebuilt derived image rather than swapping in another
+            // (#14451), exactly as host mode does.
+            let image = match config.session_image.as_deref() {
+                Some(recorded) => recorded,
+                None => image.context(
+                    "recorded session image is unknown; refusing to substitute one (start the \
+                     session by hand with --image)",
+                )?,
+            };
             docker::image_present(image)?;
+            if config.session_image.is_some() {
+                docker::verify_image(image)?;
+            }
+            check_extra_mounts(workspace, &config)?;
             held()?;
             docker::provision_controls(&config, image)?;
             docker::create(&config, image)?;
@@ -250,6 +550,323 @@ pub fn recover(
     snapshot(config, &dir)
 }
 
+/// Refuse the recorded extra read-only mounts a private session must never
+/// have (#14451): the host-mode denylist for the host source, and a container
+/// target that shadows or nests inside `/workspace`, the `CODEX_HOME` profile,
+/// the sealed bundle root or the forge-configuration mount. Run before a
+/// container is created, so a refused mount never reaches Docker.
+fn check_extra_mounts(workspace: &Path, config: &Config) -> Result<()> {
+    if config.extra_mounts.is_empty() {
+        return Ok(());
+    }
+    let reserved = [
+        PathBuf::from(ROOT),
+        PathBuf::from(PROFILE),
+        PathBuf::from(GH_CONFIG),
+    ];
+    super::super::session_mount_gate::check_private_extra_mounts(
+        &config.extra_mounts,
+        workspace,
+        &reserved,
+    )
+}
+
+/// An operator `start` over a container that already exists keeps the
+/// image and mounts it was created with; say so when the configuration now
+/// asks for something else, so the edit is not mistaken for applied.
+fn warn_if_config_drifted(workspace: &Path, config: &Config) {
+    let Ok(configured) = super::super::session_image::read_session_image_config(workspace) else {
+        return;
+    };
+    if configured.extra_mounts != config.extra_mounts
+        || (configured.image.is_some() && configured.image != config.session_image)
+    {
+        log::warn!(
+            "private session {}: accounts.session image/extraMounts differ from the running \
+             container's; they apply after `accounts session stop` and a new `start`",
+            config.account
+        );
+    }
+}
+
+/// Publish, discard or just list the unpublished branches of an account's
+/// private clones (`accounts session recover`, #14030). Same guard policy as
+/// a job: resolved workspace identity, a validated running session, and the
+/// exclusive account lease held for the whole call — so it can never race a
+/// running step, and nothing touches the volume or a branch other than the
+/// ones named by an explicit discard scope.
+pub fn session_recover(
+    workspace: &Path,
+    name: &str,
+    action: RecoverAction,
+    issue: Option<u64>,
+    branches: &[String],
+    worktrees: &[PathBuf],
+) -> Result<RecoverReport> {
+    if !worktrees.is_empty()
+        && (action != RecoverAction::Discard || !branches.is_empty() || issue.is_some())
+    {
+        bail!("discard accepts a worktree scope or a branch/issue scope, separately");
+    }
+    let (config, dir) = resolve(workspace, name)?;
+    let targets = {
+        let mut targets = vec![config.primary()];
+        for registered in &config.repositories {
+            targets.push(config.target(Some(&registered.repository))?);
+        }
+        targets
+    };
+    // Parity with a job on an additional clone: an excluded forge never
+    // reaches git, not even for a publish.
+    for target in targets.iter().filter(|t| t.slug.is_some()) {
+        check_firewall(workspace, &identify(&target.repository)?)?;
+    }
+    let _lease = lease::Lease::acquire(&dir)?;
+    let state = docker::inspect(&config.container)?
+        .context("private session is stopped; start it first")?;
+    docker::validate(&config, &state)?;
+    if state["State"]["Running"] != true || !docker::idle(Some(&state), &config.container)? {
+        bail!("private session is not running and idle; refuse recover admission");
+    }
+    // Resolved per exec (an installation token outlives no job), but checked
+    // for every clone up front: a publish pushes, and with no write credential
+    // for a GitHub clone the in-container helper can only fail, so refuse
+    // before ANY exec and name what to provide (#14433). List and discard
+    // never push.
+    let recovery_targets: Vec<_> = targets
+        .iter()
+        .map(|target| (target, forge_auth::ExecAuth::resolve(workspace, &target.repository)))
+        .collect();
+    if action == RecoverAction::Publish {
+        if let Some((target, auth)) = recovery_targets
+            .iter()
+            .find(|(_, auth)| auth.github_token_missing())
+        {
+            // An owner whose only published credential is provably expired
+            // reaches the same bail (`config_dir_for` skips a matched-but-
+            // expired directory), but the message must not tell the operator
+            // to publish an App config that is already published (#14435).
+            if auth.expired() {
+                bail!(
+                    "private workspace forge credential for {} is expired and no fresher \
+                     one is published; the credential refresh has not renewed it; the \
+                     unpublished work is retained",
+                    target.repository
+                );
+            }
+            bail!(
+                "no GitHub write credential for {}: no published App config for the \
+                 repository owner was found (.loom/gh-config-by-owner/<owner>/hosts.yml \
+                 under the running daemon's workspace root, which this command reads from \
+                 the daemon itself; if no daemon answered, start it or export \
+                 LOOM_MACHINE_CHECKOUT=<that root> as an override) and no GH_TOKEN is in \
+                 the environment; the unpublished work is retained",
+                target.repository
+            );
+        }
+    }
+    let paths_by_clone = if worktrees.is_empty() {
+        vec![Vec::new(); targets.len()]
+    } else {
+        // Check every path across all clones while holding the same account
+        // lease. A refusal in a later clone must not follow a removal in an
+        // earlier one. The worker revalidates its scope before executing it.
+        let mut validations = Vec::new();
+        for (target, auth) in &recovery_targets {
+            validations.push(docker::recover_target(
+                &config,
+                target,
+                RecoverAction::ValidateWorktrees,
+                None,
+                &[],
+                worktrees,
+                auth,
+            )?);
+        }
+        plan_worktree_discard(worktrees, &validations)?
+    };
+    let mut clones = Vec::new();
+    for ((target, auth), paths) in recovery_targets.into_iter().zip(paths_by_clone) {
+        let action = if !worktrees.is_empty() && paths.is_empty() {
+            RecoverAction::List
+        } else {
+            action
+        };
+        clones
+            .push(docker::recover_target(&config, target, action, issue, branches, &paths, &auth)?);
+    }
+    let report = RecoverReport {
+        account: config.account.clone(),
+        clones,
+    };
+    if action != RecoverAction::List
+        && (issue.is_some() || !branches.is_empty() || !worktrees.is_empty())
+        && report.clones.iter().all(|clone| {
+            clone.published.is_empty()
+                && clone.discarded.is_empty()
+                && clone.removed_worktrees.is_empty()
+        })
+    {
+        bail!(
+            "no clone of this account has unpublished commits on the named branches or a \
+             worktree at the named paths; run the listing form (`accounts session recover \
+             {name}`) to see what is unpublished and which worktrees are dirty"
+        );
+    }
+    Ok(report)
+}
+
+pub(super) fn plan_worktree_discard(
+    worktrees: &[PathBuf],
+    validations: &[RecoverOutcome],
+) -> Result<Vec<Vec<PathBuf>>> {
+    let mut by_clone = vec![Vec::new(); validations.len()];
+    for path in worktrees {
+        let name = path.display().to_string();
+        let mut owners = validations
+            .iter()
+            .enumerate()
+            .filter(|(_, clone)| clone.cloned && !clone.ignored.contains(&name));
+        let Some((index, _)) = owners.next() else {
+            bail!("no clone of this account owns worktree {}; nothing removed", path.display());
+        };
+        if owners.next().is_some() {
+            bail!("multiple clones claim worktree {}; nothing removed", path.display());
+        }
+        by_clone[index].push(path.clone());
+    }
+    Ok(by_clone)
+}
+
+/// Rebind an additional private-clone registration to the repository's
+/// canonical URL after a forge transfer (`accounts session rebind`, #14357),
+/// keeping its clone, local branches, dirty files and unpublished commits.
+///
+/// Guards are the job policy's plus the hold check: resolved workspace
+/// identity, a firewall check on the NEW url, the exclusive account lease, a
+/// running idle session, and no operator hold, all before the first mutation
+/// (a busy account is [`AccountBusy`], a held one [`OperatorHeld`]; neither is
+/// ever interrupted or lifted). The in-volume step verifies the canonical
+/// repository shares history with the clone before anything moves, and
+/// reports (changing nothing) when both locations already hold a clone.
+/// `workspace.json` is rewritten only after the volume is done, so a crash in
+/// between is finished by repeating the call. Re-running a completed rebind
+/// verifies and reports it. The primary repository is never rebound here.
+pub fn rebind(
+    workspace: &Path,
+    name: &str,
+    from: &str,
+    to: &str,
+    dry_run: bool,
+) -> Result<RebindReport> {
+    let (from_id, to_id) = (identify(&repository_url(from)?)?, identify(&repository_url(to)?)?);
+    if from_id.key == to_id.key {
+        bail!("old and canonical URLs name the same repository; a spelling change needs no rebind");
+    }
+    let (mut config, dir) = resolve(workspace, name)?;
+    let is_primary = |key: &str| identify(&config.repository).is_ok_and(|id| id.key == key);
+    if is_primary(&from_id.key) || is_primary(&to_id.key) {
+        bail!(
+            "the primary repository cannot be rebound; only additional registrations ({})",
+            registered_urls(&config)
+        );
+    }
+    let find = |key: &str| {
+        config
+            .repositories
+            .iter()
+            .position(|r| identify(&r.repository).is_ok_and(|id| id.key == key))
+    };
+    let (old_at, new_at) = (find(&from_id.key), find(&to_id.key));
+    let from_reg = match (old_at, new_at) {
+        (Some(at), _) => config.repositories[at].clone(),
+        // Old registration already retired: verify the canonical one.
+        (None, Some(at)) => Registered {
+            repository: from_id.url.clone(),
+            base: config.repositories[at].base.clone(),
+            slug: from_id.slug.clone(),
+        },
+        (None, None) => bail!(
+            "neither {} nor {} is registered on this account (registered: {})",
+            from_id.url,
+            to_id.url,
+            registered_urls(&config)
+        ),
+    };
+    if let Some(at) = new_at {
+        if config.repositories[at].base != from_reg.base {
+            bail!("the old and canonical registrations use different bases; resolve that before rebinding");
+        }
+    }
+    check_firewall(workspace, &to_id)?;
+    let _lease = lease::Lease::acquire(&dir)?;
+    let state = docker::inspect(&config.container)?
+        .context("private session is stopped; start it first")?;
+    docker::validate(&config, &state)?;
+    if state["State"]["Running"] != true || !docker::idle(Some(&state), &config.container)? {
+        return Err(
+            lease::AccountBusy("private session is not running and idle; try again later").into()
+        );
+    }
+    if session_hold::held_across(std::slice::from_ref(&config.profile)) {
+        return Err(OperatorHeld.into());
+    }
+    let auth = forge_auth::ExecAuth::resolve(workspace, &to_id.url);
+    let outcome = docker::rebind_target(&config, &from_reg, &to_id, dry_run, &auth)?;
+    let settled = matches!(
+        outcome.status,
+        RebindStatus::Moved | RebindStatus::AlreadyBound | RebindStatus::NotCloned
+    );
+    let canonical = Registered {
+        repository: to_id.url.clone(),
+        base: from_reg.base.clone(),
+        slug: to_id.slug.clone(),
+    };
+    let wanted: Vec<Registered> = {
+        let mut list = Vec::new();
+        for registered in &config.repositories {
+            let key = identify(&registered.repository).map(|id| id.key).ok();
+            if key.as_deref() == Some(from_id.key.as_str())
+                || key.as_deref() == Some(to_id.key.as_str())
+            {
+                if !list.contains(&canonical) {
+                    list.push(canonical.clone());
+                }
+            } else {
+                list.push(registered.clone());
+            }
+        }
+        list
+    };
+    let registration_changed = wanted != config.repositories;
+    if settled && registration_changed && !dry_run {
+        config.repositories = wanted;
+        save(&dir.join("workspace.json"), &config)?;
+    }
+    Ok(RebindReport {
+        account: config.account.clone(),
+        from: from_id.url,
+        to: to_id.url,
+        base: from_reg.base,
+        status: outcome.status,
+        registration_changed: registration_changed && (settled || dry_run),
+        clone_path: format!("{WORK_ROOT}/{}", to_id.slug),
+        before: if outcome.from.populated {
+            outcome.from
+        } else {
+            outcome.to.clone()
+        },
+        after: outcome.to,
+    })
+}
+
+fn registered_urls(config: &Config) -> String {
+    std::iter::once(config.repository.as_str())
+        .chain(config.repositories.iter().map(|r| r.repository.as_str()))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 fn snapshot(config: Config, dir: &Path) -> Result<Status> {
     let state = docker::inspect(&config.container)?;
     if let Some(state) = &state {
@@ -261,9 +878,14 @@ fn snapshot(config: Config, dir: &Path) -> Result<Status> {
         container_id: state
             .as_ref()
             .and_then(|s| s["Id"].as_str().map(str::to_owned)),
+        image: state
+            .as_ref()
+            .and_then(|s| s["Config"]["Image"].as_str().map(str::to_owned)),
+        extra_mounts: config.extra_mounts.clone(),
         running: state
             .as_ref()
             .is_some_and(|s| s["State"]["Running"] == true),
+        held: session_hold::held_across(std::slice::from_ref(&config.profile)),
         lease: lease::read(dir)?,
         admission: lease::admission(dir)?,
         config,
@@ -378,4 +1000,77 @@ pub fn run_job(workspace: &Path, args: JobArgs) -> Result<i32> {
     }
     lease.finish()?;
     Ok(code)
+}
+
+/// The leased seat maintenance pass (#14678): the periodic, all-clones idle
+/// counterpart of [`run_job`]'s admission. Same exclusive account lease and
+/// the same containment + running-and-idle proof, but **no job and no
+/// `docker::prepare_target`** — preparation runs `clean_worktrees`, which
+/// refuses a dirty worktree, while this pass must reach a dirty seat's
+/// scratch and report its dirty worktrees as preserved instead of stopping.
+///
+/// Every seat is independent: a busy, stopped or non-idle seat is skipped
+/// with a reason (a retry is the next pass's job, not a failure), never
+/// holding up the others. `.identity` records and the no-alternates /
+/// private-clone invariants are untouched — the in-container verb only ever
+/// removes step scratch and clean, published, merged-past-grace worktrees.
+pub fn seat_reclaim(
+    workspace: &Path,
+    max_age_secs: i64,
+    grace_secs: i64,
+) -> Vec<(String, Result<super::seat_reclaim::SeatReclaimOutcome, String>)> {
+    use super::super::account_registry::{account_inventory, AccountProvider};
+
+    let mut out = Vec::new();
+    let Ok(accounts) = account_inventory(workspace, AccountProvider::Codex) else {
+        return out;
+    };
+    for descriptor in accounts {
+        let name = descriptor.id.name.clone();
+        // A tolerant read: an account without a private workspace is not a
+        // seat, and one whose state cannot be read is skipped below by name.
+        let Some(config) = registrations(&descriptor.credential_reference) else {
+            continue;
+        };
+        out.push((name, seat_reclaim_one(workspace, &config, max_age_secs, grace_secs)));
+    }
+    out
+}
+
+/// One seat's pass; every early return is a skip reason, not an error worth
+/// failing the host pass over.
+fn seat_reclaim_one(
+    workspace: &Path,
+    config: &Config,
+    max_age_secs: i64,
+    grace_secs: i64,
+) -> Result<super::seat_reclaim::SeatReclaimOutcome, String> {
+    let dir = state_dir(&config.profile).map_err(|e| e.to_string())?;
+    let lease = lease::Lease::acquire(&dir).map_err(|error| {
+        if error.downcast_ref::<AccountBusy>().is_some() {
+            "seat busy; a job holds the account lease (retry next pass)".to_owned()
+        } else {
+            error.to_string()
+        }
+    })?;
+    let state = docker::inspect(&config.container)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| "session is stopped; nothing to reclaim this pass".to_owned())?;
+    docker::validate(config, &state).map_err(|e| e.to_string())?;
+    lease
+        .recover(config, Some(&state))
+        .map_err(|e| e.to_string())?;
+    if state["State"]["Running"] != true
+        || !docker::idle(Some(&state), &config.container).map_err(|e| e.to_string())?
+    {
+        return Err("seat is not running and idle; retry next pass".into());
+    }
+    if state["Id"].as_str().is_none() {
+        return Err("container id unavailable".into());
+    }
+    // The credential scope of the account's primary repository, the same
+    // context `recover` execs under: the verb's PR probes need a forge
+    // identity, and the scope never widens past the account's own remotes.
+    let auth = forge_auth::ExecAuth::resolve(workspace, &config.repository);
+    docker::seat_reclaim(config, max_age_secs, grace_secs, &auth).map_err(|e| e.to_string())
 }

@@ -124,22 +124,24 @@
 //! drift-recreated.
 
 use crate::script_helpers::now_epoch_secs;
+use std::borrow::Borrow;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use crate::tokens_pool::account_registry::{
-    account_inventory_quiet, AccountDescriptor, AccountProvider,
+    codex_inventory_observed, AccountDescriptor, AccountProvider,
 };
 use crate::tokens_pool::docker_cli::DockerTimedOut;
-use crate::tokens_pool::private_workspace;
+use crate::tokens_pool::private_workspace::{self, BindingReadiness};
 use crate::tokens_pool::session_hold::{self, LastStart, OperatorHeld};
+use crate::tokens_pool::session_image::SessionImageConfig;
 use crate::tokens_pool::session_lifecycle::{
     container_name, is_session_managed, refresh_session_health_uncached, ContainerRunner,
     ContainerState, ProcessContainerRunner, SessionLifecycle, SessionStatus, UndoLock,
-    SESSION_POSTURE, SESSION_POSTURE_LABEL,
+    EXTRA_MOUNTS_LABEL, SESSION_POSTURE, SESSION_POSTURE_LABEL,
 };
-use crate::tokens_pool::session_state::{self, DriftInputs, MountDrift, Snapshot};
+use crate::tokens_pool::session_state::{self, BindingSnapshot, DriftInputs, MountDrift, Snapshot};
 use crate::tokens_pool::{session_dispatch_lock, session_hold_roots, session_mount_gate};
 use crate::workspace_registry::WorkspaceRegistry;
 use serde_json::Value;
@@ -147,6 +149,8 @@ use serde_json::Value;
 #[path = "session_reconcile_drift.rs"]
 pub mod drift;
 pub use drift::DeferReason;
+#[path = "session_reconcile_bindings.rs"]
+pub mod bindings;
 #[path = "session_reconcile_skew.rs"]
 pub mod skew;
 
@@ -443,6 +447,8 @@ pub struct ReconcileState {
     docker_failures: u32,
     docker_retry_at: u64,
     docker_last_error: Option<String>,
+    /// Declared private-clone bindings: backoff and what was already WARNed.
+    bindings: bindings::State,
 }
 
 /// The container read failed: the runtime, not the account, is the problem.
@@ -465,6 +471,10 @@ impl std::error::Error for DockerUnavailable {}
 pub struct AccountIndex {
     disabled: HashSet<String>,
     profiles: HashMap<String, Vec<PathBuf>>,
+    /// ASCII-lowercased account email → `id.name` (first inventory wins, the
+    /// order `converge_bindings::root_of` resolves in), so a lookup accepts
+    /// every spelling `account_matches_reference` does (#14287).
+    emails: HashMap<String, String>,
 }
 
 impl AccountIndex {
@@ -479,6 +489,12 @@ impl AccountIndex {
             if !account.enabled {
                 index.disabled.insert(name.clone());
             }
+            if let Some(email) = account.email.as_deref() {
+                index
+                    .emails
+                    .entry(email.to_ascii_lowercase())
+                    .or_insert_with(|| name.clone());
+            }
             let profiles = index.profiles.entry(name).or_default();
             if !profiles.contains(&account.credential_reference) {
                 profiles.push(account.credential_reference.clone());
@@ -487,14 +503,28 @@ impl AccountIndex {
         index
     }
 
-    fn profiles(&self, name: &str) -> &[PathBuf] {
-        self.profiles.get(name).map_or(&[], Vec::as_slice)
+    /// The canonical `id.name` for an account reference: the name itself, or —
+    /// as in `account_matches_reference` — an `@` reference matching an email.
+    /// An unknown reference comes back unchanged (and so matches nothing).
+    fn canonical<'a>(&'a self, reference: &'a str) -> &'a str {
+        if self.profiles.contains_key(reference) || !reference.contains('@') {
+            return reference;
+        }
+        self.emails
+            .get(&reference.to_ascii_lowercase())
+            .map_or(reference, String::as_str)
     }
 
-    /// `enabled=false` in at least one root.
+    fn profiles(&self, reference: &str) -> &[PathBuf] {
+        self.profiles
+            .get(self.canonical(reference))
+            .map_or(&[], Vec::as_slice)
+    }
+
+    /// `enabled=false` in at least one root. `name` may be an email reference.
     #[must_use]
     pub fn is_disabled(&self, name: &str) -> bool {
-        self.disabled.contains(name)
+        self.disabled.contains(self.canonical(name))
     }
 
     /// An operator hold is in force (read from disk on every call).
@@ -548,22 +578,29 @@ pub struct PassInputs<'a> {
     /// The host daemon's version; `None` when it could not be read, which
     /// disables every version-coupling decision (#11727).
     pub host_version: Option<skew::DaemonVersion>,
+    /// The resolved `accounts.session` settings (issue #14019): an override
+    /// seat is never recreated by the skew pass, and a missing seat is
+    /// recreated from the configured image rather than a stale recorded
+    /// pin. `None`: unset (or unreadable — the pass warns once and carries
+    /// on; the CLI refuses the start outright, so nothing can be *created*
+    /// with a broken override).
+    pub session_config: Option<&'a SessionImageConfig>,
 }
 
 /// The pass's single container read: one [`Snapshot`] from `take`, taken on
 /// first use and reused for every account after that (issue #10364 Part B).
-pub struct PassSnapshot<'a> {
-    take: &'a mut dyn FnMut() -> Snapshot,
-    taken: Option<Snapshot>,
+pub struct PassSnapshot<'a, S = Snapshot> {
+    take: &'a mut dyn FnMut() -> S,
+    taken: Option<S>,
 }
 
-impl<'a> PassSnapshot<'a> {
-    pub fn new(take: &'a mut dyn FnMut() -> Snapshot) -> Self {
+impl<'a, S> PassSnapshot<'a, S> {
+    pub fn new(take: &'a mut dyn FnMut() -> S) -> Self {
         Self { take, taken: None }
     }
 
     /// The pass's snapshot, taking it on the first call.
-    pub fn get(&mut self) -> &Snapshot {
+    pub fn get(&mut self) -> &S {
         self.taken.get_or_insert_with(|| (self.take)())
     }
 }
@@ -585,11 +622,11 @@ fn will_read(state: &ReconcileState, index: &AccountIndex, name: &str, now: u64)
 /// longer lists (`extra` drift, a containment gap) are handled first, then
 /// those only missing a mount, then the rest, so a pass spent waiting on
 /// `docker stop`/`run` closes the gap before anything else.
-pub fn reconcile_accounts<R: ContainerRunner>(
+pub fn reconcile_accounts<R: ContainerRunner, S: Borrow<Snapshot>>(
     lifecycle: &mut SessionLifecycle<R>,
     accounts: &[AccountDescriptor],
     inputs: &PassInputs<'_>,
-    observe: &mut PassSnapshot<'_>,
+    observe: &mut PassSnapshot<'_, S>,
     state: &mut ReconcileState,
     now: u64,
 ) -> Vec<AccountOutcome> {
@@ -607,7 +644,7 @@ pub fn reconcile_accounts<R: ContainerRunner>(
         .iter()
         .any(|a| will_read(state, index, &a.id.name, now))
     {
-        let snapshot = observe.get();
+        let snapshot = observe.get().borrow();
         let class =
             |a: &&AccountDescriptor| drift::priority(snapshot, &container_name(&a.id.name), inputs);
         match inputs.class {
@@ -639,7 +676,8 @@ pub fn reconcile_accounts<R: ContainerRunner>(
             }
         } else {
             mem.held_reported = false;
-            match reconcile_one(lifecycle, account, &container, inputs, observe.get(), mem) {
+            match reconcile_one(lifecycle, account, &container, inputs, observe.get().borrow(), mem)
+            {
                 Ok(outcome) => {
                     if outcome == Outcome::Running {
                         if mem.failures > 0 {
@@ -771,6 +809,10 @@ pub fn observe_container<'s>(
 #[must_use]
 pub fn container_state(inspect: &Value) -> ContainerState {
     let text = |v: &Value| v.as_str().filter(|s| !s.is_empty()).map(str::to_string);
+    let extra_mounts = inspect["Config"]["Labels"][EXTRA_MOUNTS_LABEL]
+        .as_str()
+        .map(crate::tokens_pool::session_image::parse_extra_mounts_label)
+        .unwrap_or_default();
     ContainerState {
         id: inspect["Id"].as_str().unwrap_or_default().to_string(),
         running: session_state::container_running(inspect),
@@ -778,6 +820,7 @@ pub fn container_state(inspect: &Value) -> ContainerState {
         started_at: text(&inspect["State"]["StartedAt"]),
         image: text(&inspect["Config"]["Image"]),
         workspace: session_state::workspace_label(inspect).map(Path::to_path_buf),
+        extra_mounts,
     }
 }
 
@@ -990,6 +1033,15 @@ fn reconcile_one<R: ContainerRunner>(
                     workspace.display()
                 );
             }
+            // The configured override image (issue #14019) beats a recorded
+            // start's image: the config is what the seat should run now, and
+            // a stale recorded digest pin would recreate it on an image the
+            // operator has since replaced. It is bundle-verified inside the
+            // start (a refusal leaves the seat down, not on the stock image).
+            let recreate_image = ctx
+                .session_config
+                .and_then(|config| config.image.clone())
+                .or(recreate_image);
             skew::guard_image(ctx, recreate_image.as_deref())?;
             let undo = UndoLock::Take(ctx.dispatch_locks);
             recreate_container(lifecycle, name, &workspace, recreate_image, &is_held, undo)?;
@@ -1047,29 +1099,65 @@ pub fn run_tick(fallback_root: &Path, state: &mut ReconcileState, now: u64) -> V
     // Holds and `enabled=false` count across every root before any root
     // acts: the one hold root set the CLI also uses (#10661), a superset of
     // the roots the pass acts in.
-    let hold_inventories: Vec<(PathBuf, Vec<AccountDescriptor>)> =
-        session_hold_roots::hold_roots(&registered, Some(fallback_root))
-            .into_iter()
-            .filter_map(|root| {
-                let inventory = account_inventory_quiet(&root, AccountProvider::Codex).ok()?;
-                Some((root, inventory))
-            })
-            .collect();
+    let hold_inventories: Vec<_> = session_hold_roots::hold_roots(&registered, Some(fallback_root))
+        .into_iter()
+        .filter_map(|root| {
+            let (inventory, complete) = codex_inventory_observed(&root).ok()?;
+            Some((root, inventory, complete))
+        })
+        .collect();
     let index = AccountIndex::from_inventories(
         &hold_inventories
             .iter()
-            .map(|(_, inv)| inv.as_slice())
+            .map(|(_, inv, _)| inv.as_slice())
             .collect::<Vec<_>>(),
     );
     let acting = registry.effective_roots(fallback_root);
-    let inventories = hold_inventories
+    // The resolved `accounts.session` settings (issue #14019), read once per
+    // pass against the daemon's own root (its tier chain covers the host
+    // defaults and the per-repo tiers). An unreadable block warns and is
+    // treated as unset: the CLI refuses a *start* with the same block, so a
+    // broken override cannot silently put a fresh seat on the stock image —
+    // but an already-running seat keeps its reconcile care.
+    let session_config =
+        match crate::tokens_pool::session_image::read_session_image_config(fallback_root) {
+            Ok(config) => Some(config),
+            Err(error) => {
+                log::warn!(
+                    "session_reconcile: the accounts.session config cannot be read ({error:#}); \
+                 extra mounts and the image override are ignored this pass"
+                );
+                None
+            }
+        };
+    let acting_inventory_complete = readable
+        && acting.iter().all(|root| {
+            hold_inventories
+                .iter()
+                .any(|(observed, _, complete)| observed == root && *complete)
+        });
+    let acting_inventories: Vec<_> = hold_inventories
         .into_iter()
-        .filter(|(root, _)| acting.contains(root));
+        .filter(|(root, _, _)| acting.contains(root))
+        .map(|(root, inventory, _)| (root, inventory))
+        .collect();
+    let inventories = acting_inventories.iter().cloned();
+    let declared = bindings::read(fallback_root);
+    let attest_engine =
+        bindings::needs_seat_observation(&declared, &index, state, now, |reference| {
+            binding_account(&acting_inventories, reference).is_some()
+        });
     // One container read for the whole pass (every root), taken lazily,
     // classified with the shared drift definition (#10600).
     let drift_inputs = DriftInputs::new(readable.then_some(registered.as_slice()));
-    let read =
-        || session_state::snapshot("docker", &drift_inputs, session_state::SNAPSHOT_DEADLINE);
+    let read = || {
+        session_state::binding_snapshot(
+            "docker",
+            &drift_inputs,
+            session_state::SNAPSHOT_DEADLINE,
+            attest_engine,
+        )
+    };
     let mut take = read;
     let mut observe = PassSnapshot::new(&mut take);
     let dispatch_locks = session_dispatch_lock::lock_dir();
@@ -1103,7 +1191,8 @@ pub fn run_tick(fallback_root: &Path, state: &mut ReconcileState, now: u64) -> V
             if accounts.is_empty() {
                 continue;
             }
-            let mut lifecycle = SessionLifecycle::new(root.clone(), ProcessContainerRunner, None);
+            let mut lifecycle = SessionLifecycle::new(root.clone(), ProcessContainerRunner, None)
+                .with_session_config(session_config.clone());
             let is_private_clone =
                 |a: &AccountDescriptor| private_workspace::configured(root, &a.id.name);
             let recover_private =
@@ -1132,6 +1221,7 @@ pub fn run_tick(fallback_root: &Path, state: &mut ReconcileState, now: u64) -> V
                 host_version: skew::DaemonVersion::from_version_output(
                     crate::self_update::BUILD_IDENTITY,
                 ),
+                session_config: session_config.as_ref(),
             };
             let outcomes =
                 reconcile_accounts(&mut lifecycle, &accounts, &inputs, &mut observe, state, now);
@@ -1151,13 +1241,134 @@ pub fn run_tick(fallback_root: &Path, state: &mut ReconcileState, now: u64) -> V
             all.extend(outcomes);
         }
     }
+    let mut take_after = read;
+    let mut after = PassSnapshot::new(&mut take_after);
+    let mut seat_ready =
+        |account: &AccountDescriptor, seat: &private_workspace::ConfiguredSeatMissing| {
+            let snapshot = binding_snapshot(&account.id.name, &all, &mut observe, &mut after);
+            seat.observe(account, snapshot)
+        };
+    converge_bindings(
+        &declared,
+        &index,
+        &acting_inventories,
+        acting_inventory_complete,
+        &mut seat_ready,
+        state,
+        now,
+    );
     if all.iter().any(|o| o.outcome.started()) {
         // Selection reads the published snapshot: show it the start now.
         let started = std::time::Instant::now();
-        session_state::publish(std::sync::Arc::new(read()), started);
+        let published =
+            session_state::snapshot("docker", &drift_inputs, session_state::SNAPSHOT_DEADLINE);
+        session_state::publish(std::sync::Arc::new(published), started);
     }
     crate::session_status::record_pass(&all, now);
     all
+}
+
+/// A lifecycle action may have changed this seat since the original snapshot.
+/// Refresh at most once, only when an affected binding needs the newer view.
+fn binding_snapshot<'a>(
+    account: &str,
+    outcomes: &[AccountOutcome],
+    before: &'a mut PassSnapshot<'_, BindingSnapshot>,
+    after: &'a mut PassSnapshot<'_, BindingSnapshot>,
+) -> &'a BindingSnapshot {
+    if outcomes.iter().any(|item| {
+        item.name == account
+            && (item.outcome.started()
+                || matches!(item.outcome, Outcome::DriftRemoved { .. } | Outcome::Failed { .. }))
+    }) {
+        after.get()
+    } else {
+        before.get()
+    }
+}
+
+/// The first acting root and Codex account matching a declaration's name or
+/// email. The same decision drives readiness, convergence and drift.
+fn binding_account<'a>(
+    inventories: &'a [(PathBuf, Vec<AccountDescriptor>)],
+    reference: &str,
+) -> Option<(&'a Path, &'a AccountDescriptor)> {
+    inventories.iter().find_map(|(root, inventory)| {
+        inventory
+            .iter()
+            .find(|account| {
+                account.id.provider == AccountProvider::Codex
+                    && crate::tokens_pool::account_registry::account_matches_reference(
+                        account, reference,
+                    )
+            })
+            .map(|account| (root.as_path(), account))
+    })
+}
+
+/// Make the declared private-clone bindings true ([`bindings`], #14111), after
+/// every account's own recovery so a dead container is restored first. Costs a
+/// config read when nothing is declared; skipped while Docker is backing off.
+fn converge_bindings(
+    declared: &bindings::Declared,
+    index: &AccountIndex,
+    inventories: &[(PathBuf, Vec<AccountDescriptor>)],
+    inventory_complete: bool,
+    seat_ready: &mut dyn FnMut(
+        &AccountDescriptor,
+        &private_workspace::ConfiguredSeatMissing,
+    ) -> BindingReadiness,
+    state: &mut ReconcileState,
+    now: u64,
+) -> bindings::Pass {
+    if declared.bindings.is_empty() && declared.invalid.is_empty() {
+        return bindings::Pass::default();
+    }
+    if state.docker_retry_at > now {
+        return bindings::Pass::default();
+    }
+    let converge = |binding: &bindings::Binding, hold: &dyn Fn() -> anyhow::Result<()>| {
+        let (root, _) = binding_account(inventories, &binding.account)
+            .ok_or(private_workspace::AccountAbsent::ActingRoots)?;
+        private_workspace::converge(
+            root,
+            &binding.account,
+            &binding.repository,
+            &binding.base,
+            hold,
+        )
+    };
+    let registered = |account: &str| {
+        binding_account(inventories, account)
+            .map_or(Ok(None), |(root, _)| private_workspace::registered_repositories(root, account))
+    };
+    let mut observed = HashMap::new();
+    let mut ready = |reference: &str, wait: &bindings::WaitReason| {
+        let Some((_, account)) = binding_account(inventories, reference) else {
+            return if inventory_complete {
+                BindingReadiness::Missing
+            } else {
+                BindingReadiness::Unverified
+            };
+        };
+        match wait {
+            bindings::WaitReason::AccountAbsent => BindingReadiness::Ready,
+            bindings::WaitReason::ConfiguredSeatMissing(seat) => *observed
+                .entry((&account.id.name, &account.credential_reference, seat.clone()))
+                .or_insert_with(|| seat_ready(account, seat)),
+        }
+    };
+    bindings::converge_pass(
+        declared,
+        &mut bindings::Inputs {
+            index,
+            converge: &converge,
+            ready: &mut ready,
+            registered: &registered,
+        },
+        state,
+        now,
+    )
 }
 
 /// Spawn the loop on the shared runtime. The first tick fires immediately, so

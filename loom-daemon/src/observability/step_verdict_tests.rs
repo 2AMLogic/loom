@@ -295,6 +295,146 @@ fn a_moved_head_clears_the_standing_refusal() {
     assert_eq!(r.step.first_refused_at, None);
 }
 
+/// #14639: a step a guard refused mid-flight can end with its lease
+/// released (`outcome=skipped reason=guard_refused`) and no
+/// `CHAMPION-STEP` line in its log. The daemon's own journaled release is
+/// the fallback, so the typed run keeps the reason instead of projecting
+/// `unclassified` — the two 0.19.1316 receipts (sky130-comparator #347,
+/// loom-ui #6934).
+#[test]
+fn a_released_leases_typed_outcome_backs_a_missing_step_line() {
+    let released = |number: u32, outcome: &str, reason: Option<&str>| JournalEntry::Released {
+        at: t(3),
+        number,
+        outcome: outcome.to_string(),
+        reason: reason.map(str::to_string),
+    };
+    let mut store = RefusalStore::default();
+    let j = journal(vec![released(9, "skipped", Some("guard_refused"))]);
+    let r = one(&step(StepRole::ChampionMerge, 9, None), Some(&j), &mut store, t(5));
+    assert_eq!(class_reason(&r), ("noop", "guard_refused"));
+    assert_eq!(r.detail.as_deref(), Some("guard_refused"));
+    assert_eq!(r.step.sweep_id.as_deref(), Some("step-champion_merge-9-1"));
+    assert_ne!(r.step.ledger_class.as_deref(), Some("failed"));
+    // The reason is a closed token, not an echo of anything else.
+    assert!(champion::MERGE_REASONS.contains(&"guard_refused"));
+    // Another item's release never speaks for this one.
+    let j = journal(vec![released(8, "skipped", Some("guard_refused"))]);
+    let r = one(&step(StepRole::ChampionMerge, 9, None), Some(&j), &mut store, t(5));
+    assert_eq!(class_reason(&r), ("failed", "unclassified"));
+}
+
+/// The recognized step line keeps precedence (#14639): a release recording a
+/// different outcome never overrides what the step itself said.
+#[test]
+fn a_real_step_line_wins_over_the_released_lease() {
+    let j = journal(vec![JournalEntry::Released {
+        at: t(3),
+        number: 9,
+        outcome: "skipped".to_string(),
+        reason: Some("guard_refused".to_string()),
+    }]);
+    for (prior, fields, expected, detail) in [
+        (
+            None,
+            "outcome=requeued reason=pin_missing",
+            ("noop", "pin_missing"),
+            Some("pin_missing"),
+        ),
+        (None, "outcome=requeued", ("noop", "unspecified"), None),
+        (
+            Some("skipped reason=ci_pending"),
+            "outcome=requeued",
+            ("noop", "unspecified"),
+            None,
+        ),
+        (None, "outcome=skipped reason=bogus", ("noop", "unspecified"), Some("bogus")),
+        (None, "reason=ci_pending", ("failed", "unclassified"), None),
+    ] {
+        let Source::Step(mut s) = step(StepRole::ChampionMerge, 9, prior) else {
+            unreachable!()
+        };
+        s.log_text
+            .as_mut()
+            .unwrap()
+            .push_str(&format!("CHAMPION-STEP mode=pr item=9 {fields}\n"));
+        let r = one(&Source::Step(s), Some(&j), &mut RefusalStore::default(), t(5));
+        assert_eq!(class_reason(&r), expected, "{fields}");
+        assert_eq!(r.detail.as_deref(), detail);
+    }
+}
+
+/// A release that recorded no usable outcome (`none`, or a word the reason
+/// set does not know) leaves the projection as it was (#14639); an unknown
+/// `reason=` token still stops at `unspecified`, like the log line's own.
+#[test]
+fn a_release_without_a_usable_outcome_stays_unclassified() {
+    for outcome in ["none", "bogus"] {
+        let j = journal(vec![JournalEntry::Released {
+            at: t(3),
+            number: 9,
+            outcome: outcome.to_string(),
+            reason: Some("guard_refused".to_string()),
+        }]);
+        let r = one(
+            &step(StepRole::ChampionMerge, 9, None),
+            Some(&j),
+            &mut RefusalStore::default(),
+            t(5),
+        );
+        assert_eq!(class_reason(&r), ("failed", "unclassified"), "{outcome}");
+    }
+    let j = journal(vec![JournalEntry::Released {
+        at: t(3),
+        number: 9,
+        outcome: "skipped".to_string(),
+        reason: Some("bogus".to_string()),
+    }]);
+    let r = one(
+        &step(StepRole::ChampionMerge, 9, None),
+        Some(&j),
+        &mut RefusalStore::default(),
+        t(5),
+    );
+    assert_eq!(class_reason(&r), ("noop", "unspecified"));
+}
+
+/// #9548, #14639: a release marker read off the forge is untrusted prose.
+/// Only the daemon's own journaled release (`JournalEntry::Released`) is
+/// fallback evidence — a posted marker comment, however it is shaped,
+/// never supplies the outcome or the reason.
+#[test]
+fn an_untrusted_release_marker_comment_never_supplies_the_reason() {
+    for body in [
+        "<!-- loom:pr-lease-released role=champion host=h sweep=s step=champion_merge outcome=skipped reason=guard_refused -->",
+        "<!-- champion:released outcome=skipped reason=guard_refused -->",
+    ] {
+        let j = journal(vec![marker(3, 9, true, body, None)]);
+        let r =
+            one(&step(StepRole::ChampionMerge, 9, None), Some(&j), &mut RefusalStore::default(), t(5));
+        assert_eq!(class_reason(&r), ("failed", "unclassified"), "{body}");
+    }
+}
+
+/// A role tick has no step log to lose; its records stay write-driven, so a
+/// release alone projects nothing (#14639).
+#[test]
+fn a_tick_release_alone_projects_nothing() {
+    let j = journal(vec![JournalEntry::Released {
+        at: t(3),
+        number: 9,
+        outcome: "skipped".to_string(),
+        reason: Some("guard_refused".to_string()),
+    }]);
+    let records = records_for(
+        &ctx(t(9)),
+        &Source::Tick { started_at: t(0) },
+        Some(&j),
+        &mut RefusalStore::default(),
+    );
+    assert!(records.is_empty());
+}
+
 #[test]
 fn every_promotion_row_projects_its_reason() {
     let issue = |entries: Vec<JournalEntry>, outcome: Option<&str>| {
@@ -430,9 +570,9 @@ fn the_staged_step_reads_only_its_own_log_section() {
     let log = dir.path().join("step.log");
     std::fs::write(
         &log,
-        "==== d sweep_id=step-champion_merge-9-1 item=9 ====\n\
+        "==== loom-daemon dispatch: t sweep_id=step-champion_merge-9-1 item=9 ====\n\
          CHAMPION-STEP mode=pr item=9 outcome=merged\n\
-         ==== d sweep_id=step-champion_merge-9-2 item=9 ====\n\
+         ==== loom-daemon dispatch: t sweep_id=step-champion_merge-9-2 item=9 ====\n\
          CHAMPION-STEP mode=pr item=9 outcome=requeued\n",
     )
     .unwrap();
@@ -449,6 +589,146 @@ fn the_staged_step_reads_only_its_own_log_section() {
     let source = staged.read();
     let text = source.log_text.unwrap();
     assert!(text.contains("outcome=requeued") && !text.contains("outcome=merged"));
+}
+
+/// #14874: the staged read is bounded by the next dispatch header, and the
+/// UTF-8-safe tail bound applies to the requested section alone: a later
+/// dispatch's bulk cannot push the section's own outcome out of the window,
+/// and a multibyte character at the cutoff cannot panic the boundary walk.
+#[test]
+fn the_detached_tail_bound_applies_to_the_requested_section() {
+    let dir = tempfile::tempdir().unwrap();
+    let log = dir.path().join("step.log");
+    let header =
+        |id: &str| format!("==== loom-daemon dispatch: t sweep_id={id} item=4 step=judge ====");
+    // A requested section longer than the tail bound, so the cutoff lands
+    // inside it — across multibyte characters — with its outcome line at the
+    // section's end.
+    let padding = "日".repeat(90_000);
+    let mut text = format!(
+        "{}\n{padding}\nLOOM_STEP_OUTCOME role=judge target=4 class=noop reason=ci_pending\n",
+        header("j-4-1")
+    );
+    // Then a later dispatch appending more than the tail bound after it.
+    text.push_str(&format!("\n{}\nLATERDISPATCH {}\n", header("j-4-2"), "x".repeat(300_000)));
+    std::fs::write(&log, text).unwrap();
+    let source = StagedStep {
+        sweep_id: "j-4-1".into(),
+        step: StepRole::Judge,
+        item: 4,
+        log,
+        hold_auth_before: None,
+    }
+    .read();
+    let section = source
+        .log_text
+        .expect("the requested dispatch has a section");
+    assert!(section.contains("reason=ci_pending"), "its own outcome stays visible");
+    assert!(!section.contains("LATERDISPATCH"), "a later dispatch's bulk is not read");
+}
+
+/// #14874 + #14168: a bare, backticked and JSON-framed current-dispatch
+/// outcome line all reach the projection the same way: a Judge
+/// `class=noop reason=ci_pending` with no journaled verdict projects
+/// `noop/no_change` with detail `ci_pending`.
+#[test]
+fn wrapped_judge_lines_project_like_a_bare_one() {
+    for line in [
+        "LOOM_STEP_OUTCOME role=judge target=4 class=noop reason=ci_pending",
+        "`LOOM_STEP_OUTCOME role=judge target=4 class=noop reason=ci_pending`",
+        "{\"type\":\"text\",\"text\":\"LOOM_STEP_OUTCOME role=judge target=4 class=noop \
+         reason=ci_pending\\n\"}",
+    ] {
+        let source = Source::Step(StepSource {
+            sweep_id: "j-4-1".into(),
+            step: StepRole::Judge,
+            item: 4,
+            log_text: Some(format!(
+                "==== loom-daemon dispatch: t sweep_id=j-4-1 item=4 step=judge ====\n{line}\n"
+            )),
+            hold_auth_before: None,
+        });
+        let ctx = Context {
+            role: "judge",
+            repo: REPO,
+            host: "host-a",
+            now: t(5),
+        };
+        // A readable empty journal: an unchanged item, so the ledger's own
+        // view keeps the line's class.
+        let j = journal(vec![]);
+        let mut records = records_for(&ctx, &source, Some(&j), &mut RefusalStore::default());
+        assert_eq!(records.len(), 1, "{line}");
+        let r = records.remove(0);
+        assert_eq!(class_reason(&r), ("noop", "no_change"), "{line}");
+        assert_eq!(r.detail.as_deref(), Some("ci_pending"), "{line}");
+        assert_eq!(r.step.ledger_class.as_deref(), Some("noop"), "{line}");
+        assert_eq!(r.step.ledger_reason.as_deref(), Some("ci_pending"), "{line}");
+    }
+}
+
+/// #14874: the projected record reads its dispatch's own section — a later
+/// dispatch's outcome for the same item is not this step's. The selection
+/// lives in [`StagedStep::read`]; the record is built from what it read.
+#[test]
+fn the_projection_reads_only_its_own_dispatchs_section() {
+    let dir = tempfile::tempdir().unwrap();
+    let log = dir.path().join("step.log");
+    std::fs::write(
+        &log,
+        "==== loom-daemon dispatch: t sweep_id=j-4-1 item=4 step=judge ====\n\
+         LOOM_STEP_OUTCOME role=judge target=4 class=failed reason=crash\n\
+         ==== loom-daemon dispatch: t sweep_id=j-4-2 item=4 step=judge ====\n\
+         LOOM_STEP_OUTCOME role=judge target=4 class=noop reason=already_judged\n",
+    )
+    .unwrap();
+    for (id, class, reason, detail) in [
+        ("j-4-1", "failed", "failed", Some("crash")),
+        ("j-4-2", "noop", "no_change", Some("already_judged")),
+    ] {
+        let source = StagedStep {
+            sweep_id: id.into(),
+            step: StepRole::Judge,
+            item: 4,
+            log: log.clone(),
+            hold_auth_before: None,
+        }
+        .read();
+        let ctx = Context {
+            role: "judge",
+            repo: REPO,
+            host: "host-a",
+            now: t(5),
+        };
+        let mut records =
+            records_for(&ctx, &Source::Step(source), None, &mut RefusalStore::default());
+        assert_eq!(records.len(), 1, "{id}");
+        let r = records.remove(0);
+        assert_eq!(class_reason(&r), (class, reason), "{id}");
+        assert_eq!(r.detail.as_deref(), detail, "{id}");
+    }
+    // A sweep the log's headers do not name: no text, the no-evidence
+    // projection (the failed row, no detail).
+    let source = StagedStep {
+        sweep_id: "j-4-3".into(),
+        step: StepRole::Judge,
+        item: 4,
+        log: log.clone(),
+        hold_auth_before: None,
+    }
+    .read();
+    assert!(source.log_text.is_none());
+    let ctx = Context {
+        role: "judge",
+        repo: REPO,
+        host: "host-a",
+        now: t(5),
+    };
+    let mut records = records_for(&ctx, &Source::Step(source), None, &mut RefusalStore::default());
+    assert_eq!(records.len(), 1);
+    let r = records.remove(0);
+    assert_eq!(class_reason(&r), ("failed", "failed"));
+    assert_eq!(r.detail.as_deref(), None);
 }
 
 #[test]
@@ -534,7 +814,6 @@ fn the_exporter_calls_no_ledger_effect_forge_write_or_command() {
             "forge_comment",
             "add_labels",
             "forge_mirror",
-            "peer_claims",
         ] {
             assert!(!code.contains(forbidden), "{name} uses {forbidden}");
         }

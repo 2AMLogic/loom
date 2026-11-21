@@ -12,6 +12,8 @@ use std::path::Path;
 
 use chrono::{DateTime, Utc};
 
+use crate::observability::lifecycle::role_draw;
+use crate::runtime_preference::role_draw::RoleDrawRecord;
 use crate::step_role::StepRole;
 use crate::sweep_registry::step_spawn::StepDrawTerms;
 use crate::telemetry::trace::{SpanName, SpanRecord, SpanStatus, TraceAttributes, TraceContext};
@@ -61,6 +63,18 @@ pub struct StepDispatch<'a> {
     pub captain: Option<&'a crate::fleet_dispatch::worker::Refusal>,
     /// The role draw's model against the model actually launched (#12748).
     pub models: Option<StepModels<'a>>,
+    /// The admitted runtime the step launches on (`loom.runtime`); `None`
+    /// when the step was refused before admission resolved one.
+    pub runtime: Option<&'a str>,
+    /// The launch's reasoning effort (`loom.effort`), when one was resolved
+    /// (#14167); `None` when the runtime keeps its session default.
+    pub effort: Option<&'a str>,
+    /// The `runtimes.roleDraw` draw that decided the launch (#14233);
+    /// `None` when no table did, or the step was refused before launch.
+    /// Stamps the exported `loom.role_draw.*` facts. The
+    /// attempt is the role draw's escalation count (1 + consecutive failed
+    /// attempts), unrelated to `draw_attempt` above, the item redraw count.
+    pub role_draw: Option<&'a RoleDrawRecord>,
 }
 
 /// Selected versus launched model of a spawned step. Distinct on purpose: a
@@ -72,6 +86,25 @@ pub struct StepModels<'a> {
     /// The `--model` the child was launched with; `None` when the runtime
     /// picks its own.
     pub launched: Option<&'a str>,
+    /// The model the launch was configured for, before any selection-time
+    /// fallback (#13873); `None` when no model was resolved. Equal to
+    /// `launched` whenever no fallback fired — the pair is how an operator
+    /// sees how much work ran below its configured model.
+    pub configured: Option<&'a str>,
+    /// The selection-time fallback that changed configured → launched
+    /// (#13873), when one fired.
+    pub fallback: Option<StepModelFallback<'a>>,
+}
+
+/// One selection-time model fallback's facts (#13873): the configured model
+/// the launch fell back from, and the selector result that triggered it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StepModelFallback<'a> {
+    /// The configured model the launch fell back from.
+    pub from: &'a str,
+    /// `no-account-for-class` (`model_fallback::REASON_NO_ACCOUNT_FOR_CLASS`) or
+    /// `model-limit-kill` (`model_limit_kill::REASON_MODEL_LIMIT_KILL`, #13905).
+    pub reason: &'static str,
 }
 
 /// The span for `step` in `repo` at `at`. Pure.
@@ -105,6 +138,12 @@ pub fn span(step: &StepDispatch<'_>, repo: Option<(&str, &str)>, at: DateTime<Ut
     attributes.insert("loom.step.item".into(), item);
     attributes.insert("loom.role".into(), step.role.role_name().to_string());
     attributes.insert("loom.step.role".into(), step.role.as_str().to_string());
+    if let Some(runtime) = step.runtime {
+        attributes.insert("loom.runtime".into(), runtime.to_string());
+    }
+    if let Some(effort) = step.effort {
+        attributes.insert("loom.effort".into(), effort.to_string());
+    }
     attributes.insert("loom.dispatch.admission_result".into(), step.result.to_string());
     attributes.insert("loom.dispatch.reason".into(), step.reason.to_string());
     attributes.insert("loom.step.draw_attempt".into(), step.draw_attempt.to_string());
@@ -159,12 +198,23 @@ pub fn span(step: &StepDispatch<'_>, repo: Option<(&str, &str)>, at: DateTime<Ut
         }
     }
     if let Some(models) = step.models {
+        if let Some(configured) = models.configured {
+            attributes.insert("loom.step.model_configured".into(), configured.to_string());
+        }
         if let Some(selected) = models.selected {
             attributes.insert("loom.step.model_selected".into(), selected.to_string());
         }
         if let Some(launched) = models.launched {
             attributes.insert("loom.step.model_launched".into(), launched.to_string());
         }
+        if let Some(fallback) = models.fallback {
+            attributes.insert("loom.step.model_fallback_from".into(), fallback.from.to_string());
+            attributes
+                .insert("loom.step.model_fallback_reason".into(), fallback.reason.to_string());
+        }
+    }
+    if let Some(draw) = step.role_draw {
+        attributes.extend(role_draw::step_attributes(draw));
     }
     crate::telemetry::trace::provenance::stamp(&mut attributes);
     SpanRecord {
@@ -221,6 +271,9 @@ mod tests {
             lineage: None,
             captain: None,
             models: None,
+            runtime: Some("claude"),
+            effort: Some("high"),
+            role_draw: None,
         }
     }
 
@@ -262,6 +315,8 @@ mod tests {
             models: Some(StepModels {
                 selected: Some("sonnet"),
                 launched: Some("opus"),
+                configured: None,
+                fallback: None,
             }),
             ..judge(RESULT_SPAWNED, "ok")
         };
@@ -274,6 +329,346 @@ mod tests {
         let none = super::span(&judge(RESULT_SPAWNED, "ok"), None, Utc::now());
         assert!(!none.attributes.contains_key("loom.step.model_selected"));
         assert!(!none.attributes.contains_key("loom.step.model_launched"));
+    }
+
+    /// #13873: the span names the configured model, and — when a
+    /// selection-time fallback fired — what it fell back from and why, so an
+    /// operator can see how much work ran below its configured model.
+    #[test]
+    fn a_step_span_names_the_configured_model_and_any_fallback() {
+        let step = StepDispatch {
+            models: Some(StepModels {
+                selected: None,
+                launched: Some("opus"),
+                configured: Some("fable"),
+                fallback: Some(StepModelFallback {
+                    from: "fable",
+                    reason: "no-account-for-class",
+                }),
+            }),
+            ..judge(RESULT_SPAWNED, "ok")
+        };
+        let span = span(&step, None, Utc::now());
+        assert_eq!(span.attributes["loom.step.model_configured"], "fable");
+        assert_eq!(span.attributes["loom.step.model_launched"], "opus");
+        assert_eq!(span.attributes["loom.step.model_fallback_from"], "fable");
+        assert_eq!(span.attributes["loom.step.model_fallback_reason"], "no-account-for-class");
+        for key in [
+            "loom.step.model_configured",
+            "loom.step.model_fallback_from",
+            "loom.step.model_fallback_reason",
+        ] {
+            assert!(
+                crate::telemetry::ops::OPS_SPAN_ATTRIBUTE_KEYS.contains(&key),
+                "{key} is dropped at export"
+            );
+        }
+        // Without a fallback the two keys stay absent — `model_configured`
+        // alone records the pre-fallback model.
+        let steady = StepDispatch {
+            models: Some(StepModels {
+                selected: None,
+                launched: Some("fable"),
+                configured: Some("fable"),
+                fallback: None,
+            }),
+            ..judge(RESULT_SPAWNED, "ok")
+        };
+        let steady_span = super::span(&steady, None, Utc::now());
+        assert_eq!(steady_span.attributes["loom.step.model_configured"], "fable");
+        assert!(!steady_span
+            .attributes
+            .contains_key("loom.step.model_fallback_from"));
+        assert!(!steady_span
+            .attributes
+            .contains_key("loom.step.model_fallback_reason"));
+    }
+
+    /// #14167: every admitted step names the runtime it launches on and its
+    /// resolved effort, so a per-step comparison joins `loom.dispatch.step`
+    /// the same way `loom.runtime.run` does; a step whose launch resolved
+    /// neither omits the keys rather than guessing. Both keys are on the
+    /// lifecycle span allowlist and the collector `keep_keys` (the
+    /// long-standing `loom.runtime.run` keys).
+    #[test]
+    fn an_admitted_step_names_its_runtime_and_effort() {
+        let span = span(&judge(RESULT_SPAWNED, "ok"), None, Utc::now());
+        assert_eq!(span.attributes["loom.runtime"], "claude");
+        assert_eq!(span.attributes["loom.effort"], "high");
+        let unset = super::span(
+            &StepDispatch {
+                runtime: None,
+                effort: None,
+                ..judge(RESULT_SPAWNED, "ok")
+            },
+            None,
+            Utc::now(),
+        );
+        assert!(!unset.attributes.contains_key("loom.runtime"));
+        assert!(!unset.attributes.contains_key("loom.effort"));
+    }
+
+    /// #14233: a step a `roleDraw` table decided carries the draw's pick and
+    /// escalation attempt (not `draw_attempt`, the item redraw count); a step
+    /// no table decided carries neither key, never `0` or `none`.
+    #[test]
+    fn a_role_drawn_step_names_the_pick_and_attempt() {
+        use crate::runtime_preference::role_draw::{DrawWeight, Layer};
+        let record = RoleDrawRecord {
+            role: "judge".into(),
+            attempt: 2,
+            table_attempt: 2,
+            layer: Layer::FleetRepo,
+            table: vec![DrawWeight {
+                candidate: "codex".into(),
+                weight: 100,
+            }],
+            off: Vec::new(),
+            seed: "00000000000000ff".into(),
+            seed_inputs: None,
+            steps: Vec::new(),
+            passed_over: Vec::new(),
+            passed_over_for_span: Vec::new(),
+            pick: Some("codex".into()),
+            model: None,
+        };
+        let step = StepDispatch {
+            role_draw: Some(&record),
+            ..judge(RESULT_SPAWNED, "ok")
+        };
+        let span = span(&step, None, Utc::now());
+        assert_eq!(span.attributes["loom.role_draw.pick"], "codex");
+        assert_eq!(span.attributes["loom.role_draw.attempt"], "2");
+        assert_eq!(span.attributes["loom.step.draw_attempt"], "3", "item redraws stay apart");
+        for key in ["loom.role_draw.pick", "loom.role_draw.attempt"] {
+            assert!(
+                crate::observability::lifecycle::role_draw::KEYS.contains(&key),
+                "{key} is dropped at export"
+            );
+        }
+        let undrawn = super::span(&judge(RESULT_SPAWNED, "ok"), None, Utc::now());
+        assert!(undrawn
+            .attributes
+            .keys()
+            .all(|key| !key.starts_with("loom.role_draw.")));
+    }
+
+    fn draw_fixture(
+        rows: &[(&str, u64)],
+        skips: &[crate::runtime_preference::SkipReason],
+        first: &str,
+    ) -> RoleDrawRecord {
+        use crate::runtime_preference::resolve::resolve;
+        use crate::runtime_preference::role_draw::{plan, Candidate, EffectiveTable, Layer};
+
+        let table = EffectiveTable {
+            attempt: 2,
+            layer: Layer::FleetRepo,
+            active: rows
+                .iter()
+                .map(|(key, weight)| (Candidate::parse(key).unwrap(), *weight))
+                .collect(),
+            off: vec![("excluded-candidate".into(), "fixture exclusion".into())],
+        };
+        let plan = (0..100)
+            .map(|seed| plan("judge", 3, &table, seed, None))
+            .find(|plan| plan.order[0].key == first)
+            .unwrap();
+        let taps = plan.taps();
+        plan.finish(&resolve(
+            &taps,
+            |_| Ok(()),
+            |tier, _, ()| skips.get(tier).cloned().map_or(Ok(()), Err),
+        ))
+    }
+
+    fn drawn_span(draw: &RoleDrawRecord) -> SpanRecord {
+        span(
+            &StepDispatch {
+                role_draw: Some(draw),
+                ..judge(RESULT_SPAWNED, "ok")
+            },
+            None,
+            Utc::now(),
+        )
+    }
+
+    #[test]
+    fn role_draw_span_reports_first_pick_and_only_closed_skip_reasons() {
+        use crate::runtime_preference::{CeilingSkip, SkipReason};
+
+        let draw = draw_fixture(
+            &[
+                ("codex", 1),
+                ("claude", 1),
+                ("claude/opus", 1),
+                ("opencode:zai-flash", 1),
+                ("opencode/fast", 1),
+            ],
+            &[
+                SkipReason::NotAdmitted {
+                    unmet: vec!["fixture unmet".into()],
+                    detail: "fixture detail".into(),
+                },
+                SkipReason::Unavailable {
+                    source: "fixture source".into(),
+                    detail: "fixture detail".into(),
+                },
+                SkipReason::Unavailable {
+                    source: "launch-failure-hold".into(),
+                    detail: "fixture detail".into(),
+                },
+                SkipReason::Ceiling {
+                    skip: CeilingSkip::Unknown,
+                    detail: "fixture detail".into(),
+                },
+            ],
+            "codex",
+        );
+        let attrs = drawn_span(&draw).bounded().attributes;
+        assert_eq!(attrs["loom.role_draw.first_pick"], "codex");
+        assert_ne!(attrs["loom.role_draw.first_pick"], attrs["loom.role_draw.pick"]);
+        assert_eq!(attrs["loom.role_draw.attempt"], "3");
+        assert_eq!(attrs["loom.role_draw.layer"], "fleet-repo");
+        assert_eq!(attrs["loom.role_draw.table_attempt"], "2");
+        let skipped: Vec<(String, String)> =
+            serde_json::from_str(&attrs["loom.role_draw.passed_over"]).unwrap();
+        let expected: Vec<_> = draw
+            .steps
+            .iter()
+            .zip(["not-admitted", "no-credential", "launch-hold", "ceiling"])
+            .map(|(step, reason)| (step.picked.clone(), reason.to_owned()))
+            .collect();
+        assert_eq!(skipped, expected);
+        let local = serde_json::to_value(&draw).unwrap();
+        assert!(local.get("passed_over_for_span").is_none());
+        assert_eq!(local["passed_over"][0], "codex: not-admitted(fixture unmet)");
+        assert!(local["passed_over"][1]
+            .as_str()
+            .unwrap()
+            .contains("fixture detail"));
+        let restored: RoleDrawRecord = serde_json::from_value(local).unwrap();
+        assert_eq!(restored.passed_over, draw.passed_over);
+        assert!(!drawn_span(&restored)
+            .attributes
+            .contains_key("loom.role_draw.passed_over"));
+    }
+
+    #[test]
+    fn role_draw_span_keeps_exact_ordered_tables_distinct() {
+        let rows = [
+            ("opencode:fast=1,claude", 2),
+            ("opencode:zai:fast/vendor/gén-\"4", u64::MAX),
+        ];
+        let other = [("opencode:fast", 1), ("claude", 2), rows[1]];
+        for table in [&rows[..], &other[..]] {
+            let draw = draw_fixture(table, &[], rows[1].0);
+            let attrs = drawn_span(&draw).bounded().attributes;
+            let decoded: Vec<(String, String)> =
+                serde_json::from_str(&attrs["loom.role_draw.table"]).unwrap();
+            let expected: Vec<_> = table
+                .iter()
+                .map(|(key, weight)| (key.to_string(), weight.to_string()))
+                .collect();
+            assert_eq!(decoded, expected);
+            assert_eq!(attrs["loom.role_draw.first_pick"], rows[1].0);
+            assert!(!attrs.contains_key("loom.role_draw.passed_over"));
+            assert!(!attrs["loom.role_draw.table"].contains("excluded-candidate"));
+        }
+    }
+
+    #[test]
+    fn role_draw_span_omits_whole_values_above_the_byte_limit() {
+        // The compact JSON envelope for one candidate key and one digit consumes 10 bytes.
+        let at_limit = format!("codex:{}", "a".repeat(240));
+        let fits = draw_fixture(&[(&at_limit, 1)], &[], &at_limit);
+        assert_eq!(drawn_span(&fits).bounded().attributes["loom.role_draw.table"].len(), 256);
+        let over_limit = format!("{at_limit}a");
+        let too_big = draw_fixture(&[(&over_limit, 1)], &[], &over_limit);
+        assert!(!drawn_span(&too_big)
+            .attributes
+            .contains_key("loom.role_draw.table"));
+        assert!(!drawn_span(&too_big)
+            .bounded()
+            .attributes
+            .contains_key("loom.role_draw.table"));
+        let raw_over_limit = format!("codex:{}", "a".repeat(251));
+        let too_big = draw_fixture(&[(&raw_over_limit, 1)], &[], &raw_over_limit);
+        assert!(!drawn_span(&too_big)
+            .attributes
+            .contains_key("loom.role_draw.first_pick"));
+
+        let too_big = draw_fixture(
+            &[(&at_limit, 1), ("claude", 1)],
+            &[crate::runtime_preference::SkipReason::Unavailable {
+                source: "fixture".into(),
+                detail: String::new(),
+            }],
+            &at_limit,
+        );
+        assert!(!drawn_span(&too_big)
+            .attributes
+            .contains_key("loom.role_draw.passed_over"));
+    }
+
+    #[test]
+    fn role_draw_span_drops_path_valued_keys_as_whole_attributes() {
+        use crate::runtime_preference::SkipReason;
+
+        for path_key in [
+            "codex//private/fixture-name",
+            "codex/../fixture-name",
+            "codex/.fixture/fixture-name",
+            "codex/C:/fixture-name",
+        ] {
+            let draw = draw_fixture(
+                &[(path_key, 1), ("claude", 1)],
+                &[SkipReason::Unavailable {
+                    source: "fixture".into(),
+                    detail: String::new(),
+                }],
+                path_key,
+            );
+            assert_eq!(draw.steps[0].picked, path_key);
+            assert!(draw.passed_over[0].contains("fixture-name"));
+            let span = drawn_span(&draw);
+            let bounded = span.clone().bounded();
+            for attrs in [&span.attributes, &bounded.attributes] {
+                assert_eq!(attrs["loom.role_draw.pick"], "claude");
+                assert!(!attrs.contains_key("loom.role_draw.first_pick"));
+                assert!(!attrs.contains_key("loom.role_draw.table"));
+                assert!(!attrs.contains_key("loom.role_draw.passed_over"));
+                assert!(attrs.values().all(|value| !value.contains("fixture-name")));
+            }
+        }
+    }
+
+    #[test]
+    fn role_draw_span_omits_a_table_with_an_unrolled_path_key() {
+        let draw =
+            draw_fixture(&[("claude", 1), ("codex//private/fixture-name", 1)], &[], "claude");
+        assert_eq!(draw.steps.len(), 1);
+        let attrs = drawn_span(&draw).bounded().attributes;
+        assert_eq!(attrs["loom.role_draw.first_pick"], "claude");
+        assert!(!attrs.contains_key("loom.role_draw.table"));
+        assert!(!attrs.contains_key("loom.role_draw.passed_over"));
+        assert!(attrs.values().all(|value| !value.contains("fixture-name")));
+    }
+
+    #[test]
+    fn role_draw_span_distinguishes_a_missing_binary_from_credentials() {
+        let draw = draw_fixture(
+            &[("generic", 1), ("claude", 1)],
+            &[crate::runtime_preference::SkipReason::Unavailable {
+                source: "binary".into(),
+                detail: "fixture executable diagnostic".into(),
+            }],
+            "generic",
+        );
+        assert_eq!(
+            drawn_span(&draw).bounded().attributes["loom.role_draw.passed_over"],
+            r#"[["generic","runtime-unavailable"]]"#
+        );
     }
 
     /// #12450: a granted step carries the captain's assignment, and it

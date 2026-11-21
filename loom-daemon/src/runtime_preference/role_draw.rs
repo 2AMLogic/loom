@@ -37,9 +37,13 @@
 //!   draws from the next attempt's table ([`attempts`]). A success resets to
 //!   attempt 1. Attempt `N` uses the highest configured attempt `<= N`.
 //! - No content validation: any mix is allowed. A table that is empty after
-//!   exclusions is a non-blocking **warning** (logged, shown by `loom-daemon
-//!   roles draw --explain`); the stage then has nothing to run on and its tick
-//!   is a pre-spawn skip, exactly like a wholly unavailable preference list.
+//!   exclusions does not stall the tick: the draw falls through to the next
+//!   configured attempt's table and the first non-empty one decides (#11782,
+//!   see [`DrawConfig::effective_for`]). `loom-daemon roles draw --explain`
+//!   flags every configured empty table with a non-blocking **warning**. Only
+//!   when every remaining table is empty is the stage's tick a pre-spawn skip,
+//!   exactly like a wholly unavailable preference list; that is the case that
+//!   also logs the daemon-log warning.
 //! - Malformed entries are skipped with a warning, never fatal — an older or
 //!   newer shape must not stop a daemon.
 //! - When a role has **no** `roleDraw` table for the attempt, nothing here
@@ -74,7 +78,7 @@
 pub mod attempts;
 pub mod explain;
 
-use super::resolve::{Resolution, Tap};
+use super::resolve::{Resolution, SkipReason, Tap};
 use crate::config_resolver::{
     get_path, private_defaults_path, soft_read_json_object, FLEET_REPO_CONFIG_REL,
     LEGACY_CONFIG_REL, LOCAL_CONFIG_REL, PROJECT_CONFIG_REL,
@@ -520,6 +524,10 @@ pub struct RoleDrawRecord {
     /// Earlier picks the walk passed over, `key: reason`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub passed_over: Vec<String>,
+    /// Typed walk facts reduced to closed span reasons. Local records retain
+    /// only their existing human-readable `passed_over` field.
+    #[serde(skip)]
+    pub(crate) passed_over_for_span: Vec<(String, &'static str)>,
     /// The candidate key that launched; `None` when nothing could.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pick: Option<String>,
@@ -622,15 +630,25 @@ impl DrawPlan {
             .as_ref()
             .map_or(self.steps.len(), |chosen| chosen.tier + 1);
         record.steps = self.steps.into_iter().take(consumed).collect();
-        record.passed_over = resolution
-            .skipped
-            .iter()
-            .filter_map(|s| {
-                self.order
-                    .get(s.tier)
-                    .map(|c| format!("{}: {}", c.key, s.reason))
-            })
-            .collect();
+        for skip in &resolution.skipped {
+            if let Some(candidate) = self.order.get(skip.tier) {
+                let reason = match &skip.reason {
+                    SkipReason::NotAdmitted { .. } => "not-admitted",
+                    SkipReason::Unavailable { source, .. } => match source.as_str() {
+                        super::launch_failure_hold::SKIP_SOURCE => "launch-hold",
+                        "binary" => "runtime-unavailable",
+                        _ => "no-credential",
+                    },
+                    SkipReason::Ceiling { .. } => "ceiling",
+                };
+                record
+                    .passed_over
+                    .push(format!("{}: {}", candidate.key, skip.reason));
+                record
+                    .passed_over_for_span
+                    .push((candidate.key.clone(), reason));
+            }
+        }
         if let Some(chosen) = &resolution.chosen {
             if let Some(candidate) = self.order.get(chosen.tier) {
                 record.pick = Some(candidate.key.clone());
@@ -694,6 +712,7 @@ pub fn plan(
             seed_inputs,
             steps: Vec::new(),
             passed_over: Vec::new(),
+            passed_over_for_span: Vec::new(),
             pick: None,
             model: None,
         },
