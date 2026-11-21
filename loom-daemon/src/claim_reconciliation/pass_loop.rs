@@ -11,6 +11,7 @@
 use std::path::Path;
 
 pub(super) mod building_heal;
+pub(super) mod merge_observation;
 
 use super::{forge, merge_sequence, review_conflict, VerdictReconcileStats};
 
@@ -124,6 +125,14 @@ pub(super) fn run_reconciliation_pass_over_roots(
         // forge-visible claim label went missing; never touches a CLOSED
         // issue (#9463). Self-logging; best-effort.
         building_heal::heal_missing_building_labels(gh_bin, root);
+        // #14902: observe confirmed merges regardless of who made them and
+        // finish the issue bookkeeping they skipped — the partial-increment
+        // reset, Champion's close check, the branch-derived close and the
+        // closed-issue strip. Last in the tick so nothing above re-adopts a
+        // state this pass just wrote; like everything here it makes no
+        // merge-mode check, so it runs on direct-mode workspaces too (the
+        // merge-queue hook above returns early there).
+        merge_observation::reconcile(gh_bin, root);
         stats.roots_processed += 1;
     }
     stats
