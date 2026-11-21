@@ -824,3 +824,75 @@ fn a_stale_branch_closed_is_confirmed() {
     });
     assert_eq!(counters::get(CONFIRM_DOWNGRADE), 1);
 }
+
+/// Exercise the daemon reaper with real worktrees and a closed, unmerged
+/// pull from the fixture forge. Only the remote reachability changes
+/// between the two passes.
+#[test]
+#[serial(loom_config_env)]
+fn reaper_preserves_a_shadowed_unpushed_tip_until_a_remote_contains_it() {
+    reap_shadowed_branch();
+}
+
+#[serial]
+fn reap_shadowed_branch() {
+    use crate::env_test_support::EnvGuard;
+    use crate::test_git_helpers::{commit_file, configure, run as git};
+    use crate::worktree_reaper::{reap_worktrees_only, WorktreeReaperConfig};
+
+    let fx = Fixture::new();
+    let _root = EnvGuard::set("LOOM_WORKTREE_ROOT", fx.env.tmp.path().join("worktrees"));
+    let trees = crate::worktree_root::worktree_root(&fx.root);
+    let worktree = trees.join("pr-344");
+    let issue_worktree = trees.join("issue-345");
+    configure(&fx.root);
+    git(&fx.root, &["config", "core.hooksPath", "/dev/null"]);
+    let parent = commit_file(&fx.root, ".gitignore", ".loom-managed\n", "parent");
+    git(&fx.root, &["worktree", "add", "-b", "pr344", worktree.to_str().unwrap()]);
+    std::fs::write(worktree.join(".loom-managed"), "").unwrap();
+    let tip = commit_file(&worktree, "local.txt", "unpushed\n", "local tip");
+    git(
+        &fx.root,
+        &[
+            "worktree",
+            "add",
+            "-b",
+            "feature/issue-345",
+            issue_worktree.to_str().unwrap(),
+            &tip,
+        ],
+    );
+    std::fs::write(issue_worktree.join(".loom-managed"), "").unwrap();
+    let residue_refs = [
+        "refs/pr344",
+        "refs/remotes/pr344",
+        "refs/feature/issue-345",
+        "refs/remotes/feature/issue-345",
+    ];
+    for residue in residue_refs {
+        git(&fx.root, &["update-ref", residue, &parent]);
+    }
+    let mut pull: serde_json::Value =
+        serde_json::from_str(&pull_body(344, "closed", None, &parent)).unwrap();
+    pull["closed_at"] = "2000-01-01T00:00:00Z".into();
+    fx.forge.set("pull", &pull.to_string());
+    fx.forge.set("pulls", &format!("[{pull}]"));
+    fx.forge.set("issue", &issue_body(345, "closed"));
+
+    run(&fx.forge, || {
+        let config = WorktreeReaperConfig::default();
+        reap_worktrees_only(&fx.root, &config);
+        assert!(worktree.is_dir(), "the only copy of the branch tip is local");
+        assert_eq!(git(&worktree, &["rev-parse", "HEAD"]), tip);
+        assert_eq!(git(&issue_worktree, &["rev-parse", "HEAD"]), tip);
+
+        git(&fx.root, &["update-ref", "refs/remotes/origin/saved", &tip]);
+        reap_worktrees_only(&fx.root, &config);
+        assert!(!worktree.exists(), "the remote now contains the branch tip");
+        assert!(!issue_worktree.exists(), "the issue worktree shares the reachable tip");
+        assert_eq!(git(&fx.root, &["rev-parse", "refs/remotes/origin/saved"]), tip);
+        for residue in residue_refs {
+            assert_eq!(git(&fx.root, &["rev-parse", residue]), parent);
+        }
+    });
+}

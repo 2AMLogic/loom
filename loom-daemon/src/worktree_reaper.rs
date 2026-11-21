@@ -704,12 +704,11 @@ pub fn reap_worktrees_only(repo_root: &Path, config: &WorktreeReaperConfig) -> R
     // from some remote ref. Local refs are shared across worktrees of the
     // same repo, so this is resolved against `repo_root` (the primary
     // checkout), not the worktree path itself.
-    let branch_reachable_fn = |n: u32| {
-        clean::branch_reachable_from_remotes(
-            repo_root,
-            &crate::worktree_ops::naming::branch_name(n),
-        )
+    let local_branch_reachable = |branch: &str| {
+        clean::branch_reachable_from_remotes(repo_root, &format!("refs/heads/{branch}"))
     };
+    let branch_reachable_fn =
+        |n: u32| local_branch_reachable(&crate::worktree_ops::naming::branch_name(n));
 
     let probes = clean::production_probes(
         &active_issues,
@@ -784,8 +783,7 @@ pub fn reap_worktrees_only(repo_root: &Path, config: &WorktreeReaperConfig) -> R
     // number, then checked for remote reachability against `repo_root` (same
     // shared-refs rationale as the issue-keyed probe).
     let pr_branch_reachable_fn = |worktree_path: &Path| {
-        clean::current_branch(worktree_path)
-            .is_some_and(|branch| clean::branch_reachable_from_remotes(repo_root, &branch))
+        clean::current_branch(worktree_path).is_some_and(|branch| local_branch_reachable(&branch))
     };
     let pr_probes =
         clean::production_pr_probes(&pr_status_by_number_fn, &pr_branch_reachable_fn, Utc::now());
