@@ -16,6 +16,10 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 ### 2026-11-21
 
+- **Issue #14842** (closed): pricing: no rate rows for GLM or Gemini models, so OpenCode usage has no cost estimate; add rows and a coverage check
+- **PR #14869**: feat(pricing): price GLM and Gemini models exactly, with profile coverage
+- **Issue #14882** (closed): Document how to run a repository validator before Guide publishes work docs
+- **PR #14894**: docs: run a repository work-docs validator in Guide
 - **Issue #14891** (closed): Fix red main CI in the Guide work-log debounce fixture
 - **PR #14893**: test: isolate the Guide work-log debounce decision
 - **Issue #14862** (closed): Doctor queue mistakes discussion of a legacy cycle cap for a terminal cap
