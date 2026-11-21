@@ -148,6 +148,24 @@ fn mark_session_managed(profile: &Path) {
 }
 
 #[test]
+fn missing_runtime_is_distinct_from_a_missing_container() {
+    struct MissingRuntime;
+    impl ProbeTransport for MissingRuntime {
+        fn host(&self, _: &Path) -> Result<ExecOutput> {
+            panic!("a session profile entered the host probe")
+        }
+
+        fn container(&self, _: &str) -> Result<Option<ExecOutput>> {
+            Err(std::io::Error::from(std::io::ErrorKind::NotFound).into())
+        }
+    }
+    let profile = tempfile::tempdir().unwrap();
+    mark_session_managed(profile.path());
+    let result = probe_account(&MissingRuntime, "agent-1", profile.path(), now());
+    assert_eq!(result.detail(), Some("container_runtime_unavailable"));
+}
+
+#[test]
 fn a_session_managed_profile_with_no_running_container_is_unavailable_and_never_probed_on_the_host()
 {
     let profile = tempfile::tempdir().unwrap();
