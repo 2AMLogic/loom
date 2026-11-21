@@ -443,8 +443,8 @@ enum Wait {
     /// The classification budget was spent before this workspace was
     /// reached: it keeps its last verdict and is first next pass.
     Budget,
-    /// The pass asked no remote (an outage hold, or three remotes in a row
-    /// did not answer): no resync could be started.
+    /// Remote checks stopped during classification, or an outage hold
+    /// already prevented them when the pass began.
     Offline,
     /// The pass was past its deadline by the time the write half reached it.
     Deadline,
@@ -461,7 +461,9 @@ impl Wait {
                 "not checked this pass: the classification budget was spent before it; it \
                  keeps its last verdict and is first next pass"
             }
-            Self::Offline => "not attempted this pass: the pass asked no remote",
+            Self::Offline => {
+                "not attempted this pass: remote checks are suspended after unanswered probes"
+            }
             Self::Deadline => "not attempted this pass: the pass was past its deadline",
             Self::AttemptSlot => {
                 "not attempted this pass: the pass's one attempt went to an earlier stale \
@@ -648,11 +650,11 @@ pub fn run(env: &Env<'_>, roots: &[PathBuf], mode: Mode, memory: &mut Memory) ->
                 wait[candidate.index] = Some(why);
             }
         }
-        // #14848: a stale workspace this pass did not resync says why, once
-        // per pass, at WARN — an unvisited candidate gets the disposition of
-        // the pass that deferred it, and a visited one keeps the reason its
-        // attempt, backoff or skip already recorded. The once-only alerts
-        // above are unchanged; this line is the per-pass record.
+    }
+    if mode == Mode::Write {
+        // Every stale workspace names its disposition, including those
+        // classified from local clones while the host gate refused writes.
+        let host_refusal = gate.err().map(NotCurrent::host_note);
         for (index, report) in pass.workspaces.iter_mut().enumerate() {
             if !matches!(report.state, WState::W1 | WState::W3) {
                 continue;
@@ -661,25 +663,16 @@ pub fn run(env: &Env<'_>, roots: &[PathBuf], mode: Mode, memory: &mut Memory) ->
                 .repo
                 .clone()
                 .unwrap_or_else(|| report.root.display().to_string());
-            let deferred = wait.get(index).copied().flatten();
-            let existing = report.reason.take();
-            let why = match (&deferred, existing) {
-                (Some(deferred), existing) => {
-                    let why = match existing {
-                        Some(existing) => format!("{}; {existing}", deferred.note()),
-                        None => deferred.note().to_string(),
-                    };
-                    report.reason = Some(why.clone());
-                    why
-                }
-                (None, existing) => {
-                    report.reason = existing;
-                    report
-                        .reason
-                        .clone()
-                        .unwrap_or_else(|| "no reason recorded".to_string())
-                }
-            };
+            for note in [wait[index].map(Wait::note), host_refusal.as_deref()]
+                .into_iter()
+                .flatten()
+            {
+                report.reason = Some(match report.reason.take() {
+                    Some(reason) => format!("{note}; {reason}"),
+                    None => note.to_string(),
+                });
+            }
+            let why = report.reason.as_deref().unwrap_or("no reason recorded");
             log::warn!(
                 "workspace_resync: {name}: {}, not resynced this pass: {why}",
                 report.state.as_str()

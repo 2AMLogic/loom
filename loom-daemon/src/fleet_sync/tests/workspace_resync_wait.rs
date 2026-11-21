@@ -50,17 +50,25 @@ fn an_offline_pass_warns_for_every_stale_workspace_each_pass_and_resynces_when_b
             3,
             "pass {pass_n}: {logs:?}"
         );
+        if pass_n == 0 {
+            assert!(pass.probes > 0, "the outage was detected during this pass");
+        } else {
+            assert_eq!(network(&pass), (0, 0, 0), "the existing outage hold prevented calls");
+        }
         let offline = lines
             .iter()
-            .filter(|(_, m)| m.contains("the pass asked no remote"))
+            .filter(|(_, m)| m.contains("remote checks are suspended after unanswered probes"))
             .count();
         assert_eq!(offline, 1, "pass {pass_n}: {logs:?}");
         // The report carries the current-pass reason too.
         let held = &pass.workspaces[3];
         assert_eq!(held.state, WState::W3, "{held:?}");
-        assert_eq!(reason(held), "not attempted this pass: the pass asked no remote");
+        assert_eq!(
+            reason(held),
+            "not attempted this pass: remote checks are suspended after unanswered probes"
+        );
         assert_eq!(fx.origin_commits(), commits, "pass {pass_n}: nothing resynced");
-        host.advance(INTERVAL);
+        host.advance(INTERVAL / 2);
     }
 
     // The remotes answer again, past every backoff and the outage hold: the
@@ -90,6 +98,37 @@ fn an_offline_pass_warns_for_every_stale_workspace_each_pass_and_resynces_when_b
             "{deferred:?}"
         );
     }
+}
+
+#[test]
+fn a_host_gate_refusal_warns_per_stale_workspace_on_each_write_pass() {
+    let fx = Fixture::new(STALE);
+    let host = Host::new(&fx, "host-a");
+    let roots = [host.root.clone(), fx.clone_as("other")];
+    let commits = fx.origin_commits();
+    for gate in [NotCurrent::Draining, NotCurrent::ReleaseUnverified] {
+        for _ in 0..2 {
+            let (logs, pass) = capture_logs_pass(|| {
+                host.pass_over(&roots, Mode::Write, &|| Err(gate), Some("0.19.850"))
+            });
+            assert_eq!(network(&pass), (0, 0, 0));
+            assert_eq!(pass.workspaces.len(), roots.len());
+            let lines = waits(&logs);
+            assert_eq!(lines.len(), roots.len(), "{logs:?}");
+            for report in &pass.workspaces {
+                assert_eq!(report.state, WState::W3);
+                assert_eq!(reason(report), gate.host_note());
+            }
+            assert!(
+                lines.iter().all(|(level, message)| {
+                    *level == log::Level::Warn && message.contains(&gate.host_note())
+                }),
+                "{logs:?}"
+            );
+        }
+    }
+    assert!(fx.forge.calls.borrow().is_empty());
+    assert_eq!(fx.origin_commits(), commits);
 }
 
 #[test]
@@ -166,7 +205,13 @@ fn an_attempt_decline_is_warned_with_its_reason_each_pass() {
     write(&host.root.join(".read-only-credential"), "");
     for pass_n in 0..2 {
         let (logs, pass) = capture_logs_pass(|| host.pass());
-        let lines = waits(&logs);
+        let lines: Vec<_> = logs
+            .iter()
+            .filter(|(level, message)| {
+                *level == log::Level::Warn
+                    && message.contains("the credential has READ on acme/app, not WRITE")
+            })
+            .collect();
         assert_eq!(lines.len(), 1, "pass {pass_n}: {logs:?}");
         assert!(lines[0].1.contains("not written from this host"), "{logs:?}");
         let report = only(&pass);
