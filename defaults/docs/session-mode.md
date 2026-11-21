@@ -174,9 +174,8 @@ published and anything stale is withdrawn.
 
 ### How a separately launched reader finds it
 
-Setting a variable inside the short-lived `loom-tools` process cannot update
-the shell that later starts a fleet reader, so export the directory yourself
-(or use the downstream reader's default, 2AMLogic/2am#8152):
+If your fleet reader does not already discover the session profiles, export their
+directory in the shell that launches the reader.
 
 ```bash
 export LOOM_GH_GATEWAY_DIR="$HOME/.local/share/loom/session/.loom/gh-config-gateway"
