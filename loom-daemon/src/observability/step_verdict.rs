@@ -90,6 +90,16 @@ pub enum Event {
         /// The head the write was made against, when its writer knew it.
         head_sha: Option<String>,
     },
+    /// The run's own successful PR lease release (`lease pr release`,
+    /// #14639): the typed outcome Champion's release recorded. Trusted
+    /// because the release verified the lease was the run's own before its
+    /// PATCH landed — a release marker read off the forge (#9548) never
+    /// becomes one.
+    Released {
+        at: DateTime<Utc>,
+        outcome: String,
+        reason: Option<String>,
+    },
 }
 
 /// Everything known about one item of one run.
@@ -167,18 +177,20 @@ pub fn projector(role: &str) -> Option<Projector> {
 
 /// `key=` of the last `LOOM_STEP_OUTCOME` line in `text` for `role` and
 /// `item`, verbatim (the ledger's own line, [`outcome_ledger::OUTCOME_LINE_PREFIX`]).
+/// The prefix may sit anywhere in the line — bare, backticked, or inside a
+/// JSON text event (#14168) — and the fields are the ledger's wrapper-aware
+/// parse ([`outcome_ledger::fields`], #14874), so a framed line reads the
+/// same as a bare one.
 fn outcome_field(text: &str, role: &str, item: u32, key: &str) -> Option<String> {
     text.lines().rev().find_map(|line| {
         let rest = line
-            .trim()
-            .strip_prefix(outcome_ledger::OUTCOME_LINE_PREFIX)?;
-        let field = |key: &str| {
-            rest.split_whitespace()
-                .find_map(|kv| kv.strip_prefix(key)?.strip_prefix('='))
-        };
-        (field("role")? == role && field("target")?.parse::<u32>().ok()? == item)
-            .then(|| field(key).map(str::to_string))
-            .flatten()
+            .find(outcome_ledger::OUTCOME_LINE_PREFIX)
+            .map(|at| &line[at + outcome_ledger::OUTCOME_LINE_PREFIX.len()..])?;
+        let f = outcome_ledger::fields(rest);
+        (f.get("role").copied() == Some(role)
+            && f.get("target").and_then(|t| t.parse::<u32>().ok()) == Some(item))
+        .then(|| f.get(key).copied().map(str::to_string))
+        .flatten()
     })
 }
 
@@ -231,14 +243,18 @@ pub struct StagedStep {
 }
 
 impl StagedStep {
-    /// Read the step's own section of its log: after its dispatch header
-    /// (`sweep_id=<id> `), its last [`MAX_LOG_TAIL`] bytes.
+    /// Read the step's own dispatch's section of its log — from its dispatch
+    /// header to the next one or end of log (#14874) — its last
+    /// [`MAX_LOG_TAIL`] bytes. `None` when the log is unreadable or carries
+    /// no section of this sweep.
     #[must_use]
     pub fn read(self) -> StepSource {
         let log_text = std::fs::read(&self.log).ok().and_then(|bytes| {
             let text = String::from_utf8_lossy(&bytes).into_owned();
-            let start = text.rfind(&format!("sweep_id={} ", self.sweep_id))?;
-            let section = &text[start..];
+            let section = match outcome_ledger::dispatch_section(&text, &self.sweep_id) {
+                outcome_ledger::DispatchSection::Section(section) => section,
+                _ => return None,
+            };
             let mut cut = section.len().saturating_sub(MAX_LOG_TAIL);
             while !section.is_char_boundary(cut) {
                 cut += 1;
@@ -343,6 +359,21 @@ fn events(journal: &Journal) -> Vec<(u32, Option<bool>, Event)> {
                     action: action.clone(),
                     by: by.clone(),
                     head_sha: head_sha.clone(),
+                },
+            )),
+            // A lease release is a PR write; its number is the PR.
+            JournalEntry::Released {
+                at,
+                number,
+                outcome,
+                reason,
+            } => Some((
+                *number,
+                Some(true),
+                Event::Released {
+                    at: *at,
+                    outcome: outcome.clone(),
+                    reason: reason.clone(),
                 },
             )),
             JournalEntry::Queue { .. }

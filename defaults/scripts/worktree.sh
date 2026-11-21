@@ -1581,7 +1581,7 @@ _wt_lease_claim_owned() {
     # caller's discard of the fresh checkout or its machine-readable refusal.
     (loom_daemon_version_preflight lease "$_WT_DAEMON_BIN") || return 6
     local _rc=0 _tok=""
-    # requires-daemon: lease >= 0.19.1314   #14376 strict ownership first ships in the next patch; generic standalone/Doctor lease calls still fail open
+    # requires-daemon: lease >= 0.20.13   #14376 strict ownership first ships in the next patch; generic standalone/Doctor lease calls still fail open
     _tok=$("$_WT_DAEMON_BIN" lease ensure "$ISSUE_NUMBER" --require-ownership --watch-pid "${LOOM_AGENT_SESSION_PID:-${CLAUDE_PID:-$PPID}}" 3>&-) || _rc=$?
     [[ "$_rc" -ne 4 ]] || return 4
     [[ "$_rc" -eq 0 && "$_tok" == "OWNED" ]] || return 5

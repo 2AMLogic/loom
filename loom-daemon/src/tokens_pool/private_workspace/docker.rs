@@ -32,17 +32,7 @@ pub(super) fn command_env(
     env: &[(String, String)],
     timeout: Duration,
 ) -> Result<String> {
-    // Every Docker call of this module goes through here, so a fake installed
-    // on this thread (`fake`, tests only) stands in for the whole engine.
-    #[cfg(test)]
-    if let Some(result) = fake::dispatch(args, env) {
-        return result;
-    }
-    let (success, stdout, _stderr) = docker_cli::run_bounded_env("docker", args, env, timeout)
-        .map_err(|error| match error.downcast::<docker_cli::DockerTimedOut>() {
-            Ok(timed_out) => anyhow::Error::new(timed_out),
-            Err(error) => error.context("Docker unavailable"),
-        })?;
+    let (success, stdout) = command_status_env(args, env, timeout)?;
     if !success {
         bail!(
             "Docker {} failed; inspect the session with Docker locally",
@@ -50,6 +40,37 @@ pub(super) fn command_env(
         );
     }
     Ok(stdout)
+}
+
+/// Batch volume inspect can report found volumes on stdout after an ordinary
+/// nonzero exit. Only the sampler reconciles those per-volume results.
+pub(super) fn inspect_volume_batch(
+    volumes: &[String],
+    format: &str,
+    timeout: Duration,
+) -> Result<(bool, String)> {
+    let mut args = vec!["volume", "inspect", "--format", format];
+    args.extend(volumes.iter().map(String::as_str));
+    command_status_env(&args, &[], timeout)
+}
+
+fn command_status_env(
+    args: &[&str],
+    env: &[(String, String)],
+    timeout: Duration,
+) -> Result<(bool, String)> {
+    // Every Docker call of this module goes through here, so a fake installed
+    // on this thread (`fake`, tests only) stands in for the whole engine.
+    #[cfg(test)]
+    if let Some(result) = fake::dispatch(args, env, timeout) {
+        return result;
+    }
+    let (success, stdout, _stderr) = docker_cli::run_bounded_env("docker", args, env, timeout)
+        .map_err(|error| match error.downcast::<docker_cli::DockerTimedOut>() {
+            Ok(timed_out) => anyhow::Error::new(timed_out),
+            Err(error) => error.context("Docker unavailable"),
+        })?;
+    Ok((success, stdout))
 }
 
 pub(super) fn desktop() -> Result<bool> {
@@ -160,7 +181,10 @@ pub(super) fn validate_settings(config: &Config, state: &Value) -> Result<()> {
     // required to be distinct AND to match one of those exact roles, an exact
     // count is also a proof that none of them is MISSING — which is what makes
     // this the host-side half of the control-file protection (issue #8839).
-    let expected = 2 + bundle::PROFILE_CONTROLS.len() + usize::from(config.gh_config.is_some());
+    let expected = 2
+        + bundle::PROFILE_CONTROLS.len()
+        + usize::from(config.gh_config.is_some())
+        + config.extra_mounts.len();
     if mounts.len() != expected {
         bail!("private session has unexpected mounts; no host workspace, peer volume or runtime socket may be mounted, and every account profile control file must be bound read-only");
     }
@@ -190,12 +214,24 @@ pub(super) fn validate_settings(config: &Config, state: &Value) -> Result<()> {
             // receipt, each bound READ-ONLY over its own canonical path. The
             // mount point is what makes them unremovable and unrenameable from
             // inside the session while `auth.json` beside them stays writable.
-            other => bundle::PROFILE_CONTROLS.iter().any(|name| {
-                other == bundle::control_destination(name)
-                    && mount["Type"] == "bind"
-                    && bind_source_matches(config, mount, &config.profile.join(name))
-                    && mount["RW"] == false
-            }),
+            other => {
+                bundle::PROFILE_CONTROLS.iter().any(|name| {
+                    other == bundle::control_destination(name)
+                        && mount["Type"] == "bind"
+                        && bind_source_matches(config, mount, &config.profile.join(name))
+                        && mount["RW"] == false
+                })
+                // The recorded `accounts.session.extraMounts` (#14451): data
+                // only, so each must be a read-only bind of exactly its
+                // recorded host path. One that is not recorded, or recorded
+                // and missing, breaks the exact count above.
+                || config.extra_mounts.iter().any(|extra| {
+                    Path::new(other) == extra.container
+                        && mount["Type"] == "bind"
+                        && bind_source_matches(config, mount, &extra.host)
+                        && mount["RW"] == false
+                })
+            }
         };
         if !valid {
             bail!("private session mount does not match its account-owned configuration");
@@ -258,7 +294,11 @@ pub(super) fn volume_exists(volume: &str) -> Result<bool> {
 
 /// The recorded image must already be local: recovery never pulls or swaps one.
 pub(super) fn image_present(image: &str) -> Result<()> {
-    command(&["image", "inspect", "--format", "{{.Id}}", image])
+    image_present_with(image, docker_cli::DOCKER_CALL_TIMEOUT)
+}
+
+pub(super) fn image_present_with(image: &str, timeout: Duration) -> Result<()> {
+    command_with(&["image", "inspect", "--format", "{{.Id}}", image], timeout)
         .map(drop)
         .with_context(|| format!("recorded session image {image} is not available locally"))
 }
@@ -361,6 +401,29 @@ pub(super) fn create(config: &Config, image: &str) -> Result<()> {
             format!("GH_CONFIG_DIR={GH_CONFIG}"),
         ]);
     }
+    // The configured extra mounts, always read-only (#14451). Their JSON is
+    // labelled only when there are any, so an unconfigured create is
+    // byte-identical to what it has always been.
+    for extra in &config.extra_mounts {
+        args.extend([
+            "--mount".into(),
+            format!(
+                "type=bind,src={},dst={},readonly",
+                extra.host.display(),
+                extra.container.display()
+            ),
+        ]);
+    }
+    if !config.extra_mounts.is_empty() {
+        args.extend([
+            "--label".into(),
+            format!(
+                "{}={}",
+                super::super::session_lifecycle::EXTRA_MOUNTS_LABEL,
+                super::super::session_image::extra_mounts_label_json(&config.extra_mounts)
+            ),
+        ]);
+    }
     args.extend([
         "--entrypoint".into(),
         "/usr/bin/tini".into(),
@@ -371,6 +434,46 @@ pub(super) fn create(config: &Config, image: &str) -> Result<()> {
     ]);
     command(&args.iter().map(String::as_str).collect::<Vec<_>>())?;
     Ok(())
+}
+
+/// The sealed-bundle probe of [`super::super::session_image::verify_override_bundle`]
+/// routed through [`command_with`], so it shares this module's engine seam (and its
+/// test fake) rather than spawning its own `docker`.
+struct ImageProbe(Duration);
+
+impl super::super::session_image::BundleProbe for ImageProbe {
+    fn run_image_script(&self, image: &str, script: &str) -> Result<String> {
+        command_with(
+            &[
+                "run",
+                "--rm",
+                "--network",
+                "none",
+                "--read-only",
+                "--cap-drop",
+                "ALL",
+                "--security-opt",
+                "no-new-privileges",
+                "--entrypoint",
+                "/bin/sh",
+                image,
+                "-c",
+                script,
+            ],
+            self.0,
+        )
+    }
+}
+
+/// Prove the configured override `image` carries the sealed control bundle
+/// this daemon enforces, before any container is created from it (#14451).
+pub(super) fn verify_image(image: &str) -> Result<()> {
+    verify_image_with(image, docker_cli::DOCKER_RUN_TIMEOUT)
+}
+
+pub(super) fn verify_image_with(image: &str, timeout: Duration) -> Result<()> {
+    super::super::session_image::verify_override_bundle(image, &ImageProbe(timeout))
+        .context("refusing to create a private session from the configured override image")
 }
 
 pub(super) fn setup(config: &Config) -> Result<()> {
@@ -507,6 +610,7 @@ pub(super) fn recover_target(
     action: RecoverAction,
     issue: Option<u64>,
     branches: &[String],
+    worktrees: &[PathBuf],
     auth: &forge_auth::ExecAuth,
 ) -> Result<RecoverOutcome> {
     let scope = format!("LOOM_PRIVATE_REPOSITORY={}", target.repository);
@@ -529,7 +633,8 @@ pub(super) fn recover_target(
     ]);
     match action {
         RecoverAction::Publish => args.extend(["--publish"]),
-        RecoverAction::Discard => args.extend(["--discard"]),
+        RecoverAction::Discard => args.push("--discard"),
+        RecoverAction::ValidateWorktrees => args.extend(["--discard", "--validate-worktrees"]),
         RecoverAction::List => {}
     }
     if let Some(issue) = &issue_flag {
@@ -537,6 +642,10 @@ pub(super) fn recover_target(
     }
     for branch in branches {
         args.extend(["--branch", branch]);
+    }
+    let worktree_flags: Vec<String> = worktrees.iter().map(|w| w.display().to_string()).collect();
+    for worktree in &worktree_flags {
+        args.extend(["--worktree", worktree]);
     }
     if let Some(slug) = &target.slug {
         args.extend(["--slug", slug]);
@@ -651,6 +760,20 @@ pub(super) fn prepare_with(
     if let Some(error) = result["error"].as_str() {
         bail!("private workspace preparation refused: {error}");
     }
+    // Optional since the reap-reporting field: an older session image omits
+    // it, and a non-array or non-string entry is skipped, never fatal.
+    for path in result["reaped_worktrees"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+    {
+        log::info!(
+            "private session {}: reaped finished-PR worktree {path} in {}",
+            config.account,
+            target.repository
+        );
+    }
     result["revision"]
         .as_str()
         .map(str::to_owned)
@@ -695,11 +818,13 @@ fn bind_source_matches(config: &Config, mount: &Value, expected: &Path) -> bool 
 #[cfg(test)]
 pub(super) mod fake {
     use std::cell::RefCell;
+    use std::time::Duration;
 
     pub(in super::super) type Handler = Box<dyn FnMut(&[&str]) -> anyhow::Result<String>>;
+    type TimedHandler = Box<dyn FnMut(&[&str], Duration) -> anyhow::Result<(bool, String)>>;
 
     thread_local! {
-        static HANDLER: RefCell<Option<Handler>> = const { RefCell::new(None) };
+        static HANDLER: RefCell<Option<TimedHandler>> = const { RefCell::new(None) };
         /// The child environment each faked call would have carried (#13916).
         static ENVS: RefCell<Vec<Vec<(String, String)>>> = const { RefCell::new(Vec::new()) };
     }
@@ -710,7 +835,11 @@ pub(super) mod fake {
     }
 
     /// Route this thread's Docker calls to `handler` until the guard drops.
-    pub(in super::super) fn install(handler: Handler) -> Guard {
+    pub(in super::super) fn install(mut handler: Handler) -> Guard {
+        install_timed(Box::new(move |args, _| handler(args).map(|stdout| (true, stdout))))
+    }
+
+    pub(in super::super) fn install_timed(handler: TimedHandler) -> Guard {
         HANDLER.with(|h| *h.borrow_mut() = Some(handler));
         ENVS.with(|e| e.borrow_mut().clear());
         Guard
@@ -728,11 +857,12 @@ pub(super) mod fake {
     pub(super) fn dispatch(
         args: &[&str],
         env: &[(String, String)],
-    ) -> Option<anyhow::Result<String>> {
+        timeout: Duration,
+    ) -> Option<anyhow::Result<(bool, String)>> {
         HANDLER.with(|h| {
             h.borrow_mut().as_mut().map(|handler| {
                 ENVS.with(|e| e.borrow_mut().push(env.to_vec()));
-                handler(args)
+                handler(args, timeout)
             })
         })
     }

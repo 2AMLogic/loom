@@ -27,7 +27,7 @@ use std::process::Command;
 /// The oldest installed Loom (`install-metadata.json` `loom_version`) this
 /// daemon works with.
 ///
-/// 0.19.1314 is the next-patch floor for #14376: native Builder prelaunch
+/// 0.20.13 is the next-patch floor for #14376: native Builder prelaunch
 /// requires installed worktree/publisher scripts that enforce strict ownership.
 /// Older scripts ignore the Builder admission marker and fail open.
 ///
@@ -35,7 +35,7 @@ use std::process::Command;
 /// at or above this floor and at or below VERSION. Only a prospective next-patch
 /// floor may use current installed files until its release exists; a missing
 /// tag for an already-reached floor fails closed. See `release-cadence.md`.
-pub const SUPPORTS_INSTALLED: &str = "0.19.1314";
+pub const SUPPORTS_INSTALLED: &str = "0.20.13";
 
 /// The oldest daemon the installed files this release ships work with. The
 /// install-metadata writers record it as `requires_daemon`.
@@ -52,15 +52,15 @@ pub const SUPPORTS_INSTALLED: &str = "0.19.1314";
 /// (#13956; 0.19.1311 was cut before the merge and lacks it), called by the
 /// `resolve-role-model.sh` script-helper, whose hard
 /// floor is the same release.
-/// 0.19.1314 is the next-patch floor for strict `lease ensure --require-ownership`
-/// (#14376), required by fresh Builder worktree admission. 0.19.1313 shipped
-/// before this flag; the compatibility contract permits the next patch while
-/// the daemon and installed-script change await their first release together.
+/// 0.20.13 is the next-patch floor for strict `lease ensure --require-ownership`
+/// (#14376), required by fresh Builder worktree admission. 0.20.12 was
+/// assigned before this flag. The daemon and installed scripts therefore
+/// declare the next patch while they await their first release together.
 ///
 /// Keep this on one line in exactly this shape: the installer
 /// (`scripts/install/loom-source-path.sh`) reads it from this file with
 /// `sed`, because the tree it installs can be newer than any binary it has.
-pub const REQUIRES_DAEMON: &str = "0.19.1314";
+pub const REQUIRES_DAEMON: &str = "0.20.13";
 
 // compat:invoked-files:begin
 /// The installed files this daemon executes in a workspace. An installed tree
@@ -362,6 +362,122 @@ fn git(repo_root: &Path, args: &[&str]) -> anyhow::Result<std::process::Output> 
 /// changes meaning; adding a key does not.
 pub const CAPABILITIES_SCHEMA_VERSION: u32 = 1;
 
+/// The commands `loom-tools` serves, as typed after the binary name: the one
+/// capability list (#14395). `capabilities --json` and `install-compat show
+/// --json` both print it as `tools_commands`, so a wrapper asks the binary
+/// what it serves and carries no list of its own.
+///
+/// Sub-verbs are listed only where the verb has sub-verbs (`forge`,
+/// `forge merge-queue`, `forge parent`; every `merge-queue` verb is served
+/// since #14520, `parent link` is not); the tests in
+/// `src/bin/loom_tools.rs` and `src/cli/forge_read/tests.rs` fail when this
+/// list and the clap tree disagree.
+pub const TOOLS_COMMANDS: &[&str] = &[
+    "strip-ansi",
+    "checkpoint",
+    "config",
+    "release-fetch",
+    "install-binary",
+    "resync-payload",
+    "resolve-model",
+    "resolve-role-model",
+    "capabilities",
+    "forge issue",
+    "forge pr",
+    "forge auth",
+    "forge check-open-pr",
+    "forge priority-labels",
+    "forge rebase-guard",
+    "forge pr-congestion",
+    "forge wait-checks",
+    "forge check-claim",
+    "forge check-branch",
+    "forge tree-unchanged",
+    "forge verdict-equivalent",
+    "forge version-only-diff",
+    "forge additive-migrations",
+    "forge locked-deps-only",
+    "forge resync-waiver",
+    "forge suspect-critical-diff",
+    "forge merge-method",
+    "forge merge-config",
+    // #14519: the shared non-queue writes.
+    "forge comment",
+    "forge create-issue",
+    "forge rerun",
+    "forge auto-merge",
+    "forge disable-auto-merge",
+    "forge verdict-labels",
+    "forge verdict-reconcile",
+    "forge verdict-lock",
+    "forge doctor-handback",
+    "forge journal-ci-refusal",
+    "forge parent link",
+    "forge merge-queue mode",
+    "forge merge-queue preflight",
+    "forge merge-queue status",
+    "forge merge-queue enqueue",
+    "forge merge-queue dequeue",
+    "forge merge-queue reconcile",
+    "forge merge-queue handoff",
+    "forge merge-queue step",
+    "forge merge-queue revoke",
+    "forge merge-queue group-check",
+    "forge merge-queue authorize-check",
+    "forge token",
+    "forge is-fleet",
+    "forge trusted-comments",
+    "forge promotion-author",
+    "forge claim-liveness",
+    "forge verdict-stale-notice",
+    "forge verdict-body-check",
+    "forge workflow-write-all-check",
+    "forge verdict-gate",
+    "forge may-write",
+    "forge calls",
+    "forge identities",
+    "forge parent body",
+    "forge parent split-state",
+    "forge dashboard-link",
+    "park-record render",
+    "park-record parse",
+    "park-record apply",
+    "park-record released",
+    "park-record decision",
+    "park-record guide-conflict-route",
+    "park-record retract",
+    "operator-decision validate",
+    "operator-decision apply",
+    "operator-decision resolve",
+    "lease ensure",
+    "lease co-occupancy",
+    "lease release",
+    "lease renewer",
+    "lease pr claim",
+    "lease pr check",
+    "lease pr fence",
+    "lease pr release",
+    // #14429: top-level reads and config inspection. The write forms inside
+    // `labels`, `forge-probe` and `forge-inventory` refuse with exit 64
+    // (#14396).
+    "labels",
+    "pr-queue",
+    "premise-check",
+    "duplicate-scan",
+    "check-points-marker",
+    "label-duplicates",
+    "forge-probe",
+    "forge-inventory",
+    "affected-files",
+    "check-stale-blocked",
+    "skip-labels",
+    "roles",
+    "guards",
+    "install-compat",
+    "hooks-home",
+    "claim",
+];
+
 /// The identity of the installed-file payload this binary was built against:
 /// the contract claims plus the daemon-invoked file list, in one string.
 ///
@@ -396,6 +512,7 @@ pub fn capabilities_json(
         "requires_daemon": REQUIRES_DAEMON,
         "payload_identity": payload_identity(),
         "invoked_files": DAEMON_INVOKED_INSTALLED_FILES,
+        "tools_commands": TOOLS_COMMANDS,
         "installed": installed.map(|m| serde_json::json!({
             "loom_version": m.loom_version,
             "requires_daemon": m.requires_daemon,
