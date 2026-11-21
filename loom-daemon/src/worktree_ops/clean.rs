@@ -1989,8 +1989,9 @@ pub fn clean_worktrees(repo_root: &Path, stats: &mut CleanupStats, opts: &CleanO
     let issue_state_fn = |n: u32| pass.clean_issue_state(n);
     let issue_closed_at_fn = |n: u32| pass.issue_closed_at(n);
     let pr_status_fn = |n: u32| pass.clean_pr_status(n);
-    let branch_reachable_fn =
-        |n: u32| branch_reachable_from_remotes(repo_root, &naming::branch_name(n));
+    let branch_reachable_fn = |n: u32| {
+        branch_reachable_from_remotes(repo_root, &format!("refs/heads/{}", naming::branch_name(n)))
+    };
     // #6652: one `git worktree list` per pass, not once per worktree.
     let registered = registered_worktree_paths(repo_root);
     let is_registered_fn = is_registered_worktree_probe(&registered);
@@ -2182,10 +2183,16 @@ pub fn prune_orphaned_worktrees(repo_root: &Path, dry_run: bool) {
 /// The branch currently checked out at `repo_root`, or `None` for a detached
 /// HEAD or any `git` failure. Also used by [`crate::primary_checkout_reaper`]
 /// (#5268) to identify a primary checkout parked on a non-default branch.
+///
+/// Reads the full symbolic ref and strips the exact `refs/heads/` prefix
+/// once: `symbolic-ref --short` re-shortens the name, which under PR-fetch
+/// residue (`refs/pr344` next to `refs/heads/pr344`) yields `heads/pr344`
+/// and silently breaks name comparisons against the true branch name
+/// (#14876).
 #[must_use]
 pub fn current_branch(repo_root: &Path) -> Option<String> {
     let out = Command::new("git")
-        .args(["symbolic-ref", "--short", "HEAD"])
+        .args(["symbolic-ref", "HEAD"])
         .current_dir(repo_root)
         .output()
         .ok()?;
@@ -2193,10 +2200,11 @@ pub fn current_branch(repo_root: &Path) -> Option<String> {
         return None;
     }
     let name = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    let name = name.strip_prefix("refs/heads/")?;
     if name.is_empty() {
         None
     } else {
-        Some(name)
+        Some(name.to_string())
     }
 }
 
@@ -2315,13 +2323,17 @@ pub fn classify_stale_branch(safe: bool, reachable: bool, pr_merged: bool) -> St
     }
 }
 
-/// Short SHA for `branch`'s tip, for the "recoverable via `git reflog`"
+/// Short SHA for `rev`'s tip, for the "recoverable via `git reflog`"
 /// deletion/keep hints (mirrors the worktree half's `HEAD=<sha>` line in
 /// [`super::aggressive`]). `None` on any git failure — callers render an
 /// empty hint rather than fail the whole pass over a cosmetic lookup.
-fn branch_sha(repo_root: &Path, branch: &str) -> Option<String> {
+///
+/// Callers must pass a **fully qualified** ref for local branches
+/// (`refs/heads/<name>`): a bare name can resolve to PR-fetch residue like
+/// `refs/pr344` before the intended `refs/heads/pr344` (#14876).
+fn branch_sha(repo_root: &Path, rev: &str) -> Option<String> {
     let out = Command::new("git")
-        .args(["rev-parse", branch])
+        .args(["rev-parse", rev])
         .current_dir(repo_root)
         .output()
         .ok()?;
@@ -2338,17 +2350,24 @@ fn branch_sha(repo_root: &Path, branch: &str) -> Option<String> {
 
 /// Render the `" (HEAD=<sha>, recoverable via `git reflog`)"` suffix used by
 /// every branch deletion/keep line below, or `""` if the SHA can't be read.
-fn sha_hint(repo_root: &Path, branch: &str) -> String {
-    branch_sha(repo_root, branch)
+/// `rev` must be fully qualified for local branches — see [`branch_sha`].
+fn sha_hint(repo_root: &Path, rev: &str) -> String {
+    branch_sha(repo_root, rev)
         .map(|s| format!(" (HEAD={s}, recoverable via `git reflog`)"))
         .unwrap_or_default()
 }
 
-/// Whether every commit reachable from `branch` is also reachable from at
+/// Whether every commit reachable from `rev` is also reachable from at
 /// least one remote-tracking ref — i.e. deleting the local branch would not
 /// lose the only copy of any commit. Automates the manual check from issue
 /// #5737's report: `git rev-list --count --not --remotes <branch>` returning
 /// `0` means no content would be lost.
+///
+/// Callers must pass a **fully qualified** ref for local branches
+/// (`refs/heads/<name>`): under PR-fetch residue a bare name resolves to the
+/// residue ref first, and the probe then reports the residue's reachability
+/// instead of the branch's — which can authorize deleting the only local
+/// copy of an unpushed commit (#14876).
 ///
 /// Fails closed (`false`, "not proven safe") on any git/parse failure: a
 /// probe this function cannot answer must never look like an answer of "safe
@@ -2360,14 +2379,14 @@ fn sha_hint(repo_root: &Path, branch: &str) -> String {
 /// for that reason, so [`crate::worktree_reaper`]'s production probe wiring
 /// can call it directly.
 #[must_use]
-pub fn branch_reachable_from_remotes(repo_root: &Path, branch: &str) -> bool {
-    // NOTE: `--not --remotes` must come AFTER `branch`, not before — git
+pub fn branch_reachable_from_remotes(repo_root: &Path, rev: &str) -> bool {
+    // NOTE: `--not --remotes` must come AFTER the revision, not before — git
     // parses a bare `--remotes` (no `=`) as taking the *next* token as its
     // glob pattern when one is given positionally, silently swallowing
-    // `branch` itself and leaving no positive revision at all (which
+    // the revision itself and leaving no positive revision at all (which
     // degenerately reports "0 commits excluded", i.e. always reachable).
     let out = Command::new("git")
-        .args(["rev-list", "--count", branch, "--not", "--remotes"])
+        .args(["rev-list", "--count", rev, "--not", "--remotes"])
         .current_dir(repo_root)
         .output();
     let Ok(out) = out else { return false };
@@ -2422,8 +2441,9 @@ fn handle_stale_branch(
     stats: &mut CleanupStats,
     opts: &CleanOptions,
     branch: &str,
+    full_ref: &str,
 ) {
-    let hint = sha_hint(repo_root, branch);
+    let hint = sha_hint(repo_root, full_ref);
 
     if !opts.safe {
         println!("  Stale (no origin/{branch}) - deleting {branch}{hint}");
@@ -2442,7 +2462,7 @@ fn handle_stale_branch(
         }
     }
 
-    let reachable = branch_reachable_from_remotes(repo_root, branch);
+    let reachable = branch_reachable_from_remotes(repo_root, full_ref);
     let pr_merged = !reachable && branch_pr_merged(repo_root, branch);
     match classify_stale_branch(opts.safe, reachable, pr_merged) {
         StaleBranchDecision::Remove => {
@@ -2471,11 +2491,19 @@ fn handle_stale_branch(
 /// own to authorize deletion — see [`classify_stale_branch`] and
 /// [`handle_stale_branch`].
 pub fn clean_branches(repo_root: &Path, stats: &mut CleanupStats, opts: &CleanOptions) {
+    // #14876: enumerate with `for-each-ref` full refnames, never
+    // `%(refname:short)` — under PR-fetch residue (`refs/pr344` next to
+    // `refs/heads/pr344`) Git 2.43 renders the short name as `heads/pr344`,
+    // which then fails `git branch -D` ("branch not found") on every pass.
+    // The exact `refs/heads/` prefix is stripped exactly once, below, into
+    // the plain name every branch-name consumer needs; revision lookups
+    // (SHA hint, reachability) keep the fully qualified ref so a bare name
+    // can never resolve to the residue first.
     let out = Command::new("git")
-        .args(["branch", "--format=%(refname:short)"])
+        .args(["for-each-ref", "--format=%(refname)", "refs/heads/"])
         .current_dir(repo_root)
         .output();
-    let branches: Vec<String> = match out {
+    let refs: Vec<String> = match out {
         Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout)
             .lines()
             .map(|s| s.trim().to_string())
@@ -2483,7 +2511,7 @@ pub fn clean_branches(repo_root: &Path, stats: &mut CleanupStats, opts: &CleanOp
             .collect(),
         _ => Vec::new(),
     };
-    if branches.is_empty() {
+    if refs.is_empty() {
         println!("No local branches found");
         return;
     }
@@ -2498,8 +2526,11 @@ pub fn clean_branches(repo_root: &Path, stats: &mut CleanupStats, opts: &CleanOp
     }
     let holders = branch_holders(repo_root);
 
-    let mut issue_pass_candidates: Vec<String> = Vec::new();
-    for branch in &branches {
+    let mut issue_pass_candidates: Vec<(String, String)> = Vec::new();
+    for full_ref in &refs {
+        let Some(branch) = full_ref.strip_prefix("refs/heads/") else {
+            continue;
+        };
         if protected.contains(branch) {
             continue;
         }
@@ -2508,13 +2539,13 @@ pub fn clean_branches(repo_root: &Path, stats: &mut CleanupStats, opts: &CleanOp
             continue;
         }
         if !remote_branch_exists(repo_root, branch) {
-            handle_stale_branch(repo_root, stats, opts, branch);
+            handle_stale_branch(repo_root, stats, opts, branch, full_ref);
         } else {
-            issue_pass_candidates.push(branch.clone());
+            issue_pass_candidates.push((branch.to_string(), full_ref.clone()));
         }
     }
 
-    for branch in &issue_pass_candidates {
+    for (branch, full_ref) in &issue_pass_candidates {
         let Some(rest) = branch.strip_prefix(BRANCH_PREFIX) else {
             continue;
         };
@@ -2526,7 +2557,7 @@ pub fn clean_branches(repo_root: &Path, stats: &mut CleanupStats, opts: &CleanOp
         let status = super::hygiene_pass::branch_issue_state(repo_root, issue_num, opts.dry_run);
         match status.as_str() {
             "CLOSED" => {
-                let hint = sha_hint(repo_root, branch);
+                let hint = sha_hint(repo_root, full_ref);
                 println!("  Issue #{issue_num} CLOSED - deleting {branch}{hint}");
                 if !opts.dry_run {
                     match force_delete_branch(repo_root, branch) {

@@ -1,5 +1,5 @@
 use super::*;
-use crate::test_git_helpers::run as git;
+use crate::test_git_helpers::{git_out, run as git};
 
 // --- select_pr_status / rows_to_status / classify_pr_row (#6746) ------
 //
@@ -2354,6 +2354,248 @@ fn safe_force_overrides_retain_prefix_gate() {
         "--force must override the retain-prefix gate"
     );
     assert_eq!(stats.cleaned_branches, 1);
+}
+
+/// Full-ref existence probe for the #14876 regressions: asserts against
+/// fully qualified refs (via `git show-ref --verify`), never short names —
+/// short names are exactly what PR-fetch residue corrupts. Returns the
+/// `<sha> <ref>` line, or `None` when the ref is gone.
+fn ref_or_none(dir: &Path, full_ref: &str) -> Option<String> {
+    let out = git_out(dir, &["show-ref", "--verify", full_ref]);
+    if !out.status.success() {
+        return None;
+    }
+    Some(String::from_utf8_lossy(&out.stdout).trim().to_string())
+}
+
+/// #14876 AC1: with PR-fetch residue (`refs/pr344` + `refs/remotes/pr344`
+/// at the same tip) shadowing the branch name, `--safe` cleanup must delete
+/// the eligible local branch by its true name, preserve both residue refs at
+/// their original SHA, record no error — and a second run must be a clean
+/// no-op (the pre-fix pass re-failed the same mis-prefixed delete forever).
+#[test]
+fn safe_branch_cleanup_deletes_branch_shadowed_by_residue_and_stays_idempotent() {
+    let origin_dir = tempfile::tempdir().unwrap();
+    git(origin_dir.path(), &["init", "-q", "--bare"]);
+
+    let repo_dir = tempfile::tempdir().unwrap();
+    let repo_root = repo_dir.path();
+    git(repo_root, &["init", "-q", "--initial-branch=main"]);
+    git(repo_root, &["config", "user.email", "loom@example.com"]);
+    git(repo_root, &["config", "user.name", "Loom Test"]);
+    git(repo_root, &["commit", "-q", "--allow-empty", "-m", "seed"]);
+    git(
+        repo_root,
+        &[
+            "remote",
+            "add",
+            "origin",
+            origin_dir.path().to_str().unwrap(),
+        ],
+    );
+    git(repo_root, &["push", "-q", "origin", "main"]);
+
+    let seed = git(repo_root, &["rev-parse", "HEAD"]);
+    git(repo_root, &["branch", "pr344"]);
+    git(repo_root, &["update-ref", "refs/pr344", &seed]);
+    git(repo_root, &["update-ref", "refs/remotes/pr344", &seed]);
+
+    let opts = CleanOptions {
+        safe: true,
+        ..CleanOptions::default()
+    };
+    let mut stats = CleanupStats::default();
+    clean_branches(repo_root, &mut stats, &opts);
+
+    assert_eq!(stats.cleaned_branches, 1, "the shadowed branch is deletable: {stats:?}");
+    assert_eq!(stats.errors, 0, "no mis-prefixed `git branch -D` failure: {stats:?}");
+    assert_eq!(
+        ref_or_none(repo_root, "refs/heads/pr344"),
+        None,
+        "the eligible local branch must be gone"
+    );
+    assert_eq!(
+        ref_or_none(repo_root, "refs/pr344"),
+        Some(format!("{seed} refs/pr344")),
+        "residue ref must be preserved at its original SHA"
+    );
+    assert_eq!(
+        ref_or_none(repo_root, "refs/remotes/pr344"),
+        Some(format!("{seed} refs/remotes/pr344")),
+        "residue remote ref must be preserved at its original SHA"
+    );
+
+    let mut stats = CleanupStats::default();
+    clean_branches(repo_root, &mut stats, &opts);
+    assert_eq!(stats.cleaned_branches, 0, "second run deletes nothing: {stats:?}");
+    assert_eq!(stats.errors, 0, "second run stays clean: {stats:?}");
+    assert_eq!(
+        ref_or_none(repo_root, "refs/pr344"),
+        Some(format!("{seed} refs/pr344")),
+        "idempotent run must not touch the residue refs"
+    );
+}
+
+/// #14876 AC2: with the residue refs sitting at the PARENT of an unpushed
+/// local tip and no merged PR, `--safe` must keep `refs/heads/pr344` at that
+/// tip — the reachability probe evaluates the fully qualified ref, while a
+/// bare name resolves to the residue first and would authorize deleting the
+/// only copy of the work. The keep decision's diagnostic SHA must identify
+/// the LOCAL tip.
+#[test]
+fn safe_branch_cleanup_keeps_unpushed_tip_when_residue_sits_at_its_parent() {
+    let origin_dir = tempfile::tempdir().unwrap();
+    git(origin_dir.path(), &["init", "-q", "--bare"]);
+
+    let repo_dir = tempfile::tempdir().unwrap();
+    let repo_root = repo_dir.path();
+    git(repo_root, &["init", "-q", "--initial-branch=main"]);
+    git(repo_root, &["config", "user.email", "loom@example.com"]);
+    git(repo_root, &["config", "user.name", "Loom Test"]);
+    git(repo_root, &["commit", "-q", "--allow-empty", "-m", "seed"]);
+    git(
+        repo_root,
+        &[
+            "remote",
+            "add",
+            "origin",
+            origin_dir.path().to_str().unwrap(),
+        ],
+    );
+    git(repo_root, &["push", "-q", "origin", "main"]);
+
+    let seed = git(repo_root, &["rev-parse", "HEAD"]);
+    git(repo_root, &["checkout", "-q", "-b", "pr344"]);
+    git(repo_root, &["commit", "-q", "--allow-empty", "-m", "local-only tip"]);
+    let tip = git(repo_root, &["rev-parse", "HEAD"]);
+    git(repo_root, &["checkout", "-q", "main"]);
+    git(repo_root, &["update-ref", "refs/pr344", &seed]);
+    git(repo_root, &["update-ref", "refs/remotes/pr344", &seed]);
+
+    let mut stats = CleanupStats::default();
+    let opts = CleanOptions {
+        safe: true,
+        ..CleanOptions::default()
+    };
+    clean_branches(repo_root, &mut stats, &opts);
+
+    assert_eq!(stats.kept_branches, 1, "unreachable work is kept: {stats:?}");
+    assert_eq!(stats.cleaned_branches, 0);
+    assert_eq!(stats.errors, 0);
+    assert_eq!(
+        ref_or_none(repo_root, "refs/heads/pr344"),
+        Some(format!("{tip} refs/heads/pr344")),
+        "the unpushed tip must survive --safe at its local commit"
+    );
+    assert_eq!(
+        branch_sha(repo_root, "refs/heads/pr344").as_deref(),
+        tip.get(..12),
+        "the diagnostic SHA must identify the local tip, not the residue parent"
+    );
+}
+
+/// #14876 AC3: a matching `refs/remotes/origin/pr344` keeps the branch out
+/// of the stale path entirely — even while the residue refs shadow its name.
+#[test]
+fn matching_origin_ref_keeps_a_shadowed_branch_out_of_the_stale_path() {
+    let origin_dir = tempfile::tempdir().unwrap();
+    git(origin_dir.path(), &["init", "-q", "--bare"]);
+
+    let repo_dir = tempfile::tempdir().unwrap();
+    let repo_root = repo_dir.path();
+    git(repo_root, &["init", "-q", "--initial-branch=main"]);
+    git(repo_root, &["config", "user.email", "loom@example.com"]);
+    git(repo_root, &["config", "user.name", "Loom Test"]);
+    git(repo_root, &["commit", "-q", "--allow-empty", "-m", "seed"]);
+    git(
+        repo_root,
+        &[
+            "remote",
+            "add",
+            "origin",
+            origin_dir.path().to_str().unwrap(),
+        ],
+    );
+    git(repo_root, &["push", "-q", "origin", "main"]);
+
+    let seed = git(repo_root, &["rev-parse", "HEAD"]);
+    git(repo_root, &["branch", "pr344"]);
+    git(repo_root, &["push", "-q", "origin", "pr344"]);
+    git(repo_root, &["update-ref", "refs/pr344", &seed]);
+    git(repo_root, &["update-ref", "refs/remotes/pr344", &seed]);
+
+    let mut stats = CleanupStats::default();
+    let opts = CleanOptions {
+        safe: true,
+        ..CleanOptions::default()
+    };
+    clean_branches(repo_root, &mut stats, &opts);
+
+    assert_eq!(
+        stats.cleaned_branches, 0,
+        "a branch with a live origin counterpart never enters the stale path: {stats:?}"
+    );
+    assert_eq!(stats.kept_branches, 0);
+    assert_eq!(stats.errors, 0);
+    assert_eq!(
+        ref_or_none(repo_root, "refs/heads/pr344"),
+        Some(format!("{seed} refs/heads/pr344")),
+        "the branch must remain locally"
+    );
+}
+
+/// #14876: stripping `refs/heads/` exactly once must keep a branch literally
+/// named `heads/topic` addressable by that exact name. The `refs/topic`
+/// residue makes every short rendering of these two branches ambiguous
+/// (`git branch --format=%(refname:short)` yields non-names like
+/// `refs/heads/topic` / `heads/heads/topic`), so the pre-fix pass failed
+/// both deletes; the fixed enumeration deletes both by their true names.
+#[test]
+fn safe_branch_cleanup_handles_a_branch_literally_named_heads_topic() {
+    let origin_dir = tempfile::tempdir().unwrap();
+    git(origin_dir.path(), &["init", "-q", "--bare"]);
+
+    let repo_dir = tempfile::tempdir().unwrap();
+    let repo_root = repo_dir.path();
+    git(repo_root, &["init", "-q", "--initial-branch=main"]);
+    git(repo_root, &["config", "user.email", "loom@example.com"]);
+    git(repo_root, &["config", "user.name", "Loom Test"]);
+    git(repo_root, &["commit", "-q", "--allow-empty", "-m", "seed"]);
+    git(
+        repo_root,
+        &[
+            "remote",
+            "add",
+            "origin",
+            origin_dir.path().to_str().unwrap(),
+        ],
+    );
+    git(repo_root, &["push", "-q", "origin", "main"]);
+
+    let seed = git(repo_root, &["rev-parse", "HEAD"]);
+    git(repo_root, &["branch", "topic"]);
+    git(repo_root, &["branch", "heads/topic"]);
+    git(repo_root, &["update-ref", "refs/topic", &seed]);
+
+    let mut stats = CleanupStats::default();
+    let opts = CleanOptions {
+        safe: true,
+        ..CleanOptions::default()
+    };
+    clean_branches(repo_root, &mut stats, &opts);
+
+    assert_eq!(
+        stats.cleaned_branches, 2,
+        "both same-tip branches are deletable by their true names: {stats:?}"
+    );
+    assert_eq!(stats.errors, 0);
+    assert_eq!(ref_or_none(repo_root, "refs/heads/topic"), None);
+    assert_eq!(ref_or_none(repo_root, "refs/heads/heads/topic"), None);
+    assert_eq!(
+        ref_or_none(repo_root, "refs/topic"),
+        Some(format!("{seed} refs/topic")),
+        "the residue ref itself is out of the branch pass's scope"
+    );
 }
 
 /// AC #3: deletion output must print the branch SHA (matching the
