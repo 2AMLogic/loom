@@ -24,7 +24,7 @@
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
-use anyhow::{anyhow, bail, Result};
+use anyhow::{bail, Result};
 
 use super::operator_interrupt::{self, Interrupted};
 use crate::proc_exec::{self, Completion};
@@ -136,7 +136,10 @@ fn run_bounded_env_with(
     {
         return Err(Interrupted(signal).into());
     }
-    match completion.map_err(|e| anyhow!("failed to run `{program} {subcommand}`: {e}"))? {
+    match completion.map_err(|err| {
+        let message = format!("failed to run `{program} {subcommand}`: {err}");
+        anyhow::Error::new(err).context(message)
+    })? {
         Completion::Exited(output) => Ok((
             output.status.success(),
             String::from_utf8_lossy(&output.stdout).into_owned(),
