@@ -60,6 +60,14 @@ check() { # <expected> <actual> <message>
     fi
 }
 
+check_no_equivalence_call() {
+    local trace=absent
+    if [[ -e "$T/ve.argv" ]]; then
+        trace=present
+    fi
+    check absent "$trace" "$1"
+}
+
 # --- the shipped tick, verbatim but for the PR number placeholder -----------
 awk '/^```bash$/{f=1;next} /^```$/{f=0} f' "$HOLD_MD" | sed "s/^PR_NUMBER=<number>$/PR_NUMBER=$PR/" >"$T/tick.sh"
 grep -q "^PR_NUMBER=$PR$" "$T/tick.sh" || { echo "FAIL: could not extract the tick from $HOLD_MD"; exit 1; }
@@ -227,7 +235,7 @@ tick
 push "$B"
 rm -f "$T/ve.argv"
 tick; check "COMMENT:hold;LABEL+:loom:blocked" "$WRITES" "label present, notice at A, head B: fresh notice for B, label stays"
-[ ! -e "$T/ve.argv" ]; check 0 "$?" "no equivalence call — the label's presence is the operator's standing decision"
+check_no_equivalence_call "no equivalence call — the label's presence is the operator's standing decision"
 check 1 "$(jq -r --arg h "$B" '[.[] | select(.body | startswith("<!-- champion:critical-file-hold -->")) | select(.body | contains("hold-state head=" + $h))] | length' "$T/comments.json")" "exactly one hold notice records head B"
 tick; check "LABEL+:loom:blocked" "$WRITES" "repeat tick at B: hold stands, no second notice for B"
 check 1 "$(jq -r --arg h "$B" '[.[] | select(.body | startswith("<!-- champion:critical-file-hold -->")) | select(.body | contains("hold-state head=" + $h))] | length' "$T/comments.json")" "still exactly one notice for B"
@@ -271,7 +279,7 @@ push "$C"
 rm -f "$T/ve.argv"
 tick; check "COMMENT:hold;LABEL+:loom:blocked" "$WRITES" "a move after the reassertion: the hold is re-recorded at the new head, the old release is NOT carried (#14833)"
 check "present" "$(label)" "label still on after the move"
-[ ! -e "$T/ve.argv" ]; check 0 "$?" "reasserted hold across a move: no equivalence call — the label is the operator's standing decision"
+check_no_equivalence_call "reasserted hold across a move: no equivalence call — the label is the operator's standing decision"
 
 echo "--- every unknown fails closed, naming why ---"
 for mode in unknown disabled; do
