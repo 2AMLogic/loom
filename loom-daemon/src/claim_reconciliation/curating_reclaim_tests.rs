@@ -50,7 +50,7 @@ const YIELD: &str =
 #[test]
 fn a_fresh_lease_is_live_whatever_its_host() {
     for body in [LEASE, LEASE_PEER] {
-        let got = classify_curator_lease(&[row(1, 5, body)], now(), 15.0);
+        let got = classify_curator_lease(&[row(1, 5, body)], at(7, 0, 0, 0), now(), 15.0);
         assert_eq!(got, CuratorLeaseEvidence::Live { age_minutes: 5.0 });
     }
 }
@@ -60,39 +60,56 @@ fn a_renewed_lease_outranks_an_older_released_record_of_the_same_identity() {
     // The #14811 shape after a re-claim: the old record was edited to
     // released, a newer live lease exists. Renewal (self or peer) wins.
     let rows = [row(1, 600, RELEASED), row(2, 3, LEASE)];
-    let got = classify_curator_lease(&rows, now(), 15.0);
+    let got = classify_curator_lease(&rows, at(7, 0, 0, 0), now(), 15.0);
     assert_eq!(got, CuratorLeaseEvidence::Live { age_minutes: 3.0 });
 }
 
 #[test]
 fn a_released_record_names_the_release() {
-    let got = classify_curator_lease(&[row(1, 600, RELEASED)], now(), 15.0);
+    let got = classify_curator_lease(&[row(1, 600, RELEASED)], at(7, 0, 0, 0), now(), 15.0);
     assert_eq!(got, CuratorLeaseEvidence::Released { age_minutes: 600.0 });
 }
 
 #[test]
 fn an_unrenewed_lease_is_expired() {
-    let got = classify_curator_lease(&[row(1, 40, LEASE)], now(), 15.0);
+    let got = classify_curator_lease(&[row(1, 40, LEASE)], at(7, 0, 0, 0), now(), 15.0);
     assert_eq!(got, CuratorLeaseEvidence::Expired { age_minutes: 40.0 });
 }
 
 #[test]
 fn a_later_yield_kills_the_lease_it_names() {
     let rows = [row(1, 5, LEASE), row(2, 4, YIELD)];
-    let got = classify_curator_lease(&rows, now(), 15.0);
+    let got = classify_curator_lease(&rows, at(7, 0, 0, 0), now(), 15.0);
     assert_eq!(got, CuratorLeaseEvidence::Yielded);
 }
 
 #[test]
 fn other_roles_records_do_not_count() {
     let judge = "<!-- loom:pr-lease role=judge host=h sweep=s1 -->\nholds";
-    let got = classify_curator_lease(&[row(1, 5, judge)], now(), 15.0);
+    let got = classify_curator_lease(&[row(1, 5, judge)], at(7, 0, 0, 0), now(), 15.0);
     assert_eq!(got, CuratorLeaseEvidence::Absent);
 }
 
 #[test]
+fn an_ambiguous_event_order_cannot_authorize_removal() {
+    let rows = [row(1, 5, RELEASED)];
+    assert_eq!(
+        classify_curator_lease(&rows, rows[0].updated_at, now(), 15.0),
+        CuratorLeaseEvidence::Absent
+    );
+    let live = [row(2, 6, LEASE_PEER)];
+    assert_eq!(
+        classify_curator_lease(&live, rows[0].updated_at, now(), 15.0),
+        CuratorLeaseEvidence::Live { age_minutes: 6.0 }
+    );
+}
+
+#[test]
 fn no_records_at_all_is_absent() {
-    assert_eq!(classify_curator_lease(&[], now(), 15.0), CuratorLeaseEvidence::Absent);
+    assert_eq!(
+        classify_curator_lease(&[], at(7, 0, 0, 0), now(), 15.0),
+        CuratorLeaseEvidence::Absent
+    );
 }
 
 // -----------------------------------------------------------------------
@@ -280,7 +297,7 @@ struct FakeIssue<'a> {
 fn fleet_row(id: u64, minutes_ago: i64, body: &str) -> String {
     let updated = (Utc::now() - chrono::Duration::minutes(minutes_ago)).to_rfc3339();
     format!(
-        r#"{{"id":{id},"updated_at":"{updated}","body":{body},"user":{{"login":"loom-fleet-dispatch[bot]","type":"Bot"}},"author_association":"NONE"}}"#
+        r#"{{"id":{id},"created_at":"{updated}","updated_at":"{updated}","body":{body},"user":{{"login":"loom-fleet-dispatch[bot]","type":"Bot"}},"author_association":"NONE"}}"#
     )
 }
 
@@ -525,6 +542,65 @@ fn no_lease_record_writes_nothing() {
         !calls.contains(RELEASE),
         "absence is not evidence; the attended no-lease path must not be touched: {calls}"
     );
+}
+
+#[test]
+#[serial]
+fn a_later_claim_cannot_be_released_by_an_earlier_episodes_lease() {
+    let labeled_at = quoted(&(Utc::now() - chrono::Duration::minutes(60)).to_rfc3339());
+    let previous = fleet_row(1, 1510, &quoted(LEASE));
+    let ended = fleet_row(2, 1500, &quoted(RELEASED));
+    for (case, rows, should_release) in [
+        ("no history", vec![], false),
+        ("earlier release", vec![previous.clone(), ended.clone()], false),
+        ("earlier expired lease", vec![previous.clone()], false),
+        ("earlier yield", vec![previous, fleet_row(2, 1500, &quoted(YIELD))], false),
+        (
+            "current release",
+            vec![ended.clone(), fleet_row(3, 10, &quoted(RELEASED))],
+            true,
+        ),
+        ("current expired lease", vec![fleet_row(3, 40, &quoted(LEASE_PEER))], true),
+        ("current renewal", vec![ended, fleet_row(3, 1, &quoted(LEASE_PEER))], false),
+    ] {
+        let dir = tempdir().unwrap();
+        let fake = FakeIssue {
+            labels: &[CLAIM, "loom:issue"],
+            comments: format!("[{}]", rows.join(",")),
+            labeled_at: Some(&labeled_at),
+        };
+        let (gh, log) = write_fake_gh(dir.path(), &fake);
+        run_pass(&gh, dir.path());
+        let calls = std::fs::read_to_string(log).unwrap();
+        assert_eq!(calls.contains("-X POST"), should_release, "{case}: {calls}");
+        assert_eq!(calls.contains(RELEASE), should_release, "{case}: {calls}");
+    }
+}
+
+#[test]
+#[serial]
+fn an_earlier_recuration_note_does_not_suppress_this_claims_record() {
+    let dir = tempdir().unwrap();
+    let labeled_at = quoted(&(Utc::now() - chrono::Duration::minutes(60)).to_rfc3339());
+    let mut old_note: serde_json::Value = serde_json::from_str(&fleet_row(
+        1,
+        1500,
+        &quoted("<!-- loom:recuration-needed claim=loom:curating -->"),
+    ))
+    .unwrap();
+    // Editing the historical note during this claim does not make it the current note.
+    old_note["updated_at"] = Utc::now().to_rfc3339().into();
+    let release = fleet_row(2, 10, &quoted(RELEASED));
+    let fake = FakeIssue {
+        labels: &[CLAIM, "loom:issue"],
+        comments: format!("[{old_note},{release}]"),
+        labeled_at: Some(&labeled_at),
+    };
+    let (gh, log) = write_fake_gh(dir.path(), &fake);
+    run_pass(&gh, dir.path());
+    let calls = std::fs::read_to_string(log).unwrap();
+    assert_eq!(calls.matches("-X POST").count(), 1, "{calls}");
+    assert!(calls.contains(RELEASE), "{calls}");
 }
 
 /// Classify the actual remaining Forge labels through the same selector the

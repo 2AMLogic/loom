@@ -40,9 +40,9 @@
 //!    immediately before any write).
 //!
 //! A claim is released only when **both** say so: the lease record is
-//! released, expired or yielded (a record must exist — **absence is not
-//! evidence**: the attended Curator path of `curator.md` takes no lease at
-//! all, and `claim-staleness.sh` owns that case), AND the label has been
+//! released, expired or yielded during the current claim (the attended
+//! Curator path of `curator.md` takes no lease, and `claim-staleness.sh`
+//! owns that case), AND the label has been
 //! stale past the arbitration threshold. Everything else — a live lease,
 //! an unverifiable read, no record, an unknown age, a fresh claim, a frozen
 //! issue — keeps the claim untouched. [#11743] applies: a `loom:frozen`
@@ -125,10 +125,8 @@ pub(super) enum CuratorLeaseEvidence {
     /// The claimant stood down to an earlier holder and no live lease
     /// remains.
     Yielded,
-    /// The read succeeded and found no trusted `role=curator` record at all.
-    /// NOT evidence of abandonment: the attended Curator path takes no lease
-    /// (`curator.md`), and `claim-staleness.sh` arbitrates that case on the
-    /// next dispatch.
+    /// No trusted lease evidence for this claim. The attended Curator path
+    /// takes no lease, and `claim-staleness.sh` arbitrates that case on the next dispatch.
     Absent,
 }
 
@@ -148,7 +146,7 @@ impl std::fmt::Display for CuratorLeaseEvidence {
             Self::Yielded => write!(f, "curator_lease=yielded (claimant stood down)"),
             Self::Absent => write!(
                 f,
-                "curator_lease=absent (no trusted role=curator record — not evidence of \
+                "curator_lease=absent (no trusted role=curator record for this claim — not evidence of \
                  abandonment; claim-staleness.sh owns the no-lease case)"
             ),
         }
@@ -160,6 +158,7 @@ impl std::fmt::Display for CuratorLeaseEvidence {
 /// identity) is [`earliest_live_holder`]'s, reused rather than restated.
 pub(super) fn classify_curator_lease(
     rows: &[RoleLeaseRow],
+    claim_labeled_at: DateTime<Utc>,
     now: DateTime<Utc>,
     ttl_minutes: f64,
 ) -> CuratorLeaseEvidence {
@@ -179,8 +178,11 @@ pub(super) fn classify_curator_lease(
             .fold(f64::INFINITY, f64::min);
         return CuratorLeaseEvidence::Live { age_minutes };
     }
-    // No live lease: name what the newest trusted record of the role says.
+    // Any live holder protects the claim. A stale record can authorize removal only
+    // if the forge observed it after this label was applied. Events within the
+    // same second have no known ordering.
     rows.iter()
+        .filter(|r| r.updated_at > claim_labeled_at)
         .filter(|r| of_role(r))
         .max_by_key(|r| (r.updated_at, r.id))
         .map_or(CuratorLeaseEvidence::Absent, |newest| {
@@ -328,13 +330,18 @@ pub(super) enum CuratorLeaseRead {
 /// Read one issue's trusted Curator-lease records and any existing
 /// re-curation record in a single REST comments walk. Only a trusted
 /// author's records count (#9548); an untrusted record reads as absent.
-fn fetch_curator_lease_read(gh_bin: &Path, root: &Path, issue: u32) -> CuratorLeaseRead {
+fn fetch_curator_lease_read(
+    gh_bin: &Path,
+    root: &Path,
+    issue: u32,
+    claim_labeled_at: DateTime<Utc>,
+) -> CuratorLeaseRead {
     let path = format!("repos/{{owner}}/{{repo}}/issues/{issue}/comments?per_page=100");
     let jq = format!(
         ".[] | select(.body | startswith(\"<!-- loom:pr-lease role={ROLE}\") or \
          startswith(\"<!-- loom:pr-lease-yield role={ROLE}\") or \
          startswith(\"<!-- loom:pr-lease-released role={ROLE}\") or \
-         startswith(\"{RECURATION_MARKER_PREFIX}\")) | {{id, updated_at, body, {}}}",
+         startswith(\"{RECURATION_MARKER_PREFIX}\")) | {{id, created_at, updated_at, body, {}}}",
         crate::comment_trust::records::AUTHOR_JQ
     );
     let Some(stdout) =
@@ -359,7 +366,11 @@ fn fetch_curator_lease_read(gh_bin: &Path, root: &Path, issue: u32) -> CuratorLe
             continue;
         };
         if body.starts_with(RECURATION_MARKER_PREFIX) {
-            recuration_recorded = true;
+            // Later edits to an earlier claim's note do not document this repair.
+            recuration_recorded |= v["created_at"]
+                .as_str()
+                .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
+                .is_some_and(|at| at > claim_labeled_at);
             continue;
         }
         let (Some(id), Some(at)) = (
@@ -524,7 +535,7 @@ fn read_current_release(
     let CuratorLeaseRead::Records {
         rows,
         recuration_recorded,
-    } = fetch_curator_lease_read(gh_bin, root, issue)
+    } = fetch_curator_lease_read(gh_bin, root, issue, expected_labeled_at)
     else {
         log::warn!(
             "claim_reconciliation: could not verify the Curator lease on #{issue} in {} before \
@@ -534,7 +545,7 @@ fn read_current_release(
         return None;
     };
     let now = Utc::now();
-    let lease = classify_curator_lease(&rows, now, ttl_minutes);
+    let lease = classify_curator_lease(&rows, expected_labeled_at, now, ttl_minutes);
     match decide_curating_claim(&labels, labeled_at, lease, now, stale_minutes) {
         CuratingAction::Keep(reason) => {
             log::debug!(
