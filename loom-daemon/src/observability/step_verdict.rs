@@ -117,6 +117,10 @@ pub struct Evidence {
     pub step_path: bool,
     /// The item's labels as the run's listings served them.
     pub pre_labels: Vec<String>,
+    /// The head a verdict was evaluated against, when the run said so at the
+    /// evaluation (`forge verdict-gate --sha`, #14898): the newest one for
+    /// the item. Not a forge read — a later PR tip never stands in for it.
+    pub reviewed_head: Option<String>,
 }
 
 /// What the projection asks of the refusal store.
@@ -378,7 +382,10 @@ fn events(journal: &Journal) -> Vec<(u32, Option<bool>, Event)> {
             )),
             JournalEntry::Queue { .. }
             | JournalEntry::Listing { .. }
-            | JournalEntry::Hold { .. } => None,
+            | JournalEntry::Hold { .. }
+            // #14898: the reviewed head, read as evidence below — not a
+            // write, so it is not an event and never moves the item.
+            | JournalEntry::Reviewed { .. } => None,
         })
         .collect()
 }
@@ -406,6 +413,55 @@ fn derived(parts: &[&str]) -> String {
     crate::telemetry::trace::derived_hex(parts, 32)
 }
 
+/// The step evidence of [`records_for`]'s step path, extracted so the root
+/// close projects the very same facts (#14898): the journal's events and
+/// labels scoped to the item, the outcome words from the step's own
+/// dispatch's section of its log, and the head its verdict was evaluated
+/// against. Pure.
+fn step_evidence(projector: &Projector, step: &StepSource, journal: Option<&Journal>) -> Evidence {
+    let empty = Journal::default();
+    let read = journal.unwrap_or(&empty);
+    let labels = evaluating_rows(read);
+    Evidence {
+        number: step.item,
+        is_pr: step.step.acts_on_pr(),
+        events: events(read)
+            .into_iter()
+            .filter(|(n, _, _)| *n == step.item)
+            .map(|(_, _, e)| e)
+            .collect(),
+        outcome: (projector.outcome_word)(
+            step.log_text.as_deref().unwrap_or_default(),
+            step.step.acts_on_pr(),
+            step.item,
+        ),
+        reason: (projector.reason_word)(
+            step.log_text.as_deref().unwrap_or_default(),
+            step.step.acts_on_pr(),
+            step.item,
+        ),
+        step_path: true,
+        pre_labels: labels.get(&step.item).cloned().unwrap_or_default(),
+        reviewed_head: reviewed_head(&read.entries, step.item),
+    }
+}
+
+/// The newest head a verdict was evaluated against on `item` (#14898):
+/// journaled at the evaluation, so a PR that advanced afterwards cannot
+/// misattribute the reviewed commit. Pure.
+fn reviewed_head(entries: &[JournalEntry], item: u32) -> Option<String> {
+    entries
+        .iter()
+        .rev()
+        .find_map(|entry| match entry {
+            JournalEntry::Reviewed {
+                number, head_sha, ..
+            } if *number == item => Some(head_sha.clone()),
+            _ => None,
+        })
+        .filter(|sha| !sha.is_empty())
+}
+
 /// The records for one drained run. Pure apart from `store`, which the
 /// projections' refusal identities update.
 #[must_use]
@@ -427,22 +483,12 @@ pub fn records_for(
             if step.step.role_name() != ctx.role {
                 return Vec::new();
             }
-            let is_pr = step.step.acts_on_pr();
-            let text = step.log_text.as_deref().unwrap_or_default();
-            let evidence = Evidence {
-                number: step.item,
-                is_pr,
-                events: all
-                    .into_iter()
-                    .filter(|(n, _, _)| *n == step.item)
-                    .map(|(_, _, e)| e)
-                    .collect(),
-                outcome: (projector.outcome_word)(text, is_pr, step.item),
-                reason: (projector.reason_word)(text, is_pr, step.item),
-                step_path: true,
-                pre_labels: labels.get(&step.item).cloned().unwrap_or_default(),
-            };
-            let line = outcome_ledger::parse_outcome_line(text, step.step, step.item);
+            let evidence = step_evidence(&projector, step, journal);
+            let line = outcome_ledger::parse_outcome_line(
+                step.log_text.as_deref().unwrap_or_default(),
+                step.step,
+                step.item,
+            );
             let ledger = outcome_ledger::classify(line.as_ref(), post_state(journal, step.item));
             let Some(projection) = (projector.project)(&evidence) else {
                 return Vec::new();
@@ -490,6 +536,30 @@ pub fn records_for(
                 .collect()
         }
     }
+}
+
+/// The Judge verdict of record of one step, for its `loom.sweep` close
+/// (#14898): the same projection the detached drain's `pass.verdict` record
+/// will carry — a confirmed write's `approved` / `changes_requested` under
+/// `judge_v1`, or the line-only `reviewed` under `judge_step_v1` — with the
+/// head the verdict was evaluated against. Built from the same step-scoped
+/// evidence ([`step_evidence`]): the step's journal (read, not taken; the
+/// drain still consumes it) and the step's own dispatch's section of its
+/// log. Local reads only, so it runs under the registry lock with no forge
+/// request. `Some` only for a verdict; anything else (or any other role)
+/// keeps its raw line class on the root and nothing beside it.
+#[must_use]
+pub fn judge_verdict_of_record(
+    staged: StagedStep,
+    journal: Option<&Journal>,
+) -> Option<Projection> {
+    let step = staged.read();
+    if step.step != StepRole::Judge {
+        return None;
+    }
+    let evidence = step_evidence(&judge::PROJECTOR, &step, journal);
+    let projection = (judge::PROJECTOR.project)(&evidence)?;
+    (projection.class == "verdict").then_some(projection)
 }
 
 #[allow(clippy::too_many_arguments)]

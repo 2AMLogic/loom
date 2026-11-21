@@ -12,7 +12,11 @@
 //! `LOOM_STEP_OUTCOME role=judge` `class=` / `reason=`. A role-runner tick that
 //! wrote no verdict projects nothing (change-only, like Champion); an idle tick
 //! is counted by `role_tick.outcome.found_work` instead. The head is the one
-//! the write or refusal named; absent without either.
+//! the write or refusal named, else the one the evaluation named
+//! (`forge verdict-gate --sha`, journaled as `JournalEntry::Reviewed`,
+//! #14898); absent without either — a fresh read of the PR tip is never
+//! taken, so a head that moved after the evaluation cannot misattribute
+//! the reviewed commit.
 //!
 //! `judge_step_v1`:
 //!
@@ -115,7 +119,12 @@ fn project(e: &Evidence) -> Option<Projection> {
     if let Some((action, head_sha, at)) = written {
         if refusal.as_ref().is_none_or(|(r_at, ..)| at >= *r_at) {
             return Some(Projection {
-                head_sha: head_sha.map(str::to_string),
+                // The write's own head, else the one the evaluation named
+                // (#14898): a script roll whose `verdict-labels` knew no
+                // `--sha` still carries the head `verdict-gate` journaled.
+                head_sha: head_sha
+                    .map(str::to_string)
+                    .or_else(|| e.reviewed_head.clone()),
                 at: Some(at),
                 wrote: true,
                 ..super::projection("verdict", action, VERDICT_REASON_SET)
@@ -133,7 +142,14 @@ fn project(e: &Evidence) -> Option<Projection> {
         });
     }
     let p = match e.outcome.as_deref() {
-        Some("verdict") => super::projection("verdict", "reviewed", REASON_SET),
+        // #14898: the line-only fallback carries the head the evaluation
+        // named (`forge verdict-gate --sha`, journaled as `Reviewed`): a
+        // fresh PR tip read here would misattribute a force-push, so the
+        // head is the captured one or absent — never the item's current tip.
+        Some("verdict") => Projection {
+            head_sha: e.reviewed_head.clone(),
+            ..super::projection("verdict", "reviewed", REASON_SET)
+        },
         Some("noop") => super::projection("noop", "no_change", REASON_SET),
         Some("refused") => super::projection("refused", "declined", REASON_SET),
         _ => super::projection("failed", "failed", REASON_SET),
