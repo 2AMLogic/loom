@@ -87,7 +87,7 @@ pub enum Event {
         at: DateTime<Utc>,
         action: String,
         by: String,
-        /// The head the write was made against, when its writer knew it.
+        /// The head recorded by the writer or its preceding Judge evaluation.
         head_sha: Option<String>,
     },
     /// The run's own successful PR lease release (`lease pr release`,
@@ -317,7 +317,8 @@ fn events(journal: &Journal) -> Vec<(u32, Option<bool>, Event)> {
     journal
         .entries
         .iter()
-        .filter_map(|entry| match entry {
+        .enumerate()
+        .filter_map(|(index, entry)| match entry {
             JournalEntry::Marker {
                 at,
                 number,
@@ -362,7 +363,15 @@ fn events(journal: &Journal) -> Vec<(u32, Option<bool>, Event)> {
                     at: *at,
                     action: action.clone(),
                     by: by.clone(),
-                    head_sha: head_sha.clone(),
+                    // Older verdict writers omitted the SHA. Only evaluations
+                    // already in the journal when this write occurred can name it.
+                    head_sha: head_sha.clone().or_else(|| {
+                        if *is_pr && by == judge::VERDICT_BY {
+                            reviewed_head(&journal.entries[..index], *number, Some(*at))
+                        } else {
+                            None
+                        }
+                    }),
                 },
             )),
             // A lease release is a PR write; its number is the PR.
@@ -442,24 +451,34 @@ fn step_evidence(projector: &Projector, step: &StepSource, journal: Option<&Jour
         ),
         step_path: true,
         pre_labels: labels.get(&step.item).cloned().unwrap_or_default(),
-        reviewed_head: reviewed_head(&read.entries, step.item),
+        reviewed_head: reviewed_head(&read.entries, step.item, None),
     }
 }
 
 /// The newest head a verdict was evaluated against on `item` (#14898):
 /// journaled at the evaluation, so a PR that advanced afterwards cannot
 /// misattribute the reviewed commit. Pure.
-fn reviewed_head(entries: &[JournalEntry], item: u32) -> Option<String> {
+fn reviewed_head(
+    entries: &[JournalEntry],
+    item: u32,
+    no_later_than: Option<DateTime<Utc>>,
+) -> Option<String> {
     entries
         .iter()
-        .rev()
-        .find_map(|entry| match entry {
+        .filter_map(|entry| match entry {
             JournalEntry::Reviewed {
-                number, head_sha, ..
-            } if *number == item => Some(head_sha.clone()),
+                at,
+                number,
+                head_sha,
+            } if *number == item && no_later_than.is_none_or(|limit| *at <= limit) => {
+                Some((at, head_sha))
+            }
             _ => None,
         })
+        .max_by_key(|(at, _)| *at)
+        .map(|(_, sha)| sha)
         .filter(|sha| !sha.is_empty())
+        .cloned()
 }
 
 /// The records for one drained run. Pure apart from `store`, which the

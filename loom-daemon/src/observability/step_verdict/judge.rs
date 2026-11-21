@@ -119,12 +119,7 @@ fn project(e: &Evidence) -> Option<Projection> {
     if let Some((action, head_sha, at)) = written {
         if refusal.as_ref().is_none_or(|(r_at, ..)| at >= *r_at) {
             return Some(Projection {
-                // The write's own head, else the one the evaluation named
-                // (#14898): a script roll whose `verdict-labels` knew no
-                // `--sha` still carries the head `verdict-gate` journaled.
-                head_sha: head_sha
-                    .map(str::to_string)
-                    .or_else(|| e.reviewed_head.clone()),
+                head_sha: head_sha.map(str::to_string),
                 at: Some(at),
                 wrote: true,
                 ..super::projection("verdict", action, VERDICT_REASON_SET)

@@ -1059,11 +1059,55 @@ fn the_root_close_and_the_record_carry_the_same_verdict() {
     let dir = tempfile::tempdir().unwrap();
     let item = 31;
     let id = "step-judge-31-1";
-    for (name, entries, with_write) in [
-        ("approval", vec![verdict_write(1, item, "approved", "aaa111")], true),
-        ("changes", vec![verdict_write(1, item, "changes_requested", "bbb222")], true),
-        ("line-only", vec![reviewed(1, item, "ccc333")], false),
-        ("no verified write", vec![], false),
+    let headless_write = || JournalEntry::Applied {
+        at: t(2),
+        number: item,
+        is_pr: true,
+        action: "approved".to_string(),
+        by: judge::VERDICT_BY.to_string(),
+        head_sha: None,
+    };
+    for (name, entries, with_write, expected_head) in [
+        (
+            "approval",
+            vec![verdict_write(1, item, "approved", "aaa111")],
+            true,
+            Some("aaa111"),
+        ),
+        (
+            "changes",
+            vec![verdict_write(1, item, "changes_requested", "bbb222")],
+            true,
+            Some("bbb222"),
+        ),
+        ("line-only", vec![reviewed(1, item, "ccc333")], false, Some("ccc333")),
+        ("no verified write", vec![], false, None),
+        (
+            "another evaluation after a headless write",
+            vec![
+                reviewed(1, item, "aaa111"),
+                headless_write(),
+                reviewed(3, item, "bbb222"),
+            ],
+            true,
+            Some("aaa111"),
+        ),
+        (
+            "only another PR or later evaluations",
+            vec![
+                reviewed(1, 32, "aaa111"),
+                headless_write(),
+                reviewed(2, item, "bbb222"),
+            ],
+            true,
+            None,
+        ),
+        (
+            "an evaluation stamped after the write",
+            vec![reviewed(3, item, "bbb222"), headless_write()],
+            true,
+            None,
+        ),
     ] {
         let j = journal(entries);
         let line = "LOOM_STEP_OUTCOME role=judge target=31 class=verdict reason=x";
@@ -1100,6 +1144,7 @@ fn the_root_close_and_the_record_carry_the_same_verdict() {
         assert_eq!(root.class, "verdict", "{name}");
         assert_eq!(Some(root.reason.as_str()), record.reason.as_deref(), "{name}");
         assert_eq!(root.reason_set, record.step.reason_set.as_deref().unwrap(), "{name}");
+        assert_eq!(root.head_sha.as_deref(), expected_head, "{name}");
         assert_eq!(root.head_sha, record.step.head_sha, "{name}");
         assert_eq!(record.applied, with_write, "{name}");
     }
