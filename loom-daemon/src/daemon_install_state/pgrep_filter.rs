@@ -1,10 +1,9 @@
 //! Identity filter for `pgrep -x loom-daemon` candidates (#10110).
 //!
-//! Split out of `daemon_install_state.rs` so the parent does not grow.
-//! `pgrep` matches by process
-//! name only, so session-exec workers and concurrent `health`/`status` probes
-//! all look like the dispatcher; this module drops the proven
-//! non-dispatchers while keeping every unknown identity.
+//! Split out of `daemon_install_state.rs` so the parent does not grow. `pgrep`
+//! matches by process name only, so session-exec workers and concurrent
+//! `health`/`status` probes all look like the dispatcher; this module drops
+//! the proven non-dispatchers while keeping every unknown identity.
 
 use super::{probe_output, DAEMON_PROCESS_NAME, PROBE_TIMEOUT};
 use std::collections::HashMap;
