@@ -223,7 +223,7 @@ assert_eq "4" "$out" "guide: lowercase epic word is masked (#14750)"
 out="$(guide_parse_dependencies '**Part of Epic #2** - Depends on #4')"
 assert_eq "4" "$out" "guide: emphasised Epic form is masked (#14750)"
 
-out="$(guide_parse_dependencies 'Part of Epic other/epic#2. Depends on #4')"
+out="$(guide_parse_dependencies 'Part of Epic example-org/tool-repo#2. Depends on #4')"
 assert_eq "4" "$out" "guide: repo-qualified Epic parent is masked (#14750)"
 
 out="$(guide_parse_dependencies 'Depends on #2 (parent). Part of Epic #2')"
