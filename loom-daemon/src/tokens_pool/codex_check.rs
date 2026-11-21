@@ -74,6 +74,7 @@ use chrono::{DateTime, TimeZone, Utc};
 use super::account_registry::{AccountDescriptor, AccountProvider};
 use super::check::{self, AccountResult, ProbeReport, EXHAUSTED_THRESHOLD};
 use super::health::{self, AccountHealth, AvailabilityOutcome, HealthReason};
+use super::session_lifecycle::is_session_managed;
 
 /// Provider-namespaced ranking file name, written next to the provider-aware
 /// `account-health.json` this pool already keys on. The **contents** are the
@@ -644,6 +645,8 @@ fn health_hold_label(reason: HealthReason) -> &'static str {
 /// What [`run_check`] did, beyond the report itself.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct CheckEffects {
+    /// Host diagnostics for stderr, outside the JSON report and ranking.
+    pub probe_diagnostics: Vec<String>,
     /// Accounts newly held from selection by this probe.
     pub marked_exhausted: Vec<String>,
     /// Accounts whose exhaustion hold this probe released.
@@ -689,18 +692,41 @@ pub fn run_check_with<T: super::codex_probe::ProbeTransport + ?Sized>(
     let inventory = super::account_registry::account_inventory(workspace, AccountProvider::Codex)?;
     let mut rows = Vec::with_capacity(inventory.len());
     let mut snapshots = Vec::with_capacity(inventory.len());
+    let mut effects = CheckEffects::default();
+    let needs_runtime = options.live
+        && inventory
+            .iter()
+            .any(|account| account.enabled && is_session_managed(&account.credential_reference));
+    let runtime_failure = if needs_runtime {
+        transport
+            .check_runtime()
+            .err()
+            .map(|err| super::codex_probe::session_error(&err, "version"))
+    } else {
+        None
+    };
     for account in &inventory {
         let stored = health::account_health(workspace, &account.id)?;
         let live_probe = account.enabled && options.live;
         let (snapshot, probe_detail) = if !account.enabled {
             (None, None)
         } else if options.live {
-            match super::codex_probe::probe_account(
-                transport,
-                account.id.name.as_str(),
-                &account.credential_reference,
-                now,
-            ) {
+            let profile = &account.credential_reference;
+            let outcome = match &runtime_failure {
+                Some(failure) if is_session_managed(profile) => failure.clone(),
+                _ => super::codex_probe::probe_account(
+                    transport,
+                    account.id.name.as_str(),
+                    profile,
+                    now,
+                ),
+            };
+            if let Some(diagnostic) = outcome.diagnostic() {
+                if !effects.probe_diagnostics.contains(&diagnostic) {
+                    effects.probe_diagnostics.push(diagnostic);
+                }
+            }
+            match outcome {
                 super::codex_probe::ProbeOutcome::Measured(snapshot) => (Some(snapshot), None),
                 other => (None, other.detail()),
             }
@@ -720,7 +746,6 @@ pub fn run_check_with<T: super::codex_probe::ProbeTransport + ?Sized>(
     }
     let report = check::build_report(rows);
 
-    let mut effects = CheckEffects::default();
     if options.write_ranking {
         let path = ranking_path(workspace);
         check::write_ranking_atomic(&report, &path)?;
