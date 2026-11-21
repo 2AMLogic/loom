@@ -144,8 +144,7 @@ mod prless_retry;
 mod quarantine;
 mod quarantine_escalation;
 pub(crate) mod reaper;
-// #14816: reachable for the curating-claim pass's release plan.
-pub(crate) mod restore_to_ready;
+mod restore_to_ready;
 pub(crate) mod resume_handle;
 pub(crate) mod roll_gate;
 pub(crate) mod roll_requeue;

@@ -48,14 +48,13 @@
 //! issue — keeps the claim untouched. [#11743] applies: a `loom:frozen`
 //! issue gets no write at all, not even the claim removal.
 //!
-//! The release itself reuses the resume side's canonical per-role planner
-//! ([`plan_step_release`] for [`StepRole::Curator`], #11898) against a fresh
-//! label read: remove `loom:curating` only when the item already advanced
-//! (`loom:curated`/`loom:issue`) or is held/closed, remove-and-restore
-//! `loom:triage` otherwise. Later approvals, holds and unrelated labels are
-//! preserved by construction — each edit touches only its own label. A restore
-//! confirms triage before removing the claim so an interrupted restore stays
-//! discoverable. Re-read lease, claim age and issue state after any first write.
+//! The Curator claim adds only `loom:curating`. Release that same label
+//! with a single-label DELETE. The step selector already draws an ordinary
+//! unstaged issue for Curator. Existing triage (including a send-back) keeps
+//! its priority, and an approval arriving during recovery can advance the
+//! issue to Builder. Adding triage here would override that approval. A
+//! failed delete keeps the claim in discovery. If the response is lost after
+//! a successful delete there is no second label to restore on restart.
 //!
 //! ## The re-curation record
 //!
@@ -79,8 +78,6 @@ use std::path::Path;
 
 use chrono::{DateTime, Utc};
 
-use crate::step_role::StepRole;
-use crate::sweep_registry::restore_to_ready::step_restore::{plan_step_release, StepReleasePlan};
 use crate::sweep_registry::step_lease_owner::{
     earliest_live_holder, parse_role_lease, RoleLeaseKind, RoleLeaseRow,
 };
@@ -90,7 +87,6 @@ use super::gh_call;
 /// The claim label this pass reconciles (also
 /// `StepRole::Curator.claim_label()`).
 const CLAIM: &str = "loom:curating";
-const READY: &str = "loom:triage";
 
 /// The role token the trusted lease family keys on (`lease pr claim --role
 /// curator`); the first token after `role=` in every record of the family.
@@ -237,8 +233,6 @@ pub(super) enum CuratingAction {
     RemoveClaim {
         recuration_record: bool,
     },
-    /// Remove `loom:curating` and restore `loom:triage`.
-    Restore,
 }
 
 /// Decide one claim. Pure, total, fully unit-testable — the forge-side
@@ -279,12 +273,12 @@ pub(super) fn decide_curating_claim(
             stale_minutes,
         });
     }
-    match plan_step_release(StepRole::Curator, labels, Some(false)) {
-        StepReleasePlan::Nothing => A::Keep(K::ClaimAlreadyGone),
-        StepReleasePlan::RemoveClaim => A::RemoveClaim {
+    if labels.iter().any(|label| label == CLAIM) {
+        A::RemoveClaim {
             recuration_record: needs_recuration(labels),
-        },
-        StepReleasePlan::Restore => A::Restore,
+        }
+    } else {
+        A::Keep(K::ClaimAlreadyGone)
     }
 }
 
@@ -446,51 +440,28 @@ pub(super) fn reconcile_curating_claims(gh_bin: &Path, root: &Path) {
         let Some(release) = confirm() else {
             continue;
         };
-        match release.plan {
-            StepReleasePlan::Nothing => continue,
-            StepReleasePlan::RemoveClaim if release.record_needed => {
-                if let Err(e) = post_recuration_record(gh_bin, root, number, &release.lease, now) {
-                    log::warn!(
-                        "claim_reconciliation: could not confirm the re-curation record for \
-                         #{number} in {}: {e}; keeping {CLAIM} for retry (#14816)",
-                        root.display(),
-                    );
-                    continue;
-                }
-                // A confirmed comment does not establish that the same claim
-                // is still stale. A renewal can land during the POST.
-                if !confirm().is_some_and(|current| current.plan == StepReleasePlan::RemoveClaim) {
-                    continue;
-                }
+        if release.record_needed {
+            if let Err(e) = post_recuration_record(gh_bin, root, number, &release.lease, now) {
+                log::warn!(
+                    "claim_reconciliation: could not confirm the re-curation record for \
+                     #{number} in {}: {e}; keeping {CLAIM} for retry (#14816)",
+                    root.display(),
+                );
+                continue;
             }
-            StepReleasePlan::Restore if !release.triage_present => {
-                // Keep the claim in discovery until the first write is
-                // confirmed. A rejected or lost response can be retried.
-                if let Err(e) = run_issue_edit(gh_bin, root, number, "--add-label", READY) {
-                    log::warn!(
-                        "claim_reconciliation: could not restore {READY} on #{number} in {}: {e}; \
-                         keeping {CLAIM} for retry (#14816)",
-                        root.display(),
-                    );
-                    continue;
-                }
-                if !confirm().is_some_and(|current| {
-                    current.plan == StepReleasePlan::Restore && current.triage_present
-                }) {
-                    continue;
-                }
+            // The comment POST can race a renewal, a new claim, or a hold.
+            if confirm().is_none() {
+                continue;
             }
-            _ => {}
         }
-        match run_issue_edit(gh_bin, root, number, "--remove-label", CLAIM) {
+        match remove_claim(gh_bin, root, number) {
             Ok(()) => {
                 released += 1;
                 log::warn!(
                     "claim_reconciliation: released stale {CLAIM} from #{number} in {} \
-                     ({}, plan={:?}) (#14816)",
+                     ({}) (#14816)",
                     root.display(),
                     release.lease,
-                    release.plan,
                 );
             }
             Err(e) => {
@@ -517,10 +488,8 @@ pub(super) fn reconcile_curating_claims(gh_bin: &Path, root: &Path) {
 }
 
 struct CurrentRelease {
-    plan: StepReleasePlan,
     lease: CuratorLeaseEvidence,
     record_needed: bool,
-    triage_present: bool,
 }
 
 /// Recheck the same claim and read current trusted lease evidence just
@@ -548,7 +517,6 @@ fn read_current_release(
     if !labels.iter().any(|label| label == CLAIM) || crate::work_finder::is_frozen(&labels) {
         return None;
     }
-    let closed = super::forge::issue_is_confirmed_closed(gh_bin, root, issue);
     let labeled_at = super::forge::fetch_claim_labeled_at(gh_bin, root, issue, CLAIM);
     if labeled_at != Some(expected_labeled_at) {
         return None;
@@ -567,37 +535,29 @@ fn read_current_release(
     };
     let now = Utc::now();
     let lease = classify_curator_lease(&rows, now, ttl_minutes);
-    if let CuratingAction::Keep(reason) =
-        decide_curating_claim(&labels, labeled_at, lease, now, stale_minutes)
-    {
-        log::debug!(
-            "claim_reconciliation: keeping {CLAIM} on #{issue} in {} — {reason:?} ({lease}) (#14816)",
-            root.display(),
-        );
-        return None;
+    match decide_curating_claim(&labels, labeled_at, lease, now, stale_minutes) {
+        CuratingAction::Keep(reason) => {
+            log::debug!(
+                "claim_reconciliation: keeping {CLAIM} on #{issue} in {} — {reason:?} ({lease}) (#14816)",
+                root.display(),
+            );
+            None
+        }
+        CuratingAction::RemoveClaim { recuration_record } => Some(CurrentRelease {
+            lease,
+            record_needed: recuration_record && !recuration_recorded,
+        }),
     }
-    Some(CurrentRelease {
-        plan: plan_step_release(StepRole::Curator, &labels, Some(closed)),
-        lease,
-        record_needed: needs_recuration(&labels) && !recuration_recorded,
-        triage_present: labels.iter().any(|label| label == READY),
-    })
 }
 
-fn run_issue_edit(
-    gh_bin: &Path,
-    root: &Path,
-    issue: u32,
-    operation: &str,
-    label: &str,
-) -> anyhow::Result<()> {
-    let n = issue.to_string();
-    let cmd = gh_call::write("claim.curating_release", gh_bin, root)
-        .args(["issue", "edit", &n, operation, label]);
-    let out = gh_call::output(cmd.args(gh_call::loom_repo_flag()))?;
+fn remove_claim(gh_bin: &Path, root: &Path, issue: u32) -> anyhow::Result<()> {
+    let path = format!("repos/{{owner}}/{{repo}}/issues/{issue}/labels/loom%3Acurating");
+    let out = gh_call::output(
+        gh_call::write("claim.curating_release", gh_bin, root).args(["api", "-X", "DELETE", &path]),
+    )?;
     if !out.status.success() {
         let (root, err) = (root.display(), gh_call::stderr(&out));
-        anyhow::bail!("gh issue edit failed for #{issue} in {root}: {err}");
+        anyhow::bail!("removing {CLAIM} failed for #{issue} in {root}: {err}");
     }
     Ok(())
 }

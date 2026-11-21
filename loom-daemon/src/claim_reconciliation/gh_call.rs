@@ -112,8 +112,7 @@ pub(crate) fn forge_op_for(op: &str) -> Option<ForgeOp> {
         | "release_veto.issue_labels"
         | "intake.recheck"
         | "landed.issue_labels"
-        | "claim.labels_rest"
-        | "claim.curating_state" => ops::ISSUE_VIEW_STATE,
+        | "claim.labels_rest" => ops::ISSUE_VIEW_STATE,
         "parent_link.marker_children_rest" => ops::ISSUE_SEARCH,
         "park_hold.issue_body" => ops::ISSUE_EDIT_BODY,
         "quarantine.issue_list" => ops::ISSUE_LIST,

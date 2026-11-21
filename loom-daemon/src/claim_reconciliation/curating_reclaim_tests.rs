@@ -214,11 +214,16 @@ fn an_earned_loom_curated_beside_loom_issue_needs_no_record() {
 }
 
 #[test]
-fn an_unadvanced_issue_restores_triage() {
+fn an_unadvanced_issue_releases_only_the_claim() {
     let lease = CuratorLeaseEvidence::Expired { age_minutes: 90.0 };
     let got =
         decide_curating_claim(&labels(&["loom:curating"]), stale_labeled_at(), lease, now(), STALE);
-    assert_eq!(got, A::Restore);
+    assert_eq!(
+        got,
+        A::RemoveClaim {
+            recuration_record: false
+        }
+    );
 }
 
 #[test]
@@ -258,16 +263,18 @@ fn the_recuration_record_body_carries_the_marker_first_line() {
 // End to end against a fake `gh`
 // ---------------------------------------------------------------------------
 
-/// The fake `gh`'s issue-side answers, one field per arm.
-struct FakeIssue {
+const RELEASE: &str = "api -X DELETE repos/{owner}/{repo}/issues/300/labels/loom%3Acurating";
+
+/// The fake forge's initial issue state.
+struct FakeIssue<'a> {
     /// Labels of the discovery listing row AND the fresh `issue view` read.
-    labels: &'static [&'static str],
+    labels: &'a [&'a str],
     /// The trusted comments body (already a JSON array of lease-family and
     /// marker rows authored by the fleet App).
     comments: String,
     /// The `labeled` timeline answer for `loom:curating` (a quoted
     /// RFC-3339 timestamp), or `None` to fail the read.
-    labeled_at: Option<&'static str>,
+    labeled_at: Option<&'a str>,
 }
 
 fn fleet_row(id: u64, minutes_ago: i64, body: &str) -> String {
@@ -284,7 +291,7 @@ fn quoted(body: &str) -> String {
 
 fn write_fake_gh(
     dir: &std::path::Path,
-    issue: &FakeIssue,
+    issue: &FakeIssue<'_>,
 ) -> (std::path::PathBuf, std::path::PathBuf) {
     let log = dir.join("gh.log");
     let bin = dir.join("fake-gh-curating.sh");
@@ -308,10 +315,24 @@ fn write_fake_gh(
     let recorded_comments_json = serde_json::to_string(&recorded_comments).unwrap();
     recorded_comments.push(fresh_lease);
     let renewed_comments = serde_json::to_string(&recorded_comments).unwrap();
+    let labels_file = log.with_extension("log.labels");
+    std::fs::write(labels_file, format!("{}\n", issue.labels.join("\n"))).unwrap();
     let script = format!(
         r#"#!/usr/bin/env bash
 printf '%s\n' "$*" >> '{log}'
 case "$*" in
+  *"api -X DELETE "*"issues/300/labels/loom%3Acurating"*)
+    # An earned approval or a send-back can arrive after the final read.
+    if [ -f '{log}.approve-on-write' ]; then
+      printf '%s\n' loom:curated loom:issue >> '{log}.labels'
+    fi
+    if [ -f '{log}.triage-on-write' ]; then echo loom:triage >> '{log}.labels'; fi
+    if [ -f '{log}.hold-on-write' ]; then echo loom:blocked >> '{log}.labels'; fi
+    if [ -f '{log}.reject-delete' ]; then exit 1; fi
+    awk '$0 != "loom:curating"' '{log}.labels' > '{log}.next' && mv '{log}.next' '{log}.labels'
+    touch '{log}.removed'
+    if [ -f '{log}.lost-delete-response' ]; then exit 1; fi
+    exit 0 ;;
   *"api -X POST "*"issues/300/comments"*)
     if [ -f '{log}.reject-post' ]; then exit 1; fi
     if [ -f '{log}.post-renewal' ]; then touch '{log}.renewed'; fi
@@ -324,9 +345,9 @@ case "$*" in
     else printf '%s' '{comments}'; fi
     exit 0 ;;
   *"issues/300/timeline"*)
-    if [ -f '{log}.relabel-on-add' ] && [ -f '{log}.triage' ]; then
+    if [ -f '{log}.relabel-during-read' ] && [ -f '{log}.timeline-read' ]; then
       printf '%s' '{fresh_label_at}'
-    else {timeline}; fi
+    else touch '{log}.timeline-read'; {timeline}; fi
     exit 0 ;;
   *"issues?labels=loom:curating"*|*"labels=loom:curating"*)
     printf 'HTTP/2.0 200 OK\r\n\r\n'
@@ -334,32 +355,13 @@ case "$*" in
     else echo '[{{"number":300,"state":"open","labels":[{listing_labels}],"updated_at":"2026-11-20T00:00:00Z"}}]'; fi
     exit 0 ;;
 esac
-if [ "$1" = "api" ]; then
-  case "$*" in
-    *"issues/300"*) printf '"open"' ;;
-    *) echo '[]' ;;
-  esac
-  exit 0
-fi
 if [ "$1" = "issue" ] && [ "$2" = "view" ]; then
-  labels='{listing_labels}'
-  if [ -f '{log}.triage' ]; then
-    labels="$labels,"'{{"name":"loom:triage"}}'
-    if [ -f '{log}.hold-on-add' ]; then labels="$labels,"'{{"name":"loom:blocked"}}'; fi
-    if [ -f '{log}.approve-on-add' ]; then labels="$labels,"'{{"name":"loom:issue"}}'; fi
-  fi
+  labels=''
+  while IFS= read -r label; do
+    labels="$labels${{labels:+,}}"'{{"name":"'"$label"'"}}'
+  done < '{log}.labels'
   printf '{{"labels":[%s]}}\n' "$labels"
   exit 0
-fi
-if [ "$1" = "issue" ] && [ "$2" = "edit" ]; then
-  case "$*" in
-    *"--remove-label loom:curating"*) touch '{log}.removed' ;;
-  esac
-  case "$*" in
-    *"--add-label loom:triage"*)
-      if [ -f '{log}.reject-add' ]; then exit 1; fi
-      if [ ! -f '{log}.unconfirmed-add' ]; then touch '{log}.triage'; fi ;;
-  esac
 fi
 exit 0
 "#,
@@ -408,10 +410,7 @@ fn the_incident_shape_releases_the_claim_posts_the_record_and_preserves_labels()
     let (gh, log) = write_fake_gh(dir.path(), &fake);
     run_pass(&gh, &root);
     let calls = std::fs::read_to_string(&log).unwrap();
-    assert!(
-        calls.contains("issue edit 300 --remove-label loom:curating"),
-        "expected the claim release; got: {calls}"
-    );
+    assert!(calls.contains(RELEASE), "expected the claim release; got: {calls}");
     assert!(
         !calls.contains("--add-label"),
         "no label may be added to an advanced item: {calls}"
@@ -435,7 +434,6 @@ fn an_unconfirmed_recuration_record_keeps_the_claim_for_retry() {
         labeled_at: Some("\"2026-11-13T23:42:26Z\""),
     };
     let (gh, log) = write_fake_gh(dir.path(), &fake);
-    let release = "issue edit 300 --remove-label loom:curating";
 
     for failure in ["reject-post", "unconfirmed-post"] {
         let flag = log.with_extension(format!("log.{failure}"));
@@ -443,7 +441,7 @@ fn an_unconfirmed_recuration_record_keeps_the_claim_for_retry() {
         run_pass(&gh, &root);
         let calls = std::fs::read_to_string(&log).unwrap();
         assert_eq!(calls.matches("-X POST").count(), 1, "{calls}");
-        assert!(!calls.contains(release), "leave the claim discoverable: {calls}");
+        assert!(!calls.contains(RELEASE), "leave the claim discoverable: {calls}");
         std::fs::remove_file(&flag).unwrap();
         std::fs::write(&log, "").unwrap();
     }
@@ -455,7 +453,7 @@ fn an_unconfirmed_recuration_record_keeps_the_claim_for_retry() {
     write_fake_gh(dir.path(), &fake);
     run_pass(&gh, &root);
     let calls = std::fs::read_to_string(&log).unwrap();
-    assert!(!calls.contains("-X POST") && !calls.contains(release), "{calls}");
+    assert!(!calls.contains("-X POST") && !calls.contains(RELEASE), "{calls}");
     std::fs::write(&log, "").unwrap();
 
     // The intended stale claim remains discoverable and the issue is eligible
@@ -465,7 +463,7 @@ fn an_unconfirmed_recuration_record_keeps_the_claim_for_retry() {
     run_pass(&gh, &root);
     let calls = std::fs::read_to_string(&log).unwrap();
     assert_eq!(calls.matches("-X POST").count(), 1, "{calls}");
-    assert!(calls.find("-X POST").unwrap() < calls.find(release).unwrap(), "{calls}");
+    assert!(calls.find("-X POST").unwrap() < calls.find(RELEASE).unwrap(), "{calls}");
 }
 
 #[test]
@@ -482,7 +480,7 @@ fn a_live_lease_writes_nothing() {
     let (gh, log) = write_fake_gh(dir.path(), &fake);
     run_pass(&gh, &root);
     let calls = std::fs::read_to_string(&log).unwrap();
-    assert!(!calls.contains("issue edit"), "no write may happen: {calls}");
+    assert!(!calls.contains(RELEASE), "no write may happen: {calls}");
     assert!(!calls.contains("-X POST"), "no record may be posted: {calls}");
 }
 
@@ -506,7 +504,7 @@ fn an_unreadable_lease_read_writes_nothing() {
     std::fs::write(&bin, script).unwrap();
     run_pass(&bin, &root);
     let calls = std::fs::read_to_string(&log).unwrap();
-    assert!(!calls.contains("issue edit"), "an unverifiable read must not write: {calls}");
+    assert!(!calls.contains(RELEASE), "an unverifiable read must not write: {calls}");
 }
 
 #[test]
@@ -524,30 +522,60 @@ fn no_lease_record_writes_nothing() {
     run_pass(&gh, &root);
     let calls = std::fs::read_to_string(&log).unwrap();
     assert!(
-        !calls.contains("issue edit"),
+        !calls.contains(RELEASE),
         "absence is not evidence; the attended no-lease path must not be touched: {calls}"
     );
 }
 
+/// Classify the actual remaining Forge labels through the same selector the
+/// next draw runs, including the intentional priority of a triage send-back.
+fn recovered_route(log: &std::path::Path) -> crate::work_finder::step_item::Verdict {
+    use crate::work_finder::step_item::{classify, Inputs, IssueInput};
+    let labels = std::fs::read_to_string(log.with_extension("log.labels")).unwrap();
+    let inputs = Inputs {
+        issues: vec![IssueInput {
+            number: 300,
+            labels: labels.lines().map(str::to_owned).collect(),
+            ..IssueInput::default()
+        }],
+        ..Inputs::default()
+    };
+    classify(&inputs)[0].verdict
+}
+
 #[test]
 #[serial]
-fn an_unadvanced_issue_restores_loom_triage() {
-    let dir = tempdir().unwrap();
-    let root = dir.path().join("repo");
-    std::fs::create_dir_all(&root).unwrap();
-    let fake = FakeIssue {
-        labels: &["loom:curating"],
-        comments: released_lease_comments(&[]),
-        labeled_at: Some("\"2026-11-13T23:42:26Z\""),
-    };
-    let (gh, log) = write_fake_gh(dir.path(), &fake);
-    run_pass(&gh, &root);
-    let calls = std::fs::read_to_string(&log).unwrap();
-    let add = "issue edit 300 --add-label loom:triage";
-    let remove = "issue edit 300 --remove-label loom:curating";
-    assert!(calls.find(add).unwrap() < calls.find(remove).unwrap(), "{calls}");
-    assert!(log.with_extension("log.triage").exists());
-    assert!(log.with_extension("log.removed").exists());
+fn recovery_preserves_the_next_draw_before_and_during_release() {
+    use crate::work_finder::step_item::{PassReason, Step, Verdict};
+    type Case = (&'static [&'static str], &'static [&'static str], Verdict);
+    let cases: &[Case] = &[
+        (&[CLAIM, "loom:very-important"], &[], Verdict::Step(Step::Curator)),
+        (&[CLAIM, "loom:curated", "loom:issue"], &[], Verdict::Step(Step::Builder)),
+        (&[CLAIM], &["approve-on-write"], Verdict::Step(Step::Builder)),
+        (&[CLAIM, "loom:triage"], &["approve-on-write"], Verdict::Step(Step::Curator)),
+        (&[CLAIM], &["approve-on-write", "triage-on-write"], Verdict::Step(Step::Curator)),
+        (&[CLAIM], &["hold-on-write"], Verdict::Pass(PassReason::Blocked)),
+    ];
+    for &(labels, changes, expected) in cases {
+        let dir = tempdir().unwrap();
+        let root = dir.path().join("repo");
+        std::fs::create_dir_all(&root).unwrap();
+        let fake = FakeIssue {
+            labels,
+            comments: released_lease_comments(&[]),
+            labeled_at: Some("\"2026-11-13T23:42:26Z\""),
+        };
+        let (gh, log) = write_fake_gh(dir.path(), &fake);
+        for change in changes {
+            std::fs::write(log.with_extension(format!("log.{change}")), "").unwrap();
+        }
+        run_pass(&gh, &root);
+        run_pass(&gh, &root);
+        assert_eq!(recovered_route(&log), expected, "{labels:?} {changes:?}");
+        let calls = std::fs::read_to_string(&log).unwrap();
+        assert_eq!(calls.matches(RELEASE).count(), 1, "{calls}");
+        assert!(!calls.contains("--add-label"), "{calls}");
+    }
 }
 
 #[test]
@@ -567,7 +595,7 @@ fn a_renewal_during_the_recuration_post_keeps_the_claim() {
     let calls = std::fs::read_to_string(&log).unwrap();
     assert!(calls.contains("-X POST") && calls.contains("--jq .id"), "{calls}");
     assert!(log.with_extension("log.renewed").exists());
-    assert!(!calls.contains("issue edit"), "keep the renewed claim: {calls}");
+    assert!(!calls.contains(RELEASE), "keep the renewed claim: {calls}");
 }
 
 #[test]
@@ -594,13 +622,14 @@ fn a_lost_record_response_reuses_the_confirmed_marker_on_retry() {
 
 #[test]
 #[serial]
-fn rejected_or_unconfirmed_triage_add_leaves_a_discoverable_retry() {
-    for failure in ["reject-add", "unconfirmed-add"] {
+fn a_failed_or_unacknowledged_claim_delete_recovers_on_restart() {
+    use crate::work_finder::step_item::{Step, Verdict};
+    for failure in ["reject-delete", "lost-delete-response"] {
         let dir = tempdir().unwrap();
         let root = dir.path().join("repo");
         std::fs::create_dir_all(&root).unwrap();
         let fake = FakeIssue {
-            labels: &["loom:curating"],
+            labels: &[CLAIM, "loom:very-important"],
             comments: released_lease_comments(&[]),
             labeled_at: Some("\"2026-11-13T23:42:26Z\""),
         };
@@ -608,68 +637,37 @@ fn rejected_or_unconfirmed_triage_add_leaves_a_discoverable_retry() {
         let flag = log.with_extension(format!("log.{failure}"));
         std::fs::write(&flag, "").unwrap();
         run_pass(&gh, &root);
-        assert!(!log.with_extension("log.triage").exists());
-        assert!(!log.with_extension("log.removed").exists());
+        let applied = failure == "lost-delete-response";
+        assert_eq!(log.with_extension("log.removed").exists(), applied);
         std::fs::remove_file(flag).unwrap();
-
         run_pass(&gh, &root);
-        assert!(log.with_extension("log.triage").exists());
-        assert!(log.with_extension("log.removed").exists());
+        assert_eq!(recovered_route(&log), Verdict::Step(Step::Curator));
         let calls = std::fs::read_to_string(&log).unwrap();
-        assert_eq!(calls.matches("--add-label loom:triage").count(), 2, "{calls}");
-        assert_eq!(calls.matches("--remove-label loom:curating").count(), 1, "{calls}");
+        assert_eq!(calls.matches(RELEASE).count(), if applied { 1 } else { 2 }, "{calls}");
+        assert!(std::fs::read_to_string(log.with_extension("log.labels"))
+            .unwrap()
+            .lines()
+            .any(|l| l == "loom:very-important"));
     }
 }
 
 #[test]
 #[serial]
-fn a_hold_or_approval_after_adding_triage_defers_the_release() {
-    for state_change in ["hold-on-add", "approve-on-add"] {
-        let dir = tempdir().unwrap();
-        let root = dir.path().join("repo");
-        std::fs::create_dir_all(&root).unwrap();
-        let fake = FakeIssue {
-            labels: &["loom:curating", "loom:very-important"],
-            comments: released_lease_comments(&[]),
-            labeled_at: Some("\"2026-11-13T23:42:26Z\""),
-        };
-        let (gh, log) = write_fake_gh(dir.path(), &fake);
-        std::fs::write(log.with_extension(format!("log.{state_change}")), "").unwrap();
-        run_pass(&gh, &root);
-        assert!(log.with_extension("log.triage").exists());
-        assert!(!log.with_extension("log.removed").exists());
-        let before = std::fs::read_to_string(&log).unwrap();
-
-        run_pass(&gh, &root);
-        let after = std::fs::read_to_string(&log).unwrap();
-        let retry = after.strip_prefix(&before).unwrap();
-        assert!(!retry.contains("--add-label"), "{retry}");
-        assert!(retry.contains("issue edit 300 --remove-label loom:curating"), "{retry}");
-        assert!(!retry.contains("--remove-label loom:very-important"), "{retry}");
-        assert_eq!(retry.contains("-X POST"), state_change == "approve-on-add", "{retry}");
-    }
-}
-
-#[test]
-#[serial]
-fn a_new_claim_after_adding_triage_is_not_removed() {
+fn a_new_claim_after_discovery_is_not_removed() {
     let dir = tempdir().unwrap();
     let root = dir.path().join("repo");
     std::fs::create_dir_all(&root).unwrap();
     let fake = FakeIssue {
-        labels: &["loom:curating"],
+        labels: &[CLAIM],
         comments: released_lease_comments(&[]),
         labeled_at: Some("\"2026-11-13T23:42:26Z\""),
     };
     let (gh, log) = write_fake_gh(dir.path(), &fake);
-    std::fs::write(log.with_extension("log.relabel-on-add"), "").unwrap();
+    std::fs::write(log.with_extension("log.relabel-during-read"), "").unwrap();
     for _ in 0..2 {
         run_pass(&gh, &root);
     }
-    assert!(log.with_extension("log.triage").exists());
     assert!(!log.with_extension("log.removed").exists());
-    let calls = std::fs::read_to_string(&log).unwrap();
-    assert_eq!(calls.matches("--add-label loom:triage").count(), 1, "{calls}");
 }
 
 #[test]
@@ -691,10 +689,7 @@ fn an_existing_record_is_not_reposted_on_the_retry_after_a_partial_repair() {
     let (gh, log) = write_fake_gh(dir.path(), &fake);
     run_pass(&gh, &root);
     let calls = std::fs::read_to_string(&log).unwrap();
-    assert!(
-        calls.contains("issue edit 300 --remove-label loom:curating"),
-        "the edit must be retried: {calls}"
-    );
+    assert!(calls.contains(RELEASE), "the edit must be retried: {calls}");
     assert!(!calls.contains("-X POST"), "the record must not be posted twice: {calls}");
 }
 
@@ -723,7 +718,7 @@ fn a_completed_repair_never_reaches_a_write() {
     std::fs::write(&bin, script).unwrap();
     run_pass(&bin, &root);
     let calls = std::fs::read_to_string(&log).unwrap();
-    assert!(!calls.contains("issue edit"), "a healed item must not be written: {calls}");
+    assert!(!calls.contains(RELEASE), "a healed item must not be written: {calls}");
 }
 
 #[test]
@@ -732,16 +727,17 @@ fn a_fresh_claim_writes_nothing() {
     let dir = tempdir().unwrap();
     let root = dir.path().join("repo");
     std::fs::create_dir_all(&root).unwrap();
+    let fresh = (Utc::now() - chrono::Duration::minutes(20)).to_rfc3339();
     let fake = FakeIssue {
         labels: &["loom:curating"],
         comments: released_lease_comments(&[]),
-        labeled_at: Some("\"2026-11-21T11:40:00Z\""), // 20 minutes old
+        labeled_at: Some(&fresh),
     };
     let (gh, log) = write_fake_gh(dir.path(), &fake);
     run_pass(&gh, &root);
     let calls = std::fs::read_to_string(&log).unwrap();
     assert!(
-        !calls.contains("issue edit"),
+        !calls.contains(RELEASE),
         "a claim inside the arbitration window must not be touched: {calls}"
     );
 }
