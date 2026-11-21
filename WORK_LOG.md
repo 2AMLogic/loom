@@ -16,6 +16,15 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 ### 2026-11-21
 
+- **Issue #14877** (closed): clean --safe fails deleting branches whose %(refname:short) is disambiguated to heads/prNNN
+- **Issue #14874** (closed): Bound outcome reads to the dispatch that produced them
+- **PR #14875**: Bound step outcome reads to their own dispatch section
+- **Issue #14835** (closed): restart_verify cannot spawn its post-exit verifier (No such file or directory) and does not say which path
+- **PR #14856**: fix: resolve the post-exit verifier through daemon_bin_resolve and name the failed spawn path
+- **Issue #14861** (closed): Share the host-wide cooldown implementation across the three cleanup passes
+- **PR #14868**: refactor: single-source the host-wide cooldown in host_wide_cooldown
+- **Issue #14839** (closed): Role draw: put the effective table, the first roll and passed-over picks on loom.dispatch.step
+- **PR #14867**: feat(telemetry): report role draw facts on dispatched steps
 - **Issue #14834** (closed): Ratification lane: name the effective key markers per head and flag superseded duplicates
 - **PR #14857**: feat: add read-only ratification-lane status report for effective key markers
 - **Issue #14812** (closed): merge-sequencing: a stacked follower that conflicts with its held (loom:blocked) parent's branch is never repaired, and its linked issue never draws
