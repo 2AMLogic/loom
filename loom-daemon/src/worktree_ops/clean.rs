@@ -67,6 +67,15 @@ pub const NO_PR_GRACE_PERIOD_SECS: i64 = 30 * 24 * 60 * 60;
 /// of forge probes a single clean pass can issue.
 pub const SWEEP_TRANSIENT_MIN_AGE_SECS: u64 = 48 * 60 * 60;
 
+/// How old a worktree registration's `initializing` lock must be before
+/// [`cleanup_worktree`] / [`cleanup_pr_worktree`] may treat it as crash
+/// debris and unlock it for removal (issue #14878). `git worktree add`
+/// holds that lock only for the duration of the checkout, so one aged past
+/// this grace cannot belong to a live add — the creating process is gone
+/// (SIGKILL, OOM, reboot) and the residue would otherwise accumulate
+/// forever, since `git worktree remove --force` refuses locked worktrees.
+pub const STALE_INITIALIZING_LOCK_SECS: u64 = 24 * 60 * 60;
+
 /// Prompt on stdout/stdin for a `[y/N]` confirmation. EOF (no TTY attached,
 /// e.g. under cron) is treated as "no" — matches
 /// `clean.py`'s `except (EOFError, KeyboardInterrupt): response = ""` fallback.
@@ -1404,6 +1413,142 @@ pub fn should_force_remove_orphan_dir(cause: &str, is_managed: bool, under_root:
     is_untracked_worktree_error(cause) && is_managed && under_root
 }
 
+/// Whether a `git worktree remove` failure means "this working tree is
+/// locked" — the refusal git gives for ANY locked worktree, single
+/// `--force` included (overriding a lock takes `--force --force`, which
+/// this module never passes). The stale-`initializing` recovery
+/// (issue #14878) keys off this signature; every other failure keeps
+/// today's behavior.
+#[must_use]
+pub fn is_locked_worktree_error(cause: &str) -> bool {
+    cause
+        .to_ascii_lowercase()
+        .contains("cannot remove a locked working tree")
+}
+
+/// Whether a worktree lock qualifies for the stale-`initializing` recovery
+/// (issue #14878). The reason must be exactly git's own transient
+/// `initializing` marker — anything else (empty, an operator's free-text
+/// hold, git accepting `initializing` as a user-supplied reason) is treated
+/// as a deliberate lock, since the reason alone cannot prove how the lock
+/// was created. The lock must also be strictly older than
+/// [`STALE_INITIALIZING_LOCK_SECS`]: `age` is `None` when the lock's mtime
+/// is in the future (clock skew), which is "not stale" — preserve it.
+#[must_use]
+pub fn is_stale_initializing_lock(reason: &str, age: Option<Duration>) -> bool {
+    reason.trim() == "initializing"
+        && age.is_some_and(|a| a.as_secs() > STALE_INITIALIZING_LOCK_SECS)
+}
+
+/// Resolve the per-worktree git directory (`<repo>/.git/worktrees/<id>`)
+/// git registered for `worktree_path`, by reading the worktree's own `.git`
+/// pointer file — never by deriving `<id>` from the directory basename,
+/// which git does not guarantee (issue #14878). `None` when the pointer is
+/// missing, a directory (the primary checkout), or unreadable (an add
+/// interrupted before the pointer was written): callers must treat that as
+/// unverifiable and preserve the lock.
+#[must_use]
+fn registered_worktree_git_dir(worktree_path: &Path) -> Option<PathBuf> {
+    let dot_git = worktree_path.join(".git");
+    if !dot_git.is_file() {
+        return None;
+    }
+    let pointer = std::fs::read_to_string(&dot_git).ok()?;
+    let git_dir = pointer.trim().strip_prefix("gitdir:")?.trim();
+    if git_dir.is_empty() {
+        return None;
+    }
+    let git_dir = Path::new(git_dir);
+    Some(if git_dir.is_absolute() {
+        git_dir.to_path_buf()
+    } else {
+        worktree_path.join(git_dir)
+    })
+}
+
+/// The unlock half of [`remove_worktree_force`] (issue #14878): re-read the
+/// registered lock file's reason and mtime immediately before acting, and
+/// unlock only when [`is_stale_initializing_lock`] proves the lock is
+/// git-crash debris rather than an operator hold.
+///
+/// `Ok(true)` — a verified stale lock was unlocked; the caller retries the
+/// removal. `Ok(false)` — not eligible (different reason, too fresh,
+/// future-dated, or metadata that cannot be resolved): the worktree and its
+/// lock stay exactly as they are. `Err` — the lock qualified but
+/// `git worktree unlock` itself failed.
+fn unlock_stale_initializing_lock(repo_root: &Path, worktree_path: &Path) -> Result<bool, String> {
+    let Some(git_dir) = registered_worktree_git_dir(worktree_path) else {
+        return Ok(false);
+    };
+    let lock_file = git_dir.join("locked");
+    let Ok(reason) = std::fs::read_to_string(&lock_file) else {
+        return Ok(false);
+    };
+    let age = std::fs::metadata(&lock_file)
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|mtime| SystemTime::now().duration_since(mtime).ok());
+    if !is_stale_initializing_lock(&reason, age) {
+        return Ok(false);
+    }
+    let mut unlock = Command::new("git");
+    unlock
+        .args(["worktree", "unlock"])
+        .arg(worktree_path)
+        .current_dir(repo_root);
+    run_checked(unlock).map_err(|unlock_cause| {
+        format!("git worktree unlock failed for a stale 'initializing' lock: {unlock_cause}")
+    })?;
+    Ok(true)
+}
+
+/// One checked `git worktree remove --force` attempt, shared by
+/// [`cleanup_worktree`] and [`cleanup_pr_worktree`] (issue #14878).
+///
+/// A plain success returns `Ok(())`. When git refuses because the worktree
+/// is locked, the refusal is offered to [`unlock_stale_initializing_lock`]:
+/// a lock proven to be stale `initializing` crash debris is unlocked and the
+/// ordinary single-force removal retried exactly once — a failed unlock or
+/// retry surfaces its own error. Any other lock (a deliberate operator hold,
+/// a fresh add, unverifiable metadata) propagates the original refusal
+/// untouched, so branch cleanup, removal accounting, and the existing orphan
+/// handling in the callers behave exactly as before.
+fn remove_worktree_force(repo_root: &Path, worktree_path: &Path) -> Result<(), String> {
+    let mut remove = Command::new("git");
+    remove
+        .args(["worktree", "remove"])
+        .arg(worktree_path)
+        .arg("--force")
+        .current_dir(repo_root);
+    if let Err(cause) = run_checked(remove) {
+        if !is_locked_worktree_error(&cause) {
+            return Err(cause);
+        }
+        if !unlock_stale_initializing_lock(repo_root, worktree_path)? {
+            return Err(cause);
+        }
+        let mut retry = Command::new("git");
+        retry
+            .args(["worktree", "remove"])
+            .arg(worktree_path)
+            .arg("--force")
+            .current_dir(repo_root);
+        run_checked(retry).map_err(|retry_cause| {
+            format!(
+                "git worktree remove failed after unlocking a stale 'initializing' lock \
+                 ({cause}); retry failed: {retry_cause}"
+            )
+        })?;
+        println!(
+            "  Recovered a stale 'initializing' lock (crash debris older than {}h) by \
+             unlocking before removal: {}",
+            STALE_INITIALIZING_LOCK_SECS / 3600,
+            worktree_path.display()
+        );
+    }
+    Ok(())
+}
+
 /// What [`cleanup_worktree`] actually did on success.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CleanupOutcome {
@@ -1454,13 +1599,7 @@ pub fn cleanup_worktree(
         }
         return Ok(CleanupOutcome::Removed);
     }
-    let mut remove = Command::new("git");
-    remove
-        .args(["worktree", "remove"])
-        .arg(worktree_path)
-        .arg("--force")
-        .current_dir(repo_root);
-    let outcome = if let Err(cause) = run_checked(remove) {
+    let outcome = if let Err(cause) = remove_worktree_force(repo_root, worktree_path) {
         // #5895: git has no record of this path as a worktree at all. Two
         // physical states are possible: the directory still exists on disk
         // (the #5177 untracked-orphan shape, handled below) or it has
@@ -1838,13 +1977,7 @@ pub fn cleanup_pr_worktree(
         }
         return Ok(());
     }
-    let mut remove = Command::new("git");
-    remove
-        .args(["worktree", "remove"])
-        .arg(worktree_path)
-        .arg("--force")
-        .current_dir(repo_root);
-    if let Err(cause) = run_checked(remove) {
+    if let Err(cause) = remove_worktree_force(repo_root, worktree_path) {
         // #5177: same orphaned-directory fallback as `cleanup_worktree`.
         if should_force_remove_orphan_dir(
             &cause,
