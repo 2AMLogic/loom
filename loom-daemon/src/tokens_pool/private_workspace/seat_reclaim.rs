@@ -223,10 +223,11 @@ pub fn is_tmp_step_name(name: &str) -> bool {
 /// the item without a host path, and `cache/judge-42` stays distinct from a
 /// top-level `judge-42`.
 fn relative(root: &Path, path: &Path) -> String {
-    path.strip_prefix(root)
-        .unwrap_or(path)
-        .to_string_lossy()
-        .into_owned()
+    let path = path.strip_prefix(root).unwrap_or(path);
+    // JSON paths are strings. Preserve the byte escapes of a non-UTF-8 name
+    // so distinct files don't collapse to the same replacement character.
+    path.to_str()
+        .map_or_else(|| format!("{path:?}"), str::to_owned)
 }
 
 fn reclaim_scratch(
@@ -610,8 +611,12 @@ pub(super) fn report_seat(account: &str, outcome: &SeatReclaimOutcome) {
         },
     );
     for item in &outcome.removed {
-        reaper::publish_removal(&seat, &item.removal());
-        log::info!("private_workspace seat_reclaim: seat {account} removed {}", item.describe());
+        let mut line = item.describe();
+        if let Some(trace_id) = reaper::publish_removal(&seat, &item.removal()) {
+            line.push_str(", trace_id=");
+            line.push_str(trace_id.as_str());
+        }
+        log::info!("private_workspace seat_reclaim: seat {account} removed {line}");
     }
     if let Some(error) = &outcome.inspection_error {
         log::warn!(
@@ -1013,18 +1018,10 @@ mod tests {
 
     /// Stamp an mtime (files and directories) the way the age gates read it.
     fn set_mtime(path: &Path, when: DateTime<Utc>) {
-        let out = std::process::Command::new("touch")
-            .arg("-d")
-            .arg(when.to_rfc3339())
-            .arg(path)
-            .output()
-            .expect("touch must spawn");
-        assert!(
-            out.status.success(),
-            "touch {} failed: {}",
-            path.display(),
-            String::from_utf8_lossy(&out.stderr)
-        );
+        std::fs::File::open(path)
+            .unwrap()
+            .set_modified(when.into())
+            .unwrap();
     }
 
     #[test]
@@ -1142,6 +1139,74 @@ mod tests {
                 && line.contains(&expected_tip),
             "{line}"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn non_utf8_removal_names_remain_distinct_in_the_audit_record() {
+        use std::{ffi::OsStr, os::unix::ffi::OsStrExt};
+
+        let root = Path::new("/volume");
+        let one = root.join(OsStr::from_bytes(b"cache/judge-42-\xfe"));
+        let two = root.join(OsStr::from_bytes(b"cache/judge-42-\xff"));
+        assert_ne!(relative(root, &one), relative(root, &two));
+        assert!(!relative(root, &one).contains('\u{fffd}'));
+        let valid = "cache/judge-42-\u{fffd}";
+        assert_eq!(relative(root, &root.join(valid)), valid);
+    }
+
+    #[test]
+    fn bounded_removal_spans_identify_each_escaped_scratch_path_in_the_log() {
+        let volume = tempfile::tempdir().unwrap();
+        let cache = volume.path().join("cache");
+        std::fs::create_dir(&cache).unwrap();
+        let long = format!("judge-42-{}", "\u{1}".repeat(70));
+        let names = ["judge-42-a\nb", "judge-42-c\nd", &long, "judge-42-plain"];
+        for name in names {
+            std::fs::write(cache.join(name), b"same").unwrap();
+        }
+        let mut outcome = SeatReclaimOutcome::default();
+        reclaim_scratch(volume.path(), 86_400, Utc::now() + Duration::days(2), &mut outcome);
+        assert_eq!(outcome.scratch_removed, names.len());
+        let (logs, captured) = crate::observability::ops::capture::capture(|| {
+            crate::test_log_capture::capture_logs(|| report_seat("fixture-seat", &outcome))
+        });
+        let spans: Vec<_> = captured
+            .spans
+            .into_iter()
+            .filter(|span| span.name.as_str() == "reaper.removal")
+            .map(|span| span.bounded())
+            .collect();
+        assert_eq!(spans.len(), names.len());
+        for name in names {
+            assert!(!cache.join(name).exists());
+            let path = format!("cache/{name}");
+            let matches: Vec<_> = logs
+                .iter()
+                .filter(|(_, line)| line.contains(&format!("{path:?}")))
+                .collect();
+            assert_eq!(matches.len(), 1, "one full escaped log line for {path:?}");
+            let (_, line) = matches[0];
+            assert!(!line.contains('\n'));
+            let matching: Vec<_> = spans
+                .iter()
+                .filter(|span| {
+                    line.contains(&format!("trace_id={}", span.context.trace_id.as_str()))
+                })
+                .collect();
+            assert_eq!(matching.len(), 1, "one exported record matches {line}");
+            let attrs = &matching[0].attributes;
+            assert_eq!(attrs["loom.reaper.removal.bytes"], "4");
+            assert_eq!(
+                attrs.get("loom.reaper.removal.path"),
+                (!name.chars().any(char::is_control)).then_some(&path)
+            );
+            let escaped = name.escape_debug().to_string();
+            assert_eq!(
+                attrs.get("loom.reaper.removal.name"),
+                (escaped.len() <= 256).then_some(&escaped)
+            );
+        }
     }
 
     /// #14889: a Git inspection error no longer throws away the outcome —

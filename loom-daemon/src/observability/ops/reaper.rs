@@ -24,7 +24,9 @@ use std::path::Path;
 
 use chrono::{DateTime, Utc};
 
-use crate::telemetry::trace::{SpanName, SpanRecord, SpanStatus, TraceAttributes, TraceContext};
+use crate::telemetry::trace::{
+    SpanName, SpanRecord, SpanStatus, TraceAttributes, TraceContext, TraceId,
+};
 
 /// The removal pass.
 pub const PHASE_REAP: &str = "reap";
@@ -220,15 +222,14 @@ pub fn removal_span(repo_root: &Path, r: &Removal<'_>, at: DateTime<Utc>) -> Spa
     attributes.insert("loom.reaper.class".into(), "seat".into());
     attributes.insert("loom.reaper.removal.kind".into(), r.kind.to_string());
     attributes.insert("loom.reaper.removal.path".into(), r.path.to_string());
-    // A path longer than the 256-byte export bound would leave the span
-    // nameless; the base name (filesystem-bounded to 255 bytes) keeps the
-    // span correlatable with the item's full, escaped local log line.
+    // Keep a readable base name when the raw path is long or contains controls.
+    // The host logs this span's trace ID even when the escaped name is too long.
     if let Some(base) = Path::new(r.path)
         .file_name()
         .and_then(|n| n.to_str())
         .filter(|n| !n.is_empty())
     {
-        attributes.insert("loom.reaper.removal.name".into(), base.to_string());
+        attributes.insert("loom.reaper.removal.name".into(), base.escape_debug().to_string());
     }
     if let Some(branch) = r.branch {
         attributes.insert("loom.reaper.removal.branch".into(), branch.to_string());
@@ -253,12 +254,15 @@ pub fn removal_span(repo_root: &Path, r: &Removal<'_>, at: DateTime<Utc>) -> Spa
     }
 }
 
-/// Export one removed item through the daemon's ops sink. Never fails;
-/// nothing is built without a sink.
-pub fn publish_removal(repo_root: &Path, r: &Removal<'_>) {
-    if super::spans_exported() {
-        super::emit_span(removal_span(repo_root, r, Utc::now()));
+/// Return the emitted span's trace ID so the host can name it in the audit log.
+pub fn publish_removal(repo_root: &Path, r: &Removal<'_>) -> Option<TraceId> {
+    if !super::spans_exported() {
+        return None;
     }
+    let span = removal_span(repo_root, r, Utc::now());
+    let trace_id = span.context.trace_id.clone();
+    super::emit_span(span);
+    Some(trace_id)
 }
 
 #[cfg(test)]
@@ -536,10 +540,10 @@ mod tests {
             tip: None,
             bytes: Some(4),
         };
-        let ((), captured) = super::super::capture::capture(|| {
-            publish_removal(Path::new("/r/agent-1"), &r);
-        });
+        let (trace_id, captured) =
+            super::super::capture::capture(|| publish_removal(Path::new("/r/agent-1"), &r));
         assert_eq!(captured.spans.len(), 1);
+        assert_eq!(trace_id.as_ref(), Some(&captured.spans[0].context.trace_id));
         assert_eq!(captured.spans[0].name.as_str(), "reaper.removal");
     }
 }
