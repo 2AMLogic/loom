@@ -418,20 +418,16 @@ impl PricingCard {
     /// are scanned for the first `match` substring the id contains.
     #[must_use]
     pub fn lookup(&self, model: &str) -> Option<ModelPricing> {
-        let lowered = model.to_lowercase();
-        let resolved: &str = self
-            .aliases
-            .get(&lowered)
-            .map_or(lowered.as_str(), String::as_str);
-        self.rows
-            .iter()
-            .find(|row| row.match_on.iter().any(|m| resolved.contains(m.as_str())))
-            .map(|row| row.pricing.clone())
+        self.matching_row(model).map(|row| row.pricing.clone())
     }
 
     /// The id of the row `model` resolves to, for diagnostics.
     #[must_use]
     pub fn matching_row_id(&self, model: &str) -> Option<&str> {
+        self.matching_row(model).map(|row| row.id.as_str())
+    }
+
+    fn matching_row(&self, model: &str) -> Option<&Row> {
         let lowered = model.to_lowercase();
         let resolved: &str = self
             .aliases
@@ -440,7 +436,17 @@ impl PricingCard {
         self.rows
             .iter()
             .find(|row| row.match_on.iter().any(|m| resolved.contains(m.as_str())))
-            .map(|row| row.id.as_str())
+    }
+
+    /// Profile coverage requires an explicit alias or a full model ID on the
+    /// selected row. A substring match alone can be a runtime family fallback.
+    #[cfg(test)]
+    pub(super) fn declares_model(&self, model: &str) -> bool {
+        let model = model.to_lowercase();
+        self.aliases.contains_key(&model)
+            || self
+                .matching_row(&model)
+                .is_some_and(|row| row.match_on.contains(&model))
     }
 
     /// The date the rates in this card were last checked against `source`.

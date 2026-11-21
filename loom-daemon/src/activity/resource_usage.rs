@@ -1100,22 +1100,18 @@ mod tests {
         serde_json::from_str(&std::fs::read_to_string(shipped_profiles_path()).unwrap()).unwrap()
     }
 
-    /// Profile models `is_priced` cannot price, as "profile 'x' names model
-    /// 'y'" strings. `REPLACE_WITH_…` values are operator templates, not
-    /// concrete ids, and skip the check.
-    fn uncovered_profile_models(
-        profiles: &serde_json::Value,
-        is_priced: &dyn Fn(&str) -> bool,
-    ) -> Vec<String> {
+    /// Every concrete profile needs a declared rate on the shipped card and
+    /// a price when the compiled fallback is used.
+    fn uncovered_profile_models(profiles: &serde_json::Value, card: &PricingCard) -> Vec<String> {
         let mut missing = Vec::new();
         for (name, profile) in profiles.as_object().expect("profiles is a JSON object") {
             let Some(model) = profile.get("model").and_then(|m| m.as_str()) else {
                 continue;
             };
-            if model.starts_with("REPLACE_WITH") || PROFILE_UNPRICED_EXCEPTIONS.contains(&model) {
+            if model.starts_with("REPLACE_WITH_") || PROFILE_UNPRICED_EXCEPTIONS.contains(&model) {
                 continue;
             }
-            if !is_priced(model) {
+            if !card.declares_model(model) || ModelPricing::lookup(model).is_none() {
                 missing.push(format!("profile '{name}' names model '{model}'"));
             }
         }
@@ -1126,16 +1122,8 @@ mod tests {
     fn every_shipped_profile_model_is_priced_on_both_cards() {
         let profiles = shipped_profiles();
         let card = PricingCard::load(&pricing_card::shipped_asset_path()).unwrap();
-        let on_asset = |m: &str| card.lookup(m).is_some();
-        assert!(
-            uncovered_profile_models(&profiles, &on_asset).is_empty(),
-            "asset tier coverage gaps"
-        );
-        let on_compiled = |m: &str| ModelPricing::lookup(m).is_some();
-        assert!(
-            uncovered_profile_models(&profiles, &on_compiled).is_empty(),
-            "compiled tier coverage gaps"
-        );
+        let missing = uncovered_profile_models(&profiles, &card);
+        assert!(missing.is_empty(), "profile coverage gaps: {missing:?}");
     }
 
     /// AC: removing a row for a bundled profile must fail coverage, naming
@@ -1175,8 +1163,7 @@ mod tests {
             std::path::Path::new("/test/pricing-sans-glm-flash.json"),
         )
         .expect("row + its aliases removed leaves a loadable card");
-        let on_asset = |m: &str| card.lookup(m).is_some();
-        let missing = uncovered_profile_models(&profiles, &on_asset);
+        let missing = uncovered_profile_models(&profiles, &card);
         assert!(
             missing
                 .iter()
@@ -1193,12 +1180,26 @@ mod tests {
             "test-future-profile".into(),
             serde_json::json!({"model": "glm-6", "providers": {"opencode": "zai-coding-plan"}}),
         );
-        let on_compiled = |m: &str| ModelPricing::lookup(m).is_some();
-        let missing = uncovered_profile_models(&profiles, &on_compiled);
+        let card = PricingCard::load(&pricing_card::shipped_asset_path()).unwrap();
+        let missing = uncovered_profile_models(&profiles, &card);
         assert!(
             missing.iter().any(|m| m.contains("glm-6")),
             "the synthetic profile must be reported, got: {missing:?}"
         );
+    }
+
+    #[test]
+    fn a_family_fallback_does_not_cover_a_concrete_profile() {
+        let profiles = serde_json::json!({
+            "future-opus": {"model": "claude-opus-99"},
+            "explicit-opus": {"model": "claude-opus-5"},
+            "alias-opus": {"model": "opus"}
+        });
+        let card = PricingCard::load(&pricing_card::shipped_asset_path()).unwrap();
+        assert_eq!(card.matching_row_id("claude-opus-99"), Some("opus-newest"));
+        assert!(ModelPricing::lookup("claude-opus-99").is_some());
+        let missing = uncovered_profile_models(&profiles, &card);
+        assert_eq!(missing, ["profile 'future-opus' names model 'claude-opus-99'"]);
     }
 
     #[test]
