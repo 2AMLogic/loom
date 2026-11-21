@@ -433,6 +433,44 @@ struct Candidate {
     commit: String,
 }
 
+/// Why a pass left a stale workspace not resynced, for the one WARN each
+/// such workspace gets per pass (#14848): a dispatch hold names the
+/// workspace, and without this its cause could not be read at any level the
+/// daemon logs by default. The classification half owns [`Self::Budget`];
+/// the rest are the write half's early stops.
+#[derive(Debug, Clone, Copy)]
+enum Wait {
+    /// The classification budget was spent before this workspace was
+    /// reached: it keeps its last verdict and is first next pass.
+    Budget,
+    /// The pass asked no remote (an outage hold, or three remotes in a row
+    /// did not answer): no resync could be started.
+    Offline,
+    /// The pass was past its deadline by the time the write half reached it.
+    Deadline,
+    /// The pass's one attempt went to an earlier stale workspace.
+    AttemptSlot,
+}
+
+impl Wait {
+    /// The note for the per-pass WARN; also the report's reason when nothing
+    /// more specific was recorded this pass.
+    fn note(self) -> &'static str {
+        match self {
+            Self::Budget => {
+                "not checked this pass: the classification budget was spent before it; it \
+                 keeps its last verdict and is first next pass"
+            }
+            Self::Offline => "not attempted this pass: the pass asked no remote",
+            Self::Deadline => "not attempted this pass: the pass was past its deadline",
+            Self::AttemptSlot => {
+                "not attempted this pass: the pass's one attempt went to an earlier stale \
+                 workspace"
+            }
+        }
+    }
+}
+
 /// What one pass has done on the network so far, and what it will publish.
 #[derive(Default)]
 struct Scan {
@@ -525,6 +563,8 @@ pub fn run(env: &Env<'_>, roots: &[PathBuf], mode: Mode, memory: &mut Memory) ->
     }
     let first = if count == 0 { 0 } else { memory.cursor % count };
     let mut reports: Vec<Option<WorkspaceReport>> = vec![None; count];
+    // Why each workspace was left for a later pass, when it was (#14848).
+    let mut wait: Vec<Option<Wait>> = vec![None; count];
     let mut candidates = Vec::new();
     let mut resume = None;
     for step in 0..count {
@@ -537,6 +577,7 @@ pub fn run(env: &Env<'_>, roots: &[PathBuf], mode: Mode, memory: &mut Memory) ->
         }
         let nwo = names.get(index).cloned().flatten();
         let (report, found) = if resume.is_some() {
+            wait[index] = Some(Wait::Budget);
             (carried(root, nwo, memory), None)
         } else {
             let head = asked.remove(root).unwrap_or(Asked::No);
@@ -571,11 +612,17 @@ pub fn run(env: &Env<'_>, roots: &[PathBuf], mode: Mode, memory: &mut Memory) ->
                 .get(c.index)
                 .is_none_or(|w| w.state != WState::W3)
         });
-        for candidate in &candidates {
+        // Where the loop stopped, and why the candidates after it wait: they
+        // were never offered the attempt (#14848).
+        let mut stopped = candidates.len();
+        let mut stopped_why = None;
+        for (pos, candidate) in candidates.iter().enumerate() {
             let Some(report) = pass.workspaces.get_mut(candidate.index) else {
                 continue;
             };
             if !scan.online {
+                stopped = pos;
+                stopped_why = Some(Wait::Offline);
                 break;
             }
             if (env.overdue)() {
@@ -584,11 +631,59 @@ pub fn run(env: &Env<'_>, roots: &[PathBuf], mode: Mode, memory: &mut Memory) ->
                      and the stale workspaces wait for the next pass",
                     PASS_DEADLINE.as_secs()
                 );
+                stopped = pos;
+                stopped_why = Some(Wait::Deadline);
                 break;
             }
             if attempt(env, candidate, report, memory, &mut scan) {
+                // This candidate had the pass's attempt; the ones after it
+                // are the ones deferred.
+                stopped = pos + 1;
+                stopped_why = Some(Wait::AttemptSlot);
                 break;
             }
+        }
+        if let Some(why) = stopped_why {
+            for candidate in &candidates[stopped..] {
+                wait[candidate.index] = Some(why);
+            }
+        }
+        // #14848: a stale workspace this pass did not resync says why, once
+        // per pass, at WARN — an unvisited candidate gets the disposition of
+        // the pass that deferred it, and a visited one keeps the reason its
+        // attempt, backoff or skip already recorded. The once-only alerts
+        // above are unchanged; this line is the per-pass record.
+        for (index, report) in pass.workspaces.iter_mut().enumerate() {
+            if !matches!(report.state, WState::W1 | WState::W3) {
+                continue;
+            }
+            let name = report
+                .repo
+                .clone()
+                .unwrap_or_else(|| report.root.display().to_string());
+            let deferred = wait.get(index).copied().flatten();
+            let existing = report.reason.take();
+            let why = match (&deferred, existing) {
+                (Some(deferred), existing) => {
+                    let why = match existing {
+                        Some(existing) => format!("{}; {existing}", deferred.note()),
+                        None => deferred.note().to_string(),
+                    };
+                    report.reason = Some(why.clone());
+                    why
+                }
+                (None, existing) => {
+                    report.reason = existing;
+                    report
+                        .reason
+                        .clone()
+                        .unwrap_or_else(|| "no reason recorded".to_string())
+                }
+            };
+            log::warn!(
+                "workspace_resync: {name}: {}, not resynced this pass: {why}",
+                report.state.as_str()
+            );
         }
     }
     let outage = memory.note_network(
