@@ -27,3 +27,33 @@ fn the_issue_lease_chain_runs_on_a_tools_only_host() {
     );
     assert!(stdout.contains("ALL PASSED"), "{stdout}");
 }
+
+#[test]
+fn strict_ensure_reports_indeterminate_when_mode_resolution_fails() {
+    let root = tempfile::tempdir().expect("isolated mode fixture");
+    for (strict, dispatched, exit, stdout) in [
+        (false, false, 0, ""),
+        (true, false, 2, "INDETERMINATE"),
+        (true, true, 0, "OWNED"),
+    ] {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_loom-tools"));
+        command
+            .env_clear()
+            .env("LOOM_MODE", "invalid-fixture-mode")
+            .current_dir(root.path())
+            .args(["lease", "ensure", "42", "--watch-pid", "1", "--force"]);
+        if strict {
+            command.arg("--require-ownership");
+        }
+        if dispatched {
+            command.env("LOOM_SWEEP_LEASE_RENEW_DISPATCHED", "42");
+        }
+        let out = command
+            .output()
+            .expect("run lease ensure with invalid mode");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(stderr.contains("invalid mode"), !dispatched, "{stderr}");
+        assert_eq!(out.status.code(), Some(exit), "{stderr}");
+        assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), stdout);
+    }
+}

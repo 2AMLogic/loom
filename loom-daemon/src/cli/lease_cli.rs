@@ -4,7 +4,7 @@
 
 use anyhow::Result;
 
-use super::lease_ensure::{LeaseCommand, SessionEnv};
+use super::lease_ensure::{exit_indeterminate_ownership, LeaseCommand, SessionEnv};
 use super::lease_renewer::RenewerAction;
 
 /// `loom-tools lease <verb>`: the [`LeaseCommand`] tree, unchanged. The field is
@@ -46,23 +46,40 @@ impl LeaseCli {
     /// Whether a failure to resolve `mode` must leave the verb's own exit
     /// contract intact instead of exiting 1.
     ///
-    /// `ensure` "always exits 0" (a lease is evidence, never a precondition) and
-    /// `co-occupancy` fails open with 0 on any read error, because its exit 1 is
+    /// Ordinary `ensure` and `co-occupancy` fail open with 0 on read errors.
+    /// Co-occupancy's exit 1 is
     /// the one signal `worktree.sh` treats as "two live sweeps share this
     /// worktree" and refuses on. A mode error must not alias either. `release`
     /// already exits 1 when it cannot read the lease comments, so it reports
     /// the mode error the usual way.
-    #[must_use]
-    pub fn fails_open_on_mode_error(&self) -> bool {
+    fn fails_open_on_mode_error(&self) -> bool {
         match &self.command {
-            LeaseCommand::Ensure(_) | LeaseCommand::CoOccupancy(_) => true,
+            LeaseCommand::Ensure(args) => !args.require_ownership,
+            LeaseCommand::CoOccupancy(_) => true,
             LeaseCommand::Release(_) | LeaseCommand::Renewer(_) | LeaseCommand::Pr(_) => false,
         }
     }
 
-    /// The verb as typed, for diagnostics.
-    #[must_use]
-    pub fn verb(&self) -> &'static str {
+    /// Translate a mode-resolution failure into the selected lease result.
+    ///
+    /// # Errors
+    /// Returns the mode error when the lease verb has no specialized result.
+    pub fn handle_issue_mode_error(&self, error: anyhow::Error) -> Result<()> {
+        if matches!(&self.command, LeaseCommand::Ensure(args) if args.require_ownership) {
+            eprintln!("lease ensure: {error:#}");
+            exit_indeterminate_ownership();
+        }
+        if self.fails_open_on_mode_error() {
+            eprintln!(
+                "lease {}: {error:#} -- failing open (a lease is evidence, never a precondition)",
+                self.verb()
+            );
+            return Ok(());
+        }
+        Err(error)
+    }
+
+    fn verb(&self) -> &'static str {
         match &self.command {
             LeaseCommand::Ensure(_) => "ensure",
             LeaseCommand::CoOccupancy(_) => "co-occupancy",
@@ -123,7 +140,7 @@ mod tests {
     fn issue_mode_gate_is_classified_by_effect() {
         big_stack(|| {
             // (argv tail, uses the issue-mode gate, fails open on a mode error)
-            let table: [(&[&str], bool, bool); 9] = [
+            let table: [(&[&str], bool, bool); 10] = [
                 (&["co-occupancy", "7"], true, true),
                 (&["release", "7"], true, false),
                 (&["renewer", "stop", "--issue", "7"], false, false),
@@ -133,6 +150,18 @@ mod tests {
                 (&["renewer", "check", "7", "--token", "t"], false, false),
                 // A forced ensure always reaches the publish script.
                 (&["ensure", "7", "--watch-pid", "1", "--force"], true, true),
+                (
+                    &[
+                        "ensure",
+                        "7",
+                        "--watch-pid",
+                        "1",
+                        "--force",
+                        "--require-ownership",
+                    ],
+                    true,
+                    false,
+                ),
                 // The PR handler applies its own workspace-specific gate.
                 (&["pr", "check", "7", "--role", "judge"], false, false),
             ];
