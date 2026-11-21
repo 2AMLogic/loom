@@ -210,8 +210,10 @@ pub fn configure_forge_reads(repo_root: &Path) -> Result<(), String> {
 }
 
 /// Like [`configure_forge_reads`], but also return the selected mode for a
-/// detached self-invocation. Route input paths are inherited separately.
-pub(crate) fn configure_forge_read_route(repo_root: &Path) -> Result<String, String> {
+/// detached self-invocation or a command that gates on the mode value itself
+/// (the session gateway publisher, #14884). Route input paths are inherited
+/// separately.
+pub fn configure_forge_read_route(repo_root: &Path) -> Result<String, String> {
     let resolution = resolve(&inputs_from_env(repo_root))?;
     for note in resolution.notes {
         eprintln!("{note}");
@@ -226,6 +228,15 @@ pub(crate) fn configure_forge_read_route(repo_root: &Path) -> Result<String, Str
         }
     }
     Ok(resolution.mode)
+}
+
+/// The selected mode value for a read-only report (`gateway status`,
+/// #14884): `None` when `mode` cannot be resolved (unset or invalid — not an
+/// error for a status line). Prints nothing; a caller that should report
+/// resolution problems uses [`resolve`] directly.
+#[must_use]
+pub fn quiet_mode(repo_root: &Path) -> Option<String> {
+    resolve(&inputs_from_env(repo_root)).ok().map(|r| r.mode)
 }
 
 #[cfg(test)]

@@ -27,6 +27,12 @@
 //! --write`, `labels undeclared --prune`, `labels migrate --apply`,
 //! `forge-probe --live-write`, `forge-inventory gate --update`) refused with
 //! exit 64 before any handler runs.
+//!
+//! `gateway refresh|status|clean` (#14884) is the session-mode gateway
+//! publisher: a daemon-free pass of the same profile publisher the daemon's
+//! loop runs, into a session-owned destination. `refresh` resolves `mode`
+//! and requires `session`; `status` and `clean` run ungated (a leftover
+//! publication is reported and removed whatever the mode). No forge call.
 
 use std::io::Write;
 
@@ -216,6 +222,39 @@ enum ToolsCommands {
         #[arg(long, value_name = "PATH")]
         repo: Option<std::path::PathBuf>,
     },
+    /// The session-mode gateway read profiles (#14884): `refresh` publishes,
+    /// `status` inspects and `clean` withdraws the profiles a session-only
+    /// host publishes for itself — no daemon loop runs there, so its fleet
+    /// reads would otherwise fall back to a direct App token and its smaller
+    /// quota. Daemon-free, no forge call, and no credential in argv or
+    /// output; the profiles are the same read-only ones the daemon
+    /// publishes, at `<session root>/.loom/gh-config-gateway` (default root
+    /// `~/.local/share/loom/session`).
+    Gateway {
+        #[command(subcommand)]
+        action: GatewayAction,
+    },
+}
+
+/// The `gateway` verbs (#14884).
+#[derive(Subcommand)]
+enum GatewayAction {
+    /// Publish the gateway read profile of every owner configured in the
+    /// host defaults tier (`~/.local/share/loom/config/defaults.json`; a
+    /// repository setting cannot redirect it). Run at session start and
+    /// after a key rotation: a second invocation picks up a rotated key,
+    /// drops removed owners and withdraws a profile whose key no longer
+    /// resolves. Requires `mode` = session.
+    Refresh,
+    /// Report the publication — per owner current, due for refresh, stray or
+    /// missing, plus the `gh-ok` marker readers validate. Read-only; prints
+    /// no credentials. Freshness is the age of each owner's `hosts.yml`
+    /// against the 5-minute republish cadence the daemon's loop uses.
+    Status,
+    /// Remove the session publication (leaving session mode). That directory
+    /// only: a daemon host's workspace publication is never touched.
+    /// Idempotent.
+    Clean,
 }
 
 /// `capabilities`: one JSON object on stdout. Read-only, no forge call.
@@ -231,6 +270,103 @@ fn capabilities(repo: Option<&std::path::Path>) -> Result<()> {
     obj["binary"] = "loom-tools".into();
     println!("{obj}");
     Ok(())
+}
+
+/// `gateway refresh|status|clean` (#14884): the session-mode publication, a
+/// daemon-free pass of the same publisher the daemon's loop runs. `refresh`
+/// resolves `mode` first and requires `session` (it applies the session
+/// route like every gated command, discarding inherited fleet routing);
+/// `status` and `clean` run without the gate — a leftover publication is
+/// reported and removed whatever the mode. `status` prints nothing when
+/// there is no publication and the host is not in session mode, so a fleet
+/// host's `loom status` stays quiet.
+fn gateway(action: GatewayAction) -> Result<()> {
+    use loom_daemon::forge_gateway::{session, PassOutcome};
+
+    let cwd = std::env::current_dir().unwrap_or_else(|_| ".".into());
+    match action {
+        GatewayAction::Refresh => {
+            let mode = tools_mode::configure_forge_read_route(&cwd).map_err(anyhow::Error::msg)?;
+            if mode != "session" {
+                anyhow::bail!(
+                    "`gateway refresh` publishes the session profiles, but mode is {mode:?}; a \
+                     daemon or fleet host gets its profiles from its own route. Set mode to \
+                     \"session\" (env `LOOM_MODE` or the `mode` key in .loom-local/local.json) \
+                     to publish them here"
+                );
+            }
+            let base = session::checked_base().map_err(anyhow::Error::msg)?;
+            let host = session::host_tier_config();
+            let (outcome, warnings) = session::refresh_real(&base, &host);
+            for w in &warnings {
+                eprintln!("loom-tools gateway: {w}");
+            }
+            match outcome {
+                PassOutcome::Published { ref owners, .. } if !owners.is_empty() => {
+                    println!(
+                        "gateway read profiles published for [{}] into {}",
+                        owners.join(", "),
+                        base.display()
+                    );
+                    Ok(())
+                }
+                PassOutcome::Published { failed, .. } => anyhow::bail!(
+                    "no gateway profile could be published ({}); fix the key sources named \
+                     above and run 'loom-tools gateway refresh' again",
+                    failed.join(", ")
+                ),
+                PassOutcome::Off => anyhow::bail!(
+                    "forge.gateway is not set in the host defaults tier ({}); nothing \
+                     published. Configure it there — a repository tier cannot redirect a host \
+                     key",
+                    crate_defaults_path()
+                ),
+                PassOutcome::GhTooOld(seen) => anyhow::bail!(
+                    "gh {} is below the minimum {}; nothing published (an older gh ignores \
+                     api_host and would send the key to GitHub)",
+                    seen.map_or_else(|| "missing".to_string(), |v| v.to_string()),
+                    loom_daemon::forge_gateway::MIN_GH_VERSION
+                ),
+                PassOutcome::Unchanged => Ok(()),
+            }
+        }
+        GatewayAction::Status => {
+            let base = session::session_root()
+                .map(|root| session::session_base_at(&root))
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "no session root resolves: {} is explicitly empty or no home directory \
+                         is set",
+                        session::SESSION_ROOT_ENV
+                    )
+                })?;
+            let st =
+                session::status(&base, &session::host_tier_config(), std::time::SystemTime::now());
+            let on_session_host = tools_mode::quiet_mode(&cwd).as_deref() == Some("session");
+            if st.exists || on_session_host {
+                for line in session::render_status(&st) {
+                    println!("{line}");
+                }
+            }
+            Ok(())
+        }
+        GatewayAction::Clean => {
+            let base = session::checked_base().map_err(anyhow::Error::msg)?;
+            if session::clean(&base) {
+                println!("removed the session gateway profiles at {}", base.display());
+            } else {
+                println!("no session gateway profiles at {}", base.display());
+            }
+            Ok(())
+        }
+    }
+}
+
+/// Where `gateway refresh` expected `forge.gateway`: the private defaults
+/// path, for its refusal text.
+fn crate_defaults_path() -> String {
+    loom_daemon::config_resolver::private_defaults_path()
+        .map_or_else(|| "(no host defaults file resolves)".to_string(), |p| p.display().to_string())
 }
 
 /// Resolve `mode`, then (fleet route only) adopt the exported read routing.
@@ -357,6 +493,7 @@ fn run() -> Result<()> {
             std::process::exit(script_helpers::claim::run(&cwd, command.as_deref(), &args));
         }
         ToolsCommands::Capabilities { json: _, repo } => capabilities(repo.as_deref()),
+        ToolsCommands::Gateway { action } => gateway(action),
     }
 }
 
