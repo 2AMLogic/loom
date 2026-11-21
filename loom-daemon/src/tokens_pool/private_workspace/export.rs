@@ -268,7 +268,10 @@ fn snapshot_command(config: &Config, job: &lease::Job) -> Result<Command> {
     let target = config
         .target((!job.repository.is_empty()).then_some(job.repository.as_str()))
         .context(containment::WRONG_CLONE)?;
-    let mut command = Command::new("docker");
+    // Shared lookup (#14885); an unresolvable docker keeps an unlaunchable
+    // name so the exec fails — never a fall-through to a PATH docker an
+    // invalid override forbids.
+    let mut command = Command::new(crate::docker_bin::scoped_or_fail_open(None));
     command.args([
         "exec",
         "--env",
@@ -703,7 +706,13 @@ mod tests {
     /// The job's container is unreachable from a test, so the snapshot is not
     /// fresh — the pre-existing leg of the rule whose fresh leg now lives in
     /// `completed_certified` (#14031).
+    ///
+    /// `#[serial]`: `update` resolves the docker CLI through the shared
+    /// lookup (#14885), which reads the process-global `LOOM_DOCKER_BIN` —
+    /// the same lock the reaper's stub-injecting tests take, so a plain
+    /// `cargo test` run cannot interleave them.
     #[test]
+    #[serial]
     fn update_downgrades_uncertified_completion() {
         let root = tempfile::tempdir().unwrap();
         let config = Config {

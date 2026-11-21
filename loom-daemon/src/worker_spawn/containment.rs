@@ -367,13 +367,15 @@ pub fn docker_command(
     credentials: &[&str],
     injection: Option<&Injection>,
 ) -> Result<Command, LaunchError> {
-    if which_docker().is_none() {
-        return Err(LaunchError::config(
-            "native containment is enabled (runtimes.containment.native / LOOM_NATIVE_CONTAINERIZED) but 'docker' is not on PATH. Install docker, or disable containment (LOOM_NATIVE_CONTAINERIZED=0, or remove runtimes.containment.native from .loom/config.json).",
-        ));
-    }
+    let docker = which_docker().ok_or_else(|| {
+        LaunchError::config(
+            "native containment is enabled (runtimes.containment.native / LOOM_NATIVE_CONTAINERIZED) but no docker executable could be found (LOOM_DOCKER_BIN, PATH, /usr/local/bin, /opt/homebrew/bin, ~/.docker/bin, /Applications/Docker.app/Contents/Resources/bin, /usr/bin). Install docker, or disable containment (LOOM_NATIVE_CONTAINERIZED=0, or remove runtimes.containment.native from .loom/config.json).",
+        )
+    })?;
     let root = profile.ephemeral_root();
-    let mut command = Command::new("docker");
+    // `which_docker` above and this launch agree on one executable (#14885):
+    // both go through the same shared lookup.
+    let mut command = Command::new(docker);
     command.arg("run").arg("--rm");
 
     // --- Mounts (MOUNT-CONTRACT.md) -------------------------------------
@@ -561,15 +563,16 @@ pub fn materialize_launch_dirs() {
     }
 }
 
+/// The docker executable native containment launches — the shared
+/// [`crate::docker_bin`] lookup (override → `$PATH` → fallback directories,
+/// #14885), so a minimal (launchd-style) `PATH` still reaches Docker
+/// Desktop's directories. `LOOM_TEST_ASSUME_DOCKER` short-circuits to the
+/// bare name for tests that only build (never spawn) the command.
 fn which_docker() -> Option<PathBuf> {
     if env_nonempty("LOOM_TEST_ASSUME_DOCKER").is_some() {
         return Some(PathBuf::from("docker"));
     }
-    std::env::var_os("PATH").and_then(|path| {
-        std::env::split_paths(&path)
-            .map(|dir| dir.join("docker"))
-            .find(|candidate| candidate.is_file())
-    })
+    crate::docker_bin::resolve().ok()
 }
 
 fn mount(host: &Path, container: &str, read_only: bool) -> OsString {

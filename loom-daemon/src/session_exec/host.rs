@@ -66,8 +66,18 @@ impl Probed {
     }
 }
 
+/// The docker CLI the preflight probes launch (#14885): the shared override →
+/// `$PATH` → fallback resolution. Failure is reported as an io `NotFound`
+/// error so the caller's existing not-found arm (exit 127) fires for a
+/// missing docker and a broken explicit override alike.
+fn probe_program() -> Result<std::path::PathBuf> {
+    crate::docker_bin::resolve().map_err(|error| {
+        anyhow::Error::new(std::io::Error::new(std::io::ErrorKind::NotFound, error.to_string()))
+    })
+}
+
 fn probe(args: &[&str], parent: i32) -> Result<Probed> {
-    let mut child = Command::new("docker")
+    let mut child = Command::new(probe_program()?)
         .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -185,7 +195,10 @@ pub(super) fn mount_stale_line(
 /// arguments; `child_env` values are set on this `docker` child only, never in
 /// argv, for the bare `--env NAME` entries that copy them (#13916).
 pub(crate) fn exec_command(args: &HostArgs, id: &str) -> Command {
-    let mut command = Command::new("docker");
+    // Shared lookup (#14885); a resolution failure keeps an unlaunchable
+    // name carrying the reason, so the spawn below fails rather than
+    // falling back to a PATH docker an invalid override forbids.
+    let mut command = Command::new(crate::docker_bin::scoped_or_fail_open(None));
     command.args(["exec", "-i", "--workdir", &args.workdir]);
     for env in &args.env {
         command.args(["--env", env]);
@@ -258,7 +271,7 @@ pub fn run(args: HostArgs) -> Result<i32> {
                 .downcast_ref::<std::io::Error>()
                 .is_some_and(|e| e.kind() == std::io::ErrorKind::NotFound) =>
         {
-            eprintln!("session-exec: 'docker' command not found in PATH");
+            eprintln!("session-exec: docker CLI could not be resolved: {error}");
             return Ok(127);
         }
         Ok(inspect) => preflight(&inspect, &args.workdir),

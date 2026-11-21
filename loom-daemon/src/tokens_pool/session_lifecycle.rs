@@ -779,10 +779,23 @@ pub trait ContainerRunner: session_image::BundleProbe {
 pub struct ProcessContainerRunner;
 
 impl ProcessContainerRunner {
+    /// The docker CLI every capture of this runner launches: the shared
+    /// override → `$PATH` → fallback lookup (#14885), so a daemon started
+    /// with a minimal (launchd-style) `PATH` still reaches Docker Desktop's
+    /// directories.
+    fn docker_program() -> Result<String> {
+        crate::docker_bin::resolve_str()
+            .map_err(|error| anyhow!("docker CLI could not be resolved: {error}"))
+    }
+
     /// Bounded by [`super::docker_cli::timeout_for`] (issue #10453): a hung
     /// Docker daemon fails the call instead of stalling the caller forever.
     fn run_capture(args: &[&str]) -> Result<(bool, String, String)> {
-        super::docker_cli::run_bounded("docker", args, super::docker_cli::timeout_for(args))
+        super::docker_cli::run_bounded(
+            &Self::docker_program()?,
+            args,
+            super::docker_cli::timeout_for(args),
+        )
     }
 
     /// The baseline process set the session image's entrypoint establishes:
@@ -836,8 +849,11 @@ impl session_image::BundleProbe for ProcessContainerRunner {
             "-c",
             script,
         ];
-        let (success, stdout, stderr) =
-            super::docker_cli::run_bounded("docker", &args, super::docker_cli::DOCKER_RUN_TIMEOUT)?;
+        let (success, stdout, stderr) = super::docker_cli::run_bounded(
+            &Self::docker_program()?,
+            &args,
+            super::docker_cli::DOCKER_RUN_TIMEOUT,
+        )?;
         if !success {
             bail!("docker run {image} (bundle probe) failed: {}", stderr.trim());
         }
@@ -1015,18 +1031,21 @@ impl ContainerRunner for ProcessContainerRunner {
     }
 
     fn attach_interactive(&self, container: &str, tmux_session_name: &str) -> Result<i32> {
-        let status = Command::new("docker")
-            .args([
-                "exec",
-                "-it",
-                container,
-                "tmux",
-                "attach",
-                "-t",
-                tmux_session_name,
-            ])
-            .status()
-            .with_context(|| format!("failed to attach to session container {container}"))?;
+        let status = Command::new(
+            Self::docker_program()
+                .with_context(|| format!("failed to attach to session container {container}"))?,
+        )
+        .args([
+            "exec",
+            "-it",
+            container,
+            "tmux",
+            "attach",
+            "-t",
+            tmux_session_name,
+        ])
+        .status()
+        .with_context(|| format!("failed to attach to session container {container}"))?;
         Ok(status.code().unwrap_or(-1))
     }
 
@@ -1036,7 +1055,21 @@ impl ContainerRunner for ProcessContainerRunner {
         argv: &[&str],
         timeout: Duration,
     ) -> Result<ExecOutput> {
-        let mut command = Command::new("docker");
+        let mut command = Command::new(match Self::docker_program() {
+            Ok(program) => program,
+            // Same contract as the spawn's old NotFound arm: unresolvable
+            // means unavailable, an ordinary failed probe — never a
+            // fall-through to a PATH docker an invalid override forbids.
+            Err(error) => {
+                return Ok(ExecOutput {
+                    success: false,
+                    unavailable: true,
+                    timed_out: false,
+                    exit_code: None,
+                    output: format!("docker CLI could not be resolved: {error}"),
+                });
+            }
+        });
         command
             .arg("exec")
             .arg(container)

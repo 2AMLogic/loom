@@ -177,6 +177,115 @@ fn session_start_and_shell_parse_mount_workspace_without_panicking() {
     }
 }
 
+/// Issue #14885: the daemon resolves the docker CLI through
+/// `LOOM_DOCKER_BIN` → `$PATH` → absolute fallback directories, so a caller
+/// started with a launchd-style minimal `PATH` (llm-monitor's menubar app,
+/// any launchd/systemd login item) still reaches a Docker installed in a
+/// fallback directory. Before the shared lookup every bare
+/// `Command::new("docker")` failed with not-found and each session-managed
+/// account read `unknown` / `session_probe_error` within milliseconds.
+///
+/// Determinism on hosts with Docker installed (the issue's test plan): the
+/// child gets a `$PATH` naming one empty directory and a `$HOME` of the
+/// fixture's own, whose `~/.docker/bin` the fallback order searches before
+/// `/usr/bin`. A docker in `/usr/local/bin` or `/opt/homebrew/bin` (a Docker
+/// Desktop mac) would precede the fake in the order, so those hosts skip
+/// rather than probe their real engine.
+#[cfg(unix)]
+#[test]
+fn accounts_check_live_measures_sessions_through_a_fallback_docker() {
+    use std::os::unix::fs::PermissionsExt;
+    use std::process::Command;
+
+    for precedes in ["/usr/local/bin/docker", "/opt/homebrew/bin/docker"] {
+        if std::path::Path::new(precedes).exists() {
+            eprintln!(
+                "skipping: host docker at {precedes} precedes the fake in the fallback order"
+            );
+            return;
+        }
+    }
+
+    let fixture = tempfile::tempdir().unwrap();
+    let home = fixture.path().join("home");
+    let empty_path = fixture.path().join("empty-path");
+    let workspace = fixture.path().join("workspace");
+    let profiles = fixture.path().join("profiles");
+    for dir in [
+        home.join(".docker/bin"),
+        empty_path.clone(),
+        workspace.join(".loom"),
+        profiles.join("alice"),
+    ] {
+        std::fs::create_dir_all(dir).unwrap();
+    }
+
+    std::fs::write(
+        workspace.join(".loom/accounts.json"),
+        r#"{"version":1,"accounts":[{"provider":"codex","name":"alice","credential_kind":"codex_home","credential_reference":"alice","enabled":true}]}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        profiles.join("alice/.session-managed.json"),
+        r#"{"schema_version":1,"container_name":"loom-codex-session-alice","adopted_at_unix":0}"#,
+    )
+    .unwrap();
+
+    // The fake docker records each subcommand, then answers `inspect` with a
+    // running container (the tab-separated `--format` line
+    // parse_inspect_line reads) and `exec` with the app-server replies
+    // codex_probe parses: account known, 23% of a 300-minute (5h) window.
+    let calls = fixture.path().join("docker-calls");
+    let docker = home.join(".docker/bin/docker");
+    let script = format!(
+        "#!/bin/sh\necho \"$1\" >> '{calls}'\ncase \"$1\" in\n  \
+         inspect) printf 'abc123\\ttrue\\tfalse\\t2026-11-21T00:00:00Z\\tsession-image:1\\t\\t\\n' ;;\n  \
+         exec) printf '{{\"id\":2,\"result\":{{\"account\":{{\"id\":\"alice\"}}}}}}\\n{{\"id\":3,\"result\":{{\"rateLimits\":{{\"primary\":{{\"usedPercent\":23.0,\"windowDurationMins\":300,\"resetsAt\":4851000000}},\"secondary\":null}}}}}}\\n' ;;\n  \
+         *) exit 0 ;;\nesac\n",
+        calls = calls.display()
+    );
+    std::fs::write(&docker, script).unwrap();
+    std::fs::set_permissions(&docker, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_loom-daemon"))
+        .args([
+            "accounts",
+            "--workspace",
+            workspace.to_str().unwrap(),
+            "check",
+            "--provider",
+            "codex",
+            "--live",
+            "--json",
+        ])
+        .env("LOOM_CODEX_PROFILE_ROOT", &profiles)
+        .env("HOME", &home)
+        .env("PATH", &empty_path)
+        .output()
+        .unwrap();
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert_eq!(output.status.code(), Some(0), "stdout: {stdout}");
+    // In --json mode the command's stdout is the JSON document alone (probe
+    // progress, if any, goes to stderr).
+    let report: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    let account = &report["report"]["accounts"][0];
+    assert_eq!(account["name"], "alice", "{account}");
+    assert_eq!(account["status"], "available", "{account}");
+    let utilization = account["5h_utilization"]
+        .as_f64()
+        .expect("measured utilization");
+    assert!(
+        (utilization - 0.23).abs() < 1e-9,
+        "the fixture's 23% window reads as 0.23, got {utilization}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&calls).unwrap(),
+        "inspect\nexec\n",
+        "the probe reached the container through inspect then exec"
+    );
+}
+
 // =========================================================================
 // Which registry a verb acts on (issue #8540)
 // =========================================================================

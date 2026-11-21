@@ -110,7 +110,7 @@
 //! or `autonomous.dockerImageRetention.enabled=false`.
 
 use std::collections::BTreeMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
 
@@ -176,9 +176,15 @@ pub const DOCKER_RETENTION_SLOT_WAIT_SECS: u64 = 5;
 
 const DOCKER_RETENTION_SLOT_POLL: Duration = Duration::from_millis(500);
 
-/// docker CLI binary name — overridable only for tests (production always
-/// uses the system `docker`).
-const DOCKER_BIN: &str = "docker";
+/// The docker CLI binary the pass invokes — the shared lookup (#14885):
+/// `LOOM_DOCKER_BIN` override, `$PATH`, then the absolute fallback
+/// directories. A resolution failure yields an unlaunchable path carrying
+/// the reason, so the pass's existing "docker unqueryable" error paths fire
+/// (never a fall-through to a working docker an invalid override forbids).
+fn docker_bin() -> PathBuf {
+    crate::docker_bin::resolve()
+        .unwrap_or_else(|error| PathBuf::from(format!("/nonexistent/docker ({error})")))
+}
 
 /// Inventory stage labels (#14679) — the operation a failed evaluation names
 /// in its one WARN summary. Every stage of [`list_images`] that can fail
@@ -704,7 +710,7 @@ fn failure_detail(out: &std::process::Output) -> String {
 /// "zero images" (the same unknown-!=-zero discipline
 /// [`crate::deep_clean::evaluate`] applies to an unmeasurable `df`).
 pub fn list_images() -> Result<Vec<DockerImageRecord>, DockerInventoryError> {
-    let ids_output = Command::new(DOCKER_BIN)
+    let ids_output = Command::new(docker_bin())
         .args(["image", "ls", "-aq", "--no-trunc"])
         .output()
         .map_err(|e| DockerInventoryError {
@@ -731,7 +737,7 @@ pub fn list_images() -> Result<Vec<DockerImageRecord>, DockerInventoryError> {
 
     let in_use_ids = list_container_image_ids()?;
 
-    let mut cmd = Command::new(DOCKER_BIN);
+    let mut cmd = Command::new(docker_bin());
     cmd.arg("image").arg("inspect");
     cmd.args(&ids);
     let inspect_output = cmd.output().map_err(|e| DockerInventoryError {
@@ -771,7 +777,7 @@ pub fn list_images() -> Result<Vec<DockerImageRecord>, DockerInventoryError> {
 /// `Err` names the failed stage — unknown must never read as "no container
 /// uses it".
 fn list_container_image_ids() -> Result<std::collections::BTreeSet<String>, DockerInventoryError> {
-    let ps = Command::new(DOCKER_BIN)
+    let ps = Command::new(docker_bin())
         .args(["ps", "-aq", "--no-trunc"])
         .output()
         .map_err(|e| DockerInventoryError {
@@ -793,7 +799,7 @@ fn list_container_image_ids() -> Result<std::collections::BTreeSet<String>, Dock
     if containers.is_empty() {
         return Ok(std::collections::BTreeSet::new());
     }
-    let inspect = Command::new(DOCKER_BIN)
+    let inspect = Command::new(docker_bin())
         .args(["inspect", "--format", "{{.Image}}"])
         .args(&containers)
         .output()
@@ -821,7 +827,7 @@ fn list_container_image_ids() -> Result<std::collections::BTreeSet<String>, Dock
 /// container) is logged and treated as a soft per-image failure, not fatal to
 /// the rest of the pass.
 pub fn remove_image(id: &str) -> bool {
-    match Command::new(DOCKER_BIN).args(["rmi", id]).output() {
+    match Command::new(docker_bin()).args(["rmi", id]).output() {
         Ok(out) if out.status.success() => true,
         Ok(out) => {
             log::warn!(

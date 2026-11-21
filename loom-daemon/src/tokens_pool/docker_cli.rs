@@ -157,7 +157,11 @@ fn run_bounded_env_with(
 /// # Errors
 /// When Docker cannot be asked, or the pull fails or times out.
 pub fn ensure_image_for_operator(image: &str) -> Result<()> {
-    ensure_image_with("docker", image, &operator_interrupt::pending, DOCKER_PULL_TIMEOUT)
+    // Shared lookup (#14885): override → `$PATH` → fallback directories, so
+    // an operator command started with a minimal PATH still finds Docker.
+    let program = crate::docker_bin::resolve_str()
+        .map_err(|error| anyhow!("docker CLI could not be resolved: {error}"))?;
+    ensure_image_with(&program, image, &operator_interrupt::pending, DOCKER_PULL_TIMEOUT)
 }
 
 pub(crate) fn ensure_image_with(
