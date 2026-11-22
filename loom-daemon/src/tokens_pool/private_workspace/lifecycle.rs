@@ -4,6 +4,74 @@ use super::super::session_lifecycle::{
 };
 use super::*;
 
+/// An unattended registration found the recorded seat absent. Only a fresh
+/// observation of that same seat can make its binding retry early.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) struct ConfiguredSeatMissing {
+    account: String,
+    profile: PathBuf,
+    container: String,
+    engine: String,
+    volume: String,
+}
+
+impl ConfiguredSeatMissing {
+    pub(crate) fn of(config: &Config) -> Self {
+        Self {
+            account: config.account.clone(),
+            profile: config.profile.clone(),
+            container: config.container.clone(),
+            engine: config.engine.clone(),
+            volume: config.volume.clone(),
+        }
+    }
+
+    pub(crate) fn observe(
+        &self,
+        account: &super::super::account_registry::AccountDescriptor,
+        snapshot: &super::super::session_state::BindingSnapshot,
+    ) -> BindingReadiness {
+        use super::super::session_state::container_running;
+
+        if self.account != account.id.name
+            || account.credential_reference.canonicalize().ok().as_ref() != Some(&self.profile)
+        {
+            return BindingReadiness::Unverified;
+        }
+        let Some(current) = registrations(&self.profile).filter(|config| Self::of(config) == *self)
+        else {
+            return BindingReadiness::Unverified;
+        };
+        match snapshot.listed(&self.engine, &self.container) {
+            Some(false) => return BindingReadiness::Missing,
+            Some(true) => {}
+            None => return BindingReadiness::Unverified,
+        }
+        let Some(inspection) = snapshot.snapshot.inspect_of(&self.container) else {
+            return BindingReadiness::Unverified;
+        };
+        let state = &inspection["State"];
+        if !state["Running"].is_boolean()
+            || !state["Restarting"].is_boolean()
+            || docker::validate_settings(&current, inspection).is_err()
+        {
+            BindingReadiness::Unverified
+        } else if container_running(inspection) {
+            BindingReadiness::Ready
+        } else {
+            BindingReadiness::Missing
+        }
+    }
+}
+
+impl std::fmt::Display for ConfiguredSeatMissing {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("private session container is missing; refusing to recreate it with a default image (the reconcile recovery restores it with the recorded one)")
+    }
+}
+
+impl std::error::Error for ConfiguredSeatMissing {}
+
 pub fn configured(workspace: &Path, name: &str) -> Result<bool> {
     let account = account(workspace, name)?;
     Ok(state_dir(&account.credential_reference)?
@@ -211,19 +279,7 @@ fn start_with(
         register(workspace, &mut existing, &repository, base)?;
         existing
     } else {
-        let gh_config = std::env::var_os("GH_CONFIG_DIR")
-            .map(PathBuf::from)
-            .or_else(|| dirs::home_dir().map(|home| home.join(".config/gh")))
-            .filter(|path| path.is_dir())
-            .map(|path| path.canonicalize())
-            .transpose()?;
-        if let Some(path) = &gh_config {
-            for parent in path.ancestors() {
-                if parent.join(".git").exists() {
-                    bail!("forge credentials must be outside every repository/worktree");
-                }
-            }
-        }
+        let gh_config = resolve_gh_config(workspace)?;
         Config {
             schema_version: 1,
             account: account.id.name.clone(),
@@ -260,7 +316,7 @@ fn start_with(
         }
         check_hold()?;
         if existed && state.is_none() {
-            bail!("private session container is missing; refusing to recreate it with a default image (the reconcile recovery restores it with the recorded one)");
+            return Err(ConfiguredSeatMissing::of(&config).into());
         }
     }
     // The image and read-only mounts a NEW container gets are decided here,
@@ -329,7 +385,87 @@ fn start_with(
     // session whose guard code lives in worker-writable paths (issue #8839).
     docker::setup(&config)?;
     docker::control(&config, id)?;
+    // Host mirrors (#14680): populate and refresh the per-repository object
+    // stores from origin under a proved read authority. Deliberately last
+    // and never a gate — a mirror that cannot be proved or fetched leaves
+    // the session and its private clones exactly as they were.
+    mirror::refresh_session_mirrors(workspace, &config);
     snapshot(config, &dir)
+}
+
+/// The forge configuration directory a NEW private workspace records and
+/// binds read-only at [`GH_CONFIG`], or `None` when none may be mounted.
+///
+/// The daemon-owned GitHub App directories under the workspace root's own
+/// `.loom/` are deliberately not recorded ([`daemon_owned_gh_config`]): an
+/// App-only host delivers its installation token per exec as `GH_TOKEN`
+/// (`forge_auth`, #13916), so binding the directory would only re-expose
+/// the credential inside the seat — and it lives inside the daemon's own
+/// checkout, which the ancestor check below rightly refuses. Before #14744
+/// that refusal kept unattended `session_reconcile` from ever creating a
+/// seat on an App-only host, because the daemon activates that directory
+/// as its process-global `GH_CONFIG_DIR` at startup. Every other directory
+/// at or under a git checkout keeps the refusal.
+fn resolve_gh_config(workspace: &Path) -> Result<Option<PathBuf>> {
+    resolve_gh_config_with(
+        workspace,
+        std::env::var_os("GH_CONFIG_DIR"),
+        dirs::home_dir().map(|home| home.join(".config/gh")),
+        crate::credential_preflight::primary_workspace_root(),
+    )
+}
+
+/// [`resolve_gh_config`] over an injected `GH_CONFIG_DIR` value and
+/// home-default directory (tests): the same resolution and the same
+/// ancestor refusal for every directory the daemon does not own.
+pub(super) fn resolve_gh_config_with(
+    workspace: &Path,
+    gh_config_dir: Option<std::ffi::OsString>,
+    home_default: Option<PathBuf>,
+    primary_root: Option<PathBuf>,
+) -> Result<Option<PathBuf>> {
+    let resolved = gh_config_dir
+        .map(PathBuf::from)
+        .or(home_default)
+        .filter(|path| path.is_dir())
+        .map(|path| path.canonicalize())
+        .transpose()?
+        .filter(|path| !daemon_owned_gh_config(workspace, primary_root.as_deref(), path));
+    if let Some(path) = &resolved {
+        for parent in path.ancestors() {
+            if parent.join(".git").exists() {
+                bail!("forge credentials must be outside every repository/worktree");
+            }
+        }
+    }
+    Ok(resolved)
+}
+
+/// `true` when `path` (already canonicalized) is one of the daemon-owned
+/// GitHub App credential directories: the process-global `GH_CONFIG_DIR` the
+/// daemon activates at startup
+/// ([`crate::credential_preflight::github_app_gh_config_dir`]) or a per-owner
+/// sibling ([`github_app_gh_config_dir_for_owner`]), under either the daemon's
+/// primary workspace root (the credential owner: startup config belongs to it,
+/// whichever registered checkout acts) or the acting `workspace`.
+///
+/// Both sides are compared canonicalized: `path` already is, so each expected
+/// location is canonicalized too (an aliased `.loom` or `gh-config` resolves
+/// to the same place). A root that cannot be resolved owns nothing, so the
+/// caller's refusal stands.
+fn daemon_owned_gh_config(workspace: &Path, primary_root: Option<&Path>, path: &Path) -> bool {
+    std::iter::once(workspace)
+        .chain(primary_root)
+        .filter_map(|root| root.canonicalize().ok())
+        .any(|root| {
+            let canon = |p: PathBuf| p.canonicalize().unwrap_or(p);
+            if path == canon(crate::credential_preflight::github_app_gh_config_dir(&root)) {
+                return true;
+            }
+            let owners = canon(root.join(".loom").join("gh-config-by-owner"));
+            path.strip_prefix(&owners)
+                .is_ok_and(|rest| rest.components().count() == 1)
+        })
 }
 
 /// Unattended recovery of an already-configured private session whose
@@ -869,4 +1005,77 @@ pub fn run_job(workspace: &Path, args: JobArgs) -> Result<i32> {
     }
     lease.finish()?;
     Ok(code)
+}
+
+/// The leased seat maintenance pass (#14678): the periodic, all-clones idle
+/// counterpart of [`run_job`]'s admission. Same exclusive account lease and
+/// the same containment + running-and-idle proof, but **no job and no
+/// `docker::prepare_target`** — preparation runs `clean_worktrees`, which
+/// refuses a dirty worktree, while this pass must reach a dirty seat's
+/// scratch and report its dirty worktrees as preserved instead of stopping.
+///
+/// Every seat is independent: a busy, stopped or non-idle seat is skipped
+/// with a reason (a retry is the next pass's job, not a failure), never
+/// holding up the others. `.identity` records and the no-alternates /
+/// private-clone invariants are untouched — the in-container verb only ever
+/// removes step scratch and clean, published, merged-past-grace worktrees.
+pub fn seat_reclaim(
+    workspace: &Path,
+    max_age_secs: i64,
+    grace_secs: i64,
+) -> Vec<(String, Result<super::seat_reclaim::SeatReclaimOutcome, String>)> {
+    use super::super::account_registry::{account_inventory, AccountProvider};
+
+    let mut out = Vec::new();
+    let Ok(accounts) = account_inventory(workspace, AccountProvider::Codex) else {
+        return out;
+    };
+    for descriptor in accounts {
+        let name = descriptor.id.name.clone();
+        // A tolerant read: an account without a private workspace is not a
+        // seat, and one whose state cannot be read is skipped below by name.
+        let Some(config) = registrations(&descriptor.credential_reference) else {
+            continue;
+        };
+        out.push((name, seat_reclaim_one(workspace, &config, max_age_secs, grace_secs)));
+    }
+    out
+}
+
+/// One seat's pass; every early return is a skip reason, not an error worth
+/// failing the host pass over.
+fn seat_reclaim_one(
+    workspace: &Path,
+    config: &Config,
+    max_age_secs: i64,
+    grace_secs: i64,
+) -> Result<super::seat_reclaim::SeatReclaimOutcome, String> {
+    let dir = state_dir(&config.profile).map_err(|e| e.to_string())?;
+    let lease = lease::Lease::acquire(&dir).map_err(|error| {
+        if error.downcast_ref::<AccountBusy>().is_some() {
+            "seat busy; a job holds the account lease (retry next pass)".to_owned()
+        } else {
+            error.to_string()
+        }
+    })?;
+    let state = docker::inspect(&config.container)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| "session is stopped; nothing to reclaim this pass".to_owned())?;
+    docker::validate(config, &state).map_err(|e| e.to_string())?;
+    lease
+        .recover(config, Some(&state))
+        .map_err(|e| e.to_string())?;
+    if state["State"]["Running"] != true
+        || !docker::idle(Some(&state), &config.container).map_err(|e| e.to_string())?
+    {
+        return Err("seat is not running and idle; retry next pass".into());
+    }
+    if state["Id"].as_str().is_none() {
+        return Err("container id unavailable".into());
+    }
+    // The credential scope of the account's primary repository, the same
+    // context `recover` execs under: the verb's PR probes need a forge
+    // identity, and the scope never widens past the account's own remotes.
+    let auth = forge_auth::ExecAuth::resolve(workspace, &config.repository);
+    docker::seat_reclaim(config, max_age_secs, grace_secs, &auth).map_err(|e| e.to_string())
 }

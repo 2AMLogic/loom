@@ -836,6 +836,14 @@ pub enum Commands {
         action: ForgeAction,
     },
 
+    /// Read-only ratification-lane inspection (#14834): `ratification-lane
+    /// status <PR>` names the effective ee/market key markers for a PR's
+    /// current head and flags superseded duplicates.
+    RatificationLane {
+        #[command(subcommand)]
+        action: super::ratification_lane_cmd::Action,
+    },
+
     /// Shadow-mode Jev (TypeSafe) pre-score for Champion's PR auto-merge
     /// the `merge-risk` criterion (issue #8545) — read-only telemetry, never a merge
     /// decision. Prints a JSON object with four calibrated
@@ -901,8 +909,7 @@ pub enum Commands {
     /// Token-cost telemetry: `usage` (live, from the Anthropic OAuth API) and
     /// `ingest-transcripts` (#8059 — persist transcript token usage into
     /// `activity.db`). Flattened, so each stays top-level; the args and their
-    /// docs live in `super::telemetry` because this file is frozen by the
-    /// file-size ratchet.
+    /// docs live in `super::telemetry`.
     #[command(flatten)]
     Telemetry(super::telemetry::TelemetryCommand),
 
@@ -947,8 +954,7 @@ pub enum Commands {
     },
 
     /// Subcommands backing a retired shell script (epic #7810). Flattened, so
-    /// each is top-level; the args and their docs live in `super::script_ports`
-    /// because this file is frozen by the file-size ratchet.
+    /// each is top-level; the args and their docs live in `super::script_ports`.
     #[command(flatten)]
     ScriptPorts(super::script_ports::ScriptPortCommand),
     Labels(super::labels_cmd::LabelsArgs),
@@ -958,23 +964,20 @@ pub enum Commands {
     /// shapes a textual conflict-merge union produces. GitHub rejects such a
     /// file at validation with zero jobs, so its gate vanishes while every
     /// rollup reads green. Exit 0 clean, non-zero on any defect (fail closed).
-    /// Args live in `crate::workflow_lint` because this file is frozen by the
-    /// file-size ratchet.
+    /// Args live in `crate::workflow_lint`.
     WorkflowLint(crate::workflow_lint::WorkflowLintArgs),
 
     /// Historical replay of scheduling predictions vs eventual PRs (#9785):
     /// `overlap-replay validate | outcomes | score`. Nested (not flattened)
     /// so the verb names cannot collide with existing top-level commands;
-    /// args live in `super::overlap_replay` because this file is frozen by the
-    /// ratchet.
+    /// args live in `super::overlap_replay`.
     OverlapReplay {
         #[command(subcommand)]
         action: super::overlap_replay::OverlapReplayCommand,
     },
 
     /// Lease the liveness of a `loom:building` claim (#8193). The args and
-    /// their docs live in `super::lease_ensure` because this file is frozen by
-    /// the file-size ratchet.
+    /// their docs live in `super::lease_ensure`.
     Lease {
         #[command(subcommand)]
         action: super::lease_ensure::LeaseCommand,
@@ -1052,8 +1055,7 @@ pub enum Commands {
     /// SUPERSET of that summary.
     //
     // The flag set and the `summary` sub-verb live in
-    // `super::sweep_outcomes_cli`, not here: `main.rs` is over the file-size
-    // ratchet's threshold (`scripts/check-file-size-budget.sh`), so new CLI
+    // `super::sweep_outcomes_cli`, not here: new CLI
     // surface goes in a sibling module behind a one-line dispatch arm. A
     // `#[derive(Args)]` struct parses identically to an inline variant body.
     SweepOutcomes(super::sweep_outcomes_cli::SweepOutcomesArgs),
@@ -2481,6 +2483,7 @@ pub async fn handle_cli_command(command: Commands) -> Result<()> {
             verbose,
         } => handle_recover_orphans_command(&workspace, recover, json, verbose),
         Commands::Forge { action } => handle_forge_command(action),
+        Commands::RatificationLane { action } => super::ratification_lane_cmd::handle(action),
         Commands::Status(_) => {
             // Routed directly in `main()` (it needs the async runtime for the
             // socket round-trip), never dispatched through this sync handler.

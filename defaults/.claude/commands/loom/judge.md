@@ -437,7 +437,7 @@ Full policy, TTL/invalidation semantics, and the manual verification steps:
 0. **Sweep stale verdicts first**: run the Stale-Verdict Sweep (see below) over the open `loom:pr` / `loom:changes-requested` PRs. Any PR it re-queues joins step 1's queue on this same pass.
 1. **Find work**: `loom-daemon pr-queue --role judge`. Walk its JSON rows in order; `mode=workflow` uses this workflow, `mode=fallback` uses Fallback Queue below. Follow `.loom/docs/pr-planning.md`; skip non-actionable rows and continue. Never change origin or a priority label.
 2. **Claim PR** (run the "Stale `loom:reviewing` Claim Check" below first): PR lease, then the label — `loom-daemon lease pr claim <number> --role judge --watch-pid "${LOOM_AGENT_SESSION_PID:-${CLAUDE_PID:-$PPID}}"; [[ $? =~ ^[02]$ ]] && gh pr edit <number> --add-label "loom:reviewing"`. Any other exit: stand down, touch no worktree (see "PR Lease")
-2b. **CI pre-check (before any checkout or test, #11690)**: CI is the test gate, so read it first: `first="$(loom-daemon forge wait-checks <number> --timeout 20 --settle-red 2>/dev/null | head -n1)"` (`--timeout` is **seconds**, so 20 is a short slice, not minutes; a build taking tens of minutes needs one long wait such as `--timeout 1800`, never a loop of 20 s polls; `--settle-red`: no RED until the run finishes, #12011). `LOOM-CHECKS-TIMEOUT*` / `-HEAD-MOVED*` (pending, including checks queued behind the CI job cap) → "When CI is Pending": no review, no end-state label. `LOOM-CHECKS-RED*` → no code review; "When CI Fails". `GREEN` → continue. `NONE` → continue the review, but no test ever ran — before any approving verdict, run the repo's documented test command on the PR head ("No-Checks PRs" under "How to Check CI Status"). Pending is never red.
+2b. **CI pre-check (before any checkout or test, #11690)**: CI is the test gate, so read it first: `err="$(mktemp)"; first="$(loom-daemon forge wait-checks <number> --timeout 20 --settle-red 2>"$err" | head -n1)"` (`--timeout` is **seconds**, so 20 is a short slice, not minutes; a build taking tens of minutes needs one long wait such as `--timeout 1800`, never a loop of 20 s polls — and that long wait is the attended/manual foreground path only, "Never End Your Turn on a Background CI Monitor"; a daemon step (`step-judge-*` sweep id) hands back via "When CI is Pending" instead; `--settle-red`: no RED until the run finishes, #12011). `LOOM-CHECKS-TIMEOUT*` / `-HEAD-MOVED*` (pending, including checks queued behind the CI job cap) → "When CI is Pending": no review, no end-state label. `LOOM-CHECKS-RED*` → no code review; "When CI Fails". `GREEN` → continue. `NONE` → continue the review, but no test ever ran — before any approving verdict, run the repo's documented test command on the PR head ("No-Checks PRs" under "How to Check CI Status"). Pending is never red.
 3. **Check merge state**: Check for conflicts and attempt automated rebase if DIRTY (see Automated Rebase for DIRTY PRs below)
    ```bash
    # Plain `gh` — merge state is verdict-gating and must be live (see "Cached Forge Reads")
@@ -447,7 +447,7 @@ Full policy, TTL/invalidation semantics, and the manual verification steps:
    fi
    ```
 4. **Understand context** (first capture `REVIEW_STARTED=$(date -u +%Y-%m-%dT%H:%M:%SZ)`, before reading anything — and for each linked issue `N` the hash of the body you read: `ISSUE_HASH_N=$(printf %s "$(gh api repos/<owner>/<repo>/issues/N --jq .body)" | sha256sum | cut -d' ' -f1)` (a hash that keeps jq's trailing newline is accepted too, as is the raw body's own hash with or without that newline); see "Stale-Read Gate" under Verdict SHA Marker): Read PR description and linked issues, and run the "Spec Reconciliation" step below on each `Closes`/`Fixes`/`Resolves`/`Part of`/`Contributes to` reference (current body + trusted comments, not the PR's account of them)
-4b. **Check docs-only fast-path eligibility** (see "Docs-Only Fast Path (WORK_LOG / WORK_PLAN / README, #6134)" below) — if the changed-file list is an exact match against the fast-path allowlist **and the PR has no closing-issue reference** (Step 3 below, #14182 — both conditions are required, and a failed closing-reference read counts as a reference), skip steps 5-7b and the "Evaluation Focus Areas" review entirely; go straight to CI Status Check (step 8), the formal-review reconciliation gate (step 8b — **not** skipped: a docs-only diff can still carry an unresolved formal review, #7647) and the fast-path approval write. Otherwise continue normally.
+4b. **Check docs-only fast-path eligibility** (see "Docs-Only Fast Path (WORK_LOG / WORK_PLAN / README, #6134)" below) — if the changed-file list is an exact match against the fast-path allowlist **and the PR has no closing-issue reference** (Step 3 below, #14182 — both conditions are required, and a failed closing-reference read counts as a reference) **and every WORK_LOG record the diff adds verifies against the base repository** (Step 4 below, #13760 — number, kind and title; a failed diff or target read is not eligible), skip steps 5-7b and the "Evaluation Focus Areas" review entirely; go straight to CI Status Check (step 8), the formal-review reconciliation gate (step 8b — **not** skipped: a docs-only diff can still carry an unresolved formal review, #7647) and the fast-path approval write. Otherwise continue normally.
 5. **Check out code**: Use the existing builder worktree, else `./.loom/scripts/pr-worktree.sh <number>` — never a bare `gh pr checkout` in the main checkout (see "PR Branch Isolation" and Worktree-Aware Code Access below). Capture `REVIEW_HEAD_SHA=$(gh pr view <number> --json headRefOid --jq '.headRefOid')` here — step 11's recheck compares against it, and your verdict marker records it.
 6. **Rebase check**: Verify PR has no merge conflicts with main (see Rebase Check section below)
 7. **Targeted checks only**: read the diff and trust the green CI from step 2b. At most run scoped tests for a specific doubt (Scoped Test Execution below); never the full suite or `buildGate.command`. If the *environment* cannot run a command you need for a verdict, see "Environment Gap: Cannot Verify Here" below
@@ -1387,13 +1387,17 @@ read via ETag, so it is live too.) See "Cached Forge Reads" for the full policy.
 
 ### How to Check CI Status
 
-**Step 1: Snapshot all PR checks** (`--timeout 0` would read a no-checks repo as `TIMEOUT`)
+**Step 1: Snapshot all PR checks.** Reuse step 2b's result for the same head if
+you have it. Otherwise take the bounded snapshot below. `--timeout 0` would
+read a no-checks repo as `TIMEOUT`.
 
 ```bash
-loom-daemon forge wait-checks <PR_NUMBER> --timeout 20   # seconds
+err="$(mktemp)"; first="$(loom-daemon forge wait-checks <PR_NUMBER> --timeout 20 --settle-red 2>"$err" | head -n1)"
 ```
 
-Branch on the first stdout line:
+Branch on the first stdout line. Treat a snapshot stamped for a different
+head as `LOOM-CHECKS-HEAD-MOVED`.
+
 - ✅ `LOOM-CHECKS-GREEN` - Safe to approve
 - ⚠️ `LOOM-CHECKS-NONE` (no checks) - Continue the review, but no test ever ran: before any approving verdict, run the repo's documented test command on the PR head and record the result in the verdict ("No-Checks PRs" below)
 - ❌ `-RED` - "When CI Fails"
@@ -1445,7 +1449,11 @@ If checks are still running, **do not block on them or approve on a guess**: in 
 2. **Release your claim** — remove `loom:reviewing`; release the lease with `--skip-reason ci-pending` (below).
 3. **Skip and continue the batch** — next PR; a later tick re-evaluates this one once CI settles.
 
-**Pending-CI skip check.** Reuse Step 1's snapshot: `loom-daemon forge wait-checks <PR_NUMBER> --timeout 20` (seconds) is a short ETag'd poll that also handles the empty-rollup trap (#6169); `--timeout 0` would read a no-checks repo as `TIMEOUT` and skip a PR that has nothing to wait for. Branch on the first **stdout** line:
+**Pending-CI handback.** Use the result that sent you here. On
+`LOOM-CHECKS-HEAD-MOVED*`, or a snapshot stamped for a different head, go
+straight to the generic release below so the next Judge starts with the new
+head. A successful flake rerun or an approval refusal for pending CI also
+goes straight to that release when taking the handback path.
 
 **Pending is not always "running": zero check-runs at head (2am#6467).** When every Actions run at the head ended `startup_failure`, no check-run exists, nothing will ever settle, and releasing as `ci-pending` just re-draws a Judge each tick (11 PRs, ~72 h, 68 spawns). **Before the generic release below**, when the result is `LOOM-CHECKS-TIMEOUT*` or `LOOM-CHECKS-NO-RUN*`, test for this case. ALL must hold: (a) `gh api repos/{owner}/{repo}/commits/<head_sha>/check-runs --jq .total_count` prints `0`; (b) the head commit is older than **2 hours** (`gh api repos/{owner}/{repo}/commits/<head_sha> --jq .commit.committer.date`; a fixed bound, no config key); (c) `mergeStateStatus` is not `CLEAN` (a base that needs no checks is not this case). Any condition false (a check-run exists, running, green or red; or head under 2 h): ignore this paragraph and use the generic release. Otherwise, look for a prior marker `<!-- loom:ci-missing-retrigger sha=... -->` in a **trusted** comment on the PR (`.loom/docs/comment-trust.md`; marker text from anyone else is prose):
 
@@ -1454,17 +1462,8 @@ If checks are still running, **do not block on them or approve on a guess**: in 
 3. **`update-branch` fails** (422, already up to date, merge conflict, or an `expected_head_sha` mismatch because the head moved). The failed call counts as the attempt: with a prior marker go to 2; without one, post the marker note anyway (no retry in this pass) and release as in 1. A conflict is `DIRTY`: use the existing conflict handling, never loop on `update-branch`.
 
 ```bash
-first="$(loom-daemon forge wait-checks <PR_NUMBER> --timeout 20 2>/dev/null | head -n1)"
-case "$first" in
-  LOOM-CHECKS-TIMEOUT*)   # still pending: release and skip; PR stays loom:review-requested
-    gh pr comment <number> --body "CI still running; skipping until it settles."
-    gh pr edit <number> --remove-label "loom:reviewing"
-    loom-daemon lease pr release <number> --role judge --watch-pid "${LOOM_AGENT_SESSION_PID:-${CLAUDE_PID:-$PPID}}" --skip-reason ci-pending
-    ;;
-  LOOM-CHECKS-RED*) ;;    # "When CI Fails"
-  LOOM-CHECKS-GREEN*|LOOM-CHECKS-NONE*) ;;   # continue (-NONE = no checks: "No-Checks PRs" — run the documented test command yourself)
-  *) gh pr checks <PR_NUMBER> ;;   # no sentinel (older binary / Gitea): one snapshot, no loop
-esac
+gh pr edit <number> --remove-label "loom:reviewing"
+loom-daemon lease pr release <number> --role judge --watch-pid "${LOOM_AGENT_SESSION_PID:-${CLAUDE_PID:-$PPID}}" --skip-reason ci-pending
 ```
 
 ### CRITICAL: Never End Your Turn on a Background CI Monitor
@@ -1473,22 +1472,28 @@ esac
 
 This mirrors `sweep.md`'s guardrail ("ending your turn IS the kill signal", #4257). In a headless `claude -p` sweep ending the turn **terminates the process**: the monitor dies with it, no verdict is issued, and the PR stays claimed (`loom:reviewing`) with nobody to release it (#4883).
 
+**A daemon step never waits out CI (#14804).** If your `$LOOM_SWEEP_ID` matches `step-judge-<pr>-<epoch>` (the same test as the `LOOM_SWEEP_ID` rule under Label Workflow), you are a daemon step judging exactly one PR inside a step budget (30 min, `daemon-reference.md`) that a slow repo's CI can outlive — the `--timeout 1800` foreground wait in path 2 would be killed mid-wait with no verdict. Take **one bounded snapshot** — `loom-daemon forge wait-checks <PR_NUMBER> --timeout 20 --settle-red` — and on `LOOM-CHECKS-TIMEOUT*` / `-HEAD-MOVED*`, follow "When CI is Pending" above: release `loom:reviewing`, release the lease with `--skip-reason ci-pending`, and end with `LOOM_STEP_OUTCOME role=judge target=<n> class=noop reason=ci_pending` (a `noop` that does not count toward the repeat cap). Path 1 is your path, always.
+
 **There are exactly two safe paths when CI is pending and you cannot approve on a guess:**
 
-1. **Batch mode (there is a next PR to move to): skip and continue.** Use the "When CI is Pending" procedure above — release `loom:reviewing`, leave `loom:review-requested` in place, move on to the next PR. This is not a fallback of last resort; it is the correct default whenever a next PR exists, because a later tick re-evaluates this one.
-2. **Single-PR / manual invocation (there is no next PR — you were dispatched to judge exactly this one PR and a verdict is expected before your turn ends): wait in the foreground.** Run `loom-daemon forge wait-checks` **inside this same turn** (bounded by `--timeout`; it also handles the empty-rollup trap, #6169). It returns control before you write your final message; nothing about it depends on a future turn. Branch on the first **stdout** line, never the exit code; keep stderr separate (RED detail).
+1. **Hand back (a daemon step always; batch mode whenever a next PR exists): skip and continue.** Use the "When CI is Pending" procedure above — release `loom:reviewing`, leave `loom:review-requested` in place, move on to the next PR if one remains (a daemon step judges exactly one PR, so none remains: end with the `ci_pending` outcome line above). This is not a fallback of last resort; it is the correct default whenever a next PR exists, because a later tick re-evaluates this one.
+2. **Attended / manual single-PR invocation (no `step-judge-*` sweep id — an operator ran `/loom:judge <n>` in a terminal and expects a settled verdict before your turn ends): wait in the foreground.** Run `loom-daemon forge wait-checks` **inside this same turn** (bounded by `--timeout`; it also handles the empty-rollup trap, #6169). It returns control before you write your final message; nothing about it depends on a future turn. Branch on the first **stdout** line, never the exit code; keep stderr separate (RED detail).
 
 ```bash
 err="$(mktemp)"; out="$(loom-daemon forge wait-checks <PR_NUMBER> --timeout 1800 --settle-red 2>"$err")"; first="${out%%$'\n'*}"
 case "$first" in
   LOOM-CHECKS-GREEN*|LOOM-CHECKS-NONE*) ;;   # settled green (-NONE = no checks: "No-Checks PRs" — run the documented test command yourself)
   LOOM-CHECKS-RED*) cat "$err" ;;            # <name>\t<url>\t<run_id>; "When CI Fails"
-  LOOM-CHECKS-TIMEOUT*|LOOM-CHECKS-HEAD-MOVED*|LOOM-CHECKS-ERROR*) ;;   # unsettled: conditional verdict below
+  LOOM-CHECKS-HEAD-MOVED*) ;;   # hand back for review of the new head
+  LOOM-CHECKS-TIMEOUT*|LOOM-CHECKS-ERROR*) ;;   # unsettled: hand back as described below
   *) gh pr checks <PR_NUMBER> ;;             # no sentinel (older binary / Gitea): one snapshot, no loop
 esac
 ```
 
-**If the cap is reached and CI is still pending, do not extend the wait and do not reach for a background watcher instead.** Post a conditional-verdict comment stating plainly that the code review passed but CI had not settled after the bounded wait, then — since there is no batch to hand this off to — release `loom:reviewing` and leave `loom:review-requested` in place, exactly as the skip-and-continue path does, so a later Judge invocation (the next cron tick, or a fresh manual dispatch) can re-evaluate once CI has settled.
+**Hand back when the head moves or the bounded wait ends with CI still
+pending.** If you report the result in a note, include `<!-- loom:judge-note -->`
+and describe any completed code review only for the head it covered. Release
+`loom:reviewing` and leave `loom:review-requested` in place for a later Judge.
 
 **Never substitute an armed `Monitor`/`ScheduleWakeup` timer or a `run_in_background` watcher for either path above.** A timer or background task that is still armed when you end your turn is not "waiting" — in headless `-p` mode it is simply killed along with the process, and the PR is orphaned with a stale claim and no verdict. If you have not personally observed the CI result (a CI result you read in this turn), you have not verified it, and you MUST NOT write a final message that implies the verdict is settled or "in progress elsewhere."
 
@@ -1827,13 +1832,159 @@ if [ "$ELIGIBILITY" = "ELIGIBLE" ]; then
 fi
 ```
 
+**Step 4: Verify new WORK_LOG records against the base repository (#13760).**
+The file list answers "what could this diff break?", not "is the content
+true". A Guide backfill once filled one repository's `WORK_LOG.md` with
+another repository's merged history (sg13g2-vco#311: 61 entries above that
+repo's highest number, verbatim titles from a sibling repo), and this fast
+path approved it — it checked file names, not content. So before a fast-path
+approval, the records the diff **adds** must be verified mechanically against
+the PR's **base repository**, independently of Guide's own provenance gate,
+its receipts, or anything the PR body claims:
+
+```bash
+# #13760: verify the canonical WORK_LOG records a docs-only diff ADDS against
+# the PR's base repository before the fast path may approve it. Echoes
+# "ELIGIBLE" when the diff adds no new canonical records (a WORK_PLAN/README
+# or WORK_PLAN-only change, or an exact archive rotation — every added record
+# is matched by an identical removal in the same diff, so a move to a monthly
+# archive is not "new") or when every added record checks out: the number
+# exists in the base repository, with the recorded kind (PR vs issue), in the
+# right state (a PR merged, an issue closed), under exactly the recorded
+# title. Any foreign/missing/wrong-kind/wrong-state/mismatched or unreadable
+# record echoes "NOT ELIGIBLE: <reason>" naming it — the caller must then take
+# the normal review flow and report the reason. Distinct numbers are READ once
+# each, but every record is VERIFIED: a repeated number's later records (a
+# duplicate with a different title or kind included) are checked against the
+# cached fetch, not skipped; bullets outside WORK_LOG.md and its monthly
+# archives (WORK_PLAN/README prose, `- **#N**: …` backlog rows included) and
+# anything not a canonical `- **PR #N**` / `- **Issue #N**` bullet are never
+# read.
+docs_only_fast_path_worklog_check() {
+  # $1 = PR number. The target is the PR's BASE repository (read from the
+  # forge, never the cwd's remote and never a receipt); the additions are the
+  # exact reviewed base..head diff (never Guide's own account of them).
+  local pr="$1" out raw line body mid num stated kind rest got got_title got_is_pr got_state got_merged
+  local -A fetched=()
+  local -a new_records=()
+  if ! out=$(gh pr view "$pr" --json baseRepository --jq '.baseRepository.nameWithOwner' 2>/dev/null) || [ -z "$out" ]; then
+    echo "NOT ELIGIBLE: base repository read failed"
+    return 0
+  fi
+  local repo="$out"
+  if ! raw=$(gh pr diff --repo "$repo" "$pr" 2>/dev/null); then
+    echo "NOT ELIGIBLE: PR diff read failed"
+    return 0
+  fi
+  # Added canonical records: `+`-prefixed `- **PR/Issue ...` bullet lines,
+  # collected ONLY from WORK_LOG.md and its monthly archives — a
+  # WORK_PLAN/README bullet (`- **#N**: …` or any other bold prose) is not a
+  # WORK_LOG record and must not be read as one (AC 3: WORK_PLAN/README-only
+  # diffs stay no-ops). Removed ones: `-`-prefixed. A record both added and
+  # removed in the same diff is a move (archive rotation), not a new record.
+  # The current file is tracked from the `diff --git` headers so a
+  # non-WORK_LOG hunk can neither produce a record nor trigger a refusal.
+  local in_worklog=0 added="" removed="" l
+  while IFS= read -r l; do
+    case "$l" in
+      'diff --git '*)
+        case "$l" in
+          *' b/WORK_LOG.md') in_worklog=1 ;;
+          *' b/work_log/WORK_LOG_'*.md) in_worklog=1 ;;
+          *) in_worklog=0 ;;
+        esac
+        continue ;;
+    esac
+    [ "$in_worklog" = 1 ] || continue
+    case "$l" in
+      '+- **'*) added+="${l#+}"$'\n' ;;
+      '-- **'*) removed+="${l#-}"$'\n' ;;
+    esac
+  done < <(printf '%s\n' "$raw")
+  while IFS= read -r line; do
+    [ -z "$line" ] && continue
+    if printf '%s\n' "$removed" | grep -Fxq -- "$line"; then continue; fi
+    new_records+=("$line")
+  done <<<"$added"
+  if [ "${#new_records[@]}" -eq 0 ]; then
+    echo "ELIGIBLE"
+    return 0
+  fi
+  for line in "${new_records[@]}"; do
+    case "$line" in
+      "- **PR "*) kind=pr ;;
+      "- **Issue "*) kind=issue ;;
+      *) echo "NOT ELIGIBLE: unparseable WORK_LOG record: $line"; return 0 ;;
+    esac
+    body="${line#- **}"
+    mid="${body#* }"; mid="${mid%%\*\**}"
+    num="${mid##*\#}"
+    case "$num" in
+      ''|*[!0-9]*) echo "NOT ELIGIBLE: unparseable WORK_LOG record: $line"; return 0 ;;
+    esac
+    stated="${mid%%#*}"; stated="${stated%/}"
+    if [ -n "$stated" ] && [ "$stated" != "$repo" ]; then
+      echo "NOT ELIGIBLE: WORK_LOG record claims repository $stated, not the base $repo: $line"
+      return 0
+    fi
+    # One forge read per DISTINCT number, cached as the fetched tuple; every
+    # record for that number — including a later duplicate with a different
+    # title or kind — is still verified against the cached tuple (#14532).
+    if [ -z "${fetched[$num]:-}" ]; then
+      if ! got=$(gh api "repos/$repo/issues/$num" --jq '"\(.title)\t\(.pull_request != null)\t\(.state)\t\((.pull_request.merged_at != null))"' 2>/dev/null) || [ -z "$got" ]; then
+        echo "NOT ELIGIBLE: WORK_LOG record #$num does not exist in $repo (or the read failed)"
+        return 0
+      fi
+      fetched[$num]="$got"
+    fi
+    got="${fetched[$num]}"
+    IFS=$'\t' read -r got_title got_is_pr got_state got_merged <<<"$got"
+    if [ "$kind" = pr ]; then
+      rest="${body#*\*\*: }"
+      if [ "$got_is_pr" != "true" ]; then
+        echo "NOT ELIGIBLE: WORK_LOG record #$num is not a PR in $repo: $line"
+        return 0
+      fi
+      if [ "$got_merged" != "true" ]; then
+        echo "NOT ELIGIBLE: WORK_LOG record #$num is not a merged PR in $repo (open or closed unmerged): $line"
+        return 0
+      fi
+    else
+      rest="${body#*\*\* }"; rest="${rest#*\(closed\): }"
+      if [ "$got_is_pr" != "false" ]; then
+        echo "NOT ELIGIBLE: WORK_LOG record #$num is not an issue in $repo: $line"
+        return 0
+      fi
+      if [ "$got_state" != "closed" ]; then
+        echo "NOT ELIGIBLE: WORK_LOG record #$num is not a closed issue in $repo: $line"
+        return 0
+      fi
+    fi
+    if [ "$rest" != "$got_title" ]; then
+      echo "NOT ELIGIBLE: WORK_LOG record #$num title mismatch in $repo (record '$rest', forge '$got_title')"
+      return 0
+    fi
+  done
+  echo "ELIGIBLE"
+}
+
+if [ "$ELIGIBILITY" = "ELIGIBLE" ]; then
+  ELIGIBILITY=$(docs_only_fast_path_worklog_check "$PR_NUMBER")
+fi
+```
+
 If `$ELIGIBILITY` is anything other than the literal string `ELIGIBLE`
 (including an empty diff, a diff that mixes an allowlisted file with
 anything else — a source file, a nested README, `.github/workflows/*.yml`,
-`.loom/config.json`, or any other path — or a PR whose body carries a closing
-reference such as `Closes #N`, or whose closing-reference read failed) — **do not use this fast path.**
-Proceed with the normal Primary Queue steps 5-11 (checkout, quality checks,
-test plan execution, full code evaluation).
+`.loom/config.json`, or any other path — a PR whose body carries a closing
+reference such as `Closes #N`, a PR whose closing-reference read failed, or
+a PR whose new WORK_LOG records failed the base-repository verification:
+missing number, wrong kind, wrong state (an unmerged PR or an open issue),
+title mismatch, foreign repository identity, or
+an unreadable diff/target read) — **do not use this fast path.** Report the
+`NOT ELIGIBLE` reason verbatim in the verdict comment, and proceed with the
+normal Primary Queue steps 5-11 (checkout, quality checks, test plan
+execution, full code evaluation).
 
 ### Fast-Path Evaluation Process
 
@@ -1871,6 +2022,10 @@ API, not the PR's stated intent or any marker — to be an exact match against
 The closing-issue set was verified empty via the closing-reference read
 (no closing references, #14182).
 
+Any WORK_LOG records this diff adds were verified against the base
+repository (number, kind, title; moves to monthly archives excluded as
+non-new, #13760).
+
 A diff confined to this exact set needs no full code evaluation (no lint,
 type-check, tests, or functional review apply). All CI checks pass.
 
@@ -1893,6 +2048,13 @@ EOF
 - **No closing links**: a PR that would auto-close any issue on merge is
   ineligible (Step 3), so a free-form generated body cannot close an unrelated
   issue past a review that never reads it. Champion re-checks this itself.
+- **Content is checked, not just shape (#13760)**: WORK_LOG records the diff
+  adds are verified against the base repository (number, kind, title) before
+  approval — the incident this closes was a foreign repo's history carried in
+  through an allowlist-clean, CI-green, content-unread diff. The verification
+  reads the exact reviewed diff and the forge, never Guide's receipts or the
+  PR prose, so a compromised Guide pass cannot launder another repo's history
+  through the fast path.
 - **Narrowly scoped**: the allowlist is three exact root-level filenames — no
   glob, no directory prefix, no "looks like docs" heuristic. A diff that adds
   a fourth file of any kind, anywhere, including another `.md` file, is

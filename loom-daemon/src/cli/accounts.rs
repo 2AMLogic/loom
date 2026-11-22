@@ -430,6 +430,10 @@ fn run_availability_check(
         chrono::Utc::now(),
     )?;
 
+    for diagnostic in &effects.probe_diagnostics {
+        eprintln!("{diagnostic}");
+    }
+
     if report.accounts.is_empty() {
         if json {
             println!(
