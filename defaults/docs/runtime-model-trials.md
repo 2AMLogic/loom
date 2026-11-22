@@ -504,6 +504,16 @@ encode operator decisions and therefore fail *closed* — an unusable lease
 store degrades **open** and the spawn proceeds uncapped: a broken counter
 directory must not become an outage.
 
+A role draw checks the same cap before it picks, and a dispatching role tick
+also **reserves** the slot it picks (#14983): one file under
+`<provider>/.reserved/`, written under the same lock the selection counts
+under. A tick admits several runs of a role before any of them has started,
+and without the hold every one of those draws saw the last slot free. The
+launch's own selection ignores reservations and retires one when it takes its
+lease; a reservation no launch takes stops counting when the daemon that wrote
+it exits or after `LOOM_API_KEY_RESERVATION_STALE_SECS` (default 120). Sweep
+and phase dispatch do not reserve. This store degrades open too.
+
 **Syncing from an external secret source (#8511).** Everything above is a
 *per-host* registry an operator populates by running `add` on that host. That
 does not survive a fleet that is mostly ephemeral cloud workers: a rebuilt Spot
