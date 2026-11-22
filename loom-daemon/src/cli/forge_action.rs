@@ -1087,10 +1087,11 @@ pub(crate) enum ForgeAction {
     /// `forge comment <number> (--body TEXT | --body-file PATH)
     /// [--repo OWNER/REPO] [--pr]` — the #9772 comment chokepoint as a verb:
     /// appends the dashboard link (`loom:dashboard-link`, #9772) and POSTs to
-    /// `repos/<owner>/<repo>/issues/<number>/comments`. A PR IS an issue for
-    /// comments; `--pr` only picks `/pull/N` over `/issues/N` in the link.
-    /// `--repo` defaults to the current checkout's `origin` remote. GitHub
-    /// only, like every daemon comment path (`gh` REST).
+    /// the issue-comments endpoint (`repos/<owner>/<repo>/issues/<number>/
+    /// comments` on GitHub, `api/v1/repos/...` on Gitea #14940). A PR IS an
+    /// issue for comments; `--pr` only picks `/pull/N` over `/issues/N` in
+    /// the link. `--repo` defaults to the repository the write-scope check
+    /// authorizes from the current checkout.
     #[command(name = "comment")]
     Comment {
         /// Issue or PR number to comment on (post path; omit when
@@ -1177,13 +1178,18 @@ pub(crate) fn handle_forge_command(action: ForgeAction) -> Result<()> {
     // #9548: the verbs that write are vetted before they run. `issue`/`pr`
     // pass straight through to `gh`, which would otherwise pick an `upstream`
     // remote over `origin`; the arm/disarm verbs mutate a PR.
+    // #14940: the repository the check authorized is kept — `forge comment`
+    // posts to exactly the target the vetting resolved and approved, which on
+    // Gitea is also the only resolvable one.
+    let mut authorized: Option<String> = None;
     if let Some(repo) = write_target(&action) {
         let cwd = std::env::current_dir()?;
-        if let crate::write_scope::Verdict::Deny(why) =
-            crate::write_scope::may_write_from(&cwd, repo.as_deref())
-        {
-            eprintln!("loom-daemon forge: refusing the write (#9548): {why}");
-            std::process::exit(1);
+        match crate::write_scope::may_write_from(&cwd, repo.as_deref()) {
+            crate::write_scope::Verdict::Allow(nwo) => authorized = Some(nwo),
+            crate::write_scope::Verdict::Deny(why) => {
+                eprintln!("loom-daemon forge: refusing the write (#9548): {why}");
+                std::process::exit(1);
+            }
         }
     }
     let cmd = match action {
@@ -1237,6 +1243,7 @@ pub(crate) fn handle_forge_command(action: ForgeAction) -> Result<()> {
                 body_file,
                 is_pr: pr,
                 patch_created,
+                authorized,
             });
         }
         ForgeAction::TrustedComments {

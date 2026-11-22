@@ -325,8 +325,9 @@ pub(crate) fn classify_gitea_permissions(body: &str) -> Option<Permission> {
 
 /// Split curl's `-o - -w "\n%{http_code}"` output into the response body and
 /// the numeric status. The marker is the *last* newline: a JSON body never
-/// contains a raw one.
-fn split_body_and_status(raw: &str) -> Option<(&str, u16)> {
+/// contains a raw one. Shared with the Gitea comment transport (#14940), so
+/// the two curl callers cannot drift on the convention.
+pub(crate) fn split_body_and_status(raw: &str) -> Option<(&str, u16)> {
     let (body, code) = raw.rsplit_once('\n')?;
     Some((body, code.trim().parse().ok()?))
 }
@@ -353,6 +354,16 @@ pub(crate) struct GiteaProbe {
 }
 
 impl GiteaProbe {
+    /// The Gitea connection a write from `root` carries (#14940): the same
+    /// resolution this probe authenticates with (env overrides, then config),
+    /// so a vetted write uses the instance, repository and credential the
+    /// permission check approved — never a second, differently-resolved one.
+    /// `Err` carries why it could not resolve (no credential, a malformed
+    /// config, …), which the caller fails closed on.
+    pub(crate) fn writer_connection(root: &Path) -> Result<crate::forge_cmd::GiteaConfig, String> {
+        Self::resolve(root)
+    }
+
     /// Resolve the credential writes from `root` will carry. `GITEA_URL`
     /// beats `.loom/config.json`'s `forge.gitea.url`; the token falls back
     /// `GITEA_TOKEN`, then config, then `FORGE_TOKEN` (the generic fallback
