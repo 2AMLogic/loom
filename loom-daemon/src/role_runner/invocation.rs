@@ -234,10 +234,19 @@ impl RoleInvocationRunner for ScriptRoleInvocationRunner {
                 // Issue #14017: resolved against the admitted runtime, so a role that
                 // draws both Claude and Codex can carry a different effort for each
                 // (`roleEfforts.<role>@<runtime>`) and a Codex launch never runs unset.
-                let (effort, effort_source) = resolve_role_runner_effort_for_runtime(
+                // Issue #14963: through the launch form, which drops an *unqualified*
+                // effort the admitted native profile's `allowedEfforts` does not
+                // include — the profile's own effort launches instead of a
+                // `profile_selection` refusal — while a runtime-qualified pin is
+                // forwarded verbatim and keeps its refusal.
+                let (effort, effort_source) = resolve_role_runner_effort_for_launch(
                     &self.workspace_root,
                     role,
                     admission.as_ref().map(|a| a.runtime.as_str()),
+                    admission
+                        .as_ref()
+                        .and_then(|a| a.preference.as_ref())
+                        .and_then(|p| p.model_profile.as_deref()),
                 );
                 // Issue #8056: the launched values, captured for the durable
                 // `role_tick.outcome` record. Set here — after every pre-spawn bail-out
