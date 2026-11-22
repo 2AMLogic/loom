@@ -150,6 +150,7 @@ test-guide-work-log-issue-out-of-order.sh
 test-guide-work-log-issue-pagination.sh
 test-guide-work-log-out-of-order-merge.sh
 test-guide-work-log-pr-pagination.sh
+test-guide-work-log-provenance.sh
 test-guide-work-log-self-loop.sh
 test-guide-work-plan-approved-review-label-fidelity.sh
 test-guide-work-plan-debounce.sh
@@ -208,6 +209,7 @@ test-require-daemon-bin-provenance.sh
 test-resync-installed-agent-skills-guard.sh
 test-resync-installed-agents-hooks.sh
 test-resync-installed-gh-config-guard.sh
+test-resync-installed-gitignore-stub.sh
 test-resync-installed-guard-check.sh
 test-resync-installed-host-optout.sh
 test-resync-installed-labels-block.sh

@@ -79,7 +79,9 @@ pub fn evaluate(
         }
         Some(h) if h != head_sha => {
             return refuse(&format!(
-                "the head moved since Champion's hold (hold-state head={h}, current head={head_sha})."
+                "the head moved since Champion's hold (hold-state head={h}, current head={head_sha}). \
+                 Rerun Champion on this PR so it records its hold notice at the current head, then \
+                 retry `merge-pr.sh {pr} --release-hold`.",
             ));
         }
         Some(_) => {}
@@ -129,7 +131,13 @@ mod tests {
     #[test]
     fn refuses_moved_hold_head() {
         let d = evaluate("5", LBL, &comments("1234567", H, "approved"), H, "alice");
-        assert!(matches!(d, Decision::Refuse(m) if m.contains("since Champion's hold")));
+        assert!(matches!(&d, Decision::Refuse(m) if m.contains("since Champion's hold")));
+        // #14833: the stale-marker refusal names both heads and the recovery
+        // path — rerun Champion so it records the hold at the current head,
+        // then retry. The old refusal printed the SHAs and stopped there,
+        // leaving the operator to strip `loom:blocked` by hand.
+        assert!(matches!(&d, Decision::Refuse(m)
+            if m.contains("1234567") && m.contains(H) && m.contains("Rerun Champion")));
     }
     #[test]
     fn refuses_moved_judge_head() {

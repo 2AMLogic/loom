@@ -77,6 +77,7 @@ ALLOWED_HOST_SUFFIXES=(
   test.com t.com
   github.com githubusercontent.com
   anthropic.com claude.com
+  aistudio.google.com
   # `kimi.com` / `moonshot.ai` are Moonshot AI's public endpoints, added with
   # the Kimi Code CLI native harness (#8561): the former hosts the CLI docs
   # `defaults/docs/runtime-model-trials.md` cites, the latter the platform API
@@ -243,6 +244,7 @@ if [[ "$SELF_TEST" -eq 1 ]]; then
   cat > "$tmp/clean/docs/a.md" <<'EOF'
 See example-org/tool-repo#202 and rjwalters/loom#1, hosted at dashboard.example.com and configured via `autonomous.ciTelemetry.org` (#8981), a config key, not a host.
 A same-repo ref (#4736) and prose like scheduling/anti-#4736 must not trip this.
+Vendor pricing and model changes are public at https://aistudio.google.com/docs/pricing and https://aistudio.google.com/docs/deprecations.
 EOF
   if scan_tree "$tmp/clean" >/dev/null; then
     echo "self-test: OK — clean fixture (incl. a config-key path ending in a TLD-shaped segment) passes"
