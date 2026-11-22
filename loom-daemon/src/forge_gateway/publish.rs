@@ -21,7 +21,7 @@ pub const MIN_GH_VERSION: GhVersion = GhVersion(2, 100, 0);
 const REPUBLISH: Duration = crate::credential_preflight::GITHUB_APP_REFRESH_INTERVAL;
 
 /// The file beside the profiles naming the `gh` the daemon version-checked.
-const GH_MARKER: &str = "gh-ok";
+pub(super) const GH_MARKER: &str = "gh-ok";
 
 /// `gh --version` deadline: it never touches the network.
 const GH_VERSION_TIMEOUT: Duration = Duration::from_secs(10);
@@ -61,7 +61,7 @@ pub trait Deps {
     fn read_key(&self, r: &KeyRef, aws: &super::AwsAccess<'_>) -> Result<String, String>;
 }
 
-struct RealDeps;
+pub(crate) struct RealDeps;
 
 impl Deps for RealDeps {
     fn gh(&self, base: &Path) -> Option<(PathBuf, GhVersion)> {
@@ -288,40 +288,21 @@ impl Refresher {
         version: GhVersion,
         deps: &dyn Deps,
     ) -> PassOutcome {
-        let mut owners = Vec::new();
-        let mut failed = Vec::new();
-        let region = super::resolve_region(cfg.region.as_deref(), &|k| {
-            std::env::var(k).ok().filter(|v| !v.is_empty())
-        });
-        let aws = super::AwsAccess {
-            region: region.as_deref(),
-            profile: &cfg.aws_profile,
-        };
-        for (owner, r) in &cfg.key_refs {
-            let dir = base.join(owner);
-            let result = deps.read_key(r, &aws).and_then(|key| {
-                publish_profile(&dir, &key, &cfg.api_host).map_err(|e| e.to_string())
+        let wrote = write_all(base, cfg, gh_path, deps);
+        for (owner, why) in &wrote.failed {
+            self.log_once(format!("{owner}: {why}"), |m| {
+                log::warn!(
+                    "forge_gateway: no gateway profile for {m}; that owner's reads keep \
+                     today's routing — 2am#4367"
+                );
             });
-            match result {
-                Ok(()) => owners.push(owner.clone()),
-                Err(why) => {
-                    let _ = std::fs::remove_dir_all(&dir);
-                    self.log_once(format!("{owner}: {why}"), |m| {
-                        log::warn!(
-                            "forge_gateway: no gateway profile for {m}; that owner's reads keep \
-                             today's routing — 2am#4367"
-                        );
-                    });
-                    failed.push(owner.clone());
-                }
-            }
         }
-        remove_strays(base, &cfg.key_refs.keys().cloned().collect());
-        let marker = write_private(&base.join(GH_MARKER), gh_path.to_string_lossy().as_bytes());
-        if marker.is_err() {
+        if !wrote.marker_ok {
             // Without the marker no agent front routes; the daemon still does.
             log::warn!("forge_gateway: could not write {GH_MARKER} in {}", base.display());
         }
+        let owners = wrote.owners;
+        let failed = wrote.failed.into_iter().map(|(owner, _)| owner).collect();
         let set: BTreeSet<String> = owners.iter().cloned().collect();
         // The version is re-probed on every due pass; what used to hide an
         // upgraded `gh` was this line logging only when the owner set moved.
@@ -357,6 +338,59 @@ impl Refresher {
     }
 }
 
+/// [`write_all`]'s result: what a pass wrote, what it could not (with a
+/// reason that never contains the key), and whether the `gh` marker could
+/// be stamped — without it no reader adopts the publication.
+#[derive(Debug, Clone, Default)]
+pub(super) struct WriteAll {
+    pub owners: Vec<String>,
+    pub failed: Vec<(String, String)>,
+    pub marker_ok: bool,
+}
+
+/// The write half of one pass, shared by the daemon's refresh loop and the
+/// session publisher ([`super::session`]): every configured owner's profile
+/// into `base`, the stray sweep, and the `gh` marker. Owns no process state
+/// (the daemon's `Active` set and its log-once bookkeeping stay with
+/// [`Refresher`]).
+pub(super) fn write_all(
+    base: &Path,
+    cfg: &GatewayConfig,
+    gh_path: &Path,
+    deps: &dyn Deps,
+) -> WriteAll {
+    let mut owners = Vec::new();
+    let mut failed = Vec::new();
+    let region = super::resolve_region(cfg.region.as_deref(), &|k| {
+        std::env::var(k).ok().filter(|v| !v.is_empty())
+    });
+    let aws = super::AwsAccess {
+        region: region.as_deref(),
+        profile: &cfg.aws_profile,
+    };
+    for (owner, r) in &cfg.key_refs {
+        let dir = base.join(owner);
+        let result = deps
+            .read_key(r, &aws)
+            .and_then(|key| publish_profile(&dir, &key, &cfg.api_host).map_err(|e| e.to_string()));
+        match result {
+            Ok(()) => owners.push(owner.clone()),
+            Err(why) => {
+                let _ = std::fs::remove_dir_all(&dir);
+                failed.push((owner.clone(), why));
+            }
+        }
+    }
+    remove_strays(base, &cfg.key_refs.keys().cloned().collect());
+    let marker_ok =
+        write_private(&base.join(GH_MARKER), gh_path.to_string_lossy().as_bytes()).is_ok();
+    WriteAll {
+        owners,
+        failed,
+        marker_ok,
+    }
+}
+
 /// Remove every profile under `base` whose owner is not in `keep`.
 fn remove_strays(base: &Path, keep: &BTreeSet<String>) {
     let Ok(entries) = std::fs::read_dir(base) else {
@@ -377,7 +411,7 @@ pub fn teardown(base: &Path) {
     }
 }
 
-fn ensure_private_dir(dir: &Path) -> std::io::Result<()> {
+pub(super) fn ensure_private_dir(dir: &Path) -> std::io::Result<()> {
     std::fs::create_dir_all(dir)?;
     #[cfg(unix)]
     {
