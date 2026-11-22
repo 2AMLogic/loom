@@ -169,6 +169,63 @@ fn a_base_inside_a_checkout_is_refused() {
 }
 
 #[test]
+fn a_relative_root_inside_a_checkout_is_refused_from_below_the_root() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path().join("repo");
+    let deeper = repo.join("subdir/deeper");
+    std::fs::create_dir_all(&deeper).unwrap();
+    std::fs::create_dir_all(repo.join(".git")).unwrap();
+    for cwd in [repo.clone(), deeper.clone()] {
+        let err = checked_base_at(Path::new("sess"), || Ok(cwd.clone())).unwrap_err();
+        assert!(
+            err.contains("checkout") && err.contains(SESSION_ROOT_ENV),
+            "{err} (cwd {})",
+            cwd.display()
+        );
+    }
+    // A worktree's `.git` file counts too.
+    std::fs::remove_dir_all(repo.join(".git")).unwrap();
+    std::fs::write(repo.join(".git"), "gitdir: /elsewhere\n").unwrap();
+    assert!(
+        checked_base_at(Path::new("sess"), || Ok(deeper.clone())).is_err(),
+        "a worktree `.git` file is refused from below the root"
+    );
+}
+
+#[test]
+fn a_relative_root_traversing_into_a_checkout_is_refused() {
+    let tmp = tempfile::tempdir().unwrap();
+    let outside = tmp.path().join("outside");
+    std::fs::create_dir_all(&outside).unwrap();
+    std::fs::create_dir_all(tmp.path().join("repo/.git")).unwrap();
+    let err = checked_base_at(Path::new("../repo/sess"), || Ok(outside.clone())).unwrap_err();
+    assert!(err.contains("checkout") && err.contains(SESSION_ROOT_ENV), "{err}");
+}
+
+#[test]
+fn a_relative_root_outside_every_checkout_resolves_to_an_absolute_base() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path().join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    let base = checked_base_at(Path::new("sess"), || Ok(home.clone())).unwrap();
+    assert!(base.is_absolute());
+    assert_eq!(base, home.join("sess/.loom").join(DIR_NAME));
+    assert!(!inside_a_checkout(&base));
+}
+
+#[test]
+fn an_unresolvable_cwd_fails_closed_for_a_relative_root() {
+    let err =
+        checked_base_at(Path::new("sess"), || Err(std::io::Error::other("gone"))).unwrap_err();
+    assert!(err.contains(SESSION_ROOT_ENV) && err.contains("cannot resolve"), "{err}");
+    // An absolute root needs no cwd and still resolves.
+    let tmp = tempfile::tempdir().unwrap();
+    assert!(
+        checked_base_at(&tmp.path().join("sess"), || Err(std::io::Error::other("gone"))).is_ok()
+    );
+}
+
+#[test]
 fn clean_removes_only_the_session_publication() {
     let home = tempfile::tempdir().unwrap();
     let base = session_base_at(home.path());

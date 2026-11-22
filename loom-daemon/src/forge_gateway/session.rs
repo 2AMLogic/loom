@@ -113,7 +113,47 @@ pub fn checked_base() -> Result<PathBuf, String> {
              directory is set"
         ));
     };
-    let base = session_base_at(&root);
+    checked_base_at(&root, std::env::current_dir)
+}
+
+/// [`checked_base`] for an explicit root and cwd lookup: the root is
+/// absolutized before [`inside_a_checkout`] runs, because a relative
+/// [`SESSION_ROOT_ENV`] leaves `ancestors()` walking a relative path that
+/// never reaches the checkout root and slips the guard from below it
+/// (#14964). The cwd lookup is injectable since the process cwd is global
+/// state every concurrent `#[test]` shares.
+///
+/// # Errors
+///
+/// A reason naming the refused location and the fix, or naming
+/// [`SESSION_ROOT_ENV`] when the root cannot be resolved — fail closed, the
+/// un-absolutized relative path is never checked.
+fn checked_base_at(
+    root: &Path,
+    cwd: impl FnOnce() -> std::io::Result<PathBuf>,
+) -> Result<PathBuf, String> {
+    let joined = if root.is_absolute() {
+        root.to_path_buf()
+    } else {
+        let cwd = cwd().map_err(|e| {
+            format!(
+                "cannot resolve the current directory to anchor the relative {SESSION_ROOT_ENV} \
+                 session root {}: {e}",
+                root.display()
+            )
+        })?;
+        cwd.join(root)
+    };
+    // `absolute` cleans redundant components without touching the filesystem
+    // (the root need not exist yet), so `ancestors()` walks to `/`; `..` is
+    // left in place, and the OS resolves it during the `.git` lookup.
+    let rooted = std::path::absolute(joined.as_path()).map_err(|e| {
+        format!(
+            "cannot absolutize the {SESSION_ROOT_ENV} session root {}: {e}",
+            joined.display()
+        )
+    })?;
+    let base = session_base_at(&rooted);
     if inside_a_checkout(&base) {
         return Err(format!(
             "the session publication {} would sit inside a git checkout; point {SESSION_ROOT_ENV} \
