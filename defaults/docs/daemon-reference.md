@@ -11121,6 +11121,24 @@ naming a runtime that never launches is simply never matched.
   and not validated against a vocabulary — the runtime owns that list (the
   sweep-dispatch path forwards `effort` the same way), so a bad level fails the
   tick loudly at the CLI instead of being silently dropped.
+- **An unqualified tier reconciles against a native profile's
+  `allowedEfforts` (#14963).** A bare `roleEfforts.<role>` or the global
+  `effort` is a runtime-neutral default, so it may name a level a native
+  model profile's vocabulary does not include. When the launch it reaches is
+  a native one (`opencode`, `pi`, `kimi`) whose selected profile (the
+  preference tap's `modelProfile`, then `LOOM_MODEL_PROFILE`,
+  `runtimes.defaultModelProfile`, then the bundled `zai-flash`) declares an
+  `allowedEfforts` list that does not contain the value, the daemon drops
+  the override and the child launches with the profile's own `effort`
+  instead of the launch being refused before the CLI starts
+  (`profile_selection`, exit 78). The drop is logged, and the per-tick
+  header's source names it, e.g.
+  `effort=<runtime CLI default> (source=autonomous.roleRunner.roleEfforts.builder (profile default for opencode:zai-flash))`.
+  A runtime-qualified `roleEfforts.<role>@<runtime>` entry is an explicit
+  statement of intent about that runtime and is **never** dropped: a value
+  the profile disallows is still forwarded and still refused loudly — pin it
+  inside the profile's vocabulary instead (`"builder@opencode": "high"`).
+  Claude and Codex launches are unaffected.
 - **Keys are trimmed + lower-cased**, matching `roleModels`/`onIdleMaxWait`, so
   a `"Judge"` config key matches the `judge` role the runner dispatches under.
 - **Logged per tick** in the header line above as
