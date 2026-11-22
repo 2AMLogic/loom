@@ -204,3 +204,74 @@ fn an_operator_pin_still_wins_over_a_draw() {
     std::env::remove_var("LOOM_RUNTIME_CURATOR");
     assert!(matches!(decision.unwrap(), Decision::Static { .. }));
 }
+
+/// One draw of `role` on a role tick: `(runtime, model profile, record)`.
+fn tick(root: &Path, role: &str) -> (Option<String>, role_draw::RoleDrawRecord) {
+    let Decision::Preference {
+        resolution, draw, ..
+    } = resolve_runtime_for(root, role, None, 1_800_000_000, role_tick()).unwrap()
+    else {
+        panic!("expected the draw to decide");
+    };
+    (resolution.chosen.map(|c| c.admitted.runtime), *draw.expect("a draw record"))
+}
+
+/// #14944: an API-key pool whose every account holds its declared
+/// `maxConcurrent` is unavailable **at draw time**, the way a Codex tap with
+/// no idle seat is. Before, `availability` counted the account as selectable,
+/// a table renormalised onto the capped pick (98% on 2026-11-22) drew it on
+/// nearly every tick, and each launch was refused at 78 (`stage=credential`)
+/// with the tick lost.
+#[test]
+#[serial_test::serial]
+fn a_pick_whose_api_key_pool_is_at_its_concurrency_cap_is_passed_over() {
+    let _env = DrawEnv::new();
+    let dir = workspace(&json!({"roleDraw": {"builder": [
+        {"attempt": 1, "draw": {"opencode": 1000, "claude": 1}}]}}));
+    super::unprovisioned_tests::provision_zai_pool(dir.path(), true);
+    let pool = crate::api_keys_pool::paths::per_repo_api_keys_dir(dir.path());
+    crate::api_keys_pool::limits::set_max_concurrent(&pool, "zai", "alpha", Some(1)).unwrap();
+
+    // Under the cap: the heavy pick launches.
+    let (runtime, draw) = role_draw::with_seed(7, || tick(dir.path(), "builder"));
+    assert_eq!(runtime.as_deref(), Some("opencode"), "{draw:?}");
+    assert!(draw.passed_over.is_empty(), "{draw:?}");
+
+    // One live spawn holds the only slot: same seed, same first roll, but the
+    // pick is passed over and the row renormalises onto Claude.
+    let lease = crate::api_keys_pool::inflight::register(&pool, "zai", "alpha").unwrap();
+    let (runtime, draw) = role_draw::with_seed(7, || tick(dir.path(), "builder"));
+    assert_eq!(runtime.as_deref(), Some("claude"), "{draw:?}");
+    assert_eq!(draw.pick.as_deref(), Some("claude"));
+    assert_eq!(draw.steps.len(), 2, "one roll for the capped pick, one for claude: {draw:?}");
+    let [skip] = draw.passed_over.as_slice() else {
+        panic!("exactly the capped pick is passed over: {draw:?}");
+    };
+    assert!(
+        skip.starts_with("opencode: unavailable(api_keys:zai: pool zai at cap"),
+        "{skip}"
+    );
+    // A skip before spawn is not a failed attempt.
+    assert_eq!(attempts::current(dir.path(), "builder"), 1);
+
+    // The slot frees: the pick is drawable again.
+    lease.release();
+    let (runtime, _) = role_draw::with_seed(7, || tick(dir.path(), "builder"));
+    assert_eq!(runtime.as_deref(), Some("opencode"));
+}
+
+/// #14944: with nothing else in the row, a capped pool is a pre-spawn skip
+/// (no pick), never a launch that is then refused.
+#[test]
+#[serial_test::serial]
+fn a_row_holding_only_a_capped_pool_draws_nothing() {
+    let _env = DrawEnv::new();
+    let dir =
+        workspace(&json!({"roleDraw": {"builder": [{"attempt": 1, "draw": {"opencode": 1}}]}}));
+    super::unprovisioned_tests::provision_zai_pool(dir.path(), true);
+    let pool = crate::api_keys_pool::paths::per_repo_api_keys_dir(dir.path());
+    crate::api_keys_pool::limits::set_max_concurrent(&pool, "zai", "alpha", Some(1)).unwrap();
+    let _lease = crate::api_keys_pool::inflight::register(&pool, "zai", "alpha").unwrap();
+    let (runtime, draw) = tick(dir.path(), "builder");
+    assert_eq!((runtime, draw.pick.as_deref()), (None, None), "{draw:?}");
+}
