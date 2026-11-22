@@ -26,8 +26,7 @@ pub struct ModelRuntimeMismatch {
     pub role: String,
     /// The admitted runtime (e.g. `"codex"`).
     pub runtime: String,
-    /// The model resolved by [`resolve_role_runner_model`] (or the test-only
-    /// `with_model` override) for this role.
+    /// The model resolved by [`resolve_role_runner_model`] for this role.
     pub model: String,
     /// The config/env tier label [`resolve_role_runner_model`] attributes the
     /// model to (e.g. `"default"`, `"autonomous.roleRunner.model"`), unchanged

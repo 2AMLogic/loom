@@ -2057,7 +2057,7 @@ pub fn spawn_multi_work_finder_task(
             // guaranteed to kill every sweep dispatched into it at token
             // selection, ~30s in, after the claim label flip and the lease
             // comment have already landed on a real issue. See
-            // `pool_preflight::preflight_held_per_root` for why the two holds
+            // `pool_preflight::preflight_held_causes_per_root` for why the two holds
             // are computed together and why a pool hold outranks a #5030
             // recovery probe.
             let now_tick = chrono::Utc::now();

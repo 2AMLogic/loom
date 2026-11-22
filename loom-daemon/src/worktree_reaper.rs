@@ -87,7 +87,7 @@
 //!
 //! # REST, not GraphQL
 //!
-//! The probes use [`clean::check_pr_merged_rest`] /
+//! The probes use [`clean::check_pr_status_for_branch_rest`] /
 //! `gh::issue_state_rest` rather than the GraphQL-backed
 //! `gh issue view` / `gh pr list`. GraphQL quota exhaustion under concurrent
 //! agents is a live failure mode; an unattended cadence prober must not compete

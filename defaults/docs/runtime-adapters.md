@@ -1207,7 +1207,7 @@ region, or an `account=unknown`/malformed identity. `category` is one of the
 
 Consumer: `sweep_registry::quarantine::apply_provider_health_feedback`, the
 only production caller, feeds the parsed `(provider, account, category,
-model)` into `tokens_pool::record_terminal_for_model` — a
+model)` into `tokens_pool::record_terminal_for_model_with_reset` — a
 `MODEL_CREDITS_EXHAUSTED` category with a recognized `model` writes a
 **class-scoped** `class_cooldowns` entry (`.loom/account-health.json`)
 rather than the account-wide `plan_exhausted` cooldown every other category
