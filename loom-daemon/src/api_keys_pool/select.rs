@@ -27,6 +27,11 @@
 //! provider-side ceiling the operator declared, which is the failure the cap
 //! exists to prevent.
 //!
+//! The ladder counts live spawns only. A role draw's reservation
+//! ([`super::reservation`], #14983) holds a slot *for* a launch that is on its
+//! way here, so counting it would refuse that launch; a successful selection
+//! retires one instead.
+//!
 //! # Model-class scoping (#8424 item 3)
 //!
 //! Selection takes the model the spawn asked for and resolves bad marks
@@ -242,6 +247,10 @@ pub fn select_api_key_for(
     }
     // Count this spawn against the chosen account, still under `_cap_lock`.
     let lease = inflight::register(&root, provider, &chosen.name);
+    // #14983: this acquire is what a role draw's reservation was holding the
+    // slot for. Retire one in the same locked step, so the slot is counted
+    // once (as the lease) instead of twice.
+    super::reservation::consume_one(&root, provider);
     Ok(SelectedApiKey {
         provider: provider.to_string(),
         name: chosen.name.clone(),
@@ -360,6 +369,14 @@ pub struct ProviderHealth {
     /// halves for a human.
     #[serde(skip)]
     pub selectable_under_cap: usize,
+    /// Slots a draw could still take: the selectable accounts' declared caps,
+    /// minus live spawns, minus other draws' live reservations
+    /// ([`super::reservation`], #14983). `None` when a selectable account
+    /// declares no cap (no finite count) or none is selectable. A read like
+    /// [`Self::selectable_under_cap`]; only
+    /// [`super::reservation::try_reserve`] holds a slot. Not serialized.
+    #[serde(skip)]
+    pub unreserved_slots: Option<usize>,
     /// Accounts withheld because `.disabled` / `.bad_accounts.json` exists but
     /// cannot be read or parsed.
     pub unverifiable: usize,
@@ -498,6 +515,12 @@ pub fn health_in(
                     .iter()
                     .filter(|a| a.selectable() && !at_cap(a))
                     .count(),
+                unreserved_slots: super::reservation::capped_slots(&root, &provider, &accounts)
+                    .map(|(slots, in_flight)| {
+                        slots
+                            .saturating_sub(in_flight)
+                            .saturating_sub(super::reservation::live_count(&root, &provider))
+                    }),
                 unverifiable: count(Ineligible::Unverifiable),
                 unreadable,
                 insecure_permissions: accounts
