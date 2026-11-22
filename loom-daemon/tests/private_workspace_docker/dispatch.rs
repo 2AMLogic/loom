@@ -173,6 +173,28 @@ impl Fixture {
     }
 }
 
+/// A checked private-clone session start for `account` against `url`: the
+/// shared command shape, per-command forge environment and success check of
+/// the dispatch tests, with the forge host passed explicitly so a
+/// two-repository fixture still starts each clone against its own origin.
+fn start_session(f: &Fixture, account: &str, url: &str, gh_host: &str) {
+    checked(
+        f.command(&[
+            "session",
+            "start",
+            account,
+            "--private-clone",
+            url,
+            "--image",
+            &f.image,
+        ])
+        .env("GH_HOST", gh_host)
+        .env("GH_TOKEN", auth::GH_TOKEN)
+        .output()
+        .unwrap(),
+    );
+}
+
 #[test]
 #[serial_test::serial]
 #[ignore = "requires Docker; explicitly run by CI"]
@@ -185,68 +207,9 @@ fn adapter_chain_pushes_private_branch_and_preserves_host_logs_and_work() {
         .host_str()
         .unwrap()
         .to_owned();
-    checked(
-        f.command(&[
-            "session",
-            "start",
-            name,
-            "--private-clone",
-            &f.repository,
-            "--image",
-            &f.image,
-        ])
-        .env("GH_HOST", &gh_host)
-        .env("GH_TOKEN", auth::GH_TOKEN)
-        .output()
-        .unwrap(),
-    );
-    let root = f.root.path().join("registry");
-    checked(
-        Command::new("git")
-            .args(["init", "-b", "main"])
-            .current_dir(&root)
-            .output()
-            .unwrap(),
-    );
-    checked(
-        Command::new("git")
-            .args(["remote", "add", "origin", &f.repository])
-            .current_dir(&root)
-            .output()
-            .unwrap(),
-    );
-    let defaults = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .unwrap()
-        .join("defaults");
-    for (src, dest) in [
-        ("scripts", ".loom/scripts"),
-        ("runtimes", ".loom/runtimes"),
-        ("roles", ".loom/roles"),
-        (".claude/commands/loom", ".claude/commands/loom"),
-    ] {
-        copy_tree(&defaults.join(src), &root.join(dest));
-    }
-    let [gh_bin, write_scope_cache] = f.write_scope_env();
-    let _environment = Environment::set(&[
-        gh_bin,
-        write_scope_cache,
-        ("LOOM_WORKSPACE", Some(root.clone().into_os_string())),
-        ("LOOM_CODEX_PROFILE_ROOT", Some(f.root.path().join("profiles").into_os_string())),
-        ("LOOM_CODEX_PROFILE", Some(name.into())),
-        ("LOOM_RUNTIME", Some("codex".into())),
-        ("LOOM_DAEMON_SELF_BIN", Some(f.host.clone().into_os_string())),
-        ("GH_CONFIG_DIR", Some(f.root.path().join("forge").into_os_string())),
-        ("GH_HOST", Some(gh_host.clone().into())),
-        ("GH_TOKEN", Some(auth::GH_TOKEN.into())),
-        ("LOOM_CODEX_AUTH_MODE_CHECK", Some("0".into())),
-        ("CODEX_HOME", None),
-        ("LOOM_CODEX_HOME", None),
-        ("LOOM_PRIVATE_LEASE_FD", None),
-        ("LOOM_ROLE", None),
-        ("LOOM_CODEX_NO_EXEC", None),
-        ("LOOM_SPAWN_NO_EXPORT", None),
-    ]);
+    start_session(&f, name, &f.repository, &gh_host);
+    let root = containment::registry_workspace(&f);
+    let _environment = containment::environment(&f, &root, name, &gh_host);
     // An unrelated private account must not force legacy explicit homes into
     // the inventory or touch Docker for their selection.
     let legacy = f.root.path().join("legacy-explicit");
@@ -474,21 +437,7 @@ fn adapter_chain_pushes_private_branch_and_preserves_host_logs_and_work() {
     // A disappearing container must leave a durable, non-success outcome and
     // host logs; the next process must refuse runtime failover after restart.
     let second = &f.names[1];
-    checked(
-        f.command(&[
-            "session",
-            "start",
-            second,
-            "--private-clone",
-            &f.repository,
-            "--image",
-            &f.image,
-        ])
-        .env("GH_HOST", &gh_host)
-        .env("GH_TOKEN", auth::GH_TOKEN)
-        .output()
-        .unwrap(),
-    );
+    start_session(&f, second, &f.repository, &gh_host);
     let _second = Environment::set(&[("LOOM_CODEX_PROFILE", Some(second.into()))]);
     let selection = Selection::prepare(
         &root,
@@ -601,33 +550,16 @@ fn each_account_admission_is_bound_to_its_own_repository_clone() {
         .host_str()
         .unwrap()
         .to_owned();
-    let start = |name: &str, url: &str| {
-        checked(
-            f.command(&[
-                "session",
-                "start",
-                name,
-                "--private-clone",
-                url,
-                "--image",
-                &f.image,
-            ])
-            .env("GH_HOST", &gh_host)
-            .env("GH_TOKEN", auth::GH_TOKEN)
-            .output()
-            .unwrap(),
-        );
-    };
     // Accounts `a` (repository one) and `b` (repository two) have hook trust
     // established, the operator's one-time decision. Account `c` also holds
     // repository two but never had trust established.
     for (name, url) in [(a, &one), (b, &two)] {
-        start(name, url);
+        start_session(&f, name, url, &gh_host);
         f.cli(&["session", "stop", name, "--json"]);
         containment::establish_hook_trust(&f.root.path().join("profiles").join(name));
-        start(name, url);
+        start_session(&f, name, url, &gh_host);
     }
-    start(c, &two);
+    start_session(&f, c, &two, &gh_host);
     let root = containment::registry_workspace(&f);
     let _env = containment::environment(&f, &root, a, &gh_host);
     let origin = |url: &str| {
