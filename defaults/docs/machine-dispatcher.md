@@ -104,6 +104,13 @@ machine dispatcher. The dispatcher resolves this by **detecting** a nearby
 - **git worktree** (under `.loom/worktrees/…`) → `repo: git-worktree (main checkout: …)`
 - **non-repo directory** (e.g. `/tmp`) → `repo: non-repo (no .loom/ found from cwd)`
 
+When `loom-tools` is on PATH, `status` also includes its session gateway
+report (`loom-tools gateway status`, #14884): current / due-for-refresh /
+missing / stray profiles per owner, no credentials. The binary decides
+whether there is anything to report — a non-session host with no publication
+prints nothing — so the dispatcher adds no logic of its own. See
+[`session-mode.md`](session-mode.md) § "Gateway read profiles".
+
 ## Config resolution (AC5)
 
 `loom status` resolves configuration through the Phase 2 tier resolver
