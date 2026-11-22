@@ -6,9 +6,9 @@
 //! may then comment on it. Neither path read the issue's labels, so each pays
 //! one REST label read ([`SweepRegistry::frozen_blocks_write`]) right before
 //! posting. Fail-open, like every other step of these best-effort notices: a
-//! failed read posts the
-//! comment as before. The claim restore the stale-sweep reap performs goes
-//! through `restore_label_to_ready`, which already leaves a frozen issue alone.
+//! failed read posts the comment as before. The claim restore the stale-sweep
+//! reap performs goes through `restore_label_to_ready`, which already leaves
+//! a frozen issue alone.
 
 use super::*;
 
