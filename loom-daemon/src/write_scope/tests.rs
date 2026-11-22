@@ -522,7 +522,6 @@ pub(super) fn seed_disk_for(
     write: bool,
     age: std::time::Duration,
 ) {
-    use std::io::Write as _;
     let dir = probe::cache_dir();
     assert!(crate::forge_etag_store::private_dir(&dir, true));
     let key = probe::cache_key(key_dir, scope, repo).expect("a keyed scope");
@@ -533,10 +532,15 @@ pub(super) fn seed_disk_for(
         .saturating_sub(age.as_secs());
     let body = serde_json::json!({"write": write, "detail": "seeded", "at": at}).to_string();
     let path = dir.join(format!("{key}.json"));
-    // Re-seeding replaces the entry (the file is created exclusively).
-    let _ = std::fs::remove_file(&path);
-    let mut f = crate::forge_etag_store::create_private_file(&path).unwrap();
-    f.write_all(body.as_bytes()).unwrap();
+    crate::fs_util::write_atomic(
+        &path,
+        body.as_bytes(),
+        crate::fs_util::AtomicOpts {
+            private: true,
+            sync_dir: false,
+        },
+    )
+    .unwrap();
 }
 
 #[test]

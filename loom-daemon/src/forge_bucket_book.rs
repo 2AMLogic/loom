@@ -408,7 +408,6 @@ struct Entry {
 ///
 /// When `dir` is not a private directory or the write fails.
 pub fn persist(dir: &Path, now: i64) -> std::io::Result<()> {
-    use std::io::Write;
     if !crate::forge_etag_store::private_dir(dir, true) {
         return Err(std::io::Error::other("untrusted sink dir"));
     }
@@ -417,11 +416,14 @@ pub fn persist(dir: &Path, now: i64) -> std::io::Result<()> {
         .map(|(key, reading)| Entry { key, reading })
         .collect();
     let body = serde_json::to_vec(&entries)?;
-    let tmp = dir.join(format!(".{SNAPSHOT_FILE}.{}", std::process::id()));
-    let _ = std::fs::remove_file(&tmp);
-    let mut file = crate::forge_etag_store::create_private_file(&tmp)?;
-    file.write_all(&body)?;
-    std::fs::rename(&tmp, dir.join(SNAPSHOT_FILE))
+    crate::fs_util::write_atomic(
+        &dir.join(SNAPSHOT_FILE),
+        &body,
+        crate::fs_util::AtomicOpts {
+            private: true,
+            sync_dir: true,
+        },
+    )
 }
 
 /// The readings in `dir`'s [`SNAPSHOT_FILE`] still believed at `now`. A
