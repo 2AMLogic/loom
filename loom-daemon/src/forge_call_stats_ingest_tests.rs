@@ -211,6 +211,38 @@ fn an_oversize_contained_file_is_removed() {
     assert!(!big.exists());
 }
 
+/// Host-only names accepted by `is_sink_entry` (the parent dir's mount
+/// gate) but never written by a front into the contained dir: the bucket
+/// book snapshot, its legacy staging branch, and the `write_atomic`
+/// staging shape of #14978. Only `calls-<hour>.jsonl` is non-foreign
+/// there (#14993).
+#[test]
+fn host_only_sink_names_are_foreign_in_the_contained_dir() {
+    let sink = tempfile::tempdir().unwrap();
+    let contained = sink.path().join(CONTAINED_SUBDIR);
+    std::fs::create_dir(&contained).unwrap();
+    let keep = file(&contained, HOUR);
+    std::fs::write(&keep, "").unwrap();
+    for name in ["bucket-book.json", ".bucket-book.json.123", ".tmpAbC123"] {
+        std::fs::write(contained.join(name), "x").unwrap();
+    }
+    // A negative hour parses and is stale, exactly as before.
+    std::fs::write(file(&contained, -5), "").unwrap();
+    // A subdirectory is never touched.
+    std::fs::create_dir(contained.join("adir")).unwrap();
+    assert_eq!(
+        sweep_contained(&contained, HOUR),
+        4,
+        "the three host-only names and the stale hour"
+    );
+    assert!(keep.exists(), "the in-window hour file stays");
+    assert!(contained.join("adir").exists(), "a subdirectory is left alone");
+    assert!(!file(&contained, -5).exists(), "calls--5.jsonl is stale");
+    for name in ["bucket-book.json", ".bucket-book.json.123", ".tmpAbC123"] {
+        assert!(!contained.join(name).exists(), "{name} removed");
+    }
+}
+
 #[test]
 fn a_line_longer_than_a_read_is_skipped_not_stuck_on() {
     let sink = tempfile::tempdir().unwrap();
