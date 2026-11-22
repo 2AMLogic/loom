@@ -75,7 +75,7 @@ pub struct ExecArgs {
     #[arg(long, value_name = "URL", default_value = "https://api.anthropic.com")]
     pub upstream: String,
     /// How the real credential is presented upstream:
-    /// `authorization-bearer` (default) or `x-api-key`.
+    /// `authorization-bearer` (default), `x-api-key` or `x-goog-api-key`.
     #[arg(long, value_name = "STYLE", default_value = "authorization-bearer", value_parser = parse_header)]
     pub header: HeaderStyle,
     /// Environment variable set, in the command's environment, to the proxy's
@@ -118,7 +118,8 @@ fn parse_header(raw: &str) -> Result<HeaderStyle, String> {
     match raw.trim() {
         "authorization-bearer" => Ok(HeaderStyle::AuthorizationBearer),
         "x-api-key" => Ok(HeaderStyle::XApiKey),
-        _ => Err("expected authorization-bearer or x-api-key".to_string()),
+        "x-goog-api-key" => Ok(HeaderStyle::XGoogApiKey),
+        _ => Err("expected authorization-bearer, x-api-key or x-goog-api-key".to_string()),
     }
 }
 
