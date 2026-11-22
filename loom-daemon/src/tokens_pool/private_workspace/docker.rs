@@ -344,11 +344,19 @@ pub(super) fn create(config: &Config, image: &str) -> Result<()> {
         ])?;
     }
     validate_ownership(config)?;
+    // `--restart unless-stopped` (#14912): on a session-only host no daemon
+    // runs the reconcile pass, so Docker's own policy is what returns the
+    // seat after an engine restart or host reboot — the same policy the
+    // host-mounted seat has carried since #10452. It never fights an
+    // operator's stop: `stop` removes the container, and the `--rm` helper
+    // runs above and below stay ephemeral with no policy.
     let mut args = vec![
         "run".to_owned(),
         "-d".into(),
         "--name".into(),
         config.container.clone(),
+        "--restart".into(),
+        "unless-stopped".into(),
         "--user".into(),
         "1000:1000".into(),
         "--read-only".into(),
