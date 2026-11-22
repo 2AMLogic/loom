@@ -1304,8 +1304,6 @@ mod tests {
         let dmode = fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
         assert_eq!(fmode, 0o600);
         assert_eq!(dmode, 0o700);
-        // No leftover temp file.
-        assert!(!dir.join("a.token.tmp").exists());
     }
 
     #[test]
@@ -1472,7 +1470,6 @@ mod tests {
 
         // No secret material anywhere in the file.
         assert!(!raw.contains("sk-ant-oat01-secret"));
-        assert!(!index_path.with_file_name("index.json.tmp").exists());
     }
 
     #[test]

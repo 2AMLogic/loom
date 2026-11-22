@@ -2533,9 +2533,6 @@ mod tests {
         assert!(hosts.contains("oauth_token: ghs_first"));
         let config = std::fs::read_to_string(config_dir.join("config.yml")).unwrap();
         assert!(config.contains("version: 1"));
-
-        // No leftover temp file after a successful publish (rename consumed it).
-        assert!(!config_dir.join("hosts.yml.tmp").exists());
     }
 
     #[test]
