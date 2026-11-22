@@ -275,3 +275,125 @@ fn a_row_holding_only_a_capped_pool_draws_nothing() {
     let (runtime, draw) = tick(dir.path(), "builder");
     assert_eq!((runtime, draw.pick.as_deref()), (None, None), "{draw:?}");
 }
+
+/// One **dispatching** role tick, the way `role_runner::runtime_preflight`
+/// resolves: the only draw that holds the pool slot it picks (#14983).
+fn dispatch_tick(root: &Path, role: &str) -> (Option<String>, role_draw::RoleDrawRecord) {
+    let context = DispatchContext {
+        intent: Intent::Dispatch,
+        role_tick: true,
+    };
+    let Decision::Preference {
+        resolution, draw, ..
+    } = resolve_runtime_for(root, role, None, 1_800_000_000, context).unwrap()
+    else {
+        panic!("expected the draw to decide");
+    };
+    (resolution.chosen.map(|c| c.admitted.runtime), *draw.expect("a draw record"))
+}
+
+/// #14983: a role-runner tick admits several runs of one role before any of
+/// them has acquired its pool account (9 Champion runs in ~200 ms on
+/// 2026-11-22). The #14944 cap check is a read, so every draw saw the one slot
+/// free and picked the capped tap; one launch got the account and the rest
+/// were refused at 78 with the tick lost. Each dispatching draw now holds the
+/// slot it picks: N concurrent draws against one free slot yield exactly one
+/// pick of the pool, and the others draw the rest of their row.
+#[test]
+#[serial_test::serial]
+fn concurrent_draws_against_one_free_slot_pick_the_pool_exactly_once() {
+    use crate::api_keys_pool::{inflight, reservation};
+    const DRAWS: usize = 9;
+    let _env = DrawEnv::new();
+    let dir = workspace(&json!({"roleDraw": {"builder": [
+        {"attempt": 1, "draw": {"opencode": 1000, "claude": 1}}]}}));
+    super::unprovisioned_tests::provision_zai_pool(dir.path(), true);
+    let pool = crate::api_keys_pool::paths::per_repo_api_keys_dir(dir.path());
+    crate::api_keys_pool::limits::set_max_concurrent(&pool, "zai", "alpha", Some(1)).unwrap();
+
+    let barrier = std::sync::Barrier::new(DRAWS);
+    let ticks: Vec<_> = std::thread::scope(|scope| {
+        let handles: Vec<_> = (0..DRAWS)
+            .map(|_| {
+                scope.spawn(|| {
+                    barrier.wait();
+                    // Seed 7 rolls the heavy pick first on every thread.
+                    role_draw::with_seed(7, || dispatch_tick(dir.path(), "builder"))
+                })
+            })
+            .collect();
+        handles.into_iter().map(|h| h.join().unwrap()).collect()
+    });
+    let picks = |runtime: &str| {
+        ticks
+            .iter()
+            .filter(|(chosen, _)| chosen.as_deref() == Some(runtime))
+            .count()
+    };
+    assert_eq!(picks("opencode"), 1, "{ticks:?}");
+    assert_eq!(picks("claude"), DRAWS - 1, "the rest draw the remaining candidate: {ticks:?}");
+    for (_, draw) in ticks
+        .iter()
+        .filter(|(chosen, _)| chosen.as_deref() == Some("claude"))
+    {
+        let [skip] = draw.passed_over.as_slice() else {
+            panic!("exactly the reserved pick is passed over: {draw:?}");
+        };
+        assert!(
+            skip.starts_with("opencode: unavailable(api_keys:zai: pool zai at cap"),
+            "{skip}"
+        );
+    }
+    // A skip before spawn is not a failed attempt.
+    assert_eq!(attempts::current(dir.path(), "builder"), 1);
+    assert_eq!(reservation::live_count(&pool, "zai"), 1);
+
+    // The one launch acquires: the reservation becomes its lease, and the
+    // pool stays at cap for the next draw.
+    let selected = crate::api_keys_pool::select_api_key(dir.path(), "zai", None).unwrap();
+    assert_eq!(reservation::live_count(&pool, "zai"), 0);
+    assert_eq!(inflight::live_count(&pool, "zai", "alpha"), 1);
+    let (runtime, _) = role_draw::with_seed(7, || dispatch_tick(dir.path(), "builder"));
+    assert_eq!(runtime.as_deref(), Some("claude"));
+    assert_eq!(reservation::live_count(&pool, "zai"), 0, "a passed-over pick holds nothing");
+
+    // The run ends: the pick is drawable again.
+    selected.lease.unwrap().release();
+    let (runtime, _) = role_draw::with_seed(7, || dispatch_tick(dir.path(), "builder"));
+    assert_eq!(runtime.as_deref(), Some("opencode"));
+}
+
+/// #14983: a pick that never launches does not keep its slot. A probe (the
+/// explain view, pool pre-flight) holds none to begin with, and a dispatching
+/// tick's unconsumed reservation stops counting when it expires.
+#[test]
+#[serial_test::serial]
+fn a_pick_that_never_launches_gives_its_slot_back() {
+    use crate::api_keys_pool::reservation;
+    let _env = DrawEnv::new();
+    let dir = workspace(&json!({"roleDraw": {"builder": [
+        {"attempt": 1, "draw": {"opencode": 1000, "claude": 1}}]}}));
+    super::unprovisioned_tests::provision_zai_pool(dir.path(), true);
+    let pool = crate::api_keys_pool::paths::per_repo_api_keys_dir(dir.path());
+    crate::api_keys_pool::limits::set_max_concurrent(&pool, "zai", "alpha", Some(1)).unwrap();
+
+    let (runtime, _) = role_draw::with_seed(7, || tick(dir.path(), "builder"));
+    assert_eq!(runtime.as_deref(), Some("opencode"));
+    assert_eq!(reservation::live_count(&pool, "zai"), 0, "a probe holds nothing");
+
+    let (runtime, _) = role_draw::with_seed(7, || dispatch_tick(dir.path(), "builder"));
+    assert_eq!(runtime.as_deref(), Some("opencode"));
+    assert_eq!(reservation::live_count(&pool, "zai"), 1);
+    // Held: a second draw, and a read-only probe, both see the pool at cap.
+    let (runtime, _) = role_draw::with_seed(7, || dispatch_tick(dir.path(), "builder"));
+    assert_eq!(runtime.as_deref(), Some("claude"));
+    let (runtime, draw) = role_draw::with_seed(7, || tick(dir.path(), "builder"));
+    assert_eq!(runtime.as_deref(), Some("claude"), "{draw:?}");
+
+    // No launch ever acquires. Past the window the slot is free again.
+    std::env::set_var(reservation::RESERVATION_STALE_SECS_ENV, "1");
+    std::thread::sleep(std::time::Duration::from_millis(2100));
+    let (runtime, _) = role_draw::with_seed(7, || dispatch_tick(dir.path(), "builder"));
+    std::env::remove_var(reservation::RESERVATION_STALE_SECS_ENV);
+    assert_eq!(runtime.as_deref(), Some("opencode"));
+}

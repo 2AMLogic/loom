@@ -840,15 +840,16 @@ fn gate_admitted_candidate(
             });
         }
     }
-    match availability::availability_in(root, tap, admitted, now, binary_env) {
-        state if state.is_spawnable() => {}
-        state => {
-            release(preparer);
-            return Err(state
-                .skip_reason()
-                .expect("a non-spawnable availability always yields a skip reason"));
-        }
-    }
+    let credential_source =
+        match availability::availability_in(root, tap, admitted, now, binary_env) {
+            state if state.is_spawnable() => state.source().clone(),
+            state => {
+                release(preparer);
+                return Err(state
+                    .skip_reason()
+                    .expect("a non-spawnable availability always yields a skip reason"));
+            }
+        };
     if context.intent == Intent::Dispatch {
         preparer
             .reserve_seat(admitted, tap.model.as_deref())
@@ -861,15 +862,60 @@ fn gate_admitted_candidate(
     // credentials first means a tap that could not have run anyway is
     // never charged a metered slot, and asking last means the slot is
     // taken only for a tap the walk is about to return.
-    let Some(bound) = ceiling_config.filter(|c| c.governs(tier)) else {
-        return Ok(None);
+    let backstop = match ceiling_config.filter(|c| c.governs(tier)) {
+        None => None,
+        Some(bound) => match ceiling::admit(bound, role, tap, context.intent) {
+            ceiling::Verdict::Admitted(slot) => slot,
+            ceiling::Verdict::Refused(reason) => {
+                release(preparer);
+                return Err(reason);
+            }
+        },
     };
-    match ceiling::admit(bound, role, tap, context.intent) {
-        ceiling::Verdict::Admitted(slot) => Ok(slot),
-        ceiling::Verdict::Refused(reason) => {
-            release(preparer);
-            Err(reason)
-        }
+    // #14983: a dispatching role tick holds the pool slot its pick was drawn
+    // against; the availability read above holds nothing, and a tick admits
+    // several runs of a role before any child has acquired. Taken after every
+    // other gate, so it is only ever held for the tap the walk returns; a
+    // refusal here drops `backstop`, which releases that slot.
+    if let Err(reason) = hold_pool_slot(root, &credential_source, context) {
+        release(preparer);
+        return Err(reason);
+    }
+    Ok(backstop)
+}
+
+/// Hold one slot of the API-key pool a spawnable tap draws from (#14983), when
+/// this is a **dispatching role tick**: the one caller whose pick is followed
+/// by exactly one launch and one acquire. A probe holds nothing. Sweep and
+/// step dispatch do not reserve either: they re-resolve per phase, so a
+/// reservation there would not pair with an acquire and would hold a slot the
+/// sweep's own phases then could not draw.
+///
+/// The hold is not carried to the launch: the launched child's acquire
+/// retires it, and one that is never acquired expires
+/// ([`crate::api_keys_pool::reservation`]).
+///
+/// # Errors
+/// [`SkipReason::Unavailable`] when other draws and live spawns hold every
+/// slot: the walk passes the tap over and continues down its row.
+fn hold_pool_slot(
+    root: &Path,
+    source: &CredentialSource,
+    context: DispatchContext,
+) -> Result<(), SkipReason> {
+    use crate::api_keys_pool::reservation::{try_reserve, Reserve};
+    let CredentialSource::ApiKeys { provider } = source else {
+        return Ok(());
+    };
+    if !(context.role_tick && context.intent == Intent::Dispatch) {
+        return Ok(());
+    }
+    match try_reserve(root, provider) {
+        Reserve::Held(_) | Reserve::Unbounded => Ok(()),
+        Reserve::AtCap { .. } => Err(SkipReason::Unavailable {
+            source: source.wire(),
+            detail: availability::reserved_detail(provider),
+        }),
     }
 }
 

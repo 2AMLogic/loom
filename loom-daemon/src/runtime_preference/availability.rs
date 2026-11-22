@@ -452,7 +452,8 @@ fn codex(root: &Path, admitted: &ResolvedRuntime, now: u64) -> Availability {
 /// A pooled provider counts only accounts **under their concurrency cap**
 /// (#14944): one that is selectable but already holds `maxConcurrent` live
 /// spawns would be refused by the ladder's tier 0, so a pool with nothing else
-/// is [`PoolHold::SelfHealing`] and the walk moves on.
+/// is [`PoolHold::SelfHealing`] and the walk moves on. So is one whose free
+/// slots are all held by other draws' reservations (#14983).
 fn native(root: &Path, tap: &Tap, runtime: &str) -> Availability {
     let config = crate::config_resolver::resolve_effective_config(root);
     // An unresolvable profile is not this function's error to report: the
@@ -553,13 +554,23 @@ fn native(root: &Path, tap: &Tap, runtime: &str) -> Availability {
     // their declared `maxConcurrent`. `selectable` ignores the cap, so a pool
     // whose every account was at it read as spawnable here, the draw picked
     // it, and the launch was refused at 78 (`stage=credential`) with the tick
-    // lost. This read takes no lease, so a pick can still lose a race to a
-    // concurrent spawn; the ladder stays the enforcement point.
-    if entry.selectable_under_cap > 0 {
+    // lost. #14983: slots other draws have reserved count as taken too. This
+    // read holds nothing; a dispatching role tick takes its slot in
+    // `gate_admitted_candidate` (`api_keys_pool::reservation`), and the ladder
+    // stays the enforcement point.
+    let reserved_out = entry.unreserved_slots == Some(0);
+    if entry.selectable_under_cap > 0 && !reserved_out {
         return Availability::Spawnable {
             source,
             spawnable: Some(entry.selectable_under_cap),
             total: Some(entry.total),
+        };
+    }
+    if entry.selectable_under_cap > 0 {
+        return Availability::Exhausted {
+            source,
+            hold: PoolHold::SelfHealing,
+            detail: reserved_detail(&provider),
         };
     }
     if entry.selectable > 0 {
@@ -586,6 +597,16 @@ fn native(root: &Path, tap: &Tap, runtime: &str) -> Availability {
             entry.total, entry.exhausted, entry.disabled, entry.at_capacity
         ),
     }
+}
+
+/// The skip detail for a pool whose last free slot another draw holds
+/// (#14983). Shares its `pool <provider> at cap` prefix with the #14944 skip,
+/// so one grep finds both.
+pub(crate) fn reserved_detail(provider: &str) -> String {
+    format!(
+        "pool {provider} at cap: every free slot under maxConcurrent is reserved by a concurrent \
+         draw; clears when that launch acquires or its reservation expires — #14983"
+    )
 }
 
 /// Whether an external native auth snapshot is configured — the one way a

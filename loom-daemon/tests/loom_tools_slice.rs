@@ -3449,6 +3449,24 @@ fn gateway_refresh_refuses_wrong_mode_unsafe_destination_and_old_gh() {
     );
     assert!(!repo.path().join("sess").exists(), "nothing was written");
 
+    // A relative destination inside a git checkout, run from below the
+    // checkout root: absolutized before the ancestor walk, so still refused
+    // (#14964).
+    let deeper = repo.path().join("subdir/deeper");
+    std::fs::create_dir_all(&deeper).unwrap();
+    let mut c = base(TOOLS, &f.root, &deeper);
+    c.env("LOOM_GH_BIN", &f.gh)
+        .env("LOOM_CONFIG_DEFAULTS_FILE", &f.defaults)
+        .env("LOOM_SESSION_GATEWAY_ROOT", "sess")
+        .args(["gateway", "refresh"]);
+    let o = run(c, None);
+    assert_eq!(o.status.code(), Some(1), "{}", String::from_utf8_lossy(&o.stderr));
+    assert!(
+        String::from_utf8_lossy(&o.stderr).contains("checkout"),
+        "stderr refuses the relative in-checkout destination"
+    );
+    assert!(!deeper.join("sess").exists(), "nothing was written");
+
     // A gh below the minimum publishes nothing.
     let f = gateway_setup("2.96.0");
     let o = gateway_run(&f, "refresh");
