@@ -1877,8 +1877,8 @@ assert_doc_contains "$CHAMPION_MD" \
     "a human removal for the same concern is a PASS, not a silent hold (#11416)"
 
 assert_doc_contains "$CHAMPION_MD" \
-    'if [ "$MANUAL_RELEASE_SINCE_HOLD" != true ] && [ "$("$GH_READ" pr view' \
-    "a NEW concern after a human removal always posts a fresh hold notice, bypassing the idempotency guard (#11416)"
+    'if [ "$MANUAL_RELEASE_SINCE_HOLD" != true ] && [ -n "$HOLD_HEAD" ] && [ "$HOLD_HEAD" = "$HEAD_SHA" ]' \
+    "a NEW concern after a human removal always posts a fresh hold notice, bypassing the head-scoped idempotency guard (#11416, #14833)"
 
 assert_doc_contains "$CHAMPION_MD" \
     'loom-daemon park-record apply --pr "$PR_NUMBER" --reason "champion merge-risk hold"' \
