@@ -1050,7 +1050,7 @@ silently waived.
 
 | Obligation | Mechanism | Where it is enforced |
 |---|---|---|
-| Host, sibling and peer repository isolation | Account-private named volume, independent Git root with no object alternates, no host repository/Docker socket/daemon socket mounted; Docker's own mount and ownership inventory re-validated by container ID | `docker::validate` at preparation **and** again in `Selection::contain`; the worker re-checks `/workspace/repo` is an owned clone |
+| Host, sibling and peer repository isolation | Account-private named volume, independent Git root whose only possible object alternate is its own read-only origin mirror (#14680; no alternate at all is the pre-#14680 shape and stays admitted), no host repository/Docker socket/daemon socket mounted; Docker's own mount and ownership inventory re-validated by container ID | `docker::validate` at preparation **and** again in `Selection::contain`; the worker re-checks `/workspace/repo` is an owned clone and that its alternate is exactly the repository's canonical read-only mirror bind |
 | Exclusive writer, stale-context refusal | `flock`-owned account lease carried to the child as an inherited file descriptor, plus the durable job identity (container ID + control identity) | `lease::Lease`, `dispatch::inherited_lease`, `Selection::contain`, `transport::run` |
 | **Protected remote operations** | The managed `pre_tool_use` bridge, executed from the **image-owned sealed bundle**, with the forced guard policy (`LOOM_FORCE_SCOPE=protected`, …) applied by the host to the Codex process itself. Admission additionally requires the clone to *have* a managed registration (`Report::managed`) **and** Codex to run it: hook trust recorded for the profile, or a registration Loom has sealed (#14105) — an untrusted hook is read and then silently ignored by the pinned CLI, so "registered" is not "enforcing" | `bundle::accept` / `bundle::rebind`, `containment::enforcing`, `bundle::apply_policy` |
 | Loom lifecycle controls | Same bridge (`guard-loom-workflow.sh` in the sealed bundle); `private-workspace` refuses the SSH/host/Docker `run-job` executor; MCP/plugin/alternate-profile/agent config audit and argv audit before exec | `control::audit`, `control::audit_args`, `worker_setup::check_host_job` |
@@ -1064,9 +1064,8 @@ Each host keeps ONE object mirror per registered forge repository
 (`~/.loom/mirrors/<slug>/`, `LOOM_MIRROR_ROOT` to relocate), populated and
 refreshed solely from that repository's canonical origin under the #14716
 read-authority contract. The operator ruling of 2026-11-19 (option b) sets
-five conditions; the host-side store implements them as follows, and the
-seat-side slice (read-only binds, the single verified alternate, idle clone
-migration) lands separately on top of this store:
+five conditions; the host-side store and the seat-side borrowing implement
+them as follows:
 
 - **Origin only.** A mirror is created and fetched by the host daemon
   through `forge_auth::ProvedReader` — the exact verified route and the
@@ -1077,10 +1076,31 @@ migration) lands separately on top of this store:
   Seat clones, seat refs and unpublished seat objects are never inputs, and
   nothing a seat produces ever enters the mirror. A failed verification is
   never fatal: the session keeps the fully private legacy clone path.
-- **Read-only into every seat** is the seat-side slice's obligation
-  (`docker.rs` bind validation and `containment.rs` alternate admission);
-  until it lands, the "no object alternates" rule below is unchanged and
-  fully enforced for every seat clone.
+- **Read-only into every seat.** A container is created with one read-only
+  bind per authorized repository, at exactly `MIRRORS/<slug>/objects` from
+  the host mirror root, only when the host opts in via
+  `accounts.session.objectMirrors`; the slugs it was created with are
+  recorded in the seat's state and re-verified against Docker's own mount
+  inventory on every reuse (`docker::validate_settings`: exact source,
+  destination and read-only mode, no extra bind). A clone's sole possible
+  alternate is that path for exactly its own repository
+  (`repository::verify_alternates` at preparation,
+  `containment::in_bound_container` at admission — which also refuses a
+  symlinked or indirect mirror, a writable mount, and
+  `GIT_ALTERNATE_OBJECT_DIRECTORIES`), and a clone with no alternate stays
+  supported. An operator extra mount can never squat the `/mirrors`
+  namespace. A borrowed-from clone whose mirror bind cannot be restored
+  refuses the recreation rather than dangling (`mirror::ensure_bound`).
+- **Migration, in place and retryable.** At preparation, a fresh clone
+  borrows from creation and an existing clone migrates in place
+  (`repository::borrow_published`): the alternate is verified and written,
+  a local-only `repack -a -d -l` drops the local duplicates of published
+  objects while every unpublished commit, ref, index, identity record and
+  linked worktree stays local, and `fsck --full` proves connectivity
+  before a completion marker makes the step a no-op. Interruptions are
+  safe to retry; a repository registered after the container's creation
+  keeps its private clone until the next idle recreation installs and
+  verifies the new bind.
 - **Never pruned.** The fetch is `--no-prune`, the mirror sets `gc.auto=0`
   and `fetch.prune=false`, and no code path repacks or deletes mirror
   objects: an object whose upstream ref moved or vanished stays readable

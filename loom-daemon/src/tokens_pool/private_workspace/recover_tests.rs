@@ -437,6 +437,19 @@ fn session_container(config: &Config, id: &str, running: bool, image: &str) -> V
             "RW": false,
         }));
     }
+    // The origin mirror binds the container was created with (#14680): the
+    // host objects directories of exactly the recorded slugs, read-only.
+    if !config.mirror_binds.is_empty() {
+        let root = mirror::mirror_root().unwrap();
+        for slug in &config.mirror_binds {
+            mounts.push(json!({
+                "Destination": mirror::in_container_objects(slug),
+                "Type": "bind",
+                "Source": mirror::objects_dir(&root, slug),
+                "RW": false,
+            }));
+        }
+    }
     Run {
         name: config.container.clone(),
         user: "1000:1000".into(),
@@ -558,6 +571,7 @@ fn setup() -> Env {
         gh_config: None,
         session_image: None,
         extra_mounts: Vec::new(),
+        mirror_binds: Vec::new(),
     };
     let dir = state_dir(&account.credential_reference).unwrap();
     std::fs::create_dir_all(&dir).unwrap();
@@ -1778,6 +1792,16 @@ fn intact_probe() -> String {
 
 /// Write `accounts.session` into the workspace's own config tier.
 fn configure(env: &Env, image: Option<&str>, mounts: &[(&Path, &str)]) {
+    configure_session(env, image, mounts, false)
+}
+
+/// [`configure`] with the origin object mirror opt-in (#14680).
+fn configure_session(
+    env: &Env,
+    image: Option<&str>,
+    mounts: &[(&Path, &str)],
+    object_mirrors: bool,
+) {
     let mounts: Vec<Value> = mounts
         .iter()
         .map(|(host, container)| json!({"host": host, "container": container}))
@@ -1785,6 +1809,9 @@ fn configure(env: &Env, image: Option<&str>, mounts: &[(&Path, &str)]) {
     let mut session = json!({"extraMounts": mounts});
     if let Some(image) = image {
         session["image"] = json!(image);
+    }
+    if object_mirrors {
+        session["objectMirrors"] = json!(true);
     }
     let dir = env.workspace.path().join(".loom");
     std::fs::create_dir_all(&dir).unwrap();
@@ -2723,6 +2750,7 @@ fn seed_seat(env: &Env, name: &str, id: &str, trusted: bool) -> Seat {
         gh_config: None,
         session_image: None,
         extra_mounts: Vec::new(),
+        mirror_binds: Vec::new(),
     };
     let dir = state_dir(&account.credential_reference).unwrap();
     std::fs::create_dir_all(&dir).unwrap();
@@ -3161,4 +3189,219 @@ fn a_named_manual_exec_refuses_on_its_own_busy_seat_never_another() {
     assert!(!bob.dir.join(lease::ADMISSION).exists());
     drop(held);
     drop(super::tests::reacquire(&env.dir));
+}
+
+// ---------------------------------------------------------------------------
+// Origin object mirrors (#14680): creation binds, mount validation, and the
+// preparation hand-down, all through the fake Docker and mirror seams.
+// ---------------------------------------------------------------------------
+
+/// Point the host mirror root at a throwaway directory for one test. The env
+/// is process-global, so every test that touches it is `#[serial]`.
+struct MirrorRoot(Option<std::ffi::OsString>);
+
+impl MirrorRoot {
+    fn set(path: &Path) -> Self {
+        let previous = std::env::var_os(mirror::MIRROR_ROOT_ENV);
+        std::fs::create_dir_all(path).unwrap();
+        std::env::set_var(mirror::MIRROR_ROOT_ENV, path);
+        Self(previous)
+    }
+}
+
+impl Drop for MirrorRoot {
+    fn drop(&mut self) {
+        match self.0.take() {
+            Some(value) => std::env::set_var(mirror::MIRROR_ROOT_ENV, value),
+            None => std::env::remove_var(mirror::MIRROR_ROOT_ENV),
+        }
+    }
+}
+
+/// A mirror store populated on disk (its objects directory is all a bind
+/// and its borrowers need).
+fn seed_mirror(root: &Path, slug: &str) -> PathBuf {
+    let objects = mirror::objects_dir(root, slug);
+    std::fs::create_dir_all(&objects).unwrap();
+    objects
+}
+
+/// A start with `accounts.session.objectMirrors` on binds exactly the
+/// repository's own mirror read-only, records the bind, and hands the
+/// in-container preparation exactly that objects path.
+#[test]
+#[serial]
+fn a_start_with_mirrors_binds_them_read_only_and_hands_them_down() {
+    let env = setup();
+    env.seed_volume();
+    let mirrors = tempfile::tempdir().unwrap();
+    let _root = MirrorRoot::set(mirrors.path());
+    let id = identify(&env.config.repository).unwrap();
+    seed_mirror(mirrors.path(), &id.slug);
+    let planned = Rc::new(RefCell::new(Vec::<String>::new()));
+    let recorder = planned.clone();
+    let _fake = mirror::fake::install(Box::new(move |repo| {
+        recorder.borrow_mut().push(repo.slug.clone());
+        Ok(())
+    }));
+    configure_session(&env, None, &[], true);
+    let status = operator_start(&env, None).unwrap();
+    assert!(status.running);
+    let runs = created_runs(&env);
+    let bind = runs[0]
+        .mounts
+        .iter()
+        .find(|m| m["Destination"] == mirror::in_container_objects(&id.slug))
+        .expect("the mirror objects bind is created");
+    assert_eq!(bind["RW"], json!(false));
+    assert_eq!(bind["Source"], json!(mirror::objects_dir(mirrors.path(), &id.slug)));
+    assert_eq!(recorded(&env).mirror_binds, vec![id.slug.clone()]);
+    assert_eq!(*planned.borrow(), vec![id.slug.clone()]);
+    // The in-container prepare verb is told exactly this objects path.
+    assert!(env.engine().calls.iter().any(|c| {
+        c.contains(&"--mirror-objects".to_owned())
+            && c.contains(&mirror::in_container_objects(&id.slug))
+    }));
+}
+
+/// A mirror that cannot be populated is skipped, not fatal: the seat starts
+/// with a fully private clone (no bind, no alternate handed down).
+#[test]
+#[serial]
+fn an_unusable_mirror_keeps_the_seat_fully_private() {
+    let env = setup();
+    env.seed_volume();
+    let mirrors = tempfile::tempdir().unwrap();
+    let _root = MirrorRoot::set(mirrors.path());
+    let _fake = mirror::fake::install(Box::new(|_| bail!("origin unreachable")));
+    configure_session(&env, None, &[], true);
+    let status = operator_start(&env, None).unwrap();
+    assert!(status.running);
+    assert!(recorded(&env).mirror_binds.is_empty());
+    let runs = created_runs(&env);
+    assert!(!runs[0].mounts.iter().any(|m| m["Destination"]
+        .as_str()
+        .is_some_and(|d| d.starts_with(MIRRORS))));
+    assert!(!env
+        .engine()
+        .calls
+        .iter()
+        .any(|c| c.contains(&"--mirror-objects".to_owned())));
+}
+
+/// The recorded binds are checked against Docker's own mount inventory: a
+/// wrong source, a writable bind, a missing bind, or a bind for a repository
+/// of another account all refuse the session.
+#[test]
+#[serial]
+fn mirror_binds_are_validated_against_the_mount_inventory() {
+    let mut env = setup();
+    env.seed_volume();
+    env.seed_container(CONTAINER_ID, true);
+    let mirrors = tempfile::tempdir().unwrap();
+    let _root = MirrorRoot::set(mirrors.path());
+    let id = identify(&env.config.repository).unwrap();
+    let source = seed_mirror(mirrors.path(), &id.slug);
+    let container_name = env.config.container.clone();
+    env.config.mirror_binds = vec![id.slug.clone()];
+    save(&env.dir.join("workspace.json"), &env.config).unwrap();
+    let destination = mirror::in_container_objects(&id.slug);
+    let bind = |dst: &str, src: &Path, rw: bool| json!({"Destination": dst, "Type": "bind", "Source": src, "RW": rw});
+    let mounts_reset = |e: &mut Engine| {
+        let mounts = e.containers.get_mut(&container_name).unwrap()["Mounts"]
+            .as_array_mut()
+            .unwrap();
+        mounts.retain(|m| {
+            !m["Destination"]
+                .as_str()
+                .unwrap_or_default()
+                .starts_with(MIRRORS)
+        });
+    };
+    env.with(|e| mounts_reset(e));
+    env.with(|e| {
+        e.containers.get_mut(&container_name).unwrap()["Mounts"]
+            .as_array_mut()
+            .unwrap()
+            .push(bind(&destination, &source, false));
+    });
+    assert!(env.recover(None).is_ok(), "the honest bind must validate");
+
+    for tamper in [
+        "wrong-source",
+        "writable",
+        "second-alternate",
+        "missing",
+        "unauthorized-slug",
+    ] {
+        if tamper == "unauthorized-slug" {
+            env.config.mirror_binds = vec!["other-repo-22222222".into()];
+            save(&env.dir.join("workspace.json"), &env.config).unwrap();
+        }
+        env.with(|e| mounts_reset(e));
+        env.with(|e| {
+            let mounts = e.containers.get_mut(&container_name).unwrap()["Mounts"]
+                .as_array_mut()
+                .unwrap();
+            match tamper {
+                "wrong-source" => {
+                    mounts.push(bind(&destination, Path::new("/somewhere/else"), false))
+                }
+                "writable" => mounts.push(bind(&destination, &source, true)),
+                "second-alternate" => {
+                    mounts.push(bind(&destination, &source, false));
+                    mounts.push(bind(&format!("{MIRRORS}/a-b-11111111/objects"), &source, false));
+                }
+                "missing" => {}
+                "unauthorized-slug" => mounts.push(bind(
+                    &mirror::in_container_objects("other-repo-22222222"),
+                    &source,
+                    false,
+                )),
+                _ => unreachable!(),
+            }
+        });
+        assert!(env.recover(None).is_err(), "{tamper} must refuse");
+        // Restore the recorded binds for the next round.
+        env.config.mirror_binds = vec![id.slug.clone()];
+        save(&env.dir.join("workspace.json"), &env.config).unwrap();
+    }
+}
+
+/// A session recreated by recovery gets exactly its recorded binds back —
+/// and refuses to come back without them when the store is unusable, rather
+/// than leaving borrowed-from clones on a dangling alternate.
+#[test]
+#[serial]
+fn a_recreated_session_needs_its_bound_mirrors_back() {
+    let mut env = setup();
+    env.seed_volume();
+    let mirrors = tempfile::tempdir().unwrap();
+    let _root = MirrorRoot::set(mirrors.path());
+    let id = identify(&env.config.repository).unwrap();
+    seed_mirror(mirrors.path(), &id.slug);
+    env.config.mirror_binds = vec![id.slug.clone()];
+    save(&env.dir.join("workspace.json"), &env.config).unwrap();
+    let _fake = mirror::fake::install(Box::new(|_| Ok(())));
+    let status = env.recover(Some(IMAGE)).unwrap();
+    assert!(status.running);
+    let runs = created_runs(&env);
+    assert!(runs[0]
+        .mounts
+        .iter()
+        .any(|m| m["Destination"] == mirror::in_container_objects(&id.slug)));
+
+    // The store gone and origin unreachable: the recreation refuses.
+    let mut env = setup();
+    env.seed_volume();
+    let mirrors = tempfile::tempdir().unwrap();
+    let _root = MirrorRoot::set(mirrors.path());
+    let id = identify(&env.config.repository).unwrap();
+    env.config.mirror_binds = vec![id.slug.clone()];
+    save(&env.dir.join("workspace.json"), &env.config).unwrap();
+    let _fake = mirror::fake::install(Box::new(|_| bail!("origin unreachable")));
+    let error = env.recover(Some(IMAGE)).unwrap_err();
+    let text = format!("{error:#}");
+    assert!(text.contains("not usable"), "{text}");
+    assert!(created_runs(&env).is_empty());
 }
