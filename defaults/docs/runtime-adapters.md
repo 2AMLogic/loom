@@ -134,9 +134,9 @@ new script carrying that CLI's flag knowledge. Aider is the worked example:
    }
    ```
 
-2. **Exec stub (`defaults/scripts/spawn-aider.sh`)** — copy `spawn-aider.sh`
-   and change the runtime name so `spawn-worker.sh` can resolve it by script
-   name:
+2. **Exec stub (`defaults/scripts/spawn-<name>.sh`)** — copy Aider's stub
+   (`defaults/scripts/spawn-aider.sh`) verbatim and change the one runtime name
+   so `spawn-worker.sh` can resolve it by script name. Aider's own stub is:
 
    ```bash
    #!/usr/bin/env bash
@@ -1971,8 +1971,9 @@ stays env-passthrough even with the flag on.
   Validated at profile-selection time; userinfo, a query and a fragment are
   refused rather than normalised away.
 - `header` — `authorization-bearer` (Claude Code's `ANTHROPIC_AUTH_TOKEN`
-  shape, and most OpenAI-compatible endpoints) or `x-api-key` (Anthropic's
-  native API-key header).
+  shape, and most OpenAI-compatible endpoints), `x-api-key` (Anthropic's
+  native API-key header) or `x-goog-api-key` (the Google Gemini API-key
+  header).
 - `baseUrlEnv` — the environment variables set to the proxy's own base URL.
   Use this when the harness reads its base URL from the environment
   (`ANTHROPIC_BASE_URL`, `OPENAI_BASE_URL`, …).
