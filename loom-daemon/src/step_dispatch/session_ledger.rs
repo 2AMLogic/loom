@@ -241,6 +241,15 @@ pub fn decide(
     if record.context_size > cfg.context_cap {
         return fresh(FreshReason::OverContextCap, Some(record));
     }
+    // A transcript written inside a persistent seat can be resumed only by a
+    // launch that lands in that same seat. Nothing pins the Claude dispatch's
+    // account yet (Codex fails closed the same way), so a resume would hit a
+    // draw-dependent "no conversation found". Fresh until the follow-up pin
+    // (a `tokens select` account input + the Claude arm of
+    // `resume_handle::apply_env`) lands; tracked on #14371.
+    if record.runtime == "claude" && (record.session_store.is_some() || record.account.is_some()) {
+        return fresh(FreshReason::StoreUnreachable, Some(record));
+    }
     if !store_reachable(record) {
         return fresh(FreshReason::StoreUnreachable, Some(record));
     }

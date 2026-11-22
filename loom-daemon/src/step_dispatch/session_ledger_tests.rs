@@ -216,6 +216,22 @@ fn the_resume_prompt_names_the_role_and_item() {
 }
 
 #[test]
+fn a_seat_stored_claude_record_is_never_resumed_until_the_dispatch_can_pin_the_seat() {
+    let cfg = on();
+    let mut seat = record(7, StepRole::Judge, HOST, 0, 10);
+    seat.account = Some("beta".into());
+    seat.session_store = Some("/seats/beta/home".into());
+    // Reachable store, yet Fresh: nothing pins the launch into that seat.
+    assert_eq!(
+        reason(&run(&ledger(vec![seat]), StepRole::Judge, 5, &cfg, true)),
+        Some(FreshReason::StoreUnreachable)
+    );
+    // A host-stored record still resumes.
+    let host = ledger(vec![record(7, StepRole::Judge, HOST, 0, 10)]);
+    assert_eq!(reason(&run(&host, StepRole::Judge, 5, &cfg, true)), None);
+}
+
+#[test]
 fn claude_session_is_located_in_the_host_dir_or_the_seat_that_wrote_it() {
     let tmp = tempfile::tempdir().unwrap();
     let host = tmp.path().join("host");
