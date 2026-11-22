@@ -1,7 +1,7 @@
 //! Coverage for the unified hyperparameters module (Issue #9683): schema
 //! defaults, tier precedence (`env > config > legacy > default`),
-//! strict layer validation, and the startup capture that feeds the
-//! lease-TTL resolver.
+//! strict layer validation, digest stability, and the startup capture that
+//! feeds the provenance stamper and the lease-TTL resolver.
 //!
 //! Env-var-touching tests are `#[serial]` (`serial_test`) so concurrent
 //! tests cannot observe each other's env. The startup-success
@@ -179,8 +179,19 @@ fn validate_treats_nulls_as_absent() {
 }
 
 // ---------------------------------------------------------------------------
-// Startup capture
+// Digest and startup capture
 // ---------------------------------------------------------------------------
+
+#[test]
+fn digest_is_stable_and_distinct() {
+    let a = digest_of(&Hyperparameters::default());
+    let b = digest_of(&Hyperparameters::default());
+    assert_eq!(a, b);
+    assert!(a.starts_with("sha256:"), "{a}");
+    let mut tweaked = Hyperparameters::default();
+    tweaked.dispatch.max_concurrent += 1;
+    assert_ne!(a, digest_of(&tweaked));
+}
 
 #[test]
 #[serial]
@@ -191,8 +202,8 @@ fn startup_init_fails_fast_naming_the_offending_path() {
     assert!(problem.contains("dispatch.maxConcurrent"), "{problem}");
 }
 
-// The startup SUCCESS path populates process globals (resolved vector)
-// that outlive a test: its coverage lives in
+// The startup SUCCESS path populates process globals (resolved vector +
+// digest) that outlive a test: its coverage lives in
 // `tests/hyperparams_startup.rs` as its own integration-test process so the
 // lib suite's default-TTL and exact-attribute-count assertions stay
 // unpoisoned.
@@ -390,6 +401,14 @@ fn champion_caps_accept_zero_but_slices_do_not() {
     assert_eq!(resolved.sources["champion.tier3Cap"], Source::Config);
 }
 
+#[test]
+fn champion_values_enter_the_digest() {
+    let base = Hyperparameters::default();
+    let mut tweaked = base;
+    tweaked.champion.tier3_cap = 2;
+    assert_ne!(digest_of(&base), digest_of(&tweaked));
+}
+
 // ---------------------------------------------------------------------------
 // Dispatch weight bonuses (#11742)
 // ---------------------------------------------------------------------------
@@ -419,7 +438,7 @@ fn retired_weight_bonuses_are_accepted_ignored_and_reported() {
         retired_dispatch_keys(&serde_json::json!({"dispatch": {"itemAgeCapDays": 9}})).is_empty()
     );
 
-    // Retired keys leave the resolved configuration unchanged.
+    // They no longer move the resolved vector or its digest.
     let tmp = empty_workspace();
     let base = resolve_effective(tmp.path());
     write_config(
@@ -428,13 +447,14 @@ fn retired_weight_bonuses_are_accepted_ignored_and_reported() {
     );
     let resolved = resolve_effective(tmp.path());
     assert_eq!(resolved.params, base.params);
+    assert_eq!(digest_of(&resolved.params), digest_of(&base.params));
     assert!(!resolved
         .sources
         .contains_key("dispatch.weightBonusRedMainFix"));
 }
 
 /// #12185: α and β default to 0 (the two-stage draw, no busy-ness), read the
-/// config block and are validated by name.
+/// config block, enter the digest, and are validated by name.
 #[test]
 #[serial]
 fn pool_exponents_default_read_every_tier_and_validate_by_name() {
@@ -453,6 +473,7 @@ fn pool_exponents_default_read_every_tier_and_validate_by_name() {
     assert_eq!(resolved.params.dispatch.backlog_exponent, 0.75);
     assert_eq!(resolved.params.dispatch.busy_exponent, 1.0);
     assert_eq!(resolved.sources["dispatch.backlogExponent"], Source::Config);
+    assert_ne!(digest_of(&resolved.params), digest_of(&Hyperparameters::default()));
     // The draw's own reader sees the same block, and re-reads it each tick.
     let knobs = crate::step_dispatch::item_draw::PoolKnobs::for_root(tmp.path());
     assert_eq!((knobs.backlog_exponent, knobs.busy_exponent), (0.75, 1.0));
@@ -520,6 +541,7 @@ fn item_draw_knobs_default_read_the_block_and_validate_by_name() {
     assert_eq!(resolved.params.dispatch.item_age_divisor_days, 15);
     assert_eq!(resolved.sources["dispatch.itemWeightRedMain"], Source::Config);
     assert_eq!(resolved.sources["dispatch.itemAgeCapDays"], Source::Default);
+    assert_ne!(digest_of(&resolved.params), digest_of(&Hyperparameters::default()));
     // The draw's own overlay reads the same block.
     let w = crate::step_dispatch::item_draw::ItemWeights::for_root(tmp.path());
     assert_eq!((w.red_main, w.age_divisor_days), (20, 15));

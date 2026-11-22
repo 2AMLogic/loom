@@ -1,15 +1,17 @@
 //! Startup-capture integration coverage for the unified hyperparameters
 //! (Issue #9683): the success path of [`loom_daemon::hyperparams::startup_init`]
-//! populates **process globals** (the resolved vector), and the lease-TTL
-//! resolver reads them. Those globals are `OnceLock`s that live for the whole test binary —
+//! populates **process globals** (the resolved vector + its provenance
+//! digest), and the lease-TTL resolver and the span provenance stamper read
+//! them. Those globals are `OnceLock`s that live for the whole test binary —
 //! so this coverage runs as its OWN integration-test process, isolated from
 //! the lib unit tests whose suites assert default TTLs and exact span
 //! attribute counts. Keep it here; do not fold it back into
 //! `hyperparams_tests.rs`.
 
 use loom_daemon::hyperparams::{
-    lease_ttl_minutes_from_layer, resolved_global, startup_init, Source,
+    digest_global, lease_ttl_minutes_from_layer, resolved_global, startup_init, Source,
 };
+use loom_daemon::telemetry::trace::{provenance, TraceAttributes};
 use serial_test::serial;
 
 fn write_config(dir: &std::path::Path, body: &str) {
@@ -37,6 +39,16 @@ fn startup_capture_and_lease_ttl_hot_apply_without_a_restart() {
     let resolved = resolved_global().expect("startup_init captured the vector");
     assert_eq!(resolved.params.lifecycle.lease_ttl_minutes, 42.0);
     assert_eq!(resolved.sources["lifecycle.leaseTtlMinutes"], Source::Config);
+    let mut attributes = TraceAttributes::new();
+    provenance::stamp(&mut attributes);
+    let digest = resolved.digest();
+    assert_eq!(
+        attributes
+            .get(provenance::HYPERPARAMS_DIGEST)
+            .map(String::as_str),
+        Some(digest.as_str())
+    );
+    assert_eq!(digest_global(), Some(digest.as_str()));
     assert_eq!(lease_ttl_minutes_from_layer(), Some(42.0));
     assert_eq!(loom_daemon::claim_reconciliation::resolve_lease_ttl_minutes(), 42.0);
 

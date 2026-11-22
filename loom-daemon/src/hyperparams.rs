@@ -34,8 +34,12 @@
 //!    startup; it never half-applies a bad vector. (Legacy-tier values keep
 //!    each module's own soft-fallback semantics — only the new surface is
 //!    strict.)
-//! 3. **Per-field provenance** — [`resolve_effective`] reports which tier
-//!    supplied each field ([`Source`]), logged at startup and printed by
+//! 3. **Run provenance** — [`startup_init`] stamps the resolved vector's
+//!    SHA-256 digest into a process global that
+//!    [`crate::telemetry::trace::provenance`] records as
+//!    `loom.hyperparams.digest` on every `loom.*` span, so telemetry from a
+//!    run is reproducible from the exact vector it ran under, alongside
+//!    per-field [`Source`] provenance reported by [`resolve_effective`] and
 //!    `loom-daemon hyperparams`.
 //!
 //! Tranche 1 fields (each a real consumed tunable — see the field docs):
@@ -48,7 +52,7 @@
 //! (`prSlice,promotionSlice,tier2Cap,tier3Cap,tier3BacklogCap`; since #11512
 //! `tier2Cap` caps no-level promotions and the two `tier3*` caps are unused). Later tranches migrate the
 //! remaining knobs (host breaker, admission brake, merge-train bounds, role
-//! budgets) onto the same surface; the schema, validation and provenance
+//! budgets) onto the same surface; the schema, validation and digest
 //! mechanics here are the whole point — adding a field is one struct entry,
 //! one range check, and one consumer overlay.
 
@@ -56,6 +60,7 @@ use anyhow::{bail, Result};
 use clap::Args;
 use serde::Serialize;
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Once, OnceLock};
@@ -71,6 +76,10 @@ use crate::work_finder::{
 /// #11107). It is no longer read as a tier; it is only named so a stale
 /// export gets one warning instead of silently doing nothing.
 pub const HYPERPARAMS_ENV: &str = "LOOM_HYPERPARAMS";
+
+/// Attribute key the provenance stamper records the resolved vector's digest
+/// under (see [`crate::telemetry::trace::provenance`]).
+pub const DIGEST_ATTRIBUTE: &str = "loom.hyperparams.digest";
 
 static WARN_RETIRED_ENV: Once = Once::new();
 
@@ -88,6 +97,9 @@ pub fn warn_if_retired_env_set() {
 
 /// The resolved vector, captured once at daemon startup.
 static RESOLVED: OnceLock<Resolved> = OnceLock::new();
+/// The startup vector's digest, computed once so the per-span stamper never
+/// re-serializes (or, worse, allocates) per span.
+static DIGEST: OnceLock<String> = OnceLock::new();
 /// The workspace root `startup_init` resolved against — the anchor for
 /// hot-applied knob re-reads ([`lease_ttl_minutes_from_layer`]). `None`
 /// before `startup_init` runs.
@@ -193,20 +205,21 @@ pub struct ChampionParams {
     /// Range `[0, 100]` (`0` disables).
     pub tier2_cap: usize,
     /// The old Tier 3 per-pass cap. Unused since #11512: no priority level
-    /// maps onto Tier 3's population. Still parsed so existing
+    /// maps onto Tier 3's population. Still parsed and digested so existing
     /// config loads. Env: `LOOM_CHAMPION_TIER3_CAP`. Default 1. Range
     /// `[0, 100]`.
     pub tier3_cap: usize,
     /// The old Tier 3 backlog gate. Unused since #11512: keyed on no level it
     /// counted 46 promoted issues against 5 and froze promotion. Still parsed
-    /// so existing config loads. Env:
+    /// and digested so existing config loads. Env:
     /// `LOOM_CHAMPION_TIER3_BACKLOG_CAP`. Default 5. Range `[0, 1000]`.
     pub tier3_backlog_cap: usize,
 }
 
 /// The unified hyperparameter vector: every consolidated operational tunable,
-/// grouped by concern. Fields serialize in declaration order (the
-/// `hyperparams --json` output).
+/// grouped by concern. Field order is the digest's canonical serialization
+/// order — append-only from here on (reordering or renaming changes every
+/// run's digest).
 #[derive(Debug, Clone, Copy, PartialEq, Serialize)]
 pub struct Hyperparameters {
     pub dispatch: DispatchParams,
@@ -590,6 +603,24 @@ pub struct Resolved {
     pub sources: BTreeMap<String, Source>,
 }
 
+impl Resolved {
+    /// The vector's provenance digest: `sha256:<hex>` over the canonical
+    /// (field-order) JSON serialization of [`Resolved::params`]. Same vector
+    /// ⇒ same digest, any two runs.
+    #[must_use]
+    pub fn digest(&self) -> String {
+        digest_of(&self.params)
+    }
+}
+
+/// `sha256:<hex>` over the canonical JSON of a vector.
+#[must_use]
+pub fn digest_of(params: &Hyperparameters) -> String {
+    let serialized = serde_json::to_string(params).unwrap_or_default();
+    let hash = Sha256::digest(serialized.as_bytes());
+    format!("sha256:{}", hex::encode(hash))
+}
+
 /// A layer group lookup in the committed block.
 fn tier_value<'a>(block: &'a Value, group: &str, key: &str) -> Option<&'a Value> {
     block.get(group).and_then(|g| g.get(key))
@@ -767,9 +798,9 @@ pub fn resolve_effective(root: &Path) -> Resolved {
         },
         champion: {
             // The `LOOM_CHAMPION_*` single-knob env tier is what Champion's
-            // shell actually consumes, so it outranks the block here
-            // and reports `Source::Env`, naming the values the role really
-            // ran under (#10753).
+            // shell actually consumes, so it outranks the block here and
+            // reports `Source::Env` — the digest then names the values the
+            // role really ran under (#10753).
             let d = Hyperparameters::default().champion;
             let mut pick = |key: &str, default: usize| {
                 let env_var = CHAMPION_KEYS
@@ -805,6 +836,14 @@ pub fn resolved_global() -> Option<&'static Resolved> {
     RESOLVED.get()
 }
 
+/// The startup vector's digest, for the provenance stamper. `None` when the
+/// process never ran [`startup_init`] (the attribute is then simply omitted —
+/// best-effort, like the install-metadata stamps).
+#[must_use]
+pub fn digest_global() -> Option<&'static str> {
+    DIGEST.get().map(String::as_str)
+}
+
 /// The lease-freshness TTL from the hyperparameters layer, when the layer —
 /// not the default — supplied it. Consumed by
 /// `claim_reconciliation::resolve_lease_ttl_minutes` between its env tier and
@@ -830,8 +869,10 @@ pub fn lease_ttl_minutes_from_layer() -> Option<f64> {
 
 /// Daemon-startup gate (Issue #9683): resolve the hyperparameters layer,
 /// **fail fast** on any violation (naming every offending path), otherwise
-/// capture the resolved vector into the process global the per-knob
-/// resolvers read. Run once, early, in `daemon_service::run_daemon`.
+/// capture the resolved vector + digest into the process globals the
+/// per-knob resolvers and the provenance stamper read. Run once, early, in
+/// `daemon_service::run_daemon` — before any span exists, so every span of
+/// the run carries the digest of the vector it started under.
 ///
 /// # Errors
 /// Aborts startup when the layer has any schema violation. A set
@@ -858,9 +899,14 @@ pub fn startup_init(root: &Path) -> Result<()> {
         .map(|(path, source)| format!("{path}={}", source.as_str()))
         .collect::<Vec<_>>()
         .join(", ");
+    let digest = resolved.digest();
     let _ = RESOLVED.set(resolved);
+    let _ = DIGEST.set(digest);
     let _ = ROOT.set(root.to_path_buf());
-    log::info!("hyperparams: ({fields})");
+    log::info!(
+        "hyperparams: digest={} ({fields})",
+        DIGEST.get().map(String::as_str).unwrap_or_default()
+    );
     Ok(())
 }
 
@@ -868,14 +914,14 @@ pub fn startup_init(root: &Path) -> Result<()> {
 // CLI surface: `loom-daemon hyperparams`
 // ============================================================================
 
-/// Print the resolved hyperparameter vector and its provenance —
+/// Print the resolved hyperparameter vector, its provenance and its digest —
 /// the inspection surface for checking the effective configuration. With `--validate`, run the same
 /// strict gate daemon startup runs (`startup_init`: unknown keys, types,
 /// ranges, crossed pair) **without starting a daemon** — a config lint for a
 /// proposed `.loom/config.json` edit (#9768).
 #[derive(Debug, Args)]
 pub struct HyperparamsArgs {
-    /// Emit machine-readable JSON (`params`, `sources`) instead of
+    /// Emit machine-readable JSON (`params`, `sources`, `digest`) instead of
     /// a human-readable table. With `--validate`, emit the violations as a
     /// JSON array instead of prose lines.
     #[arg(long)]
@@ -938,6 +984,7 @@ impl HyperparamsArgs {
             return self.run_validate();
         }
         let resolved = resolve_effective(&self.workspace);
+        let digest = resolved.digest();
         if self.json {
             let out = serde_json::json!({
                 "params": resolved.params,
@@ -946,10 +993,12 @@ impl HyperparamsArgs {
                     .iter()
                     .map(|(k, v)| (k.clone(), v.as_str()))
                     .collect::<BTreeMap<_, _>>(),
+                "digest": digest,
             });
             println!("{out}");
             return Ok(());
         }
+        println!("digest: {digest}");
         println!(
             "dispatch.tickIntervalSecs      = {:>6}  [{}]",
             resolved.params.dispatch.tick_interval_secs,

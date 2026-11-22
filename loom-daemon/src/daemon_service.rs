@@ -357,8 +357,10 @@ pub(crate) async fn run_daemon() -> Result<()> {
     // down its tier chain (single-knob env >
     // "hyperparameters" config block > legacy autonomous.* keys > defaults),
     // fail fast on any out-of-range/unknown/contradictory value on the
-    // hyperparameters surface, and capture the resolved vector into the
-    // process global the per-knob resolvers read.
+    // hyperparameters surface, and capture the resolved vector + digest into
+    // the process globals the per-knob resolvers and the span provenance
+    // stamper read. Runs before any span exists so every span of this run
+    // records `loom.hyperparams.digest` for the vector it started under.
     hyperparams::startup_init(&sweep_workspace)?;
 
     let sweep_config = SweepRegistryConfig::new(sweep_workspace.clone());

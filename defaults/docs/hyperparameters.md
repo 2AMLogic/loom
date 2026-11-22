@@ -2,7 +2,8 @@
 
 **Issue #9683.** One typed, validated surface for Loom's operational
 tunables — the knobs that govern dispatch cadence, concurrency, lease
-lifetimes, and review-debt backoff — with per-field provenance of which
+lifetimes, and review-debt backoff — with run-level provenance (a digest
+stamped onto every telemetry span) and per-field provenance of which
 config tier supplied each value.
 
 Implementation: `loom-daemon/src/hyperparams.rs`. Consumers overlay their
@@ -117,8 +118,8 @@ adverts reach; a peer that does not advertise is not counted.
 
 **Knobs live in the fleet state store.** Set the six hyperparameter keys in
 `fleet/defaults.json` or a host overlay like any other `hyperparameters` key
-(the validated block is re-read each tick, so the fleet state store merge
-applies without a restart).
+(they are in the strict validated block, enter `loom.hyperparams.digest`, and
+are re-read every tick, so the fleet state store merge applies without a restart).
 `dispatch.backlogExponent` must be in `[0, 1]` and `dispatch.busyExponent`
 in `[0, 100]`; `--validate` rejects a value outside, a non-number, or an
 unknown `dispatch` key. The exponents are read from the primary workspace's
@@ -134,12 +135,12 @@ drawn item's draw weight, the pool total at that draw, and its repo's
 `loom.step.repo_items`, `loom.step.in_flight_repo`); `weight / total_weight`
 is the item's selection probability.
 
-Champion's shell snippets read
+The `champion` values enter the run digest. Champion's shell snippets read
 the `LOOM_CHAMPION_*` env vars directly, so the resolver honours them at the
 top tier (provenance `env`) with the shell's own parse: a non-negative
 integer wins (`0` included, unclamped), empty/non-integer falls through. The
 daemon does not yet export block values into role sessions (follow-up
-on #10753): until it does, a config value is resolved but only the env
+on #10753): until it does, a config value is digested but only the env
 var changes Champion's behaviour.
 
 ### Role-runner knobs (`autonomous.roleRunner.*`)
@@ -214,15 +215,23 @@ can never start failing this gate after an upgrade.
 ## Run provenance
 
 After validation, `startup_init` resolves the effective vector down the full
-precedence chain and logs each field's source tier. `loom-daemon hyperparams`
-prints the same provenance on demand. (The former per-span digest attribute
-was removed in #11107: nothing read it.)
+precedence chain and records a digest — `sha256:<hex>` over the vector's
+canonical JSON — in a process global. The trace provenance stamper
+(`telemetry/trace/provenance.rs`) then writes it as
+**`loom.hyperparams.digest`** on every `loom.*` span, alongside
+`loom.daemon.revision` and `loom.prompts.digest` (policy:
+[trace-identity](trace-identity.md)). A run's telemetry is therefore
+reproducible from the exact hyperparameter vector it ran under.
+
+The digest covers the whole resolved vector including inherited defaults —
+two runs with identical digests ran identical tunables, even if they got
+there by different tiers.
 
 ## Inspecting & validating: `loom-daemon hyperparams`
 
 ```
-$ loom-daemon hyperparams              # human-readable table
-$ loom-daemon hyperparams --json       # {"params":…, "sources":…}
+$ loom-daemon hyperparams              # human-readable table + digest
+$ loom-daemon hyperparams --json       # {"params":…, "sources":…, "digest":…}
 $ loom-daemon hyperparams --validate   # run the startup gate without a daemon
 ```
 
