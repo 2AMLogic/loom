@@ -448,6 +448,11 @@ fn codex(root: &Path, admitted: &ResolvedRuntime, now: u64) -> Availability {
 ///
 /// An unreadable pool directory is fail-closed too, matching the ladder's
 /// step 3 refusal.
+///
+/// A pooled provider counts only accounts **under their concurrency cap**
+/// (#14944): one that is selectable but already holds `maxConcurrent` live
+/// spawns would be refused by the ladder's tier 0, so a pool with nothing else
+/// is [`PoolHold::SelfHealing`] and the walk moves on.
 fn native(root: &Path, tap: &Tap, runtime: &str) -> Availability {
     let config = crate::config_resolver::resolve_effective_config(root);
     // An unresolvable profile is not this function's error to report: the
@@ -544,11 +549,28 @@ fn native(root: &Path, tap: &Tap, runtime: &str) -> Availability {
             ),
         };
     }
-    if entry.selectable > 0 {
+    // #14944: count what the selection ladder would offer, i.e. accounts under
+    // their declared `maxConcurrent`. `selectable` ignores the cap, so a pool
+    // whose every account was at it read as spawnable here, the draw picked
+    // it, and the launch was refused at 78 (`stage=credential`) with the tick
+    // lost. This read takes no lease, so a pick can still lose a race to a
+    // concurrent spawn; the ladder stays the enforcement point.
+    if entry.selectable_under_cap > 0 {
         return Availability::Spawnable {
             source,
-            spawnable: Some(entry.selectable),
+            spawnable: Some(entry.selectable_under_cap),
             total: Some(entry.total),
+        };
+    }
+    if entry.selectable > 0 {
+        return Availability::Exhausted {
+            source,
+            hold: PoolHold::SelfHealing,
+            detail: format!(
+                "pool {provider} at cap: 0/{} selectable account(s) under maxConcurrent ({} at \
+                 capacity); clears when a spawn exits — #14944",
+                entry.selectable, entry.at_capacity
+            ),
         };
     }
     Availability::Exhausted {

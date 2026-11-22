@@ -351,6 +351,15 @@ pub struct ProviderHealth {
     /// counted live here rather than derived from
     /// [`Ineligible::AtCapacity`], which only the selection ladder sets.
     pub at_capacity: usize,
+    /// Selectable accounts that are also under their declared concurrency cap
+    /// right now: what the selection ladder's tier 0 would actually offer a
+    /// spawn (#14944). [`Self::selectable`] alone ignores the cap (only the
+    /// ladder sets [`Ineligible::AtCapacity`]), so a caller deciding "would a
+    /// launch get a credential?" must read this. Not serialized: the health
+    /// JSON is unchanged, and `selectable` / `atCapacity` already carry both
+    /// halves for a human.
+    #[serde(skip)]
+    pub selectable_under_cap: usize,
     /// Accounts withheld because `.disabled` / `.bad_accounts.json` exists but
     /// cannot be read or parsed.
     pub unverifiable: usize,
@@ -473,6 +482,10 @@ pub fn health_in(
                     Ok(list) => (list, None),
                     Err(e) => (Vec::new(), Some(e)),
                 };
+            let at_cap = |a: &ApiKeyAccount| {
+                a.max_concurrent
+                    .is_some_and(|cap| inflight::live_count(&root, &provider, &a.name) >= cap)
+            };
             ProviderHealth {
                 dir: provider_dir(&root, &provider),
                 total: accounts.len(),
@@ -480,13 +493,10 @@ pub fn health_in(
                 disabled: count(Ineligible::Disabled),
                 malformed: count(Ineligible::Malformed),
                 exhausted: count(Ineligible::Exhausted),
-                at_capacity: accounts
+                at_capacity: accounts.iter().filter(|a| at_cap(a)).count(),
+                selectable_under_cap: accounts
                     .iter()
-                    .filter(|a| {
-                        a.max_concurrent.is_some_and(|cap| {
-                            inflight::live_count(&root, &provider, &a.name) >= cap
-                        })
-                    })
+                    .filter(|a| a.selectable() && !at_cap(a))
                     .count(),
                 unverifiable: count(Ineligible::Unverifiable),
                 unreadable,
