@@ -231,7 +231,10 @@ do not overlap, because a sweep-run Builder is not a recorded step.
   reads a step's last `LOOM_STEP_OUTCOME` line from its log into its end
   record and role-tick capture. The work finder's step tick computes each
   role's post-state from the claim release's own read, before its restore
-  write (`step_dispatch/step_end.rs`, #11909).
+  write (`step_dispatch/step_end.rs`, #11909); a release that noted its own
+  read failed (fail-open, #11480) supplies no observation, so the tick reads
+  the item itself then (#14899) — only no successful read at all is
+  `probe_failed`.
 - **Doctor** was out of this audit's scope (it was already targeted). Its PR
   Fix Mode has no kind probe: it should take gate 2 of the Judge row.
 - **The Judge lane assigner** hands fallback rows to `/loom:judge <PR>`. The
