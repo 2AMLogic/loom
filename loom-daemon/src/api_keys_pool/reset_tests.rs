@@ -6,8 +6,9 @@
 //! [`super::super::classify`].
 
 use super::super::classify::{
-    classify, CAPTURED_ZAI_FIVE_HOUR_LIMIT_EVENT, CAPTURED_ZAI_RATE_LIMIT_EVENT,
-    CAPTURED_ZAI_WEEKLY_LIMIT_EVENT,
+    classify, is_monthly_spend_cap, CAPTURED_ZAI_FIVE_HOUR_LIMIT_EVENT,
+    CAPTURED_ZAI_RATE_LIMIT_EVENT, CAPTURED_ZAI_WEEKLY_LIMIT_EVENT, SYNTHETIC_GOOGLE_PREPAY_EVENT,
+    SYNTHETIC_GOOGLE_SPEND_CAP_EVENT,
 };
 use super::*;
 
@@ -243,4 +244,77 @@ fn a_quoted_or_parenthesised_stamp_is_still_read() {
     ] {
         assert_eq!(parse_reset_at(line, NOW), Some(NOW + 5 * 3600), "{line}");
     }
+}
+
+/// 2026-11-01T00:00:00Z — a month start.
+const NOV_1: u64 = 1_793_491_200;
+/// 2026-11-30T23:59:30Z — thirty seconds before the next month start.
+const NOV_30_END: u64 = 1_796_083_170;
+/// 2026-12-01T00:00:00Z.
+const DEC_1: u64 = 1_796_083_200;
+
+/// #14933: a spend-cap refusal recovers at the next UTC month start, computed
+/// from the calendar rather than parsed — the one horizon exempt from
+/// `MAX_RESET_HORIZON_SECS` (a month is up to 31 days). Mid-month and
+/// end-of-month `now`s, both fixed.
+#[test]
+fn a_spend_cap_exhaustion_resolves_to_the_next_utc_month_start() {
+    assert!(is_monthly_spend_cap(SYNTHETIC_GOOGLE_SPEND_CAP_EVENT));
+    // Mid-month: 2026-10-10T00:00:00Z -> 2026-11-01T00:00:00Z (22 days).
+    assert_eq!(
+        resolve_cooldown(Classification::Exhausted, SYNTHETIC_GOOGLE_SPEND_CAP_EVENT, NOW, None),
+        Some((22 * 86_400, CooldownSource::MonthStart))
+    );
+    // End of month: 2026-11-30T23:59:30Z -> 2026-12-01T00:00:00Z (30 s).
+    assert_eq!(
+        resolve_cooldown(
+            Classification::Exhausted,
+            SYNTHETIC_GOOGLE_SPEND_CAP_EVENT,
+            NOV_30_END,
+            None
+        ),
+        Some((DEC_1 - NOV_30_END, CooldownSource::MonthStart))
+    );
+    // Exactly a month start: the horizon is the month AFTER, not `now`.
+    assert_eq!(
+        resolve_cooldown(Classification::Exhausted, SYNTHETIC_GOOGLE_SPEND_CAP_EVENT, NOV_1, None),
+        Some((30 * 86_400, CooldownSource::MonthStart))
+    );
+    // The calendar fact outranks a configured generic window.
+    assert_eq!(
+        resolve_cooldown(
+            Classification::Exhausted,
+            SYNTHETIC_GOOGLE_SPEND_CAP_EVENT,
+            NOW,
+            Some(3600)
+        ),
+        Some((22 * 86_400, CooldownSource::MonthStart))
+    );
+    // A reset the provider itself printed still outranks the calendar.
+    let printed = r#"{"error":{"message":"spend cap reached; will reset at 2026-10-10 05:00:00"}}"#;
+    assert_eq!(
+        resolve_cooldown(Classification::Exhausted, printed, NOW, None),
+        Some((5 * 3600, CooldownSource::ProviderReset))
+    );
+}
+
+/// The month-start horizon is the spend-cap shape's alone (#14933): every
+/// other exhaustion keeps the provider-parsed / configured / default order,
+/// and a rate limit never takes an exhaustion calendar horizon.
+#[test]
+fn only_the_spend_cap_shape_gets_the_month_start_horizon() {
+    for other in [
+        "Error: insufficient balance",
+        "quota exceeded",
+        CAPTURED_ZAI_WEEKLY_LIMIT_EVENT,
+        SYNTHETIC_GOOGLE_PREPAY_EVENT,
+    ] {
+        let resolved = resolve_cooldown(Classification::Exhausted, other, NOW, None);
+        assert_ne!(resolved.map(|(_, source)| source), Some(CooldownSource::MonthStart), "{other}");
+    }
+    // Even spend-cap wording read as a rate limit keeps the 60 s default.
+    assert_eq!(
+        resolve_cooldown(Classification::RateLimited, SYNTHETIC_GOOGLE_SPEND_CAP_EVENT, NOW, None),
+        Some((60, CooldownSource::Default))
+    );
 }

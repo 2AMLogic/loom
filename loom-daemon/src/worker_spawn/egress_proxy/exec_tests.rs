@@ -244,7 +244,29 @@ fn the_cli_shape_spawn_claude_uses_parses() {
     assert_eq!(parsed.base_url_env, vec!["OPENAI_BASE_URL".to_string()]);
     assert!(parsed.docker_workspace.is_none());
     assert!(parse_header("x-api-key").is_ok());
+    assert_eq!(parse_header("x-goog-api-key"), Ok(HeaderStyle::XGoogApiKey));
     assert!(parse_header("basic").is_err());
+}
+
+/// #14933: the Google header style parses from the CLI flag and is named in
+/// the dispatch marker, so an operator reading a launch log sees which header
+/// the proxy injects — mirroring the `x-api-key` handling.
+#[test]
+fn the_google_header_style_reaches_the_dispatch_marker() {
+    let env = env_with(&[("GEMINI_API_KEY", REAL), ("LOOM_TOKEN_NAME", "account-g")]);
+    let mut google = args(&["docker", "run", "img"]);
+    google.credential_env = "GEMINI_API_KEY".into();
+    google.upstream = "https://generativelanguage.googleapis.com".into();
+    google.header = HeaderStyle::XGoogApiKey;
+    google.base_url_env = Vec::new();
+    let (prepared, _command) = build(&google, &env).unwrap();
+    let marker = prepared.dispatch_marker();
+    assert!(marker.contains("header=x-goog-api-key"), "{marker}");
+    assert!(
+        marker.contains("upstream=https://generativelanguage.googleapis.com"),
+        "{marker}"
+    );
+    assert!(!marker.contains(REAL), "{marker}");
 }
 
 // ------------------------------------------------------ --docker-workspace
