@@ -464,6 +464,14 @@ repair the claim:
   shell needs. Choose this when the gap is a regression, not an intended
   break.
 
+For the introduction of strict Builder ownership, PR and merge-group CI pass the
+base commit to `install-compat check --base-ref`. Until the base carries strict
+admission, the two compatibility constants and the worktree lease directive must
+equal the patch after the base's `VERSION`. The note next to the workspace package
+version in `Cargo.toml` makes another version bump conflict even after PR checks
+passed. Resolve that conflict against the new base and refresh the note and all three floors.
+Once strict admission has landed, later releases retain its original floor.
+
 When the floor is exactly `VERSION` plus one patch and no eligible tag exists,
 the check exercises current installed files against the new daemon and labels
 that proof **prospective**. It does not claim to have tested an absent release.

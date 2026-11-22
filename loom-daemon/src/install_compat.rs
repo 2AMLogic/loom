@@ -27,7 +27,7 @@ use std::process::Command;
 /// The oldest installed Loom (`install-metadata.json` `loom_version`) this
 /// daemon works with.
 ///
-/// 0.20.13 is the next-patch floor for #14376: native Builder prelaunch
+/// 0.20.17 is the next-patch floor for #14376: native Builder prelaunch
 /// requires installed worktree/publisher scripts that enforce strict ownership.
 /// Older scripts ignore the Builder admission marker and fail open.
 ///
@@ -35,7 +35,7 @@ use std::process::Command;
 /// at or above this floor and at or below VERSION. Only a prospective next-patch
 /// floor may use current installed files until its release exists; a missing
 /// tag for an already-reached floor fails closed. See `release-cadence.md`.
-pub const SUPPORTS_INSTALLED: &str = "0.20.13";
+pub const SUPPORTS_INSTALLED: &str = "0.20.17";
 
 /// The oldest daemon the installed files this release ships work with. The
 /// install-metadata writers record it as `requires_daemon`.
@@ -52,15 +52,15 @@ pub const SUPPORTS_INSTALLED: &str = "0.20.13";
 /// (#13956; 0.19.1311 was cut before the merge and lacks it), called by the
 /// `resolve-role-model.sh` script-helper, whose hard
 /// floor is the same release.
-/// 0.20.13 is the next-patch floor for strict `lease ensure --require-ownership`
-/// (#14376), required by fresh Builder worktree admission. 0.20.12 was
+/// 0.20.17 is the next-patch floor for strict `lease ensure --require-ownership`
+/// (#14376), required by fresh Builder worktree admission. 0.20.16 was
 /// assigned before this flag. The daemon and installed scripts therefore
 /// declare the next patch while they await their first release together.
 ///
 /// Keep this on one line in exactly this shape: the installer
 /// (`scripts/install/loom-source-path.sh`) reads it from this file with
 /// `sed`, because the tree it installs can be newer than any binary it has.
-pub const REQUIRES_DAEMON: &str = "0.20.13";
+pub const REQUIRES_DAEMON: &str = "0.20.17";
 
 // compat:invoked-files:begin
 /// The installed files this daemon executes in a workspace. An installed tree
@@ -382,6 +382,12 @@ pub const TOOLS_COMMANDS: &[&str] = &[
     "resolve-model",
     "resolve-role-model",
     "capabilities",
+    "champion-hold classify",
+    "champion-hold merge-failed-marker",
+    "champion-hold ratification",
+    "champion-hold self-release-calibration",
+    "curation-complete",
+    "notify-cleared-blockers",
     "forge issue",
     "forge pr",
     "forge auth",
@@ -452,6 +458,7 @@ pub const TOOLS_COMMANDS: &[&str] = &[
     "lease ensure",
     "lease co-occupancy",
     "lease release",
+    "lease read",
     "lease renewer",
     "lease pr claim",
     "lease pr check",

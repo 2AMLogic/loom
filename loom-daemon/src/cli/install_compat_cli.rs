@@ -45,6 +45,9 @@ pub struct CheckArgs {
     /// The checkout under test. Defaults to the current directory.
     #[arg(long, value_name = "PATH", default_value = ".")]
     repo_root: PathBuf,
+    /// Verify new strict Builder floors against the target branch's version at this commit.
+    #[arg(long, value_name = "COMMIT")]
+    base_ref: Option<String>,
     /// A daemon binary for direction B: the oldest release at or above
     /// `requires_daemon` (releases skip versions, so not always that exact one).
     #[arg(long, value_name = "BIN", conflicts_with = "fetch_old_daemon")]
@@ -161,6 +164,7 @@ impl CheckArgs {
         };
         let opts = harness::CheckOptions {
             repo_root: self.repo_root,
+            base_ref: self.base_ref,
             new_daemon: std::env::current_exe()?,
             old_daemon,
             prev_ref: self.prev_ref,

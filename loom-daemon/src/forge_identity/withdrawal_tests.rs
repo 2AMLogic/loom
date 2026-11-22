@@ -417,6 +417,86 @@ fn a_real_core_limit_still_empties_core_until_its_reset() {
     assert_eq!((r.remaining, r.reset_epoch), (Some(0), reset));
 }
 
+// ---- #14881: the refusal books at its observation instant ---------------------
+
+#[test]
+fn a_scoped_refusal_books_the_bucket_at_its_observation_instant() {
+    // The bucket write behind a header-reset refusal used a fresh wall
+    // clock, so a refusal observed before a newer positive reading erased
+    // it once the ambient clock rolled past the reading. Every fixture
+    // instant is a whole second before a separately sampled ambient anchor
+    // and the raw header reset sits far beyond it, so the write happens
+    // under both clocks and only its booking instant can differ.
+    let anchor = SystemTime::now();
+    let at = |before: u64| anchor - Duration::from_secs(before);
+    let app = "940106";
+    let refusal = Failure::RateLimited {
+        resource: Resource::Graphql,
+        reset: Some(anchor + Duration::from_secs(3000)),
+        secondary: false,
+        retry_after: None,
+        remaining: Some(0),
+        graphql_primary_message: false,
+    };
+    let proven = |owner: &str, now: SystemTime| {
+        super::super::route::primary_graphql_withdrawn_at(app, owner, now)
+    };
+
+    // Older positive headroom: the refusal is the newer evidence and must
+    // replace it, stamped with the supplied observation instant.
+    let older_key = || BucketKey::new("app-940106", "obs-older", Resource::Graphql);
+    forge_bucket_book::insert(
+        older_key(),
+        forge_bucket_book::Reading {
+            limit: Some(5000),
+            remaining: Some(12),
+            used: None,
+            reset_epoch: epoch_secs(at(120)),
+            observed_at: epoch_secs(at(120)),
+            source: forge_bucket_book::Source::Header,
+        },
+    );
+    withdraw_after_in(RoutingMode::Scoped, app, "obs-older/x", refusal, "test", at(119), &no_probe);
+    let r = forge_bucket_book::reading(&older_key(), epoch_secs(at(60))).unwrap();
+    assert_eq!(r.remaining, Some(0));
+    assert_eq!(r.source, forge_bucket_book::Source::Refusal);
+    assert_eq!(
+        r.observed_at,
+        epoch_secs(at(119)),
+        "the refusal books at its observation instant, not the ambient clock"
+    );
+    assert!(proven("obs-older", at(60)));
+
+    // Newer positive headroom: a refusal observed one second earlier must
+    // not erase it, and the route's proof predicate stays contradicted.
+    let newer_key = || BucketKey::new("app-940106", "obs-newer", Resource::Graphql);
+    forge_bucket_book::insert(
+        newer_key(),
+        forge_bucket_book::Reading {
+            limit: Some(5000),
+            remaining: Some(12),
+            used: None,
+            reset_epoch: epoch_secs(anchor) + 300,
+            observed_at: epoch_secs(at(1)),
+            source: forge_bucket_book::Source::Header,
+        },
+    );
+    withdraw_after_in(RoutingMode::Scoped, app, "obs-newer/x", refusal, "test", at(2), &no_probe);
+    let r = forge_bucket_book::reading(&newer_key(), epoch_secs(anchor)).unwrap();
+    assert_eq!(
+        (r.source, r.remaining, r.observed_at),
+        (forge_bucket_book::Source::Header, Some(12), epoch_secs(at(1))),
+        "the newer positive reading survives the older refusal"
+    );
+    assert!(forge_read_pool::is_budget_withdrawn_at(
+        app,
+        "obs-newer",
+        Resource::Graphql,
+        anchor
+    ));
+    assert!(!proven("obs-newer", anchor));
+}
+
 // ---- secondary and credential -----------------------------------------------
 
 #[test]

@@ -569,7 +569,12 @@ jobs:
       # listing) settle whether the stub was written (#14229, #14691). The
       # per-pid /proc capture names WHICH fd a hung child is blocked on:
       # occurrence 3 (#14691) caught the lib binary in anon_pipe_write but
-      # could not say which pipe fd or how full it was. Guard dir resolves via
+      # could not say which pipe fd it was blocked on. The fdinfo capture
+      # answers that; it does NOT carry the pipe's buffer fill level --
+      # /proc/<pid>/fdinfo/<n> for a pipe reports only pos/flags/mnt_id/ino,
+      # and occupancy needs an ioctl(FIONREAD) on the read end -- so no
+      # fill-level number will appear in this log (#14708). Guard dir
+      # resolves via
       # `${TMPDIR:-/tmp}` because `live_gh_guard` uses `std::env::temp_dir()`,
       # which honors TMPDIR. Every command is failure-tolerant: this step is
       # continue-on-error evidence gathering, never a verdict.
@@ -586,8 +591,10 @@ jobs:
           for pid in $pids; do
             echo "--- pid ${pid}: $(tr '\0' ' ' < /proc/${pid}/cmdline 2>/dev/null || true)"
             echo "wchan: $(cat /proc/${pid}/wchan 2>/dev/null || true)"
-            echo "/proc/${pid}/stack (best effort; often root-only):"
-            cat /proc/${pid}/stack 2>/dev/null || echo "(unreadable)"
+            echo "/proc/${pid}/stack (best effort; sudo -n fallback for the root-only read):"
+            cat /proc/${pid}/stack 2>/dev/null \
+              || sudo -n cat /proc/${pid}/stack 2>/dev/null \
+              || echo "(unreadable)"
             echo "/proc/${pid}/fd:"
             ls -l /proc/${pid}/fd 2>/dev/null || echo "(unreadable)"
             echo "fdinfo for pipe fds of ${pid}:"
@@ -1384,8 +1391,13 @@ jobs:
         if: ${{ !cancelled() }}
         env:
           GH_TOKEN: ${{ github.token }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha }}
         run: |
-          ./target/debug/loom-daemon install-compat check --repo-root . \
+          base_args=()
+          if [[ "$GITHUB_EVENT_NAME" == pull_request || "$GITHUB_EVENT_NAME" == merge_group ]]; then
+            base_args=(--base-ref "${BASE_SHA:?missing merge base tip}")
+          fi
+          ./target/debug/loom-daemon install-compat check --repo-root . "${base_args[@]}" \
             --fetch-old-daemon --release-repo "$GITHUB_REPOSITORY" \
             --asset loom-daemon-x86_64-unknown-linux-gnu
 
@@ -1603,9 +1615,8 @@ jobs:
         if: ${{ !cancelled() && steps.daemon-bin.outcome == 'success' }}
         run: bash defaults/scripts/tests/test-worktree-stash-baseline.sh
       # #8553: worktree.sh's new issue claim-lock cross-check delegates to
-      # `loom-daemon worktree-lock check-issue` (this file is frozen by the
-      # file-size ratchet, so the new guard's decision logic lives in Rust,
-      # not shell) — needs the binary this job downloads.
+      # `loom-daemon worktree-lock check-issue` (the new guard's decision
+      # logic lives in Rust, not shell) — needs the binary this job downloads.
       - name: worktree issue claim-lock cross-check (#8553)
         if: ${{ !cancelled() && steps.daemon-bin.outcome == 'success' }}
         run: bash defaults/scripts/tests/test-worktree-issue-lock.sh
@@ -1895,6 +1906,12 @@ jobs:
       - name: merge-pr --release-hold (#13517)
         if: ${{ !cancelled() && steps.daemon-bin.outcome == 'success' }}
         run: bash defaults/scripts/tests/test-merge-pr-release-hold.sh
+      # #14833: the merge-risk hold-writer suite's release-decision leg runs
+      # only where a build of this checkout exists, so the suite runs a second
+      # time here (its hermetic legs run again unchanged in the shell job).
+      - name: merge-risk hold writer -> release decision (#14833)
+        if: ${{ !cancelled() && steps.daemon-bin.outcome == 'success' }}
+        run: bash defaults/scripts/tests/test-champion-pr-merge-hold-release.sh
       # #9657 (#9548 slice): this suite pins the working-tree binary for the
       # real `forge trusted-comments` filter, so it needs this job's shared
       # build.
@@ -2403,14 +2420,14 @@ jobs:
     # image smokes below each used to rebuild it (plus their own release
     # loom-daemon build); they now `needs:` this job and `docker load` the
     # tarball it uploads, under the exact tags they used before
-    # (`loom-worker:ci-smoke` and `ghcr.io/rjwalters/loom-worker:ci-smoke`, the
+    # (`loom-worker:ci-smoke` and `ghcr.io/2amlogic/loom-worker:ci-smoke`, the
     # overlays' BASE_IMAGE). Same `if:` as the smokes, so it runs exactly when
     # they do: always on merge_group; on push only when `changes` found an
     # image input since the last green push run, or did not succeed (fails
     # closed); on a PR when `changes.docker` is true (#10825). `release-build`'s
     # gate must stay a superset of this one (equal on PRs; see its comment).
     #
-    # Layer cache: a REGISTRY cache at ghcr.io/rjwalters/loom-worker:buildcache,
+    # Layer cache: a REGISTRY cache at ghcr.io/2amlogic/loom-worker:buildcache,
     # not `type=gha`. The Actions cache is already over its 10 GB cap (13.28 GB
     # on 2026-10-07; the #9065 eviction problem in this file's header), and an
     # apt layer there would evict rust-cache entries and be evicted in turn.
@@ -2422,7 +2439,7 @@ jobs:
     # or merge_group token holds `packages: write` (#10846). The cache is
     # WRITTEN only by `worker-buildcache` below, a separate job gated at job
     # level to a push to main in 2AMLogic/loom (mirrors rust-cache's
-    # `save-if`): a fork PR's token cannot push to ghcr.io/rjwalters/*, and a
+    # `save-if`): a fork PR's token cannot push to ghcr.io/2amlogic/*, and a
     # same-repo PR must not be able to seed the cache main builds from. The
     # published `:latest` is not used as cache-from: CI passes APT_MIRROR and
     # release does not, so its apt layers never match.
@@ -2437,7 +2454,7 @@ jobs:
       contents: read
       packages: read
     env:
-      BUILDCACHE_REF: ghcr.io/rjwalters/loom-worker:buildcache
+      BUILDCACHE_REF: ghcr.io/2amlogic/loom-worker:buildcache
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -2470,7 +2487,7 @@ jobs:
             --cache-from "type=registry,ref=${BUILDCACHE_REF}" \
             --output type=docker,dest=/tmp/loom-worker-base.tar \
             -t loom-worker:ci-smoke \
-            -t ghcr.io/rjwalters/loom-worker:ci-smoke \
+            -t ghcr.io/2amlogic/loom-worker:ci-smoke \
             .
       - name: Upload the base image for the smoke jobs
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
@@ -2485,7 +2502,7 @@ jobs:
     name: Publish loom-worker build cache
     # The ONLY job in this workflow with `packages: write` (#10846). It writes
     # the registry layer cache `worker-base-image` reads
-    # (ghcr.io/rjwalters/loom-worker:buildcache; rationale in that job's
+    # (ghcr.io/2amlogic/loom-worker:buildcache; rationale in that job's
     # header). Job permissions cannot vary by event, so the write is split out
     # here and gated at JOB level to a push to main in 2AMLogic/loom: on
     # pull_request and merge_group this job is skipped, so no token those
@@ -2519,7 +2536,7 @@ jobs:
       contents: read
       packages: write
     env:
-      BUILDCACHE_REF: ghcr.io/rjwalters/loom-worker:buildcache
+      BUILDCACHE_REF: ghcr.io/2amlogic/loom-worker:buildcache
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -2610,7 +2627,7 @@ jobs:
     # loom-worker-only one, is worth re-validating this layer against): #6899,
     # Epic #6896 Phase 1. Its FROM target is the base image this run's
     # `worker-base-image` built from the PR's own Dockerfile (#10822), loaded
-    # under ghcr.io/rjwalters/loom-worker:ci-smoke -- never a pull of the
+    # under ghcr.io/2amlogic/loom-worker:ci-smoke -- never a pull of the
     # published image, which a PR's Dockerfile changes are not in.
     needs: [changes, worker-base-image]
     if: >-
@@ -2638,12 +2655,12 @@ jobs:
         run: |
           set -euo pipefail
           docker load --input /tmp/loom-worker-base/loom-worker-base.tar
-          docker image inspect ghcr.io/rjwalters/loom-worker:ci-smoke >/dev/null
+          docker image inspect ghcr.io/2amlogic/loom-worker:ci-smoke >/dev/null
       - name: Build the loom-worker-session image (no push)
         timeout-minutes: 10
         run: |
           docker build -f docker/session/Dockerfile \
-            --build-arg BASE_IMAGE=ghcr.io/rjwalters/loom-worker:ci-smoke \
+            --build-arg BASE_IMAGE=ghcr.io/2amlogic/loom-worker:ci-smoke \
             -t loom-worker-session:ci-smoke .
       - name: Run the smoke test
         run: ./docker/session/test-image.sh loom-worker-session:ci-smoke
@@ -2687,12 +2704,12 @@ jobs:
         run: |
           set -euo pipefail
           docker load --input /tmp/loom-worker-base/loom-worker-base.tar
-          docker image inspect ghcr.io/rjwalters/loom-worker:ci-smoke >/dev/null
+          docker image inspect ghcr.io/2amlogic/loom-worker:ci-smoke >/dev/null
       - name: Build the loom-worker-native image (no push)
         timeout-minutes: 10
         run: |
           docker build -f docker/native/Dockerfile \
-            --build-arg BASE_IMAGE=ghcr.io/rjwalters/loom-worker:ci-smoke \
+            --build-arg BASE_IMAGE=ghcr.io/2amlogic/loom-worker:ci-smoke \
             -t loom-worker-native:ci-smoke .
       - name: Run the smoke test
         run: ./docker/native/test-image.sh loom-worker-native:ci-smoke

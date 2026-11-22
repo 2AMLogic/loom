@@ -67,6 +67,8 @@ pub struct CheckOptions {
     /// The checkout whose `defaults/` are the new installed files and whose
     /// tags name the releases.
     pub repo_root: PathBuf,
+    /// Base branch tip for checking a new strict Builder contract before merge.
+    pub base_ref: Option<String>,
     /// The new daemon (built from `repo_root`).
     pub new_daemon: PathBuf,
     /// Where direction B's old daemon comes from.
@@ -227,6 +229,10 @@ pub fn run(opts: &CheckOptions) -> Result<Report> {
         opts.supports_installed, opts.requires_daemon
     ));
 
+    if let Some(base) = &opts.base_ref {
+        check_builder_release_boundary(opts, base, &mut report)?;
+    }
+
     let new_tree = opts.repo_root.join("defaults");
     let new_scripts = installed_shell_files(&new_tree)?;
     check_claims(opts, ships_as, &new_tree, &new_scripts, &mut report);
@@ -235,6 +241,61 @@ pub fn run(opts: &CheckOptions) -> Result<Report> {
     direction_a(opts, version, &mut probe, &mut report)?;
     direction_b(opts, &new_tree, &new_scripts, &mut probe, &mut report)?;
     Ok(report)
+}
+
+/// A floor that was prospective at review can name an incompatible release by
+/// merge time. Compare with the event's actual base, even if it has no tag yet.
+fn check_builder_release_boundary(
+    opts: &CheckOptions,
+    base: &str,
+    report: &mut Report,
+) -> Result<()> {
+    const WORKTREE: &str = "defaults/scripts/worktree.sh";
+    let base_file = |path: &str| -> Result<String> {
+        let spec = format!("{base}:{path}");
+        let out = crate::git_utils::git_run(&opts.repo_root, &["cat-file", "blob", &spec])?;
+        anyhow::ensure!(
+            out.status.success(),
+            "could not read {spec}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        Ok(String::from_utf8(out.stdout)?)
+    };
+
+    // Once strict admission is on the base, later release bumps leave its
+    // introduction floor alone. Read the capability independently of its marker.
+    if base_file(WORKTREE)?.lines().any(|line| {
+        !line.trim_start().starts_with('#')
+            && line.contains("lease ensure")
+            && line.contains("--require-ownership")
+    }) {
+        return Ok(());
+    }
+    let version = Version::parse(&base_file("VERSION")?).context("invalid base VERSION")?;
+    let expected = version.next_patch();
+    // Git refuses a concurrent release's edit to this adjacent version line,
+    // including when green PR checks were recorded before the release.
+    let manifest = std::fs::read_to_string(opts.repo_root.join("Cargo.toml"))?;
+    let boundary = format!(
+        "\n# First release with strict Builder ownership: {expected}\nversion = \"{version}\"\n"
+    );
+    if !manifest.contains(&boundary) {
+        report.violations.push(format!("keep the strict Builder release boundary for {expected} directly above workspace.package.version {version} in Cargo.toml"));
+    }
+    let script = std::fs::read_to_string(opts.repo_root.join(WORKTREE))?;
+    let lease_floors: Vec<_> = hard_floors(&script)
+        .into_iter()
+        .filter_map(|(sub, floor)| (sub == "lease").then_some(floor))
+        .collect();
+    if opts.supports_installed != expected
+        || opts.requires_daemon != expected
+        || lease_floors != [expected]
+    {
+        report.violations.push(format!(
+            "strict Builder ownership first ships after base VERSION {version}: set SUPPORTS_INSTALLED, REQUIRES_DAEMON and {WORKTREE}'s lease floor to {expected}"
+        ));
+    }
+    Ok(())
 }
 
 fn check_claims(

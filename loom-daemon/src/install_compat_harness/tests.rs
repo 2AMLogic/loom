@@ -187,6 +187,7 @@ fn checkout(version: &str, release_tags: &[&str]) -> tempfile::TempDir {
 fn opts(root: &Path, req: &str, old_daemon: OldDaemon) -> CheckOptions {
     CheckOptions {
         repo_root: root.to_path_buf(),
+        base_ref: None,
         new_daemon: PathBuf::from("/nonexistent/new-daemon"),
         old_daemon,
         prev_ref: None,
@@ -195,6 +196,70 @@ fn opts(root: &Path, req: &str, old_daemon: OldDaemon) -> CheckOptions {
         requires_daemon: v(req),
         invoked_files: Vec::new(),
     }
+}
+
+#[test]
+fn builder_floors_follow_the_unreleased_base_until_strict_admission_lands() {
+    let repo = checkout("0.20.16", &[]);
+    let root = repo.path();
+    let worktree = root.join("defaults/scripts/worktree.sh");
+    std::fs::create_dir_all(worktree.parent().unwrap()).unwrap();
+    std::fs::write(&worktree, "# ordinary lease ensure\n").unwrap();
+    git(root, &["add", "."]);
+    git(root, &["commit", "-qm", "base without strict admission"]);
+    let mut options = opts(root, "0.20.17", OldDaemon::Absent);
+    options.supports_installed = v("0.20.17");
+    let check = |opts: &CheckOptions| {
+        let mut report = Report::default();
+        check_builder_release_boundary(opts, "HEAD", &mut report).unwrap();
+        report.violations
+    };
+    let strict =
+        "# requires-daemon: lease >= 0.20.17\nloom-daemon lease ensure 1 --require-ownership\n";
+    let manifest = root.join("Cargo.toml");
+    let initial = "[workspace.package]\n# First release with strict Builder ownership: 0.20.17\nversion = \"0.20.16\"\n";
+    std::fs::write(&manifest, initial).unwrap();
+    std::fs::write(&worktree, strict).unwrap();
+    assert!(check(&options).is_empty());
+    std::fs::write(root.join("VERSION"), "0.20.17\n").unwrap();
+    git(
+        root,
+        &[
+            "commit",
+            "-qm",
+            "release bumped while the PR waited",
+            "VERSION",
+        ],
+    );
+    let stale = check(&options);
+    assert!(stale
+        .iter()
+        .any(|msg| msg.contains("release boundary for 0.20.18")));
+    assert!(stale.iter().any(|msg| msg.contains("to 0.20.18")));
+    std::fs::write(
+        &manifest,
+        initial
+            .replace("0.20.17", "0.20.18")
+            .replace("0.20.16", "0.20.17"),
+    )
+    .unwrap();
+    let refreshed = strict.replace("0.20.17", "0.20.18");
+    std::fs::write(&worktree, &refreshed).unwrap();
+    options.requires_daemon = v("0.20.18");
+    assert_eq!(check(&options).len(), 1, "old installed scripts would be admitted");
+    options.supports_installed = v("0.20.18");
+    options.requires_daemon = v("0.20.17");
+    assert_eq!(check(&options).len(), 1, "old daemons would be admitted");
+    options.requires_daemon = v("0.20.18");
+    std::fs::write(&worktree, strict).unwrap();
+    assert_eq!(check(&options).len(), 1, "the worktree directive is stale");
+    std::fs::write(&worktree, refreshed).unwrap();
+    assert!(check(&options).is_empty());
+    git(root, &["add", "Cargo.toml"]);
+    git(root, &["commit", "-qam", "land strict admission"]);
+    std::fs::write(root.join("VERSION"), "0.20.18\n").unwrap();
+    git(root, &["commit", "-qam", "next release"]);
+    assert!(check(&options).is_empty());
 }
 
 /// A stand-in old daemon that reports `version`.
