@@ -16,7 +16,7 @@
 //! own call site unchanged.
 //!
 //! The Codex half is the only production caller of
-//! `tokens_pool::record_terminal_for_model`, and the sole producer for
+//! `tokens_pool::record_terminal_for_model_with_reset`, and the sole producer for
 //! #8058 Phase 2's class-scoped `class_cooldowns` marks.
 
 use super::*;

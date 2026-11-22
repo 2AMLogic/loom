@@ -549,22 +549,6 @@ impl SweepRegistry {
         LockReleaseOutcome::Released
     }
 
-    /// Release the lock dir for an issue (idempotent).
-    ///
-    /// UNCONDITIONAL: removes `.loom/locks/issue-<N>` regardless of which sweep
-    /// owns it. Prefer [`release_lock_owned`](Self::release_lock_owned) from any
-    /// reaper / cancel / re-dispatch path so a newer sweep's live claim is not
-    /// clobbered (Issue #4463) — this remains for callers that intentionally
-    /// want an owner-blind removal.
-    pub fn release_lock(&self, issue: u32) -> Result<()> {
-        let lock = self.config.locks_dir().join(format!("issue-{issue}"));
-        if lock.exists() {
-            std::fs::remove_dir_all(&lock)
-                .with_context(|| format!("failed to remove lock dir {}", lock.display()))?;
-        }
-        Ok(())
-    }
-
     /// Ownership-checked lock release (Issue #4463).
     ///
     /// Removes `.loom/locks/issue-<N>` **only when** its `owner.json`
