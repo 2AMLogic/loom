@@ -1404,6 +1404,44 @@ pub fn should_force_remove_orphan_dir(cause: &str, is_managed: bool, under_root:
     is_untracked_worktree_error(cause) && is_managed && under_root
 }
 
+/// #5177 fallback for a failed `git worktree remove`: the directory still
+/// exists on disk but git no longer tracks it. Removes it directly — but
+/// ONLY when [`should_force_remove_orphan_dir`] proves this is a
+/// Loom-managed worktree path (git error + `.loom-managed` sentinel +
+/// containment under the managed root), never a blanket rm — then prunes
+/// the stale registration best-effort. Returns `Err(cause)` (the original
+/// git failure) on an ineligible path, or the combined diagnostic when the
+/// direct removal itself fails. Shared by [`cleanup_worktree`] and
+/// [`cleanup_pr_worktree`].
+fn remove_untracked_worktree_dir(
+    repo_root: &Path,
+    worktree_path: &Path,
+    cause: &str,
+) -> Result<(), String> {
+    if !should_force_remove_orphan_dir(
+        cause,
+        is_loom_managed(worktree_path),
+        is_under_worktree_root(repo_root, worktree_path),
+    ) {
+        return Err(cause.to_string());
+    }
+    std::fs::remove_dir_all(worktree_path).map_err(|e| {
+        format!(
+            "git worktree remove failed ({cause}); direct removal of the untracked \
+             worktree directory also failed: {e}"
+        )
+    })?;
+    println!(
+        "  Removed untracked worktree directory (no git worktree entry): {}",
+        worktree_path.display()
+    );
+    let _ = Command::new("git")
+        .args(["worktree", "prune"])
+        .current_dir(repo_root)
+        .status();
+    Ok(())
+}
+
 /// What [`cleanup_worktree`] actually did on success.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CleanupOutcome {
@@ -1479,35 +1517,12 @@ pub fn cleanup_worktree(
                 .current_dir(repo_root)
                 .status();
             CleanupOutcome::AlreadyGone
-        } else if should_force_remove_orphan_dir(
-            // #5177: an orphaned `.loom/worktrees/*` directory git no longer
-            // tracks fails `git worktree remove` with "is not a working
-            // tree" and could never be cleaned by the normal path. Fall back
-            // to a direct removal — but ONLY when we can prove this is a
-            // Loom-managed worktree path (the specific git error + the
-            // `.loom-managed` sentinel + containment under the managed
-            // worktree root), never a blanket rm on any failure.
-            &cause,
-            is_loom_managed(worktree_path),
-            is_under_worktree_root(repo_root, worktree_path),
-        ) {
-            std::fs::remove_dir_all(worktree_path).map_err(|e| {
-                format!(
-                    "git worktree remove failed ({cause}); direct removal of the untracked \
-                     worktree directory also failed: {e}"
-                )
-            })?;
-            println!(
-                "  Removed untracked worktree directory (no git worktree entry): {}",
-                worktree_path.display()
-            );
-            let _ = Command::new("git")
-                .args(["worktree", "prune"])
-                .current_dir(repo_root)
-                .status();
-            CleanupOutcome::Removed
         } else {
-            return Err(cause);
+            // #5177: an orphaned `.loom/worktrees/*` directory git no longer
+            // tracks falls back to the shared direct removal; any other git
+            // failure comes back out of it unchanged.
+            remove_untracked_worktree_dir(repo_root, worktree_path, &cause)?;
+            CleanupOutcome::Removed
         }
     } else {
         println!("  Removed worktree: {}", worktree_path.display());
@@ -1846,28 +1861,7 @@ pub fn cleanup_pr_worktree(
         .current_dir(repo_root);
     if let Err(cause) = run_checked(remove) {
         // #5177: same orphaned-directory fallback as `cleanup_worktree`.
-        if should_force_remove_orphan_dir(
-            &cause,
-            is_loom_managed(worktree_path),
-            is_under_worktree_root(repo_root, worktree_path),
-        ) {
-            std::fs::remove_dir_all(worktree_path).map_err(|e| {
-                format!(
-                    "git worktree remove failed ({cause}); direct removal of the untracked \
-                     worktree directory also failed: {e}"
-                )
-            })?;
-            println!(
-                "  Removed untracked worktree directory (no git worktree entry): {}",
-                worktree_path.display()
-            );
-            let _ = Command::new("git")
-                .args(["worktree", "prune"])
-                .current_dir(repo_root)
-                .status();
-        } else {
-            return Err(cause);
-        }
+        remove_untracked_worktree_dir(repo_root, worktree_path, &cause)?;
     } else {
         println!("  Removed worktree: {}", worktree_path.display());
     }
