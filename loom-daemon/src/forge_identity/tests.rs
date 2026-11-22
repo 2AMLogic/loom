@@ -330,7 +330,7 @@ fn refresh_publishes_each_reader_for_each_owner_and_withdraws_failures() {
 
 /// Structural guard (#9537 AC): reader credentials are only ever requested
 /// from the reviewed READ call sites. A new caller of `read_credential` /
-/// `apply_read_credential` / `route_read` (W4-B) must be added here deliberately, by someone who
+/// `route_read` (W4-B) must be added here deliberately, by someone who
 /// has checked that the call it serves is a read.
 #[test]
 fn only_reviewed_read_paths_request_reader_credentials() {
@@ -370,10 +370,9 @@ fn only_reviewed_read_paths_request_reader_credentials() {
         "agent_gh/read_route.rs",
     ];
     let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
-    let re = regex::Regex::new(
-        r"\b(read_credential|read_credential_in|apply_read_credential|route_read|route_read_in)\b",
-    )
-    .unwrap();
+    let re =
+        regex::Regex::new(r"\b(read_credential|read_credential_in|route_read|route_read_in)\b")
+            .unwrap();
     let mut offenders = Vec::new();
     let mut stack = vec![src.clone()];
     while let Some(dir) = stack.pop() {

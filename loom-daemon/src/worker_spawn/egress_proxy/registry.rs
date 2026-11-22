@@ -40,6 +40,11 @@ pub enum HeaderStyle {
     AuthorizationBearer,
     /// `x-api-key: <credential>` — Anthropic's native API-key header.
     XApiKey,
+    /// `x-goog-api-key: <credential>` — the Google Gemini API-key header
+    /// (#14933). Already stripped inbound as one of [`CREDENTIAL_HEADERS`];
+    /// this variant lets a profile *inject* it upstream instead, so observe
+    /// mode can see Google's own rate-limit responses.
+    XGoogApiKey,
 }
 
 impl HeaderStyle {
@@ -49,6 +54,7 @@ impl HeaderStyle {
         match self {
             Self::AuthorizationBearer => ("authorization", format!("Bearer {credential}")),
             Self::XApiKey => ("x-api-key", credential.to_string()),
+            Self::XGoogApiKey => ("x-goog-api-key", credential.to_string()),
         }
     }
 }

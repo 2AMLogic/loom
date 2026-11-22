@@ -29,6 +29,7 @@
 //! nothing, so its head stays marker-less for that key and it is retried.
 
 use crate::champion_hold::ratification::{self, ChangedFile, Comment, Verdict};
+use crate::park_record::blank_block_code;
 use regex::Regex;
 use serde_json::Value;
 
@@ -544,8 +545,18 @@ fn bound_verdict(text: &str) -> String {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum KeyPost {
     Posted,
-    /// No marker posted; the reason is logged.
-    Withheld(String),
+    /// No marker posted. Only the fixed class goes to telemetry.
+    Withheld(WithheldClass, String),
+}
+
+/// Fixed causes of a withheld marker, in tick attribute order after `posted`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WithheldClass {
+    PreLaunchFailed = 1,
+    InvocationFailed,
+    OutputMissing,
+    VerdictInvalid,
+    PostFailed,
 }
 
 /// Post a marker for each **attempted** key whose session ended in
@@ -564,34 +575,39 @@ pub fn post_markers(
 ) -> Vec<(Key, KeyPost)> {
     use super::ratification_dispatch::{role_name, KeyOutcome};
     use super::RoleTickOutcome;
+    use WithheldClass::{
+        InvocationFailed, OutputMissing, PostFailed, PreLaunchFailed, VerdictInvalid,
+    };
     [Key::Ee, Key::Market]
         .into_iter()
         .filter_map(|key| {
             let result = match dispatched.get(key)? {
                 KeyOutcome::Ran(RoleTickOutcome::Success) => {
-                    let parsed = dispatched
-                        .output(key)
-                        .ok_or_else(|| "no session output captured".to_string())
-                        .and_then(|out| parse_review(key, out));
-                    match parsed {
-                        Ok(review) => sink
+                    match dispatched.output(key).map(|out| parse_review(key, out)) {
+                        Some(Ok(review)) => sink
                             .post(
                                 pr,
                                 &marker_body(key, head_sha, role_name(key), Some(&review.text)),
                             )
                             .map(|()| KeyPost::Posted)
                             .unwrap_or_else(|e| {
-                                KeyPost::Withheld(format!("marker post failed: {e}"))
+                                KeyPost::Withheld(PostFailed, format!("marker post failed: {e}"))
                             }),
-                        Err(reason) => KeyPost::Withheld(reason),
+                        Some(Err(reason)) => KeyPost::Withheld(VerdictInvalid, reason),
+                        None => {
+                            KeyPost::Withheld(OutputMissing, "no session output captured".into())
+                        }
                     }
                 }
-                KeyOutcome::Ran(other) => {
-                    KeyPost::Withheld(format!("session did not succeed: {other:?}"))
+                KeyOutcome::Ran(other) => KeyPost::Withheld(
+                    InvocationFailed,
+                    format!("session did not succeed: {other:?}"),
+                ),
+                KeyOutcome::FailedClosed(reason) => {
+                    KeyPost::Withheld(PreLaunchFailed, reason.clone())
                 }
-                KeyOutcome::FailedClosed(reason) => KeyPost::Withheld(reason.clone()),
             };
-            if let KeyPost::Withheld(reason) = &result {
+            if let KeyPost::Withheld(_, reason) = &result {
                 let kind = match key {
                     Key::Ee => "withheld:ee",
                     Key::Market => "withheld:market",
@@ -703,9 +719,13 @@ pub struct TickOutcome {
     pub posted: usize,
     /// PRs not selected because a candidate file's head content was unreadable.
     pub unreadable: usize,
-    /// Keys not posted (pin unresolved, session failed, post failed).
+    /// Keys not posted.
     pub withheld: usize,
+    /// One count per fixed class, first for EE and then for market.
+    key_counts: [[usize; CLASSES_PER_KEY]; 2],
 }
+
+const CLASSES_PER_KEY: usize = 1 + WithheldClass::PostFailed as usize;
 
 impl TickOutcome {
     fn bare(reason: &'static str) -> Self {
@@ -717,6 +737,7 @@ impl TickOutcome {
             posted: 0,
             unreadable: 0,
             withheld: 0,
+            key_counts: Default::default(),
         }
     }
 
@@ -733,16 +754,20 @@ impl TickOutcome {
         skipped: usize,
         unreadable: usize,
     ) -> Self {
-        let withheld = results
-            .iter()
-            .flat_map(|(_, keys)| keys)
-            .filter(|(_, p)| matches!(p, KeyPost::Withheld(_)))
-            .count();
-        let posted = results
-            .iter()
-            .flat_map(|(_, keys)| keys)
-            .filter(|(_, p)| *p == KeyPost::Posted)
-            .count();
+        let mut key_counts = [[0; CLASSES_PER_KEY]; 2];
+        for (key, post) in results.iter().flat_map(|(_, keys)| keys) {
+            let key_index = match key {
+                Key::Ee => 0,
+                Key::Market => 1,
+            };
+            let class_index = match post {
+                KeyPost::Posted => 0,
+                KeyPost::Withheld(class, _) => *class as usize,
+            };
+            key_counts[key_index][class_index] += 1;
+        }
+        let posted = key_counts.iter().map(|counts| counts[0]).sum();
+        let withheld = key_counts.iter().flatten().sum::<usize>() - posted;
         Self {
             reason: if !results.is_empty() {
                 "ran"
@@ -757,6 +782,7 @@ impl TickOutcome {
             posted,
             unreadable,
             withheld,
+            key_counts,
         }
     }
 }
@@ -789,7 +815,8 @@ pub const KEY_RAN: &str = "loom.ratification.ran";
 pub const KEY_POSTED: &str = "loom.ratification.posted";
 pub const KEY_UNREADABLE: &str = "loom.ratification.unreadable";
 pub const KEY_WITHHELD: &str = "loom.ratification.withheld";
-pub const KEYS: [&str; 8] = [
+const KEY_COUNT_START: usize = 8;
+pub const KEYS: [&str; KEY_COUNT_START + 2 * CLASSES_PER_KEY] = [
     KEY_REASON,
     KEY_SOURCE,
     KEY_SELECTED,
@@ -798,6 +825,18 @@ pub const KEYS: [&str; 8] = [
     KEY_POSTED,
     KEY_UNREADABLE,
     KEY_WITHHELD,
+    "loom.ratification.ee.posted",
+    "loom.ratification.ee.pre_launch_failed",
+    "loom.ratification.ee.invocation_failed",
+    "loom.ratification.ee.output_missing",
+    "loom.ratification.ee.verdict_invalid",
+    "loom.ratification.ee.post_failed",
+    "loom.ratification.market.posted",
+    "loom.ratification.market.pre_launch_failed",
+    "loom.ratification.market.invocation_failed",
+    "loom.ratification.market.output_missing",
+    "loom.ratification.market.verdict_invalid",
+    "loom.ratification.market.post_failed",
 ];
 
 /// The `ratification_lane.tick` span: an instant, its own root.
@@ -826,6 +865,12 @@ pub fn tick_span(
     put(KEY_POSTED, o.posted.to_string());
     put(KEY_UNREADABLE, o.unreadable.to_string());
     put(KEY_WITHHELD, o.withheld.to_string());
+    for (key, count) in KEYS[KEY_COUNT_START..]
+        .iter()
+        .zip(o.key_counts.iter().flatten())
+    {
+        put(key, count.to_string());
+    }
     crate::telemetry::trace::provenance::stamp(&mut attributes);
     SpanRecord {
         context,
@@ -997,6 +1042,300 @@ impl PrSource for GhPrSource<'_> {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Read-only status report (#14834)
+// ---------------------------------------------------------------------------
+
+/// One **trusted** PR comment with the forge identity the report links by:
+/// [`PrSource::trusted_comments`] discards id, creation time and link after
+/// the trust filter; the status report needs them back.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MarkerComment {
+    /// The forge-assigned comment id — the tie-breaker between equal
+    /// creation times (newer ids are newer comments).
+    pub id: u64,
+    /// The forge comment's creation time: the **only** ordering signal that
+    /// counts. An edit, a date written inside the review, or a more
+    /// favourable verdict never re-dates or re-ranks a comment (#14834).
+    pub created_at: chrono::DateTime<chrono::Utc>,
+    /// `html_url`: the link the report prints.
+    pub url: String,
+    pub body: String,
+}
+
+impl MarkerComment {
+    /// From a REST issue-comment record. `None` when the body or an identity
+    /// field the report needs (id, creation time, link) is missing or
+    /// malformed; the caller treats that as an unreadable history, the same
+    /// fail-closed contract as a malformed record in
+    /// [`PrSource::trusted_comments`].
+    #[must_use]
+    pub fn from_record(row: &Value) -> Option<Self> {
+        Some(MarkerComment {
+            id: row.get("id").and_then(Value::as_u64)?,
+            created_at: row
+                .get("created_at")
+                .and_then(Value::as_str)
+                .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())?
+                .with_timezone(&chrono::Utc),
+            url: row.get("html_url").and_then(Value::as_str)?.to_string(),
+            body: row.get("body").and_then(Value::as_str)?.to_string(),
+        })
+    }
+}
+
+/// The two wire shapes a key marker appears in (#14834). Both compete for
+/// "effective" on exactly the same terms.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MarkerFormat {
+    /// The lane's own `<!-- ratify:key=<k> sha=<40-hex> -->` first line.
+    Lane,
+    /// The hand-applied `<!-- RATIFY-KEY: <k> verdict=… block=… sha=… -->`
+    /// comment.
+    Hand,
+}
+
+impl MarkerFormat {
+    /// The name the report prints beside a link.
+    #[must_use]
+    pub fn label(self) -> &'static str {
+        match self {
+            MarkerFormat::Lane => "ratify:key",
+            MarkerFormat::Hand => "RATIFY-KEY",
+        }
+    }
+}
+
+/// One key marker found in a comment body.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MarkerFound {
+    pub key: Key,
+    /// The full 40-hex head the marker names.
+    pub sha: String,
+    pub format: MarkerFormat,
+    /// The `block=owner/repo#<n>` PR identity the marker carries, when it has
+    /// one. A block naming another repo or PR disqualifies the marker for
+    /// this PR.
+    pub block: Option<String>,
+}
+
+/// Every standalone key marker in `body` outside indented or fenced code
+/// and block quotes (#14834). A hand marker must carry a full 40-hex `sha` attribute.
+#[must_use]
+pub fn scan_markers(body: &str) -> Vec<MarkerFound> {
+    let lane_re = Regex::new(r"^<!--\s*ratify:key=(ee|market)\s+sha=([0-9a-fA-F]{40})\s*-->$")
+        .expect("static");
+    let hand_re = Regex::new(r"^<!--\s*RATIFY-KEY:\s*(ee|market)((?:\s+[a-z-]+=[^\s<>]+)+)\s*-->$")
+        .expect("static");
+    let mut out = Vec::new();
+    let visible = blank_block_code(body);
+    for (line, visible_line) in body.lines().zip(visible.lines()) {
+        let after_spaces = line.trim_start_matches(' ');
+        // Match original standalone lines only. The mask cannot create one.
+        if line != visible_line
+            || line.len() - after_spaces.len() >= 4
+            || after_spaces.starts_with('\t')
+        {
+            continue;
+        }
+        let t = line.trim();
+        if let Some(cap) = lane_re.captures(t) {
+            out.push(MarkerFound {
+                key: wire_key(&cap[1]),
+                sha: cap[2].to_string(),
+                format: MarkerFormat::Lane,
+                block: None,
+            });
+        } else if let Some(cap) = hand_re.captures(t) {
+            let mut sha = None;
+            let mut block = None;
+            for attr in cap[2].split_whitespace() {
+                let Some((name, value)) = attr.split_once('=') else {
+                    continue;
+                };
+                match name {
+                    "sha" => sha = Some(value.to_string()),
+                    "block" => block = Some(value.to_string()),
+                    _ => {}
+                }
+            }
+            let Some(sha) = sha.filter(|s| is_full_sha(s)) else {
+                continue;
+            };
+            out.push(MarkerFound {
+                key: wire_key(&cap[1]),
+                sha,
+                format: MarkerFormat::Hand,
+                block,
+            });
+        }
+    }
+    out
+}
+
+fn is_full_sha(sha: &str) -> bool {
+    sha.len() == 40 && sha.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+/// `ee`/`market` from a marker capture.
+fn wire_key(name: &str) -> Key {
+    if name == "ee" {
+        Key::Ee
+    } else {
+        Key::Market
+    }
+}
+
+/// The link the report prints for one marker-carrying comment.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MarkerLink {
+    pub comment_id: u64,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+    pub url: String,
+    pub format: MarkerFormat,
+}
+
+impl MarkerLink {
+    fn of(comment: &MarkerComment, format: MarkerFormat) -> Self {
+        MarkerLink {
+            comment_id: comment.id,
+            created_at: comment.created_at,
+            url: comment.url.clone(),
+            format,
+        }
+    }
+}
+
+/// What the report says about one key at one head (#14834).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KeyStatus {
+    pub key: Key,
+    /// The **effective** marker: the newest trusted marker naming exactly the
+    /// head — the review to read first. `None` when a complete read found
+    /// none: the key is missing at this head.
+    pub effective: Option<MarkerLink>,
+    /// Every other eligible marker comment at the same head, oldest first —
+    /// the superseded duplicates the pre-#14800 retry pileup posted. Each
+    /// comment is linked once; nothing is deleted or edited.
+    pub superseded: Vec<MarkerLink>,
+}
+
+/// The whole report: one row per key for the PR's current head.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LaneStatus {
+    pub head_sha: String,
+    pub ee: KeyStatus,
+    pub market: KeyStatus,
+}
+
+/// Resolve the report for `head_sha` from the PR's **complete, trusted**
+/// comment history (`MarkerComment`s; the caller applied the same trust
+/// policy as every marker read). A marker is eligible when it names the exact
+/// head (a full 40-hex SHA), and its `block=` identity — when it carries one
+/// — names exactly this PR. Newest by forge comment creation time wins, the
+/// numeric comment id breaks ties, and both formats compete on the same
+/// terms. A marker naming another head or another PR is neither effective nor
+/// superseded: it is not a marker for this head.
+#[must_use]
+pub fn resolve_status(
+    head_sha: &str,
+    nwo: &str,
+    pr: u64,
+    comments: &[MarkerComment],
+) -> LaneStatus {
+    let block_id = format!("{nwo}#{pr}");
+    let row = |key: Key| {
+        let mut eligible: Vec<MarkerLink> = comments
+            .iter()
+            .filter_map(|c| {
+                let marker = scan_markers(&c.body).into_iter().find(|m| {
+                    m.key == key
+                        && m.sha.eq_ignore_ascii_case(head_sha)
+                        && m.block.as_deref().is_none_or(|b| b == block_id)
+                })?;
+                Some(MarkerLink::of(c, marker.format))
+            })
+            .collect();
+        eligible.sort_by_key(|m| (m.created_at, m.comment_id));
+        let effective = eligible.pop();
+        KeyStatus {
+            key,
+            effective,
+            superseded: eligible,
+        }
+    };
+    LaneStatus {
+        head_sha: head_sha.to_string(),
+        ee: row(Key::Ee),
+        market: row(Key::Market),
+    }
+}
+
+impl GhPrSource<'_> {
+    /// The PR's current head SHA, or why it could not be read (#14834).
+    pub fn pr_head(&self, pr: u64) -> Result<String, String> {
+        let endpoint = format!("repos/{}/pulls/{pr}", self.nwo);
+        let gh = std::path::PathBuf::from(crate::gh_invocation::gh_bin());
+        let inv =
+            crate::claim_reconciliation::gh_call::read("ratification.pr_head", &gh, self.root)
+                .args(["api", &endpoint]);
+        match inv.run() {
+            crate::cmd_out::CmdOutcome::Ran(out) if out.status.success() => {
+                let record: Value = serde_json::from_slice(&out.stdout)
+                    .map_err(|_| "PR record was not valid JSON".to_string())?;
+                let sha = record
+                    .pointer("/head/sha")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| "head sha missing from the PR record".to_string())?;
+                if !is_full_sha(sha) {
+                    return Err("head sha in the PR record is not a full 40-hex SHA".to_string());
+                }
+                Ok(sha.to_string())
+            }
+            other => Err(super::ratification_dispatch::gh_failure_detail(&other)),
+        }
+    }
+
+    /// The PR's complete issue-comment history as [`MarkerComment`]s —
+    /// trusted authors only, identity retained. `Err` when the listing or any
+    /// readable record is unreadable: the same fail-closed contract as
+    /// [`PrSource::trusted_comments`] (#14797), because an incomplete
+    /// history cannot prove which marker is effective. A successfully read
+    /// empty history is `Ok(vec![])`.
+    pub fn marker_comments(&self, pr: u64) -> Result<Vec<MarkerComment>, String> {
+        let list = self
+            .get_detailed(&format!("repos/{}/issues/{pr}/comments?per_page=100", self.nwo))
+            .map_err(|why| format!("comments could not be read: {why}"))?;
+        let Value::Array(list) = list else {
+            return Err("comments could not be read: listing was not an array".to_string());
+        };
+        const MALFORMED: &str = "comments could not be read: malformed comment record";
+        let mut out = Vec::new();
+        for row in &list {
+            if row.get("body").and_then(Value::as_str).is_none() {
+                return Err(MALFORMED.to_string());
+            }
+            if row.get("user") == Some(&Value::Null) {
+                // A deleted author is a readable record with no marker authority.
+                continue;
+            }
+            if !row
+                .pointer("/user/login")
+                .and_then(Value::as_str)
+                .is_some_and(|login| !login.trim().is_empty())
+            {
+                return Err(MALFORMED.to_string());
+            }
+            if !self.policy.trusts_json(row) {
+                continue;
+            }
+            let comment = MarkerComment::from_record(row).ok_or(MALFORMED.to_string())?;
+            out.push(comment);
+        }
+        Ok(out)
+    }
+}
+
 /// The real [`CommentSink`]: `forge_comment::post_comment` as the fleet identity.
 pub struct GhCommentSink<'a> {
     pub root: &'a std::path::Path,
@@ -1026,6 +1365,9 @@ impl<R: super::RoleInvocationRunner + ?Sized> super::RoleInvocationRunner for Ru
     }
     fn last_output(&self) -> Option<String> {
         self.0.last_output()
+    }
+    fn unlaunched_failure(&self) -> Option<crate::observability::lifecycle::RoleFailure> {
+        self.0.unlaunched_failure()
     }
 }
 
@@ -1186,6 +1528,125 @@ mod tests {
     use std::collections::HashMap;
 
     const SHA: &str = "0123456789abcdef0123456789abcdef01234567";
+
+    #[test]
+    fn production_adapter_preserves_typed_launch_evidence() {
+        use crate::observability::lifecycle::{pre_launch, RoleFailure, UNCLASSIFIED_PRE_LAUNCH};
+        use crate::role_runner::{
+            ratification_dispatch::InstructionSource, RoleInvocationRunner, RoleTickOutcome,
+        };
+        use std::cell::{Cell, RefCell};
+
+        #[derive(Default)]
+        struct Inputs {
+            instruction_repos: RefCell<Vec<String>>,
+            visibility_reads: Cell<usize>,
+        }
+
+        impl InstructionSource for Inputs {
+            fn fetch(&self, pin: &Pin) -> Result<String, String> {
+                self.instruction_repos.borrow_mut().push(pin.repo.clone());
+                Ok("fixture instructions".into())
+            }
+
+            fn repo_is_private(&self, _repo: &str) -> Option<bool> {
+                self.visibility_reads.set(self.visibility_reads.get() + 1);
+                Some(false)
+            }
+        }
+
+        #[derive(Default)]
+        struct Sink(RefCell<Vec<(u64, String)>>);
+
+        impl CommentSink for Sink {
+            fn post(&self, pr: u64, body: &str) -> Result<(), String> {
+                self.0.borrow_mut().push((pr, body.into()));
+                Ok(())
+            }
+        }
+
+        struct Runner {
+            evidence: &'static str,
+            calls: Vec<String>,
+        }
+
+        impl RoleInvocationRunner for Runner {
+            fn invoke(&mut self, role: &str, _prompt: &str) -> RoleTickOutcome {
+                self.calls.push(role.into());
+                if role == "ratification-ee" {
+                    RoleTickOutcome::Failure("fixture failure".into())
+                } else {
+                    RoleTickOutcome::Success
+                }
+            }
+
+            fn last_output(&self) -> Option<String> {
+                self.calls
+                    .last()
+                    .filter(|role| *role == "ratification-market")
+                    .map(|_| {
+                        "## Market-key review: fixture\n**Overall verdict:** uncompetitive\n".into()
+                    })
+            }
+
+            fn unlaunched_failure(&self) -> Option<RoleFailure> {
+                // The Market call replaces the evidence from EE, as the production runner does.
+                self.calls
+                    .last()
+                    .filter(|role| *role == "ratification-ee")
+                    .map(|_| RoleFailure::new(self.evidence, None, "fixture-only typed detail"))
+            }
+        }
+
+        let mut cfg = enabled();
+        cfg.ee.as_mut().unwrap().commit = SHA.into();
+        cfg.market.as_mut().unwrap().commit = SHA.into();
+        let prs = one_pr("alice", request(), vec![]);
+        for (evidence, counts) in [
+            (UNCLASSIFIED_PRE_LAUNCH, ("0", "1", "1")),
+            (pre_launch::WRITE_SCOPE_REFUSED.class, ("1", "0", "1")),
+        ] {
+            let inputs = Inputs::default();
+            let sink = Sink::default();
+            let mut runner = Runner {
+                evidence,
+                calls: vec![],
+            };
+            let mut adapter = RunnerRef(&mut runner as &mut dyn RoleInvocationRunner);
+            let (results, skipped, unreadable) =
+                run_lane_stats(&cfg, None, "fixture/example", &prs, &inputs, &sink, &mut adapter);
+            assert_eq!(inputs.instruction_repos.borrow().as_slice(), ["o/ee", "o/mk"]);
+            assert_eq!(inputs.visibility_reads.get(), 1);
+            assert_eq!(runner.calls, ["ratification-ee", "ratification-market"]);
+            let posts = sink.0.borrow();
+            assert_eq!(posts.len(), 1);
+            assert_eq!(posts[0].0, 7);
+            assert!(posts[0]
+                .1
+                .starts_with(&format!("<!-- ratify:key=market sha={SHA} -->")));
+            assert!(posts[0].1.contains("**Overall verdict:** uncompetitive"));
+
+            let tick = TickOutcome::from_run_stats(&results, skipped, unreadable);
+            assert_eq!((tick.posted, tick.withheld, tick.unreadable), (1, 1, 0));
+            let span =
+                tick_span(std::path::Path::new("/fixture-only"), "test", &tick, chrono::Utc::now())
+                    .bounded();
+            let count = |key: &str| span.attributes.get(key).unwrap().as_str();
+            assert_eq!(
+                (
+                    count("loom.ratification.ee.pre_launch_failed"),
+                    count("loom.ratification.ee.invocation_failed"),
+                    count("loom.ratification.market.posted"),
+                ),
+                counts,
+                "typed evidence: {evidence}"
+            );
+            assert!(span
+                .attributes
+                .values()
+                .all(|value| !value.contains("fixture-only typed detail")));
+        }
+    }
 
     fn file(name: &str, head: &str) -> ChangedFile {
         ChangedFile {

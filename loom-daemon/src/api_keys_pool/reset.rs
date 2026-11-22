@@ -16,11 +16,16 @@
 //!    `… will reset at <timestamp>` line. Applies to both `Exhausted` and
 //!    `RateLimited`: the provider's own word on when it recovers is the best
 //!    fact available whatever the needle was.
-//! 2. **The account's configured plan window** (`exhaustionWindowSecs` in the
+//! 2. **The next UTC month start** — for the Google monthly spend-cap shape
+//!    only (#14933, [`super::classify::is_monthly_spend_cap`]): computed from
+//!    the calendar, not parsed from text, and therefore the one horizon
+//!    exempt from [`MAX_RESET_HORIZON_SECS`] (a month is up to 31 days; the
+//!    bound exists to catch a misread stamp, and there is no stamp).
+//! 3. **The account's configured plan window** (`exhaustionWindowSecs` in the
 //!    provider's `.limits.json`, set with `api-keys limit --exhaustion-window`)
 //!    — `Exhausted` only. The plan limit is *configured, not probed*: no
 //!    provider here offers a cheap, plan-safe usage probe.
-//! 3. **The classification's default** — the pre-#11286 behaviour, so an
+//! 4. **The classification's default** — the pre-#11286 behaviour, so an
 //!    account with neither keeps working exactly as before.
 //!
 //! A credential failure never gets a horizon at all (see [`super::classify`]).
@@ -99,6 +104,12 @@ const RELATIVE_PHRASES: &[&str] = &["retry-after:", "retry-after=", "retry after
 pub enum CooldownSource {
     /// The provider printed a reset instant ([`parse_reset_at`]).
     ProviderReset,
+    /// The next UTC month start after `now` — the computed horizon for the
+    /// Google monthly spend-cap shape (#14933). The one source exempt from
+    /// [`MAX_RESET_HORIZON_SECS`]: the instant is derived from the calendar,
+    /// not read from text, so the plausibility bound that guards against a
+    /// misread stamp does not apply.
+    MonthStart,
     /// The account's configured `exhaustionWindowSecs`.
     ConfiguredWindow,
     /// [`Classification::default_cooldown_secs`].
@@ -110,6 +121,7 @@ impl CooldownSource {
     pub fn label(self) -> &'static str {
         match self {
             Self::ProviderReset => "provider-reported reset",
+            Self::MonthStart => "next month start (UTC)",
             Self::ConfiguredWindow => "configured plan window",
             Self::Default => "default cooldown",
         }
@@ -134,12 +146,41 @@ pub fn resolve_cooldown(
     if let Some(at) = parse_reset_at(provider_text, now) {
         return Some(((at - now).max(1), CooldownSource::ProviderReset));
     }
+    // A monthly spend-cap refusal recovers at the next UTC month start
+    // (#14933), which outranks the configured window: the calendar fact is
+    // more specific than a generic configured guess. Computed, never parsed,
+    // so `MAX_RESET_HORIZON_SECS` deliberately does not bound it.
+    if classification == Classification::Exhausted
+        && super::classify::is_monthly_spend_cap(provider_text)
+    {
+        if let Some(at) = next_utc_month_start(now) {
+            return Some(((at - now).max(1), CooldownSource::MonthStart));
+        }
+    }
     match (classification, configured_window.filter(|secs| *secs > 0)) {
         (Classification::Exhausted, Some(window)) => {
             Some((window, CooldownSource::ConfiguredWindow))
         }
         _ => Some((fallback, CooldownSource::Default)),
     }
+}
+
+/// The first day of the next UTC month, at 00:00:00, strictly after `now`
+/// (#14933): when `now` is itself a month start, the month after. `None` only
+/// when `now` cannot be read as a calendar instant (not reachable for a real
+/// epoch-seconds value); the caller then falls through to the configured or
+/// default window rather than guessing.
+fn next_utc_month_start(now: u64) -> Option<u64> {
+    use chrono::{Datelike, NaiveDate};
+    let seen = chrono::DateTime::from_timestamp(i64::try_from(now).ok()?, 0)?;
+    let (year, month) = (seen.year(), seen.month());
+    let (year, month) = if month == 12 {
+        (year + 1, 1)
+    } else {
+        (year, month + 1)
+    };
+    let midnight = NaiveDate::from_ymd_opt(year, month, 1)?.and_hms_opt(0, 0, 0)?;
+    u64::try_from(midnight.and_utc().timestamp()).ok()
 }
 
 /// The account's configured plan window, or `None` when none is declared or

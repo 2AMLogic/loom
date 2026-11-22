@@ -9,8 +9,8 @@
 //! itself lives in [`crate::status_section::SectionSet`] so the CLI's
 //! client-side collectors consult the same answers.
 //!
-//! A sibling of `ipc.rs` (an over-threshold file frozen by the file-size
-//! ratchet), so the full-build entry point and the drain overlay live here.
+//! A sibling of `ipc.rs`: the full-build entry point and the drain overlay
+//! live here.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -189,12 +189,12 @@ pub(super) fn host_shard_posture(
     sections: &SectionSet,
 ) -> Option<crate::types::RoleRunnerShardPosture> {
     sections.when(StatusSection::RoleRunner, || {
-        // `decide(...).posture` rather than `resolve_posture(...)` so that
-        // with roster mode on (#7691) the header reports the ring the
+        // `decide(...).posture` rather than a config-only posture resolution
+        // so that with roster mode on (#7691) the header reports the ring the
         // fence actually produced — "shard 1 of 3 (index from roster,
         // count from roster)" — instead of a static posture no tick uses.
-        // With the roster off (the default) `decide`'s posture IS
-        // `resolve_posture`'s, so this is byte-identical to pre-#7691.
+        // With the roster off (the default) `decide`'s posture IS the
+        // config-only one, so this is byte-identical to pre-#7691.
         let decision = crate::role_shard::decide(fallback_root);
         let posture = decision.posture;
         crate::types::RoleRunnerShardPosture {
