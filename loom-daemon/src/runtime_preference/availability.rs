@@ -339,7 +339,8 @@ fn claude(root: &Path) -> Availability {
 /// availability mapping" direction on #8436.
 ///
 /// **Known blind spot (#8443).** Role ticks do not record `TOKEN_EXHAUSTED`
-/// health holds — only the sweep reaper calls `record_terminal_for_model` —
+/// health holds — only the sweep reaper calls
+/// `record_terminal_for_model_with_reset` —
 /// so an account whose *usage* is capped can still read as spawnable here.
 /// That is a defect in the health feed this function consumes, not in the
 /// mapping; it makes the Codex tier read as available more often than it is,
