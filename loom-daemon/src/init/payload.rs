@@ -424,7 +424,7 @@ impl std::fmt::Display for ResyncRefusal {
     }
 }
 
-/// The result of [`apply`] / [`resync_workspace`].
+/// The result of [`apply`] / [`resync_workspace_with`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ResyncOutcome {
     /// Refused before writing anything.
@@ -596,7 +596,7 @@ pub fn materialize_with(payload: &Payload, dest: &Path) -> Result<PayloadDiff> {
     let mut shipped =
         install_into(payload.defaults(), stage).map_err(|e| anyhow!("stage the payload: {e}"))?;
     let mut skipped_surfaces = Vec::new();
-    surfaces::stage_extras(payload.defaults(), stage, &mut shipped, &mut skipped_surfaces)
+    surfaces::stage_extras(payload.defaults(), stage, dest, &mut shipped, &mut skipped_surfaces)
         .map_err(|e| anyhow!("stage the extra surfaces: {e}"))?;
 
     skipped_surfaces.extend(unreachable);
@@ -751,18 +751,9 @@ pub fn apply(dest: &Path, diff: &PayloadDiff) -> Result<ResyncOutcome> {
     Ok(ResyncOutcome::Applied { written })
 }
 
-/// Gate, materialize and apply this binary's payload over `dest`'s working
-/// tree. The single entry point for a resync; committing and pushing the
-/// result (and the per-workspace claim) are the caller's (#10718).
-///
-/// # Errors
-/// See [`materialize_payload`] and [`apply`].
-pub fn resync_workspace(dest: &Path) -> Result<ResyncOutcome> {
-    let payload = Payload::embedded()?;
-    resync_workspace_with(&payload, dest)
-}
-
-/// [`resync_workspace`] for an explicit payload.
+/// Gate, materialize and apply `payload` over `dest`'s working tree. The
+/// single entry point for a resync; committing and pushing the result (and
+/// the per-workspace claim) are the caller's (#10718).
 ///
 /// # Errors
 /// See [`materialize_with`] and [`apply`].

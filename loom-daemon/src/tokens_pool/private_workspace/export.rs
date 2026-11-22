@@ -19,6 +19,12 @@ pub struct Record {
     pub volume: String,
     pub outcome: String,
     pub snapshot: Option<Snapshot>,
+    /// Sanitized diagnostic of the last snapshot attempt that produced no
+    /// answer — the recognized operation name plus its failure kind, never
+    /// the exec's payload, arguments or environment (#14943). A fresh
+    /// snapshot clears it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub snapshot_diagnostic: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -185,6 +191,7 @@ pub(super) fn record_prepared(
         volume: config.volume.clone(),
         outcome: "prepared".into(),
         snapshot: prior_snapshot,
+        snapshot_diagnostic: None,
     };
     save(&prior_path, &record)?;
     Ok(PreparedRecord {
@@ -194,6 +201,10 @@ pub(super) fn record_prepared(
         owner: std::cell::RefCell::new(job.owner.clone()),
     })
 }
+
+/// Wall budget for one in-container snapshot exec: the same bound the
+/// incident's stranded records were created under (#14943).
+const SNAPSHOT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 
 pub(super) fn update(root: &Path, config: &Config, job: &lease::Job, outcome: &str) -> Result<()> {
     let path = record_path(root, job.issue, &job.owner)?;
@@ -207,10 +218,16 @@ pub(super) fn update(root: &Path, config: &Config, job: &lease::Job, outcome: &s
     record.outcome = outcome.into();
     let mut fresh = false;
     let command = snapshot_command(config, job)?;
-    if let Ok(crate::proc_exec::Completion::Exited(output)) =
-        crate::proc_exec::run_bounded(command, std::time::Duration::from_secs(2))
-    {
-        if output.status.success() && output.stdout.len() <= 65536 {
+    // The snapshot attempt's own diagnostic (#14943): an exec whose create
+    // succeeded but whose start failed or hit the deadline leaves no answer
+    // — and, the incident this comes from, a never-started exec record that
+    // then wedges the seat's idle proof. The operation and its failure kind
+    // are recorded; the docker CLI never prints the exec id, so none is
+    // claimed. The wording is fixed: no payload rides the record.
+    let diagnostic = match crate::proc_exec::run_bounded(command, SNAPSHOT_TIMEOUT) {
+        Ok(crate::proc_exec::Completion::Exited(output))
+            if output.status.success() && output.stdout.len() <= 65536 =>
+        {
             let snapshot: Snapshot = serde_json::from_slice(&output.stdout)?;
             validate(&snapshot, job.issue)?;
             if let (Some(issue), Some(checkpoint)) = (job.issue, &snapshot.checkpoint) {
@@ -233,8 +250,18 @@ pub(super) fn update(root: &Path, config: &Config, job: &lease::Job, outcome: &s
             }
             record.snapshot = Some(snapshot);
             fresh = true;
+            None
         }
-    }
+        Ok(crate::proc_exec::Completion::Exited(_)) => {
+            Some("private-workspace snapshot failed".to_owned())
+        }
+        Ok(crate::proc_exec::Completion::TimedOut { .. }) => Some(format!(
+            "private-workspace snapshot timed out after {}s",
+            SNAPSHOT_TIMEOUT.as_secs()
+        )),
+        Err(_) => Some("private-workspace snapshot could not be executed".to_owned()),
+    };
+    record.snapshot_diagnostic = diagnostic;
     // A previous run's snapshot cannot prove this run finished safely, and a
     // fresh one only certifies completion for an issue job when the issue
     // branch is published and its worktree clean: work the step left behind —
@@ -473,6 +500,8 @@ mod tests {
             volume: "v".into(),
             profile: PathBuf::from("/nonexistent"),
             gh_config: None,
+            session_image: None,
+            extra_mounts: Vec::new(),
         };
         let second = identify("https://example.invalid/o/second").unwrap();
         config.repositories.push(Registered {
@@ -716,6 +745,8 @@ mod tests {
             volume: "v".into(),
             profile: PathBuf::from("/nonexistent"),
             gh_config: None,
+            session_image: None,
+            extra_mounts: Vec::new(),
         };
         let job = lease::Job {
             owner: "fixture".into(),
@@ -740,6 +771,7 @@ mod tests {
             volume: "v".into(),
             outcome: "prepared".into(),
             snapshot: None,
+            snapshot_diagnostic: None,
         };
         std::fs::create_dir_all(root.path().join(".loom/private-jobs")).unwrap();
         let path = record_path(root.path(), Some(7), "").unwrap();
@@ -774,6 +806,7 @@ mod tests {
             volume: "private".into(),
             outcome: "prepared".into(),
             snapshot: None,
+            snapshot_diagnostic: None,
         };
         std::fs::create_dir_all(root.path().join(".loom/private-jobs")).unwrap();
         save(&record_path(root.path(), Some(7), "").unwrap(), &record).unwrap();
@@ -864,6 +897,7 @@ mod tests {
             volume: "volume".into(),
             outcome: "prepared".into(),
             snapshot: None,
+            snapshot_diagnostic: None,
         };
         save(&path, &record).unwrap();
         let token = PreparedRecord {

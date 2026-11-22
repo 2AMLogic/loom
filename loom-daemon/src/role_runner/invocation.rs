@@ -2,6 +2,29 @@
 use super::*;
 use crate::observability::lifecycle::pre_launch;
 
+/// The outcome and telemetry from one invocation, captured before the
+/// Champion's follow-up ratification runs can reuse the same runner.
+pub(super) struct InvocationOutcome {
+    pub(super) outcome: RoleTickOutcome,
+    pub(super) resolved: Option<crate::role_tick_telemetry::ResolvedLaunch>,
+    pub(super) trace: Option<crate::observability::lifecycle::RoleTrace>,
+    pub(super) unlaunched: Option<crate::observability::lifecycle::RoleFailure>,
+}
+
+impl InvocationOutcome {
+    pub(super) fn capture<R: RoleInvocationRunner + ?Sized>(
+        outcome: RoleTickOutcome,
+        runner: &R,
+    ) -> Self {
+        Self {
+            outcome,
+            resolved: runner.resolved_launch(),
+            trace: runner.trace_context(),
+            unlaunched: runner.unlaunched_failure(),
+        }
+    }
+}
+
 impl RoleInvocationRunner for ScriptRoleInvocationRunner {
     fn invoke(&mut self, role: &str, prompt: &str) -> RoleTickOutcome {
         let trace_root = self.workspace_root.clone();
@@ -10,6 +33,7 @@ impl RoleInvocationRunner for ScriptRoleInvocationRunner {
         let log_path = role_log_path(&self.logs_dir(), role);
         let log_start = std::fs::metadata(&log_path).map_or(0, |m| m.len());
         self.last_output = None;
+        self.resolved_launch = None;
         let (outcome, context, unlaunched) =
             crate::observability::lifecycle::role_invocation_classified(&trace_root, role, || {
                 let script = match self.resolve_spawn_bin() {
@@ -35,10 +59,7 @@ impl RoleInvocationRunner for ScriptRoleInvocationRunner {
                 // Preparation is Docker work, done here on the blocking
                 // launch path; the selection it holds is the one the launch
                 // uses, never a second account pick.
-                let model_hint = match &self.model {
-                    Some(m) => (m.clone(), "override".to_string()),
-                    None => resolve_role_runner_model(&self.workspace_root, role),
-                };
+                let model_hint = resolve_role_runner_model(&self.workspace_root, role);
                 let mut containment =
                     crate::tokens_pool::private_workspace::containment::Preparer::new(
                         &self.workspace_root,
@@ -47,13 +68,10 @@ impl RoleInvocationRunner for ScriptRoleInvocationRunner {
                         format!("role-{role}-{}", uuid::Uuid::new_v4()),
                         Box::new(move |runtime: &str, drawn: Option<&str>| {
                             // Same precedence as the launch below (#12748):
-                            // the runner's override, then the draw's model,
-                            // then the resolved hint.
-                            let (model, source) = match (model_hint.1 == "override", drawn) {
-                                (false, Some(drawn)) => {
-                                    (drawn.to_string(), "role-draw".to_string())
-                                }
-                                _ => model_hint.clone(),
+                            // the draw's model, then the resolved hint.
+                            let (model, source) = match drawn {
+                                Some(drawn) => (drawn.to_string(), "role-draw".to_string()),
+                                None => model_hint.clone(),
                             };
                             let (model, _) =
                                 reconcile_unpinned_model_with_runtime(runtime, model, source);
@@ -125,15 +143,14 @@ impl RoleInvocationRunner for ScriptRoleInvocationRunner {
                 // where every role child burned the most constrained quota tier and then
                 // died on "You've reached your Fable 5 limit").
                 // #11726: a role draw whose pick names a model (`claude/opus`)
-                // pins it, below only the runner's own test override.
+                // pins it.
                 let drawn_model = admission
                     .as_ref()
                     .and_then(|a| a.preference.as_ref())
                     .and_then(|p| p.model.clone());
-                let (model, model_source) = match (&self.model, drawn_model) {
-                    (Some(m), _) => (m.clone(), "override".to_string()),
-                    (None, Some(drawn)) => (drawn, "role-draw".to_string()),
-                    (None, None) => resolve_role_runner_model(&self.workspace_root, role),
+                let (model, model_source) = match drawn_model {
+                    Some(drawn) => (drawn, "role-draw".to_string()),
+                    None => resolve_role_runner_model(&self.workspace_root, role),
                 };
                 // Issue #7894: an UNPINNED model that conflicts with the admitted
                 // runtime degrades to the runtime CLI's own default rather than being
@@ -266,6 +283,12 @@ impl RoleInvocationRunner for ScriptRoleInvocationRunner {
         self.trace_context = context;
         self.unlaunched_failure = unlaunched;
         self.last_output = read_log_since(&log_path, log_start);
+        if let Some(launch) = &mut self.resolved_launch {
+            launch.codex_session_id = self
+                .last_output
+                .as_deref()
+                .and_then(crate::usage_source::role_tick_codex_session_id);
+        }
         outcome
     }
 

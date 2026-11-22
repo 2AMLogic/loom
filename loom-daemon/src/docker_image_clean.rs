@@ -7,7 +7,7 @@
 //! `session-image-smoke` in `.github/workflows/ci.yml`, plus a fleet-side
 //! `audit-smoke`/`audit-test` flow outside this repo) build and tag images
 //! under a **fixed** tag (`loom-worker:ci-smoke`,
-//! `ghcr.io/rjwalters/loom-worker:ci-smoke`, `loom-worker-session:ci-smoke`,
+//! `ghcr.io/2amlogic/loom-worker:ci-smoke`, `loom-worker-session:ci-smoke`,
 //! …) on every run. Docker re-points that tag at the new image on each build
 //! and leaves the *previous* image dangling (untagged, unreferenced by any
 //! name) — it never disappears on its own. A host that runs these flows daily
@@ -77,6 +77,21 @@
 //! **Container-referenced images are never planned** (any removal rule),
 //! whether the container is running or stopped.
 //!
+//! # Observability: one summary per evaluation (#14679)
+//!
+//! The 2026-11 loom-worker-1 incident (root 97 MB–1 GB free for days, ~50 GB
+//! of unreferenced images, **one** `docker_image_clean` log line in the whole
+//! window — and only after an operator's manual prune) showed that a failed
+//! inventory and a healthy pass are indistinguishable in the logs: both were
+//! silent at the daemon's default `info` level. Since #14679 every **enabled**
+//! evaluation produces exactly one summary line through
+//! [`log_pass_outcome`]: a failed inventory WARNs naming the failed `docker`
+//! operation ([`DockerInventoryError`]), a below-floor evaluation reports the
+//! measured free space, floor and planned/removed counts even when both are
+//! zero, and everything else keeps the WARN-on-action / DEBUG-on-no-op
+//! discipline. Cooldown-only calls never log — on a multi-repo host they fire
+//! once per repo per tick.
+//!
 //! # Safety
 //!
 //! Mirrors `deep_clean`'s gates: the removal half holds the machine-wide
@@ -97,12 +112,12 @@
 use std::collections::BTreeMap;
 use std::path::Path;
 use std::process::Command;
-use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 
 use crate::fs_util::human_size;
+use crate::host_wide_cooldown::HostWideCooldown;
 use serde::Deserialize;
 
 // ============================================================================
@@ -146,10 +161,19 @@ pub const DEFAULT_MIN_INTERVAL_SECS: u64 = 1_800;
 /// Membership is **exact repository-name equality** (see
 /// [`plan_retention`]), not a substring test — `loom-worker-native` is a
 /// distinct entry precisely because `loom-worker` does not cover it.
+///
+/// The `ghcr.io/rjwalters/*` entries are **legacy** (#14419): the repository
+/// moved to `2AMLogic` and the images publish under `ghcr.io/2amlogic/*`, but
+/// hosts still hold images pulled from the old path, which this pass must keep
+/// recognising so they are cleaned up rather than orphaned.
 pub const DEFAULT_TRACKED_REPOS: &[&str] = &[
     "loom-worker",
     "loom-worker-session",
     "loom-worker-native",
+    "ghcr.io/2amlogic/loom-worker",
+    "ghcr.io/2amlogic/loom-worker-session",
+    "ghcr.io/2amlogic/loom-worker-native",
+    // Legacy pre-transfer path (see above).
     "ghcr.io/rjwalters/loom-worker",
     "ghcr.io/rjwalters/loom-worker-session",
     "ghcr.io/rjwalters/loom-worker-native",
@@ -164,6 +188,21 @@ const DOCKER_RETENTION_SLOT_POLL: Duration = Duration::from_millis(500);
 /// docker CLI binary name — overridable only for tests (production always
 /// uses the system `docker`).
 const DOCKER_BIN: &str = "docker";
+
+/// Inventory stage labels (#14679) — the operation a failed evaluation names
+/// in its one WARN summary. Every stage of [`list_images`] that can fail
+/// produces a [`DockerInventoryError`] carrying one of these, so "retention
+/// found nothing to remove" and "retention has been blind for days" are no
+/// longer the same log line.
+const STAGE_IMAGE_LS: &str = "`docker image ls -aq --no-trunc`";
+/// Stage label for the container-listing half of the inventory.
+const STAGE_PS: &str = "`docker ps -aq --no-trunc`";
+/// Stage label for resolving container → image IDs.
+const STAGE_CONTAINER_INSPECT: &str = "`docker inspect --format {{.Image}}` (containers)";
+/// Stage label for the per-image metadata fetch.
+const STAGE_IMAGE_INSPECT: &str = "`docker image inspect`";
+/// Stage label for parsing that fetch's JSON.
+const STAGE_IMAGE_INSPECT_PARSE: &str = "parsing `docker image inspect` JSON";
 
 /// Default Docker data root; its nearest existing ancestor's filesystem is the
 /// volume the free-space floor is measured against (#11195).
@@ -629,20 +668,63 @@ struct InspectImage {
     size: Option<u64>,
 }
 
+/// Why one Docker inventory operation failed (#14679): the `docker` call (or
+/// JSON parse) that failed, plus the best detail available (exit status,
+/// stderr tail, or error). An evaluation whose inventory fails performs zero
+/// removals (unknown != zero, as ever) and logs one WARN summary naming
+/// `stage`, instead of collapsing every failure into an invisible `debug!`
+/// line the way the pre-#14679 `Option` return did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DockerInventoryError {
+    /// The operation that failed (a `docker` subcommand or the parse step).
+    pub stage: &'static str,
+    /// Exit status + bounded stderr tail, spawn error, or serde error.
+    pub detail: String,
+}
+
+impl std::fmt::Display for DockerInventoryError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Keep the outcome on the same log line as its timestamp and stage.
+        let detail = self.detail.split_whitespace().collect::<Vec<_>>().join(" ");
+        write!(f, "docker inventory failed at {} ({detail})", self.stage)
+    }
+}
+
+/// Bounded detail for a failed `docker` invocation: exit status
+/// plus the first 200 chars of stderr (daemon errors are routinely
+/// multi-screen; the full text stays in Docker's own logs).
+fn failure_detail(out: &std::process::Output) -> String {
+    let stderr_tail: String = String::from_utf8_lossy(&out.stderr)
+        .trim()
+        .chars()
+        .take(200)
+        .collect();
+    if stderr_tail.is_empty() {
+        out.status.to_string()
+    } else {
+        format!("{}: {stderr_tail}", out.status)
+    }
+}
+
 /// List every image on the host, one [`DockerImageRecord`] per unique image
 /// ID (multi-tag aliases already collapsed by `docker image inspect` into a
-/// single `RepoTags` array). `None` on any failure to run or parse `docker`
-/// output — treated identically to "docker unavailable" by [`run_pass`],
-/// never as "zero images" (the same unknown-!=-zero discipline
+/// single `RepoTags` array). `Err` names **which** stage failed (#14679) —
+/// treated by [`run_pass`] as "docker unqueryable, zero removals", never as
+/// "zero images" (the same unknown-!=-zero discipline
 /// [`crate::deep_clean::evaluate`] applies to an unmeasurable `df`).
-#[must_use]
-pub fn list_images() -> Option<Vec<DockerImageRecord>> {
+pub fn list_images() -> Result<Vec<DockerImageRecord>, DockerInventoryError> {
     let ids_output = Command::new(DOCKER_BIN)
         .args(["image", "ls", "-aq", "--no-trunc"])
         .output()
-        .ok()?;
+        .map_err(|e| DockerInventoryError {
+            stage: STAGE_IMAGE_LS,
+            detail: e.to_string(),
+        })?;
     if !ids_output.status.success() {
-        return None;
+        return Err(DockerInventoryError {
+            stage: STAGE_IMAGE_LS,
+            detail: failure_detail(&ids_output),
+        });
     }
     let mut ids: Vec<String> = String::from_utf8_lossy(&ids_output.stdout)
         .lines()
@@ -653,7 +735,7 @@ pub fn list_images() -> Option<Vec<DockerImageRecord>> {
     ids.sort();
     ids.dedup();
     if ids.is_empty() {
-        return Some(Vec::new());
+        return Ok(Vec::new());
     }
 
     let in_use_ids = list_container_image_ids()?;
@@ -661,40 +743,55 @@ pub fn list_images() -> Option<Vec<DockerImageRecord>> {
     let mut cmd = Command::new(DOCKER_BIN);
     cmd.arg("image").arg("inspect");
     cmd.args(&ids);
-    let inspect_output = cmd.output().ok()?;
+    let inspect_output = cmd.output().map_err(|e| DockerInventoryError {
+        stage: STAGE_IMAGE_INSPECT,
+        detail: e.to_string(),
+    })?;
     if !inspect_output.status.success() {
-        return None;
+        return Err(DockerInventoryError {
+            stage: STAGE_IMAGE_INSPECT,
+            detail: failure_detail(&inspect_output),
+        });
     }
-    let parsed: Vec<InspectImage> = serde_json::from_slice(&inspect_output.stdout).ok()?;
-    Some(
-        parsed
-            .into_iter()
-            .filter_map(|img| {
-                let created_at = DateTime::parse_from_rfc3339(&img.created)
-                    .ok()?
-                    .with_timezone(&Utc);
-                let in_use = in_use_ids.contains(&img.id);
-                Some(DockerImageRecord {
-                    id: img.id,
-                    repo_tags: img.repo_tags.unwrap_or_default(),
-                    created_at,
-                    size_bytes: img.size.unwrap_or(0),
-                    in_use,
-                })
+    let parsed: Vec<InspectImage> =
+        serde_json::from_slice(&inspect_output.stdout).map_err(|e| DockerInventoryError {
+            stage: STAGE_IMAGE_INSPECT_PARSE,
+            detail: e.to_string(),
+        })?;
+    Ok(parsed
+        .into_iter()
+        .filter_map(|img| {
+            let created_at = DateTime::parse_from_rfc3339(&img.created)
+                .ok()?
+                .with_timezone(&Utc);
+            let in_use = in_use_ids.contains(&img.id);
+            Some(DockerImageRecord {
+                id: img.id,
+                repo_tags: img.repo_tags.unwrap_or_default(),
+                created_at,
+                size_bytes: img.size.unwrap_or(0),
+                in_use,
             })
-            .collect(),
-    )
+        })
+        .collect())
 }
 
 /// Image IDs referenced by any container, running **or** stopped (#11195).
-/// `None` on any failure — unknown must never read as "no container uses it".
-fn list_container_image_ids() -> Option<std::collections::BTreeSet<String>> {
+/// `Err` names the failed stage — unknown must never read as "no container
+/// uses it".
+fn list_container_image_ids() -> Result<std::collections::BTreeSet<String>, DockerInventoryError> {
     let ps = Command::new(DOCKER_BIN)
         .args(["ps", "-aq", "--no-trunc"])
         .output()
-        .ok()?;
+        .map_err(|e| DockerInventoryError {
+            stage: STAGE_PS,
+            detail: e.to_string(),
+        })?;
     if !ps.status.success() {
-        return None;
+        return Err(DockerInventoryError {
+            stage: STAGE_PS,
+            detail: failure_detail(&ps),
+        });
     }
     let containers: Vec<String> = String::from_utf8_lossy(&ps.stdout)
         .lines()
@@ -703,24 +800,28 @@ fn list_container_image_ids() -> Option<std::collections::BTreeSet<String>> {
         .map(str::to_string)
         .collect();
     if containers.is_empty() {
-        return Some(std::collections::BTreeSet::new());
+        return Ok(std::collections::BTreeSet::new());
     }
     let inspect = Command::new(DOCKER_BIN)
         .args(["inspect", "--format", "{{.Image}}"])
         .args(&containers)
         .output()
-        .ok()?;
+        .map_err(|e| DockerInventoryError {
+            stage: STAGE_CONTAINER_INSPECT,
+            detail: e.to_string(),
+        })?;
     if !inspect.status.success() {
-        return None;
+        return Err(DockerInventoryError {
+            stage: STAGE_CONTAINER_INSPECT,
+            detail: failure_detail(&inspect),
+        });
     }
-    Some(
-        String::from_utf8_lossy(&inspect.stdout)
-            .lines()
-            .map(str::trim)
-            .filter(|l| !l.is_empty())
-            .map(str::to_string)
-            .collect(),
-    )
+    Ok(String::from_utf8_lossy(&inspect.stdout)
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .map(str::to_string)
+        .collect())
 }
 
 /// Remove one image **by ID**, taking every alias tag pointing at it with it
@@ -761,6 +862,10 @@ pub struct DockerRetentionReport {
     pub removed: Vec<DockerImageRecord>,
     /// Present when a safety gate deferred removal (build slot unavailable).
     pub deferred: Option<String>,
+    /// Present when the inventory itself failed (#14679) — the rendered
+    /// [`DockerInventoryError`], naming the `docker` operation that failed.
+    /// Such an evaluation performs zero removals and WARNs once.
+    pub inventory_error: Option<String>,
     /// When this evaluation ran.
     pub at: DateTime<Utc>,
 }
@@ -777,6 +882,9 @@ impl DockerRetentionReport {
         }
         if let Some(reason) = &self.deferred {
             return format!("deferred: {reason}");
+        }
+        if let Some(failure) = &self.inventory_error {
+            return format!("{failure} — zero removals (unknown != empty)");
         }
         match &self.plan {
             None => "docker was unqueryable — skipping (unknown != empty)".to_string(),
@@ -822,7 +930,7 @@ pub struct DockerRetentionInputs<'a> {
 /// [`crate::deep_clean::run_pass`]'s shape.
 pub fn run_pass(
     inputs: &DockerRetentionInputs<'_>,
-    lister: &dyn Fn() -> Option<Vec<DockerImageRecord>>,
+    lister: &dyn Fn() -> Result<Vec<DockerImageRecord>, DockerInventoryError>,
     remover: &dyn Fn(&str) -> bool,
     with_build_slot: WithBuildSlot<'_>,
 ) -> DockerRetentionReport {
@@ -832,18 +940,26 @@ pub fn run_pass(
             plan: None,
             removed: Vec::new(),
             deferred: None,
+            inventory_error: None,
             at: inputs.now,
         };
     }
 
-    let Some(images) = lister() else {
-        return DockerRetentionReport {
-            enabled: true,
-            plan: None,
-            removed: Vec::new(),
-            deferred: None,
-            at: inputs.now,
-        };
+    let images = match lister() {
+        Ok(images) => images,
+        Err(error) => {
+            // Unknown != zero (#14679): a failed inventory removes nothing,
+            // and the failed operation travels in the report so the one
+            // pass summary can name it.
+            return DockerRetentionReport {
+                enabled: true,
+                plan: None,
+                removed: Vec::new(),
+                deferred: None,
+                inventory_error: Some(error.to_string()),
+                at: inputs.now,
+            };
+        }
     };
 
     let plan = plan_retention_with_pressure(
@@ -860,6 +976,7 @@ pub fn run_pass(
             plan: Some(plan),
             removed: Vec::new(),
             deferred: None,
+            inventory_error: None,
             at: inputs.now,
         };
     }
@@ -885,6 +1002,7 @@ pub fn run_pass(
             plan: Some(plan),
             removed: Vec::new(),
             deferred: Some(reason),
+            inventory_error: None,
             at: inputs.now,
         };
     }
@@ -894,6 +1012,7 @@ pub fn run_pass(
         plan: Some(plan),
         removed,
         deferred: None,
+        inventory_error: None,
         at: inputs.now,
     }
 }
@@ -942,10 +1061,68 @@ fn production_with_build_slot(work: &mut dyn FnMut()) -> Option<String> {
     None
 }
 
-/// Log one pass's outcome — `WARN` when it removed anything or deferred
-/// (an operator should see multi-GB reclaims and stuck deferrals at default
-/// verbosity), `DEBUG` otherwise.
-pub fn log_report(report: &DockerRetentionReport) {
+/// Log **exactly one** outcome summary per enabled evaluation (#14679) —
+/// the direct fix for the incident's silence: a failed inventory and a
+/// healthy pass used to be indistinguishable at the daemon's default
+/// `info` verbosity (`daemon_service.rs` initializes `env_logger` with
+/// `default_filter_or("info")`).
+///
+/// - **Failed inventory** → one WARN naming the failed `docker` operation
+///   (`report.inventory_error`, from [`DockerInventoryError`]). Zero
+///   removals were performed; the pass's outcome is unknown, not "healthy".
+/// - **Below the Docker floor** → one line reporting the measured free
+///   space, the floor, and the planned/removed counts **even when both are
+///   zero**, plus what was left reclaimable — so "removed 0 next to tens of
+///   GB reclaimable" reads as the anomaly it is. WARN when it removed
+///   something or deferred, INFO on a zero-plan pass.
+/// - **Everything else** (above the floor, or free space unmeasured) keeps
+///   the pre-#14679 discipline: WARN when it removed anything or deferred
+///   (an operator should see multi-GB reclaims and stuck deferrals at
+///   default verbosity), DEBUG otherwise.
+///
+/// Cooldown-only calls never reach this function — [`run_for`] returns
+/// before logging — so a multi-repo host's per-repo cooldown skips stay
+/// quiet.
+pub fn log_pass_outcome(report: &DockerRetentionReport, pressure: Option<&PressurePolicy>) {
+    if !report.enabled {
+        log::debug!("docker_image_clean: {}", report.reason());
+        return;
+    }
+    if let Some(failure) = &report.inventory_error {
+        log::warn!("docker_image_clean: {failure} — zero removals performed");
+        return;
+    }
+    if let Some(p) = pressure.filter(|p| p.below_floor()) {
+        let warn = report.deferred.is_some() || !report.removed.is_empty();
+        let deferred_note = report
+            .deferred
+            .as_ref()
+            .map_or(String::new(), |r| format!("; deferred: {r}"));
+        let line = match &report.plan {
+            Some(plan) => format!(
+                "below floor ({} GB free < {} GB floor): removed {} of planned {} ({}, {} kept, \
+                 {} allowlisted, {} left reclaimable){deferred_note}",
+                p.free_gb,
+                p.floor_gb,
+                report.removed.len(),
+                plan.to_remove().len(),
+                plan.summary(),
+                plan.kept.len(),
+                plan.allowlisted.len(),
+                human_size(plan.reclaimable_left_bytes),
+            ),
+            None => format!(
+                "below floor ({} GB free < {} GB floor): no plan was computed{deferred_note}",
+                p.free_gb, p.floor_gb,
+            ),
+        };
+        if warn {
+            log::warn!("docker_image_clean: {line}");
+        } else {
+            log::info!("docker_image_clean: {line}");
+        }
+        return;
+    }
     if report.deferred.is_some() || !report.removed.is_empty() {
         log::warn!("docker_image_clean: {}", report.reason());
     } else {
@@ -961,43 +1138,27 @@ pub fn log_report(report: &DockerRetentionReport) {
 /// deliberately host-wide (not per-repo, unlike `deep_clean`'s state map):
 /// Docker images are not scoped to any one registered repo, and a host with
 /// several repos ticking on the same reaper cadence must not re-shell to
-/// `docker` once per repo per tick.
-static LAST_EVALUATED_AT: OnceLock<Mutex<Option<DateTime<Utc>>>> = OnceLock::new();
-
-fn last_evaluated_slot() -> &'static Mutex<Option<DateTime<Utc>>> {
-    LAST_EVALUATED_AT.get_or_init(|| Mutex::new(None))
-}
+/// `docker` once per repo per tick. The elapsed/record logic lives in the
+/// shared [`HostWideCooldown`]; the instance is this module's own, so a
+/// pass here never suppresses the tmpfs or native-state passes.
+static COOLDOWN: HostWideCooldown = HostWideCooldown::new();
 
 /// Whether enough time has passed since the last evaluation to run another —
 /// the cooldown gate `run_for` applies before touching `docker` at all.
 #[must_use]
 fn cooldown_elapsed(now: DateTime<Utc>, min_interval_secs: u64) -> bool {
-    let guard = last_evaluated_slot()
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    match *guard {
-        None => true,
-        Some(last) => {
-            let since = (now - last).num_seconds();
-            since < 0 || since >= i64::try_from(min_interval_secs).unwrap_or(i64::MAX)
-        }
-    }
+    COOLDOWN.elapsed(now, min_interval_secs)
 }
 
 fn record_evaluated(now: DateTime<Utc>) {
-    let mut guard = last_evaluated_slot()
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    *guard = Some(now);
+    COOLDOWN.record(now);
 }
 
 /// Drop cooldown state. Test-only seam (the process-global would otherwise
 /// leak between `#[serial]` tests in the same binary).
 #[doc(hidden)]
 pub fn reset_state_for_test() {
-    *last_evaluated_slot()
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+    COOLDOWN.reset();
 }
 
 /// Arm the host-wide cooldown as if a pass had just evaluated at `now`.
@@ -1042,6 +1203,7 @@ pub fn run_for(repo_root: &Path) -> DockerRetentionReport {
                 "host-wide cooldown active (min interval {min_interval_secs}s) — \
                  `docker` was not queried"
             )),
+            inventory_error: None,
             at: now,
         };
     }
@@ -1072,19 +1234,11 @@ pub fn run_for(repo_root: &Path) -> DockerRetentionReport {
     if enabled {
         record_evaluated(now);
     }
-    log_report(&report);
-    // #11195: below the floor, always say what the pass left behind at INFO,
-    // so "removed 0" next to tens of GB reclaimable reads as an anomaly.
-    if let (Some(p), Some(plan)) = (pressure.filter(PressurePolicy::below_floor), &report.plan) {
-        log::info!(
-            "docker_image_clean: below floor ({} GB free < {} GB): planned {}, removed {},              {} left reclaimable",
-            p.free_gb,
-            p.floor_gb,
-            plan.summary(),
-            report.removed.len(),
-            human_size(plan.reclaimable_left_bytes)
-        );
-    }
+    // #14679: exactly one summary per enabled evaluation (failed inventory
+    // WARNs naming the failed stage; below-floor reports free/floor/planned/
+    // removed even when all zero). The pre-#14679 shape logged the reason
+    // line *and* a separate below-floor INFO line — two lines for one pass.
+    log_pass_outcome(&report, pressure.as_ref());
     report
 }
 

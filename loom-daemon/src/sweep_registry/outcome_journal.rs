@@ -1180,6 +1180,13 @@ impl SweepRegistry {
             sweep_id,
             started_at,
             outcome_record.tokens_by_model.as_deref(),
+            // #14566: an unreadable sweep says why, so the gap is countable.
+            (outcome_record.tokens_status == Some(crate::telemetry::TokensStatus::Unattributable))
+                .then_some(outcome_record.tokens_status_reason.as_deref())
+                .flatten()
+                .and_then(
+                    crate::observability::runtime_usage::missing::UsageMissing::from_sweep_reason,
+                ),
             span_runtime.as_deref(),
         );
         let trace_context = crate::observability::lifecycle::finish_execution(
@@ -1507,9 +1514,7 @@ impl PhaseWindow {
 mod tests;
 
 // End-to-end tests for the #8222 label-timeline sourcing, in their own sibling
-// file rather than appended to `tests` above: that module is already near the
-// file-size ratchet's threshold (`scripts/check-file-size-budget.sh`), and the
-// rule there is to add a new sibling module rather than grow a big one.
+// file rather than appended to `tests` above.
 #[cfg(test)]
 #[allow(
     clippy::unwrap_used,
@@ -1519,8 +1524,7 @@ mod tests;
 )]
 mod timeline_tests;
 
-// API-key-pool credential attribution (#8447), in its own sibling module for
-// the same file-size reason as `timeline_tests` above.
+// API-key-pool credential attribution (#8447), in its own sibling module.
 #[cfg(test)]
 #[allow(
     clippy::unwrap_used,
@@ -1531,8 +1535,7 @@ mod timeline_tests;
 mod credential_tests;
 
 // Runtime/provider/profile attribution + the OpenCode `tokens_by_model`
-// dispatch seam (Issue #8507), in its own sibling module for the same
-// file-size reason as `credential_tests` above.
+// dispatch seam (Issue #8507), in its own sibling module.
 #[cfg(test)]
 #[allow(
     clippy::unwrap_used,
@@ -1543,7 +1546,7 @@ mod credential_tests;
 mod runtime_tests;
 
 // Per-phase token attribution + `tokens_unattributed` (#9443), in its own
-// sibling module for the same file-size reason as `runtime_tests` above.
+// sibling module.
 #[cfg(test)]
 #[allow(
     clippy::unwrap_used,
@@ -1565,7 +1568,7 @@ mod phase_usage_tests;
 mod phase_effort_tests;
 
 // Tap-attributed usage accounting (#8556) end-to-end across both terminal
-// journals, in its own sibling module for the same file-size reason.
+// journals, in its own sibling module.
 #[cfg(test)]
 #[allow(
     clippy::unwrap_used,
@@ -1576,7 +1579,7 @@ mod phase_effort_tests;
 mod tap_usage_tests;
 
 // End-to-end tests for the issue-signal sourcing (`story_points`), in their own
-// sibling file for the same file-size reason as `timeline_tests` above.
+// sibling file.
 #[cfg(test)]
 #[allow(
     clippy::unwrap_used,
@@ -1587,8 +1590,7 @@ mod tap_usage_tests;
 mod complexity_tests;
 
 // End-to-end tests for the #9056 issue write-back (posting, idempotency, the
-// `Success`-only gate), in their own sibling file for the same file-size
-// reason as `timeline_tests` above. `writeback`'s own
+// `Success`-only gate), in their own sibling file. `writeback`'s own
 // pure/unit tests live inline in those modules instead.
 #[cfg(test)]
 #[allow(
@@ -1600,8 +1602,7 @@ mod complexity_tests;
 mod writeback_tests;
 
 // End-to-end tests for the #9441 `disposition` field as it lands on a real
-// journal record, in their own sibling file for the same file-size reason as
-// `timeline_tests` above. The classifier's own exhaustive contract tests are
+// journal record, in their own sibling file. The classifier's own exhaustive contract tests are
 // pure and live with it, in `telemetry::disposition`.
 #[cfg(test)]
 #[allow(
@@ -1614,7 +1615,7 @@ mod disposition_tests;
 
 // End-to-end tests for the #9440 `tokens_status` axis (a failed/cancelled
 // sweep's token counters and the absence-case discriminator), in their own
-// sibling file for the same file-size reason as `timeline_tests` above.
+// sibling file.
 #[cfg(test)]
 #[allow(
     clippy::unwrap_used,
@@ -1625,8 +1626,7 @@ mod disposition_tests;
 mod tokens_status_tests;
 
 // Contract tests for the #9465 PR-linkage and actually-ran-model derivation
-// (`pr_numbers`, `model` vs. `config["arm"]`), in their own sibling file for
-// the same file-size reason as `timeline_tests` above.
+// (`pr_numbers`, `model` vs. `config["arm"]`), in their own sibling file.
 #[cfg(test)]
 #[allow(
     clippy::unwrap_used,

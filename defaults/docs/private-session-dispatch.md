@@ -143,6 +143,82 @@ clears a hold: a published branch is never discarded, so an already-published
 hold is cleared by hand (`accounts session attach <account>`, then
 `git worktree remove <path>` in the clone — nothing unpublished is lost).
 
+### A dirty leftover worktree (`seat_dirty`)
+
+A leftover worktree with uncommitted or untracked files refuses preparation of
+**its own clone** (the account's other registered repositories prepare
+independently) with a message starting `seat_dirty:` — unless the automatic
+finished-PR reap described below removes it first; the step's failure is
+recorded with that reason instead of `unclassified`. The listing form of
+`accounts session recover <account>` names every dirty worktree — path,
+branch, tracked and untracked counts, and commits unpublished at its HEAD —
+even when no branch is unpublished. Save or resolve changes in the main
+checkout in place. To remove a leftover linked worktree, use
+`recover <account> --discard --worktree <path>`. Repeat `--worktree` to
+name multiple paths in one call. Recovery validates all paths across the
+account's clones before removing anything and resolves aliases to one
+worktree. It keeps branch refs and refuses primary, locked, out-of-volume,
+or unpublished worktrees. Publish or save any local commits before retrying.
+Use a separate call for `--branch` or `--issue` discards.
+
+Untracked files under `.loom/lease-renew/` and the worktree-root `.cache/`
+are ignored. Tracked changes in those directories are reported.
+Preparation can remove an unlocked linked worktree when its commits are
+reachable from the freshly fetched origin and the GitHub PR listing confirms
+a merged or closed PR for that exact repository, branch, and head commit.
+This includes squash and fast-forward merges and published PRs closed without
+merge. An open PR on the same branch, an unverifiable response, or an
+unsupported forge leaves the worktree in place.
+
+This automatic reap runs **before** the dirty check, so it wins over
+`seat_dirty`: a linked worktree whose tip is published and heads a finished
+PR is removed even when it carries uncommitted or untracked files. The
+removal is forced (`git worktree remove --force`): those uncommitted and
+untracked files are deleted with the worktree, while the branch ref and its
+commits are kept. Locked worktrees, the primary clone, and worktrees with
+unpublished commits are never reaped; when such a worktree is dirty, the
+refusal above still applies. Every path the reap removes is reported to the
+host on both success and refusal. The host logs each removed path with its
+account and repository before returning the preparation result.
+
+### Who reaps what: preparation vs the periodic seat pass
+
+Two paths reclaim inside a seat volume, with different rules (#14483 vs
+#14678):
+
+- **Job preparation** (per admission, the one target clone only): forgives
+  untracked caches, reaps linked worktrees whose tip heads a *finished* PR —
+  merged **or closed-unmerged**, dirty ones included via the forced removal
+  above — and backs the explicit `accounts session recover` listing and
+  `--discard`/`--worktree` removal of dirty leftovers. Preparation's reap
+  runs before its dirty check (`reap_finished_worktrees` before
+  `clean_worktrees`) and can remove a dirty, unlocked worktree whose tip is
+  published at a finished PR. That behavior is preparation's own and is not
+  changed by the seat pass.
+- **The periodic seat pass** (idle, every seat and every registered clone):
+  a leased maintenance verb — the account's exclusive lease, the container
+  proven running and idle, and **no `prepare` step**, so a dirty seat still
+  gets its pass — removes step scratch (`cache/<role>-<n>.*`, top-level
+  `*-tmp` and `<role>-<n>.*` dirs) older than
+  `autonomous.worktreeReaper.scratchReclaim.maxAgeHours`, and reaps a linked
+  worktree only when it is clean, fully published, unlocked, in-volume, and
+  its branch has a confirmed **merged** PR at that exact tip past
+  `autonomous.worktreeReaper.gracePeriodSecs`. It never quarantines and
+  never takes a backup; a worktree it cannot prove finished is preserved
+  with a reason (dirty, unpublished, open PR, closed-unmerged, grace not
+  passed, state unreadable). The pass honors the existing
+  `scratchReclaim.*` surface — no new flags — and reports reclaimed bytes
+  and preserved reasons through `reaper.pass` spans (class `seat`, the span's
+  repo label the seat's account name) instead of the host reaper's blanket
+  `preserved.private_workspace` wording for what it now handles.
+
+The preservation guarantee — a dirty, unpublished, open-PR or
+closed-unmerged worktree is never removed — is the **seat pass's** rule. A
+dirty worktree whose tip is published at a merged PR past grace is the
+dividing case: preparation may force-remove it at the next admission of that
+clone, the seat pass preserves and reports it. `.identity` records and the
+no-alternates / private-clone invariants are untouched by both paths.
+
 ## Rebinding a registration after a repository transfer
 
 A forge transfer changes the owner-qualified URL, and with it the registration

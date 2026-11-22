@@ -8,7 +8,7 @@
 //! [`super::account_registry::account_inventory`] exactly the way
 //! `loom-daemon accounts status <name>` already does. What this module adds
 //! is the container half — start/stop/status/attach a long-lived
-//! `ghcr.io/rjwalters/loom-worker-session` container that mounts the
+//! `ghcr.io/2amlogic/loom-worker-session` container that mounts the
 //! account's `CODEX_HOME` profile directory, per the mount contract
 //! (`docker/worker/MOUNT-CONTRACT.md` §2/§3) and the image's own `CODEX_HOME`
 //! convention (`docker/session/README.md`).
@@ -73,7 +73,7 @@ use super::health::{self, ProbeEffect, ProbeOutcome};
 use super::session_hold;
 use super::session_image::{self, ExtraMount, SessionImageConfig};
 
-// The pass-level health refresh lives in a sibling (file-size ratchet, #7711).
+// The pass-level health refresh lives in a sibling (#7711).
 #[path = "session_health.rs"]
 mod session_health;
 pub use session_health::{refresh_session_health, refresh_session_health_uncached};
@@ -83,7 +83,7 @@ pub use session_health::{refresh_session_health, refresh_session_health_uncached
 pub mod liveness;
 
 // `stop`, and the reconciler's hold-respecting start, with their race
-// handling (file-size ratchet, #7711; #10661).
+// handling (#7711; #10661).
 mod start;
 mod stop;
 pub use start::UndoLock;
@@ -91,7 +91,7 @@ pub use start::UndoLock;
 /// Default image this lifecycle launches session containers from
 /// (`docker/session/README.md`). Overridable per-invocation (`--image`) for
 /// tests and for an operator pinning a specific published tag.
-pub const DEFAULT_SESSION_IMAGE: &str = "ghcr.io/rjwalters/loom-worker-session:latest";
+pub const DEFAULT_SESSION_IMAGE: &str = "ghcr.io/2amlogic/loom-worker-session:latest";
 
 /// The session image's fixed `CODEX_HOME` mount point
 /// (`docker/session/README.md` § "`CODEX_HOME` mount contract").
@@ -691,6 +691,24 @@ pub trait ContainerRunner: session_image::BundleProbe {
         extra_mounts: &[ExtraMount],
     ) -> Result<()>;
 
+    /// Create and start a Claude seat container (issue #14371): like
+    /// [`Self::create`], but mounting the seat's own `claude_home` at the
+    /// session image's Claude config path instead of a `CODEX_HOME` profile
+    /// (see [`super::claude_seat`]). The default refuses, so a runner with no
+    /// Claude-seat support fails closed rather than creating a Codex-shaped
+    /// container for a Claude account.
+    fn create_claude_seat(
+        &self,
+        _container: &str,
+        _image: &str,
+        _claude_home: &Path,
+        _workspace: &Path,
+        _daemon_root: &Path,
+        _extra_mounts: &[ExtraMount],
+    ) -> Result<()> {
+        bail!("this container runner cannot create a Claude seat container")
+    }
+
     /// Make sure `image` is available locally (`docker image inspect`, then
     /// `docker pull`), so a caller can fail *before* tearing a container down
     /// rather than after (#11727: the version-skew recreate must not delete a
@@ -763,7 +781,7 @@ pub struct ProcessContainerRunner;
 impl ProcessContainerRunner {
     /// Bounded by [`super::docker_cli::timeout_for`] (issue #10453): a hung
     /// Docker daemon fails the call instead of stalling the caller forever.
-    fn run_capture(args: &[&str]) -> Result<(bool, String, String)> {
+    pub(super) fn run_capture(args: &[&str]) -> Result<(bool, String, String)> {
         super::docker_cli::run_bounded("docker", args, super::docker_cli::timeout_for(args))
     }
 
@@ -924,6 +942,25 @@ impl ContainerRunner for ProcessContainerRunner {
             bail!("docker run {image} failed: {}", stderr.trim());
         }
         Ok(())
+    }
+
+    fn create_claude_seat(
+        &self,
+        container: &str,
+        image: &str,
+        claude_home: &Path,
+        workspace: &Path,
+        daemon_root: &Path,
+        extra_mounts: &[ExtraMount],
+    ) -> Result<()> {
+        super::claude_seat::docker_create_seat(
+            container,
+            image,
+            claude_home,
+            workspace,
+            daemon_root,
+            extra_mounts,
+        )
     }
 
     fn ensure_image(&self, image: &str) -> Result<()> {

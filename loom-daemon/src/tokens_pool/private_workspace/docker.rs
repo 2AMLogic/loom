@@ -1,5 +1,8 @@
 use super::*;
 use serde_json::{json, Value};
+use std::io::{Read, Write};
+use std::net::{TcpStream, ToSocketAddrs};
+use std::os::unix::net::UnixStream;
 use std::time::Duration;
 
 use super::super::docker_cli;
@@ -32,17 +35,7 @@ pub(super) fn command_env(
     env: &[(String, String)],
     timeout: Duration,
 ) -> Result<String> {
-    // Every Docker call of this module goes through here, so a fake installed
-    // on this thread (`fake`, tests only) stands in for the whole engine.
-    #[cfg(test)]
-    if let Some(result) = fake::dispatch(args, env) {
-        return result;
-    }
-    let (success, stdout, _stderr) = docker_cli::run_bounded_env("docker", args, env, timeout)
-        .map_err(|error| match error.downcast::<docker_cli::DockerTimedOut>() {
-            Ok(timed_out) => anyhow::Error::new(timed_out),
-            Err(error) => error.context("Docker unavailable"),
-        })?;
+    let (success, stdout) = command_status_env(args, env, timeout)?;
     if !success {
         bail!(
             "Docker {} failed; inspect the session with Docker locally",
@@ -50,6 +43,37 @@ pub(super) fn command_env(
         );
     }
     Ok(stdout)
+}
+
+/// Batch volume inspect can report found volumes on stdout after an ordinary
+/// nonzero exit. Only the sampler reconciles those per-volume results.
+pub(super) fn inspect_volume_batch(
+    volumes: &[String],
+    format: &str,
+    timeout: Duration,
+) -> Result<(bool, String)> {
+    let mut args = vec!["volume", "inspect", "--format", format];
+    args.extend(volumes.iter().map(String::as_str));
+    command_status_env(&args, &[], timeout)
+}
+
+fn command_status_env(
+    args: &[&str],
+    env: &[(String, String)],
+    timeout: Duration,
+) -> Result<(bool, String)> {
+    // Every Docker call of this module goes through here, so a fake installed
+    // on this thread (`fake`, tests only) stands in for the whole engine.
+    #[cfg(test)]
+    if let Some(result) = fake::dispatch(args, env, timeout) {
+        return result;
+    }
+    let (success, stdout, _stderr) = docker_cli::run_bounded_env("docker", args, env, timeout)
+        .map_err(|error| match error.downcast::<docker_cli::DockerTimedOut>() {
+            Ok(timed_out) => anyhow::Error::new(timed_out),
+            Err(error) => error.context("Docker unavailable"),
+        })?;
+    Ok((success, stdout))
 }
 
 pub(super) fn desktop() -> Result<bool> {
@@ -160,7 +184,10 @@ pub(super) fn validate_settings(config: &Config, state: &Value) -> Result<()> {
     // required to be distinct AND to match one of those exact roles, an exact
     // count is also a proof that none of them is MISSING — which is what makes
     // this the host-side half of the control-file protection (issue #8839).
-    let expected = 2 + bundle::PROFILE_CONTROLS.len() + usize::from(config.gh_config.is_some());
+    let expected = 2
+        + bundle::PROFILE_CONTROLS.len()
+        + usize::from(config.gh_config.is_some())
+        + config.extra_mounts.len();
     if mounts.len() != expected {
         bail!("private session has unexpected mounts; no host workspace, peer volume or runtime socket may be mounted, and every account profile control file must be bound read-only");
     }
@@ -190,12 +217,24 @@ pub(super) fn validate_settings(config: &Config, state: &Value) -> Result<()> {
             // receipt, each bound READ-ONLY over its own canonical path. The
             // mount point is what makes them unremovable and unrenameable from
             // inside the session while `auth.json` beside them stays writable.
-            other => bundle::PROFILE_CONTROLS.iter().any(|name| {
-                other == bundle::control_destination(name)
-                    && mount["Type"] == "bind"
-                    && bind_source_matches(config, mount, &config.profile.join(name))
-                    && mount["RW"] == false
-            }),
+            other => {
+                bundle::PROFILE_CONTROLS.iter().any(|name| {
+                    other == bundle::control_destination(name)
+                        && mount["Type"] == "bind"
+                        && bind_source_matches(config, mount, &config.profile.join(name))
+                        && mount["RW"] == false
+                })
+                // The recorded `accounts.session.extraMounts` (#14451): data
+                // only, so each must be a read-only bind of exactly its
+                // recorded host path. One that is not recorded, or recorded
+                // and missing, breaks the exact count above.
+                || config.extra_mounts.iter().any(|extra| {
+                    Path::new(other) == extra.container
+                        && mount["Type"] == "bind"
+                        && bind_source_matches(config, mount, &extra.host)
+                        && mount["RW"] == false
+                })
+            }
         };
         if !valid {
             bail!("private session mount does not match its account-owned configuration");
@@ -221,18 +260,43 @@ fn control_mounts(config: &Config) -> Vec<String> {
         .collect()
 }
 
+/// Whether a live session is provably idle, alone. Every other caller wants
+/// the refusal's own clause too, so it goes through [`idle_refusal`].
 pub(super) fn idle(state: Option<&Value>, container: &str) -> Result<bool> {
-    let Some(state) = state else { return Ok(true) };
+    Ok(idle_refusal(state, container)?.is_none())
+}
+
+/// Why a live session is NOT provably idle, or `None` when it is. The clause
+/// is one line of safe fields only — for a blocking container exec, its id
+/// and its classified state, with an explicit unknown when inspection could
+/// not answer — and it rides the stale-lease refusal on both the admission
+/// path and `roles draw --explain` verbatim (#14943).
+pub(super) fn idle_refusal(state: Option<&Value>, container: &str) -> Result<Option<String>> {
+    let Some(state) = state else { return Ok(None) };
     if state["State"]["Running"] == false {
-        return Ok(true);
+        return Ok(None);
     }
-    if state["State"]["Running"] != true
-        || state["State"]["Paused"] == true
-        || state["ExecIDs"]
-            .as_array()
-            .is_some_and(|ids| !ids.is_empty())
-    {
-        return Ok(false);
+    if state["State"]["Paused"] == true {
+        return Ok(Some("session container is paused".into()));
+    }
+    if state["State"]["Running"] != true {
+        return Ok(Some("session container running state is unverified".into()));
+    }
+    // Docker never garbage-collects an exec record that was created but never
+    // started, so a non-empty `ExecIDs` is NOT by itself a busy proof: each
+    // record is inspected, and only a live, pending or unresolvable one
+    // holds the seat (#14943). All leased exec creators (the snapshot
+    // monitor, transport) hold the same account flock this proof runs under,
+    // so an ignorable record has no live creator left; an unleased hand exec
+    // that starts after this check is the same race `docker top` already has
+    // against it, and its process still fails the baseline check below.
+    if let Some(ids) = state["ExecIDs"].as_array() {
+        let container_id = state["Id"].as_str().unwrap_or_default();
+        for id in ids.iter().filter_map(Value::as_str) {
+            if let Some(refusal) = exec_record(id, container_id).refusal(id) {
+                return Ok(Some(refusal));
+            }
+        }
     }
     let output = command(&["top", container, "-o", "pid,args"])?;
     let processes: Vec<_> = output
@@ -246,9 +310,329 @@ pub(super) fn idle(state: Option<&Value>, container: &str) -> Result<bool> {
         .collect();
     // Private sessions deliberately have no tmux/baseline interactive shell.
     // Every extra process, including a detached child, is busy/ambiguous.
-    Ok(processes.len() == 2
-        && processes.contains(&"/usr/bin/tini -- /bin/sleep infinity")
-        && processes.contains(&"/bin/sleep infinity"))
+    Ok((processes.len() != 2
+        || !processes.contains(&"/usr/bin/tini -- /bin/sleep infinity")
+        || !processes.contains(&"/bin/sleep infinity"))
+    .then(|| "session process list is not the idle baseline".to_owned()))
+}
+
+/// The Docker Engine API version the exec probe pins: old enough for every
+/// engine this daemon runs against, and `/exec/{id}/json` has reported
+/// `Running`, `ExitCode`, `Pid` and `ContainerID` since long before it.
+const EXEC_API_VERSION: &str = "1.43";
+/// Wall budget for one exec-inspect request: a read-only call against a
+/// local daemon, bounded so a wedged engine cannot hold the account lease.
+const EXEC_PROBE_TIMEOUT: Duration = Duration::from_secs(10);
+/// An exec-inspect body is a few hundred bytes; anything larger is not a
+/// body this probe can trust.
+const EXEC_PROBE_BODY_LIMIT: usize = 64 * 1024;
+
+/// What one Docker exec record proves about session busyness.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum ExecRecord {
+    /// `Running: true` — a live exec worker.
+    Running,
+    /// Started and finished (`ExitCode` set). Docker prunes finished records
+    /// from `ExecIDs` on its own; this covers the prune race.
+    Exited,
+    /// Created but never started (`ExitCode` null, `Pid` 0) — the record a
+    /// snapshot exec leaves behind when its creating client died between
+    /// create and start and the start never came (#14943).
+    NeverStarted,
+    /// Not running and not exited, with a pid attached: neither idle-proof
+    /// nor dead, so it holds the seat.
+    Pending,
+    /// Inspect answered for a different container than the one being proven.
+    Foreign,
+    /// Inspect could not answer or did not classify: an explicit unknown,
+    /// carrying the sanitized category for the refusal text.
+    Unknown(&'static str),
+}
+
+impl ExecRecord {
+    /// The blocking record's clause for [`idle_refusal`], or `None` when the
+    /// record is ignorable. Safe fields only: the exec id and its classified
+    /// state — never the exec's command, arguments or environment (#14943).
+    fn refusal(&self, id: &str) -> Option<String> {
+        match self {
+            Self::Running => Some(format!("container exec {id} is running")),
+            Self::Pending => {
+                Some(format!("container exec {id} has not started and has not exited"))
+            }
+            Self::Foreign => Some(format!("container exec {id} belongs to another container")),
+            Self::Unknown(why) => Some(format!("container exec {id} state unknown ({why})")),
+            Self::Exited | Self::NeverStarted => None,
+        }
+    }
+}
+
+/// Classify one exec record of `container_id` from the engine that reports
+/// it. Anything the probe cannot resolve classifies as unknown and keeps the
+/// session busy — a stranded seat is recoverable by hand, a guessed-at idle
+/// proof is not.
+fn exec_record(id: &str, container_id: &str) -> ExecRecord {
+    if id.len() != 64 || !id.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return ExecRecord::Unknown("exec id is malformed");
+    }
+    match exec_inspect_body(id) {
+        Ok(body) if body.len() <= EXEC_PROBE_BODY_LIMIT => classify_exec(&body, container_id),
+        Ok(_) => ExecRecord::Unknown("exec inspect response was oversized"),
+        Err(error) => {
+            if error.downcast_ref::<NoExecProbeTransport>().is_some() {
+                ExecRecord::Unknown("engine endpoint has no exec probe transport")
+            } else {
+                ExecRecord::Unknown("exec inspect failed")
+            }
+        }
+    }
+}
+
+/// Marker: the configured engine endpoint uses a scheme this probe cannot
+/// open (ssh, TLS) — distinct from a transport that tried and failed.
+#[derive(Debug)]
+struct NoExecProbeTransport;
+
+impl std::fmt::Display for NoExecProbeTransport {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("engine endpoint has no exec probe transport")
+    }
+}
+
+impl std::error::Error for NoExecProbeTransport {}
+
+/// The exec record's JSON body straight from the Engine API. Tests intercept
+/// the pseudo-argv `exec-inspect <id>` at the shared fake seam, so no test
+/// touches a real engine (#12772).
+fn exec_inspect_body(id: &str) -> Result<String> {
+    #[cfg(test)]
+    if let Some(result) = fake::dispatch(&["exec-inspect", id], &[], EXEC_PROBE_TIMEOUT) {
+        return result.map(|(_, body)| body);
+    }
+    let endpoint = engine_endpoint().ok_or_else(|| anyhow::anyhow!(NoExecProbeTransport))?;
+    engine_api_get(&endpoint, &format!("/v{EXEC_API_VERSION}/exec/{id}/json"))
+        .map_err(|error| error.context("engine exec inspect failed"))
+}
+
+/// Classify an `/exec/{id}/json` body against the container being proven.
+fn classify_exec(body: &str, container_id: &str) -> ExecRecord {
+    let Ok(value) = serde_json::from_str::<Value>(body) else {
+        return ExecRecord::Unknown("exec state unrecognized");
+    };
+    let classified = match (value["Running"].as_bool(), value["ExitCode"].as_i64()) {
+        (Some(true), _) => ExecRecord::Running,
+        (_, Some(_)) => ExecRecord::Exited,
+        (Some(false), _) if value["Pid"] == json!(0) => ExecRecord::NeverStarted,
+        (Some(false), _) => ExecRecord::Pending,
+        _ => return ExecRecord::Unknown("exec state unrecognized"),
+    };
+    match value["ContainerID"].as_str() {
+        Some(recorded) if recorded == container_id => classified,
+        // A record answered for another container is not this proof's to
+        // use; one that names no container at all did not classify.
+        Some(_) => ExecRecord::Foreign,
+        None => ExecRecord::Unknown("exec state unrecognized"),
+    }
+}
+
+/// The engine endpoint the `docker` CLI itself would use, with the CLI's own
+/// precedence — `DOCKER_HOST` first, then the current context's endpoint,
+/// then the platform default — so the probe speaks to the same engine that
+/// supplied the container inventory. Schemes without an openable transport
+/// here (ssh, TLS) answer `None`: the exec stays unverified and the seat is
+/// preserved, never guessed at.
+fn engine_endpoint() -> Option<EngineEndpoint> {
+    if let Some(host) = std::env::var_os("DOCKER_HOST") {
+        if !host.is_empty() {
+            return parse_docker_host(&host.to_string_lossy());
+        }
+    }
+    if let Ok(current) = command(&[
+        "context",
+        "inspect",
+        "--format",
+        "{{.Endpoints.docker.Host}}",
+    ]) {
+        let host = current.trim();
+        if !host.is_empty() {
+            return parse_docker_host(host);
+        }
+    }
+    default_endpoint()
+}
+
+/// Where a raw engine probe can be opened.
+#[derive(Debug, PartialEq, Eq)]
+enum EngineEndpoint {
+    Unix(PathBuf),
+    Tcp(String),
+}
+
+/// Parse a `DOCKER_HOST`-shaped endpoint URI into an openable transport.
+fn parse_docker_host(host: &str) -> Option<EngineEndpoint> {
+    let (scheme, rest) = host.split_once("://")?;
+    match scheme {
+        "unix" => Some(EngineEndpoint::Unix(if rest.is_empty() {
+            PathBuf::from(default_socket())
+        } else {
+            PathBuf::from(rest)
+        })),
+        "tcp" | "http"
+            if std::env::var_os("DOCKER_TLS_VERIFY").is_none_or(|value| value.is_empty()) =>
+        {
+            (!rest.is_empty()).then(|| EngineEndpoint::Tcp(rest.to_owned()))
+        }
+        _ => None,
+    }
+}
+
+/// The platform's default engine socket, in probe order.
+fn default_endpoint() -> Option<EngineEndpoint> {
+    let candidates: &[&str] = if cfg!(target_os = "macos") {
+        &["/.docker/run/docker.sock", "/var/run/docker.sock"]
+    } else {
+        &["/var/run/docker.sock"]
+    };
+    let home = std::env::var_os("HOME");
+    candidates
+        .iter()
+        .map(|suffix| {
+            if let Some(prefix) = suffix.strip_prefix('/') {
+                home.as_ref()
+                    .map(|home| Path::new(home).join(format!(".{prefix}")))
+                    .unwrap_or_else(|| PathBuf::from(suffix))
+            } else {
+                PathBuf::from(suffix)
+            }
+        })
+        .find(|path| std::fs::symlink_metadata(path).is_ok())
+        .map(EngineEndpoint::Unix)
+}
+
+/// The first default socket path for this platform, without an existence
+/// check (`unix://` with no path resolves to it).
+fn default_socket() -> &'static str {
+    // Docker Desktop keeps a symlink at the Unix path on macOS too.
+    "/var/run/docker.sock"
+}
+
+/// One bounded read-only GET against the Docker Engine API, spoken directly
+/// over the endpoint the `docker` CLI resolves. HTTP/1.1 with
+/// `Connection: close` is the whole contract the daemon's JSON replies need.
+fn engine_api_get(endpoint: &EngineEndpoint, path: &str) -> Result<String> {
+    match endpoint {
+        EngineEndpoint::Unix(socket) => {
+            let mut stream = UnixStream::connect(socket)
+                .with_context(|| format!("engine socket {} unreachable", socket.display()))?;
+            stream.set_read_timeout(Some(EXEC_PROBE_TIMEOUT))?;
+            stream.set_write_timeout(Some(EXEC_PROBE_TIMEOUT))?;
+            engine_request(&mut stream, path)
+        }
+        EngineEndpoint::Tcp(host) => {
+            let address = host
+                .to_socket_addrs()
+                .with_context(|| format!("engine endpoint {host} did not resolve"))?
+                .next()
+                .context("engine endpoint resolved to no address")?;
+            let mut stream = TcpStream::connect_timeout(&address, EXEC_PROBE_TIMEOUT)
+                .with_context(|| format!("engine endpoint {host} unreachable"))?;
+            stream.set_read_timeout(Some(EXEC_PROBE_TIMEOUT))?;
+            stream.set_write_timeout(Some(EXEC_PROBE_TIMEOUT))?;
+            engine_request(&mut stream, path)
+        }
+    }
+}
+
+/// Write one GET and read the reply to the connection close, within the
+/// probe's budgets.
+fn engine_request(stream: &mut (impl Read + Write), path: &str) -> Result<String> {
+    stream.write_all(
+        format!("GET {path} HTTP/1.1\r\nHost: docker\r\nConnection: close\r\n\r\n").as_bytes(),
+    )?;
+    let mut bytes = Vec::new();
+    let mut buffer = [0_u8; 4096];
+    loop {
+        let read = stream.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        if bytes.len() + read > EXEC_PROBE_BODY_LIMIT * 2 {
+            bail!("engine response exceeds the probe's body budget");
+        }
+        bytes.extend_from_slice(&buffer[..read]);
+    }
+    parse_http_body(&bytes)
+}
+
+/// The body of an engine HTTP reply: 200 only, framed by `Content-Length`,
+/// chunked encoding, or the connection close itself.
+fn parse_http_body(response: &[u8]) -> Result<String> {
+    let header_end = response
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n")
+        .context("engine response has no header terminator")?;
+    let head = std::str::from_utf8(&response[..header_end])
+        .context("engine response header is not UTF-8")?;
+    let mut lines = head.split("\r\n");
+    let status = lines.next().unwrap_or_default();
+    if !status.starts_with("HTTP/1.0 200")
+        && !status.starts_with("HTTP/1.1 200")
+        && !status.starts_with("HTTP/2 200")
+    {
+        bail!("engine responded with {status}");
+    }
+    let mut chunked = false;
+    let mut length = None;
+    for line in lines {
+        let Some((name, value)) = line.split_once(':') else {
+            continue;
+        };
+        match name.trim().to_ascii_lowercase().as_str() {
+            "transfer-encoding" if value.to_ascii_lowercase().contains("chunked") => {
+                chunked = true;
+            }
+            "content-length" => length = value.trim().parse::<usize>().ok(),
+            _ => {}
+        }
+    }
+    let body = &response[header_end + 4..];
+    if chunked {
+        return Ok(dechunk(body));
+    }
+    let body = match length {
+        Some(length) => body
+            .get(..length)
+            .context("engine body shorter than declared")?,
+        None => body,
+    };
+    Ok(String::from_utf8_lossy(body).into_owned())
+}
+
+/// Decode a chunked engine reply body.
+fn dechunk(body: &[u8]) -> String {
+    let mut decoded = Vec::new();
+    let mut cursor = 0;
+    while let Some(line_end) = body[cursor.min(body.len())..]
+        .iter()
+        .position(|b| *b == b'\n')
+        .map(|at| cursor + at)
+    {
+        let size_line = &body[cursor..line_end];
+        let size_text = String::from_utf8_lossy(size_line);
+        let size_text = size_text.trim().split(';').next().unwrap_or_default();
+        let Ok(size) = usize::from_str_radix(size_text, 16) else {
+            break;
+        };
+        cursor = line_end + 1;
+        if size == 0 {
+            break;
+        }
+        let Some(chunk) = body.get(cursor..cursor + size) else {
+            break;
+        };
+        decoded.extend_from_slice(chunk);
+        cursor += size + 2;
+    }
+    String::from_utf8_lossy(&decoded).into_owned()
 }
 
 pub(super) fn volume_exists(volume: &str) -> Result<bool> {
@@ -258,7 +642,11 @@ pub(super) fn volume_exists(volume: &str) -> Result<bool> {
 
 /// The recorded image must already be local: recovery never pulls or swaps one.
 pub(super) fn image_present(image: &str) -> Result<()> {
-    command(&["image", "inspect", "--format", "{{.Id}}", image])
+    image_present_with(image, docker_cli::DOCKER_CALL_TIMEOUT)
+}
+
+pub(super) fn image_present_with(image: &str, timeout: Duration) -> Result<()> {
+    command_with(&["image", "inspect", "--format", "{{.Id}}", image], timeout)
         .map(drop)
         .with_context(|| format!("recorded session image {image} is not available locally"))
 }
@@ -361,6 +749,29 @@ pub(super) fn create(config: &Config, image: &str) -> Result<()> {
             format!("GH_CONFIG_DIR={GH_CONFIG}"),
         ]);
     }
+    // The configured extra mounts, always read-only (#14451). Their JSON is
+    // labelled only when there are any, so an unconfigured create is
+    // byte-identical to what it has always been.
+    for extra in &config.extra_mounts {
+        args.extend([
+            "--mount".into(),
+            format!(
+                "type=bind,src={},dst={},readonly",
+                extra.host.display(),
+                extra.container.display()
+            ),
+        ]);
+    }
+    if !config.extra_mounts.is_empty() {
+        args.extend([
+            "--label".into(),
+            format!(
+                "{}={}",
+                super::super::session_lifecycle::EXTRA_MOUNTS_LABEL,
+                super::super::session_image::extra_mounts_label_json(&config.extra_mounts)
+            ),
+        ]);
+    }
     args.extend([
         "--entrypoint".into(),
         "/usr/bin/tini".into(),
@@ -371,6 +782,46 @@ pub(super) fn create(config: &Config, image: &str) -> Result<()> {
     ]);
     command(&args.iter().map(String::as_str).collect::<Vec<_>>())?;
     Ok(())
+}
+
+/// The sealed-bundle probe of [`super::super::session_image::verify_override_bundle`]
+/// routed through [`command_with`], so it shares this module's engine seam (and its
+/// test fake) rather than spawning its own `docker`.
+struct ImageProbe(Duration);
+
+impl super::super::session_image::BundleProbe for ImageProbe {
+    fn run_image_script(&self, image: &str, script: &str) -> Result<String> {
+        command_with(
+            &[
+                "run",
+                "--rm",
+                "--network",
+                "none",
+                "--read-only",
+                "--cap-drop",
+                "ALL",
+                "--security-opt",
+                "no-new-privileges",
+                "--entrypoint",
+                "/bin/sh",
+                image,
+                "-c",
+                script,
+            ],
+            self.0,
+        )
+    }
+}
+
+/// Prove the configured override `image` carries the sealed control bundle
+/// this daemon enforces, before any container is created from it (#14451).
+pub(super) fn verify_image(image: &str) -> Result<()> {
+    verify_image_with(image, docker_cli::DOCKER_RUN_TIMEOUT)
+}
+
+pub(super) fn verify_image_with(image: &str, timeout: Duration) -> Result<()> {
+    super::super::session_image::verify_override_bundle(image, &ImageProbe(timeout))
+        .context("refusing to create a private session from the configured override image")
 }
 
 pub(super) fn setup(config: &Config) -> Result<()> {
@@ -507,6 +958,7 @@ pub(super) fn recover_target(
     action: RecoverAction,
     issue: Option<u64>,
     branches: &[String],
+    worktrees: &[PathBuf],
     auth: &forge_auth::ExecAuth,
 ) -> Result<RecoverOutcome> {
     let scope = format!("LOOM_PRIVATE_REPOSITORY={}", target.repository);
@@ -529,7 +981,8 @@ pub(super) fn recover_target(
     ]);
     match action {
         RecoverAction::Publish => args.extend(["--publish"]),
-        RecoverAction::Discard => args.extend(["--discard"]),
+        RecoverAction::Discard => args.push("--discard"),
+        RecoverAction::ValidateWorktrees => args.extend(["--discard", "--validate-worktrees"]),
         RecoverAction::List => {}
     }
     if let Some(issue) = &issue_flag {
@@ -537,6 +990,10 @@ pub(super) fn recover_target(
     }
     for branch in branches {
         args.extend(["--branch", branch]);
+    }
+    let worktree_flags: Vec<String> = worktrees.iter().map(|w| w.display().to_string()).collect();
+    for worktree in &worktree_flags {
+        args.extend(["--worktree", worktree]);
     }
     if let Some(slug) = &target.slug {
         args.extend(["--slug", slug]);
@@ -554,6 +1011,50 @@ pub(super) fn recover_target(
     }
     serde_json::from_value(result["outcome"].clone())
         .context("private workspace recover returned an invalid report")
+}
+
+/// Drive the in-volume `private-workspace seat-reclaim` verb (#14678) under
+/// the credential scope of the account's primary repository — the same exec
+/// shape as [`recover_target`] with **no preparation step**: the verb must
+/// run in a dirty seat too, so nothing here calls [`prepare_target`].
+pub(super) fn seat_reclaim(
+    config: &Config,
+    max_age_secs: i64,
+    grace_secs: i64,
+    auth: &forge_auth::ExecAuth,
+) -> Result<super::seat_reclaim::SeatReclaimOutcome> {
+    let scope = format!("LOOM_PRIVATE_REPOSITORY={}", config.repository);
+    let max_age = max_age_secs.to_string();
+    let grace = grace_secs.to_string();
+    let mut args = vec!["exec", "--workdir", ROOT, "--env", &scope];
+    for name in auth.names() {
+        args.extend(["--env", name]);
+    }
+    args.extend([
+        &config.container,
+        "loom-daemon",
+        "private-workspace",
+        "seat-reclaim",
+        "--account",
+        &config.account,
+        "--max-age-secs",
+        &max_age,
+        "--grace-secs",
+        &grace,
+    ]);
+    let output = command_env(&args, &auth.child_env(), EXEC_TIMEOUT).context(
+        "private workspace endpoint failed; use a current session image supporting private-workspace protocol",
+    )?;
+    let result: Value = serde_json::from_str(&output)
+        .context("private workspace endpoint unavailable; update the session image before reuse")?;
+    if result["protocol"] != PROTOCOL {
+        bail!("private workspace endpoint protocol mismatch; update session image");
+    }
+    if let Some(error) = result["error"].as_str() {
+        bail!("private clone seat reclaim refused: {error}");
+    }
+    serde_json::from_value(result["outcome"].clone())
+        .context("private workspace seat-reclaim returned an invalid report")
 }
 
 /// Drive the in-volume `private-workspace rebind` verb (#14357) under the
@@ -643,10 +1144,30 @@ pub(super) fn prepare_with(
         args.extend(["--slug", slug]);
     }
     let output = command_env(&args, &auth.child_env(), EXEC_TIMEOUT).context("private workspace endpoint failed; use a current session image supporting private-workspace protocol")?;
-    let result: Value = serde_json::from_str(&output)
+    prepare_result(&output, |path| {
+        log::info!(
+            "private session {}: reaped finished-PR worktree {path} in {}",
+            config.account,
+            target.repository
+        );
+    })
+}
+
+fn prepare_result(output: &str, mut report_reaped: impl FnMut(&str)) -> Result<String> {
+    let result: Value = serde_json::from_str(output)
         .context("private workspace endpoint unavailable; update the session image before reuse")?;
     if result["protocol"] != PROTOCOL {
         bail!("private workspace endpoint protocol mismatch; update session image");
+    }
+    // Optional since the reap-reporting field: an older session image omits
+    // it, and a non-array or non-string entry is skipped, never fatal.
+    for path in result["reaped_worktrees"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+    {
+        report_reaped(path);
     }
     if let Some(error) = result["error"].as_str() {
         bail!("private workspace preparation refused: {error}");
@@ -655,6 +1176,138 @@ pub(super) fn prepare_with(
         .as_str()
         .map(str::to_owned)
         .context("private clone did not resolve a base revision")
+}
+
+#[cfg(test)]
+mod prepare_tests {
+    use super::*;
+
+    #[test]
+    fn prepare_refusal_reports_paths_before_returning_the_same_error() {
+        for paths in [
+            Some(vec!["/workspace/finished-a", "/workspace/finished-b"]),
+            None,
+        ] {
+            let mut reply = serde_json::json!({"protocol": PROTOCOL, "error": "seat_dirty"});
+            if let Some(paths) = &paths {
+                reply["reaped_worktrees"] = serde_json::json!(paths);
+            }
+            let mut reported = Vec::new();
+            let error = prepare_result(&reply.to_string(), |path| reported.push(path.to_owned()))
+                .unwrap_err();
+            assert_eq!(error.to_string(), "private workspace preparation refused: seat_dirty");
+            assert_eq!(reported, paths.unwrap_or_default());
+        }
+    }
+}
+
+#[cfg(test)]
+mod exec_probe_tests {
+    use super::*;
+
+    #[test]
+    fn endpoint_uris_parse_to_openable_transports_only() {
+        let _tls = crate::env_test_support::EnvGuard::clear(&["DOCKER_TLS_VERIFY"]);
+        assert_eq!(
+            parse_docker_host("unix:///var/run/docker.sock"),
+            Some(EngineEndpoint::Unix(PathBuf::from("/var/run/docker.sock")))
+        );
+        assert_eq!(
+            parse_docker_host("tcp://127.0.0.1:2375"),
+            Some(EngineEndpoint::Tcp("127.0.0.1:2375".into()))
+        );
+        for unsupported in [
+            "ssh://worker.example",
+            "https://engine.example:2376",
+            "npipe:////./pipe/docker_engine",
+            "fd://",
+            "garbage",
+            "tcp://",
+        ] {
+            assert_eq!(parse_docker_host(unsupported), None, "{unsupported}");
+        }
+        // A TLS-verified endpoint is not probeable over plain HTTP either.
+        let _tls_on = crate::env_test_support::EnvGuard::set("DOCKER_TLS_VERIFY", "1");
+        assert_eq!(parse_docker_host("tcp://127.0.0.1:2375"), None);
+    }
+
+    #[test]
+    fn http_bodies_parse_by_length_chunk_or_close() {
+        let by_length =
+            b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 6\r\nConnection: close\r\n\r\n{\"a\":1";
+        assert_eq!(parse_http_body(by_length).unwrap(), "{\"a\":1");
+        let chunked = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n4\r\n{\"a\"\r\n3\r\n:1}\r\n0\r\n\r\n";
+        assert_eq!(parse_http_body(chunked).unwrap(), "{\"a\":1}");
+        let by_close = b"HTTP/1.0 200 OK\r\n\r\n{}";
+        assert_eq!(parse_http_body(by_close).unwrap(), "{}");
+        for refused in [
+            &b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n"[..],
+            b"HTTP/1.1 500 Internal Server Error\r\n\r\n",
+            b"not http at all",
+        ] {
+            assert!(parse_http_body(refused).is_err(), "{refused:?}");
+        }
+    }
+
+    #[test]
+    fn exec_bodies_classify_into_the_four_states_plus_unknown() {
+        let container = "a".repeat(64);
+        let id = "b".repeat(64);
+        let record = |running: Value, exit: Value, pid: Value| {
+            json!({"ID": id, "Running": running, "ExitCode": exit, "Pid": pid,
+                   "ContainerID": container, "ProcessConfig": {"entrypoint": "loom-daemon",
+                   "arguments": ["private-workspace", "snapshot"]}})
+            .to_string()
+        };
+        // The incident's stranded record: created, never started (#14943).
+        assert_eq!(
+            classify_exec(&record(json!(false), json!(null), json!(0)), &container),
+            ExecRecord::NeverStarted
+        );
+        assert_eq!(
+            classify_exec(&record(json!(false), json!(0), json!(4242)), &container),
+            ExecRecord::Exited
+        );
+        assert_eq!(
+            classify_exec(&record(json!(true), json!(null), json!(99)), &container),
+            ExecRecord::Running
+        );
+        // Not running, no exit, a pid attached: neither proof nor dead.
+        assert_eq!(
+            classify_exec(&record(json!(false), json!(null), json!(99)), &container),
+            ExecRecord::Pending
+        );
+        // A record answered for another container is not this proof's to use.
+        assert_eq!(
+            classify_exec(&record(json!(true), json!(null), json!(1)), &"c".repeat(64)),
+            ExecRecord::Foreign
+        );
+        for unrecognized in ["{\"Running\": \"yes\"}".to_owned(), "not json".to_owned()] {
+            assert_eq!(
+                classify_exec(&unrecognized, &container),
+                ExecRecord::Unknown("exec state unrecognized"),
+                "{unrecognized}"
+            );
+        }
+        // Only the blocking states produce a refusal clause, and the clause
+        // never carries the record's arguments (#14943).
+        for (record, clause) in [
+            (ExecRecord::Running, format!("container exec {id} is running")),
+            (
+                ExecRecord::Pending,
+                format!("container exec {id} has not started and has not exited"),
+            ),
+            (ExecRecord::Foreign, format!("container exec {id} belongs to another container")),
+            (
+                ExecRecord::Unknown("exec inspect failed"),
+                format!("container exec {id} state unknown (exec inspect failed)"),
+            ),
+        ] {
+            assert_eq!(record.refusal(&id).as_deref(), Some(clause.as_str()));
+        }
+        assert_eq!(ExecRecord::Exited.refusal(&id), None);
+        assert_eq!(ExecRecord::NeverStarted.refusal(&id), None);
+    }
 }
 
 fn validate_volume(config: &Config) -> Result<()> {
@@ -695,11 +1348,13 @@ fn bind_source_matches(config: &Config, mount: &Value, expected: &Path) -> bool 
 #[cfg(test)]
 pub(super) mod fake {
     use std::cell::RefCell;
+    use std::time::Duration;
 
     pub(in super::super) type Handler = Box<dyn FnMut(&[&str]) -> anyhow::Result<String>>;
+    type TimedHandler = Box<dyn FnMut(&[&str], Duration) -> anyhow::Result<(bool, String)>>;
 
     thread_local! {
-        static HANDLER: RefCell<Option<Handler>> = const { RefCell::new(None) };
+        static HANDLER: RefCell<Option<TimedHandler>> = const { RefCell::new(None) };
         /// The child environment each faked call would have carried (#13916).
         static ENVS: RefCell<Vec<Vec<(String, String)>>> = const { RefCell::new(Vec::new()) };
     }
@@ -710,7 +1365,11 @@ pub(super) mod fake {
     }
 
     /// Route this thread's Docker calls to `handler` until the guard drops.
-    pub(in super::super) fn install(handler: Handler) -> Guard {
+    pub(in super::super) fn install(mut handler: Handler) -> Guard {
+        install_timed(Box::new(move |args, _| handler(args).map(|stdout| (true, stdout))))
+    }
+
+    pub(in super::super) fn install_timed(handler: TimedHandler) -> Guard {
         HANDLER.with(|h| *h.borrow_mut() = Some(handler));
         ENVS.with(|e| e.borrow_mut().clear());
         Guard
@@ -728,11 +1387,12 @@ pub(super) mod fake {
     pub(super) fn dispatch(
         args: &[&str],
         env: &[(String, String)],
-    ) -> Option<anyhow::Result<String>> {
+        timeout: Duration,
+    ) -> Option<anyhow::Result<(bool, String)>> {
         HANDLER.with(|h| {
             h.borrow_mut().as_mut().map(|handler| {
                 ENVS.with(|e| e.borrow_mut().push(env.to_vec()));
-                handler(args)
+                handler(args, timeout)
             })
         })
     }
