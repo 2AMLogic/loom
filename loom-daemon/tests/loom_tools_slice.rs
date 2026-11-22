@@ -3204,3 +3204,320 @@ fn merge_queue_unreadable_scope_makes_no_remote_mutation() {
         assert!(!log.contains(write), "a remote mutation ({write}) was attempted:\n{log}");
     }
 }
+
+// ---------------------------------------------------------------------------
+// gateway: the session-mode publication (#14884)
+// ---------------------------------------------------------------------------
+
+/// The fixture every gateway test shares: a fake `gh` answering `--version`,
+/// a host defaults tier naming two owners' key files, and a session root —
+/// all outside every checkout, with the daemon absent from PATH.
+mod gateway_fixture {
+    use std::os::unix::fs::PermissionsExt;
+    use std::path::{Path, PathBuf};
+
+    pub const KEY_A1: &str = "gp_aaaa0123456789abcdef0123456789";
+    pub const KEY_A2: &str = "gp_bbbb0123456789abcdef0123456789";
+    pub const KEY_B: &str = "gp_cccc0123456789abcdef0123456789";
+
+    pub struct Fixture {
+        pub root: PathBuf,
+        pub gh: PathBuf,
+        pub defaults: PathBuf,
+        pub key_a: PathBuf,
+        pub session: PathBuf,
+    }
+
+    pub fn setup(gh_version: &str) -> Fixture {
+        let root = tempfile::tempdir().unwrap().keep();
+        let gh = root.join("bin/gh");
+        std::fs::create_dir_all(root.join("bin")).unwrap();
+        std::fs::write(&gh, format!("#!/bin/sh\necho 'gh version {gh_version} (2026-11-01)'\n"))
+            .unwrap();
+        std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let key_a = root.join("a.key");
+        let key_b = root.join("b.key");
+        std::fs::write(&key_a, KEY_A1).unwrap();
+        std::fs::write(&key_b, KEY_B).unwrap();
+        // A key source must be owner-only, exactly as on a real host.
+        std::fs::set_permissions(&key_a, std::fs::Permissions::from_mode(0o600)).unwrap();
+        std::fs::set_permissions(&key_b, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+        let defaults = root.join("defaults.json");
+        write_defaults(&defaults, &[("sess-a", &key_a), ("sess-b", &key_b)]);
+
+        let session = root.join("session");
+        Fixture {
+            root,
+            gh,
+            defaults,
+            key_a,
+            session,
+        }
+    }
+
+    pub fn write_defaults(path: &Path, owners: &[(&str, &Path)]) {
+        let refs: serde_json::Map<String, serde_json::Value> = owners
+            .iter()
+            .map(|(o, k)| ((*o).to_string(), serde_json::json!(format!("file:{}", k.display()))))
+            .collect();
+        std::fs::write(
+            path,
+            serde_json::json!({"forge": {"gateway": {"origin": "https://gw.example.com",
+                "keyRefs": refs}}})
+            .to_string(),
+        )
+        .unwrap();
+    }
+
+    pub fn mode(p: &Path) -> u32 {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::metadata(p).unwrap().permissions().mode() & 0o777
+    }
+}
+
+use gateway_fixture::{mode as file_mode, setup as gateway_setup};
+
+/// One `loom-tools gateway <verb>` run in the fixture's session host.
+fn gateway_run(f: &gateway_fixture::Fixture, verb: &str) -> Output {
+    let mut c = base(TOOLS, &f.root, &f.root);
+    c.env("LOOM_GH_BIN", &f.gh)
+        .env("LOOM_CONFIG_DEFAULTS_FILE", &f.defaults)
+        .env("LOOM_SESSION_GATEWAY_ROOT", &f.session)
+        .args(["gateway", verb]);
+    run(c, None)
+}
+
+#[test]
+fn gateway_refresh_publishes_rotates_and_withdraws() {
+    let f = gateway_setup("2.102.0");
+    let base_dir = f.session.join(".loom").join("gh-config-gateway");
+
+    // First pass: both owners publish, privately, with the gh marker.
+    let o = gateway_run(&f, "refresh");
+    assert_eq!(o.status.code(), Some(0), "{}", String::from_utf8_lossy(&o.stderr));
+    for (owner, key) in [
+        ("sess-a", gateway_fixture::KEY_A1),
+        ("sess-b", gateway_fixture::KEY_B),
+    ] {
+        let dir = base_dir.join(owner);
+        let hosts = std::fs::read_to_string(dir.join("hosts.yml")).unwrap();
+        assert!(hosts.contains(key) && hosts.contains("api_host: gw.example.com"), "{hosts}");
+        assert_eq!(std::fs::read_to_string(dir.join("config.yml")).unwrap(), "version: 1\n");
+        assert_eq!(file_mode(&dir), 0o700);
+        assert_eq!(file_mode(&dir.join("hosts.yml")), 0o600);
+    }
+    assert_eq!(file_mode(&base_dir), 0o700);
+    let marker = std::fs::read_to_string(base_dir.join("gh-ok")).unwrap();
+    assert_eq!(marker.trim(), std::fs::canonicalize(&f.gh).unwrap().to_str().unwrap());
+    // No credential in argv-reachable output.
+    let all =
+        format!("{}{}", String::from_utf8_lossy(&o.stdout), String::from_utf8_lossy(&o.stderr));
+    assert!(
+        !all.contains(gateway_fixture::KEY_A1) && !all.contains(gateway_fixture::KEY_B),
+        "{all}"
+    );
+
+    // Second pass: a rotated key is picked up, a removed owner is dropped.
+    std::fs::write(&f.key_a, gateway_fixture::KEY_A2).unwrap();
+    gateway_fixture::write_defaults(&f.defaults, &[("sess-a", &f.key_a)]);
+    let o = gateway_run(&f, "refresh");
+    assert_eq!(o.status.code(), Some(0), "{}", String::from_utf8_lossy(&o.stderr));
+    let hosts = std::fs::read_to_string(base_dir.join("sess-a/hosts.yml")).unwrap();
+    assert!(hosts.contains(gateway_fixture::KEY_A2), "{hosts}");
+    assert!(!hosts.contains(gateway_fixture::KEY_A1), "{hosts}");
+    assert!(!base_dir.join("sess-b").exists(), "a removed owner is withdrawn");
+
+    // A key that no longer resolves withdraws its profile and fails loudly.
+    std::fs::remove_file(&f.key_a).unwrap();
+    let o = gateway_run(&f, "refresh");
+    assert_eq!(o.status.code(), Some(1), "{}", String::from_utf8_lossy(&o.stderr));
+    let err = String::from_utf8_lossy(&o.stderr);
+    assert!(err.contains("gateway refresh") && err.contains("sess-a"), "{err}");
+    assert!(!base_dir.join("sess-a").exists(), "the unusable profile is withdrawn");
+}
+
+#[test]
+fn gateway_status_distinguishes_current_due_and_missing() {
+    let f = gateway_setup("2.102.0");
+    let base_dir = f.session.join(".loom").join("gh-config-gateway");
+
+    // A session host with no publication is told what to run, per owner.
+    let o = gateway_run(&f, "status");
+    assert_eq!(o.status.code(), Some(0), "{}", String::from_utf8_lossy(&o.stderr));
+    let out = String::from_utf8_lossy(&o.stdout);
+    assert!(out.contains("sess-a: missing") && out.contains("sess-b: missing"), "{out}");
+    assert!(out.contains("gateway refresh"), "{out}");
+    assert!(out.contains("gh-ok marker: missing"), "{out}");
+
+    gateway_run(&f, "refresh");
+    let o = gateway_run(&f, "status");
+    let out = String::from_utf8_lossy(&o.stdout);
+    assert!(out.contains("sess-a: current") && out.contains("sess-b: current"), "{out}");
+    assert!(out.contains("gh-ok marker: present"), "{out}");
+
+    // A hosts.yml older than the cadence is due for refresh.
+    std::process::Command::new("/usr/bin/touch")
+        .arg("-d")
+        .arg("1 hour ago")
+        .arg(base_dir.join("sess-a/hosts.yml"))
+        .status()
+        .unwrap();
+    let o = gateway_run(&f, "status");
+    let out = String::from_utf8_lossy(&o.stdout);
+    assert!(out.contains("sess-a: due for refresh"), "{out}");
+    assert!(out.contains("sess-b: current"), "{out}");
+
+    // No credential ever reaches the report.
+    assert!(!out.contains(gateway_fixture::KEY_A1), "{out}");
+}
+
+#[test]
+fn gateway_status_is_quiet_off_a_session_host_with_no_publication() {
+    let f = gateway_setup("2.102.0");
+    let mut c = base(TOOLS, &f.root, &f.root);
+    c.env("LOOM_GH_BIN", &f.gh)
+        .env("LOOM_CONFIG_DEFAULTS_FILE", &f.defaults)
+        .env("LOOM_SESSION_GATEWAY_ROOT", &f.session)
+        .env("LOOM_MODE", "local-daemon")
+        .args(["gateway", "status"]);
+    let o = run(c, None);
+    assert_eq!(o.status.code(), Some(0), "{}", String::from_utf8_lossy(&o.stderr));
+    assert!(o.stdout.is_empty(), "a fleet/daemon host reads no session noise");
+}
+
+#[test]
+fn gateway_clean_removes_only_the_session_publication() {
+    let f = gateway_setup("2.102.0");
+    gateway_run(&f, "refresh");
+    let base_dir = f.session.join(".loom").join("gh-config-gateway");
+
+    // A daemon host's workspace publication in an unrelated checkout.
+    let ws = tempfile::tempdir().unwrap();
+    let ws_base = ws.path().join(".loom").join("gh-config-gateway");
+    std::fs::create_dir_all(ws_base.join("fleet-a")).unwrap();
+    std::fs::write(ws_base.join("fleet-a/hosts.yml"), "daemon-published\n").unwrap();
+    std::fs::write(ws_base.join("gh-ok"), "/usr/bin/gh\n").unwrap();
+
+    let mut c = base(TOOLS, &f.root, ws.path());
+    c.env("LOOM_GH_BIN", &f.gh)
+        .env("LOOM_CONFIG_DEFAULTS_FILE", &f.defaults)
+        .env("LOOM_SESSION_GATEWAY_ROOT", &f.session)
+        .args(["gateway", "clean"]);
+    let o = run(c, None);
+    assert_eq!(o.status.code(), Some(0), "{}", String::from_utf8_lossy(&o.stderr));
+    assert!(!base_dir.exists(), "the session publication is removed");
+    assert!(
+        ws_base.join("fleet-a/hosts.yml").is_file(),
+        "operating in an unrelated checkout removes no host publication"
+    );
+
+    // Idempotent.
+    let o = gateway_run(&f, "clean");
+    assert_eq!(o.status.code(), Some(0), "{}", String::from_utf8_lossy(&o.stderr));
+    assert!(String::from_utf8_lossy(&o.stdout).contains("no session gateway profiles"));
+}
+
+#[test]
+fn gateway_refresh_refuses_wrong_mode_unsafe_destination_and_old_gh() {
+    // Not a session host.
+    let f = gateway_setup("2.102.0");
+    let mut c = base(TOOLS, &f.root, &f.root);
+    c.env("LOOM_GH_BIN", &f.gh)
+        .env("LOOM_CONFIG_DEFAULTS_FILE", &f.defaults)
+        .env("LOOM_SESSION_GATEWAY_ROOT", &f.session)
+        .env("LOOM_MODE", "local-daemon")
+        .args(["gateway", "refresh"]);
+    let o = run(c, None);
+    assert_eq!(o.status.code(), Some(1), "{}", String::from_utf8_lossy(&o.stderr));
+    assert!(String::from_utf8_lossy(&o.stderr).contains("session"), "stderr names the mode");
+
+    // A destination inside a git checkout.
+    let repo = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(repo.path().join(".git")).unwrap();
+    let mut c = base(TOOLS, &f.root, &f.root);
+    c.env("LOOM_GH_BIN", &f.gh)
+        .env("LOOM_CONFIG_DEFAULTS_FILE", &f.defaults)
+        .env("LOOM_SESSION_GATEWAY_ROOT", repo.path().join("sess"))
+        .args(["gateway", "refresh"]);
+    let o = run(c, None);
+    assert_eq!(o.status.code(), Some(1), "{}", String::from_utf8_lossy(&o.stderr));
+    assert!(
+        String::from_utf8_lossy(&o.stderr).contains("checkout"),
+        "stderr refuses the in-checkout destination"
+    );
+    assert!(!repo.path().join("sess").exists(), "nothing was written");
+
+    // A relative destination inside a git checkout, run from below the
+    // checkout root: absolutized before the ancestor walk, so still refused
+    // (#14964).
+    let deeper = repo.path().join("subdir/deeper");
+    std::fs::create_dir_all(&deeper).unwrap();
+    let mut c = base(TOOLS, &f.root, &deeper);
+    c.env("LOOM_GH_BIN", &f.gh)
+        .env("LOOM_CONFIG_DEFAULTS_FILE", &f.defaults)
+        .env("LOOM_SESSION_GATEWAY_ROOT", "sess")
+        .args(["gateway", "refresh"]);
+    let o = run(c, None);
+    assert_eq!(o.status.code(), Some(1), "{}", String::from_utf8_lossy(&o.stderr));
+    assert!(
+        String::from_utf8_lossy(&o.stderr).contains("checkout"),
+        "stderr refuses the relative in-checkout destination"
+    );
+    assert!(!deeper.join("sess").exists(), "nothing was written");
+
+    // A gh below the minimum publishes nothing.
+    let f = gateway_setup("2.96.0");
+    let o = gateway_run(&f, "refresh");
+    assert_eq!(o.status.code(), Some(1), "{}", String::from_utf8_lossy(&o.stderr));
+    assert!(
+        String::from_utf8_lossy(&o.stderr).contains("2.100.0"),
+        "stderr names the minimum"
+    );
+    assert!(
+        !f.session.join(".loom").join("gh-config-gateway").exists(),
+        "nothing was published"
+    );
+
+    // No gateway configured in the host tier.
+    let empty = f.root.join("empty-defaults.json");
+    std::fs::write(&empty, "{}").unwrap();
+    let mut c = base(TOOLS, &f.root, &f.root);
+    c.env("LOOM_GH_BIN", &f.gh)
+        .env("LOOM_CONFIG_DEFAULTS_FILE", &empty)
+        .env("LOOM_SESSION_GATEWAY_ROOT", &f.session)
+        .args(["gateway", "refresh"]);
+    let o = run(c, None);
+    assert_eq!(o.status.code(), Some(1), "{}", String::from_utf8_lossy(&o.stderr));
+    assert!(
+        String::from_utf8_lossy(&o.stderr).contains("host defaults tier"),
+        "stderr names the config source"
+    );
+
+    // A repository tier cannot redirect the host's gateway: the same cwd
+    // carries a repo config with a different origin, and it is ignored.
+    let f = gateway_setup("2.102.0");
+    let repo_cfg = f.root.join("repo/.loom/config.json");
+    std::fs::create_dir_all(repo_cfg.parent().unwrap()).unwrap();
+    std::fs::write(
+        &repo_cfg,
+        serde_json::json!({"forge": {"gateway": {"origin": "https://attacker.example.com",
+            "keyRefs": {"sess-a": "file:/dev/null"}}}})
+        .to_string(),
+    )
+    .unwrap();
+    let mut c = base(TOOLS, &f.root, repo_cfg.parent().unwrap().parent().unwrap());
+    c.env("LOOM_GH_BIN", &f.gh)
+        .env("LOOM_CONFIG_DEFAULTS_FILE", &f.defaults)
+        .env("LOOM_SESSION_GATEWAY_ROOT", &f.session)
+        .args(["gateway", "refresh"]);
+    let o = run(c, None);
+    assert_eq!(o.status.code(), Some(0), "{}", String::from_utf8_lossy(&o.stderr));
+    let hosts = std::fs::read_to_string(f.session.join(".loom/gh-config-gateway/sess-a/hosts.yml"))
+        .unwrap();
+    assert!(
+        hosts.contains("api_host: gw.example.com"),
+        "a repo tier did not redirect it: {hosts}"
+    );
+}

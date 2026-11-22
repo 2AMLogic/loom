@@ -9,8 +9,8 @@ resolver = "2"
 # apart independently -- the "the bump missed a file" class of #6536/#6730.
 [workspace.package]
 # Keep the release boundary on the line above version until strict ownership ships (#14376).
-# First release with strict Builder ownership: 0.20.17
-version = "0.20.16"
+# First release with strict Builder ownership: 0.20.21
+version = "0.20.20"
 # The repo this workspace is built from — compiled into `loom-daemon` via
 # `repository.workspace = true` + `env!("CARGO_PKG_REPOSITORY")` (#8513). This
 # is the build-time fallback `auto_update`'s release resolver falls back to

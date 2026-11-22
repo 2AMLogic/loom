@@ -587,7 +587,7 @@ fn a_crashing_probe_is_one_violation_and_never_a_per_file_gap() {
         assert!(text.contains(status), "names the exit status: {text}");
 
         let mut report = Report::default();
-        record_gaps("A", &gaps, dir.path(), &mut report);
+        record_gaps("A", &daemon, &gaps, dir.path(), &mut report);
         assert_eq!(report.violations.len(), 2, "{:?}", report.violations);
         assert!(gaps
             .summary("A", 2)
@@ -624,4 +624,161 @@ fn a_daemon_that_cannot_be_executed_is_broken_and_reported_once() {
 fn a_clean_probe_summary_keeps_its_wording() {
     let gaps = Gaps::default();
     assert_eq!(gaps.summary("A", 3), "A: 3 shell files, 0 subcommand gaps");
+}
+
+// ---- #14985: a hard-floored nested verb is probed, not just its parent ----
+
+/// The repo's own detector, copied into a fixture checkout so `hard_pairs`
+/// runs the real pair-emission logic — the same `--list` CI consumes.
+const DETECTOR: &str = include_str!("../../../scripts/check-daemon-subcommand-versions.sh");
+
+/// A checkout whose `defaults/scripts/seat.sh` carries `marker` for
+/// `session-exec` and calls `session-exec claude-seat` — the PR #14596
+/// shape: a nested verb under a hard-floored subcommand.
+fn nested_verb_repo(marker: &str) -> tempfile::TempDir {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    git(root, &["init", "-q"]);
+    git(root, &["config", "user.email", "t@example.com"]);
+    git(root, &["config", "user.name", "t"]);
+    std::fs::create_dir_all(root.join("defaults/scripts")).unwrap();
+    std::fs::create_dir_all(root.join("scripts")).unwrap();
+    std::fs::write(
+        root.join("defaults/scripts/seat.sh"),
+        format!(
+            "#!/usr/bin/env bash\n{marker}\n\"$LOOM_DAEMON_BIN\" session-exec claude-seat --help\n"
+        ),
+    )
+    .unwrap();
+    std::fs::write(root.join("scripts/check-daemon-subcommand-versions.sh"), DETECTOR).unwrap();
+    std::fs::write(root.join("VERSION"), "0.19.897\n").unwrap();
+    git(root, &["add", "-A"]);
+    git(root, &["commit", "-qm", "init"]);
+    for t in ["v0.19.890", "v0.19.895"] {
+        git(root, &["tag", t]);
+    }
+    dir
+}
+
+/// A daemon reporting 0.19.890 (the oldest release at or above the floor)
+/// that HAS `session-exec` but, unless `has_verb`, not its `claude-seat`
+/// verb: clap's refusal for the nested probe, a plain answer for the
+/// top-level one.
+fn nested_verb_daemon(dir: &Path, has_verb: bool) -> PathBuf {
+    let verb = if has_verb {
+        "      claude-seat) exit 0 ;;"
+    } else {
+        "      claude-seat) echo \"error: unrecognized subcommand 'claude-seat'\" >&2; exit 2 ;;"
+    };
+    script(
+        dir,
+        "old-0.19.890",
+        &format!(
+            "case \"${{1:-}}\" in
+  --version) echo 'loom-daemon 0.19.890'; exit 0 ;;
+  session-exec)
+    case \"${{2:-}}\" in
+{verb}
+      *) exit 0 ;;
+    esac ;;
+esac
+exit 0"
+        ),
+    )
+}
+
+/// `run` over [`nested_verb_repo`]: direction B probes `session-exec
+/// claude-seat` against the old daemon 0.19.890 — the release the floor
+/// names, which has the subcommand but (unless `has_verb`) not the verb;
+/// direction A probes the previous release's copy against a daemon that
+/// answers everything.
+fn nested_verb_report(marker: &str, has_verb: bool) -> Report {
+    let repo = nested_verb_repo(marker);
+    let dir = tempfile::tempdir().unwrap();
+    let mut o = opts(
+        repo.path(),
+        "0.19.890",
+        OldDaemon::Given(nested_verb_daemon(dir.path(), has_verb)),
+    );
+    o.new_daemon = fake_daemon(dir.path(), "0.19.99");
+    let report = run(&o).unwrap();
+    assert!(
+        report
+            .notes
+            .iter()
+            .any(|n| n.starts_with("A (v0.19.895 installed files vs new daemon): ")),
+        "direction A ran: {:?}",
+        report.notes
+    );
+    report
+}
+
+#[test]
+fn a_nested_verb_missing_from_the_old_daemon_is_a_violation() {
+    let report = nested_verb_report("# requires-daemon: session-exec >= 0.19.890", false);
+    assert_eq!(report.violations.len(), 1, "{:?}", report.violations);
+    let v = &report.violations[0];
+    assert!(v.contains("defaults/scripts/seat.sh"), "names the file: {v}");
+    assert!(v.contains("`session-exec claude-seat`"), "names the verb path: {v}");
+    assert!(v.contains("old-0.19.890"), "names the daemon: {v}");
+    assert!(v.contains("0.19.890"), "names the daemon's release: {v}");
+}
+
+#[test]
+fn a_nested_verb_present_in_the_old_daemon_passes() {
+    let report = nested_verb_report("# requires-daemon: session-exec >= 0.19.890", true);
+    assert!(report.violations.is_empty(), "{:?}", report.violations);
+    assert!(
+        report.notes.iter().any(|n| n.contains(
+            "B (new installed files vs daemon 0.19.890): 1 shell files, 0 subcommand gaps"
+        )),
+        "{:?}",
+        report.notes
+    );
+}
+
+#[test]
+fn an_optional_marker_still_skips_a_nested_call() {
+    // The daemon LACKS the verb; the `optional` marker must keep the pair
+    // out of the probe exactly as it does for a plain subcommand.
+    let report = nested_verb_report("# requires-daemon: session-exec optional", false);
+    assert!(report.violations.is_empty(), "{:?}", report.violations);
+}
+
+#[test]
+fn an_unfloored_nested_call_keeps_its_top_level_probe() {
+    // No marker at all: the pair stays `session-exec`, so only the
+    // subcommand's presence is asked of the old daemon (#14985 keeps the
+    // deeper probe for hard-floored calls only).
+    let report = nested_verb_report("# prose, not a marker", false);
+    assert!(report.violations.is_empty(), "{:?}", report.violations);
+    assert!(
+        report.notes.iter().any(|n| n.contains("0 subcommand gaps")),
+        "{:?}",
+        report.notes
+    );
+}
+
+#[test]
+fn the_probe_runs_the_full_verb_path() {
+    let dir = tempfile::tempdir().unwrap();
+    let daemon = script(
+        dir.path(),
+        "verb-daemon",
+        r#"case "$1" in
+  seat)
+    case "${2:-}" in
+      claude-seat) echo "error: unrecognized subcommand 'claude-seat'" >&2; exit 2 ;;
+      *) exit 0 ;;
+    esac ;;
+esac"#,
+    );
+    let mut probe = Probe::default();
+    assert_eq!(probe.probe(&daemon, "seat"), Probed::Present);
+    assert_eq!(probe.probe(&daemon, "seat claude-seat"), Probed::Missing);
+    assert_eq!(
+        probe.probe(&daemon, "seat other-seat"),
+        Probed::Present,
+        "a verb the daemon has, reached through the path, is present"
+    );
 }
