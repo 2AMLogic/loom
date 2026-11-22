@@ -47,7 +47,12 @@
 //! ([`crate::tokens_pool::private_workspace::seat_reclaim`]) to tier 1: the
 //! scratch and finished-work debris inside seat volumes is exactly the "Loom
 //! debris nobody is using" this tier exists for, and no other sub-pass can
-//! reach it.
+//! reach it. Since #14777 that walk is **scheduled, not awaited**: each
+//! seat's exec is bounded by a 600s timeout, so a synchronous walk could
+//! hold the tick for `seats × 600s`. The tier-1 trigger schedules the
+//! sequential walk on a blocking worker and returns immediately; at most one
+//! walk is in flight host-wide, and the walk's verdict is folded into the
+//! originating root's ledger on completion.
 //!
 //! # Tiers, safest first (#11192)
 //!
@@ -262,8 +267,16 @@ pub struct EagerReclaimReport {
     pub scratch: Option<ScratchReclaimReport>,
     /// The private-workspace seat-volume sub-pass's own report (#14678):
     /// step scratch and merged-PR worktrees inside seat volumes the other
-    /// sub-passes cannot reach.
+    /// sub-passes cannot reach. Since #14777 the walk runs off the dispatch
+    /// tick, so this is the scheduling disposition, never the walk's result —
+    /// `seats_pending` carries the in-flight marker.
     pub seats: Option<crate::tokens_pool::private_workspace::seat_reclaim::SeatReclaimReport>,
+    /// A seat walk was in flight when this pass ran — scheduled by this pass
+    /// or already running from any root (#14777): the pass has no empty-pass
+    /// verdict yet, so neither the alert nor the backoff streak moves until
+    /// the walk completes and folds its verdict into the originating root's
+    /// ledger.
+    pub seats_pending: bool,
     /// The orphaned cargo target dir sub-pass's own report (#8370).
     pub target_orphans: Option<TargetOrphanReport>,
     /// When this pass ran.
@@ -384,10 +397,12 @@ impl EagerReclaimReport {
 
     /// The alert line for a pass that ran and reclaimed nothing (#11192), or
     /// `None`. `empty_streak` is how many passes in a row came back empty,
-    /// this one included.
+    /// this one included. A pass with a seat walk still in flight has no
+    /// verdict yet (#14777) — its result is deferred to the walk's
+    /// completion, so it neither alerts here nor advances the streak.
     #[must_use]
     pub fn empty_pass_alert(&self, empty_streak: u32) -> Option<String> {
-        if self.skipped.is_some() || self.reclaimed_anything() {
+        if self.skipped.is_some() || self.seats_pending || self.reclaimed_anything() {
             return None;
         }
         Some(format!(
@@ -442,10 +457,13 @@ pub struct SubPasses<'a> {
     pub docker: &'a dyn Fn(&Path) -> DockerRetentionReport,
     /// [`crate::scratch_reclaim::run_for`].
     pub scratch: &'a dyn Fn(&Path) -> ScratchReclaimReport,
-    /// [`crate::tokens_pool::private_workspace::seat_reclaim::run_for`]
-    /// (#14678): the in-volume seat pass (scratch + merged-only worktrees).
+    /// [`crate::tokens_pool::private_workspace::seat_reclaim::schedule_from_tick`]
+    /// (#14678; off the dispatch tick since #14777): decides eligibility
+    /// against the existing enable/cooldown gates and schedules the
+    /// sequential seat walk on a blocking worker — it returns the
+    /// scheduling disposition, never the walk's result.
     pub seats:
-        &'a dyn Fn(&Path) -> crate::tokens_pool::private_workspace::seat_reclaim::SeatReclaimReport,
+        &'a dyn Fn(&Path) -> crate::tokens_pool::private_workspace::seat_reclaim::SeatScheduling,
     /// [`crate::target_orphan_reclaim::run_for`] (#8370).
     pub target_orphans: &'a dyn Fn(&Path) -> TargetOrphanReport,
     /// Free GB on the worktree-root volume, sampled before, between tiers,
@@ -474,7 +492,10 @@ pub struct PassLedger {
 }
 
 impl PassLedger {
-    /// Fold one report in. A skipped pass changes nothing.
+    /// Fold one report in. A skipped pass changes nothing. A pass with a
+    /// seat walk still in flight holds the streak where it is: the walk's
+    /// verdict is deferred to its completion ([`record_seat_verdict`],
+    /// #14777), which delivers the reset-or-advance exactly once.
     pub fn record(&mut self, report: &EagerReclaimReport) {
         if report.skipped.is_some() {
             return;
@@ -483,7 +504,9 @@ impl PassLedger {
         if report.worktree_reap_ran {
             self.last_worktree_reap = Some(report.at);
         }
-        self.empty_streak = if report.reclaimed_anything() {
+        self.empty_streak = if report.seats_pending {
+            self.empty_streak
+        } else if report.reclaimed_anything() {
             0
         } else {
             self.empty_streak.saturating_add(1)
@@ -559,6 +582,7 @@ pub fn run_pass(
         docker: None,
         scratch: None,
         seats: None,
+        seats_pending: false,
         target_orphans: None,
         at: inputs.now,
         git_tmp: None,
@@ -600,7 +624,29 @@ pub fn run_pass(
     // then re-probes free space after it — as in `reap_repo`.
     report.git_tmp = Some((passes.git_tmp)(repo_root));
     report.scratch = Some((passes.scratch)(repo_root));
-    report.seats = Some((passes.seats)(repo_root));
+    // #14777: the seat walk runs off the dispatch tick. Scheduling never
+    // blocks the pass; a walk in flight defers this pass's empty-pass
+    // verdict to the walk's completion (folded into the originating root's
+    // ledger), while the remaining tiers below run as before.
+    report.seats = Some(match (passes.seats)(repo_root) {
+        crate::tokens_pool::private_workspace::seat_reclaim::SeatScheduling::Pending => {
+            report.seats_pending = true;
+            crate::tokens_pool::private_workspace::seat_reclaim::SeatReclaimReport {
+                skipped: Some(
+                    "walk in flight (off the dispatch tick); the verdict is folded into this \
+                     root's ledger on completion"
+                        .into(),
+                ),
+                seats: Vec::new(),
+            }
+        }
+        crate::tokens_pool::private_workspace::seat_reclaim::SeatScheduling::Skipped(reason) => {
+            crate::tokens_pool::private_workspace::seat_reclaim::SeatReclaimReport {
+                skipped: Some(reason),
+                seats: Vec::new(),
+            }
+        }
+    });
     report.target_orphans = Some((passes.target_orphans)(repo_root));
 
     // Tier 2 (#11071): kept worktrees' idle build caches, largest first, until
@@ -649,6 +695,31 @@ fn record_report(repo_root: &Path, report: &EagerReclaimReport) -> PassLedger {
     *ledger
 }
 
+/// Fold one completed off-tick seat walk's verdict into the originating
+/// root's ledger (#14777), exactly once, from the walk worker's completion
+/// path: a walk that removed something resets the empty-pass streak (the
+/// pass that scheduled it was not empty after all); a walk that removed
+/// nothing delivers the increment that pass deferred. A walk that never ran
+/// (a skipped report) carries no verdict.
+pub(crate) fn record_seat_verdict(
+    repo_root: &Path,
+    report: &crate::tokens_pool::private_workspace::seat_reclaim::SeatReclaimReport,
+) {
+    if report.skipped.is_some() {
+        return;
+    }
+    let removed = report.worktrees_removed() > 0 || report.scratch_removed() > 0;
+    let mut map = ledger_slot()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let ledger = map.entry(repo_root.to_path_buf()).or_default();
+    ledger.empty_streak = if removed {
+        0
+    } else {
+        ledger.empty_streak.saturating_add(1)
+    };
+}
+
 /// Drop cooldown state. Test-only seam (the process-global would otherwise
 /// leak between tests in the same binary).
 #[doc(hidden)]
@@ -690,7 +761,7 @@ pub fn run_for(repo_root: &Path) -> EagerReclaimReport {
     let deep_clean = |root: &Path| crate::deep_clean::run_for(root, floor_gb);
     let docker = crate::docker_image_clean::run_for;
     let scratch = crate::scratch_reclaim::run_for;
-    let seats = crate::tokens_pool::private_workspace::seat_reclaim::run_for;
+    let seats = crate::tokens_pool::private_workspace::seat_reclaim::schedule_from_tick;
     let target_orphans = crate::target_orphan_reclaim::run_for;
     let free_gb = crate::disk_headroom::worktree_root_free_gb;
     let git_tmp = crate::git_tmp_reclaim::run_for;
@@ -855,10 +926,9 @@ mod tests {
         };
         let seats = |_: &Path| {
             counters.order.borrow_mut().push("seats");
-            crate::tokens_pool::private_workspace::seat_reclaim::SeatReclaimReport {
-                skipped: None,
-                seats: Vec::new(),
-            }
+            crate::tokens_pool::private_workspace::seat_reclaim::SeatScheduling::Skipped(
+                "stub: seats not under test".into(),
+            )
         };
         let passes = SubPasses {
             reap_worktrees: &reap,
@@ -947,6 +1017,122 @@ mod tests {
     }
 
     // ===================================================================
+    // #14777: a seat walk in flight defers the empty-pass verdict
+    // ===================================================================
+
+    use crate::tokens_pool::private_workspace::seat_reclaim::{SeatReclaimReport, SeatScheduling};
+
+    /// One below-the-floor pass where every synchronous sub-pass is empty and
+    /// the seat trigger returns `scheduling`. All tiers run, so the pass has
+    /// a real empty/non-empty verdict to defer.
+    fn empty_tiered_pass(now: DateTime<Utc>, scheduling: SeatScheduling) -> EagerReclaimReport {
+        let reap = |_: &Path| 0usize;
+        let deep = |root: &Path| stub_deep_report(root, now);
+        let docker = |_: &Path| stub_docker_report(now);
+        let scratch = |root: &Path| stub_scratch_report(root, now);
+        let seats = move |_: &Path| scheduling.clone();
+        let target_orphans = |root: &Path| stub_target_orphan_report(root);
+        let free_gb = |_: &Path| Some(1u64);
+        let git_tmp = |root: &Path| stub_git_tmp_report(root, now);
+        let idle_targets = |_: &Path| None;
+        let passes = SubPasses {
+            reap_worktrees: &reap,
+            deep_clean: &deep,
+            docker: &docker,
+            scratch: &scratch,
+            seats: &seats,
+            target_orphans: &target_orphans,
+            free_gb: &free_gb,
+            git_tmp: &git_tmp,
+            idle_targets: &idle_targets,
+        };
+        run_pass(Path::new("/repo"), &base_inputs(now), &passes)
+    }
+
+    /// A completed off-tick walk's report: `worktrees` removed worktrees and
+    /// `scratch` removed scratch entries from one seat that ran.
+    fn seat_walk_verdict(worktrees: usize, scratch: usize) -> SeatReclaimReport {
+        use crate::tokens_pool::private_workspace::seat_reclaim::{
+            SeatReclaimOutcome, SeatWalkResult,
+        };
+        SeatReclaimReport {
+            skipped: None,
+            seats: vec![SeatWalkResult {
+                account: "seat-1".into(),
+                result: Ok(SeatReclaimOutcome {
+                    worktrees_scanned: worktrees,
+                    worktrees_removed: worktrees,
+                    worktrees_failed: 0,
+                    preserved: Vec::new(),
+                    bytes: 1024 * u64::try_from(worktrees + scratch).unwrap_or(u64::MAX),
+                    scratch_removed: scratch,
+                    scratch_scanned: scratch,
+                    scratch_bytes: 1024 * u64::try_from(scratch).unwrap_or(u64::MAX),
+                }),
+                elapsed: std::time::Duration::from_secs(2),
+            }],
+        }
+    }
+
+    /// AC: while the walk is pending, the tick's pass neither alerts nor
+    /// advances the empty-pass streak; the walk's completion folds the
+    /// verdict into the originating root's ledger exactly once (a
+    /// seat-only removal resets the streak, an empty walk delivers the one
+    /// deferred increment), and only that root's ledger moves. A pass with
+    /// no walk pending completes its verdict as before.
+    #[test]
+    #[serial]
+    fn a_pending_seat_walk_defers_the_empty_pass_verdict_to_the_walk() {
+        reset_state_for_test();
+        let root = Path::new("/seat-origin");
+        let other = Path::new("/other-root");
+
+        // A completed pass with no seat walk (trigger declined) and nothing
+        // reclaimed: the streak advances and the alert fires — the
+        // pre-#14777 behavior an all-empty host must still see.
+        let completed = empty_tiered_pass(t(0), SeatScheduling::Skipped("cooldown".into()));
+        assert!(!completed.seats_pending);
+        let alert = completed
+            .empty_pass_alert(0)
+            .expect("an empty completed pass alerts");
+        assert!(alert.contains("reclaim"), "{alert}");
+        assert_eq!(record_report(root, &completed).empty_streak, 1);
+
+        // Two passes while a walk is in flight: neither alerts at any streak
+        // nor advances it.
+        let mut streak = ledger_for(root).empty_streak;
+        for _ in 0..2 {
+            let pending = empty_tiered_pass(t(601), SeatScheduling::Pending);
+            assert!(pending.seats_pending);
+            assert!(pending.empty_pass_alert(streak).is_none(), "a pending walk holds the alert");
+            streak = record_report(root, &pending).empty_streak;
+            assert_eq!(streak, 1, "a pending walk holds the streak");
+        }
+
+        // The other root carries its own streak, unaffected by this root's
+        // verdicts.
+        let other_completed = empty_tiered_pass(t(0), SeatScheduling::Skipped("cooldown".into()));
+        assert_eq!(record_report(other, &other_completed).empty_streak, 1);
+
+        // A seat-only removal resets the originating root's streak.
+        record_seat_verdict(root, &seat_walk_verdict(1, 0));
+        assert_eq!(ledger_for(root).empty_streak, 0, "a removal resets the streak");
+        assert_eq!(ledger_for(other).empty_streak, 1, "credit lands on the origin only");
+
+        // A later pending pass holds the reset; an empty walk then delivers
+        // exactly one increment — the one that pass deferred.
+        let pending = empty_tiered_pass(t(1202), SeatScheduling::Pending);
+        assert_eq!(record_report(root, &pending).empty_streak, 0);
+        record_seat_verdict(root, &seat_walk_verdict(0, 0));
+        assert_eq!(
+            ledger_for(root).empty_streak,
+            1,
+            "an empty walk advances the streak by exactly one"
+        );
+        assert_eq!(ledger_for(other).empty_streak, 1);
+    }
+
+    // ===================================================================
     // Cooldown pass-through: the eager trigger must NOT shorten or bypass
     // any sub-pass's own cooldown (#7512 AC1).
     // ===================================================================
@@ -981,11 +1167,11 @@ mod tests {
         let reap = |_: &Path| 0usize;
         let docker = |_: &Path| stub_docker_report(now);
         let scratch = |root: &Path| stub_scratch_report(root, now);
-        let seats =
-            |_: &Path| crate::tokens_pool::private_workspace::seat_reclaim::SeatReclaimReport {
-                skipped: None,
-                seats: Vec::new(),
-            };
+        let seats = |_: &Path| {
+            crate::tokens_pool::private_workspace::seat_reclaim::SeatScheduling::Skipped(
+                "stub: seats not under test".into(),
+            )
+        };
         let target_orphans = |root: &Path| stub_target_orphan_report(root);
         let free_gb = |_: &Path| Some(1u64);
         let git_tmp = |root: &Path| stub_git_tmp_report(root, now);

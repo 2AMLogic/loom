@@ -1023,7 +1023,7 @@ pub fn seat_reclaim(
     workspace: &Path,
     max_age_secs: i64,
     grace_secs: i64,
-) -> Vec<(String, Result<super::seat_reclaim::SeatReclaimOutcome, String>)> {
+) -> Vec<super::seat_reclaim::SeatWalkResult> {
     use super::super::account_registry::{account_inventory, AccountProvider};
 
     let mut out = Vec::new();
@@ -1037,7 +1037,17 @@ pub fn seat_reclaim(
         let Some(config) = registrations(&descriptor.credential_reference) else {
             continue;
         };
-        out.push((name, seat_reclaim_one(workspace, &config, max_age_secs, grace_secs)));
+        // #14777's baseline: one monotonic timer per seat attempt, so a walk
+        // report distinguishes how long each seat took — a cheap skip from a
+        // 600s-bounded exec — where the `reaper.pass` spans alone publish
+        // only point-in-time results.
+        let started = std::time::Instant::now();
+        let result = seat_reclaim_one(workspace, &config, max_age_secs, grace_secs);
+        out.push(super::seat_reclaim::SeatWalkResult {
+            account: name,
+            result,
+            elapsed: started.elapsed(),
+        });
     }
     out
 }
