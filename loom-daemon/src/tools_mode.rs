@@ -206,7 +206,15 @@ pub fn inputs_from_env(repo_root: &Path) -> Inputs {
 /// # Errors
 /// The mode or its configured fleet route is missing or invalid.
 pub fn configure_forge_reads(repo_root: &Path) -> Result<(), String> {
-    configure_forge_read_route(repo_root).map(|_| ())
+    configure_forge_reads_with_route(repo_root).map(|_| ())
+}
+
+/// Configure forge reads and return the same route for command-specific policy.
+///
+/// # Errors
+/// The mode or its configured fleet route is missing or invalid.
+pub fn configure_forge_reads_with_route(repo_root: &Path) -> Result<Route, String> {
+    configure_forge_read_resolution(repo_root).map(|resolution| resolution.route)
 }
 
 /// Like [`configure_forge_reads`], but also return the selected mode for a
@@ -214,20 +222,24 @@ pub fn configure_forge_reads(repo_root: &Path) -> Result<(), String> {
 /// (the session gateway publisher, #14884). Route input paths are inherited
 /// separately.
 pub fn configure_forge_read_route(repo_root: &Path) -> Result<String, String> {
+    configure_forge_read_resolution(repo_root).map(|resolution| resolution.mode)
+}
+
+fn configure_forge_read_resolution(repo_root: &Path) -> Result<Resolution, String> {
     let resolution = resolve(&inputs_from_env(repo_root))?;
-    for note in resolution.notes {
+    for note in &resolution.notes {
         eprintln!("{note}");
     }
     match resolution.route {
         Route::Fleet => crate::forge_gateway::enable_cli_reads(),
         // Discard fleet readers before this process or one it starts can use them.
         Route::Local => {
-            for var in resolution.ignored_vars {
+            for var in &resolution.ignored_vars {
                 std::env::remove_var(var);
             }
         }
     }
-    Ok(resolution.mode)
+    Ok(resolution)
 }
 
 /// The selected mode value for a read-only report (`gateway status`,

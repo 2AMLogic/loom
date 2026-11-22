@@ -52,15 +52,30 @@ set -euo pipefail
 # ---------------------------------------------------------------------------
 #
 # Owners permitted in an `owner/repo#N` cross-repo reference under defaults/:
-# this repo's own org, the RFC-2606-style placeholders used by the genericized
-# narratives, and the single-letter/obvious stand-ins used by the shell test
-# fixtures ("no"/"nowner" are artifacts of `\n`-escaped fixture strings).
+# the pre-transfer owner (rjwalters — kept for existing cross-references to
+# public repos such as rjwalters/repo and rjwalters/kicad-tools, plus the
+# self-test's clean fixture asserting on `rjwalters/loom#1`), the
+# RFC-2606-style placeholders used by the genericized narratives, and the
+# single-letter/obvious stand-ins used by the shell test fixtures ("no"/
+# "nowner" are artifacts of `\n`-escaped fixture strings).
+#
+# Do NOT add `2AMLogic` here: that org also hosts private repositories, so
+# allowlisting the whole owner would reopen the #6190 leak class. Permit the
+# public Loom repository narrowly in ALLOWED_REPOS below.
 ALLOWED_OWNERS=(
   rjwalters
   example-org
   owner OWNER
   o a no nowner private
   my-org some-owner
+)
+
+# Exact `owner/repo` pairs permitted in an `owner/repo#N` cross-repo reference
+# when the owner itself is not broadly allowlisted: this repo's own public
+# repository under 2AMLogic (#14170 / #14221). Sibling repositories under the
+# same org remain rejected.
+ALLOWED_REPOS=(
+  2AMLogic/loom
 )
 
 # Hosts permitted anywhere in a scanned tree: public services Loom actually
@@ -132,6 +147,14 @@ owner_allowed() {
   return 1
 }
 
+repo_allowed() {
+  local repo="$1" a
+  for a in "${ALLOWED_REPOS[@]}"; do
+    [[ "$repo" == "$a" ]] && return 0
+  done
+  return 1
+}
+
 host_allowed() {
   local host s
   host="$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')"
@@ -184,14 +207,15 @@ scan_tree() {
   # 1. Cross-repo issue references: owner/repo#N.
   #    The repo half must end in an alphanumeric so prose like "anti-#4736"
   #    is not read as a reference.
-  local line file lineno ref owner
+  local line file lineno ref owner repo
   while IFS= read -r line; do
     [[ -z "$line" ]] && continue
     file="${line%%:*}"; line="${line#*:}"
     lineno="${line%%:*}"; ref="${line#*:}"
     owner="${ref%%/*}"
-    if ! owner_allowed "$owner"; then
-      echo "  $file:$lineno: cross-repo reference to a non-allowlisted owner: $ref"
+    repo="${ref%%#*}"
+    if ! owner_allowed "$owner" && ! repo_allowed "$repo"; then
+      echo "  $file:$lineno: cross-repo reference to a non-allowlisted owner/repo: $ref"
       violations=1
     fi
   done < <(scan_matches '[A-Za-z0-9][A-Za-z0-9._-]*/[A-Za-z0-9._-]*[A-Za-z0-9]#[0-9]+' "$dir")
@@ -263,6 +287,22 @@ EOF
   else
     echo "self-test: FAIL — dirty fixture was not fully detected. Got:" >&2
     echo "$out" >&2
+    fails=1
+  fi
+
+  # Repo-scoped allowlist (#14221): `2AMLogic/loom#N` is permitted while an
+  # unlisted sibling repository under the same org is still rejected.
+  mkdir -p "$tmp/org-ok/docs" "$tmp/org-bad/docs"
+  printf 'See 2AMLogic/loom#14221 for the rename.\n' > "$tmp/org-ok/docs/loom.md"
+  printf 'See 2AMLogic/example-unlisted-repository#1 for details.\n' > "$tmp/org-bad/docs/sibling.md"
+  org_bad_out="$(scan_tree "$tmp/org-bad" || true)"
+  if scan_tree "$tmp/org-ok" >/dev/null \
+     && ! scan_tree "$tmp/org-bad" >/dev/null \
+     && grep -q '2AMLogic/example-unlisted-repository#1' <<<"$org_bad_out"; then
+    echo "self-test: OK — 2AMLogic/loom#N passes while unlisted 2AMLogic sibling repo fails"
+  else
+    echo "self-test: FAIL — 2AMLogic repo-scoped allowlist did not discriminate. Got:" >&2
+    echo "$org_bad_out" >&2
     fails=1
   fi
 
