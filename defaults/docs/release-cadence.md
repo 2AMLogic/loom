@@ -384,7 +384,14 @@ it, never at release time:
   `# requires-daemon: <sub> >= <version>` floor above the current value. Name
   a published release, or the version this change ships as (`VERSION` + 1
   patch) when the dependency lands in the same PR — still the next bump, but
-  that bump may now be up to a release interval away (see Cadence above). The value is a floor, not
+  that bump may now be up to a release interval away (see Cadence above). A
+  `VERSION` + 1 value is provisional (#14985): it names a release that does
+  not exist yet, and it goes stale whenever `main` cuts a release before the
+  PR merges. CI re-checks it — the compat step below probes a hard-floored
+  call's full verb path (`<daemon> <sub> <verb> --help`) against the oldest
+  published release at or above the floor and fails naming the missing verb
+  the moment such a release publishes without it — so on a rebase, raise the
+  value to the release that will actually carry the change. The value is a floor, not
   a tag: releases skip versions (above), so `v<REQUIRES_DAEMON>` may never be
   published, and CI proves the claim against the oldest published release at
   or above it.
@@ -430,8 +437,12 @@ Three things about that step's verdict (#10868):
   `no_shipped_hard_floor_is_above_requires_daemon`
   (`loom-daemon/src/install_compat/tests.rs`) walks `defaults/` with the
   harness's own code and fails when a hard `# requires-daemon:` floor is above
-  `REQUIRES_DAEMON`. It catches a floor that is too high, never one that is
-  too low.
+  `REQUIRES_DAEMON`. It catches a floor that is too high. A floor that is too
+  low is caught by the probe itself (#14985): a call whose subcommand the
+  file hard-floors is probed with its full verb path — the detector's `--list`
+  emits `session-exec claude-seat`, and the harness runs
+  `<daemon> <sub> <verb> --help` — so a floor naming a release that lacks the
+  verb fails direction B as soon as a release at or above the floor publishes.
 
 ### The daily proof of `SUPPORTS_INSTALLED`
 
