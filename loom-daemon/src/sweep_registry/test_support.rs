@@ -1115,46 +1115,6 @@ pub(crate) fn install_fake_gh_env_logger(
     fake_gh
 }
 
-/// RAII guard that scrubs `GH_CONFIG_DIR` from the *test process's own*
-/// environment for the lifetime of the guard, restoring whatever value (or
-/// absence) preceded it on drop.
-///
-/// Mirrors `role_runner.rs`'s private `ClearedGhConfigDirEnv` (added for
-/// #5508), shared here for the `sweep_registry` "unregistered workspace root
-/// is a no-op" tests (guards.rs / quarantine.rs / watchdog.rs) that spawn
-/// [`install_fake_gh_env_logger`]'s fake `gh` and assert its child inherits
-/// `GH_CONFIG_DIR=<unset>`.
-///
-/// Without this guard, the assertion only holds on a clean CI runner. A real
-/// Loom fleet worker host runs the daemon (and any `cargo nextest` invoked
-/// directly on that host) with `GH_CONFIG_DIR` already exported
-/// host/process-wide (#4458) — that ambient value leaks straight through
-/// [`install_fake_gh_env_logger`]'s fake `gh` script, which logs its own
-/// *inherited* `GH_CONFIG_DIR`, and the "unset" assertion fails even though
-/// the production no-op behavior it exercises (`credential_preflight.rs`'s
-/// "child inherits the process-global `GH_CONFIG_DIR` untouched" contract)
-/// is unchanged (#5651). Every call site pairs this with the existing
-/// `#[serial]` attribute so the process-global scrub cannot race a
-/// concurrent test that depends on `GH_CONFIG_DIR`.
-pub(crate) struct ClearedGhConfigDirEnv(Option<String>);
-
-impl ClearedGhConfigDirEnv {
-    pub(crate) fn new() -> Self {
-        let prior = std::env::var("GH_CONFIG_DIR").ok();
-        std::env::remove_var("GH_CONFIG_DIR");
-        Self(prior)
-    }
-}
-
-impl Drop for ClearedGhConfigDirEnv {
-    fn drop(&mut self) {
-        match self.0.take() {
-            Some(v) => std::env::set_var("GH_CONFIG_DIR", v),
-            None => std::env::remove_var("GH_CONFIG_DIR"),
-        }
-    }
-}
-
 // --- dispatch-time live-claim guard (Issue #4556) ---
 
 /// Seed the machine-level sweep journal (confined to this fixture's tempdir)
@@ -1220,8 +1180,7 @@ pub(crate) use git_worktree_fixture::make_dirty_git_worktree;
 
 // `SweepRegistry::set_activity_window` — the test-only writer for the window
 // `make_quiet_dirty_git_worktree` pins below — lives in the child
-// `activity_window` module rather than in `sweep_registry/mod.rs`, which is
-// over the file-size ratchet's threshold (`.loom/docs/file-size-policy.md`).
+// `activity_window` module rather than in `sweep_registry/mod.rs`.
 // It is an inherent method, so there is nothing to re-export here.
 mod activity_window;
 

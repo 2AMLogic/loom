@@ -314,7 +314,7 @@ A sweep began work on an issue.
 ```json
 {
   "kind": "sweep.started",
-  "repo": "rjwalters/loom",
+  "repo": "2AMLogic/loom",
   "visibility": "public",
   "issue": 4703,
   "sweep_id": "sweep-issue-4703-0",
@@ -457,7 +457,7 @@ A sweep advanced to a new lifecycle phase (mirrors `sweep.issue.{N}.phase`).
 ```json
 {
   "kind": "sweep.phase",
-  "repo": "rjwalters/loom",
+  "repo": "2AMLogic/loom",
   "visibility": "public",
   "issue": 4703,
   "sweep_id": "sweep-issue-4703-0",
@@ -499,7 +499,7 @@ paired `sweep.outcome`).
 ```json
 {
   "kind": "sweep.completed",
-  "repo": "rjwalters/loom",
+  "repo": "2AMLogic/loom",
   "visibility": "public",
   "issue": 4703,
   "sweep_id": "sweep-issue-4703-0",
@@ -601,7 +601,7 @@ is `#[serde(default)]`); the fix is at the emitters, not the readers.
 ```json
 {
   "kind": "sweep.outcome",
-  "repo": "rjwalters/loom",
+  "repo": "2AMLogic/loom",
   "visibility": "public",
   "issue": 4703,
   "sweep_id": "sweep-issue-4703-0",
@@ -949,7 +949,18 @@ same key and the same rules, so step duration and load can be read by size:
   key, `none` when nothing could launch) and `loom.role_draw.attempt` (#14233)
   on a spawned step a `runtimes.roleDraw` table decided; neither key on a step
   no table decided, or one refused before launch, never `0` or `none` as a
-  stand-in. They are the role tick's keys, same names and spelling. **Not
+  stand-in. The same span adds `loom.role_draw.first_pick` (candidate key),
+  `.layer` (config tier), `.table_attempt` (configured attempt table), `.table`
+  (compact ordered JSON pairs `[["codex","999"],["claude","1"]]`), and
+  `.passed_over` (walk-order pairs `[["codex","no-credential"]]`). Weights are
+  decimal strings so the complete unsigned 64-bit value survives decoding.
+  The skip reasons are `not-admitted`, `no-credential`, `launch-hold`,
+  `ceiling` and `runtime-unavailable` (missing executable). No diagnostic text,
+  excluded entries or seed inputs are sent. A first pick, table or skip list
+  that cannot be represented safely within the 256-byte span attribute limit
+  is omitted in full. A missing table, or a missing skip list when the first
+  and final picks differ, is unavailable for comparison. The skip list is
+  also absent when the first roll won and nothing was skipped. **Not
   `loom.step.draw_attempt`**: that is the 1-based item redraw count within a
   dispatch slot. Stage steps draw attempt 1 (no failure feed, #14235), so
   `loom.role_draw.attempt` on this span stays `1` until one lands.
@@ -1161,7 +1172,7 @@ the two journals:
 
 Full rationale, and why this is a prerequisite of every fleet-wide spend
 ceiling rather than one:
-[`ADR-0020`](https://github.com/rjwalters/loom/blob/main/docs/adr/0020-fleet-metered-spend-ceiling.md).
+[`ADR-0020`](https://github.com/2AMLogic/loom/blob/main/docs/adr/0020-fleet-metered-spend-ceiling.md).
 
 `model` / `effort` likewise survive a daemon restart: the dispatch stamps both
 into the claim lock's `owner.json` (alongside the child pid and process
@@ -1334,7 +1345,7 @@ gradeable by a model or prompt experiment.
 ```json
 {
   "kind": "role_tick.outcome",
-  "repo": "rjwalters/loom",
+  "repo": "2AMLogic/loom",
   "visibility": "public",
   "role": "judge",
   "started_at": "2026-07-30T12:00:00Z",
@@ -1517,7 +1528,7 @@ output, a key and an email produces a record carrying none of the four.
 ```json
 {
   "kind": "session.summary",
-  "repo": "rjwalters/loom",
+  "repo": "2AMLogic/loom",
   "visibility": "private",
   "session_id": "agent-1",
   "parent_session_id": "7d8119a7-250a-48ca-a0ee-b4b2c7f14d92",
@@ -1606,7 +1617,7 @@ pinned by the redaction test suite (`otlp/mapping/metadata/tests.rs` +
 ```json
 {
   "kind": "session.analysis",
-  "repo": "rjwalters/loom",
+  "repo": "2AMLogic/loom",
   "visibility": "private",
   "session_id": "uuid-a",
   "parent_session_id": "7d8119a7-250a-48ca-a0ee-b4b2c7f14d92",
@@ -2445,7 +2456,7 @@ Guard denies (Issue #11582):
 |---|---|---|---|
 | `guard.cargo_target_dir.denied` span | instant; a child of the agent's execution span, delivered through its trace journal (`LOOM_TRACE_CONTEXT_FILE`), so only a session inside a traced execution exports one | `loom.guard.root` (`/tmp`, `$TMPDIR`, `~/.cache`, `~`, `.loom/target-*`), `loom.guard.source` (`inherited`, `inline`, `env`, `export`, `target-dir-flag`, `make-arg`), `loom.role` | one `loom:cargo-target-dir` deny: a cargo build whose target dir was under a root nothing owns ([`guard-hooks.md`](guard-hooks.md#cargo-target-dir-guard-guardscargotargetdir--loom_guard_cargo_target_dir)). Never the path or the command |
 | `build_gate.run` span | one per host-side run of `buildGate.command`; pre-flight's is a child of the sweep's execution span, delivered through its trace journal (`LOOM_TRACE_CONTEXT_FILE`; an attended session with no `LOOM_TRACEPARENT` emits none), the main-health gate's is its own root through the ops sink | `loom.build_gate.stage` (`preflight` / `main_health`), `loom.build_gate.tier` (`fast` / `full`), `loom.build_gate.outcome` (`pass` / `pass_flaky` / `fail` / `unresolved` / `timeout` / `unevaluated`), `loom.build_gate.duration_ms`, `loom.build_gate.attempt` (1-based within the pre-flight episode; `1` for main-health) | what host-side gating costs and how often it fails, per stage and tier (#11690: CI is the test gate, pre-flight is the fast tier). Status `error` unless `pass` / `pass_flaky`. Never the command, a path or the output |
-| `reaper.pass` span | one per worktree-reaper pass over one repo and worktree class, through the ops sink: an instant span, its own root (#12461) | `loom.repo` (workspace directory name, never a path), `loom.reaper.class` (`issue` / `pr`), `loom.reaper.phase` (`reap` removes worktrees; `reclaim` removes build-artifact directories from kept ones), `loom.reaper.scanned` / `removed` / `failed` / `preserved` (worktrees for `reap`; artifact directories removed and worktrees left whole for `reclaim`), `loom.reaper.bytes` (bytes freed; `reap` measures only while an ops sink is registered), `loom.reaper.preserved.<reason>` with `<reason>` one of `in_use` / `unmanaged` / `editable_install` / `issue_open` / `pr_open` / `pr_unknown` / `not_merged` / `grace` / `uncommitted` / `private_workspace` / `backup_failed` / `other` (the gate's fixed category, never its wording; absent when 0), `loom.reaper.backed_up` (open-item worktrees whose whole state was pushed to a remote backup ref before removal, #12458; always `0` for `reclaim`), `loom.reaper.backup_refs` (those refs, space-separated — `refs/loom/backup/<issue-N or pr-N>/<branch or detached>/<UTC stamp>` on `origin`, the restore handle; absent when none) | what the reaper scanned, removed, kept and freed per pass, where #12453 had only host logs and `du`. Status `error` when a removal failed. Carries the daemon version and full SHA like every span |
+| `reaper.pass` span | one per worktree-reaper pass over one repo and worktree class, through the ops sink: an instant span, its own root (#12461) | `loom.repo` (workspace directory name, never a path), `loom.reaper.class` (`issue` / `pr` / `seat` — the last the private-workspace seat pass, whose `loom.repo` is the seat's account name, #14678), `loom.reaper.phase` (`reap` removes worktrees; `reclaim` removes build-artifact directories from kept ones), `loom.reaper.scanned` / `removed` / `failed` / `preserved` (worktrees for `reap`; artifact directories removed and worktrees left whole for `reclaim`), `loom.reaper.bytes` (bytes freed; `reap` measures only while an ops sink is registered), `loom.reaper.preserved.<reason>` with `<reason>` one of `in_use` / `unmanaged` / `editable_install` / `issue_open` / `pr_open` / `pr_unknown` / `not_merged` / `grace` / `uncommitted` / `private_workspace` / `backup_failed` / `other` (the gate's fixed category, never its wording; absent when 0), `loom.reaper.backed_up` (open-item worktrees whose whole state was pushed to a remote backup ref before removal, #12458; always `0` for `reclaim`), `loom.reaper.backup_refs` (those refs, space-separated — `refs/loom/backup/<issue-N or pr-N>/<branch or detached>/<UTC stamp>` on `origin`, the restore handle; absent when none) | what the reaper scanned, removed, kept and freed per pass, where #12453 had only host logs and `du`. Status `error` when a removal failed. Carries the daemon version and full SHA like every span |
 | `main_red.autofile` span | instant, its own root, through the ops sink; one per change the daemon makes to a red `main`'s auto-filed fix issue (Issue #11766) | `loom.repo`, `loom.issue`, `loom.main_red.sha` (the failing or green SHA, `unknown` when not known), `loom.main_red.action` (`created` / `reused` / `closed` / `closed_duplicate`; `reused` once per issue per daemon process), `loom.main_red.source` (`gate` / `ci`) | when a red `main` got its fix issue, and when it was closed again. Status `ok` |
 | `loom.fleet_dispatch.call` span | its own root, through the ops sink; one per call on each side, `loom.fleet_dispatch.side` says which: `captain`, one per request the fleet-dispatch captain (`loom-daemon fleet-dispatch serve`, #12449) answered; `worker`, one per call a worker makes to it (#12450). Spec `docs/design/fleet-captain-dispatch.md` | `loom.fleet_dispatch.side` (`captain` / `worker`), `loom.fleet_dispatch.host` (on the captain the caller's roster host id, `-` before it is identified; on a worker its own), `loom.fleet_dispatch.endpoint` (`/v1/heartbeat` / `/v1/claim` / `/v1/refuse` / `/v1/release`, `other` for a path the captain does not serve), `loom.fleet_dispatch.latency_ms`, `loom.fleet_dispatch.status` (HTTP status; on a worker `0` with no answer), `loom.fleet_dispatch.result` (`granted` / `refused` / `ok` / `error`, the same set on both sides), `loom.fleet_dispatch.reason` (the refusal reason, `refuse` token, release outcome, or the error class: on a worker `transport` / `status_5xx` / `status_4xx` / `malformed`), `loom.fleet_dispatch.server_epoch`, `loom.assignment.id`, `loom.fleet_dispatch.step` (the step's wire name, when the call names an item), and on a refused claim (#12707) `loom.fleet_dispatch.retry_after_s` (integer seconds), `loom.fleet_dispatch.held_by` (the holding host, only when the captain names one: absent on a no-progress hold), `loom.fleet_dispatch.holder_assignment_id` (#12740: the holder's assignment id, on the captain's span only, only on a `held` refusal from a live row, so absent on a no-progress hold; the wire response does not carry it) and, when the refusal is a no-progress hold (`reason` `no_progress_cooldown` on the captain, `cooldown` on a worker), `loom.fleet_dispatch.hold_until` (RFC 3339 UTC wall clock: the span's time plus `retry_after_s`; no monotonic value is exported). The captain's span also carries that hold's `loom.fleet_dispatch.hold_rung` (consecutive no-progress releases), `loom.fleet_dispatch.hold_set_by_outcome` and `loom.fleet_dispatch.hold_set_by_assignment_id` (the release that set it). On a `champion_merge` claim, release or expiry (#13009) the captain's span also carries `loom.fleet_dispatch.merge_slot_holder`: the repo's `champion_merge` holder (an assignment id) after the call, or `none`, so a holder that outlives its release is visible without joining refusals. Key ETA queries on `reason`, not on `held_by`. Each key is emitted only when known. And `loom.repo` with `loom.issue` or `loom.pr_number` (by whether the step acts on a PR) when the call names an item; a worker's span also carries `loom.role` (the step's role name, as on `loom.dispatch.step`) | which host asked for what and what the captain answered, and when a worker could not reach it (design §12). Both sides use the same keys and values, so one query joins them. Status `error` on a captain's non-200 answer and on a worker's call with no usable answer. `loom.dispatch.step` carries the same `loom.assignment.id` on a granted step, and on a step a captain refused `loom.dispatch.held_by`, `loom.dispatch.retry_after_s` and (for `captain_cooldown`) `loom.dispatch.hold_until` (#12707), and (#12875) on a step the captain granted after an earlier assignment of the same repo, item and step ended: `loom.dispatch.attempt` (how many earlier assignments ended), `loom.dispatch.prev_assignment_id` (join it to the earlier step's `loom.assignment.id`) and `loom.dispatch.prev_end` (`released` / `expired` / `host_lost`, the last when the worker released it because its host was lost to a spot interruption, #12876). A first grant, and a renewed one, carries none of the three. The captain's lineage record is bounded (4096 steps, 24 h) and in memory only: a captain restart resets `attempt`. Each assignment that expires also gets a captain span with `loom.fleet_dispatch.endpoint` `expire`, `loom.fleet_dispatch.result` `expired` and `loom.fleet_dispatch.reason` `lease_expired`, carrying the host, `loom.repo`, `loom.issue` or `loom.pr_number`, `loom.fleet_dispatch.step` and `loom.assignment.id` of the row (a held row's expiry emits none). The captain also hosts the fleet issue-filing lock (#13918): `/v1/filing-lock` (`result` `granted` / `refused`; `reason` `granted`, `refreshed` or `held`, with `held_by` and `retry_after_s` on a refusal) and `/v1/filing-unlock` (`reason` `released`, `not_holder` or `empty`, and `loom.fleet_dispatch.hold_ms`: how long the slot was held, on `released` only), and a hold whose holder never unlocked ends in a captain span with `loom.fleet_dispatch.endpoint` `filing-expire`, `result` `expired`, `reason` `lease_expired` and `hold_ms`. A worker's filing span is one per acquire, whose `latency_ms` is the whole wait: `result` `granted`, `refused` with `reason` `deferred` (the slot stayed held past the bounded wait; the burst did not file), or `error` with `reason` `fallback` or the failed call's token (the burst filed under the host lock alone: the fallback count). The worker side runs in the one-shot `fleet-dispatch filing-lock` subcommand, which registers the standalone ops sink at startup and flushes its queue once at exit (#14129); what a flush could not export within its bound stays queued, retried by the next filing's flush |
 
@@ -2575,7 +2586,14 @@ counters come from one reader that dedupes streamed chunks on `message.id`
 (per-counter max) — before #9303 it summed every chunk and ran ~2x high
 (#8186). The USD estimate uses the per-model rate card (5-minute and 1-hour
 cache writes at their own rates), ignores `speed`/`service_tier`, and is an API
-list-price estimate, not a bill.
+list-price estimate, not a bill. For `llm.billing=subscription` it is therefore
+a **list-price equivalent** — what the same token buckets would have cost at
+the vendor's published per-token rate — never money that changed hands. The
+card applies at read time (#14842): a consumer may recompute any span's
+estimate from its own `loom.model` and token buckets with a newer
+`defaults/pricing.json`, so a rate correction is retroactive for analysis,
+while an already-exported `loom.cost.usd_estimate` keeps the value it was
+recorded with (it names its own `loom.pricing.verified_on`).
 
 `reason` is a closed enum and `provider` is a fixed literal or a pool
 namespace that must be a short `[a-z0-9_-]` token (anything else is
@@ -3523,7 +3541,7 @@ negative delta): only a removed or reset ledger file produces one now, but
 the defensive read stays correct for either shape. `dropped_by_reason` is
 additive (serde-defaulted), so records from before #11527 still parse and no
 `schema_version` bump is needed. The committed query is
-[`defaults/observability/signoz/host-export-queries.sql`](https://github.com/rjwalters/loom/blob/main/defaults/observability/signoz/host-export-queries.sql):
+[`defaults/observability/signoz/host-export-queries.sql`](https://github.com/2AMLogic/loom/blob/main/defaults/observability/signoz/host-export-queries.sql):
 hosts with drops, or with no `host.export` at all, in the last 2 h. Query 3 compares a rendered `hosts.yml` roster against `host.export` to find silent hosts by absence (#11198). Query 5 combines `daemon.start`, `daemon.exit` and `host.export` into one `running` / `stopped` / `silent` row per roster host (#10023); `stopped` needs a `daemon.exit`, so a crash, kill or power loss reads as `silent`.
 
 ### `checkout.freshness`
@@ -3759,7 +3777,7 @@ splits into **queue wait** (`entered_at` → `started_at`) and **work time**
 ```json
 {
   "kind": "stage.work_started",
-  "repo": "rjwalters/loom",
+  "repo": "2AMLogic/loom",
   "issue": 11641,
   "pr_number": 11700,
   "stage": "doctor",

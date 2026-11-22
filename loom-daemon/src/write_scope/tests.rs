@@ -672,7 +672,7 @@ fn daemon_write_paths_are_scoped() {
         ),
         ("role_runner/roster.rs", Gated),
         ("dep_classify/forge.rs", OriginResolved("dep_classify/cli.rs")),
-        ("cli/notify_cleared_blockers.rs", ShellVetted("merge-pr.sh")),
+        ("cli/notify_cleared_blockers.rs", Gated),
         (DISPATCH, Gated),
         ("work_finder/pool_preflight.rs", Gated),
         ("intake_reconcile.rs", Gated),
@@ -933,6 +933,10 @@ fn daemon_write_paths_are_scoped() {
             NotAWrite("read-only probe: its only calls are `api --method GET`"),
         ),
         ("tokens_pool/check.rs", NotAWrite("Anthropic API, not the forge")),
+        (
+            "tokens_pool/private_workspace/read_authority.rs",
+            NotAWrite("read probe: its only curl call is `-X GET`, never a forge write"),
+        ),
         (
             "remote_fleet_exec/mod.rs",
             NotAWrite("scp's `-X` option in a guard's argv vocabulary, runs none"),

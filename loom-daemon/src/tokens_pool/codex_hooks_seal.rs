@@ -13,7 +13,7 @@
 //!
 //! | Source | Where Codex reads it | How this module closes it |
 //! |---|---|---|
-//! | user layer | `$CODEX_HOME/hooks.json`, `[hooks]` in `$CODEX_HOME/config.toml` | [`vet_hooks_json`] / [`vet_user_config`]: exactly Loom's one entry, no `[hooks]` events |
+//! | user layer | `$CODEX_HOME/hooks.json`, `[hooks]` in `$CODEX_HOME/config.toml` | [`vet_hooks_json_for`] / [`vet_user_config`]: exactly Loom's one entry, no `[hooks]` events |
 //! | project layers | `.codex/hooks.json` and `.codex/config.toml` from the cwd up to the project root, plus the main checkout's `.codex/` for a linked worktree | [`vet_project_layers`]: none present |
 //! | session flags | `-c hooks…`, `--enable`/`--disable`, `--profile`, and `-C`/`--cd`/`--worktree` (which move project discovery) | [`vet_session_flags`]: none present |
 //! | plugins | enabled plugins' hook files, some installed remotely by the account's backend | not vetted. Removed instead: a bypassed launch also passes [`PLUGINS_OFF`] |
@@ -207,16 +207,9 @@ struct Handler {
     timeout: i64,
 }
 
-/// `hooks.json` is exactly Loom's sealed registration. Returns the parsed
-/// value (for the trust keys Loom's entry occupies).
-///
-/// # Errors
-/// On any byte that is not Loom's entry.
-pub fn vet_hooks_json(bytes: &[u8]) -> Result<serde_json::Value, String> {
-    vet_hooks_json_for(bytes, SHARED_COMMAND)
-}
-
-/// [`vet_hooks_json`] for a registration whose one command is `command`.
+/// Vet that `hooks.json` is exactly Loom's sealed registration, for a
+/// registration whose one command is `command`. Returns the parsed value
+/// (for the trust keys Loom's entry occupies).
 ///
 /// # Errors
 /// On any byte that is not Loom's entry carrying exactly `command`.

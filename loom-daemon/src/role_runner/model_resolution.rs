@@ -1,6 +1,5 @@
 //! Role-runner model resolution (#4501 / #5001) and its runtime reconciliation
-//! (#7894), split out of `role_runner.rs` so the over-threshold parent file
-//! shrinks rather than grows (`.loom/docs/file-size-policy.md`).
+//! (#7894), split out of `role_runner.rs`.
 //!
 //! Three questions live here, and only here:
 //!
@@ -27,8 +26,7 @@ pub struct ModelRuntimeMismatch {
     pub role: String,
     /// The admitted runtime (e.g. `"codex"`).
     pub runtime: String,
-    /// The model resolved by [`resolve_role_runner_model`] (or the test-only
-    /// `with_model` override) for this role.
+    /// The model resolved by [`resolve_role_runner_model`] for this role.
     pub model: String,
     /// The config/env tier label [`resolve_role_runner_model`] attributes the
     /// model to (e.g. `"default"`, `"autonomous.roleRunner.model"`), unchanged
@@ -254,9 +252,7 @@ pub const CODEX_DEFAULT_EFFORT_SOURCE: &str = "codex-default";
 /// [`effort`](RoleRunnerConfig::effort) /
 /// [`role_efforts`](RoleRunnerConfig::role_efforts) fields. Called by
 /// [`read_role_runner_config`]; it lives here rather than inline in the parser
-/// so the module that *resolves* these keys also owns their parse contract (and
-/// so the over-threshold `role_runner.rs` shrinks rather than grows —
-/// `.loom/docs/file-size-policy.md`).
+/// so the module that *resolves* these keys also owns their parse contract.
 ///
 /// The contract is `roleModels`'s, verbatim:
 ///
