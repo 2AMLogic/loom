@@ -11199,6 +11199,32 @@ The same pass-through can be requested deliberately with
 `autonomous.roleRunner.model`); see
 [`runtime-adapters.md` § "Per-role model override"](runtime-adapters.md#per-role-model-override-autonomousrolerunnerrolemodels).
 
+**A configured tier reconciles against a native profile's own model
+(#14962).** A `roleModels.<role>` pin (or the global
+`autonomous.roleRunner.model` / `autonomous.model`) is a runtime-neutral
+default, so it may name a model the native pick the draw landed on does not
+run: an `opencode:<profile>` candidate pins a *profile*, and
+`worker_spawn::profiles::select` refuses a launch whose `--model` differs
+from that profile's own `model` (`bare model differs from the selected
+profile`, `profile_selection`, exit 78) — before #14962 this lost whole
+Judge/Guide steps whose `roleModels.<role>` was aimed at the Claude picks.
+Both launch sites (the sweep step spawn and the role runner's invocation) now
+resolve the model through `resolve_role_runner_model_for_launch`: when the
+admitted runtime is native (`opencode`, `pi`, `kimi`) and the profile the
+launch will select (the preference tap's `modelProfile`, then
+`LOOM_MODEL_PROFILE`, `runtimes.defaultModelProfile`, then the bundled
+`zai-flash`) declares a different `model`, the configured pin is dropped and
+the child launches with the profile's own model instead of the launch being
+refused. The drop is logged, and the per-tick header's source names it, e.g.
+`model=<runtime CLI default> (source=autonomous.roleRunner.roleModels.judge (profile model for opencode:zai-flash))`.
+A model the pick itself pins (`claude/opus`, `opencode:<profile>/<model>`)
+is an explicit statement of intent about that launch and is **never** dropped:
+a value the profile disallows is still forwarded and still refused loudly —
+pin `opencode:<profile>/<the profile's model>` (or nothing) instead. Claude
+and Codex launches are unaffected, so #5028's
+`model_runtime_mismatch` refusal of a genuinely wrong cross-family pin
+survives verbatim.
+
 **Pinned models fall back one rung at selection time when their class limit
 is hit (#13873).** A model pin has no answer to an org-wide class ceiling:
 when every pool account is bad-marked `[model-class:fable]` (#8058/#13872),
