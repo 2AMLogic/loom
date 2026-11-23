@@ -1,6 +1,5 @@
 //! Role-runner model resolution (#4501 / #5001) and its runtime reconciliation
-//! (#7894), split out of `role_runner.rs` so the over-threshold parent file
-//! shrinks rather than grows (`.loom/docs/file-size-policy.md`).
+//! (#7894), split out of `role_runner.rs`.
 //!
 //! Three questions live here, and only here:
 //!
@@ -16,7 +15,11 @@
 //!    cross-family conflict to the runtime CLI's own default instead of letting
 //!    `ScriptRoleInvocationRunner::invoke`'s #5028 preflight skip the tick
 //!    forever. An explicit pin is never touched, so that refusal survives
-//!    intact.
+//!    intact. [`resolve_role_runner_effort_for_launch`] (#14963) asks the same
+//!    question of the *effort*: an unqualified tier's level that the selected
+//!    native model profile's `allowedEfforts` does not include is dropped to
+//!    the profile's own effort instead of losing the launch, while a
+//!    runtime-qualified pin keeps its refusal.
 
 use super::*;
 
@@ -27,8 +30,7 @@ pub struct ModelRuntimeMismatch {
     pub role: String,
     /// The admitted runtime (e.g. `"codex"`).
     pub runtime: String,
-    /// The model resolved by [`resolve_role_runner_model`] (or the test-only
-    /// `with_model` override) for this role.
+    /// The model resolved by [`resolve_role_runner_model`] for this role.
     pub model: String,
     /// The config/env tier label [`resolve_role_runner_model`] attributes the
     /// model to (e.g. `"default"`, `"autonomous.roleRunner.model"`), unchanged
@@ -212,6 +214,34 @@ pub fn resolve_role_runner_effort_for_runtime(
     role: &str,
     runtime: Option<&str>,
 ) -> (String, String) {
+    let (effort, source, _tier) = resolve_role_runner_effort_with_tier(repo_root, role, runtime);
+    (effort, source)
+}
+
+/// Issue #14963: which kind of tier supplied a resolved effort — the
+/// structural fact the launch-time reconciliation
+/// ([`resolve_role_runner_effort_for_launch`]) keys on. A runtime-qualified
+/// `roleEfforts.<role>@<runtime>` entry is an explicit statement of intent
+/// about *that* runtime and is never dropped; the unqualified tiers (bare
+/// `roleEfforts.<role>`, global `effort`) are runtime-neutral defaults that
+/// may predate a native model profile's `allowedEfforts` vocabulary; the
+/// shipped Codex default and unset carry no operator intent at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EffortTier {
+    RuntimeQualified,
+    Unqualified,
+    Default,
+}
+
+/// The shared body of [`resolve_role_runner_effort_for_runtime`] and
+/// [`resolve_role_runner_effort_for_launch`]: the precedence chain above,
+/// returning the effort, its source label, and the [`EffortTier`] that
+/// supplied it. One body so the two public resolvers can never drift.
+fn resolve_role_runner_effort_with_tier(
+    repo_root: &Path,
+    role: &str,
+    runtime: Option<&str>,
+) -> (String, String, EffortTier) {
     let config = read_role_runner_config(repo_root);
     let role_key = role.trim().to_ascii_lowercase();
     let runtime_key = runtime
@@ -220,19 +250,99 @@ pub fn resolve_role_runner_effort_for_runtime(
     if let Some(rt) = &runtime_key {
         let qualified = format!("{role_key}@{rt}");
         if let Some(e) = config.role_efforts.get(&qualified) {
-            return (e.clone(), format!("autonomous.roleRunner.roleEfforts.{qualified}"));
+            return (
+                e.clone(),
+                format!("autonomous.roleRunner.roleEfforts.{qualified}"),
+                EffortTier::RuntimeQualified,
+            );
         }
     }
     if let Some(e) = config.role_efforts.get(&role_key) {
-        return (e.clone(), format!("autonomous.roleRunner.roleEfforts.{role_key}"));
+        return (
+            e.clone(),
+            format!("autonomous.roleRunner.roleEfforts.{role_key}"),
+            EffortTier::Unqualified,
+        );
     }
     if let Some(e) = config.effort {
-        return (e, "autonomous.roleRunner.effort".to_string());
+        return (e, "autonomous.roleRunner.effort".to_string(), EffortTier::Unqualified);
     }
     if runtime_key.as_deref() == Some(CODEX_RUNTIME_ID) {
-        return (CODEX_DEFAULT_EFFORT.to_string(), CODEX_DEFAULT_EFFORT_SOURCE.to_string());
+        return (
+            CODEX_DEFAULT_EFFORT.to_string(),
+            CODEX_DEFAULT_EFFORT_SOURCE.to_string(),
+            EffortTier::Default,
+        );
     }
-    (String::new(), UNSET_EFFORT_SOURCE.to_string())
+    (String::new(), UNSET_EFFORT_SOURCE.to_string(), EffortTier::Default)
+}
+
+/// Issue #14963: [`resolve_role_runner_effort_for_runtime`] for a launch that
+/// is about to happen, reconciling an **unqualified** effort against the
+/// native model profile that launch will select.
+///
+/// The bug this closes: an operator sets a bare `roleEfforts.<role>` (or the
+/// global `autonomous.roleRunner.effort`) with the Claude/Codex runtimes in
+/// mind — say `"medium"` — and a step's preference walk draws a native
+/// profile (`opencode`/`pi`/`kimi`) whose `allowedEfforts` does not include
+/// that level (`zai-flash` allows `low`/`high`/`max` only). The daemon
+/// forwarded `--effort medium` regardless, and `worker_spawn::profiles::select`
+/// — correctly, on the evidence it has — refused the whole launch before the
+/// CLI started (`LOOM_LAUNCH_REJECTED code=78 stage=profile_selection`),
+/// losing the step over a default nobody aimed at that runtime.
+///
+/// The resolution mirrors [`reconcile_unpinned_model_with_runtime`]: an
+/// **unqualified** tier's value that the selected native profile does not
+/// allow is dropped (the child launches with the profile's own `effort`, the
+/// same outcome omitting `--effort` produces in `profiles::select`) instead of
+/// refusing the launch. A **runtime-qualified** `roleEfforts.<role>@<runtime>`
+/// entry is an explicit statement of intent about that exact runtime and is
+/// never touched: if its value is outside `allowedEfforts`, `--effort` is
+/// still forwarded and `profiles::select` still refuses it loudly. Non-native
+/// runtimes, empty efforts, unknown profiles (the launch fails closed on
+/// those with its own diagnostic) and profiles without a provider for the
+/// runtime are all left exactly as resolved.
+///
+/// `model_profile` is the admitted preference tap's `modelProfile`; `None`
+/// falls back exactly as the launch's own profile lookup does
+/// (`LOOM_MODEL_PROFILE`, `runtimes.defaultModelProfile`, the bundled
+/// `zai-flash`), so the reconciliation judges the profile the child would
+/// actually select. Dropping an effort re-labels its source for the per-role
+/// log header as `<source> (profile default for <runtime>:<profile>)` and
+/// logs an `info!` line, so `role_tick.outcome` and `loom-daemon logs` both
+/// name what was dropped and why.
+#[must_use]
+pub fn resolve_role_runner_effort_for_launch(
+    repo_root: &Path,
+    role: &str,
+    runtime: Option<&str>,
+    model_profile: Option<&str>,
+) -> (String, String) {
+    let (effort, source, tier) = resolve_role_runner_effort_with_tier(repo_root, role, runtime);
+    if effort.is_empty() || tier != EffortTier::Unqualified {
+        return (effort, source);
+    }
+    let Some(runtime) = runtime.map(str::trim).filter(|r| !r.is_empty()) else {
+        return (effort, source);
+    };
+    if !crate::worker_spawn::is_native(runtime) {
+        return (effort, source);
+    }
+    let config = crate::config_resolver::resolve_effective_config(repo_root);
+    let Some(profile) = crate::worker_spawn::profiles::profile_rejects_effort(
+        runtime,
+        model_profile,
+        &effort,
+        &config,
+    ) else {
+        return (effort, source);
+    };
+    log::info!(
+        "role_runner: dropping unqualified effort {effort:?} from {source} for the \
+         {runtime}:{profile} model profile (not in its allowedEfforts); launching with the \
+         profile's own effort instead of refusing the launch (#14963)"
+    );
+    (String::new(), format!("{source} (profile default for {runtime}:{profile})"))
 }
 
 /// Issue #14017: the runtime id the shipped default effort applies to.
@@ -254,9 +364,7 @@ pub const CODEX_DEFAULT_EFFORT_SOURCE: &str = "codex-default";
 /// [`effort`](RoleRunnerConfig::effort) /
 /// [`role_efforts`](RoleRunnerConfig::role_efforts) fields. Called by
 /// [`read_role_runner_config`]; it lives here rather than inline in the parser
-/// so the module that *resolves* these keys also owns their parse contract (and
-/// so the over-threshold `role_runner.rs` shrinks rather than grows —
-/// `.loom/docs/file-size-policy.md`).
+/// so the module that *resolves* these keys also owns their parse contract.
 ///
 /// The contract is `roleModels`'s, verbatim:
 ///

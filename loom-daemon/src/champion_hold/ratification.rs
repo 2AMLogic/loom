@@ -324,9 +324,10 @@ pub fn release_due(comments: &[Comment]) -> bool {
 pub enum Action {
     /// Nothing: not held, or released at this very head.
     None,
-    /// Open a hold: notice + `loom:blocked` + park record.
+    /// Open or re-arm a hold at this head: notice + `loom:blocked` + park record.
     Hold,
-    /// A hold stands: re-assert `loom:blocked` and the park record, no comment.
+    /// A hold stands at this very head: re-assert `loom:blocked` and the park
+    /// record, no comment.
     Stands,
     /// A person released it: post [`RELEASED_MARKER`], remove `loom:blocked`.
     Release,
@@ -352,6 +353,16 @@ impl Action {
 /// still declares ratification re-arms the hold, because the text the operator
 /// released may not be the text now on the PR.
 ///
+/// The hold is head-scoped the same way (#14833): `Stands` — the quiet,
+/// no-comment answer — is returned only when the standing notice records this
+/// very head. A notice at an older head (or a legacy one with no head) was
+/// written against a text that has since moved; a `Hold` verdict at the new
+/// head re-arms with a fresh notice recording it, so the marker an audited
+/// `merge-pr.sh --release-hold` reads back always names the head it refuses
+/// or authorizes. Without this, a Doctor push followed by a re-hold left the
+/// newest `champion:hold-state` record at the old head and the release was
+/// refused forever.
+///
 /// A [`Verdict::Unreadable`] cannot reach `decide` from the CLI: the verb
 /// fails closed on it first (#13932). If one arrives anyway, it falls through
 /// to `Hold`/`Stands` — fail closed, never a silent pass.
@@ -367,7 +378,11 @@ pub fn decide(verdict: &Verdict, comments: &[Comment], head: &str) -> Action {
         (Verdict::Clear, Episode::None) => Action::None,
         (Verdict::Clear, _) => Action::Clear,
         (_, Episode::Held { .. }) if release_due(comments) => Action::Release,
-        (_, Episode::Held { .. }) => Action::Stands,
+        // A repeat tick is quiet only at the head the standing notice records.
+        (_, Episode::Held { head: Some(h) }) if h == head => Action::Stands,
+        // A moved head (or a legacy notice with none): re-arm with a fresh
+        // notice that records this head (#14833).
+        (_, Episode::Held { .. }) => Action::Hold,
         (_, Episode::None | Episode::Released { .. }) => Action::Hold,
     }
 }
