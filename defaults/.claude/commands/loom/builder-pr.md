@@ -881,7 +881,12 @@ externally-visible action of this whole Builder run — run the sweep-side
 fencing check:
 
 ```bash
-./.loom/scripts/sweep-lease-fence.sh check "$N" --branch "$(git rev-parse --abbrev-ref HEAD)"
+FENCE_ARGS=(check "$N" --branch "$(git rev-parse --abbrev-ref HEAD)")
+# #15043: when this run has a sweep id, narrow "own lease" to it so a shared
+# worker's same-host peer dispatches are told apart; runs with no
+# LOOM_SWEEP_ID (manual / --no-daemon) keep host-only matching.
+[[ -z "${LOOM_SWEEP_ID:-}" ]] || FENCE_ARGS+=(--sweep-id "$LOOM_SWEEP_ID")
+./.loom/scripts/sweep-lease-fence.sh "${FENCE_ARGS[@]}"
 FENCE_RC=$?
 if [[ "$FENCE_RC" -eq 3 ]]; then
   echo "Lease fence: EXPIRED — MY OWN claim's lease record is stale on the forge's own clock (my renewal loop died). Aborting before push/PR-open; NOT pushing, NOT opening a PR." >&2
@@ -939,6 +944,15 @@ never-renewed, never-yielded lease would otherwise fence out every successor
 dispatch forever (observed on issue #6694 / PR #6773). Exit `4` (SUPERSEDED
 — a *fresh* lease from a live peer) is unaffected: that case still means a
 live peer genuinely holds the claim.
+
+**Issue #15043: `--sweep-id` distinguishes same-host dispatches.** The
+recipe above passes `--sweep-id "$LOOM_SWEEP_ID"` when (and only when) that
+variable is set, and "own lease" then additionally requires the freshest
+lease's `sweep=` to name **this** dispatch: on a shared worker — several
+concurrent sweeps under one `host=` — a fresh same-host peer lease aborts
+exit `4` (superseded) and an abandoned expired one PASSes, instead of both
+reading as "own". Runs with no sweep id (manual `/loom:sweep`,
+`--no-daemon`) omit the flag and keep host-only matching unchanged.
 
 ### Creating the PR
 
