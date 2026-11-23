@@ -2384,8 +2384,15 @@ fn idle_refusal_uses_the_draw_snapshot_when_inventory_changes() {
         );
         let _liveness = set_selector_docker(fake_docker.to_str().unwrap(), false);
 
-        let result =
-            dispatch::Selection::prepare_idle(root, None, JobKind::Sweep, None, "fixture", false);
+        let result = dispatch::Selection::prepare_idle(
+            root,
+            None,
+            JobKind::Sweep,
+            None,
+            "fixture",
+            false,
+            dispatch::ForgeNeed::Writer,
+        );
         assert_eq!(std::fs::read(file).unwrap(), changed, "snapshot must have run");
         let error = result.err().expect("the matching account is not healthy");
         assert!(error.is::<health::NoHealthyAccountError>(), "{error:#}");
@@ -2600,9 +2607,17 @@ fn idle_reservation_retries_a_busy_weekly_favorite_and_hands_off_the_next_lease(
     save(&runtimes.join("codex.json"), &json!({"accountProvider": "codex"})).unwrap();
 
     let reserve = |issue, owner| {
-        dispatch::Selection::prepare_idle(&root, None, JobKind::Sweep, Some(issue), owner, false)
-            .unwrap()
-            .unwrap()
+        dispatch::Selection::prepare_idle(
+            &root,
+            None,
+            JobKind::Sweep,
+            Some(issue),
+            owner,
+            false,
+            dispatch::ForgeNeed::Writer,
+        )
+        .unwrap()
+        .unwrap()
     };
     // Advance the cursor past Alice with a real locked draw. The next draw
     // would still favor Alice on usage, independent of the cursor.
@@ -3391,6 +3406,353 @@ fn a_blocking_exec_is_named_by_the_admission_refusal_and_the_explain_view() {
     assert!(!reason.contains(&stranded), "{reason}");
     assert!(!reason.contains(&bob_stranded), "{reason}");
     assert!(!reason.contains("arguments"), "{reason}");
+}
+
+// ---------------------------------------------------------------------------
+// #14936: a GitHub job that needs a writer is refused before the lease when
+// the writer is missing or expired.
+// ---------------------------------------------------------------------------
+
+const GITHUB_REPO: &str = "https://github.com/acme-14936/widget";
+const MISSING_WRITER: &str =
+    "no GitHub write credential for https://github.com/acme-14936/widget: \
+                              no writer was published for the repository owner and no GH_TOKEN is \
+                              in the environment; the seat was not leased";
+const EXPIRED_WRITER: &str = "private workspace forge credential for \
+                              https://github.com/acme-14936/widget is expired and no fresher one \
+                              is published; the credential refresh has not renewed it";
+
+/// The Builder-draw fixture over a GitHub repository: both seats clone it and
+/// the workspace origin names it, so a seat's forge credential is looked up.
+fn github_builder_env(env: &mut Env) -> Seat {
+    env.config.repository = GITHUB_REPO.into();
+    save(&env.dir.join("workspace.json"), &env.config).unwrap();
+    builder_draw_env(env, true)
+}
+
+/// The environment a daemon-dispatched Builder step runs in: the daemon's
+/// primary root pinned into the child's env, and no ambient token.
+fn writer_env(primary: &Path) -> crate::env_test_support::EnvGuard {
+    crate::env_test_support::EnvGuard::set("LOOM_MACHINE_CHECKOUT", primary)
+        .and_set("GH_HOST", Some("github.com".as_ref()))
+        .and_set("GH_TOKEN", None)
+        .and_set("GITHUB_TOKEN", None)
+}
+
+fn builder_runtime_env() -> crate::env_test_support::EnvGuard {
+    crate::env_test_support::EnvGuard::clear(&[
+        "CODEX_HOME",
+        "LOOM_CODEX_HOME",
+        "LOOM_CODEX_PROFILE",
+        "LOOM_CODEX_NO_EXEC",
+        "LOOM_CODEX_SESSION_EXEC",
+        "LOOM_RUNTIME",
+        "LOOM_RUNTIME_BUILDER",
+        "LOOM_SPAWN_NO_EXEC",
+        "LOOM_SPAWN_NO_EXPORT",
+    ])
+}
+
+/// The codex credential pool the draw's fallback runtime draws from. The
+/// directory is returned too: it must outlive the guard that names it.
+fn token_pool() -> (tempfile::TempDir, crate::env_test_support::EnvGuard) {
+    let tokens = tempfile::tempdir().unwrap();
+    std::fs::write(tokens.path().join("fixture.token"), "sk-ant-oat-fixture\n").unwrap();
+    let guard = crate::env_test_support::EnvGuard::set(
+        crate::tokens_pool::paths::SHARED_TOKENS_DIR_ENV,
+        tokens.path(),
+    );
+    (tokens, guard)
+}
+
+/// Publish a writer for the fixture owner under `root`, with `expires_at`.
+fn publish_writer(root: &Path, expires_at: &str) -> PathBuf {
+    let dir = crate::credential_preflight::github_app_gh_config_dir_for_owner(root, "acme-14936");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("hosts.yml"), "github.com: {}\n").unwrap();
+    std::fs::write(
+        dir.join("identity.json"),
+        format!(
+            r#"{{"appId":"1","slug":null,"installationId":"2","owner":"acme-14936","role":"writer","expiresAt":"{expires_at}"}}"#
+        ),
+    )
+    .unwrap();
+    dir
+}
+
+fn walk_report(record: &crate::runtime_preference::role_draw::RoleDrawRecord) -> String {
+    record
+        .passed_over
+        .iter()
+        .find(|reason| reason.contains("no eligible seat could be prepared"))
+        .expect("the codex refusal names the walk")
+        .to_string()
+}
+
+/// #14936: a Builder draw on a GitHub repository with no writer published
+/// anywhere. Before, only a provably expired credential stopped here, so
+/// this draw leased a seat, began its job and failed on a credential-less
+/// `git fetch` — the 2026-11-21 loom-crew-7 report.
+#[test]
+#[serial]
+fn a_builder_draw_with_no_published_writer_is_refused_before_the_lease() {
+    use crate::runtime_preference::role_draw;
+    let _runtime_env = builder_runtime_env();
+    let _probe = crate::env_test_support::EnvGuard::set("LOOM_CODEX_SESSION_PROBE", "0");
+    let mut env = setup();
+    let bob = github_builder_env(&mut env);
+    let (_tokens_dir, _tokens) = token_pool();
+    let primary = tempfile::tempdir().unwrap();
+    let _writer = writer_env(primary.path());
+    let root = env.workspace.path();
+
+    let mut draw = builder_draw(root);
+    let (runtime, record, selection, seat_unavailable) = draw("builder-writer-1".into());
+    assert_eq!(runtime, "claude", "the draw falls through to a runtime that can serve it");
+    assert!(selection.is_none());
+    assert!(!seat_unavailable, "a missing writer is not a busy pool");
+    // The walk's record is capped by design (resolve.rs `SUMMARY_DETAIL_MAX`),
+    // so it carries only the refusal's own opening words; the explain row
+    // below carries all of it.
+    let passed = walk_report(&record);
+    assert!(passed.contains("2 of 2 eligible seats idle"), "{passed}");
+    assert!(passed.contains("alice failed: no GitHub write"), "{passed}");
+    // Before the lease and before any Docker work: both seats are free and
+    // nothing was prepared on either.
+    assert!(
+        env.engine()
+            .calls
+            .iter()
+            .all(|call| !call.iter().any(|a| a == "exec")),
+        "{:?}",
+        env.engine().calls
+    );
+    drop(lease::Lease::acquire(&env.dir).unwrap());
+    drop(lease::Lease::acquire(&bob.dir).unwrap());
+    assert!(!env.dir.join("job.json").exists());
+    assert!(!bob.dir.join("job.json").exists());
+
+    // `roles draw --explain` reads the same refusal and names the workspace's
+    // writer state: no writer for the owner, under the root it looked in.
+    let doc = role_draw::explain::explain_json(root);
+    let codex = &builder_stage_of(&doc)["roleDraw"][0]["candidates"][0];
+    assert_eq!(codex["candidate"], "codex");
+    assert_eq!(codex["admitted"], false);
+    let reason = codex["reason"].as_str().unwrap();
+    assert!(reason.contains(&format!("alice failed: {MISSING_WRITER}")), "{reason}");
+    assert!(reason.contains(&format!("bob failed: {MISSING_WRITER}")), "{reason}");
+    let writer = &doc["writer"];
+    assert_eq!(writer["state"], "missing");
+    assert_eq!(writer["admitted"], false);
+    assert_eq!(writer["owner"], "acme-14936");
+    assert_eq!(writer["repository"], GITHUB_REPO);
+    assert_eq!(writer["primaryRoot"], primary.path().display().to_string());
+    assert_eq!(writer["primaryRootSource"], "LOOM_MACHINE_CHECKOUT");
+    let text = role_draw::explain::explain_text(root);
+    assert!(
+        text.contains(&format!(
+            "writer for {GITHUB_REPO} (owner acme-14936): no writer was published for owner \
+             acme-14936 under the primary root or this workspace, and no GH_TOKEN is in this \
+             process; primary root {} (from LOOM_MACHINE_CHECKOUT)",
+            primary.path().display()
+        )),
+        "{text}"
+    );
+    assert!(
+        text.contains("a Builder or Doctor seat cannot be admitted until this is resolved"),
+        "{text}"
+    );
+    drop(super::tests::reacquire(&env.dir));
+    drop(super::tests::reacquire(&bob.dir));
+}
+
+/// #14936: an expired-only writer is refused as expired, apart from a missing
+/// one, and just as early.
+#[test]
+#[serial]
+fn a_builder_draw_with_only_an_expired_writer_is_refused_as_expired() {
+    use crate::runtime_preference::role_draw;
+    let _runtime_env = builder_runtime_env();
+    let _probe = crate::env_test_support::EnvGuard::set("LOOM_CODEX_SESSION_PROBE", "0");
+    let mut env = setup();
+    let bob = github_builder_env(&mut env);
+    let (_tokens_dir, _tokens) = token_pool();
+    let primary = tempfile::tempdir().unwrap();
+    let expired = publish_writer(primary.path(), "2020-01-01T00:00:00Z");
+    let _writer = writer_env(primary.path());
+    let root = env.workspace.path();
+
+    let mut draw = builder_draw(root);
+    let (runtime, record, selection, seat_unavailable) = draw("builder-writer-2".into());
+    assert_eq!(runtime, "claude");
+    assert!(selection.is_none());
+    assert!(!seat_unavailable);
+    let passed = walk_report(&record);
+    assert!(passed.contains("2 of 2 eligible seats idle"), "{passed}");
+    assert!(passed.contains("alice failed: private workspace forge"), "{passed}");
+    assert!(!passed.contains("no GitHub write"), "{passed}");
+    assert!(
+        env.engine()
+            .calls
+            .iter()
+            .all(|call| !call.iter().any(|a| a == "exec")),
+        "{:?}",
+        env.engine().calls
+    );
+    drop(lease::Lease::acquire(&env.dir).unwrap());
+    drop(lease::Lease::acquire(&bob.dir).unwrap());
+
+    let doc = role_draw::explain::explain_json(root);
+    let reason = builder_stage_of(&doc)["roleDraw"][0]["candidates"][0]["reason"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert!(reason.contains(&format!("bob failed: {EXPIRED_WRITER}")), "{reason}");
+    assert!(!reason.contains("no GitHub write credential"), "{reason}");
+    let writer = &doc["writer"];
+    assert_eq!(writer["state"], "expired");
+    assert_eq!(writer["admitted"], false);
+    assert_eq!(writer["passedOver"][0]["dir"], expired.display().to_string());
+    assert!(
+        writer["passedOver"][0]["credential"]["lifetime"]["expiredSecondsAgo"]
+            .as_u64()
+            .is_some(),
+        "{writer}"
+    );
+    let text = role_draw::explain::explain_text(root);
+    assert!(
+        text.contains(&format!("every published writer is expired ({})", expired.display())),
+        "{text}"
+    );
+    drop(super::tests::reacquire(&env.dir));
+    drop(super::tests::reacquire(&bob.dir));
+}
+
+/// #14936: a valid ambient writer keeps admitting the draw exactly as before.
+#[test]
+#[serial]
+fn a_builder_draw_with_an_ambient_writer_admits_the_idle_seat() {
+    use crate::runtime_preference::role_draw;
+    let _runtime_env = builder_runtime_env();
+    let _probe = crate::env_test_support::EnvGuard::set("LOOM_CODEX_SESSION_PROBE", "0");
+    let mut env = setup();
+    let bob = github_builder_env(&mut env);
+    let (_tokens_dir, _tokens) = token_pool();
+    let primary = tempfile::tempdir().unwrap();
+    let _writer = writer_env(primary.path());
+    let _token = crate::env_test_support::EnvGuard::set("GH_TOKEN", "ghs_TESTONLY_14936");
+    let root = env.workspace.path();
+    let held = lease::Lease::acquire(&env.dir).unwrap();
+
+    let mut draw = builder_draw(root);
+    let (runtime, _, selection, seat_unavailable) = draw("builder-writer-3".into());
+    assert_eq!(runtime, "codex");
+    assert_eq!(selection.as_ref().unwrap().name, "bob");
+    assert!(!seat_unavailable);
+    drop(selection);
+    drop(super::tests::reacquire(&bob.dir));
+
+    let doc = role_draw::explain::explain_json(root);
+    let codex = &builder_stage_of(&doc)["roleDraw"][0]["candidates"][0];
+    assert_eq!(codex["admitted"], true, "{codex}");
+    assert_eq!(doc["writer"]["state"], "ambient");
+    assert_eq!(doc["writer"]["admitted"], true);
+    assert!(role_draw::explain::explain_text(root).contains("a writer job can be admitted"),);
+    drop(super::tests::reacquire(&bob.dir));
+    drop(held);
+    drop(super::tests::reacquire(&env.dir));
+}
+
+/// #14936: a launch with no push of its own keeps its earlier path — a Judge
+/// draw on the same credential-less workspace still reserves the seat, only
+/// a provably expired credential refusing it.
+#[test]
+#[serial]
+fn a_judge_draw_on_a_workspace_without_a_writer_keeps_its_earlier_path() {
+    use crate::runtime_preference::{
+        resolve_runtime_contained, role_draw, Decision, DispatchContext, Intent,
+    };
+    let _runtime_env = builder_runtime_env();
+    let _probe = crate::env_test_support::EnvGuard::set("LOOM_CODEX_SESSION_PROBE", "0");
+    let mut env = setup();
+    let bob = github_builder_env(&mut env);
+    let (_tokens_dir, _tokens) = token_pool();
+    let primary = tempfile::tempdir().unwrap();
+    let _writer = writer_env(primary.path());
+    let root = env.workspace.path();
+    crate::tokens_pool::session_lifecycle::mark_session_managed(
+        &env.config.profile,
+        &env.config.container,
+    )
+    .unwrap();
+    env.seed_container(CONTAINER_ID, true);
+    env.seed_volume();
+    let shipped = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap()
+        .join("defaults");
+    let judge = root.join(".loom").join("roles/judge.json");
+    std::fs::copy(shipped.join("roles/judge.json"), &judge).unwrap();
+    save(
+        &root.join(".loom/config.json"),
+        &json!({"runtimes":{"roleDraw":{"judge":{"1":{"codex":1000,"claude":1}}}}}),
+    )
+    .unwrap();
+
+    let draw = |owner: String| {
+        let mut preparer =
+            containment::Preparer::new(root, JobKind::Role, None, owner, Box::new(|_, _| None));
+        let result = role_draw::with_seed(1, || {
+            resolve_runtime_contained(
+                root,
+                "judge",
+                None,
+                1_800_000_000,
+                DispatchContext {
+                    intent: Intent::Dispatch,
+                    role_tick: true,
+                },
+                &mut preparer,
+            )
+        });
+        let Decision::Preference { resolution, .. } = result.unwrap() else {
+            panic!("expected the role draw");
+        };
+        (
+            resolution.chosen.unwrap().admitted.runtime,
+            crate::sweep_registry::private_dispatch::take_held(&mut preparer, false)
+                .unwrap()
+                .map(|(selection, _)| selection),
+        )
+    };
+
+    // No writer anywhere: the Judge draw reserves the seat as before.
+    let (runtime, reserved) = draw("judge-writer-1".into());
+    assert_eq!(runtime, "codex");
+    assert!(reserved.is_some(), "a launch with no push keeps its earlier path");
+    drop(reserved);
+    drop(super::tests::reacquire(&bob.dir));
+    drop(super::tests::reacquire(&env.dir));
+
+    // The explain view reports the same writer state for both stages, and
+    // only the stage that pushes is refused for it.
+    let doc = role_draw::explain::explain_json(root);
+    assert_eq!(doc["writer"]["state"], "missing");
+    let judge_stage = doc["stages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|stage| stage["stage"] == "judge")
+        .unwrap();
+    assert_eq!(judge_stage["roleDraw"][0]["candidates"][0]["candidate"], "codex");
+    assert_eq!(judge_stage["roleDraw"][0]["candidates"][0]["admitted"], true);
+
+    // Expired: every job is refused, as before (#14435).
+    publish_writer(primary.path(), "2020-01-01T00:00:00Z");
+    let (runtime, reserved) = draw("judge-writer-2".into());
+    assert_eq!(runtime, "claude");
+    assert!(reserved.is_none());
+    drop(super::tests::reacquire(&env.dir));
 }
 
 #[test]

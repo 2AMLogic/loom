@@ -228,6 +228,20 @@ Candidates that `excludeProviders` or weight 0 removed are not probed (they
 were never drawable), and stages without a table are not probed either;
 their `rolePreference` / static fallback is unchanged.
 
+The view also reports the workspace's **seat writer** (#14936), measured by
+the same lookup a seat preparation runs: a `writer` object under `--json`
+and a `writer for …` line in text. It names the repository and owner, the
+primary root consulted and which source named it, and the state — `published`
+(with the directory and source, `ageSeconds` from the token file's publish
+time and the sidecar's remaining lifetime), `missing` (no writer published
+for the owner), `expired` (each directory passed over, and how long ago its
+token died), `unreadable` (a directory matched but `gh auth token` yielded
+nothing), `ambient` (a token already in the process environment, whose age
+is not measurable), `not-github`, or `unresolved` (no readable origin). Each
+fact the lookup cannot measure says so rather than guessing. A Builder or
+Doctor row refused for it carries the cause; the line ends with whether a
+writer job can be admitted.
+
 ## Compatibility
 
 - A daemon that predates `roleDraw` ignores `runtimes.roleDraw` and

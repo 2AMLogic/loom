@@ -27,6 +27,35 @@ pub(super) const TOKEN_ENV: &str = "GH_TOKEN";
 /// Bound on the local `gh auth token` read (no network request is sent).
 const TOKEN_READ_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// Which directory a lookup reads the owner's token from, in lookup order
+/// (#14936). A name and a path, never a token value, so a refusal or the
+/// `roles draw --explain` view can say which source was consulted.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Source {
+    /// The daemon's per-owner registry.
+    Registry,
+    /// The owner's App directory under the daemon's primary root.
+    PrimaryOwner,
+    /// The owner's App directory under this workspace.
+    WorkspaceOwner,
+    /// The primary root's own `.loom/gh-config`, for the root owner.
+    PrimaryRoot,
+    /// This workspace's own `.loom/gh-config`, for the root owner.
+    WorkspaceRoot,
+}
+
+impl Source {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Registry => "the daemon's per-owner registry",
+            Self::PrimaryOwner => "the owner's App directory under the primary root",
+            Self::WorkspaceOwner => "the owner's App directory under this workspace",
+            Self::PrimaryRoot => "the primary root's own App directory (root owner)",
+            Self::WorkspaceRoot => "this workspace's own App directory (root owner)",
+        }
+    }
+}
+
 /// What one exec forwards: the forge variable names for argv, and the values
 /// this host resolved itself, for the `docker` child's environment only.
 ///
@@ -41,6 +70,14 @@ pub(super) struct ExecAuth {
     /// A credential directory matched to this repository's owner exists but
     /// its token is provably expired, and no fresher one was found (#14435).
     expired: bool,
+    /// The directory `secret` was read from (#14936).
+    chosen: Option<(PathBuf, Source)>,
+    /// Every matched directory a sidecar proved expired (#14936).
+    expired_dirs: Vec<(PathBuf, Source)>,
+    /// The primary root the lookup consulted, and which source named it
+    /// (#14936).
+    primary: Option<PathBuf>,
+    primary_source: &'static str,
 }
 
 impl ExecAuth {
@@ -112,41 +149,50 @@ impl ExecAuth {
             .iter()
             .any(|name| env(name).is_some_and(|v| !v.is_empty()));
         if has_token {
-            return Self {
-                names,
-                secret: None,
-                github_unresolved: false,
-                expired: false,
-            };
+            return Self::forwarded(names);
         }
         let gh_host = env("GH_HOST")
             .and_then(|v| v.into_string().ok())
             .filter(|v| !v.is_empty())
             .unwrap_or_else(|| "github.com".into());
         let Some(slug) = github_slug(repository, &gh_host) else {
-            return Self {
-                names,
-                secret: None,
-                github_unresolved: false,
-                expired: false,
-            };
+            return Self::forwarded(names);
         };
         // No directory proven to hold THIS owner's installation token: read
         // nothing. The process `GH_CONFIG_DIR` is the workspace-root owner's
         // credential on a daemon host, and handing it to another owner's
         // repository would forward the wrong installation's token.
-        let primary = primary_root(env, registered, daemon_root);
+        let (primary, primary_source) = primary_root(env, registered, daemon_root);
         let choice =
             config_dir_for(workspace, primary.as_deref(), &slug, &gh_host, SystemTime::now());
-        let secret = choice.dir.and_then(|dir| read(&dir));
+        let secret = choice.dir.as_ref().and_then(|(dir, _)| read(dir));
         if secret.is_some() && !names.contains(&TOKEN_ENV) {
             names.push(TOKEN_ENV);
         }
         Self {
-            names,
             github_unresolved: secret.is_none(),
-            expired: secret.is_none() && choice.expired,
+            expired: secret.is_none() && !choice.expired.is_empty(),
             secret,
+            chosen: choice.dir,
+            expired_dirs: choice.expired,
+            primary,
+            primary_source,
+            names,
+        }
+    }
+
+    /// An exec that forwards only what the process already carries: a token
+    /// in the environment, or a repository no GitHub lookup applies to.
+    fn forwarded(names: Vec<&'static str>) -> Self {
+        Self {
+            names,
+            secret: None,
+            github_unresolved: false,
+            expired: false,
+            chosen: None,
+            expired_dirs: Vec::new(),
+            primary: None,
+            primary_source: NO_PRIMARY_ROOT,
         }
     }
 
@@ -155,6 +201,36 @@ impl ExecAuth {
     /// should refuse before it claims anything (#14435).
     pub(super) fn expired(&self) -> bool {
         self.expired
+    }
+
+    /// Why preparing a seat for `repository` must stop BEFORE its lease, or
+    /// `None` when this credential state admits the job (#14435, #14936).
+    ///
+    /// A job that needs the writer is refused on a missing credential too:
+    /// before #14936 only a provably expired one stopped here, so a GitHub
+    /// job with no published writer at all took the lease, began its job and
+    /// only then failed on a credential-less `git fetch` — leaving a seat to
+    /// recover. A job with no push of its own keeps the earlier rule. The two
+    /// refusals are worded apart so the operator can tell an unpublished
+    /// writer from one the refresh has not renewed.
+    pub(super) fn refusal(
+        &self,
+        repository: &str,
+        need: super::dispatch::ForgeNeed,
+    ) -> Option<String> {
+        if self.expired {
+            return Some(format!(
+                "private workspace forge credential for {repository} is expired and no fresher \
+                 one is published; the credential refresh has not renewed it"
+            ));
+        }
+        if need == super::dispatch::ForgeNeed::Writer && self.github_unresolved {
+            return Some(format!(
+                "no GitHub write credential for {repository}: no writer was published for the \
+                 repository owner and no GH_TOKEN is in the environment; the seat was not leased"
+            ));
+        }
+        None
     }
 
     /// The variable names to pass as bare `--env NAME` arguments.
@@ -183,6 +259,317 @@ impl ExecAuth {
     /// process that carries a token (#14433).
     pub(super) fn github_token_missing(&self) -> bool {
         self.github_unresolved
+    }
+}
+
+/// The seat writer state of one workspace for one repository, in non-secret
+/// terms (#14936): what `roles draw --explain` shows. Paths, sources, a
+/// publish time and a sidecar expiry — never a token value.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct WriterView {
+    /// The repository a seat of this workspace acts on. `None` when the
+    /// workspace's origin cannot be read, so no seat can be selected at all.
+    pub repository: Option<String>,
+    /// That repository's GitHub owner, when it is on the GitHub host.
+    pub owner: Option<String>,
+    /// The primary root a seat's lookup consults, and which source named it
+    /// (`NO_PRIMARY_ROOT` when nothing does).
+    pub primary_root: Option<PathBuf>,
+    pub primary_root_source: &'static str,
+    pub state: WriterState,
+}
+
+/// What a lookup found for the repository's owner (#14936).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum WriterState {
+    /// The process environment already carries a token; its age is not
+    /// measurable here.
+    Ambient,
+    /// Not a repository on the GitHub host: no writer is looked for.
+    NotGithub,
+    /// The workspace's origin could not be read.
+    Unresolved,
+    /// A matched directory yielded a token. `credential` is `None` only if
+    /// the directory vanished between the read and the report.
+    Published {
+        dir: PathBuf,
+        source: Source,
+        credential: Option<crate::credential_preflight::PublishedCredential>,
+    },
+    /// A directory matched the owner but `gh auth token` yielded nothing
+    /// from it: published, and still no writer for the seat.
+    Unreadable {
+        dir: PathBuf,
+        source: Source,
+        credential: Option<crate::credential_preflight::PublishedCredential>,
+    },
+    /// A matched directory's sidecar proves its token expired, and no token
+    /// was read from any fresher one — the state a launch refuses as
+    /// expired.
+    Expired {
+        passed_over: Vec<(PathBuf, Source)>,
+        credentials: Vec<crate::credential_preflight::PublishedCredential>,
+    },
+    /// No directory matched the owner: no writer was published for it.
+    None,
+}
+
+type CredentialRef<'a> = Option<&'a crate::credential_preflight::PublishedCredential>;
+
+impl WriterState {
+    /// The stable name the JSON form carries.
+    pub(crate) fn name(&self) -> &'static str {
+        match self {
+            Self::Ambient => "ambient",
+            Self::NotGithub => "not-github",
+            Self::Unresolved => "unresolved",
+            Self::Published { .. } => "published",
+            Self::Unreadable { .. } => "unreadable",
+            Self::Expired { .. } => "expired",
+            Self::None => "missing",
+        }
+    }
+
+    fn located(&self) -> Option<(&Path, Source, CredentialRef<'_>)> {
+        let (dir, source, credential) = match self {
+            Self::Published {
+                dir,
+                source,
+                credential,
+            }
+            | Self::Unreadable {
+                dir,
+                source,
+                credential,
+            } => (dir, *source, credential.as_ref()),
+            _ => return None,
+        };
+        Some((dir.as_path(), source, credential))
+    }
+}
+
+impl WriterView {
+    /// Whether a seat preparation for a job that needs the writer would be
+    /// admitted: the same answer [`ExecAuth::refusal`] gives that launch.
+    pub(crate) fn admitted(&self) -> bool {
+        matches!(
+            self.state,
+            WriterState::Ambient | WriterState::NotGithub | WriterState::Published { .. }
+        )
+    }
+
+    /// One line for the text view.
+    pub(crate) fn describe(&self) -> String {
+        let repository = self.repository.as_deref().unwrap_or("the repository");
+        let owner = self.owner.as_deref().unwrap_or("?");
+        let subject = match &self.owner {
+            Some(owner) => format!(" for {repository} (owner {owner})"),
+            None if self.repository.is_some() => format!(" for {repository}"),
+            None => String::new(),
+        };
+        let state = match &self.state {
+            WriterState::Ambient => {
+                "a token is already in this process environment; its age is not measurable here"
+                    .to_owned()
+            }
+            WriterState::NotGithub => "not on the GitHub host; no writer is looked for".to_owned(),
+            WriterState::Unresolved => {
+                "the workspace origin cannot be read; there is no repository to find a writer for"
+                    .to_owned()
+            }
+            WriterState::Published { .. } | WriterState::Unreadable { .. } => {
+                let (dir, source, credential) = self.state.located().expect("a located state");
+                let read = if matches!(self.state, WriterState::Published { .. }) {
+                    ""
+                } else {
+                    ", but no token could be read from it"
+                };
+                format!(
+                    "published in {} ({}), {}{read}",
+                    dir.display(),
+                    source.as_str(),
+                    credential
+                        .map_or_else(|| "age and expiry unknown".to_owned(), |c| c.describe())
+                )
+            }
+            WriterState::Expired { passed_over, .. } => {
+                let named: Vec<String> = passed_over
+                    .iter()
+                    .map(|(dir, _)| dir.display().to_string())
+                    .collect();
+                format!(
+                    "every published writer is expired ({}); no fresher one was found",
+                    named.join(", ")
+                )
+            }
+            WriterState::None if self.primary_root.is_some() => format!(
+                "no writer was published for owner {owner} under the primary root or this \
+                 workspace, and no GH_TOKEN is in this process"
+            ),
+            WriterState::None => format!(
+                "no writer was published for owner {owner} under this workspace, and no GH_TOKEN \
+                 is in this process"
+            ),
+        };
+        let root = self.primary_root.as_ref().map_or_else(String::new, |root| {
+            format!("; primary root {} (from {})", root.display(), self.primary_root_source)
+        });
+        format!("writer{subject}: {state}{root}")
+    }
+
+    /// The JSON object the `--json` form carries.
+    pub(crate) fn to_json(&self) -> serde_json::Value {
+        use serde_json::json;
+        let located = self.state.located();
+        let mut object = json!({
+            "repository": self.repository,
+            "owner": self.owner,
+            "primaryRoot": self.primary_root,
+            "primaryRootSource": self.primary_root_source,
+            "state": self.state.name(),
+            "admitted": self.admitted(),
+            "detail": self.describe(),
+        });
+        if let Some((dir, source, credential)) = located {
+            object["dir"] = json!(dir.display().to_string());
+            object["source"] = json!(source.as_str());
+            object["credential"] = credential.map_or(serde_json::Value::Null, credential_json);
+        }
+        if let WriterState::Expired {
+            passed_over,
+            credentials,
+        } = &self.state
+        {
+            object["passedOver"] = json!(passed_over
+                .iter()
+                .zip(credentials)
+                .map(|((dir, source), credential)| json!({
+                    "dir": dir.display().to_string(),
+                    "source": source.as_str(),
+                    "credential": credential_json(credential),
+                }))
+                .collect::<Vec<_>>());
+        }
+        object
+    }
+}
+
+/// The measurable facts of one published credential, each `null` when it
+/// cannot be measured (#14936).
+fn credential_json(
+    credential: &crate::credential_preflight::PublishedCredential,
+) -> serde_json::Value {
+    use crate::credential_preflight::CredentialLife;
+    use serde_json::json;
+    json!({
+        "ageSeconds": credential.age.map(|age| age.as_secs()),
+        "lifetime": match credential.life {
+            CredentialLife::Live { remaining } => json!({"remainingSeconds": remaining.as_secs()}),
+            CredentialLife::Expired { since } => json!({"expiredSecondsAgo": since.as_secs()}),
+            CredentialLife::Unknown => serde_json::Value::Null,
+        },
+    })
+}
+
+/// The writer state of `workspace` for `repository` (#14936), by the same
+/// lookup a seat preparation runs — so the view cannot say a launch is
+/// admitted where the launch would refuse, or the reverse.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn writer_view(
+    workspace: &Path,
+    repository: Option<&str>,
+    env: &dyn Fn(&str) -> Option<OsString>,
+    read: &dyn Fn(&Path) -> Option<String>,
+    registered: Option<&Path>,
+    daemon_root: &dyn Fn() -> Option<PathBuf>,
+    now: SystemTime,
+) -> WriterView {
+    use crate::credential_preflight as creds;
+    let gh_host = env("GH_HOST")
+        .and_then(|v| v.into_string().ok())
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| "github.com".into());
+    let slug = repository.and_then(|r| github_slug(r, &gh_host));
+    let owner = slug
+        .as_deref()
+        .map(|slug| creds::owner_of_nwo(slug).to_owned());
+    let ambient = ["GH_TOKEN", "GITHUB_TOKEN"]
+        .iter()
+        .any(|name| env(name).is_some_and(|v| !v.is_empty()));
+    if repository.is_none() {
+        return WriterView {
+            repository: None,
+            owner: None,
+            primary_root: None,
+            primary_root_source: NO_PRIMARY_ROOT,
+            state: WriterState::Unresolved,
+        };
+    }
+    if ambient || slug.is_none() {
+        // Nothing is looked up, exactly as a launch looks nothing up here;
+        // so no daemon is asked for a root either.
+        let (primary_root, primary_root_source) =
+            match env("LOOM_MACHINE_CHECKOUT").filter(|v| !v.is_empty()) {
+                Some(root) => (Some(PathBuf::from(root)), "LOOM_MACHINE_CHECKOUT"),
+                None => (
+                    registered.map(Path::to_path_buf),
+                    registered.map_or(NO_PRIMARY_ROOT, |_| "the daemon's registered root"),
+                ),
+            };
+        return WriterView {
+            repository: repository.map(str::to_owned),
+            owner,
+            primary_root,
+            primary_root_source,
+            state: if ambient {
+                WriterState::Ambient
+            } else {
+                WriterState::NotGithub
+            },
+        };
+    }
+    let auth = ExecAuth::resolve_with_lookup(
+        workspace,
+        repository.unwrap_or_default(),
+        env,
+        read,
+        registered,
+        daemon_root,
+    );
+    let state = if auth.expired {
+        let credentials = auth
+            .expired_dirs
+            .iter()
+            .filter_map(|(dir, _)| creds::published_credential(dir, now))
+            .collect();
+        WriterState::Expired {
+            passed_over: auth.expired_dirs.clone(),
+            credentials,
+        }
+    } else if let Some((dir, source)) = &auth.chosen {
+        let credential = creds::published_credential(dir, now);
+        if auth.secret.is_some() {
+            WriterState::Published {
+                dir: dir.clone(),
+                source: *source,
+                credential,
+            }
+        } else {
+            WriterState::Unreadable {
+                dir: dir.clone(),
+                source: *source,
+                credential,
+            }
+        }
+    } else {
+        WriterState::None
+    };
+    WriterView {
+        repository: repository.map(str::to_owned),
+        owner,
+        primary_root: auth.primary.clone(),
+        primary_root_source: auth.primary_source,
+        state,
     }
 }
 
@@ -228,17 +615,24 @@ pub(super) fn github_slug(repository: &str, gh_host: &str) -> Option<String> {
 /// (#13937), as does any operator export. A CLI process launched from an
 /// operator shell has none of these, so as a last resort it asks the running
 /// daemon for the root it registered (#14534); an explicit root always wins.
+/// The label names which of the three answered (#14936), so a view can say
+/// where a lookup looked.
 fn primary_root(
     env: &dyn Fn(&str) -> Option<OsString>,
     registered: Option<&Path>,
     daemon_root: &dyn Fn() -> Option<PathBuf>,
-) -> Option<PathBuf> {
-    env("LOOM_MACHINE_CHECKOUT")
-        .filter(|v| !v.is_empty())
-        .map(PathBuf::from)
-        .or(registered.map(Path::to_path_buf))
-        .or_else(daemon_root)
+) -> (Option<PathBuf>, &'static str) {
+    if let Some(root) = env("LOOM_MACHINE_CHECKOUT").filter(|v| !v.is_empty()) {
+        return (Some(PathBuf::from(root)), "LOOM_MACHINE_CHECKOUT");
+    }
+    if let Some(root) = registered {
+        return (Some(root.to_path_buf()), "the daemon's registered root");
+    }
+    (daemon_root(), "the running daemon's answer")
 }
+
+/// No primary root is known to this process: nothing names one.
+pub(crate) const NO_PRIMARY_ROOT: &str = "none";
 
 /// The `GH_CONFIG_DIR` proven to hold the installation token for `slug`'s
 /// owner: the daemon's per-owner registry, else the owner's App directory
@@ -289,38 +683,41 @@ fn config_dir_for(
             .eq_ignore_ascii_case(owner)
             .then_some(dir)
     };
-    let candidates: [&dyn Fn() -> Option<PathBuf>; 5] = [
-        &|| creds::gh_config_dir_for_owner_slug(slug).filter(|dir| dir.join("hosts.yml").is_file()),
-        &|| primary.and_then(published),
-        &|| published(workspace),
-        &|| primary.and_then(root_owned),
-        &|| root_owned(workspace),
+    let candidates: [(Source, &dyn Fn() -> Option<PathBuf>); 5] = [
+        (Source::Registry, &|| {
+            creds::gh_config_dir_for_owner_slug(slug).filter(|dir| dir.join("hosts.yml").is_file())
+        }),
+        (Source::PrimaryOwner, &|| primary.and_then(published)),
+        (Source::WorkspaceOwner, &|| published(workspace)),
+        (Source::PrimaryRoot, &|| primary.and_then(root_owned)),
+        (Source::WorkspaceRoot, &|| root_owned(workspace)),
     ];
     // The first candidate whose token is not provably dead wins. A directory
     // that is merely present is NOT enough (#14435): `gh-config-by-owner/
     // <owner>/hosts.yml` outlives its token whenever nothing refreshes it
     // (the workspace-root owner's live token is in `.loom/gh-config`), and
     // `gh auth token` hands back an expired value without complaint.
-    let mut expired = false;
-    for candidate in candidates {
+    let mut choice = DirChoice {
+        dir: None,
+        expired: Vec::new(),
+    };
+    for (source, candidate) in candidates {
         let Some(dir) = candidate() else { continue };
         if token_expired(&dir, now) {
-            expired = true;
+            choice.expired.push((dir, source));
             continue;
         }
-        return DirChoice {
-            dir: Some(dir),
-            expired: false,
-        };
+        choice.dir = Some((dir, source));
+        break;
     }
-    DirChoice { dir: None, expired }
+    choice
 }
 
-/// Which credential directory an exec reads, and whether a matched one was
-/// passed over because its token is dead.
+/// Which credential directory an exec reads, and which matched ones were
+/// passed over because their token is dead (#14936 names both by source).
 struct DirChoice {
-    dir: Option<PathBuf>,
-    expired: bool,
+    dir: Option<(PathBuf, Source)>,
+    expired: Vec<(PathBuf, Source)>,
 }
 
 /// `true` only when `dir`'s `identity.json` sidecar PROVES the token expired
@@ -1142,5 +1539,370 @@ mod tests {
         std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
         assert_eq!(read_token(dir.path(), Some(&stub)).as_deref(), Some(SECRET));
         assert_eq!(read_token(Path::new("/elsewhere"), Some(&stub)), None);
+    }
+
+    // ---- #14936: the pre-lease refusal and the writer view ----
+
+    const WRITER_REPO: &str = "https://github.com/acme-14936/widget";
+
+    /// Publish `expires_at` beside an owner directory under `root`.
+    fn owner_dir(root: &Path, owner: &str, expires_at: Option<&str>) -> PathBuf {
+        let dir = crate::credential_preflight::github_app_gh_config_dir_for_owner(root, owner);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("hosts.yml"), "github.com: {}\n").unwrap();
+        if let Some(expires_at) = expires_at {
+            write_sidecar(&dir, expires_at);
+        }
+        dir
+    }
+
+    /// #14936: the refusal a seat preparation stops on, over the states the
+    /// issue's test plan names. A writer job with NO writer was the gap: only
+    /// a provably expired credential stopped it, so it leased a seat and
+    /// failed on a credential-less fetch.
+    #[test]
+    fn a_writer_job_is_refused_on_a_missing_writer_apart_from_an_expired_one() {
+        use super::super::dispatch::ForgeNeed;
+        let repo = WRITER_REPO;
+        let none = env_of(&[]);
+        let unread = |_: &Path| -> Option<String> { None };
+        let seat = tempfile::tempdir().unwrap();
+
+        // No writer anywhere.
+        let auth = ExecAuth::resolve_with_root(seat.path(), repo, &none, &unread, None);
+        let missing = auth
+            .refusal(repo, ForgeNeed::Writer)
+            .expect("a writer job is refused");
+        assert!(
+            missing.starts_with(&format!("no GitHub write credential for {repo}:")),
+            "{missing}"
+        );
+        assert!(missing.contains("the seat was not leased"), "{missing}");
+        assert!(!missing.contains("expired"), "{missing}");
+        // A job with no push of its own keeps its earlier path.
+        assert_eq!(auth.refusal(repo, ForgeNeed::Any), None);
+
+        // Expired-only candidates: both needs refuse, as expired.
+        let stale = tempfile::tempdir().unwrap();
+        owner_dir(stale.path(), "acme-14936", Some("2020-01-01T00:00:00Z"));
+        let auth = ExecAuth::resolve_with_root(stale.path(), repo, &none, &unread, None);
+        for need in [ForgeNeed::Writer, ForgeNeed::Any] {
+            let refused = auth
+                .refusal(repo, need)
+                .expect("an expired credential is refused");
+            assert!(
+                refused.starts_with(&format!(
+                    "private workspace forge credential for {repo} is expired and no fresher one \
+                     is published"
+                )),
+                "{refused}"
+            );
+            assert!(!refused.contains("no GitHub write credential"), "{refused}");
+        }
+
+        // A fresh writer under the primary root, with an EMPTY managed
+        // checkout: admitted, and read from the primary root alone.
+        let primary = tempfile::tempdir().unwrap();
+        let fresh = owner_dir(primary.path(), "acme-14936", Some("2999-01-01T00:00:00Z"));
+        let seen = std::cell::RefCell::new(None);
+        let read = |dir: &Path| {
+            *seen.borrow_mut() = Some(dir.to_path_buf());
+            Some(SECRET.to_owned())
+        };
+        let auth =
+            ExecAuth::resolve_with_root(seat.path(), repo, &none, &read, Some(primary.path()));
+        assert_eq!(auth.refusal(repo, ForgeNeed::Writer), None);
+        assert_eq!(seen.borrow().as_deref(), Some(fresh.as_path()));
+        assert!(!seat.path().join(".loom").exists(), "the managed checkout stays empty");
+
+        // The managed checkout's own copy has no sidecar (its age is
+        // unknown): the primary root's fresh, dated writer still wins.
+        let undated_copy = owner_dir(seat.path(), "acme-14936", None);
+        *seen.borrow_mut() = None;
+        let auth =
+            ExecAuth::resolve_with_root(seat.path(), repo, &none, &read, Some(primary.path()));
+        assert_eq!(auth.refusal(repo, ForgeNeed::Writer), None);
+        assert_eq!(seen.borrow().as_deref(), Some(fresh.as_path()));
+        std::fs::remove_dir_all(&undated_copy).unwrap();
+
+        // Unknown age with nothing fresher: unknown is not expired, so the
+        // token is still read and the job admitted (the pre-sidecar rule).
+        let undated = tempfile::tempdir().unwrap();
+        owner_dir(undated.path(), "acme-14936", None);
+        let auth =
+            ExecAuth::resolve_with_root(undated.path(), repo, &none, &read, Some(undated.path()));
+        assert_eq!(auth.refusal(repo, ForgeNeed::Writer), None);
+        assert!(auth.resolved());
+
+        // An ambient writer.
+        let ambient = env_of(&[("GITHUB_TOKEN", "from-process")]);
+        let auth = ExecAuth::resolve_with_root(seat.path(), repo, &ambient, &unread, None);
+        assert_eq!(auth.refusal(repo, ForgeNeed::Writer), None);
+
+        // A non-GitHub forge follows its existing path.
+        let gitea = ExecAuth::resolve_with_root(
+            seat.path(),
+            "https://forge.example/acme-14936/widget",
+            &none,
+            &unread,
+            None,
+        );
+        assert_eq!(
+            gitea.refusal("https://forge.example/acme-14936/widget", ForgeNeed::Writer),
+            None
+        );
+
+        // A healthy read relay alone: fresh READER tokens under the owner,
+        // and no writer. The fetch could be served; the writer job cannot.
+        let relayed = tempfile::tempdir().unwrap();
+        let owner = crate::credential_preflight::github_app_gh_config_dir_for_owner(
+            relayed.path(),
+            "acme-14936",
+        );
+        for app in ["5100879", "5101048"] {
+            let reader = owner.join(app);
+            std::fs::create_dir_all(&reader).unwrap();
+            std::fs::write(reader.join("hosts.yml"), "github.com: {}\n").unwrap();
+            std::fs::write(
+                reader.join("identity.json"),
+                r#"{"appId":"x","slug":null,"installationId":"2","owner":"acme-14936","role":"reader","expiresAt":"2999-01-01T00:00:00Z"}"#,
+            )
+            .unwrap();
+        }
+        let auth = ExecAuth::resolve_with_root(relayed.path(), repo, &none, &unread, None);
+        assert!(auth.refusal(repo, ForgeNeed::Writer).is_some(), "a reader is not a writer");
+
+        // A healthy sibling workspace stays eligible while this one is
+        // refused: the lookup is per workspace. Neither can lean on the
+        // daemon root here, which publishes nothing for this owner.
+        let bare = tempfile::tempdir().unwrap();
+        let sibling = tempfile::tempdir().unwrap();
+        let sibling_dir = owner_dir(sibling.path(), "acme-14936", Some("2999-01-01T00:00:00Z"));
+        let empty = tempfile::tempdir().unwrap();
+        let refused =
+            ExecAuth::resolve_with_root(empty.path(), repo, &none, &read, Some(bare.path()));
+        assert!(refused.refusal(repo, ForgeNeed::Writer).is_some());
+        *seen.borrow_mut() = None;
+        let eligible =
+            ExecAuth::resolve_with_root(sibling.path(), repo, &none, &read, Some(bare.path()));
+        assert_eq!(eligible.refusal(repo, ForgeNeed::Writer), None);
+        assert_eq!(seen.borrow().as_deref(), Some(sibling_dir.as_path()));
+    }
+
+    fn minutes(n: u64) -> Duration {
+        Duration::from_secs(n * 60)
+    }
+
+    /// #14936: the view names the workspace, the source a writer was read
+    /// from, its age when measurable, and says when the age or the writer is
+    /// unknown — in paths and times, never a token.
+    #[test]
+    fn the_writer_view_names_the_source_and_measures_the_age_against_a_fixed_clock() {
+        let repo = WRITER_REPO;
+        let none = env_of(&[]);
+        let down = || None;
+        let seat = tempfile::tempdir().unwrap();
+        let unread = |_: &Path| -> Option<String> { None };
+        let primary = tempfile::tempdir().unwrap();
+        let checkout = primary.path().to_str().unwrap().to_owned();
+
+        // Published and read: the age is the token file's, measured against
+        // the injected clock; the lifetime is the sidecar's.
+        let dir = owner_dir(primary.path(), "acme-14936", Some("2999-01-01T00:00:00Z"));
+        let published = std::fs::metadata(dir.join("hosts.yml"))
+            .unwrap()
+            .modified()
+            .unwrap();
+        let read = |_: &Path| Some(SECRET.to_owned());
+        let view = writer_view(
+            seat.path(),
+            Some(repo),
+            &env_of(&[("LOOM_MACHINE_CHECKOUT", &checkout)]),
+            &read,
+            None,
+            &down,
+            published + minutes(12),
+        );
+        assert_eq!(view.repository.as_deref(), Some(repo));
+        assert_eq!(view.owner.as_deref(), Some("acme-14936"));
+        assert_eq!(view.primary_root.as_deref(), Some(primary.path()));
+        assert_eq!(view.primary_root_source, "LOOM_MACHINE_CHECKOUT");
+        assert!(view.admitted());
+        let WriterState::Published {
+            dir: chosen,
+            source,
+            credential: Some(credential),
+        } = &view.state
+        else {
+            panic!("a published, read writer: {:?}", view.state);
+        };
+        assert_eq!(chosen, &dir);
+        assert_eq!(*source, Source::PrimaryOwner);
+        assert_eq!(credential.age, Some(minutes(12)));
+        assert!(matches!(
+            credential.life,
+            crate::credential_preflight::CredentialLife::Live { .. }
+        ));
+        let text = view.describe();
+        assert!(
+            text.contains("for https://github.com/acme-14936/widget (owner acme-14936)"),
+            "{text}"
+        );
+        assert!(
+            text.contains(&format!(
+                "published in {} (the owner's App directory under the primary root), age 12m, ",
+                dir.display()
+            )),
+            "{text}"
+        );
+        assert!(
+            text.contains(&format!(
+                "primary root {} (from LOOM_MACHINE_CHECKOUT)",
+                primary.path().display()
+            )),
+            "{text}"
+        );
+        assert!(!text.contains(SECRET), "a token value never reaches the view");
+        let json = view.to_json();
+        assert_eq!(json["state"], "published");
+        assert_eq!(json["admitted"], true);
+        assert_eq!(json["dir"], dir.display().to_string());
+        assert_eq!(json["source"], "the owner's App directory under the primary root");
+        assert_eq!(json["credential"]["ageSeconds"], 720);
+        assert!(json["credential"]["lifetime"]["remainingSeconds"]
+            .as_u64()
+            .is_some());
+        assert!(json.to_string().find(SECRET).is_none(), "a token value never reaches the JSON");
+
+        // No sidecar: the age still measures, the expiry is unknown.
+        std::fs::remove_file(dir.join("identity.json")).unwrap();
+        let view = writer_view(
+            seat.path(),
+            Some(repo),
+            &none,
+            &read,
+            Some(primary.path()),
+            &down,
+            published + minutes(30),
+        );
+        let text = view.describe();
+        assert!(text.contains("age 30m, expiry unknown (no identity sidecar)"), "{text}");
+        assert_eq!(view.to_json()["credential"]["lifetime"], serde_json::Value::Null);
+
+        // Published but unreadable: `gh auth token` yields nothing.
+        let view = writer_view(
+            seat.path(),
+            Some(repo),
+            &none,
+            &unread,
+            Some(primary.path()),
+            &down,
+            published + minutes(30),
+        );
+        assert_eq!(view.state.name(), "unreadable");
+        assert!(!view.admitted());
+        assert!(
+            view.describe()
+                .contains(", but no token could be read from it"),
+            "{}",
+            view.describe()
+        );
+
+        // Expired: named with how long ago, and the directories passed over.
+        std::fs::remove_dir_all(&dir).unwrap();
+        let expired = owner_dir(primary.path(), "acme-14936", Some("2020-01-01T00:00:00Z"));
+        let view = writer_view(
+            seat.path(),
+            Some(repo),
+            &none,
+            &read,
+            Some(primary.path()),
+            &down,
+            SystemTime::now(),
+        );
+        assert_eq!(view.state.name(), "expired");
+        assert!(!view.admitted());
+        let text = view.describe();
+        assert!(
+            text.contains(&format!("every published writer is expired ({})", expired.display())),
+            "{text}"
+        );
+        assert!(
+            view.to_json()["passedOver"][0]["credential"]["lifetime"]["expiredSecondsAgo"]
+                .as_u64()
+                .is_some(),
+            "{}",
+            view.to_json()
+        );
+        assert_eq!(
+            view.to_json()["passedOver"][0]["source"],
+            "the owner's App directory under the primary root"
+        );
+
+        // No writer published: the owner and the root looked under are named.
+        std::fs::remove_dir_all(&expired).unwrap();
+        let view = writer_view(
+            seat.path(),
+            Some(repo),
+            &none,
+            &read,
+            Some(primary.path()),
+            &down,
+            published,
+        );
+        assert_eq!(view.state, WriterState::None);
+        assert!(!view.admitted());
+        let text = view.describe();
+        assert_eq!(
+            text,
+            format!(
+                "writer for {repo} (owner acme-14936): no writer was published for owner \
+                 acme-14936 under the primary root or this workspace, and no GH_TOKEN is in this \
+                 process; primary root {} (from the daemon's registered root)",
+                primary.path().display()
+            )
+        );
+        assert_eq!(view.to_json()["state"], "missing");
+        assert_eq!(view.to_json()["dir"], serde_json::Value::Null);
+        assert_eq!(view.to_json()["passedOver"], serde_json::Value::Null);
+
+        // No repository to find a writer for, an ambient token, and a
+        // non-GitHub forge each say so.
+        let unresolved = writer_view(seat.path(), None, &none, &unread, None, &down, published);
+        assert_eq!(unresolved.state, WriterState::Unresolved);
+        assert_eq!(unresolved.primary_root_source, NO_PRIMARY_ROOT);
+        assert!(unresolved
+            .describe()
+            .contains("the workspace origin cannot be read"));
+        let ambient = writer_view(
+            seat.path(),
+            Some(repo),
+            &env_of(&[("GH_TOKEN", "from-process")]),
+            &unread,
+            None,
+            &down,
+            published,
+        );
+        assert_eq!(ambient.state, WriterState::Ambient);
+        assert_eq!(ambient.primary_root, None);
+        assert_eq!(ambient.primary_root_source, NO_PRIMARY_ROOT);
+        assert!(
+            ambient
+                .describe()
+                .contains("its age is not measurable here"),
+            "{}",
+            ambient.describe()
+        );
+        let gitea = writer_view(
+            seat.path(),
+            Some("https://forge.example/acme-14936/widget"),
+            &none,
+            &unread,
+            None,
+            &down,
+            published,
+        );
+        assert_eq!(gitea.state, WriterState::NotGithub);
+        assert!(gitea.admitted());
     }
 }

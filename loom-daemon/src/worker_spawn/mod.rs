@@ -1123,13 +1123,16 @@ fn run_preflight(
                 return Err(LaunchError::config(rejection.diagnostic())
                     .with_stage(LaunchStage::RoleAdmission))
             }
-            _ => crate::tokens_pool::private_workspace::dispatch::Selection::prepare(
+            _ => crate::tokens_pool::private_workspace::dispatch::Selection::prepare_as(
                 root,
                 &runtime,
                 model.as_deref(),
                 crate::tokens_pool::private_workspace::JobKind::Role,
                 None,
                 &owner,
+                crate::tokens_pool::private_workspace::dispatch::ForgeNeed::of_role(
+                    &nonempty_env("LOOM_ROLE").unwrap_or_default(),
+                ),
             )
             .map_err(|e| {
                 LaunchError::config(e.to_string()).with_stage(LaunchStage::WorkspaceAdmission)

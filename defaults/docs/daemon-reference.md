@@ -3112,6 +3112,63 @@ repo's verdict forever would be a worse failure than the one this fixes. Setting
 `LOOM_FORGE_CREDENTIAL_STALE_GRACE_SECS` to a very small value effectively
 restores pre-#5630 behavior.
 
+#### A writer job is refused before its lease when no writer reaches it (#14936)
+
+A Builder or Doctor step — and the sweep that hosts one — pushes from its
+private seat, so seat preparation resolves the repository owner's writer
+before it takes the account lease. Two credential states stop it there, in
+words that tell the operator which cause it is:
+
+- `no GitHub write credential for <repository>: no writer was published for
+  the repository owner and no GH_TOKEN is in the environment; the seat was
+  not leased` — nothing was found for the owner. The lookup read the daemon's
+  per-owner registry, `gh-config-by-owner/<owner>/` under the primary root
+  (`LOOM_MACHINE_CHECKOUT`, else the daemon's registered root) and under the
+  workspace, and, for the root owner only, the root's own `.loom/gh-config`.
+- `private workspace forge credential for <repository> is expired and no
+  fresher one is published; the credential refresh has not renewed it`
+  (#14435) — a directory matched, and its `identity.json` proved the token
+  dead.
+
+Before #14936 only the second state refused. A job with no published writer
+took the lease, began its job, and failed on a credential-less `git fetch`,
+leaving a seat to recover. A healthy read relay does not change this: reader
+tokens are never candidates for the writer, so they cannot admit a job that
+pushes. A valid token in the process environment, an owner-matched writer
+under the primary root (with or without a copy in the managed checkout), and
+a sidecar-less directory (expiry unknown, which is not expiry) are admitted
+as before. A launch with no push of its own — Judge, Curator — keeps its
+earlier rule and is refused only for the expired state; a repository not on
+the GitHub host is never refused here.
+
+The refusal reaches the dispatch walk's report (`<seat> failed: …` inside
+`no eligible seat could be prepared`), so the draw falls through to a runtime
+that can serve the role instead of stranding the step.
+
+#### Writer refresh diagnostics
+
+Each refresh source — the primary tick and every registered per-owner tick —
+logs **one** diagnostic per continuous failure, on its first failing tick and
+again on the first after a success:
+
+```
+writer refresh diagnostic: workspace=<daemon root> source=<source> renews=<config dir> reason=<failure>; published credential: age 19m, 41m left; a Builder or Doctor seat drawing on this workspace is refused until a refresh publishes a fresh writer — #14936
+```
+
+It names the root and directory the source was to renew and the credential
+actually on disk (its publish time and its sidecar's expiry; `age unknown`
+or `expiry unknown (no identity sidecar)` when either cannot be read;
+`nothing is published there` when no token file exists). No token value is
+ever logged. The per-tick failure lines above are unchanged; a per-owner
+source whose App no longer mints (`not_configured`) is an inactive publisher
+and gets the same single diagnostic.
+
+To see the state without waiting for a draw: `loom-daemon roles draw
+--explain` reports the workspace's writer under `writer` (`--json`) or as a
+`writer for …` line (text) — which source a token was read from, its age and
+remaining lifetime, and `missing`, `expired`, `unreadable` or `ambient`
+otherwise — see [role-draw.md](role-draw.md).
+
 ### One shared halt state
 
 `work_finder::tick_multi` derives `TickReport.halted` **directly** from the

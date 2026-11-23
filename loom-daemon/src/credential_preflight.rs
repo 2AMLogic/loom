@@ -88,11 +88,11 @@
 //!   path unchanged; that flag is explicit follow-up work once this core
 //!   lands (#4430 scope note).
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Mutex, OnceLock};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use chrono::Utc;
 use serde_json::Value;
@@ -809,6 +809,83 @@ pub fn forge_credential_stale_summary() -> Option<String> {
         .summary_at(Instant::now(), grace)
 }
 
+// ============================================================================
+// One diagnostic per continuous refresh failure (#14936)
+// ============================================================================
+
+/// Which refresh sources have already had their failure diagnostic logged.
+///
+/// A refresh tick that fails keeps failing on every tick (~5 min), and the
+/// per-tick warning says only that this tick failed. An operator reading the
+/// log needs the cause stated once per continuous failure — which workspace,
+/// which source, which directory it publishes to, and what the credential
+/// on disk looks like now — not the same line again every five minutes. The
+/// latch is per source, so a healthy owner's success neither suppresses nor
+/// re-arms a failing owner's diagnostic, and a success re-arms its own.
+#[derive(Debug, Default)]
+pub struct RefreshDiagnostics {
+    diagnosed: BTreeSet<String>,
+}
+
+impl RefreshDiagnostics {
+    /// Record one failed tick of `source`, which renews `config_dir` for
+    /// `workspace`, and log the diagnostic ([`refresh_failure_diagnostic`])
+    /// when this is the first failure of a new continuous failure. Returns
+    /// whether it logged: `true` on the first failing tick and on the first
+    /// again after a [`Self::success`], `false` for every tick in between.
+    pub fn failure(
+        &mut self,
+        workspace: &Path,
+        source: &str,
+        config_dir: &Path,
+        reason: &str,
+    ) -> bool {
+        if !self.diagnosed.insert(source.to_owned()) {
+            return false;
+        }
+        log::warn!(
+            "{}",
+            refresh_failure_diagnostic(workspace, source, config_dir, reason, SystemTime::now())
+        );
+        true
+    }
+
+    /// `source` refreshed successfully: its continuous failure is over, and
+    /// the next one is diagnosed again.
+    pub fn success(&mut self, source: &str) {
+        self.diagnosed.remove(source);
+    }
+}
+
+/// The one-line diagnostic for a refresh failure of `source` (#14936): the
+/// workspace and directory it was to renew, the credential actually on disk
+/// there, and the failure. Every part is non-secret — the reason is the
+/// shell helper's already-scrubbed text, and the credential is described by
+/// its publish time and its sidecar's expiry, never by its value.
+#[must_use]
+pub fn refresh_failure_diagnostic(
+    workspace: &Path,
+    source: &str,
+    config_dir: &Path,
+    reason: &str,
+    now: SystemTime,
+) -> String {
+    let published = published_credential(config_dir, now).map_or_else(
+        || "nothing is published there".to_owned(),
+        |credential| credential.describe(),
+    );
+    format!(
+        "writer refresh diagnostic: workspace={} source={} renews={} reason={}; published \
+         credential: {}; a Builder or Doctor seat drawing on this workspace is refused until a \
+         refresh publishes a fresh writer — #14936",
+        workspace.display(),
+        source,
+        config_dir.display(),
+        reason.split_whitespace().collect::<Vec<_>>().join(" "),
+        published
+    )
+}
+
 /// Resolve the `github-app-token.sh` path: prefer the installed
 /// `.loom/scripts/lib/` copy, else the in-repo `defaults/scripts/lib/`
 /// source — mirrors `auto_update::ScriptAutoUpdateProbe::resolve_script`.
@@ -1100,6 +1177,94 @@ pub fn publish_github_app_token(config_dir: &Path, token: &str) -> std::io::Resu
             sync_dir: false,
         },
     )
+}
+
+// ============================================================================
+// Published-credential state and refresh diagnostics (#14936)
+// ============================================================================
+
+/// How much of a published token's lifetime its `identity.json` sidecar
+/// claims is left (#14936).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CredentialLife {
+    /// The sidecar's expiry is still ahead.
+    Live { remaining: Duration },
+    /// The sidecar's expiry has passed.
+    Expired { since: Duration },
+    /// No readable sidecar: the expiry is unknown, which is not expiry.
+    Unknown,
+}
+
+/// The non-secret state of one published App credential directory (#14936):
+/// when its token file was last written, and how much lifetime its sidecar
+/// claims. The token value is never read.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PublishedCredential {
+    /// How long ago `hosts.yml` was written. `None` when its modification
+    /// time cannot be read or is ahead of `now` (a skewed clock): unknown,
+    /// never reported as an age.
+    pub age: Option<Duration>,
+    /// The lifetime the `identity.json` sidecar claims.
+    pub life: CredentialLife,
+}
+
+impl PublishedCredential {
+    /// One phrase for a log line, naming each fact it cannot measure.
+    #[must_use]
+    pub fn describe(&self) -> String {
+        let age = match self.age {
+            Some(age) => format!("age {}", elapsed_text(age)),
+            None => "age unknown (no readable publish time)".to_owned(),
+        };
+        let life = match self.life {
+            CredentialLife::Live { remaining } => format!("{} left", elapsed_text(remaining)),
+            CredentialLife::Expired { since } => {
+                format!("expired {} ago", elapsed_text(since))
+            }
+            CredentialLife::Unknown => "expiry unknown (no identity sidecar)".to_owned(),
+        };
+        format!("{age}, {life}")
+    }
+}
+
+/// The state of the credential published in `dir`, or `None` when `dir`
+/// holds no `hosts.yml` (#14936).
+#[must_use]
+pub fn published_credential(dir: &Path, now: SystemTime) -> Option<PublishedCredential> {
+    let hosts = dir.join("hosts.yml");
+    let Ok(written) = std::fs::metadata(&hosts).and_then(|meta| meta.modified()) else {
+        return None;
+    };
+    let age = now.duration_since(written).ok();
+    let life = match crate::forge_identity::read_sidecar(dir) {
+        None => CredentialLife::Unknown,
+        Some(side) => match chrono::DateTime::parse_from_rfc3339(&side.expires_at) {
+            Err(_) => CredentialLife::Unknown,
+            Ok(expiry) => {
+                let expiry: SystemTime = expiry.with_timezone(&chrono::Utc).into();
+                match expiry.duration_since(now) {
+                    Ok(remaining) => CredentialLife::Live { remaining },
+                    Err(past) => CredentialLife::Expired {
+                        since: past.duration(),
+                    },
+                }
+            }
+        },
+    };
+    Some(PublishedCredential { age, life })
+}
+
+/// A duration for a diagnostic line: `45s`, `19m`, `2h 5m`, `3d 4h`.
+#[must_use]
+pub fn elapsed_text(duration: Duration) -> String {
+    let seconds = duration.as_secs();
+    let (days, hours, minutes) = (seconds / 86_400, seconds % 86_400 / 3_600, seconds % 3_600 / 60);
+    match (days, hours, minutes) {
+        (0, 0, 0) => format!("{seconds}s"),
+        (0, 0, minutes) => format!("{minutes}m"),
+        (0, hours, minutes) => format!("{hours}h {minutes}m"),
+        (days, hours, _) => format!("{days}d {hours}h"),
+    }
 }
 
 // ============================================================================
@@ -3163,5 +3328,150 @@ mod tests {
         );
 
         clear_owner_root_registry();
+    }
+
+    // ---- #14936: published-credential state and one diagnostic per failure ----
+
+    /// Publish a writer credential through the real publisher, so the
+    /// directory carries the token file and its sidecar exactly as a refresh
+    /// tick leaves them.
+    fn publish_writer(dir: &Path, expires_at: &str) {
+        publish_outcome(
+            dir,
+            &GithubAppOutcome::Minted {
+                token: "ghs_TESTONLY_14936".to_owned(),
+                installation_id: "2".to_owned(),
+                app_id: "1".to_owned(),
+                expires_at: expires_at.to_owned(),
+            },
+            "Acme-14936/widget",
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn a_published_credential_reports_its_age_and_lifetime_against_a_fixed_clock() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(published_credential(dir.path(), SystemTime::now()), None, "nothing published");
+
+        publish_writer(dir.path(), "2999-01-01T00:00:00Z");
+        let written = std::fs::metadata(dir.path().join("hosts.yml"))
+            .unwrap()
+            .modified()
+            .unwrap();
+        let now = written + Duration::from_secs(19 * 60);
+        let state = published_credential(dir.path(), now).unwrap();
+        assert_eq!(state.age, Some(Duration::from_secs(19 * 60)));
+        assert!(matches!(state.life, CredentialLife::Live { .. }));
+        let described = state.describe();
+        assert!(described.starts_with("age 19m, "), "{described}");
+        assert!(described.ends_with(" left"), "{described}");
+
+        // A clock behind the publish time measures no age, and says so.
+        let skewed = published_credential(dir.path(), written - Duration::from_secs(60)).unwrap();
+        assert_eq!(skewed.age, None);
+        assert!(
+            skewed
+                .describe()
+                .starts_with("age unknown (no readable publish time), "),
+            "{}",
+            skewed.describe()
+        );
+
+        // Expired.
+        publish_writer(dir.path(), "2020-01-01T00:00:00Z");
+        let state = published_credential(dir.path(), now).unwrap();
+        assert!(matches!(state.life, CredentialLife::Expired { .. }));
+        assert!(state.describe().contains(", expired "), "{}", state.describe());
+
+        // No sidecar: the expiry is unknown, which is not expiry. No token
+        // file: no credential at all.
+        std::fs::remove_file(dir.path().join("identity.json")).unwrap();
+        assert_eq!(published_credential(dir.path(), now).unwrap().life, CredentialLife::Unknown);
+        std::fs::remove_file(dir.path().join("hosts.yml")).unwrap();
+        assert_eq!(published_credential(dir.path(), now), None);
+    }
+
+    #[test]
+    fn elapsed_text_rounds_a_duration_for_a_diagnostic_line() {
+        assert_eq!(elapsed_text(Duration::from_secs(45)), "45s");
+        assert_eq!(elapsed_text(Duration::from_secs(19 * 60)), "19m");
+        assert_eq!(elapsed_text(Duration::from_secs(2 * 3600 + 5 * 60)), "2h 5m");
+        assert_eq!(elapsed_text(Duration::from_secs(3 * 86_400 + 4 * 3600 + 59 * 60)), "3d 4h");
+    }
+
+    /// #14936: repeated failures, recovery and recurrence in the refresh
+    /// loop's latch — one diagnostic per continuous failure of a source, a
+    /// new one after a success, each source on its own.
+    #[test]
+    fn a_continuous_refresh_failure_is_diagnosed_once_and_again_after_recovery() {
+        let workspace = tempfile::tempdir().unwrap();
+        let dir = workspace.path().join(".loom").join("gh-config");
+        publish_writer(&dir, "2999-01-01T00:00:00Z");
+        let mut diagnostics = RefreshDiagnostics::default();
+        let primary = CREDENTIAL_SOURCE_PRIMARY;
+        let sibling = "per-owner github-app refresh (acme-14936/other)";
+        let fail = |diagnostics: &mut RefreshDiagnostics, source: &str| {
+            crate::test_log_capture::capture_logs(|| {
+                diagnostics.failure(workspace.path(), source, &dir, "mint timed out\nafter 20s");
+            })
+        };
+
+        let first = fail(&mut diagnostics, primary);
+        assert_eq!(first.len(), 1, "the first failing tick is diagnosed: {first:?}");
+        assert_eq!(first[0].0, log::Level::Warn);
+        let line = &first[0].1;
+        assert!(
+            line.starts_with(&format!(
+                "writer refresh diagnostic: workspace={} source={primary} renews={} ",
+                workspace.path().display(),
+                dir.display()
+            )),
+            "{line}"
+        );
+        assert!(line.contains("reason=mint timed out after 20s"), "one line: {line}");
+        assert!(
+            line.contains("published credential: age "),
+            "the credential on disk is described: {line}"
+        );
+        assert!(line.contains("#14936"), "{line}");
+        assert!(!line.contains("ghs_TESTONLY_14936"), "a token value never reaches the log");
+
+        // The streak continues: every further failing tick is silent.
+        assert!(fail(&mut diagnostics, primary).is_empty());
+        assert!(fail(&mut diagnostics, primary).is_empty());
+
+        // A healthy sibling source is neither suppressed by the failing one
+        // nor mixed into it: its own failure is diagnosed on its own.
+        let own = fail(&mut diagnostics, sibling);
+        assert_eq!(own.len(), 1, "{own:?}");
+        assert!(own[0].1.contains(&format!("source={sibling}")), "{}", own[0].1);
+        assert!(fail(&mut diagnostics, sibling).is_empty());
+
+        // Recovery ends the streak; the next failure is a new one.
+        diagnostics.success(primary);
+        assert!(fail(&mut diagnostics, primary).len() == 1, "a new diagnostic after recovery");
+        assert!(fail(&mut diagnostics, primary).is_empty());
+        // A success for a source that never failed is harmless.
+        diagnostics.success("never failed");
+    }
+
+    #[test]
+    fn a_refresh_failure_diagnostic_names_an_unpublished_credential() {
+        let workspace = tempfile::tempdir().unwrap();
+        let dir = workspace
+            .path()
+            .join(".loom")
+            .join("gh-config-by-owner")
+            .join("acme");
+        let line = refresh_failure_diagnostic(
+            workspace.path(),
+            "per-owner github-app refresh (acme/widget)",
+            &dir,
+            "  the   App is not configured ",
+            SystemTime::now(),
+        );
+        assert!(line.contains("published credential: nothing is published there"), "{line}");
+        assert!(line.contains("reason=the App is not configured;"), "{line}");
     }
 }
