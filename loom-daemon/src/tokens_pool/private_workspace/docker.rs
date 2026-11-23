@@ -68,7 +68,11 @@ fn command_status_env(
     if let Some(result) = fake::dispatch(args, env, timeout) {
         return result;
     }
-    let (success, stdout, _stderr) = docker_cli::run_bounded_env("docker", args, env, timeout)
+    // Shared lookup (#14885); a resolution failure fails the call with the
+    // same "Docker unavailable" context a failed spawn produced.
+    let program = crate::docker_bin::resolve_str()
+        .map_err(|error| anyhow::Error::new(error).context("Docker unavailable"))?;
+    let (success, stdout, _stderr) = docker_cli::run_bounded_env(&program, args, env, timeout)
         .map_err(|error| match error.downcast::<docker_cli::DockerTimedOut>() {
             Ok(timed_out) => anyhow::Error::new(timed_out),
             Err(error) => error.context("Docker unavailable"),

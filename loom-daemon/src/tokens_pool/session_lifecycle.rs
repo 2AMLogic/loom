@@ -782,7 +782,11 @@ impl ProcessContainerRunner {
     /// Bounded by [`super::docker_cli::timeout_for`] (issue #10453): a hung
     /// Docker daemon fails the call instead of stalling the caller forever.
     pub(super) fn run_capture(args: &[&str]) -> Result<(bool, String, String)> {
-        super::docker_cli::run_bounded("docker", args, super::docker_cli::timeout_for(args))
+        super::docker_cli::run_bounded(
+            &super::docker_cli::docker_program()?,
+            args,
+            super::docker_cli::timeout_for(args),
+        )
     }
 
     /// The baseline process set the session image's entrypoint establishes:
@@ -836,8 +840,11 @@ impl session_image::BundleProbe for ProcessContainerRunner {
             "-c",
             script,
         ];
-        let (success, stdout, stderr) =
-            super::docker_cli::run_bounded("docker", &args, super::docker_cli::DOCKER_RUN_TIMEOUT)?;
+        let (success, stdout, stderr) = super::docker_cli::run_bounded(
+            &super::docker_cli::docker_program()?,
+            &args,
+            super::docker_cli::DOCKER_RUN_TIMEOUT,
+        )?;
         if !success {
             bail!("docker run {image} (bundle probe) failed: {}", stderr.trim());
         }
@@ -1015,18 +1022,21 @@ impl ContainerRunner for ProcessContainerRunner {
     }
 
     fn attach_interactive(&self, container: &str, tmux_session_name: &str) -> Result<i32> {
-        let status = Command::new("docker")
-            .args([
-                "exec",
-                "-it",
-                container,
-                "tmux",
-                "attach",
-                "-t",
-                tmux_session_name,
-            ])
-            .status()
-            .with_context(|| format!("failed to attach to session container {container}"))?;
+        let status = Command::new(
+            super::docker_cli::docker_program()
+                .with_context(|| format!("failed to attach to session container {container}"))?,
+        )
+        .args([
+            "exec",
+            "-it",
+            container,
+            "tmux",
+            "attach",
+            "-t",
+            tmux_session_name,
+        ])
+        .status()
+        .with_context(|| format!("failed to attach to session container {container}"))?;
         Ok(status.code().unwrap_or(-1))
     }
 
@@ -1036,13 +1046,16 @@ impl ContainerRunner for ProcessContainerRunner {
         argv: &[&str],
         timeout: Duration,
     ) -> Result<ExecOutput> {
-        let mut command = Command::new("docker");
-        command
-            .arg("exec")
-            .arg(container)
-            .args(argv)
-            .stdin(Stdio::null());
-        let output = match crate::proc_exec::run_bounded(command, timeout) {
+        let completion = super::docker_cli::docker_program().and_then(|program| {
+            let mut command = Command::new(program);
+            command
+                .arg("exec")
+                .arg(container)
+                .args(argv)
+                .stdin(Stdio::null());
+            crate::proc_exec::run_bounded(command, timeout)
+        });
+        let output = match completion {
             Ok(Completion::Exited(output)) => output,
             Ok(Completion::TimedOut { .. }) => {
                 // Kills the local `docker exec` client's whole process group,
@@ -1065,10 +1078,10 @@ impl ContainerRunner for ProcessContainerRunner {
                     unavailable: true,
                     timed_out: false,
                     exit_code: None,
-                    output: "docker CLI is not installed or not on PATH".into(),
+                    output: format!("docker CLI could not start: {error}"),
                 });
             }
-            Err(ExecError::Spawn(error) | ExecError::Collect(error)) => return Err(error.into()),
+            Err(error) => return Err(error.into()),
         };
         let text = if output.stdout.is_empty() {
             &output.stderr

@@ -131,18 +131,23 @@ fn mtime_of(meta: &fs::Metadata) -> DateTime<Utc> {
 /// bit set? On non-unix targets, any regular file qualifies.
 #[must_use]
 pub fn is_executable(path: &Path) -> bool {
-    let Ok(meta) = fs::metadata(path) else {
-        return false;
-    };
+    check_executable(path).is_ok()
+}
+
+/// Like `is_executable`, retaining the failure kind for startup diagnostics.
+pub(crate) fn check_executable(path: &Path) -> io::Result<()> {
+    let meta = fs::metadata(path)?;
+    if !meta.is_file() {
+        return Err(io::ErrorKind::PermissionDenied.into());
+    }
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt as _;
-        meta.is_file() && meta.permissions().mode() & 0o111 != 0
+        if meta.permissions().mode() & 0o111 == 0 {
+            return Err(io::ErrorKind::PermissionDenied.into());
+        }
     }
-    #[cfg(not(unix))]
-    {
-        meta.is_file()
-    }
+    Ok(())
 }
 
 /// Keep only the last `max` bytes of captured output, snapped forward to a
