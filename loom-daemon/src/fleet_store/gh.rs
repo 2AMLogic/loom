@@ -40,8 +40,9 @@ use serde_json::Value;
 
 use super::fetch::{Reply, Transport};
 use crate::credential_preflight::{self as cp, GithubAppMinter, GithubAppOutcome};
+use crate::forge_bucket_book::Resource;
 use crate::forge_call_stats::{ops, ForgeOp};
-use crate::forge_identity::{served, Failure, IdentityRole};
+use crate::forge_identity::{served, Failure, IdentityRole, RouteDecision, RouteRequest};
 use crate::gh_invocation::{AccessIntent, GhCompletion, GhInvocation, GhTarget, Operation};
 use crate::proc_exec::Completion;
 
@@ -53,6 +54,9 @@ const MAX_READERS_TRIED: usize = 8;
 
 /// The next usable reader for the transport's repo: `(GH_CONFIG_DIR, app id)`.
 type NextReader = dyn Fn() -> Option<(PathBuf, String)>;
+
+/// The live gateway profile directory for an owner, if any.
+type GatewayLookup = dyn Fn(&str) -> Option<PathBuf>;
 
 /// `(app id, owner/repo, failure, why)` → withdraw that reader.
 type WithdrawReader = dyn Fn(&str, &str, Failure, &str);
@@ -114,6 +118,9 @@ pub struct GhTransport {
     withdraw: Box<WithdrawReader>,
     writer: RefCell<Option<Credential>>,
     last_used: RefCell<Option<Credential>>,
+    /// The live gateway profile directory for an owner (2am#4367 P4);
+    /// [`crate::forge_gateway::profile_for`] in production.
+    gateway: Box<GatewayLookup>,
 }
 
 impl GhTransport {
@@ -181,6 +188,7 @@ impl GhTransport {
             withdraw,
             writer: RefCell::new(None),
             last_used: RefCell::new(None),
+            gateway: Box::new(crate::forge_gateway::profile_for),
         }
     }
 
@@ -285,8 +293,12 @@ impl GhTransport {
             .program(&self.gh_bin)
             .current_dir(&self.workspace_root)
             .gh_config_dir(dir)
-            // 2am#4367 P4 break-glass: `fleet.json` is how a broken gateway
-            // is unset, so this fetch must never depend on it.
+            // 2am#4367 P4 break-glass: the facade never routes a store
+            // request through the gateway itself. The cacheable reads ask for
+            // it explicitly ([`GhTransport::gateway_read`]) and fall back to
+            // the readers; every other request (a fresh claim read, a
+            // write, the repo probe) stays off it, so `fleet.json` can always
+            // be read to unset a broken gateway.
             .gateway_exempt()
     }
 
@@ -317,13 +329,131 @@ impl GhTransport {
     /// # Errors
     /// `gh` could not complete the request at all, or no reader can serve
     /// it; any HTTP status is `Ok`.
+    ///
+    /// Never through the gateway: a claim read must not be answered from a
+    /// relay cache (2am#15098).
     pub(crate) fn get_fresh(&self, api_path: &str) -> Result<Reply> {
-        self.read(api_path, None, None)
+        self.read_direct(api_path, None, None)
     }
 
-    /// One store read (see the module docs): a reader's answer, the writer's
-    /// on a host with no reader pool, or an error when it was shed.
+    /// One cacheable store read (see the module docs): the github-read
+    /// gateway first when one is live for the store's owner, else (or when it
+    /// cannot answer) [`Self::read_direct`].
     fn read(&self, api_path: &str, accept: Option<&str>, etag: Option<&str>) -> Result<Reply> {
+        if let Some(reply) = self.gateway_read(api_path, accept, etag) {
+            return Ok(reply);
+        }
+        self.read_direct(api_path, accept, etag)
+    }
+
+    /// The cacheable read on the gateway profile, with its `If-None-Match`
+    /// intact so the relay answers an unchanged file from its ETag cache.
+    ///
+    /// `None` means "ask the readers instead": no live gateway for the owner,
+    /// or the gateway did not answer. A gateway that is down, slow, refuses
+    /// the credential or cannot see the repository never fails the read (the
+    /// store never *depends* on the gateway); a fault it signals itself
+    /// withdraws it, as for every other read. Only an answer (`2xx`/`304`)
+    /// is returned: a `404` is left to the readers, which judge coverage.
+    ///
+    /// The serving route is the attempt's accounting row: `route=gateway`
+    /// for this attempt, `route=direct_read` for a fallback's, each its own
+    /// `fleet_store` span; the fallback reason is logged and, when it
+    /// withdraws the gateway, recorded with the withdrawal.
+    fn gateway_read(
+        &self,
+        api_path: &str,
+        accept: Option<&str>,
+        etag: Option<&str>,
+    ) -> Option<Reply> {
+        use crate::forge_gateway::{outage, GATEWAY_APP_ID};
+        let now = SystemTime::now();
+        let request = RouteRequest::gate(&self.repo, None, Resource::Core);
+        let Some(RouteDecision::Reader { dir, .. }) =
+            crate::forge_gateway::decide(&request, now, &*self.gateway)
+        else {
+            return None;
+        };
+        let cred = Credential::ConfigDir {
+            dir,
+            label: format!("gateway app {GATEWAY_APP_ID}"),
+        };
+        let why = format!("fleet_store {api_path}");
+        let (response, stderr) = match self.run(&cred, Some(GATEWAY_APP_ID), api_path, accept, etag)
+        {
+            Ok((response, stderr, _)) => (response, stderr),
+            Err(e) => {
+                // A timeout or a spawn failure: the gateway did not answer.
+                log::info!("fleet_store: gateway read of {api_path} failed ({e}); using readers");
+                if outage::escalate(outage::Fault::Rerun) == outage::Fault::Withdraw {
+                    outage::withdraw_for_outage("fleet_store");
+                    crate::forge_gateway::note_outage_from_front();
+                }
+                return None;
+            }
+        };
+        let status = response.as_ref().map(|r| r.status);
+        if matches!(status, Some(200..=299 | 304)) {
+            served::note_reader_served(
+                GATEWAY_APP_ID,
+                &self.repo,
+                served::endpoint_family(api_path),
+                now,
+            );
+            return reply_of(api_path, response, &stderr).ok();
+        }
+        let fault = outage::escalate(outage::fault(response.as_ref(), "", &stderr));
+        if fault.reruns() {
+            if fault == outage::Fault::Withdraw {
+                outage::withdraw_for_outage("fleet_store");
+                crate::forge_gateway::note_outage_from_front();
+            }
+        } else if let Some(mut failure) = crate::forge_identity::classify_failure(
+            &stderr,
+            status,
+            response.as_ref().map(|r| &r.ratelimit),
+            Resource::Core,
+        ) {
+            let refusal = (failure == Failure::Coverage).then(|| {
+                served::judge_coverage(
+                    GATEWAY_APP_ID,
+                    &self.repo,
+                    served::endpoint_family(api_path),
+                    served::is_item_path(api_path),
+                    status,
+                    &stderr,
+                    now,
+                )
+            });
+            match refusal {
+                // The gateway sees the repository (or this is one item's
+                // answer): leave it in place; the readers decide.
+                Some(served::CoverageRefusal::Answer | served::CoverageRefusal::Shed) => {}
+                Some(served::CoverageRefusal::WithdrawUnproven) => {
+                    failure = Failure::CoverageUnproven;
+                    (self.withdraw)(GATEWAY_APP_ID, &self.repo, failure, &why);
+                }
+                Some(served::CoverageRefusal::Withdraw) | None => {
+                    (self.withdraw)(GATEWAY_APP_ID, &self.repo, failure, &why);
+                }
+            }
+        }
+        log::info!(
+            "fleet_store: gateway did not answer {api_path} (status {status:?}, fault {fault:?}); \
+             using readers"
+        );
+        None
+    }
+
+    /// One store read on the direct route (see the module docs): a reader's
+    /// answer, the writer's on a host with no reader pool, or an error when
+    /// it was shed.
+    fn read_direct(
+        &self,
+        api_path: &str,
+        accept: Option<&str>,
+        etag: Option<&str>,
+    ) -> Result<Reply> {
         if !self.pooled {
             let (response, stderr, _) = self.run(&self.writer(), None, api_path, accept, etag)?;
             return reply_of(api_path, response, &stderr);
