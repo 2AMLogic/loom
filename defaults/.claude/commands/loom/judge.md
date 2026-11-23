@@ -1853,9 +1853,11 @@ its receipts, or anything the PR body claims:
 # right state (a PR merged, an issue closed), under exactly the recorded
 # title. Any foreign/missing/wrong-kind/wrong-state/mismatched or unreadable
 # record echoes "NOT ELIGIBLE: <reason>" naming it — the caller must then take
-# the normal review flow and report the reason. A READ failure (base
-# repository, diff, or record fetch) echoes "NOT ELIGIBLE: ENVIRONMENT: …"
-# instead: an environment failure is never a passed or waived content check.
+# the normal review flow and report the reason. A READ failure on the base
+# repository or the diff echoes "NOT ELIGIBLE: ENVIRONMENT: …" instead: an
+# environment failure is never a passed or waived content check. A record
+# fetch cannot tell a 404 (a content verdict) from a transport failure, so
+# its refusal states both readings and waives neither.
 # Distinct numbers are READ once each, but every record is VERIFIED: a
 # repeated number's later records (a
 # duplicate with a different title or kind included) are checked against the

@@ -653,7 +653,7 @@ fi
 
 out="$(FAIL_LOOKUP=1 WL_DIFF="$GOOD_DIFF" docs_only_fast_path_worklog_check 1)"
 assert_eq "NOT ELIGIBLE: WORK_LOG record #5 does not exist in owner/mine, or the read failed — if the record does not exist this IS a content verdict (#13760); if the read failed it is an environment failure. Either way, do NOT treat this as a passed or waived #13760 content check" "$out" \
-    "a temporary forge failure on the target read is not eligible (fails closed, flagged ENVIRONMENT)"
+    "a temporary forge failure on the target read is not eligible (fails closed, states both readings)"
 
 out="$(WL_DIFF="" docs_only_fast_path_worklog_check 1)"
 assert_eq "ELIGIBLE" "$out" "an empty diff (no canonical records) is eligible"
