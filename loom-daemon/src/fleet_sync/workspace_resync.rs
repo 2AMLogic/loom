@@ -446,6 +446,9 @@ enum Wait {
     /// Remote checks stopped during classification, or an outage hold
     /// already prevented them when the pass began.
     Offline,
+    /// The forge rate-limit breaker is open: no head was asked, so nothing
+    /// went unanswered.
+    Breaker,
     /// The pass was past its deadline by the time the write half reached it.
     Deadline,
     /// The pass's one attempt went to an earlier stale workspace.
@@ -463,6 +466,10 @@ impl Wait {
             }
             Self::Offline => {
                 "not attempted this pass: remote checks are suspended after unanswered probes"
+            }
+            Self::Breaker => {
+                "not attempted this pass: the forge rate-limit breaker is open, so no remote \
+                 check was made"
             }
             Self::Deadline => "not attempted this pass: the pass was past its deadline",
             Self::AttemptSlot => {
@@ -624,7 +631,11 @@ pub fn run(env: &Env<'_>, roots: &[PathBuf], mode: Mode, memory: &mut Memory) ->
             };
             if !scan.online {
                 stopped = pos;
-                stopped_why = Some(Wait::Offline);
+                stopped_why = Some(if scan.breaker_open {
+                    Wait::Breaker
+                } else {
+                    Wait::Offline
+                });
                 break;
             }
             if (env.overdue)() {

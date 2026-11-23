@@ -270,3 +270,24 @@ fn capture_logs_pass(
     let logs = capture_logs(|| pass = Some(f()));
     (logs, pass.expect("a pass ran"))
 }
+
+#[test]
+fn an_open_breaker_is_warned_as_the_breaker_not_as_unanswered_probes() {
+    let fx = Fixture::new(STALE);
+    let host = Host::new(&fx, "host-a");
+    host.heads.breaker.set(true);
+    for pass_n in 0..3 {
+        let (logs, pass) = capture_logs_pass(|| host.pass());
+        let lines = waits(&logs);
+        assert_eq!(lines.len(), 1, "pass {pass_n}: {logs:?}");
+        assert!(
+            lines[0].1.contains("the forge rate-limit breaker is open"),
+            "pass {pass_n}: {logs:?}"
+        );
+        assert!(!lines[0].1.contains("unanswered"), "pass {pass_n}: {logs:?}");
+        assert_eq!(network(&pass), (0, 0, 0));
+        assert_eq!(only(&pass).state, WState::W1, "{pass:?}");
+        host.advance(INTERVAL);
+    }
+    assert_eq!(host.heads.requests.get(), 0);
+}
