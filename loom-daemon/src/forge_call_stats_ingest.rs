@@ -33,7 +33,7 @@
 //! - **Volume.** The agent series have their own cap in `forge_calls`, so a
 //!   flood of label sets folds there and never displaces the daemon's own.
 //!   The contained directory is swept each tick ([`sweep_contained`]):
-//!   symlinks and special files, files not named like a sink file, hour
+//!   symlinks and special files, files not named like an hour file, hour
 //!   files outside the retained window and any file over
 //!   [`MAX_CONTAINED_FILE_BYTES`] are removed. This bounds what a container
 //!   can leave behind between ticks; a hard disk quota needs a filesystem
@@ -364,8 +364,23 @@ fn token(v: Option<&str>, max: usize) -> String {
         .to_string()
 }
 
+/// The hour a `calls-<hour>.jsonl` name carries — an optional leading `-`
+/// then digits — else `None`. That is the only name a front ever writes
+/// into the contained dir ([`super::sink::append`]), so it is the only
+/// non-foreign name there; deliberately narrower than
+/// [`agent::is_sink_entry`], which gates the parent dir's mount and also
+/// accepts host-only names (the bucket book's snapshot and its staging
+/// files) that never belong in the contained sink (#14993).
+fn hour_of(name: &str) -> Option<i64> {
+    let h = name.strip_prefix("calls-")?.strip_suffix(".jsonl")?;
+    let digits = h.strip_prefix('-').unwrap_or(h);
+    (!digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()))
+        .then(|| h.parse::<i64>().ok())
+        .flatten()
+}
+
 /// Bound what a container leaves in `dir` (the contained sink): remove
-/// symlinks and special files, files not named like a sink file, hour files
+/// symlinks and special files, files not named like an hour file, hour files
 /// outside the retained window, and any file over
 /// [`MAX_CONTAINED_FILE_BYTES`]. Never follows a link and never recurses (a
 /// subdirectory is left alone); returns how many entries it removed.
@@ -382,12 +397,9 @@ pub fn sweep_contained(dir: &Path, hour: i64) -> u64 {
             continue;
         }
         let name = entry.file_name();
-        let foreign = !name.to_str().is_some_and(agent::is_sink_entry);
-        let stale = name
-            .to_str()
-            .and_then(|n| n.strip_prefix("calls-")?.strip_suffix(".jsonl"))
-            .and_then(|h| h.parse::<i64>().ok())
-            .is_some_and(|h| h < hour - RETAIN_HOURS || h > hour + 1);
+        let file_hour = name.to_str().and_then(hour_of);
+        let foreign = file_hour.is_none();
+        let stale = file_hour.is_some_and(|h| h < hour - RETAIN_HOURS || h > hour + 1);
         let oversize = kind.is_file()
             && entry
                 .metadata()

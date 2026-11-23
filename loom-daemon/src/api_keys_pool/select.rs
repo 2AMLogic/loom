@@ -27,6 +27,11 @@
 //! provider-side ceiling the operator declared, which is the failure the cap
 //! exists to prevent.
 //!
+//! The ladder counts live spawns only. A role draw's reservation
+//! ([`super::reservation`], #14983) holds a slot *for* a launch that is on its
+//! way here, so counting it would refuse that launch; a successful selection
+//! retires one instead.
+//!
 //! # Model-class scoping (#8424 item 3)
 //!
 //! Selection takes the model the spawn asked for and resolves bad marks
@@ -242,6 +247,10 @@ pub fn select_api_key_for(
     }
     // Count this spawn against the chosen account, still under `_cap_lock`.
     let lease = inflight::register(&root, provider, &chosen.name);
+    // #14983: this acquire is what a role draw's reservation was holding the
+    // slot for. Retire one in the same locked step, so the slot is counted
+    // once (as the lease) instead of twice.
+    super::reservation::consume_one(&root, provider);
     Ok(SelectedApiKey {
         provider: provider.to_string(),
         name: chosen.name.clone(),
@@ -351,6 +360,23 @@ pub struct ProviderHealth {
     /// counted live here rather than derived from
     /// [`Ineligible::AtCapacity`], which only the selection ladder sets.
     pub at_capacity: usize,
+    /// Selectable accounts that are also under their declared concurrency cap
+    /// right now: what the selection ladder's tier 0 would actually offer a
+    /// spawn (#14944). [`Self::selectable`] alone ignores the cap (only the
+    /// ladder sets [`Ineligible::AtCapacity`]), so a caller deciding "would a
+    /// launch get a credential?" must read this. Not serialized: the health
+    /// JSON is unchanged, and `selectable` / `atCapacity` already carry both
+    /// halves for a human.
+    #[serde(skip)]
+    pub selectable_under_cap: usize,
+    /// Slots a draw could still take: the selectable accounts' declared caps,
+    /// minus live spawns, minus other draws' live reservations
+    /// ([`super::reservation`], #14983). `None` when a selectable account
+    /// declares no cap (no finite count) or none is selectable. A read like
+    /// [`Self::selectable_under_cap`]; only
+    /// [`super::reservation::try_reserve`] holds a slot. Not serialized.
+    #[serde(skip)]
+    pub unreserved_slots: Option<usize>,
     /// Accounts withheld because `.disabled` / `.bad_accounts.json` exists but
     /// cannot be read or parsed.
     pub unverifiable: usize,
@@ -473,6 +499,10 @@ pub fn health_in(
                     Ok(list) => (list, None),
                     Err(e) => (Vec::new(), Some(e)),
                 };
+            let at_cap = |a: &ApiKeyAccount| {
+                a.max_concurrent
+                    .is_some_and(|cap| inflight::live_count(&root, &provider, &a.name) >= cap)
+            };
             ProviderHealth {
                 dir: provider_dir(&root, &provider),
                 total: accounts.len(),
@@ -480,14 +510,17 @@ pub fn health_in(
                 disabled: count(Ineligible::Disabled),
                 malformed: count(Ineligible::Malformed),
                 exhausted: count(Ineligible::Exhausted),
-                at_capacity: accounts
+                at_capacity: accounts.iter().filter(|a| at_cap(a)).count(),
+                selectable_under_cap: accounts
                     .iter()
-                    .filter(|a| {
-                        a.max_concurrent.is_some_and(|cap| {
-                            inflight::live_count(&root, &provider, &a.name) >= cap
-                        })
-                    })
+                    .filter(|a| a.selectable() && !at_cap(a))
                     .count(),
+                unreserved_slots: super::reservation::capped_slots(&root, &provider, &accounts)
+                    .map(|(slots, in_flight)| {
+                        slots
+                            .saturating_sub(in_flight)
+                            .saturating_sub(super::reservation::live_count(&root, &provider))
+                    }),
                 unverifiable: count(Ineligible::Unverifiable),
                 unreadable,
                 insecure_permissions: accounts

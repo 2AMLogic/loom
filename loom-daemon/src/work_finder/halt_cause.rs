@@ -13,12 +13,11 @@
 //! `cause.is_some()` keeps the two in lockstep by construction.
 //!
 //! `token_pool` and `preflight_advisory` are deliberately distinct values:
-//! `pool_preflight::preflight_held_per_root` folds the #7708 token-pool
-//! exhaustion hold and the #5030 claude-wrapper pre-flight advisory into one
-//! bool, and its cause-carrying counterpart
-//! ([`crate::work_finder::pool_preflight::preflight_held_causes_per_root`])
-//! splits them back out — an operator's remedy for a dead pool (add/wait for
-//! accounts) is different from a broken `.mcp.json` (fix the workspace).
+//! [`crate::work_finder::pool_preflight::preflight_held_causes_per_root`]
+//! folds the #7708 token-pool exhaustion hold and the #5030 claude-wrapper
+//! pre-flight advisory into one pass and splits them back out — an
+//! operator's remedy for a dead pool (add/wait for accounts) is different
+//! from a broken `.mcp.json` (fix the workspace).
 
 use std::path::PathBuf;
 

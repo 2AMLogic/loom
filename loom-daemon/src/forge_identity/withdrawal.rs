@@ -577,9 +577,13 @@ fn apply(
             ) = (failure, source)
             {
                 let account = crate::observability::ops::ratelimit::app_account_label(app_id);
-                forge_bucket_book::mark_exhausted(
+                // Book at the refusal's own observation instant (#14881): a
+                // fresh wall clock can be newer than a positive reading seen
+                // after the refusal and would let the older refusal erase it.
+                forge_bucket_book::mark_exhausted_at(
                     BucketKey::new(&account, owner, resource),
                     epoch_secs(reset),
+                    epoch_secs(now),
                 );
             }
             export(app_id, owner, scope.as_str(), held, *source, *secondary);
