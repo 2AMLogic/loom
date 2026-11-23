@@ -441,6 +441,7 @@ fn test_backoff_resets_once_a_pass_reclaims_something() {
         last_run: Some(t(0)),
         last_worktree_reap: Some(t(0)),
         empty_streak: 3,
+        seat_walk_pass_reclaimed: false,
     };
     assert!(!worktree_reap_due(&ledger, t(600), COOLDOWN));
     assert!(worktree_reap_due(&ledger, t(4800), COOLDOWN));

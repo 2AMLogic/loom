@@ -489,6 +489,10 @@ pub struct PassLedger {
     pub last_worktree_reap: Option<DateTime<Utc>>,
     /// Consecutive passes that reclaimed nothing.
     pub empty_streak: u32,
+    /// A pass that ran while a seat walk was in flight reclaimed something
+    /// elsewhere (#14777): the walk's completion must not deliver the
+    /// deferred empty-pass increment over that definite verdict.
+    pub seat_walk_pass_reclaimed: bool,
 }
 
 impl PassLedger {
@@ -504,12 +508,19 @@ impl PassLedger {
         if report.worktree_reap_ran {
             self.last_worktree_reap = Some(report.at);
         }
-        self.empty_streak = if report.seats_pending {
-            self.empty_streak
-        } else if report.reclaimed_anything() {
+        // A definite non-empty verdict wins immediately, even with a walk in
+        // flight; only the empty-pass increment is deferred to the walk.
+        self.empty_streak = if report.reclaimed_anything() {
             0
+        } else if report.seats_pending {
+            self.empty_streak
         } else {
             self.empty_streak.saturating_add(1)
+        };
+        self.seat_walk_pass_reclaimed = if report.seats_pending {
+            self.seat_walk_pass_reclaimed || report.reclaimed_anything()
+        } else {
+            false
         };
     }
 }
@@ -633,8 +644,8 @@ pub fn run_pass(
             report.seats_pending = true;
             crate::tokens_pool::private_workspace::seat_reclaim::SeatReclaimReport {
                 skipped: Some(
-                    "walk in flight (off the dispatch tick); the verdict is folded into this \
-                     root's ledger on completion"
+                    "walk in flight (off the dispatch tick); the verdict is folded into the \
+                     originating root's ledger on completion"
                         .into(),
                 ),
                 seats: Vec::new(),
@@ -715,9 +726,14 @@ pub(crate) fn record_seat_verdict(
     let ledger = map.entry(repo_root.to_path_buf()).or_default();
     ledger.empty_streak = if removed {
         0
+    } else if ledger.seat_walk_pass_reclaimed {
+        // A pass during this walk already reset the streak for a real
+        // reclaim; an empty walk must not push it back to 1.
+        ledger.empty_streak
     } else {
         ledger.empty_streak.saturating_add(1)
     };
+    ledger.seat_walk_pass_reclaimed = false;
 }
 
 /// Drop cooldown state. Test-only seam (the process-global would otherwise
@@ -1130,6 +1146,33 @@ mod tests {
             "an empty walk advances the streak by exactly one"
         );
         assert_eq!(ledger_for(other).empty_streak, 1);
+    }
+
+    /// A pass that reclaimed elsewhere while a walk is pending resets the
+    /// streak at once, and the walk's empty completion does not push it
+    /// back up (#14777 review).
+    #[test]
+    #[serial]
+    fn a_pending_pass_that_reclaimed_elsewhere_resets_and_survives_an_empty_walk() {
+        reset_state_for_test();
+        let root = Path::new("/seat-origin");
+        let empty = empty_tiered_pass(t(0), SeatScheduling::Skipped("cooldown".into()));
+        record_report(root, &empty);
+        assert_eq!(ledger_for(root).empty_streak, 1);
+
+        let mut pending = empty_tiered_pass(t(601), SeatScheduling::Pending);
+        pending.worktrees_removed = 1;
+        assert!(pending.reclaimed_anything() && pending.seats_pending);
+        assert_eq!(record_report(root, &pending).empty_streak, 0);
+
+        record_seat_verdict(root, &seat_walk_verdict(0, 0));
+        assert_eq!(ledger_for(root).empty_streak, 0, "empty walk adds nothing");
+
+        // The flag is spent: a later empty walk after an empty pending pass
+        // delivers its one increment.
+        record_report(root, &empty_tiered_pass(t(1202), SeatScheduling::Pending));
+        record_seat_verdict(root, &seat_walk_verdict(0, 0));
+        assert_eq!(ledger_for(root).empty_streak, 1);
     }
 
     // ===================================================================
