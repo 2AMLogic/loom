@@ -206,6 +206,14 @@ pub(super) fn run(args: WorkerArgs) -> Result<i32> {
     let mut cancelled = false;
     loop {
         if reap(root, &mut result)? {
+            // The invocation's lease is over: every descendant is reaped, and
+            // the seat's exclusive lease means no sibling step can hold
+            // scratch of its own. Drain this run's step scratch from the
+            // resolved temp base (#14929) — a seat whose tmpfs never drains
+            // between jobs fills its 512 MB `/tmp` across days. Best-effort:
+            // the age-gated seat reclaim stays the backstop for a worker
+            // killed before it reaches here.
+            clean_step_scratch(&crate::forge_etag_store::host_tmp_base());
             std::io::stderr().write_all(&ack(&args.id))?;
             return Ok(if cancelled {
                 143
@@ -261,6 +269,45 @@ pub(super) fn run(args: WorkerArgs) -> Result<i32> {
     }
 }
 
+/// Remove the finished invocation's per-run step scratch from `base`
+/// (#14929): entries named for the step that made them (`<role>-<n>.*`,
+/// `*-tmp` — the shapes [`seat_reclaim`]'s idle pass already owns on the
+/// volume) are per-invocation by construction. Nothing else is touched: the
+/// long-lived caches and Loom state dirs live on the cache volume after
+/// #14929, and the shapes never match them (`loom-uv-cache` has no
+/// `<role>-<digits>` head). Best-effort by design — a removal that fails is
+/// left for the idle pass, never for the next job to inherit.
+fn clean_step_scratch(base: &std::path::Path) -> usize {
+    use crate::tokens_pool::private_workspace::seat_reclaim::{
+        is_step_scratch_name, is_tmp_step_name,
+    };
+    let Ok(entries) = std::fs::read_dir(base) else {
+        return 0;
+    };
+    let mut removed = 0;
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        if !is_step_scratch_name(name) && !is_tmp_step_name(name) {
+            continue;
+        }
+        let path = entry.path();
+        let removed_ok = if path.is_dir() {
+            std::fs::remove_dir_all(&path)
+        } else {
+            std::fs::remove_file(&path)
+        };
+        if removed_ok.is_ok() {
+            removed += 1;
+        } else {
+            log::debug!("session-exec: step scratch not removed: {}", path.display());
+        }
+    }
+    removed
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -313,6 +360,34 @@ mod tests {
 
     fn lease_line() -> Vec<u8> {
         format!("{}\n", now_ms() + LEASE_MS).into_bytes()
+    }
+
+    /// #14929 AC: per-run scratch present before the invocation's lease ends
+    /// is gone after it, while everything else under the temp base — the
+    /// long-lived caches, foreign `mkdtemp` shapes — is left exactly as it
+    /// was.
+    #[test]
+    fn step_scratch_is_removed_at_invocation_end_and_nothing_else_is() {
+        let base = tempfile::tempdir().unwrap();
+        let scratch_dir = base.path().join("doctor-6422-tmp");
+        std::fs::create_dir(&scratch_dir).unwrap();
+        std::fs::write(scratch_dir.join("repro.log"), "x").unwrap();
+        let scratch_file = base.path().join("builder-6940.tar.gz");
+        std::fs::write(&scratch_file, "x").unwrap();
+        let uv_cache = base.path().join("loom-uv-cache");
+        std::fs::create_dir(&uv_cache).unwrap();
+        let python_tmp = base.path().join("tmp0unndweb");
+        std::fs::create_dir(&python_tmp).unwrap();
+        std::fs::write(python_tmp.join("fleet.json"), "{}").unwrap();
+        assert_eq!(clean_step_scratch(base.path()), 2);
+        assert!(!scratch_dir.exists(), "per-run scratch dir must be removed");
+        assert!(!scratch_file.exists(), "per-run scratch file must be removed");
+        assert!(uv_cache.exists(), "a long-lived cache must never match step scratch");
+        assert!(python_tmp.exists(), "a foreign mkdtemp shape is not ours to remove");
+        // A base that does not exist is a no-op, not an error.
+        let gone = base.path().join("gone");
+        assert_eq!(clean_step_scratch(&gone), 0);
+        assert_eq!(clean_step_scratch(base.path()), 0, "a second pass is a no-op");
     }
 
     #[test]
