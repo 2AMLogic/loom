@@ -1084,6 +1084,8 @@ mod tests {
                     scratch_removed: scratch,
                     scratch_scanned: scratch,
                     scratch_bytes: 1024 * u64::try_from(scratch).unwrap_or(u64::MAX),
+                    removed: Vec::new(),
+                    inspection_error: None,
                 }),
                 elapsed: std::time::Duration::from_secs(2),
             }],
