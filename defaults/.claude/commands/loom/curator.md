@@ -552,7 +552,8 @@ this reclaim comment:
 
 ```bash
 gh api -X DELETE repos/{owner}/{repo}/issues/$N/labels/loom%3Acurating
-./.loom/scripts/post-comment.sh $N --body "Reclaiming loom:curating claim: $STANDDOWN_COUNT stand-down passes, no curation progress for ${LOOM_STALE_CURATING_MINUTES:-45}m (bounded by LOOM_MAX_STANDDOWN_STREAK=${LOOM_MAX_STANDDOWN_STREAK:-3}) — breaking the livelock."
+./.loom/scripts/post-comment.sh $N --body "Reclaiming loom:curating claim: $STANDDOWN_COUNT stand-down passes, no curation progress for ${LOOM_STALE_CURATING_MINUTES:-45}m (bounded by LOOM_MAX_STANDDOWN_STREAK=${LOOM_MAX_STANDDOWN_STREAK:-3}) — breaking the livelock.
+<!-- loom:reclaim claim=$CLAIMED_AT -->"
 gh api repos/{owner}/{repo}/issues/$N/labels -f 'labels[]=loom:curating'
 # Continue with normal curation
 ```
@@ -562,10 +563,18 @@ pass the pool gate first, else stand down):
 
 ```bash
 gh api -X DELETE repos/{owner}/{repo}/issues/$N/labels/loom%3Acurating
-./.loom/scripts/post-comment.sh $N --body "Reclaiming stale loom:curating claim (idle ${IDLE_MINUTES}m > ${LOOM_STALE_CURATING_MINUTES:-45}m, no claimant activity) — the prior sweep likely died mid-enhancement."
+./.loom/scripts/post-comment.sh $N --body "Reclaiming stale loom:curating claim (idle ${IDLE_MINUTES}m > ${LOOM_STALE_CURATING_MINUTES:-45}m, no claimant activity) — the prior sweep likely died mid-enhancement.
+<!-- loom:reclaim claim=$CLAIMED_AT -->"
 gh api repos/{owner}/{repo}/issues/$N/labels -f 'labels[]=loom:curating'
 # Continue with normal curation
 ```
+
+**Both reclaim comments end with the `loom:reclaim` claim marker
+keyed to `$CLAIMED_AT` (#15044)**: the forge timeline can lag the label remove + re-add above,
+and `claim-staleness.sh` then matches this marker against the stale verdict it
+computed from the pre-reclaim timestamp — so your replacement claim reads
+`fresh` while you are active and is not reclaimed in turn (and `unknown`, never
+stale, once you go idle).
 
 **If `.loom/scripts/claim-staleness.sh` is missing** (an older install that has
 not been resynced yet): fall back to the **age-only** rule — read the latest
