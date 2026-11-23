@@ -109,9 +109,31 @@ mod e2e {
     /// takes the ordinary path without the equivalence machinery (its
     /// evidence gate has its own coverage in `verdict_dedup_tests.rs`).
     fn reconcile(timeline: &str, perm: &str) -> (VerdictReconcileStats, String) {
+        reconcile_with(timeline, perm, None)
+    }
+
+    /// As [`reconcile`], with an optional `forge.trustedCommenters` login
+    /// and `perm == "fail"` making the permission probe exit non-zero.
+    fn reconcile_with(
+        timeline: &str,
+        perm: &str,
+        allowlisted: Option<&str>,
+    ) -> (VerdictReconcileStats, String) {
         let dir = tempdir().unwrap();
         let root = dir.path().join("repo");
-        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(root.join(".loom")).unwrap();
+        if let Some(login) = allowlisted {
+            std::fs::write(
+                root.join(".loom/config.json"),
+                format!(r#"{{"forge":{{"trustedCommenters":["{login}"]}}}}"#),
+            )
+            .unwrap();
+        }
+        let perm_arm = if perm == "fail" {
+            "echo 'Not Found' >&2; exit 1".to_string()
+        } else {
+            format!("echo '{perm}'")
+        };
         let comments = dir.path().join("comments.json");
         std::fs::write(
             &comments,
@@ -133,7 +155,7 @@ mod e2e {
   "pr edit "*|"pr comment "*) printf '%s\n' "$*" >> "{writes}" ;;
   "api repos/{{owner}}/{{repo}}/issues/400/comments"*) cat "{comments}" ;;
   "api repos/{{owner}}/{{repo}}/issues/400/timeline"*) cat "{tl}" ;;
-  "api repos/{{owner}}/{{repo}}/collaborators/rjwalters/permission"*) echo '{perm}' ;;
+  "api repos/{{owner}}/{{repo}}/collaborators/rjwalters/permission"*) {perm_arm} ;;
   *) echo '{{}}' ;;
 esac
 "#,
@@ -141,7 +163,7 @@ esac
                 pulls = pulls_arm(&[row(400, &["loom:changes-requested"]).sha(SHA_B)]),
                 comments = comments.display(),
                 tl = tl.display(),
-                perm = perm,
+                perm_arm = perm_arm,
             ),
         )
         .unwrap();
@@ -192,6 +214,23 @@ esac
         let (stats, writes) = reconcile(&incident_timeline(), "none");
         assert_eq!(stats.invalidated, 1, "untrusted actor -> ordinary clear: {stats:?}");
         assert!(writes.contains("--add-label loom:review-requested"), "{writes}");
+    }
+
+    #[test]
+    #[serial]
+    fn an_unreadable_probe_still_trusts_an_allowlisted_login() {
+        // The probe 404s (not a collaborator) but the login is on
+        // `forge.trustedCommenters`: the shell guard keeps the verdict.
+        let (stats, writes) = reconcile_with(&incident_timeline(), "fail", Some("rjwalters"));
+        assert_eq!(stats.invalidated, 0, "login-trusted send-back stands: {stats:?}");
+        assert!(!writes.contains("pr edit"), "{writes}");
+    }
+
+    #[test]
+    #[serial]
+    fn an_unreadable_probe_for_an_unlisted_login_fails_closed() {
+        let (stats, _) = reconcile_with(&incident_timeline(), "fail", None);
+        assert_eq!(stats.invalidated, 1, "{stats:?}");
     }
 
     #[test]

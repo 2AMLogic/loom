@@ -3107,10 +3107,9 @@ pub mod forge {
                         super::read_cache::key(root, r.number, &what, r.updated_at.as_deref());
                     super::read_cache::VERDICT_SEND_BACK
                         .get_or(key, || {
-                            // `get_or` stores whatever this returns, so a FAILED
-                            // walk (None) is retried next tick while a completed
-                            // one (Some(None) = positively no send-back) is
-                            // cached — fail closed never becomes a cached verdict.
+                            // `get_or` only stores a `Some`; `None` (a failed walk
+                            // OR no send-back, indistinguishable here) is
+                            // re-walked next tick — fail closed is never cached.
                             super::verdict_send_back::fetch_operator_send_back(
                                 gh_bin, root, r.number, kind,
                             )
@@ -3229,6 +3228,13 @@ pub mod forge {
                     VerdictAction::Keep(VerdictKeepReason::Unverifiable) => {
                         super::unanchored_verdict::handle_unverifiable(
                             gh_bin, root, &pr, anchoring, &mut stats,
+                        );
+                    }
+                    VerdictAction::Keep(VerdictKeepReason::OperatorSendBack) => {
+                        log::info!(
+                            "verdict reconcile: PR #{} keeps its hand-applied changes-requested \
+                             (trusted operator send-back at an unmoved head, #15068)",
+                            pr.number
                         );
                     }
                     VerdictAction::Keep(_) => {}

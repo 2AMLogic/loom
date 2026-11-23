@@ -231,8 +231,12 @@ fn latest_label_event(
 /// `admin`/`maintain`/`write` maps to `COLLABORATOR` — and the resulting
 /// association is fed through the same [`comment_trust::TrustPolicy`] the
 /// marker scan uses, so an allowlisted login, a fleet admin or a fleet App
-/// passes exactly as it does for comments. `false` on any failure: an
-/// unverifiable actor is an untrusted one.
+/// passes exactly as it does for comments. An unreadable permission probe
+/// (non-zero exit, 404 for a non-collaborator, 403 for a reader-only App)
+/// is "no `COLLABORATOR` proof" (`NONE`), **not** "untrusted": the login
+/// rules still apply, exactly as in `verdict-staleness-guard.sh` step 4b.
+/// (The actor is passed as a user, not an App, so the fleet-App rule does
+/// not fire for a timeline actor.)
 ///
 /// The permission probe runs on the **writer** identity (it requires push
 /// access to answer at all — a reader App is 403'd, which would make every
@@ -250,15 +254,13 @@ fn actor_trusted(gh_bin: &Path, root: &Path, actor: &str) -> bool {
     .current_dir(root)
     .writer_identity()
     .args(["api", &path, "--jq", ".permission"]);
-    let CmdOutcome::Ran(out) = inv.run() else {
-        return false;
+    let perm = match inv.run() {
+        CmdOutcome::Ran(out) if out.status.success() => String::from_utf8_lossy(&out.stdout)
+            .trim()
+            .to_ascii_lowercase(),
+        // Unreadable == no COLLABORATOR proof, not untrusted.
+        _ => String::new(),
     };
-    if !out.status.success() {
-        return false;
-    }
-    let perm = String::from_utf8_lossy(&out.stdout)
-        .trim()
-        .to_ascii_lowercase();
     let association = match perm.as_str() {
         "admin" | "maintain" | "write" => "COLLABORATOR",
         _ => "NONE",
