@@ -235,10 +235,6 @@ pub fn write_at(path: &Path, reason: &str, who: &str) -> Result<bool, String> {
     if matches!(read_at(path), State::Disabled(_)) {
         return Ok(false);
     }
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .map_err(|e| format!("could not create {}: {e}", parent.display()))?;
-    }
     let body = format!(
         "# loom host opt-out (#10179): no autonomous daemon belongs on this host.\n\
          # Cleared only by `loom-daemon host enable`. Do not hand-edit.\n\
@@ -246,29 +242,15 @@ pub fn write_at(path: &Path, reason: &str, who: &str) -> Result<bool, String> {
         who = who.replace(['\n', '\r'], " "),
         when = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ"),
     );
-    let tmp = path.with_extension(format!("tmp.{}", uuid::Uuid::new_v4()));
-    let write = {
-        #[cfg(unix)]
-        {
-            use std::io::Write as _;
-            use std::os::unix::fs::OpenOptionsExt as _;
-            std::fs::OpenOptions::new()
-                .write(true)
-                .create(true)
-                .truncate(true)
-                .mode(0o600)
-                .open(&tmp)
-                .and_then(|mut f| f.write_all(body.as_bytes()))
-        }
-        #[cfg(not(unix))]
-        {
-            std::fs::write(&tmp, body.as_bytes())
-        }
-    };
-    if let Err(e) = write.and_then(|()| std::fs::rename(&tmp, path)) {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(format!("could not write {}: {e}", path.display()));
-    }
+    crate::fs_util::write_atomic(
+        path,
+        body.as_bytes(),
+        crate::fs_util::AtomicOpts {
+            private: true,
+            sync_dir: true,
+        },
+    )
+    .map_err(|e| format!("could not write {}: {e}", path.display()))?;
     Ok(true)
 }
 

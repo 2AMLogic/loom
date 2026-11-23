@@ -111,15 +111,27 @@ pub fn parse_outcome_line(line: &str) -> Option<StepOutcomeLine> {
     })
 }
 
-/// The last outcome line in `log` written after `sweep_id`'s own dispatch
-/// header (an earlier run's line in the same per-item log is not this
-/// step's). `None` when the session wrote none.
+/// The last outcome line in `log` written in `sweep_id`'s own dispatch
+/// section — from its dispatch header to the next one or end of log — naming
+/// `role` and `item` (#14874). A line of an earlier or later run in the same
+/// per-item log, or one for any other role or target, is not this step's.
+/// `None` when the log carries no section of this sweep or the session wrote
+/// no matching line.
 #[must_use]
-pub fn read_outcome_line(log: &Path, sweep_id: &str) -> Option<StepOutcomeLine> {
+pub fn read_outcome_line(
+    log: &Path,
+    sweep_id: &str,
+    role: StepRole,
+    item: u32,
+) -> Option<StepOutcomeLine> {
     let text = String::from_utf8_lossy(&std::fs::read(log).ok()?).into_owned();
-    let anchor = format!("sweep_id={sweep_id} ");
-    let start = text.rfind(&anchor)?;
-    text[start..].lines().rev().find_map(parse_outcome_line)
+    let section = match crate::step_dispatch::outcome_ledger::dispatch_section(&text, sweep_id) {
+        crate::step_dispatch::outcome_ledger::DispatchSection::Section(section) => section,
+        _ => return None,
+    };
+    section.lines().rev().find_map(|line| {
+        parse_outcome_line(line).filter(|l| l.role == role.role_name() && l.target == item)
+    })
 }
 
 /// A typed report belongs to the launch's own child. Keep the existing
@@ -241,8 +253,8 @@ pub(crate) fn seat_busy_exit_reason(
 
 /// The release class of a step that wrote no `LOOM_STEP_OUTCOME` line: a
 /// Champion step's `CHAMPION-STEP` outcome folded onto the four classes
-/// ([`crate::step_dispatch::outcome_ledger::parse_outcome_line`]), read after
-/// `sweep_id`'s own dispatch header; else `failed`.
+/// ([`crate::step_dispatch::outcome_ledger::parse_outcome_line`]), read in
+/// its own dispatch's section of the log (#14874); else `failed`.
 pub(crate) fn release_class_fallback(
     log: &Path,
     sweep_id: &str,
@@ -253,11 +265,15 @@ pub(crate) fn release_class_fallback(
         return "failed";
     };
     let text = String::from_utf8_lossy(&bytes);
-    let Some(start) = text.rfind(&format!("sweep_id={sweep_id} ")) else {
-        return "failed";
-    };
-    crate::step_dispatch::outcome_ledger::parse_outcome_line(&text[start..], role, item)
-        .map_or("failed", |o| release_token(o.class.as_str(), &o.reason))
+    match crate::step_dispatch::outcome_ledger::dispatch_section(&text, sweep_id) {
+        crate::step_dispatch::outcome_ledger::DispatchSection::Section(section) => {
+            crate::step_dispatch::outcome_ledger::parse_outcome_line(section, role, item)
+                .map_or("failed", |o| release_token(o.class.as_str(), &o.reason))
+        }
+        // No section of this sweep in the log — none, or only other
+        // dispatches' — so a later dispatch's outcome is not its release.
+        _ => "failed",
+    }
 }
 
 /// Steps whose exit-time provider feedback classified the launch's failure
@@ -537,7 +553,7 @@ impl SweepRegistry {
         let info = self.entries.get(sweep_id);
         let log_path =
             info.map_or_else(|| self.compute_step_log_path(item, role), |i| i.log_path.clone());
-        let line = read_outcome_line(&log_path, sweep_id);
+        let line = read_outcome_line(&log_path, sweep_id, role, item);
         let (launch_rejection, sandbox_unavailable) =
             step_exit_evidence(end, line.as_ref(), rejection, || {
                 sandbox_unavailable_in(&log_path, sweep_id)
@@ -659,6 +675,29 @@ impl SweepRegistry {
         // this end. Peeked, not taken: `step_end::settle` still classifies
         // with it. `Some(None)` (a failed read) is no post-state.
         let post = super::ended::peek_post(&self.config.workspace_root, sweep_id).flatten();
+        // #14898: the Judge verdict of record, onto the root at its close.
+        // Computed here, under the lock, from the same step-scoped evidence
+        // the detached drain will read — the step's journal file (peeked,
+        // never taken, so the drain's input stays intact) and the step's own
+        // dispatch's section of its log. Local reads only: no forge request
+        // holds the registry lock. Any other role closes as before.
+        let verdict = (role == StepRole::Judge)
+            .then(|| {
+                crate::observability::step_verdict::judge_verdict_of_record(
+                    crate::observability::step_verdict::StagedStep {
+                        sweep_id: sweep_id.to_string(),
+                        step: role,
+                        item,
+                        log: log_path.clone(),
+                        hold_auth_before: None,
+                    },
+                    Some(&crate::observability::pick_journal::peek_step(
+                        &self.config.workspace_root,
+                        sweep_id,
+                    )),
+                )
+            })
+            .flatten();
         let (result, close) = super::span::sweep_close(
             end,
             line.as_ref(),
@@ -671,6 +710,7 @@ impl SweepRegistry {
             pr_number,
             provider_exhausted,
             post,
+            verdict.as_ref(),
         );
         let trace_context = self.close_step_span(sweep_id, info.map(|i| i.pid), result, close);
         // Hermetic fixtures (no forge) keep their tests free of the detached

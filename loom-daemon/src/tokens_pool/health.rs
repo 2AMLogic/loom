@@ -513,28 +513,17 @@ pub fn record_terminal(
     record_terminal_at(workspace, id, classification, provenance, now_epoch_secs())
 }
 
-/// [`record_terminal`], telling it which **model** was in flight (#8058 Phase
-/// 2's producer, issue #8277). See [`record_terminal_for_model_at`] for the
-/// narrowing/fail-safe contract.
-pub fn record_terminal_for_model(
-    workspace: &Path,
-    id: &AccountId,
-    classification: TerminalClassification,
-    model: Option<&str>,
-    provenance: &str,
-) -> Result<()> {
-    record_terminal_for_model_at(workspace, id, classification, model, provenance, now_epoch_secs())
-}
-
-/// [`record_terminal_for_model`], carrying the **provider-reported reset
-/// horizon** the failure named (issue #8539).
+/// Record terminal feedback for a `model` at the current clock
+/// (`now_epoch_secs()`), carrying the **provider-reported reset horizon** the
+/// failure named (issue #8539); see [`record_terminal_for_model_at`] for the
+/// model-narrowing contract.
 ///
 /// `reset_at` is a Unix timestamp read out of the provider's own refusal (for
 /// Codex, [`super::codex_reset`]). It replaces the blind
 /// `now + LOOM_CODEX_EXHAUSTED_COOLDOWN_SECS` deadline on the exhaustion arms
 /// **only** — see [`record_terminal_for_class_with_reset_at`] for the
-/// validation and for why the other arms ignore it. `None` reproduces
-/// [`record_terminal_for_model`] exactly.
+/// validation and for why the other arms ignore it. `None` records what
+/// [`record_terminal_for_model_at`] would at `now_epoch_secs()`.
 pub fn record_terminal_for_model_with_reset(
     workspace: &Path,
     id: &AccountId,

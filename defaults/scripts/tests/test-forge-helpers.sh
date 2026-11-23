@@ -467,6 +467,176 @@ set -e
 
 rm -rf "$HUNG_STUB_DIR"
 
+# --- Test forge_get_pr_reviews GraphQL fallback (#15009) ----------------------
+# The formal-review read was REST-only, so a REST reader shed (#14739) turned
+# every gate approval into UNKNOWN while GraphQL served. The GitHub branch now
+# retries a FAILED REST read through a paginated GraphQL pullRequest.reviews
+# query emitting the identical record shape — never a timed-out read (the
+# #13927 wall-clock bound holds; 124 reaches the caller) — and fails closed on
+# any GraphQL error, missing pageInfo, or truncated pagination.
+echo ""
+echo "Testing forge_get_pr_reviews GraphQL fallback (#15009)..."
+
+FB_STUB_DIR=$(mktemp -d)
+cat > "$FB_STUB_DIR/gh" <<'STUB'
+#!/usr/bin/env bash
+# Records every invocation into calls.log. REST reviews listing: page-*.json
+# with --paginate/--jq semantics, unless FB_FAIL_REST (hard failure) or
+# FB_HANG_REST (wedge). GraphQL reviews query: gql-page-N.json, cursor
+# paginated — no cursor serves page 1; a cursor equal to page N's endCursor
+# serves page N+1, and a missing follower page exits 1 — unless
+# FB_FAIL_GRAPHQL.
+FB="${FB_STUB_DIR_ENV:?}"
+echo "$*" >> "$FB/calls.log"
+
+if [[ "${1:-}" == "api" && "${2:-}" == "graphql" ]]; then
+  [[ -n "${FB_FAIL_GRAPHQL:-}" ]] && exit 1
+  query="" cursor=""
+  shift 2
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -f) [[ "$2" == query=* ]] && query="$2"; shift 2 ;;
+      -F) [[ "$2" == cursor=* ]] && cursor="${2#cursor=}"; shift 2 ;;
+      *) shift ;;
+    esac
+  done
+  [[ "$query" == *"reviews(first"* ]] || exit 1
+  if [[ -z "$cursor" ]]; then
+    [[ -f "$FB/gql-page-1.json" ]] || exit 1
+    cat "$FB/gql-page-1.json"
+    exit 0
+  fi
+  for page in "$FB"/gql-page-*.json; do
+    [[ -f "$page" ]] || continue
+    [[ "$page" =~ -page-([0-9]+)\.json$ ]] || continue
+    if [[ "$cursor" == "$(jq -r '.data.repository.pullRequest.reviews.pageInfo.endCursor // empty' "$page")" ]]; then
+      next="${page%-page-*}-page-$((BASH_REMATCH[1] + 1)).json"
+      [[ -f "$next" ]] || exit 1
+      cat "$next"
+      exit 0
+    fi
+  done
+  exit 1
+fi
+
+if [[ -n "${FB_HANG_REST:-}" ]]; then sleep 30; exit 0; fi
+if [[ -n "${FB_FAIL_REST:-}" ]]; then
+  echo "stub gh: simulated REST reviews failure" >&2
+  exit 1
+fi
+shift  # drop "api"
+shift  # drop the endpoint
+jq_filter=""
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --jq) jq_filter="$2"; shift 2 ;;
+    *) shift ;;
+  esac
+done
+for page in "$FB"/page-*.json; do
+  [[ -f "$page" ]] || continue
+  jq -r "$jq_filter" "$page" || exit 1
+done
+exit 0
+STUB
+chmod +x "$FB_STUB_DIR/gh"
+
+cat > "$FB_STUB_DIR/page-1.json" <<'JSON'
+[{"id":11,"state":"COMMENTED","commit_id":"aaa","submitted_at":"2026-09-14T20:00:00Z","user":{"login":"carol"},"body":"rest note"}]
+JSON
+cat > "$FB_STUB_DIR/gql-page-1.json" <<'JSON'
+{"data":{"repository":{"pullRequest":{"reviews":{"pageInfo":{"hasNextPage":true,"endCursor":"GQLC1"},"nodes":[
+  {"databaseId":21,"state":"CHANGES_REQUESTED","commit":{"oid":"ccc"},"submittedAt":"2026-09-15T10:00:00Z","author":{"login":"alice"},"body":"needs coverage"},
+  {"databaseId":22,"state":"PENDING","commit":null,"submittedAt":null,"author":null,"body":""}
+]}}}}}
+JSON
+cat > "$FB_STUB_DIR/gql-page-2.json" <<'JSON'
+{"data":{"repository":{"pullRequest":{"reviews":{"pageInfo":{"hasNextPage":false,"endCursor":"GQLC2"},"nodes":[
+  {"databaseId":23,"state":"APPROVED","commit":{"oid":"ddd"},"submittedAt":"2026-09-15T11:00:00Z","author":{"login":"bob"},"body":"lgtm"}
+]}}}}}
+JSON
+
+FORGE_TYPE="github"
+
+fb_run() { # fb_run forge_get_pr_reviews ... -> sets fb_out / fb_rc
+  set +e
+  fb_out=$(FB_STUB_DIR_ENV="$FB_STUB_DIR" "$@" 2>/dev/null)
+  fb_rc=$?
+  set -e
+}
+
+fb_fail_closed() { # asserts fb_rc != 0 && fb_out empty; MSG
+  TESTS_RUN=$((TESTS_RUN + 1))
+  if [[ "$fb_rc" -ne 0 && -z "$fb_out" ]]; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "  ${GREEN}PASS${NC}: $1"
+  else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "  ${RED}FAIL${NC}: $1 (rc=$fb_rc, out=${fb_out:-<empty>})"
+  fi
+}
+
+# REST success is unchanged, and no GraphQL call is made.
+rm -f "$FB_STUB_DIR/calls.log"
+fb_run forge_get_pr_reviews "owner/repo" "5369" "$FB_STUB_DIR/gh"
+assert_eq "0" "$fb_rc" "REST success: read succeeds"
+assert_eq "11" "$(printf '%s\n' "$fb_out" | jq -r '.id')" "REST success: the REST record is served"
+assert_no_grep "graphql" "$FB_STUB_DIR/calls.log" "REST success: no GraphQL call is made"
+
+# REST failure + GraphQL serving: the fallback answers with the identical
+# record shape, across cursor-paginated pages.
+rm -f "$FB_STUB_DIR/calls.log"
+FB_FAIL_REST=1 fb_run forge_get_pr_reviews "owner/repo" "5369" "$FB_STUB_DIR/gh"
+assert_eq "0" "$fb_rc" "REST fail + GraphQL serving: the fallback read succeeds"
+assert_eq "3" "$(printf '%s\n' "$fb_out" | grep -c '^{')" "records from BOTH GraphQL pages are returned"
+assert_eq "true" "$(printf '%s\n' "$fb_out" | jq 'select(.id == 21) | .id | type == "number"')" "id stays numeric (databaseId), like the REST path"
+assert_eq "CHANGES_REQUESTED" "$(printf '%s\n' "$fb_out" | jq -r 'select(.id == 21) | .state')" "state maps through (GitHub enum, already normalized)"
+assert_eq "ccc" "$(printf '%s\n' "$fb_out" | jq -r 'select(.id == 21) | .commit_id')" "commit_id maps (commit.oid -> commit_id)"
+assert_eq "2026-09-15T10:00:00Z" "$(printf '%s\n' "$fb_out" | jq -r 'select(.id == 21) | .submitted_at')" "submitted_at maps (submittedAt -> submitted_at)"
+assert_eq "alice" "$(printf '%s\n' "$fb_out" | jq -r 'select(.id == 21) | .author')" "author maps (author.login -> author)"
+assert_eq "needs coverage" "$(printf '%s\n' "$fb_out" | jq -r 'select(.id == 21) | .body')" "body maps"
+assert_eq "23" "$(printf '%s\n' "$fb_out" | jq -r 'select(.id == 23) | .id')" "the cursor-paginated page-2 record is served"
+assert_eq "PENDING|||" "$(printf '%s\n' "$fb_out" | jq -r 'select(.id == 22) | [.state, .commit_id, .submitted_at, .author] | join("|")')" "null GraphQL fields map to the REST path's empty-string defaults"
+
+# Both transports failing: non-zero, no output (fail closed).
+FB_FAIL_REST=1 FB_FAIL_GRAPHQL=1 fb_run forge_get_pr_reviews "owner/repo" "5369" "$FB_STUB_DIR/gh"
+fb_fail_closed "both transports failing -> non-zero with no output"
+
+# Truncated pagination: page 1 advertises a follower that never arrives.
+mv "$FB_STUB_DIR/gql-page-2.json" "$FB_STUB_DIR/gql-page-2.json.aside"
+FB_FAIL_REST=1 fb_run forge_get_pr_reviews "owner/repo" "5369" "$FB_STUB_DIR/gh"
+fb_fail_closed "an advertised follower page that never arrives -> non-zero, no partial output"
+mv "$FB_STUB_DIR/gql-page-2.json.aside" "$FB_STUB_DIR/gql-page-2.json"
+
+# A page missing pageInfo must not be guessed complete.
+cp "$FB_STUB_DIR/gql-page-1.json" "$FB_STUB_DIR/gql-page-1.json.keep"
+cat > "$FB_STUB_DIR/gql-page-1.json" <<'JSON'
+{"data":{"repository":{"pullRequest":{"reviews":{"nodes":[
+  {"databaseId":21,"state":"APPROVED","commit":{"oid":"ccc"},"submittedAt":"2026-09-15T10:00:00Z","author":{"login":"alice"},"body":"no pageInfo on this page"}
+]}}}}}
+JSON
+FB_FAIL_REST=1 fb_run forge_get_pr_reviews "owner/repo" "5369" "$FB_STUB_DIR/gh"
+fb_fail_closed "a page missing pageInfo -> non-zero (never guessed complete)"
+mv "$FB_STUB_DIR/gql-page-1.json.keep" "$FB_STUB_DIR/gql-page-1.json"
+
+# A GraphQL-level errors payload (200 + errors key) must not pass for data.
+cp "$FB_STUB_DIR/gql-page-1.json" "$FB_STUB_DIR/gql-page-1.json.keep"
+cat > "$FB_STUB_DIR/gql-page-1.json" <<'JSON'
+{"errors":[{"message":"Something went wrong."}],"data":{"repository":{"pullRequest":{"reviews":{"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[]}}}}}
+JSON
+FB_FAIL_REST=1 fb_run forge_get_pr_reviews "owner/repo" "5369" "$FB_STUB_DIR/gh"
+fb_fail_closed "a GraphQL errors payload -> non-zero with no output"
+mv "$FB_STUB_DIR/gql-page-1.json.keep" "$FB_STUB_DIR/gql-page-1.json"
+
+# A timed-out REST read (124) is never retried through the fallback.
+rm -f "$FB_STUB_DIR/calls.log"
+LOOM_FORGE_REVIEW_READ_TIMEOUT=1 FB_HANG_REST=1 \
+  fb_run forge_get_pr_reviews "owner/repo" "5369" "$FB_STUB_DIR/gh"
+assert_eq "124" "$fb_rc" "a hung REST read returns 124 (the #13927 bound)"
+assert_no_grep "graphql" "$FB_STUB_DIR/calls.log" "a timed-out REST read is NOT retried through the fallback"
+
+rm -rf "$FB_STUB_DIR"
+
 # --- Test gitea_api auth-mode selection (issue #3297) ---
 # Use a `curl` shim on PATH that records its argv and returns a fake 200.
 echo ""

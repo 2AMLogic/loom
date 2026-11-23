@@ -491,6 +491,29 @@ fn malformed_preference_config_fails_closed() {
         .contains("more than once"));
 }
 
+/// #14932: a `runtimes.apiKeyLimits` block that cannot be understood withholds
+/// accounts at selection time, so `validate` names it beside the other
+/// `runtimes.*` failings — before any launch meets it.
+#[test]
+fn a_malformed_api_key_limits_block_is_a_validate_finding() {
+    let config = serde_json::json!({
+        "runtimes": { "apiKeyLimits": { "zai": { "alice": { "maxConcurrent": 0 } } } }
+    });
+    let findings = check_runtimes_preference_config(&config);
+    assert_eq!(findings.len(), 1, "{findings:?}");
+    assert!(findings[0].starts_with("runtimes api-key limits: "), "{}", findings[0]);
+    assert!(
+        findings[0].contains("runtimes.apiKeyLimits.zai.alice.maxConcurrent must be > 0"),
+        "{}",
+        findings[0]
+    );
+    // A well-formed block, and an absent one, add nothing.
+    let sound = serde_json::json!({
+        "runtimes": { "apiKeyLimits": { "zai": { "alice": { "maxConcurrent": 1 } } } }
+    });
+    assert!(check_runtimes_preference_config(&sound).is_empty(), "{sound}");
+}
+
 // ---------------------------------------------------------------------------
 // End-to-end resolution against a real fixture
 // ---------------------------------------------------------------------------

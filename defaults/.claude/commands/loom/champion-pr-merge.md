@@ -1263,7 +1263,7 @@ It is eligible only when **all** hold, each read live in this pass:
   same gate rule; they differ only in scope (strict byte-checks every changed file, not just the
   kept set);
 - `.loom/install-metadata.json` at the PR head has `loom_version` equal to `<X.Y.Z>`, and
-  `refs/tags/v<X.Y.Z>` exists in `rjwalters/loom`;
+  `refs/tags/v<X.Y.Z>` exists in `2AMLogic/loom`;
 - the files read is complete (count equals `changed_files`) and at least one changed file is a
   kept-set path;
 - **every** kept-set file is `added` or `modified` (a removal, rename or copy holds), maps to a
@@ -1850,7 +1850,7 @@ fi
 | `PRIOR_HOLD=true`, no `RELEASE_REASON`, "Self-release" does not clear | **HOLD the merge, silently.** The PR is not merged this pass regardless of how the axes read this tick, and no comment is posted (anti-spam guard already covers it). It is **not** skipped, though: `MERGE_BLOCKED_BY_HOLD=true` routes it to the **Held-PR Health Pass** (#6720), which still evaluates the `mergeable`, `recency` and `ci-green` criteria. |
 | `OPEN_CONDITION=true` (#12594), no `loom:auto-merge-ok` | **HOLD the merge** whatever (b)-(e) and the axes say — `PRIOR_HOLD=true`, `RELEASE_REASON=""`, `MERGE_BLOCKED_BY_HOLD=true`, even with no hold marker on the PR. The notice names the condition (once per condition comment). Closed only by a later trusted comment from a person (never an `x[bot]` author, never Champion) that opens with `<!-- loom:release-condition-met -->`, or that is a release instruction (`clear the hold — …`, `override: …`, `ok to merge — …`) citing the condition (the word "condition" in its body); then the rows below apply as usual. A clearing comment that does not cite it releases nothing: the condition is the hold. |
 | `PRIOR_HOLD=true`, released by `loom:auto-merge-ok` (`HOLD_OVERRIDE=true`) | The `merge-risk` criterion **PASS** by override — the axes are not re-scored. Continue to `critical-files`. Step 2's reversal block is **mandatory**. |
-| `PRIOR_HOLD=true`, released by (b), (c), (d), or (e) | Re-judge the four axes normally. Now green -> **PASS**, continue to `critical-files`, and Step 2's reversal block is **mandatory**. Still red **and** `MANUAL_RELEASE_SINCE_HOLD=true` **and** the concern is byte-identical to the prior hold's bullet -> **PASS** the same way: a human released exactly that concern (#11416); "Hold behavior"'s first branch executes it (no notice, no label). When your concern *is* the one on record, copy the prior bullet verbatim; write a new bullet only for a concern it does not name. Still red otherwise -> the hold persists: `MERGE_BLOCKED_BY_HOLD=true`, "Hold behavior" below, then the **Held-PR Health Pass**. |
+| `PRIOR_HOLD=true`, released by (b), (c), (d), or (e) | Re-judge the four axes normally. Now green -> **PASS**, continue to `critical-files`, and Step 2's reversal block is **mandatory**. Still red **and** `MANUAL_RELEASE_SINCE_HOLD=true` **and** the concern is byte-identical to the prior hold's bullet -> **PASS** the same way: a human released exactly that concern (#11416); "Hold behavior"'s first branch executes it (no notice, no label). When your concern *is* the one on record, copy the prior bullet verbatim; write a new bullet only for a concern it does not name. Still red otherwise -> the hold persists: `MERGE_BLOCKED_BY_HOLD=true`, "Hold behavior" below (at a NEW head it posts its notice for that head, #14833, so the `--release-hold` marker stays current), then the **Held-PR Health Pass**. |
 
 **Once released, stays released.** A release signal is consumed by the change
 itself, not by a counter: after a new commit lands, later ticks keep seeing
@@ -1874,6 +1874,11 @@ Apps) is trusted to hold, never to record an operator's condition as met.
 
 - **Several hold comments from different ticks** — only the *latest* one matters
   (`| last`); the count is irrelevant, and the marker's presence is what binds.
+  The idempotency guard is head-scoped to that latest notice (#14833): a repeat
+  tick at the head it records is quiet, while a red verdict at a NEW head posts
+  a fresh notice for that head — exactly one notice per held head, so the
+  `champion:hold-state` marker `--release-hold` reads never goes stale while
+  the hold stands.
 - **Force-push that leaves commit dates untouched** — caught by the head-SHA
   comparison, which is why the hold records `champion:hold-state head=<sha>`.
   Legacy holds without that line fall back to `committedDate`, so a same-date
@@ -1983,15 +1988,22 @@ elif [ "$MANUAL_RELEASE_SINCE_HOLD" = true ] && [ "$CONCERN_BULLET" = "$PRIOR_CO
   # concern. PASS — continue to critical-files; Step 2's reversal block is mandatory.
   echo "PASS: #$PR_NUMBER — human released this same concern ($RELEASE_REASON)"
 else
-  # Idempotency guard (same pattern as the stale-PR and verdict-janitor notices):
-  # comment ONCE per hold episode, not every tick. The hold BINDS later ticks
-  # (see "Sticky holds"). Cached ("$GH_READ") marker grep; `startswith`, not a
-  # substring, so a comment quoting the marker in prose is never mistaken for
-  # the notice (#5371). A NEW concern after a human removal (#11416) always
-  # posts: it becomes the hold on record, so the human's next removal releases
-  # it instead of looping on a concern they were never shown.
-  if [ "$MANUAL_RELEASE_SINCE_HOLD" != true ] && [ "$("$GH_READ" pr view "$PR_NUMBER" --json comments --jq "[.comments[].body] | any(startswith(\"$HOLD_MARKER\"))")" = "true" ]; then
-    echo "Merge-risk hold already posted for #$PR_NUMBER — hold stands, no comment"
+  # Idempotency guard, HEAD-SCOPED (#14833): comment once per hold episode AT
+  # A HEAD, not once per PR. The hold BINDS later ticks (see "Sticky holds").
+  # The precheck's HOLD_BODY/HOLD_HEAD are the latest `$HOLD_MARKER` notice and
+  # the head it recorded — the same latest-notice read release path (c) uses, so
+  # the guard and the release test can never disagree. A notice recorded at
+  # THIS tick's head is a repeat tick: quiet. A notice at an older head, or a
+  # legacy one with no recorded head, was written against a diff that no longer
+  # exists — this tick's red verdict re-holds the PR at a NEW head, so the
+  # fresh notice below must post and record `champion:hold-state
+  # head=<current>`, or `merge-pr.sh --release-hold` reads the stale head and
+  # refuses a valid release at the current one. A NEW concern after a human
+  # removal (#11416) always posts: it becomes the hold on record, so the
+  # human's next removal releases it instead of looping on a concern they were
+  # never shown.
+  if [ "$MANUAL_RELEASE_SINCE_HOLD" != true ] && [ -n "$HOLD_HEAD" ] && [ "$HOLD_HEAD" = "$HEAD_SHA" ]; then
+    echo "Merge-risk hold already posted for #$PR_NUMBER at this head — hold stands, no comment"
     # #12933: the daemon drew this hold because the standing-authorization
     # digest moved (or a legacy record has none). The hold stands, so record
     # the current digest ONCE at this head — the daemon reads the LAST trusted
@@ -2810,9 +2822,11 @@ missing its label with no removal on record gets the label back
 #
 # #13930 degraded census: every "$GH_READ" call is bounded by gh-cached's
 # LOOM_GH_TIMEOUT_S — a stalled query fails fast (exit 124, diagnostic on
-# stderr) instead of hanging this pass. A failed query contributes nothing
-# and raises HELD_STRUCTURAL_UNAVAILABLE; the Per-PR Digest below then marks
-# structural fields unavailable instead of silently dropping the digest.
+# stderr) instead of hanging this pass. Any failed census read — the two
+# bulk holds queries, the at-Doctor count, or the released list (#14011) —
+# contributes nothing and raises HELD_STRUCTURAL_UNAVAILABLE; the Per-PR
+# Digest below then marks structural fields unavailable instead of silently
+# dropping the digest.
 # Never issue a second bulk `pr list` to "recover" — the deliberate
 # single-read pin stands; a degraded digest beats a duplicated census read.
 HELD_JSON=""
@@ -2839,11 +2853,14 @@ HELD_JSON=$(printf '%s' "$HELD_JSON" | jq -s 'add // [] | unique_by(.number)')
 # rindex idiom from champion-critical-file-hold.md). The previous selector
 # excluded a PR on ANY cleared marker, dropping a held PR whose *other*
 # hold still stands.
-HELD_AT_DOCTOR=$("$GH_READ" pr list --label "loom:changes-requested" --label "loom:blocked" --state open --limit 500 --json number,labels,comments \
+if ! HELD_AT_DOCTOR=$("$GH_READ" pr list --label "loom:changes-requested" --label "loom:blocked" --state open --limit 500 --json number,labels,comments \
   --jq '[.[] | select(any(.labels[]?.name; . == "loom:frozen") | not) | select(
       ([.comments[].body] | (map(startswith("<!-- champion:merge-risk-hold -->")) | rindex(true)) as $h | (map(contains("<!-- champion:merge-risk-hold-cleared -->")) | rindex(true)) as $c | $h != null and ($c == null or $h > $c))
       or ([.comments[].body] | (map(startswith("<!-- champion:critical-file-hold -->")) | rindex(true)) as $h | (map(startswith("<!-- champion:critical-file-hold-cleared -->")) | rindex(true)) as $c | $h != null and ($c == null or $h > $c))
-      or ([.comments[].body] | (map(startswith("<!-- champion:ratification-hold -->")) | rindex(true)) as $h | (map(startswith("<!-- champion:ratification-hold-cleared -->") or startswith("<!-- champion:ratification-release-respected -->")) | rindex(true)) as $c | $h != null and ($c == null or $h > $c)))] | length')
+      or ([.comments[].body] | (map(startswith("<!-- champion:ratification-hold -->")) | rindex(true)) as $h | (map(startswith("<!-- champion:ratification-hold-cleared -->") or startswith("<!-- champion:ratification-release-respected -->")) | rindex(true)) as $c | $h != null and ($c == null or $h > $c)))] | length'); then
+  HELD_STRUCTURAL_UNAVAILABLE=1   # the at-Doctor read stalled too (#14011) — the 0 below is degraded, not a fact
+  HELD_AT_DOCTOR=0   # never feed a failed read's partial stdout to the arithmetic
+fi
 HELD_AT_DOCTOR=${HELD_AT_DOCTOR:-0}   # a bounded-but-failed read degrades to 0, never breaks the arithmetic (#13930)
 
 HELD_COUNT=$(( $(printf '%s\n' "$HELD_JSON" | jq 'length') + HELD_AT_DOCTOR ))
@@ -2865,9 +2882,13 @@ echo "Merge-risk holds: $HELD_COUNT open PR(s) — $HELD_CONFLICTING conflicting
 # a LATEST `ratification-release-respected` marker (the one hold kind whose
 # design is "only a human releases this, then merges by hand"); a ratification
 # hold whose last family marker is `-cleared` was auto-cleared, not listed.
-RELEASED=$("$GH_READ" pr list --label "loom:pr" --search "-label:loom:blocked -label:loom:operator -label:loom:frozen" --state open --limit 500 --json number,comments \
+RELEASED=""
+if ! RELEASED=$("$GH_READ" pr list --label "loom:pr" --search "-label:loom:blocked -label:loom:operator -label:loom:frozen" --state open --limit 500 --json number,comments \
   --jq '"<!-- champion:critical-file-hold" as $cf | [.[] | select(any(.comments[].body; startswith("<!-- champion:merge-risk-hold -->")) or ([.comments[].body | select(startswith($cf))] | last // "" | startswith($cf + " -->")) or ([.comments[].body | select(startswith("<!-- champion:ratification-hold") or startswith("<!-- champion:ratification-release-respected"))] | last // "" | startswith("<!-- champion:ratification-release-respected -->")))
-    | "#\(.number)"] | join(" ")')
+    | "#\(.number)"] | join(" ")'); then
+  HELD_STRUCTURAL_UNAVAILABLE=1   # the released read stalled too (#14011) — "none" below may be an artifact, not a fact
+  RELEASED=""   # never echo a failed read's partial stdout
+fi
 echo "Released holds, not yet merged: ${RELEASED:-none}"
 ```
 
@@ -4732,8 +4753,11 @@ Reviewed the rejection history against the forward-progress test; no qualifying 
 - **Reason**: <SAME_DEFECT_RE_LITIGATED | AMBIGUOUS_COMPARISON | ONLY_ONE_REJECTION | CHAIN_NOT_CONVERGING | APPROACH_DISAGREEMENT | NOT_CAP_PARKED | HUMAN_HOLD>
 - **Specifics**: <WHICH_DEFECT_REPEATS_ACROSS_REJECTIONS_OR_WHAT_IS_UNCLEAR>
 - **What a human needs to decide**: <THE_SPECIFIC_JUDGMENT_AUTOMATION_CANNOT_MAKE>
+- **How this park releases** (no new Judge rejection can land on a parked PR, so nothing re-opens it by itself):
+  - **Inherited-CI park only** — the verdict was a CI-only rejection AND every red check on the head fails the same way on the PR's merge base while being green on the default branch: once the default branch's required checks are green, the daemon's CI-gate recovery pass merges the recovered default branch into this PR's branch (a merge commit, never a force-push) and returns the PR to review once the new head's checks are verified exactly green (#10178, #14813). If that update conflicts, the PR is handed to Doctor's conflict lane (\`loom:merge-conflict\`) instead.
+  - **Every other reason above** — release needs exactly the condition or decision the Reason/Specifics lines name: a human decision for \`HUMAN_HOLD\`, a qualifying forward-progress record for the cap reasons. State that condition here; do not promise a re-evaluation that cannot happen.
 
-Labels unchanged (\`loom:blocked\` + \`loom:changes-requested\`). Champion will re-evaluate this PR if a new Judge rejection lands.
+Labels unchanged (\`loom:blocked\` + \`loom:changes-requested\`).
 
 ---
 *Automated by Champion role*"

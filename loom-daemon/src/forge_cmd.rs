@@ -50,7 +50,10 @@
 //!
 //! For **Gitea** the subcommands *decline* with [`EX_FORGE_DECLINED`] so the
 //! caller's existing shell fallback carries the query path (the read scripts
-//! degrade to `gh`). `auto-merge` has no Gitea implementation at all: the
+//! degrade to `gh`), with one exception: a numeric `view --json` is served
+//! from the Gitea API (`forge_gitea_view`, #14939), because neither
+//! the decline's shell path nor `gh` can read a Gitea remote. `auto-merge`
+//! has no Gitea implementation at all: the
 //! shell `forge_auto_merge` Gitea poll-and-merge it used to decline to was
 //! retired by #8427, and a pre-#8410 installed `merge-pr.sh` still carries
 //! its own copy in its own `lib/forge-helpers.sh`. This keeps the daemon's zero-HTTP-client house style
@@ -395,6 +398,18 @@ fn forge_inv(op: &'static str, intent: AccessIntent, gh: &str) -> GhInvocation {
 /// so `forge_cmd::gh_bin` callers and the facade can never disagree.
 pub(crate) use crate::gh_invocation::gh_bin;
 
+/// Return control to the caller's Gitea adapter before any GitHub I/O.
+pub(crate) fn decline_gitea(cwd: Option<&Path>) {
+    let ft = detect_forge(cwd);
+    if ft == ForgeType::Gitea {
+        eprintln!(
+            "loom-daemon forge: gitea is not handled natively; falling back to the \
+             caller's shell path"
+        );
+        std::process::exit(EX_FORGE_DECLINED);
+    }
+}
+
 /// Passthrough the given `gh` args (entity prepended), inheriting stdio and
 /// propagating the exit code. On GitHub this is byte-identical to the scripts'
 /// `FORGE=gh` fallback. Never returns on success/failure of `gh` (calls
@@ -406,14 +421,7 @@ fn is_issue_create(entity: &str, args: &[String]) -> bool {
 }
 
 fn gh_passthrough(entity: &str, args: &[String]) -> Result<()> {
-    let ft = detect_forge(None);
-    if ft == ForgeType::Gitea {
-        eprintln!(
-            "loom-daemon forge: gitea is not handled natively; falling back to the \
-             caller's shell path"
-        );
-        std::process::exit(EX_FORGE_DECLINED);
-    }
+    decline_gitea(None);
 
     // #5047: `forge issue` is a byte-identical passthrough to `gh issue`, so
     // `forge issue create` inherits `gh issue create`'s GraphQL cost and dies
@@ -845,6 +853,15 @@ pub enum ForgeCmd {
 /// a child process cannot be spawned.
 pub fn dispatch(cmd: ForgeCmd) -> Result<()> {
     match cmd {
+        // #14939: on a Gitea checkout a numeric `view --json` is served from
+        // the Gitea API. Every other `forge <issue|pr>` read on Gitea still
+        // declines (exit 3) to the caller's shell path.
+        ForgeCmd::Issue(args) if crate::forge_gitea_view::serves(&args) => {
+            crate::forge_gitea_view::handle("issue", &args)
+        }
+        ForgeCmd::Pr(args) if crate::forge_gitea_view::serves(&args) => {
+            crate::forge_gitea_view::handle("pr", &args)
+        }
         // `forge <issue|pr> list --cached …` routes to the agent-facing ETag
         // cache (#5056); it serves-and-exits(0) or declines-and-exits(3) so the
         // caller falls back to plain `gh`. Everything else is the byte-identical

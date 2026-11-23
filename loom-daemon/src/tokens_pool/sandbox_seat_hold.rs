@@ -91,7 +91,7 @@ pub fn hold_seat(workspace: &Path, id: &AccountId, secs: u64, now: u64) -> Resul
 mod tests {
     use super::*;
     use crate::tokens_pool::account_registry::AccountProvider;
-    use crate::tokens_pool::health::{account_health, record_terminal_for_model};
+    use crate::tokens_pool::health::{account_health, record_terminal_for_model_at};
     use crate::tokens_pool::TerminalClassification;
 
     fn id(name: &str) -> AccountId {
@@ -124,24 +124,26 @@ mod tests {
     fn a_longer_live_cooldown_and_a_sticky_reauth_hold_are_never_overridden() {
         let dir = tempfile::tempdir().unwrap();
         let now = u64::try_from(chrono::Utc::now().timestamp()).unwrap();
-        record_terminal_for_model(
+        record_terminal_for_model_at(
             dir.path(),
             &id("agent-3"),
             TerminalClassification::TokenExhausted,
             None,
             "test",
+            now,
         )
         .unwrap();
         let before = account_health(dir.path(), &id("agent-3")).unwrap().unwrap();
         assert!(!hold_seat(dir.path(), &id("agent-3"), 600, now).unwrap());
         assert_eq!(account_health(dir.path(), &id("agent-3")).unwrap().unwrap(), before);
 
-        record_terminal_for_model(
+        record_terminal_for_model_at(
             dir.path(),
             &id("agent-4"),
             TerminalClassification::TokenExpired,
             None,
             "test",
+            now,
         )
         .unwrap();
         assert!(!hold_seat(dir.path(), &id("agent-4"), 600, now).unwrap());
@@ -153,12 +155,13 @@ mod tests {
     fn a_success_on_the_seat_clears_the_hold() {
         let dir = tempfile::tempdir().unwrap();
         hold_seat(dir.path(), &id("agent-3"), 3_600, 1_000).unwrap();
-        record_terminal_for_model(
+        record_terminal_for_model_at(
             dir.path(),
             &id("agent-3"),
             TerminalClassification::Success,
             None,
             "test",
+            1_000,
         )
         .unwrap();
         let health = account_health(dir.path(), &id("agent-3")).unwrap().unwrap();

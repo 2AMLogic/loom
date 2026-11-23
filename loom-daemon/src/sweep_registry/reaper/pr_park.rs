@@ -1,9 +1,7 @@
 //! PR-side park check for the reaper's #4256 resume decision (Issue #8689).
 //!
-//! Extracted from `reaper.rs` (which sits just under the file-size ratchet's
-//! 1000-code-line threshold, see `.loom/docs/file-size-policy.md`) so the
-//! predicate and its rationale live together instead of adding another arm to
-//! the already-long `reap_once` match.
+//! Extracted from `reaper.rs` so the predicate and its rationale live together
+//! instead of adding another arm to the already-long `reap_once` match.
 //!
 //! # The shape this targets
 //!

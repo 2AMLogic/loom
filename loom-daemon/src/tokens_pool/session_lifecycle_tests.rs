@@ -60,7 +60,7 @@ impl FakeRunner {
                 running: true,
                 restarting: false,
                 started_at: Some("2026-09-05T00:00:00Z".into()),
-                image: Some("ghcr.io/rjwalters/loom-worker-session:test".into()),
+                image: Some("ghcr.io/2amlogic/loom-worker-session:test".into()),
                 workspace,
                 extra_mounts: Vec::new(),
             },
@@ -1531,3 +1531,6 @@ mod stop_race;
 
 #[path = "session_lifecycle_hold_roots_tests.rs"]
 mod hold_roots;
+
+#[path = "session_lifecycle_exec_capture_tests.rs"]
+mod exec_capture;
