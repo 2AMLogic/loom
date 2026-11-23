@@ -953,80 +953,6 @@ pub mod forge {
     }
 }
 
-/// The enforced GraphQL bucket: `(remaining, reset, used)`.
-pub type GraphqlReading = (u64, DateTime<Utc>, Option<u64>);
-
-/// Parse the body of the `rateLimit` GraphQL query (pure).
-#[must_use]
-pub fn parse_graphql_rate_limit(body: &str) -> Option<GraphqlReading> {
-    let json: serde_json::Value = serde_json::from_str(body).ok()?;
-    let r = json.get("data")?.get("rateLimit")?;
-    let remaining = r.get("remaining")?.as_u64()?;
-    let reset = DateTime::parse_from_rfc3339(r.get("resetAt")?.as_str()?)
-        .ok()?
-        .with_timezone(&Utc);
-    Some((remaining, reset, r.get("used").and_then(serde_json::Value::as_u64)))
-}
-
-/// Parse `X-RateLimit-{Remaining,Reset,Used}` from a `gh api -i` response
-/// head (pure). Used when the refused query carries no `rateLimit` body.
-#[must_use]
-pub fn parse_graphql_headers(head: &str) -> Option<GraphqlReading> {
-    let (mut remaining, mut reset, mut used) = (None, None, None);
-    for line in head.lines() {
-        let Some((k, v)) = line.split_once(':') else {
-            continue;
-        };
-        let v = v.trim();
-        match k.trim().to_ascii_lowercase().as_str() {
-            "x-ratelimit-remaining" => remaining = v.parse::<u64>().ok(),
-            "x-ratelimit-reset" => reset = v.parse::<i64>().ok(),
-            "x-ratelimit-used" => used = v.parse::<u64>().ok(),
-            _ => {}
-        }
-    }
-    Some((remaining?, DateTime::from_timestamp(reset?, 0)?, used))
-}
-
-/// Interpret `gh api -i graphql` stdout (headers + blank line + body):
-/// the `rateLimit` body wins, then the headers. `_now` is reserved for
-/// future clock-relative handling.
-#[must_use]
-pub fn parse_graphql_probe(out: &str, _now: DateTime<Utc>) -> Option<GraphqlReading> {
-    let normalized = out.replace("\r\n", "\n");
-    let (head, body) = normalized
-        .split_once("\n\n")
-        .unwrap_or((normalized.as_str(), ""));
-    parse_graphql_rate_limit(body.trim()).or_else(|| parse_graphql_headers(head))
-}
-
-/// Compose a [`BudgetSnapshot`]: `core` from the `gh api rate_limit` body,
-/// `graphql` from the GraphQL endpoint ([`GraphqlReading`]); the body's own
-/// `.resources.graphql` is deliberately ignored (#10038). When the graphql
-/// reading is unknown the whole snapshot is `None` (caller uses the fallback
-/// cooldown) rather than showing a figure that may be wrong.
-#[must_use]
-pub fn parse_budget(
-    body: &str,
-    graphql: Option<GraphqlReading>,
-    now: DateTime<Utc>,
-) -> Option<BudgetSnapshot> {
-    let json: serde_json::Value = serde_json::from_str(body).ok()?;
-    let core = json.get("resources")?.get("core")?;
-    let core_remaining = core.get("remaining")?.as_u64()?;
-    let core_reset = DateTime::from_timestamp(core.get("reset")?.as_i64()?, 0)?;
-    let (graphql_remaining, graphql_reset, graphql_used) = graphql?;
-    Some(BudgetSnapshot {
-        core_remaining,
-        core_reset,
-        graphql_remaining,
-        graphql_reset,
-        core_used: core.get("used").and_then(serde_json::Value::as_u64),
-        graphql_used,
-        probed_at: now,
-    })
-}
-
 /// Compose a [`BudgetSnapshot`] from one `GET /rate_limit` body alone
 /// (#12204): `core` and `graphql` both from `.resources`, so the budget
 /// costs one free request and no GraphQL points. `None` when either bucket
@@ -1034,13 +960,22 @@ pub fn parse_budget(
 #[must_use]
 pub fn parse_rate_limit_body(body: &str, now: DateTime<Utc>) -> Option<BudgetSnapshot> {
     let json: serde_json::Value = serde_json::from_str(body.trim()).ok()?;
-    let g = json.get("resources")?.get("graphql")?;
-    let graphql = (
-        g.get("remaining")?.as_u64()?,
-        DateTime::from_timestamp(g.get("reset")?.as_i64()?, 0)?,
-        g.get("used").and_then(serde_json::Value::as_u64),
-    );
-    parse_budget(body.trim(), Some(graphql), now)
+    let resources = json.get("resources")?;
+    let core = resources.get("core")?;
+    let core_remaining = core.get("remaining")?.as_u64()?;
+    let core_reset = DateTime::from_timestamp(core.get("reset")?.as_i64()?, 0)?;
+    let graphql = resources.get("graphql")?;
+    let graphql_remaining = graphql.get("remaining")?.as_u64()?;
+    let graphql_reset = DateTime::from_timestamp(graphql.get("reset")?.as_i64()?, 0)?;
+    Some(BudgetSnapshot {
+        core_remaining,
+        core_reset,
+        graphql_remaining,
+        graphql_reset,
+        core_used: core.get("used").and_then(serde_json::Value::as_u64),
+        graphql_used: graphql.get("used").and_then(serde_json::Value::as_u64),
+        probed_at: now,
+    })
 }
 
 #[cfg(test)]
@@ -1231,7 +1166,7 @@ mod tests {
         assert_eq!(snap.trips_total, 1);
     }
 
-    // ===== parse_budget =====
+    // ===== parse_rate_limit_body =====
 
     const CORE_BODY: &str = r#"{
         "resources": {
@@ -1240,58 +1175,28 @@ mod tests {
         }
     }"#;
 
-    const GQL_BODY: &str = r#"{"data":{"rateLimit":{"limit":5000,"used":5208,"remaining":0,"resetAt":"2026-07-29T19:20:35Z"}}}"#;
-
     #[test]
-    fn parse_graphql_rate_limit_reads_body() {
-        let (rem, reset, used) = parse_graphql_rate_limit(GQL_BODY).unwrap();
-        assert_eq!((rem, used), (0, Some(5208)));
-        assert_eq!(reset, DateTime::parse_from_rfc3339("2026-07-29T19:20:35Z").unwrap());
-    }
-
-    #[test]
-    fn parse_graphql_headers_fallback() {
-        let out = "HTTP/2.0 403 Forbidden\r\nX-Ratelimit-Remaining: 0\r\nX-Ratelimit-Reset: 1785352835\r\nX-Ratelimit-Used: 5208\r\n\r\n{\"message\":\"API rate limit already exceeded\"}";
-        let (rem, reset, used) = parse_graphql_probe(out, t(0)).unwrap();
-        assert_eq!((rem, used), (0, Some(5208)));
-        assert_eq!(reset, DateTime::from_timestamp(1_785_352_835, 0).unwrap());
-    }
-
-    #[test]
-    fn parse_graphql_probe_missing_fields_is_unknown() {
-        assert!(parse_graphql_probe("HTTP/2.0 502 Bad Gateway\n\noops", t(0)).is_none());
-        assert!(parse_graphql_rate_limit(r#"{"data":{"rateLimit":{"remaining":1}}}"#).is_none());
-        assert!(parse_graphql_rate_limit("").is_none());
-    }
-
-    #[test]
-    fn graphql_endpoint_overrides_disagreeing_rate_limit_resource() {
-        // /rate_limit says graphql used 64 (healthy); the endpoint says 0 left.
-        let out = format!("HTTP/2.0 200 OK\n\n{GQL_BODY}");
-        let gql = parse_graphql_probe(&out, t(0));
-        let b = parse_budget(CORE_BODY, gql, t(0)).unwrap();
-        assert_eq!(b.graphql_remaining, 0);
-        assert_eq!(b.graphql_used, Some(5208));
+    fn parse_rate_limit_body_reads_both_buckets() {
+        let b = parse_rate_limit_body(CORE_BODY, t(0)).unwrap();
+        assert_eq!(b.core_remaining, 4722);
         assert_eq!(b.core_used, Some(278));
-        let reset = DateTime::parse_from_rfc3339("2026-07-29T19:20:35Z")
-            .unwrap()
-            .with_timezone(&Utc);
-        assert_eq!(b.graphql_reset, reset);
-        // Cooldown follows the GraphQL reset, not the 900s fallback.
-        let until = cooldown_until(Some(&b), t(0), 900);
-        assert_eq!(until, reset);
+        assert_eq!(b.core_reset, DateTime::from_timestamp(1_785_352_027, 0).unwrap());
+        assert_eq!(b.graphql_remaining, 4936);
+        assert_eq!(b.graphql_used, Some(64));
+        assert_eq!(b.graphql_reset, DateTime::from_timestamp(1_785_355_000, 0).unwrap());
+        assert_eq!(b.probed_at, t(0));
     }
 
     #[test]
-    fn parse_budget_unknown_graphql_yields_none() {
-        assert!(parse_budget(CORE_BODY, None, t(0)).is_none());
+    fn parse_rate_limit_body_missing_graphql_bucket_is_unknown() {
+        let core_only = r#"{"resources": {"core": {"limit": 5000, "used": 278, "remaining": 4722, "reset": 1785352027}}}"#;
+        assert!(parse_rate_limit_body(core_only, t(0)).is_none());
     }
 
     #[test]
-    fn parse_budget_rejects_malformed_bodies() {
-        let g = Some((1, t(10), None));
-        assert!(parse_budget("", g, t(0)).is_none());
-        assert!(parse_budget("not json", g, t(0)).is_none());
-        assert!(parse_budget(r#"{"resources": {}}"#, g, t(0)).is_none());
+    fn parse_rate_limit_body_rejects_malformed_bodies() {
+        assert!(parse_rate_limit_body("", t(0)).is_none());
+        assert!(parse_rate_limit_body("not json", t(0)).is_none());
+        assert!(parse_rate_limit_body(r#"{"resources": {}}"#, t(0)).is_none());
     }
 }

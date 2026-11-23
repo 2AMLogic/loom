@@ -66,32 +66,6 @@ impl SweepRegistry {
             .collect()
     }
 
-    /// Block the subtree stacked on `parent` (issue #3729, v1 item 4).
-    ///
-    /// For each direct child of `parent` (see [`Self::children_of`]), emit a
-    /// `sweep.issue.{child}.blocker` event on the existing frozen event-bus
-    /// topic (#3453 — no new topic). This is the safety net that keeps a
-    /// stacked child from auto-progressing (opening/merging its PR) when its
-    /// parent ends in `loom:blocked`. Auto-detach (rebasing an orphaned child
-    /// onto `main`) is explicitly out of v1 scope — block-the-subtree is the
-    /// only cascade behavior.
-    ///
-    /// Returns the child issue numbers that were signalled. Emission is
-    /// best-effort (no subscribers ⇒ debug log only), mirroring the rest of
-    /// the reaper's event handling.
-    pub fn block_children_of(&self, parent: u32, reason: &str) -> Vec<u32> {
-        let children = self.children_of(parent);
-        for child in &children {
-            self.emit_event(Event::SweepBlocker {
-                issue: *child,
-                reason: reason.to_string(),
-                label_added: "loom:blocked".to_string(),
-                repo: None, // stamped by emit_event (#3929)
-            });
-        }
-        children
-    }
-
     /// Best-effort check of whether `issue` currently carries the
     /// `loom:blocked` label on the forge. Used by the reaper to decide
     /// whether a terminated parent ended blocked (in which case its stacked
@@ -215,66 +189,6 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
     use std::time::SystemTime;
     use tempfile::tempdir;
-
-    /// Issue #3729 (v1 item 4, block-the-subtree): `block_children_of` emits a
-    /// `sweep.issue.{child}.blocker` event for every live child whose
-    /// `depends_on` names the given parent — and nothing for unrelated sweeps.
-    #[tokio::test]
-    async fn block_children_of_emits_blocker_for_dependents_only() {
-        use crate::event_bus::EventBus;
-
-        let dir = tempdir().unwrap();
-        let (mut registry, _record_log) = fixture_registry(dir.path());
-        let bus = Arc::new(EventBus::new());
-        registry.set_event_bus(bus.clone());
-        let mut sub = bus.subscribe::<[&str; 0], &str>([]);
-
-        // Parent #60, a stacked child #61 (depends_on=60), and an unrelated
-        // independent sweep #62 (depends_on=None).
-        for (sid, issue, dep) in [
-            ("sweep-issue-60", 60u32, None),
-            ("sweep-issue-61", 61u32, Some(60u32)),
-            ("sweep-issue-62", 62u32, None),
-        ] {
-            registry.entries.insert(
-                sid.to_string(),
-                SweepInfo {
-                    pgid: None,
-                    sweep_id: sid.to_string(),
-                    kind: SweepKind::Issue(issue),
-                    pid: 2_147_483_640,
-                    token_name: "unknown".into(),
-                    runtime: "unknown".into(),
-                    runtime_source: None,
-                    log_path: registry.compute_log_path(issue),
-                    idempotency_key: None,
-                    started_at: Utc::now(),
-                    state: SweepState::Running,
-                    latest_phase: None,
-                    pr_number: None,
-                    model: None,
-                    effort: None,
-                    depends_on: dep,
-                    repo: None,
-                },
-            );
-        }
-
-        let blocked = registry.block_children_of(60, "parent #60 blocked");
-        assert_eq!(blocked, vec![61], "only #61 depends on #60");
-
-        // Exactly one blocker event, for issue 61 on its .blocker topic.
-        let ev = sub.recv().await.unwrap();
-        match ev {
-            Event::SweepBlocker {
-                issue, label_added, ..
-            } => {
-                assert_eq!(issue, 61);
-                assert_eq!(label_added, "loom:blocked");
-            }
-            other => panic!("unexpected event: {other:?}"),
-        }
-    }
 
     /// Issue #3729: `children_of` only returns *live* direct children, and a
     /// terminal child is excluded (it no longer needs blocking).
