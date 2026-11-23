@@ -1292,6 +1292,169 @@ fn the_per_account_cycle_record_fires_once_per_cycle() {
 }
 
 // -----------------------------------------------------------------
+// #15091: the heartbeat relays the fleet's Codex account holds.
+// -----------------------------------------------------------------
+
+/// A deadline `secs` past the wall now — hold deadlines live in wall-clock
+/// epoch seconds, not the server's uptime clock.
+fn ahead(secs: i64) -> u64 {
+    u64::try_from(chrono::Utc::now().timestamp() + secs).unwrap()
+}
+
+fn hb_with_holds(host: &str, holds: Value) -> Value {
+    let mut body = hb_body(host, json!([]), 1);
+    body["codex_holds"] = holds;
+    body
+}
+
+fn beat(s: &Arc<Server<StaticIdentity>>, host: &str, body: &Value) -> Value {
+    let (reply, _) = s.handle(host, "/v1/heartbeat", body.to_string().as_bytes());
+    assert_eq!(reply.status, 200, "{}", reply.body);
+    serde_json::from_str(&reply.body).unwrap()
+}
+
+/// A worker's reported holds reach the next worker's answer within one
+/// heartbeat (#15091 AC1) — the captain relays without any wiring of its own.
+#[test]
+fn worker_reported_codex_holds_ride_the_next_answer() {
+    let s = open_server("node-a");
+    let answer = beat(
+        &s,
+        A,
+        &hb_with_holds(
+            A,
+            json!([{"name": "agent-7", "reason": "plan_exhausted", "cooldown_until": ahead(3600)}]),
+        ),
+    );
+    let holds = answer["codex_holds"]
+        .as_array()
+        .expect("the report rides at once");
+    assert_eq!(holds.len(), 1);
+    assert_eq!(holds[0]["name"], "agent-7");
+    let answer = beat(&s, B, &hb_body(B, json!([]), 1));
+    let holds = answer["codex_holds"].as_array().expect("the holds ride");
+    assert_eq!(holds.len(), 1);
+    assert_eq!(holds[0]["name"], "agent-7");
+    assert_eq!(holds[0]["reason"], "plan_exhausted");
+    assert_eq!(holds[0]["cooldown_until"], json!(ahead(3600)));
+}
+
+/// The aggregate keeps the later deadline: an earlier report never shortens
+/// what a later one established (#15091 AC2, upward side).
+#[test]
+fn an_earlier_report_never_shortens_the_aggregate() {
+    let s = open_server("node-a");
+    beat(
+        &s,
+        A,
+        &hb_with_holds(
+            A,
+            json!([{"name": "agent-7", "reason": "plan_exhausted", "cooldown_until": ahead(7200)}]),
+        ),
+    );
+    beat(
+        &s,
+        A,
+        &hb_with_holds(
+            A,
+            json!([{"name": "agent-7", "reason": "transient_failure", "cooldown_until": ahead(60)}]),
+        ),
+    );
+    let answer = beat(&s, B, &hb_body(B, json!([]), 1));
+    let holds = answer["codex_holds"].as_array().unwrap();
+    assert_eq!(holds[0]["cooldown_until"], json!(ahead(7200)));
+    assert_eq!(holds[0]["reason"], "plan_exhausted", "the later record wins wholesale");
+
+    // A later report still extends.
+    beat(
+        &s,
+        A,
+        &hb_with_holds(
+            A,
+            json!([{"name": "agent-7", "reason": "plan_exhausted", "cooldown_until": ahead(9000)}]),
+        ),
+    );
+    let answer = beat(&s, B, &hb_body(B, json!([]), 1));
+    assert_eq!(answer["codex_holds"][0]["cooldown_until"], json!(ahead(9000)));
+}
+
+/// Expired and invalid holds do not ride, and a quiet fleet's answer omits
+/// the field — the exact body an old captain sent (#15091 AC2/AC3).
+#[test]
+fn expired_and_invalid_holds_do_not_ride() {
+    let s = open_server("node-a");
+    let answer = beat(
+        &s,
+        A,
+        &hb_with_holds(
+            A,
+            json!([
+                {"name": "gone", "reason": "plan_exhausted", "cooldown_until": ahead(-10)},
+                {"name": "far", "reason": "plan_exhausted",
+                 "cooldown_until": ahead(35 * 24 * 3600 + 60)},
+                {"name": "odd", "reason": "quota_nuked", "cooldown_until": ahead(60)},
+                {"name": "", "reason": "plan_exhausted", "cooldown_until": ahead(60)}
+            ]),
+        ),
+    );
+    assert!(answer.get("codex_holds").is_none(), "nothing carriable was known: {answer}");
+    let answer = beat(&s, B, &hb_body(B, json!([]), 1));
+    assert!(answer.get("codex_holds").is_none(), "and nothing is republished");
+}
+
+/// The captain's own locally learned holds publish beside the aggregate
+/// (#15091): `with_codex_health` names the workspace whose health file the
+/// captain reads fresh on every heartbeat, like `with_token_probe`.
+#[test]
+fn the_captains_own_holds_publish_beside_the_aggregate() {
+    let workspace = tempfile::tempdir().unwrap();
+    crate::tokens_pool::health::record_terminal_for_class_with_reset_at(
+        workspace.path(),
+        &crate::tokens_pool::account_registry::AccountId {
+            provider: crate::tokens_pool::AccountProvider::Codex,
+            name: "captain-seat".to_string(),
+        },
+        crate::tokens_pool::health::TerminalClassification::TokenExhausted,
+        None,
+        Some(ahead(5400)),
+        "adapter_v1",
+        ahead(-60),
+    )
+    .unwrap();
+    let clock = Arc::new(ManualClock::default());
+    let s = Arc::new(
+        Server::new(
+            identity("node-a"),
+            clock.clone(),
+            roster(),
+            Policy::default(),
+            "epoch-test".into(),
+        )
+        .with_codex_health(workspace.path().to_path_buf()),
+    );
+    clock.set(91);
+    let answer = beat(&s, B, &hb_body(B, json!([]), 1));
+    let holds = answer["codex_holds"]
+        .as_array()
+        .expect("the captain's own hold rides");
+    assert_eq!(holds[0]["name"], "captain-seat");
+    assert_eq!(holds[0]["cooldown_until"], json!(ahead(5400)));
+
+    // A worker's later report for the same account wins over the captain's
+    // own earlier one — one never-narrows rule, both sources.
+    beat(
+        &s,
+        A,
+        &hb_with_holds(
+            A,
+            json!([{"name": "captain-seat", "reason": "plan_exhausted", "cooldown_until": ahead(9000)}]),
+        ),
+    );
+    let answer = beat(&s, B, &hb_body(B, json!([]), 1));
+    assert_eq!(answer["codex_holds"][0]["cooldown_until"], json!(ahead(9000)));
+}
+
+// -----------------------------------------------------------------
 // #13943: `POST /v1/tokens-refresh` — the on-demand fleet probe
 // (`tokens refresh --fleet`, part 3 of #13893).
 // -----------------------------------------------------------------

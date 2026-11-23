@@ -64,6 +64,11 @@
 //! that, every later heartbeat would renew its steps and the captain would
 //! keep their items `held` fleet-wide until this daemon restarts: the
 //! captain's TTL backstop (spec §5.4, §6) only fires on rows nobody renews.
+//!
+//! The heartbeat also carries this host's live Codex account holds upward,
+//! and merges the fleet's back into `account-health.json` under a
+//! never-narrows rule (#15091) — same host-root resolution as the snapshot,
+//! same absent-field tolerance on an old peer.
 
 use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
@@ -691,6 +696,15 @@ pub(crate) fn local_role_holds(root: &Path, now: Instant) -> BTreeSet<&'static s
 /// nothing was ever granted.
 pub fn on_reaper_tick(root: &Path, live: &[(String, u32, StepRole, DateTime<Utc>)]) {
     let url = host_endpoint(root);
+    // #13942/#15091: the pool artifacts a heartbeat touches — the probe
+    // sidecar it stores, the Codex holds it reports and merges — are
+    // host-level facts, so they resolve from the daemon workspace
+    // (`host_root`) the same way the endpoint does, falling back to the
+    // ticking repo's root before one is named.
+    let probe_root = state()
+        .host_root
+        .clone()
+        .unwrap_or_else(|| root.to_path_buf());
     let (vanished, heartbeat) = {
         let mut s = state();
         if url.is_none() && s.assignments.is_empty() && s.live_by_root.is_empty() {
@@ -749,6 +763,14 @@ pub fn on_reaper_tick(root: &Path, live: &[(String, u32, StepRole, DateTime<Utc>
                         .collect(),
                     free_slots: *free_slots,
                     roles_ok: roles_ok.clone(),
+                    // #15091: this host's live Codex holds ride upward, so
+                    // the captain can republish them to the rest of the
+                    // fleet. `None` (nothing live, or the state file is
+                    // unreadable) omits the field — the old worker's body.
+                    codex_holds: crate::tokens_pool::health::live_codex_holds(
+                        &probe_root,
+                        u64::try_from(Utc::now().timestamp()).unwrap_or(0),
+                    ),
                 };
                 s.last_heartbeat = Some(now);
                 Some((url.clone(), request))
@@ -765,25 +787,27 @@ pub fn on_reaper_tick(root: &Path, live: &[(String, u32, StepRole, DateTime<Utc>
             endpoint: proto::HEARTBEAT_PATH,
             ..CallFacts::default()
         };
-        // #13942: the pool the snapshot lands in is a host-level fact, so it
-        // resolves from the daemon workspace (`host_root`) the same way the
-        // endpoint does, falling back to the ticking repo's root before one
-        // is named.
-        let probe_root = state()
-            .host_root
-            .clone()
-            .unwrap_or_else(|| root.to_path_buf());
+        let merge_root = probe_root.clone();
         send_detached_then::<_, HeartbeatResponse>(
             &url,
             proto::HEARTBEAT_PATH,
             request,
             facts,
             move |resp| {
-                let Some(snapshot) = &resp.token_probe else {
-                    return;
-                };
-                let dir = crate::tokens_pool::paths::resolve_tokens_dir(&probe_root);
-                crate::tokens_pool::fleet_probe::apply_snapshot(&dir, snapshot, Utc::now());
+                if let Some(snapshot) = &resp.token_probe {
+                    let dir = crate::tokens_pool::paths::resolve_tokens_dir(&probe_root);
+                    crate::tokens_pool::fleet_probe::apply_snapshot(&dir, snapshot, Utc::now());
+                }
+                // #15091: the fleet's Codex holds land under the
+                // never-narrows merge (`merge_codex_holds`); a hold learned
+                // on any host blocks the account here until its deadline.
+                if let Some(holds) = &resp.codex_holds {
+                    crate::tokens_pool::health::merge_codex_holds(
+                        &merge_root,
+                        holds,
+                        u64::try_from(Utc::now().timestamp()).unwrap_or(0),
+                    );
+                }
             },
         );
     }

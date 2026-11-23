@@ -173,6 +173,15 @@ pub struct HeartbeatRequest {
     pub free_slots: u32,
     /// Roles the host can run now (pool, brake and back-off already applied).
     pub roles_ok: Vec<String>,
+    /// This worker's live Codex account-wide holds, reported upward so the
+    /// captain can republish them fleet-wide (#15091): a host that learned an
+    /// exhaustion tells the fleet, so a freshly seated host stops paying the
+    /// failed-dispatch cost the fleet already paid. Absent on an old worker
+    /// and ignored by an old captain — both mixed-version sides keep today's
+    /// behaviour. No credential material; exactly the account-wide fields
+    /// `account-health.json` already holds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub codex_holds: Option<Vec<crate::tokens_pool::health::CodexAccountHold>>,
 }
 
 /// The heartbeat's answer.
@@ -191,6 +200,14 @@ pub struct HeartbeatResponse {
     /// `.ranking` already holds.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub token_probe: Option<crate::tokens_pool::fleet_probe::TokenProbeSnapshot>,
+    /// The fleet's Codex account-wide holds (#15091): the captain's own plus
+    /// every worker's latest report, later deadlines winning, expired pruned.
+    /// A worker merges them into its `account-health.json` under a
+    /// never-narrows rule, so a hold learned on any host blocks the account
+    /// fleet-wide within one heartbeat. Absent on an old captain (or when no
+    /// hold is live) and ignored by an old worker. No credential material.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub codex_holds: Option<Vec<crate::tokens_pool::health::CodexAccountHold>>,
 }
 
 /// `POST /v1/claim`: "may I claim this item I drew?"
@@ -555,6 +572,7 @@ mod tests {
             server_epoch: "e1".into(),
             grace: false,
             token_probe: None,
+            codex_holds: None,
         })
         .unwrap();
         assert_eq!(none, json!({"server_epoch": "e1", "grace": false}));
@@ -585,6 +603,7 @@ mod tests {
             server_epoch: "e1".into(),
             grace: false,
             token_probe: Some(snapshot.clone()),
+            codex_holds: None,
         })
         .unwrap();
         assert_eq!(
@@ -596,11 +615,25 @@ mod tests {
             "server_epoch": "e1",
             "grace": false,
             "token_probe": wire["token_probe"],
+            "codex_holds": [
+                {"name": "agent-9", "reason": "plan_exhausted", "cooldown_until": 1_800_000_000}
+            ],
             "next_field": "unknown to this build"
         }))
         .unwrap();
         assert_eq!(richer.token_probe.as_ref(), Some(&snapshot));
         assert!(!richer.grace);
+        // #15091: the fleet's holds ride the same optional-field contract.
+        assert_eq!(
+            richer.codex_holds.as_deref(),
+            Some(
+                &[crate::tokens_pool::health::CodexAccountHold {
+                    name: "agent-9".into(),
+                    reason: "plan_exhausted".into(),
+                    cooldown_until: 1_800_000_000,
+                }][..]
+            )
+        );
     }
 
     #[test]

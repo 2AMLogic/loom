@@ -1392,3 +1392,258 @@ fn weekly_preference_never_resurrects_an_ineligible_seat() {
         assert_eq!(pick(tmp.path(), &accounts), "b");
     }
 }
+
+// -----------------------------------------------------------------
+// #15091: the fleet heartbeat's Codex holds — publish read + merge
+// -----------------------------------------------------------------
+
+fn remote_hold(name: &str, reason: &str, until: u64) -> CodexAccountHold {
+    CodexAccountHold {
+        name: name.to_string(),
+        reason: reason.to_string(),
+        cooldown_until: until,
+    }
+}
+
+/// A local plan-exhaustion hold with a provider-named reset horizon, the
+/// exact artifact a worker's failed dispatch leaves behind (#8443/#8539).
+fn local_exhaustion(root: &Path, name: &str, until: u64) {
+    record_terminal_for_class_with_reset_at(
+        root,
+        &AccountId {
+            provider: AccountProvider::Codex,
+            name: name.to_string(),
+        },
+        TerminalClassification::TokenExhausted,
+        None,
+        Some(until),
+        "adapter_v1",
+        100,
+    )
+    .unwrap();
+}
+
+fn held_entry(root: &Path, name: &str) -> Option<AccountHealth> {
+    account_health(
+        root,
+        &AccountId {
+            provider: AccountProvider::Codex,
+            name: name.to_string(),
+        },
+    )
+    .unwrap()
+}
+
+/// A remote hold lands on a fresh host, blocks selection and capacity until
+/// its deadline, and is labelled with the fleet provenance (#15091 AC1).
+#[test]
+fn a_remote_hold_blocks_selection_until_its_deadline() {
+    let tmp = tempfile::tempdir().unwrap();
+    let accounts = vec![
+        descriptor(AccountProvider::Codex, "a"),
+        descriptor(AccountProvider::Codex, "b"),
+    ];
+    assert_eq!(
+        merge_codex_holds(tmp.path(), &[remote_hold("a", "plan_exhausted", 1000)], 100),
+        1,
+        "the hold applies to an account with no local record"
+    );
+    let entry = held_entry(tmp.path(), "a").unwrap();
+    assert_eq!(entry.reason, HealthReason::PlanExhausted);
+    assert_eq!(entry.cooldown_until, Some(1000));
+    assert_eq!(entry.signal_provenance, FLEET_HOLD_PROVENANCE);
+
+    // The same eligibility question `codex_pool_state` and the selector ask.
+    assert_eq!(
+        select_healthy_at(tmp.path(), AccountProvider::Codex, &accounts, 101)
+            .unwrap()
+            .id
+            .name,
+        "b",
+        "the held account is not spawnable before the deadline"
+    );
+    let capacity =
+        provider_capacity_at(tmp.path(), AccountProvider::Codex, &accounts, 101).unwrap();
+    assert_eq!(capacity.cooldown, 1);
+    let recovered = held_entry(tmp.path(), "a").unwrap();
+    assert!(recovered.is_eligible_at(1000), "the hold ends at its deadline");
+}
+
+/// The merge never narrows: a remote deadline beats the local one only when
+/// strictly later; equal and earlier remotes change nothing (#15091 AC2).
+#[test]
+fn the_merge_never_shortens_a_local_hold() {
+    let tmp = tempfile::tempdir().unwrap();
+    local_exhaustion(tmp.path(), "a", 5000);
+    assert_eq!(
+        merge_codex_holds(tmp.path(), &[remote_hold("a", "plan_exhausted", 3000)], 200),
+        0,
+        "an earlier remote hold is ignored"
+    );
+    assert_eq!(
+        merge_codex_holds(tmp.path(), &[remote_hold("a", "transient_failure", 5000)], 200),
+        0,
+        "an equal remote hold is ignored"
+    );
+    let entry = held_entry(tmp.path(), "a").unwrap();
+    assert_eq!(entry.cooldown_until, Some(5000));
+    assert_eq!(entry.signal_provenance, "adapter_v1", "nothing was rewritten");
+
+    // Strictly later wins wholesale: the deadline extends and the record
+    // names the fact that carries the later deadline.
+    assert_eq!(
+        merge_codex_holds(tmp.path(), &[remote_hold("a", "plan_exhausted", 9000)], 200),
+        1
+    );
+    let entry = held_entry(tmp.path(), "a").unwrap();
+    assert_eq!(entry.cooldown_until, Some(9000));
+    assert_eq!(entry.reason, HealthReason::PlanExhausted);
+    assert_eq!(entry.signal_provenance, FLEET_HOLD_PROVENANCE);
+}
+
+/// A sticky reauth hold is never touched by a remote timed hold, however
+/// far out its deadline is (#15091 AC2).
+#[test]
+fn a_reauth_hold_is_untouched_by_remote_holds() {
+    let tmp = tempfile::tempdir().unwrap();
+    let id = AccountId {
+        provider: AccountProvider::Codex,
+        name: "a".to_string(),
+    };
+    record_terminal_at(tmp.path(), &id, TerminalClassification::TokenExpired, "adapter_v1", 100)
+        .unwrap();
+    assert_eq!(
+        merge_codex_holds(tmp.path(), &[remote_hold("a", "plan_exhausted", 9000)], 200),
+        0
+    );
+    let entry = held_entry(tmp.path(), "a").unwrap();
+    assert_eq!(entry.reason, HealthReason::ReauthRequired);
+    assert_eq!(entry.cooldown_until, None);
+}
+
+/// Expired, implausibly-far, unknown-reason and malformed holds are ignored,
+/// never an error — and a live hold beside them still lands (#15091 AC2/AC3).
+#[test]
+fn invalid_holds_are_ignored_not_errors() {
+    let tmp = tempfile::tempdir().unwrap();
+    let now = 1000;
+    let long = "x".repeat(MAX_FLEET_HOLD_NAME_LEN + 1);
+    let holds = vec![
+        remote_hold("expired", "plan_exhausted", now),
+        remote_hold("past", "plan_exhausted", now - 1),
+        remote_hold("far", "plan_exhausted", now + MAX_EXHAUSTION_RESET_HORIZON_SECS + 1),
+        remote_hold("unknown", "quota_nuked", now + 500),
+        remote_hold("healthy", "healthy", now + 500),
+        remote_hold("reauth", "reauth_required", now + 500),
+        remote_hold("", "plan_exhausted", now + 500),
+        remote_hold(&long, "plan_exhausted", now + 500),
+        remote_hold("good", "session_limit", now + 500),
+    ];
+    assert_eq!(merge_codex_holds(tmp.path(), &holds, now), 1);
+    for name in [
+        "expired", "past", "far", "unknown", "healthy", "reauth", "", &long,
+    ] {
+        assert!(held_entry(tmp.path(), name).is_none(), "{name:?} must not land");
+    }
+    let entry = held_entry(tmp.path(), "good").unwrap();
+    assert_eq!(entry.reason, HealthReason::SessionLimit);
+    assert_eq!(entry.cooldown_until, Some(now + 500));
+}
+
+/// The merge touches only the account-wide hold: class-scoped cooldowns,
+/// transient counters and success stamps survive it (#15091 AC2).
+#[test]
+fn the_merge_leaves_class_cooldowns_and_counters_alone() {
+    let tmp = tempfile::tempdir().unwrap();
+    let id = AccountId {
+        provider: AccountProvider::Codex,
+        name: "a".to_string(),
+    };
+    record_terminal_for_model_at(
+        tmp.path(),
+        &id,
+        TerminalClassification::ModelCreditsExhausted,
+        Some("gpt-5-codex"),
+        "adapter_v1",
+        100,
+    )
+    .unwrap();
+    record_terminal_at(tmp.path(), &id, TerminalClassification::Recoverable, "adapter_v1", 110)
+        .unwrap();
+    let before = held_entry(tmp.path(), "a").unwrap();
+    assert_eq!(before.class_cooldowns.len(), 1);
+    let class_deadline = *before.class_cooldowns.values().next().unwrap();
+    assert_eq!(before.consecutive_transient_failures, 1);
+
+    // An account-wide remote hold strictly later than the 60 s transient
+    // backoff applies without narrowing the class hold into anything.
+    assert_eq!(
+        merge_codex_holds(tmp.path(), &[remote_hold("a", "plan_exhausted", 5000)], 120),
+        1
+    );
+    let after = held_entry(tmp.path(), "a").unwrap();
+    assert_eq!(after.cooldown_until, Some(5000));
+    assert_eq!(after.class_cooldowns.len(), 1);
+    assert_eq!(*after.class_cooldowns.values().next().unwrap(), class_deadline);
+    assert_eq!(after.consecutive_transient_failures, 1);
+}
+
+/// [`live_codex_holds`] publishes exactly the live timed Codex holds — never
+/// reauth, never expired, never another provider — and nothing at all when
+/// the state is unreadable or quiet (#15091 AC1/AC4).
+#[test]
+fn live_codex_holds_publishes_only_live_timed_codex_holds() {
+    let tmp = tempfile::tempdir().unwrap();
+    assert_eq!(live_codex_holds(tmp.path(), 100), None, "no state file");
+
+    local_exhaustion(tmp.path(), "a", 5000);
+    record_terminal_at(
+        tmp.path(),
+        &AccountId {
+            provider: AccountProvider::Codex,
+            name: "reauth".to_string(),
+        },
+        TerminalClassification::TokenExpired,
+        "adapter_v1",
+        100,
+    )
+    .unwrap();
+    record_terminal_at(
+        tmp.path(),
+        &AccountId {
+            provider: AccountProvider::Claude,
+            name: "claude-1".to_string(),
+        },
+        TerminalClassification::TokenExhausted,
+        "adapter_v1",
+        100,
+    )
+    .unwrap();
+    assert_eq!(
+        live_codex_holds(tmp.path(), 101),
+        Some(vec![remote_hold("a", "plan_exhausted", 5000)])
+    );
+    assert_eq!(
+        live_codex_holds(tmp.path(), 5000),
+        None,
+        "a hold is live only strictly before its deadline"
+    );
+}
+
+/// [`CodexAccountHold::is_carriable`] is the one gate both the captain's
+/// ingest and the worker's merge apply (#15091).
+#[test]
+fn is_carriable_gates_name_reason_and_deadline() {
+    let now = 1000;
+    assert!(remote_hold("a", "plan_exhausted", now + 1).is_carriable(now));
+    assert!(remote_hold("a", "transient_failure", now + 1).is_carriable(now));
+    assert!(remote_hold("a", "model_credits_exhausted", now + 1).is_carriable(now));
+    assert!(!remote_hold("a", "plan_exhausted", now).is_carriable(now));
+    assert!(!remote_hold("a", "plan_exhausted", now - 1).is_carriable(now));
+    assert!(!remote_hold("a", "bogus", now + 1).is_carriable(now));
+    assert!(!remote_hold("a", "reauth_required", now + 1).is_carriable(now));
+    assert!(!remote_hold("", "plan_exhausted", now + 1).is_carriable(now));
+    assert!(!remote_hold(&"x".repeat(129), "plan_exhausted", now + 1).is_carriable(now));
+    assert!(!remote_hold("a", "plan_exhausted", now + MAX_EXHAUSTION_RESET_HORIZON_SECS + 1)
+        .is_carriable(now));
+}

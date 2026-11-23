@@ -65,6 +65,12 @@ use crate::telemetry::ops::MetricPoint;
 /// (#12551), so a worker tells it from another host's live claim.
 pub const NO_PROGRESS_REASON: &str = "no_progress_cooldown";
 
+/// Wall-clock epoch seconds, the domain Codex hold deadlines live in (#15091)
+/// — the server's [`Clock`] is uptime-based and cannot weigh them.
+fn wall_epoch_now() -> u64 {
+    u64::try_from(chrono::Utc::now().timestamp()).unwrap_or(0)
+}
+
 /// Default TCP port of `loom-daemon fleet-dispatch serve`.
 pub const DEFAULT_PORT: u16 = 7433;
 /// Largest request body read.
@@ -149,6 +155,17 @@ pub struct Server<I: Identity> {
     /// record (#13942): one record per distinct `.ranking` mtime, not one
     /// per heartbeat.
     last_probe_cycle: Mutex<Option<DateTime<Utc>>>,
+    /// The captain's own workspace, whose `.loom/account-health.json` holds
+    /// the Codex holds it learned locally (#15091); published alongside the
+    /// fleet aggregate. `None` on a server built without one: the answer
+    /// still republishes what workers report.
+    codex_health: Option<PathBuf>,
+    /// The fleet's Codex holds as workers reported them (#15091): account
+    /// name → the latest-deadline hold. Merged with the captain's own at
+    /// publish; an earlier report never shortens a later one, and entries
+    /// decay by their own deadlines (pruned on ingest and publish).
+    fleet_codex_holds:
+        Mutex<std::collections::BTreeMap<String, crate::tokens_pool::health::CodexAccountHold>>,
     /// Runs the captain's token-pool probe on demand (#13943, part 3 of
     /// #13893): one `tokens refresh --fleet` request probes now instead of
     /// at the next `tokenRankingRefresh` tick. `None` on a server built
@@ -200,6 +217,8 @@ impl<I: Identity> Server<I> {
             seq: AtomicU64::new(0),
             token_probe: None,
             last_probe_cycle: Mutex::new(None),
+            codex_health: None,
+            fleet_codex_holds: Mutex::new(std::collections::BTreeMap::new()),
             token_refresh: None,
             token_refresh_slot: tokio::sync::Mutex::new(TokenRefreshSlot::default()),
         }
@@ -214,6 +233,85 @@ impl<I: Identity> Server<I> {
     pub fn with_token_probe(mut self, tokens_dir: PathBuf) -> Self {
         self.token_probe = Some(tokens_dir);
         self
+    }
+
+    /// Publish the Codex holds of the workspace at `workspace` alongside the
+    /// fleet aggregate on every heartbeat answer (#15091): the captain is a
+    /// host too, and holds its own ticks learn ride the same channel the
+    /// workers' reports do. Read fresh on each heartbeat, like
+    /// [`Self::with_token_probe`].
+    #[must_use]
+    pub fn with_codex_health(mut self, workspace: PathBuf) -> Self {
+        self.codex_health = Some(workspace);
+        self
+    }
+
+    /// Take a worker's reported Codex holds into the fleet aggregate
+    /// (#15091): the later deadline per account wins wholesale, an earlier
+    /// report never shortens a later one, and entries that have expired are
+    /// pruned. A worker that reports an account *without* a hold clears
+    /// nothing — absence is "not learned here", never "recovered".
+    fn ingest_codex_holds(&self, hb: &HeartbeatRequest) {
+        let Some(reported) = &hb.codex_holds else {
+            return;
+        };
+        let now = wall_epoch_now();
+        let mut holds = self
+            .fleet_codex_holds
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        holds.retain(|_, hold| hold.cooldown_until > now);
+        for hold in reported
+            .iter()
+            .take(crate::tokens_pool::health::MAX_FLEET_HOLDS)
+        {
+            if !hold.is_carriable(now) {
+                continue;
+            }
+            match holds.get(&hold.name) {
+                Some(current) if current.cooldown_until >= hold.cooldown_until => {}
+                Some(_) => {
+                    holds.insert(hold.name.clone(), hold.clone());
+                }
+                None if holds.len() < crate::tokens_pool::health::MAX_FLEET_HOLDS => {
+                    holds.insert(hold.name.clone(), hold.clone());
+                }
+                None => {}
+            }
+        }
+    }
+
+    /// The Codex holds to publish (#15091): the captain's own live holds
+    /// merged with the fleet aggregate, later deadlines winning, expired
+    /// pruned, name-sorted. `None` when nothing is live — the field is
+    /// omitted, the exact body an old captain sent.
+    fn codex_holds_snapshot(&self) -> Option<Vec<crate::tokens_pool::health::CodexAccountHold>> {
+        let now = wall_epoch_now();
+        let mut merged: std::collections::BTreeMap<
+            String,
+            crate::tokens_pool::health::CodexAccountHold,
+        > = std::collections::BTreeMap::new();
+        if let Some(workspace) = &self.codex_health {
+            if let Some(own) = crate::tokens_pool::health::live_codex_holds(workspace, now) {
+                for hold in own {
+                    merged.insert(hold.name.clone(), hold);
+                }
+            }
+        }
+        let mut fleet = self
+            .fleet_codex_holds
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        fleet.retain(|_, hold| hold.cooldown_until > now);
+        for (name, hold) in fleet.iter() {
+            if merged
+                .get(name)
+                .is_none_or(|current| current.cooldown_until < hold.cooldown_until)
+            {
+                merged.insert(name.clone(), hold.clone());
+            }
+        }
+        (!merged.is_empty()).then(|| merged.into_values().collect())
     }
 
     /// Answer `POST /v1/tokens-refresh` by running `probe` on demand
@@ -532,11 +630,13 @@ impl<I: Identity> Server<I> {
     fn heartbeat(&self, host: &str, body: &[u8], call: &mut Call) -> Result<Reply, Reply> {
         let hb: HeartbeatRequest = self.parse(host, body)?;
         let grace = self.with_table(|t, now, _| t.heartbeat(now, host, &hb));
+        self.ingest_codex_holds(&hb);
         call.reason = grace.then(|| "grace".to_string());
         Ok(self.ok(&HeartbeatResponse {
             server_epoch: self.epoch.clone(),
             grace,
             token_probe: self.token_probe_snapshot(),
+            codex_holds: self.codex_holds_snapshot(),
         }))
     }
 

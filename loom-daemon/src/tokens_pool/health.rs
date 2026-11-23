@@ -41,6 +41,20 @@
 //!   broken for every class, so the sticky-reauth arm swallows class-scoped
 //!   feedback exactly as it swallows every other terminal signal.
 //!
+//! # Fleet sharing (#15091)
+//!
+//! Codex exhaustion is learned per host: a host that newly seats the pool has
+//! no `account-health.json` entries, so every account reads as spawnable and
+//! the host pays the failed-dispatch cost the fleet already paid elsewhere.
+//! [`CodexAccountHold`] carries a host's live account-wide holds over the
+//! fleet-dispatch heartbeat — workers report theirs upward, the captain
+//! republishes the aggregate — and [`merge_codex_holds`] lands them in this
+//! file under the same never-narrows rule the module already holds: a remote
+//! deadline applies only when it is later than the local one, a local hold is
+//! never cleared or shortened, and a `ReauthRequired` entry is never touched.
+//! A reauth hold itself never rides the wire: it has no deadline, and the
+//! verification that releases it ([`clear_reauth`]) is a host-local fact.
+//!
 //! [`is_bad`]: super::bad_tokens::is_bad
 
 use crate::script_helpers::now_epoch_secs;
@@ -1004,6 +1018,206 @@ pub fn clear_reauth(workspace: &Path, id: &AccountId, provenance: &str) -> Resul
         entry.updated_at = now_epoch_secs();
         entry.signal_provenance = provenance.to_string();
         Ok(())
+    })
+}
+
+// -----------------------------------------------------------------
+// #15091: the fleet heartbeat's Codex account holds
+// -----------------------------------------------------------------
+
+/// The `signal_provenance` a remotely learned hold records, so an operator
+/// reading `account-health.json` can tell a fleet-reported hold from a local
+/// dispatch failure (#15091).
+pub const FLEET_HOLD_PROVENANCE: &str = "fleet-heartbeat";
+
+/// The longest account name a fleet hold may carry (#15091). Account names
+/// are short (`a-z0-9-`); anything longer is a misbehaving peer, not a pool.
+const MAX_FLEET_HOLD_NAME_LEN: usize = 128;
+
+/// The most holds one [`merge_codex_holds`] applies, and the most the
+/// captain's aggregate keeps, per heartbeat and in total (#15091). A fleet
+/// pool has a handful of accounts; the bound exists so a hostile or buggy
+/// peer cannot grow the state file or the answer without limit.
+pub const MAX_FLEET_HOLDS: usize = 256;
+
+/// One Codex account-wide hold as it rides the fleet-dispatch heartbeat
+/// (#15091): exactly the account-wide fields of [`AccountHealth`] the wire
+/// needs — account name, reason, deadline. No credential material, and never
+/// a `ReauthRequired` (sticky, no deadline — see the module docs).
+///
+/// `reason` is a plain string, deliberately not a [`HealthReason`]: a later
+/// captain may know a reason this build does not, and an unknown reason must
+/// read as "ignore that hold", never as a malformed heartbeat (the
+/// mixed-version contract [`super::fleet_probe`] holds for `token_probe`).
+/// The vocabulary is the snake_case text [`HealthReason`] serializes to.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CodexAccountHold {
+    /// Account name (the health record's `name`).
+    pub name: String,
+    /// The hold's reason (`plan_exhausted`, `transient_failure`,
+    /// `session_limit`, `model_credits_exhausted`).
+    pub reason: String,
+    /// When the hold ends, Unix epoch seconds.
+    pub cooldown_until: u64,
+}
+
+/// The wire text of a reason a heartbeat may carry: the **timed,
+/// account-wide** holds only (#15091). `Healthy` is not a hold, and
+/// `ReauthRequired` is sticky and deadline-less — neither ever rides.
+fn timed_reason_wire(reason: HealthReason) -> Option<&'static str> {
+    match reason {
+        HealthReason::PlanExhausted => Some("plan_exhausted"),
+        HealthReason::TransientFailure => Some("transient_failure"),
+        HealthReason::SessionLimit => Some("session_limit"),
+        HealthReason::ModelCreditsExhausted => Some("model_credits_exhausted"),
+        HealthReason::Healthy | HealthReason::ReauthRequired => None,
+    }
+}
+
+/// The [`HealthReason`] a wire reason names, when it is one a merge applies.
+/// Unknown text — a newer peer's vocabulary — is `None`, i.e. ignored.
+fn timed_reason_of(wire: &str) -> Option<HealthReason> {
+    match wire {
+        "plan_exhausted" => Some(HealthReason::PlanExhausted),
+        "transient_failure" => Some(HealthReason::TransientFailure),
+        "session_limit" => Some(HealthReason::SessionLimit),
+        "model_credits_exhausted" => Some(HealthReason::ModelCreditsExhausted),
+        _ => None,
+    }
+}
+
+impl CodexAccountHold {
+    /// Whether this hold is one the wire may carry and a merge may apply at
+    /// `now`: a sane name, a timed reason, a deadline that is strictly in the
+    /// future and no further out than [`MAX_EXHAUSTION_RESET_HORIZON_SECS`].
+    ///
+    /// The horizon ceiling is the same #8539 judgement a locally recorded
+    /// reset horizon passes: a deadline months out is far more likely a
+    /// misparse than a real reset, and too *long* a hold idles a working
+    /// account with nothing scheduled to notice. An implausible remote hold
+    /// is dropped, not clamped — there is no trusted fact left to clamp to.
+    #[must_use]
+    pub fn is_carriable(&self, now: u64) -> bool {
+        !self.name.is_empty()
+            && self.name.len() <= MAX_FLEET_HOLD_NAME_LEN
+            && timed_reason_of(&self.reason).is_some()
+            && self.cooldown_until > now
+            && self.cooldown_until <= now.saturating_add(MAX_EXHAUSTION_RESET_HORIZON_SECS)
+    }
+}
+
+/// This workspace's live Codex account-wide holds, as a heartbeat reports
+/// them upward (#15091): every Codex record under a timed hold whose
+/// deadline has not passed, sorted by name for a stable wire order.
+///
+/// `None` when there is nothing to report — the state file is unreadable
+/// (a read failure publishes nothing; the field is omitted, exactly what an
+/// old worker sends) or no hold is live. A `ReauthRequired` entry never
+/// rides (see [`CodexAccountHold`]).
+#[must_use]
+pub fn live_codex_holds(workspace: &Path, now: u64) -> Option<Vec<CodexAccountHold>> {
+    let state = read_state(workspace).ok()?;
+    let mut holds: Vec<CodexAccountHold> = state
+        .accounts
+        .into_iter()
+        .filter(|entry| entry.provider == AccountProvider::Codex)
+        .filter_map(|entry| {
+            let reason = timed_reason_wire(entry.reason)?;
+            let cooldown_until = entry.cooldown_until.filter(|until| *until > now)?;
+            Some(CodexAccountHold {
+                name: entry.name,
+                reason: reason.to_string(),
+                cooldown_until,
+            })
+        })
+        .collect();
+    holds.sort_by(|a, b| a.name.cmp(&b.name));
+    (!holds.is_empty()).then_some(holds)
+}
+
+/// Merge holds received on a heartbeat answer into this workspace's state
+/// (#15091), and return how many were applied.
+///
+/// **Never narrows** — the module's rule, applied to a remote fact:
+///
+/// * A remote deadline applies only when it is **later** than the local
+///   one; an equal or earlier remote hold changes nothing (the later
+///   deadline's record wins wholesale, reason included — the reason is
+///   descriptive, every timed reason blocks identically).
+/// * A local hold is never cleared or shortened; `class_cooldowns`,
+///   `last_success`, transient-failure counters and cursors are untouched.
+/// * A `ReauthRequired` entry is never touched — a remote timed hold never
+///   converts it, and reauth never rides the wire to be merged back.
+/// * A hold that is expired, implausibly far out, or names an unknown
+///   reason is ignored, never an error.
+///
+/// Failures never propagate: a worker that cannot merge keeps its local
+/// evidence and retries on the next heartbeat (the same contract
+/// [`super::fleet_probe::apply_snapshot`] holds).
+pub fn merge_codex_holds(workspace: &Path, holds: &[CodexAccountHold], now: u64) -> usize {
+    let valid: Vec<&CodexAccountHold> = holds.iter().filter(|h| h.is_carriable(now)).collect();
+    if valid.is_empty() {
+        return 0;
+    }
+    let result = with_state(workspace, |state| {
+        let mut applied = 0;
+        for hold in valid.iter().take(MAX_FLEET_HOLDS) {
+            let Some(reason) = timed_reason_of(&hold.reason) else {
+                continue;
+            };
+            let id = AccountId {
+                provider: AccountProvider::Codex,
+                name: hold.name.clone(),
+            };
+            match state.accounts.iter().position(|entry| entry.id() == id) {
+                None => {
+                    state.accounts.push(AccountHealth {
+                        provider: AccountProvider::Codex,
+                        name: hold.name.clone(),
+                        reason,
+                        updated_at: now,
+                        signal_provenance: FLEET_HOLD_PROVENANCE.to_string(),
+                        cooldown_until: Some(hold.cooldown_until),
+                        consecutive_transient_failures: 0,
+                        last_success: None,
+                        last_probe: None,
+                        class_cooldowns: HashMap::new(),
+                    });
+                    applied += 1;
+                }
+                Some(index) => {
+                    let entry = &mut state.accounts[index];
+                    // Sticky reauth outranks a remote timed fact; a local
+                    // deadline the remote does not beat stands as it is.
+                    if entry.reason == HealthReason::ReauthRequired
+                        || entry
+                            .cooldown_until
+                            .is_some_and(|held| held >= hold.cooldown_until)
+                    {
+                        continue;
+                    }
+                    entry.reason = reason;
+                    entry.cooldown_until = Some(hold.cooldown_until);
+                    entry.updated_at = now;
+                    entry.signal_provenance = FLEET_HOLD_PROVENANCE.to_string();
+                    applied += 1;
+                }
+            }
+        }
+        if applied > 0 {
+            state
+                .accounts
+                .sort_by(|a, b| (a.provider as u8, &a.name).cmp(&(b.provider as u8, &b.name)));
+        }
+        Ok(applied)
+    });
+    result.unwrap_or_else(|error| {
+        log::warn!(
+            "tokens_pool: could not merge the fleet's codex holds into {}: {error}; keeping \
+             local evidence",
+            state_path(workspace).display()
+        );
+        0
     })
 }
 

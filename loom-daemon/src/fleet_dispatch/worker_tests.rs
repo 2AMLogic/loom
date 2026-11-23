@@ -663,3 +663,140 @@ fn an_answer_without_the_snapshot_writes_nothing() {
         "no snapshot on the wire, no sidecar on disk"
     );
 }
+
+// -----------------------------------------------------------------
+// #15091: the heartbeat's Codex-hold round trip — the worker reports
+// its holds upward and merges the fleet's back.
+// -----------------------------------------------------------------
+
+/// A captain that answers with one live Codex hold. The deadline is pinned
+/// past the wall now at answer time, the clock the merge weighs.
+fn hold_answering() -> TestServer {
+    TestServer::start(|path, _| match path {
+        proto::HEARTBEAT_PATH => {
+            let until = chrono::Utc::now().timestamp() + 3600;
+            (
+                200,
+                json!({
+                    "server_epoch": "e1",
+                    "grace": false,
+                    "codex_holds": [
+                        {"name": "agent-9", "reason": "plan_exhausted",
+                         "cooldown_until": until}
+                    ]
+                }),
+            )
+        }
+        _ => (200, json!({"server_epoch": "e1"})),
+    })
+}
+
+/// Poll `account-health.json` for `name`'s record, the client-side
+/// application's landing point.
+fn held_record(root: &Path, name: &str) -> Option<crate::tokens_pool::health::AccountHealth> {
+    crate::tokens_pool::health::account_health(
+        root,
+        &crate::tokens_pool::account_registry::AccountId {
+            provider: crate::tokens_pool::AccountProvider::Codex,
+            name: name.to_string(),
+        },
+    )
+    .unwrap()
+}
+
+/// A hold on the heartbeat answer lands in the worker's account-health
+/// within one round trip and blocks the account until its deadline
+/// (#15091 AC1).
+#[test]
+#[serial]
+fn a_hold_on_the_heartbeat_answer_lands_in_account_health() {
+    reset_for_test();
+    let root = rooted_pool();
+    let server = hold_answering();
+    enable(root.path(), &server.url(), true);
+    note_capacity(1, &roles_ok(&BTreeSet::new()));
+    on_reaper_tick(root.path(), &[]);
+    server.wait_for(proto::HEARTBEAT_PATH, 1);
+
+    let mut seen = None;
+    for _ in 0..50 {
+        if let Some(entry) = held_record(root.path(), "agent-9") {
+            seen = Some(entry);
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let entry = seen.expect("the fleet hold never landed in account-health.json");
+    assert_eq!(entry.reason, crate::tokens_pool::health::HealthReason::PlanExhausted);
+    assert!(entry
+        .cooldown_until
+        .is_some_and(|until| until > now_epoch()));
+    assert_eq!(entry.signal_provenance, "fleet-heartbeat");
+    // The account-wide question every gate asks: blocked until the deadline.
+    assert!(!entry.is_eligible_at(now_epoch()));
+    assert!(entry.is_eligible_at(entry.cooldown_until.unwrap()));
+}
+
+/// An old captain's answer (no `codex_holds` field) writes nothing: worker
+/// behaviour with the field absent is byte-for-byte today's (#15091 AC3).
+#[test]
+#[serial]
+fn an_answer_without_holds_writes_nothing() {
+    reset_for_test();
+    let root = rooted_pool();
+    let server = granting(); // answers carry no codex_holds field
+    enable(root.path(), &server.url(), true);
+    note_capacity(1, &roles_ok(&BTreeSet::new()));
+    on_reaper_tick(root.path(), &[]);
+    server.wait_for(proto::HEARTBEAT_PATH, 1);
+    std::thread::sleep(Duration::from_millis(200));
+    assert!(
+        !root
+            .path()
+            .join(".loom")
+            .join("account-health.json")
+            .exists(),
+        "no holds on the wire, no health entries on disk"
+    );
+}
+
+/// The wall-clock epoch now, the domain hold deadlines live in.
+fn now_epoch() -> u64 {
+    u64::try_from(chrono::Utc::now().timestamp()).unwrap_or(0)
+}
+
+/// The worker's own live holds ride the heartbeat upward (#15091): a host
+/// that learned an exhaustion tells the captain, an old captain just sees an
+/// unknown field.
+#[test]
+#[serial]
+fn the_workers_own_holds_ride_the_heartbeat() {
+    reset_for_test();
+    let root = rooted_pool();
+    let server = granting();
+    enable(root.path(), &server.url(), true);
+    let until = now_epoch() + 7200;
+    crate::tokens_pool::health::record_terminal_for_class_with_reset_at(
+        root.path(),
+        &crate::tokens_pool::account_registry::AccountId {
+            provider: crate::tokens_pool::AccountProvider::Codex,
+            name: "agent-3".to_string(),
+        },
+        crate::tokens_pool::health::TerminalClassification::TokenExhausted,
+        None,
+        Some(until),
+        "adapter_v1",
+        now_epoch() - 60,
+    )
+    .unwrap();
+    note_capacity(1, &roles_ok(&BTreeSet::new()));
+    on_reaper_tick(root.path(), &[]);
+    let beats = server.wait_for(proto::HEARTBEAT_PATH, 1);
+    let holds = beats[0]["codex_holds"]
+        .as_array()
+        .expect("the holds ride upward");
+    assert_eq!(holds.len(), 1);
+    assert_eq!(holds[0]["name"], "agent-3");
+    assert_eq!(holds[0]["reason"], "plan_exhausted");
+    assert_eq!(holds[0]["cooldown_until"], json!(until));
+}
