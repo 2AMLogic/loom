@@ -36,6 +36,14 @@ impl ForgeNeed {
     /// The need of a launch for `role`, in any spelling [`canonical_role`]
     /// accepts.
     ///
+    /// Only the roles whose job IS a push (Builder, Doctor, the sweep
+    /// lifecycle) need the writer. Judge and Guide do push in some lanes (a
+    /// branch update or conflict resolution, a docs PR branch), but those are
+    /// conditional, and most of their launches only read: refusing them
+    /// without a writer would change admission for seats that are mostly
+    /// fine (#14936 scopes itself to Builder and Doctor). They are admitted
+    /// on the earlier rule and fail at push time if the lane is reached.
+    ///
     /// [`canonical_role`]: crate::runtime_admission::canonical_role
     #[must_use]
     pub fn of_role(role: &str) -> Self {

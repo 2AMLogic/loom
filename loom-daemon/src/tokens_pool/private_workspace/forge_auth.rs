@@ -68,7 +68,8 @@ pub(super) struct ExecAuth {
     /// the owner's published App directory yielded a token (#14433).
     github_unresolved: bool,
     /// A credential directory matched to this repository's owner exists but
-    /// its token is provably expired, and no fresher one was found (#14435).
+    /// its token is provably expired, and no usable directory was chosen (#14435);
+    /// a fresh directory chosen after an expired one is not expired.
     expired: bool,
     /// The directory `secret` was read from (#14936).
     chosen: Option<(PathBuf, Source)>,
@@ -171,7 +172,7 @@ impl ExecAuth {
         }
         Self {
             github_unresolved: secret.is_none(),
-            expired: secret.is_none() && !choice.expired.is_empty(),
+            expired: choice.dir.is_none() && !choice.expired.is_empty(),
             secret,
             chosen: choice.dir,
             expired_dirs: choice.expired,
@@ -1277,6 +1278,71 @@ mod tests {
         assert!(auth.resolved());
         assert!(!auth.expired());
         assert_eq!(seen.borrow().as_deref(), Some(live.as_path()));
+    }
+
+    /// #14936 review: an expired `PrimaryOwner` directory AHEAD of a fresh but
+    /// unreadable `PrimaryRoot` directory (the fleet's real layout) is an
+    /// unreadable writer, not an expired one: the fresh directory was chosen,
+    /// so neither the refusal nor the view may blame the refresh.
+    #[test]
+    fn an_expired_sibling_does_not_mask_a_fresh_but_unreadable_writer() {
+        use super::super::dispatch::ForgeNeed;
+        let ws = tempfile::tempdir().unwrap();
+        let git = |args: &[&str]| {
+            let ok = std::process::Command::new("git")
+                .arg("-C")
+                .arg(ws.path())
+                .args(args)
+                .output()
+                .unwrap()
+                .status
+                .success();
+            assert!(ok, "git {args:?}");
+        };
+        git(&["init", "-q"]);
+        git(&[
+            "remote",
+            "add",
+            "origin",
+            "https://github.com/RootOwner14435/primary.git",
+        ]);
+        let stale = crate::credential_preflight::github_app_gh_config_dir_for_owner(
+            ws.path(),
+            "rootowner14435",
+        );
+        let live = crate::credential_preflight::github_app_gh_config_dir(ws.path());
+        for dir in [&stale, &live] {
+            std::fs::create_dir_all(dir).unwrap();
+            std::fs::write(dir.join("hosts.yml"), "github.com: {}\n").unwrap();
+        }
+        write_sidecar(&stale, "2020-01-01T00:00:00Z");
+        write_sidecar(&live, "2999-01-01T00:00:00Z");
+        let repo = "https://github.com/rootowner14435/second";
+        let unread = |_: &Path| -> Option<String> { None };
+
+        let auth =
+            ExecAuth::resolve_with_root(ws.path(), repo, &env_of(&[]), &unread, Some(ws.path()));
+        assert!(!auth.expired(), "a fresh directory was chosen");
+        let refusal = auth
+            .refusal(repo, ForgeNeed::Writer)
+            .expect("an unreadable writer is refused for a writer job");
+        assert!(!refusal.contains("expired"), "{refusal}");
+        assert_eq!(auth.refusal(repo, ForgeNeed::Any), None);
+
+        let down = || None;
+        let view = writer_view(
+            ws.path(),
+            Some(repo),
+            &env_of(&[]),
+            &unread,
+            Some(ws.path()),
+            &down,
+            SystemTime::now(),
+        );
+        assert_eq!(view.state.name(), "unreadable");
+        let text = view.describe();
+        assert!(text.contains(&live.display().to_string()), "{text}");
+        assert!(!text.contains("every published writer is expired"), "{text}");
     }
 
     /// #14435: with nothing fresher, an expired credential is neither read nor
