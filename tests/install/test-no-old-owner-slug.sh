@@ -71,14 +71,20 @@ ALLOWLIST_RE='^loom-daemon/src/init/scaffolding\.rs:[0-9]+:[[:space:]]*"\*\*Loom
 
 # scan_old_slug <repo-root> [allowlist-re]: print "path:line:text" for each
 # non-allowlisted hit. Prints "MISSING: <path>" for a SHIPPED_PATHS entry that
-# does not exist, so a renamed directory cannot turn the guard into a silent
-# no-op. Treats grep exit 1 as "no matches" and propagates fatal errors (> 1)
-# with a diagnostic on stderr.
+# does not exist and "UNTRACKED: <path>" for one that exists but matches zero
+# tracked paths -- git grep reads tracked files only, so such an entry would
+# otherwise read as covered while scanning nothing (#15080). In a non-git tree
+# the ls-files query fails; that case is left to the fatal git grep path below
+# so stdout stays quiet for it. Treats grep exit 1 as "no matches" and
+# propagates fatal errors (> 1) with a diagnostic on stderr.
 scan_old_slug() {
   local root="$1" allowlist_re="${2:-$ALLOWLIST_RE}"
-  local p hits err_file err grep_rc filtered filter_rc
+  local p tracked hits err_file err grep_rc filtered filter_rc
   for p in "${SHIPPED_PATHS[@]}"; do
-    [[ -e "$root/$p" ]] || echo "MISSING: $p"
+    [[ -e "$root/$p" ]] || { echo "MISSING: $p"; continue; }
+    if tracked="$(git -C "$root" ls-files -- "$p" 2>/dev/null)"; then
+      [[ -n "$tracked" ]] || echo "UNTRACKED: $p"
+    fi
   done
 
   err_file="$(mktemp "$TMP_WORK/scan-err.XXXXXX")"
@@ -172,6 +178,19 @@ assert_eq "fixture mirrors each shipped path's real shape (dir/file)" \
   "$shape_mismatches"
 
 assert_eq "clean fixture: no hits" "" "$(scan_old_slug "$FIXTURE")"
+
+# Untracked-but-present: git grep reads tracked files only, so a shipped path
+# that exists on disk but matches zero tracked paths would read as covered
+# while scanning nothing (#15080). Untrack scripts/install in the index only
+# and expect exactly one UNTRACKED diagnostic -- not MISSING, not silence.
+git -C "$FIXTURE" rm -qr --cached -- scripts/install
+assert_eq "untracked shipped path keeps its placeholder on disk" \
+  "true" \
+  "$([[ -f "$FIXTURE/scripts/install/placeholder.md" ]] && echo true || echo false)"
+assert_eq "an untracked-but-present shipped path is reported, not silently unscanned" \
+  "UNTRACKED: scripts/install" \
+  "$(scan_old_slug "$FIXTURE")"
+git -C "$FIXTURE" add -- scripts/install
 
 echo "see https://github.com/$OLD_SLUG/issues/1" >"$FIXTURE/defaults/regressed.md"
 echo "image ghcr.io/$OLD_SLUG-worker:latest" >"$FIXTURE/defaults/ghcr-line.md"
