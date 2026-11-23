@@ -810,9 +810,12 @@ forge_get_pr_body() {
 #
 # GitHub: Uses GraphQL `closingIssuesReferences` via `gh pr view`. This is
 #   GitHub's authoritative parse of the PR body — it correctly handles case
-#   sensitivity, word boundaries, fenced code blocks, and the full list of
-#   closing keywords (close/closes/closed, fix/fixes/fixed, resolve/resolves/
-#   resolved). It also follows GitHub's own rule that "Updates #N", "See #N",
+#   sensitivity, word boundaries, and the full list of closing keywords
+#   (close/closes/closed, fix/fixes/fixed, resolve/resolves/resolved).
+#   Measured per-surface behavior (#15058): fenced code blocks and inline code
+#   spans are ignored, while blockquoted lines and full issue URLs ARE parsed
+#   (and close on merge) — see defaults/docs/issue-pr-linking.md. It also
+#   follows GitHub's own rule that "Updates #N", "See #N",
 #   and "References #N" do NOT close the issue.
 #   Neither branch is negation-aware: "does not fix #N" reads exactly like
 #   "fixes #N" (#1057). A caller about to ACT on a candidate re-checks it with
@@ -844,9 +847,12 @@ forge_pr_close_targets() {
     body=$(forge_get_pr_body "$nwo" "$pr_number")
     # Fenced code blocks and blockquoted lines are prose, not intent (#9879):
     # a `Closes #N` inside a ``` / ~~~ fence or after `>` must not count as a
-    # landing closer. Negation (`Refs #N`, "not closing") stays with the
-    # daemon's has-unnegated-closing-ref cross-check — the GitHub branch's
-    # closingIssuesReferences is API-computed with this same fence-awareness.
+    # landing closer. Measured (#15058): GitHub's API-computed
+    # closingIssuesReferences AGREES on fences (ignored) but DISAGREES on
+    # blockquotes (parsed — PR #12122), so this strip is deliberately stricter
+    # than GitHub for a blockquoted closer; aligning it is out of scope there.
+    # Negation (`Refs #N`, "not closing") stays with the daemon's
+    # has-unnegated-closing-ref cross-check.
     # `|| true` neutralizes grep's exit-1 (no match) under `set -e`.
     { printf '%s\n' "$body" \
         | awk '/^[[:space:]]*(```|~~~)/ { infence = !infence; next } infence { next } /^[[:space:]]*>/ { next } { print }' \
