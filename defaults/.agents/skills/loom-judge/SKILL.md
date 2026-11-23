@@ -1877,12 +1877,16 @@ its receipts, or anything the PR body claims:
 # read.
 docs_only_fast_path_worklog_check() {
   # $1 = PR number. The target is the PR's BASE repository (read from the
-  # forge, never the cwd's remote and never a receipt); the additions are the
-  # exact reviewed base..head diff (never Guide's own account of them).
+  # forge, never the cwd's remote and never a receipt). A PR's own URL is
+  # always its base repository's, whatever the forge host — `gh pr view
+  # --json` has no base-repository field, and a URL of any other shape
+  # derives nothing, so the guard below fails closed (#15005). The additions
+  # are the exact reviewed base..head diff (never Guide's own account of
+  # them).
   local pr="$1" out raw line body mid num stated kind rest got got_title got_is_pr got_state got_merged
   local -A fetched=()
   local -a new_records=()
-  if ! out=$(gh pr view "$pr" --json baseRepository --jq '.baseRepository.nameWithOwner' 2>/dev/null) || [ -z "$out" ]; then
+  if ! out=$(gh pr view "$pr" --json url --jq '.url | capture("^https://[^/]+/(?<r>[^/]+/[^/]+)/pull/[0-9]+/?$").r' 2>/dev/null) || [ -z "$out" ]; then
     echo "NOT ELIGIBLE: base repository read failed"
     return 0
   fi
