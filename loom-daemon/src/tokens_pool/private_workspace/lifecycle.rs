@@ -872,6 +872,14 @@ fn registered_urls(config: &Config) -> String {
         .join(", ")
 }
 
+/// The `running` status field from a `docker inspect` object. Docker sets
+/// `State.Running=true` while a crash-looping seat backs off under
+/// `--restart unless-stopped`, so the shared `container_running` rule
+/// (`Restarting` is down, #10453) decides, not `State.Running` alone (#15015).
+pub(super) fn reports_running(state: Option<&serde_json::Value>) -> bool {
+    state.is_some_and(super::super::session_state::container_running)
+}
+
 fn snapshot(config: Config, dir: &Path) -> Result<Status> {
     let state = docker::inspect(&config.container)?;
     if let Some(state) = &state {
@@ -887,9 +895,7 @@ fn snapshot(config: Config, dir: &Path) -> Result<Status> {
             .as_ref()
             .and_then(|s| s["Config"]["Image"].as_str().map(str::to_owned)),
         extra_mounts: config.extra_mounts.clone(),
-        running: state
-            .as_ref()
-            .is_some_and(|s| s["State"]["Running"] == true),
+        running: reports_running(state.as_ref()),
         held: session_hold::held_across(std::slice::from_ref(&config.profile)),
         lease: lease::read(dir)?,
         admission: lease::admission(dir)?,

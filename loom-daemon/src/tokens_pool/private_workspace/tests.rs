@@ -2328,3 +2328,17 @@ fn a_dirty_worktree_in_one_clone_does_not_refuse_the_seats_other_clone() {
     // The other repository's clone prepares regardless (#14458).
     repository::prepare(&f.root, &additional).unwrap();
 }
+
+#[test]
+fn status_running_is_false_while_the_seat_is_restarting() {
+    let state = |running, restarting| serde_json::json!({"State": {"Running": running, "Restarting": restarting}});
+    // Docker reports Running=true during a crash-loop back-off (#15015).
+    assert!(!lifecycle::reports_running(Some(&state(true, true))));
+    assert!(lifecycle::reports_running(Some(&state(true, false))));
+    assert!(!lifecycle::reports_running(Some(&state(false, false))));
+    // A missing `Restarting` key is not restarting; no container is not running.
+    assert!(lifecycle::reports_running(Some(
+        &serde_json::json!({"State": {"Running": true}})
+    )));
+    assert!(!lifecycle::reports_running(None));
+}
