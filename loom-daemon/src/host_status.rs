@@ -525,61 +525,32 @@ fn query_nvidia_smi(
     program: &str,
     deadline: std::time::Duration,
 ) -> std::io::Result<Option<GpuReadings>> {
-    use std::io::Read;
     use std::process::{Command, Stdio};
-    use std::time::Instant;
 
-    let mut child = Command::new(program)
-        .args([
-            "--query-gpu=utilization.gpu,memory.used,memory.total",
-            "--format=csv,noheader,nounits",
-        ])
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()?;
-    // Drain stdout on a thread so a chatty child cannot block on a full pipe.
-    let mut stdout = child.stdout.take();
-    let (tx, rx) = std::sync::mpsc::channel();
-    std::thread::spawn(move || {
-        let mut buf = Vec::new();
-        if let Some(s) = stdout.as_mut() {
-            let _ = s.read_to_end(&mut buf);
+    let mut cmd = Command::new(program);
+    cmd.args([
+        "--query-gpu=utilization.gpu,memory.used,memory.total",
+        "--format=csv,noheader,nounits",
+    ])
+    .stdin(Stdio::null());
+    match crate::proc_exec::run_bounded(cmd, deadline) {
+        Ok(crate::proc_exec::Completion::Exited(out)) if out.status.success() => {
+            Ok(parse_nvidia_smi(&String::from_utf8_lossy(&out.stdout)))
         }
-        let _ = tx.send(buf);
-    });
-
-    let start = Instant::now();
-    let status = loop {
-        match child.try_wait() {
-            Ok(Some(status)) => break status,
-            Ok(None) if start.elapsed() < deadline => {
-                std::thread::sleep(std::time::Duration::from_millis(20));
-            }
-            Ok(None) => {
-                log::debug!("nvidia-smi timed out after {deadline:?}; killing");
-                let _ = child.kill();
-                let _ = child.wait();
-                return Ok(None);
-            }
-            Err(e) => {
-                log::debug!("nvidia-smi wait failed: {e}");
-                let _ = child.kill();
-                let _ = child.wait();
-                return Ok(None);
-            }
+        Ok(crate::proc_exec::Completion::Exited(out)) => {
+            log::debug!("nvidia-smi exited with {}", out.status);
+            Ok(None)
         }
-    };
-    if !status.success() {
-        log::debug!("nvidia-smi exited with {status}");
-        return Ok(None);
+        Ok(crate::proc_exec::Completion::TimedOut { .. }) => {
+            log::debug!("nvidia-smi timed out after {deadline:?}; killing");
+            Ok(None)
+        }
+        Err(crate::proc_exec::ExecError::Spawn(e)) => Err(e),
+        Err(crate::proc_exec::ExecError::Collect(e)) => {
+            log::debug!("nvidia-smi wait failed: {e}");
+            Ok(None)
+        }
     }
-    // The child has exited; the reader normally finishes at once. Bound the
-    // wait in case a grandchild still holds the pipe open.
-    let Ok(buf) = rx.recv_timeout(std::time::Duration::from_millis(500)) else {
-        return Ok(None);
-    };
-    Ok(parse_nvidia_smi(&String::from_utf8_lossy(&buf)))
 }
 
 #[cfg(not(target_os = "linux"))]
