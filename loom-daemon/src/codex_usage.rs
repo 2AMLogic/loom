@@ -884,6 +884,52 @@ pub fn tokens_by_model(
     fold_sessions(sessions(filter, window, home))
 }
 
+/// Per-`(model, speed, service_tier)` token totals for exactly the sessions
+/// named in `ids`, across every [`codex_homes`] store — the merge reader's key
+/// (#14883), the Codex counterpart of
+/// [`crate::opencode_usage::tokens_by_session_ids`].
+///
+/// The key is the id alone: no directory constraint (a private-clone seat's
+/// rollout reports its container path as `cwd`, #14540) and **no window** — a
+/// Builder rollout can start before the PR's creation, so a `createdAt`-anchored
+/// lower bound would drop the very session the merge is paying for. The id
+/// already names exactly one session; a window would only lose usage, never
+/// sharpen the key.
+///
+/// Economical by filename: the date-partitioned walk enumerates rollout
+/// *names* only, and only a file whose own name carries one of the exact ids
+/// is opened — then the id is checked again against `session_meta.session_id`
+/// by [`SessionFilter::matches`] and folded by the existing counter folding
+/// ([`fold_rollout`] + [`fold_sessions`]). An id no rollout holds (absent, or
+/// a filename coincidence the metadata rejects) contributes no row. `None` —
+/// never `Some(vec![])` — for an empty `ids` set or when no named rollout
+/// recorded usage: unknown is not zero.
+#[must_use]
+pub fn tokens_by_session_ids(ids: &[String], home: Option<&Path>) -> Option<Vec<ModelUsageTotals>> {
+    if ids.is_empty() {
+        return None;
+    }
+    let filter = SessionFilter {
+        directories: Vec::new(),
+        ids: ids.to_vec(),
+    };
+    let mut rows: Vec<CodexSessionUsage> = Vec::new();
+    for (root, path) in discover_home_rollouts(home, None).0 {
+        let name = path.file_name().and_then(|n| n.to_str());
+        // Select by exact session id in the FILENAME before any content read:
+        // the rollout's own uuid is part of its name
+        // (`rollout-<ts>-<session-id>.jsonl`).
+        if !name.is_some_and(|name| ids.iter().any(|id| name.contains(id))) {
+            continue;
+        }
+        let Some(read) = read_rollout(&root, &path, u64::MAX) else {
+            continue;
+        };
+        rows.extend(fold_rollout(&read.lines, &filter, None));
+    }
+    fold_sessions(rows)
+}
+
 /// The usage rows or the reason a by-id Codex read could not produce them —
 /// the rollout-store counterpart of [`crate::opencode_usage::IdLookup`], so
 /// `usage_source::native_close_usage` can say WHY a Codex run closed without

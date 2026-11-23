@@ -382,67 +382,34 @@ pub fn add(
     Ok(describe(root, provider, &path))
 }
 
-/// Atomically replace `path` with `body`: stage a sibling temp file created
-/// `0600` **at open** (so the bytes are never briefly world-readable), write
-/// and flush it, then `rename` it over the target.
+/// Atomically replace `path` with `body` through
+/// [`crate::fs_util::write_atomic`]: a sibling temp file created `0600` **at
+/// open** (so the bytes are never briefly world-readable), written and
+/// `fsync`ed, then `rename`d over the target and the parent directory synced.
 ///
 /// `rename` is what makes every reader safe without taking a lock: selection
 /// reads account files, `.disabled` and `.bad_accounts.json` lock-free, and
 /// with an in-place `O_TRUNC` + `write` it could observe a zero-length or torn
 /// file — which for `.bad_accounts.json` used to mean "no marks" and for
 /// `.disabled` means "nothing is disabled". A reader now sees the old file or
-/// the new one, never a partial one; a crash or `ENOSPC` mid-write strands a
-/// dot-prefixed temp file and leaves the target untouched. Mirrors
-/// `tokens_pool::bad_tokens` / `account_registry` (temp + `rename`).
+/// the new one, never a partial one; a crash mid-write can strand a
+/// dot-prefixed temp file, any I/O error removes it, and either way the target
+/// is left untouched. Mirrors `tokens_pool::bad_tokens` / `account_registry`
+/// (temp + `rename`).
 ///
 /// Also used for the non-secret state files: `reason` in the bad-marks sidecar
 /// is free text an operator may paste a provider error body into, so the whole
 /// provider directory stays uniformly `0600`.
 pub(super) fn write_secret(path: &Path, body: &str) -> Result<(), String> {
-    use std::io::Write;
-    let parent = path
-        .parent()
-        .ok_or_else(|| format!("{} has no parent directory", path.display()))?;
-    let file_name = path
-        .file_name()
-        .and_then(|n| n.to_str())
-        .ok_or_else(|| format!("{} has no file name", path.display()))?;
-    // Dot-prefixed and not `*.env`, so a stranded temp is never an account.
-    let temp = parent.join(format!(
-        ".{}.tmp-{}-{}",
-        file_name.trim_start_matches('.'),
-        std::process::id(),
-        uuid::Uuid::new_v4()
-    ));
-    let mut options = fs::OpenOptions::new();
-    options.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-    }
-    let staged: std::io::Result<()> = (|| {
-        let mut file = options.open(&temp)?;
-        file.write_all(body.as_bytes())?;
-        file.sync_all()?;
-        fs::rename(&temp, path)?;
-        // Durability of the just-written mark across power loss: on most Unix
-        // filesystems a `rename` is not itself durable until the directory
-        // entry is fsynced. Atomicity is already correct without this (a
-        // reader always sees the old file or the new one, never a torn one);
-        // this only narrows "the rename landed but a crash immediately after
-        // loses it" (issue #8450 item 7). Best-effort — `tokens_pool` does not
-        // do this either, and a failure here must not fail the write itself.
-        #[cfg(unix)]
-        if let Ok(dir) = fs::File::open(parent) {
-            let _ = dir.sync_all();
-        }
-        Ok(())
-    })();
-    staged.map_err(|e| {
-        let _ = fs::remove_file(&temp);
-        format!("cannot write {}: {e}", path.display())
-    })
+    crate::fs_util::write_atomic(
+        path,
+        body.as_bytes(),
+        crate::fs_util::AtomicOpts {
+            private: true,
+            sync_dir: true,
+        },
+    )
+    .map_err(|e| format!("cannot write {}: {e}", path.display()))
 }
 
 /// Best-effort in-place overwrite for [`remove`]. Deliberately NOT

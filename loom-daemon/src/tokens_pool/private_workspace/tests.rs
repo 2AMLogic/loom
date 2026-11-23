@@ -1452,7 +1452,7 @@ fn seat_reclaim_outcome_carries_removal_records_and_tolerates_counts_only_images
     assert!(outcome.removed.is_empty(), "older images carry no records");
     assert_eq!(outcome.inspection_error, None);
     let ((), captured) = crate::observability::ops::capture::capture(|| {
-        seat_reclaim::report_seat("agent-7", &outcome);
+        seat_reclaim::report_seat("agent-7", &outcome, std::time::Duration::from_secs(1));
     });
     // A counts-only response still yields the two per-seat summaries with
     // their phases, counts and byte totals.
@@ -1572,7 +1572,7 @@ fn removal_spans_survive_export_bounding_for_every_item() {
 
     let logs = crate::test_log_capture::capture_logs(|| {
         let ((), captured) = crate::observability::ops::capture::capture(|| {
-            seat_reclaim::report_seat("agent-7", &outcome);
+            seat_reclaim::report_seat("agent-7", &outcome, std::time::Duration::from_secs(1));
         });
         let summaries: Vec<(&str, &str)> = captured
             .spans

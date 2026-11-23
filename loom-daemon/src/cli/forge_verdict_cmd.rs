@@ -164,6 +164,11 @@ pub(crate) fn verdict_gate(
 ) -> Result<()> {
     let kind = verdict_or_exit("verdict-gate", verdict);
     let root = super::forge_identity_cmd::workspace();
+    // #14898: capture the reviewed head when the Judge evaluates it, before
+    // any write — an unconfirmed or absent `verdict-labels` write then still
+    // leaves the evaluated head on the step's evidence, and a later PR tip
+    // can never stand in for it. Telemetry only; no forge call.
+    crate::observability::pick_journal::record_review(pr, sha);
     let flag_started = review_started.map(|s| {
         chrono::DateTime::parse_from_rfc3339(s.trim())
             .map(|d| d.with_timezone(&chrono::Utc))

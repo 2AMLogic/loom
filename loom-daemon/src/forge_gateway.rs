@@ -76,6 +76,8 @@ use crate::forge_identity::{ExhaustCause, Placement, RouteDecision, RouteRequest
 pub mod outage;
 #[path = "forge_gateway/publish.rs"]
 mod publish;
+#[path = "forge_gateway/session.rs"]
+pub mod session;
 pub use publish::{
     gateway_hosts_yaml, parse_gh_version, profile_api_host, publish_profile, refresh,
     spawn_refresh, teardown, Deps, GhVersion, PassOutcome, Refresher, GATEWAY_CONFIG_YAML,

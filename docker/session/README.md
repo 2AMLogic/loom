@@ -160,6 +160,7 @@ time:
 
 ```bash
 docker run -d --name codex-session-<account> \
+  --restart unless-stopped \
   -v "/path/to/codex-profiles/<account>:/home/loom/.codex-profile" \
   ghcr.io/2amlogic/loom-worker-session:<version>
 ```
@@ -286,6 +287,63 @@ The Claude token pool and the operator's `~/.config/gh` are no longer mounted.
 [`defaults/docs/guardrail-parity-codex.md`](../../defaults/docs/guardrail-parity-codex.md#session-containers-the-container-is-the-boundary-issue-9979)
 has the full reach audit, the residual exposures (cloud metadata, host
 services) and the rollout steps.
+
+## Seat restart policy and engine-restart recovery (issue #14912)
+
+Every persistent seat container is created `--restart unless-stopped` —
+host-mounted seats since #10452, private-clone seats since #14912. Before
+that, the private-clone `docker run` omitted the flag, so on a host with no
+`loom-daemon` (session-only mode, #12708) — where no reconcile pass runs —
+a Docker engine restart left every seat `Exited` until someone ran
+`docker start` on each by hand. `unless-stopped`, not `always`, because
+`accounts session stop` writes the operator hold and then removes the
+container: the policy returns a seat after an engine restart or host reboot
+and never resurrects one an operator retired. The disposable `--rm` helpers
+of a private-clone create (control provisioning, the fresh-volume `chown`
+initializer, the image bundle probe) carry no policy and stay ephemeral.
+
+**One-time migration of a running legacy seat.** A binary upgrade does not
+change an existing container's policy: both start paths reuse a running
+seat or resume a stopped one as-is, so a seat created before #14912 keeps
+its old `no` policy until it is recreated or migrated. For each account on
+a session-only host, while its seat is running and not held:
+
+```bash
+seat="loom-codex-session-ACCOUNT"
+docker inspect -f '{{.Id}} {{.HostConfig.RestartPolicy.Name}} {{.State.Running}}' "$seat"
+# policy "no" → migrate in place (same container, no workspace churn):
+docker update --restart unless-stopped "$seat"
+docker inspect -f '{{.Id}} {{.HostConfig.RestartPolicy.Name}} {{.State.Running}}' "$seat"
+```
+
+The re-inspect must show the **same container ID** with the new policy. An
+account deliberately stopped (`accounts session stop`, which holds it) or a
+missing seat needs no migration: the next `accounts session start` recreates
+the container with the policy. ([Docker restart
+policies](https://docs.docker.com/engine/containers/start-containers-automatically/).)
+
+**What an attended host recovers through Docker alone.** On a session-only
+host Docker's policy is the whole recovery story:
+
+- A healthy running seat returns after a Docker engine restart or host
+  reboot with no Loom command.
+- An account deliberately stopped through `accounts session stop` stays
+  held and down — the container is removed and the hold stands until an
+  operator `start`.
+- A **missing** container is not something Docker can recover: recreating
+  one is a separate lifecycle operation — the daemon's reconcile pass on a
+  daemon host
+  ([daemon-reference](../../defaults/docs/daemon-reference.md#codex-session-container-reconciler-10453)),
+  the operator's `accounts session start` on a session-only host.
+
+**Check on a disposable host** (the acceptance check for this issue): start
+a healthy seat and let it run at least 10 s; deliberately stop a second
+account with `accounts session stop`; restart Docker with no Loom daemon
+running; then, before invoking any Loom start or shell command, inspect
+each seat with the `docker inspect` line above. Expect the healthy seat's
+original container ID, `unless-stopped`, and `running=true`; the stopped
+account stays held and down. Repeat the healthy-seat check once more on a
+pre-existing seat after the one-time migration.
 
 ## Re-authenticating a session-managed account (the ownership rule, issue #7389)
 

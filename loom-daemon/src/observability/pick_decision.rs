@@ -715,7 +715,8 @@ pub fn role_record(
             JournalEntry::Marker { .. }
             | JournalEntry::Applied { .. }
             | JournalEntry::Hold { .. }
-            | JournalEntry::Released { .. } => {}
+            | JournalEntry::Released { .. }
+            | JournalEntry::Reviewed { .. } => {}
         }
     }
     // Decisions are observed when the agent ran with a journal that was read

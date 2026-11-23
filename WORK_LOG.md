@@ -14,8 +14,75 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 - [2026-02](work_log/WORK_LOG_2026-02.md)
 - [2026-01](work_log/WORK_LOG_2026-01.md)
 
+### 2026-11-22
+
+- **Issue #14971** (closed): record_terminal_for_model_with_reset doc names the wrong sibling (_at, which takes an explicit now)
+- **PR #14987**: docs(tokens_pool): describe record_terminal_for_model_with_reset on its own terms
+- **Issue #14982** (closed): Reuse registry setup and session starts in private workspace Docker dispatch tests
+- **PR #14989**: test: reuse containment fixture setup in private-workspace dispatch tests
+- **Issue #14967** (closed): defaults/docs/merge-queue-ci.md has no table of contents, so check-doc-tocs.sh fails on main
+- **PR #14984**: docs: add generated TOC block to defaults/docs/merge-queue-ci.md
+- **Issue #14983** (closed): Concurrent role draws all pick a capped API-key pool: the #14970 cap check is a read, not a reservation
+- **PR #14988**: fix(daemon): a role draw holds the capped API-key pool slot it picks
+- **Issue #14963** (closed): A bare roleEfforts.<role> is applied to an OpenCode profile pick that does not allow it and the launch is refused at profile_selection
+- **PR #14980**: fix: drop unqualified role effort a native model profile disallows
+- **Issue #14170** (closed): After the org transfer: shipped files, loom_source_remote and the daemon's per-owner credential still follow the old owner
+- **Issue #14961** (closed): docs: runtime-adapters.md's credentialProxy.header list omits x-goog-api-key
+- **Issue #14964** (closed): forge_gateway::session: a relative LOOM_SESSION_GATEWAY_ROOT can bypass the in-checkout refusal
+- **PR #14972**: fix(daemon): refuse a relative session gateway root inside a checkout
+- **Issue #14944** (closed): roleDraw picks an API-key pool at its maxConcurrent cap; the launch is refused (exit 78) and the tick is lost
+- **PR #14970**: fix: role draw passes over an API-key pool at its concurrency cap
+- **Issue #14955** (closed): Remove 14 orphaned pub helpers in loom-daemon with zero callers
+- **PR #14968**: refactor: drop 14 orphaned pub helpers from loom-daemon
+- **Issue #14933** (closed): classify: Google Gemini API quota and spend-cap errors (429 RESOURCE_EXHAUSTED, spend cap / prepay 402) under OpenCode's google provider
+- **PR #14959**: fix: classify Google Gemini quota and spend-cap errors with month-start cooldown
+- **Issue #14954** (closed): Consolidate the tier-3 adapter guide and clarify when Aider can run Judge
+- **PR #14965**: docs: consolidate tier-3 adapter guide and clarify Aider Judge rules
+- **PR #14922**: feat: publish session-mode gateway profiles via loom-tools gateway
+- **Issue #14663** (closed): [ci-daily] Flake Detection (shell suites, ubuntu-latest, parallelism 1)
+- **Issue #14221** (closed): Shipped files, installer and resync output name 2AMLogic/loom; test rejects the old slug
+- **PR #14281**: docs: name 2AMLogic/loom in shipped files and add old-slug guard test
+- **Issue #14943** (closed): Private-clone seat refused forever: a never-started docker exec record makes the idle proof fail (stale lease)
+- **PR #14957**: fix: classify docker exec records so stranded snapshot execs cannot wedge seat recovery
+- **Issue #14956** (closed): Ratification lane loops: a verdict token with a trailing full stop is withheld, the key stays missing, and the PR is re-reviewed every tick (1,825 sessions for 5 keys)
+- **Issue #14813** (closed): ci-gate parked PRs never reach exact-head green after main recovers; Champion keep-parked text states an unreachable release
+- **PR #14858**: feat(daemon): update ci-gate parked branches once main recovers
+- **Issue #14870** (closed): Share the orphan-directory fallback in issue and PR worktree cleanup
+- **PR #14901**: refactor: share the orphan-directory fallback between issue and PR worktree cleanup
+- **Issue #14798** (closed): Ratification telemetry cannot explain which key reviews are withheld
+- **PR #14820**: feat(telemetry): break down ratification key outcomes
+- **Issue #14565** (closed): Test which forge route serves installed issue leases in the three Loom modes
+- **PR #14576**: fix(lease): route installed issue lease reads through Loom mode
+- **PR #14478**: feat: serve hold diagnostics and scoped issue workflows from loom-tools
+- **Issue #14931** (closed): main is red: volume_usage reader_selection_shares_one_deadline test fails since #14441 merged
+- **Issue #14815** (closed): Release each step’s own role claim when a daemon roll interrupts it
+- **PR #14871**: fix(roll): fence and retry the release of interrupted steps
+- **Issue #14586** (closed): Stub detection root vs authority root: two residual asymmetries in the #13898 .gitignore path
+- **PR #14855**: fix: treat unparseable package.json as not-a-stub in resync gitignore stale-check
+- **PR #14873**: feat: add host-owned per-repo Git object mirrors with proved read authority
+- **Issue #14881** (closed): Use the observation timestamp when booking a scoped rate-limit refusal
+- **PR #14908**: fix: book scoped refusal bucket entries at the observation instant
+- **Issue #14833** (closed): merge-pr.sh --release-hold refuses a valid release after Champion re-holds at a new head without a new hold-state marker
+- **PR #14890**: fix: re-record Champion holds at a new head so --release-hold stays usable
+
 ### 2026-11-21
 
+- **Issue #14923** (closed): Repair the volume-reader deadline fixture after the worker image namespace change
+- **PR #14926**: test: derive volume reader fixture tags from the default session image
+- **Issue #14872** (closed): Consolidate the four ListSweeps routing cases into one two-workspace IPC test
+- **PR #14906**: test: consolidate ListSweeps routing cases into one two-workspace IPC test
+- **Issue #14886** (closed): accounts check --live reports a missing container runtime as session_probe_error, with nothing on stderr
+- **PR #14907**: fix: report a missing session runtime once during live account checks
+- **Issue #14135** (closed): gh-cached: -f/-F flag pairing inverted in comments and docs (behavior correct)
+- **Issue #14011** (closed): gh-cached: `gh api -F/--raw-field` writes are classified as reads (retried on timeout, and marked cacheable); two smaller #13930 follow-ups
+- **PR #14078**: fix: treat gh api -F/--field and -f/--raw-field as writes and flag stalled census reads
+- **Issue #14419** (closed): Release cannot publish container images since the transfer: pushes to ghcr.io/rjwalters are denied, so no session image exists after 0.19.1311
+- **PR #14441**: fix: publish worker images under the repository owner's GHCR namespace
+- **PR #14747**: fix: stamp daemon compatibility on quick installs
+- **Issue #14708** (closed): ci: discovery-stall diagnostic prints `(unreadable)` for /proc/<pid>/stack — needs sudo to capture the kernel stack
+- **PR #14728**: ci: capture kernel stack via sudo -n fallback in discovery-stall diagnostic
+- **Issue #13827** (closed): Remove stale file-size ratchet comments: 242 files cite a gate #12099 deleted, and new code still obeys it
+- **PR #14335**: docs: drop stale file-size ratchet comments from loom-daemon and ci.yml (slice c)
 - **Issue #14842** (closed): pricing: no rate rows for GLM or Gemini models, so OpenCode usage has no cost estimate; add rows and a coverage check
 - **PR #14869**: feat(pricing): price GLM and Gemini models exactly, with profile coverage
 - **Issue #14882** (closed): Document how to run a repository validator before Guide publishes work docs

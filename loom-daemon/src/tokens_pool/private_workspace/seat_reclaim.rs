@@ -24,13 +24,25 @@
 //! `private-workspace seat-reclaim` verb driven like `prepare`/`recover`; it
 //! never mutates `.identity` records, never quarantines and never takes a
 //! backup — a worktree it cannot prove finished is preserved with a reason.
-//! The host half ([`run_for`], called from the eager-reclaim tier 1 the way
-//! [`crate::scratch_reclaim`] is) enumerates the seats, takes each account's
-//! exclusive lease, requires the container running and idle — the same
-//! admission [`super::lifecycle::run_job`] applies — and execs the verb. It
-//! never calls `docker::prepare_target`: preparation runs `clean_worktrees`,
-//! which refuses a dirty worktree, and a dirty seat must still get its
-//! scratch reclaimed and its size reported.
+//! The host half ([`schedule_from_tick`], called from the eager-reclaim tier
+//! 1 the way [`crate::scratch_reclaim`] is) enumerates the seats, takes each
+//! account's exclusive lease, requires the container running and idle — the
+//! same admission [`super::lifecycle::run_job`] applies — and execs the verb.
+//! It never calls `docker::prepare_target`: preparation runs
+//! `clean_worktrees`, which refuses a dirty worktree, and a dirty seat must
+//! still get its scratch reclaimed and its size reported.
+//!
+//! # Off the dispatch tick (#14777)
+//!
+//! Each seat's exec is bounded by a 600s timeout, so a synchronous whole-host
+//! walk can hold the dispatch loop's tick for `seats × 600s` — exactly while
+//! free space is below the floor. Since #14777 the eager tier-1 trigger
+//! therefore **schedules** the sequential walk on a blocking worker
+//! ([`schedule_from_tick`]) and returns immediately: at most one walk is in
+//! flight host-wide (a trigger during a walk returns pending and queues
+//! nothing), the existing enable switch and host-wide cooldown still gate it,
+//! and the walk's verdict — reclaimed something, or empty — is folded into
+//! the originating root's eager-reclaim ledger exactly once on completion.
 //!
 //! # Ownership vs per-job preparation (#14483)
 //!
@@ -53,6 +65,8 @@
 //! never reclaimable ([`crate::scratch_reclaim::is_reclaimable_age`]).
 
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -509,6 +523,17 @@ pub(super) fn github_pr_at_head(
 // The host-side pass (leased, idle-only, no preparation)
 // ============================================================================
 
+/// One seat's contribution to a host walk (#14678): the account, the verb's
+/// outcome (or the reason this seat was skipped), and how long the attempt
+/// took — the per-seat elapsed figure the #14777 baseline records, so a live
+/// pass distinguishes how long a skip cost from how long a reclaim ran.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SeatWalkResult {
+    pub account: String,
+    pub result: Result<SeatReclaimOutcome, String>,
+    pub elapsed: Duration,
+}
+
 /// One host-wide pass's outcome over every private-workspace seat.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SeatReclaimReport {
@@ -517,8 +542,9 @@ pub struct SeatReclaimReport {
     pub skipped: Option<String>,
     /// Per-seat results: the account name and either the verb's outcome or
     /// the reason this seat was skipped/refused (busy, stopped, not idle, a
-    /// containment-validation refusal, an endpoint error).
-    pub seats: Vec<(String, Result<SeatReclaimOutcome, String>)>,
+    /// containment-validation refusal, an endpoint error), with the attempt's
+    /// elapsed time.
+    pub seats: Vec<SeatWalkResult>,
 }
 
 impl SeatReclaimReport {
@@ -527,7 +553,7 @@ impl SeatReclaimReport {
     pub fn worktrees_removed(&self) -> usize {
         self.seats
             .iter()
-            .filter_map(|(_, result)| result.as_ref().ok())
+            .filter_map(|walk| walk.result.as_ref().ok())
             .map(|outcome| outcome.worktrees_removed)
             .sum()
     }
@@ -537,7 +563,7 @@ impl SeatReclaimReport {
     pub fn scratch_removed(&self) -> usize {
         self.seats
             .iter()
-            .filter_map(|(_, result)| result.as_ref().ok())
+            .filter_map(|walk| walk.result.as_ref().ok())
             .map(|outcome| outcome.scratch_removed)
             .sum()
     }
@@ -547,7 +573,7 @@ impl SeatReclaimReport {
     pub fn bytes(&self) -> u64 {
         self.seats
             .iter()
-            .filter_map(|(_, result)| result.as_ref().ok())
+            .filter_map(|walk| walk.result.as_ref().ok())
             .map(|outcome| outcome.bytes)
             .sum()
     }
@@ -573,7 +599,11 @@ impl SeatReclaimReport {
 /// before), one `reaper.removal` span and one info line per removed item,
 /// and a warning when a Git error stopped the worktree half mid-pass — the
 /// removals recorded before it stand and are each reported once.
-pub(super) fn report_seat(account: &str, outcome: &SeatReclaimOutcome) {
+pub(super) fn report_seat(
+    account: &str,
+    outcome: &SeatReclaimOutcome,
+    elapsed: std::time::Duration,
+) {
     use crate::observability::ops::reaper;
 
     // The span's repo label is the seat's account name: one path-shaped
@@ -635,81 +665,149 @@ pub(super) fn report_seat(account: &str, outcome: &SeatReclaimOutcome) {
         );
     } else {
         log::debug!(
-            "private_workspace seat_reclaim: seat {account} nothing to reclaim — preserved \
-             {preserved:?}"
+            "private_workspace seat_reclaim: seat {account} (took {:?}s) nothing to reclaim — \
+             preserved {preserved:?}",
+            elapsed.as_secs(),
         );
     }
 }
 
-/// Host-wide cooldown state: one marker key, not per-repo — the pass walks
+/// Host-wide walk state: one marker key, not per-repo — the pass walks
 /// every seat from whatever root the eager trigger names, so a per-root key
-/// would re-run it once per registered root per tick.
-static LAST_RUN_AT: std::sync::OnceLock<std::sync::Mutex<Option<DateTime<Utc>>>> =
-    std::sync::OnceLock::new();
-
-fn last_run_slot() -> &'static std::sync::Mutex<Option<DateTime<Utc>>> {
-    LAST_RUN_AT.get_or_init(|| std::sync::Mutex::new(None))
+/// would re-run it once per registered root per tick. Since #14777 the
+/// cooldown eligibility check, its recording and the single-flight marker
+/// are one lock acquisition, and `active` additionally caps the whole host
+/// at one in-flight walk (#14777).
+struct WalkState {
+    /// When a walk last started (recorded at schedule time, so a walk that
+    /// outlasts the cooldown is still single-flighted, not re-triggered).
+    last_run_at: Option<DateTime<Utc>>,
+    /// The one walk currently in flight, if any.
+    active: Option<ActiveWalk>,
+    /// Monotonic walk id, so a late-clearing guard can only ever clear its
+    /// own walk.
+    next_id: u64,
 }
 
-/// Drop cooldown state. Unused today (the host driver path needs a full
-/// account registry fixture); kept as the standard seam for the first test
-/// that gets one.
+/// The in-flight walk marker. Only the id is read: a late-clearing guard
+/// (a worker that panicked long after a test reset, say) may only ever
+/// clear its own walk.
+struct ActiveWalk {
+    id: u64,
+}
+
+static WALK_STATE: OnceLock<Mutex<WalkState>> = OnceLock::new();
+
+fn walk_state_slot() -> &'static Mutex<WalkState> {
+    WALK_STATE.get_or_init(|| {
+        Mutex::new(WalkState {
+            last_run_at: None,
+            active: None,
+            next_id: 0,
+        })
+    })
+}
+
+/// Drop walk state. Test-only seam (the process-global would otherwise leak
+/// between tests in the same binary).
 #[cfg(test)]
-#[allow(dead_code)]
 #[doc(hidden)]
 pub fn reset_state_for_test() {
-    *last_run_slot()
+    *walk_state_slot()
         .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = WalkState {
+        last_run_at: None,
+        active: None,
+        next_id: 0,
+    };
 }
 
-/// Whether the host-wide cooldown suppresses a pass at `now`. Pure: the
-/// decision the report's `skipped` reason is built from.
-#[must_use]
-pub fn cooldown_skip(
-    last: Option<DateTime<Utc>>,
+/// Whether a walk is in flight right now. Test-only observation seam for the
+/// single-flight tests.
+#[cfg(test)]
+#[doc(hidden)]
+pub fn walk_in_flight_for_test() -> bool {
+    walk_state_slot()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .active
+        .is_some()
+}
+
+/// Clears this walk's in-flight marker on drop — normal completion **and**
+/// a panicked worker alike, so a failed walk cannot block the host's walks
+/// forever (#14777: "worker failure permits a later eligible pass").
+struct ActiveGuard {
+    id: u64,
+}
+
+impl Drop for ActiveGuard {
+    fn drop(&mut self) {
+        let mut state = walk_state_slot()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if state.active.as_ref().is_some_and(|walk| walk.id == self.id) {
+            state.active = None;
+        }
+    }
+}
+
+/// What the eligibility gates decided for one trigger. Pure.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum WalkDecision {
+    Start,
+    /// A walk is already in flight — the trigger returns pending and queues
+    /// nothing, even past the cooldown.
+    AlreadyRunning,
+    Skip(String),
+}
+
+/// The trigger gates, pure (#14777): the existing enable switch, then the
+/// single-flight marker (a walk in flight is a pending verdict regardless of
+/// the cooldown, since a walk can outlast its own cooldown window), then the
+/// host-wide cooldown.
+fn walk_decision(
+    enabled: bool,
+    active: bool,
+    last_run_at: Option<DateTime<Utc>>,
     now: DateTime<Utc>,
     min_interval_secs: u64,
-) -> Option<String> {
-    let last = last?;
-    let since = (now - last).num_seconds();
-    (since >= 0 && since < i64::try_from(min_interval_secs).unwrap_or(i64::MAX))
-        .then(|| format!("a pass ran {since}s ago (cooldown {min_interval_secs}s)"))
+) -> WalkDecision {
+    if !enabled {
+        return WalkDecision::Skip("disabled (scratchReclaim.enabled=false)".into());
+    }
+    if active {
+        return WalkDecision::AlreadyRunning;
+    }
+    if let Some(reason) = cooldown_skip(last_run_at, now, min_interval_secs) {
+        return WalkDecision::Skip(reason);
+    }
+    WalkDecision::Start
 }
 
-/// One production pass over every private-workspace seat (#14678), honoring
-/// the existing `autonomous.worktreeReaper.scratchReclaim.*` surface for its
-/// enable gate, scratch age floor and cooldown — no new flags. The worktree
-/// half's grace comes from the existing
-/// `autonomous.worktreeReaper.gracePeriodSecs`. Scheduled from the eager
-/// reclaim tier 1 like [`crate::scratch_reclaim::run_for`].
-pub fn run_for(workspace: &Path) -> SeatReclaimReport {
-    let config = crate::scratch_reclaim::read_scratch_reclaim_config(workspace);
-    let now = Utc::now();
-    if !crate::scratch_reclaim::resolve_enabled(&config) {
-        let report = SeatReclaimReport {
-            skipped: Some("disabled (scratchReclaim.enabled=false)".into()),
-            seats: Vec::new(),
-        };
-        log::debug!("private_workspace seat_reclaim: {}", report.summary());
-        return report;
-    }
-    let min_interval_secs = crate::scratch_reclaim::resolve_min_interval_secs(&config);
-    let last = *last_run_slot()
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    if let Some(reason) = cooldown_skip(last, now, min_interval_secs) {
-        let report = SeatReclaimReport {
-            skipped: Some(reason),
-            seats: Vec::new(),
-        };
-        log::debug!("private_workspace seat_reclaim: {}", report.summary());
-        return report;
-    }
-    *last_run_slot()
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(now);
+/// The seat sub-pass's disposition from one eager trigger (#14777): the walk
+/// runs off the dispatch tick, so a trigger either finds a walk in flight or
+/// schedules one, and never awaits the result.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SeatScheduling {
+    /// A walk is in flight (scheduled by this trigger, or already running
+    /// from any repository root). The pass's empty-pass verdict is deferred
+    /// to the walk's completion.
+    Pending,
+    /// No seat work: the existing enable gate or host-wide cooldown said no.
+    /// Carries the reason into the eager report.
+    Skipped(String),
+}
 
+/// The walk body the coordinator runs on a blocking worker: given the
+/// originating root, walk every seat and report. Injectable so the
+/// single-flight tests can gate it on a channel.
+type WalkBody = Arc<dyn Fn(PathBuf) -> SeatReclaimReport + Send + Sync>;
+
+/// The production walk body: the sequential seat walk with its existing
+/// lease, running/idle and reporting behavior, on this blocking worker.
+fn run_walk(workspace: &Path) -> SeatReclaimReport {
+    let config = crate::scratch_reclaim::read_scratch_reclaim_config(workspace);
     let max_age_secs =
         i64::try_from(crate::scratch_reclaim::resolve_max_age_hours(&config).saturating_mul(3600))
             .unwrap_or(i64::MAX);
@@ -718,10 +816,15 @@ pub fn run_for(workspace: &Path) -> SeatReclaimReport {
     );
     let seats = super::lifecycle::seat_reclaim(workspace, max_age_secs, grace_secs);
 
-    for (account, result) in &seats {
-        match result {
-            Ok(outcome) => report_seat(account, outcome),
-            Err(_) => log::debug!("private_workspace seat_reclaim: {account} skipped: {result:?}"),
+    for walk in &seats {
+        match &walk.result {
+            Ok(outcome) => report_seat(&walk.account, outcome, walk.elapsed),
+            Err(_) => log::debug!(
+                "private_workspace seat_reclaim: {} skipped after {:?}s: {:?}",
+                walk.account,
+                walk.elapsed.as_secs(),
+                walk.result
+            ),
         }
     }
 
@@ -737,6 +840,125 @@ pub fn run_for(workspace: &Path) -> SeatReclaimReport {
         );
     }
     report
+}
+
+fn secs_fmt(elapsed: Duration) -> String {
+    format!("{:.1}s", elapsed.as_secs_f64())
+}
+
+/// Spawn the walk on a blocking worker and return immediately. The worker
+/// clears the in-flight marker on exit (via [`ActiveGuard`], even on panic),
+/// folds the walk's verdict into the originating root's eager-reclaim ledger
+/// exactly once, and logs the completion line the #14777 baseline reads:
+/// per-seat elapsed, distinguishing seats that ran from seats that were
+/// skipped.
+fn spawn_walk(handle: &tokio::runtime::Handle, id: u64, origin: PathBuf, body: WalkBody) {
+    let guard = ActiveGuard { id };
+    handle.spawn_blocking(move || {
+        let _guard = guard;
+        let started = std::time::Instant::now();
+        let report = body(origin.clone());
+        let elapsed = started.elapsed();
+        crate::eager_reclaim::record_seat_verdict(&origin, &report);
+        let per_seat: Vec<String> = report
+            .seats
+            .iter()
+            .map(|walk| match &walk.result {
+                Ok(_) => format!("{}={}:ran", walk.account, secs_fmt(walk.elapsed)),
+                Err(_) => format!("{}={}:skip", walk.account, secs_fmt(walk.elapsed)),
+            })
+            .collect();
+        if report.skipped.is_none() {
+            log::info!(
+                "private_workspace seat_reclaim: off-tick walk from {} finished in {} — {} [{}] \
+                 (#14777)",
+                origin.display(),
+                secs_fmt(elapsed),
+                report.summary(),
+                per_seat.join(", "),
+            );
+        }
+    });
+}
+
+/// Schedule one walk if the existing gates allow it, against `now`. The
+/// eligibility check, the cooldown recording and the single-flight marker are
+/// one lock acquisition; the spawn happens after the lock is released. The
+/// `body` seam exists so the single-flight tests can hold the walk on a
+/// channel.
+fn schedule_with(workspace: &Path, now: DateTime<Utc>, body: WalkBody) -> SeatScheduling {
+    let Ok(handle) = tokio::runtime::Handle::try_current() else {
+        return SeatScheduling::Skipped(
+            "no async runtime in scope for the blocking walk worker (#14777)".into(),
+        );
+    };
+    let config = crate::scratch_reclaim::read_scratch_reclaim_config(workspace);
+    let enabled = crate::scratch_reclaim::resolve_enabled(&config);
+    let min_interval_secs = crate::scratch_reclaim::resolve_min_interval_secs(&config);
+    let id = {
+        let mut state = walk_state_slot()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match walk_decision(
+            enabled,
+            state.active.is_some(),
+            state.last_run_at,
+            now,
+            min_interval_secs,
+        ) {
+            WalkDecision::Skip(reason) => {
+                log::debug!("private_workspace seat_reclaim: trigger declined: {reason}");
+                return SeatScheduling::Skipped(reason);
+            }
+            WalkDecision::AlreadyRunning => return SeatScheduling::Pending,
+            WalkDecision::Start => {
+                state.last_run_at = Some(now);
+                state.next_id += 1;
+                let id = state.next_id;
+                state.active = Some(ActiveWalk { id });
+                id
+            }
+        }
+    };
+    spawn_walk(&handle, id, workspace.to_path_buf(), body);
+    SeatScheduling::Pending
+}
+
+/// The eager-reclaim tier-1 binding (#14678; off the dispatch tick since
+/// #14777): honor the existing `autonomous.worktreeReaper.scratchReclaim.*`
+/// surface for the enable gate, scratch age floor and cooldown — no new
+/// flags — and schedule the sequential seat walk on a blocking worker,
+/// returning without awaiting it. The worktree half's grace comes from the
+/// existing `autonomous.worktreeReaper.gracePeriodSecs`.
+pub fn schedule_from_tick(workspace: &Path) -> SeatScheduling {
+    schedule_with(workspace, Utc::now(), Arc::new(|root| run_walk(&root)))
+}
+
+/// Test-only: [`schedule_with`] with an injected clock and walk body, so
+/// tests outside this module (the tick-line's dispatch-advance coverage)
+/// can gate a fake walk on a channel without touching production wiring.
+#[cfg(test)]
+#[doc(hidden)]
+pub(crate) fn schedule_with_for_test(
+    workspace: &Path,
+    now: DateTime<Utc>,
+    body: WalkBody,
+) -> SeatScheduling {
+    schedule_with(workspace, now, body)
+}
+
+/// Whether the host-wide cooldown suppresses a pass at `now`. Pure: the
+/// decision the report's `skipped` reason is built from.
+#[must_use]
+pub fn cooldown_skip(
+    last: Option<DateTime<Utc>>,
+    now: DateTime<Utc>,
+    min_interval_secs: u64,
+) -> Option<String> {
+    let last = last?;
+    let since = (now - last).num_seconds();
+    (since >= 0 && since < i64::try_from(min_interval_secs).unwrap_or(i64::MAX))
+        .then(|| format!("a pass ran {since}s ago (cooldown {min_interval_secs}s)"))
 }
 
 #[cfg(test)]
@@ -1169,7 +1391,9 @@ mod tests {
         reclaim_scratch(volume.path(), 86_400, Utc::now() + Duration::days(2), &mut outcome);
         assert_eq!(outcome.scratch_removed, names.len());
         let (logs, captured) = crate::observability::ops::capture::capture(|| {
-            crate::test_log_capture::capture_logs(|| report_seat("fixture-seat", &outcome))
+            crate::test_log_capture::capture_logs(|| {
+                report_seat("fixture-seat", &outcome, std::time::Duration::from_secs(1))
+            })
         });
         let spans: Vec<_> = captured
             .spans
@@ -1261,7 +1485,7 @@ mod tests {
         // failure is reported AND each earlier removal published once.
         let logs = crate::test_log_capture::capture_logs(|| {
             let ((), captured) = crate::observability::ops::capture::capture(|| {
-                report_seat("agent-1", &outcome);
+                report_seat("agent-1", &outcome, std::time::Duration::from_secs(1));
             });
             let removals: Vec<_> = captured
                 .spans
@@ -1386,8 +1610,16 @@ mod tests {
         let report = SeatReclaimReport {
             skipped: None,
             seats: vec![
-                ("agent-1".into(), Ok(one)),
-                ("agent-2".into(), Err("seat busy".into())),
+                SeatWalkResult {
+                    account: "agent-1".into(),
+                    result: Ok(one),
+                    elapsed: std::time::Duration::from_secs(3),
+                },
+                SeatWalkResult {
+                    account: "agent-2".into(),
+                    result: Err("seat busy".into()),
+                    elapsed: std::time::Duration::from_millis(12),
+                },
             ],
         };
         assert_eq!(report.worktrees_removed(), 1);
@@ -1399,5 +1631,195 @@ mod tests {
             seats: Vec::new(),
         };
         assert!(skipped.summary().contains("disabled"));
+    }
+
+    // ===================================================================
+    // Off the dispatch tick (#14777): scheduling, single-flight, recovery
+    // ===================================================================
+
+    /// Bounded wait for `cond` — the failure guard the #14777 test plan
+    /// names: these tests gate a walk on a channel, so an unbounded wait
+    /// would hang the binary instead of failing it.
+    fn soon(cond: impl Fn() -> bool) -> bool {
+        for _ in 0..2_000 {
+            if cond() {
+                return true;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        false
+    }
+
+    /// A walk body that signals each invocation and then holds the walk open
+    /// until the test drops the release sender — the gate the single-flight
+    /// tests open from the test side. The body is one shared [`Arc`], so
+    /// every trigger handed a clone schedules the *same* counting walk.
+    struct HeldWalk {
+        release: Option<std::sync::mpsc::Sender<()>>,
+        started: std::sync::mpsc::Receiver<PathBuf>,
+        invocations: Arc<std::sync::atomic::AtomicUsize>,
+        body: WalkBody,
+    }
+
+    impl HeldWalk {
+        fn new() -> Self {
+            let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+            let (started_tx, started_rx) = std::sync::mpsc::channel::<PathBuf>();
+            let invocations = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let inv = Arc::clone(&invocations);
+            let release = std::sync::Mutex::new(release_rx);
+            let body: WalkBody = Arc::new(move |root| {
+                inv.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                started_tx.send(root).unwrap();
+                // Hold the walk open: the trigger that scheduled it has long
+                // since returned.
+                let _ = release.lock().unwrap().recv();
+                SeatReclaimReport {
+                    skipped: None,
+                    seats: Vec::new(),
+                }
+            });
+            Self {
+                release: Some(release_tx),
+                started: started_rx,
+                invocations,
+                body,
+            }
+        }
+
+        fn body(&self) -> WalkBody {
+            Arc::clone(&self.body)
+        }
+
+        /// Open the gate: the held walk's `recv` fails and the worker exits.
+        fn open_the_gate(&mut self) {
+            self.release = None;
+        }
+    }
+
+    /// AC: one walk host-wide. The first eligible trigger schedules the
+    /// sequential walk on a blocking worker and returns without awaiting it;
+    /// a trigger from a second root — even past the cooldown — finds the
+    /// walk in flight and queues nothing, including after the worker is
+    /// released. A later eligible trigger (cooldown elapsed) can start a
+    /// new walk.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_walk_is_single_flight_across_roots_and_never_queues_a_duplicate() {
+        reset_state_for_test();
+        let tmp = tempfile::tempdir().unwrap();
+        let root_a = tmp.path().join("a");
+        let root_b = tmp.path().join("b");
+        std::fs::create_dir_all(&root_a).unwrap();
+        std::fs::create_dir_all(&root_b).unwrap();
+        let t0 = Utc::now();
+        let mut walk = HeldWalk::new();
+
+        // The first trigger returns immediately — this is the dispatch tick
+        // advancing past a walk that is still blocked.
+        let started = std::time::Instant::now();
+        assert_eq!(schedule_with(&root_a, t0, walk.body()), SeatScheduling::Pending);
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "scheduling must not await the walk"
+        );
+        assert!(walk_in_flight_for_test());
+        let walked_root = walk
+            .started
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("the scheduled walk must start");
+        assert_eq!(walked_root, root_a, "the originating root reaches the body");
+
+        // A second trigger from another root, past the cooldown, while the
+        // first walk is still held: pending, not a second walk.
+        assert_eq!(
+            schedule_with(&root_b, t0 + chrono::Duration::seconds(3600), walk.body()),
+            SeatScheduling::Pending
+        );
+        assert_eq!(
+            walk.invocations.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "a walk in flight absorbs a past-cooldown trigger from another root"
+        );
+
+        // Release the worker; the watch for a queued duplicate keeps polling
+        // until the walk has fully exited, so nothing can slip in behind it.
+        walk.open_the_gate();
+        assert!(soon(|| !walk_in_flight_for_test()), "the walk must finish after release");
+        assert_eq!(
+            walk.invocations.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "no duplicate walk was queued behind the in-flight one"
+        );
+
+        // The cooldown was recorded at schedule time, so a retrigger inside
+        // that window is declined without seat work…
+        assert!(matches!(
+            schedule_with(&root_a, t0 + chrono::Duration::seconds(60), walk.body()),
+            SeatScheduling::Skipped(reason)
+                if reason.contains("cooldown"),
+        ));
+
+        // …while a later eligible trigger starts a new walk.
+        assert_eq!(
+            schedule_with(&root_b, t0 + chrono::Duration::seconds(7200), walk.body()),
+            SeatScheduling::Pending
+        );
+        assert!(soon(|| { walk.invocations.load(std::sync::atomic::Ordering::SeqCst) == 2 }));
+        // The released channel makes the second walk exit immediately.
+        assert!(soon(|| !walk_in_flight_for_test()));
+    }
+
+    /// AC: a disabled pass performs no seat work — the trigger declines
+    /// before anything is scheduled.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_disabled_pass_performs_no_seat_work() {
+        reset_state_for_test();
+        std::env::set_var(crate::scratch_reclaim::SCRATCH_RECLAIM_ENABLE_ENV, "0");
+        let tmp = tempfile::tempdir().unwrap();
+        let scheduling = schedule_with(
+            tmp.path(),
+            Utc::now(),
+            Arc::new(|_| panic!("a disabled pass must not run the walk body")),
+        );
+        std::env::remove_var(crate::scratch_reclaim::SCRATCH_RECLAIM_ENABLE_ENV);
+        assert!(
+            matches!(&scheduling, SeatScheduling::Skipped(reason) if reason.contains("disabled")),
+            "got {scheduling:?}"
+        );
+        assert!(!walk_in_flight_for_test());
+    }
+
+    /// AC: completion or **worker failure** permits a later eligible pass —
+    /// the in-flight marker is cleared by the drop guard even when the
+    /// blocking worker panics, so one failed walk cannot wedge the host.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_failed_worker_releases_the_flight_marker() {
+        reset_state_for_test();
+        let tmp = tempfile::tempdir().unwrap();
+        let t0 = Utc::now();
+        let invocations = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let inv = Arc::clone(&invocations);
+        let body: WalkBody = Arc::new(move |_: PathBuf| {
+            inv.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            panic!("the injected worker failure");
+        });
+
+        assert_eq!(schedule_with(tmp.path(), t0, Arc::clone(&body)), SeatScheduling::Pending);
+        assert!(
+            soon(|| !walk_in_flight_for_test()),
+            "a panicked walk must clear the in-flight marker"
+        );
+        assert_eq!(invocations.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+        // A later eligible trigger (cooldown elapsed) starts a new walk.
+        assert_eq!(
+            schedule_with(tmp.path(), t0 + chrono::Duration::seconds(3600), Arc::clone(&body)),
+            SeatScheduling::Pending
+        );
+        assert!(soon(|| invocations.load(std::sync::atomic::Ordering::SeqCst) == 2));
+        assert!(soon(|| !walk_in_flight_for_test()));
     }
 }
