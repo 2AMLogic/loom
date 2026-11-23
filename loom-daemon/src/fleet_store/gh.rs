@@ -193,7 +193,9 @@ impl GhTransport {
     }
 
     /// A transport whose reader pool is a test's (see
-    /// [`GhTransport::with_readers`]).
+    /// [`GhTransport::with_readers`]) and whose gateway lookup finds none:
+    /// a test must not route through whatever gateway profile the host
+    /// running it has live (2am#15098). The gateway tests inject their own.
     #[cfg(test)]
     pub(crate) fn with_test_readers(
         workspace_root: &Path,
@@ -202,7 +204,9 @@ impl GhTransport {
         next_reader: Box<NextReader>,
         withdraw: Box<WithdrawReader>,
     ) -> Self {
-        Self::with_readers(workspace_root, repo, pooled, next_reader, withdraw)
+        let mut t = Self::with_readers(workspace_root, repo, pooled, next_reader, withdraw);
+        t.gateway = Box::new(|_| None);
+        t
     }
 
     /// The credential the most recent request ran under.
