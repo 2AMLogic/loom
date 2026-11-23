@@ -257,6 +257,28 @@ fn the_state_machine_walks_hold_release_rearm_clear() {
     assert_eq!(decide(&Verdict::Clear, &[], HEAD), Action::None);
 }
 
+/// #14833: `stands` is same-head only. A Doctor push that still declares
+/// ratification moves the head; the next tick must re-arm with a fresh notice
+/// recording the new head, or the newest `champion:hold-state` record stays at
+/// the old head and an audited `merge-pr.sh --release-hold` refuses the
+/// release forever.
+#[test]
+fn a_hold_at_an_older_head_re_arms_with_a_fresh_notice() {
+    let verdict = Verdict::Hold(vec!["spec/a.md".into()]);
+    let moved = "def5678def5678def5678def5678def5678";
+    let c = [hold_note(HEAD)];
+    assert_eq!(decide(&verdict, &c, HEAD), Action::Stands);
+    assert_eq!(decide(&verdict, &c, moved), Action::Hold);
+    // A legacy notice with no recorded head cannot prove the head either:
+    // re-arm once so the fresh notice records it.
+    let legacy = Comment::new("fleet[bot]", HOLD_MARKER);
+    assert_eq!(decide(&verdict, &[legacy], HEAD), Action::Hold);
+    // Once the re-arm's notice lands at the new head, a repeat tick is quiet
+    // — exactly one notice per held head.
+    let c2 = [hold_note(HEAD), hold_note(moved)];
+    assert_eq!(decide(&verdict, &c2, moved), Action::Stands);
+}
+
 #[test]
 fn an_unreadable_candidate_never_merges_and_never_drops_a_hold() {
     let unreadable = Verdict::Unreadable(vec!["spec/a.md".into()]);

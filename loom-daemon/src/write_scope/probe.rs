@@ -766,23 +766,7 @@ impl<P: PermissionProbe> PermissionProbe for Cached<P> {
 }
 
 fn write_entry(path: &Path, entry: &DiskEntry) {
-    use std::io::Write;
-    let Some(dir) = path.parent() else { return };
-    if !crate::forge_etag_store::private_dir(dir, true) {
-        return;
-    }
-    let Ok(body) = serde_json::to_string(entry) else {
-        return;
-    };
-    let tmp = dir.join(format!(".tmp-{}-{}", std::process::id(), now_epoch_secs()));
-    let Ok(mut f) = crate::forge_etag_store::create_private_file(&tmp) else {
-        return;
-    };
-    if f.write_all(body.as_bytes()).is_ok() {
-        let _ = std::fs::rename(&tmp, path);
-    } else {
-        let _ = std::fs::remove_file(&tmp);
-    }
+    crate::forge_etag_store::write_private_json(path, entry);
 }
 
 /// Forget every in-memory answer (tests).
@@ -790,5 +774,32 @@ fn write_entry(path: &Path, entry: &DiskEntry) {
 pub(crate) fn clear_memory() {
     if let Ok(mut m) = memory().lock() {
         m.clear();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_failed_disk_write_leaves_no_temp_file_behind() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(crate::forge_etag_store::private_dir(dir.path(), true));
+        let path = dir.path().join("entry.json");
+        std::fs::create_dir(&path).unwrap();
+        let entry = DiskEntry {
+            write: true,
+            detail: String::new(),
+            at: 0,
+            cred: String::new(),
+        };
+
+        write_entry(&path, &entry);
+
+        let names: Vec<String> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, ["entry.json"]);
     }
 }

@@ -231,7 +231,7 @@ fn provider_health_feedback_ignores_a_horizon_outside_its_own_region() {
 /// AC #1: a v2 `MODEL_CREDITS_EXHAUSTED` record naming its model produces a
 /// `class_cooldowns` entry — not the account-wide `plan_exhausted`
 /// cooldown — end to end from the adapter's log line through
-/// `apply_provider_health_feedback` and `record_terminal_for_model`.
+/// `apply_provider_health_feedback` and `record_terminal_for_model_with_reset`.
 #[test]
 fn provider_health_feedback_threads_the_model_into_a_class_scoped_hold() {
     let dir = tempdir().unwrap();

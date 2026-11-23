@@ -47,6 +47,7 @@ pub mod limits;
 pub mod live_watch;
 pub mod paths;
 pub mod registry;
+pub mod reservation;
 pub mod reset;
 pub mod select;
 pub mod sync;
