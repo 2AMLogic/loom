@@ -443,9 +443,9 @@ pub fn check_pr_status_for_branch(repo_root: &Path, branch: &str) -> PrStatus {
 /// (`gh api repos/{owner}/{repo} --jq .owner.login`, `GH_REPO` stripped so
 /// gh names the checkout's own repo — W6).
 ///
-/// Used to build the `head=<owner>:<branch>` filter [`check_pr_merged_rest`]
-/// needs. Returns `None` on any failure so callers can fall back to the
-/// GraphQL-backed [`check_pr_merged`].
+/// Used to build the `head=<owner>:<branch>` filter
+/// [`check_pr_status_for_branch_rest`] needs. Returns `None` on any failure
+/// so callers can fall back to the GraphQL-backed [`check_pr_merged`].
 #[must_use]
 pub fn repo_owner_rest(repo_root: &Path) -> Option<String> {
     let out = gh::bounded_via(
@@ -470,25 +470,15 @@ pub fn repo_owner_rest(repo_root: &Path) -> Option<String> {
     }
 }
 
-/// REST variant of [`check_pr_merged`] (issue #4876).
-///
-/// `gh pr list` goes through GraphQL, whose quota is routinely exhausted on a
-/// host running several agents concurrently; the REST quota is separate and
-/// much less contended. The daemon-side reaper probes unattended on a cadence,
-/// so it must not compete with interactive agents for the scarcer pool.
-///
-/// Queries `repos/{owner}/{repo}/pulls?state=all&head=<owner>:<branch>`. Falls
-/// back to nothing on its own — the caller decides whether an `Unknown` should
-/// be retried through [`check_pr_merged`].
-#[must_use]
-pub fn check_pr_merged_rest(repo_root: &Path, owner: &str, issue_num: u32) -> PrStatus {
-    check_pr_status_for_branch_rest(repo_root, owner, &naming::branch_name(issue_num))
-}
-
-/// REST variant of [`check_pr_status_for_branch`] — an arbitrary-branch
-/// counterpart to [`check_pr_merged_rest`] for callers that do not have (or
-/// cannot assume) a `feature/issue-<n>` branch name, e.g. a primary checkout
-/// parked on a hand-created branch (#5268).
+/// REST variant of [`check_pr_status_for_branch`] for callers that do not
+/// have (or cannot assume) a `feature/issue-<n>` branch name, e.g. a primary
+/// checkout parked on a hand-created branch (#5268). `gh pr list` goes
+/// through GraphQL, whose quota is routinely exhausted on a host running
+/// several agents concurrently; the REST quota is separate and much less
+/// contended (issue #4876). The daemon-side reaper probes unattended on a
+/// cadence, so it must not compete with interactive agents for the scarcer
+/// pool. Falls back to nothing on its own — the caller decides whether an
+/// `Unknown` should be retried through [`check_pr_status_for_branch`].
 ///
 /// Queries `repos/{owner}/{repo}/pulls?state=all&head=<owner>:<branch>`. Not
 /// capped to a single row (issue #6746): the REST list endpoint defaults to
@@ -527,16 +517,17 @@ pub fn classify_pr_row(state: &str, merged_at: Option<&str>, closed_at: Option<&
 }
 
 /// REST PR-status lookup keyed **directly on a PR number**, for `pr-<N>`
-/// worktrees (issue #5939) — the counterpart of [`check_pr_merged_rest`] for
-/// worktrees that were never created from an issue number to begin with, so
-/// there is no `feature/issue-<N>` branch name to search by. Unlike
+/// worktrees (issue #5939) that were never created from an issue number to
+/// begin with, so there is no `feature/issue-<N>` branch name to search by.
+/// Unlike
 /// [`check_pr_status_for_branch_rest`], this needs no `owner` parameter: the
 /// single-PR endpoint resolves `{owner}/{repo}` from the invoking repo just
 /// like [`super::gh::issue_state_rest`] does, with no `head=<owner>:<branch>`
 /// filter to construct.
 ///
 /// Queries `repos/{owner}/{repo}/pulls/<n>` (a single object, not the search
-/// list [`check_pr_merged_rest`] and friends page through). A 404 (PR number
+/// list [`check_pr_status_for_branch_rest`] and friends page through). A 404
+/// (PR number
 /// does not exist against this repo) or any other failure resolves to
 /// [`PrStatus::Unknown`] — a probe failure is always a skip, never a removal.
 #[must_use]
@@ -756,14 +747,6 @@ pub enum WorktreeDecision {
     /// Non-`--safe` mode: the issue is closed and the caller decides
     /// (interactive prompt, or `--force`).
     ConfirmClosedIssue,
-}
-
-impl WorktreeDecision {
-    /// True only for [`WorktreeDecision::Remove`].
-    #[must_use]
-    pub fn is_remove(&self) -> bool {
-        matches!(self, Self::Remove)
-    }
 }
 
 /// Injected probes for [`classify_worktree`], so the safety decision is
@@ -1549,6 +1532,44 @@ fn remove_worktree_force(repo_root: &Path, worktree_path: &Path) -> Result<(), S
     Ok(())
 }
 
+/// #5177 fallback for a failed `git worktree remove`: the directory still
+/// exists on disk but git no longer tracks it. Removes it directly — but
+/// ONLY when [`should_force_remove_orphan_dir`] proves this is a
+/// Loom-managed worktree path (git error + `.loom-managed` sentinel +
+/// containment under the managed root), never a blanket rm — then prunes
+/// the stale registration best-effort. Returns `Err(cause)` (the original
+/// git failure) on an ineligible path, or the combined diagnostic when the
+/// direct removal itself fails. Shared by [`cleanup_worktree`] and
+/// [`cleanup_pr_worktree`].
+fn remove_untracked_worktree_dir(
+    repo_root: &Path,
+    worktree_path: &Path,
+    cause: &str,
+) -> Result<(), String> {
+    if !should_force_remove_orphan_dir(
+        cause,
+        is_loom_managed(worktree_path),
+        is_under_worktree_root(repo_root, worktree_path),
+    ) {
+        return Err(cause.to_string());
+    }
+    std::fs::remove_dir_all(worktree_path).map_err(|e| {
+        format!(
+            "git worktree remove failed ({cause}); direct removal of the untracked \
+             worktree directory also failed: {e}"
+        )
+    })?;
+    println!(
+        "  Removed untracked worktree directory (no git worktree entry): {}",
+        worktree_path.display()
+    );
+    let _ = Command::new("git")
+        .args(["worktree", "prune"])
+        .current_dir(repo_root)
+        .status();
+    Ok(())
+}
+
 /// What [`cleanup_worktree`] actually did on success.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CleanupOutcome {
@@ -1618,35 +1639,12 @@ pub fn cleanup_worktree(
                 .current_dir(repo_root)
                 .status();
             CleanupOutcome::AlreadyGone
-        } else if should_force_remove_orphan_dir(
-            // #5177: an orphaned `.loom/worktrees/*` directory git no longer
-            // tracks fails `git worktree remove` with "is not a working
-            // tree" and could never be cleaned by the normal path. Fall back
-            // to a direct removal — but ONLY when we can prove this is a
-            // Loom-managed worktree path (the specific git error + the
-            // `.loom-managed` sentinel + containment under the managed
-            // worktree root), never a blanket rm on any failure.
-            &cause,
-            is_loom_managed(worktree_path),
-            is_under_worktree_root(repo_root, worktree_path),
-        ) {
-            std::fs::remove_dir_all(worktree_path).map_err(|e| {
-                format!(
-                    "git worktree remove failed ({cause}); direct removal of the untracked \
-                     worktree directory also failed: {e}"
-                )
-            })?;
-            println!(
-                "  Removed untracked worktree directory (no git worktree entry): {}",
-                worktree_path.display()
-            );
-            let _ = Command::new("git")
-                .args(["worktree", "prune"])
-                .current_dir(repo_root)
-                .status();
-            CleanupOutcome::Removed
         } else {
-            return Err(cause);
+            // #5177: an orphaned `.loom/worktrees/*` directory git no longer
+            // tracks falls back to the shared direct removal; any other git
+            // failure comes back out of it unchanged.
+            remove_untracked_worktree_dir(repo_root, worktree_path, &cause)?;
+            CleanupOutcome::Removed
         }
     } else {
         println!("  Removed worktree: {}", worktree_path.display());
@@ -1979,28 +1977,7 @@ pub fn cleanup_pr_worktree(
     }
     if let Err(cause) = remove_worktree_force(repo_root, worktree_path) {
         // #5177: same orphaned-directory fallback as `cleanup_worktree`.
-        if should_force_remove_orphan_dir(
-            &cause,
-            is_loom_managed(worktree_path),
-            is_under_worktree_root(repo_root, worktree_path),
-        ) {
-            std::fs::remove_dir_all(worktree_path).map_err(|e| {
-                format!(
-                    "git worktree remove failed ({cause}); direct removal of the untracked \
-                     worktree directory also failed: {e}"
-                )
-            })?;
-            println!(
-                "  Removed untracked worktree directory (no git worktree entry): {}",
-                worktree_path.display()
-            );
-            let _ = Command::new("git")
-                .args(["worktree", "prune"])
-                .current_dir(repo_root)
-                .status();
-        } else {
-            return Err(cause);
-        }
+        remove_untracked_worktree_dir(repo_root, worktree_path, &cause)?;
     } else {
         println!("  Removed worktree: {}", worktree_path.display());
     }
@@ -2515,7 +2492,8 @@ pub fn branch_reachable_from_remotes(repo_root: &Path, branch: &str) -> bool {
 
 /// Whether `branch`'s PR is merged (including squash-merged, whose original
 /// commits are never reachable from a remote ref). REST first (the daemon's
-/// separate, less-contended pool — see [`check_pr_merged_rest`]'s docs),
+/// separate, less-contended pool — see
+/// [`check_pr_status_for_branch_rest`]'s docs),
 /// falling back to the GraphQL-backed [`check_pr_status_for_branch`] only
 /// when REST cannot answer. Mirrors
 /// [`super::landed`]'s `forge_probe_rest_first` for an arbitrary branch name
@@ -3441,7 +3419,9 @@ pub(super) fn dir_size_human(path: &Path) -> String {
 /// `loom-daemon clean --deep` has always removed from `repo_root` itself.
 ///
 /// Deliberately narrower than [`super::orphan_recovery::BUILD_ARTIFACT_PATTERNS`]
-/// (which [`reclaim_worktree_artifacts`] walks inside a throwaway worktree): the
+/// (which the worktree reaper's kept-worktree reclaim
+/// [`crate::worktree_reaper::reclaim_kept_worktree_artifacts`] walks inside a
+/// kept worktree): the
 /// primary checkout is a human's working clone, so the automatic pass added in
 /// #5919 must never remove more than the `clean --deep --safe` an operator would
 /// run by hand. Keeping one list means the manual and scheduled paths can never
@@ -3514,9 +3494,9 @@ fn keep_build_artifacts(repo_root: &Path) -> bool {
         .unwrap_or(false)
 }
 
-/// Remove [`PRIMARY_CHECKOUT_ARTIFACTS`] from `repo_root` **itself** (not from a
-/// worktree — that is [`reclaim_worktree_artifacts`]), reporting each entry's
-/// outcome instead of printing it.
+/// Remove [`PRIMARY_CHECKOUT_ARTIFACTS`] from `repo_root` **itself** (not from
+/// a worktree — that is [`crate::worktree_reaper::reclaim_kept_worktree_artifacts`]),
+/// reporting each entry's outcome instead of printing it.
 ///
 /// This is the shared engine behind both deep-clean paths: the interactive
 /// [`clean_build_artifacts`] (which renders these outcomes to stdout) and the
@@ -3619,57 +3599,14 @@ pub fn clean_build_artifacts(repo_root: &Path, dry_run: bool) {
     }
 }
 
-/// One build-artifact directory [`reclaim_worktree_artifacts`] removed (or
-/// would remove, under `dry_run`).
+/// One build-artifact directory [`sweep_primary_checkout_artifacts`] removed
+/// (or would remove, under `dry_run`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReclaimedArtifact {
-    /// Top-level directory name relative to the worktree root, e.g. `"target"`.
+    /// Top-level directory name relative to the repo root, e.g. `"target"`.
     pub name: String,
     /// Human-readable size, matching [`clean_build_artifacts`]'s report format.
     pub size_human: String,
-}
-
-/// Reclaim regenerable build-artifact directories (`target/`, `node_modules`,
-/// `.venv`, `coverage/`, ...) from **inside one worktree** without removing
-/// the worktree itself — the AC3 follow-up carved out of #5177 into #5187.
-///
-/// Unlike [`clean_build_artifacts`] (which only ever reclaims from
-/// `repo_root` itself, wired to `--deep`), this walks
-/// [`super::orphan_recovery::BUILD_ARTIFACT_PATTERNS`] against
-/// `worktree_path`'s **top-level** entries, trims a trailing `/`, and removes
-/// only entries that are directories — a same-named file (`Cargo.lock`,
-/// `pnpm-lock.yaml`, `.loom-checkpoint`, `.loom-in-use`) is never touched, so
-/// reusing the dirty-detection pattern list here is safe even though most of
-/// its entries are files rather than reclaimable directories.
-///
-/// Pure I/O, no eligibility gate of its own — callers (the worktree reaper's
-/// artifact-reclaim pass) decide *whether* a worktree is eligible via
-/// [`classify_worktree`] / [`WorktreeDecision`] before calling this.
-#[must_use]
-pub fn reclaim_worktree_artifacts(worktree_path: &Path, dry_run: bool) -> Vec<ReclaimedArtifact> {
-    let mut reclaimed = Vec::new();
-    for pattern in super::orphan_recovery::BUILD_ARTIFACT_PATTERNS {
-        let name = pattern.trim_end_matches('/');
-        let dir = worktree_path.join(name);
-        if !dir.is_dir() {
-            continue;
-        }
-        let size_human = dir_size_human(&dir);
-        if dry_run {
-            reclaimed.push(ReclaimedArtifact {
-                name: name.to_string(),
-                size_human,
-            });
-            continue;
-        }
-        if std::fs::remove_dir_all(&dir).is_ok() {
-            reclaimed.push(ReclaimedArtifact {
-                name: name.to_string(),
-                size_human,
-            });
-        }
-    }
-    reclaimed
 }
 
 fn spawn_loop_locks_dir(repo_root: &Path) -> std::path::PathBuf {

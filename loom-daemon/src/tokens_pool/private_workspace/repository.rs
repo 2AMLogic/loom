@@ -1,6 +1,7 @@
 use super::*;
 use serde_json::json;
 use std::io::Read;
+use std::os::unix::fs::DirBuilderExt;
 use std::process::{Command, Stdio};
 
 #[derive(clap::Subcommand)]
@@ -44,6 +45,10 @@ pub enum WorkerCommand {
     /// location, preserving every branch and file (`accounts session
     /// rebind`, issue #14357).
     Rebind(RebindArgs),
+    /// The periodic seat reclaim (#14678): remove ended step scratch and
+    /// clean, published, merged-past-grace linked worktrees inside this
+    /// volume. Host-driven, under the seat lease, while the seat is idle.
+    SeatReclaim(super::seat_reclaim::SeatReclaimArgs),
     /// Git credential-helper protocol; output goes only to Git's private pipe.
     Credential {
         operation: String,
@@ -164,19 +169,7 @@ impl WorkerCommand {
             Self::Execute { command } => worker_setup::execute(command)?,
             Self::Prepare(args) => {
                 repository_url(&args.repository)?;
-                match prepare(Path::new(ROOT), &args) {
-                    Ok(outcome) => println!(
-                        "{}",
-                        json!({
-                            "protocol": PROTOCOL,
-                            "revision": outcome.revision,
-                            "reaped_worktrees": outcome.reaped,
-                        })
-                    ),
-                    Err(error) => {
-                        println!("{}", json!({"protocol": PROTOCOL, "error": error.to_string()}))
-                    }
-                }
+                println!("{}", prepare_response(prepare(Path::new(ROOT), &args)));
             }
             Self::Recover(args) => {
                 repository_url(&args.repository)?;
@@ -203,6 +196,22 @@ impl WorkerCommand {
                     }
                 }
             }
+            Self::SeatReclaim(args) => {
+                let lookup = seat_reclaim::github_pr_at_head;
+                match seat_reclaim::seat_reclaim(
+                    Path::new(ROOT),
+                    &args,
+                    &lookup,
+                    chrono::Utc::now(),
+                ) {
+                    Ok(outcome) => {
+                        println!("{}", json!({"protocol": PROTOCOL, "outcome": outcome}))
+                    }
+                    Err(error) => {
+                        println!("{}", json!({"protocol": PROTOCOL, "error": error.to_string()}))
+                    }
+                }
+            }
             Self::Credential { operation } => credential(&operation)?,
         }
         Ok(())
@@ -221,7 +230,7 @@ fn helper_cause(stderr: &[u8]) -> Option<&'static str> {
     HELPER_CAUSES.into_iter().find(|cause| text.contains(cause))
 }
 
-fn git(root: &Path, args: &[&str]) -> Result<String> {
+pub(super) fn git(root: &Path, args: &[&str]) -> Result<String> {
     let result = Command::new("git")
         .arg("-C")
         .arg(root)
@@ -262,8 +271,43 @@ pub(super) struct PrepareOutcome {
     pub(super) reaped: Vec<String>,
 }
 
-pub(super) fn prepare(root: &Path, args: &PrepareArgs) -> Result<PrepareOutcome> {
-    prepare_with_pr_lookup(root, args, &finished_pr)
+#[derive(Debug)]
+pub(super) struct PrepareFailure {
+    error: anyhow::Error,
+    reaped: Vec<String>,
+}
+
+impl std::fmt::Display for PrepareFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(&self.error, f)
+    }
+}
+
+impl std::error::Error for PrepareFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.error.as_ref())
+    }
+}
+
+pub(super) fn prepare_response(
+    outcome: Result<PrepareOutcome, PrepareFailure>,
+) -> serde_json::Value {
+    match outcome {
+        Ok(outcome) => json!({
+            "protocol": PROTOCOL,
+            "revision": outcome.revision,
+            "reaped_worktrees": outcome.reaped,
+        }),
+        Err(failure) => json!({
+            "protocol": PROTOCOL,
+            "error": failure.to_string(),
+            "reaped_worktrees": failure.reaped,
+        }),
+    }
+}
+
+pub(super) fn prepare(root: &Path, args: &PrepareArgs) -> Result<PrepareOutcome, PrepareFailure> {
+    prepare_with_pr_lookup(root, args, &finished_pr, &crate::forge_etag_store::host_tmp_base())
 }
 
 /// The real lookup uses the credentials that the host already scopes to this
@@ -272,8 +316,49 @@ pub(super) fn prepare_with_pr_lookup(
     root: &Path,
     args: &PrepareArgs,
     has_finished_pr: &dyn Fn(&Path, &str, &str, &str) -> bool,
-) -> Result<PrepareOutcome> {
+    temp_base: &Path,
+) -> Result<PrepareOutcome, PrepareFailure> {
+    let mut reaped = Vec::new();
+    match prepare_revision(root, args, has_finished_pr, temp_base, &mut reaped) {
+        Ok(revision) => Ok(PrepareOutcome { revision, reaped }),
+        Err(error) => Err(PrepareFailure { error, reaped }),
+    }
+}
+
+/// Probe that [`temp_base`] can hold a private directory and a file in it
+/// (#14929). A full or read-only seat temp dir previously surfaced as a
+/// misleading `workspace Git fetch failed (…128)` or dirty-clone refusal;
+/// refusing here names the actual cause before any clone work is touched,
+/// and no Loom state directory is ever created in the job's working
+/// directory as a fallback (the resolved base stays absolute — see
+/// [`crate::forge_etag_store::host_tmp_base`]).
+fn require_writable_temp(temp_base: &Path) -> Result<()> {
+    let probe = temp_base.join(format!("loom-temp-probe-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&probe);
+    let probed = std::fs::DirBuilder::new()
+        .mode(0o700)
+        .create(&probe)
+        .and_then(|()| std::fs::write(probe.join("writable"), b""));
+    let _ = std::fs::remove_dir_all(&probe);
+    match probed {
+        Ok(()) => Ok(()),
+        Err(error) => bail!(
+            "{SEAT_TEMP_UNWRITABLE_REASON}: resolved temp directory {} is not writable ({error}); \
+             reclaim the seat's temp space (caches belong on its cache volume) before retrying",
+            temp_base.display()
+        ),
+    }
+}
+
+fn prepare_revision(
+    root: &Path,
+    args: &PrepareArgs,
+    has_finished_pr: &dyn Fn(&Path, &str, &str, &str) -> bool,
+    temp_base: &Path,
+    reaped: &mut Vec<String>,
+) -> Result<String> {
     valid_base(&args.base)?;
+    require_writable_temp(temp_base)?;
     if args.account.is_empty() || args.container_id.is_empty() {
         bail!("workspace account and container identity are required");
     }
@@ -361,7 +446,7 @@ pub(super) fn prepare_with_pr_lookup(
         bail!("private clone origin changed; preserve work and restore its verified identity");
     }
     git(&repo, &["fetch", "--prune", "origin"])?;
-    let reaped = reap_finished_worktrees(&root, &repo, &args.repository, has_finished_pr)?;
+    reap_finished_worktrees(&root, &repo, &args.repository, has_finished_pr, reaped)?;
     clean_worktrees(&root, &repo, &args.account)?;
     // Unpublished commits are only stranded when no branch names them:
     // preparation never moves a branch (a resumed one keeps its local tip)
@@ -454,7 +539,7 @@ pub(super) fn prepare_with_pr_lookup(
     identity.container_id = args.container_id.clone();
     identity.revision.clone_from(&revision);
     save(&record, &identity)?;
-    Ok(PrepareOutcome { revision, reaped })
+    Ok(revision)
 }
 
 /// Worktree HEADs (the main checkout included) whose detached HEAD carries
@@ -553,13 +638,12 @@ pub(super) fn unpublished_branches(repo: &Path) -> Result<Vec<UnpublishedBranch>
     Ok(unpublished)
 }
 
-fn ahead_of_origin(repo: &Path, revision: &str) -> Result<u64> {
+pub(super) fn ahead_of_origin(repo: &Path, revision: &str) -> Result<u64> {
     git(repo, &["rev-list", "--count", revision, "--not", "--remotes=origin"])?
         .trim()
         .parse::<u64>()
         .context("workspace Git returned a non-numeric ahead count")
 }
-
 /// The clone paths a `recover` call acts on. Unlike `additional_paths` this
 /// never creates anything: a clone that was never materialized has nothing
 /// to recover.
@@ -1118,12 +1202,12 @@ fn worktrees(repo: &Path) -> Result<Vec<PathBuf>> {
         .collect())
 }
 
-struct WorktreeEntry {
-    path: PathBuf,
-    locked: bool,
+pub(super) struct WorktreeEntry {
+    pub(super) path: PathBuf,
+    pub(super) locked: bool,
 }
 
-fn worktree_entries(repo: &Path) -> Result<Vec<WorktreeEntry>> {
+pub(super) fn worktree_entries(repo: &Path) -> Result<Vec<WorktreeEntry>> {
     Ok(git(repo, &["worktree", "list", "--porcelain", "-z"])?
         .split("\0\0")
         .filter_map(|record| {
@@ -1143,7 +1227,7 @@ const DIRTY_PATH_LIMIT: usize = 10;
 /// (#14458). Porcelain v1 C-quotes special path bytes, including newlines,
 /// keeping each changed path on a single line. Both prefixes are literal in
 /// a quoted path, so status of any tracked edit is preserved verbatim.
-fn worktree_status(path: &Path) -> Result<Vec<String>> {
+pub(super) fn worktree_status(path: &Path) -> Result<Vec<String>> {
     let status = git(
         path,
         &[
@@ -1294,6 +1378,25 @@ fn finished_pr(repo: &Path, repository: &str, branch: &str, tip: &str) -> bool {
     crate::worktree_ops::clean_owner::finished_pr_at_head(repo, &host, &slug, branch, tip)
 }
 
+/// `(repository, account)` recorded for one clone by its identity record
+/// (the legacy primary's at the volume root, an additional clone's under
+/// `work/.identity/`), or `None` when no record exists. A record that exists
+/// but is invalid or foreign is an error — the caller preserves the clone.
+pub(super) fn recorded_identity(record: &Path) -> Result<Option<(String, String)>> {
+    match std::fs::read(record) {
+        Ok(bytes) => {
+            let identity: Identity = serde_json::from_slice(&bytes)
+                .context("invalid private clone identity; preserve state for operator recovery")?;
+            if identity.protocol != PROTOCOL {
+                bail!("private clone identity protocol mismatch; preserve state for operator recovery");
+            }
+            Ok(Some((identity.repository, identity.account)))
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error.into()),
+    }
+}
+
 /// Reclaim only an in-volume linked checkout whose tip is published and
 /// whose own repository and branch have a finished PR at that exact tip.
 /// Keep the branch ref and every commit. A missing, open or unreadable PR
@@ -1304,8 +1407,8 @@ fn reap_finished_worktrees(
     repo: &Path,
     repository: &str,
     has_finished_pr: &dyn Fn(&Path, &str, &str, &str) -> bool,
-) -> Result<Vec<String>> {
-    let mut reaped = Vec::new();
+    reaped: &mut Vec<String>,
+) -> Result<()> {
     for WorktreeEntry { path, locked } in worktree_entries(repo)? {
         let canonical = path.canonicalize()?;
         if locked || canonical == repo || !canonical.starts_with(root) {
@@ -1318,11 +1421,12 @@ fn reap_finished_worktrees(
         }
         let tip = git(&path, &["rev-parse", "HEAD"])?;
         if has_finished_pr(repo, repository, branch, tip.trim()) {
-            git(repo, &["worktree", "remove", "--force", &path.display().to_string()])?;
-            reaped.push(path.display().to_string());
+            let display_path = path.display().to_string();
+            git(repo, &["worktree", "remove", "--force", &display_path])?;
+            reaped.push(display_path);
         }
     }
-    Ok(reaped)
+    Ok(())
 }
 
 fn credential(operation: &str) -> Result<()> {

@@ -95,6 +95,22 @@ fn a_snapshot_round_trips_through_the_sink_dir() {
 }
 
 #[test]
+fn a_failed_persist_leaves_no_temp_file_behind() {
+    let dir = tempfile::tempdir().unwrap();
+    let sink = dir.path().join("sink");
+    std::fs::create_dir_all(sink.join(SNAPSHOT_FILE)).unwrap();
+    let now = chrono::Utc::now().timestamp();
+
+    assert!(persist(&sink, now).is_err());
+
+    let names: Vec<String> = std::fs::read_dir(&sink)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(names, [SNAPSHOT_FILE]);
+}
+
+#[test]
 fn every_gauge_carries_an_owner_installation_and_role_label() {
     use crate::observability::ops::ratelimit::{bucket_points, quota_points};
     use crate::telemetry::ops::MetricName;

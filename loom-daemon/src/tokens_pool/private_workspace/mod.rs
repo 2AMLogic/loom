@@ -16,12 +16,16 @@ pub mod export;
 mod forge_auth;
 mod lease;
 mod lifecycle;
+mod mirror;
+#[cfg(test)]
+mod mirror_tests;
 pub mod read_authority;
 #[cfg(test)]
 mod read_authority_tests;
 #[cfg(test)]
 mod recover_tests;
 mod repository;
+pub(crate) mod seat_reclaim;
 #[cfg(test)]
 mod tests;
 pub mod transport;
@@ -29,6 +33,7 @@ mod volume_usage;
 mod worker_setup;
 
 pub use lease::AccountBusy;
+pub(crate) use lifecycle::ConfiguredSeatMissing;
 pub use lifecycle::{
     check_binding, configured, converge, rebind, recover, registered_repositories, registrations,
     run_job, session_recover, start, status, stop, Converged,
@@ -322,6 +327,13 @@ pub struct DetachedWork {
 /// end can classify the failure by it instead of `unclassified`.
 pub const SEAT_DIRTY_REASON: &str = "seat_dirty";
 
+/// The step-outcome reason of a preparation refused because the seat's
+/// resolved temp directory is unwritable (#14929): a full 512 MB `/tmp`
+/// previously surfaced downstream as a misleading `workspace Git fetch
+/// failed` and dirty-clone refusals. The refusal message carries it verbatim
+/// so the failure names its cause.
+pub const SEAT_TEMP_UNWRITABLE_REASON: &str = "seat_temp_unwritable";
+
 /// One worktree of a clone (the main checkout included) with uncommitted or
 /// untracked files, as the recover listing reports it (#14458). Counted over
 /// the same `git status` preparation refuses on, so the two cannot disagree.
@@ -445,12 +457,38 @@ pub struct RebindReport {
     pub after: CloneState,
 }
 
+/// A Codex account not found in the inventories used for convergence.
+#[derive(Debug)]
+pub(crate) enum AccountAbsent {
+    ActingRoots,
+    SelectedRoot,
+}
+
+impl std::fmt::Display for AccountAbsent {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::ActingRoots => "Codex account not found in any registered root",
+            Self::SelectedRoot => "Codex account not found",
+        })
+    }
+}
+
+impl std::error::Error for AccountAbsent {}
+
+/// Current evidence about the account or configured seat a binding is waiting for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BindingReadiness {
+    Ready,
+    Missing,
+    Unverified,
+}
+
 fn account(workspace: &Path, name: &str) -> Result<super::account_registry::AccountDescriptor> {
     use super::account_registry::{account_inventory, account_matches_reference, AccountProvider};
     account_inventory(workspace, AccountProvider::Codex)?
         .into_iter()
         .find(|a| account_matches_reference(a, name))
-        .context("Codex account not found")
+        .ok_or_else(|| AccountAbsent::SelectedRoot.into())
 }
 
 fn state_dir(profile: &Path) -> Result<PathBuf> {

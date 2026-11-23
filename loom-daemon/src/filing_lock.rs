@@ -337,12 +337,6 @@ impl FilingLockGuard {
     pub fn path(&self) -> &Path {
         &self.holder
     }
-
-    /// How long the lock has been held.
-    #[must_use]
-    pub fn held_for(&self) -> Duration {
-        self.acquired_at.elapsed()
-    }
 }
 
 impl Drop for FilingLockGuard {

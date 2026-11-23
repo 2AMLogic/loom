@@ -103,8 +103,10 @@ impl Lease {
                     }
                 }
             }
-            if !docker::idle(state, &config.container)? {
-                bail!("stale lease still has a surviving or unverified container worker; retain lease and workspace");
+            if let Some(reason) = docker::idle_refusal(state, &config.container)? {
+                bail!(
+                    "stale lease still has a surviving or unverified container worker ({reason}); retain lease and workspace"
+                );
             }
             self.finish()?;
         }

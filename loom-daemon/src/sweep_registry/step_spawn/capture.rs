@@ -631,6 +631,29 @@ impl SweepRegistry {
         // this end. Peeked, not taken: `step_end::settle` still classifies
         // with it. `Some(None)` (a failed read) is no post-state.
         let post = super::ended::peek_post(&self.config.workspace_root, sweep_id).flatten();
+        // #14898: the Judge verdict of record, onto the root at its close.
+        // Computed here, under the lock, from the same step-scoped evidence
+        // the detached drain will read — the step's journal file (peeked,
+        // never taken, so the drain's input stays intact) and the step's own
+        // dispatch's section of its log. Local reads only: no forge request
+        // holds the registry lock. Any other role closes as before.
+        let verdict = (role == StepRole::Judge)
+            .then(|| {
+                crate::observability::step_verdict::judge_verdict_of_record(
+                    crate::observability::step_verdict::StagedStep {
+                        sweep_id: sweep_id.to_string(),
+                        step: role,
+                        item,
+                        log: log_path.clone(),
+                        hold_auth_before: None,
+                    },
+                    Some(&crate::observability::pick_journal::peek_step(
+                        &self.config.workspace_root,
+                        sweep_id,
+                    )),
+                )
+            })
+            .flatten();
         let (result, close) = super::span::sweep_close(
             end,
             line.as_ref(),
@@ -643,6 +666,7 @@ impl SweepRegistry {
             pr_number,
             provider_exhausted,
             post,
+            verdict.as_ref(),
         );
         let trace_context = self.close_step_span(sweep_id, info.map(|i| i.pid), result, close);
         // Hermetic fixtures (no forge) keep their tests free of the detached
