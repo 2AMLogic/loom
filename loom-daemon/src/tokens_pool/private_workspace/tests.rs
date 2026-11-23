@@ -433,6 +433,15 @@ fn recover_args(remote: &Path) -> repository::RecoverArgs {
     }
 }
 
+/// PR-fetch residue (`refs/<name>`, `refs/remotes/<name>`) at `tip`: the
+/// shape that makes Git shorten every abbreviated lookup of
+/// `refs/heads/<name>` to `heads/<name>` (#15027). Neither ref lives under
+/// `refs/heads`, so no branch is created.
+fn add_residue(repo: &Path, name: &str, tip: &str) {
+    git(repo, &["update-ref", &format!("refs/{name}"), tip]);
+    git(repo, &["update-ref", &format!("refs/remotes/{name}"), tip]);
+}
+
 /// Two unpublished branches (one ahead each) with the root checkout
 /// detached at the base, and the base revision.
 fn two_unpublished_branches() -> (RepoFixture, PathBuf, String, String) {
@@ -673,6 +682,219 @@ fn recover_discard_resolves_the_base_before_mutating_any_holder() {
     assert!(git_ok(&repo, &["show-ref", "--verify", "refs/heads/aaa-wt"]));
     assert!(worktree.exists(), "the holding worktree was not removed");
     assert_eq!(git(&repo, &["rev-parse", "--abbrev-ref", "HEAD"]), "issue-3");
+}
+
+/// PR-fetch residue at an unpublished branch's tip must not break the
+/// recover listing: the shadowed branch keeps its true name and ahead
+/// count, and the residue refs are left exactly where they were (#15027).
+#[test]
+#[serial_test::serial(private_workspace_fork)]
+#[serial_test::serial]
+fn recover_lists_residue_shadowed_branches_by_their_true_names() {
+    let _fork = fork_guard();
+    let (f, repo, issue3, issue4) = two_unpublished_branches();
+    add_residue(&repo, "issue-3", &issue3);
+    let list = repository::recover(&f.root, &recover_args(&f.remote)).unwrap();
+    assert_eq!(
+        list.branches
+            .iter()
+            .map(|b| (b.branch.as_str(), b.ahead))
+            .collect::<Vec<_>>(),
+        vec![("issue-3", 1), ("issue-4", 1)]
+    );
+    assert!(list.ignored.is_empty());
+    assert_eq!(git(&repo, &["rev-parse", "refs/issue-3"]), issue3);
+    assert_eq!(git(&repo, &["rev-parse", "refs/remotes/issue-3"]), issue3);
+    assert_eq!(git(&repo, &["rev-parse", "issue-4"]), issue4);
+}
+
+/// A branch literally named `heads/topic` is reported (and scoped) as
+/// `heads/topic` under `refs/topic` residue, never shortened further (#15027).
+#[test]
+#[serial_test::serial(private_workspace_fork)]
+#[serial_test::serial]
+fn a_literal_heads_prefixed_branch_keeps_its_name_under_residue() {
+    let _fork = fork_guard();
+    let f = RepoFixture::new();
+    f.prepare().unwrap();
+    let repo = f.root.join("repo");
+    let base = git(&repo, &["rev-parse", "origin/main"]);
+    git(&repo, &["switch", "-c", "heads/topic"]);
+    std::fs::write(repo.join("fixture"), "literal").unwrap();
+    git(&repo, &["commit", "-am", "literal"]);
+    let tip = git(&repo, &["rev-parse", "refs/heads/heads/topic"]);
+    git(&repo, &["switch", "--detach", &base]);
+    add_residue(&repo, "topic", &tip);
+    let list = repository::recover(&f.root, &recover_args(&f.remote)).unwrap();
+    assert_eq!(
+        list.branches
+            .iter()
+            .map(|b| (b.branch.as_str(), b.ahead))
+            .collect::<Vec<_>>(),
+        vec![("heads/topic", 1)]
+    );
+    let mut scoped = recover_args(&f.remote);
+    scoped.branch = vec!["heads/topic".into()];
+    let out = repository::recover(&f.root, &scoped).unwrap();
+    assert!(out.ignored.is_empty());
+    assert_eq!(git(&repo, &["rev-parse", "refs/topic"]), tip);
+}
+
+/// A scoped `--publish` must reach the shadowed branch instead of ignoring
+/// it, and never disturb the residue refs (#15027).
+#[test]
+#[serial_test::serial(private_workspace_fork)]
+#[serial_test::serial]
+fn recover_publishes_a_residue_shadowed_scoped_branch() {
+    let _fork = fork_guard();
+    let (f, repo, issue3, _issue4) = two_unpublished_branches();
+    add_residue(&repo, "issue-3", &issue3);
+    let mut args = recover_args(&f.remote);
+    args.publish = true;
+    args.branch = vec!["issue-3".into()];
+    let out = repository::recover(&f.root, &args).unwrap();
+    assert_eq!(out.published, vec!["issue-3".to_owned()]);
+    assert!(out.ignored.is_empty());
+    assert_eq!(git(&f.remote, &["rev-parse", "refs/heads/issue-3"]), issue3);
+    assert_eq!(git(&repo, &["rev-parse", "refs/issue-3"]), issue3);
+    assert_eq!(git(&repo, &["rev-parse", "refs/remotes/issue-3"]), issue3);
+}
+
+/// `recover --discard` on a residue-shadowed branch held by the main
+/// checkout: the holder is found by the branch's true name, moved to the
+/// base, and the branch deleted — while the residue refs survive (#15027).
+#[test]
+#[serial_test::serial(private_workspace_fork)]
+#[serial_test::serial]
+fn recover_discards_a_residue_shadowed_branch_held_by_the_main_checkout() {
+    let _fork = fork_guard();
+    let f = RepoFixture::new();
+    f.prepare().unwrap();
+    let repo = f.root.join("repo");
+    git(&repo, &["switch", "-c", "pr344"]);
+    std::fs::write(repo.join("fixture"), "unpublished").unwrap();
+    git(&repo, &["commit", "-am", "unpublished"]);
+    let tip = git(&repo, &["rev-parse", "refs/heads/pr344"]);
+    add_residue(&repo, "pr344", &tip);
+    let mut args = recover_args(&f.remote);
+    args.discard = true;
+    args.branch = vec!["pr344".into()];
+    let out = repository::recover(&f.root, &args).unwrap();
+    assert_eq!(out.discarded, vec!["pr344".to_owned()]);
+    assert!(!git_ok(&repo, &["show-ref", "--verify", "refs/heads/pr344"]));
+    assert_eq!(git(&repo, &["rev-parse", "HEAD"]), git(&repo, &["rev-parse", "origin/main"]));
+    assert_eq!(git(&repo, &["rev-parse", "refs/pr344"]), tip);
+    assert_eq!(git(&repo, &["rev-parse", "refs/remotes/pr344"]), tip);
+}
+
+/// Residue-shadowed holders keep working both ways: a clean linked worktree
+/// is removed by its branch's true name, and a dirty one is reported under
+/// that name and still refuses the discard before any mutation (#15027).
+#[test]
+#[serial_test::serial(private_workspace_fork)]
+#[serial_test::serial]
+fn recover_discards_a_residue_shadowed_holder_and_reports_dirty_ones_by_true_name() {
+    let _fork = fork_guard();
+    let f = RepoFixture::new();
+    f.prepare().unwrap();
+    let repo = f.root.join("repo");
+    let holder = f.root.join("issue-344");
+    git(&repo, &["worktree", "add", "-b", "pr344", holder.to_str().unwrap()]);
+    std::fs::write(holder.join("fixture"), "held").unwrap();
+    git(&holder, &["add", "."]);
+    git(&holder, &["commit", "-am", "held"]);
+    let tip = git(&repo, &["rev-parse", "refs/heads/pr344"]);
+    let dirty = f.root.join("issue-345");
+    git(&repo, &["worktree", "add", "-b", "pr345", dirty.to_str().unwrap()]);
+    std::fs::write(dirty.join("fixture"), "committed").unwrap();
+    git(&dirty, &["add", "."]);
+    git(&dirty, &["commit", "-am", "committed"]);
+    let dirty_tip = git(&repo, &["rev-parse", "refs/heads/pr345"]);
+    std::fs::write(dirty.join("untracked"), "keep").unwrap();
+    add_residue(&repo, "pr344", &tip);
+    add_residue(&repo, "pr345", &dirty_tip);
+    let list = repository::recover(&f.root, &recover_args(&f.remote)).unwrap();
+    assert_eq!(list.dirty_worktrees.len(), 1);
+    assert_eq!(list.dirty_worktrees[0].branch.as_deref(), Some("pr345"));
+    let mut args = recover_args(&f.remote);
+    args.discard = true;
+    args.branch = vec!["pr344".into()];
+    let out = repository::recover(&f.root, &args).unwrap();
+    assert_eq!(out.discarded, vec!["pr344".to_owned()]);
+    assert!(!holder.exists(), "the clean shadowed holder was removed");
+    assert!(!git_ok(&repo, &["show-ref", "--verify", "refs/heads/pr344"]));
+    args.branch = vec!["pr345".into()];
+    let error = repository::recover(&f.root, &args).unwrap_err().to_string();
+    assert!(error.contains("uncommitted"), "{error}");
+    assert!(git_ok(&repo, &["show-ref", "--verify", "refs/heads/pr345"]));
+    assert!(dirty.join("untracked").exists());
+    assert_eq!(git(&repo, &["rev-parse", "refs/pr344"]), tip);
+    assert_eq!(git(&repo, &["rev-parse", "refs/remotes/pr345"]), dirty_tip);
+}
+
+/// `prepare` must find — and reap — a finished-PR worktree whose branch is
+/// residue-shadowed, passing the true branch name to the PR lookup (#15027).
+#[test]
+#[serial_test::serial(private_workspace_fork)]
+#[serial_test::serial]
+fn prepare_reaps_a_finished_pr_worktree_on_a_residue_shadowed_branch() {
+    let _fork = fork_guard();
+    let f = RepoFixture::new();
+    f.prepare().unwrap();
+    let repo = f.root.join("repo");
+    let holder = f.root.join("issue-344");
+    git(&repo, &["worktree", "add", "-b", "pr344", holder.to_str().unwrap()]);
+    let tip = git(&repo, &["rev-parse", "refs/heads/pr344"]);
+    add_residue(&repo, "pr344", &tip);
+    let outcome =
+        repository::prepare_with_pr_lookup(&f.root, &f.args, &|_, _, branch, _| branch == "pr344")
+            .unwrap();
+    assert_eq!(outcome.reaped, vec![holder.to_string_lossy().to_string()]);
+    assert!(!holder.exists(), "the shadowed finished-PR worktree was reaped");
+    assert!(git_ok(&repo, &["show-ref", "--verify", "refs/heads/pr344"]));
+    assert_eq!(git(&repo, &["rev-parse", "refs/pr344"]), tip);
+    assert_eq!(git(&repo, &["rev-parse", "refs/remotes/pr344"]), tip);
+}
+
+/// `holding_worktree` resolves a residue-shadowed holder by the branch's
+/// true name, so a preparation refusing on it names the cure (#15027).
+#[test]
+#[serial_test::serial(private_workspace_fork)]
+#[serial_test::serial]
+fn holding_worktree_finds_a_residue_shadowed_holder() {
+    let _fork = fork_guard();
+    let f = RepoFixture::new();
+    f.prepare().unwrap();
+    let repo = f.root.join("repo");
+    let holder = f.root.join("issue-344");
+    git(&repo, &["worktree", "add", "-b", "pr344", holder.to_str().unwrap()]);
+    let tip = git(&repo, &["rev-parse", "refs/heads/pr344"]);
+    add_residue(&repo, "pr344", &tip);
+    assert_eq!(repository::holding_worktree(&repo, "pr344").unwrap(), Some(holder));
+}
+
+/// `current_branch` reads the true name of a residue-shadowed checkout and
+/// answers `None` exactly when detached (#15027).
+#[test]
+#[serial_test::serial(private_workspace_fork)]
+#[serial_test::serial]
+fn current_branch_reads_true_names_under_residue() {
+    let _fork = fork_guard();
+    let f = RepoFixture::new();
+    f.prepare().unwrap();
+    let repo = f.root.join("repo");
+    // `prepare` without a branch leaves the main checkout detached at the base.
+    assert_eq!(repository::current_branch(&repo).unwrap(), None);
+    let holder = f.root.join("issue-344");
+    git(&repo, &["worktree", "add", "-b", "pr344", holder.to_str().unwrap()]);
+    let tip = git(&repo, &["rev-parse", "refs/heads/pr344"]);
+    add_residue(&repo, "pr344", &tip);
+    assert_eq!(repository::current_branch(&holder).unwrap().as_deref(), Some("pr344"));
+    // A literal heads-prefixed branch keeps that name under `refs/topic`
+    // residue.
+    git(&repo, &["switch", "-c", "heads/topic"]);
+    add_residue(&repo, "topic", &git(&repo, &["rev-parse", "refs/heads/heads/topic"]));
+    assert_eq!(repository::current_branch(&repo).unwrap().as_deref(), Some("heads/topic"));
 }
 
 #[test]
