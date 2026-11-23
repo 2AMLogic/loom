@@ -223,7 +223,10 @@ fn expression_body_references_secret(body: &str) -> bool {
             return true;
         }
         if let Some(rest) = tail.strip_prefix('[') {
-            return !bracket_access_is_builtin(rest.trim_start());
+            if bracket_access_is_builtin(rest.trim_start()) {
+                continue; // the built-in token, bracket form (#12995)
+            }
+            return true;
         }
         return true;
     }
@@ -391,6 +394,9 @@ mod tests {
             "x: ${{ toJSON(secrets) }}\n",
             "x: ${{ secrets[\"PAT\"] }}\n",
             "x: ${{ secrets['PAT'] }}\n",
+            // A built-in token access must not clear the rest of its expression.
+            "x: ${{ secrets['GITHUB_TOKEN'] || secrets.DEPLOY_KEY }}\n",
+            "x: ${{ format('{0}{1}', secrets[\"GITHUB_TOKEN\"], secrets.PAT) }}\n",
             // Contexts are case-insensitive in expressions.
             "x: ${{ SECRETS.PAT }}\n",
             // The built-in exception keeps its exact case and boundary (#12995).
