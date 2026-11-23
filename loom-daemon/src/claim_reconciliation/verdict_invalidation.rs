@@ -5,14 +5,13 @@
 //!
 //! # Why a sibling file
 //!
-//! The #9124 carve-out is new
-//! production logic, so it goes in a new module with a thin dispatch left
-//! behind — the same treatment [`super::pr_label_info`],
-//! [`super::auto_merge_disarm`] and [`super::verdict_stale_comment`] already
-//! got. `invalidate_verdict` moves here with it rather than staying behind in
-//! [`super::forge`], because the carve-out and the clear are the two branches
-//! of one decision and splitting them across files would make the arm harder
-//! to read, not easier.
+//! The #9124 carve-out is new production logic, so it goes in a new module
+//! with a thin dispatch left behind — the same treatment
+//! [`super::pr_label_info`], [`super::auto_merge_disarm`] and
+//! [`super::verdict_stale_comment`] already got. `invalidate_verdict` moves
+//! here with it rather than staying behind in [`super::forge`], because the
+//! carve-out and the clear are the two branches of one decision and splitting
+//! them across files would make the arm harder to read, not easier.
 //!
 //! **This is a relocation, not a behavior change.** The decision logic, the
 //! comment bodies, the label writes, the counters and the log lines are

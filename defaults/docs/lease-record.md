@@ -505,11 +505,16 @@ the REST comments endpoint (NDJSON output across `--paginate` pages, the same
 #4637 workaround `SweepRegistry::read_lease_comments` uses), locally picks
 the one with the freshest `updated_at`, and confirms BOTH (a) that comment is
 still within `ttl_minutes` of now (default 15, same TTL Phase 2 uses) and (b)
-its `host=` field still names this sweep's own host. It is wired into the
+its `host=` field still names this sweep's own host (an optional
+`--sweep-id ID` — which the Builder recipe passes as `$LOOM_SWEEP_ID` when
+set, #15043 — additionally requires the lease's `sweep=` to equal `ID`, so
+same-host peer dispatches on a shared worker are told apart; callers
+omitting the flag keep host-only matching). It is wired into the
 Builder phase immediately before `git push` + opening the PR
 (`defaults/roles/builder-pr.md` § "Lease Fencing: Confirm You Still Own the
 Claim") — on either failure (expired AND owned by this sweep's own host,
-exit `3`; superseded by a *fresh* lease from a different host, exit `4`) the
+exit `3`; superseded by a *fresh* lease from a different host — or, with
+`--sweep-id`, a different dispatch on this same host — exit `4`) the
 Builder aborts before doing anything externally-visible, without touching
 the `loom:building` label or contesting the peer's claim. Absence of a
 matching lease comment, a malformed marker, a `gh` fetch failure, or an

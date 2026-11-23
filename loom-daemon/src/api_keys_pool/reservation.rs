@@ -57,7 +57,7 @@ use crate::tokens_pool::locking::MkdirLock;
 
 use super::inflight;
 use super::paths::{provider_dir, resolve_provider_root};
-use super::registry::{list_provider, ApiKeyAccount};
+use super::registry::{list_provider_for_class, ApiKeyAccount};
 
 /// Directory under a provider's pool dir holding one file per reservation.
 /// Dot-prefixed, so it can never collide with an account file.
@@ -205,14 +205,28 @@ pub fn try_reserve(workspace: &Path, provider: &str) -> Reserve {
     let Ok(root) = resolve_provider_root(workspace, provider) else {
         return Reserve::Unbounded;
     };
-    try_reserve_in(&root, provider, std::process::id())
+    // The same caps the launched child's selection will enforce — the host's
+    // file merged with the workspace's `runtimes.apiKeyLimits` block
+    // (#14932) — so a config-declared cap is reserved against here instead of
+    // being discovered at launch.
+    try_reserve_in(
+        &root,
+        provider,
+        std::process::id(),
+        &super::limits::ConfiguredLimits::from_workspace(workspace),
+    )
 }
 
-/// [`try_reserve`] against an explicit pool root and owner PID: the seam
-/// tests use to fabricate a dead owner.
+/// [`try_reserve`] against an explicit pool root, owner PID and config-declared
+/// limits: the seam tests use to fabricate a dead owner.
 #[must_use]
-pub fn try_reserve_in(root: &Path, provider: &str, pid: u32) -> Reserve {
-    let Ok(accounts) = list_provider(root, provider) else {
+pub fn try_reserve_in(
+    root: &Path,
+    provider: &str,
+    pid: u32,
+    configured: &super::limits::ConfiguredLimits,
+) -> Reserve {
+    let Ok(accounts) = list_provider_for_class(root, provider, None, configured) else {
         return Reserve::Unbounded;
     };
     if !accounts.iter().any(|a| a.max_concurrent.is_some()) {

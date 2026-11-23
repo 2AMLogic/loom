@@ -768,6 +768,18 @@ pub(super) fn create(config: &Config, image: &str) -> Result<()> {
         // container's `$HOME`, which is `/home/loom` here. Point the store at
         // the cache volume so Loom's own lock stays out of the work tree.
         "LOOM_LEASE_RENEW_STATE_DIR=/workspace/cache/lease-renew".into(),
+        // The seat's 512 MB `/tmp` tmpfs filled with caches that live for the
+        // container's whole multi-day life (#14929): uv's cache alone was
+        // 395 MB after two days. Pin every long-lived cache and Loom state
+        // dir to the persistent cache volume (each consumer creates its dir
+        // on demand, so a seat created before this change needs no migration).
+        // `UV_PROJECT_ENVIRONMENT` stays on /tmp deliberately: it is one
+        // per-container venv uv recreates on repo switch, not a growing cache.
+        "UV_CACHE_DIR=/workspace/cache/uv".into(),
+        "GH_CACHE_DIR=/workspace/cache/gh".into(),
+        "LOOM_LISTING_CACHE_DIR=/workspace/cache/forge-listing".into(),
+        "LOOM_FORGE_CALL_STATS_DIR=/workspace/cache/forge-call-stats".into(),
+        "LOOM_WRITE_SCOPE_CACHE_DIR=/workspace/cache/write-scope".into(),
         format!("LOOM_PRIVATE_REPOSITORY={}", config.repository),
     ] {
         args.extend(["--env".into(), value]);

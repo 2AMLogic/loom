@@ -28,22 +28,8 @@ impl FakeDocker {
     }
 }
 
-fn fixture_is_busy(error: &anyhow::Error) -> bool {
-    matches!(error.downcast_ref::<ExecError>(), Some(ExecError::Spawn(io))
-        if io.kind() == std::io::ErrorKind::ExecutableFileBusy)
-}
-
 fn capture(argv: &[&str], timeout: Duration) -> Result<ExecOutput> {
-    let runner = ProcessContainerRunner;
-    let mut attempts = 0..1000;
-    loop {
-        match runner.exec_capture("loom-codex-session-test", argv, timeout) {
-            Err(error) if fixture_is_busy(&error) && attempts.next().is_some() => {
-                std::thread::sleep(Duration::from_millis(2));
-            }
-            output => return output,
-        }
-    }
+    ProcessContainerRunner.exec_capture("loom-codex-session-test", argv, timeout)
 }
 
 #[test]

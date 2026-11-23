@@ -51,10 +51,13 @@ SHIPPED_PATHS=(
   CLAUDE.md
   README.md
   .loom/README.md
+  .loom/bin/loom
   .loom/config
   .loom/docs
   .loom/install-metadata.json
+  .loom/runtimes
   .claude/README.md
+  .claude/settings.json
   .github/CONFIGURATION.md
   loom-daemon/src/init/scaffolding.rs
 )
@@ -104,6 +107,25 @@ scan_old_slug() {
   return 0
 }
 
+# make_fixture_tree <root>: materialise every SHIPPED_PATHS entry under <root>
+# in the shape it has in the real tree — a directory becomes a directory (with
+# a placeholder file so git tracks it), a file becomes a file. Shape is read
+# from $REPO_ROOT rather than guessed from the path: `.loom/config` is a
+# directory while the extensionless `.loom/bin/loom` is a file, so neither a
+# `*.*` split nor any basename heuristic can classify them (#14960).
+make_fixture_tree() {
+  local root="$1" p
+  for p in "${SHIPPED_PATHS[@]}"; do
+    if [[ -d "$REPO_ROOT/$p" ]]; then
+      mkdir -p "$root/$p"
+      echo "clean" >"$root/$p/placeholder.md"
+    else
+      mkdir -p "$root/$(dirname "$p")"
+      echo "clean" >"$root/$p"
+    fi
+  done
+}
+
 # ============================================================================
 # The real tree
 # ============================================================================
@@ -131,13 +153,23 @@ echo "=== Scanner flags regressions, honours allowlist, and reports fatal errors
 FIXTURE="$TMP_WORK/repo"
 mkdir -p "$FIXTURE"
 git -C "$FIXTURE" init -q
-for p in "${SHIPPED_PATHS[@]}"; do
-  case "$p" in
-    *.*) mkdir -p "$FIXTURE/$(dirname "$p")"; echo "clean" >"$FIXTURE/$p" ;;
-    *)   mkdir -p "$FIXTURE/$p"; echo "clean" >"$FIXTURE/$p/placeholder.md" ;;
-  esac
-done
+make_fixture_tree "$FIXTURE"
 git -C "$FIXTURE" add -A
+
+# Shape mirror: every shipped path must exist in the fixture in the shape the
+# real tree gives it (directory vs file) — the property #14960 fixed; a
+# regression here would otherwise pass the scans silently, as it did before.
+shape_mismatches=""
+for p in "${SHIPPED_PATHS[@]}"; do
+  if [[ -d "$REPO_ROOT/$p" ]]; then
+    [[ -d "$FIXTURE/$p" ]] || shape_mismatches+="dir:$p "
+  else
+    [[ -f "$FIXTURE/$p" ]] || shape_mismatches+="file:$p "
+  fi
+done
+assert_eq "fixture mirrors each shipped path's real shape (dir/file)" \
+  "" \
+  "$shape_mismatches"
 
 assert_eq "clean fixture: no hits" "" "$(scan_old_slug "$FIXTURE")"
 
@@ -170,12 +202,7 @@ assert_eq "a vanished shipped path is reported, not silently skipped" \
 # of returning an empty clean scan.
 EXPORTED="$TMP_WORK/exported"
 mkdir -p "$EXPORTED"
-for p in "${SHIPPED_PATHS[@]}"; do
-  case "$p" in
-    *.*) mkdir -p "$EXPORTED/$(dirname "$p")"; echo "clean" >"$EXPORTED/$p" ;;
-    *)   mkdir -p "$EXPORTED/$p"; echo "clean" >"$EXPORTED/$p/placeholder.md" ;;
-  esac
-done
+make_fixture_tree "$EXPORTED"
 echo "see https://github.com/$OLD_SLUG/issues/1" >"$EXPORTED/README.md"
 
 exported_rc=0
