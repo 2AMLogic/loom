@@ -1514,8 +1514,11 @@ fn parse_gh_run_list(stdout: &str, sha: &str, ci_workflow: Option<&str>) -> CiVe
 
 /// Run `program args…` in `cwd`, capturing stdout, killing it after `timeout`.
 ///
-/// stdout goes to a temp file rather than a pipe for the same reason the gate
-/// command's does (no pipe-buffer deadlock while polling); stderr is discarded.
+/// Delegates to [`crate::proc_exec::run_bounded`] (#15001 slice B): stdout and
+/// stderr are piped and drained concurrently, so output volume can never look
+/// like a hang (which is why the old temp-file workaround from #4005 is gone),
+/// and the deadline terminates the child's whole process group, so descendants
+/// do not outlive it. stderr is drained but discarded.
 ///
 /// `pub(crate)` (rather than private) so [`crate::credential_preflight`] can
 /// reuse the same bounded-subprocess helper for its `gh auth status` probe
@@ -1526,43 +1529,25 @@ pub(crate) fn run_capture_with_timeout(
     cwd: &Path,
     timeout: Duration,
 ) -> std::result::Result<String, String> {
-    let log_path =
-        std::env::temp_dir().join(format!("loom-gate-ci-probe-{}.json", uuid::Uuid::new_v4()));
-    let out_file = std::fs::File::create(&log_path)
-        .map_err(|e| format!("could not create probe output file: {e}"))?;
-    let mut child = Command::new(program)
-        .args(args)
-        .current_dir(cwd)
-        .stdin(Stdio::null())
-        .stdout(Stdio::from(out_file))
-        .stderr(Stdio::null())
-        .spawn()
-        .map_err(|e| {
-            let _ = std::fs::remove_file(&log_path);
-            format!("could not spawn `{program}`: {e}")
-        })?;
-
-    let start = Instant::now();
-    let result = loop {
-        match child.try_wait() {
-            Ok(Some(status)) if status.success() => {
-                break std::fs::read_to_string(&log_path)
-                    .map_err(|e| format!("could not read probe output: {e}"));
-            }
-            Ok(Some(status)) => break Err(format!("`{program}` exited with {status}")),
-            Ok(None) => {
-                if start.elapsed() >= timeout {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    break Err(format!("`{program}` timed out after {}s", timeout.as_secs()));
-                }
-                std::thread::sleep(GATE_POLL_INTERVAL);
-            }
-            Err(e) => break Err(format!("could not poll `{program}`: {e}")),
+    let mut cmd = Command::new(program);
+    cmd.args(args).current_dir(cwd).stdin(Stdio::null());
+    match crate::proc_exec::run_bounded(cmd, timeout) {
+        Ok(crate::proc_exec::Completion::Exited(out)) if out.status.success() => {
+            String::from_utf8(out.stdout).map_err(|e| format!("could not read probe output: {e}"))
         }
-    };
-    let _ = std::fs::remove_file(&log_path);
-    result
+        Ok(crate::proc_exec::Completion::Exited(out)) => {
+            Err(format!("`{program}` exited with {}", out.status))
+        }
+        Ok(crate::proc_exec::Completion::TimedOut { .. }) => {
+            Err(format!("`{program}` timed out after {}s", timeout.as_secs()))
+        }
+        Err(crate::proc_exec::ExecError::Spawn(e)) => {
+            Err(format!("could not spawn `{program}`: {e}"))
+        }
+        Err(crate::proc_exec::ExecError::Collect(e)) => {
+            Err(format!("could not read probe output: {e}"))
+        }
+    }
 }
 
 /// The concrete [`GateRunner`]: syncs the workspace to `origin/main`, then shells

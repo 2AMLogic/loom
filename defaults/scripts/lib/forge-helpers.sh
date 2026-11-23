@@ -1715,6 +1715,119 @@ _FORGE_REVIEW_COMMENT_RECORD_JQ='.[] | {
   body: (.body // "")
 } | tojson'
 
+# GraphQL fallback for forge_get_pr_reviews' GitHub branch (#15009): a
+# paginated pullRequest.reviews read mapped onto the identical record shape
+# the REST path emits, so a REST reader shed (#14739) cannot turn the gate's
+# one single-transport input into an automatic UNKNOWN while GraphQL still
+# serves (the inline-thread read already had both paths). Called ONLY after a
+# FAILED REST read — never after a 124, which must reach the caller as "timed
+# out" and must not spend a second wall-clock budget (#13927). Fails closed
+# exactly like the REST path: any gh failure, a GraphQL-level `errors`
+# payload, a page missing the reviews connection / pageInfo / nodes, or a
+# hasNextPage without a usable cursor is a non-zero return with NO output.
+_forge_get_pr_reviews_github_graphql() {
+  local nwo="$1"
+  local pr_number="$2"
+  local gh_cmd="${3:-gh}"
+
+  forge_split_nwo "$nwo"
+
+  local query='query($owner:String!,$repo:String!,$pr:Int!,$cursor:String){
+    repository(owner:$owner,name:$repo){
+      pullRequest(number:$pr){
+        reviews(first:100,after:$cursor){
+          pageInfo{hasNextPage endCursor}
+          nodes{
+            databaseId
+            state
+            commit{oid}
+            submittedAt
+            author{login}
+            body
+          }
+        }
+      }
+    }
+  }'
+
+  local cursor="" page=0 response rc records="" page_records has_next
+  while :; do
+    page=$((page + 1))
+    if [[ $page -gt 50 ]]; then
+      echo "forge_get_pr_reviews: exceeded 50 GraphQL pages — refusing to report a truncated review list" >&2
+      return 1
+    fi
+
+    if [[ -z "$cursor" ]]; then
+      response=$(_forge_review_read_run "$gh_cmd" api graphql -f query="$query" \
+        -F owner="$FORGE_OWNER" -F repo="$FORGE_REPO" -F pr="$pr_number")
+    else
+      response=$(_forge_review_read_run "$gh_cmd" api graphql -f query="$query" \
+        -F owner="$FORGE_OWNER" -F repo="$FORGE_REPO" -F pr="$pr_number" \
+        -F cursor="$cursor")
+    fi
+    rc=$?
+    if [[ "$rc" -eq 124 ]]; then
+      echo "forge_get_pr_reviews: the GraphQL review read timed out (#13927)" >&2
+      return 124
+    fi
+    [[ "$rc" -ne 0 ]] && return 1
+
+    # A GraphQL-level error rides a 200 with an `errors` key; a partial-data
+    # response must not pass for a complete page.
+    if printf '%s' "$response" | jq -e '.errors' > /dev/null 2>&1; then
+      echo "forge_get_pr_reviews: GraphQL response carried errors — review read failed" >&2
+      return 1
+    fi
+
+    # Structural guard: reviews + pageInfo + nodes must all be present. A
+    # shape without them is a truncated/errored page, and guessing
+    # "complete" is how a partial read becomes a false CLEAR.
+    if ! printf '%s' "$response" \
+      | jq -e '.data.repository.pullRequest.reviews
+               | type == "object" and has("pageInfo") and has("nodes")' > /dev/null 2>&1; then
+      echo "forge_get_pr_reviews: GraphQL page lacked the reviews/pageInfo shape — treating the read as incomplete" >&2
+      return 1
+    fi
+
+    page_records=$(printf '%s' "$response" \
+      | jq -c '.data.repository.pullRequest.reviews.nodes[] | {
+          id: (.databaseId // 0),
+          state: ((.state // "UNKNOWN") | ascii_upcase
+                  | if . == "REQUEST_CHANGES" then "CHANGES_REQUESTED"
+                    elif . == "COMMENT" then "COMMENTED"
+                    else . end),
+          commit_id: (.commit.oid // ""),
+          submitted_at: (.submittedAt // ""),
+          author: (.author.login // ""),
+          body: (.body // "")
+        }') || return 1
+    # Buffered, not streamed: the fail-closed contract is NO output on a
+    # failed read, and a page-2 failure must not leave page 1's records
+    # looking like an answer.
+    [[ -n "$page_records" ]] && records+="$page_records"$'\n'
+
+    has_next=$(printf '%s' "$response" \
+      | jq -r '.data.repository.pullRequest.reviews.pageInfo.hasNextPage') || return 1
+    if [[ "$has_next" == "false" ]]; then
+      break
+    fi
+    if [[ "$has_next" != "true" ]]; then
+      echo "forge_get_pr_reviews: hasNextPage was not a boolean — treating the read as incomplete" >&2
+      return 1
+    fi
+    cursor=$(printf '%s' "$response" \
+      | jq -r '.data.repository.pullRequest.reviews.pageInfo.endCursor') || return 1
+    if [[ -z "$cursor" || "$cursor" == "null" ]]; then
+      echo "forge_get_pr_reviews: hasNextPage without a usable endCursor — treating the read as incomplete" >&2
+      return 1
+    fi
+  done
+
+  [[ -n "$records" ]] && printf '%s' "$records"
+  return 0
+}
+
 # Get a PR's formal reviews as complete, fully-paginated NDJSON records.
 #
 # Usage: forge_get_pr_reviews NWO PR_NUMBER [GH_CMD]
@@ -1725,7 +1838,13 @@ _FORGE_REVIEW_COMMENT_RECORD_JQ='.[] | {
 #       non-zero on ANY read/pagination failure (fail closed),
 #       124 when the read exceeded LOOM_FORGE_REVIEW_READ_TIMEOUT (#13927).
 #
-# Both forges: GET /repos/{nwo}/pulls/{n}/reviews
+# GitHub: GET /repos/{nwo}/pulls/{n}/reviews — and, when that REST read FAILS
+#   (non-zero, non-124), a paginated GraphQL pullRequest.reviews fallback
+#   (#15009) emitting the identical record shape, so a REST reader shed
+#   (#14739) cannot turn every approval into UNKNOWN while GraphQL serves. A
+#   timed-out read is NEVER retried through the fallback: 124 reaches the
+#   caller, and the #13927 wall-clock bound holds.
+# Gitea: paginated GET /repos/{o}/{r}/pulls/{n}/reviews (unchanged).
 # Always plain `gh` (never a cache wrapper): this read gates a verdict, and the
 # review that landed 20 seconds ago is exactly the one a cache would hide.
 forge_get_pr_reviews() {
@@ -1740,8 +1859,23 @@ forge_get_pr_reviews() {
     return $?
   fi
 
-  _forge_review_read_run "$gh_cmd" api "repos/$nwo/pulls/$pr_number/reviews?per_page=100" --paginate \
-    --jq "$_FORGE_REVIEW_RECORD_JQ"
+  local out rc
+  out=$(_forge_review_read_run "$gh_cmd" api "repos/$nwo/pulls/$pr_number/reviews?per_page=100" --paginate \
+    --jq "$_FORGE_REVIEW_RECORD_JQ")
+  rc=$?
+  if [[ "$rc" -eq 0 ]]; then
+    # Byte-identical to the pre-#15009 stream: the record lines, and nothing
+    # else — command substitution ate the trailing newline, so put one back
+    # only when there were records at all.
+    [[ -n "$out" ]] && printf '%s\n' "$out"
+    return 0
+  fi
+  if [[ "$rc" -eq 124 ]]; then
+    return 124
+  fi
+  echo "forge_get_pr_reviews: REST review read failed (rc $rc) — falling back to the GraphQL transport (#15009)" >&2
+  _forge_get_pr_reviews_github_graphql "$nwo" "$pr_number" "$gh_cmd"
+  return $?
 }
 
 # Get a PR's INLINE review comments (diff-anchored), fully paginated.
