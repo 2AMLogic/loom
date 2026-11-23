@@ -521,6 +521,16 @@ jobs:
         # yields an out-of-range k/N, which fails loudly).
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    env:
+      # #15086: the fallback-docker CLI test must not be able to pass without
+      # executing its body. With this set, its host-docker skip guard becomes
+      # a hard failure, so a runner image change that adds
+      # /usr/local/bin/docker (which precedes the fixture's ~/.docker/bin in
+      # the resolver's fallback order) turns that test red instead of
+      # silently passing. ubuntu-latest never has /opt/homebrew/bin, and its
+      # /usr/bin/docker sits after the fixture in the order, so a healthy
+      # runner is unaffected.
+      LOOM_TEST_REQUIRE_FALLBACK_DOCKER: "1"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
