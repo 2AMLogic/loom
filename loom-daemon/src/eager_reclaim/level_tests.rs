@@ -141,11 +141,11 @@ impl Sim {
             };
             let idle =
                 |root: &Path| run_idle_targets_if_due(root, FLOOR, now, COOLDOWN, &idle_body);
-            let stub_seats =
-                |_: &Path| crate::tokens_pool::private_workspace::seat_reclaim::SeatReclaimReport {
-                    skipped: None,
-                    seats: Vec::new(),
-                };
+            let stub_seats = |_: &Path| {
+                crate::tokens_pool::private_workspace::seat_reclaim::SeatScheduling::Skipped(
+                    "stub: seats not under test".into(),
+                )
+            };
             let passes = SubPasses {
                 reap_worktrees: &reap,
                 deep_clean: &deep,
@@ -235,10 +235,9 @@ fn run_tiered(probes: &[Option<u64>]) -> (EagerReclaimReport, Vec<&'static str>)
     };
     let seats = |_: &Path| {
         order.borrow_mut().push("seats");
-        crate::tokens_pool::private_workspace::seat_reclaim::SeatReclaimReport {
-            skipped: None,
-            seats: Vec::new(),
-        }
+        crate::tokens_pool::private_workspace::seat_reclaim::SeatScheduling::Skipped(
+            "stub: seats not under test".into(),
+        )
     };
     let orphans = |root: &Path| {
         order.borrow_mut().push("target_orphans");
@@ -442,6 +441,7 @@ fn test_backoff_resets_once_a_pass_reclaims_something() {
         last_run: Some(t(0)),
         last_worktree_reap: Some(t(0)),
         empty_streak: 3,
+        seat_walk_pass_reclaimed: false,
     };
     assert!(!worktree_reap_due(&ledger, t(600), COOLDOWN));
     assert!(worktree_reap_due(&ledger, t(4800), COOLDOWN));

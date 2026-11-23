@@ -75,8 +75,6 @@ pub const INDEX_VERSION: i64 = 3;
 const INDEX_VERSION_V2: i64 = 2;
 /// Pool directory mode (`0700`).
 const DIR_MODE: u32 = 0o700;
-/// Per-token file mode (`0600`).
-const FILE_MODE: u32 = 0o600;
 
 /// Env var naming the opt-in home master accounts file (#3695/#3704).
 pub const HOME_ACCOUNTS_ENV_VAR: &str = "LOOM_ACCOUNTS_ENV";
@@ -776,11 +774,14 @@ pub fn materialize_accounts(
                 validate_claude_credential_shape(&acct.key)?;
             }
             if !dry_run {
-                let tmp = token_path.with_file_name(format!("{}.tmp", acct.file));
-                std::fs::write(&tmp, &acct.key)?;
-                chmod_best_effort(&tmp, FILE_MODE);
-                std::fs::rename(&tmp, &token_path)?;
-                chmod_best_effort(&token_path, FILE_MODE);
+                crate::fs_util::write_atomic(
+                    &token_path,
+                    acct.key.as_bytes(),
+                    crate::fs_util::AtomicOpts {
+                        private: true,
+                        sync_dir: true,
+                    },
+                )?;
             }
             outcome.written.push(acct.file.clone());
         }
@@ -821,20 +822,8 @@ pub fn write_index(
     if dry_run {
         return Ok(());
     }
-    if let Some(parent) = index_path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
     let body = serde_json::to_string_pretty(&manifest)? + "\n";
-    let tmp = index_path.with_file_name(format!(
-        "{}.tmp",
-        index_path
-            .file_name()
-            .and_then(|s| s.to_str())
-            .unwrap_or("index.json")
-    ));
-    std::fs::write(&tmp, body)?;
-    std::fs::rename(&tmp, index_path)?;
-    Ok(())
+    crate::fs_util::write_atomic(index_path, body.as_bytes(), crate::fs_util::AtomicOpts::default())
 }
 
 // ---------------------------------------------------------------------------
@@ -1315,8 +1304,6 @@ mod tests {
         let dmode = fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
         assert_eq!(fmode, 0o600);
         assert_eq!(dmode, 0o700);
-        // No leftover temp file.
-        assert!(!dir.join("a.token.tmp").exists());
     }
 
     #[test]
@@ -1328,6 +1315,38 @@ mod tests {
         let outcome = materialize_accounts(&accts, &dir, false, true, &mut warnings).unwrap();
         assert_eq!(outcome.written, vec!["a.token"]);
         assert!(!dir.exists());
+    }
+
+    #[test]
+    fn a_failed_token_write_leaves_no_temp_file_behind() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("tokens");
+        fs::create_dir_all(dir.join("a.token")).unwrap();
+        let accts = vec![acct("a@x.com", "sk-ant-oat01-a", "a.token", "repo", 1)];
+        let mut warnings = Vec::new();
+
+        assert!(materialize_accounts(&accts, &dir, false, false, &mut warnings).is_err());
+
+        let names: Vec<String> = fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, ["a.token"]);
+    }
+
+    #[test]
+    fn a_failed_index_write_leaves_no_temp_file_behind() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("tokens");
+        fs::create_dir_all(dir.join("index.json")).unwrap();
+
+        assert!(write_index(&[], &dir.join("index.json"), false).is_err());
+
+        let names: Vec<String> = fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, ["index.json"]);
     }
 
     #[test]
@@ -1451,7 +1470,6 @@ mod tests {
 
         // No secret material anywhere in the file.
         assert!(!raw.contains("sk-ant-oat01-secret"));
-        assert!(!index_path.with_file_name("index.json.tmp").exists());
     }
 
     #[test]

@@ -48,9 +48,11 @@ pub const ORPHAN_COMMENT_DEDUP_SECONDS: i64 = 300;
 /// Paths that mark an uncommitted change as "regenerable build output" rather
 /// than real work — [`cleanup_stale_worktree`] uses this to decide whether a
 /// zero-commits-ahead worktree's dirty tree is safe to discard outright, and
-/// [`super::clean::reclaim_worktree_artifacts`] (issue #5187) reuses the same
-/// list to select which top-level directories a **kept** worktree's build
-/// artifacts can be reclaimed from without removing the worktree itself.
+/// the worktree reaper's kept-worktree artifact reclaim
+/// ([`crate::worktree_reaper::reclaim_kept_worktree_artifacts`], issue #5187,
+/// reworked by #11071) reuses the same list to select which top-level
+/// directories a **kept** worktree's build artifacts can be reclaimed from
+/// without removing the worktree itself.
 ///
 /// Hoisted to module scope (was a `cleanup_stale_worktree`-local const) so a
 /// second consumer never drifts from this one — see #5187.
