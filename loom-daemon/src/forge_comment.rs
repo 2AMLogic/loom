@@ -178,9 +178,43 @@ pub fn post_comment(
 ) -> Result<String, String> {
     let gh_bin = gh_bin.as_ref();
     let full_body = append_dashboard_footer(nwo, &number, is_pr, body);
-    match comment_backend(root)? {
-        CommentBackend::Gitea(cfg) => post_comment_gitea(&cfg, nwo, &number, &full_body),
-        CommentBackend::GitHub => post_comment_gh(gh_bin, root, nwo, &number, &full_body),
+    post_with_backend(gh_bin, root, nwo, &number, &full_body, comment_backend(root)?)
+}
+
+/// [`post_comment`] for a caller that already vetted the write: `connection`
+/// is the Gitea connection the permission check approved (`None` for a
+/// non-Gitea checkout). No forge detection or connection resolution runs
+/// again, so the POST cannot land on an instance or credential the check
+/// never saw (#14940).
+///
+/// # Errors
+///
+/// As [`post_comment`].
+pub fn post_comment_authorized(
+    gh_bin: impl AsRef<OsStr>,
+    root: Option<&Path>,
+    nwo: &str,
+    number: impl fmt::Display,
+    is_pr: bool,
+    body: &str,
+    connection: Option<crate::forge_cmd::GiteaConfig>,
+) -> Result<String, String> {
+    let full_body = append_dashboard_footer(nwo, &number, is_pr, body);
+    let backend = connection.map_or(CommentBackend::GitHub, CommentBackend::Gitea);
+    post_with_backend(gh_bin.as_ref(), root, nwo, &number, &full_body, backend)
+}
+
+fn post_with_backend(
+    gh_bin: &OsStr,
+    root: Option<&Path>,
+    nwo: &str,
+    number: &impl fmt::Display,
+    full_body: &str,
+    backend: CommentBackend,
+) -> Result<String, String> {
+    match backend {
+        CommentBackend::Gitea(cfg) => post_comment_gitea(&cfg, nwo, number, full_body),
+        CommentBackend::GitHub => post_comment_gh(gh_bin, root, nwo, number, full_body),
     }
 }
 
@@ -307,19 +341,31 @@ fn post_comment_gitea(
         .write_all(payload.as_bytes())
         .and_then(|()| input.flush())
         .map_err(|e| format!("could not write the Gitea request body: {e}"))?;
-    let redact = |text: String| text.replace(&cfg.token, "[redacted]");
+    // Every form the credential takes on the wire: the raw token, and for
+    // Basic auth the `user:password` pair and its base64 header value. An
+    // error that echoes any of them is redacted in both error paths.
+    let mut secrets = vec![cfg.token.clone()];
     let auth = match &cfg.username {
         // base64 of `user:password`, computed here so the credential still
         // never reaches argv (curl's own `-u` would put it there).
         Some(u) => {
             use base64::engine::general_purpose;
             use base64::Engine as _;
-            format!(
-                "Authorization: Basic {}\n",
-                general_purpose::STANDARD.encode(format!("{u}:{}", cfg.token))
-            )
+            let pair = format!("{u}:{}", cfg.token);
+            let encoded = general_purpose::STANDARD.encode(&pair);
+            secrets.push(encoded.clone());
+            secrets.push(pair);
+            format!("Authorization: Basic {encoded}\n")
         }
         None => format!("Authorization: token {}\n", cfg.token),
+    };
+    // Longest first, so a form containing a shorter one is replaced whole.
+    secrets.sort_by_key(|x| std::cmp::Reverse(x.len()));
+    let redact = |text: String| {
+        secrets
+            .iter()
+            .filter(|x| !x.is_empty())
+            .fold(text, |t, x| t.replace(x.as_str(), "[redacted]"))
     };
     let url = format!("{}/api/v1/repos/{nwo}/issues/{number}/comments", cfg.base_url);
     let mut cmd = Command::new("curl");
@@ -524,6 +570,10 @@ pub struct CommentArgs {
     /// Gitea remote. `None` for callers that vet through their own gate;
     /// resolution then falls back to `--repo` and the checkout.
     pub authorized: Option<String>,
+    /// The Gitea connection the same check approved (#14940), carried to the
+    /// POST unchanged; `None` on a non-Gitea checkout. Only meaningful with
+    /// `authorized`.
+    pub authorized_connection: Option<crate::forge_cmd::GiteaConfig>,
     pub body: Option<String>,
     /// Path to read the body from; `-` means stdin.
     pub body_file: Option<std::path::PathBuf>,
@@ -614,14 +664,26 @@ pub fn cli_entrypoint(args: CommentArgs) -> anyhow::Result<()> {
                 )
             })?,
     };
-    let response = post_comment(
-        crate::forge_cmd::gh_bin(),
-        Some(Path::new(".")),
-        &nwo,
-        number,
-        args.is_pr,
-        &body,
-    )
+    let response = if args.authorized.is_some() {
+        post_comment_authorized(
+            crate::forge_cmd::gh_bin(),
+            Some(Path::new(".")),
+            &nwo,
+            number,
+            args.is_pr,
+            &body,
+            args.authorized_connection,
+        )
+    } else {
+        post_comment(
+            crate::forge_cmd::gh_bin(),
+            Some(Path::new(".")),
+            &nwo,
+            number,
+            args.is_pr,
+            &body,
+        )
+    }
     .map_err(anyhow::Error::msg)?;
     // #12027: journal the markers the comment opens with (a no-op outside a
     // journaled role run; best-effort, never the exit code or output).

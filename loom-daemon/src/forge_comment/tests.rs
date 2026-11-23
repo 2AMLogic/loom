@@ -348,6 +348,7 @@ fn cli_entrypoint_refuses_a_lone_at_body_without_posting() {
         is_pr: false,
         patch_created: None,
         authorized: None,
+        authorized_connection: None,
     })
     .expect_err("a lone @-token body must be refused")
     .to_string();
@@ -609,5 +610,68 @@ fn the_backend_is_github_without_a_gitea_checkout() {
     );
     let base = gitea_root("http://127.0.0.1:9", Some("t"));
     assert!(matches!(comment_backend(Some(base.path())), Ok(CommentBackend::Gitea(_))));
+    clear_gitea_env();
+}
+
+#[test]
+#[serial_test::serial(loom_config_env)]
+fn an_authorized_post_uses_the_vetted_connection_not_a_fresh_resolution() {
+    isolate_gitea_env();
+    let _env = DefaultDashboardEnv::hold();
+    let stub = recording_gh_stub();
+    // The checkout's own config now points at a dead instance (the config
+    // "changed" after the check); the connection the check approved is the
+    // live stub, and the POST must go there.
+    let root = gitea_root("http://127.0.0.1:9", Some("changed-token"));
+    let (base, request) = gitea_post_stub("201 Created", r#"{"id":1,"html_url":"u"}"#);
+    let vetted = crate::forge_cmd::GiteaConfig {
+        base_url: base,
+        token: "vetted-token".into(),
+        username: None,
+    };
+    post_comment_authorized(
+        stub.path().join("gh"),
+        Some(root.path()),
+        "acme/w",
+        42,
+        false,
+        "b",
+        Some(vetted),
+    )
+    .expect("posts to the vetted connection");
+    let request = request.join().unwrap();
+    assert!(request.contains("token vetted-token"), "the vetted credential: {request}");
+    assert!(!request.contains("changed-token"), "never the re-resolved one: {request}");
+    clear_gitea_env();
+}
+
+#[test]
+#[serial_test::serial(loom_config_env)]
+fn basic_auth_credential_forms_are_redacted_from_error_text() {
+    use base64::engine::general_purpose;
+    use base64::Engine as _;
+    isolate_gitea_env();
+    let _env = DefaultDashboardEnv::hold();
+    let stub = recording_gh_stub();
+    let encoded = general_purpose::STANDARD.encode("alice:s3cr3t-pw");
+    // The error body echoes the Authorization value and the raw pair back.
+    let (base, request) = gitea_post_stub(
+        "401 Unauthorized",
+        Box::leak(
+            format!(r#"{{"message":"bad Basic {encoded} for alice:s3cr3t-pw"}}"#).into_boxed_str(),
+        ),
+    );
+    let cfg = crate::forge_cmd::GiteaConfig {
+        base_url: base,
+        token: "s3cr3t-pw".into(),
+        username: Some("alice".into()),
+    };
+    let error =
+        post_comment_authorized(stub.path().join("gh"), None, "acme/w", 42, false, "b", Some(cfg))
+            .expect_err("401 is a failure");
+    assert!(!error.contains(&encoded), "base64 header value redacted: {error}");
+    assert!(!error.contains("s3cr3t-pw"), "password redacted: {error}");
+    assert!(error.contains("[redacted]"), "{error}");
+    request.join().unwrap();
     clear_gitea_env();
 }

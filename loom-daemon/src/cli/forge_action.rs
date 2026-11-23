@@ -1182,9 +1182,13 @@ pub(crate) fn handle_forge_command(action: ForgeAction) -> Result<()> {
     // posts to exactly the target the vetting resolved and approved, which on
     // Gitea is also the only resolvable one.
     let mut authorized: Option<String> = None;
+    let mut authorized_connection = None;
     if let Some(repo) = write_target(&action) {
         let cwd = std::env::current_dir()?;
-        match crate::write_scope::may_write_from(&cwd, repo.as_deref()) {
+        let (verdict, connection) =
+            crate::write_scope::may_write_from_with_connection(&cwd, repo.as_deref());
+        authorized_connection = connection;
+        match verdict {
             crate::write_scope::Verdict::Allow(nwo) => authorized = Some(nwo),
             crate::write_scope::Verdict::Deny(why) => {
                 eprintln!("loom-daemon forge: refusing the write (#9548): {why}");
@@ -1244,6 +1248,7 @@ pub(crate) fn handle_forge_command(action: ForgeAction) -> Result<()> {
                 is_pr: pr,
                 patch_created,
                 authorized,
+                authorized_connection,
             });
         }
         ForgeAction::TrustedComments {

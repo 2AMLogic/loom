@@ -391,6 +391,12 @@ impl GiteaProbe {
         Self { resolved, id }
     }
 
+    /// The connection this probe resolved and authenticates with, for a caller
+    /// that must write with exactly it (#14940); `None` when unresolved.
+    pub(crate) fn connection(&self) -> Option<crate::forge_cmd::GiteaConfig> {
+        self.resolved.as_ref().ok().cloned()
+    }
+
     /// The resolved connection's digest; empty when the connection could not
     /// resolve. Production reads it through [`PermissionProbe::cache_scope`].
     #[cfg(test)]
