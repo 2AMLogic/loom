@@ -1953,7 +1953,7 @@ docs_only_fast_path_worklog_check() {
     # title or kind — is still verified against the cached tuple (#14532).
     if [ -z "${fetched[$num]:-}" ]; then
       if ! got=$(gh api "repos/$repo/issues/$num" --jq '"\(.title)\t\(.pull_request != null)\t\(.state)\t\((.pull_request.merged_at != null))"' 2>/dev/null) || [ -z "$got" ]; then
-        echo "NOT ELIGIBLE: ENVIRONMENT: WORK_LOG record #$num does not exist in $repo (or the read failed) (gh error, not a PR-content verdict) — take the normal review flow; do NOT treat this as a passed or waived #13760 content check"
+        echo "NOT ELIGIBLE: WORK_LOG record #$num does not exist in $repo, or the read failed — if the record does not exist this IS a content verdict (#13760); if the read failed it is an environment failure. Either way, do NOT treat this as a passed or waived #13760 content check"
         return 0
       fi
       fetched[$num]="$got"
