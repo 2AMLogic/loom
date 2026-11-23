@@ -562,8 +562,27 @@ jobs:
         id: discover
         timeout-minutes: 3
         run: cargo nextest list --workspace --features loom-daemon/otlp --profile ci --partition count:${{ matrix.partition }}/${{ strategy.job-total }}
-      # Evidence for the next stall, captured before the runner tears down. Job
-      # log only; no artifact. `loom-live-gh-guard-*` is the per-process dir
+      - name: Run tests (process-per-test, partition ${{ matrix.partition }}/${{ strategy.job-total }})
+        id: run-tests
+        # Includes merge_group_ci::workflow_identity_tests: native regression
+        # coverage for this repo's cache/release identity guards (#14158).
+        # Healthy discovery plus execution is about 80s per leg (#11121).
+        timeout-minutes: 10
+        run: cargo nextest run --workspace --features loom-daemon/otlp --profile ci --partition count:${{ matrix.partition }}/${{ strategy.job-total }}
+      # Evidence for the next stall, captured before the runner tears down.
+      # Runs AFTER the run step (#15094): a step's `if:` is evaluated when
+      # the runner reaches it in file order, so a condition reading the run
+      # step's outcome must live below the run step. Fires on failure of
+      # EITHER gate -- the explicit discovery step (`steps.discover`) or the
+      # run step (`steps.run-tests`): occurrence 4 (#15094) stalled inside
+      # `nextest run`'s own internal `--list` pass, the run step was capped
+      # at 10 minutes, and this diagnostic was skipped. An ordinary test
+      # failure also fires it, where these captures are harmless noise. In
+      # that occurrence's log the hung pair outlived the timed-out step (the
+      # runner's `Terminate orphan process` lines printed during job cleanup,
+      # after later steps), so a sample taken here can still see them -- one
+      # log's evidence, not a guarantee.
+      # Job log only; no artifact. `loom-live-gh-guard-*` is the per-process dir
       # `live_gh_guard::install` creates pre-`main`: present with a `gh` stub
       # means install got past `write_stub` — the dir CONTENTS (not just the
       # listing) settle whether the stub was written (#14229, #14691). The
@@ -579,7 +598,7 @@ jobs:
       # which honors TMPDIR. Every command is failure-tolerant: this step is
       # continue-on-error evidence gathering, never a verdict.
       - name: Diagnose discovery stall
-        if: failure() && steps.discover.outcome == 'failure'
+        if: failure() && (steps.discover.outcome == 'failure' || steps.run-tests.outcome == 'failure')
         continue-on-error: true
         run: |
           echo "::group::cargo-nextest / loom_daemon-* process state"
@@ -625,12 +644,6 @@ jobs:
             ls -la "$guard_dir" 2>/dev/null || true
           done
           echo "::endgroup::"
-      - name: Run tests (process-per-test, partition ${{ matrix.partition }}/${{ strategy.job-total }})
-        # Includes merge_group_ci::workflow_identity_tests: native regression
-        # coverage for this repo's cache/release identity guards (#14158).
-        # Healthy discovery plus execution is about 80s per leg (#11121).
-        timeout-minutes: 10
-        run: cargo nextest run --workspace --features loom-daemon/otlp --profile ci --partition count:${{ matrix.partition }}/${{ strategy.job-total }}
       - name: Upload per-test timings (#9456)
         # The JUnit XML `.config/nextest.toml`'s `[profile.ci.junit]` writes is
         # the only surface that carries per-test durations out of a finished
