@@ -216,7 +216,7 @@ could not). Refused at its PR read: `gh pr view` fails, `loom-daemon forge`
 answers "gitea is not handled natively; falling back to the caller's shell
 path" (and the caller's shell path is `gh`), and its own unauthenticated API
 probe 404'd on the private repo. Notably it **did not use the inherited
-`GITEA_TOKEN` env** — the role prompts name `.loom/credentials.md`, not the
+`GITEA_TOKEN` env** — the role prompts name the repo-local task-credentials file (see `.loom/docs/credentials.md`), not the
 env convention — so an authenticated probe never happened.
 `LOOM_STEP_OUTCOME … class=failed reason=forge_unreachable`. Filed as
 **#14939** (same read-path family; the env-token guidance is in its
