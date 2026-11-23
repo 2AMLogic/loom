@@ -40,7 +40,7 @@
 //! is created here rather than reusing whatever the child inherited.
 
 use std::io;
-use std::process::{Command, Output, Stdio};
+use std::process::{Child, Command, Output, Stdio};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
@@ -297,6 +297,28 @@ pub fn run_bounded_observed(
 /// A caller's pending-signal probe and how long to wait after forwarding it.
 type Forward<'a> = Option<(&'a dyn Fn() -> Option<i32>, Duration)>;
 
+/// `Command::spawn`, waiting out a just-written fixture's `ETXTBSY` in test
+/// builds (#15013).
+///
+/// The plain-`cargo test` harness runs every test as a thread of one process,
+/// so a sibling thread's `fork` can hold a copy of another test's write fd to
+/// the very fixture this call execs; the kernel then refuses the `exec` with
+/// [`io::ErrorKind::ExecutableFileBusy`] until that copy's `execve` closes
+/// it. Nothing ran on a refused spawn, so waiting is side-effect free.
+/// `cargo nextest` (CI) runs one process per test and cannot see the window,
+/// and production never execs a file it just wrote, so only test builds wait:
+/// production keeps the fail-fast spawn.
+fn spawn(cmd: &mut Command) -> io::Result<Child> {
+    #[cfg(test)]
+    {
+        crate::exec_test_support::retry_while_executable_busy(|| cmd.spawn())
+    }
+    #[cfg(not(test))]
+    {
+        cmd.spawn()
+    }
+}
+
 fn run_bounded_inner(
     mut cmd: Command,
     timeout: Duration,
@@ -307,7 +329,7 @@ fn run_bounded_inner(
     cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
     place_in_own_process_group(&mut cmd);
 
-    let mut child = cmd.spawn().map_err(ExecError::Spawn)?;
+    let mut child = spawn(&mut cmd).map_err(ExecError::Spawn)?;
     let pid = child.id();
     spawned(pid);
 

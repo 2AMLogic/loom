@@ -87,6 +87,41 @@ fn a_missing_executable_is_a_spawn_error_not_a_timeout_and_not_an_exit() {
 }
 
 #[test]
+fn a_program_still_open_for_writing_is_waited_for_not_a_spawn_error() {
+    // #15013: a sibling test thread's `fork` can hand its child a copy of the
+    // write fd for microseconds, and an exec of the fixture in that window is
+    // refused with ETXTBSY. Holding the fixture open for writing stands in for
+    // that child; nothing ran while it was refused, so waiting is free.
+    let dir = tempfile::tempdir().unwrap();
+    let program = dir.path().join("busy");
+    crate::exec_test_support::write_executable(&program, "#!/bin/sh\necho ready");
+
+    let writer = std::fs::OpenOptions::new()
+        .write(true)
+        .open(&program)
+        .unwrap();
+    let releaser = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(30));
+        drop(writer);
+    });
+
+    let started = Instant::now();
+    let completion = run_bounded(Command::new(&program), GENEROUS)
+        .expect("the writer closes long before the deadline");
+    releaser.join().unwrap();
+
+    assert!(
+        started.elapsed() >= Duration::from_millis(30),
+        "the program ran before its writer closed: {:?}",
+        started.elapsed()
+    );
+    assert!(
+        matches!(completion, Completion::Exited(ref output) if output.stdout == b"ready\n"),
+        "the waited-for program must run exactly once: {completion:?}"
+    );
+}
+
+#[test]
 #[cfg(unix)]
 fn signal_termination_is_preserved_in_the_exit_status() {
     use std::os::unix::process::ExitStatusExt;
