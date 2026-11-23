@@ -1,9 +1,9 @@
 //! `loom-daemon premise-check` (#8396), backing `defaults/scripts/premise-check.sh`.
 //!
 //! The args live here rather than in `main.rs`'s `Commands` enum for the same
-//! reason `DepClassifyCommand` does: a new
-//! subcommand must cost it nothing. What the gate answers, and why each rule
-//! exists, is documented on [`crate::premise_check`].
+//! reason `DepClassifyCommand` does: a new subcommand must cost it nothing.
+//! What the gate answers, and why each rule exists, is documented on
+//! [`crate::premise_check`].
 
 use crate::premise_check::cli;
 use anyhow::Result;

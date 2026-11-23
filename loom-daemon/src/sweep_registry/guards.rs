@@ -1928,9 +1928,9 @@ impl SweepRegistry {
     ///
     /// The implementation lives in
     /// [`restore_to_ready`](super::restore_to_ready) (a sibling module),
-    /// including each carve-out's own
-    /// fail-open contract. Every carve-out only skips the `loom:issue`
-    /// re-add; the stale `loom:building` claim is always removed.
+    /// including each carve-out's own fail-open contract. Every carve-out only
+    /// skips the `loom:issue` re-add; the stale `loom:building` claim is
+    /// always removed.
     pub(crate) fn restore_label_to_ready(&self, issue: u32) -> Result<()> {
         self.restore_label_to_ready_with_state_check(issue)
     }

@@ -1627,9 +1627,8 @@ pub fn resolve_interval() -> Duration {
 // ============================================================================
 //
 // WorkFinderConfig / read_work_finder_config / the deprecated-CPU-knob notice
-// live in their own file, `config.rs` (Issue #9034), as `configured_max`
-// below does. Pure
-// move, re-exported here so every existing `WorkFinderConfig` /
+// live in their own file, `config.rs` (Issue #9034), as `configured_max` below
+// does. Pure move, re-exported here so every existing `WorkFinderConfig` /
 // `read_work_finder_config` reference in this file and its siblings is
 // unchanged.
 pub mod config;
