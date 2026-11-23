@@ -10797,6 +10797,17 @@ a reconciler that is opted out, or a restart the reconciler does not make
 (changed profile control files), is in
 [`guardrail-parity-codex.md`](guardrail-parity-codex.md#restarting-or-recreating-session-containers-by-hand).
 
+**No daemon at all (session-only hosts, #14912).** On an attended host
+running sessions without `loom-daemon` (#12708) there is no reconcile pass;
+what recovers a seat after a Docker engine restart is Docker's own
+`--restart unless-stopped` policy, which `accounts session start` sets on
+both host-mounted (#10452) and private-clone (#14912) seats. A one-time
+`docker update --restart unless-stopped` migrates a running, unheld legacy
+seat in place; an operator-stopped account stays held and down; recreating
+a missing container remains the operator's `session start`. The procedure
+and the disposable-host check are in `docker/session/README.md` § "Seat
+restart policy and engine-restart recovery (issue #14912)".
+
 **Mount drift (#10364).** A host-mode container's workspace mounts are fixed
 when it is created, so a later `loom-daemon workspace add` never reaches it
 (every Codex tick in the new repository fails `chdir to cwd`) and a later
