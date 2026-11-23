@@ -169,9 +169,5 @@ fn locate_stop_script() -> Option<PathBuf> {
     dirs.iter()
         .map(|d| d.join(REL))
         .find(|p| p.is_file())
-        .or_else(|| {
-            std::env::split_paths(&std::env::var_os("PATH")?)
-                .map(|d| d.join("loom-daemon-stop.sh"))
-                .find(|p| p.is_file())
-        })
+        .or_else(|| crate::fs_util::find_executable_on_path("loom-daemon-stop.sh"))
 }
