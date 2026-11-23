@@ -630,26 +630,35 @@ touched files (diff vs `origin/main`)"** and verify it like this:
 # Both runs from the workspace root, so the `-->` paths match git's output.
 # -j2 or fewer on the shared fleet hosts; build with the exported
 # CARGO_TARGET_DIR (.loom/docs/cargo-target-isolation.md).
+RD="$(mktemp -d)"     # one private dir per run: concurrent sweeps share /tmp
 doc_warnings() {
   cargo doc -p loom-daemon --no-deps -j2 2>&1 \
     | awk '/^warning/ { w = $0; if ((getline loc) > 0 && loc ~ /-->/)
-           print w "  " loc }' > "/tmp/rustdoc-$1.log"
+           print w "  " loc }' > "$RD/$1.log"
 }
 doc_warnings after    # in your worktree
 doc_warnings before   # in a checkout of the base (origin/main), same command
 
-# New warnings = warning texts present after but not before, per touched file:
+# Per touched file, count each warning text (location stripped) on both sides
+# and flag any text whose count rose:
 for f in $(git diff --name-only origin/main...HEAD -- '*.rs'); do
-  new="$(comm -13 \
-    <(grep -F "$f" /tmp/rustdoc-before.log | sed 's/-->.*//' | sort -u) \
-    <(grep -F "$f" /tmp/rustdoc-after.log  | sed 's/-->.*//' | sort -u))"
+  new="$(awk '
+    { side = (FILENAME == ARGV[1]) ? 1 : 2 }
+    { n[side, $0]++; seen[$0] = 1 }
+    END { for (t in seen) if (n[2, t] > n[1, t]) print n[2, t] - n[1, t] "x " t }
+  ' \
+    <(grep -F "$f" "$RD/before.log" | sed 's/-->.*//' | sort) \
+    <(grep -F "$f" "$RD/after.log"  | sed 's/-->.*//' | sort))"
   [ -z "$new" ] || { echo "NEW rustdoc warnings in $f:"; echo "$new"; }
 done
 ```
 
-Compare warning **texts**, not locations — editing a doc comment above line
-100 shifts every line number under it, and a pre-existing warning that merely
-moved is not new. An empty result — including "no touched `.rs` file at all",
+Compare warning **texts and their counts**, not locations — editing a doc
+comment above line 100 shifts every line number under it, and a pre-existing
+warning that merely moved is not new. Counts matter because the dominant
+classes (`unresolved link`, `private intra-doc link`) repeat one text many
+times in a file: a second identical warning is a new warning, and a
+set-difference would miss it. An empty result — including "no touched `.rs` file at all",
 for a docs-only PR — **counts as passing**: the criterion is about the diff,
 and an empty diff is an empty diff. A warning that *disappears* is a fix, not
 a regression.
