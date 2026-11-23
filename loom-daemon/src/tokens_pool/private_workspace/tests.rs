@@ -1441,7 +1441,8 @@ fn prepare_exec_carries_a_resolved_token_on_the_child_never_in_argv() {
             Some(SECRET.into())
         });
     let revision =
-        docker::prepare_with(&config, &config.primary(), &"a".repeat(64), None, &resolved).unwrap();
+        docker::prepare_with(&config, &config.primary(), &"a".repeat(64), None, &resolved, None)
+            .unwrap();
     assert_eq!(revision, "abc");
     let args = argv.borrow().clone();
     assert!(
@@ -1459,7 +1460,8 @@ fn prepare_exec_carries_a_resolved_token_on_the_child_never_in_argv() {
         &|name| (name == "GH_TOKEN").then(|| "from-process".into()),
         &|_| panic!("must not read a token the process already has"),
     );
-    docker::prepare_with(&config, &config.primary(), &"a".repeat(64), None, &ambient).unwrap();
+    docker::prepare_with(&config, &config.primary(), &"a".repeat(64), None, &ambient, None)
+        .unwrap();
     let args = argv.borrow().clone();
     assert!(args
         .windows(2)

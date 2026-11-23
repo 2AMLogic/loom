@@ -973,7 +973,20 @@ pub(super) fn prepare_target(
 ) -> Result<String> {
     // Resolved per exec (#13916): an App installation token outlives no job.
     let auth = forge_auth::ExecAuth::resolve(workspace, &target.repository);
-    prepare_with(config, target, id, branch, &auth)
+    // A relay Git route for this repository (#14935), resolved per exec the
+    // same way: the Git-enabled profile's key is read, never cached in
+    // state. A configured route that cannot be read refuses preparation —
+    // the direct fetch it exists to replace must not run silently.
+    let relay = git_relay::RelayRoute::resolve(workspace, &target.repository)?;
+    if let Some(relay) = &relay {
+        log::info!(
+            "private session {}: preparing {} with Git reads relayed through {}",
+            config.account,
+            target.repository,
+            relay.host()
+        );
+    }
+    prepare_with(config, target, id, branch, &auth, relay.as_ref())
 }
 
 /// Drive one clone's `private-workspace recover` verb under the job's auth
@@ -1140,6 +1153,7 @@ pub(super) fn prepare_with(
     id: &str,
     branch: Option<&str>,
     auth: &forge_auth::ExecAuth,
+    relay: Option<&git_relay::RelayRoute>,
 ) -> Result<String> {
     let scope = format!("LOOM_PRIVATE_REPOSITORY={}", target.repository);
     let mut args = vec!["exec", "--workdir", ROOT, "--env", &scope];
@@ -1149,6 +1163,15 @@ pub(super) fn prepare_with(
     // our captured output.
     for name in auth.names() {
         args.extend(["--env", name]);
+    }
+    // The relay route rides the same bare-name mechanism (#14935): its two
+    // variables reach this exec alone, never the container's persisted
+    // environment, and the key never reaches argv or a log.
+    let mut child_env = auth.child_env();
+    if let Some(relay) = relay {
+        args.extend(["--env", git_relay::RELAY_URL_ENV]);
+        args.extend(["--env", git_relay::RELAY_HEADER_ENV]);
+        child_env.extend(relay.env());
     }
     args.extend([
         &config.container,
@@ -1170,7 +1193,7 @@ pub(super) fn prepare_with(
     if let Some(slug) = &target.slug {
         args.extend(["--slug", slug]);
     }
-    let output = command_env(&args, &auth.child_env(), EXEC_TIMEOUT).context("private workspace endpoint failed; use a current session image supporting private-workspace protocol")?;
+    let output = command_env(&args, &child_env, EXEC_TIMEOUT).context("private workspace endpoint failed; use a current session image supporting private-workspace protocol")?;
     prepare_result(&output, |path| {
         log::info!(
             "private session {}: reaped finished-PR worktree {path} in {}",

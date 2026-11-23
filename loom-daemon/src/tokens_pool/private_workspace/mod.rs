@@ -14,6 +14,9 @@ pub mod dispatch;
 mod docker;
 pub mod export;
 mod forge_auth;
+mod git_relay;
+#[cfg(test)]
+mod git_relay_tests;
 mod lease;
 mod lifecycle;
 mod mirror;

@@ -28,6 +28,14 @@
 //! memory and written only into the profile's `hosts.yml` (0600, in a 0700
 //! directory). An owner with no key ref keeps today's routing.
 //!
+//! `forge.gateway.git.keyRefs` (`key_refs` accepted too) names, per owner,
+//! where that owner's **Git-read** key is read (#14935): the key of a
+//! Git-enabled read profile on the relay's git transport (a routed `read`
+//! profile with a `repos` list — the relay API profiles of `keyRefs` have
+//! no Git access). Private-seat preparation clones and fetches through it
+//! ([`crate::tokens_pool::private_workspace`]); an owner with no entry
+//! keeps today's direct Git path.
+//!
 //! # What changes when it is set
 //!
 //! [`refresh`] (every [`CHECK_INTERVAL`]) publishes one read profile per
@@ -132,6 +140,11 @@ pub struct GatewayConfig {
     pub api_host: String,
     /// Owner (lowercased) → where its key is read.
     pub key_refs: BTreeMap<String, KeyRef>,
+    /// Owner (lowercased) → where its **Git-read** key is read
+    /// (`forge.gateway.git.keyRefs`, #14935): a Git-enabled read profile's
+    /// key, apart from the relay API keys of `key_refs`, which have no Git
+    /// access. An owner with no entry keeps today's direct Git path.
+    pub git_key_refs: BTreeMap<String, KeyRef>,
     /// `forge.gateway.region`: the AWS region `ssm://` refs are read in,
     /// when set (else the environment's, [`resolve_region`]).
     pub region: Option<String>,
@@ -146,7 +159,10 @@ impl GatewayConfig {
     /// A stable digest of what the profiles depend on, keys excluded.
     #[must_use]
     pub fn fingerprint(&self) -> String {
-        format!("{}|{:?}|{:?}|{:?}", self.api_host, self.key_refs, self.region, self.aws_profile)
+        format!(
+            "{}|{:?}|{:?}|{:?}|{:?}",
+            self.api_host, self.key_refs, self.git_key_refs, self.region, self.aws_profile
+        )
     }
 }
 
@@ -214,6 +230,7 @@ pub fn parse(effective: &Value) -> (Option<GatewayConfig>, Vec<String>) {
         warnings.push(format!("{CONFIG_KEY}.keyRefs names no usable owner; the gateway stays off"));
         return (None, warnings);
     }
+    let git_key_refs = parse_git_key_refs(block, &mut warnings);
     let region = match block.get("region") {
         None | Some(Value::Null) => None,
         Some(Value::String(r)) if valid_region(r.trim()) => Some(r.trim().to_string()),
@@ -229,11 +246,69 @@ pub fn parse(effective: &Value) -> (Option<GatewayConfig>, Vec<String>) {
         Some(GatewayConfig {
             api_host,
             key_refs,
+            git_key_refs,
             region,
             aws_profile,
         }),
         warnings,
     )
+}
+
+/// The config key the Git-read key refs are named by in errors.
+pub const GIT_REFS_KEY: &str = "forge.gateway.git.keyRefs";
+
+/// `forge.gateway.git.keyRefs` (`key_refs` accepted): owner → where that
+/// owner's **Git-read** key is read (#14935). The Git-enabled read profile
+/// of the relay's git transport is a profile edit and a key apart from the
+/// relay API keys, so its refs live in their own sub-block; an empty or
+/// absent block leaves every owner on today's direct Git path. The gateway
+/// as a whole stays on for API reads either way.
+fn parse_git_key_refs(
+    block: &serde_json::Map<String, Value>,
+    warnings: &mut Vec<String>,
+) -> BTreeMap<String, KeyRef> {
+    let Some(git) = block.get("git") else {
+        return BTreeMap::new();
+    };
+    let refs = match git {
+        Value::Null => return BTreeMap::new(),
+        Value::Object(git) => git.get("keyRefs").or_else(|| git.get("key_refs")),
+        other => {
+            warnings.push(format!(
+                "{CONFIG_KEY}.git must be an object, not {other}; Git reads keep today's direct path"
+            ));
+            return BTreeMap::new();
+        }
+    };
+    let Some(Value::Object(refs)) = refs else {
+        warnings.push(format!(
+            "{GIT_REFS_KEY} must map owner -> key ref; Git reads keep today's direct path"
+        ));
+        return BTreeMap::new();
+    };
+    let mut key_refs = BTreeMap::new();
+    for (owner, spec) in refs {
+        if owner.starts_with('_') {
+            continue; // a `_note` key
+        }
+        if !crate::forge_bucket_book::valid_owner(owner) {
+            warnings.push(format!("{GIT_REFS_KEY}: {owner} is not an owner; dropped"));
+            continue;
+        }
+        match spec.as_str().map(KeyRef::parse) {
+            Some(Ok(r)) => {
+                key_refs.insert(owner.to_ascii_lowercase(), r);
+            }
+            Some(Err(e)) => warnings.push(format!("{GIT_REFS_KEY}.{owner}: {e}; dropped")),
+            None => warnings.push(format!("{GIT_REFS_KEY}.{owner} must be a string; dropped")),
+        }
+    }
+    if key_refs.is_empty() {
+        warnings.push(format!(
+            "{GIT_REFS_KEY} names no usable owner; Git reads keep today's direct path"
+        ));
+    }
+    key_refs
 }
 
 /// `<workspace>/.loom/gh-config-gateway`.
