@@ -366,7 +366,12 @@ run before the first grant write or revoke (#12579):
   CI checks are green. It says "Loom still authorizes this group", never "tests
   passed"; a revocation or head change turns it `failure`. Because it is a
   status and not a job, `audit --required "loom/merge-authorization"` reports
-  `MISSING_REQUIRED_SUITE` by design. Audit the two contexts separately:
+  `MISSING_REQUIRED_SUITE` by design. Pilot eligibility checks the native
+  publisher separately and reports its workflow. Use the template's direct
+  `loom-daemon forge merge-queue group-check` invocation in a runnable step
+  after checkout, with `statuses: write` and the merge-group head SHA. The
+  command can read that SHA from a step-level environment variable. All other
+  required contexts still need CI job coverage. To run the CI job audit directly:
 
 ```bash
 loom-daemon merge-group-ci audit --required "CI Result"        # QUALIFIED expected
