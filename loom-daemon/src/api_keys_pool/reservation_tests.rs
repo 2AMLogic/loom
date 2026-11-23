@@ -112,7 +112,7 @@ fn live_spawns_count_against_the_slots() {
 #[test]
 fn a_dead_owners_reservation_is_not_counted_and_is_reaped() {
     let (tmp, root) = workspace_with(&[("alpha", Some(1))]);
-    let slot = held(try_reserve_in(&root, "zai", DEAD_PID));
+    let slot = held(try_reserve_in(&root, "zai", DEAD_PID, &limits::ConfiguredLimits::EMPTY));
     assert!(slot.path().exists());
     assert_eq!(live_count(&root, "zai"), 0);
     assert!(!slot.path().exists(), "dead reservation was not reaped");
@@ -186,8 +186,10 @@ fn an_acquire_retires_the_oldest_reservation_only() {
 
 #[test]
 fn health_reports_the_slots_a_draw_could_still_take() {
-    let slots =
-        |root: &Path| health_in(&[root.to_path_buf()], Some("zai")).unwrap()[0].unreserved_slots;
+    let slots = |root: &Path| {
+        health_in(&[root.to_path_buf()], Some("zai"), &limits::ConfiguredLimits::EMPTY).unwrap()[0]
+            .unreserved_slots
+    };
     let (tmp, root) = workspace_with(&[("alpha", Some(2))]);
     assert_eq!(slots(&root), Some(2));
     let slot = held(try_reserve(tmp.path(), "zai"));
@@ -199,6 +201,33 @@ fn health_reports_the_slots_a_draw_could_still_take() {
     // No finite count once an uncapped account is selectable.
     add(&root, "zai", "beta", "ZAI_API_KEY", "fake-key", false).unwrap();
     assert_eq!(slots(&root), None);
+}
+
+/// #14932: a cap declared only in the workspace's config reserves like a
+/// file-declared one, so a role draw holds the slot the launched child's
+/// selection will then enforce.
+#[test]
+fn a_config_declared_cap_is_reserved_against() {
+    let (tmp, root) = workspace_with(&[("alpha", None)]);
+    assert!(matches!(try_reserve(tmp.path(), "zai"), Reserve::Unbounded));
+    std::fs::write(
+        tmp.path().join(".loom").join("config.json"),
+        serde_json::json!({
+            "runtimes": { "apiKeyLimits": { "zai": { "alpha": { "maxConcurrent": 1 } } } }
+        })
+        .to_string(),
+    )
+    .unwrap();
+    assert!(matches!(try_reserve(tmp.path(), "zai"), Reserve::Held(_)));
+    assert!(matches!(
+        try_reserve(tmp.path(), "zai"),
+        Reserve::AtCap {
+            slots: 1,
+            in_flight: 0,
+            reserved: 1
+        }
+    ));
+    assert!(!root.join("zai").join(limits::LIMITS_FILE).exists());
 }
 
 #[test]

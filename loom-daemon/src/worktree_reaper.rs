@@ -356,9 +356,9 @@ impl ReapReport {
 // `skip_reason` — the human-readable reason a decision preserved a worktree —
 // moved to the `removal_backoff` sibling module in #7939 (re-exported below as
 // `use removal_backoff::{..., skip_reason}`) purely to make room, because
-// #7939's fix
-// needs a couple of new lines right at `skip_reason`'s one call site. Its
-// logic and doc comment are unchanged — see `removal_backoff::skip_reason`.
+// #7939's fix needs a couple of new lines right at `skip_reason`'s one call
+// site. Its logic and doc comment are unchanged — see
+// `removal_backoff::skip_reason`.
 
 /// Every direct subdirectory of `repo_root`'s worktree root, sorted by path so
 /// a pass's report order is deterministic.
@@ -598,10 +598,10 @@ pub fn try_enter_reclaim(repo_root: &Path) -> Option<ReclaimGuard> {
 // Removal-failure backoff + stuck-worktree health surfacing (#7590)
 //
 // The state machine itself lives in the `removal_backoff` sibling module; only
-// the kind tag, which the
-// reaper's own log lines and classify paths also use, stays here. The names
-// below are re-exported so `crate::worktree_reaper::stuck_worktree_removals`
-// and friends keep resolving exactly as before.
+// the kind tag, which the reaper's own log lines and classify paths also use,
+// stays here. The names below are re-exported so
+// `crate::worktree_reaper::stuck_worktree_removals` and friends keep resolving
+// exactly as before.
 // ============================================================================
 
 mod removal_backoff;
