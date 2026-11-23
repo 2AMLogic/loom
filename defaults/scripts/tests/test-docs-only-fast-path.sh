@@ -784,7 +784,7 @@ assert_eq "NOT ELIGIBLE: PR diff read failed" "$out" "a failed diff read is not 
 # assumed, never the host, so a GH_HOST deployment resolves the same way.
 : >"$WL_CALL_LOG"
 out="$(WL_BASE_URL='https://github.example.test/owner/mine/pull/185' WL_DIFF="$GOOD_DIFF" docs_only_fast_path_worklog_check 1)"
-assert_eq "ELIGIBLE" "$out" "a PR URL on a non-github.com host (GH_HOST) still resolves the base repository"
+assert_eq "ELIGIBLE" "$out" "a PR URL on a non-GitHub host (GH_HOST) still resolves the base repository"
 assert_eq "repos/owner/mine/issues/5
 repos/owner/mine/issues/7" "$(cat "$WL_CALL_LOG")" \
     "a GH_HOST PR URL binds the record reads to the URL's owner/mine"
