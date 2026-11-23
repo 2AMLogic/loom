@@ -446,7 +446,7 @@ fn parse_run(args: &[&str]) -> Run {
                 run.labels.insert(k.into(), v.into());
                 i += 2;
             }
-            "--tmpfs" | "--env" | "--network" | "--cap-add" => i += 2,
+            "--tmpfs" | "--env" | "--network" | "--cap-add" | "--restart" => i += 2,
             "--entrypoint" => {
                 run.entrypoint = args[i + 1].into();
                 i += 2;
@@ -713,6 +713,40 @@ fn a_missing_private_session_is_recreated_only_against_its_surviving_volume() {
     let run: Vec<&str> = run.iter().map(String::as_str).collect();
     let created = parse_run(&run[1..]);
     assert_eq!(created.name, env.config.container);
+    // Exactly one restart policy, before the image (#14912): on a
+    // session-only host no daemon reconciles the seat, so Docker's own
+    // policy is what brings it back after an engine restart. `unless-stopped`
+    // (not `always`) like the host-mounted seat (#10452), because `stop`
+    // removes the container — the policy never fights an operator's
+    // deliberate stop.
+    let at = run
+        .iter()
+        .position(|a| *a == "--restart")
+        .expect("the persistent private seat sets a restart policy");
+    assert_eq!(run[at + 1], "unless-stopped");
+    assert_eq!(
+        run.iter().filter(|a| **a == "--restart").count(),
+        1,
+        "exactly one restart policy: {run:?}"
+    );
+    let image_at = run
+        .iter()
+        .position(|a| *a == IMAGE)
+        .expect("the detached run names the image");
+    assert!(at < image_at, "the policy precedes the image: {run:?}");
+    // The `--rm` helper runs (control provisioning here; the fresh-volume
+    // initializer and bundle probe on other paths) stay ephemeral.
+    for call in env
+        .engine()
+        .calls
+        .iter()
+        .filter(|c| c.first().is_some_and(|v| v == "run") && c.contains(&"--rm".to_owned()))
+    {
+        assert!(
+            !call.iter().any(|a| a == "--restart"),
+            "an ephemeral helper run must not set a restart policy: {call:?}"
+        );
+    }
     assert!(created.mounts.iter().any(|m| {
         m["Type"] == "volume" && m["Name"] == env.config.volume && m["Destination"] == ROOT
     }));
