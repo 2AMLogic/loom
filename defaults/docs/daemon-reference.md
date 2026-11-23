@@ -9972,7 +9972,11 @@ preserves (fail closed):
    --porcelain` must succeed — a failed status, e.g. a worktree whose parent
    repo is gone, is "not safe", never clean — and report no **tracked**
    change) and its `HEAD` is reachable from a remote ref
-   (`git rev-list --count HEAD --not --remotes` == 0, never `--branches`);
+   (`git rev-list --count HEAD --not --remotes` == 0, never `--branches`
+   for a linked worktree, whose refs are its parent's). A self-contained clone
+   (`.git` is a directory) owns its refs, so it must additionally have no
+   local branch a remote lacks (`git rev-list --count --branches --not
+   --remotes` == 0) and no `refs/stash`;
 6. the root itself is at least `scratchReclaim.maxAgeHours` old.
 
 Removal runs `chmod -R u+w` first (Go module caches and cert stores are
@@ -9981,7 +9985,9 @@ repo that still exists (deleting a worktree dir leaves a stale entry behind).
 Each removal is logged and published as `daemon.scratch_root.reaped` with
 `{path, bytes, ticket, repo, dry_run}`; the pass summary logs removed
 count/bytes and every preserved root with its reason. `dryRun` (`LOOM_SCRATCH_RECLAIM_DRY_RUN=1`)
-plans and reports without deleting.
+plans and reports without deleting. `dryRun` is the only brake specific to
+this pass: `scratchReclaim.enabled` is shared with the TMPDIR pass, so
+setting it `false` switches both off.
 
 **Where it runs.** The scheduled `worktreeReaper` tick and the eager tier-1
 pass, sharing the `scratchReclaim` block above (`enabled`, `maxAgeHours`, the

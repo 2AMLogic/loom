@@ -403,7 +403,50 @@ pub fn worktree_safety(worktree: &Path) -> WorktreeSafety {
     if !crate::worktree_ops::clean::branch_reachable_from_remotes(worktree, "HEAD") {
         return WorktreeSafety::NotSafe("worktree HEAD has commits no remote holds");
     }
+    // A self-contained clone (`.git` is a DIRECTORY) owns its whole ref
+    // namespace, so `HEAD` alone does not prove its work is published: a
+    // commit on a non-`HEAD` local branch, or a stash, is invisible to both
+    // probes above. The linked-worktree form (`.git` FILE) shares its
+    // parent's refs and keeps the HEAD-only probe, which is exactly why
+    // `--branches` is wrong there.
+    if std::fs::symlink_metadata(worktree.join(".git")).is_ok_and(|m| m.is_dir()) {
+        if !clone_branches_published(worktree) {
+            return WorktreeSafety::NotSafe("clone has local branches no remote holds");
+        }
+        if clone_has_stash(worktree) {
+            return WorktreeSafety::NotSafe("clone has a stash");
+        }
+    }
     WorktreeSafety::Safe
+}
+
+/// `git rev-list --count --branches --not --remotes == 0` in a self-contained
+/// clone. Fail-closed: any failure to run or parse reads as "not published".
+fn clone_branches_published(clone: &Path) -> bool {
+    let out = Command::new("git")
+        .args(["--no-optional-locks", "-C"])
+        .arg(clone)
+        .args(["rev-list", "--count", "--branches", "--not", "--remotes"])
+        .output();
+    let Ok(out) = out else { return false };
+    out.status.success()
+        && String::from_utf8_lossy(&out.stdout)
+            .trim()
+            .parse::<u64>()
+            .is_ok_and(|n| n == 0)
+}
+
+/// Whether a self-contained clone has a `refs/stash` entry. Fail-closed: a
+/// failure to ask reads as "has a stash".
+fn clone_has_stash(clone: &Path) -> bool {
+    let out = Command::new("git")
+        .args(["--no-optional-locks", "-C"])
+        .arg(clone)
+        .args(["rev-parse", "--verify", "--quiet", "refs/stash"])
+        .output();
+    let Ok(out) = out else { return true };
+    // 0 = ref exists; 1 = `--quiet` and absent; anything else = could not ask.
+    out.status.code() != Some(1)
 }
 
 /// The main repo a worktree belongs to, for `git worktree prune`: a `.git`
@@ -1352,6 +1395,58 @@ mod tests {
             worktree_safety(&work),
             WorktreeSafety::NotSafe("worktree HEAD has commits no remote holds")
         );
+    }
+
+    /// A clone in the root (`.git` dir) with `main` published and an unpushed
+    /// commit on a non-HEAD branch must be preserved (judge finding 1).
+    fn clone_with_published_main(tmp: &Path) -> PathBuf {
+        let origin = tmp.join("origin.git");
+        let work = tmp.join("clone");
+        std::fs::create_dir_all(&work).unwrap();
+        git(&work, &["init", "-q", "--initial-branch=main"]);
+        git(&work, &["config", "user.email", "loom@example.com"]);
+        git(&work, &["config", "user.name", "Loom Test"]);
+        std::fs::write(work.join("f"), b"v1").unwrap();
+        git(&work, &["add", "f"]);
+        git(&work, &["commit", "-q", "-m", "base"]);
+        git(&work, &["clone", "-q", "--bare", ".", origin.to_str().unwrap()]);
+        git(&work, &["remote", "add", "origin", origin.to_str().unwrap()]);
+        git(&work, &["fetch", "-q", "origin"]);
+        git(&work, &["branch", "--set-upstream-to=origin/main", "main"]);
+        work
+    }
+
+    #[test]
+    fn test_worktree_safety_clone_with_unpushed_side_branch_is_not_safe() {
+        let tmp = tempfile::tempdir().unwrap();
+        let work = clone_with_published_main(tmp.path());
+        assert_eq!(worktree_safety(&work), WorktreeSafety::Safe);
+        git(&work, &["checkout", "-q", "-b", "experiment"]);
+        git(
+            &work,
+            &[
+                "commit",
+                "-q",
+                "--allow-empty",
+                "-m",
+                "UNPUSHED EXPERIMENT WORK",
+            ],
+        );
+        git(&work, &["checkout", "-q", "main"]);
+        // HEAD (main) is published and the tree is clean; only the side branch is not.
+        assert_eq!(
+            worktree_safety(&work),
+            WorktreeSafety::NotSafe("clone has local branches no remote holds")
+        );
+    }
+
+    #[test]
+    fn test_worktree_safety_clone_with_stash_is_not_safe() {
+        let tmp = tempfile::tempdir().unwrap();
+        let work = clone_with_published_main(tmp.path());
+        std::fs::write(work.join("f"), b"v2 stashed").unwrap();
+        git(&work, &["stash", "push", "-q", "-m", "scratch-test-stash"]);
+        assert_eq!(worktree_safety(&work), WorktreeSafety::NotSafe("clone has a stash"));
     }
 
     #[test]
