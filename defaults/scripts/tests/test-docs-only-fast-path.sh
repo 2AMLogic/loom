@@ -408,20 +408,25 @@ WL_FN="$(worklog_fn_block "$JUDGE_MD")"
 assert_contains "$(printf '%s\n' "$WL_FN" | grep -v '^[[:space:]]*#')" "docs_only_fast_path_worklog_check() {" \
     "judge.md ships docs_only_fast_path_worklog_check()"
 
-# Stub `gh`: the PR's base repository is owner/mine (a second, foreign repo
-# owner/other exists but the gate must NEVER query it); the diff comes from
-# WL_DIFF; the issues/N reads are recorded to WL_CALL_LOG so the tests assert
-# the target actually queried. FAIL_LOOKUP=1 simulates a temporary forge
-# failure on the record reads.
+# Stub `gh`: the PR's base repository is owner/mine, served by the REST pulls
+# read the recipe uses (WL_BASE_RC/WL_BASE_OUT simulate that read failing or
+# coming back empty — an environment failure, never a content verdict; a
+# second, foreign repo owner/other exists but the gate must NEVER query it);
+# the diff comes from WL_DIFF; the issues/N reads are recorded to WL_CALL_LOG
+# so the tests assert the target actually queried. FAIL_LOOKUP=1 simulates a
+# temporary forge failure on the record reads.
 WL_CALL_LOG="$(mktemp)"
 gh() {
     case "$1" in
         pr)
             case "$2" in
-                view) printf '%s' "${WL_BASE_OUT-owner/mine}"; return "${WL_BASE_RC:-0}" ;;
                 diff) printf '%s' "${WL_DIFF:-}"; return "${WL_DIFF_RC:-0}" ;;
             esac ;;
         api)
+            case "$2" in
+                'repos/{owner}/{repo}/pulls/'*)
+                    printf '%s' "${WL_BASE_OUT-owner/mine}"; return "${WL_BASE_RC:-0}" ;;
+            esac
             printf '%s\n' "$2" >> "$WL_CALL_LOG"
             [[ "${FAIL_LOOKUP:-}" == 1 ]] && return 1
             case "$2" in
@@ -647,8 +652,8 @@ else
 fi
 
 out="$(FAIL_LOOKUP=1 WL_DIFF="$GOOD_DIFF" docs_only_fast_path_worklog_check 1)"
-assert_eq "NOT ELIGIBLE: WORK_LOG record #5 does not exist in owner/mine (or the read failed)" "$out" \
-    "a temporary forge failure on the target read is not eligible (fails closed)"
+assert_eq "NOT ELIGIBLE: ENVIRONMENT: WORK_LOG record #5 does not exist in owner/mine (or the read failed) (gh error, not a PR-content verdict) — take the normal review flow; do NOT treat this as a passed or waived #13760 content check" "$out" \
+    "a temporary forge failure on the target read is not eligible (fails closed, flagged ENVIRONMENT)"
 
 out="$(WL_DIFF="" docs_only_fast_path_worklog_check 1)"
 assert_eq "ELIGIBLE" "$out" "an empty diff (no canonical records) is eligible"
@@ -662,7 +667,7 @@ out="$(WL_DIFF="$README_BOLD_DIFF" docs_only_fast_path_worklog_check 1)"
 assert_eq "ELIGIBLE" "$out" "a README bold prose bullet is never read as a WORK_LOG record"
 
 out="$(WL_DIFF="$WORKPLAN_PLUS_RECORD_DIFF" docs_only_fast_path_worklog_check 1)"
-assert_eq "NOT ELIGIBLE: WORK_LOG record #99 does not exist in owner/mine (or the read failed)" "$out" \
+assert_eq "NOT ELIGIBLE: ENVIRONMENT: WORK_LOG record #99 does not exist in owner/mine (or the read failed) (gh error, not a PR-content verdict) — take the normal review flow; do NOT treat this as a passed or waived #13760 content check" "$out" \
     "file scoping ignores WORK_PLAN bullets but still verifies a WORK_LOG record in the same diff"
 
 : >"$WL_CALL_LOG"
@@ -671,13 +676,13 @@ assert_eq "ELIGIBLE" "$out" "an exact archive rotation (added records all matche
 [[ -s "$WL_CALL_LOG" ]] && fail "a pure rotation still queried the forge" || pass "a pure rotation made zero forge reads"
 
 out="$(WL_DIFF="$ROTATION_PLUS_NEW_DIFF" docs_only_fast_path_worklog_check 1)"
-assert_eq "NOT ELIGIBLE: WORK_LOG record #9 does not exist in owner/mine (or the read failed)" "$out" \
+assert_eq "NOT ELIGIBLE: ENVIRONMENT: WORK_LOG record #9 does not exist in owner/mine (or the read failed) (gh error, not a PR-content verdict) — take the normal review flow; do NOT treat this as a passed or waived #13760 content check" "$out" \
     "records moved to a monthly archive are skipped, but a new record alongside them is still verified"
 
 # Wrong-repo listings: a number absent from the target, and a number present
 # in BOTH repos but with a different title or a different kind than recorded.
 out="$(WL_DIFF="$ABSENT_DIFF" docs_only_fast_path_worklog_check 1)"
-assert_eq "NOT ELIGIBLE: WORK_LOG record #407 does not exist in owner/mine (or the read failed)" "$out" \
+assert_eq "NOT ELIGIBLE: ENVIRONMENT: WORK_LOG record #407 does not exist in owner/mine (or the read failed) (gh error, not a PR-content verdict) — take the normal review flow; do NOT treat this as a passed or waived #13760 content check" "$out" \
     "a foreign repo's real PR number (absent here) is not eligible"
 
 out="$(WL_DIFF="$TITLE_DIFF" docs_only_fast_path_worklog_check 1)"
@@ -700,7 +705,7 @@ assert_eq "NOT ELIGIBLE: WORK_LOG record claims repository owner/other, not the 
 
 # Mixed valid/invalid: one bad entry refuses the whole approval.
 out="$(WL_DIFF="$MIXED_DIFF" docs_only_fast_path_worklog_check 1)"
-assert_eq "NOT ELIGIBLE: WORK_LOG record #99 does not exist in owner/mine (or the read failed)" "$out" \
+assert_eq "NOT ELIGIBLE: ENVIRONMENT: WORK_LOG record #99 does not exist in owner/mine (or the read failed) (gh error, not a PR-content verdict) — take the normal review flow; do NOT treat this as a passed or waived #13760 content check" "$out" \
     "one invalid record among valid ones bars the fast path"
 
 # A canonical-shaped line with an unparseable record body fails closed.
@@ -747,13 +752,18 @@ out="$(WL_DIFF="$OPEN_ISSUE_DIFF" docs_only_fast_path_worklog_check 1)"
 assert_eq "NOT ELIGIBLE: WORK_LOG record #11 is not a closed issue in owner/mine: - **Issue #11** (closed): Open thing" "$out" \
     "an open issue recorded as a closed-issue record is not eligible"
 
-# Reads that fail must not read as eligible: the target and the diff.
+# Reads that fail must not read as eligible — and must say ENVIRONMENT so a
+# tooling failure can never read as, or be waved through as, a content-check
+# outcome (#15048): the target and the diff.
 out="$(WL_BASE_RC=1 WL_DIFF="$GOOD_DIFF" docs_only_fast_path_worklog_check 1)"
-assert_eq "NOT ELIGIBLE: base repository read failed" "$out" "a failed base-repository read is not eligible"
+assert_eq "NOT ELIGIBLE: ENVIRONMENT: base repository read failed (gh error, not a PR-content verdict) — take the normal review flow; do NOT treat this as a passed or waived #13760 content check" "$out" \
+    "a failed base-repository read is not eligible and is flagged as an environment failure, not a content verdict"
 out="$(WL_BASE_OUT='' WL_DIFF="$GOOD_DIFF" docs_only_fast_path_worklog_check 1)"
-assert_eq "NOT ELIGIBLE: base repository read failed" "$out" "an empty base-repository read is not eligible"
+assert_eq "NOT ELIGIBLE: ENVIRONMENT: base repository read failed (gh error, not a PR-content verdict) — take the normal review flow; do NOT treat this as a passed or waived #13760 content check" "$out" \
+    "an empty base-repository read is not eligible and is flagged as an environment failure"
 out="$(WL_DIFF_RC=1 WL_DIFF="$GOOD_DIFF" docs_only_fast_path_worklog_check 1)"
-assert_eq "NOT ELIGIBLE: PR diff read failed" "$out" "a failed diff read is not eligible"
+assert_eq "NOT ELIGIBLE: ENVIRONMENT: PR diff read failed (gh error, not a PR-content verdict) — take the normal review flow; do NOT treat this as a passed or waived #13760 content check" "$out" \
+    "a failed diff read is not eligible and is flagged as an environment failure, not a content verdict"
 
 unset -f gh
 
@@ -776,8 +786,31 @@ assert_doc_contains "$JUDGE_MD" \
     'gh pr diff --repo "$repo" "$pr"' \
     "judge.md reads the exact reviewed diff against the PR's base repository (not the cwd remote, not Guide's receipts or the PR prose)"
 assert_doc_contains "$JUDGE_MD" \
+    'gh api "repos/{owner}/{repo}/pulls/$pr" --jq ' \
+    "judge.md reads the PR's base repository via the REST pulls endpoint (#15048: no version-gated gh pr view JSON field)"
+assert_doc_contains "$JUDGE_MD" \
+    ".base.repo.full_name" \
+    "judge.md takes the base-repository identity from the forge response"
+assert_doc_lacks "$JUDGE_MD" \
     "baseRepository" \
-    "judge.md derives the target from the PR's base repository"
+    "judge.md no longer names the version-gated baseRepository field (absent on gh 2.102.0, #15048)"
+assert_doc_contains "$JUDGE_MD" \
+    "NOT ELIGIBLE: ENVIRONMENT: base repository read failed" \
+    "judge.md's base-repository read failure says ENVIRONMENT, not a content verdict (#15048)"
+assert_doc_contains "$JUDGE_MD" \
+    "do NOT treat this as a passed or waived #13760 content check" \
+    "judge.md's environment refusals tell the Judge not to waive the #13760 content check"
+
+# The judge SKILL copy ships the same recipe — both must carry the identical
+# edit (#15048 AC: judge.md and SKILL.md stay in lockstep). Mirror of the
+# PROMPT_DIR probe above (#6725).
+if [[ -d "$SCRIPTS_DIR/../../.claude/commands/loom" ]]; then
+    JUDGE_SKILL_MD="$SCRIPTS_DIR/../../.agents/skills/loom-judge/SKILL.md"
+else
+    JUDGE_SKILL_MD="$SCRIPTS_DIR/../.agents/skills/loom-judge/SKILL.md"
+fi
+assert_eq "$(worklog_fn_block "$JUDGE_MD")" "$(worklog_fn_block "$JUDGE_SKILL_MD")" \
+    "judge.md and loom-judge SKILL.md ship a byte-identical worklog gate (#15048)"
 
 # The Guide-side gate is the counterpart — guide.md must ship it and wire it.
 assert_doc_contains "$GUIDE_MD" \

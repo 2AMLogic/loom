@@ -1853,27 +1853,33 @@ its receipts, or anything the PR body claims:
 # right state (a PR merged, an issue closed), under exactly the recorded
 # title. Any foreign/missing/wrong-kind/wrong-state/mismatched or unreadable
 # record echoes "NOT ELIGIBLE: <reason>" naming it — the caller must then take
-# the normal review flow and report the reason. Distinct numbers are READ once
-# each, but every record is VERIFIED: a repeated number's later records (a
+# the normal review flow and report the reason. A READ failure (base
+# repository, diff, or record fetch) echoes "NOT ELIGIBLE: ENVIRONMENT: …"
+# instead: an environment failure is never a passed or waived content check.
+# Distinct numbers are READ once each, but every record is VERIFIED: a
+# repeated number's later records (a
 # duplicate with a different title or kind included) are checked against the
 # cached fetch, not skipped; bullets outside WORK_LOG.md and its monthly
 # archives (WORK_PLAN/README prose, `- **#N**: …` backlog rows included) and
 # anything not a canonical `- **PR #N**` / `- **Issue #N**` bullet are never
 # read.
 docs_only_fast_path_worklog_check() {
-  # $1 = PR number. The target is the PR's BASE repository (read from the
-  # forge, never the cwd's remote and never a receipt); the additions are the
+  # $1 = PR number. The target is the PR's BASE repository (its identity read
+  # from the forge response via the REST pulls endpoint, which every supported
+  # gh serves — no version-gated `gh pr view --json` field; the PR is located
+  # through the cwd remote exactly as `gh pr view` did, and the identity never
+  # comes from a receipt); the additions are the
   # exact reviewed base..head diff (never Guide's own account of them).
   local pr="$1" out raw line body mid num stated kind rest got got_title got_is_pr got_state got_merged
   local -A fetched=()
   local -a new_records=()
-  if ! out=$(gh pr view "$pr" --json baseRepository --jq '.baseRepository.nameWithOwner' 2>/dev/null) || [ -z "$out" ]; then
-    echo "NOT ELIGIBLE: base repository read failed"
+  if ! out=$(gh api "repos/{owner}/{repo}/pulls/$pr" --jq '.base.repo.full_name' 2>/dev/null) || [ -z "$out" ]; then
+    echo "NOT ELIGIBLE: ENVIRONMENT: base repository read failed (gh error, not a PR-content verdict) — take the normal review flow; do NOT treat this as a passed or waived #13760 content check"
     return 0
   fi
   local repo="$out"
   if ! raw=$(gh pr diff --repo "$repo" "$pr" 2>/dev/null); then
-    echo "NOT ELIGIBLE: PR diff read failed"
+    echo "NOT ELIGIBLE: ENVIRONMENT: PR diff read failed (gh error, not a PR-content verdict) — take the normal review flow; do NOT treat this as a passed or waived #13760 content check"
     return 0
   fi
   # Added canonical records: `+`-prefixed `- **PR/Issue ...` bullet lines,
@@ -1932,7 +1938,7 @@ docs_only_fast_path_worklog_check() {
     # title or kind — is still verified against the cached tuple (#14532).
     if [ -z "${fetched[$num]:-}" ]; then
       if ! got=$(gh api "repos/$repo/issues/$num" --jq '"\(.title)\t\(.pull_request != null)\t\(.state)\t\((.pull_request.merged_at != null))"' 2>/dev/null) || [ -z "$got" ]; then
-        echo "NOT ELIGIBLE: WORK_LOG record #$num does not exist in $repo (or the read failed)"
+        echo "NOT ELIGIBLE: ENVIRONMENT: WORK_LOG record #$num does not exist in $repo (or the read failed) (gh error, not a PR-content verdict) — take the normal review flow; do NOT treat this as a passed or waived #13760 content check"
         return 0
       fi
       fetched[$num]="$got"
@@ -1984,7 +1990,10 @@ title mismatch, foreign repository identity, or
 an unreadable diff/target read) — **do not use this fast path.** Report the
 `NOT ELIGIBLE` reason verbatim in the verdict comment, and proceed with the
 normal Primary Queue steps 5-11 (checkout, quality checks, test plan
-execution, full code evaluation).
+execution, full code evaluation). A refusal prefixed
+`NOT ELIGIBLE: ENVIRONMENT:` means a `gh` read failed and the check could not
+run — an environment failure, never a passed or waived #13760 content check;
+report it as such and still take the normal flow.
 
 ### Fast-Path Evaluation Process
 
