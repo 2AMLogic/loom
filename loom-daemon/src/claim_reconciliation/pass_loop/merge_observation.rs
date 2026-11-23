@@ -484,6 +484,28 @@ impl RecordStore {
         serde_json::from_str(&text).ok()
     }
 
+    /// Every stored record that has not completed all passes.
+    #[must_use]
+    pub fn incomplete(&self) -> Vec<MergeRecord> {
+        let Ok(rd) = std::fs::read_dir(&self.dir) else {
+            return Vec::new();
+        };
+        let mut out: Vec<MergeRecord> = rd
+            .flatten()
+            .filter(|e| {
+                let n = e.file_name();
+                let n = n.to_string_lossy();
+                n.starts_with("pr-") && n.ends_with(".json")
+            })
+            .filter_map(|e| {
+                serde_json::from_str::<MergeRecord>(&std::fs::read_to_string(e.path()).ok()?).ok()
+            })
+            .filter(|r| !r.complete())
+            .collect();
+        out.sort_by_key(|r| r.pr);
+        out
+    }
+
     /// Write the record atomically (temp file + rename).
     ///
     /// # Errors
@@ -511,10 +533,11 @@ pub fn run_pass(
     is_suppressed: impl Fn() -> bool,
 ) -> Stats {
     let mut stats = Stats::default();
-    let Some(pulls) = f.merged_pulls() else {
-        return stats;
-    };
+    // An unreadable listing no longer ends the pass: recorded merges still
+    // retry below, since a record is self-sufficient.
+    let pulls = f.merged_pulls().unwrap_or_default();
     stats.merges_seen = pulls.len();
+    let listed: Vec<u64> = pulls.iter().map(|p| p.number).collect();
     for row in pulls {
         if is_suppressed() {
             break;
@@ -561,6 +584,20 @@ pub fn run_pass(
             }
         };
         if rec.complete() {
+            continue;
+        }
+        process(f, store, &mut rec, ac_gate_on);
+        if rec.complete() {
+            stats.records_completed += 1;
+        }
+    }
+    // Deferred records whose PR has since left the discovery window: retry
+    // from the pinned record, never from the listing.
+    for mut rec in store.incomplete() {
+        if is_suppressed() {
+            break;
+        }
+        if listed.contains(&rec.pr) {
             continue;
         }
         process(f, store, &mut rec, ac_gate_on);
@@ -1003,15 +1040,13 @@ pub(super) fn reconcile(gh_bin: &Path, root: &Path) {
     if crate::rate_limit_breaker::global_skip_pass("claim_reconciliation") {
         return;
     }
-    let forge = GhForge::new(gh_bin, root);
-    let Some(nwo) = forge.nwo() else {
+    let Some(forge) = GhForge::resolve(gh_bin, root, crate::forge_cmd::repo_nwo_in) else {
         log::debug!(
             "merge_observation: could not resolve the repository at {} — pass idle",
             root.display()
         );
         return;
     };
-    let forge = forge.with_nwo(nwo);
     let stats = run_pass(&forge, &RecordStore::for_root(root), ac_gate_enabled(root), || {
         crate::rate_limit_breaker::global_skip_pass("claim_reconciliation")
     });
@@ -1048,8 +1083,22 @@ impl<'a> GhForge<'a> {
         }
     }
 
-    /// Pin the repository identity (resolved once by [`reconcile`], which
-    /// stops early without one).
+    /// Build the forge the way [`reconcile`] does: resolve the repository
+    /// identity first (`resolve` is `forge_cmd::repo_nwo_in` in production)
+    /// and return `None` without one. [`GhForge::new`] alone has no identity,
+    /// so a forge that skipped this step would leave the pass idle forever.
+    #[must_use]
+    pub fn resolve(
+        gh_bin: &'a Path,
+        root: &'a Path,
+        resolve: impl Fn(&str, Option<&Path>) -> Option<String>,
+    ) -> Option<Self> {
+        let nwo = resolve(&gh_bin.to_string_lossy(), Some(root))
+            .filter(|n| !n.is_empty() && n.contains('/'))?;
+        Some(Self::new(gh_bin, root).with_nwo(nwo))
+    }
+
+    /// Pin the repository identity (see [`GhForge::resolve`]).
     #[must_use]
     pub fn with_nwo(mut self, nwo: String) -> Self {
         self.nwo = Some(nwo);

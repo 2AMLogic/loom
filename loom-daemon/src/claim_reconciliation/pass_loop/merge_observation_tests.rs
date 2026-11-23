@@ -859,6 +859,55 @@ fn a_partial_failure_resumes_from_the_last_completed_pass() {
     assert!(store.load(9).unwrap().complete());
 }
 
+#[test]
+fn a_deferred_record_retries_after_its_pr_leaves_the_discovery_window() {
+    let mut f = partial_fixture();
+    let dir = tempfile::tempdir().unwrap();
+    let store = RecordStore::for_root(dir.path());
+    // Tick 1: close targets unreadable -> the record is pinned but deferred.
+    *f.close_targets.borrow_mut() = None;
+    run(&f, &store, false);
+    assert!(!store.load(9).unwrap().complete());
+    // PR 9 is evicted from the listing; targets become readable again.
+    f.merged.clear();
+    *f.close_targets.borrow_mut() = Some(String::new());
+    let stats = run(&f, &store, false);
+    assert_eq!(stats.merges_seen, 0);
+    assert_eq!(stats.records_completed, 1);
+    assert!(store.load(9).unwrap().complete());
+}
+
+#[test]
+fn ghforge_resolve_pins_identity_and_refuses_without_one() {
+    let gh = Path::new("/nonexistent/gh");
+    let root = Path::new("/tmp");
+    let f = GhForge::resolve(gh, root, |_, _| Some("o/r".into())).unwrap();
+    assert_eq!(Forge::nwo(&f).as_deref(), Some("o/r"));
+    assert!(GhForge::resolve(gh, root, |_, _| None).is_none());
+    assert!(GhForge::resolve(gh, root, |_, _| Some("noslash".into())).is_none());
+    // The unresolved constructor is the defect the review measured.
+    assert_eq!(Forge::nwo(&GhForge::new(gh, root)), None);
+}
+
+#[test]
+fn a_resolved_ghforge_reaches_the_discovery_listing() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let log = dir.path().join("gh.log");
+    let bin = dir.path().join("fake-gh.sh");
+    std::fs::write(
+        &bin,
+        format!("#!/usr/bin/env bash\nprintf '%s\\n' \"$*\" >> '{}'\necho '[]'\n", log.display()),
+    )
+    .unwrap();
+    std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let forge = GhForge::resolve(&bin, dir.path(), |_, _| Some("o/r".into())).unwrap();
+    let stats = run_pass(&forge, &RecordStore::for_root(dir.path()), false, || false);
+    assert_eq!(stats.merges_seen, 0);
+    let calls = std::fs::read_to_string(&log).unwrap_or_default();
+    assert!(calls.contains("pulls?state=closed"), "listing never issued: {calls:?}");
+}
+
 // ---------------------------------------------------------------------------
 // the convergence fixture (AC: script merge vs direct forge merge)
 // ---------------------------------------------------------------------------

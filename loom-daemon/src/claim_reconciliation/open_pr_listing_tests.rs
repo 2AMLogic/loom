@@ -214,7 +214,12 @@ fn an_unchanged_workspace_costs_only_304s_and_is_accounted() {
     );
     let calls = std::fs::read_to_string(&log).unwrap();
     let second: Vec<&str> = calls.lines().skip(first_len).collect();
-    let pulls: Vec<&&str> = second.iter().filter(|l| l.contains("/pulls")).collect();
+    // The merge-observation pass's closed-PR listing (#14902) is a separate,
+    // deliberately unconditional read; this test is about the open-PR reads.
+    let pulls: Vec<&&str> = second
+        .iter()
+        .filter(|l| l.contains("/pulls") && !l.contains("state=closed"))
+        .collect();
     assert!(!pulls.is_empty(), "{calls}");
     assert!(
         pulls.iter().all(|l| l.contains("If-None-Match")),
