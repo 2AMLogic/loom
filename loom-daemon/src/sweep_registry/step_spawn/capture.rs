@@ -148,6 +148,56 @@ pub(crate) fn launch_rejection_of(
     reported
 }
 
+/// The fast-fail window: the wider of `FAST_FAIL_WINDOW_SECS` and this
+/// host's configured `insta_crash_secs` ([`crate::sweep_registry::is_fast_failure`]'s
+/// own bound).
+pub(crate) fn fast_fail_window(insta_crash_secs: i64) -> std::time::Duration {
+    std::time::Duration::from_secs(
+        u64::try_from(crate::sweep_registry::FAST_FAIL_WINDOW_SECS.max(insta_crash_secs))
+            .unwrap_or(120),
+    )
+}
+
+/// The reap reason of a step that never reached the model (#14951), or `None`
+/// for one that ran. Such a step is not a Judge pass that read the PR and gave
+/// no verdict, so its lease reap must not count toward the backstop's hold
+/// ([`crate::pr_lease_reap::reason_never_reviewed`]). Only a process that
+/// exited qualifies: a timeout spent the whole ceiling and a cancel is the
+/// operator's act. In precedence order:
+///
+/// - `launch_rejected`: the launcher reported a typed rejection
+///   ([`launch_rejection_of`]); or the step exited 78 (`EX_CONFIG`, the spawn
+///   scripts' preflight refusal — Codex hook trust, an empty token pool) with
+///   no outcome line inside the fast-fail window. Those scripts are `exec`ed
+///   by the launcher, so their own `exit 78` reaches no typed socket; the
+///   window is what proves the run never worked.
+/// - `provider_exhausted`: the exit-time provider feedback said the seat was
+///   exhausted (#13966).
+///
+/// Pure.
+pub(crate) fn never_started_reason(
+    end: StepEnd,
+    line: Option<&StepOutcomeLine>,
+    typed_rejection: bool,
+    provider_exhausted: bool,
+    ran_for: std::time::Duration,
+    window: std::time::Duration,
+) -> Option<&'static str> {
+    use crate::pr_lease_reap::{REASON_LAUNCH_REJECTED, REASON_PROVIDER_EXHAUSTED};
+    if !matches!(end, StepEnd::Exited(_)) {
+        return None;
+    }
+    let fast_preflight_exit =
+        end == StepEnd::Exited(Some(78)) && line.is_none() && ran_for < window;
+    if typed_rejection || fast_preflight_exit {
+        Some(REASON_LAUNCH_REJECTED)
+    } else if provider_exhausted {
+        Some(REASON_PROVIDER_EXHAUSTED)
+    } else {
+        None
+    }
+}
+
 /// The `reason`s held as `ci_wait`: Judge's `ci_pending` (written
 /// `ci-pending` on the line; the parser folds it, #13500), and the Champion
 /// `requeued` outcome word. The captain is fed the outcome line's own reason,
@@ -184,10 +234,7 @@ pub(crate) fn fast_fail_release_class(
     ran_for: std::time::Duration,
     insta_crash_secs: i64,
 ) -> &'static str {
-    let window = std::time::Duration::from_secs(
-        u64::try_from(crate::sweep_registry::FAST_FAIL_WINDOW_SECS.max(insta_crash_secs))
-            .unwrap_or(120),
-    );
+    let window = fast_fail_window(insta_crash_secs);
     if role == StepRole::Builder
         && class == "failed"
         && ran_for < window
@@ -574,6 +621,17 @@ impl SweepRegistry {
         // `is_environmental_failure_class`); a progressing release never is,
         // and neither is `provider_exhausted`.
         let ran_for = (Utc::now() - started_at).to_std().unwrap_or_default();
+        let launch_rejection = launch_rejection_of(end, line.as_ref(), rejection);
+        // #14951: a step that never reached the model reaps with its own
+        // reason, so a Judge's reap writes no no-verdict record for it.
+        let never_started = never_started_reason(
+            end,
+            line.as_ref(),
+            launch_rejection.is_some(),
+            provider_exhausted,
+            ran_for,
+            fast_fail_window(self.quarantine_config.insta_crash_secs),
+        );
         let release_class = fast_fail_release_class(
             role,
             release_class,
@@ -583,7 +641,7 @@ impl SweepRegistry {
         );
         crate::fleet_dispatch::worker::release(sweep_id, release_class);
         if !self.config.skip_label_flip {
-            let reason = seat_busy.unwrap_or(match end {
+            let reason = seat_busy.or(never_started).unwrap_or(match end {
                 StepEnd::TimedOut => crate::pr_lease_reap::REASON_TIMEOUT,
                 StepEnd::Cancelled => "cancelled",
                 StepEnd::Exited(_) => "exited",
@@ -604,7 +662,7 @@ impl SweepRegistry {
                     ran_for: (Utc::now() - started_at).to_std().unwrap_or_default(),
                     timed_out: end == StepEnd::TimedOut,
                     provider_exhausted,
-                    launch_rejection: launch_rejection_of(end, line.as_ref(), rejection),
+                    launch_rejection,
                 },
             );
         }
