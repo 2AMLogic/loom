@@ -47,6 +47,17 @@
 //! Fold each new capture in as it is observed, replacing that row's
 //! provenance. A test keeps the labelling honest.
 //!
+//! ## Google Gemini API rows (#14933) — documented shapes, no capture yet
+//!
+//! The Google rows below are [`Provenance::DocumentedShape`]: no Google
+//! capture exists in this repo, so their fixtures (`SYNTHETIC_GOOGLE_*`) are
+//! synthetic transcriptions of Google's documented error model wrapped in the
+//! live-captured OpenCode event shape, and say so. Known honest gap: Google's
+//! long per-minute refusal form (`Quota exceeded for quota metric …`) contains
+//! the pre-existing `quota exceeded` needle and would classify `Exhausted`
+//! (6 h) rather than `RateLimited` (60 s) — a mis-hold in the conservative
+//! direction, left until a real capture settles Google's exact strings.
+//!
 //! ## Kimi (issue #8563), and a corrected premise
 //!
 //! #8563 assumed the Kimi Code CLI (`@moonshot-ai/kimi-code`) splits its exit
@@ -227,6 +238,50 @@ pub const CAPTURED_ZAI_RATE_LIMIT_EVENT: &str = r#"{"type":"error","timestamp":1
 const OPENCODE_1_18_31_ZAI: &str = "opencode 1.18.31 `run --format json`, provider \
      zai-coding-plan, observed 2026-11-16 in fleet Builder/Doctor steps (#12395, #11286)";
 
+/// SYNTHETIC, **not** a capture (#14933): the documented shape of a Google
+/// Gemini API per-minute quota refusal as OpenCode 1.x relays it. The event
+/// wrapper is the live-captured Z.ai shape above; the inner Google body is
+/// transcribed from Google's documented `RESOURCE_EXHAUSTED` error model
+/// (cloud.google.com/apis/design/errors), whose canonical message is
+/// `Resource has been exhausted (e.g. check quota).` — deliberately NOT the
+/// long `Quota exceeded for quota metric …` form, which would collide with
+/// the pre-existing `quota exceeded` `Exhausted` needle (see the module
+/// docs). No Google capture exists in this repo; replace this fixture, and
+/// the honest-gap note, the day one lands.
+pub const SYNTHETIC_GOOGLE_PER_MINUTE_EVENT: &str = r#"{"type":"error","timestamp":1795300000000,"sessionID":"ses_REDACTED","error":{"name":"APIError","data":{"message":"Resource has been exhausted (e.g. check quota).","statusCode":429,"isRetryable":true,"responseBody":"{\"error\":{\"code\":429,\"message\":\"Resource has been exhausted (e.g. check quota).\",\"status\":\"RESOURCE_EXHAUSTED\"}}","metadata":{"url":"https://generativelanguage.googleapis.com/v1beta/models/gemini-3.5-flash:generateContent"}}}}"#;
+
+/// SYNTHETIC, **not** a capture (#14933): a project whose monthly spend cap
+/// is spent. Same wrapper and same disclosure as
+/// [`SYNTHETIC_GOOGLE_PER_MINUTE_EVENT`]; the message text is the
+/// distinguishing part the `Exhausted` needle reads (`spend cap`), because a
+/// spend-cap refusal is also a `429 RESOURCE_EXHAUSTED` and must not take the
+/// 60 s rate-limit path the bare status gives it — that is the defect #14933
+/// was filed over.
+pub const SYNTHETIC_GOOGLE_SPEND_CAP_EVENT: &str = r#"{"type":"error","timestamp":1795300002000,"sessionID":"ses_REDACTED","error":{"name":"APIError","data":{"message":"Monthly spend cap reached for this project.","statusCode":429,"isRetryable":false,"responseBody":"{\"error\":{\"code\":429,\"message\":\"Monthly spend cap reached for this project.\",\"status\":\"RESOURCE_EXHAUSTED\"}}","metadata":{"url":"https://generativelanguage.googleapis.com/v1beta/models/gemini-3.5-flash:generateContent"}}}}"#;
+
+/// SYNTHETIC, **not** a capture (#14933): an empty prepay balance, answered
+/// `402 Payment Required`. Same wrapper and disclosure as
+/// [`SYNTHETIC_GOOGLE_PER_MINUTE_EVENT`]. `402` arrives as `data.statusCode`
+/// in the wrapper (not the structural `error.status` the event reader keys
+/// on), so the needle is what classifies it.
+pub const SYNTHETIC_GOOGLE_PREPAY_EVENT: &str = r#"{"type":"error","timestamp":1795300003000,"sessionID":"ses_REDACTED","error":{"name":"APIError","data":{"message":"Prepay balance is 0. Please top up your account.","statusCode":402,"isRetryable":false,"responseBody":"{\"error\":{\"code\":402,\"message\":\"Prepay balance is 0. Please top up your account.\",\"status\":\"PAYMENT_REQUIRED\"}}","metadata":{"url":"https://generativelanguage.googleapis.com/v1beta/models/gemini-3.5-flash:generateContent"}}}}"#;
+
+/// The distinguishing text of a monthly spend-cap refusal (#14933): the one
+/// `Exhausted` row whose cooldown `super::reset::resolve_cooldown` resolves
+/// to the next UTC month start. Kept a named const (not an inline literal in
+/// [`PATTERNS`]) so the row and [`is_monthly_spend_cap`] cannot drift apart —
+/// a test pins that.
+pub const GOOGLE_SPEND_CAP_NEEDLE: &str = "spend cap";
+
+/// `true` when `text` carries the monthly spend-cap refusal's distinguishing
+/// text ([`GOOGLE_SPEND_CAP_NEEDLE`] — the same needle the `Exhausted` row
+/// uses). `super::reset::resolve_cooldown` keys the next-UTC-month-start
+/// horizon on this predicate, and nothing else may.
+#[must_use]
+pub fn is_monthly_spend_cap(text: &str) -> bool {
+    text.to_ascii_lowercase().contains(GOOGLE_SPEND_CAP_NEEDLE)
+}
+
 /// The whole pattern table, grouped for readability only — precedence is
 /// decided by [`classify`], not by position (see its docs).
 pub const PATTERNS: &[Pattern] = &[
@@ -312,6 +367,22 @@ pub const PATTERNS: &[Pattern] = &[
         needle: "usage limit reached for",
         classification: Classification::Exhausted,
         provenance: Provenance::LiveCapture(OPENCODE_1_18_31_ZAI),
+    },
+    // Google Gemini API (#14933): documented shapes, no capture yet — the
+    // SYNTHETIC_GOOGLE_* fixtures say so and the module docs record the gap.
+    // The per-minute 429 needs no row: the bare-429 fallback already reads it
+    // as RateLimited (a test pins that, and that the Exhausted needles do NOT
+    // match it). The spend-cap row is the one whose cooldown resolves to the
+    // next UTC month start (`super::reset`).
+    Pattern {
+        needle: GOOGLE_SPEND_CAP_NEEDLE,
+        classification: Classification::Exhausted,
+        provenance: Provenance::DocumentedShape,
+    },
+    Pattern {
+        needle: "prepay balance",
+        classification: Classification::Exhausted,
+        provenance: Provenance::DocumentedShape,
     },
     // ---- Rate / concurrency ceiling ----
     Pattern {
@@ -865,6 +936,75 @@ mod tests {
             ),
             None
         );
+    }
+
+    /// #14933: the three Google Gemini API shapes. All fixtures are SYNTHETIC
+    /// (documented shapes — no Google capture exists yet), so no row claims
+    /// `LiveCapture`.
+    #[test]
+    fn the_documented_google_shapes_classify_as_the_issue_requires() {
+        // Per-minute 429: the bare-429 fallback already catches it, so no row
+        // was added — and, the negative check the issue insists on, it is NOT
+        // read as Exhausted: the existing `quota exceeded` /
+        // `insufficient_quota` needles must not match a per-minute message.
+        let per_minute = SYNTHETIC_GOOGLE_PER_MINUTE_EVENT.to_ascii_lowercase();
+        assert!(!per_minute.contains("quota exceeded"), "{per_minute}");
+        assert!(!per_minute.contains("insufficient_quota"), "{per_minute}");
+        assert_eq!(
+            classify(SYNTHETIC_GOOGLE_PER_MINUTE_EVENT, 1),
+            Some(Classification::RateLimited)
+        );
+        // Spend cap: `Exhausted`, not the 60 s rate limit the bare 429 gave
+        // it before this row existed — the defect #14933 was filed over.
+        assert_eq!(classify(SYNTHETIC_GOOGLE_SPEND_CAP_EVENT, 1), Some(Classification::Exhausted));
+        // Prepay balance 0 / HTTP 402: `Exhausted`.
+        assert_eq!(classify(SYNTHETIC_GOOGLE_PREPAY_EVENT, 1), Some(Classification::Exhausted));
+    }
+
+    /// #14933: the same three shapes in a retained launch log, among Loom's
+    /// own markers and the agent's transcript — and an agent that merely
+    /// quotes the spend-cap wording does not mark a seat.
+    #[test]
+    fn the_documented_google_shapes_classify_in_a_launch_region() {
+        for exhausted in [
+            SYNTHETIC_GOOGLE_SPEND_CAP_EVENT,
+            SYNTHETIC_GOOGLE_PREPAY_EVENT,
+        ] {
+            let log = format!(
+                "# LOOM_LAUNCH {{\"schema\":1}}\n# LOOM_CLI_START runtime=opencode\n\
+                 {{\"type\":\"text\",\"text\":\"working\"}}\n{exhausted}\n"
+            );
+            assert_eq!(classify_launch_region(&log, 1), Some(Classification::Exhausted));
+        }
+        let log = format!(
+            "# LOOM_LAUNCH {{\"schema\":1}}\n# LOOM_CLI_START runtime=opencode\n\
+             {{\"type\":\"text\",\"text\":\"working\"}}\n{SYNTHETIC_GOOGLE_PER_MINUTE_EVENT}\n"
+        );
+        assert_eq!(classify_launch_region(&log, 1), Some(Classification::RateLimited));
+        assert_eq!(
+            classify_launch_region(
+                r#"{"type":"text","text":"the monthly spend cap resets soon"}"#,
+                1
+            ),
+            None
+        );
+    }
+
+    /// The spend-cap row and the month-start cooldown trigger
+    /// (`is_monthly_spend_cap`) must stay the same text: if the row's needle
+    /// drifted, a spend-cap refusal would classify `Exhausted` but keep the
+    /// default 6 h horizon instead of the next month start.
+    #[test]
+    fn the_spend_cap_row_and_the_month_start_trigger_are_the_same_needle() {
+        let row = PATTERNS
+            .iter()
+            .find(|p| p.needle == GOOGLE_SPEND_CAP_NEEDLE)
+            .expect("the spend-cap Exhausted row must exist");
+        assert_eq!(row.classification, Classification::Exhausted);
+        assert!(is_monthly_spend_cap(SYNTHETIC_GOOGLE_SPEND_CAP_EVENT));
+        assert!(!is_monthly_spend_cap(SYNTHETIC_GOOGLE_PER_MINUTE_EVENT));
+        assert!(!is_monthly_spend_cap(SYNTHETIC_GOOGLE_PREPAY_EVENT));
+        assert!(!is_monthly_spend_cap("Error: insufficient balance"));
     }
 
     /// #8521: the automatic path's prose table must not read the model's own

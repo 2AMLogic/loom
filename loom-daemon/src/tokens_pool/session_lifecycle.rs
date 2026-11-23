@@ -57,10 +57,9 @@
 //! override this refusal passes `--force`, mirroring the daemon's existing
 //! `--force-after-timeout` escape hatch on `restart --drain`.
 
-use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context, Result};
 use serde::Serialize;
@@ -72,6 +71,7 @@ use super::account_registry::{
 use super::health::{self, ProbeEffect, ProbeOutcome};
 use super::session_hold;
 use super::session_image::{self, ExtraMount, SessionImageConfig};
+use crate::proc_exec::{Completion, ExecError};
 
 // The pass-level health refresh lives in a sibling (#7711).
 #[path = "session_health.rs"]
@@ -1041,55 +1041,16 @@ impl ContainerRunner for ProcessContainerRunner {
             .arg("exec")
             .arg(container)
             .args(argv)
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-        let mut child = match command.spawn() {
-            Ok(child) => child,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                return Ok(ExecOutput {
-                    success: false,
-                    unavailable: true,
-                    timed_out: false,
-                    exit_code: None,
-                    output: "docker CLI is not installed or not on PATH".into(),
-                });
-            }
-            Err(error) => return Err(error.into()),
-        };
-        let started = Instant::now();
-        loop {
-            if let Some(status) = child.try_wait()? {
-                let mut bytes = Vec::new();
-                if let Some(stdout) = child.stdout.take() {
-                    stdout
-                        .take(MAX_PROBE_BYTES as u64)
-                        .read_to_end(&mut bytes)?;
-                }
-                if bytes.is_empty() {
-                    if let Some(stderr) = child.stderr.take() {
-                        stderr
-                            .take(MAX_PROBE_BYTES as u64)
-                            .read_to_end(&mut bytes)?;
-                    }
-                }
-                return Ok(ExecOutput {
-                    success: status.success(),
-                    unavailable: false,
-                    timed_out: false,
-                    exit_code: status.code(),
-                    output: String::from_utf8_lossy(&bytes).into_owned(),
-                });
-            }
-            if started.elapsed() >= timeout {
-                // Kills the local `docker exec` client, not necessarily the
-                // process it started inside the container — which is why this
-                // seam is only ever used for read-only, self-terminating
-                // commands. A `docker top` observer may briefly still see
-                // that process, which correctly keeps `stop` in its
-                // refuse-without-`--force` state until it exits.
-                let _ = child.kill();
-                let _ = child.wait();
+            .stdin(Stdio::null());
+        let output = match crate::proc_exec::run_bounded(command, timeout) {
+            Ok(Completion::Exited(output)) => output,
+            Ok(Completion::TimedOut { .. }) => {
+                // Kills the local `docker exec` client's whole process group,
+                // not necessarily the process it started inside the container
+                // — which is why this seam is only ever used for read-only,
+                // self-terminating commands. A `docker top` observer may
+                // briefly still see that process, which correctly keeps
+                // `stop` in its refuse-without-`--force` state until it exits.
                 return Ok(ExecOutput {
                     success: false,
                     unavailable: false,
@@ -1098,8 +1059,30 @@ impl ContainerRunner for ProcessContainerRunner {
                     output: String::new(),
                 });
             }
-            std::thread::sleep(Duration::from_millis(25));
-        }
+            Err(ExecError::Spawn(error)) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(ExecOutput {
+                    success: false,
+                    unavailable: true,
+                    timed_out: false,
+                    exit_code: None,
+                    output: "docker CLI is not installed or not on PATH".into(),
+                });
+            }
+            Err(ExecError::Spawn(error) | ExecError::Collect(error)) => return Err(error.into()),
+        };
+        let text = if output.stdout.is_empty() {
+            &output.stderr
+        } else {
+            &output.stdout
+        };
+        let text = &text[..text.len().min(MAX_PROBE_BYTES)];
+        Ok(ExecOutput {
+            success: output.status.success(),
+            unavailable: false,
+            timed_out: false,
+            exit_code: output.status.code(),
+            output: String::from_utf8_lossy(text).into_owned(),
+        })
     }
 
     fn window_exists(&self, container: &str, tmux_session: &str, window: &str) -> Result<bool> {

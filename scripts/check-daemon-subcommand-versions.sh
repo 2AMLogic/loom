@@ -99,6 +99,17 @@
 # gates the call, and trying to guess how deep the nesting goes would mistake
 # `tokens --json` for a two-level subcommand.
 #
+# ONE exception (#14985): in `--list` output — the surface `loom-daemon
+# install-compat check` reads — a call whose subcommand this file HARD-floors
+# (`# requires-daemon: <sub> >= <version>`) carries its full verb path: the run
+# of subcommand-shaped tokens that follows (`session-exec claude-seat`), so the
+# harness can probe `<daemon> <sub> <verb> --help` and catch a floor naming a
+# release that predates the verb. Hard-floored calls only: a floor is the
+# author asserting which version provides the call, which is exactly the claim
+# the deeper probe re-checks, while an unfloored or `optional` call asserts
+# nothing and keeps the single token. Check mode and the (retired) baseline
+# keep single tokens, the shape the marker grammar compares.
+#
 # Limits, all accepted: a binary resolved into a variable this file never
 # assigns (passed in from a caller's environment under a novel name) is not
 # seen; a subcommand built up in a variable and expanded is not seen; test
@@ -217,6 +228,29 @@ function blank_prose(s,   out, i, c, j, inner, endq) {
   if (match(v, /^[A-Za-z_][A-Za-z0-9_]*=/)) BINVAR[substr(v, 1, RLENGTH - 1)] = 1
 }
 
+# verb_path <w> -- the subcommand to record for a call whose argument words are
+# w[1..]: `w[1]` alone, unless the file hard-floors that subcommand, in which
+# case the run of subcommand-shaped tokens that follows is recorded too
+# (`session-exec claude-seat`, #14985). The run stops at the first token that
+# is not subcommand-shaped (a flag, a number, a quoted or braced variable, a
+# path): only a token clap could accept as a subcommand can extend the path,
+# and a token clap would refuse fails the probe exactly as it would fail the
+# real call.
+function verb_path(w,    path, i) {
+  if (!(w[1] in FLOORED)) return w[1]
+  path = w[1]
+  for (i = 2; i in w; i++) {
+    if (w[i] ~ /^[a-z][a-z0-9-]*$/) path = path " " w[i]
+    else break
+  }
+  return path
+}
+
+BEGIN {
+  split(floored, _f, /[[:space:]]+/)
+  for (_i in _f) if (_f[_i] != "") FLOORED[_f[_i]] = 1
+}
+
 { LINES[NR] = $0 }
 
 END {
@@ -236,7 +270,7 @@ END {
       if (match(f, /^loom_exec_script_helper[[:space:]]+/)) {
         rest = trim(substr(f, RLENGTH + 1))
         split(rest, w, /[[:space:]]/)
-        if (w[1] ~ /^[a-z][a-z0-9-]*$/) print w[1] "\t" n
+        if (w[1] ~ /^[a-z][a-z0-9-]*$/) print verb_path(w) "\t" n
         continue
       }
       head = ""
@@ -251,16 +285,22 @@ END {
       if (head == "") continue
       rest = trim(substr(f, RLENGTH + 1))
       split(rest, w, /[[:space:]]/)
-      if (w[1] ~ /^[a-z][a-z0-9-]*$/) print w[1] "\t" n
+      if (w[1] ~ /^[a-z][a-z0-9-]*$/) print verb_path(w) "\t" n
     }
   }
 }
 DETECT_AWK_END
 
-# detect_file <path> -- print "<subcommand>\t<first-line-number>" per distinct
-# subcommand this file invokes, sorted.
+# detect_file <path> [floored-subs] -- print "<subcommand>\t<first-line-number>"
+# per distinct subcommand this file invokes, sorted. With a space-separated
+# list of hard-floored subcommands, a floored call prints its full verb path
+# (`session-exec claude-seat`, #14985) for `install-compat check` to probe;
+# without one (check mode) every call prints its first token only, the shape
+# the marker grammar and the baseline compare.
 detect_file() {
-    awk "$DETECT_AWK" "$1" | sort -u -k1,1 | sort -t$'\t' -k1,1
+    local floored="${2:-}"
+    awk -v floored="$floored" "$DETECT_AWK" "$1" \
+        | sort -t$'\t' -u -k1,1 | sort -t$'\t' -k1,1
 }
 
 # scan_targets -- the files in scope, one per line.
@@ -318,14 +358,21 @@ REPO_VERSION=""
 # ---------------------------------------------------------------------------
 
 emit_pairs() {
-    local file sub line
+    local file sub line floored
     while IFS= read -r file; do
         [[ -n "$file" && -f "$REPO_ROOT/$file" || -f "$file" ]] || continue
         local abs="$file"
         [[ -f "$abs" ]] || abs="$REPO_ROOT/$file"
+        # --list only: the compat harness asks for full verb paths on
+        # hard-floored calls (#14985). --update keeps single tokens so its
+        # baseline rows stay comparable with check mode's pairs.
+        floored=""
+        if [[ "$MODE" == "list" ]]; then
+            floored="$(declared_markers "$abs" | awk -F'\t' '$2 ~ /^[0-9]/ {printf "%s%s", s, $1; s = " "}')"
+        fi
         while IFS=$'\t' read -r sub line; do
             [[ -n "$sub" ]] && printf '%s\t%s\t%s\n' "$file" "$sub" "$line"
-        done < <(detect_file "$abs")
+        done < <(detect_file "$abs" "$floored")
     done < <(scan_targets)
 }
 
@@ -456,8 +503,19 @@ FIXTURE
 
     _expect "declared file detects its subcommand" \
         "widget-refs" "$(detect_file "$tmp/declared.sh" | cut -f1 | tr '\n' ' ' | sed 's/ $//')"
+    # No floored list passed: the call records its first token only, the shape
+    # check mode and the marker grammar compare.
     _expect "stub shape is detected" \
         "skip-widgets" "$(detect_file "$tmp/stub.sh" | cut -f1 | tr '\n' ' ' | sed 's/ $//')"
+    # #14985: a hard-floored call carries its full verb path for the compat
+    # harness to probe.
+    _expect "hard-floored call carries its verb path" \
+        "widget-refs closing-refs" "$(detect_file "$tmp/declared.sh" widget-refs | cut -f1 | tr '\n' ' ' | sed 's/ $//')"
+    _expect "unfloored call keeps a single token even when floors are known" \
+        "skip-widgets" "$(detect_file "$tmp/stub.sh" widget-refs | cut -f1 | tr '\n' ' ' | sed 's/ $//')"
+    _expect "--list emits the deepened pair for a hard-floored call" \
+        "$tmp/declared.sh:4"$'\t'"widget-refs closing-refs" \
+        "$(bash "${BASH_SOURCE[0]}" --list "$tmp/declared.sh")"
     _expect "quoted prose is NOT detected" \
         "" "$(detect_file "$tmp/prose-only.sh" | cut -f1 | tr '\n' ' ' | sed 's/ $//')"
     _expect "well-formed >= marker parses" \
