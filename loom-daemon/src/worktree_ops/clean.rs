@@ -3286,7 +3286,9 @@ pub(super) fn dir_size_human(path: &Path) -> String {
 /// `loom-daemon clean --deep` has always removed from `repo_root` itself.
 ///
 /// Deliberately narrower than [`super::orphan_recovery::BUILD_ARTIFACT_PATTERNS`]
-/// (which [`reclaim_worktree_artifacts`] walks inside a throwaway worktree): the
+/// (which the worktree reaper's kept-worktree reclaim
+/// [`crate::worktree_reaper::reclaim_kept_worktree_artifacts`] walks inside a
+/// kept worktree): the
 /// primary checkout is a human's working clone, so the automatic pass added in
 /// #5919 must never remove more than the `clean --deep --safe` an operator would
 /// run by hand. Keeping one list means the manual and scheduled paths can never
@@ -3359,9 +3361,9 @@ fn keep_build_artifacts(repo_root: &Path) -> bool {
         .unwrap_or(false)
 }
 
-/// Remove [`PRIMARY_CHECKOUT_ARTIFACTS`] from `repo_root` **itself** (not from a
-/// worktree — that is [`reclaim_worktree_artifacts`]), reporting each entry's
-/// outcome instead of printing it.
+/// Remove [`PRIMARY_CHECKOUT_ARTIFACTS`] from `repo_root` **itself** (not from
+/// a worktree — that is [`crate::worktree_reaper::reclaim_kept_worktree_artifacts`]),
+/// reporting each entry's outcome instead of printing it.
 ///
 /// This is the shared engine behind both deep-clean paths: the interactive
 /// [`clean_build_artifacts`] (which renders these outcomes to stdout) and the
@@ -3464,57 +3466,14 @@ pub fn clean_build_artifacts(repo_root: &Path, dry_run: bool) {
     }
 }
 
-/// One build-artifact directory [`reclaim_worktree_artifacts`] removed (or
-/// would remove, under `dry_run`).
+/// One build-artifact directory [`sweep_primary_checkout_artifacts`] removed
+/// (or would remove, under `dry_run`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReclaimedArtifact {
-    /// Top-level directory name relative to the worktree root, e.g. `"target"`.
+    /// Top-level directory name relative to the repo root, e.g. `"target"`.
     pub name: String,
     /// Human-readable size, matching [`clean_build_artifacts`]'s report format.
     pub size_human: String,
-}
-
-/// Reclaim regenerable build-artifact directories (`target/`, `node_modules`,
-/// `.venv`, `coverage/`, ...) from **inside one worktree** without removing
-/// the worktree itself — the AC3 follow-up carved out of #5177 into #5187.
-///
-/// Unlike [`clean_build_artifacts`] (which only ever reclaims from
-/// `repo_root` itself, wired to `--deep`), this walks
-/// [`super::orphan_recovery::BUILD_ARTIFACT_PATTERNS`] against
-/// `worktree_path`'s **top-level** entries, trims a trailing `/`, and removes
-/// only entries that are directories — a same-named file (`Cargo.lock`,
-/// `pnpm-lock.yaml`, `.loom-checkpoint`, `.loom-in-use`) is never touched, so
-/// reusing the dirty-detection pattern list here is safe even though most of
-/// its entries are files rather than reclaimable directories.
-///
-/// Pure I/O, no eligibility gate of its own — callers (the worktree reaper's
-/// artifact-reclaim pass) decide *whether* a worktree is eligible via
-/// [`classify_worktree`] / [`WorktreeDecision`] before calling this.
-#[must_use]
-pub fn reclaim_worktree_artifacts(worktree_path: &Path, dry_run: bool) -> Vec<ReclaimedArtifact> {
-    let mut reclaimed = Vec::new();
-    for pattern in super::orphan_recovery::BUILD_ARTIFACT_PATTERNS {
-        let name = pattern.trim_end_matches('/');
-        let dir = worktree_path.join(name);
-        if !dir.is_dir() {
-            continue;
-        }
-        let size_human = dir_size_human(&dir);
-        if dry_run {
-            reclaimed.push(ReclaimedArtifact {
-                name: name.to_string(),
-                size_human,
-            });
-            continue;
-        }
-        if std::fs::remove_dir_all(&dir).is_ok() {
-            reclaimed.push(ReclaimedArtifact {
-                name: name.to_string(),
-                size_human,
-            });
-        }
-    }
-    reclaimed
 }
 
 fn spawn_loop_locks_dir(repo_root: &Path) -> std::path::PathBuf {

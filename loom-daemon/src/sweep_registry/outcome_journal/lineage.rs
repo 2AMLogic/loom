@@ -100,51 +100,14 @@ mod tests {
     use super::*;
 
     fn record(sweep_id: &str, repo: &str, issue: u32, result: SweepResult) -> SweepOutcomeRecord {
-        SweepOutcomeRecord {
-            story_points: None,
-            repo: Some(repo.to_string()),
-            visibility: crate::telemetry::RepoVisibility::Private,
-            tokens_status: None,
-            tokens_status_reason: None,
-            no_phase_cause: None,
-            phase_tap_usage: Vec::new(),
-            issue,
-            sweep_id: sweep_id.to_string(),
-            model: None,
-            effort: None,
-            config: Default::default(),
-            phase_durations: Vec::new(),
-            total_duration_sec: 60,
-            result,
-            pr_number: None,
-            tokens_in: None,
-            tokens_out: None,
-            lines_added: None,
-            lines_deleted: None,
-            tokens_by_model: None,
-            failure_class: None,
-            models_used: None,
-            doctor_cycles: None,
-            judge_verdicts: None,
-            runtime: None,
-            provider: None,
-            profile: None,
-            repo_unresolved: false,
-            disposition: crate::telemetry::SweepDisposition::Unknown,
-            tokens_unattributed: None,
-            attempt_index: None,
-            previous_sweep_id: None,
-            trigger: None,
-            dispatch_origin: None,
-            role_draw: None,
-            rework_events: None,
-            pr_numbers: None,
-            hw_lines_added: None,
-            hw_lines_deleted: None,
-            hw_files: None,
-            generated_lines: None,
-            test_lines: None,
-        }
+        serde_json::from_value(serde_json::json!({
+            "sweep_id": sweep_id,
+            "repo": repo,
+            "issue": issue,
+            "total_duration_sec": 60,
+            "result": result,
+        }))
+        .expect("minimal journal record")
     }
 
     #[test]

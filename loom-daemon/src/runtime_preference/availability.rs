@@ -526,7 +526,14 @@ fn native(root: &Path, tap: &Tap, runtime: &str) -> Availability {
             }
         }
     }
-    let health = match crate::api_keys_pool::select::health(root, Some(&provider)) {
+    let health = match crate::api_keys_pool::select::health_in(
+        &crate::api_keys_pool::paths::pool_roots(root),
+        Some(&provider),
+        // #14932: a cap the workspace's `runtimes.apiKeyLimits` block declares
+        // counts here exactly as a file-declared one. The config is already
+        // resolved above; handing it over reads the tiers once per pass.
+        &crate::api_keys_pool::limits::ConfiguredLimits::from_config(&config),
+    ) {
         Ok(health) => health,
         Err(error) => {
             return Availability::Exhausted {

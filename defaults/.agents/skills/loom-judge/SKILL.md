@@ -266,7 +266,7 @@ Check for an argument passed via the slash command:
 **Arguments**: `$ARGUMENTS`
 
 If a number is provided (e.g., `/judge 123`), it is the target **PR**: skip "Finding Work", and gate it before any claim, label or comment (#11863):
-1. **Kind and state probe** (live, one REST read): `gh api "repos/{owner}/{repo}/issues/<number>" --jq '[(.pull_request != null), .state, ([.labels[].name] | join(","))] | @tsv'`. Refuse, writing nothing, on `false` (an issue number; Judge is a PR role), `closed`, `loom:frozen`, any `loom:operator*` label (#11861; retired names too), or a failed read.
+1. **Kind and state probe** (live, one REST read): `gh api "repos/{owner}/{repo}/issues/<number>" --jq '[(.pull_request != null), .state, ([.labels[].name] | join(","))] | @tsv'`. Refuse, writing nothing, on `false` (an issue number; Judge is a PR role), `closed`, `loom:frozen`, any `loom:operator*` label (#11861; retired names too), or a failed read. A Gitea checkout has no `gh` to read — `gh` fails there with `none of the git remotes … point to a known GitHub host` — so the probe is instead `loom-daemon forge pr view <number> --json number,state,labels,headRefOid,mergeable` (#14939), served from the Gitea API on the inherited `GITEA_URL` and `GITEA_TOKEN` (`GITEA_USERNAME` for Basic auth). Its non-zero exit is the refusal: it names an issue number, an unknown number, a missing credential or an unreadable answer. On success read the row as the TSV above — refuse on `CLOSED` or `MERGED` state, `loom:frozen`, any `loom:operator*` label, an unreadable field — and keep `.headRefOid` as the head you evaluate and `.mergeable` (`CONFLICTING` is the merge-conflict case below).
 2. **Stage**: `loom:review-requested` (or `loom:reviewing` alone) → claim exactly as Primary Queue step 2 (stale check, PR lease, then the label) and evaluate. A lease held by your own `$LOOM_SWEEP_ID` is yours, not a peer's: a daemon step pre-takes it, and `lease pr claim` re-attaches (exit 0, "already held by this claimant") — continue and add `loom:reviewing` yourself, the same override `LEASE_ALREADY_HELD` has in `builder.md`. Neither those nor a verdict label (e.g. only `loom:important`) → "Fallback Queue" rules (guard, review only, never claim or label). A verdict label without `loom:review-requested` → no-op, unless the operator asked for this re-review (see "Exception").
 3. End with the outcome line from `.loom/docs/targeted-role-invocation.md`: `LOOM_STEP_OUTCOME role=judge target=<n> class=<verdict|noop|refused|failed> reason=<token>`.
 
@@ -1877,12 +1877,16 @@ its receipts, or anything the PR body claims:
 # read.
 docs_only_fast_path_worklog_check() {
   # $1 = PR number. The target is the PR's BASE repository (read from the
-  # forge, never the cwd's remote and never a receipt); the additions are the
-  # exact reviewed base..head diff (never Guide's own account of them).
+  # forge, never the cwd's remote and never a receipt). A PR's own URL is
+  # always its base repository's, whatever the forge host — `gh pr view
+  # --json` has no base-repository field, and a URL of any other shape
+  # derives nothing, so the guard below fails closed (#15005). The additions
+  # are the exact reviewed base..head diff (never Guide's own account of
+  # them).
   local pr="$1" out raw line body mid num stated kind rest got got_title got_is_pr got_state got_merged
   local -A fetched=()
   local -a new_records=()
-  if ! out=$(gh pr view "$pr" --json baseRepository --jq '.baseRepository.nameWithOwner' 2>/dev/null) || [ -z "$out" ]; then
+  if ! out=$(gh pr view "$pr" --json url --jq '.url | capture("^https://[^/]+/(?<r>[^/]+/[^/]+)/pull/[0-9]+/?$").r' 2>/dev/null) || [ -z "$out" ]; then
     echo "NOT ELIGIBLE: base repository read failed"
     return 0
   fi

@@ -761,6 +761,28 @@ fn a_missing_private_session_is_recreated_only_against_its_surviving_volume() {
         envs.contains(&"LOOM_LEASE_RENEW_STATE_DIR=/workspace/cache/lease-renew"),
         "{envs:?}"
     );
+    // Every long-lived cache and Loom state dir the seat's 512 MB `/tmp`
+    // tmpfs grew across days (#14929) is pinned to the persistent cache
+    // volume instead — uv's cache alone was 395 MB after two days, and the
+    // forge listing / call-stats / write-scope state dirs surfaced untracked
+    // in the clone when the tmpfs filled.
+    for pinned in [
+        "UV_CACHE_DIR=/workspace/cache/uv",
+        "GH_CACHE_DIR=/workspace/cache/gh",
+        "LOOM_LISTING_CACHE_DIR=/workspace/cache/forge-listing",
+        "LOOM_FORGE_CALL_STATS_DIR=/workspace/cache/forge-call-stats",
+        "LOOM_WRITE_SCOPE_CACHE_DIR=/workspace/cache/write-scope",
+    ] {
+        assert!(envs.contains(&pinned), "missing cache-volume pin {pinned}: {envs:?}");
+    }
+    // The per-container venv is NOT a growing cache and stays on /tmp
+    // (curator scope: `UV_PROJECT_ENVIRONMENT` unchanged).
+    assert!(
+        !envs
+            .iter()
+            .any(|e| e.starts_with("UV_PROJECT_ENVIRONMENT=")),
+        "{envs:?}"
+    );
     // What it made passes the same validation a reused container must.
     let state = env.engine().containers[&env.config.container].clone();
     docker::validate_settings(&env.config, &state).unwrap();
