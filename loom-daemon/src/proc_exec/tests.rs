@@ -100,12 +100,14 @@ fn a_program_still_open_for_writing_is_waited_for_not_a_spawn_error() {
         .write(true)
         .open(&program)
         .unwrap();
+    // Clock first: it must precede the releaser's `sleep` by construction, or
+    // a late-scheduled parent could see less than 30 ms elapse (#15074).
+    let started = Instant::now();
     let releaser = std::thread::spawn(move || {
         std::thread::sleep(Duration::from_millis(30));
         drop(writer);
     });
 
-    let started = Instant::now();
     let completion = run_bounded(Command::new(&program), GENEROUS)
         .expect("the writer closes long before the deadline");
     releaser.join().unwrap();

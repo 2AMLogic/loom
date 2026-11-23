@@ -26,7 +26,8 @@ use std::time::Duration;
 /// and the kernel refuses to `exec` an inode that still has writers.
 /// `cargo nextest` runs one process per test, so CI cannot see this. Execs
 /// through [`crate::proc_exec::run_bounded`] are waited out at the spawn in
-/// test builds; an exec that does not go through it must be wrapped in
+/// `--lib` test builds (not integration tests under `tests/`, which link the
+/// lib without `cfg(test)`); an exec that does not go through it must be wrapped in
 /// [`retry_while_executable_busy`] itself.
 pub(crate) fn write_executable(path: &Path, body: impl AsRef<[u8]>) {
     if let Some(parent) = path.parent() {

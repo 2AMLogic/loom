@@ -297,8 +297,9 @@ pub fn run_bounded_observed(
 /// A caller's pending-signal probe and how long to wait after forwarding it.
 type Forward<'a> = Option<(&'a dyn Fn() -> Option<i32>, Duration)>;
 
-/// `Command::spawn`, waiting out a just-written fixture's `ETXTBSY` in test
-/// builds (#15013).
+/// `Command::spawn`, waiting out a just-written fixture's `ETXTBSY` in `--lib`
+/// test builds (#15013; not integration tests under `tests/`, which link the
+/// lib without `cfg(test)`).
 ///
 /// The plain-`cargo test` harness runs every test as a thread of one process,
 /// so a sibling thread's `fork` can hold a copy of another test's write fd to
