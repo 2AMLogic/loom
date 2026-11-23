@@ -154,10 +154,11 @@ it delivers; a partial PR's must print nothing.
 
 Every surface below was settled from attributable existing PRs — real bodies,
 real `closingIssuesReferences` readouts, real close events — plus a live
-placement fixture carried by #15058's own PR body (no-op targets: every fixture
-issue was already closed, so a parsed closer could only ever show up in the
-readout, never change state). No disposable repository, no merge experiments on
-active issues.
+placement fixture carried by #15058's own PR body, PR #15089 (open, base
+`main`): five adjacencies targeting already-closed issues plus the real control,
+read back as `closingIssuesReferences = [4569, 14176, 15058]` — blockquote and
+URL fixtures present, fenced and inline-code fixtures absent, control present.
+No disposable repository, no merge experiments on active issues.
 
 | Placement in a PR body (base = default branch) | `closingIssuesReferences` | Evidence |
 |---|---|---|
@@ -165,7 +166,7 @@ active issues.
 | Blockquoted line (`> … closes #N …`) | **counts** | PR #12122: body's only keyword-adjacent `#10444` sat inside a blockquote; refs = `[10444, 11613, 12039]` alongside the two plain-text closers |
 | Full issue URL (`Closes https://github.com/OWNER/REPO/issues/N`) | **counts, and closes on merge** | 2AMLogic/2am PR #4161: refs = `[4160]`, issue #4160 closed 2 s after the merge; PR #3983: same shape (closed at merge, later reopened and re-closed manually) |
 | Inline code span (`` `Closes #N` ``) | **does not count** | PR #14383: `` `Closes #14059` `` / `` `Closes #14052` `` twice each (prose + checklist), tracked issue plain; refs = `[14351]` only |
-| Fenced code block | **does not count** | PR #8199: fenced parser-fixture line naming `#1`/`#2`; refs = `[]`. Re-measured with canonical single-space form in #15058's own PR fixture |
+| Fenced code block | **does not count** | PR #8199: fenced parser-fixture line naming `#1`/`#2`; refs = `[]`. Canonical single-space form: PR #15089's fenced `Closes #9879` fixture absent from its readout `[4569, 14176, 15058]` |
 
 GitHub's documentation names only the two shorthand syntaxes (`KEYWORD #N`,
 `KEYWORD OWNER/REPOSITORY#N`), colons and uppercase — it is silent on URLs,
