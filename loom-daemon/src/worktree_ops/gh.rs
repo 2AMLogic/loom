@@ -181,6 +181,36 @@ pub fn issue_closed_at_rest(repo_root: &Path, issue: u32) -> Option<String> {
         .closed_at
 }
 
+/// REST `.state` of an **explicitly named** repo's ticket — `OPEN` /
+/// `CLOSED` / `UNKNOWN` — for a repo that is not `repo_root`'s own (the
+/// scratch-root reaper's foreign-repo gate, #14952). `cwd` only anchors the
+/// bounded gh facade's accounting (and any host/auth resolution the CLI
+/// does); the API path names the repo, so it may be any directory. REST for
+/// the same quota-isolation reason as [`issue_state_rest`]; the issues
+/// endpoint answers for PRs too (a merged or closed PR reports `state:
+/// "closed"`), which is exactly the `MERGED or CLOSED` verdict the caller
+/// needs. Any failure — `404` (a ticket number from a different repo),
+/// timeout, malformed body — is `UNKNOWN`, and the caller preserves.
+#[must_use]
+pub fn foreign_issue_state_rest(cwd: &Path, owner: &str, repo: &str, issue: u32) -> String {
+    let path = format!("repos/{owner}/{repo}/issues/{issue}");
+    let out =
+        bounded_hygiene("worktree.foreign_issue_state", cwd, ["api", &path, "--jq", ".state"]);
+    match out {
+        Some(o) if o.status.success() => {
+            let s = String::from_utf8_lossy(&o.stdout)
+                .trim()
+                .to_ascii_uppercase();
+            match s.as_str() {
+                "OPEN" => "OPEN".to_string(),
+                "CLOSED" => "CLOSED".to_string(),
+                _ => "UNKNOWN".to_string(),
+            }
+        }
+        _ => "UNKNOWN".to_string(),
+    }
+}
+
 #[derive(Debug, Deserialize)]
 struct PrRow {
     #[allow(dead_code)]

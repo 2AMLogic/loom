@@ -68,6 +68,20 @@ fn scratch_report(root: &Path, now: DateTime<Utc>, removed: usize) -> ScratchRec
     }
 }
 
+fn scratch_root_report(root: &Path, now: DateTime<Utc>) -> ScratchRootReport {
+    ScratchRootReport {
+        repo_root: root.to_path_buf(),
+        enabled: true,
+        dry_run: false,
+        candidates: 0,
+        removed: Vec::new(),
+        planned: Vec::new(),
+        preserved: Vec::new(),
+        deferred: None,
+        at: now,
+    }
+}
+
 fn git_tmp_report(root: &Path, now: DateTime<Utc>) -> GitTmpReclaimReport {
     GitTmpReclaimReport {
         repo_root: root.to_path_buf(),
@@ -146,11 +160,13 @@ impl Sim {
                     skipped: None,
                     seats: Vec::new(),
                 };
+            let stub_scratch_roots = |root: &Path| scratch_root_report(root, now);
             let passes = SubPasses {
                 reap_worktrees: &reap,
                 deep_clean: &deep,
                 docker: &docker,
                 scratch: &scratch,
+                scratch_roots: &stub_scratch_roots,
                 seats: &stub_seats,
                 target_orphans: &orphans,
                 free_gb: &free_gb,
@@ -256,11 +272,13 @@ fn run_tiered(probes: &[Option<u64>]) -> (EagerReclaimReport, Vec<&'static str>)
         order.borrow_mut().push("docker");
         docker_report(now)
     };
+    let stub_scratch_roots = |root: &Path| scratch_root_report(root, now);
     let passes = SubPasses {
         reap_worktrees: &reap,
         deep_clean: &deep,
         docker: &docker,
         scratch: &scratch,
+        scratch_roots: &stub_scratch_roots,
         seats: &seats,
         target_orphans: &orphans,
         free_gb: &free_gb,

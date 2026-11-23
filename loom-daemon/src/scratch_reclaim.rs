@@ -71,6 +71,10 @@ pub const SCRATCH_RECLAIM_MAX_AGE_HOURS_ENV: &str = "LOOM_SCRATCH_RECLAIM_MAX_AG
 /// Env override for the cooldown between passes (seconds).
 pub const SCRATCH_RECLAIM_MIN_INTERVAL_ENV: &str = "LOOM_SCRATCH_RECLAIM_MIN_INTERVAL_SECS";
 
+/// Env override for the scratch-**root** pass's dry-run mode (#14952). `1`
+/// plans removals and reports them without deleting; `0` runs live.
+pub const SCRATCH_RECLAIM_DRY_RUN_ENV: &str = "LOOM_SCRATCH_RECLAIM_DRY_RUN";
+
 /// Default age floor: 24 hours. Comfortably above any single sweep's
 /// wall-clock duration, so a live or just-finished session's `TMPDIR`
 /// contents are never in the blast radius.
@@ -101,6 +105,14 @@ pub struct ScratchReclaimConfig {
     /// `…scratchReclaim.minIntervalSecs` — cooldown between passes (a
     /// zero/invalid value drops to `None`).
     pub min_interval_secs: Option<u64>,
+    /// `…scratchReclaim.dryRun` — consumed by the scratch-**root** reaper
+    /// ([`crate::scratch_root_reaper`], #14952), which unlike this pass
+    /// removes whole roots (worktrees included). Default **false** (live):
+    /// the pass ships default-on and fail-closed on every gate, and its
+    /// acceptance bar is "roots for merged/closed tickets disappear within a
+    /// day" — a dark default would defeat the point. This TMPDIR pass keeps
+    /// its existing behavior and ignores the field.
+    pub dry_run: Option<bool>,
 }
 
 /// Read `.loom/config.json → autonomous.worktreeReaper.scratchReclaim`,
@@ -122,6 +134,7 @@ pub fn read_scratch_reclaim_config(repo_root: &Path) -> ScratchReclaimConfig {
             .get("minIntervalSecs")
             .and_then(serde_json::Value::as_u64)
             .filter(|&s| s > 0),
+        dry_run: block.get("dryRun").and_then(serde_json::Value::as_bool),
     }
 }
 
@@ -155,6 +168,17 @@ pub fn resolve_min_interval_secs(config: &ScratchReclaimConfig) -> u64 {
         .filter(|&s| s > 0)
         .or(config.min_interval_secs)
         .unwrap_or(DEFAULT_SCRATCH_MIN_INTERVAL_SECS)
+}
+
+/// Resolve the scratch-root pass's dry-run mode — precedence
+/// **env > config > default(false)**. Consumed by
+/// [`crate::scratch_root_reaper::run_for`], not this module's own sweep.
+#[must_use]
+pub fn resolve_dry_run(config: &ScratchReclaimConfig) -> bool {
+    if let Ok(v) = std::env::var(SCRATCH_RECLAIM_DRY_RUN_ENV) {
+        return matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on");
+    }
+    config.dry_run.unwrap_or(false)
 }
 
 // ============================================================================
@@ -611,10 +635,24 @@ mod tests {
             enabled: Some(false),
             max_age_hours: Some(6),
             min_interval_secs: Some(60),
+            dry_run: None,
         };
         assert!(!resolve_enabled(&config));
         assert_eq!(resolve_max_age_hours(&config), 6);
         assert_eq!(resolve_min_interval_secs(&config), 60);
+    }
+
+    #[test]
+    fn test_resolve_dry_run_env_overrides_config() {
+        let config = ScratchReclaimConfig {
+            dry_run: Some(true),
+            ..ScratchReclaimConfig::default()
+        };
+        assert!(resolve_dry_run(&config));
+        std::env::set_var(SCRATCH_RECLAIM_DRY_RUN_ENV, "0");
+        assert!(!resolve_dry_run(&config), "env decides over config");
+        std::env::remove_var(SCRATCH_RECLAIM_DRY_RUN_ENV);
+        assert!(!resolve_dry_run(&ScratchReclaimConfig::default()));
     }
 
     // ===================================================================

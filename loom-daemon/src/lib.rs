@@ -395,6 +395,7 @@ pub mod runtime_preference;
 pub(crate) mod runtime_selection_test_support;
 pub mod safehouse;
 pub mod scratch_reclaim;
+pub mod scratch_root_reaper;
 pub mod script_helpers;
 /// Content scan for credential-shaped values before commit/push (#9133).
 pub mod secret_scan;

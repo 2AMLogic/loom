@@ -21,11 +21,14 @@
 //! ([`crate::worktree_reaper::reap_worktrees_only`],
 //! [`crate::deep_clean::run_for`], [`crate::docker_image_clean::run_for`]),
 //! plus the one genuinely-new pass this issue introduces
-//! ([`crate::scratch_reclaim::run_for`]), and the aborted-fetch `.git/objects`
-//! temp-file pass ([`crate::git_tmp_reclaim::run_for`], #10995, 10m cooldown,
-//! also called by the reaper). Every sub-pass still honors its own
+//! ([`crate::scratch_reclaim::run_for`]), the per-ticket scratch-root pass
+//! ([`crate::scratch_root_reaper::run_for`], #14952), and the aborted-fetch
+//! `.git/objects` temp-file pass ([`crate::git_tmp_reclaim::run_for`],
+//! #10995, 10m cooldown, also called by the reaper). Every sub-pass still
+//! honors its own
 //! existing cooldown ([`crate::deep_clean`]'s 6h,
-//! [`crate::docker_image_clean`]'s 30m, [`crate::scratch_reclaim`]'s 30m) —
+//! [`crate::docker_image_clean`]'s 30m, [`crate::scratch_reclaim`]'s 30m)
+//! —
 //! calling them eagerly only makes an *already-due* pass run promptly instead
 //! of waiting for the reaper's next tick; it never bypasses or shortens a
 //! cooldown, because the cooldown state each sub-pass consults is theirs, and
@@ -57,8 +60,9 @@
 //! sub-passes' own gates):
 //!
 //! 1. **Loom debris nobody is using**: merged-PR worktrees, aborted-fetch
-//!    `.git` temp files, agent scratch, seat-volume scratch and merged-PR
-//!    worktrees (#14678), orphaned cargo target dirs.
+//!    `.git` temp files, agent scratch, per-ticket scratch roots (#14952),
+//!    seat-volume scratch and merged-PR worktrees (#14678), orphaned cargo
+//!    target dirs.
 //! 2. **Idle build caches of kept worktrees**, across every registered root
 //!    (#11071). Costs a rebuild if the worktree is resumed.
 //! 3. **The primary checkout's own build cache** (deep clean) and **docker
@@ -116,6 +120,7 @@ use crate::deep_clean::DeepCleanReport;
 use crate::docker_image_clean::DockerRetentionReport;
 use crate::git_tmp_reclaim::GitTmpReclaimReport;
 use crate::scratch_reclaim::ScratchReclaimReport;
+use crate::scratch_root_reaper::ScratchRootReport;
 use crate::target_orphan_reclaim::TargetOrphanReport;
 use crate::worktree_reaper::ReclaimReport;
 
@@ -260,6 +265,9 @@ pub struct EagerReclaimReport {
     pub docker: Option<DockerRetentionReport>,
     /// The `/tmp`-shaped scratch sub-pass's own report (#7512 item 3).
     pub scratch: Option<ScratchReclaimReport>,
+
+    /// The per-ticket scratch-root sub-pass's own report (#14952).
+    pub scratch_roots: Option<ScratchRootReport>,
     /// The private-workspace seat-volume sub-pass's own report (#14678):
     /// step scratch and merged-PR worktrees inside seat volumes the other
     /// sub-passes cannot reach.
@@ -289,6 +297,10 @@ impl EagerReclaimReport {
         self.worktrees_removed > 0
             || self.git_tmp.as_ref().is_some_and(|r| r.totals.files > 0)
             || self.scratch.as_ref().is_some_and(|r| r.removed_count > 0)
+            || self
+                .scratch_roots
+                .as_ref()
+                .is_some_and(|r| !r.removed.is_empty() || !r.planned.is_empty())
             || self
                 .seats
                 .as_ref()
@@ -341,6 +353,10 @@ impl EagerReclaimReport {
             .scratch
             .as_ref()
             .map_or_else(|| "n/a".to_string(), ScratchReclaimReport::removed_human);
+        let scratch_roots = self
+            .scratch_roots
+            .as_ref()
+            .map_or_else(|| "n/a".to_string(), ScratchRootReport::summary);
         let seats = self.seats.as_ref().map_or_else(
             || "n/a".to_string(),
             crate::tokens_pool::private_workspace::seat_reclaim::SeatReclaimReport::summary,
@@ -370,7 +386,8 @@ impl EagerReclaimReport {
         format!(
             "eager_reclaim: {} {} ({} free) — ran an out-of-cycle pass (tier {} of 3) now \
              instead of waiting up to 15m for worktree_reaper's own scheduled pass: worktrees \
-             {worktrees}, git-tmp {git_tmp}, scratch {scratch}, seat volumes {seats}, \
+             {worktrees}, git-tmp {git_tmp}, scratch {scratch}, scratch-roots {scratch_roots}, \
+             seat volumes {seats}, \
              cargo-target orphans {target_orphans}, idle worktree targets {idle}, deep-clean \
              {deep}, docker {docker} — now {} free vs. floor {}G (#7512, #11192)",
             self.repo_root.display(),
@@ -442,6 +459,11 @@ pub struct SubPasses<'a> {
     pub docker: &'a dyn Fn(&Path) -> DockerRetentionReport,
     /// [`crate::scratch_reclaim::run_for`].
     pub scratch: &'a dyn Fn(&Path) -> ScratchReclaimReport,
+
+    /// Per-ticket scratch roots (`loom-<ticket>-<role>.<random>`) on the
+    /// worktree volume / `$HOME` / `$TMPDIR` (#14952):
+    /// [`crate::scratch_root_reaper::run_for`].
+    pub scratch_roots: &'a dyn Fn(&Path) -> ScratchRootReport,
     /// [`crate::tokens_pool::private_workspace::seat_reclaim::run_for`]
     /// (#14678): the in-volume seat pass (scratch + merged-only worktrees).
     pub seats:
@@ -558,6 +580,7 @@ pub fn run_pass(
         deep_clean: None,
         docker: None,
         scratch: None,
+        scratch_roots: None,
         seats: None,
         target_orphans: None,
         at: inputs.now,
@@ -600,6 +623,7 @@ pub fn run_pass(
     // then re-probes free space after it — as in `reap_repo`.
     report.git_tmp = Some((passes.git_tmp)(repo_root));
     report.scratch = Some((passes.scratch)(repo_root));
+    report.scratch_roots = Some((passes.scratch_roots)(repo_root));
     report.seats = Some((passes.seats)(repo_root));
     report.target_orphans = Some((passes.target_orphans)(repo_root));
 
@@ -690,6 +714,7 @@ pub fn run_for(repo_root: &Path) -> EagerReclaimReport {
     let deep_clean = |root: &Path| crate::deep_clean::run_for(root, floor_gb);
     let docker = crate::docker_image_clean::run_for;
     let scratch = crate::scratch_reclaim::run_for;
+    let scratch_roots = crate::scratch_root_reaper::run_for;
     let seats = crate::tokens_pool::private_workspace::seat_reclaim::run_for;
     let target_orphans = crate::target_orphan_reclaim::run_for;
     let free_gb = crate::disk_headroom::worktree_root_free_gb;
@@ -710,6 +735,7 @@ pub fn run_for(repo_root: &Path) -> EagerReclaimReport {
         deep_clean: &deep_clean,
         docker: &docker,
         scratch: &scratch,
+        scratch_roots: &scratch_roots,
         seats: &seats,
         target_orphans: &target_orphans,
         free_gb: &free_gb,
@@ -790,6 +816,20 @@ mod tests {
         }
     }
 
+    fn stub_scratch_root_report(root: &Path, now: DateTime<Utc>) -> ScratchRootReport {
+        ScratchRootReport {
+            repo_root: root.to_path_buf(),
+            enabled: true,
+            dry_run: false,
+            candidates: 0,
+            removed: Vec::new(),
+            planned: Vec::new(),
+            preserved: Vec::new(),
+            deferred: None,
+            at: now,
+        }
+    }
+
     fn stub_git_tmp_report(root: &Path, now: DateTime<Utc>) -> GitTmpReclaimReport {
         GitTmpReclaimReport {
             repo_root: root.to_path_buf(),
@@ -840,6 +880,10 @@ mod tests {
             counters.order.borrow_mut().push("scratch");
             stub_scratch_report(root, now)
         };
+        let scratch_roots = |root: &Path| {
+            counters.order.borrow_mut().push("scratch_roots");
+            stub_scratch_root_report(root, now)
+        };
         let target_orphans = |root: &Path| {
             counters.order.borrow_mut().push("target_orphans");
             stub_target_orphan_report(root)
@@ -865,6 +909,7 @@ mod tests {
             deep_clean: &deep,
             docker: &docker,
             scratch: &scratch,
+            scratch_roots: &scratch_roots,
             seats: &seats,
             target_orphans: &target_orphans,
             free_gb: &free_gb,
@@ -896,6 +941,7 @@ mod tests {
                 "worktrees",
                 "git_tmp",
                 "scratch",
+                "scratch_roots",
                 "seats",
                 "target_orphans",
                 "idle_targets",
@@ -909,6 +955,7 @@ mod tests {
         assert!(report.deep_clean.is_some());
         assert!(report.docker.is_some());
         assert!(report.scratch.is_some());
+        assert!(report.scratch_roots.is_some());
         assert!(report.seats.is_some());
         assert!(report.target_orphans.is_some());
         assert_eq!(report.free_gb_before, Some(3));
@@ -933,7 +980,7 @@ mod tests {
         inputs.ledger.last_run = Some(t(0));
         let report = run_with_counters(&inputs, &counters);
         assert!(report.skipped.is_none());
-        assert_eq!(counters.total(), 8);
+        assert_eq!(counters.total(), 9);
     }
 
     #[test]
@@ -990,11 +1037,13 @@ mod tests {
         let free_gb = |_: &Path| Some(1u64);
         let git_tmp = |root: &Path| stub_git_tmp_report(root, now);
         let idle_targets = |_: &Path| Some(ReclaimReport::default());
+        let scratch_roots_stub = |root: &Path| stub_scratch_root_report(root, now);
         let passes = SubPasses {
             reap_worktrees: &reap,
             deep_clean: &deep,
             docker: &docker,
             scratch: &scratch,
+            scratch_roots: &scratch_roots_stub,
             seats: &seats,
             target_orphans: &target_orphans,
             free_gb: &free_gb,
@@ -1128,6 +1177,7 @@ mod tests {
             "deep-clean",
             "docker",
             "scratch",
+            "scratch-roots",
             "git-tmp",
             "cargo-target orphans",
             "idle worktree targets 1 dir(s) (23.0G)",

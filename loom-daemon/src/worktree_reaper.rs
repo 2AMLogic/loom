@@ -864,6 +864,13 @@ pub fn reap_repo(repo_root: &Path, config: &WorktreeReaperConfig) -> ReapReport 
     // pressure-gated deep pass, which then sees the bytes it freed.
     let _ = crate::git_tmp_reclaim::run_for(repo_root);
 
+    // #14952: agent-created per-ticket scratch roots
+    // (`loom-<ticket>-<role>.<random>`) at the top of the worktree volume,
+    // `$HOME`, `~/.cache` and `$TMPDIR`. Fail-closed gates (closed ticket,
+    // dead watch-pid, no open fds, 24h idle, clean+published worktrees),
+    // own 30-minute cooldown shared with the eager tier's call.
+    let _ = crate::scratch_root_reaper::run_for(repo_root);
+
     // #5919: the primary checkout's OWN build artifacts — the one thing
     // neither pass above can reach, and the leak that took hosts to 1.9 GiB
     // free. Fires only under disk pressure, holds the machine build slot, and

@@ -9922,7 +9922,8 @@ re-walk `.loom/claude-config/*/tmp` every 60 seconds.
       "scratchReclaim": {
         "enabled": true,
         "maxAgeHours": 24,
-        "minIntervalSecs": 1800
+        "minIntervalSecs": 1800,
+        "dryRun": false
       }
     }
   }
@@ -9934,8 +9935,59 @@ re-walk `.loom/claude-config/*/tmp` every 60 seconds.
 | `LOOM_SCRATCH_RECLAIM` | `autonomous.worktreeReaper.scratchReclaim.enabled` | env > config > default | `true` (on) |
 | `LOOM_SCRATCH_RECLAIM_MAX_AGE_HOURS` | `autonomous.worktreeReaper.scratchReclaim.maxAgeHours` | env > config > default | `24` |
 | `LOOM_SCRATCH_RECLAIM_MIN_INTERVAL_SECS` | `autonomous.worktreeReaper.scratchReclaim.minIntervalSecs` | env > config > default | `1800` (30 min) |
+| `LOOM_SCRATCH_RECLAIM_DRY_RUN` | `autonomous.worktreeReaper.scratchReclaim.dryRun` | env > config > default | `false` (live; gates the scratch-**root** pass below only) |
 
 See `loom-daemon/src/scratch_reclaim.rs`.
+
+#### Per-ticket agent scratch roots (#14952)
+
+**What was leaking.** Agent sessions create per-ticket scratch roots named
+`loom-<ticket>-<role>.<random>` at the top of the worktree volume (plus a few
+in `$HOME` and `~/.cache`) and nothing removes them when the ticket closes —
+on the reporting host ~300/day accumulated to 1.5 TB and filled the volume.
+No existing pass owns them: `scratchReclaim` covers only
+`.loom/claude-config/<agent>/tmp`, `worktreeReaper` only
+`.loom/worktrees/issue-<N>`, `agentResidueReaper` processes/scopes, not
+directories.
+
+**What it removes, and the gates.** Direct children of the mount-volume top
+holding the repo's worktree root, `$HOME`, `$HOME/.cache` and `$TMPDIR` whose
+name matches the pattern above — never deeper, never through symlinks, and a
+candidate that is itself a symlink or sits on a different device than its
+parent (a volume mounted at the candidate path) is preserved. A root is
+removed only when **every** gate proves eligibility; any unreadable answer
+preserves (fail closed):
+
+1. the linked ticket is `CLOSED`/`MERGED` on the repo resolved from a
+   worktree's `origin` remote (worktrees are found by a bounded recursive
+   search — they sit as deep as `worktrees/loom/issue-<N>/.git`; no worktree
+   or a non-GitHub origin preserves the root; a probe failure is `UNKNOWN`,
+   which preserves);
+2. a `watch-pid` file at the root's top level names a dead process (absent
+   passes; unreadable/unparseable counts as alive);
+3. no process has its cwd or an open file under the root;
+4. nothing under the root changed in the last 24 h (full walk; an unreadable
+   subtree preserves);
+5. every git worktree inside is clean (`git --no-optional-locks status
+   --porcelain` must succeed — a failed status, e.g. a worktree whose parent
+   repo is gone, is "not safe", never clean — and report no **tracked**
+   change) and its `HEAD` is reachable from a remote ref
+   (`git rev-list --count HEAD --not --remotes` == 0, never `--branches`);
+6. the root itself is at least `scratchReclaim.maxAgeHours` old.
+
+Removal runs `chmod -R u+w` first (Go module caches and cert stores are
+read-only), then `remove_dir_all`, then `git worktree prune` on every parent
+repo that still exists (deleting a worktree dir leaves a stale entry behind).
+Each removal is logged and published as `daemon.scratch_root.reaped` with
+`{path, bytes, ticket, repo, dry_run}`; the pass summary logs removed
+count/bytes and every preserved root with its reason. `dryRun` (`LOOM_SCRATCH_RECLAIM_DRY_RUN=1`)
+plans and reports without deleting.
+
+**Where it runs.** The scheduled `worktreeReaper` tick and the eager tier-1
+pass, sharing the `scratchReclaim` block above (`enabled`, `maxAgeHours`, the
+30-minute `minIntervalSecs` cooldown, and this pass's `dryRun`).
+
+See `loom-daemon/src/scratch_root_reaper.rs`.
 
 #### Aborted-fetch `.git/objects` temp-file reclaim (#10995)
 
