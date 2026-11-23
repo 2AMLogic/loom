@@ -20,6 +20,7 @@ use std::time::Duration;
 #[derive(Clone)]
 pub struct Reply {
     pub status: &'static str,
+    pub total_count: Option<usize>,
     pub body: String,
 }
 
@@ -27,6 +28,7 @@ impl Reply {
     pub fn json(status: &'static str, body: serde_json::Value) -> Self {
         Self {
             status,
+            total_count: None,
             body: body.to_string(),
         }
     }
@@ -34,6 +36,7 @@ impl Reply {
     pub fn text(status: &'static str, body: &str) -> Self {
         Self {
             status,
+            total_count: None,
             body: body.to_string(),
         }
     }
@@ -157,9 +160,13 @@ fn serve(mut stream: TcpStream, state: &Mutex<State>) {
         state.log.push(request);
         reply
     };
+    let count = reply
+        .total_count
+        .map(|n| format!("X-Total-Count: {n}\r\n"))
+        .unwrap_or_default();
     let _ = stream.write_all(
         format!(
-            "HTTP/1.1 {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\
+            "HTTP/1.1 {}\r\n{count}Content-Type: application/json\r\nContent-Length: {}\r\n\
              Connection: close\r\n\r\n{}",
             reply.status,
             reply.body.len(),

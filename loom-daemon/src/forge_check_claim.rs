@@ -44,7 +44,6 @@
 //! | `0` | BLOCKED — reason token: `OPEN_PR #X` / `TARGET_IS_PR #N` / `CLOSED` / `FROZEN` / `OPERATOR` / `BUILDING` / `LEASE_ALREADY_HELD <host> <sweep-id>` / `BRANCH_EXISTS feature/issue-N` / `MERGED_PR #X` / `TRIAGE` | the token | **Hard-abort the claim.** |
 //! | [`EX_SAFE_TO_CLAIM`] (1) | verified safe to claim | empty | Claim. |
 //! | [`EX_PROBE_FAILED`] (5) | no verdict — any leg's read failed | empty | **Fail closed.** Treat as blocked; check by hand. |
-//! | [`EX_FORGE_DECLINED`] (3) | Gitea — legs 1–3 are GitHub-only | empty | Check by hand. |
 //!
 //! `0` is the blocked state on purpose (mirroring `check-open-pr`'s
 //! 0-is-captured convention): the *unsafe* state is the one a bare `if` fires
@@ -126,16 +125,17 @@
 //!
 //! # Cost
 //!
-//! ≤3 forge reads + 1 `git ls-remote` per invocation, short-circuited on the
-//! first blocker — the budget issue #9453's design fixes for this probe.
+//! On Gitea the two PR legs share a paginated listing. The probe reads promotion
+//! history for merged candidates and the assignee roster for trust decisions.
+//! Both forges use the same label, lease, branch and verdict rules.
 
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use chrono::{DateTime, Utc};
 
 use crate::comment_trust::{records::AUTHOR_JQ, TrustPolicy};
-use crate::forge_cmd::{detect_forge, ForgeType, EX_FORGE_DECLINED};
+use crate::forge_cmd::{detect_forge, ForgeType};
 use crate::sweep_registry::preflip_labels::claim_labels_in;
 use crate::sweep_registry::{SweepRegistry, LEASE_MARKER_PREFIX};
 use crate::worktree_ops::gh::{
@@ -155,7 +155,7 @@ pub const EX_PROBE_FAILED: i32 = 5;
 /// a claimant whose `(host, sweep)` posted one has already stood down, so
 /// its still-"fresh" lease must not block leg 3 (#5331/#6485, mirroring
 /// `sweep-lease-publish.sh`'s publish-side exclusion).
-const YIELD_MARKER_PREFIX: &str = "<!-- loom:lease-yield host=";
+pub(crate) const YIELD_MARKER_PREFIX: &str = "<!-- loom:lease-yield host=";
 
 /// Leg 2's reading: the issue's current label snapshot, classified by the
 /// same `CLAIM_LABELS` predicate (`loom:building`/`loom:reviewing`/
@@ -328,23 +328,6 @@ pub struct Verdict {
     pub stderr: String,
 }
 
-/// The Gitea decline (exit [`EX_FORGE_DECLINED`]) as a [`Verdict`], so the
-/// "check by hand" wording is testable without a Gitea checkout. Legs 1–3
-/// are GitHub APIs; leg 4 alone cannot answer the claim question, so the
-/// whole probe declines rather than report a partial all-clear.
-#[must_use]
-pub fn gitea_declined(issue: u32) -> Verdict {
-    Verdict {
-        code: EX_FORGE_DECLINED,
-        stdout: String::new(),
-        stderr: format!(
-            "loom-daemon forge check-claim: legs 1-3 of the claim probe are GitHub-only; \
-             on Gitea, check issue #{issue} for an open PR, claim labels, and a fresh lease \
-             by hand before claiming it."
-        ),
-    }
-}
-
 /// A blocked verdict's helper: exit `0`, the reason token on stdout, the
 /// human explanation on stderr.
 fn blocked(issue: u32, token: &str, detail: String) -> Verdict {
@@ -415,8 +398,7 @@ pub(crate) fn decide_for(
         OpenPrProbe::ProbeFailed => {
             return unanswered(
                 issue,
-                "the open-linked-PR leg could not read the forge (gh missing, failed, \
-                 rate-limited, or the repository could not be resolved) — and --force-claim \
+                "the open-linked-PR leg could not read the forge — and --force-claim \
                  cannot override a leg it is forbidden to override",
             );
         }
@@ -441,8 +423,7 @@ pub(crate) fn decide_for(
         Some(MergedBranchPrProbe::ProbeFailed) => {
             return unanswered(
                 issue,
-                "the merged-branch-PR leg could not read the forge (gh missing, failed, \
-                 rate-limited, or the repository could not be resolved) — and --force-claim \
+                "the merged-branch-PR leg could not read the forge — and --force-claim \
                  cannot override a leg it is forbidden to override",
             );
         }
@@ -543,7 +524,7 @@ pub(crate) fn decide_for(
                 }
                 LabelLeg::Unknown => {
                     stop = overridable(
-                        "the label read failed (gh missing, failed, or unparseable)".to_string(),
+                        "the label read failed or was unparseable".to_string(),
                         None,
                         &mut forced_past,
                     );
@@ -790,7 +771,7 @@ fn read_claim_labels_rest(
     Some(classify_claim_labels(&labels, claim_owned))
 }
 
-fn classify_claim_labels(labels: &[String], claim_owned: bool) -> LabelLeg {
+pub(crate) fn classify_claim_labels(labels: &[String], claim_owned: bool) -> LabelLeg {
     if crate::work_finder::is_frozen(labels) {
         return LabelLeg::Frozen;
     }
@@ -952,10 +933,14 @@ pub(crate) fn read_freshest_live_lease(
     // neither block a claim here nor excuse a peer's live lease.
     let policy = TrustPolicy::for_root(root);
     let rows = parse_lease_rows(&String::from_utf8_lossy(&policy.trusted_ndjson(&out.stdout)));
+    lease_leg(&rows, now, ttl_minutes)
+}
+
+pub(crate) fn lease_leg(rows: &[LeaseRow], now: DateTime<Utc>, ttl_minutes: f64) -> LeaseLeg {
     let own_sweep = std::env::var("LOOM_SWEEP_ID")
         .ok()
         .filter(|s| !s.is_empty());
-    match freshest_live_lease(&rows, now, ttl_minutes, own_sweep.as_deref()) {
+    match freshest_live_lease(rows, now, ttl_minutes, own_sweep.as_deref()) {
         Some((host, sweep_id)) => LeaseLeg::Held { host, sweep_id },
         None => LeaseLeg::NoneFresh,
     }
@@ -991,27 +976,29 @@ pub(crate) fn remote_branch_leg(git_bin: &Path, root: &Path, issue: u32) -> Bran
 }
 
 /// Handle `loom-daemon forge check-claim <issue>`. Never returns (exits the
-/// process with the code from [`decide`]); returns `Err` only when the
-/// current directory cannot be resolved.
+/// process with the code from the evidence verdict).
 ///
 /// Resolution is cwd-scoped, like `forge check-open-pr`: run it from inside
 /// the repository (a managed worktree included) and it answers about that
 /// repository. `LOOM_REPO` is honored per leg exactly as each leg's
 /// precedent reader honors it.
 pub fn handle(issue: u32, force_claim: bool) -> Result<()> {
-    let root: PathBuf = std::env::current_dir().context(
-        "loom-daemon forge check-claim: could not resolve the current directory; \
-         run it from inside the repository whose issue you are about to claim",
-    )?;
+    let root = std::env::current_dir().unwrap_or_else(|e| {
+        eprintln!("loom-daemon forge check-claim: cannot resolve the current directory: {e}");
+        std::process::exit(EX_PROBE_FAILED)
+    });
 
-    // GitHub-only by construction: legs 1-3 are GitHub APIs. Declining is
-    // honest; a partial probe (leg 4 alone) reporting "safe to claim" would
-    // be the exact false all-clear this command exists to prevent.
-    if detect_forge(Some(&root)) == ForgeType::Gitea {
-        let v = gitea_declined(issue);
-        eprintln!("{}", v.stderr);
-        std::process::exit(v.code);
-    }
+    let mut gitea = if detect_forge(Some(&root)) == ForgeType::Gitea {
+        match crate::gitea_builder::Repository::resolve(&root, None) {
+            Ok(repo) => Some((repo, crate::gitea_builder::TrustedAuthors::for_root(&root))),
+            Err(e) => {
+                eprintln!("loom-daemon forge check-claim: {e}");
+                std::process::exit(EX_PROBE_FAILED);
+            }
+        }
+    } else {
+        None
+    };
 
     let gh_bin = PathBuf::from(std::env::var("LOOM_GH_BIN").unwrap_or_else(|_| "gh".into()));
     let now = Utc::now();
@@ -1023,25 +1010,51 @@ pub fn handle(issue: u32, force_claim: bool) -> Result<()> {
     // keeps collecting so the stderr warning names everything overridden).
     let owned = OwnedClaim::from_env(issue);
     let owned = owned.as_ref();
-    let open_pr = probe_open_linked_pr(&root, issue);
+    let (open_pr, merged_pr) = match &mut gitea {
+        Some((repo, trust)) => match repo.pulls(issue, trust) {
+            Ok((open, merged)) => (open, Some(merged)),
+            Err(e) => {
+                eprintln!("Gitea PR evidence: {e}");
+                (OpenPrProbe::ProbeFailed, None)
+            }
+        },
+        None => {
+            let open = probe_open_linked_pr(&root, issue);
+            let merged =
+                matches!(open, OpenPrProbe::NoneOpen).then(|| probe_merged_branch_pr(&root, issue));
+            (open, merged)
+        }
+    };
     let mut evidence = ClaimEvidence {
         open_pr,
-        merged_pr: None,
+        merged_pr,
         labels: None,
         lease: None,
         branch: None,
     };
-    if matches!(evidence.open_pr, OpenPrProbe::NoneOpen) {
-        evidence.merged_pr = Some(probe_merged_branch_pr(&root, issue));
-    }
-    let merged_clear = matches!(evidence.merged_pr, Some(MergedBranchPrProbe::NoneMerged));
+    let merged_clear = matches!(open_pr, OpenPrProbe::NoneOpen)
+        && matches!(merged_pr, Some(MergedBranchPrProbe::NoneMerged));
     if merged_clear {
-        evidence.labels = Some(read_claim_labels_for(&gh_bin, &root, issue, owned.is_some()));
+        evidence.labels = Some(match &gitea {
+            Some((repo, _)) => repo.labels(issue, owned.is_some()).unwrap_or_else(|e| {
+                eprintln!("Gitea claim labels: {e}");
+                LabelLeg::Unknown
+            }),
+            None => read_claim_labels_for(&gh_bin, &root, issue, owned.is_some()),
+        });
         let labels_clear = matches!(evidence.labels, Some(LabelLeg::Clean))
             || owned_passes_labels(owned, evidence.labels.as_ref());
         if labels_clear || force_claim {
-            evidence.lease =
-                Some(read_freshest_live_lease(&gh_bin, &root, issue, now, ttl_minutes));
+            evidence.lease = Some(match &mut gitea {
+                Some((repo, trust)) => {
+                    repo.lease(issue, trust, now, ttl_minutes)
+                        .unwrap_or_else(|e| {
+                            eprintln!("Gitea lease evidence: {e}");
+                            LeaseLeg::ReadFailed
+                        })
+                }
+                None => read_freshest_live_lease(&gh_bin, &root, issue, now, ttl_minutes),
+            });
             let lease_clear = matches!(evidence.lease, Some(LeaseLeg::NoneFresh))
                 || owned_passes_lease(owned, evidence.lease.as_ref());
             if lease_clear || force_claim {
@@ -1586,26 +1599,12 @@ mod tests {
             )
             .code,
             decide(1, &evidence(OpenPrProbe::ProbeFailed, None, None, None), false).code,
-            gitea_declined(1).code,
         ];
         let mut sorted = codes.to_vec();
         sorted.sort_unstable();
         sorted.dedup();
-        assert_eq!(sorted.len(), 4, "{codes:?}");
+        assert_eq!(sorted.len(), codes.len(), "{codes:?}");
         assert!(!codes.contains(&crate::forge_cmd::EX_FORGE_HEAD_MISMATCH), "{codes:?}");
-    }
-
-    #[test]
-    fn gitea_decline_is_exit_three_with_empty_stdout() {
-        let v = gitea_declined(42);
-        assert_eq!(v.code, EX_FORGE_DECLINED);
-        assert!(v.stdout.is_empty(), "{:?}", v.stdout);
-        assert!(v.stderr.contains("by hand"), "{}", v.stderr);
-        assert!(
-            !v.stderr.contains("safe to claim"),
-            "a decline must never read as an all-clear: {}",
-            v.stderr
-        );
     }
 
     // --- Leg-reader plumbing (pure halves) -----------------------------------

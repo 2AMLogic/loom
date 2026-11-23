@@ -103,14 +103,16 @@ pub fn handle(action: ParentAction) -> Result<()> {
         ParentAction::SplitState { parent, repo } => {
             // Fail closed: any failure (incl. an unresolvable repo) is exit 2,
             // never the startup-failure exit 1 that callers read as NOT_SPLIT.
-            let (root, slug) = match target(repo) {
-                Ok(t) => t,
-                Err(e) => {
-                    eprintln!("loom-daemon forge parent split-state: {e}");
-                    std::process::exit(2);
+            let result = (|| -> Result<SplitState> {
+                let root = std::env::current_dir()?;
+                if crate::gitea_read::on_gitea(&root) {
+                    return crate::gitea_builder::Repository::resolve(&root, repo.as_deref())?
+                        .split_state(parent);
                 }
-            };
-            match split_state(&root, &slug, parent) {
+                let (root, slug) = target(repo)?;
+                split_state(&root, &slug, parent)
+            })();
+            match result {
                 Ok(SplitState::AllClosed(kids)) => {
                     let list: Vec<String> = kids.iter().map(|n| format!("#{n}")).collect();
                     println!("SPLIT_ALL_CLOSED {}", list.join(" "));
