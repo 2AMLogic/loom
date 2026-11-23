@@ -200,7 +200,8 @@ pub fn candidate_roots(repo_root: &Path) -> Vec<PathBuf> {
         .collect()
 }
 
-/// Every direct child of `roots` whose name matches [`ROOT_NAME_RE`].
+/// Every direct child directory (or symlink) of `roots` whose name matches
+/// [`ROOT_NAME_RE`].
 /// Symlinked entries are included here so the gate layer can *report* them
 /// as preserved (never followed, never removed); the pass never recurses to
 /// find candidates.
@@ -215,7 +216,12 @@ pub fn discover_candidates(roots: &[PathBuf]) -> Vec<PathBuf> {
             let Some(name) = entry.file_name().into_string().ok() else {
                 continue;
             };
-            if parse_root_name(&name).is_some() {
+            // Plain files (`loom-<n>-<slug>.patch`) match the name pattern
+            // but are not scratch roots; symlinks stay so they are reported.
+            let is_root_shaped = entry
+                .file_type()
+                .is_ok_and(|t| t.is_dir() || t.is_symlink());
+            if is_root_shaped && parse_root_name(&name).is_some() {
                 out.push(entry.path());
             }
         }
@@ -604,8 +610,12 @@ pub fn evaluate_root(root: &Path, probes: &ScratchRootProbes<'_>) -> RootVerdict
     else {
         return RootVerdict::Preserve("name no longer matches the scratch-root pattern");
     };
-    if std::fs::symlink_metadata(root).is_ok_and(|m| m.file_type().is_symlink()) {
-        return RootVerdict::Preserve("root is a symlink (never followed)");
+    match std::fs::symlink_metadata(root) {
+        Ok(m) if m.file_type().is_symlink() => {
+            return RootVerdict::Preserve("root is a symlink (never followed)");
+        }
+        Ok(m) if !m.is_dir() => return RootVerdict::Preserve("not a directory"),
+        _ => {}
     }
     match ((probes.device_of)(root), root.parent().map(|p| (probes.device_of)(p))) {
         (Some(child_dev), Some(Some(parent_dev))) if child_dev != parent_dev => {
@@ -643,15 +653,7 @@ pub fn evaluate_root(root: &Path, probes: &ScratchRootProbes<'_>) -> RootVerdict
                     prune.insert(parent);
                 }
             }
-            WorktreeSafety::NotSafe(reason) => {
-                return RootVerdict::Preserve(match reason {
-                    "git status failed to run" | "git status failed" => {
-                        "a worktree's git status failed (not safe, not clean)"
-                    }
-                    "worktree has tracked changes" => "a worktree has tracked changes",
-                    _ => "a worktree's HEAD has commits no remote holds",
-                });
-            }
+            WorktreeSafety::NotSafe(reason) => return RootVerdict::Preserve(reason),
         }
     }
     // Ticket → repo: the first worktree whose `origin` names a GitHub repo.
@@ -1489,6 +1491,24 @@ mod tests {
     }
 
     #[test]
+    fn test_discover_candidates_skips_plain_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("loom-9987-src.patch"), b"x").unwrap();
+        std::fs::create_dir_all(tmp.path().join("loom-7-builder.abcd")).unwrap();
+        let found = discover_candidates(&[tmp.path().to_path_buf()]);
+        assert_eq!(found, vec![tmp.path().join("loom-7-builder.abcd")]);
+    }
+
+    #[test]
+    fn test_evaluate_root_plain_file_reports_not_a_directory() {
+        let tmp = tempfile::tempdir().unwrap();
+        let file = tmp.path().join("loom-9987-src.patch");
+        std::fs::write(&file, b"x").unwrap();
+        let (probes, _) = probes_now(24 * 3600, 24 * 3600);
+        assert_eq!(evaluate_root(&file, &probes), RootVerdict::Preserve("not a directory"));
+    }
+
+    #[test]
     fn test_evaluate_root_young_root_preserved() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().join("loom-9-builder.aa11");
@@ -1957,15 +1977,9 @@ mod tests {
             "a process has its cwd or an open file under the root"
         );
         assert_eq!(reason_for("loom-104-builder.eeee"), "files changed within the 24h idle window");
-        assert_eq!(reason_for("loom-105-builder.ffff"), "a worktree has tracked changes");
-        assert_eq!(
-            reason_for("loom-106-judge.1111"),
-            "a worktree's HEAD has commits no remote holds"
-        );
-        assert_eq!(
-            reason_for("loom-107-judge.2222"),
-            "a worktree's git status failed (not safe, not clean)"
-        );
+        assert_eq!(reason_for("loom-105-builder.ffff"), "worktree has tracked changes");
+        assert_eq!(reason_for("loom-106-judge.1111"), "worktree HEAD has commits no remote holds");
+        assert_eq!(reason_for("loom-107-judge.2222"), "git status failed");
         assert_eq!(reason_for("loom-108-judge.3333"), "no resolvable GitHub origin repository");
         assert_eq!(reason_for("loom-109-judge.4444"), "root is a symlink (never followed)");
         assert_eq!(
