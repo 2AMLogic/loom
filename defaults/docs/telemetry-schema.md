@@ -255,6 +255,7 @@ join's owner has agreed to. No `schema_version` bump is needed for a new key.
 | base SHA | `loom.base_sha` | sweep root | Full 40-hex tip of `origin/HEAD` (else `origin/main`) at dispatch |
 | build version | `loom.daemon.version` | every span | `CARGO_PKG_VERSION` of the binary that created the span |
 | build commit | `loom.daemon.revision` | every span | Full git SHA of that binary; `loom.daemon.tree_state` says whether it was clean |
+| prompt modifier | `loom.prompt_modifier` | every provenance-stamped span, so `loom.dispatch.step`, `loom.role_attempt` and `loom.runtime.usage` | The registered modifier a single-step run was launched under (`LOOM_PROMPT_MODIFIER`, #15017). **Absent when none is set**, so an unmodified run is unchanged; also folded into `loom.hyperparams.digest`. See [runtime-adapters](runtime-adapters.md) |
 | host | `host.id` / `host.name` / `service.instance.id` | OTLP `Resource`, not a span attribute | One value per exporting host; see [Envelope](#envelope) |
 | role | `loom.role` | phase/role spans, role-tick root | |
 
