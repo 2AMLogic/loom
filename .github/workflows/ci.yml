@@ -1533,6 +1533,12 @@ jobs:
       - name: check-main-clean build trees (#11149)
         if: ${{ !cancelled() && steps.daemon-bin.outcome == 'success' }}
         run: bash defaults/scripts/tests/test-check-main-clean-build-trees.sh
+      # #14941: the Builder lease on a Gitea checkout runs the publish/renew
+      # scripts against THIS build's `forge comment` / `trusted-comments` and a
+      # loopback Gitea fixture; it needs this job's shared build.
+      - name: sweep-lease on Gitea (#14941)
+        if: ${{ !cancelled() && steps.daemon-bin.outcome == 'success' }}
+        run: bash defaults/scripts/tests/test-sweep-lease-gitea.sh
       # #9517: fleet-send.sh is a thin SILENT stub over `loom-daemon
       # fleet-send` (its whole interface is a best-effort exit 0, so it
       # bypasses lib/script-helper.sh's loud missing-daemon path). The suite

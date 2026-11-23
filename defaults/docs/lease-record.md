@@ -279,6 +279,32 @@ Renewal is shared: both writers' records are kept fresh by
 "newest wins" — otherwise a peer's later lease comment would be the one it
 kept alive while its own expired.
 
+## Builder leases on a Gitea checkout (#14941)
+
+The same record, the same first-line marker and the same expiry, peer, yield and
+trust rules apply on a Gitea checkout; only the transport differs, and `gh` is
+never run:
+
+- **Publish** (`sweep-lease-publish.sh`) lists the issue's comments through
+  `gitea_api` (`forge-helpers.sh`; Gitea's paths are the GitHub-shaped
+  `repos/{o}/{r}/issues/{n}/comments`) and posts the one comment through the
+  shared `loom-daemon forge comment` writer (#14940), which vets the write and
+  carries the approved connection. Exit codes are unchanged: `4` for a fresh peer
+  or a yielded identity, `2` when the POST is denied or fails.
+- **Renew** (`sweep-lease-renew.sh`) lists, reads the issue state and `PATCH`es
+  `repos/{o}/{r}/issues/comments/{id}` the same way. A non-2xx PATCH is a failed
+  renewal (exit 1). Gitea's comment list has no `per_page`/`since` window, so a
+  Gitea renewer always reads the full listing instead of the cached-lease window.
+- **Trust.** Gitea reports no `author_association`, so a record counts only when
+  its author is the identity this host's Gitea credential acts as
+  (`GET /user`, passed to `forge trusted-comments --self-login`), or is listed in
+  `forge.trustedCommenters` / the fleet admin roster. A fleet whose hosts use
+  *different* Gitea accounts must list the others in `forge.trustedCommenters`,
+  or each host will read a peer's lease as prose.
+- **Not covered here:** `sweep-lease-fence.sh`, the daemon's own reclamation and
+  dispatch-time readers, and PR-phase leases still read through `gh` (#14938,
+  #14939).
+
 ## When it is written
 
 `loom-daemon`'s `SweepRegistry::dispatch_inner` (in
