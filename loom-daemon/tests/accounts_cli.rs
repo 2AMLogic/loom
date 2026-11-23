@@ -259,6 +259,7 @@ fn accounts_check_live_measures_sessions_through_a_fallback_docker() {
             "--json",
         ])
         .env("LOOM_CODEX_PROFILE_ROOT", &profiles)
+        .env_remove("LOOM_DOCKER_BIN")
         .env("HOME", &home)
         .env("PATH", &empty_path)
         .output()
@@ -281,14 +282,152 @@ fn accounts_check_live_measures_sessions_through_a_fallback_docker() {
     );
     assert_eq!(
         std::fs::read_to_string(&calls).unwrap(),
-        "inspect\nexec\n",
-        "the probe reached the container through inspect then exec"
+        "--version\ninspect\nexec\n",
+        "the runtime check, inspect and exec all used the fallback binary"
     );
 }
 
 // =========================================================================
 // Which registry a verb acts on (issue #8540)
 // =========================================================================
+
+/// Session profiles share one runtime availability check. A host-managed
+/// account still follows the host transport when Docker cannot start.
+#[cfg(unix)]
+#[test]
+fn live_check_reports_one_missing_runtime_and_preserves_host_probes() {
+    use std::os::unix::fs::PermissionsExt;
+    use std::process::Command;
+    let fixture = tempfile::tempdir().unwrap();
+    let workspace = fixture.path().join("workspace");
+    let profiles = fixture.path().join("profiles");
+    let bin = fixture.path().join("bin");
+    std::fs::create_dir_all(workspace.join(".loom")).unwrap();
+    std::fs::create_dir(&bin).unwrap();
+    let mut entries = Vec::new();
+    for name in ["alpha", "beta", "host"] {
+        let profile = profiles.join(name);
+        std::fs::create_dir_all(&profile).unwrap();
+        std::fs::write(profile.join("auth.json"), "{}").unwrap();
+        if name != "host" {
+            std::fs::write(profile.join(".session-managed.json"), "{}").unwrap();
+        }
+        entries.push(
+            serde_json::json!({"provider":"codex","name":name,"credential_kind":"codex_home",
+            "credential_reference": name, "enabled": true}),
+        );
+    }
+    let registry = workspace.join(".loom/accounts.json");
+    let write_registry = |entries: &[serde_json::Value]| {
+        std::fs::write(&registry, serde_json::json!({"version":1,"accounts":entries}).to_string())
+            .unwrap();
+    };
+    write_registry(&entries);
+    let calls = fixture.path().join("calls");
+    // A usable home fallback must never hide a broken explicit override.
+    let fallback = fixture.path().join(".docker/bin/docker");
+    std::fs::create_dir_all(fallback.parent().unwrap()).unwrap();
+    std::fs::write(&fallback, "#!/bin/sh\necho fallback >> \"$CALLS\"\n").unwrap();
+    std::fs::set_permissions(&fallback, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let check = |live: bool| {
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_loom-daemon"));
+        cmd.args(["accounts", "--workspace"])
+            .arg(&workspace)
+            .args(["check", "--json"]);
+        if live {
+            cmd.arg("--live");
+        }
+        let out = cmd
+            .env("HOME", fixture.path())
+            .env("PATH", &bin)
+            .env("LOOM_CODEX_PROFILE_ROOT", &profiles)
+            .env("LOOM_SHARED_ACCOUNTS_ROOT", fixture.path().join("shared"))
+            .env("LOOM_DOCKER_BIN", bin.join("docker"))
+            .env("CALLS", &calls)
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8(out.stderr).unwrap();
+        assert!(out.status.success(), "{stderr}");
+        let data: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+        (data["report"]["accounts"].as_array().unwrap().clone(), stderr)
+    };
+    let (rows, stderr) = check(true);
+    assert_eq!(rows.len(), 3);
+    for row in rows.iter().filter(|row| row["name"] != "host") {
+        assert_eq!(row["error"], "container_runtime_unavailable");
+        assert_eq!(row["status"], "unknown");
+        assert!(row["5h_utilization"].is_null() && row["7d_utilization"].is_null());
+    }
+    assert_eq!(
+        rows.iter().find(|r| r["name"] == "host").unwrap()["error"],
+        "codex_cli_unavailable"
+    );
+    let diagnostic: Vec<_> = stderr
+        .lines()
+        .filter(|s| s.contains("container_runtime_unavailable"))
+        .collect();
+    assert_eq!(diagnostic.len(), 1, "{stderr}");
+    assert!(
+        diagnostic[0].contains("docker")
+            && diagnostic[0].contains("NotFound")
+            && diagnostic[0].contains(bin.to_str().unwrap()),
+        "{stderr}"
+    );
+    assert!(!check(false).1.contains("container_runtime_unavailable"));
+    assert!(!calls.exists(), "the fallback ran despite the explicit override");
+
+    let docker = bin.join("docker");
+    std::fs::write(
+        &docker,
+        r#"#!/bin/sh
+echo "$1" >> "$CALLS"
+case "$1:$4" in
+    --version:*) exit 0 ;;
+    inspect:*beta) echo "No such container" >&2 ;;
+    *) echo "private daemon response" >&2 ;;
+esac
+exit 1
+"#,
+    )
+    .unwrap();
+    std::fs::set_permissions(&docker, std::fs::Permissions::from_mode(0o644)).unwrap();
+    let (rows, stderr) = check(true);
+    assert!(rows
+        .iter()
+        .filter(|r| r["name"] != "host")
+        .all(|r| r["error"] == "container_runtime_unavailable"));
+    assert!(
+        stderr.contains("PermissionDenied") && stderr.contains("LOOM_DOCKER_BIN"),
+        "{stderr}"
+    );
+    assert!(!calls.exists());
+
+    std::fs::set_permissions(&docker, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let (rows, stderr) = check(true);
+    let detail = |name: &str| {
+        rows.iter().find(|r| r["name"] == name).unwrap()["error"]
+            .as_str()
+            .unwrap()
+    };
+    assert_eq!(detail("alpha"), "session_probe_error");
+    assert_eq!(detail("beta"), "session_unavailable");
+    assert!(stderr.contains("session_probe_error") && stderr.contains("inspect"), "{stderr}");
+    assert!(!stderr.contains("private daemon response"), "{stderr}");
+    let invocations = std::fs::read_to_string(&calls).unwrap();
+    assert_eq!(
+        invocations
+            .lines()
+            .filter(|line| *line == "--version")
+            .count(),
+        1,
+        "{invocations}"
+    );
+
+    std::fs::remove_file(&calls).unwrap();
+    write_registry(&entries[2..]);
+    let (_, stderr) = check(true);
+    assert!(!calls.exists() && !stderr.contains("session_probe_error"), "{stderr}");
+}
 
 /// One account named in a registry file, in the on-disk v1 shape.
 fn registry_json(name: &str, enabled: bool) -> String {

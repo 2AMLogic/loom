@@ -169,15 +169,6 @@ pub(crate) fn private_dir(dir: &Path, create: bool) -> bool {
     }
 }
 
-/// Create `path` for writing, owner-only (`0600` on unix), failing if it exists.
-pub(crate) fn create_private_file(path: &Path) -> std::io::Result<std::fs::File> {
-    let mut opts = std::fs::OpenOptions::new();
-    opts.write(true).create_new(true);
-    #[cfg(unix)]
-    std::os::unix::fs::OpenOptionsExt::mode(&mut opts, 0o600);
-    opts.open(path)
-}
-
 /// Write the entry atomically (temp file + rename) so a concurrent reader on
 /// the same host never observes a half-written file. Best-effort: any failure
 /// just means the next call re-fetches.

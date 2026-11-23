@@ -34,6 +34,7 @@
 
 use std::ffi::OsString;
 use std::fmt;
+use std::io;
 use std::path::PathBuf;
 
 use crate::fs_util;
@@ -73,7 +74,7 @@ pub enum ResolveError {
     /// `LOOM_DOCKER_BIN` names a value that is not an executable file.
     /// Carries the offending value: the error must fail the call — never
     /// fall through to a working `docker` elsewhere (#14885).
-    InvalidOverride(String),
+    InvalidOverride(String, io::ErrorKind),
     /// No candidate resolved: the override is unset, nothing on `$PATH`, and
     /// nothing in the fallback directories.
     NotFound,
@@ -82,7 +83,7 @@ pub enum ResolveError {
 impl fmt::Display for ResolveError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::InvalidOverride(value) => {
+            Self::InvalidOverride(value, _) => {
                 write!(f, "{DOCKER_BIN_ENV}={value:?} does not name an executable file")
             }
             Self::NotFound => write!(
@@ -96,6 +97,16 @@ impl fmt::Display for ResolveError {
 }
 
 impl std::error::Error for ResolveError {}
+
+impl From<ResolveError> for io::Error {
+    fn from(error: ResolveError) -> Self {
+        let kind = match error {
+            ResolveError::InvalidOverride(_, kind) => kind,
+            ResolveError::NotFound => io::ErrorKind::NotFound,
+        };
+        Self::new(kind, error)
+    }
+}
 
 /// The environment [`resolve_in`] searches — injected so tests drive synthetic
 /// override/PATH/fallback values without mutating (and racing on) the real
@@ -136,6 +147,16 @@ pub(crate) fn override_from(value: &str) -> Option<String> {
     (!trimmed.is_empty()).then(|| trimmed.to_string())
 }
 
+/// Describe the runtime selection for the bounded session startup diagnostic.
+pub(crate) fn search_description() -> String {
+    let search = Search::from_env();
+    if let Some(value) = search.override_value {
+        return format!("{DOCKER_BIN_ENV}={value:?}");
+    }
+    let dirs: Vec<_> = search.path.iter().flat_map(std::env::split_paths).collect();
+    format!("PATH directories {dirs:?}, fallback directories {:?}", search.fallbacks)
+}
+
 /// Resolve the docker CLI executable — see the module docs for the order.
 ///
 /// # Errors
@@ -150,10 +171,9 @@ pub fn resolve() -> Result<PathBuf, ResolveError> {
 pub(crate) fn resolve_in(search: &Search) -> Result<PathBuf, ResolveError> {
     if let Some(value) = &search.override_value {
         let path = PathBuf::from(value);
-        if fs_util::is_executable(&path) {
-            return Ok(path);
-        }
-        return Err(ResolveError::InvalidOverride(value.clone()));
+        fs_util::check_executable(&path)
+            .map_err(|err| ResolveError::InvalidOverride(value.clone(), err.kind()))?;
+        return Ok(path);
     }
     if let Some(path) = &search.path {
         for dir in std::env::split_paths(path) {
@@ -298,7 +318,10 @@ mod tests {
             &[],
         ))
         .unwrap_err();
-        assert_eq!(error, ResolveError::InvalidOverride("/nonexistent/docker".to_string()));
+        assert_eq!(
+            error,
+            ResolveError::InvalidOverride("/nonexistent/docker".into(), io::ErrorKind::NotFound)
+        );
     }
 
     #[test]

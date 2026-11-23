@@ -223,8 +223,7 @@ pub fn docker_create_seat(
         extra_mounts,
     );
     let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
-    let program = crate::docker_bin::resolve_str()
-        .map_err(|error| anyhow!("docker CLI could not be resolved: {error}"))?;
+    let program = super::docker_cli::docker_program()?;
     let (success, _stdout, stderr) = super::docker_cli::run_bounded(
         &program,
         &arg_refs,

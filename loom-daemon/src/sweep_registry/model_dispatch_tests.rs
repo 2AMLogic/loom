@@ -540,3 +540,71 @@ fn a_step_resolves_its_effort_against_the_admitted_runtime() {
     let launch = step_launch(dir.path(), &bare, crate::step_role::StepRole::Curator).unwrap();
     assert_eq!(launch.effort, None);
 }
+
+// ---- #14963: an unqualified roleEfforts entry vs a native profile pick ----
+
+/// `#14963` fixture: the preference walk admits `opencode` pinned to the
+/// `strict-zai` model profile, whose `allowedEfforts` is low/high/max (the
+/// bundled zai vocabulary), with the role-effort config `efforts`.
+fn native_profile_effort_config(efforts: Value) -> Value {
+    let mut config = fallback_config();
+    config["runtimes"]["default"] = json!("opencode");
+    config["runtimes"]["preference"] =
+        json!([{"runtime": "opencode", "modelProfile": "strict-zai"}]);
+    config["runtimes"]["modelProfiles"]["strict-zai"] = json!({
+        "model": "glm-5.3",
+        "providers": {"opencode": "zai-coding-plan"},
+        "allowedEfforts": ["low", "high", "max"]
+    });
+    config["autonomous"]["roleRunner"]["roleEfforts"] = efforts;
+    config
+}
+
+/// The reported incident, at the step-launch site: a bare
+/// `roleEfforts.builder` meant for the Claude and Codex picks meets the
+/// native profile the walk drew, whose `allowedEfforts` excludes the value —
+/// the launch keeps its step (effort dropped to the profile's own) instead of
+/// being refused at `profile_selection`.
+#[test]
+#[serial_test::serial(loom_shared_tokens_dir_env)]
+fn a_bare_role_effort_a_native_profile_disallows_is_dropped_not_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let _env = Environment::isolated(dir.path());
+    let config = native_profile_effort_config(json!({"builder": "medium"}));
+    let launch = builder_launch(dir.path(), &config).unwrap();
+    let admitted = launch.admission.admitted.unwrap();
+    assert_eq!(admitted.runtime, "opencode", "the test must exercise a native pick");
+    assert_eq!(admitted.preference.unwrap().model_profile.as_deref(), Some("strict-zai"));
+    assert_eq!(
+        launch.effort, None,
+        "the profile's own effort launches instead of a profile_selection refusal"
+    );
+}
+
+/// The bounds of the same reconciliation: an unqualified effort the profile
+/// DOES allow is forwarded verbatim, and a runtime-qualified pin is forwarded
+/// verbatim even when the profile disallows it (select refuses it loudly —
+/// the fail-closed behaviour an explicit pin keeps).
+#[test]
+#[serial_test::serial(loom_shared_tokens_dir_env)]
+fn an_allowed_bare_effort_and_a_qualified_pin_are_forwarded_verbatim() {
+    let allowed = tempfile::tempdir().unwrap();
+    let _env1 = Environment::isolated(allowed.path());
+    let config = native_profile_effort_config(json!({"builder": "high"}));
+    let launch = builder_launch(allowed.path(), &config).unwrap();
+    assert_eq!(
+        launch.effort.as_deref(),
+        Some("high"),
+        "an unqualified effort inside allowedEfforts keeps its override"
+    );
+
+    let pinned = tempfile::tempdir().unwrap();
+    let _env2 = Environment::isolated(pinned.path());
+    let config = native_profile_effort_config(json!({"builder@opencode": "medium"}));
+    let launch = builder_launch(pinned.path(), &config).unwrap();
+    assert_eq!(
+        launch.effort.as_deref(),
+        Some("medium"),
+        "a runtime-qualified pin is never silently dropped"
+    );
+}

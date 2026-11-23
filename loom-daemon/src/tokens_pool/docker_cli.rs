@@ -24,10 +24,15 @@
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
-use anyhow::{anyhow, bail, Result};
+use anyhow::{bail, Result};
 
 use super::operator_interrupt::{self, Interrupted};
 use crate::proc_exec::{self, Completion};
+
+/// Resolution can prevent a launch just as spawning the resolved program can.
+pub(super) fn docker_program() -> Result<String, proc_exec::ExecError> {
+    crate::docker_bin::resolve_str().map_err(|error| proc_exec::ExecError::Spawn(error.into()))
+}
 
 /// Budget for a read-only or quick `docker` call (`inspect`, `start`, `top`,
 /// `rm`, `exec tmux …`).
@@ -136,7 +141,10 @@ fn run_bounded_env_with(
     {
         return Err(Interrupted(signal).into());
     }
-    match completion.map_err(|e| anyhow!("failed to run `{program} {subcommand}`: {e}"))? {
+    match completion.map_err(|err| {
+        let message = format!("failed to run `{program} {subcommand}`: {err}");
+        anyhow::Error::new(err).context(message)
+    })? {
         Completion::Exited(output) => Ok((
             output.status.success(),
             String::from_utf8_lossy(&output.stdout).into_owned(),
@@ -159,8 +167,7 @@ fn run_bounded_env_with(
 pub fn ensure_image_for_operator(image: &str) -> Result<()> {
     // Shared lookup (#14885): override → `$PATH` → fallback directories, so
     // an operator command started with a minimal PATH still finds Docker.
-    let program = crate::docker_bin::resolve_str()
-        .map_err(|error| anyhow!("docker CLI could not be resolved: {error}"))?;
+    let program = docker_program()?;
     ensure_image_with(&program, image, &operator_interrupt::pending, DOCKER_PULL_TIMEOUT)
 }
 
