@@ -368,7 +368,12 @@ pub fn apply_mark_at(
             });
         }
     };
-    let window = reset::configured_window(&root, &provider, &account);
+    let window = reset::configured_window(
+        &root,
+        &provider,
+        &account,
+        &super::limits::ConfiguredLimits::from_workspace(workspace),
+    );
     let (cooldown, source) =
         reset::resolve_cooldown(classification, provider_text, evidence_at, window)?;
     let resets_at = evidence_at.saturating_add(cooldown);

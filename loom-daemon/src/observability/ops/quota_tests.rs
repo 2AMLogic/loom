@@ -261,7 +261,9 @@ fn api_key_accounts_map_eligibility_to_usable_and_exhausted() {
     }
     bad_marks::mark_bad(&root, "zai", "dry", "simulated exhaustion", Some(3600)).unwrap();
     std::fs::write(dir.join(".disabled"), "off\n").unwrap();
-    let mut accounts = api_key_accounts_in(&[root]).unwrap();
+    let mut accounts =
+        api_key_accounts_in(&[root], &crate::api_keys_pool::limits::ConfiguredLimits::EMPTY)
+            .unwrap();
     accounts.sort_by(|a, b| a.account.cmp(&b.account));
     assert_eq!(
         accounts,
