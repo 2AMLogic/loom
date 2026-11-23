@@ -1093,8 +1093,11 @@ cache is stale. The local branch advances by fast-forward after verification.
 
 For a dirty worktree, the refusal is the disposition: the snapshot (when one was
 taken) preserved the WIP as a patch under
-`<worktree-root>/.snapshots/issue-<N>-<UTC-timestamp>.patch` — post its path in
-a PR comment so the preserved WIP is findable — then fall back to read-only
+`<worktree-root>/.snapshots/issue-<N>-<UTC-timestamp>.patch`. In the PR comment
+name only the relative `.snapshots/issue-<N>-<UTC-timestamp>.patch` under the
+managed worktree root; keep the absolute path (the helper's `patchPath` output
+carries the workstation username and directory layout) and the patch contents
+local, never pasted into the PR. Then fall back to read-only
 review (`gh pr diff` / `git merge-tree`) per "PR Branch Isolation", or park the
 PR per "Environment Gap: Cannot Verify Here".
 
