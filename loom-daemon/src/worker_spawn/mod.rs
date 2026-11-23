@@ -631,6 +631,7 @@ fn rejection_attributes(
     if let Some(resolution) = resolution {
         let runtime = match resolution.runtime.as_str() {
             "aider" => "aider",
+            "agy" => "agy",
             "claude" => "claude",
             "codex" => "codex",
             "gemini" => "gemini",
@@ -1062,6 +1063,62 @@ fn run_preflight(
         }
         let mut command = Command::new(runner);
         command.args(&args.args);
+        // #14945: a tier-3 runtime whose manifest declares `credentialPool`
+        // (the Antigravity `agy` pilot) draws its key from the API-key pool
+        // HERE, in the worker process that exec's the runner — the process
+        // the in-flight lease names, so the account's shared concurrency cap
+        // frees exactly when the CLI run ends. A short-lived helper would
+        // count the lease against the wrong PID. See
+        // `credential::resolve_tier3` for why the pool is mandatory (no
+        // ambient-key escape) and what refuses.
+        match crate::runtime_launch::pooled_tier3(root, &runtime) {
+            Err(detail) => {
+                return Err(LaunchError::config(format!(
+                    "runtime {runtime} has a malformed credential-pool declaration: {detail}"
+                ))
+                .with_stage(LaunchStage::Credential));
+            }
+            Ok(None) => {}
+            Ok(Some(declaration)) => {
+                // env > manifest, the tier-3 precedence: an operator's
+                // LOOM_MODEL wins and is forwarded once (spawn-generic.sh's
+                // modelFlag); the manifest default is set only when the
+                // environment did not supply one, so the CLI sees exactly
+                // one --model.
+                let env_model = nonempty_env("LOOM_MODEL");
+                let model = env_model.clone().or_else(|| declaration.model.clone());
+                let selected =
+                    credential::resolve_tier3(root, &runtime, &declaration, model.as_deref())
+                        .map_err(|e| e.or_stage(LaunchStage::Credential))?;
+                // The pool's selection is the ONLY value that reaches the
+                // child: `Command::env` overrides the inherited one, so an
+                // ambient GEMINI_API_KEY neither wins nor rides along. The
+                // value never touches argv, and the record below names the
+                // account, never the key.
+                command.env(&declaration.env_var, &selected.credential.value);
+                if env_model.is_none() {
+                    if let Some(model) = &model {
+                        command.env("LOOM_MODEL", model);
+                    }
+                }
+                let tap = crate::runtime_preference::Tap::runtime(&runtime).to_string();
+                let launch = serde_json::json!({
+                    "schema": 1,
+                    "runtime": runtime,
+                    "tap": tap,
+                    "model": model,
+                    "credentialSource": "pool",
+                    "credentialProvider": selected.provider,
+                    "credentialAccount": selected.name,
+                    "usage": "none",
+                    "billing": "not-measured",
+                })
+                .to_string();
+                writeln!(log, "# LOOM_LAUNCH {launch}").map_err(|e| {
+                    LaunchError::config(e.to_string()).with_stage(LaunchStage::LogWrite)
+                })?;
+            }
+        }
         // #14167: a legacy adapter's launch facts are the `--model`/`--effort`
         // its documented precedence resolves — exactly what the dispatch step
         // handed this child over and what `loom.step.model_launched` records

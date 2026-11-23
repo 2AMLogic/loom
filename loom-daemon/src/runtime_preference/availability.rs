@@ -167,7 +167,20 @@ pub fn availability_in(
         "claude" => claude(root),
         "codex" => codex(root, admitted, now),
         runtime if crate::worker_spawn::is_native(runtime) => native(root, tap, runtime),
-        runtime => generic(root, runtime, admitted, binary_env),
+        // #14945: a tier-3 manifest may declare a mandatory credential pool
+        // (`agy`, the Antigravity pilot). Such a tap composes the binary
+        // gate with the shared pool check — the SAME `api_keys:<provider>`
+        // source a native tap with a pooled profile reports, so one account
+        // cap governs both routes and `hold_pool_slot` reserves either.
+        // A declaration that does not parse stays ungated here and fails
+        // loudly at launch, the split `native()` already gives an
+        // unresolvable profile.
+        runtime => match crate::runtime_launch::pooled_tier3(root, runtime) {
+            Ok(Some(declaration)) => {
+                pooled_tier3(root, runtime, admitted, binary_env, &declaration)
+            }
+            _ => generic(root, runtime, admitted, binary_env),
+        },
     }
 }
 
@@ -222,25 +235,84 @@ fn generic(
     if admitted.execution.is_some() {
         return ungated(CredentialSource::Unobservable);
     }
-    let Some(bin) = crate::runtime_launch::cli_bin_with(root, runtime, env.cli_bin.as_deref())
-    else {
-        return ungated(CredentialSource::Unobservable);
-    };
+    binary_gate(root, runtime, env).unwrap_or_else(|| ungated(CredentialSource::Unobservable))
+}
+
+/// The tier-3 binary gate on its own (#9368, factored out of [`generic`] for
+/// the pooled pilot's composition, #14945): `Some(Exhausted)` when a known
+/// binary name provably does not resolve, `None` when it resolves or cannot
+/// be checked (fail-open, per the module's one rule).
+fn binary_gate(root: &Path, runtime: &str, env: &BinaryEnv) -> Option<Availability> {
+    let bin = crate::runtime_launch::cli_bin_with(root, runtime, env.cli_bin.as_deref())?;
     if binary_resolves(&bin, env.path.as_deref()) != Some(false) {
-        return ungated(CredentialSource::Unobservable);
+        return None;
     }
     let detail = if Path::new(&bin).is_absolute() {
         format!("'{bin}' is not an executable file")
     } else {
         format!("'{bin}' not found in PATH")
     };
-    Availability::Exhausted {
+    Some(Availability::Exhausted {
         source: CredentialSource::Binary,
         hold: PoolHold::Unprovisioned,
         detail: format!(
             "{detail} — install the CLI or drop tier-3 runtime {runtime} from the preference \
              list; #9368"
         ),
+    })
+}
+
+/// A tier-3 tap whose manifest declares a mandatory credential pool (#14945,
+/// the Antigravity `agy` pilot): the binary gate composed with the shared
+/// pool check.
+///
+/// The binary is asked first — an uninstalled CLI is unavailable whatever
+/// the pool says, and its `Unprovisioned` hold names the install step, not
+/// the pool. The pool is asked second and, unlike the native ladder, has no
+/// exported-variable or auth-file escape: the declaration made it mandatory,
+/// so an ambient `GEMINI_API_KEY` cannot make this tap spawnable, and a dry
+/// pool is the wall in every state the native ladder's step 3 already
+/// defines. The reported source is the shared `api_keys:<provider>` one, so
+/// one account's cap governs this route and a native route on the same
+/// namespace (OpenCode's `quick-flash`) alike.
+fn pooled_tier3(
+    root: &Path,
+    runtime: &str,
+    admitted: &ResolvedRuntime,
+    env: &BinaryEnv,
+    declaration: &crate::runtime_launch::PooledTier3,
+) -> Availability {
+    // A contained launch (#8787) execs inside its own environment; neither
+    // the host's PATH nor the host's pool says what it could use.
+    if admitted.execution.is_some() {
+        return ungated(CredentialSource::Unobservable);
+    }
+    if let Some(exhausted) = binary_gate(root, runtime, env) {
+        return exhausted;
+    }
+    let source = CredentialSource::ApiKeys {
+        provider: declaration.provider.clone(),
+    };
+    match crate::api_keys_pool::is_pooled(root, &declaration.provider) {
+        Ok(false) => Availability::Exhausted {
+            source,
+            hold: PoolHold::Unprovisioned,
+            detail: format!(
+                "runtime {runtime} requires the {} API-key pool (manifest credentialPool) and \
+                 none is registered on this host; an ambient {} cannot substitute — loom-daemon \
+                 api-keys add {} <account>; #14945",
+                declaration.provider, declaration.env_var, declaration.provider
+            ),
+        },
+        Err(error) => Availability::Exhausted {
+            source,
+            hold: PoolHold::Unreadable(PoolStateFile::Inventory),
+            detail: format!(
+                "the API-key pool for provider {:?} could not be read: {error}",
+                declaration.provider
+            ),
+        },
+        Ok(true) => api_keys_pool_availability(root, &declaration.provider, source),
     }
 }
 
@@ -538,6 +610,27 @@ fn native(root: &Path, tap: &Tap, runtime: &str) -> Availability {
             }
         }
     };
+    api_keys_pool_availability_with(health, &provider, source)
+}
+
+/// The health-counting half of a pooled tap's availability, shared by the
+/// native ladder mirror above and the tier-3 pooled pilot (#14945): one
+/// implementation of "would the selection ladder offer this walk a
+/// credential?" over a provider's already-read health snapshot.
+///
+/// #14944: count what the selection ladder would offer, i.e. accounts under
+/// their declared `maxConcurrent`. `selectable` ignores the cap, so a pool
+/// whose every account was at it read as spawnable here, the draw picked
+/// it, and the launch was refused at 78 (`stage=credential`) with the tick
+/// lost. #14983: slots other draws have reserved count as taken too. This
+/// read holds nothing; a dispatching role tick takes its slot in
+/// `gate_admitted_candidate` (`api_keys_pool::reservation`), and the ladder
+/// stays the enforcement point.
+fn api_keys_pool_availability_with(
+    health: Vec<crate::api_keys_pool::select::ProviderHealth>,
+    provider: &str,
+    source: CredentialSource,
+) -> Availability {
     let Some(entry) = health.into_iter().find(|h| h.provider == provider) else {
         return ungated(CredentialSource::Unobservable);
     };
@@ -550,14 +643,6 @@ fn native(root: &Path, tap: &Tap, runtime: &str) -> Availability {
             ),
         };
     }
-    // #14944: count what the selection ladder would offer, i.e. accounts under
-    // their declared `maxConcurrent`. `selectable` ignores the cap, so a pool
-    // whose every account was at it read as spawnable here, the draw picked
-    // it, and the launch was refused at 78 (`stage=credential`) with the tick
-    // lost. #14983: slots other draws have reserved count as taken too. This
-    // read holds nothing; a dispatching role tick takes its slot in
-    // `gate_admitted_candidate` (`api_keys_pool::reservation`), and the ladder
-    // stays the enforcement point.
     let reserved_out = entry.unreserved_slots == Some(0);
     if entry.selectable_under_cap > 0 && !reserved_out {
         return Availability::Spawnable {
@@ -570,7 +655,7 @@ fn native(root: &Path, tap: &Tap, runtime: &str) -> Availability {
         return Availability::Exhausted {
             source,
             hold: PoolHold::SelfHealing,
-            detail: reserved_detail(&provider),
+            detail: reserved_detail(provider),
         };
     }
     if entry.selectable > 0 {
@@ -597,6 +682,29 @@ fn native(root: &Path, tap: &Tap, runtime: &str) -> Availability {
             entry.total, entry.exhausted, entry.disabled, entry.at_capacity
         ),
     }
+}
+
+/// [`api_keys_pool_availability_with`] with the health snapshot read here —
+/// the shape a caller that has not already read the pool uses (the tier-3
+/// pooled pilot, #14945).
+fn api_keys_pool_availability(
+    root: &Path,
+    provider: &str,
+    source: CredentialSource,
+) -> Availability {
+    let health = match crate::api_keys_pool::select::health(root, Some(provider)) {
+        Ok(health) => health,
+        Err(error) => {
+            return Availability::Exhausted {
+                source,
+                hold: PoolHold::Unreadable(PoolStateFile::Inventory),
+                detail: format!(
+                    "the API-key pool for provider {provider:?} could not be read: {error}"
+                ),
+            }
+        }
+    };
+    api_keys_pool_availability_with(health, provider, source)
 }
 
 /// The skip detail for a pool whose last free slot another draw holds

@@ -1164,6 +1164,9 @@ mod gateway_tests;
 mod launch_failure_hold_tests;
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
+mod pooled_tier3_tests;
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod role_draw_resolve_tests;
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
