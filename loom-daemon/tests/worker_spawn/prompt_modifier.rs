@@ -146,4 +146,18 @@ fn a_native_harness_gets_the_modifier_after_the_expanded_role_prompt() {
         .output()
         .unwrap();
     refused_as_prompt_modifier(&out, "native runtime with no mapping");
+
+    // pi has a mapping, but no prompt to modify. Native adapters already refuse
+    // a missing --prompt earlier (stage=worker_options), so it never runs plain
+    // under the modifier's name; the prompt_modifier guard in the launcher is
+    // defense in depth behind that (the Judge's finding on #15051).
+    let out = worker(d.path(), "pi")
+        .env("LOOM_PROMPT_MODIFIER", "deep")
+        .args(["--dangerously-skip-permissions"])
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(78), "{stderr}");
+    assert!(stderr.contains("LOOM_LAUNCH_REJECTED code=78"), "{stderr}");
+    assert!(out.stdout.is_empty(), "the harness must never have started");
 }

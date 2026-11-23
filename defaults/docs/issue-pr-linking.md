@@ -121,6 +121,32 @@ commit's subject, #9105). `merge-pr.sh` detects the contradiction pre-merge and
 reopens the issue if GitHub closed it anyway, but that leaves a close/reopen
 flicker plus notification churn — it is a backstop, not the plan.
 
+## A quoted example can close a different issue on a final PR (#15046)
+
+The #4569 rules, and the scan that backed them, were scoped to the tracked issue
+of a non-closing PR: the scan substituted only that issue's number, so on a final
+PR that closes issue A it said nothing about an example in the body naming issue
+B — and the whole section was framed as a rule for `Part of #N` bodies, which a
+Builder on a final PR had no reason to run.
+
+The final-PR shape came from a downstream report (#15046; observed by the
+reporter, not reproduced in this repo): a final PR that quoted a closing
+reference in an inline code span had the quoted keyword and number read as a
+closing reference. The Guide's docs-only PR is the same failure in another
+template (#14176): `### Changes` prose of the shape `drops closed #N` registered
+as a closing reference — `closingIssuesReferences` returned the unrelated issue
+before the wording was changed.
+
+The remedy stays in `builder-pr.md` → "Multi-PR landings": break the adjacency in
+every quoted example (an intervening word, `Closes issue #N`, or a nonnumeric
+placeholder) on every surface — inline code, fenced blocks, checklists, test plans,
+commit subjects and bodies — and scan the body and the branch's commit messages
+for a closing keyword adjacent to **any** issue number, not only the tracked one.
+A final PR's scan may print only issues it delivers; a partial PR's must print
+nothing. The scan is a local approximation of GitHub's parser, not the parser
+itself: once a PR is open, GitHub's own answer is `closingIssuesReferences`, the
+field `forge_pr_close_targets()` reads.
+
 ## What this does not fix
 
 A reliable forge-side link does **not** by itself make `sweep.outcome`'s

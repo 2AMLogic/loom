@@ -403,3 +403,89 @@ fn raw_fallback_readers_serve_an_unpublished_host_and_defer_to_the_record() {
     assert_eq!(loadavg_1m_or_raw(8), filtered_loadavg_1m(8));
     clear_latest();
 }
+
+// -- query_nvidia_smi (#15007 slice C) --------------------------------------
+// The executor-backed probe: pin the `Err`/`Ok(None)` split `read_gpu`
+// depends on (a missing binary is latched, everything else is "no reading"),
+// plus full-output capture past a pipe buffer and group termination.
+
+/// An executable `nvidia-smi` stub running `body`.
+#[cfg(target_os = "linux")]
+fn nvidia_smi_stub(dir: &Path, body: &str) -> std::path::PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let bin = dir.join("nvidia-smi-stub");
+    std::fs::write(&bin, format!("#!/bin/sh\n{body}\n")).expect("write stub");
+    let mut perms = std::fs::metadata(&bin).expect("stat stub").permissions();
+    perms.set_mode(0o755);
+    std::fs::set_permissions(&bin, perms).expect("chmod stub");
+    bin
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn query_nvidia_smi_missing_binary_is_a_not_found_spawn_error() {
+    let err =
+        query_nvidia_smi("/nonexistent/loom-canary-nvidia-smi", std::time::Duration::from_secs(2))
+            .expect_err("a missing binary must be Err, not Ok(None)");
+    assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn query_nvidia_smi_returns_none_on_a_nonzero_exit() {
+    let dir = tempfile::tempdir().unwrap();
+    let bin = nvidia_smi_stub(dir.path(), "exit 3");
+    assert_eq!(
+        query_nvidia_smi(bin.to_str().unwrap(), std::time::Duration::from_secs(5)).unwrap(),
+        None
+    );
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn query_nvidia_smi_collects_output_larger_than_the_pipe_buffer() {
+    // 16 Ki rows of "50, 1, 2" (~150 KiB, past the 64 KiB pipe buffer). The
+    // memory sums prove every row was read: a truncated capture would
+    // under-count them.
+    let dir = tempfile::tempdir().unwrap();
+    let bin = nvidia_smi_stub(
+        dir.path(),
+        r#"awk 'BEGIN { for (i = 0; i < 16384; i++) print "50, 1, 2" }'"#,
+    );
+    let readings = query_nvidia_smi(bin.to_str().unwrap(), std::time::Duration::from_secs(30))
+        .unwrap()
+        .expect("the whole table must parse");
+    const MIB: u64 = 1024 * 1024;
+    assert!(approx(readings.utilisation, 0.5));
+    assert_eq!(readings.mem_used_bytes, 16_384 * MIB);
+    assert_eq!(readings.mem_total_bytes, 16_384 * 2 * MIB);
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn query_nvidia_smi_timeout_returns_none_and_kills_the_descendants_too() {
+    let dir = tempfile::tempdir().unwrap();
+    let pidfile = dir.path().join("grandchild.pid");
+    let bin = nvidia_smi_stub(
+        dir.path(),
+        &format!("/bin/sleep 120 & echo $! > {}; exec /bin/sleep 120", pidfile.display()),
+    );
+    assert_eq!(
+        query_nvidia_smi(bin.to_str().unwrap(), std::time::Duration::from_millis(400)).unwrap(),
+        None
+    );
+
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    let pid: i32 = std::fs::read_to_string(&pidfile)
+        .expect("grandchild must have recorded its pid")
+        .trim()
+        .parse()
+        .expect("pid must parse");
+    // SAFETY: signal 0 performs error checking only; it never delivers a signal.
+    let alive = unsafe { libc::kill(pid as libc::pid_t, 0) == 0 };
+    if alive {
+        // SAFETY: cleanup kill of a process this test spawned.
+        unsafe { libc::kill(pid, libc::SIGKILL) };
+    }
+    assert!(!alive, "grandchild {pid} outlived the nvidia-smi deadline");
+}

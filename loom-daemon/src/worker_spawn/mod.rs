@@ -1016,6 +1016,17 @@ fn run_preflight(
                 Some(transform) => transform.apply(&text),
                 None => text,
             });
+        // A resolved modifier with no prompt to modify must not launch plain
+        // under the modifier's name (provenance and the digest would record a
+        // modified run). Same refusal as the legacy arm (#15017).
+        if prompt_modifier.is_some() && expanded.is_none() {
+            return Err(LaunchError::config(format!(
+                "prompt modifier {:?} needs a prompt to modify; refusing to run without it \
+                 (#15017)",
+                crate::prompt_modifier::current().unwrap_or_default()
+            ))
+            .with_stage(LaunchStage::PromptModifier));
+        }
         let mut command = harness
             .command(
                 &options,
