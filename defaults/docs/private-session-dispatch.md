@@ -239,7 +239,10 @@ no-alternates / private-clone invariants are untouched by both paths.
 A third, smaller drain runs at a different cadence again: when the
 session-exec worker has reaped the invocation's whole process tree and the
 job's lease is over, it removes that run's step scratch (`<role>-<n>.*`,
-`*-tmp`) from the resolved **temp base** only (#14929). Volume-side scratch
+`*-tmp`) from the resolved **temp base** only (#14929), and only entries modified at/after the
+invocation started — the temp base is not a Loom-owned namespace (a seat's
+`/tmp` holds the long-lived `tmux-<uid>` socket dir, which matches the scratch
+name shape), so a pre-existing resident is never drained. Volume-side scratch
 stays with the age-gated seat pass above — the worker never touches the
 volume — and the shapes never match the long-lived caches, which live on the
 cache volume.
