@@ -64,6 +64,14 @@
       "credential_reference": "agent-6",
       "enabled": true,
       "email": null
+    },
+    {
+      "provider": "codex",
+      "name": "agent-7",
+      "credential_kind": "codex_home",
+      "credential_reference": "agent-7",
+      "enabled": true,
+      "email": null
     }
   ]
 }
