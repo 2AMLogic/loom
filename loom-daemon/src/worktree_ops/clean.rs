@@ -2402,7 +2402,11 @@ fn clean_safe_issue_branch(repo_root: &Path, branch: &str, dry_run: bool) -> Res
     if dry_run {
         println!("  Would delete branch: {branch} ({tip}, {reason})");
     } else {
-        if skip_if_held(repo_root, branch) {
+        let Some(holders) = super::branch_holders::branch_holders_checked(repo_root) else {
+            println!("  Cannot establish worktree holders - keeping {branch}");
+            return Ok(false);
+        };
+        if super::branch_holders::skip_if_held_in(&holders, branch) {
             return Ok(false);
         }
         let mut delete = Command::new("git");

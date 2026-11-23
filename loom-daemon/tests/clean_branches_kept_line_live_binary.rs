@@ -184,3 +184,68 @@ esac
 #[allow(dead_code)]
 #[path = "../src/live_gh_guard.rs"]
 mod live_gh_guard;
+
+/// A linked worktree paused mid-rebase reports `detached`; its rebase state
+/// lives under the common git dir. If the checkout is offline (locked or its
+/// volume gone) the branch must still be held, even though a remote-tracking
+/// ref makes the tip look safe to delete.
+#[test]
+fn safe_clean_keeps_branch_of_offline_worktree_paused_in_rebase() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().canonicalize().unwrap();
+    let repo = root.join("repo");
+    let branch = "feature/issue-42";
+    let wt = root.join("wt-issue-42");
+    let away = root.join("wt-issue-42-offline");
+    std::fs::create_dir_all(&repo).unwrap();
+    git(&repo, &["init", "-q", "-b", "main"]);
+    std::fs::write(repo.join("a.txt"), "base\n").unwrap();
+    git(&repo, &["add", "a.txt"]);
+    git(&repo, &["commit", "-q", "-m", "base"]);
+    git(&repo, &["worktree", "add", "-qb", branch, wt.to_str().unwrap()]);
+    std::fs::write(wt.join("a.txt"), "topic\n").unwrap();
+    git(&wt, &["commit", "-qam", "topic"]);
+    std::fs::write(repo.join("a.txt"), "main\n").unwrap();
+    git(&repo, &["commit", "-qam", "main change"]);
+    // Conflicting rebase: stops mid-way, leaving the worktree detached.
+    let mut rebase = Command::new("git");
+    rebase.current_dir(&wt).args(["rebase", "main"]);
+    assert!(!rebase.output().unwrap().status.success(), "rebase must conflict");
+    // The remote-reachability condition is true for the branch tip.
+    git(&repo, &["update-ref", "refs/remotes/origin/topic", branch]);
+    git(&repo, &["worktree", "lock", wt.to_str().unwrap()]);
+    std::fs::rename(&wt, &away).unwrap();
+
+    let mut cmd = Command::new(common::daemon_bin());
+    common::isolate_daemon_state(&mut cmd, &root);
+    let out = cmd
+        .current_dir(&repo)
+        .args([
+            "clean",
+            "--safe",
+            "--force",
+            "--branches-only",
+            "--workspace",
+        ])
+        .arg(&repo)
+        .env("LOOM_HYGIENE_MEMO", "0")
+        .env("LOOM_CONFIG_DEFAULTS_FILE", "")
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let exists = Command::new("git")
+        .current_dir(&repo)
+        .args([
+            "rev-parse",
+            "--verify",
+            "-q",
+            &format!("refs/heads/{branch}"),
+        ])
+        .output()
+        .unwrap()
+        .status
+        .success();
+    assert!(exists, "branch held by an offline paused rebase was deleted:\n{stdout}");
+    assert!(!stdout.contains("Deleted branch: feature/issue-42"), "{stdout}");
+}
