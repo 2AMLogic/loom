@@ -485,25 +485,44 @@ fn parse_docker_host(host: &str) -> Option<EngineEndpoint> {
     }
 }
 
-/// The platform's default engine socket, in probe order.
-fn default_endpoint() -> Option<EngineEndpoint> {
-    let candidates: &[&str] = if cfg!(target_os = "macos") {
-        &["/.docker/run/docker.sock", "/var/run/docker.sock"]
+/// A default-socket candidate: HOME-relative (resolved under `$HOME` when
+/// it is set, skipped when it is not) or absolute (used verbatim).
+#[derive(Debug, PartialEq, Eq)]
+enum SocketCandidate {
+    HomeRelative(&'static str),
+    Absolute(&'static str),
+}
+
+/// The platform's default engine socket candidates, in probe order.
+fn default_socket_candidates() -> &'static [SocketCandidate] {
+    if cfg!(target_os = "macos") {
+        &[
+            // Docker Desktop's socket lives under the user's home.
+            SocketCandidate::HomeRelative(".docker/run/docker.sock"),
+            // Docker Desktop also keeps a symlink at the Unix path on macOS.
+            SocketCandidate::Absolute("/var/run/docker.sock"),
+        ]
     } else {
-        &["/var/run/docker.sock"]
-    };
-    let home = std::env::var_os("HOME");
+        &[SocketCandidate::Absolute("/var/run/docker.sock")]
+    }
+}
+
+/// Map candidates plus a `$HOME` value to the paths probed, in order.
+fn resolve_socket_candidates(candidates: &[SocketCandidate], home: Option<&Path>) -> Vec<PathBuf> {
     candidates
         .iter()
-        .map(|suffix| {
-            if let Some(prefix) = suffix.strip_prefix('/') {
-                home.as_ref()
-                    .map(|home| Path::new(home).join(format!(".{prefix}")))
-                    .unwrap_or_else(|| PathBuf::from(suffix))
-            } else {
-                PathBuf::from(suffix)
-            }
+        .filter_map(|candidate| match candidate {
+            SocketCandidate::HomeRelative(suffix) => home.map(|home| home.join(suffix)),
+            SocketCandidate::Absolute(path) => Some(PathBuf::from(path)),
         })
+        .collect()
+}
+
+/// The platform's default engine socket, in probe order.
+fn default_endpoint() -> Option<EngineEndpoint> {
+    let home = std::env::var_os("HOME");
+    resolve_socket_candidates(default_socket_candidates(), home.as_deref().map(Path::new))
+        .into_iter()
         .find(|path| std::fs::symlink_metadata(path).is_ok())
         .map(EngineEndpoint::Unix)
 }
@@ -1229,6 +1248,46 @@ mod exec_probe_tests {
         // A TLS-verified endpoint is not probeable over plain HTTP either.
         let _tls_on = crate::env_test_support::EnvGuard::set("DOCKER_TLS_VERIFY", "1");
         assert_eq!(parse_docker_host("tcp://127.0.0.1:2375"), None);
+    }
+
+    #[test]
+    fn default_socket_candidates_resolve_by_home_not_by_stripping() {
+        let home = Some(Path::new("/home/probe"));
+        // The macOS list: the Docker Desktop socket is HOME-relative, the
+        // Unix path stays absolute — never `$HOME/.var/run/docker.sock`
+        // (#14958).
+        let macos = [
+            SocketCandidate::HomeRelative(".docker/run/docker.sock"),
+            SocketCandidate::Absolute("/var/run/docker.sock"),
+        ];
+        assert_eq!(
+            resolve_socket_candidates(&macos, home),
+            vec![
+                PathBuf::from("/home/probe/.docker/run/docker.sock"),
+                PathBuf::from("/var/run/docker.sock"),
+            ]
+        );
+        // HOME unset: the HOME-relative candidate cannot resolve and is
+        // skipped; the absolute one still probes.
+        assert_eq!(
+            resolve_socket_candidates(&macos, None),
+            vec![PathBuf::from("/var/run/docker.sock")]
+        );
+        // The Linux list never depends on HOME.
+        let linux = [SocketCandidate::Absolute("/var/run/docker.sock")];
+        assert_eq!(
+            resolve_socket_candidates(&linux, home),
+            vec![PathBuf::from("/var/run/docker.sock")]
+        );
+        assert_eq!(
+            resolve_socket_candidates(&linux, None),
+            vec![PathBuf::from("/var/run/docker.sock")]
+        );
+        // The shipped platform list keeps the shape probed above.
+        #[cfg(target_os = "macos")]
+        assert_eq!(default_socket_candidates(), macos.as_slice());
+        #[cfg(not(target_os = "macos"))]
+        assert_eq!(default_socket_candidates(), linux.as_slice());
     }
 
     #[test]
