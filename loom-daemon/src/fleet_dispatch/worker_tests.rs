@@ -2,7 +2,7 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-use super::super::test_server::TestServer;
+use super::super::test_server::{RegistryEnv, TestServer};
 use super::*;
 use serde_json::json;
 use serial_test::serial;
@@ -712,6 +712,7 @@ fn held_record(root: &Path, name: &str) -> Option<crate::tokens_pool::health::Ac
 fn a_hold_on_the_heartbeat_answer_lands_in_account_health() {
     reset_for_test();
     let root = rooted_pool();
+    let _registry = RegistryEnv::empty(root.path());
     let server = hold_answering();
     enable(root.path(), &server.url(), true);
     note_capacity(1, &roles_ok(&BTreeSet::new()));
@@ -744,6 +745,7 @@ fn a_hold_on_the_heartbeat_answer_lands_in_account_health() {
 fn an_answer_without_holds_writes_nothing() {
     reset_for_test();
     let root = rooted_pool();
+    let _registry = RegistryEnv::empty(root.path());
     let server = granting(); // answers carry no codex_holds field
     enable(root.path(), &server.url(), true);
     note_capacity(1, &roles_ok(&BTreeSet::new()));
@@ -773,6 +775,7 @@ fn now_epoch() -> u64 {
 fn the_workers_own_holds_ride_the_heartbeat() {
     reset_for_test();
     let root = rooted_pool();
+    let _registry = RegistryEnv::empty(root.path());
     let server = granting();
     enable(root.path(), &server.url(), true);
     let until = now_epoch() + 7200;
@@ -799,4 +802,65 @@ fn the_workers_own_holds_ride_the_heartbeat() {
     assert_eq!(holds[0]["name"], "agent-3");
     assert_eq!(holds[0]["reason"], "plan_exhausted");
     assert_eq!(holds[0]["cooldown_until"], json!(until));
+}
+
+/// The case production always runs (#15091): `host_root` is the daemon's own
+/// workspace — not a registered root — and the roots a draw reads
+/// `account-health.json` at are the registered ones. A received hold must
+/// reach those, and a hold learned there must ride upward.
+#[test]
+#[serial]
+fn holds_fan_out_over_registered_roots_not_the_host_root() {
+    reset_for_test();
+    let host = rooted_pool();
+    let ws_a = tempdir().unwrap();
+    let ws_b = tempdir().unwrap();
+    let reg_dir = tempdir().unwrap();
+    let reg_file = reg_dir.path().join("workspaces.json");
+    let mut registry = crate::workspace_registry::WorkspaceRegistry::default();
+    registry.add(ws_a.path(), None).unwrap();
+    registry.add(ws_b.path(), None).unwrap();
+    registry.save(&reg_file).unwrap();
+    let _registry = RegistryEnv::set(&reg_file);
+    set_host_root(host.path());
+
+    // Upward: a hold learned at a registered root is reported.
+    let until = now_epoch() + 7200;
+    crate::tokens_pool::health::record_terminal_for_class_with_reset_at(
+        ws_b.path(),
+        &crate::tokens_pool::account_registry::AccountId {
+            provider: crate::tokens_pool::AccountProvider::Codex,
+            name: "agent-3".to_string(),
+        },
+        crate::tokens_pool::health::TerminalClassification::TokenExhausted,
+        None,
+        Some(until),
+        "adapter_v1",
+        now_epoch() - 60,
+    )
+    .unwrap();
+
+    // Downward: the answer's hold lands in every registered root.
+    let server = hold_answering();
+    enable(host.path(), &server.url(), true);
+    note_capacity(1, &roles_ok(&BTreeSet::new()));
+    on_reaper_tick(host.path(), &[]);
+    let beats = server.wait_for(proto::HEARTBEAT_PATH, 1);
+    assert_eq!(beats[0]["codex_holds"][0]["name"], "agent-3");
+
+    let mut landed = false;
+    for _ in 0..50 {
+        if held_record(ws_a.path(), "agent-9").is_some()
+            && held_record(ws_b.path(), "agent-9").is_some()
+        {
+            landed = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(landed, "the hold must reach every registered workspace");
+    assert!(
+        held_record(host.path(), "agent-9").is_none(),
+        "the unregistered host root is not a root any draw reads"
+    );
 }

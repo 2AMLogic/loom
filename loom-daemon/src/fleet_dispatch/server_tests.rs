@@ -1406,8 +1406,10 @@ fn expired_and_invalid_holds_do_not_ride() {
 /// (#15091): `with_codex_health` names the workspace whose health file the
 /// captain reads fresh on every heartbeat, like `with_token_probe`.
 #[test]
+#[serial_test::serial]
 fn the_captains_own_holds_publish_beside_the_aggregate() {
     let workspace = tempfile::tempdir().unwrap();
+    let _registry = super::super::test_server::RegistryEnv::empty(workspace.path());
     crate::tokens_pool::health::record_terminal_for_class_with_reset_at(
         workspace.path(),
         &crate::tokens_pool::account_registry::AccountId {

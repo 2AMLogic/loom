@@ -696,11 +696,11 @@ pub(crate) fn local_role_holds(root: &Path, now: Instant) -> BTreeSet<&'static s
 /// nothing was ever granted.
 pub fn on_reaper_tick(root: &Path, live: &[(String, u32, StepRole, DateTime<Utc>)]) {
     let url = host_endpoint(root);
-    // #13942/#15091: the pool artifacts a heartbeat touches — the probe
-    // sidecar it stores, the Codex holds it reports and merges — are
-    // host-level facts, so they resolve from the daemon workspace
-    // (`host_root`) the same way the endpoint does, falling back to the
-    // ticking repo's root before one is named.
+    // #13942: the probe sidecar a heartbeat stores is a host-level fact, so
+    // it resolves from the daemon workspace (`host_root`) the same way the
+    // endpoint does, falling back to the ticking repo's root before one is
+    // named. (#15091: the Codex holds are NOT — `account-health.json` is
+    // per-workspace, so they fan out over the registered roots instead.)
     let probe_root = state()
         .host_root
         .clone()
@@ -753,6 +753,8 @@ pub fn on_reaper_tick(root: &Path, live: &[(String, u32, StepRole, DateTime<Utc>
             .is_none_or(|at| now.saturating_duration_since(at) >= HEARTBEAT_GAP);
         let heartbeat = match (&url, &s.capacity) {
             (Some(url), Some((free_slots, roles_ok))) if due => {
+                // Only a due heartbeat pays the registry read.
+                let health_roots = crate::tokens_pool::health::codex_health_roots(&probe_root);
                 let request = HeartbeatRequest {
                     host_id: host_id(),
                     live: s
@@ -767,8 +769,8 @@ pub fn on_reaper_tick(root: &Path, live: &[(String, u32, StepRole, DateTime<Utc>
                     // the captain can republish them to the rest of the
                     // fleet. `None` (nothing live, or the state file is
                     // unreadable) omits the field — the old worker's body.
-                    codex_holds: crate::tokens_pool::health::live_codex_holds(
-                        &probe_root,
+                    codex_holds: crate::tokens_pool::health::live_codex_holds_across(
+                        &health_roots,
                         u64::try_from(Utc::now().timestamp()).unwrap_or(0),
                     ),
                 };
@@ -787,7 +789,6 @@ pub fn on_reaper_tick(root: &Path, live: &[(String, u32, StepRole, DateTime<Utc>
             endpoint: proto::HEARTBEAT_PATH,
             ..CallFacts::default()
         };
-        let merge_root = probe_root.clone();
         send_detached_then::<_, HeartbeatResponse>(
             &url,
             proto::HEARTBEAT_PATH,
@@ -799,11 +800,13 @@ pub fn on_reaper_tick(root: &Path, live: &[(String, u32, StepRole, DateTime<Utc>
                     crate::tokens_pool::fleet_probe::apply_snapshot(&dir, snapshot, Utc::now());
                 }
                 // #15091: the fleet's Codex holds land under the
-                // never-narrows merge (`merge_codex_holds`); a hold learned
-                // on any host blocks the account here until its deadline.
+                // never-narrows merge in every registered workspace — the
+                // roots a draw reads `account-health.json` at — so a hold
+                // learned on any host blocks the account here until its
+                // deadline.
                 if let Some(holds) = &resp.codex_holds {
-                    crate::tokens_pool::health::merge_codex_holds(
-                        &merge_root,
+                    crate::tokens_pool::health::merge_codex_holds_across(
+                        &crate::tokens_pool::health::codex_health_roots(&probe_root),
                         holds,
                         u64::try_from(Utc::now().timestamp()).unwrap_or(0),
                     );

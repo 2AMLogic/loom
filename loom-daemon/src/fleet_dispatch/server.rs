@@ -235,8 +235,8 @@ impl<I: Identity> Server<I> {
         self
     }
 
-    /// Publish the Codex holds of the workspace at `workspace` alongside the
-    /// fleet aggregate on every heartbeat answer (#15091): the captain is a
+    /// Publish the Codex holds of this host's registered workspaces (or of
+    /// `workspace` when none is registered) alongside the fleet aggregate on every heartbeat answer (#15091): the captain is a
     /// host too, and holds its own ticks learn ride the same channel the
     /// workers' reports do. Read fresh on each heartbeat, like
     /// [`Self::with_token_probe`].
@@ -292,7 +292,8 @@ impl<I: Identity> Server<I> {
             crate::tokens_pool::health::CodexAccountHold,
         > = std::collections::BTreeMap::new();
         if let Some(workspace) = &self.codex_health {
-            if let Some(own) = crate::tokens_pool::health::live_codex_holds(workspace, now) {
+            let roots = crate::tokens_pool::health::codex_health_roots(workspace);
+            if let Some(own) = crate::tokens_pool::health::live_codex_holds_across(&roots, now) {
                 for hold in own {
                     merged.insert(hold.name.clone(), hold);
                 }

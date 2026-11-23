@@ -1110,6 +1110,12 @@ impl CodexAccountHold {
 /// them upward (#15091): every Codex record under a timed hold whose
 /// deadline has not passed, sorted by name for a stable wire order.
 ///
+/// The wire vocabulary deliberately includes the short `transient_failure` /
+/// `session_limit` holds: their deadlines (`now + 60s` / `now + 30s`) normally
+/// expire before a heartbeat delivers them and are then dropped by
+/// [`CodexAccountHold::is_carriable`]; one that does land only propagates a
+/// host-local blip for under a minute.
+///
 /// `None` when there is nothing to report — the state file is unreadable
 /// (a read failure publishes nothing; the field is omitted, exactly what an
 /// old worker sends) or no hold is live. A `ReauthRequired` entry never
@@ -1133,6 +1139,48 @@ pub fn live_codex_holds(workspace: &Path, now: u64) -> Option<Vec<CodexAccountHo
         .collect();
     holds.sort_by(|a, b| a.name.cmp(&b.name));
     (!holds.is_empty()).then_some(holds)
+}
+
+/// The workspace roots whose `account-health.json` a draw actually reads
+/// (#15091): the registered roots the role runner ticks, or `fallback` when
+/// the registry is empty or unreadable (the single-workspace shape).
+///
+/// `account-health.json` is per-workspace and every consumer reads it at the
+/// root it was handed, so a fleet hold must be applied to — and reported
+/// from — each of these, never the daemon's own (usually unregistered)
+/// host root.
+#[must_use]
+pub fn codex_health_roots(fallback: &Path) -> Vec<PathBuf> {
+    crate::workspace_registry::WorkspaceRegistry::load_default()
+        .unwrap_or_default()
+        .effective_roots(fallback)
+}
+
+/// The union of [`live_codex_holds`] over `roots` (#15091): per account the
+/// later deadline wins, name-sorted; `None` when no root has a live hold.
+#[must_use]
+pub fn live_codex_holds_across(roots: &[PathBuf], now: u64) -> Option<Vec<CodexAccountHold>> {
+    let mut merged: std::collections::BTreeMap<String, CodexAccountHold> =
+        std::collections::BTreeMap::new();
+    for root in roots {
+        for hold in live_codex_holds(root, now).into_iter().flatten() {
+            match merged.get(&hold.name) {
+                Some(current) if current.cooldown_until >= hold.cooldown_until => {}
+                _ => {
+                    merged.insert(hold.name.clone(), hold);
+                }
+            }
+        }
+    }
+    (!merged.is_empty()).then(|| merged.into_values().collect())
+}
+
+/// [`merge_codex_holds`] into every root of `roots`; returns the total applied.
+pub fn merge_codex_holds_across(roots: &[PathBuf], holds: &[CodexAccountHold], now: u64) -> usize {
+    roots
+        .iter()
+        .map(|root| merge_codex_holds(root, holds, now))
+        .sum()
 }
 
 /// Merge holds received on a heartbeat answer into this workspace's state
