@@ -629,7 +629,7 @@ touched files (diff vs `origin/main`)"** and verify it like this:
 ```bash
 # Both runs from the workspace root, so the `-->` paths match git's output.
 # -j2 or fewer on the shared fleet hosts; build with the exported
-# CARGO_TARGET_DIR (.loom/docs/cargo-target-isolation.md).
+# CARGO_TARGET_DIR (.loom/roles/cargo-target-isolation.md).
 RD="$(mktemp -d)"     # one private dir per run: concurrent sweeps share /tmp
 doc_warnings() {
   cargo doc -p loom-daemon --no-deps -j2 2>&1 \
