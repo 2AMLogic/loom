@@ -1,6 +1,7 @@
 use super::*;
 use serde_json::json;
 use std::io::Read;
+use std::os::unix::fs::DirBuilderExt;
 use std::process::{Command, Stdio};
 
 #[derive(clap::Subcommand)]
@@ -306,7 +307,7 @@ pub(super) fn prepare_response(
 }
 
 pub(super) fn prepare(root: &Path, args: &PrepareArgs) -> Result<PrepareOutcome, PrepareFailure> {
-    prepare_with_pr_lookup(root, args, &finished_pr)
+    prepare_with_pr_lookup(root, args, &finished_pr, &crate::forge_etag_store::host_tmp_base())
 }
 
 /// The real lookup uses the credentials that the host already scopes to this
@@ -315,11 +316,37 @@ pub(super) fn prepare_with_pr_lookup(
     root: &Path,
     args: &PrepareArgs,
     has_finished_pr: &dyn Fn(&Path, &str, &str, &str) -> bool,
+    temp_base: &Path,
 ) -> Result<PrepareOutcome, PrepareFailure> {
     let mut reaped = Vec::new();
-    match prepare_revision(root, args, has_finished_pr, &mut reaped) {
+    match prepare_revision(root, args, has_finished_pr, temp_base, &mut reaped) {
         Ok(revision) => Ok(PrepareOutcome { revision, reaped }),
         Err(error) => Err(PrepareFailure { error, reaped }),
+    }
+}
+
+/// Probe that [`temp_base`] can hold a private directory and a file in it
+/// (#14929). A full or read-only seat temp dir previously surfaced as a
+/// misleading `workspace Git fetch failed (…128)` or dirty-clone refusal;
+/// refusing here names the actual cause before any clone work is touched,
+/// and no Loom state directory is ever created in the job's working
+/// directory as a fallback (the resolved base stays absolute — see
+/// [`crate::forge_etag_store::host_tmp_base`]).
+fn require_writable_temp(temp_base: &Path) -> Result<()> {
+    let probe = temp_base.join(format!("loom-temp-probe-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&probe);
+    let probed = std::fs::DirBuilder::new()
+        .mode(0o700)
+        .create(&probe)
+        .and_then(|()| std::fs::write(probe.join("writable"), b""));
+    let _ = std::fs::remove_dir_all(&probe);
+    match probed {
+        Ok(()) => Ok(()),
+        Err(error) => bail!(
+            "{SEAT_TEMP_UNWRITABLE_REASON}: resolved temp directory {} is not writable ({error}); \
+             reclaim the seat's temp space (caches belong on its cache volume) before retrying",
+            temp_base.display()
+        ),
     }
 }
 
@@ -327,9 +354,11 @@ fn prepare_revision(
     root: &Path,
     args: &PrepareArgs,
     has_finished_pr: &dyn Fn(&Path, &str, &str, &str) -> bool,
+    temp_base: &Path,
     reaped: &mut Vec<String>,
 ) -> Result<String> {
     valid_base(&args.base)?;
+    require_writable_temp(temp_base)?;
     if args.account.is_empty() || args.container_id.is_empty() {
         bail!("workspace account and container identity are required");
     }

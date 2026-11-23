@@ -100,6 +100,13 @@ fn forge_credential_username_preserves_basic_auth_and_rejects_protocol_injection
 
 use crate::test_git_helpers::{configure, run as git};
 
+/// The writable temp base every [`repository::prepare_with_pr_lookup`] test
+/// passes explicitly — never the ambient `TMPDIR`, which a parallel test's
+/// fixture may be mutating.
+fn temp_base() -> std::path::PathBuf {
+    std::env::temp_dir()
+}
+
 struct RepoFixture {
     _temp: tempfile::TempDir,
     remote: PathBuf,
@@ -235,6 +242,66 @@ fn lease_renew_residue_does_not_refuse_reuse_but_other_dirt_does() {
     assert!(error.contains("stray-09"), "{error}");
     assert!(!error.contains("stray-10"), "{error}");
     assert!(error.contains("and 2 more"), "{error}");
+}
+
+/// #14929 AC: an unwritable seat temp dir refuses preparation naming the
+/// cause (`seat_temp_unwritable`) instead of surfacing later as a misleading
+/// fetch or dirty-clone refusal, and no Loom state directory appears in the
+/// private clone — the refusal happens before any clone work, and the state
+/// dirs never fall back to the job's working directory.
+#[test]
+fn an_unwritable_temp_dir_refuses_preparation_naming_the_cause_without_touching_the_clone() {
+    let _fork = fork_guard();
+    let f = RepoFixture::new();
+    // A temp base under a FILE cannot be created or written by any uid
+    // (ENOTDIR), so the refusal is deterministic even under root.
+    let blocker = f._temp.path().join("blocker");
+    std::fs::write(&blocker, b"not a directory").unwrap();
+    let blocked = blocker.join("tmp");
+    let lookup =
+        |_: &Path, _: &str, _: &str, _: &str| panic!("no clone work runs past the preflight");
+    let error = repository::prepare_with_pr_lookup(&f.root, &f.args, &lookup, &blocked)
+        .unwrap_err()
+        .to_string();
+    assert!(
+        error.contains(SEAT_TEMP_UNWRITABLE_REASON),
+        "the refusal names its cause: {error}"
+    );
+    assert!(error.contains("not writable"), "{error}");
+    // The clone was never created and the volume untouched.
+    assert!(!f.root.join("repo").exists());
+    assert!(std::fs::read_dir(&f.root).unwrap().next().is_none());
+
+    // A prepared clone stays clean of Loom state dirs across the refusal:
+    // prepare once, then refuse on the blocked base and re-check the tree.
+    std::fs::remove_file(&blocker).unwrap();
+    f.prepare().unwrap();
+    let repo = f.root.join("repo");
+    std::fs::write(&blocker, b"not a directory").unwrap();
+    let error = repository::prepare_with_pr_lookup(&f.root, &f.args, &lookup, &blocked)
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains(SEAT_TEMP_UNWRITABLE_REASON), "{error}");
+    for entry in std::fs::read_dir(&repo).unwrap().flatten() {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        assert!(
+            !name.starts_with("loom-forge-")
+                && !name.starts_with("loom-write-scope")
+                && !name.starts_with("tmp"),
+            "no Loom state or temp directory may appear in the clone: {name}"
+        );
+    }
+    // No probe residue is left behind in a writable base either.
+    let writable = f._temp.path().join("tmp");
+    std::fs::create_dir(&writable).unwrap();
+    repository::prepare_with_pr_lookup(&f.root, &f.args, &lookup, &writable).unwrap();
+    let residue: Vec<String> = std::fs::read_dir(&writable)
+        .unwrap()
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(residue, Vec::<String>::new(), "the preflight cleans up after itself");
 }
 
 #[test]
@@ -1819,7 +1886,7 @@ fn preparation_keeps_a_fast_forwarded_draft_without_finished_pr_evidence() {
         assert_eq!(revision, tip);
         false
     };
-    let error = repository::prepare_with_pr_lookup(&f.root, &f.args, &lookup)
+    let error = repository::prepare_with_pr_lookup(&f.root, &f.args, &lookup, &temp_base())
         .unwrap_err()
         .to_string();
 
@@ -1867,7 +1934,8 @@ fn preparation_reaps_published_finished_prs_independent_of_merge_method() {
             assert_eq!(revision, tip);
             true
         };
-        let outcome = repository::prepare_with_pr_lookup(&f.root, &f.args, &evidence).unwrap();
+        let outcome =
+            repository::prepare_with_pr_lookup(&f.root, &f.args, &evidence, &temp_base()).unwrap();
         assert!(!worktree.exists(), "{state} leftover removed");
         assert_eq!(outcome.reaped, vec![expected_path], "{state} reaped worktree is reported");
         assert_eq!(git(&repo, &["rev-parse", "refs/heads/finished"]), tip);
@@ -1891,7 +1959,10 @@ fn preparation_reports_a_reaped_worktree_when_another_refuses_reuse() {
     let evidence =
         |_: &Path, _: &str, branch: &str, revision: &str| branch == "finished" && revision == tip;
     let refusal = repository::prepare_response(repository::prepare_with_pr_lookup(
-        &f.root, &f.args, &evidence,
+        &f.root,
+        &f.args,
+        &evidence,
+        &temp_base(),
     ));
     assert!(refusal["error"].as_str().unwrap().contains("seat_dirty"), "{refusal}");
     assert!(!finished.exists());
@@ -1899,7 +1970,10 @@ fn preparation_reports_a_reaped_worktree_when_another_refuses_reuse() {
     assert_eq!(refusal["reaped_worktrees"], serde_json::json!([expected]));
 
     let refused_again = repository::prepare_response(repository::prepare_with_pr_lookup(
-        &f.root, &f.args, &evidence,
+        &f.root,
+        &f.args,
+        &evidence,
+        &temp_base(),
     ));
     assert_eq!(refused_again["error"], refusal["error"]);
     assert_eq!(refused_again["reaped_worktrees"], serde_json::json!([]));
@@ -1917,7 +1991,7 @@ fn preparation_preserves_commits_missing_from_origin_even_with_finished_pr_evide
     std::fs::write(worktree.join("leftover"), "keep").unwrap();
     let lookup =
         |_: &Path, _: &str, _: &str, _: &str| panic!("unpublished tips must skip the PR read");
-    let error = repository::prepare_with_pr_lookup(&f.root, &f.args, &lookup)
+    let error = repository::prepare_with_pr_lookup(&f.root, &f.args, &lookup, &temp_base())
         .unwrap_err()
         .to_string();
     assert!(error.contains("seat_dirty"), "{error}");

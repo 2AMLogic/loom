@@ -623,6 +623,13 @@ pub fn check_runtimes_preference_config(config: &Value) -> Vec<String> {
         Err(message) => vec![format!("runtimes preference: {message}")],
     };
     findings.extend(ceiling::check_config(config));
+    // #14932: a `runtimes.apiKeyLimits` block that cannot be understood
+    // withholds accounts at selection time, so name it here first.
+    findings.extend(
+        crate::api_keys_pool::limits::ConfiguredLimits::check_config(config)
+            .into_iter()
+            .map(|offence| format!("runtimes api-key limits: {offence}")),
+    );
     findings
 }
 

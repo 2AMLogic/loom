@@ -1,8 +1,7 @@
 //! PR-side park check for the reaper's #4256 resume decision (Issue #8689).
 //!
-//! Extracted from `reaper.rs` so the
-//! predicate and its rationale live together instead of adding another arm to
-//! the already-long `reap_once` match.
+//! Extracted from `reaper.rs` so the predicate and its rationale live together
+//! instead of adding another arm to the already-long `reap_once` match.
 //!
 //! # The shape this targets
 //!
