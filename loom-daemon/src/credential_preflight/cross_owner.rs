@@ -182,6 +182,28 @@ pub fn establish_cross_owner_credentials_with(
 /// and are never in this list.
 const OWNER_WRITER_FILES: [&str; 4] = ["hosts.yml", "hosts.yml.tmp", "config.yml", "identity.json"];
 
+/// A by-owner directory whose writer files were modified within this window
+/// may be a credential a live caller just published (the fleet store's
+/// memoized writer, a forced refresh) and is never reaped. It exceeds a
+/// GitHub App installation token's one-hour life, so a directory older than
+/// this holds only an expired token; judging by file mtime also covers a
+/// directory whose `identity.json` sidecar write failed. #14450 review.
+const REAP_GRACE: std::time::Duration = std::time::Duration::from_secs(2 * 60 * 60);
+
+/// `true` when any writer file in `dir` was modified within [`REAP_GRACE`],
+/// or its mtime cannot be read or is in the future (fail closed: keep it).
+fn recently_published(dir: &Path) -> bool {
+    let now = std::time::SystemTime::now();
+    OWNER_WRITER_FILES.iter().any(|f| {
+        match std::fs::symlink_metadata(dir.join(f)).and_then(|m| m.modified()) {
+            Ok(mtime) => now
+                .duration_since(mtime)
+                .map_or(true, |age| age < REAP_GRACE),
+            Err(e) => e.kind() != std::io::ErrorKind::NotFound,
+        }
+    })
+}
+
 /// Remove the writer credential of every by-owner directory whose owner is
 /// no longer a cross-owner (#14450), so a leftover directory (for example
 /// the old root owner's after the root checkout changed owner) cannot be
@@ -197,7 +219,9 @@ const OWNER_WRITER_FILES: [&str; 4] = ["hosts.yml", "hosts.yml.tmp", "config.yml
 /// Only the writer files are removed, then the directory itself if that left
 /// it empty: a reader App's `<owner>/<app id>/` subdirectories, the live
 /// root-owner credential (`.loom/gh-config`) and every other cross-owner's
-/// directory are never touched. Failures are logged and skipped.
+/// directory are never touched. A directory published within [`REAP_GRACE`]
+/// is skipped (a live caller may hold it) and reaped on a later pass.
+/// Failures are logged and skipped.
 fn reap_stale_owner_credentials(
     workspace_root: &Path,
     root_owner: &str,
@@ -234,7 +258,7 @@ fn reap_stale_owner_credentials(
                     && managed_authoritative
                     && !managed.is_empty()
                     && !plans.iter().any(|plan| plan.owner == owner));
-            if stale {
+            if stale && !recently_published(&entry.path()) {
                 remove_owner_writer_credential(&entry.path(), owner);
             }
         }

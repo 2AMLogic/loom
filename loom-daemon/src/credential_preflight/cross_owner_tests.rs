@@ -260,7 +260,19 @@ fn publish_owner_dir(root: &Path, owner: &str) -> PathBuf {
     for f in ["hosts.yml", "config.yml", "identity.json"] {
         std::fs::write(dir.join(f), "x").unwrap();
     }
+    age_owner_dir(&dir, 3 * 60 * 60);
     dir
+}
+
+/// Backdates every writer file in `dir` by `secs` (the reaper spares a
+/// directory published within its grace window).
+fn age_owner_dir(dir: &Path, secs: u64) {
+    let when = std::time::SystemTime::now() - std::time::Duration::from_secs(secs);
+    for f in ["hosts.yml", "hosts.yml.tmp", "config.yml", "identity.json"] {
+        if let Ok(file) = std::fs::File::options().write(true).open(dir.join(f)) {
+            file.set_modified(when).unwrap();
+        }
+    }
 }
 
 /// #14450: the root checkout changed owner, so the old root owner's by-owner
@@ -359,4 +371,30 @@ fn a_failed_registry_read_reaps_no_unmanaged_owner_but_still_reaps_the_root_owne
 
     establish_cross_owner_credentials_with(&workspace, &home, &managed, true, &minter);
     assert!(!gone_dir.exists(), "readable registry: unmanaged owner reaped");
+}
+
+/// #14450 review: a root-owner by-owner directory published moments ago (the
+/// fleet store's memoized writer, a forced refresh), with or without its
+/// sidecar, is not reaped; once it ages past the grace window the next pass
+/// removes it.
+#[test]
+#[serial_test::serial]
+fn a_just_published_root_owner_dir_survives_until_it_ages_out() {
+    let env = Env::new(&[]);
+    let _cache = ScratchCache::new(env.tmp.path());
+    let home = unique("home-");
+    let home_repo = format!("{home}/loom");
+    let workspace = env.repo("ws", &[("origin", &format!("https://github.com/{home_repo}.git"))]);
+    let managed = vec![(workspace.clone(), home_repo)];
+    let minter = ScriptedMinter::new(vec![minted()]);
+
+    let dir = publish_owner_dir(&workspace, &home);
+    std::fs::remove_file(dir.join("identity.json")).unwrap(); // sidecar write failed
+    age_owner_dir(&dir, 60); // one minute old
+    establish_cross_owner_credentials(&workspace, &home, &managed, &minter);
+    assert!(dir.join("hosts.yml").is_file(), "fresh publication kept");
+
+    age_owner_dir(&dir, 3 * 60 * 60);
+    establish_cross_owner_credentials(&workspace, &home, &managed, &minter);
+    assert!(!dir.exists(), "aged out: reaped on the next pass");
 }
