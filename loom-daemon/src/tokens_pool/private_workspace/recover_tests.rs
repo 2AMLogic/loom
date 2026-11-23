@@ -3433,14 +3433,23 @@ fn a_failed_or_timed_out_snapshot_records_an_operation_diagnostic() {
         assert_eq!(record.outcome, "recovery-required");
     }
 
-    // A snapshot that never started at all records the same way.
+    // A snapshot that never started at all records the same way. An empty
+    // PATH no longer expresses "docker is unreachable" — the shared lookup's
+    // absolute fallbacks (`/usr/bin`, …) can still find a host docker (#14885)
+    // — so pin `LOOM_DOCKER_BIN` at a path that is not an executable file.
     let empty = tempfile::tempdir().unwrap();
     let _path = crate::env_test_support::EnvGuard::set("PATH", empty.path().to_str().unwrap());
-    export::update(&root, &env.config, &job, "running").unwrap();
-    assert_eq!(
-        read_record().snapshot_diagnostic.as_deref(),
-        Some("private-workspace snapshot could not be executed")
-    );
+    {
+        let _docker = crate::env_test_support::EnvGuard::set(
+            crate::docker_bin::DOCKER_BIN_ENV,
+            empty.path().join("docker"),
+        );
+        export::update(&root, &env.config, &job, "running").unwrap();
+        assert_eq!(
+            read_record().snapshot_diagnostic.as_deref(),
+            Some("private-workspace snapshot could not be executed")
+        );
+    }
 
     // A fresh snapshot clears the diagnostic and certifies the completion.
     let stubs = tempfile::tempdir().unwrap();
