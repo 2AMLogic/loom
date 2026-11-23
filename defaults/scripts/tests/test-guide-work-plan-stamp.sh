@@ -79,7 +79,14 @@ else
     GUIDE_MD="$REPO_ROOT/defaults/.claude/commands/loom/guide.md"
 fi
 WORK_PLAN_MD="$REPO_ROOT/WORK_PLAN.md"
-IMAGINE_MD="$REPO_ROOT/defaults/.claude/commands/loom/imagine.md"
+# imagine.md ships the same way, so resolve it like GUIDE_MD: installed path
+# first (consumer repos, and Loom's own dogfooded checkout), defaults/
+# source-tree fallback (a bare source checkout). See issue #15076.
+if [[ -f "$REPO_ROOT/.claude/commands/loom/imagine.md" ]]; then
+    IMAGINE_MD="$REPO_ROOT/.claude/commands/loom/imagine.md"
+else
+    IMAGINE_MD="$REPO_ROOT/defaults/.claude/commands/loom/imagine.md"
+fi
 
 source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/assert.sh"
 
@@ -456,12 +463,22 @@ fi
 echo ""
 echo "Test 7: WORK_PLAN.md and the imagine.md template point at the stamp"
 
-assert_doc_contains "$WORK_PLAN_MD" \
-    'The `_Generated:` stamp at the top of the generated region dates the snapshot' \
-    "committed WORK_PLAN.md header points readers at the stamp"
-assert_doc_contains "$WORK_PLAN_MD" \
-    'it may lag live labels until the next one merges' \
-    "WORK_PLAN.md keeps the #13894 snapshot-semantics wording"
+# The WORK_PLAN.md header sits above the generated region's markers, so
+# Guide re-renders never rewrite it: the wording is hand-maintained only in
+# this repo's dogfood checkout (defaults/ source tree present). A consumer
+# repo's committed header may predate the wording and resyncs never refresh
+# it, so gate these two asserts on the dogfood layout and say so when
+# skipping (#15076). The imagine.md assert below is layout-independent.
+if [[ -d "$REPO_ROOT/defaults/.claude/commands/loom" ]]; then
+    assert_doc_contains "$WORK_PLAN_MD" \
+        'The `_Generated:` stamp at the top of the generated region dates the snapshot' \
+        "committed WORK_PLAN.md header points readers at the stamp"
+    assert_doc_contains "$WORK_PLAN_MD" \
+        'it may lag live labels until the next one merges' \
+        "WORK_PLAN.md keeps the #13894 snapshot-semantics wording"
+else
+    echo "  SKIP: WORK_PLAN.md header asserts skipped (consumer layout: header above the generated region is dogfood-maintained)"
+fi
 assert_doc_contains "$IMAGINE_MD" \
     'The `_Generated:` stamp at the top of the generated region dates the snapshot' \
     "imagine.md WORK_PLAN template header points readers at the stamp"
