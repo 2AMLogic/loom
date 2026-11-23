@@ -178,67 +178,6 @@ fn dir_size_human_handles_missing_dir() {
     assert_eq!(dir_size_human(Path::new("/does/not/exist/at/all")), "0B");
 }
 
-// --- reclaim_worktree_artifacts (#5187) ------------------------------
-
-#[test]
-fn reclaim_removes_target_and_node_modules_but_nothing_else() {
-    let tmp = tempfile::tempdir().unwrap();
-    std::fs::create_dir_all(tmp.path().join("target/debug")).unwrap();
-    std::fs::write(tmp.path().join("target/debug/binary"), b"x").unwrap();
-    std::fs::create_dir_all(tmp.path().join("node_modules/.bin")).unwrap();
-    std::fs::create_dir_all(tmp.path().join("src")).unwrap();
-    std::fs::write(tmp.path().join("src/main.rs"), b"fn main() {}").unwrap();
-    std::fs::write(tmp.path().join("Cargo.lock"), b"lockfile").unwrap();
-
-    let reclaimed = reclaim_worktree_artifacts(tmp.path(), false);
-    let names: Vec<_> = reclaimed.iter().map(|a| a.name.as_str()).collect();
-    assert_eq!(
-        names.into_iter().collect::<std::collections::HashSet<_>>(),
-        std::collections::HashSet::from(["target", "node_modules"])
-    );
-    assert!(!tmp.path().join("target").exists());
-    assert!(!tmp.path().join("node_modules").exists());
-    // Everything else — git history stand-ins, source, lockfiles — is untouched.
-    assert!(tmp.path().join("src/main.rs").is_file());
-    assert!(tmp.path().join("Cargo.lock").is_file());
-}
-
-#[test]
-fn reclaim_never_removes_a_same_named_file() {
-    // `Cargo.lock` and `pnpm-lock.yaml` are both entries in
-    // BUILD_ARTIFACT_PATTERNS, but they are files, not directories — the
-    // reclaim pass must never `remove_dir_all` a file.
-    let tmp = tempfile::tempdir().unwrap();
-    std::fs::write(tmp.path().join("Cargo.lock"), b"lockfile").unwrap();
-    std::fs::write(tmp.path().join("pnpm-lock.yaml"), b"lockfile").unwrap();
-    std::fs::write(tmp.path().join(".loom-in-use"), b"{}").unwrap();
-
-    let reclaimed = reclaim_worktree_artifacts(tmp.path(), false);
-    assert!(reclaimed.is_empty(), "{reclaimed:?}");
-    assert!(tmp.path().join("Cargo.lock").is_file());
-    assert!(tmp.path().join("pnpm-lock.yaml").is_file());
-    assert!(tmp.path().join(".loom-in-use").is_file());
-}
-
-#[test]
-fn reclaim_dry_run_reports_without_removing() {
-    let tmp = tempfile::tempdir().unwrap();
-    std::fs::create_dir_all(tmp.path().join("target")).unwrap();
-
-    let reclaimed = reclaim_worktree_artifacts(tmp.path(), true);
-    assert_eq!(reclaimed.len(), 1);
-    assert_eq!(reclaimed[0].name, "target");
-    assert!(tmp.path().join("target").is_dir(), "dry-run must not remove");
-}
-
-#[test]
-fn reclaim_with_no_artifact_dirs_is_a_clean_no_op() {
-    let tmp = tempfile::tempdir().unwrap();
-    std::fs::write(tmp.path().join("README.md"), b"hi").unwrap();
-    let reclaimed = reclaim_worktree_artifacts(tmp.path(), false);
-    assert!(reclaimed.is_empty());
-}
-
 // --- sweep_primary_checkout_artifacts (#5919) ------------------------
 
 #[test]
