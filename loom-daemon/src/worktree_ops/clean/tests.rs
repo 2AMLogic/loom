@@ -1238,6 +1238,31 @@ fn cleanup_pr_worktree_removes_untracked_orphan_directory() {
     assert!(!orphan.exists(), "orphan directory should be gone");
 }
 
+/// Unlike `cleanup_worktree` (#5895), the `pr-<N>` path has no
+/// already-gone exemption: a directory that is missing on disk while git
+/// also has no record of it must surface as an error, not `Ok(())`.
+#[test]
+#[serial_test::serial]
+fn cleanup_pr_worktree_treats_a_missing_directory_as_an_error() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo_root = tmp.path().canonicalize().unwrap();
+    assert!(Command::new("git")
+        .args(["init", "-q"])
+        .current_dir(&repo_root)
+        .status()
+        .unwrap()
+        .success());
+
+    let gone = crate::worktree_root::worktree_root(&repo_root).join("pr-4525");
+    assert!(!gone.exists(), "fixture must not exist on disk");
+
+    let result = cleanup_pr_worktree(&repo_root, &gone, 4525, false, "test", None);
+    assert!(
+        result.is_err(),
+        "a missing directory must be an error for the pr path: {result:?}"
+    );
+}
+
 #[test]
 fn cleanup_pr_worktree_dry_run_makes_no_changes() {
     let tmp = tempfile::tempdir().unwrap();

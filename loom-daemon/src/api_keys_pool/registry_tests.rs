@@ -252,7 +252,7 @@ fn write_secret_replaces_atomically_and_stays_0600() {
         .unwrap()
         .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
         .collect();
-    assert!(names.iter().all(|n| !n.contains(".tmp-")), "{names:?}");
+    assert!(names.iter().all(|n| !crate::fs_util::is_staging_name(n)), "{names:?}");
 }
 
 /// A failed write must leave the previous contents intact (the `ENOSPC` /
