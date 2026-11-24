@@ -51,6 +51,43 @@ if grep -q 'git remote get-url origin' <<<"$CNT"; then fail "_work_log_search_to
 # Stub: forge titles for the pinned repo; FAIL_LOOKUP=1 simulates an API failure.
 STUB_DIR="$(mktemp -d)"
 trap 'rm -rf "$STUB_DIR"' EXIT
+# Hermetic stand-in for the splice half of `loom-daemon guide` (#15219): the
+# role file's splice_plan_body() wrapper pipes the body into the real verb;
+# this shim implements the same documented contract (marker check, marker
+# region replaced, per-tick scratch removed) so the extracted wrapper still
+# executes end to end without a built daemon. The real verb's behaviour is
+# pinned by loom-daemon/src/cli/guide_work_plan_tests.rs.
+mkdir -p "$STUB_DIR/bin"
+cat >"$STUB_DIR/bin/loom-daemon" <<'EOF'
+#!/usr/bin/env bash
+if [[ "${1:-}" == "guide" && "${2:-}" == "work-plan-splice" ]]; then
+  wt=""
+  shift 2
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --docs-worktree) wt="$2"; shift 2 ;;
+      *) echo "shim: unexpected argument: $1" >&2; exit 2 ;;
+    esac
+  done
+  plan="$wt/WORK_PLAN.md"
+  grep -q '<!-- guide:plan-body:start -->' "$plan" 2>/dev/null \
+    && grep -q '<!-- guide:plan-body:end -->' "$plan" 2>/dev/null || exit 1
+  scratch="$(mktemp -d "${TMPDIR:-/tmp}/guide-plan.XXXXXX")" || exit 1
+  rc=0
+  cat > "$scratch/body.md" \
+    && awk -v body="$scratch/body.md" '
+      /<!-- guide:plan-body:start -->/ { print; while ((getline l < body) > 0) print l; skip=1; next }
+      /<!-- guide:plan-body:end -->/   { skip=0 }
+      !skip { print }' "$plan" > "$scratch/plan.new" \
+    && cat "$scratch/plan.new" > "$plan" || rc=1
+  rm -rf "$scratch"
+  exit "$rc"
+fi
+echo "shim: unsupported invocation: $*" >&2
+exit 2
+EOF
+chmod +x "$STUB_DIR/bin/loom-daemon"
+export PATH="$STUB_DIR/bin:$PATH"
 GH_STUB="$STUB_DIR/gh"
 : > "$GH_STUB.calls"
 cat >"$GH_STUB" <<'EOF'
