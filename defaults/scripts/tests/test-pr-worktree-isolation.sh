@@ -571,7 +571,7 @@ chmod +x .loom/hooks/post-worktree.sh
 hook_count() { wc -l < "$HOOK_LOG" | tr -d ' '; }
 
 MOCKBIN5=$(mktemp -d /tmp/loom-pr-iso-mockbin5.XXXXXX)
-trap 'rm -rf "$TMP" "$MOCKBIN" "$MOCKBIN2" "$MOCKBIN3" "$MOCKBIN4" "$MOCKBIN5" "$SYM"; cd "$REPO_ROOT" 2>/dev/null || true' EXIT
+trap 'rm -rf "$TMP" "$MOCKBIN" "$MOCKBIN2" "$MOCKBIN3" "$MOCKBIN4" "$MOCKBIN5" "${SYM:-}"; cd "$REPO_ROOT" 2>/dev/null || true' EXIT
 cat > "$MOCKBIN5/gh" <<'MOCKEOF'
 #!/usr/bin/env bash
 # Hook-test `gh` stand-in. `pr view` resolves head branch / head sha
@@ -840,6 +840,9 @@ SYM=$(mktemp -d /tmp/loom-pr-iso-sym.XXXXXX)
 SYM_BASE=$(basename "$SYM")
 SYM_PHYS="$SYM/priv/tmp/$SYM_BASE/repo"
 mkdir -p "$SYM_PHYS"
+# git prints the physical spelling in porcelain output; on macOS /tmp is a
+# symlink to /private/tmp, so the 9a expectation must be canonicalised too.
+SYM_PHYS_REAL="$(cd "$SYM_PHYS" && pwd -P)"
 git init -q -b main "$SYM/origin.git" --bare
 git -C "$SYM_PHYS" init -q -b main
 git -C "$SYM_PHYS" config user.email t@t
@@ -868,7 +871,7 @@ RC9A=$?
 set -e
 WT991="$SYM/repo/.loom/worktrees/pr-991"
 if [[ "$RC9A" -eq 0 ]] && [[ -d "$WT991" ]] \
-    && git -C "$SYM_PHYS" worktree list --porcelain | grep -q "worktree $SYM_PHYS/.loom/worktrees/pr-991$"; then
+    && git -C "$SYM_PHYS" worktree list --porcelain | grep -q "worktree $SYM_PHYS_REAL/.loom/worktrees/pr-991$"; then
     pass "symlinked repo path: attached pr-<N> created (git registers the physical spelling)"
 else
     fail "symlinked repo path: attached create failed (rc=$RC9A): $PR_OUT9A"
