@@ -7,7 +7,7 @@ pub mod reap;
 mod shared;
 mod state;
 
-pub use state::{outside_every_repository, private_directory};
+pub use state::{outside_every_repository, private_directory, private_directory_with, OnLoose};
 
 /// The `@opencode-ai/plugin` version the guarded binding pins. It moves in
 /// lockstep with `OPENCODE_VERSION` in `docker/native/Dockerfile` — the

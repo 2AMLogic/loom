@@ -69,25 +69,16 @@ pub fn sccache_wrapper(value: Option<&OsStr>) -> Option<PathBuf> {
 /// Create `dir` (and parents) owner-only if absent, and require it to be a
 /// real directory we own — a symlink or another user's directory under the
 /// shared `/tmp` is refused rather than followed. An existing directory of
-/// ours with looser bits is tightened to `0700`.
+/// ours with looser bits is tightened to `0700` (the shared
+/// [`private_directory_with`] sequence, #15187).
 fn ensure_private_dir(dir: &Path) -> std::io::Result<()> {
     #[cfg(unix)]
     {
-        use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
-        std::fs::DirBuilder::new()
-            .recursive(true)
-            .mode(0o700)
-            .create(dir)?;
-        let meta = std::fs::symlink_metadata(dir)?;
-        // SAFETY: geteuid only reads the caller's effective user id.
-        let ours = meta.uid() == unsafe { libc::geteuid() };
-        if !meta.is_dir() || !ours {
-            return Err(std::io::Error::other("exists but is not a directory owned by this user"));
-        }
-        if meta.permissions().mode() & 0o077 != 0 {
-            std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
-        }
-        Ok(())
+        crate::native_tools::provision::private_directory_with(
+            dir,
+            crate::native_tools::provision::OnLoose::Tighten,
+        )
+        .map_err(std::io::Error::other)
     }
     #[cfg(not(unix))]
     {
