@@ -7,7 +7,7 @@ The body below is a snapshot of GitHub label state as of the last merged docs-ma
 <!-- Maintained automatically by the Guide triage agent. Manual edits are fine but may be overwritten. -->
 
 <!-- guide:plan-body:start -->
-_Generated: 2026-11-24T00:28:43Z (snapshot; compare against live labels)_
+_Generated: 2026-11-23T21:49:26Z (snapshot; compare against live labels)_
 ## Operator Attention: Merge-Risk-Hold Pileup
 
 Judge-approved PRs under a hold (`loom:blocked` or `loom:operator`) — only a human merge decision is missing.
@@ -33,7 +33,6 @@ Judge-approved PRs under a hold (`loom:blocked` or `loom:operator`) — only a h
 - **#14996**: fix: rehome open-PR heads in checkout_ff and block PR-head checkouts in the primary-checkout guard
 - **#15071**: feat: relay private-seat preparation Git reads through the fleet gateway
 - **#15079**: build(deps): bump the github-actions group across 1 directory with 5 updates
-- **#15101**: fix: refuse writer seat jobs before lease when no writer is published
 
 ## Very Important
 
@@ -56,31 +55,22 @@ _None._
 
 ## Ready
 
-Human-approved issues (`loom:issue`) ready for implementation — excluding held (`loom:blocked`/`loom:operator`/`loom:frozen`), `loom:building`, and issues with an open linked PR (native admission `OPEN_PR`; listed under Issues with Open PRs).
+Human-approved issues (`loom:issue`) ready for implementation — excluding held (`loom:blocked`/`loom:operator`/`loom:frozen`), `loom:building`, and issues closed by an open `loom:pr` PR (listed under Approved).
 
-_None._
-
-## Issues with Open PRs (Not Dispatchable)
-
-`loom:issue` issues an open linked PR already holds — native admission would refuse them (`OPEN_PR`); listed with the PR and its stage, not counted above.
-
-- **#11107**: Hyperparameters: drop the optimizer-only $LOOM_HYPERPARAMS vector tier (precedence becomes env > config > default) — open PR #11305 (held)
-- **#13820**: Remove the loom-api crate: reads a database the daemon does not write, 3 of 5 endpoints query tables nothing creates — open PR #14046 (held)
-- **#13957**: Shrink always-read core of judge.md (173 KB) into on-demand sub-skills — open PR #13997 (held)
-- **#14110**: Contained roles: select only private-clone accounts registering the repository; clear refusal, status and docs — open PR #14260 (held)
-- **#14434**: resync-installed.sh restamps loom_version even when a file is blocked and the run exits 1 — open PR #14452 (held)
-- **#14450**: Remove a by-owner credential directory once its owner is no longer a cross-owner (follow-up to #14435) — open PR #14470 (unlabeled)
-- **#14455**: Codex Curator steps are dispatched to stopped, unprovisioned seats and end SANDBOX_UNAVAILABLE every time — open PR #14498 (held)
-- **#14474**: Expose worktree operations through the shared Rust CLI — open PR #14514 (unlabeled)
-- **#14497**: Codex seats: trusted-seat selection for guarded roles, machine-level accounts disable, state-change release of the sandbox hold — open PR #14510 (held)
-- **#14626**: Private-clone admission contains the winning seat twice per admission — open PR #14696 (held)
-- **#14712**: resync: a no-op resync warns that it stamped the canonical loom_source_remote, but leaves the stale one — open PR #14769 (held)
-- **#14714**: Held Doctor repairs leave stale approvals outside the Judge queue — open PR #14715 (held)
-- **#14730**: First daemon start on a new host cannot fetch the fleet store: fleet-config render is shed when readers are configured and no daemon is running — open PR #14753 (in review)
-- **#14739**: forge_identity: a release.checksum refusal withdraws the reader gateway for the whole owner, shedding every 2AMLogic read ~20 min/h since 0.20.0 — open PR #14758 (held)
-- **#14876**: clean: stale-branch pass deletes a mis-prefixed 'heads/<name>' branch and fails permanently on PR-fetch ref residue — open PR #14916 (held)
-- **#14946**: Remove serde_yaml_ng (and unsafe-libyaml): consolidate workflow-lint onto serde-saphyr — open PR #14950 (held)
-- **#14977**: write_scope cache tests race with default-key cross_owner_tests under cargo test (LOOM_WRITE_SCOPE_CACHE_DIR) — open PR #14995 (in review)
+- **#14450**: Remove a by-owner credential directory once its owner is no longer a cross-owner (follow-up to #14435)
+- **#14474**: Expose worktree operations through the shared Rust CLI
+- **#14730**: First daemon start on a new host cannot fetch the fleet store: fleet-config render is shed when readers are configured and no daemon is running
+- **#14739**: forge_identity: a release.checksum refusal withdraws the reader gateway for the whole owner, shedding every 2AMLogic read ~20 min/h since 0.20.0
+- **#14785**: Guide work plan counts issues with open partial PRs as ready for new Builders
+- **#14977**: write_scope cache tests race with default-key cross_owner_tests under cargo test (LOOM_WRITE_SCOPE_CACHE_DIR)
+- **#15023**: Codex `session id:` banner: five readers, two anchoring rules — single-source the anchoring the way #14883 single-sourced the token shape
+- **#15086**: Make #14885's fallback-docker CLI test prove it ran, and document LOOM_DOCKER_BIN as a fleet-wide fail-closed override
+- **#15094**: test flake: nextest discovery stalls inside the Run tests step (lib binary --list) on Rust Unit Tests (2/5) — fourth occurrence, #14066's diagnostic skipped
+- **#15095**: merge-group-check.yml is the repo's only unpinned action (actions/checkout@v7), and its defaults/optional template still says @v4
+- **#15097**: Held PRs are still drawn every tick on every host (about 13 draws per PR per hour)
+- **#15102**: Remove #12063 slice 2 leftovers: dead forge_get_required_status_check_contexts and dead Route::Sync branch-sync fields/stubs
+- **#15103**: Document (or route) why pr_planning and stage_occupancy reads stay direct on forge.gateway hosts
+- **#15108**: operator-decision resolve: work after a ruling replaced the block, and resolve many issues with one confirmation
 
 ## In Progress
 
@@ -94,7 +84,6 @@ Issues currently being built (`loom:building`).
 - **#14656**: judge.md/doctor.md drift recovery: dirty-worktree arm refuses with no named next step (and no longer surfaces the snapshot path)
 - **#14657**: Check the PR head repository before selecting Judge and Doctor worktrees
 - **#14680**: Share origin-only Git objects across Codex seats through read-only per-repository mirrors
-- **#14785**: Guide work plan counts issues with open partial PRs as ready for new Builders
 - **#14816**: Reconcile stale Curator claims and verify recovery of the three roll incidents
 - **#14879**: clean --safe: closed-issue branch cleanup force-deletes unpushed commits via the -d to -D fallback
 - **#14888**: Verify that one Doctor tick advances past an inherited-red PR in a 15-row queue
@@ -105,13 +94,13 @@ Issues currently being built (`loom:building`).
 - **#14938**: Gitea gap: forge check-claim and forge parent split-state are GitHub-only, blocking targeted Builder steps
 - **#14941**: Lease publish in worktree.sh is gh-backed: on Gitea the lease stays local-only and cross-host protection is lost
 - **#14945**: runtime: add Google Antigravity CLI (agy), keyed from the gemini api-keys pool
+- **#14946**: Remove serde_yaml_ng (and unsafe-libyaml): consolidate workflow-lint onto serde-saphyr
 - **#14952**: Per-ticket agent scratch roots on /Volumes/Stripe are never cleaned up (~300 new dirs/day, volume fills)
 - **#14962**: A bare roleModels.<role> is forwarded to an OpenCode profile pick and the launch is refused at profile_selection
 - **#14973**: Review sessions switch the primary checkout to a PR head; checkout_ff logs wrong-branch and never repairs it (30 checkouts on four hosts)
 - **#15017**: Single-step runs: accept a registered prompt modifier and record it on step telemetry and the hyperparams digest
 - **#15020**: Doctor hand-back leaves loom:ci-failure on, which verdict_gate refuses and ci_gate_recovery cannot clear: PRs stall unapprovably
 - **#15021**: warn-operator-gated.sh is a fifth dependency-ref consumer with no Part-of parent mask
-- **#15023**: Codex `session id:` banner: five readers, two anchoring rules — single-source the anchoring the way #14883 single-sourced the token shape
 - **#15024**: Consolidate ~13 duplicated PATH-lookup and remaining executable helpers in loom-daemon into fs_util
 - **#15025**: check-review-feedback.sh §1b: the comment-verdict read (issues/<n>/comments) is still single-path REST, so a reader shed still hard-stalls Judge approvals
 - **#15027**: private_workspace: unpublished_branches/recover enumerate with %(refname:short) and break under PR-fetch ref residue
@@ -120,15 +109,8 @@ Issues currently being built (`loom:building`).
 - **#15048**: Judge docs-only fast path: `gh pr view --json baseRepository` absent on gh 2.102.0 — recipe fails closed as a read failure, no documented version floor
 - **#15058**: Reconcile the Builder stray-closing-keyword scan with #9879 fence-awareness, and the URL reference form
 - **#15068**: An operator's hand-posted changes-requested verdict carries no verdict-sha marker, so stale-verdict reconciliation clears it and re-queues the rejected head
-- **#15086**: Make #14885's fallback-docker CLI test prove it ran, and document LOOM_DOCKER_BIN as a fleet-wide fail-closed override
 - **#15091**: Codex: an account's weekly exhaustion is learned per host, so every newly seated host burns attempts on it
-- **#15094**: test flake: nextest discovery stalls inside the Run tests step (lib binary --list) on Rust Unit Tests (2/5) — fourth occurrence, #14066's diagnostic skipped
-- **#15095**: merge-group-check.yml is the repo's only unpinned action (actions/checkout@v7), and its defaults/optional template still says @v4
-- **#15097**: Held PRs are still drawn every tick on every host (about 13 draws per PR per hour)
 - **#15098**: Route the daemon's fleet-store reads through the github-read gateway when forge.gateway is set
-- **#15102**: Remove #12063 slice 2 leftovers: dead forge_get_required_status_check_contexts and dead Route::Sync branch-sync fields/stubs
-- **#15103**: Document (or route) why pr_planning and stage_occupancy reads stay direct on forge.gateway hosts
-- **#15108**: operator-decision resolve: work after a ruling replaced the block, and resolve many issues with one confirmation
 
 ## PRs Awaiting Review
 
@@ -138,7 +120,7 @@ PRs waiting on Judge (`loom:review-requested`).
 - **#14612**: fix: launch eager reclaim detached so it cannot hold back a work-finder tick *(held)*
 - **#14753**: fix: mint a bootstrap reader so first-start fleet-config render can confirm the store
 - **#14758**: fix(release): keep checksum reads on the reader route *(held)*
-- **#14924**: feat(daemon): observe merged PRs in the reconciliation tick and finish their issue bookkeeping
+- **#14953**: feat: borrow origin object mirrors in Codex seats via verified read-only binds
 - **#14995**: test: hold write_scope_cache serial key in write_scope cross-owner tests
 - **#15022**: fix: drop a configured role model a native model profile would refuse
 - **#15029**: fix: drop loom:ci-failure in the doctor hand-back write
@@ -148,17 +130,6 @@ PRs waiting on Judge (`loom:review-requested`).
 - **#15083**: fix: mask Part-of parent refs in warn-operator-gated dependency parse
 - **#15084**: fix(claim-reconcile): keep a trusted hand-applied changes-requested pinned at an unmoved head
 - **#15099**: feat: share codex account holds across fleet hosts on the heartbeat
-- **#15126**: docs: Guide document maintenance update
-- **#15127**: test: fail the fallback-docker CLI test on skip under a CI opt-in; document LOOM_DOCKER_BIN
-- **#15128**: ci: run discovery-stall diagnostic after the run step, gate on either failure
-- **#15129**: ci: pin actions/checkout to v7.0.1 SHA in merge-group-check workflow and template
-- **#15130**: feat(fleet_store): route cacheable store reads through the github-read gateway
-- **#15131**: refactor: remove #12063 slice 2 leftovers (dead forge_get_required_status_check_contexts, Route::Sync wait/rework)
-- **#15132**: Verify the native authorization status producer during merge-queue eligibility
-- **#15133**: feat: read Builder claim and split-parent evidence from Gitea
-- **#15135**: fix: hold a backstop-held PR's Judge step at the step draw (#15097)
-- **#15137**: docs: explain direct-read fallback of two gateway-first forge reads
-- **#15138**: feat: recover operator decisions from edit history and resolve them in one confirmed batch
 
 ## Approved (Awaiting Merge)
 
@@ -356,12 +327,12 @@ Issues carrying `loom:curated`.
 
 | Bucket | Count |
 |------|-------|
-| Operator merge-risk holds | 22 |
+| Operator merge-risk holds | 21 |
 | Very important | 0 |
 | Important | 8 |
-| Ready (`loom:issue`, net of holds/building/open-linked-PRs) | 0 |
-| In Progress (`loom:building`) | 43 |
-| PRs awaiting review | 25 |
+| Ready (`loom:issue`, net of holds/building/merge-pending) | 14 |
+| In Progress (`loom:building`) | 35 |
+| PRs awaiting review | 14 |
 | Approved PRs awaiting merge | 31 |
 | Curated | 133 |
 | Architect / Hermit proposals | 5 |
