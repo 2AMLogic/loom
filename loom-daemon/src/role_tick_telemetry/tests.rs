@@ -1068,8 +1068,7 @@ fn emit_one_step(
             log_path,
         },
     );
-    let records = crate::sweep_outcomes::read_all_role_tick_outcomes(&journal);
-    records
+    crate::sweep_outcomes::read_all_role_tick_outcomes(&journal)
 }
 
 /// A step's record carries its stage and its launch attribution read from
