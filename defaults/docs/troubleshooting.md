@@ -952,13 +952,15 @@ jq -r 'select(.ts > "2026-08-10T20:00:00") | "\(.ts) \(.mechanism) \(.reason) \(
 ```
 
 `mechanism` is one of `clean`, `clean --aggressive`, `worktree_reaper`,
-`terminal_destroy`, `loom-recover-orphans`, `merge-pr.sh`, `worktree.sh remove`,
-`agent-destroy.sh`, `merge_observation` — all nine of Loom's removal paths
+`loom-recover-orphans`, `merge-pr.sh`, `worktree.sh remove`,
+`agent-destroy.sh`, `merge_observation` — all eight of Loom's removal paths
 (`merge_observation`, #14904, is the daemon's merge-observation pass: the same
 post-merge cleanup `merge-pr.sh` runs, triggered from the reconciliation tick
 when a forge-side merge is observed — a removal by it is the daemon's, not the
-script's); `reason` is the exact
-decision that authorized it (e.g. `force_override_unreachable`, `pr_merged`).
+script's); `reason` is the exact decision that authorized it (e.g.
+`force_override_unreachable`, `pr_merged`; `agent-destroy.sh` writes
+`terminal_destroy` here, and ledger lines older than #13867 may carry it as a
+`mechanism`).
 **An absent entry is evidence too**: no Loom code path removed it, so look at
 host-level/manual action — a bare `rm -rf`, a hand-run `git worktree remove`, a
 `git worktree prune` against a directory that was moved, or another checkout of
