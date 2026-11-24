@@ -11,12 +11,14 @@
 //! the host — dies with `Failed to create temp dir`.
 //!
 //! Before the worker execs, this seam makes sure the server is up *with a
-//! stable temp root*: it runs `sccache --show-stats` with `TMPDIR` set to
+//! stable temp root*: it runs `sccache --start-server` with `TMPDIR` set to
 //! [`crate::native_state_reclaim::shared_sccache_tmp`] (a non-hex leaf the
-//! reaper never removes). `--show-stats` connects to a running server, or
-//! starts one with the environment it is given when none is up, so one call
-//! is both the start and the health probe. The worker's own `TMPDIR` is not
-//! touched.
+//! reaper never removes). Measured against `sccache 0.17.0`:
+//! `--start-server` starts a server that inherits that `TMPDIR` (exit 0), and
+//! against a live server it is **not** idempotent — it exits non-zero with
+//! `Address in use`, which this seam reads as "already running". (`--show-stats`
+//! is no substitute: it exits 0 whether or not a server is up and starts none.)
+//! The worker's own `TMPDIR` is not touched.
 //!
 //! Limits, stated plainly:
 //!
@@ -46,8 +48,11 @@ const STDERR_EXCERPT_BYTES: usize = 300;
 pub enum Outcome {
     /// `RUSTC_WRAPPER` is not `sccache`: nothing was done.
     Skipped,
-    /// The server answered; it runs with (or was started with) the stable root.
-    Healthy,
+    /// No server was up; this call started one under the stable root.
+    Started,
+    /// A server was already up. Its environment is whatever it was started
+    /// with — this seam did not and cannot change it.
+    AlreadyRunning,
     /// The root could not be prepared or the probe failed; carries the reason.
     Unhealthy(String),
 }
@@ -90,13 +95,14 @@ fn ensure_private_dir(dir: &Path) -> std::io::Result<()> {
     }
 }
 
-/// Run `<wrapper> --show-stats` with `TMPDIR=<stable>`, bounded by `timeout`.
-/// `Ok(())` only on a zero exit; otherwise the reason.
-fn probe(wrapper: &Path, stable: &Path, timeout: Duration) -> Result<(), String> {
+/// Run `<wrapper> --start-server` with `TMPDIR=<stable>`, bounded by `timeout`.
+/// Zero exit is [`Outcome::Started`]; a non-zero exit whose stderr says
+/// `Address in use` is [`Outcome::AlreadyRunning`]; anything else is the reason.
+fn probe(wrapper: &Path, stable: &Path, timeout: Duration) -> Result<Outcome, String> {
     let mut stderr = tempfile::tempfile().map_err(|e| format!("no scratch file: {e}"))?;
     let mut command = Command::new(wrapper);
     command
-        .arg("--show-stats")
+        .arg("--start-server")
         .env("TMPDIR", stable)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -123,14 +129,14 @@ fn probe(wrapper: &Path, stable: &Path, timeout: Duration) -> Result<(), String>
             Ok(None) if Instant::now() >= deadline => {
                 let _ = child.kill();
                 let _ = child.wait();
-                return Err(format!("`--show-stats` did not return in {}s", timeout.as_secs()));
+                return Err(format!("`--start-server` did not return in {}s", timeout.as_secs()));
             }
             Ok(None) => std::thread::sleep(Duration::from_millis(50)),
-            Err(e) => return Err(format!("cannot wait for `--show-stats`: {e}")),
+            Err(e) => return Err(format!("cannot wait for `--start-server`: {e}")),
         }
     };
     if status.success() {
-        return Ok(());
+        return Ok(Outcome::Started);
     }
     let mut text = String::new();
     let _ = stderr.seek(SeekFrom::Start(0));
@@ -142,7 +148,10 @@ fn probe(wrapper: &Path, stable: &Path, timeout: Duration) -> Result<(), String>
         .chars()
         .take(STDERR_EXCERPT_BYTES)
         .collect();
-    Err(format!("`--show-stats` exited {status}: {excerpt}"))
+    if excerpt.contains("Address in use") {
+        return Ok(Outcome::AlreadyRunning);
+    }
+    Err(format!("`--start-server` exited {status}: {excerpt}"))
 }
 
 /// The seam with every input explicit, so a test needs no process env.
@@ -159,9 +168,17 @@ pub fn ensure_in(
         .map_err(|e| format!("temp root {} unusable: {e}", stable.display()))
         .and_then(|()| probe(&wrapper, stable, timeout));
     match result {
-        Ok(()) => {
-            let _ = writeln!(log, "# LOOM_SCCACHE_SERVER ok tmpdir={} (#15139)", stable.display());
-            Outcome::Healthy
+        Ok(Outcome::Started) => {
+            let _ =
+                writeln!(log, "# LOOM_SCCACHE_SERVER started tmpdir={} (#15139)", stable.display());
+            Outcome::Started
+        }
+        Ok(outcome) => {
+            let _ = writeln!(
+                log,
+                "# LOOM_SCCACHE_SERVER already running (environment not changed by this launch) (#15139)"
+            );
+            outcome
         }
         Err(reason) => {
             let _ = writeln!(
@@ -246,12 +263,29 @@ mod tests {
 
         let outcome = run(&wrapper, &stable, &mut log);
 
-        assert_eq!(outcome, Outcome::Healthy);
+        assert_eq!(outcome, Outcome::Started);
         let seen = std::fs::read_to_string(temp.path().join("seen")).unwrap();
-        assert_eq!(seen.trim(), format!("{} --show-stats", stable.display()));
+        assert_eq!(seen.trim(), format!("{} --start-server", stable.display()));
         assert_eq!(std::fs::metadata(&stable).unwrap().permissions().mode() & 0o777, 0o700);
         let line = String::from_utf8(log).unwrap();
-        assert!(line.contains("# LOOM_SCCACHE_SERVER ok"), "{line}");
+        assert!(line.contains("# LOOM_SCCACHE_SERVER started"), "{line}");
+    }
+
+    #[test]
+    fn address_in_use_means_a_server_is_already_running() {
+        let temp = tempfile::tempdir().unwrap();
+        let wrapper = fake(
+            temp.path(),
+            "echo 'sccache: error: Server startup failed: Address in use' >&2; exit 2",
+        );
+        let stable = temp.path().join("sccache-root");
+        let mut log = Vec::new();
+
+        assert_eq!(run(&wrapper, &stable, &mut log), Outcome::AlreadyRunning);
+        let text = String::from_utf8(log).unwrap();
+        assert_eq!(text.lines().count(), 1, "{text}");
+        assert!(text.contains("already running"), "{text}");
+        assert!(!text.contains("unhealthy"), "{text}");
     }
 
     #[test]
@@ -312,7 +346,7 @@ mod tests {
         std::fs::set_permissions(&stable, std::fs::Permissions::from_mode(0o755)).unwrap();
         let mut log = Vec::new();
 
-        assert_eq!(run(&wrapper, &stable, &mut log), Outcome::Healthy);
+        assert_eq!(run(&wrapper, &stable, &mut log), Outcome::Started);
         assert_eq!(std::fs::metadata(&stable).unwrap().permissions().mode() & 0o777, 0o700);
     }
 }
