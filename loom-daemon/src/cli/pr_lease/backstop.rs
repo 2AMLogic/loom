@@ -8,7 +8,7 @@ use std::path::PathBuf;
 
 use crate::comment_trust::TrustPolicy;
 use crate::forge_call_stats::ops;
-use crate::gh_invocation::{AccessIntent, GhTarget};
+use crate::gh_invocation::{AccessIntent, GhInvocation, GhTarget};
 use crate::judge_backstop::{self as backstop, CiRead, CiState};
 use crate::step_role::StepRole;
 use chrono::{DateTime, Utc};
@@ -75,8 +75,12 @@ impl Gh {
             .and_then(|s| GhTarget::repo(s).ok())
             .unwrap_or(GhTarget::None);
         let repo_path = slug.unwrap_or_else(|| "{owner}/{repo}".to_string());
-        let out = self
-            .inv_at("pr_lease.prs_labelled", AccessIntent::Read, ops::PR_LIST_OPEN, target)
+        // Built through the gh facade (`Gh::inv_at` -> `GhInvocation`), so the
+        // `--paginate` read is counted and page-walkable; the explicit type
+        // also lets the per-file paginate-site lint see the facade.
+        let read: GhInvocation =
+            self.inv_at("pr_lease.prs_labelled", AccessIntent::Read, ops::PR_LIST_OPEN, target);
+        let out = read
             .args([
                 "api",
                 &format!(
