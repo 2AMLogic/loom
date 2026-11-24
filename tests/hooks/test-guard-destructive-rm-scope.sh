@@ -253,6 +253,10 @@ assert_deny_reason_matches "rmScope default (#15221): function keyword body deni
     'function probe { rm -f "$NOPE/.p"; }; probe' 'is an unexpanded shell variable from the path root down' "$REPO_ROOT"
 assert_deny_reason_matches "rmScope default (#15221): function keyword + parens body denies unresolved-var" \
     'function probe() { rm -f "$NOPE/.p"; }; probe' 'is an unexpanded shell variable from the path root down' "$REPO_ROOT"
+assert_deny_reason_matches "rmScope default (#15221): space before parens, name () { rm … } denies unresolved-var" \
+    'probe () { rm -f "$NOPE/.p"; }; probe' 'is an unexpanded shell variable from the path root down' "$REPO_ROOT"
+assert_deny_reason_matches "rmScope default (#15221): function keyword + space before parens denies unresolved-var" \
+    'function probe () { rm -f "$NOPE/.p"; }; probe' 'is an unexpanded shell variable from the path root down' "$REPO_ROOT"
 assert_deny_reason_matches "rmScope default (#15221): subshell function body denies unresolved-var" \
     'probe() ( rm -f "$NOPE/.p" ); probe' 'is an unexpanded shell variable from the path root down' "$REPO_ROOT"
 # A definition that is never invoked is scanned the same way — defining it is

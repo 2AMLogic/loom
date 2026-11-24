@@ -7708,10 +7708,10 @@ _extract_rm_targets_scan() {
             # shell structure preceding the command word only, and a segment
             # whose first word already is `rm` matches none of these shapes.
             while (1) {
-                if (seg ~ /^[A-Za-z_][A-Za-z0-9_]*\(\)[ \t]*[\{(]/)
-                    sub(/^[A-Za-z_][A-Za-z0-9_]*\(\)[ \t]*[\{(][ \t]*/, "", seg)
-                else if (seg ~ /^function[ \t]+[A-Za-z_][A-Za-z0-9_]*(\(\))?[ \t]*[\{(]/)
-                    sub(/^function[ \t]+[A-Za-z_][A-Za-z0-9_]*(\(\))?[ \t]*[\{(][ \t]*/, "", seg)
+                if (seg ~ /^[A-Za-z_][A-Za-z0-9_]*[ \t]*\(\)[ \t]*[\{(]/)
+                    sub(/^[A-Za-z_][A-Za-z0-9_]*[ \t]*\(\)[ \t]*[\{(][ \t]*/, "", seg)
+                else if (seg ~ /^function[ \t]+[A-Za-z_][A-Za-z0-9_]*([ \t]*\(\))?[ \t]*[\{(]/)
+                    sub(/^function[ \t]+[A-Za-z_][A-Za-z0-9_]*([ \t]*\(\))?[ \t]*[\{(][ \t]*/, "", seg)
                 else if (seg ~ /^\{[ \t]/)
                     sub(/^\{[ \t]+/, "", seg)
                 else if (seg ~ /^\(/ && seg !~ /^\(\(/)
