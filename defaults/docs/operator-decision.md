@@ -212,7 +212,8 @@ reviewed — together with the issue's current title.
 
 **A ruled issue's scope stays pinned to the ruling.** The history fallback
 fires only while the body carries no ` ```decision ` block, and for a ruled
-issue that is permanent: the block was replaced by the "Operator ruling"
+issue that is permanent (bounded by the 100-edit history window: past it the
+resolution reads unreadable, not pinned): the block was replaced by the "Operator ruling"
 section and does not come back. So for a history-recovered decision the scope
 digest is fixed to the recovered snapshot plus the issue's **current title**,
 and a later rewrite of the **body** — a Curator enrichment, or a rescope —
