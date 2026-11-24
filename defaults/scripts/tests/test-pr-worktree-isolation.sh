@@ -25,6 +25,11 @@
 #      (worktree path, branch, PR number) from the worktree, and never on a
 #      failed refresh, a builder-held branch, or a missing/non-executable hook;
 #      a failing hook only warns on stderr.
+#   9. builder_holder excludes the PR's own pr-<N> worktree by PHYSICAL path
+#      (#15121): re-entering an attached pr-<N> through a symlinked repo path
+#      (macOS /tmp -> /private/tmp natively; a matching symlink fixture on
+#      Linux) reuses the worktree instead of dying on the builder-wins error,
+#      while a genuine builder holder is still refused.
 #
 # Tests 3-5 run the real pr-worktree.sh against a throwaway git repo with a
 # mocked `gh`, since there is no live forge in CI. Branch-shape classification
@@ -566,7 +571,7 @@ chmod +x .loom/hooks/post-worktree.sh
 hook_count() { wc -l < "$HOOK_LOG" | tr -d ' '; }
 
 MOCKBIN5=$(mktemp -d /tmp/loom-pr-iso-mockbin5.XXXXXX)
-trap 'rm -rf "$TMP" "$MOCKBIN" "$MOCKBIN2" "$MOCKBIN3" "$MOCKBIN4" "$MOCKBIN5"; cd "$REPO_ROOT" 2>/dev/null || true' EXIT
+trap 'rm -rf "$TMP" "$MOCKBIN" "$MOCKBIN2" "$MOCKBIN3" "$MOCKBIN4" "$MOCKBIN5" "${SYM:-}"; cd "$REPO_ROOT" 2>/dev/null || true' EXIT
 cat > "$MOCKBIN5/gh" <<'MOCKEOF'
 #!/usr/bin/env bash
 # Hook-test `gh` stand-in. `pr view` resolves head branch / head sha
@@ -816,6 +821,99 @@ if [[ "$RC8K" -eq 1 ]] && [[ "$(hook_count)" -eq "$BEFORE8K" ]]; then
     pass "builder-held branch: exit 1 and no hook run"
 else
     fail "builder-held branch: expected rc=1 and no new hook record (rc=$RC8K, records=$(hook_count)): $PR_OUT8K"
+fi
+
+# --- Test 9: builder_holder compares physical paths (#15121) ---
+echo ""
+echo "Test 9: pr-worktree.sh re-enters its own attached pr-<N> through a symlinked repo path (#15121)"
+
+# `git worktree list --porcelain` prints physical spellings while
+# pr-worktree.sh's WORKTREE_PATH keeps the logical spelling the repo was
+# reached by; a string compare then reports the PR's own pr-<N> as a foreign
+# builder holder and re-entry dies with the builder-wins error (CI Daily run
+# 45250283620, macOS /tmp -> /private/tmp). On Linux the same spelling split
+# is built by giving the repo a real location whose absolute path literally
+# ends with the symlink's own path string — the /tmp-into-/private/tmp shape —
+# so the reuse gate's unanchored grep still matches the physical spelling
+# while the porcelain compare splits, exactly as on macOS.
+SYM=$(mktemp -d /tmp/loom-pr-iso-sym.XXXXXX)
+SYM_BASE=$(basename "$SYM")
+SYM_PHYS="$SYM/priv/tmp/$SYM_BASE/repo"
+mkdir -p "$SYM_PHYS"
+# git prints the physical spelling in porcelain output; on macOS /tmp is a
+# symlink to /private/tmp, so the 9a expectation must be canonicalised too.
+SYM_PHYS_REAL="$(cd "$SYM_PHYS" && pwd -P)"
+git init -q -b main "$SYM/origin.git" --bare
+git -C "$SYM_PHYS" init -q -b main
+git -C "$SYM_PHYS" config user.email t@t
+git -C "$SYM_PHYS" config user.name t
+git -C "$SYM_PHYS" commit --allow-empty -q -m init
+git -C "$SYM_PHYS" remote add origin "$SYM/origin.git"
+git -C "$SYM_PHYS" push -q origin main
+ln -s "$SYM_PHYS" "$SYM/repo"
+mkdir -p "$SYM/repo/.loom/hooks"
+cat > "$SYM/repo/.loom/hooks/post-worktree.sh" <<'HOOKEOF'
+#!/usr/bin/env bash
+printf '%s|%s|%s|%s|%s\n' "$(pwd)" "$1" "$2" "$3" "$(git rev-parse HEAD)" >> "${LOOM_TEST_HOOK_LOG:?}"
+exit 0
+HOOKEOF
+chmod +x "$SYM/repo/.loom/hooks/post-worktree.sh"
+
+# 9a: create an attached pr-991 through the symlinked path (sets up 9b).
+git -C "$SYM_PHYS" checkout -q -b fix/symlink-reentry
+git -C "$SYM_PHYS" commit --allow-empty -q -m "pr 991 change"
+git -C "$SYM_PHYS" checkout -q main
+set +e
+PR_OUT9A=$(cd "$SYM/repo" && PATH="$MOCKBIN5:$PATH" LOOM_DEFAULT_BRANCH=main \
+    LOOM_TEST_HOOK_LOG="$HOOK_LOG" LOOM_TEST_HEAD_BRANCH=fix/symlink-reentry \
+    LOOM_TEST_CHECKOUT_MODE=real "$PR_WORKTREE_SH" 991 2>/dev/null)
+RC9A=$?
+set -e
+WT991="$SYM/repo/.loom/worktrees/pr-991"
+if [[ "$RC9A" -eq 0 ]] && [[ -d "$WT991" ]] \
+    && git -C "$SYM_PHYS" worktree list --porcelain | grep -q "worktree $SYM_PHYS_REAL/.loom/worktrees/pr-991$"; then
+    pass "symlinked repo path: attached pr-<N> created (git registers the physical spelling)"
+else
+    fail "symlinked repo path: attached create failed (rc=$RC9A): $PR_OUT9A"
+fi
+
+# 9b: RE-ENTER the PR's own attached pr-991 through the same symlinked path —
+#     the macOS Test 8b/8c failure. Must reuse + refresh (rc=0, one more hook
+#     record), not die on the builder-wins error.
+BEFORE9B="$(hook_count)"
+set +e
+PR_OUT9B=$(cd "$SYM/repo" && PATH="$MOCKBIN5:$PATH" LOOM_DEFAULT_BRANCH=main \
+    LOOM_TEST_HOOK_LOG="$HOOK_LOG" LOOM_TEST_HEAD_BRANCH=fix/symlink-reentry \
+    LOOM_TEST_CHECKOUT_MODE=real "$PR_WORKTREE_SH" 991 2>/dev/null)
+RC9B=$?
+set -e
+if [[ "$RC9B" -eq 0 ]] && [[ "$(hook_count)" -eq $((BEFORE9B + 1)) ]] \
+    && grep -q "already exists at $WT991 (reusing)" <<<"$PR_OUT9B" \
+    && ! grep -q "Reuse the existing worktree directly" <<<"$PR_OUT9B" \
+    && [[ "$(tail -n1 <<<"$PR_OUT9B")" == "$WT991" ]]; then
+    pass "symlinked repo path: re-entering the PR's own attached pr-<N> reuses it (rc=0)"
+else
+    fail "symlinked re-entry: expected rc=0, reuse message and one hook record (rc=$RC9B, records=$(hook_count)): $PR_OUT9B"
+fi
+
+# 9c: a GENUINE builder holder is still refused through the symlinked path.
+git -C "$SYM_PHYS" checkout -q -b feature/issue-992
+git -C "$SYM_PHYS" commit --allow-empty -q -m "pr 992 change"
+git -C "$SYM_PHYS" checkout -q main
+git -C "$SYM_PHYS" worktree add -q "$SYM_PHYS/.loom/worktrees/issue-992" feature/issue-992
+BEFORE9C="$(hook_count)"
+set +e
+PR_OUT9C=$(cd "$SYM/repo" && PATH="$MOCKBIN5:$PATH" LOOM_DEFAULT_BRANCH=main \
+    LOOM_TEST_HOOK_LOG="$HOOK_LOG" LOOM_TEST_HEAD_BRANCH=feature/issue-992 \
+    "$PR_WORKTREE_SH" 992 2>/dev/null)
+RC9C=$?
+set -e
+git -C "$SYM_PHYS" worktree remove --force "$SYM_PHYS/.loom/worktrees/issue-992"
+if [[ "$RC9C" -eq 1 ]] && [[ "$(hook_count)" -eq "$BEFORE9C" ]] \
+    && grep -q "Reuse the existing worktree directly" <<<"$PR_OUT9C"; then
+    pass "symlinked repo path: genuine builder holder still refused (rc=1)"
+else
+    fail "symlinked genuine holder: expected rc=1 and no hook record (rc=$RC9C, records=$(hook_count)): $PR_OUT9C"
 fi
 
 cd "$REPO_ROOT"
