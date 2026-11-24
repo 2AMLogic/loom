@@ -829,7 +829,8 @@ if [[ -n "\$_stdin" ]]; then echo "MOCK-SAW-STDIN:\$_stdin" >&2; fi
   echo "OpenAI Codex v0.146.0"
   echo "--------"
   echo "sandbox: read-only"
-  echo "session id: $MOCK_SESSION"
+  [[ -z "\${MOCK_QUOTED_BANNER:-}" ]] || echo "\$MOCK_QUOTED_BANNER"
+  [[ -n "\${MOCK_NO_BANNER:-}" ]] || echo "session id: $MOCK_SESSION"
   echo "--------"
   echo "tokens used"
   echo "2,502"
@@ -935,6 +936,26 @@ assert_contains "transcript=unresolved" "$mock_stderr" \
     "an unresolvable transcript is reported, not guessed"
 assert_eq "0" "$unresolved_rc" \
     "an unresolvable transcript does NOT fail the spawn"
+
+# The transcript join key is line-anchored (#15023), the rule every Rust banner
+# reader shares: a banner quoted mid-line is data about a launch, not evidence
+# of one. It never answers for a missing banner and never shadows the real one.
+QUOTED_SESSION="11111111-2222-3333-4444-555555555555"
+mock_stderr="$({ run_mock MOCK_NO_BANNER=1 \
+    MOCK_QUOTED_BANNER="the runner echoed: session id: $QUOTED_SESSION" -- -p "hi" >/dev/null; } 2>&1)"
+assert_contains "session id: $QUOTED_SESSION" "$mock_stderr" \
+    "a banner quoted mid-line still reaches the caller's stderr"
+assert_not_contains "spawn-codex: session=" "$mock_stderr" \
+    "a banner quoted mid-line is not used as the transcript join key"
+assert_contains "transcript=unresolved (no 'session id:' line in codex output)" "$mock_stderr" \
+    "a quoted banner alone leaves the transcript unresolved"
+
+mock_stderr="$({ run_mock \
+    MOCK_QUOTED_BANNER="the runner echoed: session id: $QUOTED_SESSION" -- -p "hi" >/dev/null; } 2>&1)"
+assert_contains "spawn-codex: session=$MOCK_SESSION" "$mock_stderr" \
+    "the real banner, not an earlier quoted one, is the transcript join key"
+assert_not_contains "spawn-codex: session=$QUOTED_SESSION" "$mock_stderr" \
+    "a quoted banner never shadows the real one"
 
 # LOOM_CODEX_NO_CAPTURE takes the plain exec path (no session reporting).
 mock_stderr="$({ run_mock LOOM_CODEX_NO_CAPTURE=1 -- -p "hi" >/dev/null; } 2>&1)"
