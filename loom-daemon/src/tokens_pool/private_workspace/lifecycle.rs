@@ -294,6 +294,7 @@ fn start_with(
             gh_config,
             session_image: None,
             extra_mounts: Vec::new(),
+            mirror_binds: Vec::new(),
         }
     };
     let state = docker::inspect(&config.container)?;
@@ -344,6 +345,17 @@ fn start_with(
         if let Some(configured) = &config.session_image {
             docker::verify_image(configured)?;
         }
+        // The origin object mirrors a NEW container borrows through (#14680):
+        // proved, refreshed and attached here, under this account's lease, so
+        // the binds are in place before Docker exposes the objects
+        // directories. A repository whose mirror cannot be established keeps
+        // a fully private clone (no bind, no alternate); the session is
+        // never refused for a mirror's sake.
+        config.mirror_binds = if configured.object_mirrors {
+            mirror::plan_binds(workspace, &config)
+        } else {
+            Vec::new()
+        };
     } else if image.is_none() {
         warn_if_config_drifted(workspace, &config);
     }
@@ -539,6 +551,13 @@ pub fn recover(
             }
             check_extra_mounts(workspace, &config)?;
             held()?;
+            // The recreation must install exactly the mirror binds the lost
+            // container carried (#14680): a clone that shed published objects
+            // into its mirror needs that store back, so a missing one is
+            // re-fetched from origin here and a store that cannot be
+            // re-established refuses the recreation rather than leaving the
+            // clone on a dangling alternate.
+            mirror::ensure_bound(workspace, &config)?;
             docker::provision_controls(&config, image)?;
             docker::create(&config, image)?;
         }
@@ -568,6 +587,9 @@ fn check_extra_mounts(workspace: &Path, config: &Config) -> Result<()> {
         PathBuf::from(ROOT),
         PathBuf::from(PROFILE),
         PathBuf::from(GH_CONFIG),
+        // The origin mirror bind namespace (#14680): an operator extra mount
+        // must never squat on a mirror's `MIRRORS/<slug>/objects` path.
+        PathBuf::from(MIRRORS),
     ];
     super::super::session_mount_gate::check_private_extra_mounts(
         &config.extra_mounts,
@@ -1022,8 +1044,9 @@ pub fn run_job(workspace: &Path, args: JobArgs) -> Result<i32> {
 ///
 /// Every seat is independent: a busy, stopped or non-idle seat is skipped
 /// with a reason (a retry is the next pass's job, not a failure), never
-/// holding up the others. `.identity` records and the no-alternates /
-/// private-clone invariants are untouched — the in-container verb only ever
+/// holding up the others. `.identity` records and the private-clone
+/// invariants (an alternate only ever being the clone's own read-only
+/// origin mirror, #14680) are untouched — the in-container verb only ever
 /// removes step scratch and clean, published, merged-past-grace worktrees.
 pub fn seat_reclaim(
     workspace: &Path,
