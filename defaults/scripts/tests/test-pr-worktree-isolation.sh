@@ -30,6 +30,11 @@
 #      (macOS /tmp -> /private/tmp natively; a matching symlink fixture on
 #      Linux) reuses the worktree instead of dying on the builder-wins error,
 #      while a genuine builder holder is still refused.
+#  10. The pr-<N> reuse gate matches registered worktrees by pwd -P-canonicalized
+#      physical path, not substring: re-entry through a symlinked repo path or a
+#      symlinked LOOM_WORKTREE_ROOT reuses the registered worktree (printing the
+#      logical path on stdout), and an unregistered prefix-colliding directory
+#      (pr-97 beside pr-970) is rejected without running gh pr checkout (#15196).
 #
 # Tests 3-5 run the real pr-worktree.sh against a throwaway git repo with a
 # mocked `gh`, since there is no live forge in CI. Branch-shape classification
@@ -914,6 +919,143 @@ if [[ "$RC9C" -eq 1 ]] && [[ "$(hook_count)" -eq "$BEFORE9C" ]] \
     pass "symlinked repo path: genuine builder holder still refused (rc=1)"
 else
     fail "symlinked genuine holder: expected rc=1 and no hook record (rc=$RC9C, records=$(hook_count)): $PR_OUT9C"
+fi
+
+# --- Test 10: the reuse gate matches registered worktrees by canonicalized
+#     physical path, not substring (#15196) ---
+echo ""
+echo "Test 10: the pr-<N> reuse gate matches canonicalized physical paths, not substrings (#15196)"
+
+# `gh` stand-in for Test 10: `pr view` resolves the head branch / head sha;
+# `pr checkout` records that it ran (the marker lets the prefix-collision case
+# assert the gate rejected an unregistered directory BEFORE any checkout) and
+# fails the way git does when the primary clone holds the branch — steering
+# re-entry of the registered DETACHED worktrees below through the #14391
+# refresh path, which does not trip builder_holder (fixed separately in #15121).
+MOCKBIN6=$(mktemp -d /tmp/loom-pr-iso-mockbin6.XXXXXX)
+trap 'rm -rf "$TMP" "$MOCKBIN" "$MOCKBIN2" "$MOCKBIN3" "$MOCKBIN4" "$MOCKBIN5" "$MOCKBIN6"; cd "$REPO_ROOT" 2>/dev/null || true' EXIT
+cat > "$MOCKBIN6/gh" <<'MOCKEOF'
+#!/usr/bin/env bash
+if [[ "$1" == "pr" && "$2" == "view" ]]; then
+    if [[ "$*" == *headRefOid* ]]; then echo "$LOOM_TEST_HEAD_SHA"; else echo "$LOOM_TEST_HEAD_BRANCH"; fi
+    exit 0
+fi
+if [[ "$1" == "pr" && "$2" == "checkout" ]]; then
+    touch "$LOOM_TEST_CHECKOUT_MARKER"
+    echo "fatal: '$LOOM_TEST_HEAD_BRANCH' is already used by worktree at '$LOOM_TEST_PRIMARY'" >&2
+    exit 1
+fi
+exit 0
+MOCKEOF
+chmod +x "$MOCKBIN6/gh"
+HOOK_LOG10="$TMP/hook9.log"
+: > "$HOOK_LOG10"
+
+# 10a: re-entry of a registered detached pr-971 through a symlinked repo path
+#     whose physical location is not a suffix of the logical spelling (the
+#     space in the symlink dir also exercises path quoting): `git worktree
+#     add` registers the PHYSICAL path while REPO_ROOT/WORKTREE_PATH stay
+#     logical, so the pre-fix unanchored grep missed it (#15196 false
+#     negative) and advised rm -rf on a live worktree.
+git checkout -q -b fix/sym-reentry
+git commit --allow-empty -q -m "pr 971 change"
+SHA971="$(git rev-parse HEAD)"
+git checkout -q main
+mkdir -p "$TMP/sp ace"
+ln -s "$TMP/repo" "$TMP/sp ace/repo"
+LOGICAL971="$TMP/sp ace/repo/.loom/worktrees/pr-971"
+git worktree add -q --detach "$LOGICAL971" "$SHA971"
+MARKER10A="$TMP/checkout-10a"
+rm -f "$MARKER10A"
+set +e
+PR_OUT10A=$(cd "$TMP/sp ace/repo" && PATH="$MOCKBIN6:$PATH" LOOM_DEFAULT_BRANCH=main \
+    LOOM_TEST_HEAD_BRANCH=fix/sym-reentry LOOM_TEST_HEAD_SHA="$SHA971" \
+    LOOM_TEST_PRIMARY="$TMP/repo" LOOM_TEST_CHECKOUT_MARKER="$MARKER10A" \
+    LOOM_TEST_HOOK_LOG="$HOOK_LOG10" "$PR_WORKTREE_SH" 971 2>"$TMP/err-10a")
+RC10A=$?
+set -e
+ERR10A="$(cat "$TMP/err-10a")"
+if [[ "$RC10A" -eq 0 ]] && grep -q "reusing" <<<"$PR_OUT10A" \
+    && ! grep -q "not a registered worktree" <<<"$PR_OUT10A$ERR10A" \
+    && ! grep -q "rm -rf" <<<"$PR_OUT10A$ERR10A"; then
+    pass "symlinked re-entry reuses the registered pr-971 (no refusal, no rm -rf hint)"
+else
+    fail "symlinked re-entry: expected rc=0 reuse without refusal (rc=$RC10A): $PR_OUT10A / $ERR10A"
+fi
+if [[ "$(tail -n1 <<<"$PR_OUT10A")" == "$LOGICAL971" ]]; then
+    pass "symlinked re-entry prints the logical worktree path as the last stdout line"
+else
+    fail "last stdout line is not the logical path ($LOGICAL971): $(tail -n1 <<<"$PR_OUT10A")"
+fi
+if [[ "$(git -C "$TMP/repo/.loom/worktrees/pr-971" rev-parse HEAD 2>/dev/null)" == "$SHA971" ]] \
+    && [[ "$(git -C "$TMP/repo" worktree list --porcelain | grep -c 'worktrees/pr-971$')" -eq 1 ]]; then
+    pass "symlinked re-entry leaves pr-971 registered and refreshed at the PR head sha"
+else
+    fail "pr-971 not registered/refreshed at $SHA971 after symlinked re-entry"
+fi
+
+# 10b: same when only LOOM_WORKTREE_ROOT traverses a symlink; a stale sibling
+#     entry (registered but missing on disk, no `git worktree prune`) must not
+#     abort the scan.
+git checkout -q -b fix/sym-root
+git commit --allow-empty -q -m "pr 970 change"
+SHA970="$(git rev-parse HEAD)"
+git checkout -q main
+mkdir -p "$TMP/realwt"
+ln -s "$TMP/realwt" "$TMP/linkwt"
+git worktree add -q --detach "$TMP/linkwt/repo/pr-970" "$SHA970"
+git worktree add -q --detach "$TMP/linkwt/repo/pr-969" "$SHA970"
+rm -rf "$TMP/realwt/repo/pr-969"
+MARKER10B="$TMP/checkout-10b"
+rm -f "$MARKER10B"
+set +e
+PR_OUT10B=$(cd "$TMP/repo" && PATH="$MOCKBIN6:$PATH" LOOM_DEFAULT_BRANCH=main \
+    LOOM_WORKTREE_ROOT="$TMP/linkwt" \
+    LOOM_TEST_HEAD_BRANCH=fix/sym-root LOOM_TEST_HEAD_SHA="$SHA970" \
+    LOOM_TEST_PRIMARY="$TMP/repo" LOOM_TEST_CHECKOUT_MARKER="$MARKER10B" \
+    LOOM_TEST_HOOK_LOG="$HOOK_LOG10" "$PR_WORKTREE_SH" 970 2>"$TMP/err-10b")
+RC10B=$?
+set -e
+ERR10B="$(cat "$TMP/err-10b")"
+if [[ "$RC10B" -eq 0 ]] && grep -q "reusing" <<<"$PR_OUT10B" \
+    && ! grep -q "not a registered worktree" <<<"$PR_OUT10B$ERR10B"; then
+    pass "symlinked LOOM_WORKTREE_ROOT re-entry reuses the registered pr-970"
+else
+    fail "symlinked LOOM_WORKTREE_ROOT: expected rc=0 reuse (rc=$RC10B): $PR_OUT10B / $ERR10B"
+fi
+if [[ "$(git -C "$TMP/realwt/repo/pr-970" rev-parse HEAD 2>/dev/null)" == "$SHA970" ]]; then
+    pass "symlinked-root re-entry refreshes pr-970 at the PR head sha (stale sibling skipped)"
+else
+    fail "pr-970 not refreshed at $SHA970 through the symlinked root"
+fi
+
+# 10c: an unregistered directory whose path prefixes a REGISTERED worktree
+#     (unregistered pr-97 beside registered pr-970, both spelled physically so
+#     the listing line really contains the pattern) must be rejected: the
+#     pre-fix unanchored grep matched pr-970's line and "reused" the debris,
+#     running gh pr checkout inside it (#15196 false positive).
+mkdir -p "$TMP/realwt/repo/pr-97"
+MARKER10C="$TMP/checkout-10c"
+rm -f "$MARKER10C"
+set +e
+PR_OUT10C=$(cd "$TMP/repo" && PATH="$MOCKBIN6:$PATH" LOOM_DEFAULT_BRANCH=main \
+    LOOM_WORKTREE_ROOT="$TMP/realwt" \
+    LOOM_TEST_HEAD_BRANCH=fix/sym-root LOOM_TEST_HEAD_SHA="$SHA970" \
+    LOOM_TEST_PRIMARY="$TMP/repo" LOOM_TEST_CHECKOUT_MARKER="$MARKER10C" \
+    LOOM_TEST_HOOK_LOG="$HOOK_LOG10" "$PR_WORKTREE_SH" 97 2>"$TMP/err-10c")
+RC10C=$?
+set -e
+ERR10C="$(cat "$TMP/err-10c")"
+if [[ "$RC10C" -eq 1 ]] && grep -q "not a registered worktree" <<<"$PR_OUT10C$ERR10C"; then
+    pass "unregistered prefix-colliding pr-97 is rejected as unregistered"
+else
+    fail "prefix collision: expected rc=1 'not a registered worktree' (rc=$RC10C): $PR_OUT10C / $ERR10C"
+fi
+if [[ ! -f "$MARKER10C" ]] && [[ -d "$TMP/realwt/repo/pr-97" ]] \
+    && [[ "$(git -C "$TMP/realwt/repo/pr-970" rev-parse HEAD 2>/dev/null)" == "$SHA970" ]]; then
+    pass "prefix collision: no gh pr checkout ran, git state and the debris dir untouched"
+else
+    fail "prefix collision: checkout ran or git state changed (marker present: $([[ -f "$MARKER10C" ]] && echo yes || echo no))"
 fi
 
 cd "$REPO_ROOT"

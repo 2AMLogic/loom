@@ -161,6 +161,28 @@ is_primary_clone() {
     [[ "$a" == "$b" ]]
 }
 
+# True when worktree path $1 is registered in `git worktree list` — matched by
+# pwd -P-canonicalized PHYSICAL path, never by substring (#15196): the porcelain
+# listing always prints git's resolved real_path while $1 may be spelled through
+# a symlink (a logical REPO_ROOT, #15121, or a symlinked LOOM_WORKTREE_ROOT), so
+# an unanchored grep both missed a live registered worktree (refusing re-entry
+# with an rm -rf hint on it) and falsely matched a prefix-colliding sibling
+# (pr-1 beside pr-10). A porcelain entry whose directory no longer exists
+# (stale until `git worktree prune`) keeps its literal spelling instead of
+# aborting the scan.
+is_registered_worktree() {
+    [[ -n "$1" ]] || return 1
+    local target_p wt wt_p
+    target_p="$(cd "$1" 2>/dev/null && pwd -P)" || return 1
+    while IFS= read -r wt; do
+        wt_p="$(cd "$wt" 2>/dev/null && pwd -P)" || wt_p="$wt"
+        if [[ "$wt_p" == "$target_p" ]]; then
+            return 0
+        fi
+    done < <(git -C "$REPO_ROOT" worktree list --porcelain | awk '/^worktree / { print substr($0, 10) }')
+    return 1
+}
+
 # Print the PR head sha, making sure the commit exists locally. Empty on failure.
 resolve_pr_head_sha() {
     local sha
@@ -278,7 +300,7 @@ create_detached_pr_worktree() {
 # If the worktree already exists, treat it as reusable. The doctor may
 # re-enter for the same PR across multiple iterations.
 if [[ -d "$WORKTREE_PATH" ]]; then
-    if git -C "$REPO_ROOT" worktree list | grep -q "$WORKTREE_PATH"; then
+    if is_registered_worktree "$WORKTREE_PATH"; then
         HEAD_BRANCH="$(gh pr view "$PR_NUMBER" --json headRefName --jq .headRefName 2>/dev/null || true)"
         BUILDER_WT="$(builder_holder "$HEAD_BRANCH")"
         [[ -z "$BUILDER_WT" ]] || fail_builder_holds "$BUILDER_WT"
