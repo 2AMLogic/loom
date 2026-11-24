@@ -1290,6 +1290,16 @@ assert_deny "#15112 review: newline-separated cd does not move the rm" \
     $'cd /tmp/x\nrm -rf important' "/opt/vendor"
 assert_allow "#15112 review: benign cd build ; rm keeps main's allow" \
     'cd build ; rm -rf x' "$REPO_ROOT"
+# Literal cd args whose base/link is merely untrusted fall back to main's verdict
+# (bare token), not a deny blaming a non-literal cd (#15169 review, finding 5).
+assert_allow "#15112 review: cd build ; cd src && rm keeps main's allow" \
+    'cd build ; cd src && rm -rf x' "$REPO_ROOT"
+assert_allow "#15112 review: newline-separated cds then && rm keep main's allow" \
+    $'cd build\ncd src && rm -rf x' "$REPO_ROOT"
+assert_allow "#15112 review: true | cd dir && rm keeps main's allow" \
+    'true | cd /tmp/x && rm -rf x' "$REPO_ROOT"
+assert_deny "#15112 review: non-literal cd arg still denies" \
+    'cd $D && rm -rf x' "$REPO_ROOT"
 assert_allow "#15112 review: 2>&1 redirect after cd is not a background operator" \
     'cd -- /tmp/x/work >/dev/null 2>&1 && rm -f ../note.md' "$REPO_ROOT"
 echo ""

@@ -7713,7 +7713,7 @@ _extract_rm_targets_scan() {
     # guessing. A later resolvable ABSOLUTE `cd` makes the directory known again.
     printf '%s' "$1" | awk -v mark="$2" -v startcwd="$3" -v startunres="${4:-0}" -v home="$HOME" "$_QSPLIT_AWK""$_CDEXPAND_AWK""$_CDQUOTE_AWK"'
     BEGIN {
-        curcwd = startcwd; cdseen = 0; cdunres = 0; cdlink = 0
+        curcwd = startcwd; cdseen = 0; cdunres = 0; cdlink = 0; argbad = 0; brokebase = 0
         if (startunres == 1) { cdseen = 1; cdunres = 1; cdlink = 1 }
         sdepth = 0
         CDM = sprintf("%c", 31); UNRM = sprintf("%c", 29); RSM = sprintf("%c", 30)
@@ -7733,27 +7733,33 @@ _extract_rm_targets_scan() {
         # newline, `|`, `||` or `&` followed it) makes a relative base unknowable.
         wasbroken = (cdseen && !cdlink)
         cdseen = 1
+        # argbad: this cd has a non-literal argument (the deny message is then
+        # accurate). brokebase: every argument is literal but the base is
+        # untrusted (a `;`/newline/`|`/`||`/`&` broke the link), so the target
+        # falls back to the session-cwd verdict like main, not a false deny.
+        argbad = 0; brokebase = 0
         k = 2
         # Skip option words (`cd -P dir`); a lone `-` is `cd -`. `--` ends the
         # options: whatever follows is the operand even if it looks like an
         # option, and any other `-x` word is not a plain `cd <dir>`.
         while (k <= m && toks[k] ~ /^-[LPe@]+$/) k++
         if (k <= m && toks[k] == "--") k++
-        else if (k <= m && toks[k] ~ /^-./) { cdunres = 1; return }
-        if (k > m || toks[k] == "-" || toks[k] == "") { cdunres = 1; return }
+        else if (k <= m && toks[k] ~ /^-./) { cdunres = 1; argbad = 1; return }
+        if (k > m || toks[k] == "-" || toks[k] == "") { cdunres = 1; argbad = 1; return }
         arg = expand_cd_arg(toks[k], home)
         # Anything after the directory other than a redirection is not a plain
         # `cd <dir>` (e.g. an unquoted space in the path): unresolved.
         for (bad = k + 1; bad <= m; bad++)
-            if (toks[bad] != "" && toks[bad] !~ /^[0-9]*[<>&]/) { cdunres = 1; return }
+            if (toks[bad] != "" && toks[bad] !~ /^[0-9]*[<>&]/) { cdunres = 1; argbad = 1; return }
         cls = strip_cd_quoting(arg)
         # Literal paths only: no expansion/quote/escape/glob/tilde-user/space,
         # and no control bytes that collide with the output marks.
-        if (cls == "" || nonliteral(cls) || cls ~ /^~/) { cdunres = 1; return }
+        if (cls == "" || nonliteral(cls) || cls ~ /^~/) { cdunres = 1; argbad = 1; return }
         if (cls ~ /^\//) { curcwd = cls; cdunres = 0; return }
         # A relative join needs a literal base: a session cwd with whitespace or
         # quote/glob bytes would corrupt the word split in the caller.
-        if (wasbroken || cdunres || curcwd == "" || curcwd !~ /^\// || nonliteral(curcwd)) { cdunres = 1; return }
+        if (wasbroken) { cdunres = 1; brokebase = 1; return }
+        if (cdunres || curcwd == "" || curcwd !~ /^\// || nonliteral(curcwd)) { cdunres = 1; argbad = 1; return }
         curcwd = curcwd "/" cls
     }
     {
@@ -7802,14 +7808,19 @@ _extract_rm_targets_scan() {
             if (!sudo && seg ~ /^cd([ \t]|$)/) {
                 m = split(seg, toks, /[ \t]+/)
                 track_cd()
-                cdlink = 1
+                # Literal args but an untrusted base: unlink so the emit falls
+                # back to the bare token (the main-branch verdict), not a false deny.
+                cdlink = brokebase ? 0 : 1
                 # A cd on either side of `|` / `&` runs in a child shell, and one
                 # after `||` (or before it) may not run at all: it does not
                 # reliably move the next command, so fail closed.
                 if (!opsok || (i > 1 && (qsplit_op[i - 1] == "|" || qsplit_op[i - 1] == "||")) ||
                     (i < n && (qsplit_op[i] == "|" || qsplit_op[i] == "||" ||
-                               (qsplit_op[i] == "&" && seg !~ /[<>]$/))))
+                               (qsplit_op[i] == "&" && seg !~ /[<>]$/)))) {
                     cdunres = 1
+                    # Literal args: separator adjacency alone -> the main-branch verdict.
+                    if (!argbad && opsok) cdlink = 0
+                }
             }
             else if (seg ~ /^rm([ \t]|$)/) {
                 emit_rm()
