@@ -251,10 +251,11 @@ fn a_step_dispatched_opencode_run_yields_an_opencode_usage_span() {
     let runtime = crate::usage_source::sweep_usage_runtime_from_log(None, Some(&log), &root, ISSUE);
     assert_eq!(runtime.as_deref(), Some("opencode"));
 
-    std::env::set_var(crate::opencode_usage::OPENCODE_DB_ENV, &db);
+    // Crate-wide `LOOM_OPENCODE_DB` lock (#15204), held while the variable is pinned.
+    let db_env = crate::tokens_pool::opencode_db_env::OpencodeDbEnv::set(&db);
     let window = window(Some(Utc::now() - Duration::hours(1)), 3_600);
     let usage = resolve(runtime.as_deref(), &root, ISSUE, window, None);
-    std::env::remove_var(crate::opencode_usage::OPENCODE_DB_ENV);
+    drop(db_env);
     assert_eq!(usage.status, TokensStatus::Measured, "{usage:?}");
     let rows = usage.tokens_by_model.clone().expect("opencode rows read");
 

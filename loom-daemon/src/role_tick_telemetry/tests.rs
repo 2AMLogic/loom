@@ -756,8 +756,9 @@ fn an_opencode_tick_sources_tokens_by_model_from_the_session_db() {
         )
         .unwrap();
     }
-    let _staged =
-        crate::env_test_support::EnvGuard::set(crate::opencode_usage::OPENCODE_DB_ENV, &db_path);
+    // Crate-wide `LOOM_OPENCODE_DB` lock (#15204): the default-keyed
+    // `step_completion` writers coordinate via this mutex, not the named key.
+    let _staged = crate::tokens_pool::opencode_db_env::OpencodeDbEnv::set(&db_path);
 
     let (journal, _env) = stage_tick_env(dir.path(), &root, "judge", &role_head("judge"));
     emit_for_tick(
@@ -1199,8 +1200,9 @@ fn an_opencode_step_selects_tokens_by_the_session_ids_its_log_names() {
             .unwrap();
         }
     }
-    let _staged =
-        crate::env_test_support::EnvGuard::set(crate::opencode_usage::OPENCODE_DB_ENV, &db_path);
+    // Crate-wide `LOOM_OPENCODE_DB` lock (#15204): the default-keyed
+    // `step_completion` writers coordinate via this mutex, not the named key.
+    let _staged = crate::tokens_pool::opencode_db_env::OpencodeDbEnv::set(&db_path);
 
     let body = format!(
         "{}{}\n",
@@ -1401,7 +1403,7 @@ fn opencode_step_close_preserves_launch_runtime_and_writes_newly_available_token
     let root = dir.path().join("repo");
     fs::create_dir_all(&root).unwrap();
     let db = dir.path().join("opencode.db");
-    let _db = crate::env_test_support::EnvGuard::set(crate::opencode_usage::OPENCODE_DB_ENV, &db);
+    let _db = crate::tokens_pool::opencode_db_env::OpencodeDbEnv::set(&db);
     let _tick_journal = crate::env_test_support::EnvGuard::set(
         crate::sweep_outcomes::ROLE_TICK_TELEMETRY_JOURNAL_PATH_ENV,
         dir.path().join("ticks.jsonl"),
