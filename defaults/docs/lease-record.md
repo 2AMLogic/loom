@@ -885,7 +885,20 @@ the same lease semantics, **keyed by role**:
   `reaped=timeout` appended, and with no CI exemption: a pass that burned the
   whole ceiling is the re-run the backstop exists to bound. Every host's next
   Judge is then held (1 h, 4 h, then the window), so a PR that keeps timing
-  out gets at most three Judge runs a day. Who runs next is still decided by
+  out gets at most three Judge runs a day. Not every reap reason records
+  (#14951): `seat_busy` (the seat refused the run),
+  `launch_rejected` (a typed `LOOM_LAUNCH_REJECTED` report, or an untyped
+  exit 78, a spawn script's preflight refusal, inside the fast-fail window
+  with no outcome line) and `provider_exhausted` (#13966: the run died on
+  the provider, not on the PR) each say the step never reached a review, so
+  its reap writes no no-verdict record at all and counts toward neither
+  the 1 h / 4 h ladder nor the window cap: the backstop bounds re-runs of
+  a Judge that ran and ended without a verdict (`exited`, `timeout`), not
+  a runtime fault unrelated to the PR. The skip goes further than the
+  release-side exemptions above: a gate-refused pass still writes a record
+  (`refused=<token>`) that holds the PR for only 15 minutes (#13135), and
+  a CI-exempt release skips the record only for a pass that ran — CI, not
+  a fault, is why it reached no verdict. Who runs next is still decided by
   the lease: concurrent reclaimers of the same stale claim each post a lease,
   and the earliest comment `id` is the only winner. Rules:
   `loom-daemon/src/pr_lease_reap.rs`.
