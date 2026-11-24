@@ -284,7 +284,7 @@ loom_filing_lock_acquire() {
     fi
 
     local holder="$store/holder"
-    local start now blocker logged_wait=0
+    local start now blocker logged_wait=0 vanished=0
     start="$(date +%s)"
     while :; do
         if mkdir "$holder" 2>/dev/null; then
@@ -309,11 +309,26 @@ loom_filing_lock_acquire() {
             return 0
         fi
         if [[ ! -d "$holder" ]]; then
-            # mkdir failed and the path is not a directory ⇒ the store is
-            # unusable (a FILE in the way, no permission). Degrade open.
+            # mkdir failed and the path is not a directory. Two very different
+            # causes (#15122):
+            #   * the holder VANISHED — our mkdir lost to a peer, and the peer's
+            #     release (rmdir) ran before this check. That means "released",
+            #     not "unusable": retry the mkdir. Degrading open here let this
+            #     filer file unserialized while the peer re-acquired (the #6714
+            #     cross-contamination shape, a microseconds-wide window that CPU
+            #     oversubscription widens).
+            #   * the path is genuinely unusable — a FILE in the way, or no
+            #     permission to create it. Degrade open.
+            # A FILE in the way is detectable (-e); a permission failure is not
+            # distinguishable from a vanish, so the retry is bounded.
+            if [[ ! -e "$holder" && -d "$store" ]] && (( vanished < 10 )); then
+                vanished=$(( vanished + 1 ))
+                continue
+            fi
             echo "[filing-lock] WARNING: lock path ${holder} is unusable — filing '${label}' WITHOUT serialization (degrading open)" >&2
             return 0
         fi
+        vanished=0
         if _loom_filing_lock_abandoned "$store" "$self_host" "$stale"; then
             echo "[filing-lock] reaping abandoned hold at ${holder} ($(_loom_filing_lock_blocker "$store"))" >&2
             rm -f "$holder/owner.json" 2>/dev/null || true
