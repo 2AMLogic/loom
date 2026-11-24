@@ -223,6 +223,71 @@ assert_allow "rmScope config-permissive: rm -rf \"\$p\" allowed (unresolved-var 
     'rm -rf "$p"' "$RMSCOPE_UNRESOLVED_PERM_REPO"
 [[ -n "$RMSCOPE_UNRESOLVED_PERM_REPO" && "$RMSCOPE_UNRESOLVED_PERM_REPO" != "/" && -d "$RMSCOPE_UNRESOLVED_PERM_REPO/.loom" ]] && rm -rf "$RMSCOPE_UNRESOLVED_PERM_REPO"
 
+# ---- #15221: an rm hidden behind a function-definition header or a leading
+# ---- group/subshell opener is scored exactly like its top-level twin.
+# ---- extract_rm_targets() keys the rm on the segment COMMAND WORD, and
+# ---- qsplit() breaks only on ;/&/| — so `probe() { rm -f "$X/y"; }` kept
+# ---- the rm mid-segment behind the header and EVERY rm-scope check skipped
+# ---- it, while the identical rm at top level (or after any earlier ;
+# ---- statement in the body) denied. The scan now strips `name() {`,
+# ---- `name() (`, `function name [()] {` headers and leading `{ `/`( `
+# ---- openers before the ^rm test (mirroring the extract_write_targets()
+# ---- cd-tracker opener strip, #12082). `do`/`then`/`else`/`if` openers are
+# ---- deliberately out of scope (#15221; see the #9323/#9601 block comment
+# ---- at the loop-variable resolver for that measurement bar).
+# Rows 2/3/4/7 of the issue: same deny, same reason, as the top-level twin.
+assert_deny_reason_matches "rmScope default (#15221): rm as only statement of a function body denies unresolved-var (issue row 2)" \
+    'WT="$(echo /tmp)"; probe() { rm -f "$WT/.probe-receipt"; }; probe' 'is an unexpanded shell variable from the path root down' "$REPO_ROOT"
+assert_deny_reason_matches "rmScope default (#15221): two-var function-body rm target denies (issue row 3)" \
+    'WT="$(echo /tmp)"; NAME=".probe-receipt"; probe() { rm -f "$WT/$NAME"; }; probe' 'is an unexpanded shell variable from the path root down' "$REPO_ROOT"
+assert_deny_reason_matches "rmScope default (#15221): never-assigned root in function body denies (issue row 4)" \
+    'probe() { rm -f "$NOPE/.probe-receipt"; }; probe' 'is an unexpanded shell variable from the path root down' "$REPO_ROOT"
+assert_deny_reason_matches "rmScope default (#15221): \$HOME-rooted unresolvable target in function body denies (issue row 7)" \
+    'X="$HOME/probe"; probe() { rm -rf "$X/dir"; }; probe' 'is an unexpanded shell variable from the path root down' "$REPO_ROOT"
+# Grouping openers in the same segment, and the other definition spellings.
+assert_deny_reason_matches "rmScope default (#15221): { rm … } group denies unresolved-var" \
+    '{ rm -f "$NOPE/.p"; }' 'is an unexpanded shell variable from the path root down' "$REPO_ROOT"
+assert_deny_reason_matches "rmScope default (#15221): ( rm … ) subshell denies unresolved-var" \
+    '( rm -f "$NOPE/.p" )' 'is an unexpanded shell variable from the path root down' "$REPO_ROOT"
+assert_deny_reason_matches "rmScope default (#15221): function keyword body denies unresolved-var" \
+    'function probe { rm -f "$NOPE/.p"; }; probe' 'is an unexpanded shell variable from the path root down' "$REPO_ROOT"
+assert_deny_reason_matches "rmScope default (#15221): function keyword + parens body denies unresolved-var" \
+    'function probe() { rm -f "$NOPE/.p"; }; probe' 'is an unexpanded shell variable from the path root down' "$REPO_ROOT"
+assert_deny_reason_matches "rmScope default (#15221): subshell function body denies unresolved-var" \
+    'probe() ( rm -f "$NOPE/.p" ); probe' 'is an unexpanded shell variable from the path root down' "$REPO_ROOT"
+# A definition that is never invoked is scanned the same way — defining it is
+# enough to make the rm visible to the tokenizer (fail closed).
+assert_deny_reason_matches "rmScope default (#15221): never-invoked function definition denies unresolved-var" \
+    'probe() { rm -f "$NOPE/.p"; }' 'is an unexpanded shell variable from the path root down' "$REPO_ROOT"
+# The opener strip runs BEFORE the sudo strip, so a sudo inside a subshell
+# resolves too.
+assert_deny_reason_matches "rmScope default (#15221): ( sudo rm … ) denies unresolved-var" \
+    '( sudo rm -f "$NOPE/.p" )' 'is an unexpanded shell variable from the path root down' "$REPO_ROOT"
+# Controls: a literal in-scope or ephemeral target in a single-statement
+# function body still allows, the same-command mktemp fast path (#6520) still
+# resolves a function-body rm, and only OPENERS are stripped — an `echo`
+# whose arguments merely contain the word rm stays invisible to the scan.
+assert_allow "rmScope default (#15221): function-body rm on literal ephemeral path allows" \
+    'probe() { rm -f /tmp/x/foo; }; probe' "$REPO_ROOT"
+assert_allow "rmScope default (#15221): function-body rm on literal in-repo path allows" \
+    "probe() { rm -rf $REPO_ROOT/.loom/tmp/x; }; probe" "$REPO_ROOT"
+assert_allow_env "rmScope repo (#15221): function-body rm on same-command mktemp -d var still allows (#6520)" \
+    "LOOM_RM_SCOPE=repo" 'D=$(mktemp -d); probe() { rm -rf "$D"; }; probe' "$REPO_ROOT"
+assert_allow "rmScope default (#15221): rm as a bare WORD after a non-opener command word allows" \
+    'probe() { echo rm -f "$NOPE/x"; }; probe' "$REPO_ROOT"
+assert_allow "rmScope default (#15221): (( arithmetic )) is not a subshell opener" \
+    'x=1; (( x++ )); rm -f /tmp/x/foo' "$REPO_ROOT"
+# The opt-out stays byte-for-byte permissive for the newly visible shapes.
+assert_allow_env "rmScope off (#15221): function-body unresolved rm allowed (unresolved-var check does not apply)" \
+    "LOOM_RM_SCOPE=off" 'probe() { rm -f "$NOPE/.probe-receipt"; }; probe' "$REPO_ROOT"
+# Out-of-scope openers keep their current verdicts (documented, not asserted
+# as correct): `then`/`do` still allow today — pinned here so a future fix
+# for #9323 flips these rows deliberately.
+assert_allow "rmScope default (#15221, out-of-scope pin): then-opener rm still allows today (#9323 family)" \
+    'if true; then rm -f "$NOPE/.p"; fi' "$REPO_ROOT"
+assert_allow "rmScope default (#15221, out-of-scope pin): do-opener rm still allows today (#9323 family)" \
+    'for d in a b; do rm -rf "$d"; done' "$REPO_ROOT"
+
 # ---- Same-command mktemp resolution (#6520) — a NARROW escape hatch inside
 # ---- the unresolved-var branch above: when the rm target variable is
 # ---- assigned earlier in the SAME command via the plain, default-rooted
