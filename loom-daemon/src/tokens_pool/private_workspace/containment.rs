@@ -713,7 +713,7 @@ fn in_bound_container(revision: &str, repository: &str, clone: &str) -> Result<S
     if repo.canonicalize()? != repo || !std::fs::symlink_metadata(repo.join(".git"))?.is_dir() {
         bail!("{NOT_OWNED_CLONE}");
     }
-    repository::verify_alternates(repo, repository, mirror_alternate(repository).as_deref())?;
+    repository::verify_alternates(repo, mirror_alternate(repository).as_deref())?;
     // With an alternate present, prove it is the read-only mirror bind it
     // claims to be — from inside the worker, where the proof counts (#14680).
     if let Ok(content) = std::fs::read_to_string(repo.join(".git/objects/info/alternates")) {

@@ -442,7 +442,7 @@ fn prepare_revision(
     {
         bail!("workspace must own a real clone and private Git objects, without symlinks");
     }
-    verify_alternates(&repo, &args.repository, args.mirror_objects.as_deref())?;
+    verify_alternates(&repo, args.mirror_objects.as_deref())?;
     private_metadata(&repo.join(".git"))?;
     if Path::new(git(&repo, &["rev-parse", "--show-toplevel"])?.trim()).canonicalize()? != repo {
         bail!("workspace clone is not its own independent Git root");
@@ -581,7 +581,7 @@ fn clone_args<'a>(
     Ok(args)
 }
 
-/// The one alternate shape a clone of `repository` may carry (#14680): no
+/// The one alternate shape a clone may carry (#14680): no
 /// alternate at all (a private clone, always supported), or exactly the
 /// mirror objects path the caller authorized for THIS repository. Anything
 /// else — a second entry, a wrong path, an alternate with no authorized
@@ -589,11 +589,7 @@ fn clone_args<'a>(
 /// what is authorized: preparation passes the mirror the host bound (or
 /// `None`, refusing every alternate), admission passes the repository's
 /// canonical mirror path.
-pub(super) fn verify_alternates(
-    repo: &Path,
-    _repository: &str,
-    mirror: Option<&str>,
-) -> Result<()> {
+pub(super) fn verify_alternates(repo: &Path, mirror: Option<&str>) -> Result<()> {
     let file = repo.join(".git/objects/info/alternates");
     let content = match std::fs::read_to_string(&file) {
         Ok(content) => content,
