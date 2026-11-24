@@ -1354,6 +1354,36 @@ fn test_launch_model_reconciles_configured_tier_with_native_profile() {
         "runtimes.defaultModelProfile picks the judged profile for a bare tap"
     );
 
+    // A qualified `provider/model` configured tier is the documented native
+    // shape (configuring-resources.md): with no profile requested, `select`
+    // honours it verbatim before any profile lookup, so it must be kept — not
+    // dropped for the fallback profile's model (which would also swap the
+    // credentials the launch needs).
+    let qualified = tempfile::tempdir().unwrap();
+    write_config(
+        qualified.path(),
+        r#"{"autonomous": {"roleRunner": {"roleModels": {"judge": "google/gemini-2.5-pro"}}}}"#,
+    );
+    assert_eq!(
+        launch(qualified.path(), "judge", Some("opencode"), None),
+        (
+            "google/gemini-2.5-pro".to_string(),
+            "autonomous.roleRunner.roleModels.judge".to_string(),
+        ),
+        "a qualified pin on a bare native pick is forwarded verbatim"
+    );
+    // ...but once the tap names a profile, `select` compares the full string
+    // against that profile's model, so the differing qualified pin is dropped.
+    assert_eq!(
+        launch(qualified.path(), "judge", Some("opencode"), Some("zai-flash")),
+        (
+            String::new(),
+            "autonomous.roleRunner.roleModels.judge (profile model for opencode:zai-flash)"
+                .to_string(),
+        ),
+        "a qualified pin that differs from an explicitly requested profile is dropped"
+    );
+
     // An unknown profile is left to the launch's own fail-closed diagnostic
     // (`profiles::select` reports it), never judged — the model survives.
     let unknown = tempfile::tempdir().unwrap();

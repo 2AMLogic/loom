@@ -260,8 +260,8 @@ pub fn profile_rejects_effort(
 }
 
 /// Issue #14962: the model profile a native launch of `runtime` would
-/// resolve, when that profile's model differs from `model` — the exact
-/// predicate [`select`] refuses the launch on (`stage=profile_selection`,
+/// resolve, when that profile's model differs from `model` — the
+/// predicate [`select`] refuses the launch on (see the qualified-pin carve-out below) (`stage=profile_selection`,
 /// exit 78), factored out so the daemon's launch sites can drop a
 /// *configured-tier* model override instead of losing the step.
 ///
@@ -274,11 +274,14 @@ pub fn profile_rejects_effort(
 /// an unknown profile (the launch itself fails closed on that, with its own
 /// diagnostic), or a profile with no provider for this harness (it cannot be
 /// the model that harness runs); `Some(profile_name)` when the resolved
-/// profile's `model` differs from `model`. Note the comparison is the full
+/// profile's `model` differs from `model`. The comparison is the full
 /// configured string against the profile's model, exactly as [`select`]
-/// compares them — including a *qualified* `provider/model` value, which a
-/// profile-bearing launch also refuses unless it literally equals the
-/// profile's model.
+/// compares them — including a *qualified* `provider/model` value when a
+/// profile was explicitly requested (tap `modelProfile` or
+/// `LOOM_MODEL_PROFILE`), which is refused unless it literally equals the
+/// profile's model. With **no** explicitly requested profile, a qualified
+/// `provider/model` (two non-empty halves) returns `None`: [`select`] honours
+/// it verbatim before any profile lookup, so it is not a refusal.
 #[must_use]
 pub fn profile_rejects_model(
     runtime: &str,
@@ -294,6 +297,16 @@ pub fn profile_rejects_model(
         .map(str::trim)
         .filter(|p| !p.is_empty())
         .or(env_profile.as_deref());
+    // Mirror `select`'s early return: with no explicitly requested profile, a
+    // qualified `provider/model` is honoured verbatim and never compared
+    // against a profile (documented `roleModels` shape, configuring-resources.md).
+    if requested.is_none()
+        && model
+            .split_once('/')
+            .is_some_and(|(provider, rest)| !provider.is_empty() && !rest.is_empty())
+    {
+        return None;
+    }
     let (name, resolved) = lookup(requested, config).ok()?;
     if !resolved.providers.contains_key(runtime) {
         return None;
@@ -1055,6 +1068,34 @@ mod tests {
             profile_rejects_model("opencode", None, "glm-5.3-flash", &serde_json::json!({})),
             None,
             "the bundled zai-flash's own model (glm-5.3-flash) is no objection"
+        );
+        // `select` honours a qualified `provider/model` verbatim when no
+        // profile was requested (it never consults a profile), so it is no
+        // objection — the documented `roleModels` shape.
+        assert_eq!(
+            profile_rejects_model(
+                "opencode",
+                None,
+                "google/gemini-2.5-pro",
+                &serde_json::json!({})
+            ),
+            None,
+            "a qualified pin on a bare pick is honoured by select"
+        );
+        // Malformed halves are not the early-return shape; they fall through.
+        assert_eq!(
+            profile_rejects_model("opencode", None, "google/", &serde_json::json!({})),
+            Some("zai-flash".to_string())
+        );
+        // An explicitly requested profile still refuses a differing qualified pin.
+        assert_eq!(
+            profile_rejects_model(
+                "opencode",
+                Some("zai-flash"),
+                "google/gemini-2.5-pro",
+                &serde_json::json!({})
+            ),
+            Some("zai-flash".to_string())
         );
 
         std::env::set_var("LOOM_MODEL_PROFILE", "zai-full");

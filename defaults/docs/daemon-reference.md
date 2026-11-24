@@ -11215,7 +11215,13 @@ launch will select (the preference tap's `modelProfile`, then
 `LOOM_MODEL_PROFILE`, `runtimes.defaultModelProfile`, then the bundled
 `zai-flash`) declares a different `model`, the configured pin is dropped and
 the child launches with the profile's own model instead of the launch being
-refused. The drop is logged, and the per-tick header's source names it, e.g.
+refused. **A qualified `provider/model` pin is kept** when no profile was
+requested (no tap `modelProfile`, no `LOOM_MODEL_PROFILE`): `select` honours it
+verbatim before any profile lookup — the documented
+`"roleModels": {"judge": "google/gemini-2.5-pro"}` shape
+(`configuring-resources.md`) — so only a bare tier name (or a qualified value
+differing from an *explicitly requested* profile's model) is dropped. The drop
+is logged, and the per-tick header's source names it, e.g.
 `model=<runtime CLI default> (source=autonomous.roleRunner.roleModels.judge (profile model for opencode:zai-flash))`.
 A model the pick itself pins (`claude/opus`, `opencode:<profile>/<model>`)
 is an explicit statement of intent about that launch and is **never** dropped:
