@@ -711,12 +711,33 @@ resolve_dep_states() {
   # answers false: the hold is preserved, never guessed off. Output: line 1
   # `true`/`false` (all deps terminal?), line 2 the space-joined resolved
   # refs for the unblock announcement, both read through the daemon's
-  # eval-safe KEY=VALUE quoting.
+  # eval-safe KEY=VALUE quoting. `RESOLVED` is the closed subset (#15193):
+  # it is announcement text only and never evidence that the hold may lift —
+  # lift only on `ALL_RESOLVED=true` AND the `deps_fully_resolved` set gate.
   local out ALL_RESOLVED="" RESOLVED=""
   out=$(loom-daemon dep-recheck-fingerprint dep-states --refs "$1" 2>/dev/null) || out=""
   eval "$(printf '%s\n' "$out" | grep -E '^(ALL_RESOLVED|RESOLVED)=')" || true
   [ "$ALL_RESOLVED" = "true" ] || ALL_RESOLVED=false
   printf '%s\n%s\n' "$ALL_RESOLVED" "$RESOLVED"
+}
+
+deps_fully_resolved() {
+  # #15193: the all-or-nothing gate. A park record set is robust to stale
+  # citations of closed blockers ONLY if the hold lifts when EVERY cited
+  # dependency is resolved — a verdict naming just the closed subset (three
+  # of five children on a split tracker, say) must leave it parked. Both
+  # lists are normalised the same way — whitespace-split (`parse_dependencies`
+  # emits one ref per line, the daemon's `RESOLVED` one space-joined line)
+  # and a leading `#` dropped from same-repo refs (`#104` -> `104`;
+  # cross-repo OWNER/REPO#N tokens already match on both sides) — then the
+  # deps side is filtered against the resolved set: any open, unknown, or
+  # dropped dependency survives it, as does every dep against an empty
+  # resolved list, and answers false. Fail closed, no label write, no
+  # comment.
+  local missing
+  missing=$(printf '%s\n' "$1" | tr -s '[:space:]' '\n' | sed -e '/^$/d' -e 's/^#\([0-9][0-9]*\)$/\1/' \
+    | grep -vxF -f <(printf '%s\n' "$2" | tr -s '[:space:]' '\n' | sed -e '/^$/d' -e 's/^#\([0-9][0-9]*\)$/\1/')) || true
+  [ -z "$missing" ]
 }
 
 check_and_unblock() {
@@ -750,6 +771,14 @@ check_and_unblock() {
     dep_verdict=$(resolve_dep_states "$deps")
     local all_resolved=$(printf '%s\n' "$dep_verdict" | sed -n '1p')
     local resolved_deps=$(printf '%s\n' "$dep_verdict" | sed -n '2p')
+
+    # #15193: all-or-nothing gate, deliberately INDEPENDENT of the
+    # `all_resolved` flag above — a misread verdict (or a Guide copying the
+    # closed subset `RESOLVED` list into the announcement and restoring on
+    # it) must not lift the hold. `resolved_deps` is announcement text only;
+    # every parsed dependency has to be in it, or the issue stays parked
+    # with no label write and no comment.
+    deps_fully_resolved "$deps" "$resolved_deps" || continue
 
     if [ "$all_resolved" = true ]; then
       # Superseding-block gate (#4634): a resolved body dependency is NOT
