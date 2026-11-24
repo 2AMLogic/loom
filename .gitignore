@@ -255,3 +255,8 @@ Thumbs.db
 # EPHEMERAL_PATTERNS in loom-daemon/src/init/post_init.rs, not from this file.
 # It now lives in that list (and therefore in the block above), with the
 # rationale for ignoring it recorded alongside the pattern there.
+
+# Stray XDG/gh CLI state (e.g. `.local/state/gh/device-id`) written into the
+# repo root when a tool resolves $HOME/$XDG_STATE_HOME to the checkout. Anchored
+# so it never matches a nested `.local/` that a project tree ships on purpose.
+/.local/
