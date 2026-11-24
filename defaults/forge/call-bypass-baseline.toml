@@ -39,7 +39,7 @@ removal_issue = 9799
 
 [[bypass]]
 path = "defaults/scripts/claim-staleness.sh"
-calls = 5
+calls = 6
 owner = "role-scripts"
 removal_issue = 9799
 
