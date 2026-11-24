@@ -9,7 +9,7 @@
 use std::path::Path;
 
 pub(super) mod building_heal;
-pub(super) mod merge_observation;
+pub(crate) mod merge_observation;
 
 use super::{forge, merge_sequence, review_conflict, VerdictReconcileStats};
 

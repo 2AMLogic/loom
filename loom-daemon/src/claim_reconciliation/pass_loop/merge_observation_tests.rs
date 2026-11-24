@@ -109,6 +109,16 @@ impl FakeForge {
             .to_string(),
         );
     }
+    fn reopened_at(&self, n: &str, at: &str) {
+        self.timeline.borrow_mut().insert(
+            n.to_string(),
+            serde_json::json!([{
+                "event": "reopened",
+                "created_at": at,
+            }])
+            .to_string(),
+        );
+    }
 }
 
 // Free helpers so the Forge and bookkeeping::Host impls can share bodies
@@ -257,6 +267,9 @@ impl bookkeeping::Host for FakeForge {
     fn close_issue(&self, repo: &str, issue: &str, comment: &str) -> bool {
         fake_close_issue(self, repo, issue, comment)
     }
+    fn label_events(&self, repo: &str, issue: &str) -> Option<String> {
+        Forge::label_events(self, repo, issue)
+    }
     fn timestamp(&self) -> String {
         "T".into()
     }
@@ -347,6 +360,46 @@ fn claim_predates_merge_answer_the_three_ways() {
         "created_at": BEFORE_MERGE}])
     .to_string();
     assert_eq!(claim_predates_merge(&unlabeled_only, MERGED_AT), None);
+}
+
+#[test]
+fn reopened_after_merge_answers_the_four_ways() {
+    let events = |at: &str| {
+        serde_json::json!([{"event": "labeled", "label": {"name": "x"}, "created_at": at},
+            {"event": "reopened", "created_at": at}])
+        .to_string()
+    };
+    // Absent (a readable timeline with no reopen) and before: still close.
+    assert_eq!(reopened_after_merge("[]", MERGED_AT), Some(false));
+    assert_eq!(reopened_after_merge(&events(BEFORE_MERGE), MERGED_AT), Some(false));
+    // After: a deliberate reopen the replay must not undo.
+    assert_eq!(reopened_after_merge(&events(AFTER_MERGE), MERGED_AT), Some(true));
+    // The newest reopen decides, whatever the page order.
+    let both = serde_json::json!([
+        {"event": "reopened", "created_at": AFTER_MERGE},
+        {"event": "reopened", "created_at": BEFORE_MERGE}])
+    .to_string();
+    assert_eq!(reopened_after_merge(&both, MERGED_AT), Some(true));
+    // Malformed: the unreadable read (an empty string), broken JSON, a
+    // broken merged_at — each unknown, never a guess.
+    assert_eq!(reopened_after_merge("", MERGED_AT), None);
+    assert_eq!(reopened_after_merge("not json", MERGED_AT), None);
+    assert_eq!(reopened_after_merge(&events(AFTER_MERGE), "not a time"), None);
+}
+
+#[test]
+fn incomplete_records_expire_at_the_ttl_boundary() {
+    let now = "2026-11-28T10:00:00Z";
+    // Exactly the 7-day TTL old: the record gets its whole bound.
+    assert!(!incomplete_record_expired("2026-11-21T10:00:00Z", now));
+    // One second past it: expired.
+    assert!(incomplete_record_expired("2026-11-21T09:59:59Z", now));
+    // Younger: still retried.
+    assert!(!incomplete_record_expired("2026-11-27T23:00:00Z", now));
+    // A corrupt stamp cannot age out — reclaim it.
+    assert!(incomplete_record_expired("not a time", now));
+    // A clock that cannot be read keeps the record.
+    assert!(!incomplete_record_expired("2026-11-21T10:00:00Z", "not a time"));
 }
 
 #[test]
@@ -633,6 +686,9 @@ fn close_target_fixture() -> (FakeForge, tempfile::TempDir) {
     f.issues
         .borrow_mut()
         .insert("3".into(), FakeIssue::open(&["loom:building"]));
+    // A readable timeline with no post-merge reopen: the close gate's
+    // `Some(false)` shape (#15145).
+    f.timeline_at("3", BEFORE_MERGE);
     let dir = tempfile::tempdir().unwrap();
     (f, dir)
 }
@@ -645,6 +701,45 @@ fn an_open_linked_issue_is_closed_by_the_observation() {
     assert_eq!(f.state("3"), "closed");
     assert_eq!(f.comment_count("3"), 1);
     assert!(f.calls().iter().any(|c| c == "close 3"));
+}
+
+#[test]
+fn a_target_reopened_after_the_merge_is_not_closed_again() {
+    let (f, dir) = close_target_fixture();
+    f.reopened_at("3", AFTER_MERGE);
+    let store = RecordStore::for_root(dir.path());
+    run(&f, &store, true);
+    assert_eq!(f.state("3"), "open");
+    assert!(!f.calls().iter().any(|c| c == "close 3"));
+    // A verified reopen is a decision, not a failure (#15145): the pass
+    // completed having deliberately closed nothing, so it does not loop.
+    assert!(store.load(9).unwrap().complete());
+}
+
+#[test]
+fn a_target_reopened_only_before_the_merge_still_closes() {
+    let (f, dir) = close_target_fixture();
+    f.reopened_at("3", BEFORE_MERGE);
+    let store = RecordStore::for_root(dir.path());
+    run(&f, &store, true);
+    assert_eq!(f.state("3"), "closed");
+    assert!(store.load(9).unwrap().complete());
+}
+
+#[test]
+fn an_unreadable_reopen_timeline_leaves_the_close_check_unmarked() {
+    let (f, dir) = close_target_fixture();
+    f.timeline.borrow_mut().remove("3");
+    let store = RecordStore::for_root(dir.path());
+    run(&f, &store, true);
+    assert_eq!(f.state("3"), "open");
+    assert!(!f.calls().iter().any(|c| c == "close 3"));
+    assert!(!store.load(9).unwrap().complete());
+    // Readable again: a later tick closes it and completes the record.
+    f.reopened_at("3", BEFORE_MERGE);
+    run(&f, &store, true);
+    assert_eq!(f.state("3"), "closed");
+    assert!(store.load(9).unwrap().complete());
 }
 
 #[test]
@@ -797,6 +892,10 @@ fn the_branch_derived_issue_closes_before_the_strip_reads_it() {
         .insert("3".into(), FakeIssue::open(&["loom:building"]));
     f.merged[0].body = "Closes #3\n".into();
     f.close_targets.borrow_mut().replace("3\n".to_string());
+    // Both closes pass their reopen gates (#15145): readable timelines,
+    // no post-merge reopen.
+    f.timeline_at("3", BEFORE_MERGE);
+    f.timeline_at("42", BEFORE_MERGE);
     let dir = tempfile::tempdir().unwrap();
     let store = RecordStore::for_root(dir.path());
     run(&f, &store, true);
@@ -831,6 +930,7 @@ fn a_partial_failure_resumes_from_the_last_completed_pass() {
         pr_body: f.merged[0].body.clone(),
         conflicted: String::new(),
         open_before_merge: "5".into(),
+        merged_at: None,
     };
     match bookkeeping::run(
         bookkeeping::Pass::PartialReset,
@@ -840,6 +940,7 @@ fn a_partial_failure_resumes_from_the_last_completed_pass() {
     ) {
         bookkeeping::Outcome::Done(_) => {}
         bookkeeping::Outcome::Need(n) => panic!("unexpected need {n:?}"),
+        bookkeeping::Outcome::Defer(_) => panic!("unexpected defer"),
     }
     let mut rec = MergeRecord {
         repo: "o/r".into(),
@@ -875,6 +976,90 @@ fn a_deferred_record_retries_after_its_pr_leaves_the_discovery_window() {
     assert_eq!(stats.merges_seen, 0);
     assert_eq!(stats.records_completed, 1);
     assert!(store.load(9).unwrap().complete());
+}
+
+#[test]
+#[allow(clippy::field_reassign_with_default)]
+fn the_branch_derived_close_respects_a_post_merge_reopen() {
+    let mut f = FakeForge::default();
+    f.merged = vec![MergedPull {
+        body: String::new(),
+        ..merged_row()
+    }];
+    f.close_targets.borrow_mut().replace(String::new());
+    f.issues
+        .borrow_mut()
+        .insert("42".into(), FakeIssue::open(&["loom:building"]));
+    f.reopened_at("42", AFTER_MERGE);
+    let dir = tempfile::tempdir().unwrap();
+    let store = RecordStore::for_root(dir.path());
+    run(&f, &store, true);
+    assert_eq!(f.state("42"), "open");
+    assert!(!f.calls().iter().any(|c| c == "close 42"));
+    // The verified reopen completed the pass: no retry loop (#15145).
+    assert!(store.load(9).unwrap().complete());
+}
+
+#[test]
+#[allow(clippy::field_reassign_with_default)]
+fn the_branch_derived_close_defers_on_an_unreadable_reopen_timeline() {
+    let mut f = FakeForge::default();
+    f.merged = vec![MergedPull {
+        body: String::new(),
+        ..merged_row()
+    }];
+    f.close_targets.borrow_mut().replace(String::new());
+    f.issues
+        .borrow_mut()
+        .insert("42".into(), FakeIssue::open(&["loom:building"]));
+    // No timeline for #42: the observation-driven branch close defers.
+    let dir = tempfile::tempdir().unwrap();
+    let store = RecordStore::for_root(dir.path());
+    run(&f, &store, true);
+    assert_eq!(f.state("42"), "open");
+    assert!(!f.calls().iter().any(|c| c == "close 42"));
+    let rec = store.load(9).unwrap();
+    assert!(!rec.complete());
+    assert!(!rec.done.iter().any(|d| d == BRANCH_CLOSE));
+    // Readable, with no post-merge reopen: a later tick closes it.
+    f.reopened_at("42", BEFORE_MERGE);
+    run(&f, &store, true);
+    assert_eq!(f.state("42"), "closed");
+    assert!(store.load(9).unwrap().complete());
+}
+
+fn rec_for(pr: u64, observed_at: &str, done: &[&str]) -> MergeRecord {
+    MergeRecord {
+        repo: "o/r".into(),
+        pr,
+        head: "h1".into(),
+        merge_commit: "m1".into(),
+        merged_at: MERGED_AT.into(),
+        branch: "feature/issue-42".into(),
+        body: String::new(),
+        observed_at: observed_at.to_string(),
+        done: done.iter().map(|s| (*s).to_string()).collect(),
+    }
+}
+
+#[test]
+fn an_expired_incomplete_record_is_dropped_and_young_or_complete_survive() {
+    let f = FakeForge::default();
+    let dir = tempfile::tempdir().unwrap();
+    let store = RecordStore::for_root(dir.path());
+    let week_ago = (chrono::Utc::now() - chrono::Duration::days(8)).to_rfc3339();
+    let now = chrono::Utc::now().to_rfc3339();
+    store.store(&rec_for(20, &week_ago, &PASSES)).unwrap();
+    store.store(&rec_for(21, &week_ago, &[])).unwrap();
+    store.store(&rec_for(22, &now, &[])).unwrap();
+    let stats = run(&f, &store, false);
+    // Only the expired incomplete record is reclaimed (#15145): the
+    // complete one keeps making its merge invisible, the young one is
+    // still retried.
+    assert_eq!(stats.records_expired, 1);
+    assert!(store.load(20).unwrap().complete());
+    assert!(store.load(21).is_none());
+    assert!(!store.load(22).unwrap().complete());
 }
 
 #[test]
@@ -1012,6 +1197,7 @@ fn script_merge_and_direct_forge_merge_converge_after_one_tick() {
         pr_body: body,
         conflicted: "6".into(),
         open_before_merge: "5 6 8 10".into(),
+        merged_at: None,
     };
     let shell_facts = bookkeeping::Facts {
         close_targets: Some("3\n6\n11\n".into()),
@@ -1029,6 +1215,7 @@ fn script_merge_and_direct_forge_merge_converge_after_one_tick() {
         ) {
             bookkeeping::Outcome::Done(_) => {}
             bookkeeping::Outcome::Need(n) => panic!("unexpected need {n:?}"),
+            bookkeeping::Outcome::Defer(_) => panic!("unexpected defer"),
         }
     }
     let script_stats = run(&script, &script_store, true);

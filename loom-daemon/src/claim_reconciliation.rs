@@ -1984,8 +1984,9 @@ pub(crate) mod orphan_stack_git;
 
 /// The per-repo loop of one reconciliation pass, plus the #8953 mid-pass
 /// rate-limit-breaker re-check that stops it early — a sibling file rather
-/// than more inline logic here.
-mod pass_loop;
+/// than more inline logic here. `pub(crate)` for `merge_observation`'s
+/// predicates, which the merge-pr bookkeeping shares (#15145).
+pub(crate) mod pass_loop;
 
 /// The ETag-cached `loom:building` listing [`forge`] reconciles against — a
 /// sibling file, attributed to `claim_reconciliation` in the #9251 forge-call
