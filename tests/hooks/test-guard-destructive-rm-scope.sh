@@ -1280,6 +1280,16 @@ assert_deny "#15112 review: sudo cd does not move the shell" \
     'sudo cd /tmp/x; rm -rf important' "/opt/vendor"
 assert_allow "#15112 review: ( cd dir && rm ) inside a subshell still resolves" \
     '(cd /tmp/x && rm -rf note.md)' "$REPO_ROOT"
+# A cd moves a later rm only when every operator between them is `&&`; otherwise
+# the target keeps the session-cwd verdict (never looser than main) (#15169 review).
+assert_deny "#15112 review: cd && true ; rm - the ; drops the cd link" \
+    'cd /tmp/x && true ; rm -rf important' "/opt/vendor"
+assert_deny "#15112 review: cd <missing dir> ; rm does not trust the cd" \
+    'cd /tmp/x/missing-dir ; rm -rf important' "/opt/vendor"
+assert_deny "#15112 review: newline-separated cd does not move the rm" \
+    $'cd /tmp/x\nrm -rf important' "/opt/vendor"
+assert_allow "#15112 review: benign cd build ; rm keeps main's allow" \
+    'cd build ; rm -rf x' "$REPO_ROOT"
 assert_allow "#15112 review: 2>&1 redirect after cd is not a background operator" \
     'cd -- /tmp/x/work >/dev/null 2>&1 && rm -f ../note.md' "$REPO_ROOT"
 echo ""

@@ -7713,8 +7713,8 @@ _extract_rm_targets_scan() {
     # guessing. A later resolvable ABSOLUTE `cd` makes the directory known again.
     printf '%s' "$1" | awk -v mark="$2" -v startcwd="$3" -v startunres="${4:-0}" -v home="$HOME" "$_QSPLIT_AWK""$_CDEXPAND_AWK""$_CDQUOTE_AWK"'
     BEGIN {
-        curcwd = startcwd; cdseen = 0; cdunres = 0
-        if (startunres == 1) { cdseen = 1; cdunres = 1 }
+        curcwd = startcwd; cdseen = 0; cdunres = 0; cdlink = 0
+        if (startunres == 1) { cdseen = 1; cdunres = 1; cdlink = 1 }
         sdepth = 0
         CDM = sprintf("%c", 31); UNRM = sprintf("%c", 29); RSM = sprintf("%c", 30)
         SQ = sprintf("%c", 39); DQ = sprintf("%c", 34); BS = sprintf("%c", 92)
@@ -7728,7 +7728,10 @@ _extract_rm_targets_scan() {
         return 0
     }
     # Resolve one `cd` segment (toks[1..m]); updates curcwd/cdunres/cdseen.
-    function track_cd(   k, arg, cls, bad) {
+    function track_cd(   k, arg, cls, bad, wasbroken) {
+        # A prior cd whose effect no longer reliably reaches this point (a `;`,
+        # newline, `|`, `||` or `&` followed it) makes a relative base unknowable.
+        wasbroken = (cdseen && !cdlink)
         cdseen = 1
         k = 2
         # Skip option words (`cd -P dir`); a lone `-` is `cd -`. `--` ends the
@@ -7750,10 +7753,13 @@ _extract_rm_targets_scan() {
         if (cls ~ /^\//) { curcwd = cls; cdunres = 0; return }
         # A relative join needs a literal base: a session cwd with whitespace or
         # quote/glob bytes would corrupt the word split in the caller.
-        if (cdunres || curcwd == "" || curcwd !~ /^\// || nonliteral(curcwd)) { cdunres = 1; return }
+        if (wasbroken || cdunres || curcwd == "" || curcwd !~ /^\// || nonliteral(curcwd)) { cdunres = 1; return }
         curcwd = curcwd "/" cls
     }
     {
+        # A new input record is a newline boundary, i.e. a `;`: an earlier cd
+        # does not reliably move this record (#15169 review).
+        if (startunres != 1) cdlink = 0
         $0 = qsplit($0)   # quote-aware segmentation (#3755)
         n = split($0, segs, "\n")
         # qsplit_op[k] is the operator between segments k and k+1, but a literal
@@ -7762,6 +7768,11 @@ _extract_rm_targets_scan() {
         opsok = (qsplit_nops == n - 1)
         for (i = 1; i <= n; i++) {
             seg = segs[i]
+            # Only `&&` guarantees the previous segment (and so any cd in it)
+            # succeeded and ran in this shell; any other separator drops the
+            # cd link and the target falls back to the session-cwd verdict.
+            if (i > 1 && startunres != 1 && (!opsok || (qsplit_op[i - 1] != "&&" &&
+                !(qsplit_op[i - 1] == "&" && segs[i - 1] ~ /[<>][ \t]*$/)))) cdlink = 0
             sub(/^[ \t]+/, "", seg)
             sudo = sub(/^sudo[ \t]+/, "", seg)
             sub(/^[ \t]+/, "", seg)
@@ -7785,12 +7796,13 @@ _extract_rm_targets_scan() {
             if (lead > npush) lead = npush
             if (lead) {
                 sdepth++
-                st_cwd[sdepth] = curcwd; st_seen[sdepth] = cdseen; st_unres[sdepth] = cdunres
+                st_cwd[sdepth] = curcwd; st_seen[sdepth] = cdseen; st_unres[sdepth] = cdunres; st_link[sdepth] = cdlink
             }
             while (seg ~ /^\([ \t]*/ && seg !~ /^\(\(/) sub(/^\([ \t]*/, "", seg)
             if (!sudo && seg ~ /^cd([ \t]|$)/) {
                 m = split(seg, toks, /[ \t]+/)
                 track_cd()
+                cdlink = 1
                 # A cd on either side of `|` / `&` runs in a child shell, and one
                 # after `||` (or before it) may not run at all: it does not
                 # reliably move the next command, so fail closed.
@@ -7804,10 +7816,10 @@ _extract_rm_targets_scan() {
             }
             for (q = lead; q < npush; q++) {
                 sdepth++
-                st_cwd[sdepth] = curcwd; st_seen[sdepth] = cdseen; st_unres[sdepth] = cdunres
+                st_cwd[sdepth] = curcwd; st_seen[sdepth] = cdseen; st_unres[sdepth] = cdunres; st_link[sdepth] = cdlink
             }
             for (q = 0; q < npop && sdepth > 0; q++) {
-                curcwd = st_cwd[sdepth]; cdseen = st_seen[sdepth]; cdunres = st_unres[sdepth]
+                curcwd = st_cwd[sdepth]; cdseen = st_seen[sdepth]; cdunres = st_unres[sdepth]; cdlink = st_link[sdepth]
                 sdepth--
             }
         }
@@ -7821,9 +7833,9 @@ _extract_rm_targets_scan() {
         for (j = 2; j <= m; j++) {
             if (toks[j] == "") continue
             if (toks[j] ~ /^-/) continue
-            if (cdseen && !cdunres && curcwd ~ /^\//)
+            if (cdlink && !cdunres && curcwd ~ /^\//)
                 print mark CDM curcwd CDM toks[j]
-            else if (cdseen || index(toks[j], CDM) > 0 || index(toks[j], UNRM) > 0)
+            else if (cdlink || index(toks[j], CDM) > 0 || index(toks[j], UNRM) > 0)
                 print mark UNRM toks[j]
             else
                 print mark toks[j]
