@@ -129,6 +129,34 @@ pub fn rev_list(repo: &Path, range: &str) -> Result<std::collections::BTreeSet<S
     Ok(out.stdout_trimmed().lines().map(str::to_string).collect())
 }
 
+/// The BEST common ancestors of `a` and `b` (`git merge-base --all`), one
+/// local spawn. Empty when the two histories share nothing (git's exit-1
+/// "no common ancestor" answer, not a failure).
+///
+/// `--all`, never the single-answer form: a history that merged the other
+/// side in (a child carrying an older default branch) has SEVERAL best
+/// common ancestors, and git picks among them by commit date — the single
+/// answer can name the default-branch side instead of the head being asked
+/// about, silently missing the match. Membership in this set positively
+/// proves ancestry; absence proves nothing and must fail to "no match".
+///
+/// # Errors
+/// `git merge-base` could not answer (exit other than 0 or 1, or it did
+/// not run).
+pub fn merge_bases(
+    repo: &Path,
+    a: &str,
+    b: &str,
+) -> Result<std::collections::BTreeSet<String>, String> {
+    let out = git(repo, &["merge-base", "--all", a, b], LOCAL_TIMEOUT);
+    match &out {
+        CmdOutcome::Ran(o) if o.status.success() || o.status.code() == Some(1) => {
+            Ok(out.stdout_trimmed().lines().map(str::to_string).collect())
+        }
+        _ => Err(out.failure_reason("git merge-base --all")),
+    }
+}
+
 /// The remote's live head for `branch`: `Ok(Some(sha))`, `Ok(None)` when the
 /// remote answered and has no such branch, `Err` when it could not be asked.
 ///
