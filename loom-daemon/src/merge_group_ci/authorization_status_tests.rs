@@ -19,6 +19,9 @@ fn native_status_and_ci_must_both_have_producers() {
     assert_eq!(e.audit.required.len(), 1);
     assert_eq!(e.audit.required[0].context, "Gate");
 
+    let write_implies_read =
+        eligibility(&["Gate", AUTH], &TEMPLATE.replace("checks: read", "checks: write"));
+    assert!(write_implies_read.eligible);
     let unknown = eligibility(&["No such job", AUTH], TEMPLATE);
     assert_eq!(unknown.failures[0].prereq, Prereq::MissingRequiredSuite);
     let auth_only = eligibility(&[AUTH], TEMPLATE);
@@ -46,7 +49,11 @@ fn a_job_name_or_an_unusable_status_publisher_does_not_satisfy_the_rule() {
         (cmd, "loom-daemon forge merge-queue status"),
         ("--repo \"$GH_REPO\"", "--repo other/project"),
         ("    name: Merge authorization", "    name: loom/merge-authorization\n    permissions: read-all"),
+        ("  checks: read\n", ""),
+        ("  pull-requests: read\n", ""),
+        ("  contents: read\n", ""),
         ("statuses: write", "statuses: read"),
+        ("--repo \"$GH_REPO\"", "--repo owner/repo"),
         ("  merge_group:", "  pull_request:"),
         ("      - name: Check merge-group authorization", "      - name: Check merge-group authorization\n        if: false"),
         ("        uses: actions/checkout@v4", "        if: false\n        uses: actions/checkout@v4"),

@@ -369,7 +369,8 @@ run before the first grant write or revoke (#12579):
   `MISSING_REQUIRED_SUITE` by design. Pilot eligibility checks the native
   publisher separately and reports its workflow. Use the template's direct
   `loom-daemon forge merge-queue group-check` invocation in a runnable step
-  after checkout, with `statuses: write` and the merge-group head SHA. The
+  after checkout, with `statuses: write`, read access to contents, checks,
+  and pull requests, and the merge-group head SHA. The
   command can read that SHA from a step-level environment variable. All other
   required contexts still need CI job coverage. To run the CI job audit directly:
 

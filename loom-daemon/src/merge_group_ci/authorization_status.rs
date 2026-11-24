@@ -1,6 +1,8 @@
 //! Recognize Loom's native producer of the merge-group authorization commit status.
 //! CI jobs still require exact check-run name coverage in the ordinary audit.
 
+use std::collections::BTreeMap;
+
 use super::audit::{eval_condition, job_states, needs_of, triggered};
 use super::context::{Event, EventContext, JobScope, RunState, MG_HEAD_SHA};
 use super::expr::{interpolate, Truth};
@@ -23,12 +25,9 @@ fn produces_status(wf: &Workflow) -> bool {
     let states = job_states(wf, &event);
     wf.jobs.iter().any(|job| {
         let permissions = job.permissions.as_ref().or(wf.permissions.as_ref());
-        let can_post = permissions.is_some_and(|p| {
-            p == "write-all"
-                || p.split(", ")
-                    .any(|permission| permission == "statuses: write")
-        });
-        if !can_post || states.get(&job.id) != Some(&RunState::Runs) {
+        if !has_group_permissions(permissions.map(String::as_str))
+            || states.get(&job.id) != Some(&RunState::Runs)
+        {
             return false;
         }
         let scope = JobScope {
@@ -49,14 +48,95 @@ fn produces_status(wf: &Workflow) -> bool {
     })
 }
 
+fn has_group_permissions(permissions: Option<&str>) -> bool {
+    let Some(permissions) = permissions else {
+        return false;
+    };
+    if permissions == "write-all" {
+        return true;
+    }
+    let grants: BTreeMap<_, _> = permissions
+        .split(", ")
+        .filter_map(|s| s.split_once(": "))
+        .collect();
+    grants.get("statuses") == Some(&"write")
+        && ["contents", "checks", "pull-requests"]
+            .iter()
+            .all(|key| matches!(grants.get(key).copied(), Some("read" | "write")))
+}
+
+/// Split the direct command's bare or double-quoted arguments. Preserve a
+/// quoted Actions expression as one argument so its value can be proved.
+fn command_words(mut text: &str) -> Option<Vec<&str>> {
+    let mut words = Vec::new();
+    text = text.trim();
+    while !text.is_empty() {
+        let (word, tail) = if let Some(quoted) = text.strip_prefix('"') {
+            let (word, tail) = quoted.split_once('"')?;
+            if !tail.is_empty() && !tail.starts_with(char::is_whitespace) {
+                return None;
+            }
+            (word, tail)
+        } else {
+            text.split_at(text.find(char::is_whitespace).unwrap_or(text.len()))
+        };
+        words.push(word);
+        text = tail.trim_start();
+    }
+    Some(words)
+}
+
+fn event_argument(
+    arg: &str,
+    builtin: &str,
+    expected: &str,
+    step: &Step,
+    scope: &JobScope<'_>,
+) -> bool {
+    // A literal which happens to equal an example value in EventContext is
+    // not evidence that the workflow uses the event's value at run time.
+    let expr = if arg.starts_with("${{") {
+        arg
+    } else {
+        let Some(var) = arg
+            .strip_prefix("${")
+            .and_then(|v| v.strip_suffix('}'))
+            .or_else(|| arg.strip_prefix('$'))
+        else {
+            return false;
+        };
+        if var == builtin {
+            return true;
+        }
+        let Some((_, value)) = step.env.iter().find(|(k, _)| k == var) else {
+            return false;
+        };
+        value.as_str()
+    };
+    let Some(inner) = expr
+        .trim()
+        .strip_prefix("${{")
+        .and_then(|e| e.strip_suffix("}}"))
+    else {
+        return false;
+    };
+    let paths = match builtin {
+        "GITHUB_SHA" => &[
+            "github.sha",
+            "github.event.merge_group.head_sha",
+            "github.event.workflow_run.head_sha",
+        ][..],
+        _ => &["github.repository"][..],
+    };
+    inner.split("||").all(|path| paths.contains(&path.trim()))
+        && interpolate(expr, scope).render().as_deref() == Some(expected)
+}
+
 /// Recognize the direct CLI invocation used by the shipped workflow. Unknown
 /// shell wrappers cannot establish coverage. Resolve the commit from the
 /// merge-group event, including a step-level env binding as in consumer repos.
 fn publishes_to_group(step: &Step, scope: &JobScope<'_>) -> bool {
     let Some(script) = step.run.as_deref() else {
-        return false;
-    };
-    let Some(script) = interpolate(script, scope).render() else {
         return false;
     };
     let script = script.replace("\\\n", " ");
@@ -70,10 +150,10 @@ fn publishes_to_group(step: &Step, scope: &JobScope<'_>) -> bool {
     if lines.next().is_some() {
         return false;
     }
-    let mut words = cmd
-        .split_whitespace()
-        .map(|s| s.trim_matches('"'))
-        .peekable();
+    let Some(words) = command_words(cmd) else {
+        return false;
+    };
+    let mut words = words.into_iter().peekable();
     words.next_if_eq(&"exec");
     let Some(bin) = words.next() else {
         return false;
@@ -86,23 +166,16 @@ fn publishes_to_group(step: &Step, scope: &JobScope<'_>) -> bool {
     {
         return false;
     }
-    let bound_to = |arg: &str, value: &str, builtin: &str| {
-        arg == value
-            || arg == builtin
-            || step.env.iter().any(|(name, expr)| {
-                arg.strip_prefix('$') == Some(name.as_str())
-                    && interpolate(expr, scope).render().as_deref() == Some(value)
-            })
-    };
     let mut group_target = false;
     while let Some(flag) = words.next() {
         match (flag, words.next()) {
             ("--commit", Some(arg))
-                if !group_target && bound_to(arg, MG_HEAD_SHA, "$GITHUB_SHA") =>
+                if !group_target && event_argument(arg, "GITHUB_SHA", MG_HEAD_SHA, step, scope) =>
             {
                 group_target = true
             }
-            ("--repo", Some(arg)) if bound_to(arg, "owner/repo", "$GITHUB_REPOSITORY") => {}
+            ("--repo", Some(arg))
+                if event_argument(arg, "GITHUB_REPOSITORY", "owner/repo", step, scope) => {}
             _ => return false,
         }
     }
