@@ -676,6 +676,30 @@ impl RecordStore {
         out
     }
 
+    /// Every stored record, complete or not, sorted by PR number. Corrupt or
+    /// absent files read as unobserved, as [`Self::load`]. The merged-stack
+    /// pass (#14903) reads this to find parents whose merge was observed here
+    /// regardless of bookkeeping completion.
+    #[must_use]
+    pub fn all(&self) -> Vec<MergeRecord> {
+        let Ok(rd) = std::fs::read_dir(&self.dir) else {
+            return Vec::new();
+        };
+        let mut out: Vec<MergeRecord> = rd
+            .flatten()
+            .filter(|e| {
+                let n = e.file_name();
+                let n = n.to_string_lossy();
+                n.starts_with("pr-") && n.ends_with(".json")
+            })
+            .filter_map(|e| {
+                serde_json::from_str::<MergeRecord>(&std::fs::read_to_string(e.path()).ok()?).ok()
+            })
+            .collect();
+        out.sort_by_key(|r| r.pr);
+        out
+    }
+
     /// Write the record atomically (temp file + rename).
     ///
     /// # Errors

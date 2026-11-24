@@ -647,6 +647,14 @@ fn daemon_write_paths_are_scoped() {
             ),
         ),
         (
+            "claim_reconciliation/merged_stack.rs",
+            Via(
+                PASS,
+                "merged-stack pass (#14903): base retarget PATCH and reconcile comments; its \
+                 scratch-worktree push (orphan_stack_git.rs) rides the same gate",
+            ),
+        ),
+        (
             "forge_disable_auto_merge.rs",
             Via(PASS, "verdict pass; shell guard vets its own call"),
         ),

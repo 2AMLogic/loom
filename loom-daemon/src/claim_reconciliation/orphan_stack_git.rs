@@ -117,6 +117,18 @@ pub fn is_ancestor(repo: &Path, ancestor: &str, descendant: &str) -> Result<bool
     }
 }
 
+/// The commits in `range` (e.g. `a..b`), one local `git rev-list`.
+///
+/// # Errors
+/// `git rev-list` could not run or exited non-zero.
+pub fn rev_list(repo: &Path, range: &str) -> Result<std::collections::BTreeSet<String>, String> {
+    let out = git(repo, &["rev-list", range], LOCAL_TIMEOUT);
+    if !out.succeeded() {
+        return Err(out.failure_reason("git rev-list"));
+    }
+    Ok(out.stdout_trimmed().lines().map(str::to_string).collect())
+}
+
 /// The remote's live head for `branch`: `Ok(Some(sha))`, `Ok(None)` when the
 /// remote answered and has no such branch, `Err` when it could not be asked.
 ///
