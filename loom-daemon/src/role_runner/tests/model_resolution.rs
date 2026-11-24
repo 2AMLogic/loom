@@ -1015,7 +1015,7 @@ fn test_launch_effort_reconciles_unqualified_effort_with_native_profile() {
     let saved_profile = std::env::var_os("LOOM_MODEL_PROFILE");
     std::env::remove_var("LOOM_MODEL_PROFILE");
     let launch = |root: &Path, role: &str, rt: Option<&str>, profile: Option<&str>| {
-        resolve_role_runner_effort_for_launch(root, role, rt, profile)
+        resolve_role_runner_effort_for_launch(root, role, rt, profile, None)
     };
 
     // The reported incident, verbatim: a bare `roleEfforts.builder` meant for
@@ -1199,6 +1199,51 @@ fn test_launch_effort_reconciles_unqualified_effort_with_native_profile() {
     assert_eq!(
         launch(unset.path(), "builder", Some("codex"), None),
         (CODEX_DEFAULT_EFFORT.to_string(), CODEX_DEFAULT_EFFORT_SOURCE.to_string())
+    );
+
+    // Issue #15205: a qualified `provider/model` pin on a bare native pick is
+    // honoured by `select` before any profile lookup — effort included — so
+    // the unqualified `roleEfforts` value (`medium`, which zai-flash
+    // disallows) is kept rather than dropped.
+    let pinned = tempfile::tempdir().unwrap();
+    write_config(
+        pinned.path(),
+        r#"{"autonomous": {"roleRunner": {"roleEfforts": {"builder": "medium"}}}}"#,
+    );
+    let launch_with_model = |model: Option<&str>, profile: Option<&str>| {
+        resolve_role_runner_effort_for_launch(
+            pinned.path(),
+            "builder",
+            Some("opencode"),
+            profile,
+            model,
+        )
+    };
+    let kept = ("medium".to_string(), "autonomous.roleRunner.roleEfforts.builder".to_string());
+    assert_eq!(
+        launch_with_model(Some("google/gemini-2.5-pro"), None),
+        kept,
+        "a qualified pin with no explicit profile keeps the unqualified effort"
+    );
+    let dropped = (
+        String::new(),
+        "autonomous.roleRunner.roleEfforts.builder (profile default for opencode:zai-flash)"
+            .to_string(),
+    );
+    assert_eq!(
+        launch_with_model(Some("google/gemini-2.5-pro"), Some("zai-flash")),
+        dropped,
+        "an explicit tap profile still judges the effort even with a qualified model"
+    );
+    assert_eq!(
+        launch_with_model(Some("glm-5.3"), None),
+        dropped,
+        "a bare model falls through to the profile judgment"
+    );
+    assert_eq!(
+        launch_with_model(Some("google/"), None),
+        dropped,
+        "a malformed qualified model falls through to the profile judgment"
     );
 
     std::env::remove_var(crate::config_resolver::PRIVATE_DEFAULTS_ENV);
