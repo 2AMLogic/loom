@@ -1085,6 +1085,8 @@ impl SweepRegistry {
                     .preference
                     .as_ref()
                     .and_then(|p| p.model_profile.as_deref()),
+                // #15205: the post-fallback model `select` will see.
+                model.as_deref(),
             )
             .0,
         );

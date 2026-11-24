@@ -220,6 +220,17 @@ pub fn excluded_role(
         .then_some(name)
 }
 
+/// Issues #14962 / #15205: whether `model` is a qualified `provider/model`
+/// pin (two non-empty halves) — the shape [`select`] honours verbatim, before
+/// any profile lookup, when no profile was explicitly requested. Shared by
+/// [`profile_rejects_model`] and [`profile_rejects_effort`] so both mirror
+/// `select`'s early return on one condition.
+fn is_qualified_model(model: &str) -> bool {
+    model
+        .split_once('/')
+        .is_some_and(|(provider, rest)| !provider.is_empty() && !rest.is_empty())
+}
+
 /// Issue #14963: the model profile a native launch of `runtime` would resolve,
 /// when that profile declares a non-empty `allowedEfforts` that does not
 /// include `effort` — the exact predicate [`select`] refuses the launch on
@@ -236,10 +247,21 @@ pub fn excluded_role(
 /// or a profile with no provider for this harness (it cannot be the model that
 /// harness runs); `Some(profile_name)` when the profile's `allowedEfforts`
 /// lists at least one level and does not include `effort`.
+///
+/// Issue #15205: `model` is the final model the launch will carry (`None` /
+/// empty when it launches with the profile's own). With **no** explicitly
+/// requested profile (tap `modelProfile` or `LOOM_MODEL_PROFILE`), a qualified
+/// `provider/model` (two non-empty halves) returns `None`: [`select`] honours
+/// that pin verbatim — effort included — before any profile lookup, so
+/// `allowedEfforts` is never consulted and the effort is not a refusal. This
+/// is the same carve-out, on the same condition, as [`profile_rejects_model`].
+/// With an explicit profile, or a bare / malformed model, the effort is still
+/// judged against the resolved profile.
 #[must_use]
 pub fn profile_rejects_effort(
     runtime: &str,
     profile: Option<&str>,
+    model: Option<&str>,
     effort: &str,
     config: &Value,
 ) -> Option<String> {
@@ -251,6 +273,10 @@ pub fn profile_rejects_effort(
         .map(str::trim)
         .filter(|p| !p.is_empty())
         .or(env_profile.as_deref());
+    // Mirror `select`'s early return (see `profile_rejects_model`).
+    if requested.is_none() && model.is_some_and(is_qualified_model) {
+        return None;
+    }
     let (name, resolved) = lookup(requested, config).ok()?;
     if !resolved.providers.contains_key(runtime) {
         return None;
@@ -300,11 +326,7 @@ pub fn profile_rejects_model(
     // Mirror `select`'s early return: with no explicitly requested profile, a
     // qualified `provider/model` is honoured verbatim and never compared
     // against a profile (documented `roleModels` shape, configuring-resources.md).
-    if requested.is_none()
-        && model
-            .split_once('/')
-            .is_some_and(|(provider, rest)| !provider.is_empty() && !rest.is_empty())
-    {
+    if requested.is_none() && is_qualified_model(model) {
         return None;
     }
     let (name, resolved) = lookup(requested, config).ok()?;
@@ -930,25 +952,25 @@ mod tests {
         // The reported incident's exact shape: a `medium` effort meeting a
         // profile that allows only low/high/max.
         assert_eq!(
-            profile_rejects_effort("opencode", Some("strict"), "medium", &config),
+            profile_rejects_effort("opencode", Some("strict"), None, "medium", &config),
             Some("strict".to_string())
         );
         // An effort the profile allows is no objection.
-        assert_eq!(profile_rejects_effort("opencode", Some("strict"), "high", &config), None);
+        assert_eq!(profile_rejects_effort("opencode", Some("strict"), None, "high", &config), None);
         // An empty `allowedEfforts` (here: absent) never rejects.
-        assert_eq!(profile_rejects_effort("opencode", Some("open"), "medium", &config), None);
+        assert_eq!(profile_rejects_effort("opencode", Some("open"), None, "medium", &config), None);
         // A non-native runtime is never judged (Claude/Codex forward the flag
         // to their own CLIs, which own their level vocabularies).
-        assert_eq!(profile_rejects_effort("claude", Some("strict"), "medium", &config), None);
+        assert_eq!(profile_rejects_effort("claude", Some("strict"), None, "medium", &config), None);
         // A profile with no provider entry for this harness cannot be the
         // model that harness runs.
         assert_eq!(
-            profile_rejects_effort("opencode", Some("other-harness"), "medium", &config),
+            profile_rejects_effort("opencode", Some("other-harness"), None, "medium", &config),
             None
         );
         // An unknown profile is left to the launch's own fail-closed
         // diagnostic, never judged here.
-        assert_eq!(profile_rejects_effort("opencode", Some("nope"), "medium", &config), None);
+        assert_eq!(profile_rejects_effort("opencode", Some("nope"), None, "medium", &config), None);
 
         if let Some(v) = saved {
             std::env::set_var("LOOM_MODEL_PROFILE", v);
@@ -968,15 +990,18 @@ mod tests {
 
         std::env::remove_var("LOOM_MODEL_PROFILE");
         assert_eq!(
-            profile_rejects_effort("opencode", None, "medium", &serde_json::json!({})),
+            profile_rejects_effort("opencode", None, None, "medium", &serde_json::json!({})),
             Some("zai-flash".to_string()),
             "the bundled zai-flash fallback rejects the incident's medium"
         );
-        assert_eq!(profile_rejects_effort("opencode", None, "high", &serde_json::json!({})), None);
+        assert_eq!(
+            profile_rejects_effort("opencode", None, None, "high", &serde_json::json!({})),
+            None
+        );
 
         std::env::set_var("LOOM_MODEL_PROFILE", "zai-full");
         assert_eq!(
-            profile_rejects_effort("opencode", None, "medium", &serde_json::json!({})),
+            profile_rejects_effort("opencode", None, None, "medium", &serde_json::json!({})),
             Some("zai-full".to_string()),
             "LOOM_MODEL_PROFILE names the profile a bare tap is judged against"
         );
@@ -987,10 +1012,73 @@ mod tests {
                           "allowedEfforts": ["low", "high", "max"]}
         }}});
         assert_eq!(
-            profile_rejects_effort("opencode", None, "medium", &config),
+            profile_rejects_effort("opencode", None, None, "medium", &config),
             Some("zai-full".to_string()),
             "runtimes.defaultModelProfile names the profile a bare tap is judged against"
         );
+
+        if let Some(v) = saved {
+            std::env::set_var("LOOM_MODEL_PROFILE", v);
+        }
+    }
+
+    /// Issue #15205: with no explicitly requested profile, a qualified
+    /// `provider/model` pin is honoured by `select` verbatim — effort
+    /// included, `allowedEfforts` never consulted — so `profile_rejects_effort`
+    /// must not call it a refusal. An explicit profile (tap or
+    /// `LOOM_MODEL_PROFILE`), a bare model and a malformed qualified model all
+    /// keep today's judgment against the resolved profile.
+    #[test]
+    fn profile_rejects_effort_honours_a_qualified_model_pin_like_select() {
+        let _g = env_lock();
+        let saved = std::env::var_os("LOOM_MODEL_PROFILE");
+        std::env::remove_var("LOOM_MODEL_PROFILE");
+        let none = serde_json::json!({});
+        let pin = Some("google/gemini-2.5-pro");
+
+        // The gap: the bundled zai-flash rejects `medium`, but `select`
+        // returns the pin's selection before ever reading its allowedEfforts.
+        assert_eq!(profile_rejects_effort("opencode", None, pin, "medium", &none), None);
+        // ... which the real `select` confirms, so the carve-out cannot drift.
+        let selected = select(
+            "opencode",
+            &Options {
+                model: pin.map(str::to_string),
+                effort: Some("medium".to_string()),
+                ..Options::default()
+            },
+            &none,
+        )
+        .expect("select honours a qualified pin without consulting allowedEfforts");
+        assert_eq!(selected.effort.as_deref(), Some("medium"));
+
+        // An explicit profile (tap) keeps judging the effort against it.
+        assert_eq!(
+            profile_rejects_effort("opencode", Some("zai-flash"), pin, "medium", &none),
+            Some("zai-flash".to_string())
+        );
+        // So does LOOM_MODEL_PROFILE.
+        std::env::set_var("LOOM_MODEL_PROFILE", "zai-full");
+        assert_eq!(
+            profile_rejects_effort("opencode", None, pin, "medium", &none),
+            Some("zai-full".to_string())
+        );
+        std::env::remove_var("LOOM_MODEL_PROFILE");
+
+        // Bare, empty-half and absent models fall through to today's behaviour.
+        for model in [
+            Some("glm-5.3-flash"),
+            Some("google/"),
+            Some("/gemini"),
+            Some(""),
+            None,
+        ] {
+            assert_eq!(
+                profile_rejects_effort("opencode", None, model, "medium", &none),
+                Some("zai-flash".to_string()),
+                "model {model:?} is not a qualified pin"
+            );
+        }
 
         if let Some(v) = saved {
             std::env::set_var("LOOM_MODEL_PROFILE", v);
