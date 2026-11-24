@@ -44,7 +44,7 @@
 //! # Crate-wide test-isolation invariant for `LOOM_REPO` (#8496)
 //!
 //! `LOOM_REPO` is process-global, and roughly a dozen test modules mutate it
-//! (`peer_claims::repo_slug_tests`, `claim_reconciliation::repo_env_tests`,
+//! (`host_identity::repo_slug_tests`, `claim_reconciliation::repo_env_tests`,
 //! `quarantine_reconciliation`, and the `sweep_registry` guards / dispatch /
 //! reaper / watchdog / outcome-journal test modules). **Every one of those
 //! tests MUST use the crate-default, unnamed `#[serial]` key** — `serial_test`
@@ -310,6 +310,9 @@ pub enum GhCompletion {
         owner: String,
         resource: crate::forge_bucket_book::Resource,
         until: std::time::SystemTime,
+        /// A gate read exhausted its primary GraphQL reader budget.
+        /// Other sheds give no evidence that another transport can read.
+        graphql_budget_exhausted: bool,
     },
     /// Not run (#12641): the work-finder tick stopped this read (deadline
     /// passed, or discovery ended). No request was sent and no reader budget

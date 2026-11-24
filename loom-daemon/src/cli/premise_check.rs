@@ -1,17 +1,16 @@
 //! `loom-daemon premise-check` (#8396), backing `defaults/scripts/premise-check.sh`.
 //!
 //! The args live here rather than in `main.rs`'s `Commands` enum for the same
-//! reason `DepClassifyCommand` does: `main.rs` is over
-//! `.loom/docs/file-size-policy.md`'s threshold and frozen, so a new
-//! subcommand must cost it nothing. What the gate answers, and why each rule
-//! exists, is documented on [`crate::premise_check`].
+//! reason `DepClassifyCommand` does: a new subcommand must cost it nothing.
+//! What the gate answers, and why each rule exists, is documented on
+//! [`crate::premise_check`].
 
 use crate::premise_check::cli;
 use anyhow::Result;
 use std::path::PathBuf;
 
 #[derive(clap::Args, Debug)]
-pub(crate) struct PremiseCheckArgs {
+pub struct PremiseCheckArgs {
     /// The issue to gate (forge mode).
     #[arg(long, value_name = "N")]
     issue: Option<i64>,
@@ -57,9 +56,17 @@ pub(crate) struct PremiseCheckArgs {
 }
 
 impl PremiseCheckArgs {
+    /// Whether the invocation reads the forge, and so must pass the tools
+    /// mode gate (design §10.3): only forge mode (`--issue`) does; the
+    /// hermetic `--body-file` mode touches no forge (#14429).
+    #[must_use]
+    pub fn reaches_forge(&self) -> bool {
+        self.issue.is_some()
+    }
+
     /// Never returns: exits with the gate's own code, which role prompts and
     /// the sweep orchestrator branch on.
-    pub(crate) fn run(self) -> Result<()> {
+    pub fn run(self) -> Result<()> {
         cli::run(&cli::Options {
             issue: self.issue,
             repo: self.repo,

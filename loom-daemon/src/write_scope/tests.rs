@@ -522,7 +522,6 @@ pub(super) fn seed_disk_for(
     write: bool,
     age: std::time::Duration,
 ) {
-    use std::io::Write as _;
     let dir = probe::cache_dir();
     assert!(crate::forge_etag_store::private_dir(&dir, true));
     let key = probe::cache_key(key_dir, scope, repo).expect("a keyed scope");
@@ -533,10 +532,15 @@ pub(super) fn seed_disk_for(
         .saturating_sub(age.as_secs());
     let body = serde_json::json!({"write": write, "detail": "seeded", "at": at}).to_string();
     let path = dir.join(format!("{key}.json"));
-    // Re-seeding replaces the entry (the file is created exclusively).
-    let _ = std::fs::remove_file(&path);
-    let mut f = crate::forge_etag_store::create_private_file(&path).unwrap();
-    f.write_all(body.as_bytes()).unwrap();
+    crate::fs_util::write_atomic(
+        &path,
+        body.as_bytes(),
+        crate::fs_util::AtomicOpts {
+            private: true,
+            sync_dir: false,
+        },
+    )
+    .unwrap();
 }
 
 #[test]
@@ -575,6 +579,9 @@ enum Scope {
     Gated,
     /// Reached only through the named file, which is `Gated`.
     Via(&'static str, &'static str),
+    /// Shared executor whose callers own the scope check. Each write caller is
+    /// inventoried independently because the callers' authority differs.
+    ViaCallers(&'static [&'static str]),
     /// A CLI verb whose only caller is the named shell script, which vets
     /// the repo with `loom_write_repo` and passes it as `--repo`.
     ShellVetted(&'static str),
@@ -596,7 +603,7 @@ enum Scope {
 /// managed-repo + WRITE check.
 #[test]
 fn daemon_write_paths_are_scoped() {
-    use Scope::{Gated, NotAWrite, OperatorOnly, OriginResolved, ShellVetted, Via};
+    use Scope::{Gated, NotAWrite, OperatorOnly, OriginResolved, ShellVetted, Via, ViaCallers};
     const PASS: &str = "claim_reconciliation/pass_loop.rs";
     const DISPATCH: &str = "sweep_registry/private_dispatch.rs";
     let reviewed: &[(&str, Scope)] = &[
@@ -669,7 +676,7 @@ fn daemon_write_paths_are_scoped() {
         ),
         ("role_runner/roster.rs", Gated),
         ("dep_classify/forge.rs", OriginResolved("dep_classify/cli.rs")),
-        ("cli/notify_cleared_blockers.rs", ShellVetted("merge-pr.sh")),
+        ("cli/notify_cleared_blockers.rs", Gated),
         (DISPATCH, Gated),
         ("work_finder/pool_preflight.rs", Gated),
         ("intake_reconcile.rs", Gated),
@@ -748,6 +755,16 @@ fn daemon_write_paths_are_scoped() {
         (
             "script_helpers/validate_phase_curator.rs",
             Via(DISPATCH, "curator recovery split out of validate_phase.rs; runs inside a dispatched sweep"),
+        ),
+        (
+            "script_helpers/gh_route.rs",
+            ViaCallers(&[
+                "cli/forge_verdict_cmd.rs",
+                "cli/notify_cleared_blockers.rs",
+                "dep_classify/forge.rs",
+                "script_helpers/validate_phase.rs",
+                "script_helpers/validate_phase_curator.rs",
+            ]),
         ),
         ("forge_rerun.rs", Gated),
         (
@@ -921,6 +938,10 @@ fn daemon_write_paths_are_scoped() {
         ),
         ("tokens_pool/check.rs", NotAWrite("Anthropic API, not the forge")),
         (
+            "tokens_pool/private_workspace/read_authority.rs",
+            NotAWrite("read probe: its only curl call is `-X GET`, never a forge write"),
+        ),
+        (
             "remote_fleet_exec/mod.rs",
             NotAWrite("scp's `-X` option in a guard's argv vocabulary, runs none"),
         ),
@@ -989,6 +1010,7 @@ fn daemon_write_paths_are_scoped() {
     };
     let matches =
         |f: &str| writes.is_match(&std::fs::read_to_string(src.join(f)).unwrap_or_default());
+    let calls = regex::Regex::new(r"(?:^|[^.\w])gh_write\s*(?:\(|as\b)").unwrap();
     for (file, scope) in reviewed {
         match scope {
             Gated => assert!(gated(file), "{file} is listed as gated but never calls write_scope"),
@@ -1001,6 +1023,32 @@ fn daemon_write_paths_are_scoped() {
                     "{file} ({why}) is reached via {parent}, which must be a gated entry"
                 );
                 assert!(matches(file), "stale entry: {file} ({why}) no longer writes");
+            }
+            ViaCallers(parents) => {
+                let mut actual: Vec<_> = sources
+                    .iter()
+                    .filter(|(path, text)| {
+                        path.as_str() != *file
+                            && text
+                                .lines()
+                                .any(|line| !line.contains("fn gh_write(") && calls.is_match(line))
+                    })
+                    .map(|(path, _)| path.as_str())
+                    .collect();
+                actual.sort_unstable();
+                assert_eq!(actual.as_slice(), *parents, "{file}: shared write callers changed");
+                for parent in *parents {
+                    assert!(
+                        reviewed.iter().any(|(path, scope)| {
+                            *path == *parent
+                                && matches!(
+                                    scope,
+                                    Gated | Via(..) | ShellVetted(..) | OriginResolved(..)
+                                )
+                        }),
+                        "{file}: shared write caller {parent} has no scoped entry"
+                    );
+                }
             }
             ShellVetted(script) => {
                 let text = std::fs::read_to_string(src.join("../../defaults/scripts").join(script))

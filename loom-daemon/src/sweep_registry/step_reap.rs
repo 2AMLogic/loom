@@ -88,7 +88,6 @@ impl SweepRegistry {
         };
         let held_elsewhere =
             retained || self.step_claim_held_elsewhere(item, role, sweep_id, started_at);
-        self.publish_step_claim(peer_claims::ClaimKind::Retract, item, role);
         if held_elsewhere {
             log::info!(
                 "sweep_registry: {role} step {sweep_id} on #{item} ended, but its claim is held \
@@ -115,10 +114,7 @@ impl SweepRegistry {
     }
 
     /// Whether another claimant holds a step's item on the forge (#11898), the
-    /// forge half of the reaper's and startup adoption's step release, and of
-    /// a roll requeue's PR-role release (via
-    /// [`Self::roll_pr_step_claim_still_ours`]); a roll requeue of an issue
-    /// role makes its own ownership check instead (`roll_claim_still_ours`):
+    /// forge half of the reaper's and startup adoption's step release:
     ///
     /// - Builder: `loom:building` re-applied more than
     ///   [`LABEL_CLOCK_SKEW_SECS`] after the step started;
@@ -153,77 +149,6 @@ impl SweepRegistry {
                 self.step_lease_held_elsewhere(item, role, sweep_id, started_at)
             }
         }
-    }
-
-    /// Whether a PR step's claim on `pr` is still the paused run `sweep_id`'s
-    /// to give back after a roll (#11898): no other sweep holds the role's
-    /// earliest live lease. A peer Judge or Doctor that claimed the PR during
-    /// the roll window keeps it. Decided by lease identity, never label time:
-    /// the role prompt applies `loom:reviewing` / `loom:treating` itself,
-    /// after the daemon's lease, so a label time would strand a normal step.
-    /// `now` stands in for the start time, so the shared check's label path
-    /// (#11969), which only reads a label applied after the start, never
-    /// fires here.
-    ///
-    /// # Errors
-    /// Why the claim is no longer this run's.
-    pub(crate) fn roll_pr_step_claim_still_ours(
-        &self,
-        pr: u32,
-        role: StepRole,
-        sweep_id: &str,
-    ) -> std::result::Result<(), String> {
-        if self.step_claim_held_elsewhere(pr, role, sweep_id, Utc::now()) {
-            return Err(format!("another sweep holds the live {role} claim"));
-        }
-        Ok(())
-    }
-
-    /// Publish a step's `(item, step)` peer claim (#11898): `Advertise` while
-    /// it runs, `Retract` when it ends. Fail-open and a no-op without a
-    /// publisher, like every peer-claim send. A Champion merge step's
-    /// advertisement is the repo-keyed merge signal peers read through
-    /// `PeerClaimView::merge_in_flight_at`.
-    pub(crate) fn publish_step_claim(
-        &self,
-        kind: peer_claims::ClaimKind,
-        item: u32,
-        role: StepRole,
-    ) {
-        let Some(tx) = &self.peer_claim_publisher else {
-            return;
-        };
-        let ad = ClaimAd::step(
-            kind,
-            item,
-            role,
-            peer_claims::repo_slug(&self.config.workspace_root),
-            host_identity(),
-            std::process::id(),
-            Utc::now().to_rfc3339(),
-        );
-        if let Err(e) = tx.try_send(ad) {
-            log::debug!("sweep_registry: {role} step claim for #{item} dropped ({e})");
-        }
-    }
-
-    /// Re-advertise every live step's claim on the reaper's heartbeat, as
-    /// [`Self::readvertise_peer_claims`] does for issue sweeps. Returns the
-    /// number advertised.
-    pub(crate) fn readvertise_step_claims(&self) -> usize {
-        let live: Vec<(u32, StepRole)> = self
-            .entries
-            .values()
-            .filter(|info| matches!(info.state, SweepState::Running))
-            .filter_map(|info| match info.kind {
-                SweepKind::Step { item, role } => Some((item, role)),
-                SweepKind::Issue(_) | SweepKind::PrSet(_) => None,
-            })
-            .collect();
-        for (item, role) in &live {
-            self.publish_step_claim(peer_claims::ClaimKind::Advertise, *item, *role);
-        }
-        live.len()
     }
 
     /// The terminal transition of a step the reaper (or a cancel) found dead:

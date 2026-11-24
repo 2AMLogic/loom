@@ -1589,39 +1589,18 @@ assert_contains "session attach" "$interactive_out" \
 
 # --- missing docker binary -> 127 (session-exec's runtime-missing facet) ---
 #
-# `/usr/bin:/bin` alone isn't enough here, unlike Section 7's analogous
-# missing-`codex` check: GitHub Actions Ubuntu runners ship a real `docker`
-# at /usr/bin/docker, so appending those dirs verbatim would still resolve
-# `command -v docker` successfully in CI even though this test wants it to
-# fail (it only "worked" locally because dev machines don't keep `docker` in
-# /usr/bin or /bin). Build a PATH that mirrors every dir on the real PATH but
-# with any `docker` executable filtered out, so every other coreutils
-# dependency spawn-codex.sh needs before reaching the binary check stays
-# resolvable, while `docker` itself genuinely cannot be found anywhere.
-NODOCKER_BIN="$TMPROOT/no-docker-bin"
-mkdir -p "$NODOCKER_BIN"
-IFS=':' read -r -a _real_path_dirs <<< "$PATH"
-for _dir in "${_real_path_dirs[@]}"; do
-    [[ -d "$_dir" ]] || continue
-    for _f in "$_dir"/*; do
-        [[ -e "$_f" ]] || continue
-        _base="$(basename "$_f")"
-        [[ "$_base" == "docker" ]] && continue
-        [[ -e "$NODOCKER_BIN/$_base" ]] && continue
-        ln -s "$_f" "$NODOCKER_BIN/$_base" 2>/dev/null || true
-    done
-done
-
+# An explicit missing executable keeps this deterministic even when Docker
+# is installed in a fallback directory outside PATH.
 set +e
 nodocker_out="$(env -u CODEX_HOME -u LOOM_CODEX_PROFILE LOOM_SWEEP_NICE=0 \
     LOOM_CODEX_HOME="$SESSION_PROFILE" \
-    PATH="$NODOCKER_BIN" \
+    LOOM_DOCKER_BIN="$TMPROOT/missing-docker" \
     bash "$SPAWN_CODEX" -p "hi" 2>&1)"
 nodocker_rc=$?
 set -e
 assert_eq "127" "$nodocker_rc" \
     "a missing docker binary in session-exec mode exits 127, NOT 78"
-assert_contains "'docker' command not found in PATH" "$nodocker_out" \
+assert_contains "LOOM_DOCKER_BIN=\"$TMPROOT/missing-docker\" does not name an executable file" "$nodocker_out" \
     "the missing-docker message names the binary"
 
 # --- session container not running -> named 78, not a raw docker error ---
@@ -1810,6 +1789,44 @@ mk_authmode_codex "Logged in using ChatGPT"
 out="$(run_authmode LOOM_SERVICE_TIER=fast -- -p x -m gpt-5-codex)"
 assert_contains "model=none requested_model=gpt-5-codex effort=none tier=priority" "$out" \
     "a dropped pin still reports model=none (+ requested_model) alongside the tier"
+
+# Compare config arguments in order, one per line, with the record from the
+# same mock launch. A substring inside an instruction is not an effort key.
+assert_effort_launch() {
+    local description="$1" expected_record="$2" expected_config="$3"
+    shift 3
+    local output config
+    output="$(run_mock LOOM_ROLE= LOOM_ACCOUNT_NAME= LOOM_MODEL= LOOM_CODEX_MODEL= \
+        LOOM_EFFORT= LOOM_SERVICE_TIER= -- -p x "$@" 2>&1)"
+    config="$(awk '/^(-c|--config)$/ { print; getline; print; next }
+                   /^(-c|--config)=/ { print }' "$MOCK_ARGV_FILE")"
+    assert_eq "$expected_config" "$config" "$description forwards the expected config arguments"
+    assert_eq "$expected_record" "$(grep '^# LOOM_TERMINAL_RESULT ' <<< "$output")" \
+        "$description emits the expected terminal record"
+}
+
+quoted_data='--config=developer_instructions="model_reasoning_effort=low"'
+plain_data='-c=developer_instructions=model_reasoning_effort=low'
+medium='model_reasoning_effort=medium'
+high_record="$(_tr4 unknown SUCCESS 0 none high none)"
+medium_record="$(_tr4 unknown SUCCESS 0 none medium none)"
+for data in "$quoted_data" "$plain_data"; do
+    assert_effort_launch "inline $data with --effort" "$high_record" \
+        "$(printf '%s\n' "$data" -c model_reasoning_effort=high)" --effort high "$data"
+done
+assert_effort_launch "explicit effort before inline data" "$medium_record" \
+    "$(printf '%s\n' "-c=$medium" "$quoted_data")" --effort high "-c=$medium" "$quoted_data"
+assert_effort_launch "last explicit effort after inline data" "$medium_record" \
+    "$(printf '%s\n' -c model_reasoning_effort=low "$plain_data" "--config=$medium")" \
+    --effort high -c model_reasoning_effort=low "$plain_data" "--config=$medium"
+assert_effort_launch "inline data without an effort source" "$(_tr unknown SUCCESS 0 none)" \
+    "$plain_data" "$plain_data"
+mixed_data='--config=developer_instructions=model_reasoning_effort=low,service_tier=priority'
+assert_effort_launch "instruction mentioning effort and tier" "$(_tr unknown SUCCESS 0 none)" \
+    "$mixed_data" "$mixed_data"
+assert_effort_launch "separate-value instruction" "$high_record" \
+    "$(printf '%s\n' --config "${quoted_data#--config=}" -c model_reasoning_effort=high)" \
+    --effort high --config "${quoted_data#--config=}"
 
 # ============================================================
 # Summary

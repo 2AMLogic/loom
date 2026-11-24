@@ -1,7 +1,6 @@
 //! `loom-daemon forge …`: the subcommand enum and its dispatcher.
 //!
-//! Moved verbatim out of `main.rs` (over `.loom/docs/file-size-policy.md`'s
-//! threshold and frozen) and `cli/tokens.rs` (where the dispatcher had
+//! Moved verbatim out of `main.rs` and `cli/tokens.rs` (where the dispatcher had
 //! landed for no reason but proximity), so new `forge` verbs cost `main.rs`
 //! nothing: they are added here, beside the verbs they sit with.
 
@@ -147,6 +146,8 @@ fn handle_create_issue(a: CreateIssueCli) -> Result<()> {
 /// to the `FORGE=gh` shell fallback the four scripts already understand.
 #[derive(Subcommand)]
 pub(crate) enum ForgeAction {
+    /// List staged open PRs affected by an operator hold on a linked issue.
+    OperatorHolds(super::forge_operator_holds::Args),
     /// `forge issue <args…>` — e.g. `issue view 42 --json labels --jq
     /// '.labels[].name'`. GitHub: exec `gh issue <args…>`.
     ///
@@ -897,6 +898,10 @@ pub(crate) enum ForgeAction {
     #[command(name = "verdict-body-check")]
     VerdictBodyCheck,
 
+    /// Check the workflow on stdin for a workflow- or job-level write-all
+    /// permission. Exit 0 if clear, 1 if present, or 2 for unreadable YAML.
+    WorkflowWriteAllCheck,
+
     /// `forge verdict-gate <pr> --repo R --verdict V --sha S` (#10581) — may
     /// this verdict be posted? Reads the PR's trusted comments and labels.
     /// Prints `LOOM-VERDICT-GATE PROCEED|DEDUPE|REFUSE <why>`; exits 0, 10
@@ -1082,10 +1087,11 @@ pub(crate) enum ForgeAction {
     /// `forge comment <number> (--body TEXT | --body-file PATH)
     /// [--repo OWNER/REPO] [--pr]` — the #9772 comment chokepoint as a verb:
     /// appends the dashboard link (`loom:dashboard-link`, #9772) and POSTs to
-    /// `repos/<owner>/<repo>/issues/<number>/comments`. A PR IS an issue for
-    /// comments; `--pr` only picks `/pull/N` over `/issues/N` in the link.
-    /// `--repo` defaults to the current checkout's `origin` remote. GitHub
-    /// only, like every daemon comment path (`gh` REST).
+    /// the issue-comments endpoint (`repos/<owner>/<repo>/issues/<number>/
+    /// comments` on GitHub, `api/v1/repos/...` on Gitea #14940). A PR IS an
+    /// issue for comments; `--pr` only picks `/pull/N` over `/issues/N` in
+    /// the link. `--repo` defaults to the repository the write-scope check
+    /// authorizes from the current checkout.
     #[command(name = "comment")]
     Comment {
         /// Issue or PR number to comment on (post path; omit when
@@ -1172,16 +1178,26 @@ pub(crate) fn handle_forge_command(action: ForgeAction) -> Result<()> {
     // #9548: the verbs that write are vetted before they run. `issue`/`pr`
     // pass straight through to `gh`, which would otherwise pick an `upstream`
     // remote over `origin`; the arm/disarm verbs mutate a PR.
+    // #14940: the repository the check authorized is kept — `forge comment`
+    // posts to exactly the target the vetting resolved and approved, which on
+    // Gitea is also the only resolvable one.
+    let mut authorized: Option<String> = None;
+    let mut authorized_connection = None;
     if let Some(repo) = write_target(&action) {
         let cwd = std::env::current_dir()?;
-        if let crate::write_scope::Verdict::Deny(why) =
-            crate::write_scope::may_write_from(&cwd, repo.as_deref())
-        {
-            eprintln!("loom-daemon forge: refusing the write (#9548): {why}");
-            std::process::exit(1);
+        let (verdict, connection) =
+            crate::write_scope::may_write_from_with_connection(&cwd, repo.as_deref());
+        authorized_connection = connection;
+        match verdict {
+            crate::write_scope::Verdict::Allow(nwo) => authorized = Some(nwo),
+            crate::write_scope::Verdict::Deny(why) => {
+                eprintln!("loom-daemon forge: refusing the write (#9548): {why}");
+                std::process::exit(1);
+            }
         }
     }
     let cmd = match action {
+        ForgeAction::OperatorHolds(args) => return super::forge_operator_holds::run(args),
         ForgeAction::Token {
             repo,
             access,
@@ -1231,6 +1247,8 @@ pub(crate) fn handle_forge_command(action: ForgeAction) -> Result<()> {
                 body_file,
                 is_pr: pr,
                 patch_created,
+                authorized,
+                authorized_connection,
             });
         }
         ForgeAction::TrustedComments {
@@ -1247,6 +1265,7 @@ pub(crate) fn handle_forge_command(action: ForgeAction) -> Result<()> {
             return super::forge_identity_cmd::promotion_author(number, repo.as_deref());
         }
         ForgeAction::VerdictBodyCheck => return super::forge_verdict_cmd::verdict_body_check(),
+        ForgeAction::WorkflowWriteAllCheck => super::forge_workflow_permissions::run(),
         ForgeAction::VerdictGate {
             pr,
             repo,

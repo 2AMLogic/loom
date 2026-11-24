@@ -8,7 +8,7 @@
 //! [`super::account_registry::account_inventory`] exactly the way
 //! `loom-daemon accounts status <name>` already does. What this module adds
 //! is the container half — start/stop/status/attach a long-lived
-//! `ghcr.io/rjwalters/loom-worker-session` container that mounts the
+//! `ghcr.io/2amlogic/loom-worker-session` container that mounts the
 //! account's `CODEX_HOME` profile directory, per the mount contract
 //! (`docker/worker/MOUNT-CONTRACT.md` §2/§3) and the image's own `CODEX_HOME`
 //! convention (`docker/session/README.md`).
@@ -57,10 +57,9 @@
 //! override this refusal passes `--force`, mirroring the daemon's existing
 //! `--force-after-timeout` escape hatch on `restart --drain`.
 
-use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context, Result};
 use serde::Serialize;
@@ -72,8 +71,9 @@ use super::account_registry::{
 use super::health::{self, ProbeEffect, ProbeOutcome};
 use super::session_hold;
 use super::session_image::{self, ExtraMount, SessionImageConfig};
+use crate::proc_exec::{Completion, ExecError};
 
-// The pass-level health refresh lives in a sibling (file-size ratchet, #7711).
+// The pass-level health refresh lives in a sibling (#7711).
 #[path = "session_health.rs"]
 mod session_health;
 pub use session_health::{refresh_session_health, refresh_session_health_uncached};
@@ -83,7 +83,7 @@ pub use session_health::{refresh_session_health, refresh_session_health_uncached
 pub mod liveness;
 
 // `stop`, and the reconciler's hold-respecting start, with their race
-// handling (file-size ratchet, #7711; #10661).
+// handling (#7711; #10661).
 mod start;
 mod stop;
 pub use start::UndoLock;
@@ -91,7 +91,7 @@ pub use start::UndoLock;
 /// Default image this lifecycle launches session containers from
 /// (`docker/session/README.md`). Overridable per-invocation (`--image`) for
 /// tests and for an operator pinning a specific published tag.
-pub const DEFAULT_SESSION_IMAGE: &str = "ghcr.io/rjwalters/loom-worker-session:latest";
+pub const DEFAULT_SESSION_IMAGE: &str = "ghcr.io/2amlogic/loom-worker-session:latest";
 
 /// The session image's fixed `CODEX_HOME` mount point
 /// (`docker/session/README.md` § "`CODEX_HOME` mount contract").
@@ -691,6 +691,24 @@ pub trait ContainerRunner: session_image::BundleProbe {
         extra_mounts: &[ExtraMount],
     ) -> Result<()>;
 
+    /// Create and start a Claude seat container (issue #14371): like
+    /// [`Self::create`], but mounting the seat's own `claude_home` at the
+    /// session image's Claude config path instead of a `CODEX_HOME` profile
+    /// (see [`super::claude_seat`]). The default refuses, so a runner with no
+    /// Claude-seat support fails closed rather than creating a Codex-shaped
+    /// container for a Claude account.
+    fn create_claude_seat(
+        &self,
+        _container: &str,
+        _image: &str,
+        _claude_home: &Path,
+        _workspace: &Path,
+        _daemon_root: &Path,
+        _extra_mounts: &[ExtraMount],
+    ) -> Result<()> {
+        bail!("this container runner cannot create a Claude seat container")
+    }
+
     /// Make sure `image` is available locally (`docker image inspect`, then
     /// `docker pull`), so a caller can fail *before* tearing a container down
     /// rather than after (#11727: the version-skew recreate must not delete a
@@ -763,8 +781,12 @@ pub struct ProcessContainerRunner;
 impl ProcessContainerRunner {
     /// Bounded by [`super::docker_cli::timeout_for`] (issue #10453): a hung
     /// Docker daemon fails the call instead of stalling the caller forever.
-    fn run_capture(args: &[&str]) -> Result<(bool, String, String)> {
-        super::docker_cli::run_bounded("docker", args, super::docker_cli::timeout_for(args))
+    pub(super) fn run_capture(args: &[&str]) -> Result<(bool, String, String)> {
+        super::docker_cli::run_bounded(
+            &super::docker_cli::docker_program()?,
+            args,
+            super::docker_cli::timeout_for(args),
+        )
     }
 
     /// The baseline process set the session image's entrypoint establishes:
@@ -818,8 +840,11 @@ impl session_image::BundleProbe for ProcessContainerRunner {
             "-c",
             script,
         ];
-        let (success, stdout, stderr) =
-            super::docker_cli::run_bounded("docker", &args, super::docker_cli::DOCKER_RUN_TIMEOUT)?;
+        let (success, stdout, stderr) = super::docker_cli::run_bounded(
+            &super::docker_cli::docker_program()?,
+            &args,
+            super::docker_cli::DOCKER_RUN_TIMEOUT,
+        )?;
         if !success {
             bail!("docker run {image} (bundle probe) failed: {}", stderr.trim());
         }
@@ -926,6 +951,25 @@ impl ContainerRunner for ProcessContainerRunner {
         Ok(())
     }
 
+    fn create_claude_seat(
+        &self,
+        container: &str,
+        image: &str,
+        claude_home: &Path,
+        workspace: &Path,
+        daemon_root: &Path,
+        extra_mounts: &[ExtraMount],
+    ) -> Result<()> {
+        super::claude_seat::docker_create_seat(
+            container,
+            image,
+            claude_home,
+            workspace,
+            daemon_root,
+            extra_mounts,
+        )
+    }
+
     fn ensure_image(&self, image: &str) -> Result<()> {
         let (present, _stdout, _stderr) = Self::run_capture(&["image", "inspect", image])?;
         if present {
@@ -978,18 +1022,21 @@ impl ContainerRunner for ProcessContainerRunner {
     }
 
     fn attach_interactive(&self, container: &str, tmux_session_name: &str) -> Result<i32> {
-        let status = Command::new("docker")
-            .args([
-                "exec",
-                "-it",
-                container,
-                "tmux",
-                "attach",
-                "-t",
-                tmux_session_name,
-            ])
-            .status()
-            .with_context(|| format!("failed to attach to session container {container}"))?;
+        let status = Command::new(
+            super::docker_cli::docker_program()
+                .with_context(|| format!("failed to attach to session container {container}"))?,
+        )
+        .args([
+            "exec",
+            "-it",
+            container,
+            "tmux",
+            "attach",
+            "-t",
+            tmux_session_name,
+        ])
+        .status()
+        .with_context(|| format!("failed to attach to session container {container}"))?;
         Ok(status.code().unwrap_or(-1))
     }
 
@@ -999,60 +1046,24 @@ impl ContainerRunner for ProcessContainerRunner {
         argv: &[&str],
         timeout: Duration,
     ) -> Result<ExecOutput> {
-        let mut command = Command::new("docker");
-        command
-            .arg("exec")
-            .arg(container)
-            .args(argv)
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-        let mut child = match command.spawn() {
-            Ok(child) => child,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                return Ok(ExecOutput {
-                    success: false,
-                    unavailable: true,
-                    timed_out: false,
-                    exit_code: None,
-                    output: "docker CLI is not installed or not on PATH".into(),
-                });
-            }
-            Err(error) => return Err(error.into()),
-        };
-        let started = Instant::now();
-        loop {
-            if let Some(status) = child.try_wait()? {
-                let mut bytes = Vec::new();
-                if let Some(stdout) = child.stdout.take() {
-                    stdout
-                        .take(MAX_PROBE_BYTES as u64)
-                        .read_to_end(&mut bytes)?;
-                }
-                if bytes.is_empty() {
-                    if let Some(stderr) = child.stderr.take() {
-                        stderr
-                            .take(MAX_PROBE_BYTES as u64)
-                            .read_to_end(&mut bytes)?;
-                    }
-                }
-                return Ok(ExecOutput {
-                    success: status.success(),
-                    unavailable: false,
-                    timed_out: false,
-                    exit_code: status.code(),
-                    output: String::from_utf8_lossy(&bytes).into_owned(),
-                });
-            }
-            if started.elapsed() >= timeout {
-                // Kills the local `docker exec` client, not necessarily the
-                // process it started inside the container — which is why this
-                // seam is only ever used for read-only, self-terminating
-                // commands. A `docker top` observer may briefly still see
-                // that process, which correctly keeps `stop` in its
-                // refuse-without-`--force` state until it exits.
-                let _ = child.kill();
-                let _ = child.wait();
+        let completion = super::docker_cli::docker_program().and_then(|program| {
+            let mut command = Command::new(program);
+            command
+                .arg("exec")
+                .arg(container)
+                .args(argv)
+                .stdin(Stdio::null());
+            crate::proc_exec::run_bounded(command, timeout)
+        });
+        let output = match completion {
+            Ok(Completion::Exited(output)) => output,
+            Ok(Completion::TimedOut { .. }) => {
+                // Kills the local `docker exec` client's whole process group,
+                // not necessarily the process it started inside the container
+                // — which is why this seam is only ever used for read-only,
+                // self-terminating commands. A `docker top` observer may
+                // briefly still see that process, which correctly keeps
+                // `stop` in its refuse-without-`--force` state until it exits.
                 return Ok(ExecOutput {
                     success: false,
                     unavailable: false,
@@ -1061,8 +1072,30 @@ impl ContainerRunner for ProcessContainerRunner {
                     output: String::new(),
                 });
             }
-            std::thread::sleep(Duration::from_millis(25));
-        }
+            Err(ExecError::Spawn(error)) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(ExecOutput {
+                    success: false,
+                    unavailable: true,
+                    timed_out: false,
+                    exit_code: None,
+                    output: format!("docker CLI could not start: {error}"),
+                });
+            }
+            Err(error) => return Err(error.into()),
+        };
+        let text = if output.stdout.is_empty() {
+            &output.stderr
+        } else {
+            &output.stdout
+        };
+        let text = &text[..text.len().min(MAX_PROBE_BYTES)];
+        Ok(ExecOutput {
+            success: output.status.success(),
+            unavailable: false,
+            timed_out: false,
+            exit_code: output.status.code(),
+            output: String::from_utf8_lossy(text).into_owned(),
+        })
     }
 
     fn window_exists(&self, container: &str, tmux_session: &str, window: &str) -> Result<bool> {

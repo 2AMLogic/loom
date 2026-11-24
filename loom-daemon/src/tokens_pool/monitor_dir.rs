@@ -10,8 +10,7 @@
 //! so they always agree on one directory, and Loom keeps working on a 1.x
 //! host that only has `~/.claude-monitor` (no symlink).
 //!
-//! Lives in its own module rather than `monitor.rs` because that file is
-//! frozen by the file-size ratchet (`scripts/check-file-size-budget.sh`).
+//! Lives in its own module rather than in `monitor.rs`.
 
 use std::path::{Path, PathBuf};
 
@@ -371,6 +370,7 @@ mod tests {
                 force: false,
                 dry_run: true,
                 prune: false,
+                exclude_names: &[],
             })
         };
         match import(None, None) {

@@ -189,7 +189,7 @@ identity, which every recheck refuses rather than treating as proven.
 | Component | Supported value | How it is established |
 |---|---|---|
 | Control protocol | `loom-private-control-v1`, `control_version` **2** | Exact-match on both sides; anything else is `Unsupported`. A v1 image reports v1 and is refused: its in-container half cannot make the control-file claim at all. |
-| Session image | `ghcr.io/rjwalters/loom-worker-session:<version>` built from `docker/session/Dockerfile` at or after this change, or a **derived** image built `FROM` it (issue #14019, `accounts.session.image`, digest-pinned) | The bundle must be present, sealed, digest-intact and non-writable. A derived image is additionally verified by the **host** before any container is created from it: a throwaway probe reads the manifest and recomputes every sealed asset's digest, and the image is refused unless the manifest matches the running daemon's enforced protocol, control version, forced policy and registration and every asset is intact — a missing or altered asset is named in the refusal (`session_image::verify_override_bundle`). A daemon roll therefore refuses a not-yet-rebuilt derived image instead of running a stale bundle, and the version-skew reconciler never recreates an override seat from the stock tag. |
+| Session image | `ghcr.io/2amlogic/loom-worker-session:<version>` built from `docker/session/Dockerfile` at or after this change, or a **derived** image built `FROM` it (issue #14019, `accounts.session.image`, digest-pinned) | The bundle must be present, sealed, digest-intact and non-writable. A derived image is additionally verified by the **host** before any container is created from it: a throwaway probe reads the manifest and recomputes every sealed asset's digest, and the image is refused unless the manifest matches the running daemon's enforced protocol, control version, forced policy and registration and every asset is intact — a missing or altered asset is named in the refusal (`session_image::verify_override_bundle`). A daemon roll therefore refuses a not-yet-rebuilt derived image instead of running a stale bundle, and the version-skew reconciler never recreates an override seat from the stock tag. |
 | Session mount topology | profile bound read-write; `hooks.json`, `config.toml` and `loom-codex-hooks.json` each bound read-only over their own path | Cross-checked against Docker's mount inventory on the host and `/proc/self/mountinfo` plus a real write probe in the container. |
 | Codex CLI | as pinned by `CODEX_VERSION` (tracks upstream latest via `harness-pins.yml`; 0.160.0 at 2026-10-02); floor `0.146.0` | `seal-control` records `codex --version` as observed in the image and refuses to seal below the floor. |
 | Codex hook schema | `pre_tool_use`, pinned at `0.146.0` in `guard-codex-bridge.sh` | Evidence below. |
@@ -286,7 +286,9 @@ still writable — the same pre-session step
 writes a `trusted_hash` by hand and `--dangerously-bypass-hook-trust` is not
 passed. What §12 measures is therefore the recorded-trust path exactly as a
 private-clone session runs it. (Host-mode sessions may instead pass the waiver
-for a sealed registration, #10102. Private-clone sessions never do.)
+for a sealed registration, #10102, and since #14105 so may private-clone
+sessions, which add it inside the container for a registration that vets; §12
+measures the recorded-trust path only.)
 
 Two profiles are provisioned and registered identically and differ **only** in
 the answer to that one prompt — `2` (*Trust all and continue*) versus `3`

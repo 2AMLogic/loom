@@ -626,6 +626,14 @@ behavior is byte-for-byte unchanged from before #6850.
   whatever its name. This classifies by capability, so a class can drop the
   `*deploy*` / `*release*` / `*publish*` name excludes. It does not replace
   `forbiddenDiffPatterns`, which still catches a PR that *adds* a privilege.
+- `checkWorkflowWriteAll` (#14648, optional boolean) — for a class covering
+  only GitHub workflow YAML, `true` checks the workflow and its jobs for an
+  actual `permissions: write-all` setting. Keep exactly one literal
+  `write-all` entry in `privilegedContentPatterns` as a fallback for older
+  Champions. An upgraded Champion substitutes the YAML check for that entry
+  only after explicit opt-in. Other patterns retain their regex semantics.
+  An unsupported checker, unreadable workflow or missing fallback entry
+  disqualifies the class.
   **Fail closed**: unreadable or empty content, a file the contents API cannot
   serve (too large), a `removed` file, an invalid regex, a head SHA that moved
   while the files were read, or a value that is not an array of non-empty
@@ -754,13 +762,13 @@ standing_auth_fetch_diff() {
   DIFF_JSON=$(printf '%s' "$raw" | jq -s -c 'add // []' 2>/dev/null) || return 1
 }
 
-# standing_auth_content_clear <files-json> <regexes>   (#12954)
+# standing_auth_content_clear <files-json> <regexes> [<check-write-all>]  (#12954, #14648)
 # 0 = every file in <files-json> was read at the PR head SHA and no line of it
 # matches any privilegedContentPatterns regex. Anything else (a removed or
 # unreadable or empty file, an invalid regex, a head SHA that moved) = 1.
 standing_auth_content_clear() {
-  local files_json="$1" regexes="$2" sha1 sha2 path enc body rx rc
-  [ -n "$regexes" ] || return 0
+  local files_json="$1" regexes="$2" check_write_all="${3:-false}" sha1 sha2 path enc body rx rc
+  [ -n "$regexes" ] || [ "$check_write_all" = true ] || return 0
   printf '%s' "$files_json" | jq -e 'length > 0 and all(.[]; (.status // "") != "removed")' >/dev/null 2>&1 || return 1
   while IFS= read -r rx; do
     [ -z "$rx" ] && continue
@@ -775,6 +783,10 @@ standing_auth_content_clear() {
     enc=$(jq -rn --arg p "$path" '$p | split("/") | map(@uri) | join("/")') || return 1
     body=$(gh api -H "Accept: application/vnd.github.raw" "repos/{owner}/{repo}/contents/${enc}?ref=$sha1" 2>/dev/null) || return 1
     [ -n "$body" ] || return 1
+    if [ "$check_write_all" = true ]; then
+      case "$path" in .github/workflows/*.yml|.github/workflows/*.yaml) ;; *) return 1 ;; esac
+      printf '%s' "$body" | "${LOOM_DAEMON_BIN:-loom-daemon}" forge workflow-write-all-check >/dev/null 2>&1 || return 1
+    fi
     while IFS= read -r rx; do
       [ -z "$rx" ] && continue
       # A whole-line YAML comment grants nothing, so it is not scanned: the
@@ -849,7 +861,7 @@ standing_auth_class_hits() {
 # read_ci_checks (greenCi) and, in "any" mode, FAST_PATH_FILES. In critical
 # mode $2 is the critical-files criterion's own $FILES and CRITICAL_PATTERNS its pattern list.
 standing_auth_eval() {
-  local mode="$1" crit_files="${2:-}" i NUM_CLASSES CLASS_ID PATTERNS CONDITIONS EXCLUDES FORBIDDEN PRIVILEGED
+  local mode="$1" crit_files="${2:-}" i NUM_CLASSES CLASS_ID PATTERNS CONDITIONS EXCLUDES FORBIDDEN PRIVILEGED CHECK_WORKFLOW_WRITE_ALL
   local MATCH_FILES CHANGED_COUNT CRIT_DIFF="" CRIT_PATS_JSON CRIT_MATCH_FILES="" CFO ONLY_CRIT CLASS_FILES CLASS_DIFF
   local CLASS_HITS UNION_HITS="[]" USED_IDS="" CRIT_NAMES UNCOVERED
   local ADD_MIG ADD_MIG_STATE="" ADD_MIG_LIFTED=0 LOCKED_DEPS LOCKED_STATE="" LOCKED_USED=0
@@ -906,7 +918,16 @@ standing_auth_eval() {
     # but an array of non-empty strings is malformed and skips the entry (a
     # silently ignored key would read as "no privilege found").
     jq -e ".champion.standingAuthorizations[$i].privilegedContentPatterns // [] | type == \"array\" and all(.[]; type == \"string\" and length > 0)" "$CONFIG_FILE" >/dev/null 2>&1 || continue
-    PRIVILEGED=$(jq -r ".champion.standingAuthorizations[$i].privilegedContentPatterns // [] | .[]" "$CONFIG_FILE")
+    CHECK_WORKFLOW_WRITE_ALL=$(jq -r --argjson i "$i" '
+      .champion.standingAuthorizations[$i]
+      | if has("checkWorkflowWriteAll") then
+          .checkWorkflowWriteAll | if type == "boolean" then . else error("invalid workflow check") end
+        else false end' "$CONFIG_FILE" 2>/dev/null) || continue
+    PRIVILEGED=$(jq -r --argjson i "$i" --arg typed "$CHECK_WORKFLOW_WRITE_ALL" '
+      .champion.standingAuthorizations[$i].privilegedContentPatterns // []
+      | if $typed != "true" then .[]
+        elif ([.[] | select(. == "write-all")] | length) == 1 then .[] | select(. != "write-all")
+        else error("workflow check needs one legacy write-all guard") end' "$CONFIG_FILE" 2>/dev/null) || continue
 
     # criticalFilesOnly (#12648): `null` (absent) or `false` is today's class.
     # `true` makes a class that waives the critical-files criterion for the critical-file hits
@@ -1084,10 +1105,10 @@ standing_auth_eval() {
     # privilegedContentPatterns (#12954): capability, read from each covered
     # file's full contents at the PR head SHA rather than from its name or its
     # changed lines. Any privileged line, or any unreadable file, disqualifies.
-    if [ -n "$PRIVILEGED" ]; then
+    if [ -n "$PRIVILEGED" ] || [ "$CHECK_WORKFLOW_WRITE_ALL" = true ]; then
       [ -n "$DIFF_JSON" ] || standing_auth_fetch_diff || continue
       [ "$ONLY_CRIT" -eq 1 ] || CLASS_DIFF="$DIFF_JSON"
-      standing_auth_content_clear "$CLASS_DIFF" "$PRIVILEGED" || { STANDING_AUTH_WHY+="class '$CLASS_ID': privilegedContentPatterns hit or unreadable content in a covered file"$'\n'; continue; }
+      standing_auth_content_clear "$CLASS_DIFF" "$PRIVILEGED" "$CHECK_WORKFLOW_WRITE_ALL" || { STANDING_AUTH_WHY+="class '$CLASS_ID': privilegedContentPatterns hit or unreadable content in a covered file"$'\n'; continue; }
     fi
 
     # File list matches this class and every condition is recognized --
@@ -1242,7 +1263,7 @@ It is eligible only when **all** hold, each read live in this pass:
   same gate rule; they differ only in scope (strict byte-checks every changed file, not just the
   kept set);
 - `.loom/install-metadata.json` at the PR head has `loom_version` equal to `<X.Y.Z>`, and
-  `refs/tags/v<X.Y.Z>` exists in `rjwalters/loom`;
+  `refs/tags/v<X.Y.Z>` exists in `2AMLogic/loom`;
 - the files read is complete (count equals `changed_files`) and at least one changed file is a
   kept-set path;
 - **every** kept-set file is `added` or `modified` (a removal, rename or copy holds), maps to a
@@ -1321,12 +1342,12 @@ is red.
 ```bash
 # PRIVILEGED_CONTENT_PATTERNS (#12988): the capability list (jq/Oniguruma
 # regexes, one per element) a workflow's full head contents must not match.
-# Same list as #12954's privilegedContentPatterns; operators copy it into a
-# class, and test-champion-ci-workflow-blast.sh and
-# test-champion-standing-authorization.sh both extract it from here.
+# Both Champion workflow suites extract this list. For a standing class,
+# keep the legacy `write-all` regex alongside this list and set
+# `checkWorkflowWriteAll: true` to use the same structural permission check.
 PRIVILEGED_CONTENT_PATTERNS=(
   'secrets\.(?!GITHUB_TOKEN\b)' 'secrets:\s*inherit' '^\s*environment:'
-  ':\s*write\b' 'write-all' 'id-token' 'pull_request_target' 'workflow_run'
+  ':\s*write\b' 'id-token' 'pull_request_target' 'workflow_run'
   '^\s*release:' 'types:.*released' 'wrangler\s+deploy' 'npm\s+publish'
   'gh\s+release'
 )
@@ -1376,7 +1397,7 @@ ci_workflow_blast_eval() {
     [.[] | select(((.filename | ascii_downcase) | startswith(".github/workflows/")) and ((.status // "") != "removed"))]' 2>/dev/null) \
     || { WF_BLAST_REASON="workflow files unparseable"; return 0; }
   if [ "$CONTENT_FILES" != "[]" ]; then
-    standing_auth_content_clear "$CONTENT_FILES" "$(printf '%s\n' "${PRIVILEGED_CONTENT_PATTERNS[@]}")" \
+    standing_auth_content_clear "$CONTENT_FILES" "$(printf '%s\n' "${PRIVILEGED_CONTENT_PATTERNS[@]}")" true \
       || { WF_BLAST_REASON="a workflow's head contents are privileged or unreadable"; return 0; }
   fi
   # permissions (#13291): direction-aware. A removed line naming it is red (it
@@ -1829,7 +1850,7 @@ fi
 | `PRIOR_HOLD=true`, no `RELEASE_REASON`, "Self-release" does not clear | **HOLD the merge, silently.** The PR is not merged this pass regardless of how the axes read this tick, and no comment is posted (anti-spam guard already covers it). It is **not** skipped, though: `MERGE_BLOCKED_BY_HOLD=true` routes it to the **Held-PR Health Pass** (#6720), which still evaluates the `mergeable`, `recency` and `ci-green` criteria. |
 | `OPEN_CONDITION=true` (#12594), no `loom:auto-merge-ok` | **HOLD the merge** whatever (b)-(e) and the axes say — `PRIOR_HOLD=true`, `RELEASE_REASON=""`, `MERGE_BLOCKED_BY_HOLD=true`, even with no hold marker on the PR. The notice names the condition (once per condition comment). Closed only by a later trusted comment from a person (never an `x[bot]` author, never Champion) that opens with `<!-- loom:release-condition-met -->`, or that is a release instruction (`clear the hold — …`, `override: …`, `ok to merge — …`) citing the condition (the word "condition" in its body); then the rows below apply as usual. A clearing comment that does not cite it releases nothing: the condition is the hold. |
 | `PRIOR_HOLD=true`, released by `loom:auto-merge-ok` (`HOLD_OVERRIDE=true`) | The `merge-risk` criterion **PASS** by override — the axes are not re-scored. Continue to `critical-files`. Step 2's reversal block is **mandatory**. |
-| `PRIOR_HOLD=true`, released by (b), (c), (d), or (e) | Re-judge the four axes normally. Now green -> **PASS**, continue to `critical-files`, and Step 2's reversal block is **mandatory**. Still red **and** `MANUAL_RELEASE_SINCE_HOLD=true` **and** the concern is byte-identical to the prior hold's bullet -> **PASS** the same way: a human released exactly that concern (#11416); "Hold behavior"'s first branch executes it (no notice, no label). When your concern *is* the one on record, copy the prior bullet verbatim; write a new bullet only for a concern it does not name. Still red otherwise -> the hold persists: `MERGE_BLOCKED_BY_HOLD=true`, "Hold behavior" below, then the **Held-PR Health Pass**. |
+| `PRIOR_HOLD=true`, released by (b), (c), (d), or (e) | Re-judge the four axes normally. Now green -> **PASS**, continue to `critical-files`, and Step 2's reversal block is **mandatory**. Still red **and** `MANUAL_RELEASE_SINCE_HOLD=true` **and** the concern is byte-identical to the prior hold's bullet -> **PASS** the same way: a human released exactly that concern (#11416); "Hold behavior"'s first branch executes it (no notice, no label). When your concern *is* the one on record, copy the prior bullet verbatim; write a new bullet only for a concern it does not name. Still red otherwise -> the hold persists: `MERGE_BLOCKED_BY_HOLD=true`, "Hold behavior" below (at a NEW head it posts its notice for that head, #14833, so the `--release-hold` marker stays current), then the **Held-PR Health Pass**. |
 
 **Once released, stays released.** A release signal is consumed by the change
 itself, not by a counter: after a new commit lands, later ticks keep seeing
@@ -1853,6 +1874,11 @@ Apps) is trusted to hold, never to record an operator's condition as met.
 
 - **Several hold comments from different ticks** — only the *latest* one matters
   (`| last`); the count is irrelevant, and the marker's presence is what binds.
+  The idempotency guard is head-scoped to that latest notice (#14833): a repeat
+  tick at the head it records is quiet, while a red verdict at a NEW head posts
+  a fresh notice for that head — exactly one notice per held head, so the
+  `champion:hold-state` marker `--release-hold` reads never goes stale while
+  the hold stands.
 - **Force-push that leaves commit dates untouched** — caught by the head-SHA
   comparison, which is why the hold records `champion:hold-state head=<sha>`.
   Legacy holds without that line fall back to `committedDate`, so a same-date
@@ -1962,15 +1988,22 @@ elif [ "$MANUAL_RELEASE_SINCE_HOLD" = true ] && [ "$CONCERN_BULLET" = "$PRIOR_CO
   # concern. PASS — continue to critical-files; Step 2's reversal block is mandatory.
   echo "PASS: #$PR_NUMBER — human released this same concern ($RELEASE_REASON)"
 else
-  # Idempotency guard (same pattern as the stale-PR and verdict-janitor notices):
-  # comment ONCE per hold episode, not every tick. The hold BINDS later ticks
-  # (see "Sticky holds"). Cached ("$GH_READ") marker grep; `startswith`, not a
-  # substring, so a comment quoting the marker in prose is never mistaken for
-  # the notice (#5371). A NEW concern after a human removal (#11416) always
-  # posts: it becomes the hold on record, so the human's next removal releases
-  # it instead of looping on a concern they were never shown.
-  if [ "$MANUAL_RELEASE_SINCE_HOLD" != true ] && [ "$("$GH_READ" pr view "$PR_NUMBER" --json comments --jq "[.comments[].body] | any(startswith(\"$HOLD_MARKER\"))")" = "true" ]; then
-    echo "Merge-risk hold already posted for #$PR_NUMBER — hold stands, no comment"
+  # Idempotency guard, HEAD-SCOPED (#14833): comment once per hold episode AT
+  # A HEAD, not once per PR. The hold BINDS later ticks (see "Sticky holds").
+  # The precheck's HOLD_BODY/HOLD_HEAD are the latest `$HOLD_MARKER` notice and
+  # the head it recorded — the same latest-notice read release path (c) uses, so
+  # the guard and the release test can never disagree. A notice recorded at
+  # THIS tick's head is a repeat tick: quiet. A notice at an older head, or a
+  # legacy one with no recorded head, was written against a diff that no longer
+  # exists — this tick's red verdict re-holds the PR at a NEW head, so the
+  # fresh notice below must post and record `champion:hold-state
+  # head=<current>`, or `merge-pr.sh --release-hold` reads the stale head and
+  # refuses a valid release at the current one. A NEW concern after a human
+  # removal (#11416) always posts: it becomes the hold on record, so the
+  # human's next removal releases it instead of looping on a concern they were
+  # never shown.
+  if [ "$MANUAL_RELEASE_SINCE_HOLD" != true ] && [ -n "$HOLD_HEAD" ] && [ "$HOLD_HEAD" = "$HEAD_SHA" ]; then
+    echo "Merge-risk hold already posted for #$PR_NUMBER at this head — hold stands, no comment"
     # #12933: the daemon drew this hold because the standing-authorization
     # digest moved (or a legacy record has none). The hold stands, so record
     # the current digest ONCE at this head — the daemon reads the LAST trusted
@@ -2766,7 +2799,12 @@ A pre-#11861 hold still on `loom:operator` (not yet migrated by `labels migrate
 **A hand-released hold is listed, not dropped (#11416).** A merge-risk hold
 whose `loom:blocked` a human removed is released (precheck (e)) and merges
 next tick unless the `critical-files`, `mergeable`, `recency` and `ci-green` criteria block it; a critical-file one waits for the
-operator's own merge (`champion-critical-file-hold.md`, #9016). Either way the
+operator's own merge (`champion-critical-file-hold.md`, #9016); a ratification
+one is released only by the operator's own `clear the hold —` comment
+(`champion-ratification-hold.md`, #12992) — the label's absence never releases
+it, so `RELEASED` keys on its latest marker being
+`champion:ratification-release-respected` (a still-standing marker gets the
+label re-armed by the precheck, not listed). Either way the
 PR no longer carries the label, so `RELEASED` below lists every open `loom:pr`
 PR still bearing a hold marker without it — never silently plain approved
 (a critical-file or ratification hold whose last family marker is `-cleared`
@@ -2784,9 +2822,11 @@ missing its label with no removal on record gets the label back
 #
 # #13930 degraded census: every "$GH_READ" call is bounded by gh-cached's
 # LOOM_GH_TIMEOUT_S — a stalled query fails fast (exit 124, diagnostic on
-# stderr) instead of hanging this pass. A failed query contributes nothing
-# and raises HELD_STRUCTURAL_UNAVAILABLE; the Per-PR Digest below then marks
-# structural fields unavailable instead of silently dropping the digest.
+# stderr) instead of hanging this pass. Any failed census read — the two
+# bulk holds queries, the at-Doctor count, or the released list (#14011) —
+# contributes nothing and raises HELD_STRUCTURAL_UNAVAILABLE; the Per-PR
+# Digest below then marks structural fields unavailable instead of silently
+# dropping the digest.
 # Never issue a second bulk `pr list` to "recover" — the deliberate
 # single-read pin stands; a degraded digest beats a duplicated census read.
 HELD_JSON=""
@@ -2801,22 +2841,26 @@ for H in loom:blocked loom:operator; do
 "
 done
 HELD_JSON=$(printf '%s' "$HELD_JSON" | jq -s 'add // [] | unique_by(.number)')
-# Same marker set as Step 1's $HOLD_TABLE below (#13885) — extend both
-# together when a hold kind is added. Each kind's "no longer standing"
-# markers: merge-risk clears via a contains() block (embedded in the
-# pre-merge comment), critical-file and ratification clear/release via
-# standalone notices (the same set doctor.md's CHAMPION_HELD_CONFLICT uses).
+# Same marker set as Step 1's $HOLD_TABLE below (#13885) and RELEASED's
+# per-kind selectors (#13875) — extend all three together when a hold kind is
+# added. Each kind's "no longer standing" markers: merge-risk clears via a
+# contains() block (embedded in the pre-merge comment), critical-file and
+# ratification clear/release via standalone notices (the same set doctor.md's
+# CHAMPION_HELD_CONFLICT uses).
 # #14117: a marker being present is not that hold standing — count the PR
 # when ANY kind stands (per kind, the hold marker's latest comment index
 # must outdate the kind's latest cleared/released notice: the MR_STANDS
 # rindex idiom from champion-critical-file-hold.md). The previous selector
 # excluded a PR on ANY cleared marker, dropping a held PR whose *other*
 # hold still stands.
-HELD_AT_DOCTOR=$("$GH_READ" pr list --label "loom:changes-requested" --label "loom:blocked" --state open --limit 500 --json number,labels,comments \
+if ! HELD_AT_DOCTOR=$("$GH_READ" pr list --label "loom:changes-requested" --label "loom:blocked" --state open --limit 500 --json number,labels,comments \
   --jq '[.[] | select(any(.labels[]?.name; . == "loom:frozen") | not) | select(
       ([.comments[].body] | (map(startswith("<!-- champion:merge-risk-hold -->")) | rindex(true)) as $h | (map(contains("<!-- champion:merge-risk-hold-cleared -->")) | rindex(true)) as $c | $h != null and ($c == null or $h > $c))
       or ([.comments[].body] | (map(startswith("<!-- champion:critical-file-hold -->")) | rindex(true)) as $h | (map(startswith("<!-- champion:critical-file-hold-cleared -->")) | rindex(true)) as $c | $h != null and ($c == null or $h > $c))
-      or ([.comments[].body] | (map(startswith("<!-- champion:ratification-hold -->")) | rindex(true)) as $h | (map(startswith("<!-- champion:ratification-hold-cleared -->") or startswith("<!-- champion:ratification-release-respected -->")) | rindex(true)) as $c | $h != null and ($c == null or $h > $c)))] | length')
+      or ([.comments[].body] | (map(startswith("<!-- champion:ratification-hold -->")) | rindex(true)) as $h | (map(startswith("<!-- champion:ratification-hold-cleared -->") or startswith("<!-- champion:ratification-release-respected -->")) | rindex(true)) as $c | $h != null and ($c == null or $h > $c)))] | length'); then
+  HELD_STRUCTURAL_UNAVAILABLE=1   # the at-Doctor read stalled too (#14011) — the 0 below is degraded, not a fact
+  HELD_AT_DOCTOR=0   # never feed a failed read's partial stdout to the arithmetic
+fi
 HELD_AT_DOCTOR=${HELD_AT_DOCTOR:-0}   # a bounded-but-failed read degrades to 0, never breaks the arithmetic (#13930)
 
 HELD_COUNT=$(( $(printf '%s\n' "$HELD_JSON" | jq 'length') + HELD_AT_DOCTOR ))
@@ -2838,9 +2882,13 @@ echo "Merge-risk holds: $HELD_COUNT open PR(s) — $HELD_CONFLICTING conflicting
 # a LATEST `ratification-release-respected` marker (the one hold kind whose
 # design is "only a human releases this, then merges by hand"); a ratification
 # hold whose last family marker is `-cleared` was auto-cleared, not listed.
-RELEASED=$("$GH_READ" pr list --label "loom:pr" --search "-label:loom:blocked -label:loom:operator -label:loom:frozen" --state open --limit 500 --json number,comments \
+RELEASED=""
+if ! RELEASED=$("$GH_READ" pr list --label "loom:pr" --search "-label:loom:blocked -label:loom:operator -label:loom:frozen" --state open --limit 500 --json number,comments \
   --jq '"<!-- champion:critical-file-hold" as $cf | [.[] | select(any(.comments[].body; startswith("<!-- champion:merge-risk-hold -->")) or ([.comments[].body | select(startswith($cf))] | last // "" | startswith($cf + " -->")) or ([.comments[].body | select(startswith("<!-- champion:ratification-hold") or startswith("<!-- champion:ratification-release-respected"))] | last // "" | startswith("<!-- champion:ratification-release-respected -->")))
-    | "#\(.number)"] | join(" ")')
+    | "#\(.number)"] | join(" ")'); then
+  HELD_STRUCTURAL_UNAVAILABLE=1   # the released read stalled too (#14011) — "none" below may be an artifact, not a fact
+  RELEASED=""   # never echo a failed read's partial stdout
+fi
 echo "Released holds, not yet merged: ${RELEASED:-none}"
 ```
 
@@ -2946,8 +2994,9 @@ held or *how long* it has been `CONFLICTING`. Read the reason from the PR's own
 hold comment via the `$HOLD_TABLE` below — one `(kind, hold marker, cleared/released test)` row per
 hold kind: the merge-risk marker of the `merge-risk` criterion, the
 critical-file marker of the `critical-files` and `ci-green` criteria (#6879),
-and the ratification marker (#12992, #13885 — its notice has no axis bullet;
-its reason is built from the notice itself). The winner is the latest marker
+and the ratification marker (#12992, #13885, #13875 — its notice has carried
+a `**Ratification by merge**` reason bullet since #13875; an older notice's
+reason is built from its backticked file list). The winner is the latest marker
 among the kinds that still STAND — per kind, standing means the hold marker's
 latest comment outdates the kind's latest cleared/released notice (the
 `MR_STANDS` rindex idiom from `champion-critical-file-hold.md`; #14117) — so a
@@ -3046,14 +3095,19 @@ for PR_NUM in $(printf '%s\n' "$HELD_JSON" | jq -r "sort_by(-($LVL)) | .[].numbe
   else
     case "$HOLD_KIND" in
       ratification)
-        # The ratification notice (#12992) has no axis bullet — its only
-        # bullet is a backticked file list — so build the reason from the
-        # notice itself: fixed text plus the first declared file.
-        FIRST_FILE=$(printf '%s\n' "$HOLD_BODY" | grep -m1 -E '^- `' | sed -E 's/^- `([^`]+)`.*/\1/')
-        if [ -n "$FIRST_FILE" ]; then
-          REASON="ratification hold — merging ratifies; operator approves ($FIRST_FILE)"
-        else
-          REASON="ratification hold (file bullet not parseable)"
+        # The ratification notice (#12992) has carried a leading
+        # "- **Ratification by merge**: ..." reason bullet since #13875 —
+        # read it like the other kinds. Notices posted before then have no
+        # axis bullet, only a backticked file list — build the reason from
+        # that (#13885): fixed text plus the first declared file.
+        REASON=$(printf '%s\n' "$HOLD_BODY" | grep -m1 -E '^- \*\*.+\*\*:' | sed 's/^- //')
+        if [ -z "$REASON" ]; then
+          FIRST_FILE=$(printf '%s\n' "$HOLD_BODY" | grep -m1 -E '^- `' | sed -E 's/^- `([^`]+)`.*/\1/')
+          if [ -n "$FIRST_FILE" ]; then
+            REASON="ratification hold — merging ratifies; operator approves ($FIRST_FILE)"
+          else
+            REASON="ratification hold (file bullet not parseable)"
+          fi
         fi
         ;;
       *)
@@ -4699,8 +4753,11 @@ Reviewed the rejection history against the forward-progress test; no qualifying 
 - **Reason**: <SAME_DEFECT_RE_LITIGATED | AMBIGUOUS_COMPARISON | ONLY_ONE_REJECTION | CHAIN_NOT_CONVERGING | APPROACH_DISAGREEMENT | NOT_CAP_PARKED | HUMAN_HOLD>
 - **Specifics**: <WHICH_DEFECT_REPEATS_ACROSS_REJECTIONS_OR_WHAT_IS_UNCLEAR>
 - **What a human needs to decide**: <THE_SPECIFIC_JUDGMENT_AUTOMATION_CANNOT_MAKE>
+- **How this park releases** (no new Judge rejection can land on a parked PR, so nothing re-opens it by itself):
+  - **Inherited-CI park only** — the verdict was a CI-only rejection AND every red check on the head fails the same way on the PR's merge base while being green on the default branch: once the default branch's required checks are green, the daemon's CI-gate recovery pass merges the recovered default branch into this PR's branch (a merge commit, never a force-push) and returns the PR to review once the new head's checks are verified exactly green (#10178, #14813). If that update conflicts, the PR is handed to Doctor's conflict lane (\`loom:merge-conflict\`) instead.
+  - **Every other reason above** — release needs exactly the condition or decision the Reason/Specifics lines name: a human decision for \`HUMAN_HOLD\`, a qualifying forward-progress record for the cap reasons. State that condition here; do not promise a re-evaluation that cannot happen.
 
-Labels unchanged (\`loom:blocked\` + \`loom:changes-requested\`). Champion will re-evaluate this PR if a new Judge rejection lands.
+Labels unchanged (\`loom:blocked\` + \`loom:changes-requested\`).
 
 ---
 *Automated by Champion role*"

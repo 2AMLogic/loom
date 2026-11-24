@@ -22,12 +22,9 @@
 //! its read unconditionally too. The steps with no noted read are three:
 //! the `skip_label_flip` early return, a `ChampionMerge` step (no claim
 //! label), and a step whose item is held elsewhere — the reaper and startup
-//! adoption check `step_claim_held_elsewhere` before `restore_step_claim`,
-//! and a roll requeue makes its own ownership check instead
-//! (`roll_claim_still_ours` for an issue role, `roll_pr_step_claim_still_ours`
-//! for a PR role, which does call `step_claim_held_elsewhere`); all three
-//! skip the release entirely, so no read and no note happen; the tick reads
-//! the item itself for those.
+//! adoption check `step_claim_held_elsewhere` before `restore_step_claim`.
+//! In these cases the tick reads the item itself. The guarded release for
+//! a daemon roll records its Forge results in the pause manifest.
 //! The queue is per workspace root and
 //! in-memory: a step that ended just before a restart is not recorded, which
 //! costs at most one cooldown the ledger would have armed.
@@ -54,6 +51,15 @@ pub struct EndedStep {
     /// (#13966): the launch died on an empty api-key seat, so the ledger
     /// records a refusal (`provider_exhausted`), never a run or a cooldown.
     pub provider_exhausted: bool,
+    /// The launcher's own typed preflight-rejection reason for THIS attempt
+    /// (#14634): a `preflight_<stage>` token from the worker launcher's
+    /// per-spawn socket (or the coarse `preflight_rejected`), accepted only
+    /// when the worker exited 78 and wrote no outcome line. The step-log
+    /// marker is diagnostic, never the classifier input. The report is
+    /// spent only where the ledger would otherwise have recorded
+    /// `unclassified`; ownership release, the `failed` class and the
+    /// fast-fail ladder are unchanged.
+    pub launch_rejection: Option<&'static str>,
 }
 
 type Queue = HashMap<PathBuf, Vec<EndedStep>>;
@@ -82,6 +88,9 @@ pub(crate) fn note_post(
 
 /// The post-state noted for `sweep_id`: `Some(read)` when its release took
 /// one (`read` is `None` for a failed read), `None` when none was noted.
+/// A noted failed read is not final (#14899): `step_end::settle` reads the
+/// item itself when the note is absent *or* failed, so only no successful
+/// read at all classifies `probe_failed`.
 #[must_use]
 pub fn take_post(
     root: &Path,

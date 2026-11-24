@@ -64,6 +64,7 @@ fn a_core_rate_limit_withdraws_only_that_owners_core_bucket() {
         secondary: false,
         retry_after: None,
         remaining: None,
+        graphql_primary_message: false,
     };
     let w = withdraw_after_in(
         RoutingMode::Scoped,
@@ -133,6 +134,7 @@ fn a_header_reset_books_the_bucket_exhausted() {
         secondary: false,
         retry_after: None,
         remaining: None,
+        graphql_primary_message: false,
     };
     withdraw_after_in(RoutingMode::Scoped, app, "acme/x", failure, "test", now, &no_probe);
     let key = BucketKey::new("app-940002", "acme", Resource::Graphql);
@@ -156,6 +158,7 @@ fn a_refusal_reporting_headroom_does_not_withdraw_the_reader_until_reset() {
         secondary: false,
         retry_after: None,
         remaining: Some(30),
+        graphql_primary_message: false,
     };
     let w = withdraw_after_in(RoutingMode::Scoped, app, "acme/x", failure, "test", now, &no_probe);
     let (_, _, until, source, _) = scoped(&w);
@@ -183,6 +186,7 @@ fn the_reset_comes_from_the_header_then_the_probe_then_the_default() {
             secondary: false,
             retry_after: None,
             remaining: None,
+            graphql_primary_message: false,
         };
         plan_withdrawal("acme/x", f, now, RoutingMode::Scoped, "940003", probe)
     };
@@ -413,6 +417,86 @@ fn a_real_core_limit_still_empties_core_until_its_reset() {
     assert_eq!((r.remaining, r.reset_epoch), (Some(0), reset));
 }
 
+// ---- #14881: the refusal books at its observation instant ---------------------
+
+#[test]
+fn a_scoped_refusal_books_the_bucket_at_its_observation_instant() {
+    // The bucket write behind a header-reset refusal used a fresh wall
+    // clock, so a refusal observed before a newer positive reading erased
+    // it once the ambient clock rolled past the reading. Every fixture
+    // instant is a whole second before a separately sampled ambient anchor
+    // and the raw header reset sits far beyond it, so the write happens
+    // under both clocks and only its booking instant can differ.
+    let anchor = SystemTime::now();
+    let at = |before: u64| anchor - Duration::from_secs(before);
+    let app = "940106";
+    let refusal = Failure::RateLimited {
+        resource: Resource::Graphql,
+        reset: Some(anchor + Duration::from_secs(3000)),
+        secondary: false,
+        retry_after: None,
+        remaining: Some(0),
+        graphql_primary_message: false,
+    };
+    let proven = |owner: &str, now: SystemTime| {
+        super::super::route::primary_graphql_withdrawn_at(app, owner, now)
+    };
+
+    // Older positive headroom: the refusal is the newer evidence and must
+    // replace it, stamped with the supplied observation instant.
+    let older_key = || BucketKey::new("app-940106", "obs-older", Resource::Graphql);
+    forge_bucket_book::insert(
+        older_key(),
+        forge_bucket_book::Reading {
+            limit: Some(5000),
+            remaining: Some(12),
+            used: None,
+            reset_epoch: epoch_secs(at(120)),
+            observed_at: epoch_secs(at(120)),
+            source: forge_bucket_book::Source::Header,
+        },
+    );
+    withdraw_after_in(RoutingMode::Scoped, app, "obs-older/x", refusal, "test", at(119), &no_probe);
+    let r = forge_bucket_book::reading(&older_key(), epoch_secs(at(60))).unwrap();
+    assert_eq!(r.remaining, Some(0));
+    assert_eq!(r.source, forge_bucket_book::Source::Refusal);
+    assert_eq!(
+        r.observed_at,
+        epoch_secs(at(119)),
+        "the refusal books at its observation instant, not the ambient clock"
+    );
+    assert!(proven("obs-older", at(60)));
+
+    // Newer positive headroom: a refusal observed one second earlier must
+    // not erase it, and the route's proof predicate stays contradicted.
+    let newer_key = || BucketKey::new("app-940106", "obs-newer", Resource::Graphql);
+    forge_bucket_book::insert(
+        newer_key(),
+        forge_bucket_book::Reading {
+            limit: Some(5000),
+            remaining: Some(12),
+            used: None,
+            reset_epoch: epoch_secs(anchor) + 300,
+            observed_at: epoch_secs(at(1)),
+            source: forge_bucket_book::Source::Header,
+        },
+    );
+    withdraw_after_in(RoutingMode::Scoped, app, "obs-newer/x", refusal, "test", at(2), &no_probe);
+    let r = forge_bucket_book::reading(&newer_key(), epoch_secs(anchor)).unwrap();
+    assert_eq!(
+        (r.source, r.remaining, r.observed_at),
+        (forge_bucket_book::Source::Header, Some(12), epoch_secs(at(1))),
+        "the newer positive reading survives the older refusal"
+    );
+    assert!(forge_read_pool::is_budget_withdrawn_at(
+        app,
+        "obs-newer",
+        Resource::Graphql,
+        anchor
+    ));
+    assert!(!proven("obs-newer", anchor));
+}
+
 // ---- secondary and credential -----------------------------------------------
 
 #[test]
@@ -492,6 +576,7 @@ fn a_secondary_withdrawal_covers_every_resource_of_that_owner_only() {
         secondary: true,
         retry_after: Some(Duration::from_secs(120)),
         remaining: None,
+        graphql_primary_message: false,
     };
     withdraw_after_in(RoutingMode::Scoped, app, "acme/x", f, "test", now, &no_probe);
     let during = now + Duration::from_secs(60);
@@ -552,13 +637,83 @@ fn the_refused_pool_comes_from_the_response_else_the_static_pool() {
             secondary: false,
             retry_after: None,
             remaining: Some(0),
+            graphql_primary_message: false,
         }
     );
+    assert!(f.is_primary_graphql());
     let f = classify_failure_in(RoutingMode::Scoped, "", Some(429), None, Resource::Search);
     assert_eq!(f, Some(Failure::rate_limited(Resource::Search)));
     // A 403 whose headers say the pool is empty is a rate limit, not coverage.
     let f = classify_failure_in(RoutingMode::Scoped, "", Some(403), Some(&h), Resource::Core);
     assert!(matches!(f, Some(Failure::RateLimited { .. })), "{f:?}");
+}
+
+#[test]
+fn explicit_primary_graphql_evidence_yields_to_retry_after_and_positive_remaining() {
+    let classify = |status, headers: Option<&RateLimitHeaders>| {
+        classify_failure_in(
+            RoutingMode::Scoped,
+            "GraphQL: API rate limit already exceeded",
+            status,
+            headers,
+            Resource::Graphql,
+        )
+        .unwrap()
+    };
+    let mut h = headers(None, None);
+    h.resource = Some("graphql".into());
+    assert!(classify(None, None).is_primary_graphql());
+    assert!(classify(Some(403), Some(&h)).is_primary_graphql());
+    h.retry_after_secs = Some(60);
+    assert!(!classify(Some(429), Some(&h)).is_primary_graphql());
+    h.retry_after_secs = None;
+    h.remaining = Some(12);
+    assert!(!classify(Some(403), Some(&h)).is_primary_graphql());
+}
+
+#[test]
+fn a_new_primary_graphql_observation_keeps_its_own_shorter_expiry() {
+    let app = "940043";
+    let owner = "proof-history";
+    let repo = "proof-history/example";
+    let now = t0();
+    let at = |seconds| now + Duration::from_secs(seconds);
+    let primary = |observed_at, until| {
+        let failure = Failure::RateLimited {
+            resource: Resource::Graphql,
+            reset: Some(until),
+            secondary: false,
+            retry_after: None,
+            remaining: Some(0),
+            graphql_primary_message: false,
+        };
+        withdraw_after_in(RoutingMode::Scoped, app, repo, failure, "test", observed_at, &no_probe);
+    };
+    let proven = |now| super::super::route::primary_graphql_withdrawn_at(app, owner, now);
+
+    primary(at(0), at(300));
+    assert!(proven(at(10)));
+    forge_bucket_book::insert(
+        BucketKey::new("app-940043", owner, Resource::Graphql),
+        forge_bucket_book::Reading {
+            limit: Some(5000),
+            remaining: Some(12),
+            used: None,
+            reset_epoch: epoch_secs(at(300)),
+            observed_at: epoch_secs(at(30)),
+            source: forge_bucket_book::Source::Header,
+        },
+    );
+    assert!(!proven(at(30)));
+
+    primary(at(60), at(120));
+    assert!(proven(at(100)));
+    assert!(!proven(at(120)));
+    primary(at(20), at(500)); // a delayed older observation
+    primary(at(60), at(240)); // conflicting expiry for the same observation time
+    assert!(proven(at(100)));
+    assert!(!proven(at(120)));
+    assert!(forge_read_pool::is_budget_withdrawn_at(app, owner, Resource::Graphql, at(150)));
 }
 
 #[test]

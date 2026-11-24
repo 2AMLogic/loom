@@ -181,9 +181,7 @@ pub mod daemon_root_freshness;
 pub mod daemon_start;
 /// Non-blocking wrapper around the startup claim-reconciliation +
 /// stranded-quarantine reconciliation passes (Issue #7974) — a new sibling
-/// module rather than growing `daemon_service.rs`, which the file-size
-/// ratchet freezes at its current line count
-/// (`.loom/docs/file-size-policy.md`).
+/// module rather than growing `daemon_service.rs`.
 pub mod daemon_startup_reconciliation;
 pub mod daemon_update;
 pub mod daily_log;
@@ -194,6 +192,7 @@ pub mod dep_recheck;
 /// from the mirror's worklist or per-repo listings.
 pub mod discovery;
 pub mod disk_headroom;
+pub mod docker_bin;
 pub mod docker_image_clean;
 pub mod doctor_escalation;
 /// Doctor hand-back as a conditional, verified label transition (#9388).
@@ -234,6 +233,7 @@ pub mod forge_denial;
 pub mod forge_disable_auto_merge;
 pub(crate) mod forge_etag_store;
 pub mod forge_gateway;
+pub(crate) mod forge_gitea_view;
 pub mod forge_host;
 pub mod forge_identity;
 pub mod forge_inventory;
@@ -266,6 +266,7 @@ pub mod gh_state_probe;
 pub mod git_ff_identical;
 pub mod git_tmp_reclaim;
 pub mod git_utils;
+pub(crate) mod gitea_read;
 pub mod guard_wiring;
 pub mod guards_status;
 pub mod hard_exclusion;
@@ -279,6 +280,12 @@ pub mod host_optout;
 pub mod host_pressure;
 pub mod host_shape;
 pub mod host_status;
+/// The host-wide cooldown gate shared by the cleanup passes
+/// (`docker_image_clean`, `tmpfs_reclaim`, `native_state_reclaim`): one
+/// "last evaluated at" timestamp per pass, with the elapsed/record logic
+/// single-sourced (#14861). Each pass owns its own instance — a shared
+/// timestamp would let one pass suppress the other two.
+pub(crate) mod host_wide_cooldown;
 pub mod hyperparams;
 pub mod idle_exit;
 pub mod inflight;
@@ -326,7 +333,6 @@ pub mod orphan_replace;
 pub mod overlap_replay;
 pub mod parent_link;
 pub mod park_record;
-pub mod peer_claims;
 pub mod phase_join;
 pub mod pi_usage;
 pub mod pipeline_snapshot;
@@ -415,8 +421,7 @@ pub mod stash_issue_state;
 pub mod stash_retirement;
 /// Root-count-aware cost model for `build_daemon_status` and the `status`/
 /// `health` IPC probes that wait on it (#8163). A sibling module rather than
-/// code inside `ipc.rs`/`cli/health.rs`: `ipc.rs` is an over-threshold file
-/// frozen by the file-size ratchet, and stating the model once is what keeps
+/// code inside `ipc.rs`/`cli/health.rs`: stating the model once is what keeps
 /// the daemon-side budget and the client-side probe budget from drifting.
 pub mod status_budget;
 /// The named top-level sections of `status --json` and the build phases each
@@ -496,6 +501,7 @@ pub mod weighted_draw;
 pub mod work_finder;
 pub mod work_finder_guard;
 pub mod worker_spawn;
+pub mod workflow_lint;
 pub mod workspace_hold;
 pub mod workspace_pool;
 pub mod workspace_registry;
@@ -509,6 +515,7 @@ pub mod worktree_state;
 pub mod write_scope;
 #[cfg(test)]
 pub(crate) mod write_scope_test_support;
+pub mod writer_limit;
 
 use std::collections::HashSet;
 use std::fs;

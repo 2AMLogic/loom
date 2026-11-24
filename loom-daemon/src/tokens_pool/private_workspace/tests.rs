@@ -100,6 +100,13 @@ fn forge_credential_username_preserves_basic_auth_and_rejects_protocol_injection
 
 use crate::test_git_helpers::{configure, run as git};
 
+/// The writable temp base every [`repository::prepare_with_pr_lookup`] test
+/// passes explicitly — never the ambient `TMPDIR`, which a parallel test's
+/// fixture may be mutating.
+fn temp_base() -> std::path::PathBuf {
+    std::env::temp_dir()
+}
+
 struct RepoFixture {
     _temp: tempfile::TempDir,
     remote: PathBuf,
@@ -137,6 +144,8 @@ impl RepoFixture {
 
     fn prepare(&self) -> Result<String> {
         repository::prepare(&self.root, &self.args)
+            .map(|outcome| outcome.revision)
+            .map_err(Into::into)
     }
 }
 
@@ -233,6 +242,66 @@ fn lease_renew_residue_does_not_refuse_reuse_but_other_dirt_does() {
     assert!(error.contains("stray-09"), "{error}");
     assert!(!error.contains("stray-10"), "{error}");
     assert!(error.contains("and 2 more"), "{error}");
+}
+
+/// #14929 AC: an unwritable seat temp dir refuses preparation naming the
+/// cause (`seat_temp_unwritable`) instead of surfacing later as a misleading
+/// fetch or dirty-clone refusal, and no Loom state directory appears in the
+/// private clone — the refusal happens before any clone work, and the state
+/// dirs never fall back to the job's working directory.
+#[test]
+fn an_unwritable_temp_dir_refuses_preparation_naming_the_cause_without_touching_the_clone() {
+    let _fork = fork_guard();
+    let f = RepoFixture::new();
+    // A temp base under a FILE cannot be created or written by any uid
+    // (ENOTDIR), so the refusal is deterministic even under root.
+    let blocker = f._temp.path().join("blocker");
+    std::fs::write(&blocker, b"not a directory").unwrap();
+    let blocked = blocker.join("tmp");
+    let lookup =
+        |_: &Path, _: &str, _: &str, _: &str| panic!("no clone work runs past the preflight");
+    let error = repository::prepare_with_pr_lookup(&f.root, &f.args, &lookup, &blocked)
+        .unwrap_err()
+        .to_string();
+    assert!(
+        error.contains(SEAT_TEMP_UNWRITABLE_REASON),
+        "the refusal names its cause: {error}"
+    );
+    assert!(error.contains("not writable"), "{error}");
+    // The clone was never created and the volume untouched.
+    assert!(!f.root.join("repo").exists());
+    assert!(std::fs::read_dir(&f.root).unwrap().next().is_none());
+
+    // A prepared clone stays clean of Loom state dirs across the refusal:
+    // prepare once, then refuse on the blocked base and re-check the tree.
+    std::fs::remove_file(&blocker).unwrap();
+    f.prepare().unwrap();
+    let repo = f.root.join("repo");
+    std::fs::write(&blocker, b"not a directory").unwrap();
+    let error = repository::prepare_with_pr_lookup(&f.root, &f.args, &lookup, &blocked)
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains(SEAT_TEMP_UNWRITABLE_REASON), "{error}");
+    for entry in std::fs::read_dir(&repo).unwrap().flatten() {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        assert!(
+            !name.starts_with("loom-forge-")
+                && !name.starts_with("loom-write-scope")
+                && !name.starts_with("tmp"),
+            "no Loom state or temp directory may appear in the clone: {name}"
+        );
+    }
+    // No probe residue is left behind in a writable base either.
+    let writable = f._temp.path().join("tmp");
+    std::fs::create_dir(&writable).unwrap();
+    repository::prepare_with_pr_lookup(&f.root, &f.args, &lookup, &writable).unwrap();
+    let residue: Vec<String> = std::fs::read_dir(&writable)
+        .unwrap()
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(residue, Vec::<String>::new(), "the preflight cleans up after itself");
 }
 
 #[test]
@@ -391,7 +460,7 @@ fn unpublished_commits_in_one_clone_do_not_block_another_clone_or_branch() {
         branch: Some("feature/issue-9".into()),
         slug: Some("owner-repo-12345678".into()),
     };
-    let add = repository::prepare(&f.root, &additional).unwrap();
+    let add = repository::prepare(&f.root, &additional).unwrap().revision;
     assert!(!add.is_empty());
     // Unpublished commits on one branch of the additional clone do not
     // block re-preparing it for its own branch, nor the primary at all.
@@ -425,6 +494,8 @@ fn recover_args(remote: &Path) -> repository::RecoverArgs {
         discard: false,
         issue: None,
         branch: Vec::new(),
+        worktree: Vec::new(),
+        validate_worktrees: false,
         slug: None,
     }
 }
@@ -724,6 +795,148 @@ fn https_remote_rejects_credentials_and_unsupported_transports() {
     ] {
         assert!(repository_url(url).is_err(), "accepted {url}");
     }
+}
+
+#[test]
+fn daemon_owned_gh_config_dir_under_a_checkout_is_not_recorded() {
+    let ws = tempfile::tempdir().expect("tempdir");
+    let dir = crate::credential_preflight::github_app_gh_config_dir(ws.path());
+    std::fs::create_dir_all(&dir).expect("app dir");
+    std::fs::create_dir_all(ws.path().join(".git")).expect("daemon checkout");
+    assert!(matches!(
+        lifecycle::resolve_gh_config_with(ws.path(), Some(dir.into_os_string()), None, None),
+        Ok(None)
+    ));
+}
+
+#[test]
+fn a_per_owner_daemon_gh_config_dir_under_a_checkout_is_not_recorded() {
+    let ws = tempfile::tempdir().expect("tempdir");
+    let dir = crate::credential_preflight::github_app_gh_config_dir_for_owner(ws.path(), "org");
+    std::fs::create_dir_all(&dir).expect("owner dir");
+    std::fs::create_dir_all(ws.path().join(".git")).expect("daemon checkout");
+    assert!(matches!(
+        lifecycle::resolve_gh_config_with(ws.path(), Some(dir.into_os_string()), None, None),
+        Ok(None)
+    ));
+}
+
+#[test]
+fn a_symlinked_spelling_of_the_daemon_owned_gh_config_dir_is_not_recorded() {
+    use std::os::unix::fs::symlink;
+    let ws = tempfile::tempdir().expect("tempdir");
+    let dir = crate::credential_preflight::github_app_gh_config_dir(ws.path());
+    std::fs::create_dir_all(&dir).expect("app dir");
+    symlink(&dir, ws.path().join("linked-gh-config")).expect("symlink");
+    let linked = ws.path().join("linked-gh-config");
+    assert!(matches!(
+        lifecycle::resolve_gh_config_with(ws.path(), Some(linked.into_os_string()), None, None),
+        Ok(None)
+    ));
+}
+
+#[test]
+fn a_gh_config_dir_under_a_checkout_the_daemon_does_not_own_is_refused() {
+    let ws = tempfile::tempdir().expect("tempdir");
+    std::fs::create_dir_all(ws.path().join(".git")).expect("checkout");
+    let dir = ws.path().join("credentials/gh");
+    std::fs::create_dir_all(&dir).expect("gh dir");
+    let error =
+        lifecycle::resolve_gh_config_with(ws.path(), Some(dir.into_os_string()), None, None)
+            .expect_err("a foreign dir under a checkout must be refused");
+    assert!(error
+        .to_string()
+        .contains("forge credentials must be outside every repository/worktree"));
+}
+
+#[test]
+fn a_home_default_gh_dir_under_a_checkout_is_refused() {
+    let ws = tempfile::tempdir().expect("tempdir");
+    std::fs::create_dir_all(ws.path().join(".git")).expect("checkout");
+    let home_default = ws.path().join(".config/gh");
+    std::fs::create_dir_all(&home_default).expect("gh dir");
+    let error = lifecycle::resolve_gh_config_with(ws.path(), None, Some(home_default), None)
+        .expect_err("the home-default dir under a checkout must be refused");
+    assert!(error
+        .to_string()
+        .contains("forge credentials must be outside every repository/worktree"));
+}
+
+#[test]
+fn a_gh_config_dir_outside_every_checkout_is_recorded() {
+    let ws = tempfile::tempdir().expect("tempdir");
+    let elsewhere = tempfile::tempdir().expect("tempdir");
+    let dir = elsewhere.path().join("gh");
+    std::fs::create_dir_all(&dir).expect("gh dir");
+    assert_eq!(
+        lifecycle::resolve_gh_config_with(
+            ws.path(),
+            Some(dir.clone().into_os_string()),
+            None,
+            None
+        )
+        .expect("an ordinary dir is recorded"),
+        Some(dir.canonicalize().expect("canonical"))
+    );
+}
+
+#[test]
+fn the_primary_workspace_app_dir_is_not_recorded_for_a_distinct_acting_checkout() {
+    let primary = tempfile::tempdir().expect("tempdir");
+    let acting = tempfile::tempdir().expect("tempdir");
+    let dir = crate::credential_preflight::github_app_gh_config_dir(primary.path());
+    std::fs::create_dir_all(&dir).expect("app dir");
+    std::fs::create_dir_all(primary.path().join(".git")).expect("daemon checkout");
+    std::fs::create_dir_all(acting.path().join(".git")).expect("acting checkout");
+    let primary_root = Some(primary.path().to_path_buf());
+    assert!(matches!(
+        lifecycle::resolve_gh_config_with(
+            acting.path(),
+            Some(dir.clone().into_os_string()),
+            None,
+            primary_root
+        ),
+        Ok(None)
+    ));
+    // Without the primary root the acting checkout does not own it: refused.
+    assert!(lifecycle::resolve_gh_config_with(
+        acting.path(),
+        Some(dir.into_os_string()),
+        None,
+        None
+    )
+    .is_err());
+}
+
+#[test]
+fn an_aliased_app_dir_location_is_not_recorded() {
+    use std::os::unix::fs::symlink;
+    let ws = tempfile::tempdir().expect("tempdir");
+    let real = ws.path().join("real-gh-config");
+    std::fs::create_dir_all(&real).expect("real dir");
+    std::fs::create_dir_all(ws.path().join(".loom")).expect(".loom");
+    symlink(&real, ws.path().join(".loom/gh-config")).expect("symlink");
+    std::fs::create_dir_all(ws.path().join(".git")).expect("checkout");
+    let dir = crate::credential_preflight::github_app_gh_config_dir(ws.path());
+    assert!(matches!(
+        lifecycle::resolve_gh_config_with(ws.path(), Some(dir.into_os_string()), None, None),
+        Ok(None)
+    ));
+}
+
+#[test]
+fn an_unrelated_dir_under_the_primary_checkout_is_still_refused() {
+    let primary = tempfile::tempdir().expect("tempdir");
+    std::fs::create_dir_all(primary.path().join(".git")).expect("checkout");
+    let dir = primary.path().join("credentials/gh");
+    std::fs::create_dir_all(&dir).expect("gh dir");
+    assert!(lifecycle::resolve_gh_config_with(
+        primary.path(),
+        Some(dir.into_os_string()),
+        None,
+        Some(primary.path().to_path_buf())
+    )
+    .is_err());
 }
 
 fn config() -> Config {
@@ -1031,12 +1244,12 @@ fn two_repositories_share_one_volume_with_independent_roots_and_untouched_first_
         f.additional_args(&r1.to_string_lossy(), "o-one-11111111"),
         f.additional_args(&r2.to_string_lossy(), "o-two-22222222"),
     );
-    let rev_a = repository::prepare(&f.root, &a).unwrap();
+    let rev_a = repository::prepare(&f.root, &a).unwrap().revision;
     // Unfinished work in the first additional clone survives preparing the second.
     let first = f.root.join("work/o-one-11111111");
     std::fs::write(first.join("scratch"), "unfinished").unwrap();
     std::fs::write(first.join("fixture"), "edited").unwrap();
-    let rev_b = repository::prepare(&f.root, &b).unwrap();
+    let rev_b = repository::prepare(&f.root, &b).unwrap().revision;
     assert_ne!(rev_a, rev_b);
     assert_eq!(std::fs::read_to_string(first.join("scratch")).unwrap(), "unfinished");
     assert_eq!(std::fs::read_to_string(first.join("fixture")).unwrap(), "edited");
@@ -1110,7 +1323,7 @@ fn interrupted_clone_is_recoverable_and_never_ready() {
         .to_string()
         .contains("mismatch"));
     std::fs::remove_file(f.root.join("work/.identity").join(format!("{slug}.json"))).unwrap();
-    let revision = repository::prepare(&f.root, &good).unwrap();
+    let revision = repository::prepare(&f.root, &good).unwrap().revision;
     assert!(!staging.exists());
     assert_eq!(git(&f.root.join("work").join(slug), &["rev-parse", "HEAD"]), revision);
 }
@@ -1218,6 +1431,280 @@ fn repository_bound_job_keeps_the_account_wide_exclusive_lease() {
     value.as_object_mut().unwrap().remove("repository");
     std::fs::write(root.path().join("job.json"), serde_json::to_vec(&value).unwrap()).unwrap();
     assert_eq!(lease::read(root.path()).unwrap().unwrap().repository, "");
+}
+
+/// #14678: the seat-reclaim exec drives the in-volume verb directly — same
+/// protocol envelope as `recover`, the account's resolved auth forwarded by
+/// name on the child, and **no `prepare` step anywhere in argv**: the pass
+/// must reach a dirty seat, which preparation would refuse.
+#[test]
+fn seat_reclaim_exec_drives_the_verb_without_any_preparation() {
+    const SECRET: &str = "ghs_seatTESTONLY14678";
+    let mut config = config();
+    config.repository = "https://github.com/acme/widget".into();
+    let argv = std::rc::Rc::new(std::cell::RefCell::new(Vec::<String>::new()));
+    let seen = argv.clone();
+    let _fake = docker::fake::install(Box::new(move |args| {
+        *seen.borrow_mut() = args.iter().map(|a| (*a).to_owned()).collect();
+        Ok(serde_json::json!({
+            "protocol": PROTOCOL,
+            "outcome": {
+                "worktrees_scanned": 1,
+                "worktrees_removed": 0,
+                "worktrees_failed": 0,
+                "preserved": ["PR still open"],
+                "bytes": 0,
+                "scratch_removed": 0,
+                "scratch_scanned": 0,
+                "scratch_bytes": 0,
+            }
+        })
+        .to_string())
+    }));
+    let ws = forge_auth::published_owner_workspace("acme");
+    let resolved =
+        forge_auth::ExecAuth::resolve_with(ws.path(), &config.repository, &|_| None, &|_| {
+            Some(SECRET.into())
+        });
+    let outcome = docker::seat_reclaim(&config, 86_400, 3_600, &resolved).unwrap();
+    assert_eq!(outcome.worktrees_scanned, 1);
+    assert_eq!(outcome.preserved, vec!["PR still open".to_string()]);
+
+    let args = argv.borrow().clone();
+    let joined = args.join(" ");
+    assert!(joined.contains("private-workspace seat-reclaim"), "{args:?}");
+    assert!(joined.contains("--account account"), "{args:?}");
+    assert!(joined.contains("--max-age-secs 86400"), "{args:?}");
+    assert!(joined.contains("--grace-secs 3600"), "{args:?}");
+    assert!(
+        !joined.contains("prepare"),
+        "the seat pass must not prepare the target ({args:?})"
+    );
+    assert!(
+        args.windows(2)
+            .any(|w| w[0] == "--env" && w[1] == "GH_TOKEN"),
+        "{args:?}"
+    );
+    assert!(!args.iter().any(|a| a.contains(SECRET)), "token leaked into argv");
+}
+
+/// #14889: the seat outcome carries one record per removed item with serde
+/// defaults, so an older counts-only seat image still parses and yields the
+/// two summary spans, and a current image's records reach the host intact.
+#[test]
+fn seat_reclaim_outcome_carries_removal_records_and_tolerates_counts_only_images() {
+    let mut config = config();
+    config.repository = "https://github.com/acme/widget".into();
+    let ws = forge_auth::published_owner_workspace("acme");
+    let resolved =
+        forge_auth::ExecAuth::resolve_with(ws.path(), &config.repository, &|_| None, &|_| None);
+
+    // An older seat image: counts only, no `removed`, no failure field.
+    let older = serde_json::json!({
+        "protocol": PROTOCOL,
+        "outcome": {
+            "worktrees_scanned": 2, "worktrees_removed": 1, "worktrees_failed": 0,
+            "preserved": ["PR still open"], "bytes": 4096,
+            "scratch_removed": 1, "scratch_scanned": 1, "scratch_bytes": 512,
+        }
+    })
+    .to_string();
+    let outcome = {
+        let response = older.clone();
+        let _older = docker::fake::install(Box::new(move |_| Ok(response.clone())));
+        docker::seat_reclaim(&config, 86_400, 3_600, &resolved).unwrap()
+    };
+    assert_eq!(outcome.worktrees_removed, 1);
+    assert_eq!(outcome.scratch_removed, 1);
+    assert!(outcome.removed.is_empty(), "older images carry no records");
+    assert_eq!(outcome.inspection_error, None);
+    let ((), captured) = crate::observability::ops::capture::capture(|| {
+        seat_reclaim::report_seat("agent-7", &outcome, std::time::Duration::from_secs(1));
+    });
+    // A counts-only response still yields the two per-seat summaries with
+    // their phases, counts and byte totals.
+    let summaries: Vec<(&str, &str, &str)> = captured
+        .spans
+        .iter()
+        .map(|span| {
+            (
+                span.name.as_str(),
+                span.attributes["loom.reaper.phase"].as_str(),
+                span.attributes["loom.reaper.removed"].as_str(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        summaries,
+        [
+            ("reaper.pass", "reap", "1"),
+            ("reaper.pass", "reclaim", "1")
+        ]
+    );
+    assert!(captured
+        .spans
+        .iter()
+        .all(|span| span.name.as_str() != "reaper.removal"));
+
+    // A current image: the records cross the JSON boundary field-for-field.
+    let current = serde_json::json!({
+        "protocol": PROTOCOL,
+        "outcome": {
+            "worktrees_scanned": 1, "worktrees_removed": 1, "worktrees_failed": 0,
+            "preserved": [], "bytes": 8192,
+            "scratch_removed": 1, "scratch_scanned": 1, "scratch_bytes": 512,
+            "removed": [
+                {"kind": "worktree", "path": "repo/.loom/worktrees/issue-9",
+                 "branch": "feature/issue-9", "tip": "a".repeat(40), "bytes": 7680},
+                {"kind": "scratch", "path": "cache/sta-6421", "bytes": 512},
+            ],
+            "inspection_error": "workspace Git worktree failed (exit status: 128)",
+        }
+    })
+    .to_string();
+    let outcome = {
+        let response = current.clone();
+        let _newer = docker::fake::install(Box::new(move |_| Ok(response.clone())));
+        docker::seat_reclaim(&config, 86_400, 3_600, &resolved).unwrap()
+    };
+    assert_eq!(
+        outcome.removed,
+        vec![
+            seat_reclaim::RemovedItem {
+                kind: "worktree".into(),
+                path: "repo/.loom/worktrees/issue-9".into(),
+                branch: Some("feature/issue-9".into()),
+                tip: Some("a".repeat(40)),
+                bytes: Some(7680),
+            },
+            seat_reclaim::RemovedItem {
+                kind: "scratch".into(),
+                path: "cache/sta-6421".into(),
+                branch: None,
+                tip: None,
+                bytes: Some(512),
+            },
+        ]
+    );
+    assert_eq!(
+        outcome.inspection_error.as_deref(),
+        Some("workspace Git worktree failed (exit status: 128)")
+    );
+}
+
+/// #14889: one removal span per item keeps every field after export
+/// bounding — 33 removals in one phase sit past `SpanRecord::bounded`'s
+/// 32-event cap, which a per-item span must never be subject to — and a
+/// path longer than the 256-byte attribute bound stays correlatable to the
+/// full, escaped local log entry through its bounded base name.
+#[test]
+fn removal_spans_survive_export_bounding_for_every_item() {
+    let mut config = config();
+    config.repository = "https://github.com/acme/widget".into();
+    let ws = forge_auth::published_owner_workspace("acme");
+    let resolved =
+        forge_auth::ExecAuth::resolve_with(ws.path(), &config.repository, &|_| None, &|_| None);
+
+    // A worktree path 292 bytes long in 10-byte segments: over the
+    // 256-byte attribute-value bound, with a short final component.
+    let deep = vec!["branch-xyz"; 24].join("/");
+    let long_path = format!("repo/.loom/worktrees/issue-9/{deep}");
+    assert!(long_path.len() > 256, "{}", long_path.len());
+    // A crafted scratch name that must not forge or split the log line.
+    let forged = "evil-42\nFAKE: seat agent-7 removed /etc";
+
+    let mut removed: Vec<serde_json::Value> = (0..33)
+        .map(|n| serde_json::json!({"kind": "scratch", "path": format!("cache/sta-{n}"), "bytes": 10}))
+        .collect();
+    removed.push(serde_json::json!({"kind": "scratch", "path": forged, "bytes": 7}));
+    removed.push(serde_json::json!({
+        "kind": "worktree", "path": long_path, "branch": "feature/issue-9",
+        "tip": "b".repeat(40), "bytes": 4864,
+    }));
+    let response = serde_json::json!({
+        "protocol": PROTOCOL,
+        "outcome": {
+            "worktrees_scanned": 1, "worktrees_removed": 1, "worktrees_failed": 0,
+            "preserved": [], "bytes": 8201,
+            "scratch_removed": 34, "scratch_scanned": 34, "scratch_bytes": 337,
+            "removed": removed,
+        }
+    })
+    .to_string();
+    let outcome = {
+        let _fake = docker::fake::install(Box::new(move |_| Ok(response.clone())));
+        docker::seat_reclaim(&config, 86_400, 3_600, &resolved).unwrap()
+    };
+    assert_eq!(outcome.removed.len(), 35);
+
+    let logs = crate::test_log_capture::capture_logs(|| {
+        let ((), captured) = crate::observability::ops::capture::capture(|| {
+            seat_reclaim::report_seat("agent-7", &outcome, std::time::Duration::from_secs(1));
+        });
+        let summaries: Vec<(&str, &str)> = captured
+            .spans
+            .iter()
+            .filter(|span| span.name.as_str() == "reaper.pass")
+            .map(|span| {
+                (
+                    span.attributes["loom.reaper.phase"].as_str(),
+                    span.attributes["loom.reaper.removed"].as_str(),
+                )
+            })
+            .collect();
+        assert_eq!(summaries, [("reap", "1"), ("reclaim", "34")]);
+        let removals: Vec<_> = captured
+            .spans
+            .iter()
+            .filter(|span| span.name.as_str() == "reaper.removal")
+            .map(|span| span.clone().bounded())
+            .collect();
+        assert_eq!(removals.len(), 35, "one span per item, no per-span event cap");
+        // All 33 same-phase items keep every field after bounding.
+        for n in 0..33 {
+            let span = removals
+                .iter()
+                .find(|span| {
+                    span.attributes
+                        .get("loom.reaper.removal.path")
+                        .is_some_and(|p| p == &format!("cache/sta-{n}"))
+                })
+                .unwrap_or_else(|| panic!("span for cache/sta-{n} kept its path"));
+            assert_eq!(span.attributes["loom.reaper.removal.kind"], "scratch");
+            assert_eq!(span.attributes["loom.reaper.removal.bytes"], "10");
+            assert_eq!(span.attributes["loom.reaper.removal.name"], format!("sta-{n}"));
+            assert_eq!(span.attributes["loom.repo"], "agent-7");
+        }
+        // The over-long path is dropped by the bound, but the base name
+        // keeps the span correlatable; the crafted name never enters it.
+        let long = removals
+            .iter()
+            .find(|span| {
+                span.attributes
+                    .get("loom.reaper.removal.tip")
+                    .is_some_and(|t| t.starts_with('b'))
+            })
+            .expect("the long-path worktree span");
+        assert!(!long.attributes.contains_key("loom.reaper.removal.path"));
+        assert_eq!(long.attributes["loom.reaper.removal.name"], "branch-xyz");
+        assert_eq!(long.attributes["loom.reaper.removal.tip"], "b".repeat(40));
+    });
+    // The long identity remains correlatable: the local log carries the
+    // full, escaped path AND the bounded base name the span kept.
+    let item_line = logs
+        .iter()
+        .map(|(_, line)| line.as_str())
+        .find(|line| line.contains("branch-xyz"))
+        .expect("the long-path item's log line");
+    assert!(item_line.contains(&long_path), "full path: {item_line}");
+    // The crafted name cannot forge or split a line: it appears escaped,
+    // and no captured message contains a raw newline.
+    let escaped = logs
+        .iter()
+        .map(|(_, line)| line.as_str())
+        .find(|line| line.contains("evil-42"))
+        .expect("the crafted item's log line");
+    assert!(escaped.contains("\\nFAKE:") && !escaped.contains('\n'), "{escaped:?}");
 }
 
 /// #13916: on an App-only host the prepare exec names `GH_TOKEN` as a bare
@@ -1443,4 +1930,415 @@ fn rebind_of_an_uncloned_registration_moves_nothing_and_a_foreign_dir_is_kept() 
     let mut same = rebind_args(&old, &new, false);
     same.to_slug = OLD_SLUG.into();
     assert!(repository::rebind(&f.root, &same).is_err());
+}
+
+/// A linked worktree on a fresh branch `name` cut from the base, under the
+/// volume root.
+fn linked_worktree(f: &RepoFixture, name: &str) -> PathBuf {
+    let repo = f.root.join("repo");
+    let worktree = f.root.join(name);
+    git(&repo, &["worktree", "add", "-b", name, worktree.to_str().unwrap()]);
+    worktree
+}
+
+#[test]
+#[serial_test::serial(private_workspace_fork)]
+#[serial_test::serial]
+fn untracked_tool_caches_do_not_refuse_preparation_but_other_dirt_does() {
+    let _fork = fork_guard();
+    let f = RepoFixture::new();
+    f.prepare().unwrap();
+    // The measured wedge (#14458): one untracked `.cache/` of tool caches in a
+    // leftover worktree, nothing unpublished.
+    let worktree = linked_worktree(&f, "issue-5084");
+    std::fs::create_dir_all(worktree.join(".cache/actionlint")).unwrap();
+    std::fs::write(worktree.join(".cache/actionlint/bin"), "cache").unwrap();
+    f.prepare().unwrap();
+    assert!(worktree.join(".cache/actionlint/bin").exists(), "forgiven, not removed");
+    // Real dirt next to it still refuses, names the seat_dirty reason, the
+    // path, and the listing command.
+    std::fs::write(worktree.join("stray.txt"), "retain").unwrap();
+    let error = f.prepare().unwrap_err().to_string();
+    assert!(error.contains("seat_dirty"), "{error}");
+    assert!(error.contains("stray.txt"), "{error}");
+    assert!(!error.contains(".cache"), "{error}");
+    assert!(error.contains("accounts session recover 'fixture'"), "{error}");
+    assert!(error.contains(worktree.to_str().unwrap()), "{error}");
+}
+
+#[test]
+#[serial_test::serial(private_workspace_fork)]
+#[serial_test::serial]
+fn recover_lists_dirty_worktrees_with_counts_when_nothing_is_unpublished() {
+    let _fork = fork_guard();
+    let f = RepoFixture::new();
+    f.prepare().unwrap();
+    // An abandoned merge state: staged paths, no unpublished commits.
+    let staged = linked_worktree(&f, "issue-5550");
+    for i in 0..3 {
+        std::fs::write(staged.join(format!("staged-{i}")), "x").unwrap();
+    }
+    git(&staged, &["add", "."]);
+    let untracked = linked_worktree(&f, "issue-5084");
+    std::fs::write(untracked.join("stray.txt"), "x").unwrap();
+    std::fs::write(untracked.join("other.txt"), "x").unwrap();
+    let clean = linked_worktree(&f, "issue-1");
+    let out = repository::recover(&f.root, &recover_args(&f.remote)).unwrap();
+    assert!(out.branches.is_empty() && out.detached.is_empty());
+    let listed = |path: &Path| {
+        out.dirty_worktrees
+            .iter()
+            .find(|d| d.path == path.display().to_string())
+            .cloned()
+    };
+    let staged_entry = listed(&staged).expect("staged worktree listed");
+    assert_eq!(
+        (staged_entry.branch.as_deref(), staged_entry.tracked, staged_entry.untracked),
+        (Some("issue-5550"), 3, 0)
+    );
+    assert_eq!(staged_entry.unpublished, 0);
+    let untracked_entry = listed(&untracked).expect("untracked worktree listed");
+    assert_eq!((untracked_entry.tracked, untracked_entry.untracked), (0, 2));
+    assert!(listed(&clean).is_none(), "a clean worktree is not listed");
+    assert!(listed(&f.root.join("repo")).is_none());
+}
+
+#[test]
+#[serial_test::serial(private_workspace_fork)]
+#[serial_test::serial]
+fn discard_worktree_removes_only_the_named_dirty_worktree_and_keeps_its_branch() {
+    let _fork = fork_guard();
+    let f = RepoFixture::new();
+    f.prepare().unwrap();
+    let repo = f.root.join("repo");
+    let named = linked_worktree(&f, "issue-5550");
+    std::fs::write(named.join("stray.txt"), "x").unwrap();
+    git(&named, &["add", "."]);
+    let other = linked_worktree(&f, "issue-6000");
+    std::fs::write(other.join("keep.txt"), "retain").unwrap();
+    let mut args = recover_args(&f.remote);
+    args.discard = true;
+    args.worktree = vec![named.clone()];
+    let out = repository::recover(&f.root, &args).unwrap();
+    assert_eq!(out.removed_worktrees, vec![named.display().to_string()]);
+    assert!(!named.exists());
+    assert!(git_ok(&repo, &["show-ref", "--verify", "refs/heads/issue-5550"]), "branch kept");
+    assert!(other.join("keep.txt").exists(), "an unnamed worktree is never touched");
+    assert_eq!(out.dirty_worktrees.len(), 1);
+    assert_eq!(out.dirty_worktrees[0].path, other.display().to_string());
+    // The seat is unwedged only once the other leftover is dealt with too.
+    assert!(f.prepare().unwrap_err().to_string().contains("seat_dirty"));
+    args.worktree = vec![other.clone()];
+    repository::recover(&f.root, &args).unwrap();
+    f.prepare().unwrap();
+}
+
+#[test]
+#[serial_test::serial(private_workspace_fork)]
+#[serial_test::serial]
+fn discard_worktree_refuses_unpublished_commits_main_checkout_and_unknown_paths() {
+    let _fork = fork_guard();
+    let f = RepoFixture::new();
+    f.prepare().unwrap();
+    let repo = f.root.join("repo");
+    // Dirty with two... one unpublished commit on its branch (the #6016 shape).
+    let work = linked_worktree(&f, "issue-6016");
+    std::fs::write(work.join("fixture"), "committed").unwrap();
+    git(&work, &["commit", "-am", "unpublished"]);
+    std::fs::write(work.join("fixture"), "modified").unwrap();
+    let mut args = recover_args(&f.remote);
+    args.discard = true;
+    args.worktree = vec![work.clone()];
+    let error = repository::recover(&f.root, &args).unwrap_err().to_string();
+    assert!(error.contains("unpublished"), "{error}");
+    assert!(work.exists());
+    assert_eq!(std::fs::read_to_string(work.join("fixture")).unwrap(), "modified");
+    // The main checkout is never removable this way.
+    args.worktree = vec![repo.clone()];
+    let error = repository::recover(&f.root, &args).unwrap_err().to_string();
+    assert!(error.contains("main checkout"), "{error}");
+    assert!(repo.join(".git").is_dir());
+    // A path that is no worktree of this clone is reported, not acted on.
+    let stray = f.root.join("not-a-worktree");
+    std::fs::create_dir(&stray).unwrap();
+    args.worktree = vec![stray.clone()];
+    args.validate_worktrees = true;
+    let out = repository::recover(&f.root, &args).unwrap();
+    assert_eq!(out.ignored, vec![stray.display().to_string()]);
+    args.validate_worktrees = false;
+    assert!(repository::recover(&f.root, &args).is_err());
+    assert!(stray.exists());
+    // Discard still needs some scope.
+    args.worktree.clear();
+    assert!(repository::recover(&f.root, &args).is_err());
+    // Once published, the same worktree is removable and the work survives
+    // on origin.
+    args.discard = false;
+    args.publish = true;
+    repository::recover(&f.root, &args).unwrap();
+    args.publish = false;
+    args.discard = true;
+    args.worktree = vec![work.clone()];
+    let out = repository::recover(&f.root, &args).unwrap();
+    assert_eq!(out.removed_worktrees.len(), 1);
+    assert!(git_ok(&f.remote, &["show-ref", "--verify", "refs/heads/issue-6016"]));
+}
+
+#[test]
+fn preparation_keeps_a_fast_forwarded_draft_without_finished_pr_evidence() {
+    let _fork = fork_guard();
+    let f = RepoFixture::new();
+    f.prepare().unwrap();
+    let draft = linked_worktree(&f, "draft");
+    std::fs::write(f.remote.join("fixture"), "B").unwrap();
+    git(&f.remote, &["commit", "-am", "B"]);
+    git(&draft, &["fetch", "origin"]);
+    git(&draft, &["merge", "--ff-only", "origin/main"]);
+    let tip = git(&draft, &["rev-parse", "HEAD"]);
+    std::fs::write(f.remote.join("fixture"), "C").unwrap();
+    git(&f.remote, &["commit", "-am", "C"]);
+    std::fs::write(draft.join("unsaved.txt"), "preserve").unwrap();
+
+    let lookup = |_: &Path, repository: &str, branch: &str, revision: &str| {
+        assert_eq!(repository, f.args.repository);
+        assert_eq!(branch, "draft");
+        assert_eq!(revision, tip);
+        false
+    };
+    let error = repository::prepare_with_pr_lookup(&f.root, &f.args, &lookup, &temp_base())
+        .unwrap_err()
+        .to_string();
+
+    assert!(error.contains("seat_dirty") && error.contains("unsaved.txt"), "{error}");
+    assert_eq!(std::fs::read_to_string(draft.join("unsaved.txt")).unwrap(), "preserve");
+}
+
+#[test]
+fn preparation_reaps_published_finished_prs_independent_of_merge_method() {
+    let _fork = fork_guard();
+    for state in ["fast-forward", "squash", "closed"] {
+        let f = RepoFixture::new();
+        let fresh = repository::prepare(&f.root, &f.args).unwrap();
+        assert!(fresh.reaped.is_empty(), "a no-reap preparation reports none");
+        let worktree = linked_worktree(&f, "finished");
+        let expected_path = worktree.canonicalize().unwrap().display().to_string();
+        for text in ["first", "second"] {
+            std::fs::write(worktree.join("fixture"), text).unwrap();
+            git(&worktree, &["commit", "-am", text]);
+        }
+        git(&worktree, &["push", "origin", "finished"]);
+        let tip = git(&worktree, &["rev-parse", "HEAD"]);
+        match state {
+            "fast-forward" => {
+                git(&f.remote, &["merge", "--ff-only", "finished"]);
+                assert_eq!(git(&f.remote, &["rev-parse", "HEAD"]), tip);
+            }
+            "squash" => {
+                git(&f.remote, &["merge", "--squash", "finished"]);
+                git(&f.remote, &["commit", "-m", "squash"]);
+                assert!(!git_ok(&f.remote, &["merge-base", "--is-ancestor", &tip, "HEAD"]));
+            }
+            "closed" => {
+                assert!(!git_ok(&f.remote, &["merge-base", "--is-ancestor", &tip, "HEAD"]));
+            }
+            _ => unreachable!(),
+        }
+        std::fs::write(worktree.join("leftover"), "abandoned").unwrap();
+        git(&worktree, &["add", "leftover"]);
+        let repo = f.root.join("repo").canonicalize().unwrap();
+        let evidence = |cwd: &Path, repository: &str, branch: &str, revision: &str| {
+            assert_eq!(cwd, repo);
+            assert_eq!(repository, f.args.repository);
+            assert_eq!(branch, "finished");
+            assert_eq!(revision, tip);
+            true
+        };
+        let outcome =
+            repository::prepare_with_pr_lookup(&f.root, &f.args, &evidence, &temp_base()).unwrap();
+        assert!(!worktree.exists(), "{state} leftover removed");
+        assert_eq!(outcome.reaped, vec![expected_path], "{state} reaped worktree is reported");
+        assert_eq!(git(&repo, &["rev-parse", "refs/heads/finished"]), tip);
+        assert_eq!(git(&f.remote, &["rev-parse", "refs/heads/finished"]), tip);
+    }
+}
+
+#[test]
+fn preparation_reports_a_reaped_worktree_when_another_refuses_reuse() {
+    let _fork = fork_guard();
+    let f = RepoFixture::new();
+    f.prepare().unwrap();
+    let finished = linked_worktree(&f, "finished");
+    git(&finished, &["push", "origin", "finished"]);
+    let tip = git(&finished, &["rev-parse", "HEAD"]);
+    let expected = finished.canonicalize().unwrap().display().to_string();
+    std::fs::write(finished.join("leftover"), "abandoned").unwrap();
+
+    let dirty = linked_worktree(&f, "still-active");
+    std::fs::write(dirty.join("retained.txt"), "keep me").unwrap();
+    let evidence =
+        |_: &Path, _: &str, branch: &str, revision: &str| branch == "finished" && revision == tip;
+    let refusal = repository::prepare_response(repository::prepare_with_pr_lookup(
+        &f.root,
+        &f.args,
+        &evidence,
+        &temp_base(),
+    ));
+    assert!(refusal["error"].as_str().unwrap().contains("seat_dirty"), "{refusal}");
+    assert!(!finished.exists());
+    assert_eq!(std::fs::read_to_string(dirty.join("retained.txt")).unwrap(), "keep me");
+    assert_eq!(refusal["reaped_worktrees"], serde_json::json!([expected]));
+
+    let refused_again = repository::prepare_response(repository::prepare_with_pr_lookup(
+        &f.root,
+        &f.args,
+        &evidence,
+        &temp_base(),
+    ));
+    assert_eq!(refused_again["error"], refusal["error"]);
+    assert_eq!(refused_again["reaped_worktrees"], serde_json::json!([]));
+}
+
+#[test]
+fn preparation_preserves_commits_missing_from_origin_even_with_finished_pr_evidence() {
+    let _fork = fork_guard();
+    let f = RepoFixture::new();
+    f.prepare().unwrap();
+    let worktree = linked_worktree(&f, "unpublished");
+    std::fs::write(worktree.join("fixture"), "unpublished").unwrap();
+    git(&worktree, &["commit", "-am", "unpublished"]);
+    let tip = git(&worktree, &["rev-parse", "HEAD"]);
+    std::fs::write(worktree.join("leftover"), "keep").unwrap();
+    let lookup =
+        |_: &Path, _: &str, _: &str, _: &str| panic!("unpublished tips must skip the PR read");
+    let error = repository::prepare_with_pr_lookup(&f.root, &f.args, &lookup, &temp_base())
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("seat_dirty"), "{error}");
+    assert!(worktree.join("leftover").exists());
+    assert_eq!(git(&worktree, &["rev-parse", "HEAD"]), tip);
+}
+
+#[test]
+fn preparation_and_recovery_show_tracked_cache_edits_and_main_checkout_guidance() {
+    let _fork = fork_guard();
+    let f = RepoFixture::new();
+    std::fs::create_dir(f.remote.join(".cache")).unwrap();
+    std::fs::write(f.remote.join(".cache/tracked"), "base").unwrap();
+    git(&f.remote, &["add", ".cache/tracked"]);
+    git(&f.remote, &["commit", "-m", "track fixture"]);
+    f.prepare().unwrap();
+    let main = f.root.join("repo");
+    std::fs::write(main.join(".cache/tracked"), "real edit").unwrap();
+    std::fs::write(main.join(".cache/ephemeral\ncache"), "untracked").unwrap();
+
+    let error = f.prepare().unwrap_err().to_string();
+    assert!(error.contains("seat_dirty") && error.contains(".cache/tracked"), "{error}");
+    assert!(error.contains("save or resolve its changes in place"), "{error}");
+    assert!(
+        !error.contains("--discard --worktree") && !error.contains("ephemeral"),
+        "{error}"
+    );
+    let out = repository::recover(&f.root, &recover_args(&f.remote)).unwrap();
+    assert_eq!(out.dirty_worktrees.len(), 1);
+    let dirty = &out.dirty_worktrees[0];
+    assert_eq!(dirty.path, main.display().to_string());
+    assert_eq!((dirty.tracked, dirty.untracked), (1, 0));
+    assert_eq!(dirty.recovery_guidance("fixture"), "save or resolve its changes in place");
+}
+
+#[test]
+fn discard_validates_every_path_before_removing_any_and_deduplicates_aliases() {
+    let _fork = fork_guard();
+    let f = RepoFixture::new();
+    f.prepare().unwrap();
+    let main = f.root.join("repo");
+    let worktree = linked_worktree(&f, "leftover");
+    std::fs::write(worktree.join("keep.txt"), "keep").unwrap();
+    let mut args = recover_args(&f.remote);
+    args.discard = true;
+    args.worktree = vec![worktree.clone(), main.clone()];
+    assert!(repository::recover(&f.root, &args)
+        .unwrap_err()
+        .to_string()
+        .contains("main checkout"));
+    assert!(worktree.join("keep.txt").exists());
+
+    let missing = f.root.join("missing");
+    args.worktree = vec![worktree.clone(), missing.clone()];
+    assert!(repository::recover(&f.root, &args).is_err());
+    assert!(worktree.join("keep.txt").exists());
+
+    args.validate_worktrees = true;
+    let validates = repository::recover(&f.root, &args).unwrap();
+    assert!(lifecycle::plan_worktree_discard(&args.worktree, &[validates])
+        .unwrap_err()
+        .to_string()
+        .contains("nothing removed"));
+    assert!(worktree.join("keep.txt").exists());
+
+    let alias = f.root.join("alias");
+    std::os::unix::fs::symlink(&worktree, &alias).unwrap();
+    args.worktree = vec![worktree.clone(), alias, worktree.clone()];
+    args.validate_worktrees = false;
+    let out = repository::recover(&f.root, &args).unwrap();
+    assert_eq!(out.removed_worktrees, vec![worktree.display().to_string()]);
+    assert!(!worktree.exists());
+}
+
+#[test]
+fn mixed_branch_and_worktree_discard_changes_nothing() {
+    let _fork = fork_guard();
+    let f = RepoFixture::new();
+    f.prepare().unwrap();
+    let main = f.root.join("repo");
+    git(&main, &["switch", "-c", "unpublished"]);
+    std::fs::write(main.join("fixture"), "keep this commit").unwrap();
+    git(&main, &["commit", "-am", "unpublished"]);
+    let tip = git(&main, &["rev-parse", "HEAD"]);
+    git(&main, &["switch", "--detach", "origin/main"]);
+    let mut args = recover_args(&f.remote);
+    args.discard = true;
+    args.branch = vec!["unpublished".into()];
+    args.worktree = vec![main.clone()];
+
+    let error = repository::recover(&f.root, &args).unwrap_err().to_string();
+    assert!(error.contains("separately"), "{error}");
+    assert_eq!(git(&main, &["rev-parse", "refs/heads/unpublished"]), tip);
+}
+
+#[test]
+#[serial_test::serial(private_workspace_fork)]
+#[serial_test::serial]
+fn a_dirty_worktree_in_one_clone_does_not_refuse_the_seats_other_clone() {
+    let _fork = fork_guard();
+    let f = RepoFixture::new();
+    f.prepare().unwrap();
+    let additional = repository::PrepareArgs {
+        account: "fixture".into(),
+        repository: f.remote.to_string_lossy().into_owned(),
+        base: "main".into(),
+        container_id: "test-container".into(),
+        branch: None,
+        slug: Some("owner-repo-12345678".into()),
+    };
+    repository::prepare(&f.root, &additional).unwrap();
+    let wedged = linked_worktree(&f, "issue-5084");
+    std::fs::write(wedged.join("stray.txt"), "x").unwrap();
+    assert!(f.prepare().unwrap_err().to_string().contains("seat_dirty"));
+    // The other repository's clone prepares regardless (#14458).
+    repository::prepare(&f.root, &additional).unwrap();
+}
+
+#[test]
+fn status_running_is_false_while_the_seat_is_restarting() {
+    let state = |running, restarting| serde_json::json!({"State": {"Running": running, "Restarting": restarting}});
+    // Docker reports Running=true during a crash-loop back-off (#15015).
+    assert!(!lifecycle::reports_running(Some(&state(true, true))));
+    assert!(lifecycle::reports_running(Some(&state(true, false))));
+    assert!(!lifecycle::reports_running(Some(&state(false, false))));
+    // A missing `Restarting` key is not restarting; no container is not running.
+    assert!(lifecycle::reports_running(Some(
+        &serde_json::json!({"State": {"Running": true}})
+    )));
+    assert!(!lifecycle::reports_running(None));
 }

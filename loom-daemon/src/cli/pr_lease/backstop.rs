@@ -1,16 +1,17 @@
 //! The PR-lease half of the Judge no-verdict backstop (#11855): `release`
-//! records a Judge pass that ended without a verdict, and `claim` refuses a
-//! Judge a PR those records hold. The rules live in
+//! records a Judge pass that ended without a verdict. `claim` enforces
+//! the hold, and `check` reports it. The rules live in
 //! [`crate::judge_backstop`].
 
 use crate::forge_call_stats::ops;
 use crate::gh_invocation::AccessIntent;
 use crate::judge_backstop::{self as backstop, CiRead, CiState};
+use crate::step_role::StepRole;
 use chrono::{DateTime, Utc};
 
 use super::{Ctx, Gh, Role, Row};
 
-/// `claim`: a Judge refused by the backstop. Like 4 and 5, the prompt's
+/// `claim` or `check`: a Judge held by the backstop. Like 4 and 5, the prompt's
 /// `[[ $? =~ ^[02]$ ]]` reads it as "stand down; next PR".
 pub(crate) const EXIT_BACKSTOP: i32 = 6;
 
@@ -89,6 +90,9 @@ pub(crate) fn release_fields(
 /// with no verdict; else nothing. Unlike [`release_fields`] there is no CI
 /// exemption: a pass the role runner killed at its timeout ceiling spent the
 /// whole ceiling, and is exactly the re-run the backstop exists to bound.
+/// A pass that never reached a review (`seat_busy`, a rejected launch, an
+/// exhausted provider; [`crate::pr_lease_reap::reason_never_reviewed`]) is
+/// not recorded (#14951): a runtime fault is not a no-verdict review.
 pub(crate) fn reaped_release_fields(
     role: Role,
     state: Option<(bool, String, Vec<String>)>,
@@ -96,7 +100,9 @@ pub(crate) fn reaped_release_fields(
 ) -> String {
     match state {
         Some((open, head, labels))
-            if role == Role::Judge && backstop::ended_without_verdict(open, &labels) =>
+            if !crate::pr_lease_reap::reason_never_reviewed(reason)
+                && role == Role::Judge
+                && backstop::ended_without_verdict(open, &labels) =>
         {
             backstop::reaped_fields(&head, &labels, reason)
         }
@@ -104,19 +110,22 @@ pub(crate) fn reaped_release_fields(
     }
 }
 
-/// The `outcome=` field a Champion release records (#12616): the step's
-/// `CHAMPION-STEP` outcome word, or `none` when it wrote no line (a step that
-/// died). A merge leaves the release as it was. Anything but `[A-Za-z0-9_-]`
-/// is dropped so the word cannot break the marker. A `requeued` / `skipped`
-/// outcome also records the gate it stopped at, `reason=<token>` (#12715);
-/// `unspecified` when the step named none.
-pub(crate) fn champion_outcome_fields(
+/// The typed outcome a Champion release records (#12616), as the pair its
+/// marker's fields and the step's journal (#14639) both carry: the step's
+/// `CHAMPION-STEP` outcome word (`none` when it wrote no line — a step that
+/// died), and for a `requeued` / `skipped` outcome the gate it stopped at,
+/// `reason=<token>` (#12715; `unspecified` when it named none). Anything but
+/// `[A-Za-z0-9_-]` is dropped so the word cannot break the marker. `None`
+/// when this release records no typed outcome: another role, a promotion
+/// step, or a merge (the marker keeps only its identity).
+pub(crate) fn champion_outcome(
     role: Role,
+    step: Option<StepRole>,
     outcome: Option<&str>,
     stop_reason: Option<&str>,
-) -> String {
-    if role != Role::Champion {
-        return String::new();
+) -> Option<(String, Option<String>)> {
+    if role != Role::Champion || step == Some(StepRole::ChampionPromote) {
+        return None;
     }
     let token = |raw: Option<&str>, max: usize| -> String {
         raw.unwrap_or_default()
@@ -127,8 +136,8 @@ pub(crate) fn champion_outcome_fields(
     };
     let word = token(outcome, 32);
     match word.as_str() {
-        "merged" => String::new(),
-        "" => " outcome=none".to_string(),
+        "merged" => None,
+        "" => Some(("none".to_string(), None)),
         w @ ("requeued" | "skipped") => {
             let reason = token(stop_reason, 32);
             let reason = if reason.is_empty() {
@@ -136,9 +145,18 @@ pub(crate) fn champion_outcome_fields(
             } else {
                 &reason
             };
-            format!(" outcome={w} reason={reason}")
+            Some((w.to_string(), Some(reason.to_string())))
         }
-        w => format!(" outcome={w}"),
+        w => Some((w.to_string(), None)),
+    }
+}
+
+/// The marker fields of [`champion_outcome`]'s pair.
+pub(crate) fn format_champion_outcome(word: &str, reason: Option<&str>) -> String {
+    match (word, reason) {
+        (w, Some(r)) => format!(" outcome={w} reason={r}"),
+        ("none", None) => " outcome=none".to_string(),
+        (w, None) => format!(" outcome={w}"),
     }
 }
 
@@ -172,12 +190,17 @@ pub(crate) fn hold_with_reason(
 }
 
 impl Ctx {
-    /// `claim`'s backstop check: `Some(exit)` when this Judge must stand down.
-    pub(crate) fn backstop_refusal(&self, rows: &[Row]) -> Option<i32> {
+    /// Active hold for an enabled Judge. Callers consult this when the role's lease is free.
+    pub(super) fn backstop_hold(&self, rows: &[Row]) -> Option<(DateTime<Utc>, Option<String>)> {
         if self.me.role != Role::Judge || !backstop::enabled() {
             return None;
         }
-        let (until, refused) = hold_with_reason(rows, self.gh.pr_head(self.pr()), (self.now)())?;
+        hold_with_reason(rows, self.gh.pr_head(self.pr()), (self.now)())
+    }
+
+    /// `claim`'s backstop check: `Some(exit)` when this Judge must stand down.
+    pub(crate) fn backstop_refusal(&self, rows: &[Row]) -> Option<i32> {
+        let (until, refused) = self.backstop_hold(rows)?;
         let why = match refused {
             Some(token) => format!(
                 "the last pass was refused by a gate (`{token}`), not a looping pass (#13135)"
@@ -237,6 +260,32 @@ mod tests {
             id,
             updated_at: at,
             body: format!("<!-- loom:pr-lease-released role=judge host=h sweep=s{id}{fields} -->"),
+        }
+    }
+
+    #[test]
+    fn a_seat_busy_exit_does_not_stamp_a_judge_no_verdict() {
+        let waiting = ["loom:review-requested", "loom:reviewing"];
+        assert_eq!(reaped_release_fields(Role::Judge, state(&waiting), "seat_busy"), "");
+        assert!(
+            reaped_release_fields(Role::Judge, state(&waiting), "exited").contains("verdict=none")
+        );
+    }
+
+    #[test]
+    fn a_pass_that_never_reached_a_review_does_not_stamp_a_judge_no_verdict() {
+        use crate::pr_lease_reap::{REASON_LAUNCH_REJECTED, REASON_PROVIDER_EXHAUSTED};
+        let waiting = ["loom:review-requested", "loom:reviewing"];
+        for reason in [REASON_LAUNCH_REJECTED, REASON_PROVIDER_EXHAUSTED] {
+            assert_eq!(reaped_release_fields(Role::Judge, state(&waiting), reason), "", "{reason}");
+        }
+        // A Judge that ran and ended without a verdict still counts toward the hold.
+        for reason in ["exited", "timeout"] {
+            let fields = reaped_release_fields(Role::Judge, state(&waiting), reason);
+            assert_eq!(
+                fields,
+                format!(" head={HEAD} verdict=none labels=review-requested reaped={reason}")
+            );
         }
     }
 

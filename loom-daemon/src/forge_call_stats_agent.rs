@@ -190,13 +190,17 @@ fn holds_only_sink_files(dir: &std::path::Path) -> bool {
 }
 
 /// A name the sink itself writes: `calls-<hour>.jsonl`, the bucket book's
-/// snapshot, or that snapshot's in-flight temp file
-/// (`crate::forge_bucket_book::persist`).
+/// snapshot, or that snapshot's in-flight staging file
+/// (`crate::forge_bucket_book::persist` -> [`crate::fs_util::write_atomic`],
+/// recognised by [`crate::fs_util::is_staging_name`]). The legacy
+/// `.bucket-book.json.<pid>` staging name of older daemons is kept so a stray
+/// left across an upgrade does not stop the sink mounting.
 #[must_use]
 pub fn is_sink_entry(name: &str) -> bool {
     let digits = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
     let snapshot = crate::forge_bucket_book::SNAPSHOT_FILE;
     name == snapshot
+        || crate::fs_util::is_staging_name(name)
         || name
             .strip_prefix("calls-")
             .and_then(|n| n.strip_suffix(".jsonl"))
@@ -379,6 +383,36 @@ mod tests {
         super::super::set_test_sink_dir(None);
     }
 
+    /// The writer's staging name and this allowlist are pinned together: the
+    /// name comes from a real `write_atomic` staging call, not a literal.
+    #[test]
+    fn a_real_write_atomic_staging_file_is_a_sink_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let staged = tempfile::Builder::new()
+            .prefix(crate::fs_util::STAGING_PREFIX)
+            .rand_bytes(crate::fs_util::STAGING_RAND_LEN)
+            .tempfile_in(dir.path())
+            .unwrap();
+        let name = staged
+            .path()
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        assert!(is_sink_entry(&name), "{name}");
+        // And what the real writer leaves in flight is the same shape.
+        crate::fs_util::write_atomic(
+            &dir.path().join(crate::forge_bucket_book::SNAPSHOT_FILE),
+            b"{}",
+            crate::fs_util::AtomicOpts::default(),
+        )
+        .unwrap();
+        for e in std::fs::read_dir(dir.path()).unwrap() {
+            let n = e.unwrap().file_name().to_string_lossy().into_owned();
+            assert!(n == name || is_sink_entry(&n), "{n}");
+        }
+    }
+
     #[test]
     fn sink_entries_are_only_what_the_sink_writes() {
         for ok in [
@@ -396,6 +430,10 @@ mod tests {
             "calls-1x.jsonl",
             ".bucket-book.json.",
             ".bucket-book.json.x",
+            ".tmp",
+            ".tmpabc",
+            ".tmpabcdefg",
+            ".tmpab-def",
             "bucket-book.json.bak",
             ".ssh",
             "docker.sock",

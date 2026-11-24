@@ -572,9 +572,20 @@ parse_dependencies() {
     return
   fi
   # Two-stage parse (#4508): select dependency lines (checkbox UNCHECKED-only,
-  # #7973), then extract every N / OWNER/REPO#N.
+  # #7973), then extract every N / OWNER/REPO#N. The sed stage between them
+  # is the #14732/#14750 parent-reference rule, identical to
+  # champion-common.md's extract_blocker_refs: a reference introduced by
+  # `Part of` (case-insensitive, optionally followed by the one bounded word
+  # `Epic` — Loom's generated `Part of Epic #N` vocabulary) names the issue's
+  # PARENT, not a blocker, and is masked before extraction. The bound is
+  # deliberate: no wider word run, so "Part of issue #2" and prose keep the
+  # established whole-line capture. It keys off the introducing phrase, never
+  # the number, so a parent genuinely declared again as a dependency still
+  # counts. This branch only — the park-record branch above keeps its own
+  # precedence (#13414).
   echo "$body" \
     | grep -E '(Blocked by|Depends on|Requires|\- \[ \])[*_:[:space:]]*([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)?#[0-9]+' \
+    | sed -E 's/[Pp][Aa][Rr][Tt] [Oo][Ff][*_:.[:space:]]*([Ee][Pp][Ii][Cc][*_:.[:space:]]*)?([A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+)?#[0-9]+/ /g' \
     | grep -oE '([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)?#[0-9]+' | sed 's/^#//' | sort -u
 }
 ```
@@ -703,6 +714,26 @@ has_restore_note() {  # #13414: latest trusted comment is a Champion/operator ho
   jq -e '(. | last | .body // "") | test("(^|\n)[ \t]*<!-- loom:hold-restored -->[ \t\r]*(\n|$)")' <<<"$t" >/dev/null && echo true || echo false
 }
 
+resolve_dep_states() {
+  # #14710: every dependency's state comes from ONE daemon-side resolver, not
+  # per-dep inline `gh issue view` reads. `dep-recheck-fingerprint dep-states`
+  # reads each ref live, bound to its qualified OWNER/REPO#N, and fails
+  # closed: an open draft, an unreadable read (failed/empty/shed), or an
+  # answer naming a different repo or number all leave that dependency
+  # unresolved. (On 2026-11-19 the inline loop read the cross-repo draft
+  # example-org/tool-repo#630 as resolved and lifted a hold that was still live.) A
+  # daemon failure — including an old binary without the subcommand — also
+  # answers false: the hold is preserved, never guessed off. Output: line 1
+  # `true`/`false` (all deps terminal?), line 2 the space-joined resolved
+  # refs for the unblock announcement, both read through the daemon's
+  # eval-safe KEY=VALUE quoting.
+  local out ALL_RESOLVED="" RESOLVED=""
+  out=$(loom-daemon dep-recheck-fingerprint dep-states --refs "$1" 2>/dev/null) || out=""
+  eval "$(printf '%s\n' "$out" | grep -E '^(ALL_RESOLVED|RESOLVED)=')" || true
+  [ "$ALL_RESOLVED" = "true" ] || ALL_RESOLVED=false
+  printf '%s\n%s\n' "$ALL_RESOLVED" "$RESOLVED"
+}
+
 check_and_unblock() {
   # --limit: gh defaults to 30 (#10553)
   local blocked_limit=1000 blocked_json blocked_count
@@ -727,18 +758,13 @@ check_and_unblock() {
       continue
     fi
 
-    local all_resolved=true
-    local resolved_deps=""
-
-    for dep in $deps; do
-      local dn="${dep##*#}" dr=""; [[ "$dep" == */* ]] && dr="${dep%#*}"  # OWNER/REPO#N: own repo (#10443)
-      local state=$(gh issue view "$dn" ${dr:+--repo "$dr"} --json state --jq '.state' 2>/dev/null || echo "UNKNOWN")
-      if [ "$state" != "CLOSED" ] && [ "$state" != "MERGED" ]; then
-        all_resolved=false
-        break
-      fi
-      resolved_deps="$resolved_deps $dr#$dn"
-    done
+    # #14710: binding-verified, fail-closed dependency resolution — see
+    # resolve_dep_states above. (An open cross-repo draft PR among the deps
+    # answers false here; the hold survives.)
+    local dep_verdict
+    dep_verdict=$(resolve_dep_states "$deps")
+    local all_resolved=$(printf '%s\n' "$dep_verdict" | sed -n '1p')
+    local resolved_deps=$(printf '%s\n' "$dep_verdict" | sed -n '2p')
 
     if [ "$all_resolved" = true ]; then
       # Superseding-block gate (#4634): a resolved body dependency is NOT
@@ -790,12 +816,10 @@ check_and_unblock() {
 
 ### Unblocking Pull Requests (#8925)
 
-A parked PR clears to a review-lane label, never `loom:issue` (a PR was never
-curated), and its superseding check reads the PR's OWN state, not a linked
-PR's. `check_and_unblock_prs`, `pr_has_superseding_block` and
-`previous_review_label` are defined in full, with a worked example, in
-`.loom/docs/park-record.md#the-unblock-sweeps-pr-side-functions`
-— read on demand, not inlined here.
+Load the full PR sweep, including its reason-only evidence helper, from
+`.loom/docs/park-record.md#the-unblock-sweeps-pr-side-functions`. Run
+`check_and_unblock_prs` to restore the review lane or hand a cleared conflict
+to Doctor. Verify any reported reason-only candidate through that section.
 
 ### Awaiting-Revision Parks → Revise Path (#10936)
 
@@ -818,11 +842,16 @@ and leaves **alone** anything that:
 
 ```bash
 awaiting_revision_park() {  # $1=body [$2=ISO time of latest loom:blocked label]; 0 = convertible
-  local body="$1" blocked_at="${2:-}" rec at a b
+  local body="$1" blocked_at="${2:-}" rec reason at a b
   rec=$(grep -E '^[[:space:]]*<!-- loom:park ' <<<"$body" | tail -1)
   [ -n "$rec" ] || return 1
   grep -qE 'Blocked by:[*_[:space:]]*\(unstated\)' <<<"$rec" || return 1  # any named ref => normal sweep
-  grep -qiE 'reason="[^"]*(awaiting[^"]*revision|awaiting[^"]*design epic)' <<<"$rec" || return 1
+  reason=$(sed -nE 's/.* reason="([^"]*)".*/\1/p' <<<"$rec")
+  # A bare revision request must stand alone: “awaiting revision <sha>” waits for a commit.
+  # The “revision of the <noun>” shape is end-anchored: “revision of the issue
+  # tracker config” (#15050) is an evidence wait, not a revise-path park.
+  grep -qiE '^[[:space:]]*awaiting[[:space:]]+((an?|the)[[:space:]]+)?revision[.!]?[[:space:]]*$' <<<"$reason" ||
+    grep -qiwE 'awaiting[[:space:]]+((an?|the)[[:space:]]+)?(((architect|proposal)[[:space:]]+revisions?|design[[:space:]]+epics?)|revisions?[[:space:]]+of[[:space:]]+(the|this)[[:space:]]+(proposal|scope|issue)[[:space:]]*[.!]?[[:space:]]*$)' <<<"$reason" || return 1
   if [ -n "$blocked_at" ]; then
     at=$(sed -nE 's/.* at=([^ ]+).*/\1/p' <<<"$rec")
     a=$(date -u -d "$at" +%s 2>/dev/null || date -u -j -f %Y-%m-%dT%H:%M:%SZ "$at" +%s 2>/dev/null) || return 1
@@ -1464,6 +1493,21 @@ a defer. See "WORK_PLAN.md vs a hand-written ROADMAP.md", rule 2.
 **Redact host identifiers, even quoting a title** — that is how 127 leaked
 into this public repo (#8589); the CI scrub job fails on the next one.
 
+**Provenance gate (#13760).** Before anything is written, the tick composes the
+exact canonical lines it would publish (`compose_work_log_delta`, from the
+verified candidates only) and verifies every one against the pinned repo
+(`verify_work_log_provenance`): the number must exist in `$GUIDE_REPO`, with
+the matching kind (merged PR vs closed issue), under exactly the emitted
+title. A foreign listing, a missing item, a wrong kind, a mismatched title,
+or an unreadable lookup refuses the **whole** delta (fail closed, no partial
+writes) and names the offending entry on stderr — a Guide backfill once wrote
+another repository's merged history into a consumer repo's WORK_LOG.md
+(sg13g2-vco#311), and Judge's docs-only fast path approved the file-name shape
+without reading the content. Judge re-checks the same records independently
+from the PR diff (see "Docs-Only Fast Path" in judge.md, #13760); this gate
+stops the bad delta one step earlier, before the PR exists. Zero new entries
+skips the gate trivially (a no-op tick stays a no-op).
+
 ```bash
 # #5454 BUG, DO NOT REINTRODUCE: this phase's OWN merged PRs must never count as
 # "new content". Every `docs: Guide document maintenance update` PR is itself a
@@ -1738,6 +1782,110 @@ docs_maintenance_skipped() {
     .loom/config.json 2>/dev/null | grep -Fxq -- "$1"
 }
 
+# #13760: the exact canonical lines this tick publishes, composed mechanically
+# from the verified candidate arrays ($new_prs / $new_issues) — the same text
+# verify_work_log_provenance() gates below and the pass then writes verbatim.
+# Grouping by date happens at write time; the gate needs only the lines
+# themselves. Entry format is the renderer's: `- **PR #N**: Title` and
+# `- **Issue #N** (closed): Title`.
+compose_work_log_delta() {
+  local prs="$1" issues="$2"
+  printf '%s\n' "$prs" | jq -r '.[] | "- **PR #\(.number)**: \(.title)"'
+  printf '%s\n' "$issues" | jq -r '.[] | "- **Issue #\(.number)** (closed): \(.title)"'
+}
+
+# #13760 PROVENANCE GATE, DO NOT REMOVE: a Guide backfill once wrote another
+# repository's merged history into WORK_LOG.md (sg13g2-vco#311 carried 61
+# entries above that repo's highest number, verbatim titles from
+# sg13g2-comparator). Every canonical entry line in $1 — the exact lines this
+# tick is about to publish — must match the pinned repo's own forge state:
+# the number must exist there, with the right kind (merged PR vs issue), in
+# the right state (a PR merged, an issue closed), under exactly the title the
+# renderer emits. A foreign listing's numbers can all exist under unrelated
+# titles, so existence alone is NOT enough; a wrong kind (an issue recorded as
+# a PR), a wrong state (an open PR, an open issue), and a title mismatch fail
+# the same way. An unreadable item fails closed. One
+# foreign/missing/wrong-kind/wrong-state/mismatched entry refuses the WHOLE
+# delta (no partial writes). Distinct numbers are READ once each, but every
+# record is VERIFIED: a repeated number's later records (a duplicate with a
+# different title or kind included) are checked against the cached fetch, not
+# skipped. Zero entries passes (nothing to verify — a no-op tick).
+#
+# TITLE ESCAPING LOCKSTEP: the renderer emits titles verbatim from the
+# listing JSON's `.title`, so this gate compares verbatim too. If the renderer
+# ever applies additional escaping or redaction (e.g. the #8589 host-identifier
+# redaction), the SAME transformation must be applied here in the same change —
+# an unmirrored escaping fails closed and WORK_LOG.md stops updating.
+#
+# REPOSITORY METADATA CANNOT OVERRIDE THE TARGET BINDING: if an entry itself
+# names a repository (`owner/other#N` qualifier), that identity must be the
+# pinned `$GUIDE_REPO` — refused even when the number and title coincide with
+# a real target item.
+verify_work_log_provenance() {
+  local delta="$1" line body mid num stated kind rest got got_title got_is_pr got_state got_merged bad=0
+  local -A fetched=()
+  while IFS= read -r line; do
+    [ -z "$line" ] && continue
+    case "$line" in
+      "- **PR "*) kind=pr ;;
+      "- **Issue "*) kind=issue ;;
+      *) continue ;;
+    esac
+    body="${line#- **}"
+    mid="${body#* }"; mid="${mid%%\*\**}"
+    num="${mid##*\#}"
+    case "$num" in
+      ''|*[!0-9]*) echo "provenance: unparseable WORK_LOG entry: $line" >&2; bad=1; continue ;;
+    esac
+    stated="${mid%%#*}"; stated="${stated%/}"
+    if [ -n "$stated" ] && [ "$stated" != "$GUIDE_REPO" ]; then
+      echo "provenance: entry claims repository $stated, not the pinned $GUIDE_REPO: $line" >&2
+      bad=1; continue
+    fi
+    # One forge read per DISTINCT number, cached as the fetched tuple; every
+    # record for that number — including a later duplicate with a different
+    # title or kind — is still verified against the cached tuple (#14532).
+    # $GH_READ (the 30 s-TTL cache) is deliberate here, unlike judge.md's
+    # live reads: the cache key includes the repo path, so it cannot cross
+    # repositories, and the read doubles as the per-number dedup.
+    if [ -z "${fetched[$num]:-}" ]; then
+      got="$("$GH_READ" api "repos/$GUIDE_REPO/issues/$num" --jq '"\(.title)\t\(.pull_request != null)\t\(.state)\t\((.pull_request.merged_at != null))"' 2>/dev/null)" || got=""
+      if [ -z "$got" ]; then
+        echo "provenance: cannot fetch #$num from $GUIDE_REPO" >&2; bad=1; continue
+      fi
+      fetched[$num]="$got"
+    fi
+    got="${fetched[$num]}"
+    IFS=$'\t' read -r got_title got_is_pr got_state got_merged <<<"$got"
+    if [ "$kind" = pr ]; then
+      rest="${body#*\*\*: }"
+      if [ "$got_is_pr" != "true" ]; then
+        echo "provenance: #$num in $GUIDE_REPO is not a PR but the entry records one: $line" >&2
+        bad=1; continue
+      fi
+      if [ "$got_merged" != "true" ]; then
+        echo "provenance: #$num in $GUIDE_REPO is not a merged PR (open or closed unmerged) but the entry records one: $line" >&2
+        bad=1; continue
+      fi
+    else
+      rest="${body#*\*\* }"; rest="${rest#*\(closed\): }"
+      if [ "$got_is_pr" != "false" ]; then
+        echo "provenance: #$num in $GUIDE_REPO is not an issue but the entry records one: $line" >&2
+        bad=1; continue
+      fi
+      if [ "$got_state" != "closed" ]; then
+        echo "provenance: #$num in $GUIDE_REPO is not closed but the entry records a closed issue: $line" >&2
+        bad=1; continue
+      fi
+    fi
+    if [ "$rest" != "$got_title" ]; then
+      echo "provenance: #$num title mismatch in $GUIDE_REPO (entry '$rest', forge '$got_title')" >&2
+      bad=1
+    fi
+  done < <(printf '%s\n' "$delta")
+  return "$bad"
+}
+
 update_work_log() {
   # #14116: a repo that opted out of WORK_LOG.md via
   # `guide.docsMaintenance.skipDocs` gets no create and no update, so return
@@ -1893,7 +2041,7 @@ update_work_log() {
   # shape, plus an entry-count escape hatch WORK_PLAN has no equivalent of,
   # since a "diff" is binary for WORK_PLAN but WORK_LOG has a natural
   # "how much is pending" signal):
-  #   - `LOOM_WORK_LOG_MIN_ENTRIES` (default 5): once the pending delta
+  #   - `workLogMinEntries` (default 5): once the pending delta
   #     reaches this size, write IMMEDIATELY, debounce window or not — this
   #     is the "no starvation" guarantee for a large accumulated delta from
   #     the acceptance criteria: a burst of activity must never sit
@@ -1926,7 +2074,38 @@ update_work_log() {
   local debounce_secs min_entries
   debounce_secs="${LOOM_WORK_LOG_DEBOUNCE_SECS:-$(jq -r '.guide.docsMaintenance.workLogDebounceSecs // 1800' .loom/config.json 2>/dev/null)}"
   [ -n "$debounce_secs" ] || debounce_secs=1800
-  min_entries="${LOOM_WORK_LOG_MIN_ENTRIES:-5}"
+  min_entries="${LOOM_WORK_LOG_MIN_ENTRIES:-}"
+  if [ -z "$min_entries" ]; then
+    min_entries="$(jq -Rrs '
+      . as $config
+      | fromjson
+      | select(.guide.docsMaintenance.workLogMinEntries | type == "number")
+      # Preserve JSON string tokens while quoting raw numeric lexemes. jq 1.6
+      # otherwise rounds numbers before we can check for a fraction.
+      | $config
+      | gsub("(?<quoted>\"(?:[^\"\\\\]|\\\\.)*\")|(?<number>-?(?:0|[1-9][0-9]*)(?:\\.[0-9]+)?(?:[eE][+-]?[0-9]+)?)";
+          if .number then (.number | tojson) else .quoted end)
+      | fromjson
+      | .guide.docsMaintenance.workLogMinEntries
+      | strings
+      | capture("^(?<whole>[0-9]+)(?:\\.(?<fraction>[0-9]+))?(?:[eE](?<exponent>[+-]?[0-9]+))?$")
+      | (.fraction // "") as $fraction
+      | (.whole + $fraction | sub("^0+"; "")) as $digits
+      | select($digits != "")
+      | ((.exponent // "0" | sub("^\\+"; "") | tonumber) - ($fraction | length)) as $shift
+      | (($digits | length) + $shift) as $width
+      # Bash compares signed integers. Bound the decimal width before padding.
+      | select($width > 0 and $width <= 19)
+      | if $shift >= 0 then
+          $digits + ("0" * $shift // "")
+        else
+          select($digits[$width:] | test("^0+$")) | $digits[:$width]
+        end
+    ' .loom/config.json 2>/dev/null)" || min_entries=""
+    if ! [ "$min_entries" -gt 0 ] 2>/dev/null; then
+      min_entries=5
+    fi
+  fi
 
   if [ "$total_new" -lt "$min_entries" ]; then
     local last_merged_epoch now_epoch elapsed
@@ -1940,14 +2119,30 @@ update_work_log() {
     fi
   fi
 
+  # #13760 PROVENANCE GATE, DO NOT REMOVE: before anything can be written,
+  # compose the exact canonical lines this tick would publish and verify every
+  # reference against the pinned repo — the number exists there, the kind
+  # matches, the title matches — mirroring the same gate Judge applies
+  # independently to the resulting docs PR. Any foreign/missing/wrong-kind/
+  # mismatched/unreadable entry refuses the WHOLE delta (fail closed, no
+  # partial writes) and names it on stderr; write ONLY the verified lines.
+  local delta
+  delta="$(compose_work_log_delta "$new_prs" "$new_issues")"
+  if ! verify_work_log_provenance "$delta"; then
+    echo "WORK_LOG.md NOT written: provenance check failed (fail closed) — see the provenance: lines above for the offending entries." >&2
+    return 1
+  fi
+
   # Group entries by date and prepend them to "$DOCS_WT/WORK_LOG.md" (below the
   # header/comment block, above the newest existing `### ` section).
   # Format: ### YYYY-MM-DD
   #         - **PR #N**: Title
   #         - **Issue #N** (closed): Title
   #
-  # Append ONLY what is in `$new_prs` / `$new_issues` — never hand-add a docs
-  # PR the filter above removed, and never "helpfully" log this tick's own PR.
+  # Append ONLY the verified delta above — the exact lines
+  # `compose_work_log_delta` produced and `verify_work_log_provenance` passed
+  # — never hand-add a docs PR the filter above removed, and never "helpfully"
+  # log this tick's own PR.
   #
   # Write with the Edit/Write tool against the ABSOLUTE "$DOCS_WT/WORK_LOG.md"
   # path — a repo-relative `WORK_LOG.md` resolves to the main checkout and is
@@ -1963,6 +2158,16 @@ update_work_log() {
   return 0
 }
 ```
+
+Set `guide.docsMaintenance.workLogMinEntries` in `.loom/config.json` to a
+positive JSON integer that the shell can compare. An absent or invalid setting
+falls back to 5. A nonempty `LOOM_WORK_LOG_MIN_ENTRIES` still takes precedence.
+
+For example, loom-ui could set `workLogMinEntries` to 12 and
+`workLogDebounceSecs` to 7200. Thirty minutes after a known Guide merge that
+touched WORK_LOG, six pending records would wait, and 12 would be eligible.
+A smaller delta becomes eligible two hours after that merge, on the next
+eligible Guide pass. WORK_PLAN keeps its independent publication window.
 
 **Entry format** (grouped by date, newest first):
 
@@ -2545,23 +2750,45 @@ update_work_plan() {
 # is NOT enough — a foreign render's numbers can all exist, closed, under
 # unrelated titles. Zero bullets passes; a failed lookup fails closed.
 #
-# SUFFIX LOCKSTEP, DO NOT LET THIS DRIFT: `render_plan_body()` appends at most
-# one section tag (` *(curated)*` / ` *(architect)*` / ` *(hermit)*`) and then,
-# for a held issue, ` *(held)*` (#13908) — in that order. The bullet must be the
-# forge title followed by exactly one of those combinations, so a title is
-# never guessed by stripping (a title that itself ends in ` *(held)*` still
-# matches). A new ` *(x)*` suffix in the render MUST be added here in the same
-# change: an unknown suffix fails closed and WORK_PLAN.md stops updating.
-# `test-guide-work-plan-provenance.sh` reads the render's suffix literals and
-# fails if this gate rejects any of them.
+# SUFFIX LOCKSTEP: Approved rows append ` — closes #A, #B` for the PR's
+# sorted closing refs. Other sections may append one section tag
+# (` *(curated)*` / ` *(architect)*` / ` *(hermit)*`) then ` *(held)*`.
+# Compare the complete title and suffix literally: either can be title text.
+# Keep these rules paired with the render in test-guide-work-plan-provenance.sh.
 verify_plan_provenance() {
-  local body="$1" line num rest got tag ok bad=0
+  local body="$1" line num rest got tag ok bad=0 approved=0 approved_json="" refs
   while IFS= read -r line; do
+    case "$line" in
+      '## Approved (Awaiting Merge)') approved=1; continue ;;
+      '## '*) approved=0; continue ;;
+    esac
     num="${line#- **#}"; num="${num%%\**}"
     rest="${line#*\*\*: }"
     got="$("$GH_READ" api "repos/$GUIDE_REPO/issues/$num" --jq '.title' 2>/dev/null)" || got=""
     if [ -z "$got" ]; then
       echo "provenance: cannot fetch title of #$num from $GUIDE_REPO" >&2; bad=1
+      continue
+    fi
+    if [ "$approved" -eq 1 ]; then
+      # Fetch once on the first Approved row, even a plain one: omitting
+      # every ref must fail just as changing a single number does.
+      if [ -z "$approved_json" ]; then
+        approved_json=$("$GH_READ" pr list --label "loom:pr" --state open --limit 200 --json number,labels,closingIssuesReferences \
+          --jq '[.[] | select(any(.labels[]?.name; . == "loom:frozen") | not)]') || return 1
+      fi
+      # jq 1.6 exits 0 on zero-byte or whitespace-only input without consuming
+      # a JSON value, which would leave refs empty and accept a bare title:
+      # require an actual JSON value for the matching PR first (#14575).
+      [ -n "${approved_json//[[:space:]]/}" ] || {
+        echo "provenance: cannot verify closing refs of #$num in $GUIDE_REPO" >&2; return 1
+      }
+      refs=$(jq -er --argjson n "$num" '.[] | select(.number == $n) | .closingIssuesReferences
+        | arrays | select(all(.[]; .number | type == "number")) | map(.number) | sort | map("#" + tostring) | join(", ")' <<<"$approved_json") || {
+        echo "provenance: cannot verify closing refs of #$num in $GUIDE_REPO" >&2; return 1
+      }
+      if [ "$rest" != "$got${refs:+ — closes $refs}" ]; then
+        echo "provenance: #$num Approved title or closing refs differ from $GUIDE_REPO" >&2; bad=1
+      fi
       continue
     fi
     # Plain string equality only: a `${var% \*(x)\*}` strip is a no-op under
@@ -2573,7 +2800,7 @@ verify_plan_provenance() {
     if [ "$ok" -ne 1 ]; then
       echo "provenance: #$num title mismatch in $GUIDE_REPO (rendered '$rest', forge '$got')" >&2; bad=1
     fi
-  done < <(printf '%s\n' "$body" | grep -E '^- \*\*#[0-9]+\*\*: ')
+  done < <(printf '%s\n' "$body" | grep -E '^(## |- \*\*#[0-9]+\*\*: )')
   return "$bad"
 }
 
@@ -2686,49 +2913,54 @@ its own ~10-minute loop (`autonomous.tokenRankingRefresh`, see
 invoking `loom-daemon tokens check --ranking`, which would trigger a fresh
 per-account probe (a real, if minimal, request against the very pool this
 check exists to protect) on every dry-queue tick. The verb is filesystem-only
-and costs nothing. Missing/empty/unparseable ranking data fails **open**
-(prints `0`, so this proceeds as if there is no pressure) — the same
-fail-open posture the rest of this phase uses for best-effort forge probes; a
-missing telemetry file is not evidence of pressure, and starving doc
-maintenance because the ranking file happens to be absent would be worse than
-occasionally filing without one.
+and costs nothing. Two different answers must not be confused (#14162): when
+the ranking data is absent or unparseable the verb *succeeds* and prints `0`
+— a valid no-pressure reading, and starving doc maintenance over a missing
+telemetry file would be worse than occasionally filing without one. But a
+read that never produces a number at all — a denied or failed call, empty
+output, or non-numeric output — is not a reading:
+`pool_pressure_fraction()` reports it as `unavailable`, and
+`should_defer_for_pool_pressure()` fail-**closes**, treating
+pressure-unknown like pressure (defer, bounded by the max-defer ceiling
+below), so a denied or broken read can never silently become "proceed".
 
-**Why a verb and not a file read (#13839):** do **not** open the pool
-directory yourself. Reading a path under `.loom/tokens` fails twice over.
-First, the role-tool-policy hook (#8256) treats that directory as a
-credential store, and `guide`'s `toolPolicy.allowedCapabilities` is empty, so
-a Bash call naming the path is denied *at the harness* — and the denial takes
-down the whole call, not just the one read, so a Guide that batches this with
-other commands loses all of them. Second, the path would be wrong anyway: the
-pool usually resolves to the shared machine-level directory
-(`~/.loom/tokens`, `$LOOM_SHARED_TOKENS_DIR`), not to a repo-local one, so a
-hardcoded `<repo>/.loom/tokens/.ranking` silently reports "no pressure" on
-every shared-pool host. The verb resolves the same directory the ranking
-writer targets and prints only a number — no account names, no statuses, no
-token material — which is precisely why a role without the
-`credential-store` capability may call it. `guide.json` stays unchanged.
+**Why a verb (#13839):** pool pressure is read only through
+`loom-daemon tokens pressure`. The verb resolves the same pool the ranking
+writer targets — repo-local, else the shared machine-level pool — so the
+number it prints is correct on every host shape, and it prints only that
+number: no account names, no statuses, no token material. That narrow
+output is precisely why a role whose `toolPolicy.allowedCapabilities` is
+empty may call it: the verb needs no `credential-store` capability.
+`guide.json` stays unchanged.
 
 ```bash
 # Fraction of pool accounts NOT `available` (0.0-1.0), obtained from
 # `loom-daemon tokens pressure` -- a filesystem-only read of the ranking the
 # daemon already refreshes (token-pool.md "Account health probe + ranking"),
 # never a fresh probe. The verb resolves the pool the SAME way the ranking
-# writer does (repo-local, else the shared machine-level pool), which a
-# hardcoded path here could not, and it prints only this number, so no
-# `credential-store` capability is needed (#13839).
+# writer does, and it prints only this number, so no `credential-store`
+# capability is needed (#13839).
 #
-# Fails open to "0" on anything unexpected: a daemon too old to know the verb
-# (exit != 0), a verb that printed nothing, or output that is not a bare
-# number. The verb itself already prints "0" for an absent, unreadable, or
-# unparseable ranking, so the no-data and no-pressure cases agree.
+# Prints the fraction verbatim whenever the verb succeeds with a bare
+# decimal number -- including "0", the verb's own (valid) answer for an
+# absent or unparseable ranking and for a healthy pool. Prints
+# "unavailable" for anything that is not a reading (#14162): a daemon too
+# old to know the verb (exit != 0), a verb that printed nothing, or output
+# that is not a well-formed number (a warning line, a malformed decimal
+# like "0.7.5"). The caller MUST treat "unavailable" as pressure-UNKNOWN,
+# never as "no pressure" -- see should_defer_for_pool_pressure().
 pool_pressure_fraction() {
   local out
   out="$(loom-daemon tokens pressure --workspace "$(git rev-parse --show-toplevel 2>/dev/null || echo .)" 2>/dev/null)" \
-    || { echo "0"; return; }
-  case "$out" in
-    '' | *[!0-9.]*) echo "0" ;;
-    *) echo "$out" ;;
-  esac
+    || { echo "unavailable"; return; }
+  # A reading is a bare decimal number: digits with at most one embedded
+  # "." followed by digits ("0", "0.7500"). Empty output, stray text, or a
+  # malformed decimal ("0.7.5", ".5", "5.") is not a reading.
+  if [[ ! "$out" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
+    echo "unavailable"
+    return
+  fi
+  echo "$out"
 }
 
 # Epoch seconds of the most recently MERGED docs-maintenance PR of ANY kind
@@ -2760,6 +2992,13 @@ last_docs_maintenance_merge_epoch() {
 #     (AC3, the "never starves permanently" guarantee).
 # `LOOM_GUIDE_POOL_PRESSURE_NOW` is a test seam only (mirrors
 # `LOOM_WORK_LOG_DEBOUNCE_NOW`) -- never set it in normal operation.
+#
+# #14162: a pressure read that fails or is denied never reads as "no
+# pressure". An `unavailable` result from pool_pressure_fraction() is
+# pressure-UNKNOWN and fail-CLOSES into the same bounded backoff as a real
+# at/above-threshold reading: defer now, file once the max-defer ceiling
+# elapses. The deferral/filing messages name the cause, so the skip is
+# visible in the tick's output rather than only in a PR body.
 should_defer_for_pool_pressure() {
   local threshold max_defer
   threshold="${LOOM_GUIDE_POOL_PRESSURE_THRESHOLD:-$(jq -r '.guide.docsMaintenance.poolPressureThreshold // 0.7' .loom/config.json 2>/dev/null)}"
@@ -2770,26 +3009,35 @@ should_defer_for_pool_pressure() {
   local fraction
   fraction="$(pool_pressure_fraction)"
 
-  # Below threshold -- proceed exactly as today (no pressure signal, or not
-  # enough of one to act on).
-  if awk -v f="$fraction" -v t="$threshold" 'BEGIN { exit !(f < t) }'; then
+  # Split a real reading from no reading (#14162). A valid number below
+  # threshold proceeds exactly as before; an `unavailable` read is NOT "no
+  # pressure" and joins the at/above-threshold path below so the bounded
+  # ceiling decides.
+  local pressure_reason
+  if [ "$fraction" = "unavailable" ]; then
+    pressure_reason="Pool pressure UNAVAILABLE ('loom-daemon tokens pressure' failed, was denied, or printed no number) -- treating the unknown as pressure (#14162)"
+  elif awk -v f="$fraction" -v t="$threshold" 'BEGIN { exit !(f < t) }'; then
+    # Valid reading below threshold -- proceed exactly as before.
     return 1
+  else
+    pressure_reason="Token pool pressure ${fraction} >= threshold ${threshold}"
   fi
 
-  # At/above threshold -- bounded backoff. The max-defer ceiling ALWAYS wins
-  # once it has elapsed, so doc maintenance never starves permanently no
-  # matter how long the pool stays under pressure (AC3).
+  # At/above threshold, or pressure-unknown -- bounded backoff. The
+  # max-defer ceiling ALWAYS wins once it has elapsed, so doc maintenance
+  # never starves permanently no matter how long the pool stays under
+  # pressure -- or unreadable (AC3).
   local last_merged_epoch now_epoch elapsed
   last_merged_epoch="$(last_docs_maintenance_merge_epoch)"
   now_epoch="${LOOM_GUIDE_POOL_PRESSURE_NOW:-$(date -u +%s)}"
   elapsed=$(( now_epoch - last_merged_epoch ))
 
   if [ "$last_merged_epoch" -gt 0 ] && [ "$elapsed" -lt "$max_defer" ]; then
-    echo "Token pool pressure ${fraction} >= threshold ${threshold}, and only ${elapsed}s since the last docs-maintenance PR merged (< ${max_defer}s max-defer ceiling) -- deferring document maintenance to a later tick."
+    echo "${pressure_reason}, and only ${elapsed}s since the last docs-maintenance PR merged (< ${max_defer}s max-defer ceiling) -- deferring document maintenance to a later tick."
     return 0
   fi
 
-  echo "Token pool pressure ${fraction} >= threshold ${threshold}, but the ${max_defer}s max-defer ceiling has elapsed (or no prior docs-maintenance PR ever merged) -- filing anyway."
+  echo "${pressure_reason}, but the ${max_defer}s max-defer ceiling has elapsed (or no prior docs-maintenance PR ever merged) -- filing anyway."
   return 1
 }
 ```
@@ -3031,13 +3279,13 @@ Automated document maintenance by the Guide triage agent.
 
 ### Context
 This PR is generated automatically by the Guide role as part of its triage cycle.
-See rjwalters/loom#1784 for the feature specification (this template ships to every Loom-managed repo, so the reference must be fully qualified).
+See 2AMLogic/loom#1784 for the feature specification (this template ships to every Loom-managed repo, so the reference must be fully qualified).
 
 This PR normally stages only `WORK_LOG.md`/`WORK_PLAN.md`/`README.md` (see
 `create_docs_pr()`'s `git add` above), so it qualifies for the docs-only fast
-path (rjwalters/loom#6134) Judge and Champion apply to any PR whose
+path (2AMLogic/loom#6134) Judge and Champion apply to any PR whose
 changed-file list matches that exact set — EXCEPT when the repo's
-`.loom/docs-post-stage.sh` hook (rjwalters/loom#13892) reported additional
+`.loom/docs-post-stage.sh` hook (2AMLogic/loom#13892) reported additional
 files (e.g. a regenerated integrity envelope): those land in the same PR,
 which simply falls off the fast path to a full review. The
 `<!-- loom:docs-only-fast-path -->` marker above is informational only —
@@ -3185,7 +3433,7 @@ it expresses it.
   would fail the repo's integrity check anyway; the next tick retries.
 - **No script** ⇒ behaviour byte-identical to a repo without the hook.
 - **Review impact**: a PR carrying hook-produced files falls off the docs-only
-  fast path (rjwalters/loom#6134) to a full review — by design; Judge and
+  fast path (2AMLogic/loom#6134) to a full review — by design; Judge and
   Champion re-derive eligibility from the PR's own file list.
 
 ### Document Maintenance Summary
@@ -3358,11 +3606,12 @@ Document Maintenance Phase
   scarcest capacity at exactly the moment other roles are retrying against
   a shrinking set of available accounts. Gated on `pool_pressure_fraction()`
   (`loom-daemon tokens pressure`: a filesystem-only read of the
-  already-refreshed ranking, never a fresh probe — and never a direct read
-  inside the token pool, which `guide`'s tool policy denies, #13839) against
+  already-refreshed ranking, never a fresh probe — it prints only a number,
+  so it needs no `credential-store` capability, #13839) against
   `guide.docsMaintenance.poolPressureThreshold`
   (default 0.70), and bounded by an absolute
   `guide.docsMaintenance.poolPressureMaxDeferSecs` ceiling (default 14400 =
   4h) so doc maintenance never starves permanently even if pressure never
-  clears
+  clears — or a pressure read fails, which is treated as pressure-unknown
+  and deferred the same way (#14162)
 - All changes go through the standard PR review pipeline

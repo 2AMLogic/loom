@@ -87,6 +87,133 @@ fn an_empty_body_yields_nothing() {
 }
 
 // ---------------------------------------------------------------------------
+// The `Part of #N` parent-reference exclusion (#14732)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_part_of_reference_on_a_mixed_line_is_not_a_dependency() {
+    // The incident shape: a phase child declares its parent and its one real
+    // dependency on ONE line. The phrase gate matches via `Depends on #4` and
+    // the whole-line ref scan picked up BOTH numbers — reading the parent as
+    // a blocker walked the graph into the parent's cycle and routed this
+    // issue to an operator for a loop it is not on.
+    assert_eq!(parse_dependency_refs("Part of #2. Depends on #4", REPO), vec!["o/r#4"]);
+}
+
+#[test]
+fn a_part_of_reference_on_its_own_line_still_contributes_nothing() {
+    // No dependency phrase, no line match — that was always true; pinned so
+    // the exclusion cannot be "fixed" by widening the phrase gate instead.
+    assert!(parse_dependency_refs("Part of #2", REPO).is_empty());
+}
+
+#[test]
+fn a_part_of_reference_with_a_repo_prefix_is_excluded_too() {
+    assert_eq!(
+        parse_dependency_refs("Part of other/epic#2. Depends on #4", REPO),
+        vec!["o/r#4"]
+    );
+}
+
+#[test]
+fn an_emphasised_part_of_reference_is_excluded() {
+    assert_eq!(parse_dependency_refs("**Part of #2** - Depends on #4", REPO), vec!["o/r#4"]);
+}
+
+#[test]
+fn a_parent_named_again_as_a_dependency_is_kept() {
+    // The exclusion keys off `Part of` introducing the reference, never off
+    // the number: a body may legitimately declare its parent a blocker, and
+    // that declaration survives on the same line as the Part-of mention.
+    assert_eq!(parse_dependency_refs("Depends on #2 (parent). Part of #2", REPO), vec!["o/r#2"]);
+}
+
+#[test]
+fn a_part_of_reference_is_not_a_named_blocker_either() {
+    // parse_named_blocker_refs layers the Dependencies checklist on top of
+    // the phrase-gated refs; the Part-of rule must hold for the shared base,
+    // not just the cycle walk's view of it.
+    assert_eq!(parse_named_blocker_refs("Part of #2. Depends on #4", REPO), vec!["o/r#4"]);
+}
+
+#[test]
+fn a_part_of_epic_reference_on_a_mixed_line_is_not_a_dependency() {
+    // `Part of Epic #N` is Loom's own generated vocabulary (champion-epic.md
+    // and epic.md write it into every epic-phase issue's `## Dependencies`
+    // section), so the exclusion admits that one bounded word — in either
+    // clause order (#14750).
+    assert_eq!(
+        parse_dependency_refs("Part of Epic #2. Depends on #4, #5", REPO),
+        vec!["o/r#4", "o/r#5"]
+    );
+    assert_eq!(
+        parse_dependency_refs("Depends on #4, #5. Part of Epic #2", REPO),
+        vec!["o/r#4", "o/r#5"]
+    );
+}
+
+#[test]
+fn the_phrase_and_the_epic_word_are_matched_case_insensitively() {
+    // The Rust side is case-insensitive throughout (`(?i)`); the shell masks
+    // agree by construction, pinned in test-dependency-parse.sh (#14750).
+    for body in [
+        "PART OF #2. Depends on #4",
+        "Part of EPIC #2. Depends on #4",
+        "PART OF EPIC #2. Depends on #4",
+        "Part of epic #2. Depends on #4",
+    ] {
+        assert_eq!(parse_dependency_refs(body, REPO), vec!["o/r#4"], "body: {body}");
+    }
+}
+
+#[test]
+fn an_emphasised_part_of_epic_reference_is_excluded() {
+    assert_eq!(
+        parse_dependency_refs("**Part of Epic #2** - Depends on #4", REPO),
+        vec!["o/r#4"]
+    );
+}
+
+#[test]
+fn a_part_of_epic_reference_with_a_repo_prefix_is_excluded_too() {
+    assert_eq!(
+        parse_dependency_refs("Part of Epic other/epic#2. Depends on #4", REPO),
+        vec!["o/r#4"]
+    );
+}
+
+#[test]
+fn a_parent_named_again_as_a_dependency_is_kept_with_the_epic_word() {
+    // Same structural rule as the bare form: the exclusion keys off the
+    // introducing phrase, never the number, so only the Part-of-introduced
+    // occurrence is dropped (#14750).
+    assert_eq!(
+        parse_dependency_refs("Depends on #2 (parent). Part of Epic #2", REPO),
+        vec!["o/r#2"]
+    );
+}
+
+#[test]
+fn the_optional_word_is_bounded_to_epic() {
+    // Only `Epic` may sit between the phrase and the reference. A wider word
+    // run would over-mask genuine blockers (`Part of the work tracked in #2`),
+    // so `issue` and prose keep the established whole-line capture (#14750).
+    assert_eq!(
+        parse_dependency_refs("Part of issue #2. Depends on #4", REPO),
+        vec!["o/r#2", "o/r#4"]
+    );
+    assert_eq!(
+        parse_dependency_refs("Part of the work tracked in #2. Depends on #4", REPO),
+        vec!["o/r#2", "o/r#4"]
+    );
+}
+
+#[test]
+fn a_part_of_epic_reference_is_not_a_named_blocker_either() {
+    assert_eq!(parse_named_blocker_refs("Part of Epic #2. Depends on #4", REPO), vec!["o/r#4"]);
+}
+
+// ---------------------------------------------------------------------------
 // extract_refs — the UNGATED parser, used on findings
 // ---------------------------------------------------------------------------
 

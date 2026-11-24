@@ -220,6 +220,45 @@ pub fn excluded_role(
         .then_some(name)
 }
 
+/// Issue #14963: the model profile a native launch of `runtime` would resolve,
+/// when that profile declares a non-empty `allowedEfforts` that does not
+/// include `effort` — the exact predicate [`select`] refuses the launch on
+/// (`stage=profile_selection`, exit 78), factored out so the daemon's launch
+/// sites can drop an *unqualified* effort override instead of losing the step.
+///
+/// Shares [`excluded_role`]'s lookup path verbatim — `profile` is the
+/// explicitly chosen profile (a preference tap's `modelProfile`); `None` falls
+/// back exactly as [`lookup`] does for a launch: `LOOM_MODEL_PROFILE`, then
+/// `runtimes.defaultModelProfile`, then the bundled `zai-flash` default — so
+/// the daemon's reconciliation judges the profile the child would actually
+/// select. Returns `None` (no objection) for a non-native runtime, an unknown
+/// profile (the launch itself fails closed on that, with its own diagnostic),
+/// or a profile with no provider for this harness (it cannot be the model that
+/// harness runs); `Some(profile_name)` when the profile's `allowedEfforts`
+/// lists at least one level and does not include `effort`.
+#[must_use]
+pub fn profile_rejects_effort(
+    runtime: &str,
+    profile: Option<&str>,
+    effort: &str,
+    config: &Value,
+) -> Option<String> {
+    if !super::is_native(runtime) {
+        return None;
+    }
+    let env_profile = super::nonempty_env("LOOM_MODEL_PROFILE");
+    let requested = profile
+        .map(str::trim)
+        .filter(|p| !p.is_empty())
+        .or(env_profile.as_deref());
+    let (name, resolved) = lookup(requested, config).ok()?;
+    if !resolved.providers.contains_key(runtime) {
+        return None;
+    }
+    (!resolved.allowed_efforts.is_empty() && !resolved.allowed_efforts.iter().any(|a| a == effort))
+        .then_some(name)
+}
+
 /// `loom-daemon validate` findings for `excludedRoles` (#11400): every entry,
 /// in configured `runtimes.modelProfiles` and in the bundled set, must name a
 /// known role. An unknown name would silently exclude nothing.
@@ -715,6 +754,34 @@ mod tests {
         assert!(error.message.contains("LOOM_TEST_9473_NEVER_SET"), "{}", error.message);
     }
 
+    /// The bundled `zai-full` profile is `zai-flash` with the full-strength
+    /// model: same providers, credentials, proxy and effort, and the same
+    /// Judge/Curator exclusion (GLM never runs those roles). `zai-flash` stays
+    /// the built-in fallback; a deployment opts in with
+    /// `runtimes.defaultModelProfile: zai-full`.
+    #[test]
+    fn the_bundled_zai_full_profile_is_zai_flash_with_glm_5_3() {
+        let _g = env_lock();
+        let raw: serde_json::Value =
+            serde_json::from_str(include_str!("../../../defaults/model-profiles.json")).unwrap();
+        let mut flash = raw["zai-flash"].clone();
+        let full = raw["zai-full"].clone();
+        assert_eq!(full["model"], "glm-5.3");
+        assert_eq!(full["excludedRoles"], serde_json::json!(["judge", "curator"]));
+        flash["model"] = serde_json::json!("glm-5.3");
+        assert_eq!(full, flash, "zai-full differs from zai-flash only in its model");
+
+        let saved = std::env::var_os("LOOM_MODEL_PROFILE");
+        std::env::remove_var("LOOM_MODEL_PROFILE");
+        let config = serde_json::json!({"runtimes":{"defaultModelProfile":"zai-full"}});
+        let (name, profile) = lookup(None, &config).expect("zai-full resolves as a default");
+        assert_eq!(name, "zai-full");
+        assert_eq!(profile.model, "glm-5.3");
+        if let Some(v) = saved {
+            std::env::set_var("LOOM_MODEL_PROFILE", v);
+        }
+    }
+
     /// #11714: the bundled `zai-flash` profile binds BOTH `pi` and `opencode`,
     /// and its `credentialProxy` block declares `baseUrlConfig` — an OpenCode
     /// config contract. Selection must not refuse the `pi` binding for that:
@@ -784,5 +851,94 @@ mod tests {
 
         let error = error.expect_err("a declared-but-unmapped variable must be refused");
         assert!(error.message.contains("every credentialEnv variable"), "{}", error.message);
+    }
+
+    /// Issue #14963: `profile_rejects_effort` mirrors `select`'s
+    /// `allowedEfforts` refusal predicate on `excluded_role`'s exact lookup
+    /// path, so the daemon's launch sites can drop an *unqualified* effort
+    /// instead of losing the step to a `profile_selection` refusal. The full
+    /// drop-vs-keep precedence lives with the resolver
+    /// (`role_runner/tests/model_resolution.rs`); these tests pin the
+    /// predicate itself.
+    #[test]
+    fn profile_rejects_effort_matches_selects_allowed_efforts_predicate() {
+        let _g = env_lock();
+        let saved = std::env::var_os("LOOM_MODEL_PROFILE");
+        std::env::remove_var("LOOM_MODEL_PROFILE");
+        let config = serde_json::json!({"runtimes":{"modelProfiles":{
+            "strict": {"model": "m", "providers": {"opencode": "zai-coding-plan"},
+                        "allowedEfforts": ["low", "high", "max"]},
+            "open": {"model": "m", "providers": {"opencode": "zai-coding-plan"}},
+            "other-harness": {"model": "m", "providers": {"pi": "zai"}}
+        }}});
+
+        // The reported incident's exact shape: a `medium` effort meeting a
+        // profile that allows only low/high/max.
+        assert_eq!(
+            profile_rejects_effort("opencode", Some("strict"), "medium", &config),
+            Some("strict".to_string())
+        );
+        // An effort the profile allows is no objection.
+        assert_eq!(profile_rejects_effort("opencode", Some("strict"), "high", &config), None);
+        // An empty `allowedEfforts` (here: absent) never rejects.
+        assert_eq!(profile_rejects_effort("opencode", Some("open"), "medium", &config), None);
+        // A non-native runtime is never judged (Claude/Codex forward the flag
+        // to their own CLIs, which own their level vocabularies).
+        assert_eq!(profile_rejects_effort("claude", Some("strict"), "medium", &config), None);
+        // A profile with no provider entry for this harness cannot be the
+        // model that harness runs.
+        assert_eq!(
+            profile_rejects_effort("opencode", Some("other-harness"), "medium", &config),
+            None
+        );
+        // An unknown profile is left to the launch's own fail-closed
+        // diagnostic, never judged here.
+        assert_eq!(profile_rejects_effort("opencode", Some("nope"), "medium", &config), None);
+
+        if let Some(v) = saved {
+            std::env::set_var("LOOM_MODEL_PROFILE", v);
+        }
+    }
+
+    /// Issue #14963: a bare native runtime (a preference tap with no
+    /// `modelProfile`) is judged against the profile the launch would
+    /// actually select — the `LOOM_MODEL_PROFILE` / `defaultModelProfile` /
+    /// bundled `zai-flash` fallback chain, exactly as `excluded_role` judges
+    /// it. The bundled `zai-flash` allows low/high/max, so the incident's
+    /// bare `medium` meets it too.
+    #[test]
+    fn profile_rejects_effort_falls_back_to_the_launchs_own_profile() {
+        let _g = env_lock();
+        let saved = std::env::var_os("LOOM_MODEL_PROFILE");
+
+        std::env::remove_var("LOOM_MODEL_PROFILE");
+        assert_eq!(
+            profile_rejects_effort("opencode", None, "medium", &serde_json::json!({})),
+            Some("zai-flash".to_string()),
+            "the bundled zai-flash fallback rejects the incident's medium"
+        );
+        assert_eq!(profile_rejects_effort("opencode", None, "high", &serde_json::json!({})), None);
+
+        std::env::set_var("LOOM_MODEL_PROFILE", "zai-full");
+        assert_eq!(
+            profile_rejects_effort("opencode", None, "medium", &serde_json::json!({})),
+            Some("zai-full".to_string()),
+            "LOOM_MODEL_PROFILE names the profile a bare tap is judged against"
+        );
+
+        std::env::remove_var("LOOM_MODEL_PROFILE");
+        let config = serde_json::json!({"runtimes":{"defaultModelProfile":"zai-full", "modelProfiles":{
+            "zai-full": {"model": "glm-5.3", "providers": {"opencode": "zai-coding-plan"},
+                          "allowedEfforts": ["low", "high", "max"]}
+        }}});
+        assert_eq!(
+            profile_rejects_effort("opencode", None, "medium", &config),
+            Some("zai-full".to_string()),
+            "runtimes.defaultModelProfile names the profile a bare tap is judged against"
+        );
+
+        if let Some(v) = saved {
+            std::env::set_var("LOOM_MODEL_PROFILE", v);
+        }
     }
 }

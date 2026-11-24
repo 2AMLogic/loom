@@ -27,6 +27,17 @@
 //! provider-side ceiling the operator declared, which is the failure the cap
 //! exists to prevent.
 //!
+//! The ladder counts live spawns only. A role draw's reservation
+//! ([`super::reservation`], #14983) holds a slot *for* a launch that is on its
+//! way here, so counting it would refuse that launch; a successful selection
+//! retires one instead.
+//!
+//! Which cap tier 0 enforces is decided by [`super::limits::effective_limits`]:
+//! the host's `.limits.json` merged with the calling workspace's
+//! `runtimes.apiKeyLimits` block (#14932) — the stricter value where both
+//! declare one, and a block that cannot be parsed withholding the account
+//! like any other unreadable pool state.
+//!
 //! # Model-class scoping (#8424 item 3)
 //!
 //! Selection takes the model the spawn asked for and resolves bad marks
@@ -55,8 +66,8 @@ use crate::tokens_pool::{rng::Rng, rotation::next_rotation_index};
 use super::inflight::{self, Lease};
 use super::paths::{provider_dir, resolve_provider_root, resolve_provider_root_in, PoolReadError};
 use super::registry::{
-    list_provider, list_provider_for_class, provider_is_pooled, read_credential, ApiKeyAccount,
-    Credential, Ineligible, ALLOWLIST_FILE,
+    list_provider_for_class, provider_is_pooled, read_credential, ApiKeyAccount, Credential,
+    Ineligible, ALLOWLIST_FILE,
 };
 
 /// Exit code when no account is available (sysexits.h `EX_CONFIG`), identical
@@ -147,11 +158,17 @@ pub fn select_api_key_for(
 ) -> Result<SelectedApiKey, EmptyApiKeyPoolError> {
     let unreadable = |e: PoolReadError| EmptyApiKeyPoolError(e.to_string());
     let root = resolve_provider_root(workspace, provider).map_err(unreadable)?;
+    // Tier 0's cap is whichever source declares it — the host's
+    // `.limits.json` or the workspace's `runtimes.apiKeyLimits` block
+    // (#14932). Resolved once here, where the workspace is in hand: the
+    // config belongs to the caller, so it caps a shared-pool account too.
+    let configured = super::limits::ConfiguredLimits::from_workspace(workspace);
     // An unrecognisable model normalizes to `None` — i.e. account-wide marks,
     // today's behaviour — rather than failing the spawn.
     let model_class = model_class.and_then(super::bad_marks::normalize_model_class);
     let mut accounts =
-        list_provider_for_class(&root, provider, model_class.as_deref()).map_err(unreadable)?;
+        list_provider_for_class(&root, provider, model_class.as_deref(), &configured)
+            .map_err(unreadable)?;
     if let Some(expected) = expected_env {
         for account in &mut accounts {
             let Some(actual) = account.env_name.as_deref().filter(|a| *a != expected) else {
@@ -242,6 +259,10 @@ pub fn select_api_key_for(
     }
     // Count this spawn against the chosen account, still under `_cap_lock`.
     let lease = inflight::register(&root, provider, &chosen.name);
+    // #14983: this acquire is what a role draw's reservation was holding the
+    // slot for. Retire one in the same locked step, so the slot is counted
+    // once (as the lease) instead of twice.
+    super::reservation::consume_one(&root, provider);
     Ok(SelectedApiKey {
         provider: provider.to_string(),
         name: chosen.name.clone(),
@@ -308,10 +329,9 @@ fn exhausted_detail(provider: &str, root: &Path, accounts: &[ApiKeyAccount]) -> 
                     a.name
                 ),
                 Some(Ineligible::AtCapacity) => format!(
-                    "{} — clears as soon as one of those spawns exits, or raise it with \
-                     `loom-daemon api-keys limit {provider} {} --max-concurrent <N>`",
+                    "{} — clears as soon as one of those spawns exits, or {}",
                     a.problem.as_deref().unwrap_or("at its concurrency cap"),
-                    a.name
+                    raise_cap_hint(provider, a)
                 ),
                 Some(Ineligible::Unverifiable) => format!(
                     "withheld, pool state unreadable — {}",
@@ -333,6 +353,23 @@ fn exhausted_detail(provider: &str, root: &Path, accounts: &[ApiKeyAccount]) -> 
     )
 }
 
+/// How to raise the cap that is actually holding `account` back. A cap the
+/// config declares binds over a looser file cap (#14932: the stricter value
+/// wins), so `api-keys limit` — which writes the file — would change nothing
+/// and the operator would be left believing it had.
+fn raise_cap_hint(provider: &str, account: &ApiKeyAccount) -> String {
+    match account.max_concurrent_source {
+        super::limits::LimitSource::Config | super::limits::LimitSource::BothConfig => format!(
+            "raise `runtimes.apiKeyLimits.{provider}.{}.maxConcurrent` in the workspace config",
+            account.name
+        ),
+        _ => format!(
+            "raise it with `loom-daemon api-keys limit {provider} {} --max-concurrent <N>`",
+            account.name
+        ),
+    }
+}
+
 /// Secret-free health snapshot for one provider.
 #[derive(Debug, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -351,6 +388,23 @@ pub struct ProviderHealth {
     /// counted live here rather than derived from
     /// [`Ineligible::AtCapacity`], which only the selection ladder sets.
     pub at_capacity: usize,
+    /// Selectable accounts that are also under their declared concurrency cap
+    /// right now: what the selection ladder's tier 0 would actually offer a
+    /// spawn (#14944). [`Self::selectable`] alone ignores the cap (only the
+    /// ladder sets [`Ineligible::AtCapacity`]), so a caller deciding "would a
+    /// launch get a credential?" must read this. Not serialized: the health
+    /// JSON is unchanged, and `selectable` / `atCapacity` already carry both
+    /// halves for a human.
+    #[serde(skip)]
+    pub selectable_under_cap: usize,
+    /// Slots a draw could still take: the selectable accounts' declared caps,
+    /// minus live spawns, minus other draws' live reservations
+    /// ([`super::reservation`], #14983). `None` when a selectable account
+    /// declares no cap (no finite count) or none is selectable. A read like
+    /// [`Self::selectable_under_cap`]; only
+    /// [`super::reservation::try_reserve`] holds a slot. Not serialized.
+    #[serde(skip)]
+    pub unreserved_slots: Option<usize>,
     /// Accounts withheld because `.disabled` / `.bad_accounts.json` exists but
     /// cannot be read or parsed.
     pub unverifiable: usize,
@@ -381,7 +435,9 @@ pub struct ProviderHealth {
 }
 
 /// Every registered account visible from `workspace` (or just `provider`'s),
-/// each provider read from its own effective root.
+/// each provider read from its own effective root, with limits as the pool
+/// enforces them: `.limits.json` merged with `workspace`'s
+/// `runtimes.apiKeyLimits` block (#14932), each tagged with its source.
 ///
 /// # Errors
 /// [`PoolReadError`] when any pool directory involved exists but cannot be
@@ -390,7 +446,11 @@ pub fn list_accounts(
     workspace: &Path,
     provider: Option<&str>,
 ) -> Result<Vec<ApiKeyAccount>, PoolReadError> {
-    list_accounts_in(&super::paths::pool_roots(workspace), provider)
+    list_accounts_in(
+        &super::paths::pool_roots(workspace),
+        provider,
+        &super::limits::ConfiguredLimits::from_workspace(workspace),
+    )
 }
 
 /// [`list_accounts`] over an explicit, precedence-ordered root list.
@@ -401,11 +461,16 @@ pub fn list_accounts(
 /// and were unreachable from the repo (issue #8450 item 1). `--shared` on
 /// `list`/`health` passes `&[shared_api_keys_dir()]` here.
 ///
+/// `configured` is the calling workspace's `runtimes.apiKeyLimits` block
+/// (#14932) — the caller's, whoever owns the root, so a shared account is
+/// reported under the same cap selection would enforce on it.
+///
 /// # Errors
 /// [`PoolReadError`] when any pool directory involved exists but cannot be read.
 pub fn list_accounts_in(
     roots: &[std::path::PathBuf],
     provider: Option<&str>,
+    configured: &super::limits::ConfiguredLimits,
 ) -> Result<Vec<ApiKeyAccount>, PoolReadError> {
     let providers = match provider {
         Some(p) => vec![p.to_string()],
@@ -413,7 +478,12 @@ pub fn list_accounts_in(
     };
     let mut accounts = Vec::new();
     for p in &providers {
-        accounts.extend(list_provider(&resolve_provider_root_in(roots, p)?, p)?);
+        accounts.extend(list_provider_for_class(
+            &resolve_provider_root_in(roots, p)?,
+            p,
+            None,
+            configured,
+        )?);
     }
     Ok(accounts)
 }
@@ -422,23 +492,34 @@ pub fn list_accounts_in(
 /// is `None`. An unreadable provider directory is reported in its own entry
 /// ([`ProviderHealth::unreadable`]) so it cannot hide the healthy ones.
 ///
+/// Limits are read as the pool enforces them (#14932), from `workspace`'s
+/// resolved config — which is what makes a config-declared cap count toward
+/// `at_capacity`, `selectable_under_cap` and `unreserved_slots`.
+///
 /// # Errors
 /// [`PoolReadError`] when a pool *root* cannot be enumerated at all.
 pub fn health(
     workspace: &Path,
     provider: Option<&str>,
 ) -> Result<Vec<ProviderHealth>, PoolReadError> {
-    health_in(&super::paths::pool_roots(workspace), provider)
+    health_in(
+        &super::paths::pool_roots(workspace),
+        provider,
+        &super::limits::ConfiguredLimits::from_workspace(workspace),
+    )
 }
 
 /// [`health`] over an explicit, precedence-ordered root list — see
-/// [`list_accounts_in`] for why a management verb needs one (issue #8450 item 1).
+/// [`list_accounts_in`] for why a management verb needs one (issue #8450 item 1)
+/// and for what `configured` is (#14932). A caller that already resolved the
+/// workspace's config passes it here rather than resolving it a second time.
 ///
 /// # Errors
 /// [`PoolReadError`] when a pool *root* cannot be enumerated at all.
 pub fn health_in(
     roots: &[std::path::PathBuf],
     provider: Option<&str>,
+    configured: &super::limits::ConfiguredLimits,
 ) -> Result<Vec<ProviderHealth>, PoolReadError> {
     let providers = match provider {
         Some(p) => vec![p.to_string()],
@@ -447,8 +528,10 @@ pub fn health_in(
     Ok(providers
         .into_iter()
         .map(|provider| {
-            let resolved = resolve_provider_root_in(roots, &provider)
-                .and_then(|root| list_provider(&root, &provider).map(|accounts| (root, accounts)));
+            let resolved = resolve_provider_root_in(roots, &provider).and_then(|root| {
+                list_provider_for_class(&root, &provider, None, configured)
+                    .map(|accounts| (root, accounts))
+            });
             let (root, accounts, unreadable) = match resolved {
                 Ok((root, accounts)) => (root, accounts, None),
                 Err(e) => (
@@ -473,6 +556,10 @@ pub fn health_in(
                     Ok(list) => (list, None),
                     Err(e) => (Vec::new(), Some(e)),
                 };
+            let at_cap = |a: &ApiKeyAccount| {
+                a.max_concurrent
+                    .is_some_and(|cap| inflight::live_count(&root, &provider, &a.name) >= cap)
+            };
             ProviderHealth {
                 dir: provider_dir(&root, &provider),
                 total: accounts.len(),
@@ -480,14 +567,17 @@ pub fn health_in(
                 disabled: count(Ineligible::Disabled),
                 malformed: count(Ineligible::Malformed),
                 exhausted: count(Ineligible::Exhausted),
-                at_capacity: accounts
+                at_capacity: accounts.iter().filter(|a| at_cap(a)).count(),
+                selectable_under_cap: accounts
                     .iter()
-                    .filter(|a| {
-                        a.max_concurrent.is_some_and(|cap| {
-                            inflight::live_count(&root, &provider, &a.name) >= cap
-                        })
-                    })
+                    .filter(|a| a.selectable() && !at_cap(a))
                     .count(),
+                unreserved_slots: super::reservation::capped_slots(&root, &provider, &accounts)
+                    .map(|(slots, in_flight)| {
+                        slots
+                            .saturating_sub(in_flight)
+                            .saturating_sub(super::reservation::live_count(&root, &provider))
+                    }),
                 unverifiable: count(Ineligible::Unverifiable),
                 unreadable,
                 insecure_permissions: accounts

@@ -1,8 +1,7 @@
 //! [`TickReport`] and the per-candidate `dispatch()` outcome classification
-//! (Issue #8907), split out of `work_finder.rs`, which is frozen by the
-//! file-size ratchet. Both tick loops call [`record_dispatch_outcome`], so
-//! the single- and multi-workspace ticks cannot drift apart on how a typed
-//! refusal is counted, logged or exported.
+//! (Issue #8907), split out of `work_finder.rs`. Both tick loops call
+//! [`record_dispatch_outcome`], so the single- and multi-workspace ticks
+//! cannot drift apart on how a typed refusal is counted, logged or exported.
 
 use anyhow::Result;
 use chrono::{DateTime, Utc};
@@ -110,14 +109,6 @@ pub struct TickReport {
     /// (#12298): `rate_limit_breaker` when the breaker tripped mid-tick.
     /// `None` when it never stopped.
     pub spawn_hold: Option<String>,
-    /// Issues skipped because a **peer host** advertised a live soft claim over
-    /// the safehouse room (Issue #4028, Phase 1). Counted under its **own**
-    /// distinct reason — never folded into [`collisions`](Self::collisions)
-    /// (#4085's post-hoc collision *count*) or the label/in-flight skips — so an
-    /// operator can see how many dispatches the soft claim actively prevented,
-    /// separate from the collisions it did not. Always `0` when
-    /// `safehouse.enabled` is false (the dispatcher's `peer_claimed()` is empty).
-    pub skipped_peer_claim: usize,
     /// Issues skipped because they are inside a per-issue dispatch-backoff
     /// window after a failed dispatch (Issue #4485) — either filtered out before
     /// the capacity gate via [`WorkDispatcher::backed_off`](super::WorkDispatcher::backed_off), or refused by the

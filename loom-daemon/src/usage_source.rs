@@ -306,12 +306,7 @@ pub fn native_session_ids(log_region: &str) -> NativeSessionIds {
         let Some(at) = line.find("session id:") else {
             continue;
         };
-        let token = line[at + "session id:".len()..]
-            .trim_start()
-            .chars()
-            .take_while(|c| c.is_ascii_hexdigit() || *c == '-')
-            .collect::<String>();
-        if token.len() >= 8 {
+        if let Some(token) = codex_session_token(&line[at + "session id:".len()..]) {
             ids.codex.push(token);
         }
     }
@@ -320,6 +315,39 @@ pub fn native_session_ids(log_region: &str) -> NativeSessionIds {
         list.dedup();
     }
     ids
+}
+
+/// The first Codex banner from the bytes this role invocation appended (#14664).
+/// The runner's own first header opens the slice. A later quoted header and
+/// its body cannot displace the launch banner. Pre-launch notes have no
+/// invocation header and contribute no session id.
+pub(crate) fn role_tick_codex_session_id(output: &str) -> Option<String> {
+    const HEADER: &str = "==== loom-daemon role_runner:";
+    output
+        .lines()
+        .skip_while(|line| !line.starts_with(HEADER))
+        .skip(1)
+        .take_while(|line| !line.contains(HEADER))
+        .find_map(|line| {
+            line.trim_start()
+                .strip_prefix("session id:")
+                .and_then(codex_session_token)
+        })
+}
+
+/// The uuid-shaped token of a Codex `session id:` banner: the run of
+/// hex/dash characters after the prefix, when it is at least 8 characters —
+/// the same shape `spawn-codex.sh`'s own transcript join greps for. Shared by
+/// every Codex banner reader ([`native_session_ids`],
+/// [`role_tick_codex_session_id`], and `launch_record`'s step-log pair) so the
+/// vocabulary cannot drift between them.
+pub(crate) fn codex_session_token(after_prefix: &str) -> Option<String> {
+    let token: String = after_prefix
+        .trim_start()
+        .chars()
+        .take_while(|c| c.is_ascii_hexdigit() || *c == '-')
+        .collect();
+    (token.len() >= 8).then_some(token)
 }
 
 /// Per-`(model, speed, service_tier)` token totals for one sweep, read from
@@ -393,8 +421,8 @@ pub fn has_merge_step_logs(workspace_root: &Path, issue: u32, pr: u32) -> bool {
 /// Per-`(model, speed, service_tier)` token totals for a **step-dispatched**
 /// merge of `pr` (closing `issue`), on this host only (#14018).
 ///
-/// Two sources, summed, because the steps of one PR can run on different
-/// runtimes (an OpenCode Builder, a Claude Judge):
+/// Three sources, summed, because the steps of one PR can run on different
+/// runtimes (an OpenCode Builder, a Claude Judge, a Codex Doctor):
 ///
 /// - **Claude transcripts** whose first message names the issue-keyed Builder
 ///   or the PR-keyed Judge/Doctor/`champion --pr` command
@@ -407,10 +435,17 @@ pub fn has_merge_step_logs(workspace_root: &Path, issue: u32, pr: u32) -> bool {
 ///   log (issue-keyed) is read from its last dispatch only, so an abandoned
 ///   retry is not charged to the PR; the PR-keyed Doctor/Judge/`champion_merge`
 ///   logs are read whole, as each dispatch there is a completed round (#14210).
+/// - **Codex sessions** named by the `session id:` banners in the same step
+///   logs, with the same last-dispatch (Builder) vs whole-log (PR-keyed) split
+///   (#14883), resolved through
+///   [`crate::codex_usage::tokens_by_session_ids`] by exact id with no
+///   directory and no window: a private-clone seat's rollout reports a
+///   container-local `cwd` (#14540), and a Builder rollout can start before
+///   the PR's `createdAt`, so the merge `window` must not bound it.
 ///
 /// A step that ran on another host left no log or transcript here, so its usage
 /// is absent and the total stays partial. `None` — never `Some(vec![])` — when
-/// neither source found anything.
+/// no source found anything.
 #[must_use]
 pub fn merge_step_tokens_by_model(
     workspace_root: &Path,
@@ -427,27 +462,43 @@ pub fn merge_step_tokens_by_model(
             window,
         )
     });
-    let session_ids: Vec<String> = crate::launch_record::merge_step_logs(workspace_root, issue, pr)
+    let mut session_ids: Vec<String> = Vec::new();
+    let mut codex_ids: Vec<String> = Vec::new();
+    for (role, contents) in crate::launch_record::merge_step_logs(workspace_root, issue, pr)
         .into_iter()
         .filter_map(|(role, path)| Some((role, std::fs::read_to_string(path).ok()?)))
-        .flat_map(|(role, contents)| {
-            use crate::step_role::StepRole;
-            // Spelled out, no catch-all: a role added to `merge_step_logs`
-            // must be filed under its keying here before this compiles.
-            match role {
-                // Issue-keyed: an earlier dispatch is an abandoned retry.
-                StepRole::Builder | StepRole::Curator | StepRole::ChampionPromote => {
-                    crate::launch_record::opencode_session_ids_last_dispatch(&contents)
-                }
-                // PR-keyed: an earlier dispatch is a completed round on this PR.
-                StepRole::Doctor | StepRole::Judge | StepRole::ChampionMerge => {
-                    crate::launch_record::opencode_session_ids(&contents)
-                }
+    {
+        use crate::step_role::StepRole;
+        // Spelled out, no catch-all: a role added to `merge_step_logs`
+        // must be filed under its keying here before this compiles.
+        match role {
+            // Issue-keyed: an earlier dispatch is an abandoned retry.
+            StepRole::Builder | StepRole::Curator | StepRole::ChampionPromote => {
+                session_ids
+                    .extend(crate::launch_record::opencode_session_ids_last_dispatch(&contents));
+                codex_ids.extend(crate::launch_record::codex_session_ids_last_dispatch(&contents));
             }
-        })
-        .collect();
+            // PR-keyed: an earlier dispatch is a completed round on this PR.
+            StepRole::Doctor | StepRole::Judge | StepRole::ChampionMerge => {
+                session_ids.extend(crate::launch_record::opencode_session_ids(&contents));
+                codex_ids.extend(crate::launch_record::codex_session_ids(&contents));
+            }
+        }
+    }
+    // One launch's banner can land in two logs (a resume named by both the
+    // Builder's and a round's); first-seen order, de-duplicated across the
+    // selected regions.
+    let mut seen = std::collections::HashSet::new();
+    codex_ids.retain(|id| seen.insert(id.clone()));
     let opencode = crate::opencode_usage::tokens_by_session_ids(&session_ids, None);
-    combine_model_totals(claude.into_iter().chain(opencode).flatten())
+    let codex = crate::codex_usage::tokens_by_session_ids(&codex_ids, None);
+    combine_model_totals(
+        claude
+            .into_iter()
+            .flatten()
+            .chain(opencode.into_iter().flatten())
+            .chain(codex.into_iter().flatten()),
+    )
 }
 
 /// Merge rows by `(model, speed, service_tier)`, summing every counter, sorted
@@ -590,22 +641,25 @@ pub fn sweep_tokens_by_window(
 /// Pi's ([`crate::pi_usage`]), and a step's event stream is captured in the
 /// step's own log, not the per-role one.
 ///
-/// `session_ids` (#14048) are the exact native session ids parsed from that
-/// same log's dispatch region. The OpenCode and Codex arms key on them
-/// when present, and fall back to the directory+window key when empty (a role
-/// tick, or a step whose log was unreadable). The two arms are NOT symmetric:
+/// `session_ids` (#14048) are the exact native session ids parsed from the
+/// launch's own output — a step's dispatch region, or a role tick's
+/// invocation-owned banner (#14664). The arms
+/// fall back to the directory+window key when empty. The two arms are NOT
+/// symmetric:
 ///
 /// - **OpenCode**: the id is the whole key — no directory, no window — because
 ///   the id cannot name another launch's session.
-/// - **Codex**: the ids are ANDed with the workspace directory and the window
-///   (`SessionFilter::matches` in `codex_usage`), so an id-named rollout whose
-///   `cwd` is not the workspace root, or that started outside the window, is
-///   not attributed. The window is kept deliberately: it bounds the rollout
-///   scan to the window's date directories, where dropping it would read
-///   every rollout in the store. A step child's cwd is pinned to the workspace
-///   root, so the directory constraint holds for every step dispatch today; a
-///   launch path that runs Codex from a worktree would need an ids-only
-///   filter here.
+/// - **Codex**: a run with captured ids and a bounded window — a step
+///   ([`step_tokens_by_model`], #14540) or a role tick (#14664) — reads by
+///   id + window only, since a private-clone seat's rollout reports the
+///   container path as `cwd` and never equals a host workspace directory;
+///   that directory mismatch is what left Guide and Hermit at 0-of-10 usage
+///   on 0.20.0. Without ids (or without a bounded window) the
+///   directory + window key applies, ANDing any ids with the workspace
+///   directory (`SessionFilter::matches` in `codex_usage`). The window is
+///   kept deliberately in every arm: it bounds the rollout scan to the
+///   window's date directories and the rollout's `session_meta.timestamp`,
+///   where dropping it would read every rollout in the store.
 ///
 /// The Kimi arm has no id source yet (see `crate::kimi_usage`'s module doc)
 /// and keeps the directory+window key.
@@ -617,6 +671,24 @@ pub fn role_tick_tokens_by_model(
     window: Option<(DateTime<Utc>, DateTime<Utc>)>,
     session_ids: &NativeSessionIds,
 ) -> Option<Vec<ModelUsageTotals>> {
+    // #14664: a role tick with captured Codex ids and a bounded window reads
+    // by id + window, exactly as a step does after #14540 — its rollout's
+    // `cwd` is the container path in a private-clone seat, so the directory
+    // clause would reject the tick's own id-named rollout. No directory retry
+    // on an id miss: it could fold a sibling's spend in.
+    if UsageSource::for_runtime(runtime) == UsageSource::CodexSessionRollouts
+        && !session_ids.codex.is_empty()
+    {
+        let window = window?;
+        return crate::codex_usage::tokens_by_model(
+            &crate::codex_usage::SessionFilter {
+                directories: Vec::new(),
+                ids: session_ids.codex.clone(),
+            },
+            Some(window),
+            None,
+        );
+    }
     native_tokens_by_model(runtime, &role_tick_directories(root), log_path, window, session_ids)
 }
 
@@ -635,6 +707,16 @@ pub fn role_tick_tokens_by_model(
 /// the transcript's own command) and Pi (which reads the step's own log) are
 /// exact per step. `None` for [`UsageSource::ClaudeTranscripts`], like the
 /// tick reader.
+///
+/// **Codex is the exception (#14540).** A step that captured exact Codex
+/// session ids from its own dispatch region AND has a bounded window reads
+/// Codex by those ids alone, with no directory constraint: a step in a
+/// private-clone seat runs inside the session container, so its rollout's
+/// `session_meta.cwd` is the container path (`/workspace/work/…`) and never
+/// equals the host workspace root. The id names this step's own session, and
+/// the window still bounds the date-directory scan and the rollout's
+/// `session_meta.timestamp`. An exact-id miss stays unknown: attribution is
+/// NOT retried by directory, which could fold a sibling's spend in.
 #[must_use]
 pub fn step_tokens_by_model(
     runtime: Option<&str>,
@@ -644,6 +726,19 @@ pub fn step_tokens_by_model(
     window: Option<(DateTime<Utc>, DateTime<Utc>)>,
     session_ids: &NativeSessionIds,
 ) -> Option<Vec<ModelUsageTotals>> {
+    if UsageSource::for_runtime(runtime) == UsageSource::CodexSessionRollouts
+        && !session_ids.codex.is_empty()
+        && window.is_some()
+    {
+        return crate::codex_usage::tokens_by_model(
+            &crate::codex_usage::SessionFilter {
+                directories: Vec::new(),
+                ids: session_ids.codex.clone(),
+            },
+            window,
+            None,
+        );
+    }
     let (number, acts_on_pr) = item;
     let directories = if acts_on_pr {
         role_tick_directories(root)
@@ -651,6 +746,54 @@ pub fn step_tokens_by_model(
         sweep_directories(root, number)
     };
     native_tokens_by_model(runtime, &directories, log_path, window, session_ids)
+}
+
+/// Resolve native usage for one close with its missing reason. OpenCode's and
+/// Codex's (#14664) keyed lookups return rows and absence evidence from the
+/// same read.
+pub(crate) fn native_close_usage(
+    runtime: Option<&str>,
+    root: &Path,
+    step_item: Option<(u32, bool)>,
+    log_path: &Path,
+    window: Option<(DateTime<Utc>, DateTime<Utc>)>,
+    session_ids: &NativeSessionIds,
+) -> Result<Vec<ModelUsageTotals>, crate::observability::runtime_usage::missing::UsageMissing> {
+    use crate::observability::runtime_usage::missing::UsageMissing;
+    use crate::opencode_usage::IdLookup;
+    let opencode = UsageSource::for_runtime(runtime) == UsageSource::OpenCodeSessionDb;
+    if opencode && !session_ids.opencode.is_empty() {
+        return match crate::opencode_usage::lookup_ids(&session_ids.opencode, None) {
+            IdLookup::Found(rows) => Ok(rows),
+            IdLookup::NoStore => Err(UsageMissing::StoreUnreadable),
+            IdLookup::NotFound => Err(UsageMissing::SessionNotFound),
+            IdLookup::NoUsage => Err(UsageMissing::NoUsageTokens),
+            IdLookup::Unattributable => Err(UsageMissing::NoAttributableUsage),
+        };
+    }
+    // #14664: Codex ids get the same evidence the OpenCode arm returns — no
+    // store, an id no rollout holds, or a rollout with no tokens — instead of
+    // one undifferentiated `no_attributable_usage` for every miss. The key is
+    // id + window (no directory retry; see `codex_usage::lookup_ids`).
+    let codex = UsageSource::for_runtime(runtime) == UsageSource::CodexSessionRollouts;
+    if codex && !session_ids.codex.is_empty() {
+        let window = window.ok_or(UsageMissing::NoWindow)?;
+        return match crate::codex_usage::lookup_ids(&session_ids.codex, window, None) {
+            crate::codex_usage::IdLookup::Found(rows) => Ok(rows),
+            crate::codex_usage::IdLookup::NoStore => Err(UsageMissing::StoreUnreadable),
+            crate::codex_usage::IdLookup::NotFound => Err(UsageMissing::SessionNotFound),
+            crate::codex_usage::IdLookup::NoUsage => Err(UsageMissing::NoUsageTokens),
+        };
+    }
+    let rows = match step_item {
+        Some(item) => step_tokens_by_model(runtime, root, item, log_path, window, session_ids),
+        None => role_tick_tokens_by_model(runtime, root, log_path, window, session_ids),
+    };
+    rows.ok_or(if opencode || codex {
+        UsageMissing::NoSessionId
+    } else {
+        UsageMissing::NoAttributableUsage
+    })
 }
 
 fn native_tokens_by_model(
@@ -688,6 +831,387 @@ fn native_tokens_by_model(
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+
+    /// #14566: a step whose OpenCode read found nothing is told apart by why:
+    /// no session id in its log, no store, an id no store holds, or an id whose
+    /// session recorded no tokens. Another native runtime can only say nothing
+    /// was attributable.
+    #[test]
+    #[serial_test::serial(opencode_db_env)]
+    fn a_native_read_that_found_nothing_says_why() {
+        use crate::observability::runtime_usage::missing::UsageMissing as M;
+        let tmp = tempfile::tempdir().unwrap();
+        let db = tmp.path().join("opencode.db");
+        let ids = |id: &str| NativeSessionIds {
+            opencode: vec![id.to_string()],
+            codex: Vec::new(),
+        };
+        let _db =
+            crate::env_test_support::EnvGuard::set(crate::opencode_usage::OPENCODE_DB_ENV, &db);
+        let close = |runtime, ids: &NativeSessionIds| {
+            native_close_usage(Some(runtime), tmp.path(), Some((42, false)), &db, None, ids)
+        };
+
+        // No session id in the log: nothing to look up, whatever the store holds.
+        assert_eq!(close("opencode", &NativeSessionIds::default()), Err(M::NoSessionId));
+
+        // The override names a store that does not exist: nothing is readable.
+        assert_eq!(close("opencode", &ids("ses_a")), Err(M::StoreUnreadable));
+
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE session (id TEXT PRIMARY KEY, model TEXT, tokens_input INTEGER, \
+             tokens_output INTEGER, tokens_reasoning INTEGER, tokens_cache_read INTEGER, \
+             tokens_cache_write INTEGER, directory TEXT NOT NULL, time_created INTEGER NOT NULL);
+             INSERT INTO session VALUES ('ses_zero', '{\"id\":\"m\",\"providerID\":\"p\"}', \
+             0, 0, 0, 0, 0, '/repo', 1);",
+        )
+        .unwrap();
+        drop(conn);
+        assert_eq!(close("opencode", &ids("ses_absent")), Err(M::SessionNotFound));
+        assert_eq!(close("opencode", &ids("ses_zero")), Err(M::NoUsageTokens));
+        // A later close sees the committed tokens through the same lookup
+        // that classifies absence. It hands those rows back to the emitter.
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        conn.execute("UPDATE session SET tokens_input = 10 WHERE id = 'ses_zero'", [])
+            .unwrap();
+        let rows = close("opencode", &ids("ses_zero")).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].input, 10);
+    }
+
+    /// Seed one rollout into a fixture `$CODEX_HOME` — the minimal live-shape
+    /// fixture for the dispatch seam (`codex_usage::tests` keeps the full
+    /// poisoned-sibling fixture; this only drives the seam).
+    fn seed_rollout(home: &Path, date_dir: &str, name: &str, lines: &[String]) {
+        use std::io::Write as _;
+        let dir = home.join(crate::codex_usage::SESSIONS_DIR).join(date_dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut file = std::fs::File::create(dir.join(name)).unwrap();
+        for line in lines {
+            writeln!(file, "{line}").unwrap();
+        }
+    }
+
+    /// A single-model Codex rollout: meta, turn context, and one cumulative
+    /// `token_count` event per `(input, cached, output)` triple.
+    fn codex_rollout(
+        cwd: &str,
+        created: &str,
+        id: &str,
+        model: &str,
+        tokens: &[(i64, i64, i64)],
+    ) -> Vec<String> {
+        let mut lines = vec![
+            serde_json::json!({
+                "timestamp": created,
+                "type": "session_meta",
+                "payload": {"session_id": id, "id": id, "timestamp": created, "cwd": cwd},
+            })
+            .to_string(),
+            serde_json::json!({
+                "type": "turn_context",
+                "payload": {"cwd": cwd, "model": model},
+            })
+            .to_string(),
+        ];
+        for (input, cached, output) in tokens {
+            lines.push(
+                serde_json::json!({
+                    "type": "event_msg",
+                    "payload": {"type": "token_count", "info": {"total_token_usage": {
+                        "input_tokens": input, "cached_input_tokens": cached, "output_tokens": output,
+                   }}},
+                })
+                .to_string(),
+            );
+        }
+        lines
+    }
+
+    fn at(raw: &str) -> DateTime<Utc> {
+        DateTime::parse_from_rfc3339(raw)
+            .unwrap()
+            .with_timezone(&Utc)
+    }
+
+    /// #14664: a Codex close that found nothing says why — no id in the tick's
+    /// log, no readable store, an id no rollout holds, a named rollout with no
+    /// tokens — and an id-named rollout whose `cwd` is a private-clone
+    /// container path is attributed by id, the miss that left Guide and Hermit
+    /// at 0-of-10 usage on 0.20.0.
+    #[test]
+    #[serial_test::serial(codex_home_env)]
+    fn a_codex_read_that_found_nothing_says_why() {
+        use crate::observability::runtime_usage::missing::UsageMissing as M;
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join(".codex");
+        seed_rollout(
+            &home,
+            "2026/09/20",
+            "rollout-real.jsonl",
+            &codex_rollout(
+                "/workspace/work/repo-clone",
+                "2026-09-21T02:06:31Z",
+                "11111111-2222-3333-4444-555555555555",
+                "gpt-5",
+                &[(1_000, 400, 100)],
+            ),
+        );
+        seed_rollout(
+            &home,
+            "2026/09/20",
+            "rollout-zero.jsonl",
+            &codex_rollout(
+                "/w",
+                "2026-09-21T02:06:31Z",
+                "99999999-8888-7777-6666-555555555555",
+                "gpt-5",
+                &[],
+            ),
+        );
+        let ids = |id: &str| NativeSessionIds {
+            opencode: Vec::new(),
+            codex: vec![id.to_string()],
+        };
+        let window = Some((at("2026-09-21T01:00:00Z"), at("2026-09-21T03:00:00Z")));
+        let log = tmp.path().join("role-guide.log");
+        let close = |ids: &NativeSessionIds| {
+            native_close_usage(Some("codex"), tmp.path(), None, &log, window, ids)
+        };
+        let _guard =
+            crate::env_test_support::EnvGuard::set(crate::codex_usage::CODEX_HOME_ENV, &home);
+
+        // No id captured and the directory + window read of the workspace
+        // root finds nothing (the rollout's cwd is a container path): the
+        // miss is named, not folded into `no_attributable_usage`.
+        assert_eq!(close(&NativeSessionIds::default()), Err(M::NoSessionId));
+
+        // An id no rollout in the store holds.
+        assert_eq!(close(&ids("00000000-0000-0000-0000-000000000000")), Err(M::SessionNotFound));
+
+        // A named rollout selected by the id + window key with no tokens.
+        assert_eq!(close(&ids("99999999-8888-7777-6666-555555555555")), Err(M::NoUsageTokens));
+
+        // The id-named rollout is attributed across the directory mismatch.
+        let selected = ids("11111111-2222-3333-4444-555555555555");
+        assert_eq!(
+            native_close_usage(Some("codex"), tmp.path(), Some((42, false)), &log, None, &selected),
+            Err(M::NoWindow),
+        );
+        let rows = close(&selected).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].model, "gpt-5");
+        assert_eq!(rows[0].input, 600);
+        assert_eq!(rows[0].cache_read, 400);
+        assert_eq!(rows[0].output, 100);
+
+        // A readable prefix cannot confirm an absent session or zero tokens.
+        let file = home.join("sessions/2026/09/20/rollout-real.jsonl");
+        let complete = std::fs::read(&file).unwrap();
+        let line_end = complete.iter().position(|&byte| byte == b'\n').unwrap() + 1;
+        let interrupted = [&complete[..line_end], &[0xff, b'\n'], &complete[line_end..]].concat();
+        std::fs::write(file, interrupted).unwrap();
+        assert_eq!(close(&selected), Err(M::StoreUnreadable));
+        assert_eq!(close(&ids("00000000-0000-0000-0000-000000000000")), Err(M::StoreUnreadable));
+
+        // A store that does not exist at all.
+        let absent = tmp.path().join("no-such-codex-home");
+        let _absent =
+            crate::env_test_support::EnvGuard::set(crate::codex_usage::CODEX_HOME_ENV, &absent);
+        assert_eq!(close(&ids("11111111-2222-3333-4444-555555555555")), Err(M::StoreUnreadable));
+    }
+
+    /// #14664: a role tick with captured Codex ids and a bounded window is
+    /// keyed on id + window, not on the workspace directory — a private-clone
+    /// seat's rollout reports its container path as `cwd`.
+    #[test]
+    #[serial_test::serial(codex_home_env)]
+    fn a_role_tick_keys_codex_on_ids_and_window_not_the_workspace_directory() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join(".codex");
+        seed_rollout(
+            &home,
+            "2026/09/20",
+            "rollout-guide.jsonl",
+            &codex_rollout(
+                "/workspace/work/repo-clone",
+                "2026-09-21T02:06:31Z",
+                "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+                "gpt-5",
+                &[(500, 0, 50)],
+            ),
+        );
+        let _guard =
+            crate::env_test_support::EnvGuard::set(crate::codex_usage::CODEX_HOME_ENV, &home);
+        let window = Some((at("2026-09-21T01:00:00Z"), at("2026-09-21T03:00:00Z")));
+        let log = tmp.path().join("role-guide.log");
+        let ids = NativeSessionIds {
+            opencode: Vec::new(),
+            codex: vec!["aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee".to_string()],
+        };
+
+        // The id key attributes the rollout although its cwd is not the
+        // workspace root.
+        let rows = role_tick_tokens_by_model(Some("codex"), tmp.path(), &log, window, &ids);
+        assert!(role_tick_tokens_by_model(Some("codex"), tmp.path(), &log, None, &ids).is_none());
+        assert_eq!(rows.as_ref().map(|r| r.len()), Some(1));
+        assert_eq!(rows.unwrap()[0].output, 50);
+
+        // The directory key (no ids) does not — the pre-#14664 role-tick miss.
+        assert_eq!(
+            role_tick_tokens_by_model(
+                Some("codex"),
+                tmp.path(),
+                &log,
+                window,
+                &NativeSessionIds::default()
+            ),
+            None
+        );
+    }
+
+    /// #14883: a step-dispatched merge joins Codex usage by the exact session
+    /// ids its selected regions name — the Builder's LAST dispatch plus every
+    /// PR-keyed round — with no window bounding the read (a Builder rollout
+    /// can start before the PR's creation). An abandoned attempt, an unrelated
+    /// rollout in the same home, a repeated id and a named-but-missing rollout
+    /// each contribute exactly what they must: nothing, or once.
+    #[test]
+    #[serial_test::serial(codex_home_env)]
+    fn a_merge_attributes_exactly_the_final_codex_builder_and_every_round() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = tmp.path().join("ws");
+        let logs = ws.join(".loom").join("logs");
+        std::fs::create_dir_all(&logs).unwrap();
+        const ABANDONED: &str = "00000000-0000-0000-0000-000000000001";
+        const FINAL: &str = "11111111-1111-1111-1111-111111111111";
+        const ROUND1: &str = "22222222-2222-2222-2222-222222222222";
+        const ROUND2: &str = "33333333-3333-3333-3333-333333333333";
+        const MISSING: &str = "44444444-4444-4444-4444-444444444444";
+        // Issue-keyed Builder log: an abandoned attempt, then the final one —
+        // whose banner repeats (a resume re-echo) and must count once.
+        std::fs::write(
+            logs.join("step-builder-14883.log"),
+            [
+                "==== loom-daemon dispatch: 2026-11-20T09:00:00+00:00 sweep_id=a item=14883 ===="
+                    .to_string(),
+                format!("session id: {ABANDONED}"),
+                "==== loom-daemon dispatch: 2026-11-20T11:00:00+00:00 sweep_id=b item=14883 ===="
+                    .to_string(),
+                format!("session id: {FINAL}"),
+                format!("session id: {FINAL}"),
+            ]
+            .join("\n"),
+        )
+        .unwrap();
+        // PR-keyed Judge log: two dispatch regions — two completed rounds. The
+        // final Builder's id repeated in round 2 must not double-count it, and
+        // MISSING names no rollout at all.
+        std::fs::write(
+            logs.join("step-judge-701.log"),
+            [
+                "==== loom-daemon dispatch: 2026-11-21T01:00:00+00:00 sweep_id=c item=701 ===="
+                    .to_string(),
+                format!("session id: {ROUND1}"),
+                "==== loom-daemon dispatch: 2026-11-21T03:00:00+00:00 sweep_id=d item=701 ===="
+                    .to_string(),
+                format!("session id: {ROUND2}"),
+                format!("session id: {FINAL}"),
+                format!("session id: {MISSING}"),
+            ]
+            .join("\n"),
+        )
+        .unwrap();
+
+        let home = tmp.path().join(".codex");
+        let cwd = "/workspace/work/repo-clone";
+        // The final Builder's rollout is created BEFORE the PR window opens —
+        // a `createdAt` lower bound would lose exactly this usage.
+        seed_rollout(
+            &home,
+            "2026/11/20",
+            &format!("rollout-2026-11-20T10-00-00-{FINAL}.jsonl"),
+            &codex_rollout(cwd, "2026-11-20T10:00:31Z", FINAL, "gpt-5-final", &[(1_000, 400, 100)]),
+        );
+        seed_rollout(
+            &home,
+            "2026/11/20",
+            &format!("rollout-2026-11-20T09-30-00-{ABANDONED}.jsonl"),
+            &codex_rollout(
+                cwd,
+                "2026-11-20T09:30:31Z",
+                ABANDONED,
+                "abandoned-model",
+                &[(9_000_000, 0, 900_000)],
+            ),
+        );
+        seed_rollout(
+            &home,
+            "2026/11/21",
+            &format!("rollout-2026-11-21T01-30-00-{ROUND1}.jsonl"),
+            &codex_rollout(cwd, "2026-11-21T01:30:31Z", ROUND1, "gpt-5-round1", &[(500, 0, 50)]),
+        );
+        seed_rollout(
+            &home,
+            "2026/11/21",
+            &format!("rollout-2026-11-21T03-30-00-{ROUND2}.jsonl"),
+            &codex_rollout(
+                cwd,
+                "2026-11-21T03:30:31Z",
+                ROUND2,
+                "gpt-5-round2",
+                &[(2_000, 100, 200)],
+            ),
+        );
+        // An unrelated rollout in the same home: never named by a log.
+        seed_rollout(
+            &home,
+            "2026/11/21",
+            "rollout-2026-11-21T02-00-00-55555555-6666-7777-8888-999999999999.jsonl",
+            &codex_rollout(
+                cwd,
+                "2026-11-21T02:00:31Z",
+                "55555555-6666-7777-8888-999999999999",
+                "unrelated-model",
+                &[(8_000_000, 0, 800_000)],
+            ),
+        );
+        let _guard =
+            crate::env_test_support::EnvGuard::set(crate::codex_usage::CODEX_HOME_ENV, &home);
+
+        let window = Some((at("2026-11-20T10:30:00Z"), at("2026-11-21T04:00:00Z")));
+        let rows = merge_step_tokens_by_model(&ws, 14883, 701, window).expect("three codex rows");
+        assert_eq!(
+            rows.iter().map(|r| r.model.as_str()).collect::<Vec<_>>(),
+            vec!["gpt-5-final", "gpt-5-round1", "gpt-5-round2"],
+            "{rows:?}"
+        );
+        let by_input = |model: &str| rows.iter().find(|r| r.model == model).unwrap();
+        let final_row = by_input("gpt-5-final");
+        assert_eq!(
+            (final_row.input, final_row.cache_read, final_row.output),
+            (600, 400, 100),
+            "cached input stays disjoint from input"
+        );
+        let round1 = by_input("gpt-5-round1");
+        assert_eq!((round1.input, round1.cache_read, round1.output), (500, 0, 50));
+        let round2 = by_input("gpt-5-round2");
+        assert_eq!((round2.input, round2.cache_read, round2.output), (1900, 100, 200));
+
+        // A merge nothing measured — a step log with no banners, no named
+        // rollout — omits the breakdown entirely: unknown, never zero rows.
+        let bare = tmp.path().join("ws-bare");
+        let bare_logs = bare.join(".loom").join("logs");
+        std::fs::create_dir_all(&bare_logs).unwrap();
+        std::fs::write(
+            bare_logs.join("step-builder-14884.log"),
+            "==== loom-daemon dispatch: 2026-11-21T01:00:00+00:00 sweep_id=e item=14884 ====\nno \
+             banners, no sessions\n",
+        )
+        .unwrap();
+        assert_eq!(merge_step_tokens_by_model(&bare, 14884, 702, window), None);
+    }
 
     #[test]
     fn each_mapped_runtime_selects_its_own_store_and_everything_else_stays_on_transcripts() {

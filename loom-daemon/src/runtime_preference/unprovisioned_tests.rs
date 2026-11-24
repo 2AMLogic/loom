@@ -68,3 +68,49 @@ fn an_unpooled_native_provider_without_a_credential_is_unprovisioned() {
     assert!(state.is_spawnable(), "{state:?}");
     assert_eq!(state.source(), &CredentialSource::Unobservable);
 }
+
+/// #14944: a pooled provider whose only selectable account already holds its
+/// declared `maxConcurrent` is unavailable and self-healing: the ladder's
+/// tier 0 would refuse the launch at 78. A second account under its cap, or
+/// the slot freeing, makes the tap spawnable again.
+#[test]
+#[serial_test::serial]
+fn a_pool_with_every_account_at_its_concurrency_cap_is_unavailable() {
+    use crate::api_keys_pool::{inflight, limits, registry};
+    let _env = ClearedRuntimeEnv::new();
+    let dir = backstop_fixture();
+    let pool = crate::api_keys_pool::paths::per_repo_api_keys_dir(dir.path());
+    let admitted = resolve_and_admit(dir.path(), "builder", Some("opencode")).unwrap();
+    let tap = Tap::runtime("opencode");
+    limits::set_max_concurrent(&pool, "zai", "alpha", Some(1)).unwrap();
+    assert!(availability(dir.path(), &tap, &admitted, 0).is_spawnable());
+
+    let lease = inflight::register(&pool, "zai", "alpha").unwrap();
+    let state = availability(dir.path(), &tap, &admitted, 0);
+    let Availability::Exhausted { hold, detail, .. } = &state else {
+        panic!("a pool at its cap must not be spawnable: {state:?}");
+    };
+    assert_eq!(*hold, PoolHold::SelfHealing);
+    assert!(detail.starts_with("pool zai at cap: 0/1 selectable"), "{detail}");
+    assert!(detail.contains("(1 at capacity)"), "{detail}");
+
+    // A second account with room: the ladder would skip alpha and take it.
+    registry::add(&pool, "zai", "beta", "ZAI_API_KEY", "fake", false).unwrap();
+    let state = availability(dir.path(), &tap, &admitted, 0);
+    assert!(
+        matches!(
+            state,
+            Availability::Spawnable {
+                spawnable: Some(1),
+                total: Some(2),
+                ..
+            }
+        ),
+        "{state:?}"
+    );
+    registry::set_enabled(&pool, "zai", "beta", false).unwrap();
+    assert!(!availability(dir.path(), &tap, &admitted, 0).is_spawnable());
+
+    lease.release();
+    assert!(availability(dir.path(), &tap, &admitted, 0).is_spawnable());
+}
