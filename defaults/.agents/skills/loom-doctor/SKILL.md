@@ -1099,8 +1099,9 @@ loom-daemon forge doctor-handback $N --expected-head-sha "$(git rev-parse HEAD)"
 ```
 
 It re-reads labels and head, adds `loom:review-requested` *before* removing
-`loom:changes-requested`/`loom:treating` (never an unlabelled PR), re-reads,
-and withdraws its add if a verdict landed meanwhile. Act on the exit:
+`loom:changes-requested`, `loom:ci-failure` and `loom:treating` (never an
+unlabelled PR), re-reads, and withdraws its add if a verdict landed
+meanwhile. Act on the exit:
 
 | Exit | Line | Action |
 |------|------|--------|
@@ -1569,7 +1570,7 @@ states Doctor exists to clear:
 | Label | Meaning | Doctor's action |
 |-------|---------|-----------------|
 | `loom:merge-conflict` | PR has merge conflicts requiring resolution | **Remove it once you have rebased and the conflicts are resolved** (the PR is no longer conflicting). Apply it if you triage a conflicted PR you cannot immediately fix. |
-| `loom:ci-failure` | PR has failing CI checks | **Remove it once CI is green again** after your fix. Apply it if you are flagging a PR whose CI is red and leaving it for a follow-up. |
+| `loom:ci-failure` | PR has failing CI checks | **Cleared by `forge doctor-handback` on every hand-back, green or not.** Apply it by hand only when flagging a PR whose CI is red and leaving it for a follow-up. |
 
 These are informational flags, not queue gates (the queues are `loom:pr` for conflicts and
 `loom:changes-requested` for feedback). Keep them current: clear each the moment its

@@ -2,6 +2,65 @@
 
 Sections moved byte-for-byte from [WORK_LOG.md](../WORK_LOG.md) by `loom-daemon work-docs archive`.
 
+### 2026-09-24
+
+- **Issue #8831** (closed): rework #8808 (issue #8796): port the backticked-trailer warning logic into loom-daemon (script_ports pattern) so the portable shell delta is <= 0
+- **Issue #8832** (closed): dashboard: host 'Degraded' trips on a single failed role tick or one load sample — nearly always on
+- **PR #8833**: dashboard: "Degraded" means act-on-this; self-healing states render "Throttled" (#8832)
+- **Issue #8664** (closed): observability: interactive runtime sessions (Claude Code, Codex, opencode, pi) never reach the fleet sinks — only daemon-dispatched work does
+- **Issue #8451** (closed): Native guard bridge: the 20s policy timeout refuses harmless commands on a saturated host, and the model cannot tell a timeout from a denial
+- **PR #8467**: fix(native-tools): distinguish policy timeout from denial, make the budget configurable
+- **Issue #8786** (closed): Route daemon Codex jobs into private clones with recoverable logs and checkpoints
+- **PR #8830**: feat: dispatch Codex jobs into account-private workspaces
+- **PR #8806**: feat(runtimes): tier-3 Gemini CLI passthrough adapter + claude->gemini preference fallback (part of #4167)
+- **Issue #8827** (closed): observability: standing policy — all 2amlogic build/CI logs and runs are captured in SigNoz (ci-observability policy doc + wiring; phase 4 of 4)
+- **PR #8828**: docs(observability): standing CI-observability policy — all 2amlogic CI captured in SigNoz
+- **Issue #8634** (closed): sweep-outcomes summary --group-by tap splits one tap across the #8625 profile-stamping boundary
+- **PR #8690**: fix(sweep-outcomes): flag a tap split across the #8625 profile-stamping boundary
+- **Issue #8546** (closed): dashboard: the Charts tab is unreadable — no axes, titles, legends, tooltips or table view, and the SVGs scale their text with the viewport
+- **PR #8549**: feat(dashboard): make the Charts tab readable — titles, axes, legends, tooltips and a table view (#8546)
+- **Issue #8668** (closed): observability: wire Claude Code native OTLP export for interactive sessions (#8664 item 1)
+- **PR #8682**: docs(observability): wire Claude Code native OTLP for interactive sessions
+- **Issue #8552** (closed): Champion hold-rot detector: operator-held PRs go stale against main undetected until the human merge fails (3 of 6 needed rebases, one semantic)
+- **PR #8569**: Champion: detect held-PR base staleness before merge time (#8552)
+- **Issue #8489** (closed): Flaky test: script_helpers::fleet_experiment::tests::a_different_seed_yields_a_different_assignment can coincidentally fail
+- **PR #8500**: test(fleet_experiment): fix ~1/400 flake in a_different_seed_yields_a_different_assignment
+- **Issue #8767** (closed): [Epic #8764] Authorize the forge.event bus topic in the event-bus taxonomy and state the Generic-topic rule
+- **PR #8811**: docs(taxonomy): authorize forge.event in the event-bus taxonomy and state the Generic-topic rule (#8767)
+- **Issue #8736** (closed): peer_coordination: the converse false positive (this host busy, peers idle) needs a periodic liveness heartbeat to close
+- **PR #8817**: feat(peer-claims): close the converse peer-coordination false positive with a liveness heartbeat
+- **Issue #8649** (closed): watchdog: peer-coord/outage sentinel writes silently swallow I/O errors, causing duplicate escalation issues under disk pressure
+- **PR #8704**: fix(watchdog): report sentinel write failures instead of swallowing them
+- **Issue #8697** (closed): Route Claude Code's contained dispatch through the credential egress proxy (follow-up to #8674)
+- **PR #8820**: feat(containment): route Claude's contained dispatch through the credential egress proxy (#8697)
+- **Issue #8770** (closed): Auto-update: post-provision codesign check is unbounded and misreports a non-answer as a signature downgrade
+- **PR #8781**: fix(daemon): bound and disposition-correct the post-provision codesign check
+- **Issue #8779** (closed): peer-claim coordination is DEGRADED on ip-198-51-100-42 (#6157 Layer 3)
+- **Issue #8674** (closed): Containment: keep real credentials out of the worker container via a per-launch placeholder token swapped by a host-side egress proxy (epic #6896)
+- **Issue #8643** (closed): telemetry: two durability-neutral fsync reductions in the trace journal (measured: ~10 fsyncs/span, ~2.7ms each)
+- **PR #8679**: fix(telemetry): skip redundant directory fsyncs in the trace journal (#8643)
+- **PR #8701**: feat(containment): swap a per-launch placeholder for the real credential at a host-side egress proxy
+- **Issue #8750** (closed): docs: runbook recipe — cheap fast default model (e.g. Gemini Flash) with per-role quality levels
+- **PR #8753**: docs: runbook recipe 5 — cheap fast default model (e.g. Gemini Flash) with per-role quality levels
+- **PR #8809**: docs(builder-pr): warn against backticking a partial-increment trailer
+- **Issue #8778** (closed): peer-claim coordination is DEGRADED on ip-198-51-100-23 (#6157 Layer 3)
+- **Issue #8760** (closed): observability: session.analysis derived rollups + daemon.event record kind for untyped event-bus topics (G3 part 2 + G4 of #8714)
+- **PR #8794**: feat(observability): session.analysis rollups + daemon.event record kind (#8760)
+- **Issue #8795** (closed): champion-epic.md: the idempotency guard reads SKIP_STREAK from any marker-bearing comment, not just a rejection verdict
+- **PR #8798**: fix(champion): verify a matched verdict marker is actually a rejection
+- **Issue #8793** (closed): session_exec_docker launch-failure-preservation case is timing-flaky (127 vs 143) under load
+- **PR #8814**: fix(session-exec): honor a lease grant when the channel EOF ships in the same read pass (#8793)
+- **Issue #8683** (closed): Flaky test: role_runner shrinking_the_ring… fails on its random-draw precondition (OTLP job only, same commit passes elsewhere)
+- **PR #8815**: fix(role_runner): make the shrinking-ring shard precondition deterministic (#8683)
+- **Issue #8681** (closed): bug: main is red on Docs/Defaults Parity — native-readiness-verification-2026-09-22.md is a real file where #7752 requires a symlink
+- **Issue #8804** (closed): dashboard SPA: render roster missing/unprovisioned hosts from fleet-state missingHosts
+- **PR #8807**: feat(dashboard): surface roster missing/unprovisioned hosts in the SPA
+- **Issue #8792** (closed): dashboard: a host that has never reported must render as missing, not silently absent from the fleet count
+- **PR #8805**: feat(dashboard): render roster-expected hosts that never reported as missing
+- **PR #8803**: feat(observability): assemble the credential-free ClickStack canary test
+- **Issue #8785** (closed): Codex private-clone mode: persistent session workspaces and exclusive account leases
+- **PR #8800**: feat: add account-private Codex session workspaces
+
 ### 2026-09-23
 
 - **PR #8797**: docs(observability): ClickStack trial — record #8524/#8526 merge status, real-trace gap

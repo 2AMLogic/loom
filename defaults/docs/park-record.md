@@ -607,6 +607,7 @@ route_parked_pr_conflict() {
   else
     resolved=$(resolve_dep_states "$deps") || return 1
     [ "$(sed -n '1p' <<<"$resolved")" = true ] || return 1
+    deps_fully_resolved "$deps" "$(sed -n '2p' <<<"$resolved")" || return 1
   fi
   base=$(jq -r '.baseRefName' <<<"$after") || return 1
   route=$(loom-daemon park-record guide-conflict-route --base-ref "$base") || return 1
