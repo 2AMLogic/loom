@@ -257,6 +257,18 @@ assert_deny_reason_matches "rmScope default (#15221): space before parens, name 
     'probe () { rm -f "$NOPE/.p"; }; probe' 'is an unexpanded shell variable from the path root down' "$REPO_ROOT"
 assert_deny_reason_matches "rmScope default (#15221): function keyword + space before parens denies unresolved-var" \
     'function probe () { rm -f "$NOPE/.p"; }; probe' 'is an unexpanded shell variable from the path root down' "$REPO_ROOT"
+assert_deny_reason_matches "rmScope default (#15221): hyphenated bash function name my-probe() denies unresolved-var" \
+    'my-probe() { rm -f "$NOPE/.p"; }; my-probe' 'is an unexpanded shell variable from the path root down' "$REPO_ROOT"
+assert_deny_reason_matches "rmScope default (#15221): dotted bash function name my.probe() denies unresolved-var" \
+    'my.probe() { rm -f "$NOPE/.p"; }; my.probe' 'is an unexpanded shell variable from the path root down' "$REPO_ROOT"
+assert_deny_reason_matches "rmScope default (#15221): colon-namespaced bash function name ns:probe() denies unresolved-var" \
+    'ns:probe() { rm -f "$NOPE/.p"; }; ns:probe' 'is an unexpanded shell variable from the path root down' "$REPO_ROOT"
+assert_deny_reason_matches "rmScope default (#15221): function keyword + hyphenated bash name denies unresolved-var" \
+    'function my-probe { rm -f "$NOPE/.p"; }; my-probe' 'is an unexpanded shell variable from the path root down' "$REPO_ROOT"
+assert_deny_reason_matches "rmScope default (#15221): slash-namespaced bash function name pkg/clean() denies unresolved-var" \
+    'pkg/clean() { rm -f "$NOPE/.p"; }; pkg/clean' 'is an unexpanded shell variable from the path root down' "$REPO_ROOT"
+assert_deny_reason_matches "rmScope default (#15221): leading-dot bash function name .priv() denies unresolved-var" \
+    '.priv() { rm -f "$NOPE/.p"; }; .priv' 'is an unexpanded shell variable from the path root down' "$REPO_ROOT"
 assert_deny_reason_matches "rmScope default (#15221): subshell function body denies unresolved-var" \
     'probe() ( rm -f "$NOPE/.p" ); probe' 'is an unexpanded shell variable from the path root down' "$REPO_ROOT"
 # A definition that is never invoked is scanned the same way — defining it is

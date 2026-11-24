@@ -7695,23 +7695,26 @@ _extract_rm_targets_scan() {
             # leading { group / ( subshell opener in the same segment) was
             # invisible to every rm-scope check, while the same rm after any
             # earlier ; statement denied — the fail-open asymmetry #15221
-            # reports. Strip a leading `name() {` / `name() (` header, a
-            # `function name [()] {` header, and leading `{ `/`( ` openers,
-            # mirroring the cd-tracker opener strip in extract_write_targets()
-            # (#12082) and the wt_write_tmp_cwd_loop_var_safe() strip (#11975)
-            # rather than inventing a parser. `((` (arithmetic) is never a
-            # subshell opener; `do`/`then`/`else`/`if` openers are
-            # deliberately NOT stripped (out of scope for #15221 — see the
-            # #9323/#9601 block comment at the loop-variable resolver). The
-            # strip runs BEFORE the sudo strip so `( sudo rm ... )` resolves
-            # too, and can only ADD rm targets, never remove one: it deletes
-            # shell structure preceding the command word only, and a segment
-            # whose first word already is `rm` matches none of these shapes.
+            # reports. Strip a leading `name [()] {` / `name [()] (` or
+            # `function name [()] {` header (bash function names allow `-`,
+            # `.`, `:`, `/` and other non-metacharacter word chars beyond POSIX
+            # `NAME`, e.g. `loom-daemon() { ... }`) and leading `{ `/`( `
+            # openers, mirroring the cd-tracker opener strip in
+            # extract_write_targets() (#12082) and the
+            # wt_write_tmp_cwd_loop_var_safe() strip (#11975) rather than
+            # inventing a parser. `((` (arithmetic) is never a subshell opener;
+            # `do`/`then`/`else`/`if` openers are deliberately NOT stripped
+            # (out of scope for #15221 — see the #9323/#9601 block comment at
+            # the loop-variable resolver). The strip runs BEFORE the sudo strip
+            # so `( sudo rm ... )` resolves too, and can only ADD rm targets,
+            # never remove one: it deletes shell structure preceding the
+            # command word only, and a segment whose first word already is `rm`
+            # matches none of these shapes.
             while (1) {
-                if (seg ~ /^[A-Za-z_][A-Za-z0-9_]*[ \t]*\(\)[ \t]*[\{(]/)
-                    sub(/^[A-Za-z_][A-Za-z0-9_]*[ \t]*\(\)[ \t]*[\{(][ \t]*/, "", seg)
-                else if (seg ~ /^function[ \t]+[A-Za-z_][A-Za-z0-9_]*([ \t]*\(\))?[ \t]*[\{(]/)
-                    sub(/^function[ \t]+[A-Za-z_][A-Za-z0-9_]*([ \t]*\(\))?[ \t]*[\{(][ \t]*/, "", seg)
+                if (seg ~ /^[A-Za-z0-9_./+@%,:?~-]+[ \t]*\(\)[ \t]*[\{(]/)
+                    sub(/^[A-Za-z0-9_./+@%,:?~-]+[ \t]*\(\)[ \t]*[\{(][ \t]*/, "", seg)
+                else if (seg ~ /^function[ \t]+[A-Za-z0-9_./+@%,:?~-]+([ \t]*\(\))?[ \t]*[\{(]/)
+                    sub(/^function[ \t]+[A-Za-z0-9_./+@%,:?~-]+([ \t]*\(\))?[ \t]*[\{(][ \t]*/, "", seg)
                 else if (seg ~ /^\{[ \t]/)
                     sub(/^\{[ \t]+/, "", seg)
                 else if (seg ~ /^\(/ && seg !~ /^\(\(/)
