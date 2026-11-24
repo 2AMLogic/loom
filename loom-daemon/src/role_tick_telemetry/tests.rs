@@ -1289,6 +1289,10 @@ fn a_codex_step_selects_tokens_by_the_session_id_its_log_names() {
             writeln!(file, "{line}").unwrap();
         }
     }
+    // Crate-wide `LOOM_CODEX_HOME` lock (#15174): this test holds only the
+    // crate-default serial key, so the pin below must not race the
+    // `codex_home_env`-keyed tests that also mutate the variable.
+    let _codex_home_lock = crate::tokens_pool::codex_home_env::lock();
     std::env::set_var(crate::codex_usage::CODEX_HOME_ENV, codex_home.path());
 
     let body = format!(

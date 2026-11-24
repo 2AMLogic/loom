@@ -71,6 +71,8 @@ pub mod bootstrap;
 pub mod check;
 pub mod claude_seat;
 pub mod codex_check;
+#[cfg(test)]
+pub(crate) mod codex_home_env;
 pub mod codex_hooks;
 pub mod codex_probe;
 pub mod codex_reset;
