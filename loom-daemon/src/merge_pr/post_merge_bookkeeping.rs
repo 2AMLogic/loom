@@ -553,7 +553,8 @@ impl Host for SystemHost {
 
     fn label_events(&self, repo: &str, issue: &str) -> Option<String> {
         let path = format!("repos/{repo}/issues/{issue}/timeline?per_page=100");
-        gh_stdout("post_merge.timeline", repo, &["api", &path, "--paginate"])
+        let args = ["api", path.as_str(), "--paginate"];
+        gh_stdout("post_merge.timeline", repo, &args)
     }
 
     fn helper(&self, func: &str, args: &[&str]) -> bool {
