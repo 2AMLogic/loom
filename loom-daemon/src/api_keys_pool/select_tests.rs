@@ -25,6 +25,17 @@ fn seed_cursor(workspace: &std::path::Path, value: &str) {
     fs::write(dir.join(".rotation_cursor"), value).unwrap();
 }
 
+/// Declare `runtimes.apiKeyLimits` in `workspace`'s `.loom/config.json` (#14932)
+/// — the tier a repo actually commits. No `.limits.json` is involved.
+fn declare_config_limits(workspace: &std::path::Path, block: serde_json::Value) {
+    let config = workspace.join(".loom").join("config.json");
+    fs::write(
+        &config,
+        serde_json::json!({ "runtimes": { "apiKeyLimits": block } }).to_string(),
+    )
+    .unwrap();
+}
+
 #[test]
 fn consecutive_selections_alternate_between_two_accounts() {
     let tmp = workspace_with(&["alpha", "beta"]);
@@ -427,7 +438,10 @@ fn an_account_without_a_declared_cap_is_unbounded() {
         leases.push(selected.lease);
     }
     assert_eq!(inflight::live_count(&root, "zai", "alpha"), 8);
-    assert_eq!(registry::describe_account(&root, "zai", "alpha").max_concurrent, None);
+    let described =
+        registry::describe_account(&root, "zai", "alpha", &limits::ConfiguredLimits::EMPTY);
+    assert_eq!(described.max_concurrent, None);
+    assert_eq!(described.max_concurrent_source, limits::LimitSource::Absent);
 }
 
 /// Every account at its cap fails closed at 78 with a diagnostic that names
@@ -483,6 +497,90 @@ fn an_unreadable_limits_file_fails_closed() {
     }
     let text = selected.unwrap_err().to_string();
     assert!(text.contains("pool state unreadable"), "{text}");
+}
+
+// ---- Config-declared limits: `runtimes.apiKeyLimits` (#14932) ----
+
+/// A cap declared only in the workspace's config — no `.limits.json` — is
+/// enforced exactly as a file-declared one: a second concurrent selection of
+/// the account fails closed, and the hint names the key that actually binds.
+#[test]
+fn a_config_declared_cap_holds_a_second_selection_out() {
+    let tmp = workspace_with(&["alpha"]);
+    let root = super::super::paths::per_repo_api_keys_dir(tmp.path());
+    declare_config_limits(
+        tmp.path(),
+        serde_json::json!({ "zai": { "alpha": { "maxConcurrent": 1 } } }),
+    );
+    assert!(!provider_dir(&root, "zai")
+        .join(limits::LIMITS_FILE)
+        .exists());
+
+    let first = select_api_key(tmp.path(), "zai", None).unwrap();
+    assert_eq!(first.name, "alpha");
+    let text = select_api_key(tmp.path(), "zai", None)
+        .unwrap_err()
+        .to_string();
+    first.lease.unwrap().release();
+    assert!(text.contains("concurrency cap"), "{text}");
+    assert!(text.contains("maxConcurrent 1"), "{text}");
+    assert!(text.contains("runtimes.apiKeyLimits.zai.alpha.maxConcurrent"), "{text}");
+    assert!(!text.contains("api-keys limit"), "{text}");
+}
+
+/// A config block that cannot be understood withholds the provider's accounts
+/// and names the offending key — "I could not read the caps" must never read
+/// as "there are none".
+#[test]
+fn a_malformed_config_limits_block_withholds_the_accounts() {
+    let tmp = workspace_with(&["alpha"]);
+    declare_config_limits(
+        tmp.path(),
+        serde_json::json!({ "zai": { "alice": { "maxConcurrent": 0 } } }),
+    );
+    let text = select_api_key(tmp.path(), "zai", None)
+        .unwrap_err()
+        .to_string();
+    assert!(text.contains("runtimes.apiKeyLimits.zai.alice.maxConcurrent"), "{text}");
+    assert!(text.contains("pool state unreadable"), "{text}");
+}
+
+/// The role draw reads a config-declared cap the same way: the pool has a
+/// finite number of free slots, and live spawns count against them.
+#[test]
+fn health_counts_a_config_declared_cap_toward_the_free_slots() {
+    let tmp = workspace_with(&["alpha"]);
+    let root = super::super::paths::per_repo_api_keys_dir(tmp.path());
+    let entry = || {
+        health(tmp.path(), Some("zai"))
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap()
+    };
+    // Uncapped, so without a finite slot count — until config speaks.
+    assert_eq!(entry().unreserved_slots, None);
+
+    declare_config_limits(
+        tmp.path(),
+        serde_json::json!({ "zai": { "alpha": { "maxConcurrent": 2 } } }),
+    );
+    let snapshot = entry();
+    assert_eq!(
+        (snapshot.unreserved_slots, snapshot.selectable_under_cap, snapshot.at_capacity),
+        (Some(2), 1, 0)
+    );
+    assert_eq!(snapshot.accounts[0].max_concurrent_source, limits::LimitSource::Config);
+
+    let first = inflight::register(&root, "zai", "alpha").unwrap();
+    let second = inflight::register(&root, "zai", "alpha").unwrap();
+    let snapshot = entry();
+    assert_eq!(
+        (snapshot.unreserved_slots, snapshot.selectable_under_cap, snapshot.at_capacity),
+        (Some(0), 0, 1)
+    );
+    first.release();
+    second.release();
 }
 
 // ---- Model-class-scoped selection (#8424 item 3) ----

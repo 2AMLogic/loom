@@ -29,6 +29,22 @@ impl Default for AtomicOpts {
     }
 }
 
+/// Leading part of the name [`write_atomic`] stages its temp file under.
+pub const STAGING_PREFIX: &str = ".tmp";
+
+/// Length of the random suffix after [`STAGING_PREFIX`].
+pub const STAGING_RAND_LEN: usize = 6;
+
+/// Whether `name` has the shape of a [`write_atomic`] staging file
+/// (`STAGING_PREFIX` + `STAGING_RAND_LEN` ASCII alphanumerics). Readers that
+/// allowlist a directory's entries use this rather than a second literal.
+#[must_use]
+pub fn is_staging_name(name: &str) -> bool {
+    name.strip_prefix(STAGING_PREFIX).is_some_and(|r| {
+        r.len() == STAGING_RAND_LEN && r.bytes().all(|b| b.is_ascii_alphanumeric())
+    })
+}
+
 /// Write `bytes` to `path` atomically: create the parent directory, write a
 /// uniquely named temp file beside `path`, `fsync` it, then `rename` it into
 /// place. A reader sees the old file or the new one, never a partial write,
@@ -42,7 +58,10 @@ pub fn write_atomic(path: &Path, bytes: &[u8], opts: AtomicOpts) -> io::Result<(
         _ => Path::new("."),
     };
     fs::create_dir_all(dir)?;
-    let mut tmp = tempfile::NamedTempFile::new_in(dir)?;
+    let mut tmp = tempfile::Builder::new()
+        .prefix(STAGING_PREFIX)
+        .rand_bytes(STAGING_RAND_LEN)
+        .tempfile_in(dir)?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt as _;
@@ -112,18 +131,23 @@ fn mtime_of(meta: &fs::Metadata) -> DateTime<Utc> {
 /// bit set? On non-unix targets, any regular file qualifies.
 #[must_use]
 pub fn is_executable(path: &Path) -> bool {
-    let Ok(meta) = fs::metadata(path) else {
-        return false;
-    };
+    check_executable(path).is_ok()
+}
+
+/// Like `is_executable`, retaining the failure kind for startup diagnostics.
+pub(crate) fn check_executable(path: &Path) -> io::Result<()> {
+    let meta = fs::metadata(path)?;
+    if !meta.is_file() {
+        return Err(io::ErrorKind::PermissionDenied.into());
+    }
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt as _;
-        meta.is_file() && meta.permissions().mode() & 0o111 != 0
+        if meta.permissions().mode() & 0o111 == 0 {
+            return Err(io::ErrorKind::PermissionDenied.into());
+        }
     }
-    #[cfg(not(unix))]
-    {
-        meta.is_file()
-    }
+    Ok(())
 }
 
 /// Keep only the last `max` bytes of captured output, snapped forward to a
@@ -168,6 +192,33 @@ mod tests {
             assert!(!is_executable(&f), "no exec bit");
             fs::set_permissions(&f, fs::Permissions::from_mode(0o755)).unwrap();
             assert!(is_executable(&f));
+        }
+    }
+
+    #[test]
+    fn staging_name_matcher_accepts_what_the_writer_stages() {
+        let tmp = tempfile::tempdir().unwrap();
+        let staged = tempfile::Builder::new()
+            .prefix(STAGING_PREFIX)
+            .rand_bytes(STAGING_RAND_LEN)
+            .tempfile_in(tmp.path())
+            .unwrap();
+        let name = staged
+            .path()
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        assert!(is_staging_name(&name), "{name}");
+        for bad in [
+            ".tmp",
+            ".tmpabc",
+            ".tmpabcdefg",
+            ".tmp-abcde",
+            "tmpabcdef",
+            "a.token",
+        ] {
+            assert!(!is_staging_name(bad), "{bad}");
         }
     }
 

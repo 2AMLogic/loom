@@ -3,9 +3,9 @@
   "description": "Loom-managed workspace with AI development orchestration",
   "private": true,
   "scripts": {
-    "check:ci": "echo 'No CI checks configured. Customize this script for your project.' && exit 0",
-    "check:all": "echo 'No checks configured. Customize this script for your project.' && exit 0",
-    "test": "echo 'No tests configured. Customize this script for your project.' && exit 0",
-    "lint": "echo 'No linter configured. Customize this script for your project.' && exit 0"
+    "check:ci": "echo \"check:ci not configured: wire this script to your repo's real command (edit package.json)\" && exit 1",
+    "check:all": "echo \"check:all not configured: wire this script to your repo's real command (edit package.json)\" && exit 1",
+    "test": "echo \"test not configured: wire this script to your repo's real command (edit package.json)\" && exit 1",
+    "lint": "echo \"lint not configured: wire this script to your repo's real command (edit package.json)\" && exit 1"
   }
 }

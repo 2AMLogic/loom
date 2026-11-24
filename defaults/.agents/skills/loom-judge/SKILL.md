@@ -266,7 +266,7 @@ Check for an argument passed via the slash command:
 **Arguments**: `$ARGUMENTS`
 
 If a number is provided (e.g., `/judge 123`), it is the target **PR**: skip "Finding Work", and gate it before any claim, label or comment (#11863):
-1. **Kind and state probe** (live, one REST read): `gh api "repos/{owner}/{repo}/issues/<number>" --jq '[(.pull_request != null), .state, ([.labels[].name] | join(","))] | @tsv'`. Refuse, writing nothing, on `false` (an issue number; Judge is a PR role), `closed`, `loom:frozen`, any `loom:operator*` label (#11861; retired names too), or a failed read.
+1. **Kind and state probe** (live, one REST read): `gh api "repos/{owner}/{repo}/issues/<number>" --jq '[(.pull_request != null), .state, ([.labels[].name] | join(","))] | @tsv'`. Refuse, writing nothing, on `false` (an issue number; Judge is a PR role), `closed`, `loom:frozen`, any `loom:operator*` label (#11861; retired names too), or a failed read. A Gitea checkout has no `gh` to read — `gh` fails there with `none of the git remotes … point to a known GitHub host` — so the probe is instead `loom-daemon forge pr view <number> --json number,state,labels,headRefOid,mergeable` (#14939), served from the Gitea API on the inherited `GITEA_URL` and `GITEA_TOKEN` (`GITEA_USERNAME` for Basic auth). Its non-zero exit is the refusal: it names an issue number, an unknown number, a missing credential or an unreadable answer. On success read the row as the TSV above — refuse on `CLOSED` or `MERGED` state, `loom:frozen`, any `loom:operator*` label, an unreadable field — and keep `.headRefOid` as the head you evaluate and `.mergeable` (`CONFLICTING` is the merge-conflict case below).
 2. **Stage**: `loom:review-requested` (or `loom:reviewing` alone) → claim exactly as Primary Queue step 2 (stale check, PR lease, then the label) and evaluate. A lease held by your own `$LOOM_SWEEP_ID` is yours, not a peer's: a daemon step pre-takes it, and `lease pr claim` re-attaches (exit 0, "already held by this claimant") — continue and add `loom:reviewing` yourself, the same override `LEASE_ALREADY_HELD` has in `builder.md`. Neither those nor a verdict label (e.g. only `loom:important`) → "Fallback Queue" rules (guard, review only, never claim or label). A verdict label without `loom:review-requested` → no-op, unless the operator asked for this re-review (see "Exception").
 3. End with the outcome line from `.loom/docs/targeted-role-invocation.md`: `LOOM_STEP_OUTCOME role=judge target=<n> class=<verdict|noop|refused|failed> reason=<token>`.
 
@@ -624,7 +624,7 @@ precisely the defect this section exists to fix.
 pass also reclaims stale `loom:reviewing` (and `loom:treating`) on its tick,
 with the same env vars and defaults, aged from the label's own `labeled`
 event. See [`daemon-reference.md`'s "Stale-claim reconciliation"
-section](https://github.com/rjwalters/loom/blob/main/defaults/docs/daemon-reference.md#stale-claim-reconciliation--the-sweep-journal-3953-fixed-3975-extended-to-pr-side-claims-4367).
+section](https://github.com/2AMLogic/loom/blob/main/defaults/docs/daemon-reference.md#stale-claim-reconciliation--the-sweep-journal-3953-fixed-3975-extended-to-pr-side-claims-4367).
 
 **Applies everywhere a Judge claims a PR from a multi-PR pass** — not just
 this single-PR narrative. This same check-then-claim rule governs the batch
@@ -1868,8 +1868,13 @@ its receipts, or anything the PR body claims:
 # right state (a PR merged, an issue closed), under exactly the recorded
 # title. Any foreign/missing/wrong-kind/wrong-state/mismatched or unreadable
 # record echoes "NOT ELIGIBLE: <reason>" naming it — the caller must then take
-# the normal review flow and report the reason. Distinct numbers are READ once
-# each, but every record is VERIFIED: a repeated number's later records (a
+# the normal review flow and report the reason. A READ failure on the base
+# repository or the diff echoes "NOT ELIGIBLE: ENVIRONMENT: …" instead: an
+# environment failure is never a passed or waived content check. A record
+# fetch cannot tell a 404 (a content verdict) from a transport failure, so
+# its refusal states both readings and waives neither.
+# Distinct numbers are READ once each, but every record is VERIFIED: a
+# repeated number's later records (a
 # duplicate with a different title or kind included) are checked against the
 # cached fetch, not skipped; bullets outside WORK_LOG.md and its monthly
 # archives (WORK_PLAN/README prose, `- **#N**: …` backlog rows included) and
@@ -1877,18 +1882,22 @@ its receipts, or anything the PR body claims:
 # read.
 docs_only_fast_path_worklog_check() {
   # $1 = PR number. The target is the PR's BASE repository (read from the
-  # forge, never the cwd's remote and never a receipt); the additions are the
-  # exact reviewed base..head diff (never Guide's own account of them).
+  # forge, never the cwd's remote and never a receipt). A PR's own URL is
+  # always its base repository's, whatever the forge host — `gh pr view
+  # --json` has no base-repository field, and a URL of any other shape
+  # derives nothing, so the guard below fails closed (#15005). The additions
+  # are the exact reviewed base..head diff (never Guide's own account of
+  # them).
   local pr="$1" out raw line body mid num stated kind rest got got_title got_is_pr got_state got_merged
   local -A fetched=()
   local -a new_records=()
-  if ! out=$(gh pr view "$pr" --json baseRepository --jq '.baseRepository.nameWithOwner' 2>/dev/null) || [ -z "$out" ]; then
-    echo "NOT ELIGIBLE: base repository read failed"
+  if ! out=$(gh pr view "$pr" --json url --jq '.url | capture("^https://[^/]+/(?<r>[^/]+/[^/]+)/pull/[0-9]+/?$").r' 2>/dev/null) || [ -z "$out" ]; then
+    echo "NOT ELIGIBLE: ENVIRONMENT: base repository read failed (gh error, not a PR-content verdict) — take the normal review flow; do NOT treat this as a passed or waived #13760 content check"
     return 0
   fi
   local repo="$out"
   if ! raw=$(gh pr diff --repo "$repo" "$pr" 2>/dev/null); then
-    echo "NOT ELIGIBLE: PR diff read failed"
+    echo "NOT ELIGIBLE: ENVIRONMENT: PR diff read failed (gh error, not a PR-content verdict) — take the normal review flow; do NOT treat this as a passed or waived #13760 content check"
     return 0
   fi
   # Added canonical records: `+`-prefixed `- **PR/Issue ...` bullet lines,
@@ -1947,7 +1956,7 @@ docs_only_fast_path_worklog_check() {
     # title or kind — is still verified against the cached tuple (#14532).
     if [ -z "${fetched[$num]:-}" ]; then
       if ! got=$(gh api "repos/$repo/issues/$num" --jq '"\(.title)\t\(.pull_request != null)\t\(.state)\t\((.pull_request.merged_at != null))"' 2>/dev/null) || [ -z "$got" ]; then
-        echo "NOT ELIGIBLE: WORK_LOG record #$num does not exist in $repo (or the read failed)"
+        echo "NOT ELIGIBLE: WORK_LOG record #$num does not exist in $repo, or the read failed — if the record does not exist this IS a content verdict (#13760); if the read failed it is an environment failure. Either way, do NOT treat this as a passed or waived #13760 content check"
         return 0
       fi
       fetched[$num]="$got"
@@ -1999,7 +2008,10 @@ title mismatch, foreign repository identity, or
 an unreadable diff/target read) — **do not use this fast path.** Report the
 `NOT ELIGIBLE` reason verbatim in the verdict comment, and proceed with the
 normal Primary Queue steps 5-11 (checkout, quality checks, test plan
-execution, full code evaluation).
+execution, full code evaluation). A refusal prefixed
+`NOT ELIGIBLE: ENVIRONMENT:` means a `gh` read failed and the check could not
+run — an environment failure, never a passed or waived #13760 content check;
+report it as such and still take the normal flow.
 
 ### Fast-Path Evaluation Process
 

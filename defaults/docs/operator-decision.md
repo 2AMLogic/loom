@@ -127,7 +127,18 @@ exits `5` under a dispatched sweep (`LOOM_SWEEP_ID`,
 `LOOM_AGENT_SESSION_PID`). It then:
 
 1. reads the published decision with the ranked-options parser and shows what
-   you are approving;
+   you are approving. When the body carries no ` ```decision ` block at all —
+   an attended ruling replaces the block with an "Operator ruling" section —
+   the newest prior body version that carries a parseable block is recovered
+   from the issue's edit history (GraphQL `userContentEdits`, newest 100
+   entries; for issue bodies each entry's `diff` is the complete body as it
+   stood after that edit), and the digests bind to that exact text, so
+   `resolve` and `premise-check` cannot disagree (#15108). The recovered
+   version's editor must be one the trust policy believes (the daemon
+   identity, a trusted commenter or the operator); otherwise the refusal
+   names the editor. A body that still HAS a block, however it fails to parse,
+   never falls back; a history with no recoverable block refuses and names
+   the fix: re-publish the decision with `apply`;
 2. **re-reads the issue** and refuses (exit `1`) if the decision or the
    proposal changed since the review;
 3. posts one comment anchored with `<!-- loom:operator-resolution … -->`,
@@ -146,6 +157,39 @@ filed. `reject`, `defer` and `rescope` are recorded for the audit trail but
 **never** open the gate: a choice that needs a different proposal means editing
 the proposal and resolving again.
 
+### Resolving many issues with one confirmation (#15108)
+
+An attended ruling round covers dozens of issues; resolving them one at a time
+means one terminal confirmation each. `resolve --from` takes the whole slate
+in one run — a file of lines, one per issue:
+
+```text
+owner/repo#1234=a
+owner/repo#1235=b
+# blank lines and # comments are ignored
+```
+
+```bash
+loom-daemon operator-decision resolve --from slate.txt --effect proceed --release
+```
+
+Every item is reviewed first: each prints its own
+`REPO=`/`ISSUE=`/`OPTION=`/…/`DECISION_DIGEST=`/`SCOPE_DIGEST=` block under an
+`ITEM=i/N` header, including items whose block was replaced by a ruling
+(recovered from the edit history as above). One typed confirmation —
+`resolve <N>`, naming how many items were reviewed, a form a single-issue
+option id can never spell — then records them, running the same
+re-read/verify/release steps per item. A refused item (unknown option, changed
+scope, no recoverable block) is reported and does not stop the others; the
+exit code is non-zero if any item was refused. Batch mode stays attended-only
+and refuses under a dispatched sweep exactly like the single-issue form.
+`--from -` reads the slate from stdin, which only works with `--dry-run`: a
+recording run needs the terminal on stdin for its confirmation.
+
+`--dry-run` reviews every item and records nothing; `--release` and
+`--effect` apply to the whole batch (`--release` still requires
+`--effect proceed`).
+
 ### What the resolution binds
 
 | Bound to | Changes when |
@@ -160,7 +204,10 @@ Labels, new comments, an un-park and `loom:estimate`/`loom:points` markers are
 not inputs, so a routine queue transition keeps a valid resolution valid.
 Re-publishing a byte-identical decision on the same unedited issue is the same
 decision instance. If a Curator enrichment rewrites the body after approval,
-the resolution goes stale: enrich through a comment, or resolve again.
+the resolution goes stale: enrich through a comment, or resolve again. When
+the block was recovered from the edit history (#15108), both digests are
+computed over that recovered version's text — the exact decision the operator
+reviewed — together with the issue's current title.
 
 ### Who counts
 

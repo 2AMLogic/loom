@@ -1531,3 +1531,6 @@ mod stop_race;
 
 #[path = "session_lifecycle_hold_roots_tests.rs"]
 mod hold_roots;
+
+#[path = "session_lifecycle_exec_capture_tests.rs"]
+mod exec_capture;

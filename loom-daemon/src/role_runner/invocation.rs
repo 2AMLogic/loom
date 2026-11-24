@@ -59,10 +59,7 @@ impl RoleInvocationRunner for ScriptRoleInvocationRunner {
                 // Preparation is Docker work, done here on the blocking
                 // launch path; the selection it holds is the one the launch
                 // uses, never a second account pick.
-                let model_hint = match &self.model {
-                    Some(m) => (m.clone(), "override".to_string()),
-                    None => resolve_role_runner_model(&self.workspace_root, role),
-                };
+                let model_hint = resolve_role_runner_model(&self.workspace_root, role);
                 let mut containment =
                     crate::tokens_pool::private_workspace::containment::Preparer::new(
                         &self.workspace_root,
@@ -71,13 +68,10 @@ impl RoleInvocationRunner for ScriptRoleInvocationRunner {
                         format!("role-{role}-{}", uuid::Uuid::new_v4()),
                         Box::new(move |runtime: &str, drawn: Option<&str>| {
                             // Same precedence as the launch below (#12748):
-                            // the runner's override, then the draw's model,
-                            // then the resolved hint.
-                            let (model, source) = match (model_hint.1 == "override", drawn) {
-                                (false, Some(drawn)) => {
-                                    (drawn.to_string(), "role-draw".to_string())
-                                }
-                                _ => model_hint.clone(),
+                            // the draw's model, then the resolved hint.
+                            let (model, source) = match drawn {
+                                Some(drawn) => (drawn.to_string(), "role-draw".to_string()),
+                                None => model_hint.clone(),
                             };
                             let (model, _) =
                                 reconcile_unpinned_model_with_runtime(runtime, model, source);
@@ -149,15 +143,14 @@ impl RoleInvocationRunner for ScriptRoleInvocationRunner {
                 // where every role child burned the most constrained quota tier and then
                 // died on "You've reached your Fable 5 limit").
                 // #11726: a role draw whose pick names a model (`claude/opus`)
-                // pins it, below only the runner's own test override.
+                // pins it.
                 let drawn_model = admission
                     .as_ref()
                     .and_then(|a| a.preference.as_ref())
                     .and_then(|p| p.model.clone());
-                let (model, model_source) = match (&self.model, drawn_model) {
-                    (Some(m), _) => (m.clone(), "override".to_string()),
-                    (None, Some(drawn)) => (drawn, "role-draw".to_string()),
-                    (None, None) => resolve_role_runner_model(&self.workspace_root, role),
+                let (model, model_source) = match drawn_model {
+                    Some(drawn) => (drawn, "role-draw".to_string()),
+                    None => resolve_role_runner_model(&self.workspace_root, role),
                 };
                 // Issue #7894: an UNPINNED model that conflicts with the admitted
                 // runtime degrades to the runtime CLI's own default rather than being
@@ -241,10 +234,19 @@ impl RoleInvocationRunner for ScriptRoleInvocationRunner {
                 // Issue #14017: resolved against the admitted runtime, so a role that
                 // draws both Claude and Codex can carry a different effort for each
                 // (`roleEfforts.<role>@<runtime>`) and a Codex launch never runs unset.
-                let (effort, effort_source) = resolve_role_runner_effort_for_runtime(
+                // Issue #14963: through the launch form, which drops an *unqualified*
+                // effort the admitted native profile's `allowedEfforts` does not
+                // include — the profile's own effort launches instead of a
+                // `profile_selection` refusal — while a runtime-qualified pin is
+                // forwarded verbatim and keeps its refusal.
+                let (effort, effort_source) = resolve_role_runner_effort_for_launch(
                     &self.workspace_root,
                     role,
                     admission.as_ref().map(|a| a.runtime.as_str()),
+                    admission
+                        .as_ref()
+                        .and_then(|a| a.preference.as_ref())
+                        .and_then(|p| p.model_profile.as_deref()),
                 );
                 // Issue #8056: the launched values, captured for the durable
                 // `role_tick.outcome` record. Set here — after every pre-spawn bail-out

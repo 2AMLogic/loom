@@ -385,6 +385,11 @@ fn start_with(
     // session whose guard code lives in worker-writable paths (issue #8839).
     docker::setup(&config)?;
     docker::control(&config, id)?;
+    // Host mirrors (#14680): populate and refresh the per-repository object
+    // stores from origin under a proved read authority. Deliberately last
+    // and never a gate — a mirror that cannot be proved or fetched leaves
+    // the session and its private clones exactly as they were.
+    mirror::refresh_session_mirrors(workspace, &config);
     snapshot(config, &dir)
 }
 
@@ -867,6 +872,14 @@ fn registered_urls(config: &Config) -> String {
         .join(", ")
 }
 
+/// The `running` status field from a `docker inspect` object. Docker sets
+/// `State.Running=true` while a crash-looping seat backs off under
+/// `--restart unless-stopped`, so the shared `container_running` rule
+/// (`Restarting` is down, #10453) decides, not `State.Running` alone (#15015).
+pub(super) fn reports_running(state: Option<&serde_json::Value>) -> bool {
+    state.is_some_and(super::super::session_state::container_running)
+}
+
 fn snapshot(config: Config, dir: &Path) -> Result<Status> {
     let state = docker::inspect(&config.container)?;
     if let Some(state) = &state {
@@ -882,9 +895,7 @@ fn snapshot(config: Config, dir: &Path) -> Result<Status> {
             .as_ref()
             .and_then(|s| s["Config"]["Image"].as_str().map(str::to_owned)),
         extra_mounts: config.extra_mounts.clone(),
-        running: state
-            .as_ref()
-            .is_some_and(|s| s["State"]["Running"] == true),
+        running: reports_running(state.as_ref()),
         held: session_hold::held_across(std::slice::from_ref(&config.profile)),
         lease: lease::read(dir)?,
         admission: lease::admission(dir)?,
@@ -1018,7 +1029,7 @@ pub fn seat_reclaim(
     workspace: &Path,
     max_age_secs: i64,
     grace_secs: i64,
-) -> Vec<(String, Result<super::seat_reclaim::SeatReclaimOutcome, String>)> {
+) -> Vec<super::seat_reclaim::SeatWalkResult> {
     use super::super::account_registry::{account_inventory, AccountProvider};
 
     let mut out = Vec::new();
@@ -1032,7 +1043,17 @@ pub fn seat_reclaim(
         let Some(config) = registrations(&descriptor.credential_reference) else {
             continue;
         };
-        out.push((name, seat_reclaim_one(workspace, &config, max_age_secs, grace_secs)));
+        // #14777's baseline: one monotonic timer per seat attempt, so a walk
+        // report distinguishes how long each seat took — a cheap skip from a
+        // 600s-bounded exec — where the `reaper.pass` spans alone publish
+        // only point-in-time results.
+        let started = std::time::Instant::now();
+        let result = seat_reclaim_one(workspace, &config, max_age_secs, grace_secs);
+        out.push(super::seat_reclaim::SeatWalkResult {
+            account: name,
+            result,
+            elapsed: started.elapsed(),
+        });
     }
     out
 }

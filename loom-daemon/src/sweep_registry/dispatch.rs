@@ -2296,7 +2296,6 @@ mod idempotency_inflight_tests;
 
 // Issue #8997's rate-limited label-flip breaker coverage.
 #[cfg(test)]
-#[cfg(test)]
 mod rate_limit_tests;
 
 // Issue #11304's post-claim closed-issue re-verification coverage — a sibling

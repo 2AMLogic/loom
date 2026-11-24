@@ -1627,9 +1627,8 @@ pub fn resolve_interval() -> Duration {
 // ============================================================================
 //
 // WorkFinderConfig / read_work_finder_config / the deprecated-CPU-knob notice
-// live in their own file, `config.rs` (Issue #9034), as `configured_max`
-// below does. Pure
-// move, re-exported here so every existing `WorkFinderConfig` /
+// live in their own file, `config.rs` (Issue #9034), as `configured_max` below
+// does. Pure move, re-exported here so every existing `WorkFinderConfig` /
 // `read_work_finder_config` reference in this file and its siblings is
 // unchanged.
 pub mod config;
@@ -2057,7 +2056,7 @@ pub fn spawn_multi_work_finder_task(
             // guaranteed to kill every sweep dispatched into it at token
             // selection, ~30s in, after the claim label flip and the lease
             // comment have already landed on a real issue. See
-            // `pool_preflight::preflight_held_per_root` for why the two holds
+            // `pool_preflight::preflight_held_causes_per_root` for why the two holds
             // are computed together and why a pool hold outranks a #5030
             // recovery probe.
             let now_tick = chrono::Utc::now();

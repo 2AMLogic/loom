@@ -9,7 +9,7 @@
 use crate::fs_util::is_executable;
 use std::path::Path;
 use std::process::{Command, Stdio};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use super::out;
 use super::platform;
@@ -221,42 +221,21 @@ fn calibrate_timeout_secs() -> u64 {
 ///
 /// Returns `None` on any non-zero exit, on a timeout, or when the child could
 /// not be spawned — every one of which the shell turned into `|| return 0`.
+/// Draining and group termination are [`crate::proc_exec::run_bounded`]'s, so
+/// a wedged calibrate call cannot stall the start behind a full pipe either.
 fn bounded_output(daemon_bin: &Path, repo_root: &Path, budget_secs: u64) -> Option<String> {
-    let mut child = Command::new(daemon_bin)
-        .arg("calibrate")
+    let mut cmd = Command::new(daemon_bin);
+    cmd.arg("calibrate")
         .arg("--workspace")
         .arg(repo_root)
         .arg("--json")
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .stdin(Stdio::null())
-        .spawn()
-        .ok()?;
-
-    let deadline = Instant::now() + Duration::from_secs(budget_secs);
-    loop {
-        match child.try_wait() {
-            Ok(Some(status)) => {
-                let mut buf = String::new();
-                if let Some(mut so) = child.stdout.take() {
-                    use std::io::Read;
-                    let _ = so.read_to_string(&mut buf);
-                }
-                return if status.success() { Some(buf) } else { None };
-            }
-            Ok(None) => {
-                if Instant::now() >= deadline {
-                    // The `-k 2` escalation exists because a child blocked in a
-                    // foreground read defers SIGTERM; kill outright and report
-                    // the timeout as "no hint", exactly like `|| return 0`.
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    return None;
-                }
-                std::thread::sleep(Duration::from_millis(50));
-            }
-            Err(_) => return None,
-        }
+        .stdin(Stdio::null());
+    match crate::proc_exec::run_bounded(cmd, Duration::from_secs(budget_secs)) {
+        Ok(crate::proc_exec::Completion::Exited(out)) => out
+            .status
+            .success()
+            .then(|| String::from_utf8_lossy(&out.stdout).into_owned()),
+        _ => None,
     }
 }
 
@@ -326,5 +305,80 @@ mod tests {
         if platform::have("jq") {
             assert_eq!(config_get(dir.path(), "safehouse.socket", "fallback"), "fallback");
         }
+    }
+
+    // -- bounded_output (#15007 slice C) -----------------------------------
+    // The executor-backed calibrate probe: pin the shell's `|| return 0`
+    // contract (non-zero exit, timeout and spawn failure are all `None`)
+    // plus full-output capture past a pipe buffer.
+
+    /// An executable `daemon_bin` stub running `body`.
+    #[cfg(unix)]
+    fn daemon_stub(dir: &std::path::Path, body: &str) -> std::path::PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let bin = dir.join("loom-daemon-stub");
+        std::fs::write(&bin, format!("#!/bin/sh\n{body}\n")).expect("write stub");
+        let mut perms = std::fs::metadata(&bin).expect("stat stub").permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&bin, perms).expect("chmod stub");
+        bin
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn bounded_output_returns_a_fast_documents_stdout() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = daemon_stub(dir.path(), r"printf 'line1\nline2\n'");
+        let out = bounded_output(&bin, std::path::Path::new("/repo"), 10);
+        assert_eq!(out.as_deref(), Some("line1\nline2\n"));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn bounded_output_is_none_on_a_nonzero_exit_and_a_missing_binary() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = daemon_stub(dir.path(), "exit 3");
+        assert!(bounded_output(&bin, std::path::Path::new("/repo"), 10).is_none());
+        assert!(
+            bounded_output(&dir.path().join("no-such-bin"), std::path::Path::new("/repo"), 10)
+                .is_none()
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn bounded_output_collects_a_document_larger_than_the_pipe_buffer() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = daemon_stub(dir.path(), "head -c 262144 /dev/zero | tr '\\0' 'x'");
+        let out = bounded_output(&bin, std::path::Path::new("/repo"), 30).expect("must complete");
+        assert_eq!(out.len(), 262_144, "every byte must be collected, not a timeout");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn bounded_output_timeout_kills_the_descendants_too() {
+        let dir = tempfile::tempdir().unwrap();
+        let pidfile = dir.path().join("grandchild.pid");
+        let bin = daemon_stub(
+            dir.path(),
+            &format!("/bin/sleep 120 & echo $! > {}; exec /bin/sleep 120", pidfile.display()),
+        );
+        // The budget is whole seconds (`CALIBRATE_HINT_TIMEOUT_SECS`), so the
+        // shortest real cap is 1s.
+        assert!(bounded_output(&bin, std::path::Path::new("/repo"), 1).is_none());
+
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        let pid: i32 = std::fs::read_to_string(&pidfile)
+            .expect("grandchild must have recorded its pid")
+            .trim()
+            .parse()
+            .expect("pid must parse");
+        // SAFETY: signal 0 performs error checking only; it never delivers a signal.
+        let alive = unsafe { libc::kill(pid as libc::pid_t, 0) == 0 };
+        if alive {
+            // SAFETY: cleanup kill of a process this test spawned.
+            unsafe { libc::kill(pid, libc::SIGKILL) };
+        }
+        assert!(!alive, "grandchild {pid} outlived the calibrate budget");
     }
 }

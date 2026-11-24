@@ -90,6 +90,9 @@ pub(crate) fn release_fields(
 /// with no verdict; else nothing. Unlike [`release_fields`] there is no CI
 /// exemption: a pass the role runner killed at its timeout ceiling spent the
 /// whole ceiling, and is exactly the re-run the backstop exists to bound.
+/// A pass that never reached a review (`seat_busy`, a rejected launch, an
+/// exhausted provider; [`crate::pr_lease_reap::reason_never_reviewed`]) is
+/// not recorded (#14951): a runtime fault is not a no-verdict review.
 pub(crate) fn reaped_release_fields(
     role: Role,
     state: Option<(bool, String, Vec<String>)>,
@@ -97,7 +100,7 @@ pub(crate) fn reaped_release_fields(
 ) -> String {
     match state {
         Some((open, head, labels))
-            if reason != crate::session_exec::refusal::SEAT_BUSY_REASON
+            if !crate::pr_lease_reap::reason_never_reviewed(reason)
                 && role == Role::Judge
                 && backstop::ended_without_verdict(open, &labels) =>
         {
@@ -267,6 +270,23 @@ mod tests {
         assert!(
             reaped_release_fields(Role::Judge, state(&waiting), "exited").contains("verdict=none")
         );
+    }
+
+    #[test]
+    fn a_pass_that_never_reached_a_review_does_not_stamp_a_judge_no_verdict() {
+        use crate::pr_lease_reap::{REASON_LAUNCH_REJECTED, REASON_PROVIDER_EXHAUSTED};
+        let waiting = ["loom:review-requested", "loom:reviewing"];
+        for reason in [REASON_LAUNCH_REJECTED, REASON_PROVIDER_EXHAUSTED] {
+            assert_eq!(reaped_release_fields(Role::Judge, state(&waiting), reason), "", "{reason}");
+        }
+        // A Judge that ran and ended without a verdict still counts toward the hold.
+        for reason in ["exited", "timeout"] {
+            let fields = reaped_release_fields(Role::Judge, state(&waiting), reason);
+            assert_eq!(
+                fields,
+                format!(" head={HEAD} verdict=none labels=review-requested reaped={reason}")
+            );
+        }
     }
 
     #[test]

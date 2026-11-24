@@ -179,9 +179,10 @@ pub const EPHEMERAL_PATTERNS: &[&str] = &[
     // and blocks the daemon's `cleanup_stale_worktree`, i.e. the very
     // reset/recycle path the rescue exists to make safe. Deliberately NOT
     // added to `BUILD_ARTIFACT_PATTERNS` (worktree_ops/orphan_recovery.rs)
-    // instead: that list is also what `reclaim_worktree_artifacts` (#5187)
-    // deletes to reclaim disk from KEPT worktrees, which would destroy the
-    // rescued patches this mechanism exists to preserve.
+    // instead: that list is also what the worktree reaper's artifact-reclaim
+    // pass (#5187, #11071) deletes to reclaim disk from KEPT worktrees,
+    // which would destroy the rescued patches this mechanism exists to
+    // preserve.
     ".snapshots/",
     ".loom/.daemon.pid",
     ".loom/.daemon.log",
