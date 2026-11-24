@@ -24,9 +24,10 @@
 //! # What it proves
 //!
 //! Not "the Rust looks right" — [`loom_daemon::merge_pr::reconcile`]'s own unit
-//! tests do that, and `defaults/scripts/tests/test-merge-pr-auto-reconcile.sh`
-//! proves the live script still reaches `reconcile-stack.sh` and the comment
-//! post. This proves the port did not change **which of two irreversible things
+//! tests do that, and (until #14905 retired the script's post-merge reconcile)
+//! `test-merge-pr-auto-reconcile.sh` proved the live script reached
+//! `reconcile-stack.sh` and the comment post; `claim_reconciliation/merged_stack_tests.rs`
+//! now proves the daemon tick does. This proves the port did not change **which of two irreversible things
 //! happens to a stacked child**: `reconcile` hands it to a
 //! `git rebase --onto` + `push --force-with-lease`, `defer` deliberately does
 //! not. Getting that backwards on a branch a Builder still has checked out is

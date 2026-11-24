@@ -489,6 +489,41 @@ assert_eq "0" "$(grep -c '_mp_warn_reverify_floor\|_MP_REVERIFY_FLOOR' "$MERGE_P
   "merge-pr.sh no longer carries the re-verify floor warning (the feature it guarded is deleted)"
 
 echo ""
+echo "Testing the merge-observation advisory (#14905): an old daemon is named, never fatal…"
+# The post-merge follow-up moved to the daemon's merge-observation pass
+# (loom-daemon >= 0.20.29). The script must say so when the daemon it resolves
+# predates it, must stay silent when it does not, and must never fail the merge
+# or raise the `requires-daemon: merge-pr` floor (that floor is for fail-closed
+# PRE-merge verbs; see the fail-direction table above).
+_obs_fn="$(awk '/^_warn_if_daemon_lacks_merge_observation\(\) \{/{c=1} c{print} c&&/^}/{exit}' "$MERGE_PR_SRC")"
+assert_contains "$_obs_fn" "0.20.29" "the advisory names the overlap-release floor it checks"
+_obs_run() { # <version-line> -> stderr of the advisory ($2 = rc file)
+    local bin="$WORKDIR/obs-daemon"
+    printf '#!/usr/bin/env bash\n[[ "$1" == "--version" ]] && echo "%s" && exit 0\nexit 2\n' "$1" >"$bin"; chmod +x "$bin"
+    # shellcheck disable=SC2034,SC2069  # globals are read by the eval'd function; 2>&1 >/dev/null keeps ONLY stderr on purpose
+    ( warning() { echo "WARN: $*" >&2; }
+      eval "$_obs_fn"
+      FORGE_TYPE=github PR_NUMBER=7 REPO_NWO=o/r PR_BRANCH=feature/issue-7 SCRIPT_DIR=.loom/scripts LOOM_DAEMON_BIN="$bin"
+      _warn_if_daemon_lacks_merge_observation; echo $? >"$2" ) 2>&1 >/dev/null
+}
+_obs_out="$(_obs_run "loom-daemon 0.20.20 (commit abc)" "$WORKDIR/obs-rc")"
+assert_contains "$_obs_out" "predates the merge-observation pass" "daemon 0.20.20 -> advisory says the pass is missing"
+assert_contains "$_obs_out" "loom-daemon-update.sh --fetch" "daemon 0.20.20 -> advisory names the roll command"
+assert_contains "$_obs_out" "reconcile-stack.sh <child-pr> feature/issue-7" "daemon 0.20.20 -> advisory names the manual stack remedy"
+assert_eq "0" "$(cat "$WORKDIR/obs-rc")" "an old daemon never fails the merge (advisory only)"
+_obs_out="$(_obs_run "loom-daemon 0.20.29 (commit abc)" "$WORKDIR/obs-rc")"
+assert_eq "" "$_obs_out" "daemon 0.20.29 (the overlap release) -> silent"
+_obs_out="$(_obs_run "loom-daemon 0.21.0" "$WORKDIR/obs-rc")"
+assert_eq "" "$_obs_out" "a newer daemon -> silent"
+_obs_out="$(_obs_run "loom-daemon 0.20.100" "$WORKDIR/obs-rc")"
+assert_eq "" "$_obs_out" "0.20.100 sorts above 0.20.29 (version sort, not string sort) -> silent"
+_obs_out="$(_obs_run "unparseable" "$WORKDIR/obs-rc")"
+assert_contains "$_obs_out" "Could not read" "an unreadable version warns instead of passing silently"
+assert_eq "0" "$(cat "$WORKDIR/obs-rc")" "an unreadable version never fails the merge"
+assert_eq "0" "$(grep -c '^# requires-daemon: merge-pr .*merge-observation' "$MERGE_PR_SRC")" \
+  "the observation pass does not raise the fail-closed requires-daemon floor"
+
+echo ""
 echo "Testing the CI gate agrees merge-pr.sh's dependencies are declared…"
 
 if [[ -x "$CHECKER" || -f "$CHECKER" ]]; then
