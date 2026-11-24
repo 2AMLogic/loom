@@ -1387,9 +1387,13 @@ set -e
 # resolve the concrete path when the session dir is reachable, and fall back to
 # reporting just the id when it is not (e.g. `--ephemeral`, or ambient auth
 # whose CODEX_HOME this script never set).
+# The read is line-anchored: only a line that IS the banner (after leading
+# whitespace) is a launch, the same rule as the daemon's
+# `usage_source::codex_session_banner`. A banner quoted mid-line in a message
+# block is data about a launch, not evidence of one.
 _session_id="$(
-    grep -aoE 'session id:[[:space:]]*[0-9a-fA-F-]{8,}' "$_stderr_file" 2>/dev/null \
-    | head -1 | sed -E 's/.*session id:[[:space:]]*//' || true
+    grep -aoE '^[[:space:]]*session id:[[:space:]]*[0-9a-fA-F-]{8,}' "$_stderr_file" 2>/dev/null \
+    | head -1 | sed -E 's/^[[:space:]]*session id:[[:space:]]*//' || true
 )"
 if [[ -n "$_session_id" ]]; then
     log_info "spawn-codex: session=$_session_id"

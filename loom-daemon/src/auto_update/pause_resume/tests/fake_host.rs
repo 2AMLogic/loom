@@ -30,6 +30,8 @@ pub(super) struct FakeHost {
     pub(super) requeue_fails: Mutex<BTreeSet<String>>,
     /// Health samples that fail before health holds.
     pub(super) unhealthy: Mutex<u32>,
+    /// Fail the Nth (1-based) `health_sample` call (once) with this error.
+    pub(super) fail_health_sample: Mutex<Option<(usize, String)>>,
     /// `hold_dispatch` calls refused before the hold is placed.
     pub(super) hold_blocked: Mutex<u32>,
     /// Lose the hold (once) when this many items have been launched.
@@ -37,6 +39,8 @@ pub(super) struct FakeHost {
     /// The operator aborts a drain that replaced the hold after H5 has found
     /// it in force this many times.
     pub(super) abort_drain_after: Mutex<Option<u32>>,
+    /// Acquire a fleet pause hold (once) during the pre-launch `check`.
+    pub(super) fleet_pause_on_check: Mutex<Option<String>>,
     pub(super) launch_delay: Duration,
     /// `health_sample` panics (a bug in H5's host).
     pub(super) panic_in_health: bool,
@@ -94,6 +98,13 @@ impl ResumeHost for FakeHost {
     fn health_sample(&self) -> Result<(), String> {
         assert!(!self.panic_in_health, "a host bug during health probation");
         self.log("health".to_string());
+        let sample = self.called("health").len();
+        let mut fail = self.fail_health_sample.lock().unwrap();
+        if fail.as_ref().is_some_and(|(n, _)| *n == sample) {
+            let (_, err) = fail.take().unwrap();
+            return Err(err);
+        }
+        drop(fail);
         let mut left = self.unhealthy.lock().unwrap();
         if *left > 0 {
             *left -= 1;
@@ -135,6 +146,12 @@ impl ResumeHost for FakeHost {
         item: &ManifestItem,
         _launch: &RollResumeLaunch,
     ) -> Result<(), RollResumeRefusal> {
+        if let Some(note) = self.fleet_pause_on_check.lock().unwrap().take() {
+            assert!(
+                self.drain.hold_for_fleet_state(note),
+                "expected fleet pause to take over the H5 resume hold"
+            );
+        }
         self.log(format!("check {}", item.id));
         match self.refuse_check.lock().unwrap().get(&item.id) {
             Some(refusal) => Err(refusal.clone()),

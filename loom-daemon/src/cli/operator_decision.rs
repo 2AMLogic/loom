@@ -63,12 +63,24 @@ pub(crate) enum OperatorDecisionCommand {
     /// reversal proceed for an `--effect proceed` resolution it can verify.
     Resolve {
         /// Issue whose published decision is being resolved.
-        #[arg(value_name = "ISSUE")]
-        issue: u64,
+        #[arg(value_name = "ISSUE", required_unless_present = "from")]
+        issue: Option<u64>,
 
         /// The approved option's `id` from the decision block.
-        #[arg(long, value_name = "ID")]
-        option: String,
+        #[arg(long, value_name = "ID", required_unless_present = "from")]
+        option: Option<String>,
+
+        /// Batch mode (#15108): a file of `owner/repo#issue=option` lines
+        /// (blank lines and `#` comments ignored; `-` reads stdin, which only
+        /// works with `--dry-run` — a recording run needs the terminal on
+        /// stdin for its confirmation). Every item is reviewed, ONE typed
+        /// confirmation (`resolve <reviewed count>`) records them all.
+        #[arg(
+            long,
+            value_name = "FILE|-",
+            conflicts_with_all = ["issue", "option", "repo"]
+        )]
+        from: Option<PathBuf>,
 
         /// What the choice means: `proceed` approves the proposal as filed;
         /// `reject`, `defer` and `rescope` are recorded but never open the gate.
@@ -206,13 +218,23 @@ impl OperatorDecisionCommand {
             OperatorDecisionCommand::Resolve {
                 issue,
                 option,
+                from,
                 effect,
                 release,
                 dry_run,
                 repo,
-            } => run_resolve(
-                writer, issue, option, &effect, release, dry_run, repo, &mut out, &mut err,
-            ),
+            } => match (issue, option, from) {
+                (Some(n), Some(opt), None) => {
+                    run_resolve(writer, n, opt, &effect, release, dry_run, repo, &mut out, &mut err)
+                }
+                (None, None, Some(path)) => {
+                    run_resolve_batch(writer, path, &effect, release, dry_run, &mut out, &mut err)
+                }
+                _ => {
+                    eprintln!("ERROR: pass an ISSUE and --option ID, or --from FILE|- (not both)");
+                    cli::exit::USAGE
+                }
+            },
         };
         std::process::exit(code)
     }
@@ -267,4 +289,70 @@ fn run_resolve(
         std::io::stdin().read_line(&mut line).is_ok() && line.trim() == expected
     };
     resolve::resolve(&mut forge, &policy, &req, &mut confirm, out, err)
+}
+
+/// The batch `resolve` shim (#15108): parse the effect, insist on an attended
+/// session (checked ONCE, before the slate is read) unless this is a
+/// read-only `--dry-run`, parse the `owner/repo#issue=option` lines, and
+/// confirm the whole reviewed batch with one typed `resolve <N>`.
+fn run_resolve_batch(
+    writer: WorkflowWriter,
+    from: PathBuf,
+    effect: &str,
+    release: bool,
+    dry_run: bool,
+    out: &mut dyn std::io::Write,
+    err: &mut dyn std::io::Write,
+) -> i32 {
+    use crate::operator_decision::{resolution::Effect, resolve};
+    let effect = match Effect::parse(effect) {
+        Ok(e) => e,
+        Err(e) => {
+            eprintln!("ERROR: {e}");
+            return cli::exit::USAGE;
+        }
+    };
+    if !dry_run {
+        if let Err(why) = resolve::require_attended() {
+            eprintln!(
+                "operator-decision: REFUSED - an operator resolution is an attended action: {why}"
+            );
+            return resolve::UNATTENDED;
+        }
+    }
+    let text = match read_input(&from) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("ERROR: {e}");
+            return cli::exit::USAGE;
+        }
+    };
+    let items = match resolve::parse_items(&text) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("ERROR: --from: {e}");
+            return cli::exit::USAGE;
+        }
+    };
+    let root = default_repo_root();
+    let policy = crate::comment_trust::TrustPolicy::for_root(&root);
+    let mut forge_for = |repo: &str| -> Box<dyn resolve::ResolveForge> {
+        Box::new(
+            writer
+                .forge(root.clone(), Some(repo.to_string()))
+                .with_call_site("operator_decision.resolve"),
+        )
+    };
+    let req = resolve::BatchRequest {
+        items,
+        effect,
+        release,
+        dry_run,
+    };
+    let mut confirm = |expected: &str| {
+        eprint!("Type `{expected}` to record these resolutions: ");
+        let mut line = String::new();
+        std::io::stdin().read_line(&mut line).is_ok() && line.trim() == expected
+    };
+    resolve::resolve_batch(&mut forge_for, &policy, &req, &mut confirm, out, err)
 }

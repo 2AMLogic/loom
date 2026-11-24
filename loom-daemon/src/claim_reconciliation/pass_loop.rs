@@ -9,6 +9,7 @@
 use std::path::Path;
 
 pub(super) mod building_heal;
+pub(crate) mod merge_observation;
 
 use super::{forge, merge_sequence, review_conflict, VerdictReconcileStats};
 
@@ -82,6 +83,10 @@ pub(super) fn run_reconciliation_pass_over_roots(
         let (checked, reclaimed) = forge::reconcile_workspace(gh_bin, root, is_startup);
         stats.total_checked += checked;
         stats.total_reclaimed += reclaimed;
+        // #14816 (parent #14811): stale issue-side `loom:curating` claims the
+        // roll-requeue bug left behind. Lease-evidenced release, self-logging
+        // like building_heal below — no stats plumbing here.
+        super::curating_reclaim::reconcile_curating_claims(gh_bin, root);
         let (pr_checked, pr_reclaimed) = forge::reconcile_pr_claims(gh_bin, root);
         stats.total_pr_checked += pr_checked;
         stats.total_pr_reclaimed += pr_reclaimed;
@@ -122,6 +127,21 @@ pub(super) fn run_reconciliation_pass_over_roots(
         // forge-visible claim label went missing; never touches a CLOSED
         // issue (#9463). Self-logging; best-effort.
         building_heal::heal_missing_building_labels(gh_bin, root);
+        // #14902: observe confirmed merges regardless of who made them and
+        // finish the issue bookkeeping they skipped — the partial-increment
+        // reset, Champion's close check, the branch-derived close and the
+        // closed-issue strip. It makes no merge-mode check, so it runs on
+        // direct-mode workspaces too (the merge-queue hook above returns
+        // early there). The merged-stack pass below reads only the merge
+        // records this wrote, not any state it mutated.
+        merge_observation::reconcile(gh_bin, root);
+        // #14903: stacked children of a parent that merged outside
+        // merge-pr.sh — still based on the merged parent's branch, or
+        // already retargeted onto the default branch by GitHub's
+        // delete-on-merge flow and recoverable only through git ancestry
+        // against a recorded merge. Runs after merge_observation so a merge
+        // observed this tick is reconciled this tick.
+        super::merged_stack::reconcile(gh_bin, root, open_prs.as_deref());
         stats.roots_processed += 1;
     }
     stats

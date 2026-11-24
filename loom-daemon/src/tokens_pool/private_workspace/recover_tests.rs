@@ -446,7 +446,7 @@ fn parse_run(args: &[&str]) -> Run {
                 run.labels.insert(k.into(), v.into());
                 i += 2;
             }
-            "--tmpfs" | "--env" | "--network" | "--cap-add" => i += 2,
+            "--tmpfs" | "--env" | "--network" | "--cap-add" | "--restart" => i += 2,
             "--entrypoint" => {
                 run.entrypoint = args[i + 1].into();
                 i += 2;
@@ -488,6 +488,19 @@ fn session_container(config: &Config, id: &str, running: bool, image: &str) -> V
             "Source": extra.host,
             "RW": false,
         }));
+    }
+    // The origin mirror binds the container was created with (#14680): the
+    // host objects directories of exactly the recorded slugs, read-only.
+    if !config.mirror_binds.is_empty() {
+        let root = mirror::mirror_root().unwrap();
+        for slug in &config.mirror_binds {
+            mounts.push(json!({
+                "Destination": mirror::in_container_objects(slug),
+                "Type": "bind",
+                "Source": mirror::objects_dir(&root, slug),
+                "RW": false,
+            }));
+        }
     }
     Run {
         name: config.container.clone(),
@@ -624,6 +637,7 @@ fn setup() -> Env {
         gh_config: None,
         session_image: None,
         extra_mounts: Vec::new(),
+        mirror_binds: Vec::new(),
     };
     let dir = state_dir(&account.credential_reference).unwrap();
     std::fs::create_dir_all(&dir).unwrap();
@@ -713,6 +727,40 @@ fn a_missing_private_session_is_recreated_only_against_its_surviving_volume() {
     let run: Vec<&str> = run.iter().map(String::as_str).collect();
     let created = parse_run(&run[1..]);
     assert_eq!(created.name, env.config.container);
+    // Exactly one restart policy, before the image (#14912): on a
+    // session-only host no daemon reconciles the seat, so Docker's own
+    // policy is what brings it back after an engine restart. `unless-stopped`
+    // (not `always`) like the host-mounted seat (#10452), because `stop`
+    // removes the container — the policy never fights an operator's
+    // deliberate stop.
+    let at = run
+        .iter()
+        .position(|a| *a == "--restart")
+        .expect("the persistent private seat sets a restart policy");
+    assert_eq!(run[at + 1], "unless-stopped");
+    assert_eq!(
+        run.iter().filter(|a| **a == "--restart").count(),
+        1,
+        "exactly one restart policy: {run:?}"
+    );
+    let image_at = run
+        .iter()
+        .position(|a| *a == IMAGE)
+        .expect("the detached run names the image");
+    assert!(at < image_at, "the policy precedes the image: {run:?}");
+    // The `--rm` helper runs (control provisioning here; the fresh-volume
+    // initializer and bundle probe on other paths) stay ephemeral.
+    for call in env
+        .engine()
+        .calls
+        .iter()
+        .filter(|c| c.first().is_some_and(|v| v == "run") && c.contains(&"--rm".to_owned()))
+    {
+        assert!(
+            !call.iter().any(|a| a == "--restart"),
+            "an ephemeral helper run must not set a restart policy: {call:?}"
+        );
+    }
     assert!(created.mounts.iter().any(|m| {
         m["Type"] == "volume" && m["Name"] == env.config.volume && m["Destination"] == ROOT
     }));
@@ -725,6 +773,28 @@ fn a_missing_private_session_is_recreated_only_against_its_surviving_volume() {
         .collect();
     assert!(
         envs.contains(&"LOOM_LEASE_RENEW_STATE_DIR=/workspace/cache/lease-renew"),
+        "{envs:?}"
+    );
+    // Every long-lived cache and Loom state dir the seat's 512 MB `/tmp`
+    // tmpfs grew across days (#14929) is pinned to the persistent cache
+    // volume instead — uv's cache alone was 395 MB after two days, and the
+    // forge listing / call-stats / write-scope state dirs surfaced untracked
+    // in the clone when the tmpfs filled.
+    for pinned in [
+        "UV_CACHE_DIR=/workspace/cache/uv",
+        "GH_CACHE_DIR=/workspace/cache/gh",
+        "LOOM_LISTING_CACHE_DIR=/workspace/cache/forge-listing",
+        "LOOM_FORGE_CALL_STATS_DIR=/workspace/cache/forge-call-stats",
+        "LOOM_WRITE_SCOPE_CACHE_DIR=/workspace/cache/write-scope",
+    ] {
+        assert!(envs.contains(&pinned), "missing cache-volume pin {pinned}: {envs:?}");
+    }
+    // The per-container venv is NOT a growing cache and stays on /tmp
+    // (curator scope: `UV_PROJECT_ENVIRONMENT` unchanged).
+    assert!(
+        !envs
+            .iter()
+            .any(|e| e.starts_with("UV_PROJECT_ENVIRONMENT=")),
         "{envs:?}"
     );
     // What it made passes the same validation a reused container must.
@@ -1969,6 +2039,16 @@ fn intact_probe() -> String {
 
 /// Write `accounts.session` into the workspace's own config tier.
 fn configure(env: &Env, image: Option<&str>, mounts: &[(&Path, &str)]) {
+    configure_session(env, image, mounts, false)
+}
+
+/// [`configure`] with the origin object mirror opt-in (#14680).
+fn configure_session(
+    env: &Env,
+    image: Option<&str>,
+    mounts: &[(&Path, &str)],
+    object_mirrors: bool,
+) {
     let mounts: Vec<Value> = mounts
         .iter()
         .map(|(host, container)| json!({"host": host, "container": container}))
@@ -1976,6 +2056,9 @@ fn configure(env: &Env, image: Option<&str>, mounts: &[(&Path, &str)]) {
     let mut session = json!({"extraMounts": mounts});
     if let Some(image) = image {
         session["image"] = json!(image);
+    }
+    if object_mirrors {
+        session["objectMirrors"] = json!(true);
     }
     let dir = env.workspace.path().join(".loom");
     std::fs::create_dir_all(&dir).unwrap();
@@ -2914,6 +2997,7 @@ fn seed_seat(env: &Env, name: &str, id: &str, trusted: bool) -> Seat {
         gh_config: None,
         session_image: None,
         extra_mounts: Vec::new(),
+        mirror_binds: Vec::new(),
     };
     let dir = state_dir(&account.credential_reference).unwrap();
     std::fs::create_dir_all(&dir).unwrap();
@@ -3399,14 +3483,23 @@ fn a_failed_or_timed_out_snapshot_records_an_operation_diagnostic() {
         assert_eq!(record.outcome, "recovery-required");
     }
 
-    // A snapshot that never started at all records the same way.
+    // A snapshot that never started at all records the same way. An empty
+    // PATH no longer expresses "docker is unreachable" — the shared lookup's
+    // absolute fallbacks (`/usr/bin`, …) can still find a host docker (#14885)
+    // — so pin `LOOM_DOCKER_BIN` at a path that is not an executable file.
     let empty = tempfile::tempdir().unwrap();
     let _path = crate::env_test_support::EnvGuard::set("PATH", empty.path().to_str().unwrap());
-    export::update(&root, &env.config, &job, "running").unwrap();
-    assert_eq!(
-        read_record().snapshot_diagnostic.as_deref(),
-        Some("private-workspace snapshot could not be executed")
-    );
+    {
+        let _docker = crate::env_test_support::EnvGuard::set(
+            crate::docker_bin::DOCKER_BIN_ENV,
+            empty.path().join("docker"),
+        );
+        export::update(&root, &env.config, &job, "running").unwrap();
+        assert_eq!(
+            read_record().snapshot_diagnostic.as_deref(),
+            Some("private-workspace snapshot could not be executed")
+        );
+    }
 
     // A fresh snapshot clears the diagnostic and certifies the completion.
     let stubs = tempfile::tempdir().unwrap();
@@ -3510,4 +3603,219 @@ fn a_named_manual_exec_refuses_on_its_own_busy_seat_never_another() {
     assert!(!bob.dir.join(lease::ADMISSION).exists());
     drop(held);
     drop(super::tests::reacquire(&env.dir));
+}
+
+// ---------------------------------------------------------------------------
+// Origin object mirrors (#14680): creation binds, mount validation, and the
+// preparation hand-down, all through the fake Docker and mirror seams.
+// ---------------------------------------------------------------------------
+
+/// Point the host mirror root at a throwaway directory for one test. The env
+/// is process-global, so every test that touches it is `#[serial]`.
+struct MirrorRoot(Option<std::ffi::OsString>);
+
+impl MirrorRoot {
+    fn set(path: &Path) -> Self {
+        let previous = std::env::var_os(mirror::MIRROR_ROOT_ENV);
+        std::fs::create_dir_all(path).unwrap();
+        std::env::set_var(mirror::MIRROR_ROOT_ENV, path);
+        Self(previous)
+    }
+}
+
+impl Drop for MirrorRoot {
+    fn drop(&mut self) {
+        match self.0.take() {
+            Some(value) => std::env::set_var(mirror::MIRROR_ROOT_ENV, value),
+            None => std::env::remove_var(mirror::MIRROR_ROOT_ENV),
+        }
+    }
+}
+
+/// A mirror store populated on disk (its objects directory is all a bind
+/// and its borrowers need).
+fn seed_mirror(root: &Path, slug: &str) -> PathBuf {
+    let objects = mirror::objects_dir(root, slug);
+    std::fs::create_dir_all(&objects).unwrap();
+    objects
+}
+
+/// A start with `accounts.session.objectMirrors` on binds exactly the
+/// repository's own mirror read-only, records the bind, and hands the
+/// in-container preparation exactly that objects path.
+#[test]
+#[serial]
+fn a_start_with_mirrors_binds_them_read_only_and_hands_them_down() {
+    let env = setup();
+    env.seed_volume();
+    let mirrors = tempfile::tempdir().unwrap();
+    let _root = MirrorRoot::set(mirrors.path());
+    let id = identify(&env.config.repository).unwrap();
+    seed_mirror(mirrors.path(), &id.slug);
+    let planned = Rc::new(RefCell::new(Vec::<String>::new()));
+    let recorder = planned.clone();
+    let _fake = mirror::fake::install(Box::new(move |repo| {
+        recorder.borrow_mut().push(repo.slug.clone());
+        Ok(())
+    }));
+    configure_session(&env, None, &[], true);
+    let status = operator_start(&env, None).unwrap();
+    assert!(status.running);
+    let runs = created_runs(&env);
+    let bind = runs[0]
+        .mounts
+        .iter()
+        .find(|m| m["Destination"] == mirror::in_container_objects(&id.slug))
+        .expect("the mirror objects bind is created");
+    assert_eq!(bind["RW"], json!(false));
+    assert_eq!(bind["Source"], json!(mirror::objects_dir(mirrors.path(), &id.slug)));
+    assert_eq!(recorded(&env).mirror_binds, vec![id.slug.clone()]);
+    assert_eq!(*planned.borrow(), vec![id.slug.clone()]);
+    // The in-container prepare verb is told exactly this objects path.
+    assert!(env.engine().calls.iter().any(|c| {
+        c.contains(&"--mirror-objects".to_owned())
+            && c.contains(&mirror::in_container_objects(&id.slug))
+    }));
+}
+
+/// A mirror that cannot be populated is skipped, not fatal: the seat starts
+/// with a fully private clone (no bind, no alternate handed down).
+#[test]
+#[serial]
+fn an_unusable_mirror_keeps_the_seat_fully_private() {
+    let env = setup();
+    env.seed_volume();
+    let mirrors = tempfile::tempdir().unwrap();
+    let _root = MirrorRoot::set(mirrors.path());
+    let _fake = mirror::fake::install(Box::new(|_| bail!("origin unreachable")));
+    configure_session(&env, None, &[], true);
+    let status = operator_start(&env, None).unwrap();
+    assert!(status.running);
+    assert!(recorded(&env).mirror_binds.is_empty());
+    let runs = created_runs(&env);
+    assert!(!runs[0].mounts.iter().any(|m| m["Destination"]
+        .as_str()
+        .is_some_and(|d| d.starts_with(MIRRORS))));
+    assert!(!env
+        .engine()
+        .calls
+        .iter()
+        .any(|c| c.contains(&"--mirror-objects".to_owned())));
+}
+
+/// The recorded binds are checked against Docker's own mount inventory: a
+/// wrong source, a writable bind, a missing bind, or a bind for a repository
+/// of another account all refuse the session.
+#[test]
+#[serial]
+fn mirror_binds_are_validated_against_the_mount_inventory() {
+    let mut env = setup();
+    env.seed_volume();
+    env.seed_container(CONTAINER_ID, true);
+    let mirrors = tempfile::tempdir().unwrap();
+    let _root = MirrorRoot::set(mirrors.path());
+    let id = identify(&env.config.repository).unwrap();
+    let source = seed_mirror(mirrors.path(), &id.slug);
+    let container_name = env.config.container.clone();
+    env.config.mirror_binds = vec![id.slug.clone()];
+    save(&env.dir.join("workspace.json"), &env.config).unwrap();
+    let destination = mirror::in_container_objects(&id.slug);
+    let bind = |dst: &str, src: &Path, rw: bool| json!({"Destination": dst, "Type": "bind", "Source": src, "RW": rw});
+    let mounts_reset = |e: &mut Engine| {
+        let mounts = e.containers.get_mut(&container_name).unwrap()["Mounts"]
+            .as_array_mut()
+            .unwrap();
+        mounts.retain(|m| {
+            !m["Destination"]
+                .as_str()
+                .unwrap_or_default()
+                .starts_with(MIRRORS)
+        });
+    };
+    env.with(|e| mounts_reset(e));
+    env.with(|e| {
+        e.containers.get_mut(&container_name).unwrap()["Mounts"]
+            .as_array_mut()
+            .unwrap()
+            .push(bind(&destination, &source, false));
+    });
+    assert!(env.recover(None).is_ok(), "the honest bind must validate");
+
+    for tamper in [
+        "wrong-source",
+        "writable",
+        "second-alternate",
+        "missing",
+        "unauthorized-slug",
+    ] {
+        if tamper == "unauthorized-slug" {
+            env.config.mirror_binds = vec!["other-repo-22222222".into()];
+            save(&env.dir.join("workspace.json"), &env.config).unwrap();
+        }
+        env.with(|e| mounts_reset(e));
+        env.with(|e| {
+            let mounts = e.containers.get_mut(&container_name).unwrap()["Mounts"]
+                .as_array_mut()
+                .unwrap();
+            match tamper {
+                "wrong-source" => {
+                    mounts.push(bind(&destination, Path::new("/somewhere/else"), false))
+                }
+                "writable" => mounts.push(bind(&destination, &source, true)),
+                "second-alternate" => {
+                    mounts.push(bind(&destination, &source, false));
+                    mounts.push(bind(&format!("{MIRRORS}/a-b-11111111/objects"), &source, false));
+                }
+                "missing" => {}
+                "unauthorized-slug" => mounts.push(bind(
+                    &mirror::in_container_objects("other-repo-22222222"),
+                    &source,
+                    false,
+                )),
+                _ => unreachable!(),
+            }
+        });
+        assert!(env.recover(None).is_err(), "{tamper} must refuse");
+        // Restore the recorded binds for the next round.
+        env.config.mirror_binds = vec![id.slug.clone()];
+        save(&env.dir.join("workspace.json"), &env.config).unwrap();
+    }
+}
+
+/// A session recreated by recovery gets exactly its recorded binds back —
+/// and refuses to come back without them when the store is unusable, rather
+/// than leaving borrowed-from clones on a dangling alternate.
+#[test]
+#[serial]
+fn a_recreated_session_needs_its_bound_mirrors_back() {
+    let mut env = setup();
+    env.seed_volume();
+    let mirrors = tempfile::tempdir().unwrap();
+    let _root = MirrorRoot::set(mirrors.path());
+    let id = identify(&env.config.repository).unwrap();
+    seed_mirror(mirrors.path(), &id.slug);
+    env.config.mirror_binds = vec![id.slug.clone()];
+    save(&env.dir.join("workspace.json"), &env.config).unwrap();
+    let _fake = mirror::fake::install(Box::new(|_| Ok(())));
+    let status = env.recover(Some(IMAGE)).unwrap();
+    assert!(status.running);
+    let runs = created_runs(&env);
+    assert!(runs[0]
+        .mounts
+        .iter()
+        .any(|m| m["Destination"] == mirror::in_container_objects(&id.slug)));
+
+    // The store gone and origin unreachable: the recreation refuses.
+    let mut env = setup();
+    env.seed_volume();
+    let mirrors = tempfile::tempdir().unwrap();
+    let _root = MirrorRoot::set(mirrors.path());
+    let id = identify(&env.config.repository).unwrap();
+    env.config.mirror_binds = vec![id.slug.clone()];
+    save(&env.dir.join("workspace.json"), &env.config).unwrap();
+    let _fake = mirror::fake::install(Box::new(|_| bail!("origin unreachable")));
+    let error = env.recover(Some(IMAGE)).unwrap_err();
+    let text = format!("{error:#}");
+    assert!(text.contains("not usable"), "{text}");
+    assert!(created_runs(&env).is_empty());
 }

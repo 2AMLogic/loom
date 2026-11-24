@@ -710,6 +710,7 @@ impl StepDriver {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let gather = walk.stats(Instant::now());
         self.next_start = walk.next_start();
+        let deadline_skipped: Vec<usize> = walk.skipped_indices().to_vec();
         if gather.truncated {
             log::warn!(
                 "work_finder: step gather truncated by the tick deadline after {}ms: {} repo(s) \
@@ -831,6 +832,15 @@ impl StepDriver {
         });
         for (idx, failed, listing, held) in &notes {
             note_listing(&mut report, *idx, failed.as_ref(), *listing, *held);
+        }
+        // #15182: a repo the gather deadline skipped was never listed this
+        // tick — its ready queue is unread, not empty. Recording the listing
+        // incomplete gives it the same #11139 treatment a partial listing
+        // already gets, so consumers that read a missing row as a departure
+        // (the disposition tracker, dwell, dispatch eligibility) preserve its
+        // rows instead of emitting false `left_queue` observations.
+        for idx in &deadline_skipped {
+            report.note_listing(*idx, false);
         }
         report.occupancy = Some(total + report.dispatched);
         report.note_halts(input.halted, Some(input.halt_causes), input.roots.len());

@@ -19,6 +19,9 @@
 #     T4  an older-head finding needs reconciliation, and MAY proceed once the
 #         caller supplies evidence citing it
 #     T5  a read failure / incomplete pagination fails CLOSED (never "clean")
+#     T5b a REST review shed falls back to GraphQL and still reaches a real
+#         verdict (CLEAR/BLOCKING), staying fail-closed when GraphQL breaks
+#         or paginates incompletely (#15009)
 #     T6  a clean, fully-reconciled review state approves normally
 #     T11 changes-requested verdicts posted as PR COMMENTS (#12475) are read:
 #         older head -> exit 11, current head -> exit 10, untrusted author
@@ -73,7 +76,8 @@ OLD_SHA="1111111111111111111111111111111111111111"
 #   gh api repos/O/R/pulls/N                       --jq .head.sha
 #   gh api repos/O/R/pulls/N/reviews?per_page=100  --paginate --jq FILTER
 #   gh api repos/O/R/pulls/N/comments?per_page=100 --paginate --jq FILTER
-#   gh api graphql -f query=... -F ...
+#   gh api graphql -f query=... -F ...             (reviewThreads)
+#   gh api graphql -f query=... -F ... -F cursor=  (pullRequest.reviews, #15009)
 #   gh pr comment N --body B
 # Fixture files drive the responses; `fail-<name>` marker files inject failures.
 cat > "$STUB_DIR/gh" << 'STUB'
@@ -117,7 +121,7 @@ shift
 
 endpoint="$1"
 shift
-jq_filter=""
+jq_filter="" gql_query="" gql_cursor=""
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --jq)
@@ -127,7 +131,12 @@ while [[ $# -gt 0 ]]; do
     --paginate)
       shift
       ;;
-    -f | -F)
+    -f)
+      [[ "$2" == query=* ]] && gql_query="$2"
+      shift 2
+      ;;
+    -F)
+      [[ "$2" == cursor=* ]] && gql_cursor="${2#cursor=}"
       shift 2
       ;;
     *) shift ;;
@@ -156,9 +165,36 @@ case "$endpoint" in
     # #13927: a wedged read — never writes, never exits on its own.
     [[ -f "$FIX/hang-graphql" ]] && sleep 30
     [[ -f "$FIX/fail-graphql" ]] && exit 1
-    [[ -f "$FIX/graphql-threads.json" ]] || exit 1
-    cat "$FIX/graphql-threads.json"
-    exit 0
+    # Two GraphQL subjects flow through here: reviewThreads (thread
+    # resolution) and pullRequest.reviews (#15009's formal-review fallback).
+    # Route on the query body — a subject with no fixture fails the way its
+    # real transport would, never serves the other subject's shape.
+    if [[ "$gql_query" == *reviewThreads* ]]; then
+      [[ -f "$FIX/graphql-threads.json" ]] || exit 1
+      cat "$FIX/graphql-threads.json"
+      exit 0
+    fi
+    if [[ "$gql_query" == *"reviews(first"* ]]; then
+      # Cursor pagination: no cursor serves page 1; a cursor equal to page
+      # N's endCursor serves page N+1 — a missing follower page exits 1, the
+      # truncated stream the fallback must fail closed on.
+      if [[ -z "$gql_cursor" ]]; then
+        [[ -f "$FIX/graphql-reviews-page-1.json" ]] || exit 1
+        cat "$FIX/graphql-reviews-page-1.json"
+        exit 0
+      fi
+      for page in "$FIX"/graphql-reviews-page-*.json; do
+        [[ -f "$page" ]] || continue
+        [[ "$page" =~ -page-([0-9]+)\.json$ ]] || continue
+        if [[ "$gql_cursor" == "$(jq -r '.data.repository.pullRequest.reviews.pageInfo.endCursor // empty' "$page")" ]]; then
+          next="${page%-page-*}-page-$((BASH_REMATCH[1] + 1)).json"
+          [[ -f "$next" ]] || exit 1
+          cat "$next"
+          exit 0
+        fi
+      done
+    fi
+    exit 1
     ;;
   */issues/*/comments*)
     [[ -f "$FIX/hang-comments" ]] && sleep 30
@@ -267,7 +303,8 @@ printf '{"head":{"sha":"%s"}}\n' "$HEAD_SHA" > "$FIX_DIR/pr.json"
 reset_fixtures() {
   rm -f "$FIX_DIR"/reviews-page-*.json "$FIX_DIR"/inline-page-*.json \
     "$FIX_DIR"/comments-page-*.json \
-    "$FIX_DIR/graphql-threads.json" "$FIX_DIR"/fail-* "$FIX_DIR"/hang-* \
+    "$FIX_DIR/graphql-threads.json" "$FIX_DIR"/graphql-reviews-page-*.json \
+    "$FIX_DIR"/fail-* "$FIX_DIR"/hang-* \
     "$FIX_DIR/last-pr.txt" "$FIX_DIR/last-body.txt"
   # Default: no inline threads at all (GraphQL answers with an empty node list).
   cat > "$FIX_DIR/graphql-threads.json" << 'JSON'
@@ -415,6 +452,8 @@ echo ""
 echo "T5: read failure / incomplete pagination"
 reset_fixtures
 touch "$FIX_DIR/fail-reviews"
+# With #15009 this also runs the GraphQL fallback into a stub that has no
+# graphql-reviews page to serve (exit 1): both transports fail, not just REST.
 run_gate --number 5369 --head-sha "$HEAD_SHA"
 assert_eq "12" "$GATE_RC" "failed reviews read -> exit 12 (UNKNOWN)"
 assert_contains "$GATE_OUT" "REVIEW_FEEDBACK_STATE=UNKNOWN" "a failed read is UNKNOWN, never CLEAR"
@@ -447,6 +486,79 @@ reset_fixtures
 touch "$FIX_DIR/fail-graphql"
 run_gate --number 5369 --head-sha "$HEAD_SHA"
 assert_eq "0" "$GATE_RC" "GraphQL down with zero inline comments -> CLEAR (complete REST read)"
+
+# --- T5b: REST reviews shed, GraphQL serving — the fallback reaches a real
+#     verdict instead of UNKNOWN (#15009) ------------------------------------
+# The formal-review read was the gate's only single-transport input: with the
+# REST reader shed (#14739) every approval became UNKNOWN while GraphQL kept
+# serving. forge_get_pr_reviews now retries a FAILED REST read through a
+# paginated GraphQL pullRequest.reviews query (never a timed-out one), so the
+# gate reconciles the very records the shed hid.
+echo ""
+echo "T5b: REST review read shed, GraphQL fallback serving (#15009)"
+
+load_shed_gql_reviews() { # two pages: two records, then the page-2 blocker
+  touch "$FIX_DIR/fail-reviews"
+  cat > "$FIX_DIR/graphql-reviews-page-1.json" << JSON
+{"data":{"repository":{"pullRequest":{"reviews":{"pageInfo":{"hasNextPage":true,"endCursor":"GQLR1"},"nodes":[
+  {"databaseId":7101,"state":"COMMENTED","commit":{"oid":"$HEAD_SHA"},"submittedAt":"2026-09-14T20:00:00Z","author":{"login":"carol"},"body":"drive-by note"},
+  {"databaseId":7102,"state":"APPROVED","commit":{"oid":"$OLD_SHA"},"submittedAt":"2026-09-13T09:00:00Z","author":{"login":"heidi"},"body":"earlier ok"}
+]}}}}}
+JSON
+  cat > "$FIX_DIR/graphql-reviews-page-2.json" << JSON
+{"data":{"repository":{"pullRequest":{"reviews":{"pageInfo":{"hasNextPage":false,"endCursor":"GQLR2"},"nodes":[
+  {"databaseId":7103,"state":"CHANGES_REQUESTED","commit":{"oid":"$HEAD_SHA"},"submittedAt":"2026-09-14T21:10:12Z","author":{"login":"grace"},"body":"DFM-analysis coverage is still missing."}
+]}}}}}
+JSON
+}
+
+reset_fixtures
+load_shed_gql_reviews
+run_gate --number 5369 --head-sha "$HEAD_SHA"
+assert_eq "10" "$GATE_RC" "REST reviews failing + GraphQL serving -> BLOCKING from the fallback records, not UNKNOWN"
+assert_contains "$GATE_OUT" "REVIEW_FEEDBACK_STATE=BLOCKING" "the fallback records establish BLOCKING"
+assert_contains "$GATE_OUT" "REVIEWS_TOTAL=3" "all reviews across BOTH GraphQL pages were ingested"
+assert_contains "$GATE_OUT" "REVIEW_BLOCKING_IDS=\"7103\"" "the page-2 GraphQL review id is reported for citation"
+
+run_pv 5369 approved "$HEAD_SHA" --body "Approved, CI green."
+assert_eq "3" "$PV_RC" "approval is refused on the fallback-served BLOCKING state"
+assert_contains "$PV_OUT" "7103" "refusal names the review only the fallback could see"
+
+# The same shed with a clean GraphQL record set is a genuine CLEAR, and an
+# approval on it posts — the fallback is a second path, not an UNKNOWN sink.
+reset_fixtures
+touch "$FIX_DIR/fail-reviews"
+cat > "$FIX_DIR/graphql-reviews-page-1.json" << JSON
+{"data":{"repository":{"pullRequest":{"reviews":{"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[
+  {"databaseId":7201,"state":"APPROVED","commit":{"oid":"$HEAD_SHA"},"submittedAt":"2026-09-14T22:00:00Z","author":{"login":"grace"},"body":"fixed, thanks"}
+]}}}}}
+JSON
+run_gate --number 5369 --head-sha "$HEAD_SHA"
+assert_eq "0" "$GATE_RC" "REST reviews failing + clean GraphQL records -> CLEAR"
+assert_contains "$GATE_OUT" "REVIEW_FEEDBACK_STATE=CLEAR" "the fallback read establishes CLEAR, not UNKNOWN"
+run_pv 5369 approved "$HEAD_SHA" --body "Approved — CI green."
+assert_eq "0" "$PV_RC" "approval posts on the fallback-served CLEAR review state"
+
+# A truncated fallback (page 1 advertises a follower that never arrives) is
+# an UNKNOWN, never the partial record set it did deliver.
+reset_fixtures
+touch "$FIX_DIR/fail-reviews"
+cat > "$FIX_DIR/graphql-reviews-page-1.json" << JSON
+{"data":{"repository":{"pullRequest":{"reviews":{"pageInfo":{"hasNextPage":true,"endCursor":"VANISHED"},"nodes":[
+  {"databaseId":7301,"state":"APPROVED","commit":{"oid":"$HEAD_SHA"},"submittedAt":"2026-09-14T22:00:00Z","author":{"login":"grace"},"body":"incomplete stream"}
+]}}}}}
+JSON
+run_gate --number 5369 --head-sha "$HEAD_SHA"
+assert_eq "12" "$GATE_RC" "truncated GraphQL pagination -> exit 12 (UNKNOWN), never the partial record set"
+assert_contains "$GATE_OUT" "REVIEW_FEEDBACK_STATE=UNKNOWN" "a truncated fallback read is UNKNOWN"
+
+# REST AND GraphQL both explicitly failing stays UNKNOWN — T5's fail-reviews
+# case now also runs the fallback into a stub with no graphql-reviews page to
+# serve; this spells the second transport's failure out.
+reset_fixtures
+touch "$FIX_DIR/fail-reviews" "$FIX_DIR/fail-graphql"
+run_gate --number 5369 --head-sha "$HEAD_SHA"
+assert_eq "12" "$GATE_RC" "both review transports failing -> exit 12 (UNKNOWN)"
 
 # --- T6: clean, fully reconciled review state approves ----------------------
 echo ""

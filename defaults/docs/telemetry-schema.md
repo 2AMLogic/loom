@@ -255,6 +255,7 @@ join's owner has agreed to. No `schema_version` bump is needed for a new key.
 | base SHA | `loom.base_sha` | sweep root | Full 40-hex tip of `origin/HEAD` (else `origin/main`) at dispatch |
 | build version | `loom.daemon.version` | every span | `CARGO_PKG_VERSION` of the binary that created the span |
 | build commit | `loom.daemon.revision` | every span | Full git SHA of that binary; `loom.daemon.tree_state` says whether it was clean |
+| prompt modifier | `loom.prompt_modifier` | every provenance-stamped span, so `loom.dispatch.step`, `loom.role_attempt` and `loom.runtime.usage` | The registered modifier a single-step run was launched under (`LOOM_PROMPT_MODIFIER`, #15017). **Absent when none is set**, so an unmodified run is unchanged; also folded into `loom.hyperparams.digest`. See [runtime-adapters](runtime-adapters.md) |
 | host | `host.id` / `host.name` / `service.instance.id` | OTLP `Resource`, not a span attribute | One value per exporting host; see [Envelope](#envelope) |
 | role | `loom.role` | phase/role spans, role-tick root | |
 
@@ -1476,6 +1477,9 @@ the parser accepts all three, one test each). The close carries, beside the
 | `loom.step.outcome.class` | The step's `LOOM_STEP_OUTCOME` class: `verdict`, `noop`, `refused` or `failed`. **`none`** when the step wrote no parseable outcome line — a countable value, never an absence (#13521 tracks why some steps end without one). A Champion step writes a `CHAMPION-STEP` line instead, so it closes `none` here; its class is on its `pass.verdict` record. |
 | `loom.step.outcome.reason` | The line's `reason` token as written (`-` folded to `_`), truncated to 64 `char`s. Absent when the class is `none`. A later issue may close the vocabulary. |
 | `loom.step.outcome.agrees` | **`true`** / **`false`** (#14234): whether the class the forge post-state gives the step is the class its line claimed. The daemon computes it at the close with the ledger's own `outcome_ledger::classify`, never the session, so a step that claimed `verdict` while the item did not move records `false` (the ledger still classifies it `failed`; `loom.result`, `loom.step.outcome.class` and the ledger are unchanged). **Absent** when there is nothing to compare, which is *not* agreement: the step wrote no line (`class=none`, including every Champion step, whose `CHAMPION-STEP` line is not a `LOOM_STEP_OUTCOME`), or no post-state was noted by the close (the release had not run yet, the step was a `skip_label_flip` or `ChampionMerge` step, the item was held by another claimant so no release ran, or the forge read failed), or the step ended on `provider-exhausted`. Roles whose classifier has no post-state rule for a step carry no `agrees` for the same reason. Class only: reasons are not compared. |
+| `loom.step.outcome.verdict` | The Judge verdict of record (#14898): `approved` or `changes_requested` (a confirmed verdict-labels write, reason set `judge_v1`) or `reviewed` (the line-only fallback, reason set `judge_step_v1`). Judge steps only, and only when the projection is a verdict — the raw `class` above is unchanged, so a posted verdict that survived a missing line reads `class=none` with its verdict beside it. Computed at the close from the same step-scoped evidence the `pass.verdict` record projects (the step's journal, peeked not taken, and its own dispatch's log section); local reads only, no forge request under the registry lock. |
+| `loom.step.outcome.reason_set` | Which of the Judge's two reason sets supplied `verdict`: `judge_v1` (a confirmed write) or `judge_step_v1` (the line-only fallback). |
+| `loom.step.outcome.head_sha` | The head the verdict was evaluated against: the write's own `--sha`, else the latest head `forge verdict-gate --sha` journaled before that write. A line-only verdict uses the latest evaluation for that PR in the step. Absent when neither named one — never a fresh read of the PR tip, so a head that moved after the evaluation cannot misattribute the reviewed commit. |
 | `loom.runtime` | The registry's runtime for the step (`claude`, `codex`, …), the same fact `SweepInfo.runtime` records; absent for a legacy entry. |
 
 `loom.configured_model` / `loom.effort` were already on the close. The
@@ -1490,6 +1494,20 @@ forge does not show:
 `attributes_string['loom.step.outcome.agrees'] = 'false'` over the query below.
 All three keys are on the daemon export allowlist and the collector's span
 `keep_keys` (contract-tested).
+
+**Which record supplies the verdict (#14898).** `pass.verdict`
+(`mechanism=step:judge`) is the **verdict of record**; the
+`loom.step.outcome.verdict` family on the `loom.sweep` close is a copy of it,
+stamped at the close so a trace-only reader recovers the verdict and the head
+it was evaluated against without joining the record stream. The two reason
+sets are `judge_v1` — a confirmed verdict write: `approved` /
+`changes_requested` — and `judge_step_v1` — the step's own line: `reviewed`
+(a verdict line with no confirmed write), `no_change`, `ci_red`,
+`ci_incomplete`, `declined`, `failed`. **Join:** a verdict-class Judge step's
+root joins its record by repository and sweep id — the span's `loom.repo` /
+`loom.sweep_id` equal the record's `loom.repo` / `loom.sweep_id` (`pass`
+`step.sweep_id`, the step's sweep id); the verdict word, reason set and head
+SHA agree on both (pinned by a fixture in `step_verdict_tests.rs`).
 
 One query answers "outcomes by runtime, model and role" for a day
 (SigNoz; every span attribute is exported as a string):
@@ -3025,8 +3043,12 @@ PR a verdict was written on, from a step or a role-runner tick. The evidence is 
 transition held (`post-verdict.sh` passes `--sha "$SHA"`, on the main and the
 superseded path; a refused approval, a duplicate loser and a failed transition
 journal nothing). `verdict` carries `approved` or `changes_requested`, with
-`head_sha` from the write. It wins over the step projection below unless a
-CI refusal was journaled after it. A role-runner tick that wrote no verdict
+`head_sha` from the write — or, when the write named none (a script roll
+against an older daemon), the head `forge verdict-gate --sha` journaled at the
+evaluation (`Reviewed`, #14898). It wins over the step projection below unless a
+CI refusal was journaled after it. The same verdict, reason set and head are
+copied onto the step root's close (`loom.step.outcome.verdict` family, #14898).
+A role-runner tick that wrote no verdict
 projects nothing; spawned-but-idle ticks are counted by
 `role_tick.outcome.found_work=false`. Telemetry only: no label, claim, retry,
 exit code or ledger effect changes.
@@ -3049,7 +3071,12 @@ One record per Judge step end that wrote no verdict (a written verdict is the `j
 the exact-head CI gate (#10486; it posts nothing), it journals the refusal
 through `loom-daemon forge journal-ci-refusal` (best-effort; an older daemon
 changes nothing) and the step's record carries it, with `head_sha` set. Without
-a refusal the step's `LOOM_STEP_OUTCOME role=judge` line projects.
+a refusal the step's `LOOM_STEP_OUTCOME role=judge` line projects. The
+`reviewed` row carries the head the evaluation named (`Reviewed`, journaled by
+`forge verdict-gate --sha` before any write, #14898): a PR that advanced after
+the evaluation cannot misattribute the reviewed commit — absent when the run
+named no head, never a fresh read of the PR tip. A `reviewed` step root also
+carries the copy (`loom.step.outcome.verdict`, #14898).
 
 | `class` | `reason` |
 |---|---|

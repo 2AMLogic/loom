@@ -420,10 +420,15 @@ fn watch_pass(root: &Path) {
         crate::workspace_registry::WorkspaceRegistry::load_default()
             .ok()
             .map(|registry| registry.roots());
-    let docker = std::env::var("LOOM_CODEX_SESSION_DOCKER")
-        .ok()
-        .filter(|d| !d.is_empty())
-        .unwrap_or_else(|| "docker".to_string());
+    // Scoped override verbatim, else the shared lookup (#14885); an
+    // unresolvable docker stays unlaunchable, so the snapshot reads
+    // Unavailable and nothing is marked down (fail open).
+    let docker = crate::docker_bin::scoped_or_fail_open(
+        std::env::var("LOOM_CODEX_SESSION_DOCKER")
+            .ok()
+            .filter(|d| !d.is_empty())
+            .as_deref(),
+    );
     // The docker call runs without the tracker lock held.
     let started = Instant::now();
     let inputs = DriftInputs::new(registered.as_deref());

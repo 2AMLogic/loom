@@ -68,7 +68,11 @@ fn command_status_env(
     if let Some(result) = fake::dispatch(args, env, timeout) {
         return result;
     }
-    let (success, stdout, _stderr) = docker_cli::run_bounded_env("docker", args, env, timeout)
+    // Shared lookup (#14885); a resolution failure fails the call with the
+    // same "Docker unavailable" context a failed spawn produced.
+    let program = crate::docker_bin::resolve_str()
+        .map_err(|error| anyhow::Error::new(error).context("Docker unavailable"))?;
+    let (success, stdout, _stderr) = docker_cli::run_bounded_env(&program, args, env, timeout)
         .map_err(|error| match error.downcast::<docker_cli::DockerTimedOut>() {
             Ok(timed_out) => anyhow::Error::new(timed_out),
             Err(error) => error.context("Docker unavailable"),
@@ -187,7 +191,12 @@ pub(super) fn validate_settings(config: &Config, state: &Value) -> Result<()> {
     let expected = 2
         + bundle::PROFILE_CONTROLS.len()
         + usize::from(config.gh_config.is_some())
-        + config.extra_mounts.len();
+        + config.extra_mounts.len()
+        // One read-only bind per origin object mirror the container was
+        // created with (#14680): each is verified below against its exact
+        // host source and in-container destination, so an extra, writable,
+        // or wrong-repository mirror bind cannot pass.
+        + authorized_mirror_binds(config)?.len();
     if mounts.len() != expected {
         bail!("private session has unexpected mounts; no host workspace, peer volume or runtime socket may be mounted, and every account profile control file must be bound read-only");
     }
@@ -234,6 +243,11 @@ pub(super) fn validate_settings(config: &Config, state: &Value) -> Result<()> {
                         && bind_source_matches(config, mount, &extra.host)
                         && mount["RW"] == false
                 })
+                // A read-only origin object mirror bind (#14680): only this
+                // repository's own mirror, only at its own `MIRRORS/<slug>`
+                // destination, only from the host mirror root — anything else
+                // under `/mirrors` fails here and breaks the count above.
+                || mirror_bind_valid(config, mount, other)
             }
         };
         if !valid {
@@ -242,6 +256,43 @@ pub(super) fn validate_settings(config: &Config, state: &Value) -> Result<()> {
     }
 
     Ok(())
+}
+
+/// The recorded mirror binds, after proving each names a repository of THIS
+/// account: a bind for another repository's objects is exactly the
+/// unauthorized read the mirror rule exists to prevent.
+fn authorized_mirror_binds(config: &Config) -> Result<&[String]> {
+    let slugs: Vec<String> = std::iter::once(&config.repository)
+        .chain(config.repositories.iter().map(|r| &r.repository))
+        .filter_map(|url| identify(url).ok().map(|id| id.slug))
+        .collect();
+    for bound in &config.mirror_binds {
+        if !slugs.contains(bound) {
+            bail!("origin object mirror bind {bound} is not a repository of this account");
+        }
+    }
+    Ok(&config.mirror_binds)
+}
+
+/// Whether `mount` is exactly the read-only bind of `bound`'s mirror: a bind
+/// from the host mirror root, at `MIRRORS/<slug>/objects`, read-only.
+fn mirror_bind_valid(config: &Config, mount: &Value, destination: &str) -> bool {
+    let Some(slug) = destination
+        .strip_prefix(MIRRORS)
+        .and_then(|rest| rest.strip_prefix('/'))
+        .and_then(|rest| rest.strip_suffix("/objects"))
+    else {
+        return false;
+    };
+    if !config.mirror_binds.iter().any(|bound| bound == slug) {
+        return false;
+    }
+    let Ok(root) = mirror::mirror_root() else {
+        return false;
+    };
+    mount["Type"] == "bind"
+        && bind_source_matches(config, mount, &mirror::objects_dir(&root, slug))
+        && mount["RW"] == false
 }
 
 /// The read-only control-file binds a private session is created with. One
@@ -485,25 +536,44 @@ fn parse_docker_host(host: &str) -> Option<EngineEndpoint> {
     }
 }
 
-/// The platform's default engine socket, in probe order.
-fn default_endpoint() -> Option<EngineEndpoint> {
-    let candidates: &[&str] = if cfg!(target_os = "macos") {
-        &["/.docker/run/docker.sock", "/var/run/docker.sock"]
+/// A default-socket candidate: HOME-relative (resolved under `$HOME` when
+/// it is set, skipped when it is not) or absolute (used verbatim).
+#[derive(Debug, PartialEq, Eq)]
+enum SocketCandidate {
+    HomeRelative(&'static str),
+    Absolute(&'static str),
+}
+
+/// The platform's default engine socket candidates, in probe order.
+fn default_socket_candidates() -> &'static [SocketCandidate] {
+    if cfg!(target_os = "macos") {
+        &[
+            // Docker Desktop's socket lives under the user's home.
+            SocketCandidate::HomeRelative(".docker/run/docker.sock"),
+            // Docker Desktop also keeps a symlink at the Unix path on macOS.
+            SocketCandidate::Absolute("/var/run/docker.sock"),
+        ]
     } else {
-        &["/var/run/docker.sock"]
-    };
-    let home = std::env::var_os("HOME");
+        &[SocketCandidate::Absolute("/var/run/docker.sock")]
+    }
+}
+
+/// Map candidates plus a `$HOME` value to the paths probed, in order.
+fn resolve_socket_candidates(candidates: &[SocketCandidate], home: Option<&Path>) -> Vec<PathBuf> {
     candidates
         .iter()
-        .map(|suffix| {
-            if let Some(prefix) = suffix.strip_prefix('/') {
-                home.as_ref()
-                    .map(|home| Path::new(home).join(format!(".{prefix}")))
-                    .unwrap_or_else(|| PathBuf::from(suffix))
-            } else {
-                PathBuf::from(suffix)
-            }
+        .filter_map(|candidate| match candidate {
+            SocketCandidate::HomeRelative(suffix) => home.map(|home| home.join(suffix)),
+            SocketCandidate::Absolute(path) => Some(PathBuf::from(path)),
         })
+        .collect()
+}
+
+/// The platform's default engine socket, in probe order.
+fn default_endpoint() -> Option<EngineEndpoint> {
+    let home = std::env::var_os("HOME");
+    resolve_socket_candidates(default_socket_candidates(), home.as_deref().map(Path::new))
+        .into_iter()
         .find(|path| std::fs::symlink_metadata(path).is_ok())
         .map(EngineEndpoint::Unix)
 }
@@ -692,11 +762,19 @@ pub(super) fn create(config: &Config, image: &str) -> Result<()> {
         ])?;
     }
     validate_ownership(config)?;
+    // `--restart unless-stopped` (#14912): on a session-only host no daemon
+    // runs the reconcile pass, so Docker's own policy is what returns the
+    // seat after an engine restart or host reboot — the same policy the
+    // host-mounted seat has carried since #10452. It never fights an
+    // operator's stop: `stop` removes the container, and the `--rm` helper
+    // runs above and below stay ephemeral with no policy.
     let mut args = vec![
         "run".to_owned(),
         "-d".into(),
         "--name".into(),
         config.container.clone(),
+        "--restart".into(),
+        "unless-stopped".into(),
         "--user".into(),
         "1000:1000".into(),
         "--read-only".into(),
@@ -737,6 +815,18 @@ pub(super) fn create(config: &Config, image: &str) -> Result<()> {
         // container's `$HOME`, which is `/home/loom` here. Point the store at
         // the cache volume so Loom's own lock stays out of the work tree.
         "LOOM_LEASE_RENEW_STATE_DIR=/workspace/cache/lease-renew".into(),
+        // The seat's 512 MB `/tmp` tmpfs filled with caches that live for the
+        // container's whole multi-day life (#14929): uv's cache alone was
+        // 395 MB after two days. Pin every long-lived cache and Loom state
+        // dir to the persistent cache volume (each consumer creates its dir
+        // on demand, so a seat created before this change needs no migration).
+        // `UV_PROJECT_ENVIRONMENT` stays on /tmp deliberately: it is one
+        // per-container venv uv recreates on repo switch, not a growing cache.
+        "UV_CACHE_DIR=/workspace/cache/uv".into(),
+        "GH_CACHE_DIR=/workspace/cache/gh".into(),
+        "LOOM_LISTING_CACHE_DIR=/workspace/cache/forge-listing".into(),
+        "LOOM_FORGE_CALL_STATS_DIR=/workspace/cache/forge-call-stats".into(),
+        "LOOM_WRITE_SCOPE_CACHE_DIR=/workspace/cache/write-scope".into(),
         format!("LOOM_PRIVATE_REPOSITORY={}", config.repository),
     ] {
         args.extend(["--env".into(), value]);
@@ -771,6 +861,32 @@ pub(super) fn create(config: &Config, image: &str) -> Result<()> {
                 super::super::session_image::extra_mounts_label_json(&config.extra_mounts)
             ),
         ]);
+    }
+    // One read-only bind per origin object mirror the container is created
+    // with (#14680). The host objects directory must already be populated:
+    // Docker would silently create a missing bind source as an empty
+    // root-owned directory, and a clone borrowing through an empty store
+    // would lose every published object it shed to it.
+    if !config.mirror_binds.is_empty() {
+        let root = mirror::mirror_root()?;
+        for slug in authorized_mirror_binds(config)? {
+            let objects = mirror::objects_dir(&root, slug);
+            if !objects.is_dir() {
+                bail!(
+                    "origin object mirror {slug} has no objects directory at {}; refusing to \
+                     bind an empty one",
+                    objects.display()
+                );
+            }
+            args.extend([
+                "--mount".into(),
+                format!(
+                    "type=bind,src={},dst={},readonly",
+                    objects.display(),
+                    mirror::in_container_objects(slug)
+                ),
+            ]);
+        }
     }
     args.extend([
         "--entrypoint".into(),
@@ -1143,6 +1259,13 @@ pub(super) fn prepare_with(
     if let Some(slug) = &target.slug {
         args.extend(["--slug", slug]);
     }
+    // The read-only origin mirror bind this clone borrows published objects
+    // through (#14680): handed down from the container's recorded binds, so
+    // the in-container verb never guesses a path.
+    let bound_mirror = mirror::bound_objects(config, target);
+    if let Some(objects) = bound_mirror.as_deref() {
+        args.extend(["--mirror-objects", objects]);
+    }
     let output = command_env(&args, &auth.child_env(), EXEC_TIMEOUT).context("private workspace endpoint failed; use a current session image supporting private-workspace protocol")?;
     prepare_result(&output, |path| {
         log::info!(
@@ -1229,6 +1352,46 @@ mod exec_probe_tests {
         // A TLS-verified endpoint is not probeable over plain HTTP either.
         let _tls_on = crate::env_test_support::EnvGuard::set("DOCKER_TLS_VERIFY", "1");
         assert_eq!(parse_docker_host("tcp://127.0.0.1:2375"), None);
+    }
+
+    #[test]
+    fn default_socket_candidates_resolve_by_home_not_by_stripping() {
+        let home = Some(Path::new("/home/probe"));
+        // The macOS list: the Docker Desktop socket is HOME-relative, the
+        // Unix path stays absolute — never `$HOME/.var/run/docker.sock`
+        // (#14958).
+        let macos = [
+            SocketCandidate::HomeRelative(".docker/run/docker.sock"),
+            SocketCandidate::Absolute("/var/run/docker.sock"),
+        ];
+        assert_eq!(
+            resolve_socket_candidates(&macos, home),
+            vec![
+                PathBuf::from("/home/probe/.docker/run/docker.sock"),
+                PathBuf::from("/var/run/docker.sock"),
+            ]
+        );
+        // HOME unset: the HOME-relative candidate cannot resolve and is
+        // skipped; the absolute one still probes.
+        assert_eq!(
+            resolve_socket_candidates(&macos, None),
+            vec![PathBuf::from("/var/run/docker.sock")]
+        );
+        // The Linux list never depends on HOME.
+        let linux = [SocketCandidate::Absolute("/var/run/docker.sock")];
+        assert_eq!(
+            resolve_socket_candidates(&linux, home),
+            vec![PathBuf::from("/var/run/docker.sock")]
+        );
+        assert_eq!(
+            resolve_socket_candidates(&linux, None),
+            vec![PathBuf::from("/var/run/docker.sock")]
+        );
+        // The shipped platform list keeps the shape probed above.
+        #[cfg(target_os = "macos")]
+        assert_eq!(default_socket_candidates(), macos.as_slice());
+        #[cfg(not(target_os = "macos"))]
+        assert_eq!(default_socket_candidates(), linux.as_slice());
     }
 
     #[test]

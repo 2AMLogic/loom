@@ -1408,3 +1408,5 @@ mod online;
 mod supersede;
 #[path = "workspace_resync_surfaces.rs"]
 mod surfaces;
+#[path = "workspace_resync_wait.rs"]
+mod wait_note;

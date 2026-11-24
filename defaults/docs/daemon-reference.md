@@ -10481,6 +10481,7 @@ through `.loom-local/local.json`):
 |---|---|---|
 | — | `accounts.session.image` | The image a session container is created from, **digest-pinned** (`repo@sha256:<64 hex>`). A tag-only reference is refused at parse. Unset = today's behaviour byte for byte. |
 | — | `accounts.session.extraMounts` | A list of `{ "host": …, "container": … }` bind mounts, **always read-only**. An entry carrying any other key (`rw`/`mode`/…) is refused at parse. A container target must lie outside the mounted workspace (the `--mount-workspace` path, not only the registered repositories beneath it); one inside it is refused at `create`. |
+| — | `accounts.session.objectMirrors` | `true` to create new private-session containers with one read-only bind per registered repository, at `/mirrors/<slug>/objects`, from this host's origin-only object mirror (#14680); each bound clone's sole object alternate names exactly that path. Unset/`false` (the default) keeps fully private clones. A mirror that cannot be proved or fetched skips that repository, never the session. |
 
 **Precedence**: `accounts session start --image IMAGE` (the operator's own
 invocation) beats `accounts.session.image`, which beats the stock default.
@@ -10796,6 +10797,17 @@ selection sees that container at the watch's next pass, within 60 s.
 a reconciler that is opted out, or a restart the reconciler does not make
 (changed profile control files), is in
 [`guardrail-parity-codex.md`](guardrail-parity-codex.md#restarting-or-recreating-session-containers-by-hand).
+
+**No daemon at all (session-only hosts, #14912).** On an attended host
+running sessions without `loom-daemon` (#12708) there is no reconcile pass;
+what recovers a seat after a Docker engine restart is Docker's own
+`--restart unless-stopped` policy, which `accounts session start` sets on
+both host-mounted (#10452) and private-clone (#14912) seats. A one-time
+`docker update --restart unless-stopped` migrates a running, unheld legacy
+seat in place; an operator-stopped account stays held and down; recreating
+a missing container remains the operator's `session start`. The procedure
+and the disposable-host check are in `docker/session/README.md` § "Seat
+restart policy and engine-restart recovery (issue #14912)".
 
 **Mount drift (#10364).** A host-mode container's workspace mounts are fixed
 when it is created, so a later `loom-daemon workspace add` never reaches it
@@ -11187,6 +11199,38 @@ The same pass-through can be requested deliberately with
 `autonomous.roleRunner.roleModels.<role> = "default"` (or the global
 `autonomous.roleRunner.model`); see
 [`runtime-adapters.md` § "Per-role model override"](runtime-adapters.md#per-role-model-override-autonomousrolerunnerrolemodels).
+
+**A configured tier reconciles against a native profile's own model
+(#14962).** A `roleModels.<role>` pin (or the global
+`autonomous.roleRunner.model` / `autonomous.model`) is a runtime-neutral
+default, so it may name a model the native pick the draw landed on does not
+run: an `opencode:<profile>` candidate pins a *profile*, and
+`worker_spawn::profiles::select` refuses a launch whose `--model` differs
+from that profile's own `model` (`bare model differs from the selected
+profile`, `profile_selection`, exit 78) — before #14962 this lost whole
+Judge/Guide steps whose `roleModels.<role>` was aimed at the Claude picks.
+Both launch sites (the sweep step spawn and the role runner's invocation) now
+resolve the model through `resolve_role_runner_model_for_launch`: when the
+admitted runtime is native (`opencode`, `pi`, `kimi`) and the profile the
+launch will select (the preference tap's `modelProfile`, then
+`LOOM_MODEL_PROFILE`, `runtimes.defaultModelProfile`, then the bundled
+`zai-flash`) declares a different `model`, the configured pin is dropped and
+the child launches with the profile's own model instead of the launch being
+refused. **A qualified `provider/model` pin is kept** when no profile was
+requested (no tap `modelProfile`, no `LOOM_MODEL_PROFILE`): `select` honours it
+verbatim before any profile lookup — the documented
+`"roleModels": {"judge": "google/gemini-2.5-pro"}` shape
+(`configuring-resources.md`) — so only a bare tier name (or a qualified value
+differing from an *explicitly requested* profile's model) is dropped. The drop
+is logged, and the per-tick header's source names it, e.g.
+`model=<runtime CLI default> (source=autonomous.roleRunner.roleModels.judge (profile model for opencode:zai-flash))`.
+A model the pick itself pins (`claude/opus`, `opencode:<profile>/<model>`)
+is an explicit statement of intent about that launch and is **never** dropped:
+a value the profile disallows is still forwarded and still refused loudly —
+pin `opencode:<profile>/<the profile's model>` (or nothing) instead. Claude
+and Codex launches are unaffected, so #5028's
+`model_runtime_mismatch` refusal of a genuinely wrong cross-family pin
+survives verbatim.
 
 **Pinned models fall back one rung at selection time when their class limit
 is hit (#13873).** A model pin has no answer to an org-wide class ceiling:

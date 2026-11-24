@@ -9,7 +9,7 @@
 # Eliminating these entries is the caller-migration issue's job, not this
 # ledger's — see `removal_epic` below and each entry's `removal_issue`.
 #
-# 69 file(s), 221 direct call site(s) at baseline.
+# 69 file(s), 222 direct call site(s) at baseline.
 
 removal_epic = 9769
 
@@ -39,7 +39,7 @@ removal_issue = 9799
 
 [[bypass]]
 path = "defaults/scripts/claim-staleness.sh"
-calls = 5
+calls = 6
 owner = "role-scripts"
 removal_issue = 9799
 
@@ -297,7 +297,7 @@ removal_issue = 9799
 
 [[bypass]]
 path = "loom-daemon/src/operator_decision/cli.rs"
-calls = 7
+calls = 8
 owner = "daemon-other"
 removal_issue = 9799
 

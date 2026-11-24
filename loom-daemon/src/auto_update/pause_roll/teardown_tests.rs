@@ -479,3 +479,71 @@ fn a_hanging_scope_stop_is_bounded_and_the_tree_kill_still_stops_the_tree() {
         "the setsid'd child outlived the teardown"
     );
 }
+
+/// #15007 slice C: `run_bounded` is a thin wrapper over
+/// `crate::proc_exec::run_bounded`, so these pin the wrapper's own contract —
+/// the `(bool, Vec<u8>)` mapping its three callers (table, pid_running, and
+/// the tests above) depend on — not the executor's internals.
+#[test]
+fn run_bounded_reports_success_and_stdout_of_a_fast_command() {
+    let mut cmd = Command::new("/bin/sh");
+    cmd.args(["-c", "echo probe"]);
+    let (ok, out) = run_bounded(cmd, Duration::from_secs(10)).expect("sh must run");
+    assert!(ok);
+    assert_eq!(out, b"probe\n");
+}
+
+#[test]
+fn run_bounded_reports_a_nonzero_status_without_failing() {
+    let mut cmd = Command::new("/bin/sh");
+    cmd.args(["-c", "echo partial; exit 3"]);
+    let (ok, out) = run_bounded(cmd, Duration::from_secs(10)).expect("sh must run");
+    assert!(!ok);
+    assert_eq!(out, b"partial\n");
+}
+
+#[test]
+fn run_bounded_is_none_when_the_binary_cannot_spawn() {
+    let out = run_bounded(Command::new("/nonexistent/loom-canary"), Duration::from_secs(10));
+    assert!(out.is_none());
+}
+
+#[test]
+fn run_bounded_collects_output_far_larger_than_the_pipe_buffer() {
+    // The old reader thread is gone; only the shared executor's concurrent
+    // drain can return more than a pipe-full (64 KiB) instead of a timeout.
+    let mut cmd = Command::new("/bin/sh");
+    cmd.args(["-c", "head -c 262144 /dev/zero | tr '\\0' 'x'"]);
+    let (ok, out) = run_bounded(cmd, Duration::from_secs(30)).expect("sh must run");
+    assert!(ok);
+    assert_eq!(out.len(), 262_144, "every byte must be collected");
+}
+
+#[test]
+#[cfg(unix)]
+fn run_bounded_timeout_kills_the_descendants_too() {
+    let dir = tempfile::tempdir().unwrap();
+    let pidfile = dir.path().join("grandchild.pid");
+    let mut cmd = Command::new("/bin/sh");
+    cmd.args([
+        "-c",
+        &format!("/bin/sleep 120 & echo $! > {}; exec /bin/sleep 120", pidfile.display()),
+    ]);
+    assert!(run_bounded(cmd, Duration::from_millis(400)).is_none());
+
+    // Give the group kill a moment to land before asking.
+    std::thread::sleep(Duration::from_millis(300));
+    let pid: i32 = std::fs::read_to_string(&pidfile)
+        .expect("grandchild must have recorded its pid")
+        .trim()
+        .parse()
+        .expect("pid must parse");
+    // SAFETY: signal 0 performs error checking only; it never delivers a signal.
+    let alive = unsafe { libc::kill(pid as libc::pid_t, 0) == 0 };
+    if alive {
+        // Do not leak the process if the assertion is about to fail.
+        // SAFETY: cleanup kill of a process this test spawned.
+        unsafe { libc::kill(pid, libc::SIGKILL) };
+    }
+    assert!(!alive, "grandchild {pid} outlived the timeout: child.kill() is back");
+}

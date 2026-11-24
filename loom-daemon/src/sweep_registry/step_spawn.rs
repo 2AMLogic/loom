@@ -1037,7 +1037,20 @@ impl SweepRegistry {
                 let drawn = admitted.preference.as_ref().and_then(|p| p.model.clone());
                 let (model, source) = match drawn {
                     Some(drawn) => (drawn, "role-draw".to_string()),
-                    None => models::resolve_role_runner_model(root, name),
+                    // #14962: through the launch form, which drops a
+                    // *configured-tier* model the admitted native profile's
+                    // own model differs from (the profile's model launches
+                    // instead of a `profile_selection` refusal); a drawn pin
+                    // is forwarded verbatim and keeps its refusal.
+                    None => models::resolve_role_runner_model_for_launch(
+                        root,
+                        name,
+                        Some(&admitted.runtime),
+                        admitted
+                            .preference
+                            .as_ref()
+                            .and_then(|p| p.model_profile.as_deref()),
+                    ),
                 };
                 let (model, _) =
                     models::reconcile_unpinned_model_with_runtime(&admitted.runtime, model, source);
@@ -1072,6 +1085,8 @@ impl SweepRegistry {
                     .preference
                     .as_ref()
                     .and_then(|p| p.model_profile.as_deref()),
+                // #15205: the post-fallback model `select` will see.
+                model.as_deref(),
             )
             .0,
         );

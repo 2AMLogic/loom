@@ -272,9 +272,7 @@ impl Host for SystemHost {
     }
 
     fn script_runnable(&self, dir: &str) -> bool {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::metadata(Path::new(dir).join("reconcile-stack.sh"))
-            .is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+        crate::fs_util::is_executable(&Path::new(dir).join("reconcile-stack.sh"))
     }
 
     fn reconcile_stack(&self, dir: &str, pr: &str, parent: &str) -> bool {

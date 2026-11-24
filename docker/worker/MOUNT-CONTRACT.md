@@ -83,15 +83,20 @@ normal daemon dispatch and Codex capability admission follow in #8786/#8787.
 
 - No host checkout, sibling repository, shared Git objects, or cross-account
   writable cache is mounted. Git metadata must be real private directories,
-  without alternates or symlinks. Existing issue worktrees stay inside the
-  private volume and use their container paths throughout. (One exception is
-  planned, not yet mounted: per #14680's operator ruling of 2026-11-19, each
-  host keeps ONE origin-only object mirror per registered repository —
-  host-owned, never pruned, fetched only through the #14716 proved read
-  authority — whose `objects/` directory seats will later borrow through a
-  read-only bind as their single verified alternate. Until that seat-side
-  change lands, no mirror is mounted into any session and the no-alternates
-  rule above is unchanged and fully enforced.)
+  without symlinks. Existing issue worktrees stay inside the private volume
+  and use their container paths throughout. One exception, per #14680's
+  operator ruling of 2026-11-19: each host keeps ONE origin-only object
+  mirror per registered repository — host-owned, never pruned, fetched only
+  through the #14716 proved read authority — whose `objects/` directory a
+  seat borrows through a read-only bind at `/mirrors/<slug>/objects` as that
+  clone's single verified alternate (opt-in per host via
+  `accounts.session.objectMirrors`). Nothing else may widen a clone's object
+  stores: Docker's own mount inventory re-verifies each bind's exact source,
+  destination and read-only mode, worker admission re-verifies the alternate
+  inside the container (exactly the repository's own canonical mirror path,
+  never a second entry, a symlink, an indirect mirror or a writable mount),
+  and a clone with no alternate — the shape every seat had before #14680 —
+  stays supported and admitted.
 - The volume MUST use Docker's ordinary `local` driver without driver options
   (a named bind-backed volume is not isolation). Actual mounts, volume ownership,
   peer attachments and containment settings are verified on every reuse/job.
