@@ -1,67 +1,86 @@
-//! Gate for the `loom_config_env` lock-order invariant (#14404).
+//! Gate for the named-key lock-order invariant (#14404, generalized in #15189).
 //!
-//! `loom-daemon`'s lib-test binary nests two `serial_test` locks in many places:
-//! `loom_config_env` is the **outer** lock and the crate-default unkeyed
-//! `#[serial]` group is the **inner** one. The order is mandatory — a site that
-//! acquired them the other way round would form a lock cycle, and a cycle makes
-//! the test binary *hang*, not fail.
+//! `loom-daemon`'s lib-test binary stacks `serial_test` locks in many places:
+//! every NAMED key (`loom_config_env`, `opencode_db_env`, …) is an **outer**
+//! lock and the crate-default unkeyed `#[serial]` group is the **inner** one.
+//! The order is mandatory — a site that acquired them the other way round would
+//! form a lock cycle, and a cycle makes the test binary *hang*, not fail.
 //!
-//! The property that keeps the order consistent is mechanical: a function that
-//! carries `loom_config_env` in a `serial`/`parallel` attribute must itself be a
-//! test (`#[test]`, `#[tokio::test]`, …), i.e. the key is only ever taken by the
-//! outermost frame. This module scans `loom-daemon/src` for a violation, so a
-//! reverse-order nesting fails here — loudly, on the PR that adds it — instead of
-//! hanging CI.
+//! The key set is not listed anywhere in this file: it is derived from the
+//! scanned attributes themselves, so a newly-introduced key is covered without
+//! an edit here.
 //!
-//! Out of scope: a body-level `fn inner()` nesting is invisible to an attribute
-//! scan, and so is anything a macro generates beyond the attributes it spells
-//! out (the `env_test!` macro in `host_identity_tests.rs` is covered because its
-//! attributes are literal source lines).
+//! Two mechanical properties keep the order consistent crate-wide:
+//!
+//! * Rule A (generalizes #14404's single-key gate): a function that carries a
+//!   named key in a `serial`/`parallel` attribute must itself be a test
+//!   (`#[test]`, `#[tokio::test]`, …), i.e. named keys are only ever taken by
+//!   the outermost frame. A helper holding a named key can be called from
+//!   inside the default group — the reverse order.
+//! * Rule B: on one function's attribute stack, a bare `#[serial]` /
+//!   `#[parallel]` (the default group, no keys) must not appear textually
+//!   before an attribute that names a key — the textually first attribute
+//!   expands first, so that stacking inverts the order against every
+//!   named-outer site.
+//!
+//! This module scans `loom-daemon/src` for violations, so a reverse-order
+//! nesting fails here — loudly, on the PR that adds it — instead of hanging CI.
+//!
+//! Out of scope (documented blind spots): a body-level `fn inner()` nesting is
+//! invisible to an attribute scan, and so is anything a macro generates beyond
+//! the attributes it spells out (the `env_test!` macro in
+//! `host_identity_tests.rs` is covered because its attributes are literal
+//! source lines). Rule B is likewise same-function-only: a default-group outer
+//! stack on one `fn` that calls a named-locked `fn` in its body is not seen.
 
 #![allow(clippy::unwrap_used)]
 
 use std::path::{Path, PathBuf};
 
-/// The key whose lock must only ever be the outermost one.
-const OUTER_KEY: &str = "loom_config_env";
-
-/// A function that holds the outer lock without being a test.
+/// A function that breaks the named-key lock-order rules.
 #[derive(Debug, PartialEq, Eq)]
 struct Violation {
     /// 1-based line of the offending `serial`/`parallel` attribute.
     line: usize,
     /// The attribute text, whitespace-collapsed.
     attribute: String,
+    /// The named lock key the violation is about (for a Rule B violation: the
+    /// key of the named attribute the default group was stacked outside of).
+    key: String,
 }
 
 /// Result of scanning one source file.
 #[derive(Debug, Default)]
 struct Scan {
-    /// How many attributes naming [`OUTER_KEY`] were seen.
+    /// How many named (key-carrying) `serial`/`parallel` attributes were seen.
     attributes: usize,
     violations: Vec<Violation>,
 }
 
-/// Is this attribute a `serial`/`parallel` lock attribute naming [`OUTER_KEY`]?
+/// The keys a `serial`/`parallel` lock attribute names, or `None` if the
+/// attribute is not a lock attribute at all.
 ///
 /// Matches the bare, `serial_test::`-pathed, single-key, multi-key and
 /// `parallel` forms, and tolerates the attribute being split across lines
-/// (the caller has already collapsed whitespace).
-fn is_outer_lock_attribute(attr: &str) -> bool {
-    let Some(inner) = attr.strip_prefix("#[").and_then(|a| a.strip_suffix(']')) else {
-        return false;
-    };
+/// (the caller has already collapsed whitespace). A bare `#[serial]` /
+/// `#[parallel]` is the crate-default lock group and yields an empty vector.
+fn lock_attribute_keys(attr: &str) -> Option<Vec<String>> {
+    let inner = attr.strip_prefix("#[").and_then(|a| a.strip_suffix(']'))?;
     let name = inner.split('(').next().unwrap_or("").trim();
     let name = name.strip_prefix("serial_test::").unwrap_or(name);
     if name != "serial" && name != "parallel" {
-        return false;
+        return None;
     }
-    let Some(args) = inner.split_once('(').map(|(_, a)| a) else {
-        return false;
+    let Some((_, args)) = inner.split_once('(') else {
+        return Some(Vec::new());
     };
-    args.trim_end_matches(')')
-        .split(',')
-        .any(|k| k.trim() == OUTER_KEY)
+    Some(
+        args.trim_end_matches(')')
+            .split(',')
+            .map(|k| k.trim().to_string())
+            .filter(|k| !k.is_empty())
+            .collect(),
+    )
 }
 
 /// Is this attribute a test marker (`#[test]`, `#[tokio::test]`,
@@ -80,7 +99,7 @@ fn declares_fn(line: &str) -> bool {
     words.any(|w| w == "fn")
 }
 
-/// Scan one file's source for a non-test function holding [`OUTER_KEY`].
+/// Scan one file's source for lock-order violations.
 ///
 /// Pure over `&str`, so the bite tests below need no files. Line-wise: attribute
 /// lines (joined across line breaks until their brackets balance) accumulate into
@@ -125,24 +144,43 @@ fn scan_source(src: &str) -> Scan {
 
         if declares_fn(line) {
             let is_test = stack.iter().any(|(_, a)| is_test_attribute(a));
+            // Rule B anchor: the first default-group (bare) lock attribute on
+            // the stack, if any. A named attribute stacked after it puts the
+            // default group OUTER and the named key INNER.
+            let mut default_group: Option<(usize, String)> = None;
             for (attr_line, attr) in &stack {
-                if is_outer_lock_attribute(attr) {
-                    scan.attributes += 1;
-                    if !is_test {
-                        scan.violations.push(Violation {
-                            line: *attr_line,
-                            attribute: attr.clone(),
-                        });
-                    }
+                let Some(keys) = lock_attribute_keys(attr) else {
+                    continue;
+                };
+                if keys.is_empty() {
+                    default_group.get_or_insert((*attr_line, attr.clone()));
+                    continue;
+                }
+                scan.attributes += 1;
+                if !is_test {
+                    // Rule A: a named key on a function that is not a test.
+                    scan.violations.push(Violation {
+                        line: *attr_line,
+                        attribute: attr.clone(),
+                        key: keys[0].clone(),
+                    });
+                }
+                if let Some((line, attribute)) = &default_group {
+                    // Rule B: the default group textually before a named key.
+                    scan.violations.push(Violation {
+                        line: *line,
+                        attribute: attribute.clone(),
+                        key: keys[0].clone(),
+                    });
                 }
             }
         } else {
             // An attribute stack that does not lead to a `fn` (a `mod`, a `use`,
-            // a struct field, …) still names the key; count it so the sanity
+            // a struct field, …) still names keys; count it so the sanity
             // floor measures every occurrence, but it is not a function lock.
             scan.attributes += stack
                 .iter()
-                .filter(|(_, a)| is_outer_lock_attribute(a))
+                .filter(|(_, a)| lock_attribute_keys(a).is_some_and(|k| !k.is_empty()))
                 .count();
         }
         stack.clear();
@@ -191,11 +229,16 @@ fn tracked_files(root: &Path) -> Option<Vec<String>> {
 
 /// The gate, run against every tracked `loom-daemon/src/**/*.rs` file.
 ///
-/// Fails if a function that is not a test carries `loom_config_env` in a
-/// `serial`/`parallel` attribute. The lock order is `loom_config_env` OUTER,
-/// crate-default `#[serial]` group INNER; a non-test function holding the outer
-/// key can be called from inside the inner lock, which is the reverse order and
-/// hangs the test binary.
+/// Fails if a function that is not a test carries any NAMED key in a
+/// `serial`/`parallel` attribute (Rule A), or if one function's attribute
+/// stack puts the crate-default `#[serial]` group textually before an
+/// attribute naming a key (Rule B) — the reverse of the crate-wide order
+/// "named keys OUTER, default group INNER". Either shape is a lock cycle
+/// that hangs the test binary instead of failing it.
+///
+/// The test's name preserves the #14404 incident's spelling; it is cited in
+/// comments across the crate
+/// (`git grep loom_config_env_is_only_ever_the_outer_lock`).
 #[test]
 fn loom_config_env_is_only_ever_the_outer_lock() {
     let root = repo_root();
@@ -224,21 +267,24 @@ fn loom_config_env_is_only_ever_the_outer_lock() {
         let scan = scan_source(&src);
         attributes += scan.attributes;
         for v in scan.violations {
-            problems.push(format!("{rel}:{} {}", v.line, v.attribute));
+            problems.push(format!("{rel}:{} [{}] {}", v.line, v.key, v.attribute));
         }
     }
 
     assert!(
-        attributes > 100,
-        "scanned only {attributes} `{OUTER_KEY}` attribute(s) — the scan is broken, not the tree"
+        attributes > 500,
+        "scanned only {attributes} named `serial`/`parallel` attribute(s) — the scan is broken, not the tree"
     );
     assert!(
         problems.is_empty(),
-        "`{OUTER_KEY}` must only ever be the OUTER lock: it may be taken only by a \
-         test function itself (`#[test]` / `#[tokio::test]`), never by a helper. The \
-         lock order is `{OUTER_KEY}` outer, the crate-default `#[serial]` group inner; \
-         a helper holding `{OUTER_KEY}` can be reached from inside the default group, \
-         which is a lock cycle that hangs the test binary instead of failing it.\n  {}",
+        "named `serial`/`parallel` keys must stay OUTER and the crate-default `#[serial]` \
+         group INNER. Two mechanical rules: (1) a function carrying a NAMED key must itself \
+         be a test (`#[test]` / `#[tokio::test]`) — a helper holding the key can be reached \
+         from inside the default group, which is a lock cycle that hangs the test binary \
+         instead of failing it; (2) on one function's attribute stack, a bare `#[serial]` / \
+         `#[parallel]` must not sit textually before an attribute naming a key — the outer \
+         attribute expands first, so that inverts the order against every named-outer site. \
+         Offending site(s), key in brackets:\n  {}",
         problems.join("\n  ")
     );
 }
@@ -260,7 +306,8 @@ fn a_reverse_order_nesting_fails_the_scan() {
         scan.violations,
         vec![Violation {
             line: 6,
-            attribute: "#[serial(loom_config_env)]".to_string()
+            attribute: "#[serial(loom_config_env)]".to_string(),
+            key: "loom_config_env".to_string(),
         }]
     );
 }
@@ -289,6 +336,10 @@ fn path_multi_key_and_parallel_forms_are_all_seen() {
         "#[serial(loom_config_env, other)]",
         "#[parallel(loom_config_env)]",
         "#[serial_test::parallel(loom_config_env)]",
+        // Keys other than `loom_config_env` are seen too — the key set is
+        // derived from the attributes, not listed in this file.
+        "#[serial(opencode_db_env)]",
+        "#[parallel(role_tick_ring)]",
     ] {
         let helper = scan_source(&format!("{attr}\nfn helper() {{}}\n"));
         assert_eq!(helper.violations.len(), 1, "{attr} on a helper must be flagged");
@@ -299,10 +350,53 @@ fn path_multi_key_and_parallel_forms_are_all_seen() {
 }
 
 #[test]
-fn other_keys_and_the_default_group_are_not_flagged() {
+fn named_keys_on_helpers_are_flagged_and_the_default_group_alone_is_not() {
+    // Rewritten from `other_keys_and_the_default_group_are_not_flagged` when
+    // the gate generalized from one key to every named key (#15189): "other
+    // keys" are no longer ignored.
     let src = "#[serial]\nfn a() {}\n#[serial(other_env)]\nfn b() {}\n#[serial(codesign_identity_env)]\nfn c() {}\n";
     let scan = scan_source(src);
-    assert_eq!(scan.attributes, 0);
+    assert_eq!(scan.attributes, 2);
+    assert_eq!(
+        scan.violations,
+        vec![
+            Violation {
+                line: 3,
+                attribute: "#[serial(other_env)]".to_string(),
+                key: "other_env".to_string(),
+            },
+            Violation {
+                line: 5,
+                attribute: "#[serial(codesign_identity_env)]".to_string(),
+                key: "codesign_identity_env".to_string(),
+            },
+        ]
+    );
+}
+
+#[test]
+fn a_default_group_stacked_outside_a_named_key_fails_the_scan() {
+    // The reverse of every existing site: the bare (default-group) attribute
+    // is textually first, so the default lock is OUTER and the named key
+    // INNER — a lock cycle the attribute scan can and does see.
+    let src = "#[test]\n#[serial]\n#[serial(opencode_db_env)]\nfn t() {}\n";
+    let scan = scan_source(src);
+    assert_eq!(scan.attributes, 1);
+    assert_eq!(
+        scan.violations,
+        vec![Violation {
+            line: 2,
+            attribute: "#[serial]".to_string(),
+            key: "opencode_db_env".to_string(),
+        }]
+    );
+}
+
+#[test]
+fn the_named_outside_default_order_passes() {
+    let src = "#[test]\n#[serial(opencode_db_env)]\n#[serial]\nfn t() {}\n";
+    let scan = scan_source(src);
+    assert_eq!(scan.attributes, 1);
     assert!(scan.violations.is_empty());
 }
 

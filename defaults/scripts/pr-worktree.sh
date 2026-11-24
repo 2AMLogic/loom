@@ -203,12 +203,27 @@ resolve_pr_head_sha() {
 # Print the first NON-primary worktree (other than this PR's own pr-<N>) that
 # has branch $1 checked out, e.g. the builder's issue-<N> worktree. Empty if none.
 # The builder wins over a detached review checkout (#14391).
+# The own-worktree exclusion compares PHYSICAL paths (#15121): `git worktree
+# list --porcelain` prints physical spellings (/private/tmp/... on macOS) while
+# WORKTREE_PATH keeps the logical spelling the repo was reached by (/tmp/...),
+# so a raw string compare reports the PR's own pr-<N> as a foreign builder
+# holder and re-entry dies with the builder-wins error. Same pwd -P idiom as
+# is_primary_clone above.
 builder_holder() {
     [[ -n "$1" ]] || return 0
-    git -C "$REPO_ROOT" worktree list --porcelain | awk -v branch="refs/heads/$1" -v own="$WORKTREE_PATH" '
+    local own_p
+    own_p="$(cd "$WORKTREE_PATH" 2>/dev/null && pwd -P)" || own_p="$WORKTREE_PATH"
+    git -C "$REPO_ROOT" worktree list --porcelain | awk -v branch="refs/heads/$1" '
         /^worktree / { wt = substr($0, 10) }
-        /^branch /   { if ($2 == branch && wt != own) print wt }
+        /^branch /   { if ($2 == branch) print wt }
     ' | while IFS= read -r w; do
+        # A porcelain path may itself be a logical spelling (registered by an
+        # older git); canonicalise before the own-worktree exclusion.
+        local w_p
+        w_p="$(cd "$w" 2>/dev/null && pwd -P)" || w_p="$w"
+        if [[ "$w_p" == "$own_p" ]]; then
+            continue
+        fi
         is_primary_clone "$w" || { echo "$w"; break; }
     done
 }

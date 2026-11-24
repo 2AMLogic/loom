@@ -259,6 +259,61 @@ pub fn profile_rejects_effort(
         .then_some(name)
 }
 
+/// Issue #14962: the model profile a native launch of `runtime` would
+/// resolve, when that profile's model differs from `model` — the
+/// predicate [`select`] refuses the launch on (see the qualified-pin carve-out below) (`stage=profile_selection`,
+/// exit 78), factored out so the daemon's launch sites can drop a
+/// *configured-tier* model override instead of losing the step.
+///
+/// Shares [`excluded_role`]'s lookup path verbatim — `profile` is the
+/// explicitly chosen profile (a preference tap's `modelProfile`); `None`
+/// falls back exactly as [`lookup`] does for a launch: `LOOM_MODEL_PROFILE`,
+/// then `runtimes.defaultModelProfile`, then the bundled `zai-flash` default
+/// — so the daemon's reconciliation judges the profile the child would
+/// actually select. Returns `None` (no objection) for a non-native runtime,
+/// an unknown profile (the launch itself fails closed on that, with its own
+/// diagnostic), or a profile with no provider for this harness (it cannot be
+/// the model that harness runs); `Some(profile_name)` when the resolved
+/// profile's `model` differs from `model`. The comparison is the full
+/// configured string against the profile's model, exactly as [`select`]
+/// compares them — including a *qualified* `provider/model` value when a
+/// profile was explicitly requested (tap `modelProfile` or
+/// `LOOM_MODEL_PROFILE`), which is refused unless it literally equals the
+/// profile's model. With **no** explicitly requested profile, a qualified
+/// `provider/model` (two non-empty halves) returns `None`: [`select`] honours
+/// it verbatim before any profile lookup, so it is not a refusal.
+#[must_use]
+pub fn profile_rejects_model(
+    runtime: &str,
+    profile: Option<&str>,
+    model: &str,
+    config: &Value,
+) -> Option<String> {
+    if !super::is_native(runtime) {
+        return None;
+    }
+    let env_profile = super::nonempty_env("LOOM_MODEL_PROFILE");
+    let requested = profile
+        .map(str::trim)
+        .filter(|p| !p.is_empty())
+        .or(env_profile.as_deref());
+    // Mirror `select`'s early return: with no explicitly requested profile, a
+    // qualified `provider/model` is honoured verbatim and never compared
+    // against a profile (documented `roleModels` shape, configuring-resources.md).
+    if requested.is_none()
+        && model
+            .split_once('/')
+            .is_some_and(|(provider, rest)| !provider.is_empty() && !rest.is_empty())
+    {
+        return None;
+    }
+    let (name, resolved) = lookup(requested, config).ok()?;
+    if !resolved.providers.contains_key(runtime) {
+        return None;
+    }
+    (resolved.model != model).then_some(name)
+}
+
 /// `loom-daemon validate` findings for `excludedRoles` (#11400): every entry,
 /// in configured `runtimes.modelProfiles` and in the bundled set, must name a
 /// known role. An unknown name would silently exclude nothing.
@@ -933,6 +988,129 @@ mod tests {
         }}});
         assert_eq!(
             profile_rejects_effort("opencode", None, "medium", &config),
+            Some("zai-full".to_string()),
+            "runtimes.defaultModelProfile names the profile a bare tap is judged against"
+        );
+
+        if let Some(v) = saved {
+            std::env::set_var("LOOM_MODEL_PROFILE", v);
+        }
+    }
+
+    /// Issue #14962: `profile_rejects_model` mirrors `select`'s
+    /// model-mismatch refusal predicate on `excluded_role`'s exact lookup
+    /// path, so the daemon's launch sites can drop a *configured-tier* model
+    /// instead of losing the step to a `profile_selection` refusal. The full
+    /// drop-vs-keep precedence lives with the resolver
+    /// (`role_runner/tests/model_resolution.rs`); these tests pin the
+    /// predicate itself.
+    #[test]
+    fn profile_rejects_model_matches_selects_model_predicate() {
+        let _g = env_lock();
+        let saved = std::env::var_os("LOOM_MODEL_PROFILE");
+        std::env::remove_var("LOOM_MODEL_PROFILE");
+        let config = serde_json::json!({"runtimes":{"modelProfiles":{
+            "strict": {"model": "glm-5.3", "providers": {"opencode": "zai-coding-plan"}},
+            "other-harness": {"model": "glm-5.3", "providers": {"pi": "zai"}}
+        }}});
+
+        // The reported incident's exact shape: a Claude-shaped model meeting
+        // the native profile the draw pinned.
+        assert_eq!(
+            profile_rejects_model("opencode", Some("strict"), "claude-opus-5", &config),
+            Some("strict".to_string())
+        );
+        // The profile's own model is no objection.
+        assert_eq!(profile_rejects_model("opencode", Some("strict"), "glm-5.3", &config), None);
+        // A qualified provider/model that does not literally equal the
+        // profile's model is the same objection (`select` compares the full
+        // string once a profile is selected).
+        assert_eq!(
+            profile_rejects_model("opencode", Some("strict"), "zai-coding-plan/glm-5.3", &config),
+            Some("strict".to_string())
+        );
+        // A non-native runtime is never judged (Claude/Codex forward `--model`
+        // to their own CLIs, which own their vocabularies).
+        assert_eq!(profile_rejects_model("claude", Some("strict"), "claude-opus-5", &config), None);
+        // A profile with no provider entry for this harness cannot be the
+        // model that harness runs.
+        assert_eq!(
+            profile_rejects_model("opencode", Some("other-harness"), "claude-opus-5", &config),
+            None
+        );
+        // An unknown profile is left to the launch's own fail-closed
+        // diagnostic, never judged here.
+        assert_eq!(profile_rejects_model("opencode", Some("nope"), "claude-opus-5", &config), None);
+
+        if let Some(v) = saved {
+            std::env::set_var("LOOM_MODEL_PROFILE", v);
+        }
+    }
+
+    /// Issue #14962: a bare native runtime (a preference tap with no
+    /// `modelProfile`) is judged against the profile the launch would
+    /// actually select — the `LOOM_MODEL_PROFILE` / `defaultModelProfile` /
+    /// bundled `zai-flash` fallback chain, exactly as `excluded_role` and
+    /// `profile_rejects_effort` judge it. The bundled `zai-flash` runs
+    /// `glm-5.3-flash`, so the incident's `claude-opus-5` meets it too.
+    #[test]
+    fn profile_rejects_model_falls_back_to_the_launchs_own_profile() {
+        let _g = env_lock();
+        let saved = std::env::var_os("LOOM_MODEL_PROFILE");
+
+        std::env::remove_var("LOOM_MODEL_PROFILE");
+        assert_eq!(
+            profile_rejects_model("opencode", None, "claude-opus-5", &serde_json::json!({})),
+            Some("zai-flash".to_string()),
+            "the bundled zai-flash fallback rejects the incident's model"
+        );
+        assert_eq!(
+            profile_rejects_model("opencode", None, "glm-5.3-flash", &serde_json::json!({})),
+            None,
+            "the bundled zai-flash's own model (glm-5.3-flash) is no objection"
+        );
+        // `select` honours a qualified `provider/model` verbatim when no
+        // profile was requested (it never consults a profile), so it is no
+        // objection — the documented `roleModels` shape.
+        assert_eq!(
+            profile_rejects_model(
+                "opencode",
+                None,
+                "google/gemini-2.5-pro",
+                &serde_json::json!({})
+            ),
+            None,
+            "a qualified pin on a bare pick is honoured by select"
+        );
+        // Malformed halves are not the early-return shape; they fall through.
+        assert_eq!(
+            profile_rejects_model("opencode", None, "google/", &serde_json::json!({})),
+            Some("zai-flash".to_string())
+        );
+        // An explicitly requested profile still refuses a differing qualified pin.
+        assert_eq!(
+            profile_rejects_model(
+                "opencode",
+                Some("zai-flash"),
+                "google/gemini-2.5-pro",
+                &serde_json::json!({})
+            ),
+            Some("zai-flash".to_string())
+        );
+
+        std::env::set_var("LOOM_MODEL_PROFILE", "zai-full");
+        assert_eq!(
+            profile_rejects_model("opencode", None, "claude-opus-5", &serde_json::json!({})),
+            Some("zai-full".to_string()),
+            "LOOM_MODEL_PROFILE names the profile a bare tap is judged against"
+        );
+
+        std::env::remove_var("LOOM_MODEL_PROFILE");
+        let config = serde_json::json!({"runtimes":{"defaultModelProfile":"zai-full", "modelProfiles":{
+            "zai-full": {"model": "glm-5.3", "providers": {"opencode": "zai-coding-plan"}}
+        }}});
+        assert_eq!(
+            profile_rejects_model("opencode", None, "claude-opus-5", &config),
             Some("zai-full".to_string()),
             "runtimes.defaultModelProfile names the profile a bare tap is judged against"
         );

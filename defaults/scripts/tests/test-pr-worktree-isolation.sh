@@ -25,7 +25,12 @@
 #      (worktree path, branch, PR number) from the worktree, and never on a
 #      failed refresh, a builder-held branch, or a missing/non-executable hook;
 #      a failing hook only warns on stderr.
-#   9. The pr-<N> reuse gate matches registered worktrees by pwd -P-canonicalized
+#   9. builder_holder excludes the PR's own pr-<N> worktree by PHYSICAL path
+#      (#15121): re-entering an attached pr-<N> through a symlinked repo path
+#      (macOS /tmp -> /private/tmp natively; a matching symlink fixture on
+#      Linux) reuses the worktree instead of dying on the builder-wins error,
+#      while a genuine builder holder is still refused.
+#  10. The pr-<N> reuse gate matches registered worktrees by pwd -P-canonicalized
 #      physical path, not substring: re-entry through a symlinked repo path or a
 #      symlinked LOOM_WORKTREE_ROOT reuses the registered worktree (printing the
 #      logical path on stdout), and an unregistered prefix-colliding directory
@@ -571,7 +576,7 @@ chmod +x .loom/hooks/post-worktree.sh
 hook_count() { wc -l < "$HOOK_LOG" | tr -d ' '; }
 
 MOCKBIN5=$(mktemp -d /tmp/loom-pr-iso-mockbin5.XXXXXX)
-trap 'rm -rf "$TMP" "$MOCKBIN" "$MOCKBIN2" "$MOCKBIN3" "$MOCKBIN4" "$MOCKBIN5"; cd "$REPO_ROOT" 2>/dev/null || true' EXIT
+trap 'rm -rf "$TMP" "$MOCKBIN" "$MOCKBIN2" "$MOCKBIN3" "$MOCKBIN4" "$MOCKBIN5" "${SYM:-}"; cd "$REPO_ROOT" 2>/dev/null || true' EXIT
 cat > "$MOCKBIN5/gh" <<'MOCKEOF'
 #!/usr/bin/env bash
 # Hook-test `gh` stand-in. `pr view` resolves head branch / head sha
@@ -823,12 +828,105 @@ else
     fail "builder-held branch: expected rc=1 and no new hook record (rc=$RC8K, records=$(hook_count)): $PR_OUT8K"
 fi
 
-# --- Test 9: the reuse gate matches registered worktrees by canonicalized
+# --- Test 9: builder_holder compares physical paths (#15121) ---
+echo ""
+echo "Test 9: pr-worktree.sh re-enters its own attached pr-<N> through a symlinked repo path (#15121)"
+
+# `git worktree list --porcelain` prints physical spellings while
+# pr-worktree.sh's WORKTREE_PATH keeps the logical spelling the repo was
+# reached by; a string compare then reports the PR's own pr-<N> as a foreign
+# builder holder and re-entry dies with the builder-wins error (CI Daily run
+# 45250283620, macOS /tmp -> /private/tmp). On Linux the same spelling split
+# is built by giving the repo a real location whose absolute path literally
+# ends with the symlink's own path string — the /tmp-into-/private/tmp shape —
+# so the reuse gate's unanchored grep still matches the physical spelling
+# while the porcelain compare splits, exactly as on macOS.
+SYM=$(mktemp -d /tmp/loom-pr-iso-sym.XXXXXX)
+SYM_BASE=$(basename "$SYM")
+SYM_PHYS="$SYM/priv/tmp/$SYM_BASE/repo"
+mkdir -p "$SYM_PHYS"
+# git prints the physical spelling in porcelain output; on macOS /tmp is a
+# symlink to /private/tmp, so the 9a expectation must be canonicalised too.
+SYM_PHYS_REAL="$(cd "$SYM_PHYS" && pwd -P)"
+git init -q -b main "$SYM/origin.git" --bare
+git -C "$SYM_PHYS" init -q -b main
+git -C "$SYM_PHYS" config user.email t@t
+git -C "$SYM_PHYS" config user.name t
+git -C "$SYM_PHYS" commit --allow-empty -q -m init
+git -C "$SYM_PHYS" remote add origin "$SYM/origin.git"
+git -C "$SYM_PHYS" push -q origin main
+ln -s "$SYM_PHYS" "$SYM/repo"
+mkdir -p "$SYM/repo/.loom/hooks"
+cat > "$SYM/repo/.loom/hooks/post-worktree.sh" <<'HOOKEOF'
+#!/usr/bin/env bash
+printf '%s|%s|%s|%s|%s\n' "$(pwd)" "$1" "$2" "$3" "$(git rev-parse HEAD)" >> "${LOOM_TEST_HOOK_LOG:?}"
+exit 0
+HOOKEOF
+chmod +x "$SYM/repo/.loom/hooks/post-worktree.sh"
+
+# 9a: create an attached pr-991 through the symlinked path (sets up 9b).
+git -C "$SYM_PHYS" checkout -q -b fix/symlink-reentry
+git -C "$SYM_PHYS" commit --allow-empty -q -m "pr 991 change"
+git -C "$SYM_PHYS" checkout -q main
+set +e
+PR_OUT9A=$(cd "$SYM/repo" && PATH="$MOCKBIN5:$PATH" LOOM_DEFAULT_BRANCH=main \
+    LOOM_TEST_HOOK_LOG="$HOOK_LOG" LOOM_TEST_HEAD_BRANCH=fix/symlink-reentry \
+    LOOM_TEST_CHECKOUT_MODE=real "$PR_WORKTREE_SH" 991 2>/dev/null)
+RC9A=$?
+set -e
+WT991="$SYM/repo/.loom/worktrees/pr-991"
+if [[ "$RC9A" -eq 0 ]] && [[ -d "$WT991" ]] \
+    && git -C "$SYM_PHYS" worktree list --porcelain | grep -q "worktree $SYM_PHYS_REAL/.loom/worktrees/pr-991$"; then
+    pass "symlinked repo path: attached pr-<N> created (git registers the physical spelling)"
+else
+    fail "symlinked repo path: attached create failed (rc=$RC9A): $PR_OUT9A"
+fi
+
+# 9b: RE-ENTER the PR's own attached pr-991 through the same symlinked path —
+#     the macOS Test 8b/8c failure. Must reuse + refresh (rc=0, one more hook
+#     record), not die on the builder-wins error.
+BEFORE9B="$(hook_count)"
+set +e
+PR_OUT9B=$(cd "$SYM/repo" && PATH="$MOCKBIN5:$PATH" LOOM_DEFAULT_BRANCH=main \
+    LOOM_TEST_HOOK_LOG="$HOOK_LOG" LOOM_TEST_HEAD_BRANCH=fix/symlink-reentry \
+    LOOM_TEST_CHECKOUT_MODE=real "$PR_WORKTREE_SH" 991 2>/dev/null)
+RC9B=$?
+set -e
+if [[ "$RC9B" -eq 0 ]] && [[ "$(hook_count)" -eq $((BEFORE9B + 1)) ]] \
+    && grep -q "already exists at $WT991 (reusing)" <<<"$PR_OUT9B" \
+    && ! grep -q "Reuse the existing worktree directly" <<<"$PR_OUT9B" \
+    && [[ "$(tail -n1 <<<"$PR_OUT9B")" == "$WT991" ]]; then
+    pass "symlinked repo path: re-entering the PR's own attached pr-<N> reuses it (rc=0)"
+else
+    fail "symlinked re-entry: expected rc=0, reuse message and one hook record (rc=$RC9B, records=$(hook_count)): $PR_OUT9B"
+fi
+
+# 9c: a GENUINE builder holder is still refused through the symlinked path.
+git -C "$SYM_PHYS" checkout -q -b feature/issue-992
+git -C "$SYM_PHYS" commit --allow-empty -q -m "pr 992 change"
+git -C "$SYM_PHYS" checkout -q main
+git -C "$SYM_PHYS" worktree add -q "$SYM_PHYS/.loom/worktrees/issue-992" feature/issue-992
+BEFORE9C="$(hook_count)"
+set +e
+PR_OUT9C=$(cd "$SYM/repo" && PATH="$MOCKBIN5:$PATH" LOOM_DEFAULT_BRANCH=main \
+    LOOM_TEST_HOOK_LOG="$HOOK_LOG" LOOM_TEST_HEAD_BRANCH=feature/issue-992 \
+    "$PR_WORKTREE_SH" 992 2>/dev/null)
+RC9C=$?
+set -e
+git -C "$SYM_PHYS" worktree remove --force "$SYM_PHYS/.loom/worktrees/issue-992"
+if [[ "$RC9C" -eq 1 ]] && [[ "$(hook_count)" -eq "$BEFORE9C" ]] \
+    && grep -q "Reuse the existing worktree directly" <<<"$PR_OUT9C"; then
+    pass "symlinked repo path: genuine builder holder still refused (rc=1)"
+else
+    fail "symlinked genuine holder: expected rc=1 and no hook record (rc=$RC9C, records=$(hook_count)): $PR_OUT9C"
+fi
+
+# --- Test 10: the reuse gate matches registered worktrees by canonicalized
 #     physical path, not substring (#15196) ---
 echo ""
-echo "Test 9: the pr-<N> reuse gate matches canonicalized physical paths, not substrings (#15196)"
+echo "Test 10: the pr-<N> reuse gate matches canonicalized physical paths, not substrings (#15196)"
 
-# `gh` stand-in for Test 9: `pr view` resolves the head branch / head sha;
+# `gh` stand-in for Test 10: `pr view` resolves the head branch / head sha;
 # `pr checkout` records that it ran (the marker lets the prefix-collision case
 # assert the gate rejected an unregistered directory BEFORE any checkout) and
 # fails the way git does when the primary clone holds the branch — steering
@@ -850,10 +948,10 @@ fi
 exit 0
 MOCKEOF
 chmod +x "$MOCKBIN6/gh"
-HOOK_LOG9="$TMP/hook9.log"
-: > "$HOOK_LOG9"
+HOOK_LOG10="$TMP/hook9.log"
+: > "$HOOK_LOG10"
 
-# 9a: re-entry of a registered detached pr-971 through a symlinked repo path
+# 10a: re-entry of a registered detached pr-971 through a symlinked repo path
 #     whose physical location is not a suffix of the logical spelling (the
 #     space in the symlink dir also exercises path quoting): `git worktree
 #     add` registers the PHYSICAL path while REPO_ROOT/WORKTREE_PATH stay
@@ -867,27 +965,27 @@ mkdir -p "$TMP/sp ace"
 ln -s "$TMP/repo" "$TMP/sp ace/repo"
 LOGICAL971="$TMP/sp ace/repo/.loom/worktrees/pr-971"
 git worktree add -q --detach "$LOGICAL971" "$SHA971"
-MARKER9A="$TMP/checkout-9a"
-rm -f "$MARKER9A"
+MARKER10A="$TMP/checkout-10a"
+rm -f "$MARKER10A"
 set +e
-PR_OUT9A=$(cd "$TMP/sp ace/repo" && PATH="$MOCKBIN6:$PATH" LOOM_DEFAULT_BRANCH=main \
+PR_OUT10A=$(cd "$TMP/sp ace/repo" && PATH="$MOCKBIN6:$PATH" LOOM_DEFAULT_BRANCH=main \
     LOOM_TEST_HEAD_BRANCH=fix/sym-reentry LOOM_TEST_HEAD_SHA="$SHA971" \
-    LOOM_TEST_PRIMARY="$TMP/repo" LOOM_TEST_CHECKOUT_MARKER="$MARKER9A" \
-    LOOM_TEST_HOOK_LOG="$HOOK_LOG9" "$PR_WORKTREE_SH" 971 2>"$TMP/err-9a")
-RC9A=$?
+    LOOM_TEST_PRIMARY="$TMP/repo" LOOM_TEST_CHECKOUT_MARKER="$MARKER10A" \
+    LOOM_TEST_HOOK_LOG="$HOOK_LOG10" "$PR_WORKTREE_SH" 971 2>"$TMP/err-10a")
+RC10A=$?
 set -e
-ERR9A="$(cat "$TMP/err-9a")"
-if [[ "$RC9A" -eq 0 ]] && grep -q "reusing" <<<"$PR_OUT9A" \
-    && ! grep -q "not a registered worktree" <<<"$PR_OUT9A$ERR9A" \
-    && ! grep -q "rm -rf" <<<"$PR_OUT9A$ERR9A"; then
+ERR10A="$(cat "$TMP/err-10a")"
+if [[ "$RC10A" -eq 0 ]] && grep -q "reusing" <<<"$PR_OUT10A" \
+    && ! grep -q "not a registered worktree" <<<"$PR_OUT10A$ERR10A" \
+    && ! grep -q "rm -rf" <<<"$PR_OUT10A$ERR10A"; then
     pass "symlinked re-entry reuses the registered pr-971 (no refusal, no rm -rf hint)"
 else
-    fail "symlinked re-entry: expected rc=0 reuse without refusal (rc=$RC9A): $PR_OUT9A / $ERR9A"
+    fail "symlinked re-entry: expected rc=0 reuse without refusal (rc=$RC10A): $PR_OUT10A / $ERR10A"
 fi
-if [[ "$(tail -n1 <<<"$PR_OUT9A")" == "$LOGICAL971" ]]; then
+if [[ "$(tail -n1 <<<"$PR_OUT10A")" == "$LOGICAL971" ]]; then
     pass "symlinked re-entry prints the logical worktree path as the last stdout line"
 else
-    fail "last stdout line is not the logical path ($LOGICAL971): $(tail -n1 <<<"$PR_OUT9A")"
+    fail "last stdout line is not the logical path ($LOGICAL971): $(tail -n1 <<<"$PR_OUT10A")"
 fi
 if [[ "$(git -C "$TMP/repo/.loom/worktrees/pr-971" rev-parse HEAD 2>/dev/null)" == "$SHA971" ]] \
     && [[ "$(git -C "$TMP/repo" worktree list --porcelain | grep -c 'worktrees/pr-971$')" -eq 1 ]]; then
@@ -896,7 +994,7 @@ else
     fail "pr-971 not registered/refreshed at $SHA971 after symlinked re-entry"
 fi
 
-# 9b: same when only LOOM_WORKTREE_ROOT traverses a symlink; a stale sibling
+# 10b: same when only LOOM_WORKTREE_ROOT traverses a symlink; a stale sibling
 #     entry (registered but missing on disk, no `git worktree prune`) must not
 #     abort the scan.
 git checkout -q -b fix/sym-root
@@ -908,22 +1006,22 @@ ln -s "$TMP/realwt" "$TMP/linkwt"
 git worktree add -q --detach "$TMP/linkwt/repo/pr-970" "$SHA970"
 git worktree add -q --detach "$TMP/linkwt/repo/pr-969" "$SHA970"
 rm -rf "$TMP/realwt/repo/pr-969"
-MARKER9B="$TMP/checkout-9b"
-rm -f "$MARKER9B"
+MARKER10B="$TMP/checkout-10b"
+rm -f "$MARKER10B"
 set +e
-PR_OUT9B=$(cd "$TMP/repo" && PATH="$MOCKBIN6:$PATH" LOOM_DEFAULT_BRANCH=main \
+PR_OUT10B=$(cd "$TMP/repo" && PATH="$MOCKBIN6:$PATH" LOOM_DEFAULT_BRANCH=main \
     LOOM_WORKTREE_ROOT="$TMP/linkwt" \
     LOOM_TEST_HEAD_BRANCH=fix/sym-root LOOM_TEST_HEAD_SHA="$SHA970" \
-    LOOM_TEST_PRIMARY="$TMP/repo" LOOM_TEST_CHECKOUT_MARKER="$MARKER9B" \
-    LOOM_TEST_HOOK_LOG="$HOOK_LOG9" "$PR_WORKTREE_SH" 970 2>"$TMP/err-9b")
-RC9B=$?
+    LOOM_TEST_PRIMARY="$TMP/repo" LOOM_TEST_CHECKOUT_MARKER="$MARKER10B" \
+    LOOM_TEST_HOOK_LOG="$HOOK_LOG10" "$PR_WORKTREE_SH" 970 2>"$TMP/err-10b")
+RC10B=$?
 set -e
-ERR9B="$(cat "$TMP/err-9b")"
-if [[ "$RC9B" -eq 0 ]] && grep -q "reusing" <<<"$PR_OUT9B" \
-    && ! grep -q "not a registered worktree" <<<"$PR_OUT9B$ERR9B"; then
+ERR10B="$(cat "$TMP/err-10b")"
+if [[ "$RC10B" -eq 0 ]] && grep -q "reusing" <<<"$PR_OUT10B" \
+    && ! grep -q "not a registered worktree" <<<"$PR_OUT10B$ERR10B"; then
     pass "symlinked LOOM_WORKTREE_ROOT re-entry reuses the registered pr-970"
 else
-    fail "symlinked LOOM_WORKTREE_ROOT: expected rc=0 reuse (rc=$RC9B): $PR_OUT9B / $ERR9B"
+    fail "symlinked LOOM_WORKTREE_ROOT: expected rc=0 reuse (rc=$RC10B): $PR_OUT10B / $ERR10B"
 fi
 if [[ "$(git -C "$TMP/realwt/repo/pr-970" rev-parse HEAD 2>/dev/null)" == "$SHA970" ]]; then
     pass "symlinked-root re-entry refreshes pr-970 at the PR head sha (stale sibling skipped)"
@@ -931,33 +1029,33 @@ else
     fail "pr-970 not refreshed at $SHA970 through the symlinked root"
 fi
 
-# 9c: an unregistered directory whose path prefixes a REGISTERED worktree
+# 10c: an unregistered directory whose path prefixes a REGISTERED worktree
 #     (unregistered pr-97 beside registered pr-970, both spelled physically so
 #     the listing line really contains the pattern) must be rejected: the
 #     pre-fix unanchored grep matched pr-970's line and "reused" the debris,
 #     running gh pr checkout inside it (#15196 false positive).
 mkdir -p "$TMP/realwt/repo/pr-97"
-MARKER9C="$TMP/checkout-9c"
-rm -f "$MARKER9C"
+MARKER10C="$TMP/checkout-10c"
+rm -f "$MARKER10C"
 set +e
-PR_OUT9C=$(cd "$TMP/repo" && PATH="$MOCKBIN6:$PATH" LOOM_DEFAULT_BRANCH=main \
+PR_OUT10C=$(cd "$TMP/repo" && PATH="$MOCKBIN6:$PATH" LOOM_DEFAULT_BRANCH=main \
     LOOM_WORKTREE_ROOT="$TMP/realwt" \
     LOOM_TEST_HEAD_BRANCH=fix/sym-root LOOM_TEST_HEAD_SHA="$SHA970" \
-    LOOM_TEST_PRIMARY="$TMP/repo" LOOM_TEST_CHECKOUT_MARKER="$MARKER9C" \
-    LOOM_TEST_HOOK_LOG="$HOOK_LOG9" "$PR_WORKTREE_SH" 97 2>"$TMP/err-9c")
-RC9C=$?
+    LOOM_TEST_PRIMARY="$TMP/repo" LOOM_TEST_CHECKOUT_MARKER="$MARKER10C" \
+    LOOM_TEST_HOOK_LOG="$HOOK_LOG10" "$PR_WORKTREE_SH" 97 2>"$TMP/err-10c")
+RC10C=$?
 set -e
-ERR9C="$(cat "$TMP/err-9c")"
-if [[ "$RC9C" -eq 1 ]] && grep -q "not a registered worktree" <<<"$PR_OUT9C$ERR9C"; then
+ERR10C="$(cat "$TMP/err-10c")"
+if [[ "$RC10C" -eq 1 ]] && grep -q "not a registered worktree" <<<"$PR_OUT10C$ERR10C"; then
     pass "unregistered prefix-colliding pr-97 is rejected as unregistered"
 else
-    fail "prefix collision: expected rc=1 'not a registered worktree' (rc=$RC9C): $PR_OUT9C / $ERR9C"
+    fail "prefix collision: expected rc=1 'not a registered worktree' (rc=$RC10C): $PR_OUT10C / $ERR10C"
 fi
-if [[ ! -f "$MARKER9C" ]] && [[ -d "$TMP/realwt/repo/pr-97" ]] \
+if [[ ! -f "$MARKER10C" ]] && [[ -d "$TMP/realwt/repo/pr-97" ]] \
     && [[ "$(git -C "$TMP/realwt/repo/pr-970" rev-parse HEAD 2>/dev/null)" == "$SHA970" ]]; then
     pass "prefix collision: no gh pr checkout ran, git state and the debris dir untouched"
 else
-    fail "prefix collision: checkout ran or git state changed (marker present: $([[ -f "$MARKER9C" ]] && echo yes || echo no))"
+    fail "prefix collision: checkout ran or git state changed (marker present: $([[ -f "$MARKER10C" ]] && echo yes || echo no))"
 fi
 
 cd "$REPO_ROOT"
