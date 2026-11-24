@@ -534,6 +534,23 @@ else
     else
         fail "expected the gate to pass a healthy read; got: $GATE_OK"
     fi
+    # Third direction (#14785 review): forge-supplied titles are untrusted text
+    # that lands in the rendered region. A HEALTHY read whose ready issue AND
+    # open PR are titled with the note's phrase must still pass the gate — the
+    # signal is a render-controlled marker, not prose a title can carry.
+    TITLE_DIR="$TMPROOT/titlefix"
+    mkdir -p "$TITLE_DIR"
+    jq '. + [{"number":7190,"title":"Open-PR inventory unreadable on the Gitea path","labels":[{"name":"loom:issue"}]}]' \
+        "$FIX/issue-loom_issue.json" > "$TITLE_DIR/issue-loom_issue.json"
+    jq '. + [{"number":8190,"title":"Open-PR inventory unreadable — Ready is NOT net of open-PR admission this tick","state":"open","labels":[{"name":"loom:pr"}],"body":"","closingIssuesReferences":[]}]' \
+        "$FIX/pr-.json" > "$TITLE_DIR/pr-.json"
+    GATE_TITLE="$(LOOM_FIXTURE_DIR="$TITLE_DIR" GH_READ="$GH_STUB" HELPERS_SRC="$HELPERS_BODY" RPB_SRC="$RPB_BODY" GATE_SRC="$GATE_SRC" \
+        bash -c "$GATE_RUN" 2>/dev/null || true)"
+    if grep -qF 'PASSED_GATE' <<<"$GATE_TITLE" && ! grep -qF 'RECEIPT=' <<<"$GATE_TITLE"; then
+        pass "a healthy read passes the gate even when an issue/PR title carries the unreadable-note phrase"
+    else
+        fail "expected a sentinel-phrase title not to trip the gate; got: $GATE_TITLE"
+    fi
 fi
 FAIL_READY="$(awk '/^## Ready/{flag=1; next} /^## /{flag=0} flag' <<<"$FAIL_RENDER")"
 if grep -q '#7102' <<<"$FAIL_READY" && grep -q '#7106' <<<"$FAIL_READY"; then

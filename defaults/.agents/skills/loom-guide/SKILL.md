@@ -2596,7 +2596,7 @@ render_plan_body() {
     --jq 'sort_by(.number)') || { pr_inventory="[]"; inventory_ok=""; }
   local inventory_note=""
   if [ -z "$inventory_ok" ]; then
-    inventory_note="_Open-PR inventory unreadable — Ready is NOT net of open-PR admission this tick (native admission still applies at claim time)._"
+    inventory_note="_Open-PR inventory unreadable — Ready is NOT net of open-PR admission this tick (native admission still applies at claim time)._ <!-- loom:inventory-unreadable -->"
   elif [ "$(printf '%s' "$pr_inventory" | jq 'length')" -ge 200 ]; then
     inventory_note="_Open-PR inventory hit its 200-PR read limit — open-PR linkage below may be incomplete._"
   fi
@@ -2784,7 +2784,7 @@ update_work_plan() {
   # its receipt classification instead of silently over-stating Ready.
   # In-band check: render_plan_body() ran in a subshell, so its unreadable
   # note (the only channel that crosses that boundary) is the signal.
-  if [[ "$new_body" == *"Open-PR inventory unreadable"* ]]; then
+  if [[ "$new_body" == *"<!-- loom:inventory-unreadable -->"* ]]; then
     record_work_plan_receipt "inventory-unreadable"
     echo "WORK_PLAN.md NOT written: open-PR inventory unreadable — preserving the last good plan (#14785)." >&2
     return 1
