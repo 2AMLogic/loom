@@ -221,11 +221,11 @@ chmod +x "$TMPROOT/bin/loom-daemon"
 printf '#!/usr/bin/env bash\nexit 2\n' >"$TMPROOT/bin-fail/loom-daemon"
 chmod +x "$TMPROOT/bin-fail/loom-daemon"
 
-# render_with <fixture-dir> <function-body> [<path-prepend>]: eval the shared
+# render_with <fixture-dir> <function-body> [<path-prepend>] (default: the registry stub dir, so a host with no loom-daemon, as on CI, still answers): eval the shared
 # helpers and the body, then run the real render_plan_body() against the stubs.
 render_with() {
-    local fix="$1" body="$2" prepend="${3:-}"
-    PATH="${prepend:+$prepend:}$PATH" LOOM_FIXTURE_DIR="$fix" GH_READ="$GH_STUB" HELPERS_SRC="$HELPERS_BODY" RPB_SRC="$body" \
+    local fix="$1" body="$2" prepend="${3:-$TMPROOT/bin}"
+    PATH="$prepend:$PATH" LOOM_FIXTURE_DIR="$fix" GH_READ="$GH_STUB" HELPERS_SRC="$HELPERS_BODY" RPB_SRC="$body" \
         bash -c 'eval "$HELPERS_SRC"; eval "$RPB_SRC"; render_plan_body'
 }
 # A copy of fixture dir $1 holding ONLY issue $2 (every other item removed).

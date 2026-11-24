@@ -2655,6 +2655,7 @@ render_plan_body() {
   op_names=$(printf '%s' "$op_q" | jq -Rsc 'split("\n") | map(select(length > 0))')
   held_unbucketed_json="$(
     printf '%s\n' "$hold_q" | sed '/^loom:frozen$/d' | while IFS= read -r h; do
+      # loom:frozen is excluded: sed above drops it from the hold list (#11743).
       "$GH_READ" issue list --label "$h" --state open --limit 200 --json number,labels \
         --jq 'sort_by(.number)'
     done | jq -s 'add // [] | unique_by(.number)')"
