@@ -1647,7 +1647,12 @@ Unanswered: skip the premise gate. Claim it (`loom:curating`), read that trusted
 
 - **Revise** (the normal case). Edit the body, never only comment (an unchanged body is a failed round). Fix each finding
   (verify against `origin/main`) or refute it with evidence, then append a
-  dated `## Revision` section answering each by name. Then, in one edit, remove `loom:triage` and `loom:curating` and add `loom:curated`.
+  dated `## Revision` section answering each by name. If the issue is a split
+  parent (it has children, all closed) and the revision adds work the
+  children do not cover, also add `<!-- loom:split-rescoped -->` alone on its
+  own line in the body, outside any code fence (#15242): without it
+  `forge parent split-state` reads `SPLIT_ALL_CLOSED` and the Builder refuses
+  the parent. Never add it to a pure tracker. Then, in one edit, remove `loom:triage` and `loom:curating` and add `loom:curated`.
 - **Split** an oversized issue per "Decomposing Oversized Issues", then park
   the parent on its children:
   `loom-daemon park-record apply --issue <N> --blocked-by <children> --by
