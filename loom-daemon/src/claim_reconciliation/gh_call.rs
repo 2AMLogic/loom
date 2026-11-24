@@ -92,8 +92,10 @@ pub(crate) fn forge_op_for(op: &str) -> Option<ForgeOp> {
         | "restore.label_timeline"
         | "sequence.label_timeline"
         | "intake.label_events"
-        | "champion.label_events" => ops::TIMELINE_READ,
+        | "champion.label_events"
+        | "merged_obs.timeline" => ops::TIMELINE_READ,
         "guard.open_pr_graphql" => ops::PR_CLOSING_ISSUE_REFERENCES,
+        "merged_obs.close_targets" => ops::PR_CLOSING_ISSUE_REFERENCES,
         "claim.lease_comments"
         | "guard.lease_comments"
         | "guard.finished_builder_lease"
@@ -104,7 +106,9 @@ pub(crate) fn forge_op_for(op: &str) -> Option<ForgeOp> {
         | "sequence.trusted_bodies"
         | "roster.comments"
         | "landed.route_marker"
-        | "orphan_stack.comments" => ops::COMMENT_LIST,
+        | "orphan_stack.comments"
+        | "merged_obs.issue_comments"
+        | "merged_obs.comments_trusted" => ops::COMMENT_LIST,
         "claim.pr_labels" | "sequence.predecessor" => ops::PR_VIEW_STATE,
         "orphan_stack.parent_lookup" => ops::PR_LIST_BY_HEAD,
         "orphan_stack.retarget" => ops::PR_EDIT_BASE,
@@ -112,7 +116,10 @@ pub(crate) fn forge_op_for(op: &str) -> Option<ForgeOp> {
         | "release_veto.issue_labels"
         | "intake.recheck"
         | "landed.issue_labels"
-        | "claim.labels_rest" => ops::ISSUE_VIEW_STATE,
+        | "claim.labels_rest"
+        | "merged_obs.issue_read"
+        | "merged_obs.issue_kind"
+        | "merged_obs.item_read" => ops::ISSUE_VIEW_STATE,
         "parent_link.marker_children_rest" => ops::ISSUE_SEARCH,
         "park_hold.issue_body" => ops::ISSUE_EDIT_BODY,
         "quarantine.issue_list" => ops::ISSUE_LIST,
@@ -140,6 +147,7 @@ pub(crate) fn forge_op_for(op: &str) -> Option<ForgeOp> {
         | "prless.hold_label"
         | "park_hold.issue_labels"
         | "orphan_stack.label"
+        | "merged_obs.issue_add_label"
         | "claim.curating_release" => ops::ISSUE_EDIT_LABELS,
         "verdict.anchor_comment"
         | "verdict.reanchor_comment"
@@ -163,6 +171,7 @@ pub(crate) fn forge_op_for(op: &str) -> Option<ForgeOp> {
         "roster.delete" | "roster.patch" | "sequence.comment_patch" | "sequence.comment_delete" => {
             ops::COMMENT_EDIT_DELETE
         }
+        "merged_obs.issue_close" => ops::ISSUE_CLOSE_WITH_REASON,
         _ => return None,
     })
 }
