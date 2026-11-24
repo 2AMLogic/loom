@@ -1858,6 +1858,8 @@ The config read is best-effort: a missing, empty, or malformed `.loom/config.jso
 - Anything under the **worktree root** — resolved with the same precedence as `loom_worktree_root()`: `LOOM_WORKTREE_ROOT` env → `.loom/config.json → worktree.root` → the default `<repo>/.loom/worktrees`. This admits an external scratch volume (e.g. `worktree.root: "/Volumes/scratch/wt"`).
 - The **ephemeral allowlist**: system temp roots and the Claude scratchpad.
 
+**Relative targets and `cd` (#15112):** a relative `rm` target is resolved against the directory in effect at that point of the command — a preceding `cd <literal-or-~/$HOME path>` wins over the session cwd. If an earlier `cd` argument cannot be resolved statically (variable, command substitution, glob, `cd -`, bare `cd`, whitespace in the path), a relative target is denied (`rm-scope-unresolved-var`) with a message saying the directory could not be resolved; absolute targets are unaffected.
+
 **Ephemeral allowlist prefixes**. `normalize_abs_path()` is **lexical only** — it does **not** resolve symlinks — so on macOS each temp root is listed in **both** its symlink form and its `/private` target:
 
 | Symlink form | `/private` target |
