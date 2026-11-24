@@ -33,6 +33,15 @@
 //! if you change the format here, that test breaks on the shell side too.
 //! Change both or neither.
 //!
+//! # Two transports, one chokepoint (#14940)
+//!
+//! The POST itself is selected per checkout at [`post_comment`]: a Gitea
+//! workspace goes through its own API (`POST
+//! /api/v1/repos/{owner}/{repo}/issues/{N}/comments`, with the connection the
+//! write-scope probe resolves), everything else through `gh` as before. The
+//! footer contract is identical either way — the body is footered before the
+//! transport is chosen, so no caller can tell which one answered.
+//!
 //! # Why `--input <file>` JSON, not `-f body=…`
 //!
 //! Writes go to `gh api --input <file>` as `{"body": …}` JSON rather than
@@ -42,7 +51,9 @@
 //! `serde_json` escaping is the only encoder in the path. The JSON goes
 //! through a private (`0600`) temp file rather than `--input -` because the
 //! `gh` facade (`crate::gh_invocation`, which counts every call — #10089)
-//! owns the child's stdin.
+//! owns the child's stdin. The Gitea transport follows the same discipline:
+//! its credential rides curl's stdin (`-H @-`), never argv, and its JSON
+//! body travels a private temp file (`--data-binary @file`).
 
 use std::ffi::OsStr;
 use std::fmt;
@@ -69,18 +80,6 @@ pub fn dashboard_base_url() -> String {
         return DEFAULT_DASHBOARD_BASE_URL.to_string();
     }
     trimmed.trim_end_matches('/').to_string()
-}
-
-/// The dashboard page for `number` in `nwo`: `…/pull/N` for a PR, `…/issues/N`
-/// otherwise. loom-ui's resolver lands both on the same issue page; the link
-/// itself stays truthful about which object it names.
-#[must_use]
-pub fn forge_dashboard_url(nwo: &str, number: impl fmt::Display, is_pr: bool) -> String {
-    format!(
-        "{base}/github.com/{nwo}/{kind}/{number}",
-        base = dashboard_base_url(),
-        kind = if is_pr { "pull" } else { "issues" },
-    )
 }
 
 /// `body` with the dashboard footer appended — the canonical format, pinned
@@ -137,12 +136,14 @@ pub fn footer_or_body(
 }
 
 /// The one comment POST. Appends the dashboard footer (nothing can skip it)
-/// and POSTs `{"body": …}` to `repos/{nwo}/issues/{number}/comments` via
-/// `gh api --input <file>` — a PR *is* an issue for comments, so one endpoint
-/// serves both. `root`, when given, selects the owner-partitioned
-/// `GH_CONFIG_DIR` for cross-owner managed repos (#5401 — a no-op for
-/// single-owner fleets). Returns the response body (the comment JSON, whose
-/// `html_url` is the new comment) on success.
+/// and posts `{"body": …}` — a PR *is* an issue for comments, so one endpoint
+/// serves both. The transport is selected from `root` (#14940): a Gitea
+/// checkout posts through its own API with the connection the write-scope
+/// probe resolves ([`CommentBackend`]); everything else goes through
+/// `gh api --input <file>` as before, where `root`, when given, selects the
+/// owner-partitioned `GH_CONFIG_DIR` for cross-owner managed repos (#5401 —
+/// a no-op for single-owner fleets). Returns the response body (the comment
+/// JSON, whose `html_url` is the new comment) on success.
 ///
 /// When the REST POST is rate-limited, the same footered body is posted via
 /// the GraphQL `addComment` mutation instead (#10025); see
@@ -150,10 +151,11 @@ pub fn footer_or_body(
 ///
 /// # Errors
 ///
-/// When `gh` cannot be spawned, cannot be written to, exits non-zero, or
-/// produces undecodable output. The error text carries `gh`'s stderr so a
-/// rate-limit message reaches the caller's log — on a rate limit whose GraphQL
-/// fallback also failed, it is the original REST error.
+/// When the selected transport cannot be spawned, cannot be written to,
+/// exits non-zero, or produces undecodable output. The error text carries
+/// the transport's stderr so a rate-limit message reaches the caller's log —
+/// on a rate limit whose GraphQL fallback also failed, it is the original
+/// REST error.
 pub fn post_comment(
     gh_bin: impl AsRef<OsStr>,
     root: Option<&Path>,
@@ -164,6 +166,100 @@ pub fn post_comment(
 ) -> Result<String, String> {
     let gh_bin = gh_bin.as_ref();
     let full_body = append_dashboard_footer(nwo, &number, is_pr, body);
+    post_with_backend(gh_bin, root, nwo, &number, &full_body, comment_backend(root)?)
+}
+
+/// [`post_comment`] for a caller that already vetted the write: `connection`
+/// is the Gitea connection the permission check approved (`None` for a
+/// non-Gitea checkout). No forge detection or connection resolution runs
+/// again, so the POST cannot land on an instance or credential the check
+/// never saw (#14940).
+///
+/// # Errors
+///
+/// As [`post_comment`].
+pub fn post_comment_authorized(
+    gh_bin: impl AsRef<OsStr>,
+    root: Option<&Path>,
+    nwo: &str,
+    number: impl fmt::Display,
+    is_pr: bool,
+    body: &str,
+    connection: Option<crate::forge_cmd::GiteaConfig>,
+) -> Result<String, String> {
+    let full_body = append_dashboard_footer(nwo, &number, is_pr, body);
+    let backend = connection.map_or(CommentBackend::GitHub, CommentBackend::Gitea);
+    post_with_backend(gh_bin.as_ref(), root, nwo, &number, &full_body, backend)
+}
+
+fn post_with_backend(
+    gh_bin: &OsStr,
+    root: Option<&Path>,
+    nwo: &str,
+    number: &impl fmt::Display,
+    full_body: &str,
+    backend: CommentBackend,
+) -> Result<String, String> {
+    match backend {
+        CommentBackend::Gitea(cfg) => post_comment_gitea(&cfg, nwo, number, full_body),
+        CommentBackend::GitHub => post_comment_gh(gh_bin, root, nwo, number, full_body),
+    }
+}
+
+/// The transport a comment POST uses, selected once here — the shared
+/// comment-creation path (#14940) — so the `forge comment` CLI and every
+/// in-daemon caller with a Gitea workspace post through the forge that
+/// workspace actually uses.
+enum CommentBackend {
+    /// `gh api` REST (with the #10025 GraphQL fallback).
+    GitHub,
+    /// `POST {base}/api/v1/repos/{owner}/{repo}/issues/{N}/comments` with
+    /// the connection the write-scope probe resolves.
+    Gitea(crate::forge_cmd::GiteaConfig),
+}
+
+/// Resolve [`CommentBackend`] for a post made from `root`. A Gitea checkout
+/// (`detect_forge`, the same detection the write-scope check selects its
+/// probe with) resolves its connection exactly as `GiteaProbe` does — env
+/// overrides, then config — so the write carries the instance and credential
+/// the check approved. A Gitea checkout whose connection cannot resolve is an
+/// error, never a silent fall-through to `gh`: its write was already refused
+/// (or is about to be) by the same resolution failing in the probe, and a
+/// GitHub POST against a Gitea repository is a write to the wrong forge.
+///
+/// # Errors
+///
+/// When `root` is a Gitea checkout whose connection cannot resolve; the text
+/// names why (no credential configured, …) and never contains the credential.
+fn comment_backend(root: Option<&Path>) -> Result<CommentBackend, String> {
+    if let Some(root) = root
+        .filter(|r| crate::forge_cmd::detect_forge(Some(r)) == crate::forge_cmd::ForgeType::Gitea)
+    {
+        return crate::write_scope::probe::GiteaProbe::writer_connection(root)
+            .map(CommentBackend::Gitea);
+    }
+    Ok(CommentBackend::GitHub)
+}
+
+/// The `gh` REST transport: POST `{"body": …}` to
+/// `repos/{nwo}/issues/{number}/comments` via `gh api --input <file>`, with
+/// the #10025 GraphQL `addComment` fallback on a REST rate limit. The body
+/// arrives already footered, so what lands is byte-identical whichever
+/// transport answers.
+///
+/// # Errors
+///
+/// When `gh` cannot be spawned, cannot be written to, exits non-zero, or
+/// produces undecodable output. The error text carries `gh`'s stderr so a
+/// rate-limit message reaches the caller's log — on a rate limit whose
+/// GraphQL fallback also failed, it is the original REST error.
+fn post_comment_gh(
+    gh_bin: &OsStr,
+    root: Option<&Path>,
+    nwo: &str,
+    number: &impl fmt::Display,
+    full_body: &str,
+) -> Result<String, String> {
     let payload = serde_json::json!({ "body": full_body }).to_string();
 
     let rest_error = match gh_api_write_json(
@@ -185,7 +281,7 @@ pub fn post_comment(
     if !crate::rate_limit_breaker::indicates_rate_limit(&rest_error) {
         return Err(rest_error);
     }
-    match post_comment_graphql(gh_bin, root, nwo, &number, &full_body) {
+    match post_comment_graphql(gh_bin, root, nwo, number, full_body) {
         Ok(response) => {
             log::info!(
                 "forge_comment: REST rate-limited on {nwo}#{number}; posted via GraphQL addComment (#10025)"
@@ -201,6 +297,119 @@ pub fn post_comment(
             Err(rest_error)
         }
     }
+}
+
+/// The Gitea transport (#14940): `POST
+/// {base}/api/v1/repos/{owner}/{repo}/issues/{number}/comments` — a PR is an
+/// issue for comments on Gitea too, so one endpoint serves both, exactly like
+/// the GitHub REST path. House style is the write-scope probe's sync `curl`
+/// subprocess: the `Authorization` header is written to curl's stdin
+/// (`-H @-`), never argv, where it would be world-readable (#5982), and the
+/// JSON body travels a private (`0600`) temp file (`--data-binary @file`) —
+/// this module's no-`-f`, no-argv-body discipline, the same reason the `gh`
+/// path uses `--input <file>`. Returns the response body (the created
+/// comment's JSON, whose `html_url` the CLI prints) on any 2xx.
+///
+/// # Errors
+///
+/// When curl cannot be spawned or exits non-zero, or the API answers a
+/// non-2xx status. Error text names the status and the response body, with
+/// the credential redacted — a Gitea error body can quote the request.
+fn post_comment_gitea(
+    cfg: &crate::forge_cmd::GiteaConfig,
+    nwo: &str,
+    number: &impl fmt::Display,
+    full_body: &str,
+) -> Result<String, String> {
+    use std::process::{Command, Stdio};
+    let payload = serde_json::json!({ "body": full_body }).to_string();
+    let mut input = tempfile::NamedTempFile::new()
+        .map_err(|e| format!("could not create the Gitea request body file: {e}"))?;
+    input
+        .write_all(payload.as_bytes())
+        .and_then(|()| input.flush())
+        .map_err(|e| format!("could not write the Gitea request body: {e}"))?;
+    // Every form the credential takes on the wire: the raw token, and for
+    // Basic auth the `user:password` pair and its base64 header value. An
+    // error that echoes any of them is redacted in both error paths.
+    let mut secrets = vec![cfg.token.clone()];
+    let auth = match &cfg.username {
+        // base64 of `user:password`, computed here so the credential still
+        // never reaches argv (curl's own `-u` would put it there).
+        Some(u) => {
+            use base64::engine::general_purpose;
+            use base64::Engine as _;
+            let pair = format!("{u}:{}", cfg.token);
+            let encoded = general_purpose::STANDARD.encode(&pair);
+            secrets.push(encoded.clone());
+            secrets.push(pair);
+            format!("Authorization: Basic {encoded}\n")
+        }
+        None => format!("Authorization: token {}\n", cfg.token),
+    };
+    // Longest first, so a form containing a shorter one is replaced whole.
+    secrets.sort_by_key(|x| std::cmp::Reverse(x.len()));
+    let redact = |text: String| {
+        secrets
+            .iter()
+            .filter(|x| !x.is_empty())
+            .fold(text, |t, x| t.replace(x.as_str(), "[redacted]"))
+    };
+    let url = format!("{}/api/v1/repos/{nwo}/issues/{number}/comments", cfg.base_url);
+    let mut cmd = Command::new("curl");
+    // `-q` must come first: it stops `~/.curlrc` adding `--location`, a proxy
+    // or anything else to a credentialed request. `--globoff` keeps `{}`/`[]`
+    // in the interpolated slug literal.
+    cmd.args(["-q", "--globoff", "--silent", "--show-error", "--max-time"])
+        .arg(WRITE_TIMEOUT.as_secs_f64().to_string())
+        .arg("-X")
+        .arg("POST")
+        .arg("-o")
+        .arg("-")
+        .arg("-w")
+        .arg("\n%{http_code}")
+        .arg("-H")
+        .arg("@-")
+        .arg("-H")
+        .arg("Content-Type: application/json")
+        .arg("--data-binary")
+        .arg(format!("@{}", input.path().display()))
+        .arg(&url)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let Ok(mut child) = cmd.spawn() else {
+        return Err(format!("Gitea comment on {nwo}#{number} failed: could not exec curl"));
+    };
+    if let Some(mut stdin) = child.stdin.take() {
+        let _ = stdin.write_all(auth.as_bytes());
+    }
+    let output = match child.wait_with_output() {
+        Ok(o) => o,
+        Err(e) => return Err(format!("Gitea comment on {nwo}#{number} failed: curl: {e}")),
+    };
+    if !output.status.success() {
+        return Err(format!(
+            "Gitea comment on {nwo}#{number} failed: curl exit {}: {}",
+            output.status.code().unwrap_or(-1),
+            redact(String::from_utf8_lossy(&output.stderr).trim().to_string())
+        ));
+    }
+    let raw = String::from_utf8_lossy(&output.stdout);
+    let Some((body, status)) = crate::write_scope::probe::split_body_and_status(&raw) else {
+        return Err(format!(
+            "Gitea comment on {nwo}#{number} failed: unparseable response from curl"
+        ));
+    };
+    // 201 Created is Gitea's success for a new comment; accept the 2xx class
+    // so a mirrored API that answers 200 stays a success.
+    if (200..300).contains(&status) {
+        return Ok(body.to_string());
+    }
+    Err(format!(
+        "Gitea comment on {nwo}#{number} failed: HTTP {status}: {}",
+        redact(body.trim().to_string())
+    ))
 }
 
 /// The GraphQL resolution of an issue-or-PR number to its node id.
@@ -342,6 +551,17 @@ pub struct CommentArgs {
     pub number: Option<u64>,
     /// `owner/repo`; `None` resolves from the current checkout's origin remote.
     pub repo: Option<String>,
+    /// The `owner/repo` the CLI's write-scope check authorized (#14940): the
+    /// repository the vetting resolution approved, handed in so the post
+    /// lands on exactly the target the check vetted. On Gitea this is the
+    /// only resolvable source — `gh`'s repository resolution cannot read a
+    /// Gitea remote. `None` for callers that vet through their own gate;
+    /// resolution then falls back to `--repo` and the checkout.
+    pub authorized: Option<String>,
+    /// The Gitea connection the same check approved (#14940), carried to the
+    /// POST unchanged; `None` on a non-Gitea checkout. Only meaningful with
+    /// `authorized`.
+    pub authorized_connection: Option<crate::forge_cmd::GiteaConfig>,
     pub body: Option<String>,
     /// Path to read the body from; `-` means stdin.
     pub body_file: Option<std::path::PathBuf>,
@@ -417,8 +637,13 @@ pub fn cli_entrypoint(args: CommentArgs) -> anyhow::Result<()> {
             anyhow::bail!("one of --body TEXT or --body-file PATH (- = stdin) is required");
         }
     };
-    let nwo = match &args.repo {
-        Some(nwo) => nwo.clone(),
+    // #14940: the authorized repository (what the CLI's write-scope check
+    // approved) wins; it is the normalized form of `--repo` when one was
+    // given, and of the checkout's target when not. Only without it does the
+    // GitHub-side resolution run — which cannot read a Gitea remote, exactly
+    // the failure the authorized target exists to bypass.
+    let nwo = match args.authorized.as_deref().or(args.repo.as_deref()) {
+        Some(nwo) => nwo.to_string(),
         None => crate::worktree_ops::gh::resolve_owner_repo(Path::new("."))
             .map(|(owner, name)| format!("{owner}/{name}"))
             .ok_or_else(|| {
@@ -427,14 +652,26 @@ pub fn cli_entrypoint(args: CommentArgs) -> anyhow::Result<()> {
                 )
             })?,
     };
-    let response = post_comment(
-        crate::forge_cmd::gh_bin(),
-        Some(Path::new(".")),
-        &nwo,
-        number,
-        args.is_pr,
-        &body,
-    )
+    let response = if args.authorized.is_some() {
+        post_comment_authorized(
+            crate::forge_cmd::gh_bin(),
+            Some(Path::new(".")),
+            &nwo,
+            number,
+            args.is_pr,
+            &body,
+            args.authorized_connection,
+        )
+    } else {
+        post_comment(
+            crate::forge_cmd::gh_bin(),
+            Some(Path::new(".")),
+            &nwo,
+            number,
+            args.is_pr,
+            &body,
+        )
+    }
     .map_err(anyhow::Error::msg)?;
     // #12027: journal the markers the comment opens with (a no-op outside a
     // journaled role run; best-effort, never the exit code or output).

@@ -16,7 +16,7 @@
 # the recency criterion's stale route is the ONLY automated path from `loom:pr` to
 # `loom:changes-requested` — i.e. the only way a `loom:pr` PR reaches Doctor —
 # a held PR could never be reported as conflicting nor routed for a rebase.
-# Measured on rjwalters/loom 2026-08-22: 21 open PRs carried `loom:pr` +
+# Measured on 2AMLogic/loom 2026-08-22: 21 open PRs carried `loom:pr` +
 # `loom:blocked`, 20 of the 21 were CONFLICTING (two untouched for 63h), and
 # Doctor's `loom:changes-requested` queue was empty.
 #
@@ -1877,8 +1877,8 @@ assert_doc_contains "$CHAMPION_MD" \
     "a human removal for the same concern is a PASS, not a silent hold (#11416)"
 
 assert_doc_contains "$CHAMPION_MD" \
-    'if [ "$MANUAL_RELEASE_SINCE_HOLD" != true ] && [ "$("$GH_READ" pr view' \
-    "a NEW concern after a human removal always posts a fresh hold notice, bypassing the idempotency guard (#11416)"
+    'if [ "$MANUAL_RELEASE_SINCE_HOLD" != true ] && [ -n "$HOLD_HEAD" ] && [ "$HOLD_HEAD" = "$HEAD_SHA" ]' \
+    "a NEW concern after a human removal always posts a fresh hold notice, bypassing the head-scoped idempotency guard (#11416, #14833)"
 
 assert_doc_contains "$CHAMPION_MD" \
     'loom-daemon park-record apply --pr "$PR_NUMBER" --reason "champion merge-risk hold"' \

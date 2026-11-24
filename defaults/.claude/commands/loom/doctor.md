@@ -337,13 +337,13 @@ a comment instead of a body edit — full incident and rationale in
 
 ### Never fix an installed Loom file in place (consumer repos)
 
-Outside `rjwalters/loom` itself, `.loom/hooks|scripts|roles|docs|bin/` and
+Outside `2AMLogic/loom` itself, `.loom/hooks|scripts|roles|docs|bin/` and
 `.claude/commands/loom/` are resync-refreshed copies of Loom's `defaults/`. An
 in-place fix there is reverted by the next resync — or, if you *added* the file,
 orphaned with no upstream counterpart — silently, after the PR merges. Only two
 dispositions are valid:
 
-1. **Upstream it** — PR `rjwalters/loom`'s `defaults/<same relative path>`; the
+1. **Upstream it** — PR `2AMLogic/loom`'s `defaults/<same relative path>`; the
    fix returns via the normal `chore: resync installed Loom surfaces` commit.
 2. **Pin it** — add the path to that repo's `.loom/resync-ignore`, with a comment
    saying why and which upstream PR retires the pin if it is temporary.
@@ -378,7 +378,7 @@ Check for an argument passed via the slash command:
 ### PR Fix Mode
 
 If a number is provided (e.g., `/doctor 123`):
-1. Treat that number as the target **PR** to fix. `loom:frozen` or any `loom:operator*` label on it (#11861): refuse, writing nothing
+1. **Kind and state probe** (live, one read, before any lease, label or comment; #14939): `loom-daemon forge pr view <number> --json number,state,labels,headRefOid,mergeable`. Its non-zero exit is the refusal for an issue number (Doctor is a PR role), an unknown number, a missing credential or an unreadable answer — write nothing. On success treat the number as the target **PR** to fix, and refuse, writing nothing, on `state` `CLOSED` or `MERGED`, `loom:frozen`, or any `loom:operator*` label on it (#11861). Keep `.headRefOid` as the `CLAIM_HEAD_SHA` you start from and read `.mergeable` from this one row (`CONFLICTING` → the conflict path below); on a GitHub checkout the daemon hands the read to `gh`, on a Gitea checkout it reads the Gitea API itself with the inherited `GITEA_URL` and `GITEA_TOKEN` (`GITEA_USERNAME` for Basic auth), which a private repo needs.
 2. **Skip** the "Finding Work" section entirely
 3. Claim the PR exactly as in Work Process step 2 (a dispatched PR can
    already be claimed by a concurrent Doctor). A lease held by your own
@@ -875,7 +875,8 @@ Use this reclaim comment:
 # The lease first: a live peer lease (exit 4) means stand down, label untouched.
 loom-daemon lease pr claim $N --role doctor --watch-pid "${LOOM_AGENT_SESSION_PID:-${CLAUDE_PID:-$PPID}}"; [[ $? =~ ^[02]$ ]] &&
 gh pr edit $N --remove-label "loom:treating" &&
-./.loom/scripts/post-comment.sh $N --pr --body "Reclaiming loom:treating claim: $STANDDOWN_COUNT stand-down passes, no fix progress for ${LOOM_STALE_TREATING_MINUTES:-60}m (bounded by LOOM_MAX_STANDDOWN_STREAK=${LOOM_MAX_STANDDOWN_STREAK:-3}) — breaking the livelock." &&
+./.loom/scripts/post-comment.sh $N --pr --body "Reclaiming loom:treating claim: $STANDDOWN_COUNT stand-down passes, no fix progress for ${LOOM_STALE_TREATING_MINUTES:-60}m (bounded by LOOM_MAX_STANDDOWN_STREAK=${LOOM_MAX_STANDDOWN_STREAK:-3}) — breaking the livelock.
+<!-- loom:reclaim claim=$CLAIMED_AT -->" &&
 gh pr edit $N --add-label "loom:treating"
 CLAIM_HEAD_SHA=$(gh pr view $N --json headRefOid --jq '.headRefOid')
 # Continue to step 3 (Check PR details) and fix normally
@@ -887,11 +888,19 @@ CLAIM_HEAD_SHA=$(gh pr view $N --json headRefOid --jq '.headRefOid')
 # The lease first: a live peer lease (exit 4) means stand down, label untouched.
 loom-daemon lease pr claim $N --role doctor --watch-pid "${LOOM_AGENT_SESSION_PID:-${CLAUDE_PID:-$PPID}}"; [[ $? =~ ^[02]$ ]] &&
 gh pr edit $N --remove-label "loom:treating" &&
-./.loom/scripts/post-comment.sh $N --pr --body "Reclaiming stale loom:treating claim (idle ${IDLE_MINUTES}m > ${LOOM_STALE_TREATING_MINUTES:-60}m, no claimant activity) — the prior process likely died mid-fix." &&
+./.loom/scripts/post-comment.sh $N --pr --body "Reclaiming stale loom:treating claim (idle ${IDLE_MINUTES}m > ${LOOM_STALE_TREATING_MINUTES:-60}m, no claimant activity) — the prior process likely died mid-fix.
+<!-- loom:reclaim claim=$CLAIMED_AT -->" &&
 gh pr edit $N --add-label "loom:treating"
 CLAIM_HEAD_SHA=$(gh pr view $N --json headRefOid --jq '.headRefOid')
 # Continue to step 3 (Check PR details) and fix normally
 ```
+
+**Both reclaim comments end with the `loom:reclaim` claim marker
+keyed to `$CLAIMED_AT` (#15044)**: the forge timeline can lag the label remove + re-add above,
+and `claim-staleness.sh` then matches this marker against the stale verdict it
+computed from the pre-reclaim timestamp — so your replacement claim reads
+`fresh` while you are active and is not reclaimed in turn (and `unknown`, never
+stale, once you go idle).
 
 **Env vars**: `LOOM_STALE_TREATING_MINUTES` (default **60**) — deliberately
 longer than the Judge's `LOOM_STALE_REVIEWING_MINUTES` (45): a Doctor's fix

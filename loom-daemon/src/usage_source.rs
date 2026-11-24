@@ -280,10 +280,10 @@ pub struct NativeSessionIds {
 /// Parse the native session ids a log region names (#14048). Pure: every
 /// unrecognized line is skipped, never guessed at. A JSON line contributes
 /// its `sessionID` when it carries a non-empty string one (OpenCode's
-/// `--format json` event stream); a line containing Codex's
-/// `session id: <token>` banner contributes the token when it is at least 8
-/// hex/dash characters — the same shape `spawn-codex.sh`'s own transcript
-/// join greps for.
+/// `--format json` event stream); a line that IS Codex's `session id: <token>`
+/// banner ([`codex_session_banner`]) contributes the token — the same
+/// line-anchored, ≥8 hex/dash shape `spawn-codex.sh`'s own transcript join
+/// greps for.
 #[must_use]
 pub fn native_session_ids(log_region: &str) -> NativeSessionIds {
     let mut ids = NativeSessionIds::default();
@@ -303,10 +303,7 @@ pub fn native_session_ids(log_region: &str) -> NativeSessionIds {
                 continue;
             }
         }
-        let Some(at) = line.find("session id:") else {
-            continue;
-        };
-        if let Some(token) = codex_session_token(&line[at + "session id:".len()..]) {
+        if let Some(token) = codex_session_banner(line) {
             ids.codex.push(token);
         }
     }
@@ -328,14 +325,30 @@ pub(crate) fn role_tick_codex_session_id(output: &str) -> Option<String> {
         .skip_while(|line| !line.starts_with(HEADER))
         .skip(1)
         .take_while(|line| !line.contains(HEADER))
-        .find_map(|line| {
-            line.trim_start()
-                .strip_prefix("session id:")
-                .and_then(codex_session_token)
-        })
+        .find_map(codex_session_banner)
 }
 
-fn codex_session_token(after_prefix: &str) -> Option<String> {
+/// The token of a Codex `session id: <token>` banner **line** (#15023): the
+/// line, after leading whitespace, must *start* with the prefix. A banner
+/// quoted mid-line — an agent's text, a runner's echo, an event string — is
+/// data about a launch, not evidence of one. The one anchoring rule every
+/// Codex banner reader shares ([`native_session_ids`],
+/// [`role_tick_codex_session_id`], `launch_record`'s step-log pair, and the
+/// roll-pause capture), so it cannot drift between readers the way the token
+/// shape cannot; `spawn-codex.sh`'s transcript join greps for the same
+/// `^[[:space:]]*session id:` line.
+pub(crate) fn codex_session_banner(line: &str) -> Option<String> {
+    line.trim_start()
+        .strip_prefix("session id:")
+        .and_then(codex_session_token)
+}
+
+/// The uuid-shaped token of a Codex `session id:` banner: the run of
+/// hex/dash characters after the prefix, when it is at least 8 characters —
+/// the same shape `spawn-codex.sh`'s own transcript join greps for. Reached
+/// through [`codex_session_banner`], so every Codex banner reader shares it
+/// and the vocabulary cannot drift between them.
+pub(crate) fn codex_session_token(after_prefix: &str) -> Option<String> {
     let token: String = after_prefix
         .trim_start()
         .chars()
@@ -415,8 +428,8 @@ pub fn has_merge_step_logs(workspace_root: &Path, issue: u32, pr: u32) -> bool {
 /// Per-`(model, speed, service_tier)` token totals for a **step-dispatched**
 /// merge of `pr` (closing `issue`), on this host only (#14018).
 ///
-/// Two sources, summed, because the steps of one PR can run on different
-/// runtimes (an OpenCode Builder, a Claude Judge):
+/// Three sources, summed, because the steps of one PR can run on different
+/// runtimes (an OpenCode Builder, a Claude Judge, a Codex Doctor):
 ///
 /// - **Claude transcripts** whose first message names the issue-keyed Builder
 ///   or the PR-keyed Judge/Doctor/`champion --pr` command
@@ -429,10 +442,17 @@ pub fn has_merge_step_logs(workspace_root: &Path, issue: u32, pr: u32) -> bool {
 ///   log (issue-keyed) is read from its last dispatch only, so an abandoned
 ///   retry is not charged to the PR; the PR-keyed Doctor/Judge/`champion_merge`
 ///   logs are read whole, as each dispatch there is a completed round (#14210).
+/// - **Codex sessions** named by the `session id:` banners in the same step
+///   logs, with the same last-dispatch (Builder) vs whole-log (PR-keyed) split
+///   (#14883), resolved through
+///   [`crate::codex_usage::tokens_by_session_ids`] by exact id with no
+///   directory and no window: a private-clone seat's rollout reports a
+///   container-local `cwd` (#14540), and a Builder rollout can start before
+///   the PR's `createdAt`, so the merge `window` must not bound it.
 ///
 /// A step that ran on another host left no log or transcript here, so its usage
 /// is absent and the total stays partial. `None` — never `Some(vec![])` — when
-/// neither source found anything.
+/// no source found anything.
 #[must_use]
 pub fn merge_step_tokens_by_model(
     workspace_root: &Path,
@@ -449,27 +469,43 @@ pub fn merge_step_tokens_by_model(
             window,
         )
     });
-    let session_ids: Vec<String> = crate::launch_record::merge_step_logs(workspace_root, issue, pr)
+    let mut session_ids: Vec<String> = Vec::new();
+    let mut codex_ids: Vec<String> = Vec::new();
+    for (role, contents) in crate::launch_record::merge_step_logs(workspace_root, issue, pr)
         .into_iter()
         .filter_map(|(role, path)| Some((role, std::fs::read_to_string(path).ok()?)))
-        .flat_map(|(role, contents)| {
-            use crate::step_role::StepRole;
-            // Spelled out, no catch-all: a role added to `merge_step_logs`
-            // must be filed under its keying here before this compiles.
-            match role {
-                // Issue-keyed: an earlier dispatch is an abandoned retry.
-                StepRole::Builder | StepRole::Curator | StepRole::ChampionPromote => {
-                    crate::launch_record::opencode_session_ids_last_dispatch(&contents)
-                }
-                // PR-keyed: an earlier dispatch is a completed round on this PR.
-                StepRole::Doctor | StepRole::Judge | StepRole::ChampionMerge => {
-                    crate::launch_record::opencode_session_ids(&contents)
-                }
+    {
+        use crate::step_role::StepRole;
+        // Spelled out, no catch-all: a role added to `merge_step_logs`
+        // must be filed under its keying here before this compiles.
+        match role {
+            // Issue-keyed: an earlier dispatch is an abandoned retry.
+            StepRole::Builder | StepRole::Curator | StepRole::ChampionPromote => {
+                session_ids
+                    .extend(crate::launch_record::opencode_session_ids_last_dispatch(&contents));
+                codex_ids.extend(crate::launch_record::codex_session_ids_last_dispatch(&contents));
             }
-        })
-        .collect();
+            // PR-keyed: an earlier dispatch is a completed round on this PR.
+            StepRole::Doctor | StepRole::Judge | StepRole::ChampionMerge => {
+                session_ids.extend(crate::launch_record::opencode_session_ids(&contents));
+                codex_ids.extend(crate::launch_record::codex_session_ids(&contents));
+            }
+        }
+    }
+    // One launch's banner can land in two logs (a resume named by both the
+    // Builder's and a round's); first-seen order, de-duplicated across the
+    // selected regions.
+    let mut seen = std::collections::HashSet::new();
+    codex_ids.retain(|id| seen.insert(id.clone()));
     let opencode = crate::opencode_usage::tokens_by_session_ids(&session_ids, None);
-    combine_model_totals(claude.into_iter().chain(opencode).flatten())
+    let codex = crate::codex_usage::tokens_by_session_ids(&codex_ids, None);
+    combine_model_totals(
+        claude
+            .into_iter()
+            .flatten()
+            .chain(opencode.into_iter().flatten())
+            .chain(codex.into_iter().flatten()),
+    )
 }
 
 /// Merge rows by `(model, speed, service_tier)`, summing every counter, sorted
@@ -1042,6 +1078,148 @@ mod tests {
         );
     }
 
+    /// #14883: a step-dispatched merge joins Codex usage by the exact session
+    /// ids its selected regions name — the Builder's LAST dispatch plus every
+    /// PR-keyed round — with no window bounding the read (a Builder rollout
+    /// can start before the PR's creation). An abandoned attempt, an unrelated
+    /// rollout in the same home, a repeated id and a named-but-missing rollout
+    /// each contribute exactly what they must: nothing, or once.
+    #[test]
+    #[serial_test::serial(codex_home_env)]
+    fn a_merge_attributes_exactly_the_final_codex_builder_and_every_round() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = tmp.path().join("ws");
+        let logs = ws.join(".loom").join("logs");
+        std::fs::create_dir_all(&logs).unwrap();
+        const ABANDONED: &str = "00000000-0000-0000-0000-000000000001";
+        const FINAL: &str = "11111111-1111-1111-1111-111111111111";
+        const ROUND1: &str = "22222222-2222-2222-2222-222222222222";
+        const ROUND2: &str = "33333333-3333-3333-3333-333333333333";
+        const MISSING: &str = "44444444-4444-4444-4444-444444444444";
+        // Issue-keyed Builder log: an abandoned attempt, then the final one —
+        // whose banner repeats (a resume re-echo) and must count once.
+        std::fs::write(
+            logs.join("step-builder-14883.log"),
+            [
+                "==== loom-daemon dispatch: 2026-11-20T09:00:00+00:00 sweep_id=a item=14883 ===="
+                    .to_string(),
+                format!("session id: {ABANDONED}"),
+                "==== loom-daemon dispatch: 2026-11-20T11:00:00+00:00 sweep_id=b item=14883 ===="
+                    .to_string(),
+                format!("session id: {FINAL}"),
+                format!("session id: {FINAL}"),
+            ]
+            .join("\n"),
+        )
+        .unwrap();
+        // PR-keyed Judge log: two dispatch regions — two completed rounds. The
+        // final Builder's id repeated in round 2 must not double-count it, and
+        // MISSING names no rollout at all.
+        std::fs::write(
+            logs.join("step-judge-701.log"),
+            [
+                "==== loom-daemon dispatch: 2026-11-21T01:00:00+00:00 sweep_id=c item=701 ===="
+                    .to_string(),
+                format!("session id: {ROUND1}"),
+                "==== loom-daemon dispatch: 2026-11-21T03:00:00+00:00 sweep_id=d item=701 ===="
+                    .to_string(),
+                format!("session id: {ROUND2}"),
+                format!("session id: {FINAL}"),
+                format!("session id: {MISSING}"),
+            ]
+            .join("\n"),
+        )
+        .unwrap();
+
+        let home = tmp.path().join(".codex");
+        let cwd = "/workspace/work/repo-clone";
+        // The final Builder's rollout is created BEFORE the PR window opens —
+        // a `createdAt` lower bound would lose exactly this usage.
+        seed_rollout(
+            &home,
+            "2026/11/20",
+            &format!("rollout-2026-11-20T10-00-00-{FINAL}.jsonl"),
+            &codex_rollout(cwd, "2026-11-20T10:00:31Z", FINAL, "gpt-5-final", &[(1_000, 400, 100)]),
+        );
+        seed_rollout(
+            &home,
+            "2026/11/20",
+            &format!("rollout-2026-11-20T09-30-00-{ABANDONED}.jsonl"),
+            &codex_rollout(
+                cwd,
+                "2026-11-20T09:30:31Z",
+                ABANDONED,
+                "abandoned-model",
+                &[(9_000_000, 0, 900_000)],
+            ),
+        );
+        seed_rollout(
+            &home,
+            "2026/11/21",
+            &format!("rollout-2026-11-21T01-30-00-{ROUND1}.jsonl"),
+            &codex_rollout(cwd, "2026-11-21T01:30:31Z", ROUND1, "gpt-5-round1", &[(500, 0, 50)]),
+        );
+        seed_rollout(
+            &home,
+            "2026/11/21",
+            &format!("rollout-2026-11-21T03-30-00-{ROUND2}.jsonl"),
+            &codex_rollout(
+                cwd,
+                "2026-11-21T03:30:31Z",
+                ROUND2,
+                "gpt-5-round2",
+                &[(2_000, 100, 200)],
+            ),
+        );
+        // An unrelated rollout in the same home: never named by a log.
+        seed_rollout(
+            &home,
+            "2026/11/21",
+            "rollout-2026-11-21T02-00-00-55555555-6666-7777-8888-999999999999.jsonl",
+            &codex_rollout(
+                cwd,
+                "2026-11-21T02:00:31Z",
+                "55555555-6666-7777-8888-999999999999",
+                "unrelated-model",
+                &[(8_000_000, 0, 800_000)],
+            ),
+        );
+        let _guard =
+            crate::env_test_support::EnvGuard::set(crate::codex_usage::CODEX_HOME_ENV, &home);
+
+        let window = Some((at("2026-11-20T10:30:00Z"), at("2026-11-21T04:00:00Z")));
+        let rows = merge_step_tokens_by_model(&ws, 14883, 701, window).expect("three codex rows");
+        assert_eq!(
+            rows.iter().map(|r| r.model.as_str()).collect::<Vec<_>>(),
+            vec!["gpt-5-final", "gpt-5-round1", "gpt-5-round2"],
+            "{rows:?}"
+        );
+        let by_input = |model: &str| rows.iter().find(|r| r.model == model).unwrap();
+        let final_row = by_input("gpt-5-final");
+        assert_eq!(
+            (final_row.input, final_row.cache_read, final_row.output),
+            (600, 400, 100),
+            "cached input stays disjoint from input"
+        );
+        let round1 = by_input("gpt-5-round1");
+        assert_eq!((round1.input, round1.cache_read, round1.output), (500, 0, 50));
+        let round2 = by_input("gpt-5-round2");
+        assert_eq!((round2.input, round2.cache_read, round2.output), (1900, 100, 200));
+
+        // A merge nothing measured — a step log with no banners, no named
+        // rollout — omits the breakdown entirely: unknown, never zero rows.
+        let bare = tmp.path().join("ws-bare");
+        let bare_logs = bare.join(".loom").join("logs");
+        std::fs::create_dir_all(&bare_logs).unwrap();
+        std::fs::write(
+            bare_logs.join("step-builder-14884.log"),
+            "==== loom-daemon dispatch: 2026-11-21T01:00:00+00:00 sweep_id=e item=14884 ====\nno \
+             banners, no sessions\n",
+        )
+        .unwrap();
+        assert_eq!(merge_step_tokens_by_model(&bare, 14884, 702, window), None);
+    }
+
     #[test]
     fn each_mapped_runtime_selects_its_own_store_and_everything_else_stays_on_transcripts() {
         assert_eq!(UsageSource::for_runtime(Some("opencode")), UsageSource::OpenCodeSessionDb);
@@ -1177,6 +1355,51 @@ mod tests {
             NativeSessionIds::default()
         );
         assert_eq!(native_session_ids(""), NativeSessionIds::default());
+    }
+
+    /// #15023: a `session id:` banner quoted mid-line — in prose, or inside an
+    /// event string — is data about a launch, not evidence of one. Only a line
+    /// that IS a banner contributes, the rule every Codex banner reader shares.
+    #[test]
+    fn native_session_ids_refuse_a_banner_quoted_mid_line() {
+        let quoted = concat!(
+            "the runner echoed: session id: 11111111-2222-3333-4444-555555555555\n",
+            r#"{"type":"text","part":{"text":"session id: deadbeef-aaaa-bbbb-cccc-dddddddddddd"}}"#,
+            "\n",
+        );
+        assert_eq!(native_session_ids(quoted).codex, Vec::<String>::new());
+    }
+
+    /// #15023: the one anchoring rule every Codex banner reader shares. A line
+    /// that IS the banner yields its token, leading whitespace and all; a
+    /// banner quoted mid-line, a look-alike prefix, and a too-short token are
+    /// data, not launches.
+    #[test]
+    fn codex_session_banner_is_line_anchored() {
+        const ID: &str = "3f2a9c1e-77b2-4d0a-9c1e-2f6a8b4d5e01";
+        let banner = format!("session id: {ID}");
+        assert_eq!(codex_session_banner(&banner).as_deref(), Some(ID));
+        assert_eq!(codex_session_banner(&format!(" \t session id: {ID}")).as_deref(), Some(ID));
+        assert_eq!(codex_session_banner(&format!("the runner echoed: session id: {ID}")), None);
+        assert_eq!(codex_session_banner(&format!("cosession id: {ID}")), None);
+        assert_eq!(codex_session_banner("session id: abc"), None);
+    }
+
+    /// #15023: the edge shapes a real capture can have — a CRLF line ending,
+    /// and a banner that is the last line of an unterminated capture — still
+    /// read as the banner they are.
+    #[test]
+    fn native_session_ids_read_a_crlf_or_unterminated_banner() {
+        const ID: &str = "3f2a9c1e-77b2-4d0a-9c1e-2f6a8b4d5e01";
+        let expected = NativeSessionIds {
+            opencode: Vec::new(),
+            codex: vec![ID.to_string()],
+        };
+        assert_eq!(
+            native_session_ids(&format!("OpenAI Codex v0.160\r\nsession id: {ID}\r\n")),
+            expected
+        );
+        assert_eq!(native_session_ids(&format!("tokens used\nsession id: {ID}")), expected);
     }
 
     #[test]

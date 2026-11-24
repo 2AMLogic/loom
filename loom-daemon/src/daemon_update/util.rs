@@ -54,21 +54,7 @@ pub fn env_non_empty(name: &str) -> Option<String> {
 /// `command -v <name> >/dev/null 2>&1`.
 #[must_use]
 pub fn have(name: &str) -> bool {
-    std::env::var_os("PATH").is_some_and(|paths| {
-        std::env::split_paths(&paths).any(|dir| {
-            let candidate = dir.join(name);
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                std::fs::metadata(&candidate)
-                    .is_ok_and(|m| !m.is_dir() && m.permissions().mode() & 0o111 != 0)
-            }
-            #[cfg(not(unix))]
-            {
-                candidate.is_file()
-            }
-        })
-    })
+    crate::fs_util::is_on_path(name)
 }
 
 /// `uname -s`, or `unknown` when the tool cannot be run — the script's own

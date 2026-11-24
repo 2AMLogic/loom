@@ -1037,7 +1037,20 @@ impl SweepRegistry {
                 let drawn = admitted.preference.as_ref().and_then(|p| p.model.clone());
                 let (model, source) = match drawn {
                     Some(drawn) => (drawn, "role-draw".to_string()),
-                    None => models::resolve_role_runner_model(root, name),
+                    // #14962: through the launch form, which drops a
+                    // *configured-tier* model the admitted native profile's
+                    // own model differs from (the profile's model launches
+                    // instead of a `profile_selection` refusal); a drawn pin
+                    // is forwarded verbatim and keeps its refusal.
+                    None => models::resolve_role_runner_model_for_launch(
+                        root,
+                        name,
+                        Some(&admitted.runtime),
+                        admitted
+                            .preference
+                            .as_ref()
+                            .and_then(|p| p.model_profile.as_deref()),
+                    ),
                 };
                 let (model, _) =
                     models::reconcile_unpinned_model_with_runtime(&admitted.runtime, model, source);
@@ -1058,8 +1071,22 @@ impl SweepRegistry {
             with_model_fallback(root, kind, role, model);
         // #14017: effort is resolved once the runtime is admitted, so a
         // `roleEfforts.<role>@<runtime>` entry and the Codex default can apply.
+        // #14963: resolved through the launch form, which drops an
+        // *unqualified* effort the admitted native profile's `allowedEfforts`
+        // does not include (the profile's own effort launches instead of a
+        // `profile_selection` refusal); a runtime-qualified pin is forwarded
+        // verbatim and keeps its refusal.
         let effort = non_empty(
-            models::resolve_role_runner_effort_for_runtime(root, name, Some(&admitted.runtime)).0,
+            models::resolve_role_runner_effort_for_launch(
+                root,
+                name,
+                Some(&admitted.runtime),
+                admitted
+                    .preference
+                    .as_ref()
+                    .and_then(|p| p.model_profile.as_deref()),
+            )
+            .0,
         );
         Ok(StepLaunch {
             admission: crate::runtime_preference::DispatchAdmission {

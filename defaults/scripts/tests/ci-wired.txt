@@ -167,6 +167,7 @@ test-install-active-session.sh
 test-install-agents-md-reapply.sh
 test-install-full-reinstall-no-target-mutation.sh
 test-install-lock.sh
+test-install-package-json-stub.sh
 test-install-pr-markers.sh
 test-install-source-guard.sh
 test-install-stash-scope.sh
@@ -209,6 +210,7 @@ test-require-daemon-bin-provenance.sh
 test-resync-installed-agent-skills-guard.sh
 test-resync-installed-agents-hooks.sh
 test-resync-installed-gh-config-guard.sh
+test-resync-installed-gitignore-stub.sh
 test-resync-installed-guard-check.sh
 test-resync-installed-host-optout.sh
 test-resync-installed-labels-block.sh
@@ -331,6 +333,7 @@ tests/install/test-hooks-preserve.sh
 tests/install/test-initial-commit-credential-exclusion.sh
 tests/install/test-lint-ignore-configs.sh
 tests/install/test-manifest-freshness-after-hook-wiring.sh
+tests/install/test-no-old-owner-slug.sh
 tests/install/test-pnpm-runnable-check.sh
 tests/install/test-provision-daemon.sh
 tests/install/test-provision-tools.sh

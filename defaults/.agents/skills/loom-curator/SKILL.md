@@ -567,7 +567,8 @@ this reclaim comment:
 
 ```bash
 gh api -X DELETE repos/{owner}/{repo}/issues/$N/labels/loom%3Acurating
-./.loom/scripts/post-comment.sh $N --body "Reclaiming loom:curating claim: $STANDDOWN_COUNT stand-down passes, no curation progress for ${LOOM_STALE_CURATING_MINUTES:-45}m (bounded by LOOM_MAX_STANDDOWN_STREAK=${LOOM_MAX_STANDDOWN_STREAK:-3}) — breaking the livelock."
+./.loom/scripts/post-comment.sh $N --body "Reclaiming loom:curating claim: $STANDDOWN_COUNT stand-down passes, no curation progress for ${LOOM_STALE_CURATING_MINUTES:-45}m (bounded by LOOM_MAX_STANDDOWN_STREAK=${LOOM_MAX_STANDDOWN_STREAK:-3}) — breaking the livelock.
+<!-- loom:reclaim claim=$CLAIMED_AT -->"
 gh api repos/{owner}/{repo}/issues/$N/labels -f 'labels[]=loom:curating'
 # Continue with normal curation
 ```
@@ -577,10 +578,18 @@ pass the pool gate first, else stand down):
 
 ```bash
 gh api -X DELETE repos/{owner}/{repo}/issues/$N/labels/loom%3Acurating
-./.loom/scripts/post-comment.sh $N --body "Reclaiming stale loom:curating claim (idle ${IDLE_MINUTES}m > ${LOOM_STALE_CURATING_MINUTES:-45}m, no claimant activity) — the prior sweep likely died mid-enhancement."
+./.loom/scripts/post-comment.sh $N --body "Reclaiming stale loom:curating claim (idle ${IDLE_MINUTES}m > ${LOOM_STALE_CURATING_MINUTES:-45}m, no claimant activity) — the prior sweep likely died mid-enhancement.
+<!-- loom:reclaim claim=$CLAIMED_AT -->"
 gh api repos/{owner}/{repo}/issues/$N/labels -f 'labels[]=loom:curating'
 # Continue with normal curation
 ```
+
+**Both reclaim comments end with the `loom:reclaim` claim marker
+keyed to `$CLAIMED_AT` (#15044)**: the forge timeline can lag the label remove + re-add above,
+and `claim-staleness.sh` then matches this marker against the stale verdict it
+computed from the pre-reclaim timestamp — so your replacement claim reads
+`fresh` while you are active and is not reclaimed in turn (and `unknown`, never
+stale, once you go idle).
 
 **If `.loom/scripts/claim-staleness.sh` is missing** (an older install that has
 not been resynced yet): fall back to the **age-only** rule — read the latest
@@ -619,7 +628,7 @@ Fail closed: `1` (the gate could not run) is handled as `10`, never as `0`.
 | Exit | Instead of enriching |
 |---|---|
 | `10`/`12` | Do the premise check now and post the record its `REASON=`/`EVIDENCE-CANDIDATE=` lines point at; re-run. |
-| `11` | Read `RESOLUTION=`. `pending`: route it as a ranked decision via `loom-daemon operator-decision apply` per "Routing to a human" below. `stale`/`conflict`/`malformed`: the operator's recorded choice no longer matches the text; re-ask with the original premise record kept (never rewrite it to `verdict=clear`). `rejected`/`deferred`/`rescope`: not an approval to proceed. Never treat an un-park or an approval-sounding comment as the choice: only exit `0` with `RESOLUTION=approved` (a verified `loom-daemon operator-decision resolve`, #14399) lets a deliberate reversal be enriched. |
+| `11` | Read `RESOLUTION=`. `pending`: route it as a ranked decision via `loom-daemon operator-decision apply` per "Routing to a human" below. `stale`/`conflict`/`malformed`: the operator's recorded choice no longer matches the text; re-ask with the original premise record kept (never rewrite it to `verdict=clear`). `unreadable`: read `RESOLUTION-REASON=` — a block replaced by an operator ruling is recovered from the body's edit history automatically (#15108); when the reason names a missing block with no recoverable history, the fix is re-publishing the decision with `operator-decision apply` (never ask the operator to run `resolve`: without a readable block it cannot succeed); a block that fails the contract goes through the `loom:decision-malformed` repair. `rejected`/`deferred`/`rescope`: not an approval to proceed. Never treat an un-park or an approval-sounding comment as the choice: only exit `0` with `RESOLUTION=approved` (a verified `loom-daemon operator-decision resolve`, #14399) lets a deliberate reversal be enriched. |
 | `13` | Premise false — close or rescope per "Issues Are Suggestions" above. |
 
 Record format, scoped population, and why the gate sits one stage before you:

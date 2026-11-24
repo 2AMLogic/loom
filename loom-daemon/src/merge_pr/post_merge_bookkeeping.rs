@@ -199,9 +199,29 @@ fn reset_one(issue: &str, inputs: &Inputs, host: &dyn Host, out: &mut Vec<Record
         conflicted: member(&inputs.conflicted, issue),
         open_before_merge: member(&inputs.open_before_merge, issue),
     };
+    let steps = partial_reset::plan(issue, pr, repo, &view, pre);
+    apply_partial_steps(issue, pr, repo, &issue_json, &steps, host, out);
+}
+
+/// Apply one planned partial-reset sequence — the reopen (#4569), the label
+/// swap and the two audit comments, in the retired shell's order.
+///
+/// Split out of [`reset_one`] so the merge-observation pass
+/// (`claim_reconciliation::pass_loop::merge_observation`, #14902) can plan
+/// with its own reconstructed pre-merge facts and still reuse this loop
+/// verbatim: one copy of the ordering that is load-bearing.
+pub(crate) fn apply_partial_steps(
+    issue: &str,
+    pr: &str,
+    repo: &str,
+    issue_json: &str,
+    steps: &[Step],
+    host: &dyn Host,
+    out: &mut Vec<Record>,
+) {
     let at = host.timestamp();
     let mut reopened = false;
-    for step in partial_reset::plan(issue, pr, repo, &view, pre) {
+    for step in steps {
         match step {
             Step::Info(m) => out.extend(m.split('\n').map(|l| rec("INFO", l))),
             Step::Warning(m) => out.extend(m.split('\n').map(|l| rec("WARNING", l))),
@@ -243,7 +263,7 @@ fn reset_one(issue: &str, inputs: &Inputs, host: &dyn Host, out: &mut Vec<Record
                         ),
                     ));
                     let body = if held.is_some() {
-                        let reason = hold_from_json(&issue_json).unwrap_or_default();
+                        let reason = hold_from_json(issue_json).unwrap_or_default();
                         partial_merged_held_comment(pr, reopened, &reason, &at)
                     } else {
                         partial_merged_comment(pr, reopened, &at)

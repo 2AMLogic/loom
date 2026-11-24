@@ -190,8 +190,8 @@ _check_expected_head() { [[ -z "$EXPECTED_HEAD_SHA" || "$1" == "$EXPECTED_HEAD_S
 #
 # This replaces three separate `grep` matchers in three separate `if` blocks
 # whose relative ORDER was the entire safety property: a head-mismatch reaching
-# the base-modified arm answers a moved head with forge_update_branch and another
-# merge attempt. Nothing asserted that order except an `awk` scan over THIS
+# the base-modified arm answers a moved head with a sleep and another merge
+# attempt. Nothing asserted that order except an `awk` scan over THIS
 # FILE's source text looking for which `grep` appeared first. It is now one
 # ordered `match` in loom-daemon/src/merge_pr/response.rs, pinned by a
 # differential against the frozen retired ladder
@@ -1472,7 +1472,7 @@ _auto_reconcile_stacked_children || true
 # NOTE: Full label cleanup on linked issues remains intentionally skipped for
 # the `Closes #N` / `Fixes #N` / `Resolves #N` auto-close case — MOST labels
 # on a closed issue are harmless, since every queue-driving agent filters on
-# open state. See: https://github.com/rjwalters/loom/issues/2838
+# open state. See: https://github.com/2AMLogic/loom/issues/2838
 #
 # EXCEPTION 1 (#3667): non-closing `Part of #N` / `Contributes to #N` partial-
 # increment references leave the referenced issue OPEN after merge, so its
@@ -1497,7 +1497,7 @@ _auto_reconcile_stacked_children || true
 # `forge_pr_close_targets` (which delegates to GitHub's GraphQL
 # `closingIssuesReferences` field) to confirm closure. If you are debugging
 # why an unintended issue was closed, look at the PR body and Champion logs,
-# not at this script. See: https://github.com/rjwalters/loom/issues/3267
+# not at this script. See: https://github.com/2AMLogic/loom/issues/3267
 
 # Delete remote branch (skip if forge auto-deletes on merge)
 DELETE_BRANCH_ON_MERGE=$(forge_check_auto_delete "$REPO_NWO" "$GH")

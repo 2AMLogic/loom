@@ -188,6 +188,9 @@ pub(super) fn run(args: WorkerArgs) -> Result<i32> {
         std::io::stderr().write_all(&ack(&args.id))?;
         return Ok(143);
     }
+    // Entries this invocation can own are created at/after this instant
+    // (#14929: the drain's ownership gate).
+    let invocation_start = std::time::SystemTime::now();
     let child = Command::new(&args.command[0])
         .args(&args.command[1..])
         .stdin(Stdio::null())
@@ -206,6 +209,14 @@ pub(super) fn run(args: WorkerArgs) -> Result<i32> {
     let mut cancelled = false;
     loop {
         if reap(root, &mut result)? {
+            // The invocation's lease is over: every descendant is reaped, and
+            // the seat's exclusive lease means no sibling step can hold
+            // scratch of its own. Drain this run's step scratch from the
+            // resolved temp base (#14929) — a seat whose tmpfs never drains
+            // between jobs fills its 512 MB `/tmp` across days. Best-effort:
+            // the age-gated seat reclaim stays the backstop for a worker
+            // killed before it reaches here.
+            clean_step_scratch(&crate::forge_etag_store::host_tmp_base(), invocation_start);
             std::io::stderr().write_all(&ack(&args.id))?;
             return Ok(if cancelled {
                 143
@@ -261,6 +272,68 @@ pub(super) fn run(args: WorkerArgs) -> Result<i32> {
     }
 }
 
+/// Backward slack on the ownership gate: filesystem mtimes can trail
+/// `SystemTime::now()` by a few ms (coarse kernel clock). A resident old
+/// enough to matter predates the invocation by far more than this.
+const MTIME_SLACK: Duration = Duration::from_secs(2);
+
+/// Remove the finished invocation's per-run step scratch from `base`
+/// (#14929): entries named for the step that made them (`<role>-<n>.*`,
+/// `*-tmp` — the shapes [`seat_reclaim`]'s idle pass already owns on the
+/// volume) are per-invocation by construction. Nothing else is touched: the
+/// long-lived caches and Loom state dirs live on the cache volume after
+/// #14929, and the shapes never match them (`loom-uv-cache` has no
+/// `<role>-<digits>` head). Best-effort by design — a removal that fails is
+/// left for the idle pass, never for the next job to inherit.
+///
+/// **Ownership, not just shape.** `<word>-<digits>` is a loose shape and the
+/// temp base is a namespace Loom does not own: a seat's `/tmp` also holds the
+/// long-lived tmux server's `tmux-1000` socket dir, which matches
+/// [`is_step_scratch_name`] byte-for-byte. So an entry is removed only when
+/// its mtime is at/after `since` (the invocation's start, less
+/// [`MTIME_SLACK`] for coarse filesystem timestamps): scratch this run made
+/// is newer than that, a resident that predates the run is not. Symlinks are
+/// removed as links, never followed.
+fn clean_step_scratch(base: &std::path::Path, since: std::time::SystemTime) -> usize {
+    use crate::tokens_pool::private_workspace::seat_reclaim::{
+        is_step_scratch_name, is_tmp_step_name,
+    };
+    let Ok(entries) = std::fs::read_dir(base) else {
+        return 0;
+    };
+    let mut removed = 0;
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        if !is_step_scratch_name(name) && !is_tmp_step_name(name) {
+            continue;
+        }
+        let path = entry.path();
+        let Ok(meta) = std::fs::symlink_metadata(&path) else {
+            continue;
+        };
+        let owned = meta
+            .modified()
+            .is_ok_and(|m| m >= since.checked_sub(MTIME_SLACK).unwrap_or(since));
+        if !owned {
+            continue;
+        }
+        let removed_ok = if meta.is_dir() {
+            std::fs::remove_dir_all(&path)
+        } else {
+            std::fs::remove_file(&path)
+        };
+        if removed_ok.is_ok() {
+            removed += 1;
+        } else {
+            log::debug!("session-exec: step scratch not removed: {}", path.display());
+        }
+    }
+    removed
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -313,6 +386,49 @@ mod tests {
 
     fn lease_line() -> Vec<u8> {
         format!("{}\n", now_ms() + LEASE_MS).into_bytes()
+    }
+
+    /// #14929 AC: per-run scratch present before the invocation's lease ends
+    /// is gone after it, while everything else under the temp base — the
+    /// long-lived caches, foreign `mkdtemp` shapes — is left exactly as it
+    /// was.
+    #[test]
+    fn step_scratch_is_removed_at_invocation_end_and_nothing_else_is() {
+        let base = tempfile::tempdir().unwrap();
+        // A long-lived resident that matches the *shape* (`<word>-<digits>`):
+        // the seat's tmux socket dir, created before the invocation started.
+        let tmux_dir = base.path().join("tmux-1000");
+        std::fs::create_dir(&tmux_dir).unwrap();
+        std::fs::write(tmux_dir.join("default"), "").unwrap();
+        let old = std::time::SystemTime::now() - Duration::from_secs(3600);
+        std::fs::File::open(&tmux_dir)
+            .unwrap()
+            .set_modified(old)
+            .unwrap();
+        let since = std::time::SystemTime::now();
+        let scratch_dir = base.path().join("doctor-6422-tmp");
+        std::fs::create_dir(&scratch_dir).unwrap();
+        std::fs::write(scratch_dir.join("repro.log"), "x").unwrap();
+        let scratch_file = base.path().join("builder-6940.tar.gz");
+        std::fs::write(&scratch_file, "x").unwrap();
+        let uv_cache = base.path().join("loom-uv-cache");
+        std::fs::create_dir(&uv_cache).unwrap();
+        let python_tmp = base.path().join("tmp0unndweb");
+        std::fs::create_dir(&python_tmp).unwrap();
+        std::fs::write(python_tmp.join("fleet.json"), "{}").unwrap();
+        assert_eq!(clean_step_scratch(base.path(), since), 2);
+        assert!(!scratch_dir.exists(), "per-run scratch dir must be removed");
+        assert!(!scratch_file.exists(), "per-run scratch file must be removed");
+        assert!(
+            tmux_dir.join("default").exists(),
+            "a pre-existing shape-matching resident (tmux-1000) must survive the drain"
+        );
+        assert!(uv_cache.exists(), "a long-lived cache must never match step scratch");
+        assert!(python_tmp.exists(), "a foreign mkdtemp shape is not ours to remove");
+        // A base that does not exist is a no-op, not an error.
+        let gone = base.path().join("gone");
+        assert_eq!(clean_step_scratch(&gone, since), 0);
+        assert_eq!(clean_step_scratch(base.path(), since), 0, "a second pass is a no-op");
     }
 
     #[test]

@@ -671,6 +671,7 @@ fn write_opencode_step_log(root: &Path, role: &str, item: u32, session_id: &str)
 /// the session id in the step log, so a neighbouring session in the same
 /// (workspace-root) directory is not counted.
 #[test]
+#[serial(opencode_db_env)]
 #[serial]
 fn a_step_dispatched_merge_attributes_an_opencode_builder_and_a_claude_judge() {
     let dir = tempfile::tempdir().unwrap();
@@ -708,7 +709,8 @@ fn a_step_dispatched_merge_attributes_an_opencode_builder_and_a_claude_judge() {
             .unwrap();
         }
     }
-    std::env::set_var(crate::opencode_usage::OPENCODE_DB_ENV, &db);
+    let _db_env =
+        crate::env_test_support::EnvGuard::set(crate::opencode_usage::OPENCODE_DB_ENV, &db);
 
     let gh = FakeGh::new(dir.path());
     gh.serve_view(&pr_row(700, 14018, Some(1)));
@@ -731,7 +733,6 @@ fn a_step_dispatched_merge_attributes_an_opencode_builder_and_a_claude_judge() {
         .await
     }));
     std::env::remove_var("CLAUDE_CONFIG_DIR");
-    std::env::remove_var(crate::opencode_usage::OPENCODE_DB_ENV);
 
     let meta = envelope.expect("a completion").meta.unwrap();
     assert_eq!(meta["runtime"], "opencode");
@@ -745,4 +746,272 @@ fn a_step_dispatched_merge_attributes_an_opencode_builder_and_a_claude_judge() {
         .filter_map(|row| row["model"].as_str())
         .collect();
     assert_eq!(models, vec!["claude-sonnet-4-5", "glm-5.3-flash"], "{meta}");
+}
+
+/// A Codex step log as `spawn-codex.sh` leaves it: the dispatch header, the
+/// resolved-runtime marker, and Codex's own `session id:` stderr banner
+/// (#14883).
+fn write_codex_step_log(root: &Path, role: &str, item: u32, session_id: &str) {
+    let logs = root.join(".loom").join("logs");
+    std::fs::create_dir_all(&logs).unwrap();
+    let body = format!(
+        "==== loom-daemon dispatch: 2026-11-21T01:00:00+00:00 sweep_id=step-{role}-{item}-1 \
+         item={item} step={role} ====\n\
+         # LOOM_RUNTIME_RESOLVED runtime=codex\n\
+         spawn-codex: waiting for session\n\
+         session id: {session_id}\n\
+         tokens used: 1,234 input (1,000 cached)\n"
+    );
+    std::fs::write(logs.join(format!("step-{role}-{item}.log")), body).unwrap();
+}
+
+/// One Codex rollout in the live shape: session meta, turn context, and one
+/// cumulative `token_count` event per `(input, cached, output)` triple.
+fn codex_rollout_lines(cwd: &str, created: &str, id: &str, model: &str) -> Vec<String> {
+    vec![
+        serde_json::json!({
+            "timestamp": created,
+            "type": "session_meta",
+            "payload": {"session_id": id, "id": id, "timestamp": created, "cwd": cwd},
+        })
+        .to_string(),
+        serde_json::json!({
+            "type": "turn_context",
+            "payload": {"cwd": cwd, "model": model},
+        })
+        .to_string(),
+        serde_json::json!({
+            "type": "event_msg",
+            "payload": {"type": "token_count", "info": {"total_token_usage": {
+                "input_tokens": 1_000, "cached_input_tokens": 400, "output_tokens": 100,
+            }}},
+        })
+        .to_string(),
+    ]
+}
+
+/// #14883: a step-dispatched merge with an OpenCode Builder and a Codex Judge
+/// publishes a breakdown and flat total covering BOTH. The Judge's rollout
+/// lives in a pooled seat profile under a container-local `cwd` — the exact
+/// shape #14540 ruled cannot be attributed by directory — and the ambient home
+/// is empty, so only profile discovery can find it.
+#[test]
+#[serial_test::serial(codex_home_env, opencode_db_env)]
+fn a_step_dispatched_merge_attributes_an_opencode_builder_and_a_codex_judge() {
+    a_step_dispatched_merge_attributes_an_opencode_builder_and_a_codex_judge_body();
+}
+
+/// The default-group body of
+/// [`a_step_dispatched_merge_attributes_an_opencode_builder_and_a_codex_judge`]:
+/// it also mutates `GH_BIN_ENV`, whose writers hold the crate-default
+/// `#[serial]` lock, on top of `OPENCODE_DB_ENV`/`CODEX_HOME_ENV`, whose
+/// writers hold the named `opencode_db_env`/`codex_home_env` locks. The named
+/// locks are the outer ones and the default lock the inner, the mandatory
+/// nesting order (`lock_order_tests`, #14404) — the default group's key is the
+/// empty string, so a test cannot name it in a multi-key attribute.
+#[serial]
+fn a_step_dispatched_merge_attributes_an_opencode_builder_and_a_codex_judge_body() {
+    let dir = tempfile::tempdir().unwrap();
+    let ws = dir.path().join("ws");
+    std::fs::create_dir_all(&ws).unwrap();
+    let root = ws.to_string_lossy().into_owned();
+    const JUDGE_ID: &str = "77777777-8888-9999-aaaa-bbbbccccdddd";
+    write_opencode_step_log(&ws, "builder", 14883, "ses_mine");
+    write_codex_step_log(&ws, "judge", 701, JUDGE_ID);
+
+    // The seat's pooled profile: the only place the Judge's rollout exists.
+    // Its `cwd` is the container-local path a private-clone seat reports.
+    let day = dir.path().join("codex-profiles/seat-7/sessions/2026/11/21");
+    std::fs::create_dir_all(&day).unwrap();
+    std::fs::write(
+        day.join(format!("rollout-2026-11-21T01-06-00-{JUDGE_ID}.jsonl")),
+        codex_rollout_lines(
+            "/workspace/work/repo-clone",
+            "2026-11-21T01:06:31Z",
+            JUDGE_ID,
+            "gpt-5.3",
+        )
+        .join("\n"),
+    )
+    .unwrap();
+    // The ambient home exists but is empty.
+    let ambient = dir.path().join("ambient-codex");
+    std::fs::create_dir_all(ambient.join("sessions")).unwrap();
+
+    let db = dir.path().join("opencode.db");
+    {
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE session (
+                 model TEXT, tokens_input INTEGER, tokens_output INTEGER,
+                 tokens_reasoning INTEGER, tokens_cache_read INTEGER,
+                 tokens_cache_write INTEGER, directory TEXT, time_created INTEGER,
+                 id TEXT
+             );",
+        )
+        .unwrap();
+        let model = serde_json::json!({"id": "glm-5.3-flash", "providerID": "zai"}).to_string();
+        conn.execute(
+            "INSERT INTO session VALUES (?1, 1000, 200, 0, 50, 10, ?2, ?3, 'ses_mine')",
+            rusqlite::params![model, root, Utc::now().timestamp_millis()],
+        )
+        .unwrap();
+    }
+    let _db_env =
+        crate::env_test_support::EnvGuard::set(crate::opencode_usage::OPENCODE_DB_ENV, &db);
+
+    let gh = FakeGh::new(dir.path());
+    gh.serve_view(&pr_row(701, 14883, Some(1)));
+    let _home_env = crate::env_test_support::EnvGuard::clear(&[
+        crate::codex_usage::CODEX_HOME_ENV,
+        crate::codex_usage::CODEX_NATIVE_HOME_ENV,
+    ]);
+    std::env::set_var(crate::codex_usage::CODEX_NATIVE_HOME_ENV, &ambient);
+    let _profile_root = crate::tokens_pool::profile_root_env::ProfileRootEnv::set(
+        dir.path().join("codex-profiles"),
+    );
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let mut slug_cache = HashMap::new();
+    let mut completed = std::collections::HashSet::new();
+    let envelope = rt.block_on(forge_gate::scoped(None, async {
+        completion_for_merged_step(
+            "loom_daemon",
+            &root,
+            701,
+            &mut slug_cache,
+            &mut completed,
+            None,
+            None,
+        )
+        .await
+    }));
+    std::env::remove_var(crate::codex_usage::CODEX_NATIVE_HOME_ENV);
+
+    let meta = envelope.expect("a completion").meta.unwrap();
+    // The Builder's labels speak for the PR; the Judge's runtime never
+    // relabels it (the #14018 rule, unchanged by the Codex join).
+    assert_eq!(meta["runtime"], "opencode", "{meta}");
+    // Both runtimes' usage, in one breakdown: OpenCode 1000+200+50+10 = 1260,
+    // Codex 600+400+100 = 1100 (cached input moved out of `input`, so the
+    // four counters stay disjoint).
+    assert_eq!(meta["tokens"], serde_json::json!(1260 + 1100), "{meta}");
+    let rows = meta["tokens_by_model"].as_array().unwrap();
+    let find = |model: &str| {
+        rows.iter()
+            .find(|row| row["model"] == model)
+            .unwrap_or_else(|| panic!("no {model} row: {meta}"))
+    };
+    let codex = find("gpt-5.3");
+    assert_eq!(
+        (
+            codex["input"].as_i64(),
+            codex["cache_read"].as_i64(),
+            codex["cache_write_5m"].as_i64(),
+            codex["cache_write_1h"].as_i64(),
+            codex["output"].as_i64()
+        ),
+        (Some(600), Some(400), Some(0), Some(0), Some(100)),
+        "{meta}"
+    );
+    let opencode = find("glm-5.3-flash");
+    assert_eq!(
+        (
+            opencode["input"].as_i64(),
+            opencode["cache_read"].as_i64(),
+            opencode["output"].as_i64()
+        ),
+        (Some(1000), Some(50), Some(200)),
+        "{meta}"
+    );
+}
+
+/// #14883: the Claude/OpenCode envelope stays the deterministic baseline. A
+/// Codex banner naming a rollout no store holds adds no row and changes no
+/// figure — the serialized usage surface is byte-identical to the no-Codex
+/// result.
+#[test]
+#[serial_test::serial(codex_home_env, opencode_db_env)]
+fn a_codex_banner_naming_no_rollout_leaves_the_envelope_byte_identical() {
+    a_codex_banner_naming_no_rollout_leaves_the_envelope_byte_identical_body();
+}
+
+/// The default-group body of
+/// [`a_codex_banner_naming_no_rollout_leaves_the_envelope_byte_identical`]
+/// (same named-locks-outside-default-inside nesting order as the
+/// mixed-runtime test above).
+#[serial]
+fn a_codex_banner_naming_no_rollout_leaves_the_envelope_byte_identical_body() {
+    let usage_surface = |with_banner: bool| -> serde_json::Value {
+        let dir = tempfile::tempdir().unwrap();
+        let ws = dir.path().join("ws");
+        std::fs::create_dir_all(&ws).unwrap();
+        let root = ws.to_string_lossy().into_owned();
+        // The deterministic pre-#14883 baseline fixture: an OpenCode Builder
+        // whose log names one session, and nothing else measurable.
+        write_opencode_step_log(&ws, "builder", 14883, "ses_mine");
+        if with_banner {
+            write_codex_step_log(&ws, "judge", 701, "12345678-1234-1234-1234-123456789abc");
+        }
+        let db = dir.path().join("opencode.db");
+        {
+            let conn = rusqlite::Connection::open(&db).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE session (
+                     model TEXT, tokens_input INTEGER, tokens_output INTEGER,
+                     tokens_reasoning INTEGER, tokens_cache_read INTEGER,
+                     tokens_cache_write INTEGER, directory TEXT, time_created INTEGER,
+                     id TEXT
+                 );",
+            )
+            .unwrap();
+            let model = serde_json::json!({"id": "glm-5.3-flash", "providerID": "zai"}).to_string();
+            conn.execute(
+                "INSERT INTO session VALUES (?1, 1000, 200, 0, 50, 10, ?2, ?3, 'ses_mine')",
+                rusqlite::params![model, root, Utc::now().timestamp_millis()],
+            )
+            .unwrap();
+        }
+        let _db_env =
+            crate::env_test_support::EnvGuard::set(crate::opencode_usage::OPENCODE_DB_ENV, &db);
+        // An empty Codex home: the banner names a rollout nothing holds.
+        let empty_home = dir.path().join("empty-codex");
+        std::fs::create_dir_all(empty_home.join("sessions")).unwrap();
+        let _home_env =
+            crate::env_test_support::EnvGuard::set(crate::codex_usage::CODEX_HOME_ENV, &empty_home);
+
+        let gh = FakeGh::new(dir.path());
+        gh.serve_view(&pr_row(701, 14883, Some(1)));
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let mut slug_cache = HashMap::new();
+        let mut completed = std::collections::HashSet::new();
+        let envelope = rt.block_on(forge_gate::scoped(None, async {
+            completion_for_merged_step(
+                "loom_daemon",
+                &root,
+                701,
+                &mut slug_cache,
+                &mut completed,
+                None,
+                None,
+            )
+            .await
+        }));
+        let meta = envelope.expect("a completion").meta.unwrap();
+        serde_json::json!({
+            "runtime": meta["runtime"],
+            "tokens": meta["tokens"],
+            "tokens_by_model": meta["tokens_by_model"],
+        })
+    };
+    assert_eq!(
+        serde_json::to_string(&usage_surface(false)).unwrap(),
+        serde_json::to_string(&usage_surface(true)).unwrap(),
+        "a named-but-missing rollout must not perturb the envelope"
+    );
 }

@@ -1,0 +1,1 @@
+../../defaults/docs/gitea-single-stage.md

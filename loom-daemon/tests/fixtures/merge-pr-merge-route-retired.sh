@@ -8,7 +8,7 @@
 # two-space re-indent; the only edit is the wrapping function, so the differential
 # (loom-daemon/tests/merge_pr_merge_route_differential.rs) can drive it with
 # the same recording stubs (forge_merge_pr, forge_get_pr_nocache,
-# forge_update_branch, sleep, info/success/warning/error, ...) it gives the
+# sleep, info/success/warning/error, ...) it gives the
 # live loop extracted from merge-pr.sh, and compare the two traces.
 #
 # #12063 slice 2 edited the oracle in two places, to the new contract rather

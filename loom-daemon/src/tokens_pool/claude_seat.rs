@@ -223,8 +223,9 @@ pub fn docker_create_seat(
         extra_mounts,
     );
     let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
+    let program = super::docker_cli::docker_program()?;
     let (success, _stdout, stderr) = super::docker_cli::run_bounded(
-        "docker",
+        &program,
         &arg_refs,
         super::docker_cli::timeout_for(&arg_refs),
     )?;

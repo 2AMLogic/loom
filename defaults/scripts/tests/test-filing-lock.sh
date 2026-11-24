@@ -141,6 +141,13 @@ DIR="$(new_store)"
         exit 1
     fi
 
+    # A writable store must NEVER degrade open (#15122): a vanished holder is a
+    # retry, not "unusable". Any such warning means a filer ran unserialized.
+    if grep -qE 'degrading open|WITHOUT serialization' "$DIR"/filer-*.log; then
+        echo "a filer degraded OPEN on a writable store (ran unserialized); see filer logs below" >&2
+        exit 1
+    fi
+
     if [[ "$(wc -l < "$FILED")" -ne 8 ]]; then
         echo "FILED has $(wc -l < "$FILED") rows, want 8; contents follow" >&2
         cat "$FILED" >&2
@@ -159,6 +166,61 @@ DIR="$(new_store)"
 ) && CASE_RC=0 || CASE_RC=$?
 assert_true "$CASE_RC" \
     "two concurrent filers in DIFFERENT repos each file their own body (the #6714 regression)"
+# Re-emit the diagnostics AFTER the assertion line (#15122). The case body above
+# already prints them, but ci-suite-excerpt.sh keeps only 3 TRAILING context
+# lines after a FAIL line (LOOM_CI_FAIL_CONTEXT_LINES), so a dump printed before
+# it never reached the CI excerpt. Hence exactly one collapsed line per file
+# (gf180-sram log, sky130-modexp log, FILED rows) — it must fit in that window.
+if [[ "$CASE_RC" -ne 0 ]]; then
+    for f in "$DIR/filer-gf180-sram.log" "$DIR/filer-sky130-modexp.log" "$DIR/filed.txt"; do
+        printf '  diag %s: %s\n' "${f##*/}" \
+            "$( [[ -f "$f" ]] && tr '\n\t' '|~' < "$f" || echo '(missing)' )" >&2
+    done
+fi
+
+# #15122: a waiter whose mkdir lost to a peer whose release ran before the
+# follow-up `-d` check must RETRY, not degrade open. Forced deterministically by
+# shadowing mkdir: the first `mkdir <holder>` reports failure with no holder dir
+# on disk — exactly what the waiter observes when the peer has already released.
+DIR="$(new_store)"
+(
+    export LOOM_FILING_LOCK_DIR="$DIR"
+    LOG="$DIR.log"
+    MKDIR_CALLS=0
+    mkdir() {
+        if [[ "${!#}" == "$DIR/holder" && "$MKDIR_CALLS" -eq 0 ]]; then
+            MKDIR_CALLS=1
+            return 1
+        fi
+        command mkdir "$@"
+    }
+    RC=0
+    loom_filing_lock_acquire "waiter" >"$LOG" 2>&1 || RC=$?
+    [[ "$RC" -eq 0 ]] || exit 1
+    [[ "$LOOM_FILING_LOCK_PATH" == "$DIR/holder" ]] || exit 1   # holds the lock
+    [[ -d "$DIR/holder" && -f "$DIR/holder/owner.json" ]] || exit 1
+    ! grep -qE 'degrading open|WITHOUT serialization' "$LOG" || exit 1
+    loom_filing_lock_release >/dev/null 2>&1
+    exit 0
+) && CASE_RC=0 || CASE_RC=$?
+assert_true "$CASE_RC" "a holder that vanishes between mkdir and -d is retried, not degraded open (#15122)"
+
+# The retry is bounded: a mkdir that always fails with no holder on a store that
+# is a directory (e.g. permission denied) must still degrade open, not spin.
+DIR="$(new_store)"
+(
+    export LOOM_FILING_LOCK_DIR="$DIR"
+    mkdir() {
+        if [[ "${!#}" == "$DIR/holder" ]]; then return 1; fi
+        command mkdir "$@"
+    }
+    RC=0
+    loom_filing_lock_acquire "waiter" >/dev/null 2>&1 || RC=$?
+    [[ "$RC" -eq 0 ]] || exit 1
+    [[ -z "${LOOM_FILING_LOCK_PATH:-}" ]] || exit 1
+    exit 0
+) && CASE_RC=0 || CASE_RC=$?
+assert_true "$CASE_RC" "a persistently failing holder mkdir degrades open after a bounded retry (no spin)"
 
 # The unserialized control, forced deterministically: without the lock, filer A
 # reads back filer B's body. Proves the case above is exercising the mechanism.

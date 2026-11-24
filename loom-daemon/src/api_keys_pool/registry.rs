@@ -56,9 +56,10 @@ pub enum Ineligible {
     /// A pool state file that decides eligibility (`.disabled`,
     /// `.bad_accounts.json`, `.limits.json`) exists but cannot be read or
     /// parsed, so whether this account is disabled, exhausted or capped cannot
-    /// be established. The account itself may be perfectly good; it is
-    /// withheld because "I could not read the list of disabled accounts" must
-    /// never mean "none are".
+    /// be established — or, for the last of those, the workspace's
+    /// `runtimes.apiKeyLimits` block cannot be (#14932). The account itself may
+    /// be perfectly good; it is withheld because "I could not read the list of
+    /// disabled accounts" must never mean "none are".
     Unverifiable,
 }
 
@@ -84,17 +85,26 @@ pub struct ApiKeyAccount {
     /// Declared per-account concurrency cap (#8424 item 4), or `None` for
     /// unbounded — see [`limits`]. A *declaration*, not a live count: the
     /// in-flight tally lives in [`inflight`] and is consulted only by the
-    /// selection ladder.
+    /// selection ladder. It is the cap the pool **enforces**: the host's
+    /// `.limits.json` merged with the workspace's `runtimes.apiKeyLimits`
+    /// block (#14932).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_concurrent: Option<u32>,
     /// Declared plan window (#11286) — see
-    /// [`limits::AccountLimits::exhaustion_window_secs`].
+    /// [`limits::AccountLimits::exhaustion_window_secs`], merged the same way.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub exhaustion_window_secs: Option<u64>,
     /// Declared plan token allowance (#11286) — see
-    /// [`limits::AccountLimits::plan_token_limit`].
+    /// [`limits::AccountLimits::plan_token_limit`]. File-declared only.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub plan_token_limit: Option<u64>,
+    /// Where each limit above came from (#14932), so a listing can say whether
+    /// a cap is the host's own or the fleet config's. `unknown` whenever the
+    /// account is [`Ineligible::Unverifiable`]: then no limit is known, which
+    /// is not the same as none being declared.
+    pub max_concurrent_source: limits::LimitSource,
+    pub exhaustion_window_secs_source: limits::LimitSource,
+    pub plan_token_limit_source: limits::LimitSource,
     /// When the active bad mark that makes this account
     /// [`Ineligible::Exhausted`] resets (Unix seconds), if it has a horizon.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -188,8 +198,13 @@ fn permissions_ok(_path: &Path) -> bool {
 }
 
 /// Read one account's names/state without retaining its value.
-fn describe(root: &Path, provider: &str, path: &Path) -> ApiKeyAccount {
-    describe_for_class(root, provider, path, None)
+fn describe(
+    root: &Path,
+    provider: &str,
+    path: &Path,
+    configured: &limits::ConfiguredLimits,
+) -> ApiKeyAccount {
+    describe_for_class(root, provider, path, None, configured)
 }
 
 /// [`describe`], resolving bad marks for one model class (#8424 item 3).
@@ -203,6 +218,7 @@ fn describe_for_class(
     provider: &str,
     path: &Path,
     model_class: Option<&str>,
+    configured: &limits::ConfiguredLimits,
 ) -> ApiKeyAccount {
     let name = path
         .file_stem()
@@ -226,9 +242,11 @@ fn describe_for_class(
         model_class,
         bad_marks::epoch_now(),
     );
-    let declared =
-        limits::read_limits(root, provider).map(|all| all.get(&name).cloned().unwrap_or_default());
-    let declared_cap = declared.as_ref().map(|l| l.max_concurrent);
+    // One read answers every limit question: `.limits.json` merged with the
+    // workspace's config block (#14932), so a cap either source declares is
+    // enforced, and an entry neither can make sense of withholds.
+    let declared = limits::effective_limits(root, provider, configured)
+        .map(|all| all.get(&name).cloned().unwrap_or_default());
     let ineligible = if problem.is_some() {
         Some(Ineligible::Malformed)
     } else if let Err(unreadable) = &disabled {
@@ -240,9 +258,10 @@ fn describe_for_class(
         problem = Some(unreadable.clone());
         Some(Ineligible::Unverifiable)
     } else if let Err(unreadable) = &declared {
-        // An unreadable `.limits.json` withholds the account for the same
-        // reason an unreadable `.disabled` does: the operator's declared
-        // ceiling is unknown, and guessing "unbounded" would breach it.
+        // An unreadable `.limits.json` — or a `runtimes.apiKeyLimits` entry
+        // that cannot be parsed — withholds the account for the same reason
+        // an unreadable `.disabled` does: the operator's declared ceiling is
+        // unknown, and guessing "unbounded" would breach it.
         problem = Some(unreadable.clone());
         Some(Ineligible::Unverifiable)
     } else if let Ok(Some(mark)) = &active_mark {
@@ -259,6 +278,10 @@ fn describe_for_class(
     } else {
         None
     };
+    let known = declared.as_ref().ok().map(|declared| &declared.limits);
+    let source = |pick: fn(&limits::EffectiveLimits) -> limits::LimitSource| {
+        declared.as_ref().map_or(limits::LimitSource::Unknown, pick)
+    };
     ApiKeyAccount {
         provider: provider.to_string(),
         name,
@@ -268,12 +291,12 @@ fn describe_for_class(
         permissions_ok,
         ineligible,
         problem,
-        max_concurrent: declared_cap.unwrap_or(None),
-        exhaustion_window_secs: declared
-            .as_ref()
-            .ok()
-            .and_then(|l| l.exhaustion_window_secs),
-        plan_token_limit: declared.as_ref().ok().and_then(|l| l.plan_token_limit),
+        max_concurrent: known.and_then(|l| l.max_concurrent),
+        exhaustion_window_secs: known.and_then(|l| l.exhaustion_window_secs),
+        plan_token_limit: known.and_then(|l| l.plan_token_limit),
+        max_concurrent_source: source(|d| d.max_concurrent_source),
+        exhaustion_window_secs_source: source(|d| d.exhaustion_window_secs_source),
+        plan_token_limit_source: source(|d| d.plan_token_limit_source),
         resets_at: active_mark.ok().flatten().and_then(|mark| mark.resets_at),
     }
 }
@@ -282,22 +305,39 @@ fn describe_for_class(
 /// back after mutating it. A name that is not registered still describes
 /// (as [`Ineligible::Malformed`], "unreadable"), the same way `list` reports
 /// an account file it cannot read.
+///
+/// `configured` is the calling workspace's `runtimes.apiKeyLimits` block
+/// (#14932), so the limits reported are the ones the pool enforces.
 #[must_use]
-pub fn describe_account(root: &Path, provider: &str, name: &str) -> ApiKeyAccount {
-    describe(root, provider, &account_path(root, provider, name))
+pub fn describe_account(
+    root: &Path,
+    provider: &str,
+    name: &str,
+    configured: &limits::ConfiguredLimits,
+) -> ApiKeyAccount {
+    describe(root, provider, &account_path(root, provider, name), configured)
 }
 
 /// Every registered account for one provider, sorted by name.
+///
+/// **File-declared** limits only: the read for a management verb that needs
+/// names and eligibility. Selection, reservations and health go through
+/// [`list_provider_for_class`] with the calling workspace's config, which is
+/// the only path a config-declared cap is enforced on (#14932).
 ///
 /// # Errors
 /// [`PoolReadError`] when the provider directory exists but cannot be read —
 /// never an empty list, which would read as "this provider is not pooled".
 pub fn list_provider(root: &Path, provider: &str) -> Result<Vec<ApiKeyAccount>, PoolReadError> {
-    list_provider_for_class(root, provider, None)
+    list_provider_for_class(root, provider, None, &limits::ConfiguredLimits::EMPTY)
 }
 
-/// [`list_provider`], resolving bad marks for one model class (#8424 item 3).
-/// `None` is exactly [`list_provider`].
+/// [`list_provider`], resolving bad marks for one model class (#8424 item 3)
+/// and limits from both sources (#14932).
+///
+/// `model_class = None` is exactly [`list_provider`]. `configured` is the
+/// calling workspace's `runtimes.apiKeyLimits` block, resolved once by the
+/// caller that has the workspace — never per account here.
 ///
 /// # Errors
 /// As [`list_provider`].
@@ -305,15 +345,17 @@ pub fn list_provider_for_class(
     root: &Path,
     provider: &str,
     model_class: Option<&str>,
+    configured: &limits::ConfiguredLimits,
 ) -> Result<Vec<ApiKeyAccount>, PoolReadError> {
     Ok(list_account_files(&provider_dir(root, provider))?
         .iter()
-        .map(|path| describe_for_class(root, provider, path, model_class))
+        .map(|path| describe_for_class(root, provider, path, model_class, configured))
         .collect())
 }
 
 /// Every registered account across every provider under `root` (or just
-/// `provider` when given), sorted by provider then name.
+/// `provider` when given), sorted by provider then name. File-declared
+/// limits only, as [`list_provider`].
 pub fn list_all(root: &Path, provider: Option<&str>) -> Result<Vec<ApiKeyAccount>, PoolReadError> {
     let providers = match provider {
         Some(p) => vec![p.to_string()],
@@ -348,6 +390,11 @@ pub fn read_credential(root: &Path, provider: &str, name: &str) -> Result<Creden
 
 /// Register a new account. `secret` is written to a `0600` file and is never
 /// returned, logged, or placed on a command line.
+///
+/// The returned description carries file-declared limits only: the
+/// `runtimes.apiKeyLimits` block belongs to the calling workspace, which a
+/// pool root does not name. A verb that renders limits to an operator
+/// re-describes with [`describe_account`] (#14932).
 pub fn add(
     root: &Path,
     provider: &str,
@@ -379,70 +426,37 @@ pub fn add(
         ));
     }
     write_secret(&path, &format!("{env_name}={secret}\n"))?;
-    Ok(describe(root, provider, &path))
+    Ok(describe(root, provider, &path, &limits::ConfiguredLimits::EMPTY))
 }
 
-/// Atomically replace `path` with `body`: stage a sibling temp file created
-/// `0600` **at open** (so the bytes are never briefly world-readable), write
-/// and flush it, then `rename` it over the target.
+/// Atomically replace `path` with `body` through
+/// [`crate::fs_util::write_atomic`]: a sibling temp file created `0600` **at
+/// open** (so the bytes are never briefly world-readable), written and
+/// `fsync`ed, then `rename`d over the target and the parent directory synced.
 ///
 /// `rename` is what makes every reader safe without taking a lock: selection
 /// reads account files, `.disabled` and `.bad_accounts.json` lock-free, and
 /// with an in-place `O_TRUNC` + `write` it could observe a zero-length or torn
 /// file — which for `.bad_accounts.json` used to mean "no marks" and for
 /// `.disabled` means "nothing is disabled". A reader now sees the old file or
-/// the new one, never a partial one; a crash or `ENOSPC` mid-write strands a
-/// dot-prefixed temp file and leaves the target untouched. Mirrors
-/// `tokens_pool::bad_tokens` / `account_registry` (temp + `rename`).
+/// the new one, never a partial one; a crash mid-write can strand a
+/// dot-prefixed temp file, any I/O error removes it, and either way the target
+/// is left untouched. Mirrors `tokens_pool::bad_tokens` / `account_registry`
+/// (temp + `rename`).
 ///
 /// Also used for the non-secret state files: `reason` in the bad-marks sidecar
 /// is free text an operator may paste a provider error body into, so the whole
 /// provider directory stays uniformly `0600`.
 pub(super) fn write_secret(path: &Path, body: &str) -> Result<(), String> {
-    use std::io::Write;
-    let parent = path
-        .parent()
-        .ok_or_else(|| format!("{} has no parent directory", path.display()))?;
-    let file_name = path
-        .file_name()
-        .and_then(|n| n.to_str())
-        .ok_or_else(|| format!("{} has no file name", path.display()))?;
-    // Dot-prefixed and not `*.env`, so a stranded temp is never an account.
-    let temp = parent.join(format!(
-        ".{}.tmp-{}-{}",
-        file_name.trim_start_matches('.'),
-        std::process::id(),
-        uuid::Uuid::new_v4()
-    ));
-    let mut options = fs::OpenOptions::new();
-    options.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-    }
-    let staged: std::io::Result<()> = (|| {
-        let mut file = options.open(&temp)?;
-        file.write_all(body.as_bytes())?;
-        file.sync_all()?;
-        fs::rename(&temp, path)?;
-        // Durability of the just-written mark across power loss: on most Unix
-        // filesystems a `rename` is not itself durable until the directory
-        // entry is fsynced. Atomicity is already correct without this (a
-        // reader always sees the old file or the new one, never a torn one);
-        // this only narrows "the rename landed but a crash immediately after
-        // loses it" (issue #8450 item 7). Best-effort — `tokens_pool` does not
-        // do this either, and a failure here must not fail the write itself.
-        #[cfg(unix)]
-        if let Ok(dir) = fs::File::open(parent) {
-            let _ = dir.sync_all();
-        }
-        Ok(())
-    })();
-    staged.map_err(|e| {
-        let _ = fs::remove_file(&temp);
-        format!("cannot write {}: {e}", path.display())
-    })
+    crate::fs_util::write_atomic(
+        path,
+        body.as_bytes(),
+        crate::fs_util::AtomicOpts {
+            private: true,
+            sync_dir: true,
+        },
+    )
+    .map_err(|e| format!("cannot write {}: {e}", path.display()))
 }
 
 /// Best-effort in-place overwrite for [`remove`]. Deliberately NOT
@@ -501,6 +515,9 @@ pub fn remove(root: &Path, provider: &str, name: &str) -> Result<(), String> {
 }
 
 /// Take an account out of (or back into) selection without touching its key.
+///
+/// The returned description carries file-declared limits only, as [`add`]
+/// does; re-describe with [`describe_account`] to render the enforced ones.
 pub fn set_enabled(
     root: &Path,
     provider: &str,
@@ -526,7 +543,7 @@ pub fn set_enabled(
         ));
     }
     set_listed(root, provider, DISABLED_FILE, name, !enabled)?;
-    Ok(describe(root, provider, &path))
+    Ok(describe(root, provider, &path, &limits::ConfiguredLimits::EMPTY))
 }
 
 /// Read a name-per-line control file (`.disabled` / `.allowlist`).

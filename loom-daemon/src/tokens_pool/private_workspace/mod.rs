@@ -16,6 +16,9 @@ pub mod export;
 mod forge_auth;
 mod lease;
 mod lifecycle;
+mod mirror;
+#[cfg(test)]
+mod mirror_tests;
 pub mod read_authority;
 #[cfg(test)]
 mod read_authority_tests;
@@ -323,6 +326,13 @@ pub struct DetachedWork {
 /// refused (#14458). The refusal message carries it verbatim so the step's
 /// end can classify the failure by it instead of `unclassified`.
 pub const SEAT_DIRTY_REASON: &str = "seat_dirty";
+
+/// The step-outcome reason of a preparation refused because the seat's
+/// resolved temp directory is unwritable (#14929): a full 512 MB `/tmp`
+/// previously surfaced downstream as a misleading `workspace Git fetch
+/// failed` and dirty-clone refusals. The refusal message carries it verbatim
+/// so the failure names its cause.
+pub const SEAT_TEMP_UNWRITABLE_REASON: &str = "seat_temp_unwritable";
 
 /// One worktree of a clone (the main checkout included) with uncommitted or
 /// untracked files, as the recover listing reports it (#14458). Counted over

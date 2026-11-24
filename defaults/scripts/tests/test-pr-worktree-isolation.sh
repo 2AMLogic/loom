@@ -20,6 +20,16 @@
 #   7. When the PR branch is checked out in the PRIMARY clone, pr-worktree.sh
 #      creates pr-<N> detached at the PR head sha and exits 0 (#14391), both via
 #      the up-front check and via the checkout-failure path.
+#   8. pr-worktree.sh runs the primary checkout's .loom/hooks/post-worktree.sh
+#      exactly once after each successful create or refresh (#15045), with
+#      (worktree path, branch, PR number) from the worktree, and never on a
+#      failed refresh, a builder-held branch, or a missing/non-executable hook;
+#      a failing hook only warns on stderr.
+#   9. builder_holder excludes the PR's own pr-<N> worktree by PHYSICAL path
+#      (#15121): re-entering an attached pr-<N> through a symlinked repo path
+#      (macOS /tmp -> /private/tmp natively; a matching symlink fixture on
+#      Linux) reuses the worktree instead of dying on the builder-wins error,
+#      while a genuine builder holder is still refused.
 #
 # Tests 3-5 run the real pr-worktree.sh against a throwaway git repo with a
 # mocked `gh`, since there is no live forge in CI. Branch-shape classification
@@ -537,6 +547,373 @@ if [[ "$PR_RC7F" -ne 0 ]] && [[ "$(cat .loom/worktrees/pr-996/t14391.txt)" == "l
     pass "failed detached refresh: nonzero exit and local edit preserved"
 else
     fail "failed refresh: expected nonzero + preserved edit (rc=$PR_RC7F): $PR_OUT7F"
+fi
+
+# --- Test 8: provisioning hook runs on successful checkouts only (#15045) ---
+echo ""
+echo "Test 8: pr-worktree.sh provisions checkouts via .loom/hooks/post-worktree.sh (#15045)"
+
+# A recording hook in the PRIMARY checkout (the lookup path worktree.sh uses,
+# which is what pr-worktree.sh must mirror — never the PR's own copy): logs
+# its cwd, the three hook arguments and the checkout sha, prints a marker on
+# stdout (to prove hook stdout is routed to stderr), and can be made to fail
+# or vanish per case below.
+HOOK_LOG="$TMP/hook.log"
+: > "$HOOK_LOG"
+mkdir -p .loom/hooks
+cat > .loom/hooks/post-worktree.sh <<'HOOKEOF'
+#!/usr/bin/env bash
+echo "HOOK-STDOUT-MARKER"
+printf '%s|%s|%s|%s|%s\n' "$(pwd)" "$1" "$2" "$3" "$(git rev-parse HEAD)" >> "${LOOM_TEST_HOOK_LOG:?}"
+exit "${LOOM_TEST_HOOK_RC:-0}"
+HOOKEOF
+chmod +x .loom/hooks/post-worktree.sh
+hook_count() { wc -l < "$HOOK_LOG" | tr -d ' '; }
+
+MOCKBIN5=$(mktemp -d /tmp/loom-pr-iso-mockbin5.XXXXXX)
+trap 'rm -rf "$TMP" "$MOCKBIN" "$MOCKBIN2" "$MOCKBIN3" "$MOCKBIN4" "$MOCKBIN5" "${SYM:-}"; cd "$REPO_ROOT" 2>/dev/null || true' EXIT
+cat > "$MOCKBIN5/gh" <<'MOCKEOF'
+#!/usr/bin/env bash
+# Hook-test `gh` stand-in. `pr view` resolves head branch / head sha
+# (LOOM_TEST_VIEW=none makes it fail); `pr checkout` either performs a REAL
+# git checkout (LOOM_TEST_CHECKOUT_MODE=real), fails silently (=fail), or
+# reports the primary-held-branch collision git itself produces (default).
+if [[ "$1" == "pr" && "$2" == "view" ]]; then
+    [[ "${LOOM_TEST_VIEW:-}" == "none" ]] && exit 1
+    if [[ "$*" == *headRefOid* ]]; then echo "$LOOM_TEST_HEAD_SHA"; else echo "$LOOM_TEST_HEAD_BRANCH"; fi
+    exit 0
+fi
+if [[ "$1" == "pr" && "$2" == "checkout" ]]; then
+    case "${LOOM_TEST_CHECKOUT_MODE:-}" in
+        real) git checkout -q "$LOOM_TEST_HEAD_BRANCH"; exit $? ;;
+        fail) exit 1 ;;
+    esac
+    echo "fatal: '$LOOM_TEST_HEAD_BRANCH' is already used by worktree at '$LOOM_TEST_PRIMARY'" >&2
+    exit 1
+fi
+exit 0
+MOCKEOF
+chmod +x "$MOCKBIN5/gh"
+
+# 8.0: --help documents the provisioning hook.
+HELP_OUT8=$("$PR_WORKTREE_SH" --help 2>&1)
+if grep -q "post-worktree\.sh" <<<"$HELP_OUT8"; then
+    pass "pr-worktree.sh --help documents the post-worktree hook"
+else
+    fail "pr-worktree.sh --help does not mention the post-worktree hook"
+fi
+
+# 8a: fresh attached create runs the hook exactly once, from the worktree,
+#     with <worktree path> <PR head branch> <PR number>; hook stdout is routed
+#     to stderr so the worktree path stays the last stdout line.
+git checkout -q main
+git checkout -q -b fix/hook-fresh
+git commit --allow-empty -q -m "pr 983 change"
+SHA983="$(git rev-parse HEAD)"
+git checkout -q main
+set +e
+PR_OUT8A=$(PATH="$MOCKBIN5:$PATH" LOOM_DEFAULT_BRANCH=main LOOM_TEST_HOOK_LOG="$HOOK_LOG" \
+    LOOM_TEST_HEAD_BRANCH=fix/hook-fresh LOOM_TEST_CHECKOUT_MODE=real "$PR_WORKTREE_SH" 983 2>"$TMP/err-8a")
+RC8A=$?
+set -e
+WT983="$(cd .loom/worktrees/pr-983 && pwd)"
+if [[ "$RC8A" -eq 0 ]] && [[ "$(hook_count)" -eq 1 ]]; then
+    pass "fresh attached create runs the hook exactly once and exits 0"
+else
+    fail "fresh attached create: expected rc=0 and exactly one hook record (rc=$RC8A, records=$(hook_count)): $PR_OUT8A"
+fi
+if grep -qF "${WT983}|${WT983}|fix/hook-fresh|983|${SHA983}" "$HOOK_LOG"; then
+    pass "hook runs from the worktree with (path, branch, PR number) and sees the PR head"
+else
+    fail "hook record missing or wrong (want ${WT983}|${WT983}|fix/hook-fresh|983|${SHA983}): $(cat "$HOOK_LOG")"
+fi
+if [[ "$(tail -n1 <<<"$PR_OUT8A")" == "$WT983" ]]; then
+    pass "worktree path remains the last stdout line"
+else
+    fail "last stdout line is not the worktree path: $(tail -n1 <<<"$PR_OUT8A")"
+fi
+if grep -q "HOOK-STDOUT-MARKER" "$TMP/err-8a" && ! grep -q "HOOK-STDOUT-MARKER" <<<"$PR_OUT8A"; then
+    pass "hook stdout is routed to stderr, not stdout"
+else
+    fail "hook stdout leaked to stdout or did not reach stderr"
+fi
+
+# 8b: attached reuse with a successful refresh runs the hook again.
+set +e
+PR_OUT8B=$(PATH="$MOCKBIN5:$PATH" LOOM_DEFAULT_BRANCH=main LOOM_TEST_HOOK_LOG="$HOOK_LOG" \
+    LOOM_TEST_HEAD_BRANCH=fix/hook-fresh LOOM_TEST_CHECKOUT_MODE=real "$PR_WORKTREE_SH" 983 2>/dev/null)
+RC8B=$?
+set -e
+if [[ "$RC8B" -eq 0 ]] && [[ "$(hook_count)" -eq 2 ]] \
+    && grep -q "Refreshed PR branch" <<<"$PR_OUT8B"; then
+    pass "successful attached refresh runs the hook exactly once more"
+else
+    fail "attached refresh: expected rc=0 and a second hook record (rc=$RC8B, records=$(hook_count)): $PR_OUT8B"
+fi
+
+# 8c: attached reuse whose refresh FAILS (the warning fallback) runs no hook.
+BEFORE8C="$(hook_count)"
+set +e
+PR_OUT8C=$(PATH="$MOCKBIN5:$PATH" LOOM_DEFAULT_BRANCH=main LOOM_TEST_HOOK_LOG="$HOOK_LOG" \
+    LOOM_TEST_HEAD_BRANCH=fix/hook-fresh LOOM_TEST_CHECKOUT_MODE=fail "$PR_WORKTREE_SH" 983 2>/dev/null)
+RC8C=$?
+set -e
+if [[ "$RC8C" -eq 0 ]] && [[ "$(hook_count)" -eq "$BEFORE8C" ]] \
+    && grep -q "continuing with existing checkout" <<<"$PR_OUT8C" \
+    && [[ "$(tail -n1 <<<"$PR_OUT8C")" == "$WT983" ]]; then
+    pass "failed attached refresh: no hook run, exit 0, path still returned"
+else
+    fail "failed attached refresh: expected no new hook record, rc=0 and the path (rc=$RC8C, records $(hook_count)): $PR_OUT8C"
+fi
+
+# 8d: detached create (primary holds the branch) runs the hook with the head
+#     branch, which IS known here via `gh pr view`.
+git checkout -q -b fix/hook-detached
+git commit --allow-empty -q -m "pr 982 change"
+SHA982="$(git rev-parse HEAD)"
+BEFORE8D="$(hook_count)"
+set +e
+PR_OUT8D=$(PATH="$MOCKBIN5:$PATH" LOOM_DEFAULT_BRANCH=main LOOM_TEST_HOOK_LOG="$HOOK_LOG" \
+    LOOM_TEST_HEAD_BRANCH=fix/hook-detached LOOM_TEST_HEAD_SHA="$SHA982" \
+    LOOM_TEST_PRIMARY="$PRIMARY_ABS" "$PR_WORKTREE_SH" 982 2>/dev/null)
+RC8D=$?
+set -e
+WT982="$(cd .loom/worktrees/pr-982 && pwd)"
+if [[ "$RC8D" -eq 0 ]] && [[ "$(hook_count)" -eq $((BEFORE8D + 1)) ]] \
+    && grep -qF "${WT982}|${WT982}|fix/hook-detached|982|${SHA982}" "$HOOK_LOG"; then
+    pass "detached create runs the hook once with (path, head branch, PR number, sha)"
+else
+    fail "detached create: hook record wrong or missing (rc=$RC8D, want ${WT982}|${WT982}|fix/hook-detached|982|${SHA982}): $(tail -1 "$HOOK_LOG") / $PR_OUT8D"
+fi
+
+# 8e: detached reuse refresh to a new head sha runs the hook again.
+git commit --allow-empty -q -m "pr 982 follow-up"
+SHA982B="$(git rev-parse HEAD)"
+BEFORE8E="$(hook_count)"
+set +e
+PR_OUT8E=$(PATH="$MOCKBIN5:$PATH" LOOM_DEFAULT_BRANCH=main LOOM_TEST_HOOK_LOG="$HOOK_LOG" \
+    LOOM_TEST_HEAD_BRANCH=fix/hook-detached LOOM_TEST_HEAD_SHA="$SHA982B" \
+    LOOM_TEST_PRIMARY="$PRIMARY_ABS" "$PR_WORKTREE_SH" 982 2>/dev/null)
+RC8E=$?
+set -e
+if [[ "$RC8E" -eq 0 ]] && [[ "$(hook_count)" -eq $((BEFORE8E + 1)) ]] \
+    && grep -qF "${WT982}|${WT982}|fix/hook-detached|982|${SHA982B}" "$HOOK_LOG"; then
+    pass "successful detached refresh runs the hook once at the new sha"
+else
+    fail "detached refresh: expected one new hook record at $SHA982B (rc=$RC8E, records=$(hook_count)): $PR_OUT8E"
+fi
+
+# 8f: detached create with branch metadata UNAVAILABLE (checkout-failure
+#     path, `gh pr view` fails) derives the branch argument from the checkout:
+#     "HEAD" when detached.
+git checkout -q -b fix/hook-detached2
+git commit --allow-empty -q -m "pr 981 change"
+SHA981="$(git rev-parse HEAD)"
+git push -q origin "$SHA981:refs/pull/981/head"
+BEFORE8F="$(hook_count)"
+set +e
+PR_OUT8F=$(PATH="$MOCKBIN5:$PATH" LOOM_DEFAULT_BRANCH=main LOOM_TEST_HOOK_LOG="$HOOK_LOG" \
+    LOOM_TEST_VIEW=none LOOM_TEST_PRIMARY="$PRIMARY_ABS" "$PR_WORKTREE_SH" 981 2>/dev/null)
+RC8F=$?
+set -e
+WT981="$(cd .loom/worktrees/pr-981 && pwd)"
+if [[ "$RC8F" -eq 0 ]] && [[ "$(hook_count)" -eq $((BEFORE8F + 1)) ]] \
+    && grep -qF "${WT981}|${WT981}|HEAD|981|${SHA981}" "$HOOK_LOG"; then
+    pass "detached create without branch metadata passes branch arg 'HEAD'"
+else
+    fail "detached create (view=none): expected a hook record with branch 'HEAD' at $SHA981 (rc=$RC8F, records=$(hook_count)): $PR_OUT8F"
+fi
+
+# 8g: FAILED detached refresh (local edit blocks the move) runs no hook.
+git checkout -q -b tmp-hook-b main
+echo base > thook.txt; git add thook.txt; git commit -q -m "hook base"
+TH_B="$(git rev-parse HEAD)"
+echo new > thook.txt; git commit -q -am "hook new"
+TH_C="$(git rev-parse HEAD)"
+git checkout -q fix/hook-detached
+git -C .loom/worktrees/pr-982 checkout -q --detach "$TH_B"
+echo local > .loom/worktrees/pr-982/thook.txt
+BEFORE8G="$(hook_count)"
+set +e
+PR_OUT8G=$(PATH="$MOCKBIN5:$PATH" LOOM_DEFAULT_BRANCH=main LOOM_TEST_HOOK_LOG="$HOOK_LOG" \
+    LOOM_TEST_HEAD_BRANCH=fix/hook-detached LOOM_TEST_HEAD_SHA="$TH_C" \
+    LOOM_TEST_PRIMARY="$PRIMARY_ABS" "$PR_WORKTREE_SH" 982 2>/dev/null)
+RC8G=$?
+set -e
+if [[ "$RC8G" -ne 0 ]] && [[ "$(hook_count)" -eq "$BEFORE8G" ]]; then
+    pass "failed detached refresh: nonzero exit and no hook run"
+else
+    fail "failed detached refresh: expected rc!=0 and no new hook record (rc=$RC8G, records=$(hook_count)): $PR_OUT8G"
+fi
+
+# 8h: a FAILING hook only warns on stderr; checkout success is preserved.
+git checkout -q main
+git checkout -q -b fix/hook-failing
+git commit --allow-empty -q -m "pr 980 change"
+git checkout -q main
+BEFORE8H="$(hook_count)"
+set +e
+PR_OUT8H=$(PATH="$MOCKBIN5:$PATH" LOOM_DEFAULT_BRANCH=main LOOM_TEST_HOOK_LOG="$HOOK_LOG" \
+    LOOM_TEST_HOOK_RC=1 LOOM_TEST_HEAD_BRANCH=fix/hook-failing \
+    LOOM_TEST_CHECKOUT_MODE=real "$PR_WORKTREE_SH" 980 2>"$TMP/err-8h")
+RC8H=$?
+set -e
+WT980="$(cd .loom/worktrees/pr-980 && pwd)"
+if [[ "$RC8H" -eq 0 ]] && [[ "$(hook_count)" -eq $((BEFORE8H + 1)) ]] \
+    && grep -q "hook failed" "$TMP/err-8h" \
+    && [[ "$(tail -n1 <<<"$PR_OUT8H")" == "$WT980" ]]; then
+    pass "failing hook: warns on stderr, exit 0, worktree path still the last stdout line"
+else
+    fail "failing hook: expected rc=0 + stderr warning + path on stdout (rc=$RC8H): $PR_OUT8H / $(cat "$TMP/err-8h")"
+fi
+
+# 8i: a MISSING hook is skipped silently (no warning, still success).
+mv .loom/hooks/post-worktree.sh .loom/hooks/post-worktree.sh.hidden
+git checkout -q -b fix/hook-missing
+git commit --allow-empty -q -m "pr 979 change"
+git checkout -q main
+BEFORE8I="$(hook_count)"
+set +e
+PR_OUT8I=$(PATH="$MOCKBIN5:$PATH" LOOM_DEFAULT_BRANCH=main LOOM_TEST_HOOK_LOG="$HOOK_LOG" \
+    LOOM_TEST_HEAD_BRANCH=fix/hook-missing LOOM_TEST_CHECKOUT_MODE=real "$PR_WORKTREE_SH" 979 2>"$TMP/err-8i")
+RC8I=$?
+set -e
+mv .loom/hooks/post-worktree.sh.hidden .loom/hooks/post-worktree.sh
+if [[ "$RC8I" -eq 0 ]] && [[ "$(hook_count)" -eq "$BEFORE8I" ]] \
+    && ! grep -qi "hook" "$TMP/err-8i"; then
+    pass "missing hook: skipped silently, exit 0"
+else
+    fail "missing hook: expected silent skip and rc=0 (rc=$RC8I): $PR_OUT8I / $(cat "$TMP/err-8i")"
+fi
+
+# 8j: a NON-EXECUTABLE hook is skipped silently.
+git checkout -q -b fix/hook-noexec
+git commit --allow-empty -q -m "pr 978 change"
+git checkout -q main
+chmod -x .loom/hooks/post-worktree.sh
+BEFORE8J="$(hook_count)"
+set +e
+PR_OUT8J=$(PATH="$MOCKBIN5:$PATH" LOOM_DEFAULT_BRANCH=main LOOM_TEST_HOOK_LOG="$HOOK_LOG" \
+    LOOM_TEST_HEAD_BRANCH=fix/hook-noexec LOOM_TEST_CHECKOUT_MODE=real "$PR_WORKTREE_SH" 978 2>"$TMP/err-8j")
+RC8J=$?
+set -e
+chmod +x .loom/hooks/post-worktree.sh
+if [[ "$RC8J" -eq 0 ]] && [[ "$(hook_count)" -eq "$BEFORE8J" ]] \
+    && ! grep -qi "hook" "$TMP/err-8j"; then
+    pass "non-executable hook: skipped silently, exit 0"
+else
+    fail "non-executable hook: expected silent skip and rc=0 (rc=$RC8J): $PR_OUT8J / $(cat "$TMP/err-8j")"
+fi
+
+# 8k: builder-held branch (exit 1, no checkout created) runs no hook.
+git checkout -q -b feature/issue-977
+git commit --allow-empty -q -m "pr 977 change"
+git checkout -q main
+git worktree add -q .loom/worktrees/issue-977 feature/issue-977
+BEFORE8K="$(hook_count)"
+set +e
+PR_OUT8K=$(PATH="$MOCKBIN5:$PATH" LOOM_DEFAULT_BRANCH=main LOOM_TEST_HOOK_LOG="$HOOK_LOG" \
+    LOOM_TEST_HEAD_BRANCH=feature/issue-977 "$PR_WORKTREE_SH" 977 2>/dev/null)
+RC8K=$?
+set -e
+git worktree remove --force .loom/worktrees/issue-977
+if [[ "$RC8K" -eq 1 ]] && [[ "$(hook_count)" -eq "$BEFORE8K" ]]; then
+    pass "builder-held branch: exit 1 and no hook run"
+else
+    fail "builder-held branch: expected rc=1 and no new hook record (rc=$RC8K, records=$(hook_count)): $PR_OUT8K"
+fi
+
+# --- Test 9: builder_holder compares physical paths (#15121) ---
+echo ""
+echo "Test 9: pr-worktree.sh re-enters its own attached pr-<N> through a symlinked repo path (#15121)"
+
+# `git worktree list --porcelain` prints physical spellings while
+# pr-worktree.sh's WORKTREE_PATH keeps the logical spelling the repo was
+# reached by; a string compare then reports the PR's own pr-<N> as a foreign
+# builder holder and re-entry dies with the builder-wins error (CI Daily run
+# 45250283620, macOS /tmp -> /private/tmp). On Linux the same spelling split
+# is built by giving the repo a real location whose absolute path literally
+# ends with the symlink's own path string — the /tmp-into-/private/tmp shape —
+# so the reuse gate's unanchored grep still matches the physical spelling
+# while the porcelain compare splits, exactly as on macOS.
+SYM=$(mktemp -d /tmp/loom-pr-iso-sym.XXXXXX)
+SYM_BASE=$(basename "$SYM")
+SYM_PHYS="$SYM/priv/tmp/$SYM_BASE/repo"
+mkdir -p "$SYM_PHYS"
+# git prints the physical spelling in porcelain output; on macOS /tmp is a
+# symlink to /private/tmp, so the 9a expectation must be canonicalised too.
+SYM_PHYS_REAL="$(cd "$SYM_PHYS" && pwd -P)"
+git init -q -b main "$SYM/origin.git" --bare
+git -C "$SYM_PHYS" init -q -b main
+git -C "$SYM_PHYS" config user.email t@t
+git -C "$SYM_PHYS" config user.name t
+git -C "$SYM_PHYS" commit --allow-empty -q -m init
+git -C "$SYM_PHYS" remote add origin "$SYM/origin.git"
+git -C "$SYM_PHYS" push -q origin main
+ln -s "$SYM_PHYS" "$SYM/repo"
+mkdir -p "$SYM/repo/.loom/hooks"
+cat > "$SYM/repo/.loom/hooks/post-worktree.sh" <<'HOOKEOF'
+#!/usr/bin/env bash
+printf '%s|%s|%s|%s|%s\n' "$(pwd)" "$1" "$2" "$3" "$(git rev-parse HEAD)" >> "${LOOM_TEST_HOOK_LOG:?}"
+exit 0
+HOOKEOF
+chmod +x "$SYM/repo/.loom/hooks/post-worktree.sh"
+
+# 9a: create an attached pr-991 through the symlinked path (sets up 9b).
+git -C "$SYM_PHYS" checkout -q -b fix/symlink-reentry
+git -C "$SYM_PHYS" commit --allow-empty -q -m "pr 991 change"
+git -C "$SYM_PHYS" checkout -q main
+set +e
+PR_OUT9A=$(cd "$SYM/repo" && PATH="$MOCKBIN5:$PATH" LOOM_DEFAULT_BRANCH=main \
+    LOOM_TEST_HOOK_LOG="$HOOK_LOG" LOOM_TEST_HEAD_BRANCH=fix/symlink-reentry \
+    LOOM_TEST_CHECKOUT_MODE=real "$PR_WORKTREE_SH" 991 2>/dev/null)
+RC9A=$?
+set -e
+WT991="$SYM/repo/.loom/worktrees/pr-991"
+if [[ "$RC9A" -eq 0 ]] && [[ -d "$WT991" ]] \
+    && git -C "$SYM_PHYS" worktree list --porcelain | grep -q "worktree $SYM_PHYS_REAL/.loom/worktrees/pr-991$"; then
+    pass "symlinked repo path: attached pr-<N> created (git registers the physical spelling)"
+else
+    fail "symlinked repo path: attached create failed (rc=$RC9A): $PR_OUT9A"
+fi
+
+# 9b: RE-ENTER the PR's own attached pr-991 through the same symlinked path —
+#     the macOS Test 8b/8c failure. Must reuse + refresh (rc=0, one more hook
+#     record), not die on the builder-wins error.
+BEFORE9B="$(hook_count)"
+set +e
+PR_OUT9B=$(cd "$SYM/repo" && PATH="$MOCKBIN5:$PATH" LOOM_DEFAULT_BRANCH=main \
+    LOOM_TEST_HOOK_LOG="$HOOK_LOG" LOOM_TEST_HEAD_BRANCH=fix/symlink-reentry \
+    LOOM_TEST_CHECKOUT_MODE=real "$PR_WORKTREE_SH" 991 2>/dev/null)
+RC9B=$?
+set -e
+if [[ "$RC9B" -eq 0 ]] && [[ "$(hook_count)" -eq $((BEFORE9B + 1)) ]] \
+    && grep -q "already exists at $WT991 (reusing)" <<<"$PR_OUT9B" \
+    && ! grep -q "Reuse the existing worktree directly" <<<"$PR_OUT9B" \
+    && [[ "$(tail -n1 <<<"$PR_OUT9B")" == "$WT991" ]]; then
+    pass "symlinked repo path: re-entering the PR's own attached pr-<N> reuses it (rc=0)"
+else
+    fail "symlinked re-entry: expected rc=0, reuse message and one hook record (rc=$RC9B, records=$(hook_count)): $PR_OUT9B"
+fi
+
+# 9c: a GENUINE builder holder is still refused through the symlinked path.
+git -C "$SYM_PHYS" checkout -q -b feature/issue-992
+git -C "$SYM_PHYS" commit --allow-empty -q -m "pr 992 change"
+git -C "$SYM_PHYS" checkout -q main
+git -C "$SYM_PHYS" worktree add -q "$SYM_PHYS/.loom/worktrees/issue-992" feature/issue-992
+BEFORE9C="$(hook_count)"
+set +e
+PR_OUT9C=$(cd "$SYM/repo" && PATH="$MOCKBIN5:$PATH" LOOM_DEFAULT_BRANCH=main \
+    LOOM_TEST_HOOK_LOG="$HOOK_LOG" LOOM_TEST_HEAD_BRANCH=feature/issue-992 \
+    "$PR_WORKTREE_SH" 992 2>/dev/null)
+RC9C=$?
+set -e
+git -C "$SYM_PHYS" worktree remove --force "$SYM_PHYS/.loom/worktrees/issue-992"
+if [[ "$RC9C" -eq 1 ]] && [[ "$(hook_count)" -eq "$BEFORE9C" ]] \
+    && grep -q "Reuse the existing worktree directly" <<<"$PR_OUT9C"; then
+    pass "symlinked repo path: genuine builder holder still refused (rc=1)"
+else
+    fail "symlinked genuine holder: expected rc=1 and no hook record (rc=$RC9C, records=$(hook_count)): $PR_OUT9C"
 fi
 
 cd "$REPO_ROOT"

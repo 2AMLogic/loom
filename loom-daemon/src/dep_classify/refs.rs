@@ -67,14 +67,20 @@ fn ref_re() -> &'static Regex {
     })
 }
 
-/// The `Part of #N` parent-reference shape: optional markdown emphasis around
-/// the phrase, then punctuation/emphasis/whitespace, then the reference —
-/// bare `#N` or `owner/repo#N` — that phrase introduces (#14732).
+/// The `Part of #N` / `Part of Epic #N` parent-reference shape: optional
+/// markdown emphasis around the phrase, an optional **bounded** `Epic` word
+/// (`Part of Epic #<n>` is Loom's own generated vocabulary —
+/// `champion-epic.md` / `epic.md` write it into every epic-phase issue's
+/// `## Dependencies` section; no other word is admitted, so prose like
+/// `Part of the work tracked in #2` stays a whole-line capture), then
+/// punctuation/emphasis/whitespace, then the reference — bare `#N` or
+/// `owner/repo#N` — that phrase introduces (#14732; the Epic word and the
+/// case-insensitive shell agreement are #14750).
 fn part_of_re() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| {
         Regex::new(
-            r"(?i)(?:\*\*|__|\*|_)*part of(?:\*\*|__|\*|_)*[*_:\s]*(?:[A-Za-z0-9._-]+/[A-Za-z0-9._-]+)?#[0-9]+",
+            r"(?i)(?:\*\*|__|\*|_)*part of(?:\*\*|__|\*|_)*(?:[*_:\s]*epic)?[*_:\s]*(?:[A-Za-z0-9._-]+/[A-Za-z0-9._-]+)?#[0-9]+",
         )
         .expect("static part-of pattern")
     })
@@ -141,8 +147,9 @@ pub fn dependency_lines(body: &str, default_repo: &str) -> Vec<(String, Vec<Stri
     out
 }
 
-/// Byte spans of the `Part of #N` parent references in `line` — the regions
-/// [`dependency_lines`] ignores when collecting blockers (#14732).
+/// Byte spans of the `Part of #N` / `Part of Epic #N` parent references in
+/// `line` — the regions [`dependency_lines`] ignores when collecting blockers
+/// (#14732; the bounded `Epic` word is #14750).
 ///
 /// Like the `(Epic #M …)` exclusion in [`extract_refs`], the filter is
 /// **structural, not positional**: it keys off `Part of` introducing a

@@ -458,6 +458,18 @@ pub(crate) fn may_write_decision(
     repo: Option<&str>,
     gh: &Path,
 ) -> (Decision, Option<PathBuf>) {
+    let (decision, credential_dir, _) = may_write_decision_conn(cwd, repo, gh);
+    (decision, credential_dir)
+}
+
+/// [`may_write_decision`] plus the Gitea connection the probe resolved and
+/// vetted (`None` off Gitea or when it could not resolve) — the one a vetted
+/// write must carry (#14940).
+pub(crate) fn may_write_decision_conn(
+    cwd: &Path,
+    repo: Option<&str>,
+    gh: &Path,
+) -> (Decision, Option<PathBuf>, Option<crate::forge_cmd::GiteaConfig>) {
     let root = checkout_root(cwd);
     let remotes = target::read_remotes(&root);
     let origin = target::origin_nwo(&remotes);
@@ -476,6 +488,7 @@ pub(crate) fn may_write_decision(
                         format!("`{r}` is not an OWNER/REPO"),
                     ),
                     None,
+                    None,
                 )
             }
         },
@@ -487,7 +500,7 @@ pub(crate) fn may_write_decision(
     let credential_dir =
         crate::credential_preflight::gh_config_dir_for_call(Some(cwd), explicit_nwo);
     let managed = |r: &str| is_managed(&root, origin.as_deref(), r);
-    let probe = probe_for(&root, credential_dir.clone(), gh);
+    let (probe, connection) = probe_for_conn(&root, credential_dir.clone(), gh);
     let decision = decide_classified(
         &Inputs {
             target,
@@ -497,7 +510,21 @@ pub(crate) fn may_write_decision(
         },
         probe.as_ref(),
     );
-    (decision, credential_dir)
+    (decision, credential_dir, connection)
+}
+
+/// [`may_write_from`] plus the Gitea connection its probe vetted (#14940), so
+/// the write that follows carries exactly that connection.
+#[must_use]
+pub fn may_write_from_with_connection(
+    cwd: &Path,
+    repo: Option<&str>,
+) -> (Verdict, Option<crate::forge_cmd::GiteaConfig>) {
+    let (decision, credential_dir, connection) = may_write_decision_conn(cwd, repo, &default_gh());
+    if !decision.verdict.is_allowed() {
+        emit_refused(cwd, credential_dir.as_deref(), &decision, "may_write_from");
+    }
+    (decision.verdict, connection)
 }
 
 /// The production probe for writes made from `root` under `config_dir` (a
@@ -506,19 +533,37 @@ pub(crate) fn may_write_decision(
 /// own API, #9699); when its connection cannot even resolve, the probe
 /// answers `Unknown` and the decision refuses — the fail-closed rule.
 fn probe_for(root: &Path, config_dir: Option<PathBuf>, gh: &Path) -> Box<dyn PermissionProbe> {
+    probe_for_conn(root, config_dir, gh).0
+}
+
+/// [`probe_for`] plus the Gitea connection the probe resolved (`None` off
+/// Gitea), so a caller can write with the connection that was vetted.
+fn probe_for_conn(
+    root: &Path,
+    config_dir: Option<PathBuf>,
+    gh: &Path,
+) -> (Box<dyn PermissionProbe>, Option<crate::forge_cmd::GiteaConfig>) {
     if crate::forge_cmd::detect_forge(Some(root)) == crate::forge_cmd::ForgeType::Gitea {
         // The Gitea probe names its own key space (forge + base URL +
         // connection digest); an unresolved connection has none and is never
         // cached or graced.
-        return Box::new(probe::Cached {
-            inner: probe::GiteaProbe::for_root(root),
-            key_dir: config_dir,
-        });
+        let inner = probe::GiteaProbe::for_root(root);
+        let connection = inner.connection();
+        return (
+            Box::new(probe::Cached {
+                inner,
+                key_dir: config_dir,
+            }),
+            connection,
+        );
     }
-    Box::new(probe::Cached {
-        inner: probe::GhProbe::new(gh.to_path_buf(), config_dir.clone()),
-        key_dir: config_dir,
-    })
+    (
+        Box::new(probe::Cached {
+            inner: probe::GhProbe::new(gh.to_path_buf(), config_dir.clone()),
+            key_dir: config_dir,
+        }),
+        None,
+    )
 }
 
 /// [`probe_for`] under `root`'s own credential, run through `gh`.
