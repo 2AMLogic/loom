@@ -42,10 +42,14 @@
 #      byte-identical to the pre-fix render (the #15201 block and the row
 #      stripped from the function) — update_work_plan() compares the region
 #      byte-for-byte.
-#   5. Registry-driven: an unmigrated retired hold name is counted, an issue
+#   5. #15228: a listing read that puts non-JSON on stdout breaks the loop's
+#      jq -s 'add // []' slurp (exit 5, no output), leaving $held_unbucketed
+#      empty — the row's ${held_unbucketed:-0} guard renders 0, never an
+#      empty cell (the same empty-input guard count() gives sibling rows).
+#   6. Registry-driven: an unmigrated retired hold name is counted, an issue
 #      carrying two hold labels is counted once, and the daemon-failure
 #      fallback list still counts a `loom:blocked` issue.
-#   6. NEGATIVE CONTROL: the pre-fix body renders no such row and the parked
+#   7. NEGATIVE CONTROL: the pre-fix body renders no such row and the parked
 #      issue nowhere — i.e. this test would have failed before the fix.
 #
 # Hermetic: `gh` and `loom-daemon` are stubbed with fixture JSON; only the
@@ -94,7 +98,7 @@ ROW='| Held, no other bucket |'
 # update_work_plan() compares byte-for-byte must differ from it by exactly
 # that one row.
 OLD_BODY="$(awk '/^  # #15201:/ {s = 1} s && /^  section "Operator Attention/ {s = 0} !s' <<<"$RPB_BODY" \
-    | grep -vF -- "$ROW \$held_unbucketed |")"
+    | grep -vF -- "$ROW \${held_unbucketed:-0} |")"
 # The #15201 block alone, for the structural assertions.
 HELD_BLOCK="$(awk '/^  # #15201:/ {s = 1} s && /^  section "Operator Attention/ {s = 0} s' <<<"$RPB_BODY")"
 
@@ -104,10 +108,10 @@ HELD_BLOCK="$(awk '/^  # #15201:/ {s = 1} s && /^  section "Operator Attention/ 
 echo ""
 echo "Test 1: the row exists in Backlog Balance and derives from the registry sets"
 
-if grep -qF -- "$ROW \$held_unbucketed |" <<<"$RPB_BODY"; then
+if grep -qF -- "$ROW \${held_unbucketed:-0} |" <<<"$RPB_BODY"; then
     pass "render_plan_body() renders a 'Held, no other bucket' Backlog Balance row"
 else
-    fail "expected a '| Held, no other bucket | \$held_unbucketed |' row in render_plan_body()"
+    fail "expected a '| Held, no other bucket | \${held_unbucketed:-0} |' row in render_plan_body()"
 fi
 
 if [[ -n "$HELD_BLOCK" ]]; then
@@ -223,9 +227,10 @@ chmod +x "$TMPROOT/bin-fail/loom-daemon"
 
 # render_with <fixture-dir> <function-body> [<path-prepend>] (default: the registry stub dir, so a host with no loom-daemon, as on CI, still answers): eval the shared
 # helpers and the body, then run the real render_plan_body() against the stubs.
+# LOOM_TEST_GH_READ overrides the gh stub (poisoned-read variants, #15228).
 render_with() {
     local fix="$1" body="$2" prepend="${3:-$TMPROOT/bin}"
-    PATH="$prepend:$PATH" LOOM_FIXTURE_DIR="$fix" GH_READ="$GH_STUB" HELPERS_SRC="$HELPERS_BODY" RPB_SRC="$body" \
+    PATH="$prepend:$PATH" LOOM_FIXTURE_DIR="$fix" GH_READ="${LOOM_TEST_GH_READ:-$GH_STUB}" HELPERS_SRC="$HELPERS_BODY" RPB_SRC="$body" \
         bash -c 'eval "$HELPERS_SRC"; eval "$RPB_SRC"; render_plan_body'
 }
 # A copy of fixture dir $1 holding ONLY issue $2 (every other item removed).
@@ -408,10 +413,45 @@ assert_eq "$(grep -c '^## ' <<<"$RENDER_AC1_OLD")" "$(grep -c '^## ' <<<"$RENDER
     "the fix adds no section"
 
 # ---------------------------------------------------------------------------
-# Test 5: registry-driven — retired hold name, two holds, fallback list
+# Test 5 (AC, #15228): a poisoned listing read renders 0, not an empty cell
 # ---------------------------------------------------------------------------
 echo ""
-echo "Test 5: the count follows the registry hold set"
+echo "Test 5: a read that puts non-JSON on stdout renders 0, not an empty cell"
+
+# Every sibling row reads its count through count(), which guards empty input
+# ('[ -z "$1" ] && printf 0'), but the held row read $held_unbucketed raw: a
+# listing that puts non-JSON on stdout makes the loop's 'jq -s add // []'
+# slurp fail (exit 5, no output), and jq on the then-empty stream prints
+# nothing (exit 0) — so the row rendered '| Held, no other bucket |  |'.
+# gh writes errors to stderr, so only a stdout pollutant (e.g. a stale cache
+# read behind $GH_READ) produces this shape. Variant stub: one hold-label
+# issue listing answers non-JSON on stdout; everything else delegates to the
+# fixture stub.
+GH_STUB_GARBAGE="$TMPROOT/gh-stub-garbage"
+cat > "$GH_STUB_GARBAGE" <<STUB
+#!/usr/bin/env bash
+label=""; prev=""
+for a in "\$@"; do
+  [[ "\$prev" = "--label" ]] && label="\$a"
+  prev="\$a"
+done
+if [[ "\${1:-}" = issue && "\$label" = loom:blocked ]]; then
+  printf 'stale cache entry: non-JSON on stdout\n'
+  exit 0
+fi
+exec "$GH_STUB" "\$@"
+STUB
+chmod +x "$GH_STUB_GARBAGE"
+
+RENDER_GARBAGE="$(LOOM_TEST_GH_READ="$GH_STUB_GARBAGE" render_with "$FIX" "$RPB_BODY")"
+assert_eq "| Held, no other bucket | 0 |" "$(row_of "$RENDER_GARBAGE")" \
+    "a read that emits non-JSON on stdout renders '| Held, no other bucket | 0 |', never an empty cell (#15228)"
+
+# ---------------------------------------------------------------------------
+# Test 6: registry-driven — retired hold name, two holds, fallback list
+# ---------------------------------------------------------------------------
+echo ""
+echo "Test 6: the count follows the registry hold set"
 
 FIX5="$TMPROOT/ac5"
 mkdir -p "$FIX5"
@@ -436,10 +476,10 @@ assert_eq "| Held, no other bucket | 0 |" "$(row_of "$(render_with "$TMPROOT/onl
     "fallback list cannot count the retired name (it only knows the three holds)"
 
 # ---------------------------------------------------------------------------
-# Test 6: NEGATIVE CONTROL — the pre-fix body renders no row and no #9101
+# Test 7: NEGATIVE CONTROL — the pre-fix body renders no row and no #9101
 # ---------------------------------------------------------------------------
 echo ""
-echo "Test 6: negative control — the pre-fix render has no row (bug reproduced)"
+echo "Test 7: negative control — the pre-fix render has no row (bug reproduced)"
 
 if [[ -z "$(row_of "$RENDER_AC1_OLD")" ]]; then
     pass "the pre-fix render has no 'Held, no other bucket' row"
