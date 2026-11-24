@@ -43,8 +43,7 @@ fn base_modified_and_405_keep_their_own_routes() {
 
 /// The whole point of the module. A body naming BOTH branches must take the
 /// head-mismatch route: routing it to `BaseModified` would answer a head that
-/// moved past the approved SHA with `forge_update_branch` and another merge
-/// attempt.
+/// moved past the approved SHA with a sleep and another merge attempt.
 ///
 /// In the shell this was two `if` blocks five lines apart, and the only thing
 /// asserting their order was an `awk` scan for which `grep` appeared first in
