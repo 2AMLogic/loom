@@ -475,14 +475,8 @@ _check_expected_head "$PR_HEAD_SHA"
 # the tip could not be pinned at all. --allow-stacked-children skips past that
 # block; --dry-run reports the would-be outcome and writes no ref.
 #
-# It emits `CHILDREN`/`PIN-WRITTEN`/`WARNING`/`BLOCK<TAB>line` records, replayed
-# below through this script's own warning/error so the operator-visible text is
-# unchanged from before the port. `CHILDREN` carries the pre-merge snapshot the
-# post-merge reconcile prefers (#8010 item 2); `PIN-WRITTEN` fires only where a
-# ref was actually written, which is what the item-3 re-pin must gate on (a
-# bypass finds children without pinning). The two globals are plain (non-local)
-# assignments so they survive this function returning, and are read as
-# `${VAR:-}` everywhere else so a standalone invocation still behaves as before.
+# Replay WARNING and BLOCK records for the operator. Only PIN-WRITTEN permits
+# a later re-pin. The daemon discovers children again after merge (#14905).
 #
 # Exit 1 WITH a BLOCK record refuses; any other non-zero is a guard FAULT and
 # warns-and-proceeds. Unlike every gate below this one, that is fail-OPEN, and
@@ -503,17 +497,15 @@ _check_no_open_stacked_children() {
   # Only GitHub can have Loom-style stacked children; the parent-branch shape
   # gate is the Rust side's (it returns before any forge call).
   [[ "$FORGE_TYPE" == "github" ]] || return 0
-  local out rc=0 level text children_json="" warn="" blk="" flags=()
+  local out rc=0 level text warn="" blk="" flags=()
   [[ "${DRY_RUN:-false}" != "true" ]] || flags+=(--dry-run)
   [[ "${ALLOW_STACKED_CHILDREN:-false}" != "true" ]] || flags+=(--allow-stacked-children)
   out="$("${LOOM_DAEMON_BIN:-loom-daemon}" merge-pr stacked-children --repo "$REPO_NWO" --repo-root "$REPO_ROOT" --branch "$PR_BRANCH" --head-sha "$PR_HEAD_SHA" --pr "$PR_NUMBER" ${flags[@]+"${flags[@]}"})" || rc=$?
   while IFS=$'\t' read -r level text; do case "$level" in
-    CHILDREN) children_json="$text" ;;
     PIN-WRITTEN) STACKED_CHILDREN_PIN_WRITTEN=true ;;
     WARNING) warn+="${warn:+$'\n'}$text" ;;
     BLOCK) blk+="${blk:+$'\n'}$text" ;;
   esac; done <<< "$out"
-  [[ -z "$children_json" ]] || STACKED_CHILDREN_JSON="$children_json"
   [[ -z "$warn" ]] || warning "$warn"
   [[ $rc -ne 1 || -z "$blk" ]] || error "$blk"
   [[ $rc -eq 0 ]] || warning "The merge-ordering guard (#3747 item 2) did not run — '${LOOM_DAEMON_BIN:-loom-daemon} merge-pr stacked-children' exited $rc (a loom-daemon predating #8191's slice has no such verb). Proceeding, because this guard establishes a postcondition for the POST-merge stacked reconcile rather than judging this tree: a skip costs at most one manual './.loom/scripts/reconcile-stack.sh <child-pr> $PR_BRANCH' against tip $PR_HEAD_SHA, never a wrong merge. Restore it by rolling this host: ${SCRIPT_DIR:-.loom/scripts}/cli/loom-daemon-update.sh --fetch. $(! declare -F _mp_daemon_roll_hint >/dev/null || _mp_daemon_roll_hint merge-pr "$(command -v "${LOOM_DAEMON_BIN:-loom-daemon}" 2>/dev/null || true)")"
@@ -1226,11 +1218,8 @@ _apply_champion_hold_release  # #14101: release writes only once the required-co
 # wrong commit range. Gated on `$DRY_RUN != true` — this runs unconditionally
 # ahead of both merge paths' own dry-run checks below, and the guard's pin
 # path honors the "dry-run never mutates local refs" contract, so this must
-# too. Gated on STACKED_CHILDREN_PIN_WRITTEN, NOT STACKED_CHILDREN_JSON: the
-# latter is set as soon as the guard FINDS an open child, even on the
-# --allow-stacked-children bypass path that returns without ever writing a
-# pin — gating on it would silently create a pin the guard itself declined
-# to create.
+# too. A bypass can find children without writing a pin. Re-pin only after
+# the guard has reported a successful write.
 [[ "$DRY_RUN" != "true" && "${STACKED_CHILDREN_PIN_WRITTEN:-}" == "true" && "$MERGE_PRECONDITION_SHA" != "$PR_HEAD_SHA" ]] && { git -C "$REPO_ROOT" update-ref "refs/loom/parent/$PR_BRANCH" "$MERGE_PRECONDITION_SHA" 2>/dev/null || true; }
 
 # The --auto settle-wait, the head/label re-validation after it, the SYNC branch update and the

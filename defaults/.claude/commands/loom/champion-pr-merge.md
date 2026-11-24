@@ -3554,12 +3554,10 @@ queue merge, or one made on the forge — from a record pinned under
 Do not duplicate any of it here. A second writer would race the daemon's
 once-per-merge comment dedupe and its reopened-after-merge check.
 
-**What Champion still owes: do not act on an issue the gate would hold.** The
-daemon runs a tick later, so right after the merge a gated issue is still
-`CLOSED` (GitHub's own close) and Step 5 would read that as "done" and unblock
-its dependents — the unsound "merged ⇒ done" inference the gate exists to stop.
-So before Step 5, derive the issues that are **safe to treat as closed** with a
-**read-only** classification; it writes nothing.
+**Before unblocking dependents, check which linked issues are ready.** GitHub can
+already show an issue as closed while the daemon still has to reopen it for
+unverified acceptance criteria or a negated-only reference (#1057). Read the
+merged PR and its merge commit once, then check each target before Step 5.
 
 ```bash
 PR_NUMBER=$1
@@ -3579,19 +3577,36 @@ forge_detect
 LINKED_ISSUES=$(forge_pr_close_targets "$PR_NUMBER")
 [ -z "$LINKED_ISSUES" ] && { echo "No linked issues found in PR body"; exit 0; }
 
-# The merged head (the tree any `loom:ac-verified` marker must name).
-HEAD_SHA=$(gh api "repos/{owner}/{repo}/pulls/$PR_NUMBER" --jq .head.sha 2>/dev/null)
-
 READY_TO_UNBLOCK=""
+# A failed read leaves the readiness list empty. An empty PR body is valid:
+# the squash commit alone can say "does not fix #N".
+REPO=$(forge_get_repo_nwo) || exit 1
+PR_JSON=$(forge_get_pr "$REPO" "$PR_NUMBER") || exit 1
+HEAD_SHA=$(jq -er '.head.sha | strings | select(length > 0)' <<<"$PR_JSON") || exit 1
+MERGE_SHA=$(jq -er 'select(.merged == true) | .merge_commit_sha | strings | select(length > 0)' <<<"$PR_JSON") || exit 1
+PR_BODY=$(jq -er '(.body // "") | strings' <<<"$PR_JSON") || exit 1
+if [ "$FORGE_TYPE" = gitea ]; then
+  COMMIT_JSON=$(gitea_api GET "repos/$REPO/git/commits/$MERGE_SHA") || exit 1
+else
+  COMMIT_JSON=$(gh api "repos/$REPO/commits/$MERGE_SHA") || exit 1
+fi
+MERGE_MESSAGE=$(jq -er '.commit.message | strings' <<<"$COMMIT_JSON") || exit 1
+
 for issue in $LINKED_ISSUES; do
+  REF_RC=0
+  loom-daemon merge-pr-refs has-unnegated-closing-ref --issue "$issue" <<<"$PR_BODY"$'\n'"$MERGE_MESSAGE" || REF_RC=$?
+  # 3 means no textual match, e.g. a Development sidebar link. Only a
+  # readable, non-negated target may use GitHub's current CLOSED state.
+  case "$REF_RC" in 0|3) ;; *) continue ;; esac
   if ac_gate_enabled; then
     # Read-only classifier. 0 CLEAR / 10 NO-AC / 11 SATISFIED pass; 12 UNVERIFIED,
     # 13 STALE-MARKER and 1 ERROR do NOT ("could not run" is not "criteria met").
-    ./.loom/scripts/classify-ac-verification.sh --issue "$issue" --pr "$PR_NUMBER" --head-sha "$HEAD_SHA" >/dev/null
-    case $? in 0|10|11) ;; *) echo "Issue #$issue: out-of-band AC unverified — NOT unblocking dependents (the daemon holds the close)"; continue ;; esac
+    AC_RC=0
+    ./.loom/scripts/classify-ac-verification.sh --issue "$issue" --pr "$PR_NUMBER" --head-sha "$HEAD_SHA" >/dev/null || AC_RC=$?
+    case "$AC_RC" in 0|10|11) ;; *) echo "Issue #$issue: out-of-band AC unverified — NOT unblocking dependents (the daemon holds the close)"; continue ;; esac
   fi
-  # Plain `gh`, not "$GH_READ": this gates a write and must see post-merge state.
-  [ "$(gh issue view "$issue" --json state --jq .state 2>/dev/null)" = "CLOSED" ] && READY_TO_UNBLOCK="$READY_TO_UNBLOCK $issue"
+  # Read the live state for this unblocking decision.
+  if [ "$(forge_get_issue_state "$REPO" "$issue")" = "CLOSED" ]; then READY_TO_UNBLOCK="$READY_TO_UNBLOCK $issue"; fi
 done
 # Step 5 runs only for $READY_TO_UNBLOCK. An issue still OPEN or skipped above is
 # picked up on a later pass, once the daemon has finished with it or a human has
@@ -3760,12 +3775,10 @@ broader list would still miss the next phrasing while flagging ordinary prose.
 
 After verifying issue closure, check for blocked issues that can now be unblocked.
 
-**Run this only for issues in Step 4's `READY_TO_UNBLOCK` list.** An issue the
-Out-of-Band Acceptance-Criteria Gate would hold (the daemon reopens it on its next
-tick) is, by construction, *not* done — unblocking
-its dependents would propagate the same unsound "merged ⇒ done" inference one
-level further out. Skip it in this step and pick it up on a later pass, once a
-human has cleared the hold.
+**Run this only for issues in Step 4's `READY_TO_UNBLOCK` list.** Carry
+`LINKED_ISSUES` and `READY_TO_UNBLOCK` from that step into the check below.
+A dependent can name several issues from this merge. Each must pass Step 4
+even when another one triggered the scan.
 
 **Epic-aware dependency check (#5211).** This is *the* call site named first
 under "Affected Files" in issue #5211 — the bare `state != CLOSED` read below
@@ -3844,6 +3857,11 @@ for blocked in $BLOCKED_ISSUES; do
   ALL_RESOLVED=true
   for ref in $ALL_DEPS; do
     parse_blocker_ref "$ref" "$THIS_REPO" || continue
+    if grep -Fxiq "$BLOCKER_REPO" <<<"$THIS_REPO" && grep -Fxq "$BLOCKER_NUM" <<<"${LINKED_ISSUES:?run Step 4 first}" &&
+       [[ " ${READY_TO_UNBLOCK?run Step 4 first} " != *" $BLOCKER_NUM "* ]]; then
+      ALL_RESOLVED=false
+      break
+    fi
     # Run champion-common.md → "Epic-Aware Blocker Check" Step 2 for
     # BLOCKER_REPO/BLOCKER_NUM here — it sets EPIC_BLOCK_STATE.
     case "$EPIC_BLOCK_STATE" in
