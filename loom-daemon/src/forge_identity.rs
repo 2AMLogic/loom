@@ -1248,17 +1248,51 @@ fn refresh_pass(ws: &Path, primary: Option<String>) {
 /// uses, so every later process, the daemon included, reuses the token while
 /// it stays fresh.
 ///
-/// `Ok(())` asks the caller to retry routing. If a credential was already
-/// published for an eligible reader, skip minting and let routing decide
-/// whether it can serve the read. `Err` names the reader setup to fix before
-/// starting the daemon, including when the workspace has no mint helper. A mint failure
-/// never withdraws the reader (owner-level coverage, exactly as in
-/// [`refresh_reader_credentials`]).
+/// `Ok(())` asks the caller to retry routing. It returns without minting
+/// when an eligible reader that is not withdrawn already holds a *fresh*
+/// credential ([`dir_is_fresh`], the test routing applies), and when every
+/// eligible reader is withdrawn: a withdrawal is kept, never worked around by
+/// a remint, so the read sheds as before. An expired or missing credential on a
+/// non-withdrawn reader is reminted. `Err` names the reader setup to fix before
+/// starting the daemon, including when the workspace has no mint helper. A mint
+/// failure never withdraws the reader (owner-level coverage, exactly as in
+/// [`refresh_reader_credentials`]) but is remembered for
+/// [`BOOTSTRAP_MINT_BACKOFF`] across callers in this process, so repeated reads
+/// do not re-run the helper each time.
 pub fn provision_bootstrap_reader(
     workspace_root: &Path,
     roster: &Roster,
     owner_repo: &str,
     make_minter: Option<&impl Fn(&Identity) -> Box<dyn GithubAppMinter>>,
+) -> std::result::Result<(), String> {
+    provision_bootstrap_reader_at(
+        workspace_root,
+        roster,
+        owner_repo,
+        make_minter,
+        SystemTime::now(),
+    )
+}
+
+/// How long a failed bootstrap mint for one workspace and store repo is not
+/// retried (#14730). Short: a fixed key or helper is picked up soon.
+pub const BOOTSTRAP_MINT_BACKOFF: Duration = Duration::from_secs(60);
+
+type BootstrapFailures = std::collections::HashMap<(PathBuf, String), (SystemTime, String)>;
+
+/// `(workspace root, owner/repo)` -> `(retry not before, last failure)`.
+fn bootstrap_failures() -> &'static Mutex<BootstrapFailures> {
+    static MAP: OnceLock<Mutex<BootstrapFailures>> = OnceLock::new();
+    MAP.get_or_init(|| Mutex::new(BootstrapFailures::new()))
+}
+
+/// [`provision_bootstrap_reader`] at an explicit `now`.
+pub(crate) fn provision_bootstrap_reader_at(
+    workspace_root: &Path,
+    roster: &Roster,
+    owner_repo: &str,
+    make_minter: Option<&impl Fn(&Identity) -> Box<dyn GithubAppMinter>>,
+    now: SystemTime,
 ) -> std::result::Result<(), String> {
     let owner = crate::credential_preflight::owner_of_nwo(owner_repo);
     if owner.is_empty() {
@@ -1271,12 +1305,26 @@ pub fn provision_bootstrap_reader(
              `owners` list covers the store repository",
         ));
     }
-    if eligible.iter().any(|reader| {
-        reader_dir(workspace_root, owner, reader)
-            .join("hosts.yml")
-            .is_file()
-    }) {
+    let mode = RoutingMode::current();
+    let eligible: Vec<&Identity> = eligible
+        .into_iter()
+        .filter(|r| reader_eligible(&r.app_id, owner_repo, Resource::Core, now, mode))
+        .collect();
+    if eligible.is_empty()
+        || eligible
+            .iter()
+            .any(|r| dir_is_fresh(&reader_dir(workspace_root, owner, r), now))
+    {
         return Ok(());
+    }
+    let key = (workspace_root.to_path_buf(), owner_repo.to_ascii_lowercase());
+    if let Ok(map) = bootstrap_failures().lock() {
+        if let Some((until, reason)) = map.get(&key).filter(|(until, _)| now < *until) {
+            let wait = until.duration_since(now).unwrap_or_default().as_secs();
+            return Err(format!(
+                "{reason} (mint not retried for another {wait}s after that failure)"
+            ));
+        }
     }
 
     let Some(make_minter) = make_minter else {
@@ -1316,15 +1364,21 @@ pub fn provision_bootstrap_reader(
             failures.push(format!("reader app {}: {reason}", reader.app_id));
         }
     }
-    if read_credential_in(workspace_root, roster, owner_repo, SystemTime::now()).is_some() {
+    if read_credential_in(workspace_root, roster, owner_repo, now).is_some() {
+        if let Ok(mut map) = bootstrap_failures().lock() {
+            map.remove(&key);
+        }
         return Ok(());
     }
-    if failures.is_empty() {
-        return Err(format!(
-            "published bootstrap credentials still cannot route a read of {owner_repo}"
-        ));
+    let reason = if failures.is_empty() {
+        format!("published bootstrap credentials still cannot route a read of {owner_repo}")
+    } else {
+        failures.join("; ")
+    };
+    if let Ok(mut map) = bootstrap_failures().lock() {
+        map.insert(key, (now + BOOTSTRAP_MINT_BACKOFF, reason.clone()));
     }
-    Err(failures.join("; "))
+    Err(reason)
 }
 
 /// The production minter factory: [`IdentityMinter`] over the workspace's

@@ -648,8 +648,21 @@ fn a_withdrawn_reader_keeps_the_ordinary_cached_fallback() {
     assert_eq!(calls, vec![(APP.into(), format!("repos/{REPO}/commits/main"))]);
 }
 
+/// Rewrite the published sidecar's expiry, leaving the token in place.
+fn set_expiry(dir: &Path, expires_at: &str) {
+    let path = dir.join(crate::forge_identity::SIDECAR);
+    let mut v: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    v["expiresAt"] = serde_json::Value::String(expires_at.to_string());
+    std::fs::write(&path, serde_json::to_vec(&v).unwrap()).unwrap();
+}
+
+fn an_hour_ago() -> String {
+    (chrono::Utc::now() - chrono::Duration::hours(1)).to_rfc3339()
+}
+
 #[test]
-fn a_bootstrap_mint_that_cannot_route_has_a_nonempty_failure() {
+fn a_withdrawn_reader_with_nothing_published_is_not_minted() {
     const APP: &str = "147003";
     const REPO: &str = "blocked-bootstrap-fixture-14730/fleet";
     fn roster(ws: &Path) -> crate::forge_identity::Roster {
@@ -669,11 +682,123 @@ fn a_bootstrap_mint_that_cannot_route_has_a_nonempty_failure() {
     let error = transport
         .get(&format!("repos/{REPO}/commits/main"), None, None)
         .unwrap_err();
-    let reason = format!("published bootstrap credentials still cannot route a read of {REPO}");
-    assert_eq!(transport.bootstrap_failure().as_deref(), Some(reason.as_str()));
-    assert!(error.to_string().contains(&reason));
+    assert!(error.to_string().contains("no reader can serve"), "{error:#}");
+    assert_eq!(transport.bootstrap_failure(), None, "a withdrawal is not a bootstrap failure");
+    assert!(b.mints().is_empty(), "a withdrawal is never worked around by a mint");
+    assert!(b.calls().is_empty());
+}
+
+#[test]
+fn an_expired_published_reader_is_reminted_and_advances_a_cached_stop() {
+    let b = Boot::new();
+    let cache = tempfile::tempdir().unwrap();
+    let loc = boot_location();
+    let now = chrono::Utc::now();
+    std::fs::write(&b.commit, COMMIT_A).unwrap();
+    crate::fleet_store::fetch::sync(&b.transport(), cache.path(), &loc, now).unwrap();
     assert_eq!(b.mints().len(), 1);
-    assert!(b.calls().is_empty(), "no reader or writer may serve the withdrawn route");
+    // The daemon ran once and has been down: the token is on disk but expired.
+    set_expiry(&b.reader_dir(), &an_hour_ago());
+    assert!(b.reader_dir().join("hosts.yml").is_file());
+    std::fs::write(&b.commit, COMMIT_B).unwrap();
+    std::fs::write(&b.log, "").unwrap();
+
+    let later = now + chrono::Duration::hours(3);
+    let t = b.transport();
+    let loaded = crate::fleet_store::fetch::load(
+        &t,
+        cache.path(),
+        &loc,
+        crate::fleet_store::fetch::Policy::AllowStale,
+        later,
+    )
+    .unwrap();
+    assert!(matches!(
+        loaded.freshness,
+        crate::fleet_store::fetch::Freshness::Live { changed: true }
+    ));
+    assert_eq!(loaded.snapshot.manifest.commit, COMMIT_B);
+    assert_eq!(b.mints().len(), 2, "the expired token was reminted once");
+    never_the_writer(&b.calls());
+    let pass =
+        crate::fleet_state::state_pass(&b.transport(), cache.path(), &loc, "boot-h", None, later);
+    assert_eq!(pass.enforcement(), crate::fleet_state::Enforcement::Proceed);
+}
+
+#[test]
+fn an_expired_and_withdrawn_reader_is_neither_reminted_nor_a_bootstrap_failure() {
+    const APP: &str = "147004";
+    const REPO: &str = "expired-withdrawn-fixture-14730/fleet";
+    fn roster(ws: &Path) -> crate::forge_identity::Roster {
+        let mut roster = boot_roster(ws);
+        roster.readers[0].app_id = APP.into();
+        roster
+    }
+
+    let b = Boot::new();
+    // Publish through a first read, then expire it and withdraw the reader.
+    b.transport_for(REPO, roster)
+        .get(&format!("repos/{REPO}/commits/main"), None, None)
+        .unwrap();
+    let dir = crate::forge_read_pool::gh_config_dir_for_owner_app(
+        b.tmp.path(),
+        "expired-withdrawn-fixture-14730",
+        APP,
+    );
+    set_expiry(&dir, &an_hour_ago());
+    crate::forge_identity::withdraw_after(
+        APP,
+        REPO,
+        crate::forge_identity::Failure::Credential,
+        "fixture withdrawal",
+    );
+    let t = b.transport_for(REPO, roster);
+    let err = t
+        .get(&format!("repos/{REPO}/commits/main"), None, None)
+        .unwrap_err();
+    assert!(err.to_string().contains("no reader can serve"), "{err:#}");
+    assert_eq!(t.bootstrap_failure(), None);
+    assert_eq!(b.mints().len(), 1, "no remint over an active withdrawal");
+}
+
+#[test]
+fn a_failed_mint_is_not_retried_inside_the_backoff_and_recovers_after_it() {
+    let b = Boot::new();
+    std::fs::write(&b.mint_fail, "").unwrap();
+    let read = |t: &GhTransport| t.get(&format!("repos/{BOOT_REPO}/commits/main"), None, None);
+
+    // Separate transports share one backoff: the book is process-wide.
+    let first = b.transport();
+    assert!(read(&first).is_err());
+    assert_eq!(b.mints().len(), 1);
+    for _ in 0..2 {
+        let t = b.transport();
+        let err = read(&t).unwrap_err();
+        assert!(format!("{err:#}").contains("private key not readable"), "{err:#}");
+        assert!(t
+            .bootstrap_failure()
+            .is_some_and(|r| r.contains("not retried")));
+    }
+    assert_eq!(b.mints().len(), 1, "no helper invocation inside the backoff");
+
+    // After the backoff the helper runs again and, now healthy, recovers.
+    std::fs::remove_file(&b.mint_fail).unwrap();
+    let root = b.tmp.path();
+    let after = SystemTime::now() + crate::forge_identity::BOOTSTRAP_MINT_BACKOFF * 2;
+    let factory = crate::forge_identity::real_minter_factory(root);
+    crate::forge_identity::provision_bootstrap_reader_at(
+        root,
+        &boot_roster(root),
+        BOOT_REPO,
+        factory.as_ref(),
+        after,
+    )
+    .unwrap();
+    assert_eq!(b.mints().len(), 2);
+    assert!(b.reader_dir().join("hosts.yml").is_file());
+    let t = b.transport();
+    assert_eq!(read(&t).unwrap().status, 200);
+    assert!(t.bootstrap_failure().is_none());
 }
 
 #[test]
