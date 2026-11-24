@@ -48,6 +48,17 @@
 //! read that fails yields the same answer it always did (`{}` for an issue, no
 //! commit messages), and a pass that cannot establish its facts changes
 //! nothing.
+//!
+//! # The observation replay (#15145)
+//!
+//! The same `run` is also driven asynchronously by the merge-observation
+//! pass, with `Inputs::merged_at` set. That caller — and only it — arms the
+//! branch close's reopened-after-merge gate: a human may already have acted
+//! on the merge (the close comment itself invites a reopen), so an
+//! observation replay must not close what they reopened, and an unreadable
+//! timeline returns [`Outcome::Defer`] (nothing done, retry later) rather
+//! than guessing. The synchronous shell protocol above is unchanged: it
+//! supplies no `merged_at`, so it never gates and never defers.
 
 use std::io::Write as _;
 use std::path::Path;
@@ -63,6 +74,7 @@ use super::partial_comment::{
 use super::partial_reset::{self, hold_from_json, IssueView, PreMerge, Step};
 use super::refs::partial_increment_refs;
 use crate::claim_reconciliation::gh_call;
+use crate::claim_reconciliation::pass_loop::merge_observation::reopened_after_merge;
 use crate::gh_invocation::{AccessIntent, GhInvocation};
 
 /// Last stdout line of a finished run.
@@ -97,6 +109,12 @@ pub struct Inputs {
     pub conflicted: String,
     /// `$PARTIAL_OPEN_BEFORE_MERGE`, space separated.
     pub open_before_merge: String,
+    /// The merge's `mergedAt` (RFC 3339), set only by the asynchronous
+    /// observation replay (`merge_observation`): it arms the branch close's
+    /// reopened-after-merge gate (#15145). `None` — the synchronous shell
+    /// caller, which runs before any human can have reacted to the merge —
+    /// never gates and never reads a timeline.
+    pub merged_at: Option<String>,
 }
 
 /// Facts the shell supplies once asked.
@@ -126,6 +144,12 @@ impl Need {
 pub enum Outcome {
     Need(Need),
     Done(Vec<Record>),
+    /// A fact the pass could not establish made it do nothing (#15145):
+    /// today only the observation-driven branch close's reopen timeline
+    /// being unreadable. The synchronous shell protocol never produces it
+    /// (its caller sets no `merged_at`, so the gate never runs) — the
+    /// observation caller leaves the pass unmarked and retries later.
+    Defer(Vec<Record>),
 }
 
 /// Everything the pass does to the outside world.
@@ -142,6 +166,11 @@ pub trait Host {
     fn helper(&self, func: &str, args: &[&str]) -> bool;
     /// `gh issue close <n> --repo <nwo> --reason completed --comment <body>`.
     fn close_issue(&self, repo: &str, issue: &str, comment: &str) -> bool;
+    /// The issue's timeline JSON (`repos/<nwo>/issues/<n>/timeline`, label
+    /// and reopen events); `None` when unreadable. Consulted only by the
+    /// observation-driven branch close (its caller sets `Inputs::merged_at`)
+    /// — the synchronous shell path never reads it (#15145).
+    fn label_events(&self, repo: &str, issue: &str) -> Option<String>;
     /// The sign-off timestamp the audit comments carry.
     fn timestamp(&self) -> String;
 }
@@ -338,6 +367,40 @@ fn branch_close_pass(inputs: &Inputs, facts: &Facts, host: &dyn Host) -> Outcome
     if host.issue_kind(&inputs.repo, issue) != "open" {
         return done(Vec::new());
     }
+    // The reopened-after-merge gate (#15145), observation replay only: the
+    // synchronous shell caller sets no `merged_at`, so its close is exactly
+    // what it was. A deliberate reopen after the merge must survive the
+    // replay — this pass's own close comment invites one — and an
+    // unreadable timeline skips the close rather than guess, the same fail
+    // direction `claim_predates_merge` has.
+    if let Some(merged_at) = inputs.merged_at.as_deref().filter(|s| !s.is_empty()) {
+        match reopened_after_merge(
+            &host.label_events(&inputs.repo, issue).unwrap_or_default(),
+            merged_at,
+        ) {
+            Some(false) => {}
+            Some(true) => {
+                return done(vec![rec(
+                    "INFO",
+                    format!(
+                        "Issue #{issue}: reopened after PR #{} merged — not closing it again (a \
+                         deliberate reopen is not this pass's to undo, #15145)",
+                        inputs.pr_number
+                    ),
+                )]);
+            }
+            None => {
+                return Outcome::Defer(vec![rec(
+                    "WARNING",
+                    format!(
+                        "Issue #{issue}: could not verify it was not reopened after PR #{}'s \
+                         merge — not closing it this pass (#15145)",
+                        inputs.pr_number
+                    ),
+                )]);
+            }
+        }
+    }
     let (pr, branch, repo) = (&inputs.pr_number, &inputs.pr_branch, &inputs.repo);
     let comment = format!(
         "Closing: PR #{pr} merged from `{branch}` without a closing keyword or a `Part of #{issue}` partial-increment reference, so this issue's work is delivered (#12615). If more work remains, reopen it and have the follow-up PR declare `Part of #{issue}`."
@@ -486,6 +549,12 @@ impl Host for SystemHost {
                 .to_string(),
             Err(_) => String::new(),
         }
+    }
+
+    fn label_events(&self, repo: &str, issue: &str) -> Option<String> {
+        let path = format!("repos/{repo}/issues/{issue}/timeline?per_page=100");
+        let args = ["api", path.as_str(), "--paginate"];
+        gh_stdout("post_merge.timeline", repo, &args)
     }
 
     fn helper(&self, func: &str, args: &[&str]) -> bool {

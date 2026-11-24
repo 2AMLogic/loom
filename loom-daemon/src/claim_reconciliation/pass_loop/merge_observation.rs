@@ -82,6 +82,26 @@
 //! merge ([`claim_predates_merge`]); an unreadable timeline fails the same
 //! way — the swap is skipped, never guessed.
 //!
+//! A **deliberate reopen survives replay too** (#15145): the branch close's
+//! own comment tells a human with remaining work to *reopen* the issue, and
+//! the discovery listing re-offers arbitrarily old merges the moment they
+//! are touched, so a replayed close must not undo that reopen. Before either
+//! close — the close check's belt-and-suspenders close and the
+//! observation-driven branch close — the pass reads the target's timeline
+//! and requires no `reopened` event later than the merge
+//! ([`reopened_after_merge`]); an unreadable timeline skips the close and
+//! leaves the pass unmarked, the same fail direction. The synchronous shell
+//! caller of the branch close is unchanged: it runs before any human can
+//! have reacted to the merge, so it never gates.
+//!
+//! An incomplete record cannot be retried **forever** (#15145): one whose
+//! passes can never complete (a close target whose state reads as neither
+//! `open` nor `closed` — a deleted or transferred issue) would otherwise
+//! cost its forge reads on every tick, indefinitely. A record still
+//! incomplete [`INCOMPLETE_RECORD_TTL_SECS`] after it was first observed is
+//! dropped ([`incomplete_record_expired`], [`RecordStore::remove`]) with one
+//! log line — the store's only reclamation.
+//!
 //! # Convergence during the overlap release
 //!
 //! The shell and Champion callers keep running (retirement is a later child
@@ -157,6 +177,16 @@ use crate::merge_pr::refs::{
 /// only bounds how far BACK a first observation reaches.
 const MERGED_WINDOW: usize = 15;
 
+/// How old an incomplete record may be before it is dropped (#15145): a
+/// record whose passes can never complete (a deleted or transferred close
+/// target reads as neither `open` nor `closed`) would otherwise cost its
+/// forge reads on every tick, forever — 144 retries a day at the 600 s
+/// default. A fixed wall-clock bound, deliberately NOT a config key: an
+/// operator reasons about "a week stuck", not "N ticks". A dropped record
+/// whose PR still sits in the discovery window is simply re-observed fresh
+/// — a one-pass-per-week cycle, not a per-tick one.
+const INCOMPLETE_RECORD_TTL_SECS: i64 = 7 * 24 * 60 * 60;
+
 /// Pass tokens, in run order. The relative order of `partial-reset`,
 /// `branch-close` and `strip` is the shell's own and load-bearing;
 /// `worktree-cleanup` runs last, as `_post_merge_cleanup` did after the
@@ -227,6 +257,8 @@ pub struct Stats {
     pub merges_seen: usize,
     /// Records this run carried to `complete()`.
     pub records_completed: usize,
+    /// Incomplete records past the TTL that this run dropped (#15145).
+    pub records_expired: usize,
 }
 
 /// Parse the discovery listing (REST `pulls?state=closed…`, `--paginate`
@@ -309,6 +341,69 @@ pub fn claim_predates_merge(events: &str, merged_at: &str) -> Option<bool> {
     let newest = labeled.last()?;
     let at = newest.get("created_at").and_then(Value::as_str)?;
     Some(chrono::DateTime::parse_from_rfc3339(at.trim()).ok()? <= merged)
+}
+
+/// Whether `events` (an issue timeline, `--paginate` concatenated pages)
+/// carries a `reopened` event later than `merged_at` — the mirror image of
+/// [`claim_predates_merge`] for closes (#15145): a deliberate reopen is not
+/// the merge's bookkeeping to undo, exactly as a deliberate close is not
+/// Step 4's.
+///
+/// `Some(true)` = the issue was reopened after the merge: the caller must
+/// not close it. `Some(false)` = no reopen after the merge — none at all,
+/// or only ones that predate it — safe to close. `None` = unknown — an
+/// unreadable timeline, or a timestamp that does not parse — and the caller
+/// skips the close rather than guess, the same fail direction
+/// [`claim_predates_merge`] has. An empty `events` string is the unreadable
+/// case (the live read's failure shape), not "no events": a readable
+/// timeline is at least `[]`.
+#[must_use]
+pub fn reopened_after_merge(events: &str, merged_at: &str) -> Option<bool> {
+    if events.trim().is_empty() {
+        return None;
+    }
+    let merged = chrono::DateTime::parse_from_rfc3339(merged_at.trim()).ok()?;
+    let mut rows: Vec<Value> = Vec::new();
+    for page in serde_json::Deserializer::from_str(events).into_iter::<Value>() {
+        let Ok(Value::Array(items)) = page else {
+            return None;
+        };
+        rows.extend(items);
+    }
+    let mut reopened: Vec<&Value> = rows
+        .iter()
+        .filter(|e| e.get("event").and_then(Value::as_str) == Some("reopened"))
+        .collect();
+    reopened.sort_by_key(|e| {
+        e.get("created_at")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .unwrap_or_default()
+    });
+    let Some(newest) = reopened.last() else {
+        return Some(false);
+    };
+    let at = newest.get("created_at").and_then(Value::as_str)?;
+    Some(chrono::DateTime::parse_from_rfc3339(at.trim()).ok()? > merged)
+}
+
+/// Whether an incomplete record first observed at `observed_at` (RFC 3339,
+/// [`MergeRecord::observed_at`]) is older than the reclamation TTL at `now`
+/// (RFC 3339) — the pure half of `run_pass`'s drop sweep (#15145). Exactly
+/// the TTL old is NOT expired (the record gets its whole bound); one second
+/// past it is. An unreadable `observed_at` counts as expired: the record
+/// cannot age out otherwise, and it was written by this pass, so an
+/// unparseable stamp means the file is corrupt. An unreadable `now` is the
+/// opposite — the age cannot be established, so the record is kept.
+#[must_use]
+pub fn incomplete_record_expired(observed_at: &str, now: &str) -> bool {
+    let Ok(at) = chrono::DateTime::parse_from_rfc3339(observed_at.trim()) else {
+        return true;
+    };
+    let Ok(now) = chrono::DateTime::parse_from_rfc3339(now.trim()) else {
+        return false;
+    };
+    now.signed_duration_since(at) > chrono::Duration::seconds(INCOMPLETE_RECORD_TTL_SECS)
 }
 
 /// Would posting `body` duplicate an audit comment already on the issue?
@@ -488,6 +583,9 @@ impl<F: Forge> Host for AsHost<'_, F> {
     }
     fn close_issue(&self, repo: &str, issue: &str, comment: &str) -> bool {
         self.0.close_issue(repo, issue, comment)
+    }
+    fn label_events(&self, repo: &str, issue: &str) -> Option<String> {
+        self.0.label_events(repo, issue)
     }
     fn timestamp(&self) -> String {
         now_timestamp()
@@ -716,6 +814,24 @@ impl RecordStore {
             self.dir.join(format!("pr-{}.json", r.pr)),
         )
     }
+
+    /// Remove a stored record — the store's only reclamation (#15145),
+    /// reached when an incomplete record outlives
+    /// [`INCOMPLETE_RECORD_TTL_SECS`]. Completed records are never removed
+    /// (they are what makes an out-of-window merge invisible to the pass).
+    ///
+    /// # Errors
+    ///
+    /// The file exists but could not be removed; the record then survives
+    /// to be retried (and re-dropped) on a later tick. A record that is
+    /// already gone is a success, not an error — dropping is idempotent.
+    pub fn remove(&self, pr: u64) -> std::io::Result<()> {
+        match std::fs::remove_file(self.dir.join(format!("pr-{pr}.json"))) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(e),
+        }
+    }
 }
 
 /// One pass over a workspace: discover merged PRs, and for each without a
@@ -728,6 +844,36 @@ pub fn run_pass(
     is_suppressed: impl Fn() -> bool,
 ) -> Stats {
     let mut stats = Stats::default();
+    // Reclamation first (#15145): an incomplete record past the TTL is
+    // dropped before any processing, with the one log line it will ever
+    // get. Purely local (no forge reads), so the rate-limit suppression
+    // does not gate it. A dropped record whose PR is still listed below is
+    // re-observed fresh — the bounded weekly cycle the TTL buys.
+    let now = now_timestamp();
+    for rec in store.incomplete() {
+        if !incomplete_record_expired(&rec.observed_at, &now) {
+            continue;
+        }
+        match store.remove(rec.pr) {
+            Ok(()) => {
+                log::warn!(
+                    "merge_observation: dropping the incomplete record for PR #{} in {} \
+                     (observed at {}) — older than the {}-day retry TTL (#15145); finish any \
+                     remaining bookkeeping for that merge manually if it is still wanted",
+                    rec.pr,
+                    rec.repo,
+                    rec.observed_at,
+                    INCOMPLETE_RECORD_TTL_SECS / (24 * 60 * 60)
+                );
+                stats.records_expired += 1;
+            }
+            Err(e) => log::warn!(
+                "merge_observation: could not remove the expired record for PR #{}: {e} — \
+                 retrying the drop next tick",
+                rec.pr
+            ),
+        }
+    }
     // An unreadable listing no longer ends the pass: recorded merges still
     // retry below, since a record is self-sufficient.
     let pulls = f.merged_pulls().unwrap_or_default();
@@ -858,10 +1004,15 @@ fn process(
             continue;
         }
         let mut out = Vec::new();
-        run_bookkeeping_pass(pass, f, rec, &targets, &mut out);
+        let ran = run_bookkeeping_pass(pass, f, rec, &targets, &mut out);
         log_records(rec, &out);
-        rec.mark(token);
-        let _ = store.store(rec);
+        if ran {
+            rec.mark(token);
+            let _ = store.store(rec);
+        }
+        // A deferred pass (an unreadable reopen timeline on the branch
+        // close, #15145) stays unmarked: a later tick retries it, bounded
+        // by the record TTL above.
     }
 
     // #14904: last, as `_post_merge_cleanup` ran last in the script — the
@@ -882,14 +1033,19 @@ fn process(
 
 /// One of the retired shell passes, replayed through the same verb the
 /// shell calls — only the facts arrive from the record instead of the
-/// script's variables.
+/// script's variables. This is the **observation** caller: it supplies
+/// `merged_at`, which arms the branch close's reopened-after-merge gate
+/// (#15145) — the gate the shell's own synchronous caller must never take.
+/// Returns false only for [`bookkeeping::Outcome::Defer`] (the pass could
+/// not establish a fact and did nothing): the caller leaves the pass
+/// unmarked for a later tick.
 fn run_bookkeeping_pass(
     pass: bookkeeping::Pass,
     f: &impl Forge,
     rec: &MergeRecord,
     targets: &str,
     out: &mut Vec<bookkeeping::Record>,
-) {
+) -> bool {
     let inputs = bookkeeping::Inputs {
         repo: rec.repo.clone(),
         pr_number: rec.pr.to_string(),
@@ -897,20 +1053,31 @@ fn run_bookkeeping_pass(
         pr_body: rec.body.clone(),
         conflicted: String::new(),
         open_before_merge: String::new(),
+        merged_at: Some(rec.merged_at.clone()),
     };
     let facts = bookkeeping::Facts {
         close_targets: Some(targets.to_string()),
     };
     match bookkeeping::run(pass, &inputs, &facts, &AsHost(f)) {
-        bookkeeping::Outcome::Done(records) => out.extend(records),
-        bookkeeping::Outcome::Need(need) => out.push(mk_rec(
-            "WARNING",
-            format!(
-                "Post-merge bookkeeping ({}) asked for {} after it was supplied — nothing done",
-                need.token(),
-                need.token()
-            ),
-        )),
+        bookkeeping::Outcome::Done(records) => {
+            out.extend(records);
+            true
+        }
+        bookkeeping::Outcome::Defer(records) => {
+            out.extend(records);
+            false
+        }
+        bookkeeping::Outcome::Need(need) => {
+            out.push(mk_rec(
+                "WARNING",
+                format!(
+                    "Post-merge bookkeeping ({}) asked for {} after it was supplied — nothing done",
+                    need.token(),
+                    need.token()
+                ),
+            ));
+            true
+        }
     }
 }
 
@@ -1137,20 +1304,54 @@ fn close_check(
                 format!("Issue #{n_s} is closed (closed by PR #{pr_s}'s merge)"),
             )),
             "open" => {
-                let comment = format!(
-                    "Closed by PR #{pr_s} (merge observed by Loom post-merge bookkeeping, \
-                     #14902)."
-                );
-                if f.close_issue(&rec.repo, &n_s, &comment) {
-                    out.push(mk_rec(
-                        "SUCCESS",
-                        format!("Issue #{n_s}: closed (linked to merged PR #{pr_s})"),
-                    ));
-                } else {
-                    out.push(mk_rec(
-                        "WARNING",
-                        format!("Could not close issue #{n_s} after observing PR #{pr_s}'s merge"),
-                    ));
+                // A deliberate reopen is not this pass's to undo (#15145):
+                // the branch close's own comment tells a human with
+                // remaining work to reopen, and the discovery listing
+                // re-offers old merges once touched, so the close is gated
+                // on no `reopened` event later than the merge — the mirror
+                // of the claim gate above. One extra timeline read, taken
+                // only for a target that is about to be closed.
+                match reopened_after_merge(
+                    &f.label_events(&rec.repo, &n_s).unwrap_or_default(),
+                    &rec.merged_at,
+                ) {
+                    Some(false) => {
+                        let comment = format!(
+                            "Closed by PR #{pr_s} (merge observed by Loom post-merge bookkeeping, \
+                             #14902)."
+                        );
+                        if f.close_issue(&rec.repo, &n_s, &comment) {
+                            out.push(mk_rec(
+                                "SUCCESS",
+                                format!("Issue #{n_s}: closed (linked to merged PR #{pr_s})"),
+                            ));
+                        } else {
+                            out.push(mk_rec(
+                                "WARNING",
+                                format!(
+                                    "Could not close issue #{n_s} after observing PR #{pr_s}'s \
+                                     merge"
+                                ),
+                            ));
+                        }
+                    }
+                    Some(true) => out.push(mk_rec(
+                        "INFO",
+                        format!(
+                            "Issue #{n_s}: reopened after PR #{pr_s} merged — not closing it \
+                             again (a deliberate reopen is not this pass's to undo, #15145)"
+                        ),
+                    )),
+                    None => {
+                        complete = false;
+                        out.push(mk_rec(
+                            "WARNING",
+                            format!(
+                                "Issue #{n_s}: could not verify it was not reopened after PR \
+                                 #{pr_s}'s merge — not closing it this pass (#15145)"
+                            ),
+                        ));
+                    }
                 }
             }
             _ => {
