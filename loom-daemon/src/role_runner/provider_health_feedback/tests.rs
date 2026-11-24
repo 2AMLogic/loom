@@ -36,18 +36,22 @@ const GUARDED_ENV: [&str; 8] = [
 ];
 
 /// The shared env guard plus the crate-wide `LOOM_CODEX_PROFILE_ROOT` lock
-/// (#9964). Field order matters: the env is restored before the lock is released.
+/// (#9964) and `LOOM_CODEX_HOME` lock (#15174). Field order matters: the env
+/// is restored before the locks are released, and the codex-home lock —
+/// acquired first — is released last (see `codex_home_env`'s lock order).
 struct EnvGuard(
     #[allow(dead_code)] crate::env_test_support::EnvGuard,
     #[allow(dead_code)] crate::tokens_pool::profile_root_env::ProfileRootLock,
+    #[allow(dead_code)] crate::tokens_pool::codex_home_env::CodexHomeLock,
 );
 
 impl EnvGuard {
     fn new(profile_root: &Path) -> Self {
+        let codex_home_lock = crate::tokens_pool::codex_home_env::lock();
         let lock = crate::tokens_pool::profile_root_env::lock();
         let env = crate::env_test_support::EnvGuard::clear(&GUARDED_ENV)
             .and_set("LOOM_CODEX_PROFILE_ROOT", Some(profile_root.as_os_str()));
-        Self(env, lock)
+        Self(env, lock, codex_home_lock)
     }
 }
 

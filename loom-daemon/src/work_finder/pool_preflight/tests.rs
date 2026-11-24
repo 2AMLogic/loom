@@ -370,14 +370,18 @@ const PREFERENCE_ENV: [&str; 8] = [
     "LOOM_CODEX_PROFILE_ROOT",
 ];
 
-/// The second field holds the crate-wide `LOOM_CODEX_PROFILE_ROOT` lock (#9964).
+/// The second field holds the crate-wide `LOOM_CODEX_PROFILE_ROOT` lock (#9964);
+/// the third the crate-wide `LOOM_CODEX_HOME` lock (#15174), acquired before it
+/// and released after (see `codex_home_env`'s documented lock order).
 struct PreferenceEnvGuard(
     Vec<(&'static str, Option<String>)>,
     #[allow(dead_code)] crate::tokens_pool::profile_root_env::ProfileRootLock,
+    #[allow(dead_code)] crate::tokens_pool::codex_home_env::CodexHomeLock,
 );
 
 impl PreferenceEnvGuard {
     fn new(profile_root: &Path) -> Self {
+        let codex_home_lock = crate::tokens_pool::codex_home_env::lock();
         let lock = crate::tokens_pool::profile_root_env::lock();
         let prior = PREFERENCE_ENV
             .iter()
@@ -387,7 +391,7 @@ impl PreferenceEnvGuard {
             std::env::remove_var(key);
         }
         std::env::set_var("LOOM_CODEX_PROFILE_ROOT", profile_root);
-        Self(prior, lock)
+        Self(prior, lock, codex_home_lock)
     }
 }
 

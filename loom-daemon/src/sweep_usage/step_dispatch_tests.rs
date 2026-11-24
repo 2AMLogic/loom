@@ -116,6 +116,9 @@ fn a_step_dispatched_codex_run_yields_a_codex_usage_span() {
     let runtime = crate::usage_source::sweep_usage_runtime_from_log(None, Some(&log), &root, ISSUE);
     assert_eq!(runtime.as_deref(), Some("codex"));
 
+    // Crate-wide `LOOM_CODEX_HOME` lock (#15174): the pin below must not
+    // race the isolation helpers that clear the variable under other keys.
+    let _codex_home_lock = crate::tokens_pool::codex_home_env::lock();
     std::env::set_var(crate::codex_usage::CODEX_HOME_ENV, &home);
     let window = window(Some(Utc::now() - Duration::hours(1)), 3_600);
     let usage = resolve(runtime.as_deref(), &root, ISSUE, window, None);
@@ -170,6 +173,9 @@ fn a_codex_run_with_no_rollout_yields_no_span() {
     let log = step_log(&root);
     let runtime = crate::usage_source::sweep_usage_runtime_from_log(None, Some(&log), &root, ISSUE);
 
+    // Crate-wide `LOOM_CODEX_HOME` lock (#15174): the pin below must not
+    // race the isolation helpers that clear the variable under other keys.
+    let _codex_home_lock = crate::tokens_pool::codex_home_env::lock();
     std::env::set_var(crate::codex_usage::CODEX_HOME_ENV, &home);
     let usage = resolve(
         runtime.as_deref(),
@@ -465,6 +471,9 @@ fn a_codex_steps_usage_survives_journal_retirement_after_close() {
     assert!(journal.retire_if_drained().unwrap());
     assert!(!sidecar.exists());
 
+    // Crate-wide `LOOM_CODEX_HOME` lock (#15174): the pin below must not
+    // race the isolation helpers that clear the variable under other keys.
+    let _codex_home_lock = crate::tokens_pool::codex_home_env::lock();
     std::env::set_var(crate::codex_usage::CODEX_HOME_ENV, &home);
     end_step(&root, StepRole::Builder, SWEEP_ID, ISSUE, closed_context);
     std::env::remove_var(crate::codex_usage::CODEX_HOME_ENV);
@@ -562,6 +571,9 @@ fn codex_step_spans(
     TraceStore::new(root)
         .load_or_create(root, sweep_id)
         .unwrap();
+    // Crate-wide `LOOM_CODEX_HOME` lock (#15174): the pin below must not
+    // race the isolation helpers that clear the variable under other keys.
+    let _codex_home_lock = crate::tokens_pool::codex_home_env::lock();
     std::env::set_var(crate::codex_usage::CODEX_HOME_ENV, home);
     end_step(root, role, sweep_id, item, None);
     std::env::remove_var(crate::codex_usage::CODEX_HOME_ENV);
@@ -747,6 +759,9 @@ fn a_step_call_without_a_window_keeps_the_directory_and_id_key() {
         codex: vec![STEP_ID.to_owned()],
         ..Default::default()
     };
+    // Crate-wide `LOOM_CODEX_HOME` lock (#15174): the pin below must not
+    // race the isolation helpers that clear the variable under other keys.
+    let _codex_home_lock = crate::tokens_pool::codex_home_env::lock();
     std::env::set_var(crate::codex_usage::CODEX_HOME_ENV, &home);
     let rows = crate::usage_source::step_tokens_by_model(
         Some("codex"),
