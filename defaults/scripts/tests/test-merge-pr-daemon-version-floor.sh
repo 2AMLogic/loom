@@ -535,6 +535,11 @@ awk '
 ' "$MERGE_PR_SRC" >"$GATE_FILE"
 assert_contains "$(cat "$GATE_FILE")" "_post_merge_cleanup" "the cleanup gate block was extracted from merge-pr.sh"
 
+# The sourced gate block consumes FORGE_TYPE / WORKTREE_PATH_OVERRIDE /
+# REMOVE_IGNORED / CLEANUP_WORKTREE; shellcheck cannot follow the dynamic
+# `source "$GATE_FILE"` and sees dead assignments. A directive placed before the
+# function covers its whole body.
+# shellcheck disable=SC2034
 _gate_run() { # <FORGE_TYPE|-> <WORKTREE_PATH_OVERRIDE> <REMOVE_IGNORED>
     (
         if [[ "$1" == "-" ]]; then unset FORGE_TYPE; else FORGE_TYPE="$1"; fi
