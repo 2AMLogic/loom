@@ -537,6 +537,13 @@ pub enum PassReason {
     /// forge read (`step_dispatch::gather::hold_ci_pending`), the step path's
     /// copy of the #12003 Judge gate.
     CiPending,
+    /// A Judge step whose PR the no-verdict backstop holds (#11855, #15097):
+    /// its passes at this head and label set already ended without a verdict
+    /// often enough. The classifier never answers it: the step tick's gather
+    /// applies it (`step_dispatch::gather::hold_judge_backstop`), the step
+    /// path's copy of `pr_planning`'s `backstop_holds` rule, so the PR stops
+    /// spending draw slots only to be refused by the pre-claim.
+    BackstopHeld,
     /// A Champion-held PR still at the head its hold recorded, with no
     /// release signal (#12900). The classifier never answers it: the step
     /// tick's gather applies it (`step_dispatch::gather::hold_at_recorded_head`),
@@ -581,6 +588,7 @@ impl PassReason {
             Self::NoStage => "no_stage",
             Self::Draft => "draft",
             Self::CiPending => "ci_pending",
+            Self::BackstopHeld => "backstop_held",
             Self::HeldAtHead => "held_at_head",
             Self::AuthorGateHeld => "author_gate_held",
             Self::Conflicting => "conflicting",
