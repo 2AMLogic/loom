@@ -8,12 +8,16 @@ use super::*;
 fn dashboard_url_issues_vs_pull() {
     let _env = DefaultDashboardEnv::hold();
     assert_eq!(
-        forge_dashboard_url("o/r", 42, false),
-        format!("{DEFAULT_DASHBOARD_BASE_URL}/github.com/o/r/issues/42")
+        append_dashboard_footer("o/r", 42, false, "body"),
+        format!(
+            "body\n\n[loom dashboard]({DEFAULT_DASHBOARD_BASE_URL}/github.com/o/r/issues/42)\n{FOOTER_MARKER}\n"
+        )
     );
     assert_eq!(
-        forge_dashboard_url("o/r", 42, true),
-        format!("{DEFAULT_DASHBOARD_BASE_URL}/github.com/o/r/pull/42")
+        append_dashboard_footer("o/r", 42, true, "body"),
+        format!(
+            "body\n\n[loom dashboard]({DEFAULT_DASHBOARD_BASE_URL}/github.com/o/r/pull/42)\n{FOOTER_MARKER}\n"
+        )
     );
 }
 
@@ -54,8 +58,8 @@ fn env_override_changes_the_base_and_trims_trailing_slashes() {
     std::env::set_var(ENV_DASHBOARD_BASE_URL, "https://d.example.com///");
     assert_eq!(dashboard_base_url(), "https://d.example.com");
     assert_eq!(
-        forge_dashboard_url("o/r", 1, false),
-        "https://d.example.com/github.com/o/r/issues/1"
+        append_dashboard_footer("o/r", 1, false, "body"),
+        "body\n\n[loom dashboard](https://d.example.com/github.com/o/r/issues/1)\n<!-- loom:dashboard-link -->\n"
     );
     match previous {
         Some(value) => std::env::set_var(ENV_DASHBOARD_BASE_URL, value),
