@@ -909,6 +909,65 @@ fn operator_decision_offline_forms_match_loom_daemon_with_no_credential() {
     );
 }
 
+/// #15108: a batch `resolve` refuses under a dispatched sweep before it reads
+/// the slate, in both roots, exactly as the single-issue form does.
+#[test]
+fn operator_decision_resolve_batch_refuses_a_dispatched_run_before_reading() {
+    let tmp = tempfile::tempdir().unwrap();
+    // A slate that does not exist: exit 5 (not a usage error) proves the
+    // dispatch check runs before anything is read.
+    let args = [
+        "operator-decision",
+        "resolve",
+        "--from",
+        "/nonexistent/slate.txt",
+    ];
+    let mut outputs = Vec::new();
+    for bin in [TOOLS, DAEMON] {
+        let mut c = base(bin, tmp.path(), tmp.path());
+        c.args(args).env("LOOM_SWEEP_ID", "sweep-x");
+        outputs.push(run(c, None));
+    }
+    for o in &outputs {
+        assert_eq!(o.status.code(), Some(5));
+        let e = String::from_utf8_lossy(&o.stderr);
+        assert!(e.contains("LOOM_SWEEP_ID is set"), "{e}");
+    }
+}
+
+/// #15108: batch `resolve` usage errors — a malformed slate under
+/// `--dry-run`, and mixing `--from` with a positional issue — are exit 2 in
+/// both roots, before any forge call.
+#[test]
+fn operator_decision_resolve_batch_usage_errors_match() {
+    let tmp = tempfile::tempdir().unwrap();
+    let bad = tmp.path().join("bad.txt");
+    std::fs::write(&bad, "not a slate line\n").unwrap();
+    let bad_arg = bad.to_str().unwrap();
+    let o = parity(
+        &[
+            "operator-decision",
+            "resolve",
+            "--from",
+            bad_arg,
+            "--dry-run",
+        ],
+        None,
+        tmp.path(),
+        tmp.path(),
+    );
+    assert_eq!(o.status.code(), Some(2));
+    let e = String::from_utf8_lossy(&o.stderr);
+    assert!(e.contains("not owner/repo#issue=option"), "{e}");
+    let o = parity(
+        &["operator-decision", "resolve", "--from", bad_arg, "7"],
+        None,
+        tmp.path(),
+        tmp.path(),
+    );
+    assert_eq!(o.status.code(), Some(2));
+}
+
 /// The online forms need a forge. With none, both roots fail on the first read
 /// with the handler's own forge-failure code (4) and nothing is written; an
 /// invalid decision is still refused (1) before any forge call.

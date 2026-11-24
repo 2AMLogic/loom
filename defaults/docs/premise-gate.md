@@ -248,6 +248,11 @@ loom-daemon operator-decision resolve <N> --option <id> --release   # attended; 
 ./.loom/scripts/premise-check.sh --issue <N>                         # 0, RESOLUTION=approved
 ```
 
+When a ruling replaced the block with an "Operator ruling" section, both
+`resolve` and the gate recover the newest published block from the issue's
+edit history, binding to that exact text (#15108); see
+`defaults/docs/operator-decision.md`.
+
 A verified `proceed` resolution of the *current* decision and proposal returns
 `0`, the same proceed result as any clear premise. Everything else leaves the
 reversal pending at `11`, with `RESOLUTION-REASON=` naming why:
