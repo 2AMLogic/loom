@@ -618,6 +618,7 @@ assert_eq "unknown" "$(field "$out" CLAIM_STATE)" \
 reset
 CLAIM_TS="$(ago 90)"
 set_claim loom:reviewing "$CLAIM_TS"
+set_updated_at "$(ago 5)"
 jq -n --arg t "$(ago 60)" --arg m "<!-- loom:reclaim claim=$CLAIM_TS -->" \
     '[{id:801,created_at:$t,body:("Judge: reclaiming stale claim.\n" + $m)}]' | set_comments
 out="$(LOOM_TEST_LIVE_DROP_LABEL=loom:reviewing "$TARGET_SCRIPT" check --repo owner/repo --number 6513 --label loom:reviewing)"
