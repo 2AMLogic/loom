@@ -33,7 +33,8 @@
 #      `sort_by(.number)`, and adds no section.
 #   2. The reproduction's five synthetic items render
 #      `| Held, no other bucket | 1 |`: only #9101 counts, and it still has
-#      no bullet anywhere.
+#      no bullet anywhere — with an open PR linked to it included (#14785's
+#      "Issues with Open PRs" section lists Ready candidates only).
 #   3. A `loom:frozen`-only issue is not counted; `loom:blocked`+
 #      `loom:building` (listed under In Progress) is not counted;
 #      `loom:operator`+`loom:building` (not listed there) counts.
@@ -75,6 +76,9 @@ fi
 # closing `}` is the first line starting at column 0 after the opening line
 # (its nested `section()`/`count()` helpers are indented).
 RPB_BODY="$(awk '/^render_plan_body\(\) \{/{flag=1} flag{print} /^\}/{if(flag){exit}}' "$GUIDE_MD")"
+# #14785: render_plan_body() calls the shared open-PR linkage helpers, so
+# they ride along in every eval of the extracted body.
+HELPERS_BODY="$(awk '/^open_pr_linkage_rows\(\) \{/{f=1} f{print} /^\}/{if(f) exit}' "$GUIDE_MD"; awk '/^open_pr_annotation\(\) \{/{f=1} f{print} /^\}/{if(f) exit}' "$GUIDE_MD")"
 
 if [[ -z "$RPB_BODY" ]]; then
     fail "could not extract render_plan_body() body from guide.md"
@@ -217,12 +221,12 @@ chmod +x "$TMPROOT/bin/loom-daemon"
 printf '#!/usr/bin/env bash\nexit 2\n' >"$TMPROOT/bin-fail/loom-daemon"
 chmod +x "$TMPROOT/bin-fail/loom-daemon"
 
-# render_with <fixture-dir> <function-body> [<path-prepend>]: eval the body
-# and run the real render_plan_body() against the stubs.
+# render_with <fixture-dir> <function-body> [<path-prepend>]: eval the shared
+# helpers and the body, then run the real render_plan_body() against the stubs.
 render_with() {
     local fix="$1" body="$2" prepend="${3:-}"
-    PATH="${prepend:+$prepend:}$PATH" LOOM_FIXTURE_DIR="$fix" GH_READ="$GH_STUB" RPB_SRC="$body" \
-        bash -c 'eval "$RPB_SRC"; render_plan_body'
+    PATH="${prepend:+$prepend:}$PATH" LOOM_FIXTURE_DIR="$fix" GH_READ="$GH_STUB" HELPERS_SRC="$HELPERS_BODY" RPB_SRC="$body" \
+        bash -c 'eval "$HELPERS_SRC"; eval "$RPB_SRC"; render_plan_body'
 }
 # A copy of fixture dir $1 holding ONLY issue $2 (every other item removed).
 mk_variant() {
@@ -314,6 +318,24 @@ for n in 9102 9103 9104 9105; do
     assert_eq "| Held, no other bucket | 0 |" "$(row_of "$(render_with "$TMPROOT/only-$n" "$RPB_BODY")")" \
         "#$n alone contributes 0 to the row"
 done
+
+# #14785: an open PR linked to the held issue (here by its Builder branch)
+# does not give it a bucket — "Issues with Open PRs" lists Ready candidates
+# only, and a held issue is never one — so the row still counts it.
+mkdir -p "$TMPROOT/ac1-pr"
+cp "$FIX"/*.json "$TMPROOT/ac1-pr/"
+cat > "$TMPROOT/ac1-pr/pr-.json" <<'JSON'
+[{"number":8001,"title":"Open PR on the held issue's branch","state":"open","labels":[],"closingIssuesReferences":[],"body":"","headRefName":"feature/issue-9101","isCrossRepository":false}]
+JSON
+RPR="$(render_with "$TMPROOT/ac1-pr" "$RPB_BODY")"
+assert_eq "| Held, no other bucket | 1 |" "$(row_of "$RPR")" \
+    "an open PR linked to the held issue leaves the count at 1"
+OPENPR_BODY="$(section_body '## Issues with Open PRs (Not Dispatchable)' "$RPR")"
+if grep -qxF '_None._' <<<"$OPENPR_BODY" && ! grep -q '#9101' <<<"$OPENPR_BODY"; then
+    pass "a held issue is not listed under 'Issues with Open PRs' (Ready candidates only, #14785)"
+else
+    fail "expected the held issue absent from '## Issues with Open PRs (Not Dispatchable)', got: $OPENPR_BODY"
+fi
 
 # ---------------------------------------------------------------------------
 # Test 3 (AC): frozen, and the two loom:building shapes
