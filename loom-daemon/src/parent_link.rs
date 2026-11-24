@@ -637,9 +637,9 @@ esac"#;
     #[cfg(unix)]
     #[test]
     fn rescoped_marker_makes_an_all_closed_parent_not_split() {
-        let none = marker_page(0, Vec::new());
+        let pages = [marker_page(0, Vec::new())];
         let split = |body: Option<&str>| {
-            mocked_split_body("7 CLOSED\n9 CLOSED\n", GRAPHQL_EXHAUSTED, &[none.clone()], body)
+            mocked_split_body("7 CLOSED\n9 CLOSED\n", GRAPHQL_EXHAUSTED, &pages, body)
         };
         let marked = format!("Residue work.\n{SPLIT_RESCOPED_MARKER}\n");
         assert_eq!(split(Some(&marked)).unwrap(), SplitState::NoChildren);
