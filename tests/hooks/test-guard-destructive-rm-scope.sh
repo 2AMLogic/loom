@@ -1256,6 +1256,32 @@ assert_deny "#15112: no cd, relative target resolved against session cwd outside
 # rmScope off: an unresolved cd keeps today's behavior (no new deny).
 assert_allow_env "#15112 rmScope off: unresolved cd does not newly deny" "LOOM_RM_SCOPE=off" \
     'cd "$WORK" && rm -rf ./scratch/x' "$REPO_ROOT"
+# Review findings (#15169): a cd that does not reliably move the shell that runs
+# the rm, or a session cwd that breaks the word split, must fail closed.
+assert_deny "#15112 review: relative cd from a cwd with whitespace fails closed" \
+    "cd .. && rm -rf outside_wt" "/opt/ven dor/sub"
+assert_deny "#15112 review: cd inside \$( ) does not leak to the outer rm" \
+    'x="$(true; cd /tmp/a/b/c/d/e && pwd)" && rm -rf ../../../../etc' "/a/b/c/d"
+assert_deny "#15112 review: cd inside a ( ) subshell does not leak to the outer rm" \
+    '(true; cd /tmp/a/b/c/d/e; true); rm -rf ../../../../etc' "/a/b/c/d"
+assert_deny "#15112 review: cd on the left of a pipe does not move the rm" \
+    'cd /tmp/a/b/c/d/e | rm -rf ../../../../etc' "/a/b/c/d"
+assert_deny "#15112 review: cd before & does not move the rm" \
+    'cd /tmp/a/b/c/d/e & rm -rf ../../../../etc' "/a/b/c/d"
+assert_deny "#15112 review: cd before || does not move the rm" \
+    'cd /tmp/a/b/c/d/e || rm -rf ../../../../etc' "/a/b/c/d"
+assert_deny "#15112 review: brace-group cd is honoured (rm lands out of scope)" \
+    '{ cd /opt/vendor && rm -rf important; }' "$REPO_ROOT"
+assert_deny "#15112 review: heredoc span rm after an outer cd is not judged against the session cwd" \
+    $'cd /opt/vendor && cat <<EOF\n$(rm -rf important)\nEOF' "$REPO_ROOT"
+assert_deny "#15112 review: cd -- -P /dir is not a plain cd (fails closed)" \
+    'cd -- -P /tmp/x; rm -rf important' "/opt/vendor"
+assert_deny "#15112 review: sudo cd does not move the shell" \
+    'sudo cd /tmp/x; rm -rf important' "/opt/vendor"
+assert_allow "#15112 review: ( cd dir && rm ) inside a subshell still resolves" \
+    '(cd /tmp/x && rm -rf note.md)' "$REPO_ROOT"
+assert_allow "#15112 review: 2>&1 redirect after cd is not a background operator" \
+    'cd -- /tmp/x/work >/dev/null 2>&1 && rm -f ../note.md' "$REPO_ROOT"
 echo ""
 
 # =========================================================================

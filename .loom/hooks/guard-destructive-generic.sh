@@ -7673,7 +7673,16 @@ _RM_CDUNRES_MARK=$'\035'
 extract_rm_targets() {
     _extract_rm_targets_scan "$1" "" "$CWD"
     heredoc_subst_span_text "$1"
-    [[ -n "$_HD_SPAN_TEXT" ]] && _extract_rm_targets_scan "$_HD_SPAN_TEXT" "$_RM_SPAN_MARK" "$CWD"
+    if [[ -n "$_HD_SPAN_TEXT" ]]; then
+        # An unquoted heredoc body's `$( … )` runs in whatever directory the
+        # OUTER command had reached by then. The span pass cannot see that
+        # state, so when the outer command contains any `cd` word it starts
+        # UNRESOLVED (relative span targets fail closed) instead of assuming
+        # the session cwd (#15169 review).
+        local _span_unres=0
+        printf '%s' "$1" | grep -qE '(^|[;&|({[:space:]])cd([[:space:]]|$)' && _span_unres=1
+        _extract_rm_targets_scan "$_HD_SPAN_TEXT" "$_RM_SPAN_MARK" "$CWD" "$_span_unres"
+    fi
     return 0
 }
 
@@ -7702,9 +7711,11 @@ _extract_rm_targets_scan() {
     # bare `cd`, a path containing whitespace, or a relative path with no known
     # base is left UNRESOLVED, which the caller fails closed on rather than
     # guessing. A later resolvable ABSOLUTE `cd` makes the directory known again.
-    printf '%s' "$1" | awk -v mark="$2" -v startcwd="$3" -v home="$HOME" "$_QSPLIT_AWK""$_CDEXPAND_AWK""$_CDQUOTE_AWK"'
+    printf '%s' "$1" | awk -v mark="$2" -v startcwd="$3" -v startunres="${4:-0}" -v home="$HOME" "$_QSPLIT_AWK""$_CDEXPAND_AWK""$_CDQUOTE_AWK"'
     BEGIN {
         curcwd = startcwd; cdseen = 0; cdunres = 0
+        if (startunres == 1) { cdseen = 1; cdunres = 1 }
+        sdepth = 0
         CDM = sprintf("%c", 31); UNRM = sprintf("%c", 29); RSM = sprintf("%c", 30)
         SQ = sprintf("%c", 39); DQ = sprintf("%c", 34); BS = sprintf("%c", 92)
         BAD = "$`*?[ \t" SQ DQ BS CDM UNRM RSM
@@ -7720,8 +7731,12 @@ _extract_rm_targets_scan() {
     function track_cd(   k, arg, cls, bad) {
         cdseen = 1
         k = 2
-        # Skip option words (`cd -P dir`, `cd -- dir`); a lone `-` is `cd -`.
-        while (k <= m && (toks[k] == "--" || toks[k] ~ /^-[LPe@]+$/)) k++
+        # Skip option words (`cd -P dir`); a lone `-` is `cd -`. `--` ends the
+        # options: whatever follows is the operand even if it looks like an
+        # option, and any other `-x` word is not a plain `cd <dir>`.
+        while (k <= m && toks[k] ~ /^-[LPe@]+$/) k++
+        if (k <= m && toks[k] == "--") k++
+        else if (k <= m && toks[k] ~ /^-./) { cdunres = 1; return }
         if (k > m || toks[k] == "-" || toks[k] == "") { cdunres = 1; return }
         arg = expand_cd_arg(toks[k], home)
         # Anything after the directory other than a redirection is not a plain
@@ -7733,38 +7748,85 @@ _extract_rm_targets_scan() {
         # and no control bytes that collide with the output marks.
         if (cls == "" || nonliteral(cls) || cls ~ /^~/) { cdunres = 1; return }
         if (cls ~ /^\//) { curcwd = cls; cdunres = 0; return }
-        if (cdunres || curcwd == "" || curcwd !~ /^\//) { cdunres = 1; return }
+        # A relative join needs a literal base: a session cwd with whitespace or
+        # quote/glob bytes would corrupt the word split in the caller.
+        if (cdunres || curcwd == "" || curcwd !~ /^\// || nonliteral(curcwd)) { cdunres = 1; return }
         curcwd = curcwd "/" cls
     }
     {
         $0 = qsplit($0)   # quote-aware segmentation (#3755)
         n = split($0, segs, "\n")
+        # qsplit_op[k] is the operator between segments k and k+1, but a literal
+        # newline records none: when the counts disagree the operators cannot be
+        # trusted, so every cd below fails closed.
+        opsok = (qsplit_nops == n - 1)
         for (i = 1; i <= n; i++) {
             seg = segs[i]
             sub(/^[ \t]+/, "", seg)
-            sub(/^sudo[ \t]+/, "", seg)
+            sudo = sub(/^sudo[ \t]+/, "", seg)
             sub(/^[ \t]+/, "", seg)
-            if (seg ~ /^cd([ \t]|$)/) {
+            # Grouping: `{ ` runs in the current shell (stripped); `(` and `$(`
+            # open a subshell whose cd never leaks out, so save the state on
+            # each open paren and restore it on each close (#12082 analogue).
+            # Quoted spans are blanked before counting.
+            while (seg ~ /^\{[ \t]/) sub(/^\{[ \t]+/, "", seg)
+            pq = segs[i]
+            gsub(/"[^"]*"/, "", pq)
+            gsub(/\047[^\047]*\047/, "", pq)
+            popen = gsub(/\(/, "", pq)
+            pclose = gsub(/\)/, "", pq)
+            # A leading `(` encloses this segment, so the state is saved before
+            # it; a `$(` later in the segment opens AFTER the segment own
+            # command ran in the outer shell, so that save happens after it.
+            lead = (seg ~ /^\(/ && seg !~ /^\(\(/) ? 1 : 0
+            npush = (popen - pclose > lead) ? popen - pclose : lead
+            if (npush > popen) npush = popen
+            npop = pclose - (popen - npush)
+            if (lead > npush) lead = npush
+            if (lead) {
+                sdepth++
+                st_cwd[sdepth] = curcwd; st_seen[sdepth] = cdseen; st_unres[sdepth] = cdunres
+            }
+            while (seg ~ /^\([ \t]*/ && seg !~ /^\(\(/) sub(/^\([ \t]*/, "", seg)
+            if (!sudo && seg ~ /^cd([ \t]|$)/) {
                 m = split(seg, toks, /[ \t]+/)
                 track_cd()
-                continue
+                # A cd on either side of `|` / `&` runs in a child shell, and one
+                # after `||` (or before it) may not run at all: it does not
+                # reliably move the next command, so fail closed.
+                if (!opsok || (i > 1 && (qsplit_op[i - 1] == "|" || qsplit_op[i - 1] == "||")) ||
+                    (i < n && (qsplit_op[i] == "|" || qsplit_op[i] == "||" ||
+                               (qsplit_op[i] == "&" && seg !~ /[<>]$/))))
+                    cdunres = 1
             }
-            if (seg !~ /^rm([ \t]|$)/) continue
-            m = split(seg, toks, /[ \t]+/)
-            has_rf = 0
-            for (j = 2; j <= m; j++)
-                if (toks[j] ~ /^-/ && toks[j] ~ /[rRfF]/) has_rf = 1
-            if (!has_rf) continue
-            for (j = 2; j <= m; j++) {
-                if (toks[j] == "") continue
-                if (toks[j] ~ /^-/) continue
-                if (cdseen && !cdunres && curcwd ~ /^\//)
-                    print mark CDM curcwd CDM toks[j]
-                else if (cdseen || index(toks[j], CDM) > 0 || index(toks[j], UNRM) > 0)
-                    print mark UNRM toks[j]
-                else
-                    print mark toks[j]
+            else if (seg ~ /^rm([ \t]|$)/) {
+                emit_rm()
             }
+            for (q = lead; q < npush; q++) {
+                sdepth++
+                st_cwd[sdepth] = curcwd; st_seen[sdepth] = cdseen; st_unres[sdepth] = cdunres
+            }
+            for (q = 0; q < npop && sdepth > 0; q++) {
+                curcwd = st_cwd[sdepth]; cdseen = st_seen[sdepth]; cdunres = st_unres[sdepth]
+                sdepth--
+            }
+        }
+    }
+    function emit_rm(   j, has_rf) {
+        m = split(seg, toks, /[ \t]+/)
+        has_rf = 0
+        for (j = 2; j <= m; j++)
+            if (toks[j] ~ /^-/ && toks[j] ~ /[rRfF]/) has_rf = 1
+        if (!has_rf) return
+        for (j = 2; j <= m; j++) {
+            if (toks[j] == "") continue
+            if (toks[j] ~ /^-/) continue
+            if (cdseen && !cdunres && curcwd ~ /^\//)
+                print mark CDM curcwd CDM toks[j]
+            else if (cdseen || index(toks[j], CDM) > 0 || index(toks[j], UNRM) > 0)
+                print mark UNRM toks[j]
+            else
+                print mark toks[j]
         }
     }'
 }
