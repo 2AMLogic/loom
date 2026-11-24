@@ -5,16 +5,15 @@
 //! Before this port the loop body spelled the route out inline — an `if` per
 //! response kind, the `MERGE_ATTEMPT -lt MAX_MERGE_RETRIES` retry budget, the
 //! `MERGE_RETRY_DELAY * 2` exponential backoff, and five narration strings
-//! interpolating all three. The I/O those routes perform (the 405 re-read, the
-//! `forge_update_branch` call, the sleeps, `_refresh_precondition_sha`, the
-//! rework marker) stays in the shell; the DECISION and its wording live here,
+//! interpolating all three. The I/O those routes perform (the 405 re-read
+//! and the sleeps) stays in the shell; the DECISION and its wording live here,
 //! pinned by a differential against the retired loop body
 //! (`tests/merge_pr_merge_route_differential.rs`).
 //!
 //! | kind | route |
 //! |---|---|
 //! | `merge-in-progress` | [`Route::Await`]: narrate, sleep 5s, re-read `.merged`; merged → success + break, else warn + next attempt |
-//! | `base-modified`, attempt < max | [`Route::Sync`]: narrate, update the branch, sleep `delay`, re-read the head, mark the rework, double the delay, next attempt |
+//! | `base-modified`, attempt < max | [`Route::Sync`]: narrate, sleep `delay`, double the delay, next attempt |
 //! | `base-modified`, attempt ≥ max | [`Route::Fail`]: "…after M attempts: Branch remains behind base branch" |
 //! | `other` | [`Route::Fail`]: "Failed to merge PR #P: <response>" |
 //! | `head-mismatch` | [`Route::Fail`], quoting the response |
@@ -60,18 +59,14 @@ pub enum Route {
         /// `warning`, when it does not (the loop moves to the next attempt).
         pending: String,
     },
-    /// The base moved and retry budget remains: sync the head, then retry.
+    /// The base moved and retry budget remains: sleep, then retry.
     Sync {
-        /// Seconds to wait for the sync — the CURRENT delay.
+        /// Seconds to wait — the CURRENT delay.
         sleep: i64,
-        /// The delay the next sync will use (exponential backoff).
+        /// The delay the next attempt will use (exponential backoff).
         next_delay: i64,
-        /// `info`, before `forge_update_branch`.
+        /// `info`, before the sleep.
         before: String,
-        /// `info`, after it, before the sleep.
-        wait: String,
-        /// `record-rework --reason` for the #9444 rebase marker.
-        rework: String,
     },
     /// Hard stop: the shell's `error` (exit 1), quoting this message.
     Fail { message: Vec<u8> },
@@ -106,11 +101,6 @@ pub fn decide(i: &Inputs<'_>) -> Route {
                 "Branch is behind base branch, updating... (attempt {}/{})",
                 i.attempt, i.max
             ),
-            wait: format!("Waiting {}s for branch to sync...", i.delay),
-            rework: format!(
-                "base branch was modified; synced before merge retry {}/{}",
-                i.attempt, i.max
-            ),
         },
         Kind::BaseModified => Route::Fail {
             message: format!(
@@ -133,8 +123,8 @@ impl Route {
     /// ```text
     /// LOOM-MERGE-ROUTE AWAIT <sleep>          LOOM-MERGE-ROUTE SYNC <sleep> <next-delay>
     /// BEFORE\t<text>                          BEFORE\t<text>
-    /// MERGED\t<text>                          WAIT\t<text>
-    /// PENDING\t<text>                         REWORK\t<text>
+    /// MERGED\t<text>
+    /// PENDING\t<text>
     ///
     /// LOOM-MERGE-ROUTE FAIL
     /// <message, verbatim, possibly several lines>
@@ -160,12 +150,7 @@ impl Route {
                 sleep,
                 next_delay,
                 before,
-                wait,
-                rework,
-            } => format!(
-                "LOOM-MERGE-ROUTE SYNC {sleep} {next_delay}\nBEFORE\t{before}\nWAIT\t{wait}\nREWORK\t{rework}\n"
-            )
-            .into_bytes(),
+            } => format!("LOOM-MERGE-ROUTE SYNC {sleep} {next_delay}\nBEFORE\t{before}\n").into_bytes(),
             Self::Fail { message } => {
                 let mut out = b"LOOM-MERGE-ROUTE FAIL\n".to_vec();
                 out.extend_from_slice(message);

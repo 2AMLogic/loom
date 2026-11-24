@@ -2,15 +2,14 @@
 //! mid-pass rate-limit-breaker re-check Issue #8953 added to it.
 //!
 //! Lives in its own sibling module rather than inline in
-//! `claim_reconciliation.rs`: that file is already over the file-size
-//! ratchet's threshold and therefore frozen at its current size (see
-//! `.loom/docs/file-size-policy.md`), and the loop is the one piece of
+//! `claim_reconciliation.rs`: the loop is the one piece of
 //! `run_reconciliation_pass` worth unit-testing on its own — everything else
 //! in that function is env-gating and summary logging.
 
 use std::path::Path;
 
 pub(super) mod building_heal;
+pub(super) mod merge_observation;
 
 use super::{forge, merge_sequence, review_conflict, VerdictReconcileStats};
 
@@ -84,6 +83,10 @@ pub(super) fn run_reconciliation_pass_over_roots(
         let (checked, reclaimed) = forge::reconcile_workspace(gh_bin, root, is_startup);
         stats.total_checked += checked;
         stats.total_reclaimed += reclaimed;
+        // #14816 (parent #14811): stale issue-side `loom:curating` claims the
+        // roll-requeue bug left behind. Lease-evidenced release, self-logging
+        // like building_heal below — no stats plumbing here.
+        super::curating_reclaim::reconcile_curating_claims(gh_bin, root);
         let (pr_checked, pr_reclaimed) = forge::reconcile_pr_claims(gh_bin, root);
         stats.total_pr_checked += pr_checked;
         stats.total_pr_reclaimed += pr_reclaimed;
@@ -124,6 +127,14 @@ pub(super) fn run_reconciliation_pass_over_roots(
         // forge-visible claim label went missing; never touches a CLOSED
         // issue (#9463). Self-logging; best-effort.
         building_heal::heal_missing_building_labels(gh_bin, root);
+        // #14902: observe confirmed merges regardless of who made them and
+        // finish the issue bookkeeping they skipped — the partial-increment
+        // reset, Champion's close check, the branch-derived close and the
+        // closed-issue strip. Last in the tick so nothing above re-adopts a
+        // state this pass just wrote; like everything here it makes no
+        // merge-mode check, so it runs on direct-mode workspaces too (the
+        // merge-queue hook above returns early there).
+        merge_observation::reconcile(gh_bin, root);
         stats.roots_processed += 1;
     }
     stats

@@ -100,6 +100,13 @@ fn forge_credential_username_preserves_basic_auth_and_rejects_protocol_injection
 
 use crate::test_git_helpers::{configure, run as git};
 
+/// The writable temp base every [`repository::prepare_with_pr_lookup`] test
+/// passes explicitly — never the ambient `TMPDIR`, which a parallel test's
+/// fixture may be mutating.
+fn temp_base() -> std::path::PathBuf {
+    std::env::temp_dir()
+}
+
 struct RepoFixture {
     _temp: tempfile::TempDir,
     remote: PathBuf,
@@ -136,7 +143,9 @@ impl RepoFixture {
     }
 
     fn prepare(&self) -> Result<String> {
-        repository::prepare(&self.root, &self.args).map(|outcome| outcome.revision)
+        repository::prepare(&self.root, &self.args)
+            .map(|outcome| outcome.revision)
+            .map_err(Into::into)
     }
 }
 
@@ -233,6 +242,66 @@ fn lease_renew_residue_does_not_refuse_reuse_but_other_dirt_does() {
     assert!(error.contains("stray-09"), "{error}");
     assert!(!error.contains("stray-10"), "{error}");
     assert!(error.contains("and 2 more"), "{error}");
+}
+
+/// #14929 AC: an unwritable seat temp dir refuses preparation naming the
+/// cause (`seat_temp_unwritable`) instead of surfacing later as a misleading
+/// fetch or dirty-clone refusal, and no Loom state directory appears in the
+/// private clone — the refusal happens before any clone work, and the state
+/// dirs never fall back to the job's working directory.
+#[test]
+fn an_unwritable_temp_dir_refuses_preparation_naming_the_cause_without_touching_the_clone() {
+    let _fork = fork_guard();
+    let f = RepoFixture::new();
+    // A temp base under a FILE cannot be created or written by any uid
+    // (ENOTDIR), so the refusal is deterministic even under root.
+    let blocker = f._temp.path().join("blocker");
+    std::fs::write(&blocker, b"not a directory").unwrap();
+    let blocked = blocker.join("tmp");
+    let lookup =
+        |_: &Path, _: &str, _: &str, _: &str| panic!("no clone work runs past the preflight");
+    let error = repository::prepare_with_pr_lookup(&f.root, &f.args, &lookup, &blocked)
+        .unwrap_err()
+        .to_string();
+    assert!(
+        error.contains(SEAT_TEMP_UNWRITABLE_REASON),
+        "the refusal names its cause: {error}"
+    );
+    assert!(error.contains("not writable"), "{error}");
+    // The clone was never created and the volume untouched.
+    assert!(!f.root.join("repo").exists());
+    assert!(std::fs::read_dir(&f.root).unwrap().next().is_none());
+
+    // A prepared clone stays clean of Loom state dirs across the refusal:
+    // prepare once, then refuse on the blocked base and re-check the tree.
+    std::fs::remove_file(&blocker).unwrap();
+    f.prepare().unwrap();
+    let repo = f.root.join("repo");
+    std::fs::write(&blocker, b"not a directory").unwrap();
+    let error = repository::prepare_with_pr_lookup(&f.root, &f.args, &lookup, &blocked)
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains(SEAT_TEMP_UNWRITABLE_REASON), "{error}");
+    for entry in std::fs::read_dir(&repo).unwrap().flatten() {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        assert!(
+            !name.starts_with("loom-forge-")
+                && !name.starts_with("loom-write-scope")
+                && !name.starts_with("tmp"),
+            "no Loom state or temp directory may appear in the clone: {name}"
+        );
+    }
+    // No probe residue is left behind in a writable base either.
+    let writable = f._temp.path().join("tmp");
+    std::fs::create_dir(&writable).unwrap();
+    repository::prepare_with_pr_lookup(&f.root, &f.args, &lookup, &writable).unwrap();
+    let residue: Vec<String> = std::fs::read_dir(&writable)
+        .unwrap()
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(residue, Vec::<String>::new(), "the preflight cleans up after itself");
 }
 
 #[test]
@@ -1364,6 +1433,280 @@ fn repository_bound_job_keeps_the_account_wide_exclusive_lease() {
     assert_eq!(lease::read(root.path()).unwrap().unwrap().repository, "");
 }
 
+/// #14678: the seat-reclaim exec drives the in-volume verb directly — same
+/// protocol envelope as `recover`, the account's resolved auth forwarded by
+/// name on the child, and **no `prepare` step anywhere in argv**: the pass
+/// must reach a dirty seat, which preparation would refuse.
+#[test]
+fn seat_reclaim_exec_drives_the_verb_without_any_preparation() {
+    const SECRET: &str = "ghs_seatTESTONLY14678";
+    let mut config = config();
+    config.repository = "https://github.com/acme/widget".into();
+    let argv = std::rc::Rc::new(std::cell::RefCell::new(Vec::<String>::new()));
+    let seen = argv.clone();
+    let _fake = docker::fake::install(Box::new(move |args| {
+        *seen.borrow_mut() = args.iter().map(|a| (*a).to_owned()).collect();
+        Ok(serde_json::json!({
+            "protocol": PROTOCOL,
+            "outcome": {
+                "worktrees_scanned": 1,
+                "worktrees_removed": 0,
+                "worktrees_failed": 0,
+                "preserved": ["PR still open"],
+                "bytes": 0,
+                "scratch_removed": 0,
+                "scratch_scanned": 0,
+                "scratch_bytes": 0,
+            }
+        })
+        .to_string())
+    }));
+    let ws = forge_auth::published_owner_workspace("acme");
+    let resolved =
+        forge_auth::ExecAuth::resolve_with(ws.path(), &config.repository, &|_| None, &|_| {
+            Some(SECRET.into())
+        });
+    let outcome = docker::seat_reclaim(&config, 86_400, 3_600, &resolved).unwrap();
+    assert_eq!(outcome.worktrees_scanned, 1);
+    assert_eq!(outcome.preserved, vec!["PR still open".to_string()]);
+
+    let args = argv.borrow().clone();
+    let joined = args.join(" ");
+    assert!(joined.contains("private-workspace seat-reclaim"), "{args:?}");
+    assert!(joined.contains("--account account"), "{args:?}");
+    assert!(joined.contains("--max-age-secs 86400"), "{args:?}");
+    assert!(joined.contains("--grace-secs 3600"), "{args:?}");
+    assert!(
+        !joined.contains("prepare"),
+        "the seat pass must not prepare the target ({args:?})"
+    );
+    assert!(
+        args.windows(2)
+            .any(|w| w[0] == "--env" && w[1] == "GH_TOKEN"),
+        "{args:?}"
+    );
+    assert!(!args.iter().any(|a| a.contains(SECRET)), "token leaked into argv");
+}
+
+/// #14889: the seat outcome carries one record per removed item with serde
+/// defaults, so an older counts-only seat image still parses and yields the
+/// two summary spans, and a current image's records reach the host intact.
+#[test]
+fn seat_reclaim_outcome_carries_removal_records_and_tolerates_counts_only_images() {
+    let mut config = config();
+    config.repository = "https://github.com/acme/widget".into();
+    let ws = forge_auth::published_owner_workspace("acme");
+    let resolved =
+        forge_auth::ExecAuth::resolve_with(ws.path(), &config.repository, &|_| None, &|_| None);
+
+    // An older seat image: counts only, no `removed`, no failure field.
+    let older = serde_json::json!({
+        "protocol": PROTOCOL,
+        "outcome": {
+            "worktrees_scanned": 2, "worktrees_removed": 1, "worktrees_failed": 0,
+            "preserved": ["PR still open"], "bytes": 4096,
+            "scratch_removed": 1, "scratch_scanned": 1, "scratch_bytes": 512,
+        }
+    })
+    .to_string();
+    let outcome = {
+        let response = older.clone();
+        let _older = docker::fake::install(Box::new(move |_| Ok(response.clone())));
+        docker::seat_reclaim(&config, 86_400, 3_600, &resolved).unwrap()
+    };
+    assert_eq!(outcome.worktrees_removed, 1);
+    assert_eq!(outcome.scratch_removed, 1);
+    assert!(outcome.removed.is_empty(), "older images carry no records");
+    assert_eq!(outcome.inspection_error, None);
+    let ((), captured) = crate::observability::ops::capture::capture(|| {
+        seat_reclaim::report_seat("agent-7", &outcome, std::time::Duration::from_secs(1));
+    });
+    // A counts-only response still yields the two per-seat summaries with
+    // their phases, counts and byte totals.
+    let summaries: Vec<(&str, &str, &str)> = captured
+        .spans
+        .iter()
+        .map(|span| {
+            (
+                span.name.as_str(),
+                span.attributes["loom.reaper.phase"].as_str(),
+                span.attributes["loom.reaper.removed"].as_str(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        summaries,
+        [
+            ("reaper.pass", "reap", "1"),
+            ("reaper.pass", "reclaim", "1")
+        ]
+    );
+    assert!(captured
+        .spans
+        .iter()
+        .all(|span| span.name.as_str() != "reaper.removal"));
+
+    // A current image: the records cross the JSON boundary field-for-field.
+    let current = serde_json::json!({
+        "protocol": PROTOCOL,
+        "outcome": {
+            "worktrees_scanned": 1, "worktrees_removed": 1, "worktrees_failed": 0,
+            "preserved": [], "bytes": 8192,
+            "scratch_removed": 1, "scratch_scanned": 1, "scratch_bytes": 512,
+            "removed": [
+                {"kind": "worktree", "path": "repo/.loom/worktrees/issue-9",
+                 "branch": "feature/issue-9", "tip": "a".repeat(40), "bytes": 7680},
+                {"kind": "scratch", "path": "cache/sta-6421", "bytes": 512},
+            ],
+            "inspection_error": "workspace Git worktree failed (exit status: 128)",
+        }
+    })
+    .to_string();
+    let outcome = {
+        let response = current.clone();
+        let _newer = docker::fake::install(Box::new(move |_| Ok(response.clone())));
+        docker::seat_reclaim(&config, 86_400, 3_600, &resolved).unwrap()
+    };
+    assert_eq!(
+        outcome.removed,
+        vec![
+            seat_reclaim::RemovedItem {
+                kind: "worktree".into(),
+                path: "repo/.loom/worktrees/issue-9".into(),
+                branch: Some("feature/issue-9".into()),
+                tip: Some("a".repeat(40)),
+                bytes: Some(7680),
+            },
+            seat_reclaim::RemovedItem {
+                kind: "scratch".into(),
+                path: "cache/sta-6421".into(),
+                branch: None,
+                tip: None,
+                bytes: Some(512),
+            },
+        ]
+    );
+    assert_eq!(
+        outcome.inspection_error.as_deref(),
+        Some("workspace Git worktree failed (exit status: 128)")
+    );
+}
+
+/// #14889: one removal span per item keeps every field after export
+/// bounding — 33 removals in one phase sit past `SpanRecord::bounded`'s
+/// 32-event cap, which a per-item span must never be subject to — and a
+/// path longer than the 256-byte attribute bound stays correlatable to the
+/// full, escaped local log entry through its bounded base name.
+#[test]
+fn removal_spans_survive_export_bounding_for_every_item() {
+    let mut config = config();
+    config.repository = "https://github.com/acme/widget".into();
+    let ws = forge_auth::published_owner_workspace("acme");
+    let resolved =
+        forge_auth::ExecAuth::resolve_with(ws.path(), &config.repository, &|_| None, &|_| None);
+
+    // A worktree path 292 bytes long in 10-byte segments: over the
+    // 256-byte attribute-value bound, with a short final component.
+    let deep = vec!["branch-xyz"; 24].join("/");
+    let long_path = format!("repo/.loom/worktrees/issue-9/{deep}");
+    assert!(long_path.len() > 256, "{}", long_path.len());
+    // A crafted scratch name that must not forge or split the log line.
+    let forged = "evil-42\nFAKE: seat agent-7 removed /etc";
+
+    let mut removed: Vec<serde_json::Value> = (0..33)
+        .map(|n| serde_json::json!({"kind": "scratch", "path": format!("cache/sta-{n}"), "bytes": 10}))
+        .collect();
+    removed.push(serde_json::json!({"kind": "scratch", "path": forged, "bytes": 7}));
+    removed.push(serde_json::json!({
+        "kind": "worktree", "path": long_path, "branch": "feature/issue-9",
+        "tip": "b".repeat(40), "bytes": 4864,
+    }));
+    let response = serde_json::json!({
+        "protocol": PROTOCOL,
+        "outcome": {
+            "worktrees_scanned": 1, "worktrees_removed": 1, "worktrees_failed": 0,
+            "preserved": [], "bytes": 8201,
+            "scratch_removed": 34, "scratch_scanned": 34, "scratch_bytes": 337,
+            "removed": removed,
+        }
+    })
+    .to_string();
+    let outcome = {
+        let _fake = docker::fake::install(Box::new(move |_| Ok(response.clone())));
+        docker::seat_reclaim(&config, 86_400, 3_600, &resolved).unwrap()
+    };
+    assert_eq!(outcome.removed.len(), 35);
+
+    let logs = crate::test_log_capture::capture_logs(|| {
+        let ((), captured) = crate::observability::ops::capture::capture(|| {
+            seat_reclaim::report_seat("agent-7", &outcome, std::time::Duration::from_secs(1));
+        });
+        let summaries: Vec<(&str, &str)> = captured
+            .spans
+            .iter()
+            .filter(|span| span.name.as_str() == "reaper.pass")
+            .map(|span| {
+                (
+                    span.attributes["loom.reaper.phase"].as_str(),
+                    span.attributes["loom.reaper.removed"].as_str(),
+                )
+            })
+            .collect();
+        assert_eq!(summaries, [("reap", "1"), ("reclaim", "34")]);
+        let removals: Vec<_> = captured
+            .spans
+            .iter()
+            .filter(|span| span.name.as_str() == "reaper.removal")
+            .map(|span| span.clone().bounded())
+            .collect();
+        assert_eq!(removals.len(), 35, "one span per item, no per-span event cap");
+        // All 33 same-phase items keep every field after bounding.
+        for n in 0..33 {
+            let span = removals
+                .iter()
+                .find(|span| {
+                    span.attributes
+                        .get("loom.reaper.removal.path")
+                        .is_some_and(|p| p == &format!("cache/sta-{n}"))
+                })
+                .unwrap_or_else(|| panic!("span for cache/sta-{n} kept its path"));
+            assert_eq!(span.attributes["loom.reaper.removal.kind"], "scratch");
+            assert_eq!(span.attributes["loom.reaper.removal.bytes"], "10");
+            assert_eq!(span.attributes["loom.reaper.removal.name"], format!("sta-{n}"));
+            assert_eq!(span.attributes["loom.repo"], "agent-7");
+        }
+        // The over-long path is dropped by the bound, but the base name
+        // keeps the span correlatable; the crafted name never enters it.
+        let long = removals
+            .iter()
+            .find(|span| {
+                span.attributes
+                    .get("loom.reaper.removal.tip")
+                    .is_some_and(|t| t.starts_with('b'))
+            })
+            .expect("the long-path worktree span");
+        assert!(!long.attributes.contains_key("loom.reaper.removal.path"));
+        assert_eq!(long.attributes["loom.reaper.removal.name"], "branch-xyz");
+        assert_eq!(long.attributes["loom.reaper.removal.tip"], "b".repeat(40));
+    });
+    // The long identity remains correlatable: the local log carries the
+    // full, escaped path AND the bounded base name the span kept.
+    let item_line = logs
+        .iter()
+        .map(|(_, line)| line.as_str())
+        .find(|line| line.contains("branch-xyz"))
+        .expect("the long-path item's log line");
+    assert!(item_line.contains(&long_path), "full path: {item_line}");
+    // The crafted name cannot forge or split a line: it appears escaped,
+    // and no captured message contains a raw newline.
+    let escaped = logs
+        .iter()
+        .map(|(_, line)| line.as_str())
+        .find(|line| line.contains("evil-42"))
+        .expect("the crafted item's log line");
+    assert!(escaped.contains("\\nFAKE:") && !escaped.contains('\n'), "{escaped:?}");
+}
+
 /// #13916: on an App-only host the prepare exec names `GH_TOKEN` as a bare
 /// `--env` and the resolved value rides on the `docker` child alone — never
 /// in argv. A token already in the process env adds nothing to the child.
@@ -1762,7 +2105,7 @@ fn preparation_keeps_a_fast_forwarded_draft_without_finished_pr_evidence() {
         assert_eq!(revision, tip);
         false
     };
-    let error = repository::prepare_with_pr_lookup(&f.root, &f.args, &lookup)
+    let error = repository::prepare_with_pr_lookup(&f.root, &f.args, &lookup, &temp_base())
         .unwrap_err()
         .to_string();
 
@@ -1778,6 +2121,7 @@ fn preparation_reaps_published_finished_prs_independent_of_merge_method() {
         let fresh = repository::prepare(&f.root, &f.args).unwrap();
         assert!(fresh.reaped.is_empty(), "a no-reap preparation reports none");
         let worktree = linked_worktree(&f, "finished");
+        let expected_path = worktree.canonicalize().unwrap().display().to_string();
         for text in ["first", "second"] {
             std::fs::write(worktree.join("fixture"), text).unwrap();
             git(&worktree, &["commit", "-am", text]);
@@ -1809,16 +2153,49 @@ fn preparation_reaps_published_finished_prs_independent_of_merge_method() {
             assert_eq!(revision, tip);
             true
         };
-        let outcome = repository::prepare_with_pr_lookup(&f.root, &f.args, &evidence).unwrap();
+        let outcome =
+            repository::prepare_with_pr_lookup(&f.root, &f.args, &evidence, &temp_base()).unwrap();
         assert!(!worktree.exists(), "{state} leftover removed");
-        assert_eq!(
-            outcome.reaped,
-            vec![worktree.display().to_string()],
-            "{state} reaped worktree is reported"
-        );
+        assert_eq!(outcome.reaped, vec![expected_path], "{state} reaped worktree is reported");
         assert_eq!(git(&repo, &["rev-parse", "refs/heads/finished"]), tip);
         assert_eq!(git(&f.remote, &["rev-parse", "refs/heads/finished"]), tip);
     }
+}
+
+#[test]
+fn preparation_reports_a_reaped_worktree_when_another_refuses_reuse() {
+    let _fork = fork_guard();
+    let f = RepoFixture::new();
+    f.prepare().unwrap();
+    let finished = linked_worktree(&f, "finished");
+    git(&finished, &["push", "origin", "finished"]);
+    let tip = git(&finished, &["rev-parse", "HEAD"]);
+    let expected = finished.canonicalize().unwrap().display().to_string();
+    std::fs::write(finished.join("leftover"), "abandoned").unwrap();
+
+    let dirty = linked_worktree(&f, "still-active");
+    std::fs::write(dirty.join("retained.txt"), "keep me").unwrap();
+    let evidence =
+        |_: &Path, _: &str, branch: &str, revision: &str| branch == "finished" && revision == tip;
+    let refusal = repository::prepare_response(repository::prepare_with_pr_lookup(
+        &f.root,
+        &f.args,
+        &evidence,
+        &temp_base(),
+    ));
+    assert!(refusal["error"].as_str().unwrap().contains("seat_dirty"), "{refusal}");
+    assert!(!finished.exists());
+    assert_eq!(std::fs::read_to_string(dirty.join("retained.txt")).unwrap(), "keep me");
+    assert_eq!(refusal["reaped_worktrees"], serde_json::json!([expected]));
+
+    let refused_again = repository::prepare_response(repository::prepare_with_pr_lookup(
+        &f.root,
+        &f.args,
+        &evidence,
+        &temp_base(),
+    ));
+    assert_eq!(refused_again["error"], refusal["error"]);
+    assert_eq!(refused_again["reaped_worktrees"], serde_json::json!([]));
 }
 
 #[test]
@@ -1833,7 +2210,7 @@ fn preparation_preserves_commits_missing_from_origin_even_with_finished_pr_evide
     std::fs::write(worktree.join("leftover"), "keep").unwrap();
     let lookup =
         |_: &Path, _: &str, _: &str, _: &str| panic!("unpublished tips must skip the PR read");
-    let error = repository::prepare_with_pr_lookup(&f.root, &f.args, &lookup)
+    let error = repository::prepare_with_pr_lookup(&f.root, &f.args, &lookup, &temp_base())
         .unwrap_err()
         .to_string();
     assert!(error.contains("seat_dirty"), "{error}");
@@ -1950,4 +2327,18 @@ fn a_dirty_worktree_in_one_clone_does_not_refuse_the_seats_other_clone() {
     assert!(f.prepare().unwrap_err().to_string().contains("seat_dirty"));
     // The other repository's clone prepares regardless (#14458).
     repository::prepare(&f.root, &additional).unwrap();
+}
+
+#[test]
+fn status_running_is_false_while_the_seat_is_restarting() {
+    let state = |running, restarting| serde_json::json!({"State": {"Running": running, "Restarting": restarting}});
+    // Docker reports Running=true during a crash-loop back-off (#15015).
+    assert!(!lifecycle::reports_running(Some(&state(true, true))));
+    assert!(lifecycle::reports_running(Some(&state(true, false))));
+    assert!(!lifecycle::reports_running(Some(&state(false, false))));
+    // A missing `Restarting` key is not restarting; no container is not running.
+    assert!(lifecycle::reports_running(Some(
+        &serde_json::json!({"State": {"Running": true}})
+    )));
+    assert!(!lifecycle::reports_running(None));
 }

@@ -10,9 +10,8 @@
 //! ingestion's derived data does not cover).
 //!
 //! They are gathered into one **flattened** enum, exactly as
-//! [`super::script_ports`] is and for the same second reason: `main.rs` is over
-//! `.loom/docs/file-size-policy.md`'s threshold and frozen, so a subcommand
-//! that costs it a variant-with-args each time cannot be added at all.
+//! [`super::script_ports`] is and for the same second reason: a subcommand
+//! that costs `main.rs` a variant-with-args each time is not worth adding.
 //! Flattening keeps every subcommand top-level on the CLI (`loom-daemon usage`,
 //! `loom-daemon ingest-transcripts` — neither gains a `telemetry` prefix) while
 //! `main.rs` holds a single variant and a single dispatch arm for the family.
@@ -26,8 +25,7 @@ use anyhow::Result;
 
 use crate::script_helpers;
 
-#[path = "curation_complete.rs"]
-mod curation_complete;
+use super::CurationCompleteArgs;
 #[path = "record_rework.rs"]
 mod record_rework;
 #[path = "telemetry_export.rs"]
@@ -46,7 +44,7 @@ mod telemetry_overhead;
 #[derive(clap::Subcommand)]
 pub(crate) enum TelemetryCommand {
     /// Journal one Curator completion before applying curated labels.
-    CurationComplete(curation_complete::CurationCompleteArgs),
+    CurationComplete(CurationCompleteArgs),
     /// Plan or explicitly execute two bounded Pi/OpenCode GLM smoke runs.
     TelemetryLiveCanary(telemetry_live::LiveArgs),
     /// Write deterministic synthetic telemetry and an independent-query manifest.

@@ -909,6 +909,20 @@ fn fetch_published_at(tag: &str, repo: &str, root: &Path) -> Result<String, Read
     .map(|p| p.published_at)
 }
 
+/// A checksum read (`release.checksum` / `release.checksum_lookup`).
+///
+/// Gateway-exempt (#15134): releases never use the forge gateway, so these
+/// reads go straight to the reader pool. Offered to the gateway, the relay
+/// refuses them, the refusal classifies as `Failure::Credential`, and that
+/// withdraws the gateway for the whole owner for `CREDENTIAL_WITHDRAWAL`.
+fn checksum_read(op: &'static str, target: GhTarget, root: &Path) -> GhInvocation {
+    GhInvocation::new(Operation::new(op), AccessIntent::Read, target, GH_TIMEOUT)
+        .program(crate::gh_invocation::gh_bin())
+        .current_dir(root)
+        .reader_only()
+        .gateway_exempt()
+}
+
 /// The published sha256 for this platform's binary, read from the release's own
 /// `.sha256` asset.
 ///
@@ -935,11 +949,12 @@ fn fetch_asset_sha256(tag: &str, repo: &str, sha_name: &str, root: &Path) -> Opt
         return None;
     };
     let (releases, tag_lookup) = checksum_paths(owner, name, tag)?;
-    let Query::Populated(release) =
-        gh_read::<Release, _>("release.checksum_lookup", repo, &["api", &tag_lookup], root, |_| {
-            false
-        })
-    else {
+    let Query::Populated(release) = decode_json::<Release, _>(
+        checksum_read("release.checksum_lookup", target.clone(), root)
+            .args(["api", &tag_lookup])
+            .run(),
+        |_| false,
+    ) else {
         return None;
     };
     let id = release
@@ -948,23 +963,15 @@ fn fetch_asset_sha256(tag: &str, repo: &str, sha_name: &str, root: &Path) -> Opt
         .find(|asset| asset.name == sha_name && asset.id > 0)?
         .id;
     let asset_path = format!("{releases}/assets/{id}");
-    let out = GhInvocation::new(
-        Operation::new("release.checksum"),
-        AccessIntent::Read,
-        target,
-        GH_TIMEOUT,
-    )
-    .program(crate::gh_invocation::gh_bin())
-    .current_dir(root)
-    .args([
-        "api",
-        &asset_path,
-        "--include",
-        "-H",
-        "Accept: application/octet-stream",
-    ])
-    .reader_only()
-    .run();
+    let out = checksum_read("release.checksum", target, root)
+        .args([
+            "api",
+            &asset_path,
+            "--include",
+            "-H",
+            "Accept: application/octet-stream",
+        ])
+        .run();
     let parsed = crate::forge_listing::parse_http_response(&String::from_utf8_lossy(
         &out.ok_output()?.stdout,
     ))?;

@@ -53,6 +53,9 @@ fn setup_test_context() -> TestContext {
     let db = Arc::new(Mutex::new(db));
     let mut sr_config = SweepRegistryConfig::new(dir.path().to_path_buf());
     sr_config.skip_label_flip = true;
+    // Confine the #3953 sweep journal to this fixture's tempdir — never the
+    // real machine-level `~/.loom/sweeps.json`.
+    sr_config.journal_path = Some(dir.path().join("test-sweeps-journal.json"));
     let bus = Arc::new(EventBus::new());
     let mut registry = SweepRegistry::new(sr_config);
     registry.set_event_bus(bus.clone());
@@ -472,8 +475,7 @@ fn test_dispatch_sweep_still_dispatches_under_synthetic_low_headroom() {
 
 #[test]
 fn test_handle_request_list_sweeps_empty() {
-    let (_context_dir, tm, db, _, bus) = setup_test_context();
-    let (sr, _dir, _rec) = setup_sweep_registry_in_tempdir();
+    let (_context_dir, tm, db, sr, bus) = setup_test_context();
     let response = handle_request(
         Request::ListSweeps {
             state_filter: None,
@@ -618,20 +620,39 @@ fn test_sweep_requests_route_to_explicit_workspace_root() {
 // `REGISTRY_PATH_ENV` at a temp file (via `seed_temp_registry`) rather
 // than touching the real `~/.loom/workspaces.json`.
 
-/// `all_workspaces: true` aggregates sweeps from every registered root in
-/// one call — no caller-supplied `workspace_root` needed — and each
-/// returned `SweepInfo` still carries the `repo` field naming its owner,
-/// so a fleet-wide caller never needs to already know the individual repo
-/// roots (the issue's core acceptance criterion).
+/// One two-workspace fixture for the four `ListSweeps` routing cases
+/// (`all_workspaces` × `workspace_root`, Issue #6006 — deferred follow-up
+/// to #3930): the fan-out is strictly opt-in, the flag wins over an
+/// explicit root, and each `SweepInfo` still carries the `repo` field
+/// naming its owner, so a fleet-wide caller never needs to already know
+/// the individual repo roots. Seeding the two roots once (instead of one
+/// fixture per case) keeps every assertion on the complete
+/// owning-repository list, so a response carrying the wrong owner or a
+/// short count fails, not just the length check.
+///
+/// Routing matrix asserted, in order:
+///
+/// 1. Only repo B populated — with fan-out disabled, the default request
+///    sees nothing (byte-for-byte pre-#6006 behavior) and a request for B
+///    sees B alone.
+/// 2. While repo A is still empty, fan-out with an explicit root naming A
+///    must still see B alone: the flag wins over the requested root, which
+///    catches a handler that scopes to the explicitly requested root.
+/// 3. Both repos populated — with fan-out enabled, an explicit request for
+///    B (catching a handler that falls back to the default workspace) and
+///    a request with no explicit root must each return exactly one sweep
+///    from A and one from B.
 #[test]
 #[serial_test::serial]
-fn test_list_sweeps_all_workspaces_fans_out_across_registered_roots() {
+fn test_list_sweeps_all_workspaces_routing_matrix() {
     let (_context_dir, tm, db, _, bus) = setup_test_context();
 
     let (sr_default, dir_a, _rec_a) = setup_sweep_registry_in_tempdir();
     let (sr_b, dir_b, _rec_b) = setup_sweep_registry_in_tempdir();
     let root_a = crate::workspace_registry::normalize_path(dir_a.path());
     let root_b = crate::workspace_registry::normalize_path(dir_b.path());
+    let repo_a = dir_a.path().display().to_string();
+    let repo_b = dir_b.path().display().to_string();
 
     let pool = Arc::new(WorkspacePool::new(Arc::new(EventBus::new()), test_runtime_handle()));
     pool.seed(root_a, sr_default.clone());
@@ -640,21 +661,37 @@ fn test_list_sweeps_all_workspaces_fans_out_across_registered_roots() {
     // Register BOTH roots so `effective_roots` enumerates both.
     let _guard = seed_temp_registry(&[dir_a.path(), dir_b.path()]);
 
-    let dispatched_a = handle_request(
-        issue_dispatch(60_060, Some(dir_a.path())),
-        &tm,
-        &db,
-        &sr_default,
-        &bus,
-        &pool,
-    );
-    assert!(
-        matches!(dispatched_a, Response::SweepDispatched { .. }),
-        "expected SweepDispatched for repo A, got: {dispatched_a:?}"
-    );
+    // Issue a `ListSweeps` request and normalize the response to the
+    // sorted list of owning repositories — count-preserving and
+    // order-independent. The flag and requested root are echoed into every
+    // failure message.
+    let owning_repos = |all: bool, root: Option<&str>| -> Vec<Option<String>> {
+        let routing = format!("all_workspaces={all}, workspace_root={root:?}");
+        match handle_request(
+            Request::ListSweeps {
+                state_filter: None,
+                workspace_root: root.map(String::from),
+                all_workspaces: all,
+            },
+            &tm,
+            &db,
+            &sr_default,
+            &bus,
+            &pool,
+        ) {
+            Response::SweepList { sweeps } => {
+                let mut repos: Vec<Option<String>> =
+                    sweeps.iter().map(|s| s.repo.clone()).collect();
+                repos.sort();
+                repos
+            }
+            other => panic!("{routing}: expected SweepList, got: {other:?}"),
+        }
+    };
 
+    // Populate repo B only.
     let dispatched_b = handle_request(
-        issue_dispatch(60_061, Some(dir_b.path())),
+        issue_dispatch(60_060, Some(dir_b.path())),
         &tm,
         &db,
         &sr_default,
@@ -666,173 +703,61 @@ fn test_list_sweeps_all_workspaces_fans_out_across_registered_roots() {
         "expected SweepDispatched for repo B, got: {dispatched_b:?}"
     );
 
-    // Fleet-wide fan-out: no `workspace_root`, just `all_workspaces: true`.
-    let listed_all = handle_request(
-        Request::ListSweeps {
-            state_filter: None,
-            workspace_root: None,
-            all_workspaces: true,
-        },
-        &tm,
-        &db,
-        &sr_default,
-        &bus,
-        &pool,
+    // Fan-out off: the default workspace (repo A) must not see repo B's
+    // sweep — the fan-out is strictly opt-in, never a reinterpretation of
+    // the `workspace_root: None` contract.
+    assert_eq!(
+        owning_repos(false, None),
+        Vec::<Option<String>>::new(),
+        "all_workspaces=false, workspace_root=None: default-only listing must ignore repo B's sweep"
     );
-    match listed_all {
-        Response::SweepList { sweeps } => {
-            assert_eq!(sweeps.len(), 2, "fan-out must see both repos' sweeps");
-            let repos: std::collections::BTreeSet<_> =
-                sweeps.iter().map(|s| s.repo.clone()).collect();
-            assert_eq!(
-                repos,
-                std::collections::BTreeSet::from([
-                    Some(dir_a.path().display().to_string()),
-                    Some(dir_b.path().display().to_string()),
-                ]),
-                "each SweepInfo must carry its owning repo, no repo omitted"
-            );
-        }
-        other => panic!("Expected SweepList, got: {other:?}"),
-    }
-}
-
-/// Regression guard: `all_workspaces` absent/`false` reproduces
-/// byte-for-byte pre-#6006 `workspace_root`-scoped (or
-/// default-workspace-only) behavior even when multiple workspaces are
-/// registered and populated — the fan-out is strictly opt-in, never a
-/// reinterpretation of the existing `None`/absent `workspace_root`
-/// contract. Also asserts an explicit `workspace_root` still scopes to
-/// that one repo when `all_workspaces` is left at its default.
-#[test]
-#[serial_test::serial]
-fn test_list_sweeps_all_workspaces_false_preserves_single_workspace_behavior() {
-    let (_context_dir, tm, db, _, bus) = setup_test_context();
-
-    let (sr_default, dir_a, _rec_a) = setup_sweep_registry_in_tempdir();
-    let (sr_b, dir_b, _rec_b) = setup_sweep_registry_in_tempdir();
-    let root_a = crate::workspace_registry::normalize_path(dir_a.path());
-    let root_b = crate::workspace_registry::normalize_path(dir_b.path());
-
-    let pool = Arc::new(WorkspacePool::new(Arc::new(EventBus::new()), test_runtime_handle()));
-    pool.seed(root_a, sr_default.clone());
-    pool.seed(root_b.clone(), sr_b.clone());
-
-    let _guard = seed_temp_registry(&[dir_a.path(), dir_b.path()]);
-
-    // Dispatch into repo B only.
-    let dispatched_b = handle_request(
-        issue_dispatch(60_062, Some(dir_b.path())),
-        &tm,
-        &db,
-        &sr_default,
-        &bus,
-        &pool,
+    // Fan-out off: an explicit root still scopes to that one repo.
+    assert_eq!(
+        owning_repos(false, Some(&repo_b)),
+        vec![Some(repo_b.clone())],
+        "all_workspaces=false, workspace_root={repo_b:?}: explicit root must scope to repo B alone"
     );
-    assert!(matches!(dispatched_b, Response::SweepDispatched { .. }));
 
-    // Default (`workspace_root: None`, `all_workspaces: false`) must NOT
-    // see repo B's sweep, exactly as before #6006 — even though repo B is
-    // now registered and populated.
-    let listed_default = handle_request(
-        Request::ListSweeps {
-            state_filter: None,
-            workspace_root: None,
-            all_workspaces: false,
-        },
-        &tm,
-        &db,
-        &sr_default,
-        &bus,
-        &pool,
+    // Repo A is still empty: fan-out with an explicit root naming A must
+    // still see repo B's sweep — the flag wins, so a handler that scopes
+    // to the requested root (and returns nothing) fails here.
+    assert_eq!(
+        owning_repos(true, Some(&repo_a)),
+        vec![Some(repo_b.clone())],
+        "all_workspaces=true, workspace_root={repo_a:?}: fan-out must ignore the requested root and see repo B"
     );
-    match listed_default {
-        Response::SweepList { sweeps } => assert!(
-            sweeps.is_empty(),
-            "default-only listing must ignore repo B's sweep even though it exists"
-        ),
-        other => panic!("Expected SweepList, got: {other:?}"),
-    }
 
-    // An explicit `workspace_root` still scopes to that one repo when
-    // `all_workspaces` is left at its default.
-    let listed_b = handle_request(
-        Request::ListSweeps {
-            state_filter: None,
-            workspace_root: Some(dir_b.path().to_string_lossy().into_owned()),
-            all_workspaces: false,
-        },
-        &tm,
-        &db,
-        &sr_default,
-        &bus,
-        &pool,
-    );
-    match listed_b {
-        Response::SweepList { sweeps } => {
-            assert_eq!(sweeps.len(), 1, "explicit workspace_root still scopes to repo B");
-        }
-        other => panic!("Expected SweepList, got: {other:?}"),
-    }
-}
-
-/// `all_workspaces: true` and an explicit `workspace_root` are mutually
-/// exclusive by design — the flag always wins. Repo A's sweep is still
-/// visible in the fan-out even though `workspace_root` names repo B.
-#[test]
-#[serial_test::serial]
-fn test_list_sweeps_all_workspaces_true_ignores_explicit_workspace_root() {
-    let (_context_dir, tm, db, _, bus) = setup_test_context();
-
-    let (sr_default, dir_a, _rec_a) = setup_sweep_registry_in_tempdir();
-    let (sr_b, dir_b, _rec_b) = setup_sweep_registry_in_tempdir();
-    let root_a = crate::workspace_registry::normalize_path(dir_a.path());
-    let root_b = crate::workspace_registry::normalize_path(dir_b.path());
-
-    let pool = Arc::new(WorkspacePool::new(Arc::new(EventBus::new()), test_runtime_handle()));
-    pool.seed(root_a, sr_default.clone());
-    pool.seed(root_b.clone(), sr_b.clone());
-
-    let _guard = seed_temp_registry(&[dir_a.path(), dir_b.path()]);
-
+    // Populate repo A as well.
     let dispatched_a = handle_request(
-        issue_dispatch(60_063, Some(dir_a.path())),
+        issue_dispatch(60_061, Some(dir_a.path())),
         &tm,
         &db,
         &sr_default,
         &bus,
         &pool,
     );
-    assert!(matches!(dispatched_a, Response::SweepDispatched { .. }));
+    assert!(
+        matches!(dispatched_a, Response::SweepDispatched { .. }),
+        "expected SweepDispatched for repo A, got: {dispatched_a:?}"
+    );
 
-    // `workspace_root` names repo B, but `all_workspaces: true` wins —
-    // repo A's sweep is still visible in the aggregated response.
-    let listed = handle_request(
-        Request::ListSweeps {
-            state_filter: None,
-            workspace_root: Some(dir_b.path().to_string_lossy().into_owned()),
-            all_workspaces: true,
-        },
-        &tm,
-        &db,
-        &sr_default,
-        &bus,
-        &pool,
+    let mut both_repos = vec![Some(repo_a.clone()), Some(repo_b.clone())];
+    both_repos.sort();
+
+    // Fan-out with an explicit root naming B, both roots populated:
+    // exactly one sweep per repo — a handler that falls back to the
+    // default workspace (repo A only) fails here.
+    assert_eq!(
+        owning_repos(true, Some(&repo_b)),
+        both_repos.clone(),
+        "all_workspaces=true, workspace_root={repo_b:?}: fan-out must aggregate one sweep from each repo"
     );
-    match listed {
-        Response::SweepList { sweeps } => {
-            assert_eq!(
-                sweeps.len(),
-                1,
-                "fan-out must include repo A's sweep despite workspace_root naming repo B"
-            );
-            assert_eq!(
-                sweeps[0].repo.as_deref(),
-                Some(dir_a.path().display().to_string().as_str())
-            );
-        }
-        other => panic!("Expected SweepList, got: {other:?}"),
-    }
+    // Fan-out with no explicit root: the same aggregation.
+    assert_eq!(
+        owning_repos(true, None),
+        both_repos,
+        "all_workspaces=true, workspace_root=None: fan-out must aggregate one sweep from each repo"
+    );
 }
 
 // ===== Dispatch-path workspace resolution (#4299) =====
@@ -2304,8 +2229,7 @@ async fn test_handle_request_publish_event_malformed_and_unknown_stay_generic() 
 
 #[test]
 fn test_handle_request_get_sweep_status_missing() {
-    let (_context_dir, tm, db, _, bus) = setup_test_context();
-    let (sr, _dir, _rec) = setup_sweep_registry_in_tempdir();
+    let (_context_dir, tm, db, sr, bus) = setup_test_context();
     let response = handle_request(
         Request::GetSweepStatus {
             sweep_id: "no-such-sweep".to_string(),
@@ -2325,8 +2249,7 @@ fn test_handle_request_get_sweep_status_missing() {
 
 #[test]
 fn test_handle_request_tail_sweep_log_missing_sweep_returns_error() {
-    let (_context_dir, tm, db, _, bus) = setup_test_context();
-    let (sr, _dir, _rec) = setup_sweep_registry_in_tempdir();
+    let (_context_dir, tm, db, sr, bus) = setup_test_context();
     let response = handle_request(
         Request::TailSweepLog {
             sweep_id: "no-such-sweep".to_string(),
@@ -2354,8 +2277,7 @@ fn test_handle_request_tail_sweep_log_missing_sweep_returns_error() {
 fn test_handle_request_clear_quarantine_noop() {
     // Issue #3939/#3960: clearing an issue that is not quarantined is an
     // idempotent no-op success routed through the full IPC dispatcher.
-    let (_context_dir, tm, db, _, bus) = setup_test_context();
-    let (sr, _dir, _rec) = setup_sweep_registry_in_tempdir();
+    let (_context_dir, tm, db, sr, bus) = setup_test_context();
     let response = handle_request(
         Request::ClearQuarantine {
             issue: 4242,
@@ -2383,8 +2305,7 @@ fn test_handle_request_clear_quarantine_noop() {
 fn test_handle_request_clear_quarantine_clears_existing() {
     // Seed a quarantine directly, then clear it via the IPC dispatcher and
     // assert the in-memory state was released (was_quarantined: true).
-    let (_context_dir, tm, db, _, bus) = setup_test_context();
-    let (sr, _dir, _rec) = setup_sweep_registry_in_tempdir();
+    let (_context_dir, tm, db, sr, bus) = setup_test_context();
     {
         let mut reg = sr.lock().unwrap();
         reg.seed_quarantine_for_test(808);
@@ -2422,8 +2343,7 @@ fn test_handle_request_record_dispatch_failure_arms_backoff() {
     // caller with no direct registry access) records a failed dispatch
     // via IPC and gets back the resulting consecutive count + window,
     // mirroring the reaper's own automatic bookkeeping (#4485).
-    let (_context_dir, tm, db, _, bus) = setup_test_context();
-    let (sr, _dir, _rec) = setup_sweep_registry_in_tempdir();
+    let (_context_dir, tm, db, sr, bus) = setup_test_context();
     let response = handle_request(
         Request::RecordDispatchFailure {
             issue: 6192,
@@ -2459,8 +2379,7 @@ fn test_handle_request_record_dispatch_failure_arms_backoff() {
 fn test_handle_request_record_dispatch_failure_accumulates_consecutive() {
     // Two calls for the same issue accumulate — mirrors the reaper
     // calling `record_dispatch_failure` on repeated failed dispatches.
-    let (_context_dir, tm, db, _, bus) = setup_test_context();
-    let (sr, _dir, _rec) = setup_sweep_registry_in_tempdir();
+    let (_context_dir, tm, db, sr, bus) = setup_test_context();
     for _ in 0..2 {
         handle_request(
             Request::RecordDispatchFailure {
@@ -2501,8 +2420,7 @@ fn test_handle_request_record_dispatch_failure_disabled_is_noop() {
     // idempotent no-op: `consecutive` stays 0 and `backoff_secs` is None,
     // never a hard error — mirrors `record_dispatch_failure`'s own early
     // return when `dispatch_backoff_config.enabled` is false.
-    let (_context_dir, tm, db, _, bus) = setup_test_context();
-    let (sr, _dir, _rec) = setup_sweep_registry_in_tempdir();
+    let (_context_dir, tm, db, sr, bus) = setup_test_context();
     {
         let mut reg = sr.lock().unwrap();
         let mut cfg = reg.dispatch_backoff_config();
@@ -2543,8 +2461,7 @@ fn test_handle_request_record_noop_release_arms_cooldown() {
     // access) records a self-reported no-op release via IPC and gets back
     // the resulting consecutive count + window, mirroring
     // `RecordDispatchFailure`'s own contract.
-    let (_context_dir, tm, db, _, bus) = setup_test_context();
-    let (sr, _dir, _rec) = setup_sweep_registry_in_tempdir();
+    let (_context_dir, tm, db, sr, bus) = setup_test_context();
     let response = handle_request(
         Request::RecordNoopRelease {
             issue: 6670,
@@ -2584,8 +2501,7 @@ fn test_handle_request_record_noop_release_arms_cooldown() {
 fn test_handle_request_record_noop_release_accumulates_consecutive() {
     // Two calls for the same issue accumulate — mirrors the sweep
     // orchestrator reporting "still nothing to do" on repeated passes.
-    let (_context_dir, tm, db, _, bus) = setup_test_context();
-    let (sr, _dir, _rec) = setup_sweep_registry_in_tempdir();
+    let (_context_dir, tm, db, sr, bus) = setup_test_context();
     for _ in 0..2 {
         handle_request(
             Request::RecordNoopRelease {
@@ -2626,8 +2542,7 @@ fn test_handle_request_record_noop_release_disabled_is_noop() {
     // idempotent no-op: `consecutive` stays 0 and `cooldown_secs` is None,
     // never a hard error — mirrors `record_noop_release`'s own early
     // return when `noop_cooldown_config.enabled` is false.
-    let (_context_dir, tm, db, _, bus) = setup_test_context();
-    let (sr, _dir, _rec) = setup_sweep_registry_in_tempdir();
+    let (_context_dir, tm, db, sr, bus) = setup_test_context();
     {
         let mut reg = sr.lock().unwrap();
         let mut cfg = reg.noop_cooldown_config();
@@ -2800,8 +2715,7 @@ fn test_record_noop_release_routes_to_explicit_non_default_workspace() {
 /// `workspace_root` calls.
 #[test]
 fn test_record_noop_release_none_workspace_root_still_targets_default() {
-    let (_context_dir, tm, db, _, bus) = setup_test_context();
-    let (sr, _dir, _rec) = setup_sweep_registry_in_tempdir();
+    let (_context_dir, tm, db, sr, bus) = setup_test_context();
 
     let response = handle_request(
         Request::RecordNoopRelease {
@@ -2971,8 +2885,7 @@ fn test_handle_request_list_quarantines_ttl_clamps_to_zero() {
 
 #[test]
 fn test_handle_request_cancel_sweep_unknown_returns_error() {
-    let (_context_dir, tm, db, _, bus) = setup_test_context();
-    let (sr, _dir, _rec) = setup_sweep_registry_in_tempdir();
+    let (_context_dir, tm, db, sr, bus) = setup_test_context();
     let response = handle_request(
         Request::CancelSweep {
             sweep_id: "no-such-sweep".to_string(),

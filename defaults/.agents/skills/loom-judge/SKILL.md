@@ -266,7 +266,7 @@ Check for an argument passed via the slash command:
 **Arguments**: `$ARGUMENTS`
 
 If a number is provided (e.g., `/judge 123`), it is the target **PR**: skip "Finding Work", and gate it before any claim, label or comment (#11863):
-1. **Kind and state probe** (live, one REST read): `gh api "repos/{owner}/{repo}/issues/<number>" --jq '[(.pull_request != null), .state, ([.labels[].name] | join(","))] | @tsv'`. Refuse, writing nothing, on `false` (an issue number; Judge is a PR role), `closed`, `loom:frozen`, any `loom:operator*` label (#11861; retired names too), or a failed read.
+1. **Kind and state probe** (live, one REST read): `gh api "repos/{owner}/{repo}/issues/<number>" --jq '[(.pull_request != null), .state, ([.labels[].name] | join(","))] | @tsv'`. Refuse, writing nothing, on `false` (an issue number; Judge is a PR role), `closed`, `loom:frozen`, any `loom:operator*` label (#11861; retired names too), or a failed read. A Gitea checkout has no `gh` to read — `gh` fails there with `none of the git remotes … point to a known GitHub host` — so the probe is instead `loom-daemon forge pr view <number> --json number,state,labels,headRefOid,mergeable` (#14939), served from the Gitea API on the inherited `GITEA_URL` and `GITEA_TOKEN` (`GITEA_USERNAME` for Basic auth). Its non-zero exit is the refusal: it names an issue number, an unknown number, a missing credential or an unreadable answer. On success read the row as the TSV above — refuse on `CLOSED` or `MERGED` state, `loom:frozen`, any `loom:operator*` label, an unreadable field — and keep `.headRefOid` as the head you evaluate and `.mergeable` (`CONFLICTING` is the merge-conflict case below).
 2. **Stage**: `loom:review-requested` (or `loom:reviewing` alone) → claim exactly as Primary Queue step 2 (stale check, PR lease, then the label) and evaluate. A lease held by your own `$LOOM_SWEEP_ID` is yours, not a peer's: a daemon step pre-takes it, and `lease pr claim` re-attaches (exit 0, "already held by this claimant") — continue and add `loom:reviewing` yourself, the same override `LEASE_ALREADY_HELD` has in `builder.md`. Neither those nor a verdict label (e.g. only `loom:important`) → "Fallback Queue" rules (guard, review only, never claim or label). A verdict label without `loom:review-requested` → no-op, unless the operator asked for this re-review (see "Exception").
 3. End with the outcome line from `.loom/docs/targeted-role-invocation.md`: `LOOM_STEP_OUTCOME role=judge target=<n> class=<verdict|noop|refused|failed> reason=<token>`.
 
@@ -462,7 +462,7 @@ Full policy, TTL/invalidation semantics, and the manual verification steps:
    fi
    ```
 4. **Understand context** (first capture `REVIEW_STARTED=$(date -u +%Y-%m-%dT%H:%M:%SZ)`, before reading anything — and for each linked issue `N` the hash of the body you read: `ISSUE_HASH_N=$(printf %s "$(gh api repos/<owner>/<repo>/issues/N --jq .body)" | sha256sum | cut -d' ' -f1)` (a hash that keeps jq's trailing newline is accepted too, as is the raw body's own hash with or without that newline); see "Stale-Read Gate" under Verdict SHA Marker): Read PR description and linked issues, and run the "Spec Reconciliation" step below on each `Closes`/`Fixes`/`Resolves`/`Part of`/`Contributes to` reference (current body + trusted comments, not the PR's account of them)
-4b. **Check docs-only fast-path eligibility** (see "Docs-Only Fast Path (WORK_LOG / WORK_PLAN / README, #6134)" below) — if the changed-file list is an exact match against the fast-path allowlist **and the PR has no closing-issue reference** (Step 3 below, #14182 — both conditions are required, and a failed closing-reference read counts as a reference), skip steps 5-7b and the "Evaluation Focus Areas" review entirely; go straight to CI Status Check (step 8), the formal-review reconciliation gate (step 8b — **not** skipped: a docs-only diff can still carry an unresolved formal review, #7647) and the fast-path approval write. Otherwise continue normally.
+4b. **Check docs-only fast-path eligibility** (see "Docs-Only Fast Path (WORK_LOG / WORK_PLAN / README, #6134)" below) — if the changed-file list is an exact match against the fast-path allowlist **and the PR has no closing-issue reference** (Step 3 below, #14182 — both conditions are required, and a failed closing-reference read counts as a reference) **and every WORK_LOG record the diff adds verifies against the base repository** (Step 4 below, #13760 — number, kind and title; a failed diff or target read is not eligible), skip steps 5-7b and the "Evaluation Focus Areas" review entirely; go straight to CI Status Check (step 8), the formal-review reconciliation gate (step 8b — **not** skipped: a docs-only diff can still carry an unresolved formal review, #7647) and the fast-path approval write. Otherwise continue normally.
 5. **Check out code**: Use the existing builder worktree, else `./.loom/scripts/pr-worktree.sh <number>` — never a bare `gh pr checkout` in the main checkout (see "PR Branch Isolation" and Worktree-Aware Code Access below). Capture `REVIEW_HEAD_SHA=$(gh pr view <number> --json headRefOid --jq '.headRefOid')` here — step 11's recheck compares against it, and your verdict marker records it.
 6. **Rebase check**: Verify PR has no merge conflicts with main (see Rebase Check section below)
 7. **Targeted checks only**: read the diff and trust the green CI from step 2b. At most run scoped tests for a specific doubt (Scoped Test Execution below); never the full suite or `buildGate.command`. If the *environment* cannot run a command you need for a verdict, see "Environment Gap: Cannot Verify Here" below
@@ -624,7 +624,7 @@ precisely the defect this section exists to fix.
 pass also reclaims stale `loom:reviewing` (and `loom:treating`) on its tick,
 with the same env vars and defaults, aged from the label's own `labeled`
 event. See [`daemon-reference.md`'s "Stale-claim reconciliation"
-section](https://github.com/rjwalters/loom/blob/main/defaults/docs/daemon-reference.md#stale-claim-reconciliation--the-sweep-journal-3953-fixed-3975-extended-to-pr-side-claims-4367).
+section](https://github.com/2AMLogic/loom/blob/main/defaults/docs/daemon-reference.md#stale-claim-reconciliation--the-sweep-journal-3953-fixed-3975-extended-to-pr-side-claims-4367).
 
 **Applies everywhere a Judge claims a PR from a multi-PR pass** — not just
 this single-PR narrative. This same check-then-claim rule governs the batch
@@ -1847,13 +1847,171 @@ if [ "$ELIGIBILITY" = "ELIGIBLE" ]; then
 fi
 ```
 
+**Step 4: Verify new WORK_LOG records against the base repository (#13760).**
+The file list answers "what could this diff break?", not "is the content
+true". A Guide backfill once filled one repository's `WORK_LOG.md` with
+another repository's merged history (sg13g2-vco#311: 61 entries above that
+repo's highest number, verbatim titles from a sibling repo), and this fast
+path approved it — it checked file names, not content. So before a fast-path
+approval, the records the diff **adds** must be verified mechanically against
+the PR's **base repository**, independently of Guide's own provenance gate,
+its receipts, or anything the PR body claims:
+
+```bash
+# #13760: verify the canonical WORK_LOG records a docs-only diff ADDS against
+# the PR's base repository before the fast path may approve it. Echoes
+# "ELIGIBLE" when the diff adds no new canonical records (a WORK_PLAN/README
+# or WORK_PLAN-only change, or an exact archive rotation — every added record
+# is matched by an identical removal in the same diff, so a move to a monthly
+# archive is not "new") or when every added record checks out: the number
+# exists in the base repository, with the recorded kind (PR vs issue), in the
+# right state (a PR merged, an issue closed), under exactly the recorded
+# title. Any foreign/missing/wrong-kind/wrong-state/mismatched or unreadable
+# record echoes "NOT ELIGIBLE: <reason>" naming it — the caller must then take
+# the normal review flow and report the reason. A READ failure on the base
+# repository or the diff echoes "NOT ELIGIBLE: ENVIRONMENT: …" instead: an
+# environment failure is never a passed or waived content check. A record
+# fetch cannot tell a 404 (a content verdict) from a transport failure, so
+# its refusal states both readings and waives neither.
+# Distinct numbers are READ once each, but every record is VERIFIED: a
+# repeated number's later records (a
+# duplicate with a different title or kind included) are checked against the
+# cached fetch, not skipped; bullets outside WORK_LOG.md and its monthly
+# archives (WORK_PLAN/README prose, `- **#N**: …` backlog rows included) and
+# anything not a canonical `- **PR #N**` / `- **Issue #N**` bullet are never
+# read.
+docs_only_fast_path_worklog_check() {
+  # $1 = PR number. The target is the PR's BASE repository (read from the
+  # forge, never the cwd's remote and never a receipt). A PR's own URL is
+  # always its base repository's, whatever the forge host — `gh pr view
+  # --json` has no base-repository field, and a URL of any other shape
+  # derives nothing, so the guard below fails closed (#15005). The additions
+  # are the exact reviewed base..head diff (never Guide's own account of
+  # them).
+  local pr="$1" out raw line body mid num stated kind rest got got_title got_is_pr got_state got_merged
+  local -A fetched=()
+  local -a new_records=()
+  if ! out=$(gh pr view "$pr" --json url --jq '.url | capture("^https://[^/]+/(?<r>[^/]+/[^/]+)/pull/[0-9]+/?$").r' 2>/dev/null) || [ -z "$out" ]; then
+    echo "NOT ELIGIBLE: ENVIRONMENT: base repository read failed (gh error, not a PR-content verdict) — take the normal review flow; do NOT treat this as a passed or waived #13760 content check"
+    return 0
+  fi
+  local repo="$out"
+  if ! raw=$(gh pr diff --repo "$repo" "$pr" 2>/dev/null); then
+    echo "NOT ELIGIBLE: ENVIRONMENT: PR diff read failed (gh error, not a PR-content verdict) — take the normal review flow; do NOT treat this as a passed or waived #13760 content check"
+    return 0
+  fi
+  # Added canonical records: `+`-prefixed `- **PR/Issue ...` bullet lines,
+  # collected ONLY from WORK_LOG.md and its monthly archives — a
+  # WORK_PLAN/README bullet (`- **#N**: …` or any other bold prose) is not a
+  # WORK_LOG record and must not be read as one (AC 3: WORK_PLAN/README-only
+  # diffs stay no-ops). Removed ones: `-`-prefixed. A record both added and
+  # removed in the same diff is a move (archive rotation), not a new record.
+  # The current file is tracked from the `diff --git` headers so a
+  # non-WORK_LOG hunk can neither produce a record nor trigger a refusal.
+  local in_worklog=0 added="" removed="" l
+  while IFS= read -r l; do
+    case "$l" in
+      'diff --git '*)
+        case "$l" in
+          *' b/WORK_LOG.md') in_worklog=1 ;;
+          *' b/work_log/WORK_LOG_'*.md) in_worklog=1 ;;
+          *) in_worklog=0 ;;
+        esac
+        continue ;;
+    esac
+    [ "$in_worklog" = 1 ] || continue
+    case "$l" in
+      '+- **'*) added+="${l#+}"$'\n' ;;
+      '-- **'*) removed+="${l#-}"$'\n' ;;
+    esac
+  done < <(printf '%s\n' "$raw")
+  while IFS= read -r line; do
+    [ -z "$line" ] && continue
+    if printf '%s\n' "$removed" | grep -Fxq -- "$line"; then continue; fi
+    new_records+=("$line")
+  done <<<"$added"
+  if [ "${#new_records[@]}" -eq 0 ]; then
+    echo "ELIGIBLE"
+    return 0
+  fi
+  for line in "${new_records[@]}"; do
+    case "$line" in
+      "- **PR "*) kind=pr ;;
+      "- **Issue "*) kind=issue ;;
+      *) echo "NOT ELIGIBLE: unparseable WORK_LOG record: $line"; return 0 ;;
+    esac
+    body="${line#- **}"
+    mid="${body#* }"; mid="${mid%%\*\**}"
+    num="${mid##*\#}"
+    case "$num" in
+      ''|*[!0-9]*) echo "NOT ELIGIBLE: unparseable WORK_LOG record: $line"; return 0 ;;
+    esac
+    stated="${mid%%#*}"; stated="${stated%/}"
+    if [ -n "$stated" ] && [ "$stated" != "$repo" ]; then
+      echo "NOT ELIGIBLE: WORK_LOG record claims repository $stated, not the base $repo: $line"
+      return 0
+    fi
+    # One forge read per DISTINCT number, cached as the fetched tuple; every
+    # record for that number — including a later duplicate with a different
+    # title or kind — is still verified against the cached tuple (#14532).
+    if [ -z "${fetched[$num]:-}" ]; then
+      if ! got=$(gh api "repos/$repo/issues/$num" --jq '"\(.title)\t\(.pull_request != null)\t\(.state)\t\((.pull_request.merged_at != null))"' 2>/dev/null) || [ -z "$got" ]; then
+        echo "NOT ELIGIBLE: WORK_LOG record #$num does not exist in $repo, or the read failed — if the record does not exist this IS a content verdict (#13760); if the read failed it is an environment failure. Either way, do NOT treat this as a passed or waived #13760 content check"
+        return 0
+      fi
+      fetched[$num]="$got"
+    fi
+    got="${fetched[$num]}"
+    IFS=$'\t' read -r got_title got_is_pr got_state got_merged <<<"$got"
+    if [ "$kind" = pr ]; then
+      rest="${body#*\*\*: }"
+      if [ "$got_is_pr" != "true" ]; then
+        echo "NOT ELIGIBLE: WORK_LOG record #$num is not a PR in $repo: $line"
+        return 0
+      fi
+      if [ "$got_merged" != "true" ]; then
+        echo "NOT ELIGIBLE: WORK_LOG record #$num is not a merged PR in $repo (open or closed unmerged): $line"
+        return 0
+      fi
+    else
+      rest="${body#*\*\* }"; rest="${rest#*\(closed\): }"
+      if [ "$got_is_pr" != "false" ]; then
+        echo "NOT ELIGIBLE: WORK_LOG record #$num is not an issue in $repo: $line"
+        return 0
+      fi
+      if [ "$got_state" != "closed" ]; then
+        echo "NOT ELIGIBLE: WORK_LOG record #$num is not a closed issue in $repo: $line"
+        return 0
+      fi
+    fi
+    if [ "$rest" != "$got_title" ]; then
+      echo "NOT ELIGIBLE: WORK_LOG record #$num title mismatch in $repo (record '$rest', forge '$got_title')"
+      return 0
+    fi
+  done
+  echo "ELIGIBLE"
+}
+
+if [ "$ELIGIBILITY" = "ELIGIBLE" ]; then
+  ELIGIBILITY=$(docs_only_fast_path_worklog_check "$PR_NUMBER")
+fi
+```
+
 If `$ELIGIBILITY` is anything other than the literal string `ELIGIBLE`
 (including an empty diff, a diff that mixes an allowlisted file with
 anything else — a source file, a nested README, `.github/workflows/*.yml`,
-`.loom/config.json`, or any other path — or a PR whose body carries a closing
-reference such as `Closes #N`, or whose closing-reference read failed) — **do not use this fast path.**
-Proceed with the normal Primary Queue steps 5-11 (checkout, quality checks,
-test plan execution, full code evaluation).
+`.loom/config.json`, or any other path — a PR whose body carries a closing
+reference such as `Closes #N`, a PR whose closing-reference read failed, or
+a PR whose new WORK_LOG records failed the base-repository verification:
+missing number, wrong kind, wrong state (an unmerged PR or an open issue),
+title mismatch, foreign repository identity, or
+an unreadable diff/target read) — **do not use this fast path.** Report the
+`NOT ELIGIBLE` reason verbatim in the verdict comment, and proceed with the
+normal Primary Queue steps 5-11 (checkout, quality checks, test plan
+execution, full code evaluation). A refusal prefixed
+`NOT ELIGIBLE: ENVIRONMENT:` means a `gh` read failed and the check could not
+run — an environment failure, never a passed or waived #13760 content check;
+report it as such and still take the normal flow.
 
 ### Fast-Path Evaluation Process
 
@@ -1891,6 +2049,10 @@ API, not the PR's stated intent or any marker — to be an exact match against
 The closing-issue set was verified empty via the closing-reference read
 (no closing references, #14182).
 
+Any WORK_LOG records this diff adds were verified against the base
+repository (number, kind, title; moves to monthly archives excluded as
+non-new, #13760).
+
 A diff confined to this exact set needs no full code evaluation (no lint,
 type-check, tests, or functional review apply). All CI checks pass.
 
@@ -1913,6 +2075,13 @@ EOF
 - **No closing links**: a PR that would auto-close any issue on merge is
   ineligible (Step 3), so a free-form generated body cannot close an unrelated
   issue past a review that never reads it. Champion re-checks this itself.
+- **Content is checked, not just shape (#13760)**: WORK_LOG records the diff
+  adds are verified against the base repository (number, kind, title) before
+  approval — the incident this closes was a foreign repo's history carried in
+  through an allowlist-clean, CI-green, content-unread diff. The verification
+  reads the exact reviewed diff and the forge, never Guide's receipts or the
+  PR prose, so a compromised Guide pass cannot launder another repo's history
+  through the fast path.
 - **Narrowly scoped**: the allowlist is three exact root-level filenames — no
   glob, no directory prefix, no "looks like docs" heuristic. A diff that adds
   a fourth file of any kind, anywhere, including another `.md` file, is
