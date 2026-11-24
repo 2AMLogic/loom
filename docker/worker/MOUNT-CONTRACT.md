@@ -96,7 +96,15 @@ normal daemon dispatch and Codex capability admission follow in #8786/#8787.
   inside the container (exactly the repository's own canonical mirror path,
   never a second entry, a symlink, an indirect mirror or a writable mount),
   and a clone with no alternate — the shape every seat had before #14680 —
-  stays supported and admitted.
+  stays supported and admitted. Opting back out is one-way per seat: once a
+  clone borrows, a recreation without the bind (flag
+  `accounts.session.objectMirrors` off) is refused fail-closed at
+  preparation — "its object alternate is not authorized for this session
+  (a clone that already borrows needs its mirror bind back: restore the
+  mirror, or re-enable accounts.session.objectMirrors)" — and the supported
+  remedies are restoring the mirror / re-enabling the flag, or discarding
+  that seat's clone and re-cloning; no supported path un-borrows a live
+  clone.
 - The volume MUST use Docker's ordinary `local` driver without driver options
   (a named bind-backed volume is not isolation). Actual mounts, volume ownership,
   peer attachments and containment settings are verified on every reuse/job.
