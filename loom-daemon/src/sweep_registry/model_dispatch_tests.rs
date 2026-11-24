@@ -608,3 +608,106 @@ fn an_allowed_bare_effort_and_a_qualified_pin_are_forwarded_verbatim() {
         "a runtime-qualified pin is never silently dropped"
     );
 }
+
+// ---- #14962: a configured role-tier model vs a native profile pick ----
+
+/// `#14962` fixture: a non-Builder stage draws with certainty onto a native
+/// pick pinned to the `strict-zai` model profile (model `glm-5.3`, no
+/// `allowedEfforts` vocabulary — the model, not the effort, is what this
+/// exercises), with the role-model config `models`.
+fn native_profile_model_config(models: Value) -> Value {
+    let mut config = fallback_config();
+    config["runtimes"]["default"] = json!("opencode");
+    config["runtimes"]["preference"] =
+        json!([{"runtime": "opencode", "modelProfile": "strict-zai"}]);
+    config["runtimes"]["modelProfiles"]["strict-zai"] = json!({
+        "model": "glm-5.3",
+        "providers": {"opencode": "zai-coding-plan"}
+    });
+    config["autonomous"]["roleRunner"]["roleModels"] = models;
+    config
+}
+
+/// The reported incident, at the step-launch site: a bare
+/// `roleModels.curator` meant for the Claude and Codex picks meets the
+/// native profile the walk drew, whose model differs from the resolved pin —
+/// the launch keeps its step (the configured model dropped to the profile's
+/// own) instead of being refused at `profile_selection`.
+#[test]
+#[serial_test::serial(loom_shared_tokens_dir_env)]
+fn a_configured_role_model_a_native_profile_pick_would_refuse_is_dropped_not_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let _env = Environment::isolated(dir.path());
+    let config = native_profile_model_config(json!({"curator": "opus"}));
+    let launch = step_launch(dir.path(), &config, crate::step_role::StepRole::Curator).unwrap();
+    let admitted = launch.admission.admitted.unwrap();
+    assert_eq!(admitted.runtime, "opencode", "the test must exercise a native pick");
+    let profile = admitted.preference.unwrap().model_profile;
+    assert_eq!(profile.as_deref(), Some("strict-zai"));
+    assert_eq!(
+        launch.model, None,
+        "the profile's own model launches instead of a profile_selection refusal"
+    );
+    // And the launched shape is one `profiles::select` accepts: no `--model`
+    // for the profile's own to supply.
+    let options = Options {
+        model: launch.model,
+        profile,
+        ..Options::default()
+    };
+    let selection = profiles::select("opencode", &options, &config).unwrap();
+    assert_eq!(selection.model, "glm-5.3");
+    assert_eq!(selection.profile.as_deref(), Some("strict-zai"));
+}
+
+/// The bounds of the same reconciliation at the step-launch site: the same
+/// config drawing Claude still launches `--model` (alias-resolved), and a
+/// drawn model pin on the native pick — an explicit statement of intent — is
+/// forwarded verbatim even when it differs from the selected profile, so
+/// `profiles::select` keeps its loud refusal.
+#[test]
+#[serial_test::serial(loom_shared_tokens_dir_env)]
+fn a_configured_role_model_on_claude_and_a_drawn_native_pin_are_forwarded_verbatim() {
+    // The Claude draw: the configured pin still launches.
+    let claude = tempfile::tempdir().unwrap();
+    let _env1 = Environment::isolated(claude.path());
+    let mut config = native_profile_model_config(json!({"curator": "opus"}));
+    config["runtimes"]["preference"] = json!(["claude", "opencode"]);
+    let launch = step_launch(claude.path(), &config, crate::step_role::StepRole::Curator).unwrap();
+    assert_eq!(
+        launch.admission.admitted.unwrap().runtime,
+        "claude",
+        "control: this arm must draw the Claude pick"
+    );
+    assert_eq!(
+        launch.model.as_deref(),
+        Some("claude-opus-5"),
+        "a Claude launch keeps the configured model (alias-resolved)"
+    );
+
+    // The drawn pin: `opencode:<profile>/<model>` names BOTH, and the model
+    // half is the pick's own statement — never dropped, refused by select.
+    let pinned = tempfile::tempdir().unwrap();
+    let _env2 = Environment::isolated(pinned.path());
+    let mut config = native_profile_model_config(json!({"curator": "opus"}));
+    config["runtimes"]["roleDraw"] =
+        json!({"curator": [{"attempt": 1, "draw": {"opencode:strict-zai/glm-5.4": 100}}]});
+    let launch = step_launch(pinned.path(), &config, crate::step_role::StepRole::Curator).unwrap();
+    let admitted = launch.admission.admitted.unwrap();
+    assert_eq!(admitted.runtime, "opencode");
+    assert_eq!(
+        launch.model.as_deref(),
+        Some("glm-5.4"),
+        "a drawn model pin is never silently dropped"
+    );
+    let options = Options {
+        model: launch.model,
+        profile: admitted.preference.and_then(|p| p.model_profile),
+        ..Options::default()
+    };
+    let error = profiles::select("opencode", &options, &config).unwrap_err();
+    assert_eq!(error.code, 78);
+    assert!(error
+        .message
+        .contains("bare model differs from the selected profile"));
+}

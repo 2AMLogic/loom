@@ -20,6 +20,11 @@
 //!    native model profile's `allowedEfforts` does not include is dropped to
 //!    the profile's own effort instead of losing the launch, while a
 //!    runtime-qualified pin keeps its refusal.
+//!    [`resolve_role_runner_model_for_launch`] (#14962) asks it of the *model*
+//!    against the profile's own `model`: a configured tier's value a native
+//!    profile pick would be refused for (`bare model differs from the selected
+//!    profile`) is dropped to the profile's model instead of losing the launch,
+//!    while a drawn pin keeps its refusal.
 
 use super::*;
 
@@ -630,4 +635,75 @@ pub(crate) fn reconcile_unpinned_model_with_runtime(
         String::new(),
         format!("{SHIPPED_DEFAULT_MODEL_SOURCE} (CLI default for {runtime})"),
     )
+}
+
+/// Issue #14962: [`resolve_role_runner_model`] for a launch that is about to
+/// happen, reconciling a **configured-tier** model against the native model
+/// profile that launch will select.
+///
+/// The bug this closes: an operator sets `roleModels.<role>` (or the global
+/// `autonomous.roleRunner.model` / `autonomous.model`) with the Claude and
+/// Codex picks in mind — say `"opus"` — and a step's preference walk draws a
+/// native profile pick (`opencode:<profile>`), which pins a profile, not a
+/// model. The daemon forwarded `--model opus --profile <profile>` regardless,
+/// and `worker_spawn::profiles::select` — correctly, on the evidence it has —
+/// refused the whole launch before the CLI started (`bare model differs from
+/// the selected profile`, `LOOM_LAUNCH_REJECTED code=78
+/// stage=profile_selection`), losing the step over a default nobody aimed at
+/// that runtime.
+///
+/// The resolution mirrors [`resolve_role_runner_effort_for_launch`] (#14963):
+/// a **configured tier's** model that the selected native profile's own
+/// `model` differs from is dropped (the child launches with the profile's
+/// model, the same outcome omitting `--model` produces in `profiles::select`)
+/// instead of refusing the launch. A **drawn** `role-draw` pin never reaches
+/// this function — the launch sites forward it verbatim, keeping `select`'s
+/// loud refusal, because a pick's own pin is an explicit statement of intent.
+/// The **shipped default** tier is also untouched here: it is never
+/// operator-configured, and [`reconcile_unpinned_model_with_runtime`] (#7894)
+/// — which every launch site runs after this — already drops it for a native
+/// runtime. Non-native runtimes are left exactly as resolved, so #5028's
+/// refusal of a genuinely mismatched explicit pin (`codex` +
+/// `roleModels.<role> = "sonnet"`) survives verbatim.
+///
+/// `model_profile` is the admitted preference tap's `modelProfile`; `None`
+/// falls back exactly as the launch's own profile lookup does
+/// (`LOOM_MODEL_PROFILE`, `runtimes.defaultModelProfile`, the bundled
+/// `zai-flash`), so the reconciliation judges the profile the child would
+/// actually select. Dropping a model re-labels its source for the per-role
+/// log header as `<source> (profile model for <runtime>:<profile>)` and logs
+/// an `info!` line, so `role_tick.outcome` and `loom-daemon logs` both name
+/// what was dropped and why.
+#[must_use]
+pub fn resolve_role_runner_model_for_launch(
+    repo_root: &Path,
+    role: &str,
+    runtime: Option<&str>,
+    model_profile: Option<&str>,
+) -> (String, String) {
+    let (model, source) = resolve_role_runner_model(repo_root, role);
+    if model.is_empty() || source == SHIPPED_DEFAULT_MODEL_SOURCE {
+        return (model, source);
+    }
+    let Some(runtime) = runtime.map(str::trim).filter(|r| !r.is_empty()) else {
+        return (model, source);
+    };
+    if !crate::worker_spawn::is_native(runtime) {
+        return (model, source);
+    }
+    let config = crate::config_resolver::resolve_effective_config(repo_root);
+    let Some(profile) = crate::worker_spawn::profiles::profile_rejects_model(
+        runtime,
+        model_profile,
+        &model,
+        &config,
+    ) else {
+        return (model, source);
+    };
+    log::info!(
+        "role_runner: dropping configured model {model:?} from {source} for the \
+         {runtime}:{profile} model profile (differs from its model); launching with the \
+         profile's own model instead of refusing the launch (#14962)"
+    );
+    (String::new(), format!("{source} (profile model for {runtime}:{profile})"))
 }
