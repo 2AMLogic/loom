@@ -1091,11 +1091,12 @@ them as follows:
   supported. An operator extra mount can never squat the `/mirrors`
   namespace. A borrowed-from clone whose mirror bind cannot be restored
   refuses the recreation rather than dangling (`mirror::ensure_bound`).
-  Opting out is one-way per seat: with `accounts.session.objectMirrors`
+  Opting in is one-way per seat: with `accounts.session.objectMirrors`
   back off, the seat's next recreation carries no binds and a clone that
   already borrows is refused fail-closed at preparation
-  (`repository::verify_alternates`) — "its object alternate is not
-  authorized for this session (a clone that already borrows needs its
+  (`repository::verify_alternates`) — "workspace must own a real
+  clone and private Git objects; its object alternate is not authorized for
+  this session (a clone that already borrows needs its
   mirror bind back: restore the mirror, or re-enable
   accounts.session.objectMirrors)" — and the supported remedies are
   restoring the mirror / re-enabling the flag, or discarding that seat's
