@@ -29,7 +29,7 @@
 #
 # Verifies that:
 #   1. STRUCTURE: every `--jq` pipeline inside `render_plan_body()` carries
-#      `sort_by(.number)` (all 10 of them), and `approved_json` is sorted at
+#      `sort_by(.number)` (all 11 of them), and `approved_json` is sorted at
 #      the source so the `approved`/`held` split stays consistent.
 #   2. THE REGRESSION, executed rather than grepped: the REAL
 #      `render_plan_body()` (extracted from guide.md and eval'd against a
@@ -93,7 +93,7 @@ fi
 pass "render_plan_body() body extracted from $GUIDE_MD"
 
 JQ_LINES="$(grep -c -- '--jq' <<<"$RPB_BODY")"
-assert_eq "$JQ_LINES" "10" "render_plan_body() has the expected 10 --jq forge pipelines"
+assert_eq "$JQ_LINES" "11" "render_plan_body() has the expected 11 --jq forge pipelines"
 
 UNSORTED="$(grep -n -- '--jq' <<<"$RPB_BODY" | grep -v 'sort_by(\.number)' || true)"
 if [[ -z "$UNSORTED" ]]; then
