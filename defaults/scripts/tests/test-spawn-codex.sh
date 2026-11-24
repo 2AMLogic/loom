@@ -48,10 +48,40 @@ SCRIPTS_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 SPAWN_CODEX="$SCRIPTS_DIR/spawn-codex.sh"
 CLASSIFY_LIB="$SCRIPTS_DIR/lib/classify-error.sh"
 
+# The suite's result must not depend on the caller's session (#15140). A
+# daemon-dispatched Builder exports LOOM_ROLE (the adapter's mutable-role
+# hook-trust preflight then exits 78 on every case), LOOM_MODEL and
+# LOOM_CODEX_AUTH_MODE_CHECK (model-pin and auth-mode cases) and LOOM_RUNTIME
+# (classify-error.sh's default provider table); CI's runner has none of them.
+# Scrub them once here. Every case that needs one sets it on its own run_* /
+# env line, and the per-case `env -u` lists below stay as belt and braces.
+# LOOM_DAEMON_BIN is the caller's managed/probed daemon, never this suite's
+# subject, and section 13 sets its own per case.
+unset LOOM_ROLE LOOM_MODEL LOOM_CODEX_AUTH_MODE_CHECK LOOM_RUNTIME LOOM_DAEMON_BIN
+
 # Every case runs spawn-codex.sh, which execs loom-daemon: pin THIS checkout's
 # build up front, before the first case, never the installed one (#10662).
 # shellcheck source=lib/require-daemon-bin.sh
 source "$SCRIPT_DIR/lib/require-daemon-bin.sh"
+
+# A dispatched session pins LOOM_DAEMON_SELF_BIN to the host's installed daemon,
+# and the helper honours that pin without asking whose build it is, so it would
+# then fail its own #10662 provenance check. Honour a pin only when it names a
+# build of THIS checkout; otherwise drop it and let the helper resolve this
+# checkout's build. Not in a checkout without daemon source (an installed
+# consumer repo has nothing to resolve, so the pin is the only answer), and not
+# under LOOM_TEST_ALLOW_DAEMON_MISMATCH=1 (a deliberate cross-version pin).
+# CI exports no pin for this suite, so it is unaffected.
+if [[ -n "${LOOM_DAEMON_SELF_BIN:-}" \
+      && -f "$SCRIPTS_DIR/../../loom-daemon/Cargo.toml" \
+      && "${LOOM_TEST_ALLOW_DAEMON_MISMATCH:-}" != "1" ]]; then
+    _pin_src="$(_loom_test_version_source "$(_loom_test_daemon_bin_version "$LOOM_DAEMON_SELF_BIN")" || true)"
+    _checkout_head="$(git -C "$SCRIPTS_DIR" rev-parse --verify HEAD 2>/dev/null || true)"
+    if [[ -z "$_pin_src" || "${_pin_src%% *}" != "$_checkout_head" ]]; then
+        unset LOOM_DAEMON_SELF_BIN
+    fi
+    unset _pin_src _checkout_head
+fi
 loom_test_require_daemon_bin --self-only --path "$SCRIPTS_DIR" spawn-worker session-exec private-workspace
 
 # shellcheck source=lib/assert.sh
