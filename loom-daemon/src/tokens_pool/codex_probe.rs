@@ -91,9 +91,12 @@ pub enum ProbeOutcome {
     NotLoggedIn,
     /// The CLI does not implement `account/rateLimits/read`.
     CapabilityAbsent,
-    /// Session-managed, but its session container is not running (or the
-    /// container runtime is unavailable). Not evidence about the account.
+    /// The session container is missing or stopped.
     SessionUnavailable,
+    /// The runtime executable could not start.
+    RuntimeUnavailable(std::io::ErrorKind),
+    /// The executable started, but its inspection or execution failed.
+    SessionProbeError(String),
     /// The probe ran but produced no usable answer.
     Failed(&'static str),
 }
@@ -108,18 +111,84 @@ impl ProbeOutcome {
             Self::NotLoggedIn => Some("not_logged_in"),
             Self::CapabilityAbsent => Some("rate_limits_unsupported_by_codex_cli"),
             Self::SessionUnavailable => Some("session_unavailable"),
+            Self::RuntimeUnavailable(_) => Some("container_runtime_unavailable"),
+            Self::SessionProbeError(_) => Some("session_probe_error"),
             Self::Failed(why) => Some(why),
         }
     }
+
+    pub(super) fn diagnostic(&self) -> Option<String> {
+        match self {
+            Self::RuntimeUnavailable(kind) => {
+                let search = match std::env::var_os("PATH") {
+                    Some(path) => {
+                        let dirs: Vec<_> = std::env::split_paths(&path)
+                            .map(|dir| {
+                                if dir.as_os_str().is_empty() {
+                                    ".".into()
+                                } else {
+                                    dir
+                                }
+                            })
+                            .collect();
+                        format!("searched PATH directories {dirs:?}")
+                    }
+                    None => "PATH is unset (system default search)".into(),
+                };
+                Some(format!(
+                    "container_runtime_unavailable: docker could not start ({kind:?}), {search}"
+                ))
+            }
+            Self::SessionProbeError(category) => {
+                Some(format!("session_probe_error: docker {category}"))
+            }
+            _ => None,
+        }
+    }
+}
+
+/// Keep the underlying spawn error distinct from a command that ran. Only
+/// the bounded category is reported: Docker stderr may contain private data.
+pub(super) fn session_error(err: &anyhow::Error, operation: &str) -> ProbeOutcome {
+    use crate::proc_exec::ExecError;
+    match err.downcast_ref::<ExecError>() {
+        Some(ExecError::Spawn(io)) => return ProbeOutcome::RuntimeUnavailable(io.kind()),
+        Some(ExecError::Collect(io)) => {
+            return ProbeOutcome::SessionProbeError(format!(
+                "{operation} output collection: {:?}",
+                io.kind()
+            ));
+        }
+        None => {}
+    }
+    if let Some(io) = err.downcast_ref::<std::io::Error>() {
+        return match io.kind() {
+            std::io::ErrorKind::NotFound | std::io::ErrorKind::PermissionDenied => {
+                ProbeOutcome::RuntimeUnavailable(io.kind())
+            }
+            kind => ProbeOutcome::SessionProbeError(format!("{operation} I/O: {kind:?}")),
+        };
+    }
+    let kind = if err.is::<super::docker_cli::DockerTimedOut>() {
+        "timeout"
+    } else {
+        "command failed"
+    };
+    ProbeOutcome::SessionProbeError(format!("{operation}: {kind}"))
 }
 
 /// How a probe program is run. Split out so tests can prove the ownership
 /// rule (a session-managed profile never reaches [`ProbeTransport::host`]).
 pub trait ProbeTransport {
+    /// Check executable availability once before inspecting session profiles.
+    fn check_runtime(&self) -> Result<()> {
+        Ok(())
+    }
+
     /// Run the probe host-directly with `CODEX_HOME=profile`.
     fn host(&self, profile: &Path) -> Result<ExecOutput>;
     /// Run the probe inside `container`. `Ok(None)` = no probe was possible
-    /// (not running, or no container runtime).
+    /// (the container is missing or stopped). Spawn errors remain typed.
     fn container(&self, container: &str) -> Result<Option<ExecOutput>>;
 }
 
@@ -128,6 +197,12 @@ pub trait ProbeTransport {
 pub struct ProcessProbeTransport;
 
 impl ProbeTransport for ProcessProbeTransport {
+    fn check_runtime(&self) -> Result<()> {
+        // Only the spawn matters here. Inspect each container separately when
+        // the executable runs, even if its version command exits nonzero.
+        ProcessContainerRunner::run_capture(&["--version"]).map(|_| ())
+    }
+
     fn host(&self, profile: &Path) -> Result<ExecOutput> {
         run_bounded(
             Command::new("sh")
@@ -144,7 +219,12 @@ impl ProbeTransport for ProcessProbeTransport {
         }
         let script = probe_script();
         let out = runner.exec_capture(container, &["sh", "-c", &script], PROBE_TIMEOUT)?;
-        Ok((!out.unavailable).then_some(out))
+        if out.unavailable {
+            // exec_capture sets this bit when spawning Docker returned ENOENT,
+            // including if the executable disappeared after the initial check.
+            return Err(std::io::Error::from(std::io::ErrorKind::NotFound).into());
+        }
+        Ok(Some(out))
     }
 }
 
@@ -159,7 +239,7 @@ pub fn probe_account<T: ProbeTransport + ?Sized>(
         match transport.container(&session_lifecycle::container_name(name)) {
             Ok(Some(out)) => out,
             Ok(None) => return ProbeOutcome::SessionUnavailable,
-            Err(_) => return ProbeOutcome::Failed("session_probe_error"),
+            Err(err) => return session_error(&err, "inspect/exec"),
         }
     } else {
         match transport.host(profile) {
