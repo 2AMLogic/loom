@@ -379,6 +379,12 @@ pub fn is_local_command(args: &[OsString]) -> bool {
     }
 }
 
+/// A `gh release …` command (#15158): releases never use the forge gateway.
+#[must_use]
+fn is_release_command(args: &[OsString]) -> bool {
+    args.first().and_then(|a| a.to_str()) == Some("release")
+}
+
 /// `gh api rate_limit`: free against every budget, and an answer about the
 /// asking credential itself (a bucket probe), so never reader-only.
 #[must_use]
@@ -628,6 +634,17 @@ impl GhInvocation {
     #[cfg(test)]
     pub(crate) fn is_gateway_exempt(&self) -> bool {
         self.gateway_exempt
+    }
+
+    /// Whether this read skips the forge gateway: the site opted out
+    /// ([`GhInvocation::gateway_exempt`]) **or** the argv is a `gh release …`
+    /// command (#15158). `forge_gateway` documents that releases never use
+    /// it, and a refused asset download classifies as `Failure::Credential`,
+    /// which withdraws the gateway for the whole owner (#15134). Deciding it
+    /// here, from the argv, means a new `gh release` site cannot reintroduce
+    /// that by forgetting the per-site flag.
+    pub(crate) fn skips_gateway(&self) -> bool {
+        self.gateway_exempt || is_release_command(&self.args)
     }
 
     /// Keep this read on the writer credential (#9872): for a read whose
@@ -1035,7 +1052,7 @@ impl GhInvocation {
         }
         // 2am#4367 P4: the gateway profile first (a no-op while
         // `forge.gateway` is unset), unless the site opted out.
-        let route = read_router(self.gateway_exempt);
+        let route = read_router(self.skips_gateway());
         let lookup = move |req: &crate::forge_identity::RouteRequest<'_>| {
             route(req, std::time::SystemTime::now())
         };
@@ -1180,6 +1197,10 @@ mod migrated_sites_tests_d;
 #[cfg(test)]
 #[path = "migrated_sites_tests_e.rs"]
 mod migrated_sites_tests_e;
+
+#[cfg(test)]
+#[path = "release_gateway_tests.rs"]
+mod release_gateway_tests;
 
 /// The read router an execution uses (2am#4367 P4): the forge gateway first
 /// ([`crate::forge_gateway::route_read`]), or — for a
