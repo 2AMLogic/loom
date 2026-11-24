@@ -280,10 +280,10 @@ pub struct NativeSessionIds {
 /// Parse the native session ids a log region names (#14048). Pure: every
 /// unrecognized line is skipped, never guessed at. A JSON line contributes
 /// its `sessionID` when it carries a non-empty string one (OpenCode's
-/// `--format json` event stream); a line containing Codex's
-/// `session id: <token>` banner contributes the token when it is at least 8
-/// hex/dash characters — the same shape `spawn-codex.sh`'s own transcript
-/// join greps for.
+/// `--format json` event stream); a line that IS Codex's `session id: <token>`
+/// banner ([`codex_session_banner`]) contributes the token — the same
+/// line-anchored, ≥8 hex/dash shape `spawn-codex.sh`'s own transcript join
+/// greps for.
 #[must_use]
 pub fn native_session_ids(log_region: &str) -> NativeSessionIds {
     let mut ids = NativeSessionIds::default();
@@ -303,10 +303,7 @@ pub fn native_session_ids(log_region: &str) -> NativeSessionIds {
                 continue;
             }
         }
-        let Some(at) = line.find("session id:") else {
-            continue;
-        };
-        if let Some(token) = codex_session_token(&line[at + "session id:".len()..]) {
+        if let Some(token) = codex_session_banner(line) {
             ids.codex.push(token);
         }
     }
@@ -328,19 +325,29 @@ pub(crate) fn role_tick_codex_session_id(output: &str) -> Option<String> {
         .skip_while(|line| !line.starts_with(HEADER))
         .skip(1)
         .take_while(|line| !line.contains(HEADER))
-        .find_map(|line| {
-            line.trim_start()
-                .strip_prefix("session id:")
-                .and_then(codex_session_token)
-        })
+        .find_map(codex_session_banner)
+}
+
+/// The token of a Codex `session id: <token>` banner **line** (#15023): the
+/// line, after leading whitespace, must *start* with the prefix. A banner
+/// quoted mid-line — an agent's text, a runner's echo, an event string — is
+/// data about a launch, not evidence of one. The one anchoring rule every
+/// Codex banner reader shares ([`native_session_ids`],
+/// [`role_tick_codex_session_id`], `launch_record`'s step-log pair, and the
+/// roll-pause capture), so it cannot drift between readers the way the token
+/// shape cannot; `spawn-codex.sh`'s transcript join greps for the same
+/// `^[[:space:]]*session id:` line.
+pub(crate) fn codex_session_banner(line: &str) -> Option<String> {
+    line.trim_start()
+        .strip_prefix("session id:")
+        .and_then(codex_session_token)
 }
 
 /// The uuid-shaped token of a Codex `session id:` banner: the run of
 /// hex/dash characters after the prefix, when it is at least 8 characters —
-/// the same shape `spawn-codex.sh`'s own transcript join greps for. Shared by
-/// every Codex banner reader ([`native_session_ids`],
-/// [`role_tick_codex_session_id`], and `launch_record`'s step-log pair) so the
-/// vocabulary cannot drift between them.
+/// the same shape `spawn-codex.sh`'s own transcript join greps for. Reached
+/// through [`codex_session_banner`], so every Codex banner reader shares it
+/// and the vocabulary cannot drift between them.
 pub(crate) fn codex_session_token(after_prefix: &str) -> Option<String> {
     let token: String = after_prefix
         .trim_start()
@@ -1352,6 +1359,51 @@ mod tests {
             NativeSessionIds::default()
         );
         assert_eq!(native_session_ids(""), NativeSessionIds::default());
+    }
+
+    /// #15023: a `session id:` banner quoted mid-line — in prose, or inside an
+    /// event string — is data about a launch, not evidence of one. Only a line
+    /// that IS a banner contributes, the rule every Codex banner reader shares.
+    #[test]
+    fn native_session_ids_refuse_a_banner_quoted_mid_line() {
+        let quoted = concat!(
+            "the runner echoed: session id: 11111111-2222-3333-4444-555555555555\n",
+            r#"{"type":"text","part":{"text":"session id: deadbeef-aaaa-bbbb-cccc-dddddddddddd"}}"#,
+            "\n",
+        );
+        assert_eq!(native_session_ids(quoted).codex, Vec::<String>::new());
+    }
+
+    /// #15023: the one anchoring rule every Codex banner reader shares. A line
+    /// that IS the banner yields its token, leading whitespace and all; a
+    /// banner quoted mid-line, a look-alike prefix, and a too-short token are
+    /// data, not launches.
+    #[test]
+    fn codex_session_banner_is_line_anchored() {
+        const ID: &str = "3f2a9c1e-77b2-4d0a-9c1e-2f6a8b4d5e01";
+        let banner = format!("session id: {ID}");
+        assert_eq!(codex_session_banner(&banner).as_deref(), Some(ID));
+        assert_eq!(codex_session_banner(&format!(" \t session id: {ID}")).as_deref(), Some(ID));
+        assert_eq!(codex_session_banner(&format!("the runner echoed: session id: {ID}")), None);
+        assert_eq!(codex_session_banner(&format!("cosession id: {ID}")), None);
+        assert_eq!(codex_session_banner("session id: abc"), None);
+    }
+
+    /// #15023: the edge shapes a real capture can have — a CRLF line ending,
+    /// and a banner that is the last line of an unterminated capture — still
+    /// read as the banner they are.
+    #[test]
+    fn native_session_ids_read_a_crlf_or_unterminated_banner() {
+        const ID: &str = "3f2a9c1e-77b2-4d0a-9c1e-2f6a8b4d5e01";
+        let expected = NativeSessionIds {
+            opencode: Vec::new(),
+            codex: vec![ID.to_string()],
+        };
+        assert_eq!(
+            native_session_ids(&format!("OpenAI Codex v0.160\r\nsession id: {ID}\r\n")),
+            expected
+        );
+        assert_eq!(native_session_ids(&format!("tokens used\nsession id: {ID}")), expected);
     }
 
     #[test]
