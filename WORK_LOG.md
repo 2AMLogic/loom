@@ -16,6 +16,29 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 ### 2026-11-24
 
+- **PR #15241**: fix: render 0 for the held-unbucketed row when a listing read fails
+- **PR #15239**: test: require strictly increasing stacked named lock keys (Rule C)
+- **PR #15237**: docs: document the one-way object-mirror opt-out for private-clone seats
+- **PR #15235**: refactor: drop stale not-yet-landed #14680 comments and unused verify_alternates parameter
+- **PR #15234**: refactor: deduplicate private-dir hardening into private_directory_with
+- **PR #15232**: test: make T29 pin the live-read label check in claim-staleness
+- **PR #15230**: fix: apply deps_fully_resolved set gate in route_parked_pr_conflict
+- **PR #15229**: docs: add merge_observation to the removal-path enumerations
+- **PR #15227**: docs: name loom:ci-failure in the doctor hand-back prose and label row
+- **PR #15222**: fix: move Guide Step 3 WORK_PLAN writes behind loom-daemon guide verbs
+- **PR #15213**: fix(guide): add a Backlog Balance row for held issues with no bucket (#15201)
+- **Issue #15228** (closed): guide: held-unbucketed count renders an empty table cell on a read failure, and costs one forge read per hold label
+- **Issue #15226** (closed): test flake: `scripts/run-otlp-collector-test.sh --release` stalls past the 30-minute budget on OTLP Collector Test (release step)
+- **Issue #15219** (closed): guide.md: the Step 3 block (update_work_plan, splice_plan_body, record_work_plan_receipt) is denied by the default guard before execution, so the #13923 provenance gate cannot run from a guarded shell
+- **Issue #15217** (closed): doctor.md/SKILL.md describe forge doctor-handback as removing only changes-requested/treating — loom:ci-failure is now missing
+- **Issue #15208** (closed): lock_order_tests: two stacked named keys are unordered by Rule A/B — document or add Rule C
+- **Issue #15206** (closed): guide: route_parked_pr_conflict's pre-write dep re-check is flag-only, skipping the #15193 deps_fully_resolved set gate
+- **Issue #15201** (closed): WORK_PLAN render_plan_body(): an issue whose only stage label is a hold has no bucket — excluded from Ready and listed nowhere, so a parked issue disappears from the roadmap
+- **Issue #15194** (closed): Document the merge-observation worktree-removal path (ninth `mechanism`, fifth cargo-target reclaimer)
+- **Issue #15187** (closed): Deduplicate ensure_private_dir and native_tools::provision::state::private_directory
+- **Issue #15168** (closed): Seat object-mirror lifecycle after the first migration: one-shot re-shed, borrowers never detached, no documented disable path
+- **Issue #15167** (closed): Clean up stale #14680 'seat-side slice has not landed yet' comments in mirror.rs
+- **Issue #15151** (closed): test: T29 in test-claim-staleness.sh does not pin the #15044 live-read label check
 - **PR #15215**: test(daemon): exercise observed-merge worktree cleanup on real git checkouts
 - **PR #15203**: test: add crate-wide LOOM_CODEX_HOME lock for runtime-isolation helpers
 - **PR #15211**: fix: match pr-worktree.sh's pr-<N> reuse gate by canonicalized physical path
