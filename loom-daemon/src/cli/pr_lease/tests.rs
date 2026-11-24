@@ -786,6 +786,39 @@ fn the_claim_stand_down_line_carries_the_cause_last() {
 }
 
 #[test]
+fn the_check_stderr_line_carries_the_cause_last() {
+    // #15105: `check` reported `unknown` with empty stderr.
+    let dir = TempDir::new().unwrap();
+    fake_gh(dir.path());
+    fs::write(dir.path().join("fail"), "").unwrap();
+    let c = ctx(dir.path(), who(Role::Judge, "s"));
+    let why = c.gh.read_rows_retrying_why(77, &c.policy).unwrap_err();
+    let line = unreadable_check_line(Some(&why));
+    assert!(line.contains("(state unknown): gh exited "), "{line}");
+    assert!(line.ends_with("HTTP 502"), "{line}");
+    assert!(unreadable_check_line(None).ends_with("(state unknown)"));
+}
+
+#[test]
+fn an_exhausted_check_read_is_unknown_and_exits_unverified() {
+    let dir = TempDir::new().unwrap();
+    fake_gh(dir.path());
+    fs::write(dir.path().join("fail"), "").unwrap();
+    assert_eq!(ctx(dir.path(), who(Role::Judge, "s")).check(), EXIT_UNVERIFIED);
+}
+
+#[test]
+fn a_check_read_that_recovers_on_retry_reports_the_resolved_state() {
+    let dir = TempDir::new().unwrap();
+    fake_gh(dir.path());
+    let me = who(Role::Judge, "sweep-j");
+    fs::write(dir.path().join("rows"), live_row(100, &me)).unwrap();
+    // The first read fails; the retry succeeds and resolves held-self.
+    fs::write(dir.path().join("fail_reads"), "0 0").unwrap();
+    assert_eq!(ctx(dir.path(), me).check(), EXIT_HELD);
+}
+
+#[test]
 fn a_failure_reason_is_bounded_and_free_of_control_characters() {
     let r = bounded_reason(&format!("  a\x1b[31m\tb{}\n", "x".repeat(500)));
     assert!(!r.chars().any(char::is_control), "{r:?}");

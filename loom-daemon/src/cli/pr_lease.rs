@@ -663,6 +663,15 @@ fn unreadable_claim_line(why: Option<&str>) -> String {
     }
 }
 
+/// The stderr line of `lease pr check` when it reports `unknown` (#15105): the
+/// bounded cause of the exhausted read, so the first run is diagnosable.
+fn unreadable_check_line(why: Option<&str>) -> String {
+    match why {
+        Some(why) => format!("could not read this PR's lease records (state unknown): {why}"),
+        None => "could not read this PR's lease records (state unknown)".to_string(),
+    }
+}
+
 /// The writer credential directory this process inherited
 /// (`GH_CONFIG_DIR`): the daemon resolved it for this claim
 /// (`lease_command` sets it from its own per-root registry, or the child
@@ -1755,8 +1764,17 @@ impl Ctx {
 
     /// `check`.
     pub(crate) fn check(&self) -> i32 {
-        let rows = self.gh.read_rows_retrying(self.pr(), &self.policy);
+        // #15105: keep the final read failure's reason — a probe whose whole
+        // contract is "report the state" must not fail silently.
+        let (rows, why) = match self.gh.read_rows_retrying_why(self.pr(), &self.policy) {
+            Ok(rows) => (Some(rows), None),
+            Err(why) => (None, Some(why)),
+        };
         let state = self.state_of(rows.as_deref());
+        if state == ClaimState::Unknown {
+            // stderr only: stdout stays exactly `PR_LEASE_STATE=unknown`.
+            self.say(&unreadable_check_line(why.as_deref()));
+        }
         if let Some((until, refused)) = rows
             .as_deref()
             .filter(|_| state == ClaimState::Free)
