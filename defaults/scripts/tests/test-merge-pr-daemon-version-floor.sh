@@ -524,6 +524,34 @@ assert_eq "0" "$(grep -c '^# requires-daemon: merge-pr .*merge-observation' "$ME
   "the observation pass does not raise the fail-closed requires-daemon floor"
 
 echo ""
+echo "Testing the default cleanup gate is forge-aware (#14905)…"
+
+# Extract the REAL gate block from merge-pr.sh and run it with stubs.
+GATE_FILE="$WORKDIR/cleanup-gate.sh"
+awk '
+  /^if \[\[ "\$\{FORGE_TYPE:-github\}" != "github" \|\|/ { on = 1 }
+  on { print }
+  on && /^fi$/ { exit }
+' "$MERGE_PR_SRC" >"$GATE_FILE"
+assert_contains "$(cat "$GATE_FILE")" "_post_merge_cleanup" "the cleanup gate block was extracted from merge-pr.sh"
+
+_gate_run() { # <FORGE_TYPE|-> <WORKTREE_PATH_OVERRIDE> <REMOVE_IGNORED>
+    (
+        if [[ "$1" == "-" ]]; then unset FORGE_TYPE; else FORGE_TYPE="$1"; fi
+        WORKTREE_PATH_OVERRIDE="$2"; REMOVE_IGNORED="$3"; CLEANUP_WORKTREE=true
+        _post_merge_cleanup() { echo "INLINE-CLEANUP"; }
+        info() { echo "DAEMON-HANDLED"; }
+        # shellcheck disable=SC1090
+        source "$GATE_FILE"
+    )
+}
+assert_eq "INLINE-CLEANUP" "$(_gate_run gitea "" false)" "gitea: default cleanup stays inline (no daemon pass on that forge)"
+assert_eq "DAEMON-HANDLED" "$(_gate_run github "" false)" "github: default cleanup is left to the daemon pass"
+assert_eq "DAEMON-HANDLED" "$(_gate_run - "" false)" "unset FORGE_TYPE defaults to github"
+assert_eq "INLINE-CLEANUP" "$(_gate_run github /tmp/x false)" "github: explicit --worktree-path still cleans inline"
+assert_eq "INLINE-CLEANUP" "$(_gate_run github "" true)" "github: --remove-ignored still cleans inline"
+
+echo ""
 echo "Testing the CI gate agrees merge-pr.sh's dependencies are declared…"
 
 if [[ -x "$CHECKER" || -f "$CHECKER" ]]; then

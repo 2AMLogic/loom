@@ -1495,7 +1495,10 @@ _post_merge_cleanup() {
 # (and `--remove-ignored`, which only modifies it) is still honored inline.
 # A bare `--no-cleanup-worktree` is NOT something the daemon can see; see the
 # PR for #14905 (known gap, unchanged from the overlap release).
-if [[ -n "$WORKTREE_PATH_OVERRIDE" || "${REMOVE_IGNORED:-false}" == "true" ]]; then
+# The daemon pass is GitHub-only (it reads through `GhForge`; on another forge
+# the pass stays idle), so on a non-GitHub forge (Gitea) the default cleanup
+# has no replacement and stays inline.
+if [[ "${FORGE_TYPE:-github}" != "github" || -n "$WORKTREE_PATH_OVERRIDE" || "${REMOVE_IGNORED:-false}" == "true" ]]; then
   _post_merge_cleanup
 elif [[ "$CLEANUP_WORKTREE" == "true" ]]; then
   info "Worktree/branch cleanup is handled by the daemon's merge-observation pass (#14905); pass --worktree-path <dir> to clean a specific path now."
