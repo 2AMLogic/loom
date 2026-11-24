@@ -2688,6 +2688,33 @@ render_plan_body() {
   epics=$("$GH_READ" issue list --label "loom:epic" --state open --limit 200 --json number,title,labels \
     --jq 'sort_by(.number) | .[] | select(any(.labels[]?.name; . == "loom:frozen") | not) | "- **#\(.number)**: \(.title)"'"$held_sfx")
 
+  # #15201: an issue whose only stage label is a hold renders nowhere — every
+  # hold is excluded from Ready, and the *(held)* suffix above can only
+  # annotate a bullet that already exists — so a parked issue vanished from
+  # the roadmap. Backlog Balance says how many it is not listing: held on any
+  # registry hold except `loom:frozen`, carrying none of the six labels
+  # that render a bullet above, and not already under In Progress (that query
+  # is `loom:building` minus the operator gates, so `loom:blocked`+
+  # `loom:building` is listed there and `loom:operator`+`loom:building` is
+  # not). One cached listing per hold label — `--label` cannot say "any
+  # hold" (gh ANDs labels) — unioned by number. A count, never a
+  # listing: a `## Blocked` section stays rejected (#13908).
+  local bucket_names op_names held_unbucketed_json held_unbucketed
+  bucket_names='["loom:very-important","loom:important","loom:curated","loom:architect","loom:hermit","loom:epic"]'
+  op_names=$(printf '%s' "$op_q" | jq -Rsc 'split("\n") | map(select(length > 0))')
+  held_unbucketed_json="$(
+    printf '%s\n' "$hold_q" | sed '/^loom:frozen$/d' | while IFS= read -r h; do
+      # loom:frozen is excluded: sed above drops it from the hold list (#11743).
+      "$GH_READ" issue list --label "$h" --state open --limit 200 --json number,labels \
+        --jq 'sort_by(.number)'
+    done | jq -s 'add // [] | unique_by(.number)')"
+  held_unbucketed=$(printf '%s' "$held_unbucketed_json" | jq --argjson hold "$hold_names" \
+    --argjson bucket "$bucket_names" --argjson op "$op_names" '[.[] | select(
+      (any(.labels[]?.name; . == "loom:frozen") | not) and
+      any(.labels[]?.name; . as $n | $hold | index($n)) and
+      (any(.labels[]?.name; . as $n | $bucket | index($n)) | not) and
+      ((any(.labels[]?.name; . == "loom:building") | not) or any(.labels[]?.name; . as $n | $op | index($n))))] | length')
+
   section "Operator Attention: Merge-Risk-Hold Pileup" \
     "Judge-approved PRs under a hold (\`loom:blocked\` or \`loom:operator\`) — only a human merge decision is missing." \
     "$held"
@@ -2724,6 +2751,7 @@ render_plan_body() {
     "| Important | $(count "$imp") |" \
     "| Ready (\`loom:issue\`, net of holds/building/open-linked-PRs) | $(count "$ready") |" \
     "| In Progress (\`loom:building\`) | $(count "$building") |" \
+    "| Held, no other bucket | $held_unbucketed |" \
     "| PRs awaiting review | $(count "$review") |" \
     "| Approved PRs awaiting merge | $(count "$approved") |" \
     "| Curated | $(count "$curated") |" \
