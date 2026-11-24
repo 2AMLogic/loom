@@ -37,6 +37,11 @@
 #      ever checked out in the dedicated worktree
 #   3. Writes a `.loom-managed` sentinel so merge-pr.sh / loom-clean will
 #      remove the worktree on PR merge
+#   4. Runs the primary checkout's `.loom/hooks/post-worktree.sh` provisioning
+#      hook once from the worktree after each successful create or refresh
+#      (#15045), so review checkouts get the same project setup the Builder's
+#      worktrees get (#926) — e.g. an editable-install repo re-points its
+#      environment at the PR's code instead of the main checkout's
 #
 # Known failure mode (#6264, reproduced): if the PR's branch is ALREADY
 # checked out in another local worktree (most commonly this same PR's
@@ -94,6 +99,11 @@ If a builder issue-<N> worktree holds the branch, exits 1 and names the holder;
 use it or stop. Never invent a judge-* directory or run raw `git worktree add`
 instead. If the primary clone holds the branch, pr-<PR_NUMBER> is created
 detached at the PR head sha instead (review only; the output says so).
+
+After each successful create or refresh (not a failed refresh), runs the
+primary checkout's executable .loom/hooks/post-worktree.sh from the worktree
+with <worktree path> <branch> <PR number> (#15045); a missing hook is skipped
+and a failing one only warns on stderr.
 
 Exit codes:
   0 = worktree ready at .loom/worktrees/pr-<PR_NUMBER>/
@@ -203,6 +213,30 @@ link_mcp_json() {
     fi
 }
 
+# Run the repository's provisioning hook from the PR worktree (#15045),
+# mirroring worktree.sh's post-worktree convention (#926): the hook is looked
+# up in the PRIMARY checkout ($REPO_ROOT) — never the PR's own copy — and is
+# invoked as (cd "$WORKTREE_PATH" && "$HOOK" "$WORKTREE_PATH" "<branch>" "<PR
+# number>"). The branch is the PR head branch when known; when branch lookup
+# was unavailable (the detached fallbacks) it is derived from the resulting
+# checkout — `git rev-parse --abbrev-ref HEAD`, i.e. "HEAD" when detached. An
+# absent or non-executable hook is skipped silently; a failing hook only warns
+# (on stderr — callers capture stdout, whose last line must stay the worktree
+# path, so hook output is routed to stderr) and the checkout stays usable.
+run_post_worktree_hook() {
+    local hook="$REPO_ROOT/.loom/hooks/post-worktree.sh"
+    [[ -x "$hook" ]] || return 0
+    local branch="${HEAD_BRANCH:-}"
+    if [[ -z "$branch" ]]; then
+        branch="$(git -C "$WORKTREE_PATH" rev-parse --abbrev-ref HEAD 2>/dev/null || echo HEAD)"
+    fi
+    if (cd "$WORKTREE_PATH" && "$hook" "$WORKTREE_PATH" "$branch" "$PR_NUMBER" >&2); then
+        print_info "Post-worktree hook completed for pr-$PR_NUMBER"
+    else
+        print_warning "Post-worktree hook failed for pr-$PR_NUMBER (worktree still usable)" >&2
+    fi
+}
+
 # Create pr-<N> detached at the PR head sha (the branch itself is checked out in
 # the primary clone, which git will not allow twice). Exits the script.
 create_detached_pr_worktree() {
@@ -219,6 +253,7 @@ create_detached_pr_worktree() {
     fi
     write_sentinel
     link_mcp_json
+    run_post_worktree_hook
     print_info "Detached at ${sha} because the PR's branch is checked out in the primary clone (${REPO_ROOT}); review only, do not commit or push from here. Record 'reviewed at detached worktree ${sha}' in the verdict."
     print_success "PR worktree ready at $WORKTREE_PATH (detached at ${sha})"
     echo "$WORKTREE_PATH"
@@ -236,17 +271,22 @@ if [[ -d "$WORKTREE_PATH" ]]; then
         # Refresh the PR branch in case upstream pushed new commits.
         if (cd "$WORKTREE_PATH" && gh pr checkout "$PR_NUMBER" --force >/dev/null 2>&1); then
             print_success "Refreshed PR branch in existing worktree"
+            run_post_worktree_hook
         elif ! git -C "$WORKTREE_PATH" symbolic-ref -q HEAD >/dev/null 2>&1; then
             # #14391: a detached pr-<N> (primary-clone holder) cannot be refreshed
             # by `gh pr checkout`; move it to the current PR head sha instead.
             NEW_SHA="$(resolve_pr_head_sha)"
             if [[ -n "$NEW_SHA" ]] && git -C "$WORKTREE_PATH" checkout -q --detach "$NEW_SHA" 2>/dev/null; then
                 print_success "Refreshed detached PR worktree to ${NEW_SHA}"
+                run_post_worktree_hook
             else
                 print_error "Could not move detached PR worktree $WORKTREE_PATH to the PR head (${NEW_SHA:-unresolved}); local edits are preserved and the checkout is still at $(git -C "$WORKTREE_PATH" rev-parse HEAD 2>/dev/null)"
                 exit 1
             fi
         else
+            # No run_post_worktree_hook here (#15045): this checkout was NOT
+            # successfully refreshed, so it keeps whatever provisioning its
+            # last successful refresh applied.
             print_warning "Could not refresh PR branch (continuing with existing checkout)"
         fi
         echo "$WORKTREE_PATH"
@@ -356,6 +396,8 @@ fi
 # Symlink .mcp.json so MCP servers work in the PR worktree (same pattern
 # as worktree.sh).
 link_mcp_json
+
+run_post_worktree_hook
 
 print_success "PR worktree ready at $WORKTREE_PATH"
 echo "$WORKTREE_PATH"

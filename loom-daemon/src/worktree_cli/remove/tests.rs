@@ -184,9 +184,8 @@ fn a_hostile_path_still_produces_parseable_json() {
 // The cargo-target-dir status mapping
 // ---------------------------------------------------------------------------
 
-/// Every [`cargo_target::TargetDirOutcome`] must map to the status token the
-/// shell's `_loom_ctd_record` emitted, since `targetDirStatus` is asserted by
-/// the retained suite.
+/// Every [`cargo_target::TargetDirOutcome`] must map to its status token, since
+/// `targetDirStatus` is asserted by the retained suite.
 #[test]
 fn every_target_dir_outcome_maps_to_the_shells_status_token() {
     use cargo_target::TargetDirOutcome as O;
@@ -244,33 +243,6 @@ fn every_target_dir_outcome_maps_to_the_shells_status_token() {
         report.report_target_dir(&out, &outcome);
         assert_eq!(report.target_dir_status, expected);
         assert_eq!(report.target_dir_path, "/vol/target");
-    }
-}
-
-/// The status tokens are the shell library's, verbatim. Pinned against the
-/// real `lib/cargo-target-dir.sh` so a rename there cannot silently split the
-/// vocabulary.
-#[test]
-fn status_tokens_match_the_shell_twin() {
-    let lib =
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("../defaults/scripts/lib/cargo-target-dir.sh");
-    let Ok(sh) = std::fs::read_to_string(&lib) else {
-        return;
-    };
-    for token in [
-        "inside",
-        "absent",
-        "refused",
-        "shared",
-        "protected",
-        "would-reclaim",
-        "reclaimed",
-        "failed",
-    ] {
-        assert!(
-            sh.contains(&format!("\"{token}\"")),
-            "status token {token:?} missing from {lib:?}"
-        );
     }
 }
 

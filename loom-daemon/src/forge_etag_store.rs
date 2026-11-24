@@ -46,11 +46,23 @@ use crate::proc_exec::Completion;
 
 /// `${TMPDIR:-/tmp}` — the per-user, per-host scratch base the ETag store and
 /// the forge-call sink ([`crate::forge_call_stats`]) both live under.
+///
+/// A **relative** `TMPDIR` is ignored (#14929): joining a state-dir name onto
+/// a relative base resolves against the process cwd, which inside a
+/// private-clone seat is the clone root — exactly where `loom-forge-*` and
+/// `loom-write-scope` directories were observed untracked, refusing the seat
+/// as dirty. Every resolver through this function stays absolute; a relative
+/// value reads as unset.
 pub(crate) fn host_tmp_base() -> PathBuf {
-    let base = std::env::var("TMPDIR")
-        .ok()
+    host_tmp_base_from(std::env::var("TMPDIR").ok().as_deref())
+}
+
+/// [`host_tmp_base`]'s resolution as a pure function of the `TMPDIR` value.
+pub(crate) fn host_tmp_base_from(tmpdir: Option<&str>) -> PathBuf {
+    let base = tmpdir
         .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| "/tmp".to_string());
+        .filter(|s| Path::new(s).is_absolute())
+        .unwrap_or("/tmp");
     PathBuf::from(base)
 }
 
@@ -855,6 +867,28 @@ fn get_cache() -> &'static Mutex<HashMap<String, std::sync::Arc<DiskEntry>>> {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+
+    /// #14929: a relative `TMPDIR` must never resolve state dirs against the
+    /// process cwd — inside a private-clone seat that is the clone root,
+    /// where `loom-forge-*` and `loom-write-scope` directories were observed
+    /// untracked. Relative reads as unset; the base stays absolute.
+    #[test]
+    fn a_relative_tmpdir_is_ignored_so_state_dirs_never_land_in_the_cwd() {
+        for relative in ["relative-tmp", "tmp", ".", "..", "sub/dir"] {
+            assert_eq!(
+                host_tmp_base_from(Some(relative)),
+                PathBuf::from("/tmp"),
+                "relative TMPDIR {relative:?} must read as unset"
+            );
+        }
+        assert_eq!(host_tmp_base_from(Some("")), PathBuf::from("/tmp"));
+        assert_eq!(host_tmp_base_from(None), PathBuf::from("/tmp"));
+        assert_eq!(host_tmp_base_from(Some("/var/folders/xy")), PathBuf::from("/var/folders/xy"));
+        // Joins onto an absolute base stay absolute, so no state dir a
+        // writer derives from the base can resolve into the job's cwd.
+        let dir = host_tmp_base_from(Some("relative-tmp")).join("loom-forge-listing-cache");
+        assert_eq!(dir, PathBuf::from("/tmp/loom-forge-listing-cache"));
+    }
 
     #[test]
     fn parses_remote_urls_with_host() {

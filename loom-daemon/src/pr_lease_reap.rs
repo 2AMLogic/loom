@@ -48,6 +48,33 @@ pub const LEASE_FILE_ENV: &str = "LOOM_ROLE_PR_LEASE_FILE";
 /// Why a lease was reaped, as written to the record's `reaped=` field.
 pub const REASON_TIMEOUT: &str = "timeout";
 
+/// The reap reason of a step whose launch was rejected before the runtime did
+/// any work (#14951): a typed `LOOM_LAUNCH_REJECTED` report, or an untyped
+/// exit 78 (`EX_CONFIG`, a spawn script's preflight refusal such as missing
+/// Codex hook trust or an empty token pool) that came back inside the
+/// fast-fail window with no outcome line.
+pub const REASON_LAUNCH_REJECTED: &str = "launch_rejected";
+
+/// The reap reason of a step whose provider feedback said its seat was
+/// exhausted (#13966, #14951): the run died on the provider, not on the PR.
+pub const REASON_PROVIDER_EXHAUSTED: &str = "provider_exhausted";
+
+/// Whether a reap `reason` says the run never reached a review: the seat
+/// refused it (`seat_busy`), its launch was rejected, or the provider was
+/// exhausted. Such a pass reviewed nothing, so a Judge's reap writes no
+/// no-verdict record for it (#14951); the backstop bounds re-runs of a Judge
+/// that *ran* and ended without a verdict (`exited`, `timeout`), not a runtime
+/// fault that is unrelated to the PR.
+#[must_use]
+pub fn reason_never_reviewed(reason: &str) -> bool {
+    matches!(
+        reason,
+        REASON_LAUNCH_REJECTED
+            | REASON_PROVIDER_EXHAUSTED
+            | crate::session_exec::refusal::SEAT_BUSY_REASON
+    )
+}
+
 /// The deadline for one `lease pr reap` child: a bounded lease read (three
 /// attempts), one PR read and one PATCH, each with its own `gh` deadline.
 pub const REAP_TIMEOUT: Duration = Duration::from_secs(150);

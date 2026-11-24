@@ -46,7 +46,6 @@
 
 use std::cell::{Cell, RefCell};
 use std::collections::BTreeMap;
-use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::rc::Rc;
@@ -68,7 +67,6 @@ pub const PASS_DEADLINE: Duration = Duration::from_secs(120);
 const FETCH_TIMEOUT: Duration = Duration::from_secs(60);
 /// Bound on one `git merge-tree` / `cat-file` run.
 const GIT_TIMEOUT: Duration = Duration::from_secs(30);
-const POLL: Duration = Duration::from_millis(20);
 
 /// The remote PR heads are fetched from (`refs/pull/<n>/head`).
 const REMOTE: &str = "origin";
@@ -282,9 +280,23 @@ fn git_code(root: &Path, args: &[&str], timeout: Duration, deadline: &Deadline) 
     git_run(root, args, timeout, deadline).map(|(code, _)| code)
 }
 
-/// As [`git_code`], also returning stdout. The pipe is drained on a thread so
-/// a large output cannot stall the child while this loop polls it.
+/// As [`git_code`], also returning stdout. Draining and group termination are
+/// [`crate::proc_exec::run_bounded`]'s: a large `merge-tree` listing is
+/// collected concurrently with the wait instead of stalling the child against
+/// a full pipe, and a timeout kills git's whole process group.
 fn git_run(
+    root: &Path,
+    args: &[&str],
+    timeout: Duration,
+    deadline: &Deadline,
+) -> Option<(i32, String)> {
+    git_run_with("git", root, args, timeout, deadline)
+}
+
+/// [`git_run`] against a named binary, so tests can substitute a script for
+/// the real `git`.
+fn git_run_with(
+    program: &str,
     root: &Path,
     args: &[&str],
     timeout: Duration,
@@ -294,36 +306,18 @@ fn git_run(
     if timeout.is_zero() {
         return None;
     }
-    let mut child = Command::new("git")
-        .current_dir(root)
+    let mut cmd = Command::new(program);
+    cmd.current_dir(root)
         .args(args)
         .env("GIT_TERMINAL_PROMPT", "0")
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .ok()?;
-    let mut pipe = child.stdout.take()?;
-    let reader = std::thread::spawn(move || {
-        let mut buf = String::new();
-        let _ = pipe.read_to_string(&mut buf);
-        buf
-    });
-    let start = Instant::now();
-    loop {
-        match child.try_wait() {
-            Ok(Some(status)) => {
-                let out = reader.join().unwrap_or_default();
-                return status.code().map(|c| (c, out));
-            }
-            Ok(None) if start.elapsed() < timeout => std::thread::sleep(POLL),
-            _ => {
-                let _ = child.kill();
-                let _ = child.wait();
-                let _ = reader.join();
-                return None;
-            }
-        }
+        .stdin(Stdio::null());
+    match crate::proc_exec::run_bounded(cmd, timeout) {
+        // A signal-killed git has no exit code and stays `None`, as before.
+        Ok(crate::proc_exec::Completion::Exited(out)) => out
+            .status
+            .code()
+            .map(|c| (c, String::from_utf8_lossy(&out.stdout).into_owned())),
+        _ => None,
     }
 }
 

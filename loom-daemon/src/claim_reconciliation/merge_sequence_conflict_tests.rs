@@ -283,3 +283,112 @@ fn real_merge_tree_distinguishes_clean_mod_appends_from_same_line_edits() {
     let ghost = at(4, &"1".repeat(40));
     assert!(checker.conflicts(&prs[0], &ghost));
 }
+
+/// #15007 slice C: `git_run_with` is the executor-backed body behind
+/// [`super::git_run`]; these pin its `(code, stdout)` contract, including the
+/// behaviours a wrapper must not lose — a signal death staying `None`, and a
+/// spent [`Deadline`] launching nothing.
+#[test]
+fn git_run_reports_the_exit_code_and_stdout_of_a_fast_command() {
+    let dir = tempfile::tempdir().unwrap();
+    let deadline = Deadline::unbounded();
+    let (code, out) = git_run_with(
+        "/bin/sh",
+        dir.path(),
+        &["-c", "echo probe; exit 3"],
+        Duration::from_secs(10),
+        &deadline,
+    )
+    .expect("sh must run");
+    assert_eq!(code, 3, "the exact exit code must survive");
+    assert_eq!(out, "probe\n");
+}
+
+#[test]
+fn git_run_is_none_for_a_signal_killed_child_and_a_failed_spawn() {
+    let dir = tempfile::tempdir().unwrap();
+    let deadline = Deadline::unbounded();
+    let signaled = git_run_with(
+        "/bin/sh",
+        dir.path(),
+        &["-c", "kill -TERM $$"],
+        Duration::from_secs(10),
+        &deadline,
+    );
+    assert_eq!(signaled, None, "a signalled git has no exit code, as before");
+    let no_spawn = git_run_with(
+        "/nonexistent/loom-canary-git",
+        dir.path(),
+        &["-c", "true"],
+        Duration::from_secs(10),
+        &deadline,
+    );
+    assert!(no_spawn.is_none());
+}
+
+#[test]
+fn git_run_is_none_without_launching_once_the_deadline_is_spent() {
+    let dir = tempfile::tempdir().unwrap();
+    let deadline = Deadline::new(Duration::ZERO);
+    let out = git_run_with(
+        "/bin/sh",
+        dir.path(),
+        &["-c", "echo ran > launched"],
+        Duration::from_secs(10),
+        &deadline,
+    );
+    assert!(out.is_none());
+    assert!(
+        !dir.path().join("launched").exists(),
+        "a spent deadline must not launch the child at all"
+    );
+}
+
+#[test]
+fn git_run_collects_output_far_larger_than_the_pipe_buffer() {
+    // A large `merge-tree --name-only` listing is the reason stdout is
+    // captured at all; only a concurrent drain returns it whole.
+    let dir = tempfile::tempdir().unwrap();
+    let deadline = Deadline::unbounded();
+    let (code, out) = git_run_with(
+        "/bin/sh",
+        dir.path(),
+        &["-c", "head -c 262144 /dev/zero | tr '\\0' 'x'"],
+        Duration::from_secs(30),
+        &deadline,
+    )
+    .expect("sh must run");
+    assert_eq!(code, 0);
+    assert_eq!(out.len(), 262_144, "every byte must be collected");
+}
+
+#[test]
+#[cfg(unix)]
+fn git_run_timeout_kills_the_descendants_too() {
+    let dir = tempfile::tempdir().unwrap();
+    let pidfile = dir.path().join("grandchild.pid");
+    let script = format!("/bin/sleep 120 & echo $! > {}; exec /bin/sleep 120", pidfile.display());
+    let deadline = Deadline::unbounded();
+    let out = git_run_with(
+        "/bin/sh",
+        dir.path(),
+        &["-c", &script],
+        Duration::from_millis(400),
+        &deadline,
+    );
+    assert!(out.is_none());
+
+    std::thread::sleep(Duration::from_millis(300));
+    let pid: i32 = std::fs::read_to_string(&pidfile)
+        .expect("grandchild must have recorded its pid")
+        .trim()
+        .parse()
+        .expect("pid must parse");
+    // SAFETY: signal 0 performs error checking only; it never delivers a signal.
+    let alive = unsafe { libc::kill(pid as libc::pid_t, 0) == 0 };
+    if alive {
+        // SAFETY: cleanup kill of a process this test spawned.
+        unsafe { libc::kill(pid, libc::SIGKILL) };
+    }
+    assert!(!alive, "grandchild {pid} outlived the git timeout");
+}

@@ -513,14 +513,17 @@ config hierarchy) and reclaims it afterwards — but only when the redirect is
 attributable to that one worktree, which means a `.cargo/config.toml` inside it
 (see the never-delete list and the limitation below):
 
-- `worktree.sh remove <N>` — bash side, via
-  `defaults/scripts/lib/cargo-target-dir.sh`.
-- `merge-pr.sh`'s post-merge worktree cleanup — same bash library. This is the
-  removal path most worktrees actually take, so it is where the leak was
-  largest.
-- `loom-daemon clean` and the daemon's periodic worktree reaper — Rust side,
-  via `loom-daemon/src/worktree_ops/cargo_target.rs` (both `issue-<N>` and
-  `pr-<N>` worktrees).
+- `worktree.sh remove <N>` — via `loom-daemon worktree-remove`.
+- `merge-pr.sh`'s post-merge worktree cleanup — via `loom-daemon merge-pr
+  post-merge-cleanup`. This is the removal path most worktrees actually take,
+  so it is where the leak was largest.
+- `loom-daemon clean` and the daemon's periodic worktree reaper — directly.
+
+All of them run the same Rust reclaim in
+`loom-daemon/src/worktree_ops/cargo_target.rs` (both `issue-<N>` and `pr-<N>`
+worktrees); the parallel bash reclaim stack that once lived in
+`defaults/scripts/lib/cargo-target-dir.sh` was deleted (#15075) once every
+removal surface had migrated.
 
 Preview what a removal would reclaim, with sizes, without touching anything:
 

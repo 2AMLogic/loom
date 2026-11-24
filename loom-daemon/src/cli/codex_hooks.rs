@@ -124,7 +124,10 @@ impl VerifyArgs {
                 launch_dir: self.cwd.clone().or_else(|| self.workspace.clone()),
                 codex_args: self.codex_args.clone(),
                 container: self.container.clone().map(|name| seal::Container {
-                    docker: self.docker.clone(),
+                    // The argument's `default_value` literal means "the
+                    // shared lookup" (#14885); an explicit program (a test's
+                    // injected fake) stays verbatim.
+                    docker: crate::docker_bin::cli_arg_or_fail_open(&self.docker),
                     name,
                 }),
                 command: None,

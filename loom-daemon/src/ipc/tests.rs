@@ -53,6 +53,9 @@ fn setup_test_context() -> TestContext {
     let db = Arc::new(Mutex::new(db));
     let mut sr_config = SweepRegistryConfig::new(dir.path().to_path_buf());
     sr_config.skip_label_flip = true;
+    // Confine the #3953 sweep journal to this fixture's tempdir — never the
+    // real machine-level `~/.loom/sweeps.json`.
+    sr_config.journal_path = Some(dir.path().join("test-sweeps-journal.json"));
     let bus = Arc::new(EventBus::new());
     let mut registry = SweepRegistry::new(sr_config);
     registry.set_event_bus(bus.clone());
@@ -472,8 +475,7 @@ fn test_dispatch_sweep_still_dispatches_under_synthetic_low_headroom() {
 
 #[test]
 fn test_handle_request_list_sweeps_empty() {
-    let (_context_dir, tm, db, _, bus) = setup_test_context();
-    let (sr, _dir, _rec) = setup_sweep_registry_in_tempdir();
+    let (_context_dir, tm, db, sr, bus) = setup_test_context();
     let response = handle_request(
         Request::ListSweeps {
             state_filter: None,
@@ -2227,8 +2229,7 @@ async fn test_handle_request_publish_event_malformed_and_unknown_stay_generic() 
 
 #[test]
 fn test_handle_request_get_sweep_status_missing() {
-    let (_context_dir, tm, db, _, bus) = setup_test_context();
-    let (sr, _dir, _rec) = setup_sweep_registry_in_tempdir();
+    let (_context_dir, tm, db, sr, bus) = setup_test_context();
     let response = handle_request(
         Request::GetSweepStatus {
             sweep_id: "no-such-sweep".to_string(),
@@ -2248,8 +2249,7 @@ fn test_handle_request_get_sweep_status_missing() {
 
 #[test]
 fn test_handle_request_tail_sweep_log_missing_sweep_returns_error() {
-    let (_context_dir, tm, db, _, bus) = setup_test_context();
-    let (sr, _dir, _rec) = setup_sweep_registry_in_tempdir();
+    let (_context_dir, tm, db, sr, bus) = setup_test_context();
     let response = handle_request(
         Request::TailSweepLog {
             sweep_id: "no-such-sweep".to_string(),
@@ -2277,8 +2277,7 @@ fn test_handle_request_tail_sweep_log_missing_sweep_returns_error() {
 fn test_handle_request_clear_quarantine_noop() {
     // Issue #3939/#3960: clearing an issue that is not quarantined is an
     // idempotent no-op success routed through the full IPC dispatcher.
-    let (_context_dir, tm, db, _, bus) = setup_test_context();
-    let (sr, _dir, _rec) = setup_sweep_registry_in_tempdir();
+    let (_context_dir, tm, db, sr, bus) = setup_test_context();
     let response = handle_request(
         Request::ClearQuarantine {
             issue: 4242,
@@ -2306,8 +2305,7 @@ fn test_handle_request_clear_quarantine_noop() {
 fn test_handle_request_clear_quarantine_clears_existing() {
     // Seed a quarantine directly, then clear it via the IPC dispatcher and
     // assert the in-memory state was released (was_quarantined: true).
-    let (_context_dir, tm, db, _, bus) = setup_test_context();
-    let (sr, _dir, _rec) = setup_sweep_registry_in_tempdir();
+    let (_context_dir, tm, db, sr, bus) = setup_test_context();
     {
         let mut reg = sr.lock().unwrap();
         reg.seed_quarantine_for_test(808);
@@ -2345,8 +2343,7 @@ fn test_handle_request_record_dispatch_failure_arms_backoff() {
     // caller with no direct registry access) records a failed dispatch
     // via IPC and gets back the resulting consecutive count + window,
     // mirroring the reaper's own automatic bookkeeping (#4485).
-    let (_context_dir, tm, db, _, bus) = setup_test_context();
-    let (sr, _dir, _rec) = setup_sweep_registry_in_tempdir();
+    let (_context_dir, tm, db, sr, bus) = setup_test_context();
     let response = handle_request(
         Request::RecordDispatchFailure {
             issue: 6192,
@@ -2382,8 +2379,7 @@ fn test_handle_request_record_dispatch_failure_arms_backoff() {
 fn test_handle_request_record_dispatch_failure_accumulates_consecutive() {
     // Two calls for the same issue accumulate — mirrors the reaper
     // calling `record_dispatch_failure` on repeated failed dispatches.
-    let (_context_dir, tm, db, _, bus) = setup_test_context();
-    let (sr, _dir, _rec) = setup_sweep_registry_in_tempdir();
+    let (_context_dir, tm, db, sr, bus) = setup_test_context();
     for _ in 0..2 {
         handle_request(
             Request::RecordDispatchFailure {
@@ -2424,8 +2420,7 @@ fn test_handle_request_record_dispatch_failure_disabled_is_noop() {
     // idempotent no-op: `consecutive` stays 0 and `backoff_secs` is None,
     // never a hard error — mirrors `record_dispatch_failure`'s own early
     // return when `dispatch_backoff_config.enabled` is false.
-    let (_context_dir, tm, db, _, bus) = setup_test_context();
-    let (sr, _dir, _rec) = setup_sweep_registry_in_tempdir();
+    let (_context_dir, tm, db, sr, bus) = setup_test_context();
     {
         let mut reg = sr.lock().unwrap();
         let mut cfg = reg.dispatch_backoff_config();
@@ -2466,8 +2461,7 @@ fn test_handle_request_record_noop_release_arms_cooldown() {
     // access) records a self-reported no-op release via IPC and gets back
     // the resulting consecutive count + window, mirroring
     // `RecordDispatchFailure`'s own contract.
-    let (_context_dir, tm, db, _, bus) = setup_test_context();
-    let (sr, _dir, _rec) = setup_sweep_registry_in_tempdir();
+    let (_context_dir, tm, db, sr, bus) = setup_test_context();
     let response = handle_request(
         Request::RecordNoopRelease {
             issue: 6670,
@@ -2507,8 +2501,7 @@ fn test_handle_request_record_noop_release_arms_cooldown() {
 fn test_handle_request_record_noop_release_accumulates_consecutive() {
     // Two calls for the same issue accumulate — mirrors the sweep
     // orchestrator reporting "still nothing to do" on repeated passes.
-    let (_context_dir, tm, db, _, bus) = setup_test_context();
-    let (sr, _dir, _rec) = setup_sweep_registry_in_tempdir();
+    let (_context_dir, tm, db, sr, bus) = setup_test_context();
     for _ in 0..2 {
         handle_request(
             Request::RecordNoopRelease {
@@ -2549,8 +2542,7 @@ fn test_handle_request_record_noop_release_disabled_is_noop() {
     // idempotent no-op: `consecutive` stays 0 and `cooldown_secs` is None,
     // never a hard error — mirrors `record_noop_release`'s own early
     // return when `noop_cooldown_config.enabled` is false.
-    let (_context_dir, tm, db, _, bus) = setup_test_context();
-    let (sr, _dir, _rec) = setup_sweep_registry_in_tempdir();
+    let (_context_dir, tm, db, sr, bus) = setup_test_context();
     {
         let mut reg = sr.lock().unwrap();
         let mut cfg = reg.noop_cooldown_config();
@@ -2723,8 +2715,7 @@ fn test_record_noop_release_routes_to_explicit_non_default_workspace() {
 /// `workspace_root` calls.
 #[test]
 fn test_record_noop_release_none_workspace_root_still_targets_default() {
-    let (_context_dir, tm, db, _, bus) = setup_test_context();
-    let (sr, _dir, _rec) = setup_sweep_registry_in_tempdir();
+    let (_context_dir, tm, db, sr, bus) = setup_test_context();
 
     let response = handle_request(
         Request::RecordNoopRelease {
@@ -2894,8 +2885,7 @@ fn test_handle_request_list_quarantines_ttl_clamps_to_zero() {
 
 #[test]
 fn test_handle_request_cancel_sweep_unknown_returns_error() {
-    let (_context_dir, tm, db, _, bus) = setup_test_context();
-    let (sr, _dir, _rec) = setup_sweep_registry_in_tempdir();
+    let (_context_dir, tm, db, sr, bus) = setup_test_context();
     let response = handle_request(
         Request::CancelSweep {
             sweep_id: "no-such-sweep".to_string(),

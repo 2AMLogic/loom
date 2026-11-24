@@ -32,6 +32,12 @@ for copy in "defaults/.claude/commands/loom/guide.md" "defaults/.agents/skills/l
         "$(printf "$P" 'Awaiting a revision.')" "2026-11-01T10:00:30Z"
     check "explicit proposal revision request => convertible" 0 \
         "$(printf "$P" 'Awaiting proposal revision of the scope.')" "2026-11-01T10:00:30Z"
+    check "plural architect revisions => convertible (#15050)" 0 \
+        "$(printf "$P" 'awaiting architect revisions')" "2026-11-01T10:00:30Z"
+    check "revision of the proposal => convertible (#15050)" 0 \
+        "$(printf "$P" 'Awaiting revision of the proposal.')" "2026-11-01T10:00:30Z"
+    check "plural design epics => convertible (#15050)" 0 \
+        "$(printf "$P" 'awaiting design epics')" "2026-11-01T10:00:30Z"
     check "unrelated reason => left alone" 1 "$(printf "$P" 'needs an architecture ruling')"
     check "no park record => left alone" 1 "just a body"
     check "revision reason + open blocker named => left alone" 1 \
@@ -48,6 +54,8 @@ for copy in "defaults/.claude/commands/loom/guide.md" "defaults/.agents/skills/l
         "$(printf "$P" 'Awaiting revision d89fb26c2 to be deployed for SigNoz verification.')" "2026-11-01T10:00:30Z"
     check "fresh wait for revision evidence => left alone" 1 \
         "$(printf "$P" 'Awaiting revision evidence from the deployed worker.')" "2026-11-01T10:00:30Z"
+    check "revision of a non-park noun => left alone (#15050)" 1 \
+        "$(printf "$P" 'Awaiting revision of the issue tracker config')" "2026-11-01T10:00:30Z"
     check "block re-applied >5min after record => stale, left alone" 1 \
         "$(printf "$P" 'awaiting Architect revision')" "2026-11-03T10:00:00Z"
 done

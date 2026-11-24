@@ -388,57 +388,32 @@ mod tests {
     }
 
     fn fixture_record() -> telemetry::SweepOutcomeRecord {
-        telemetry::SweepOutcomeRecord {
-            story_points: Some(8),
-            repo: Some("rjwalters/loom".to_string()),
-            repo_unresolved: false,
-            visibility: telemetry::RepoVisibility::Private,
-            issue: 9056,
-            sweep_id: "sweep-issue-9056-0".to_string(),
-            model: Some("sonnet".to_string()),
-            effort: None,
-            config: std::collections::BTreeMap::new(),
-            phase_durations: vec![
-                telemetry::PhaseDuration::new("curator".to_string(), 120),
-                telemetry::PhaseDuration::new("builder".to_string(), 3600),
-            ],
-            total_duration_sec: 4000,
-            result: telemetry::SweepResult::Success,
-            disposition: telemetry::SweepDisposition::Landed,
-            pr_number: Some(42),
-            tokens_in: Some(200_000),
-            tokens_out: Some(15_000),
-            lines_added: Some(120),
-            lines_deleted: Some(30),
-            tokens_by_model: None,
-            tokens_unattributed: None,
-            failure_class: None,
-            models_used: None,
-            doctor_cycles: Some(1),
-            judge_verdicts: Some(vec![telemetry::JudgeVerdict {
-                attempt: 1,
-                verdict: "pass".to_string(),
-            }]),
-            runtime: None,
-            provider: None,
-            profile: None,
-            tokens_status: None,
-            tokens_status_reason: None,
-            no_phase_cause: None,
-            phase_tap_usage: Vec::new(),
-            attempt_index: None,
-            previous_sweep_id: None,
-            trigger: None,
-            dispatch_origin: None,
-            role_draw: None,
-            rework_events: None,
-            pr_numbers: None,
-            hw_lines_added: None,
-            hw_lines_deleted: None,
-            hw_files: None,
-            generated_lines: None,
-            test_lines: None,
-        }
+        let mut record: telemetry::SweepOutcomeRecord = serde_json::from_value(serde_json::json!({
+            "repo": "rjwalters/loom",
+            "issue": 9056,
+            "sweep_id": "sweep-issue-9056-0",
+            "total_duration_sec": 4000,
+            "result": "success",
+        }))
+        .expect("minimal journal record");
+        record.story_points = Some(8);
+        record.model = Some("sonnet".to_string());
+        record.phase_durations = vec![
+            telemetry::PhaseDuration::new("curator".to_string(), 120),
+            telemetry::PhaseDuration::new("builder".to_string(), 3600),
+        ];
+        record.disposition = telemetry::SweepDisposition::Landed;
+        record.pr_number = Some(42);
+        record.tokens_in = Some(200_000);
+        record.tokens_out = Some(15_000);
+        record.lines_added = Some(120);
+        record.lines_deleted = Some(30);
+        record.doctor_cycles = Some(1);
+        record.judge_verdicts = Some(vec![telemetry::JudgeVerdict {
+            attempt: 1,
+            verdict: "pass".to_string(),
+        }]);
+        record
     }
 
     // ---- Comment formatting (pure, no `gh` needed) ----
