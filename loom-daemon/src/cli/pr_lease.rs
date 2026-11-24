@@ -41,6 +41,10 @@
 //!   reap records the no-verdict pass for the backstop whatever the CI state.
 //! - **check** reports [`ClaimState`] (`free`, `held-self`, `held-peer`,
 //!   `unknown`) — the PR-phase shape of #11118's proposed `claim_state(item)`.
+//! - **backstop-clear** (operator, #15096) releases Judge no-verdict
+//!   backstop holds without a push or a label change, by rewriting each
+//!   trusted in-window record to `verdict=cleared` — a token no hold reader
+//!   counts (`cli/pr_lease/backstop.rs`).
 //!
 //! The label stays the caller's to write, **after** a won claim: the label is
 //! a projection of the lease, not the evidence (#11118).
@@ -1052,6 +1056,14 @@ pub(crate) enum PrLeaseAction {
     /// Always 0.
     #[command(hide = true)]
     Reap(ReapArgs),
+    /// Operator (#15096): release Judge no-verdict backstop holds without a
+    /// push or a label change, by rewriting each trusted in-window record on
+    /// the PR from `verdict=none` to `verdict=cleared` (which no hold reader
+    /// counts). `--pr N` clears one PR; `--all` clears every open
+    /// `loom:review-requested` PR `lease pr check --role judge` reports
+    /// `held-backstop`. Exit 0 = done (a `BACKSTOP_CLEAR pr=<n> cleared=<k>`
+    /// line per PR); 1 = a read, the write target or a rewrite failed.
+    BackstopClear(BackstopClearArgs),
 }
 
 /// `release`'s arguments: the shared flags plus the pass's own skip reason.
@@ -1097,6 +1109,21 @@ pub(crate) struct ReapArgs {
     pub(crate) workspace: PathBuf,
 }
 
+/// `backstop-clear`'s arguments (#15096): one PR, or every held one.
+#[derive(clap::Args, Debug, Clone)]
+pub(crate) struct BackstopClearArgs {
+    /// The PR whose Judge no-verdict records to clear.
+    #[arg(long, value_name = "PR", required_unless_present = "all")]
+    pub(crate) pr: Option<u64>,
+    /// Clear every open `loom:review-requested` PR the backstop holds
+    /// (`lease pr check --role judge` answers `held-backstop`).
+    #[arg(long, conflicts_with = "pr")]
+    pub(crate) all: bool,
+    /// Repo checkout to operate in.
+    #[arg(long, default_value = ".")]
+    pub(crate) workspace: PathBuf,
+}
+
 impl PrLeaseAction {
     /// Tools-only dispatch. The daemon runs the same actions without consulting
     /// tools mode, and retains its scheduled attach/reap entry points.
@@ -1112,6 +1139,12 @@ impl PrLeaseAction {
             Self::RenewLoop(args) => &mut args.workspace,
             Self::Attach(_) | Self::Reap(_) => {
                 eprintln!("loom-tools lease pr: attach and reap are daemon service operations; use loom-daemon");
+                std::process::exit(super::forge_read::EX_WRITE_VERB_NOT_MIGRATED);
+            }
+            Self::BackstopClear(_) => {
+                eprintln!(
+                    "loom-tools lease pr: backstop-clear is an operator verb of loom-daemon; use loom-daemon lease pr backstop-clear"
+                );
                 std::process::exit(super::forge_read::EX_WRITE_VERB_NOT_MIGRATED);
             }
         };
@@ -1164,6 +1197,9 @@ impl PrLeaseAction {
                 };
                 with_context_as(&common, Some(&r.host), EXIT_HELD, true, |ctx| ctx.reap(&r.reason))
             }
+            // An operator verb, not a claimant's: it has no lease identity,
+            // so it resolves its own context (cli/pr_lease/backstop.rs).
+            Self::BackstopClear(a) => backstop::backstop_clear(&a),
         };
         std::process::exit(code)
     }
