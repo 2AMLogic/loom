@@ -517,6 +517,11 @@ attributable to that one worktree, which means a `.cargo/config.toml` inside it
 - `merge-pr.sh`'s post-merge worktree cleanup — via `loom-daemon merge-pr
   post-merge-cleanup`. This is the removal path most worktrees actually take,
   so it is where the leak was largest.
+- the daemon's merge-observation pass (#14904) — directly: when the
+  reconciliation tick observes a merge made on the forge side (GitHub's own
+  merge button, a queue-merged PR), it replays `merge-pr.sh`'s whole
+  post-merge worktree-cleanup block in-process, so those worktrees are
+  reclaimed without waiting for the periodic reaper.
 - `loom-daemon clean` and the daemon's periodic worktree reaper — directly.
 
 All of them run the same Rust reclaim in
@@ -795,9 +800,12 @@ or `LOOM_PER_WORKTREE_TARGET_DIR=1` in the daemon's environment. Then:
   every rule in the scheme is stated once, in the daemon; the shell scripts hold
   only the call sites.
 - Every removal path reclaims it: `worktree.sh remove`, `merge-pr.sh`'s
-  post-merge cleanup, `loom-daemon clean`, and the daemon's periodic reaper (so a
-  worktree whose PR merged on another host is cleaned up here too). All four now
-  run the **same** Rust decision (`worktree_ops::cargo_target::plan_reclaim`):
+  post-merge cleanup, `loom-daemon clean`, the daemon's periodic reaper (so a
+  worktree whose PR merged on another host is cleaned up here too), and the
+  daemon's merge-observation pass (#14904), which replays the script's whole
+  post-merge worktree cleanup once it observes a forge-side merge. All five
+  now run the **same** Rust decision
+  (`worktree_ops::cargo_target::plan_reclaim`):
   `merge-pr.sh` removes worktrees with its own `git worktree remove --force`
   rather than through `worktree.sh remove`, so it could not inherit that reclaim
   by delegation and carried the last bash copy of the resolve/reclaim call
@@ -945,7 +953,11 @@ jq -r 'select(.ts > "2026-08-10T20:00:00") | "\(.ts) \(.mechanism) \(.reason) \(
 
 `mechanism` is one of `clean`, `clean --aggressive`, `worktree_reaper`,
 `terminal_destroy`, `loom-recover-orphans`, `merge-pr.sh`, `worktree.sh remove`,
-`agent-destroy.sh` — all eight of Loom's removal paths; `reason` is the exact
+`agent-destroy.sh`, `merge_observation` — all nine of Loom's removal paths
+(`merge_observation`, #14904, is the daemon's merge-observation pass: the same
+post-merge cleanup `merge-pr.sh` runs, triggered from the reconciliation tick
+when a forge-side merge is observed — a removal by it is the daemon's, not the
+script's); `reason` is the exact
 decision that authorized it (e.g. `force_override_unreachable`, `pr_merged`).
 **An absent entry is evidence too**: no Loom code path removed it, so look at
 host-level/manual action — a bare `rm -rf`, a hand-run `git worktree remove`, a
