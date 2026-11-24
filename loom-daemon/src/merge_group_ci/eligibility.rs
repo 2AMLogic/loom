@@ -20,6 +20,7 @@ use serde_json::Value as Json;
 use super::audit::{self, AuditReport, Code};
 use super::workflow::Workflow;
 use crate::cmd_out::{decode_json, Query};
+use crate::forge_merge_queue::authz::REQUIRED_CHECK_CONTEXT;
 use crate::gh_invocation::{AccessIntent, GhInvocation, GhTarget, Operation};
 
 const PROBE_TIMEOUT: Duration = Duration::from_secs(20);
@@ -129,6 +130,9 @@ pub struct Eligibility {
     pub facts: RepoFacts,
     /// Required status-check contexts from the branch's rules.
     pub required_checks: Vec<String>,
+    /// Native commit-status publisher when the authorization context is required.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub authorization_workflow: Option<String>,
     /// The `merge_queue` rule's parameters, when one is active.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub merge_queue: Option<Json>,
@@ -215,17 +219,27 @@ pub fn evaluate(
                 );
             }
             let req = required_contexts(rules);
-            if req.is_empty() {
+            if req.iter().all(|c| c == REQUIRED_CHECK_CONTEXT) {
                 fail(
                     Prereq::NoRequiredChecks,
-                    format!("no required status checks on {branch}; a queue would merge combined trees nothing validated"),
+                    format!("no required CI checks on {branch}; a queue needs a test check on the combined tree"),
                 );
             }
             (mq.map(|r| r.parameters.clone().unwrap_or(Json::Null)), req)
         }
     };
 
-    let report = audit::audit(workflows, unparseable, &required);
+    let mut suites = required.clone();
+    suites.retain(|c| c != REQUIRED_CHECK_CONTEXT);
+    let mut authorization_workflow = None;
+    if suites.len() != required.len() {
+        authorization_workflow =
+            super::authorization_status::producer(workflows).map(str::to_owned);
+        if authorization_workflow.is_none() {
+            fail(Prereq::WorkflowNotQualified, format!("required commit status `{REQUIRED_CHECK_CONTEXT}` has no runnable merge-group workflow that posts it with `forge merge-queue group-check`"));
+        }
+    }
+    let report = audit::audit(workflows, unparseable, &suites);
     for f in &report.findings {
         let prereq = match f.code {
             Code::MissingRequiredSuite => Prereq::MissingRequiredSuite,
@@ -239,6 +253,7 @@ pub fn evaluate(
         eligible: failures.is_empty(),
         facts: facts.clone(),
         required_checks: required,
+        authorization_workflow,
         merge_queue,
         failures,
         audit: report,

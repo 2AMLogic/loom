@@ -21,6 +21,7 @@ mod profile_check;
 pub(crate) mod profiles;
 mod prompt;
 pub(crate) mod rejection;
+pub mod sccache_server;
 
 pub use profile_check::{cli as profile_cli, WorkerArgs as WorkerCommand};
 // #11360: the mixed-sweep accounting fixture builds its escalated-Doctor log
@@ -1263,6 +1264,11 @@ fn run_preflight(
     // the build on an empty value instead of reading it as unset.
     cargo_debuginfo::apply(&mut command, &debuginfo, |k| std::env::var_os(k));
     let _ = writeln!(log, "{}", debuginfo.marker);
+    // #15139: a shared `sccache` server started lazily by this worker's own
+    // `cargo` would inherit the per-run TMPDIR the reaper later removes, then
+    // fail every compile on the host. Start (or probe) it now under a stable
+    // root instead; a failure is one log line, never a failed launch.
+    let _ = sccache_server::ensure(&mut log);
     // The other half of #8453, on the same seam and for the same reason
     // (#8458): when the repo opts in (`cargo.perWorktreeTargetDir`), a spawn
     // that OWNS a sweep's claim runs under that issue worktree's own
