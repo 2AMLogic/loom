@@ -1982,6 +1982,11 @@ pub mod review_conflict;
 pub mod orphan_stack;
 pub(crate) mod orphan_stack_git;
 
+/// Retarget the stacked children of a parent that merged outside
+/// `merge-pr.sh` — including the ones GitHub already retargeted (#14903) —
+/// a sibling of [`orphan_stack`] reusing its git mechanics.
+pub mod merged_stack;
+
 /// The per-repo loop of one reconciliation pass, plus the #8953 mid-pass
 /// rate-limit-breaker re-check that stops it early — a sibling file rather
 /// than more inline logic here.
