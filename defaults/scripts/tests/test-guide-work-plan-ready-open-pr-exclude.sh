@@ -244,7 +244,7 @@ FIX="$TMPROOT/fixtures"
 #   #7107 bare-mention control (#8009 mentions it without a phrase).
 #   #7108 epic-parent control (#8010 says "Part of Epic #7108" — a parent
 #         reference, b89d38d1e, never a link).
-#   #7109 foreign-reference control (#8011: "Contributes to other/repo#7109").
+#   #7109 foreign-reference control (#8011: "Contributes to example-org/tool-repo#7109").
 #   #7110 closed-PR control (#8012 is state closed, "Closes #7110").
 cat > "$FIX/issue-loom_issue.json" <<'JSON'
 [
@@ -277,7 +277,7 @@ cat > "$FIX/pr-.json" <<'JSON'
   {"number":8008,"title":"Draft partial PR for #7106","state":"open","labels":[],"isDraft":true,"closingIssuesReferences":[],"body":"Contributes to #7106"},
   {"number":8009,"title":"Bare-mention PR","state":"open","labels":[],"closingIssuesReferences":[],"body":"Also see #7107 for context"},
   {"number":8010,"title":"Epic-phase PR","state":"open","labels":[],"closingIssuesReferences":[],"body":"Part of Epic #7108. Depends on #4"},
-  {"number":8011,"title":"Foreign-repo reference PR","state":"open","labels":[],"closingIssuesReferences":[],"body":"Contributes to other/repo#7109"},
+  {"number":8011,"title":"Foreign-repo reference PR","state":"open","labels":[],"closingIssuesReferences":[],"body":"Contributes to example-org/tool-repo#7109"},
   {"number":8012,"title":"Closed PR that once closed #7110","state":"closed","labels":[],"closingIssuesReferences":[],"body":"Closes #7110"}
 ]
 JSON
