@@ -10,7 +10,7 @@
 //! scanned attributes themselves, so a newly-introduced key is covered without
 //! an edit here.
 //!
-//! Two mechanical properties keep the order consistent crate-wide:
+//! Three mechanical properties keep the order consistent crate-wide:
 //!
 //! * Rule A (generalizes #14404's single-key gate): a function that carries a
 //!   named key in a `serial`/`parallel` attribute must itself be a test
@@ -22,6 +22,14 @@
 //!   before an attribute that names a key — the textually first attribute
 //!   expands first, so that stacking inverts the order against every
 //!   named-outer site.
+//! * Rule C: the keys of the named attributes on one function's attribute
+//!   stack, flattened in textual order, must be strictly increasing. Each
+//!   attribute's own keys count sorted — the lexicographic order
+//!   `serial_test` itself applies inside a multi-key attribute — so one
+//!   lexicographic order covers a `#[serial(a, b)]` and a stack alike.
+//!   Nothing orders two stacked attributes but their source position, so
+//!   `a` outer / `b` inner at one site and the reverse at another is the
+//!   same lock cycle, one level above Rule B's default-group case.
 //!
 //! This module scans `loom-daemon/src` for violations, so a reverse-order
 //! nesting fails here — loudly, on the PR that adds it — instead of hanging CI.
@@ -45,7 +53,9 @@ struct Violation {
     /// The attribute text, whitespace-collapsed.
     attribute: String,
     /// The named lock key the violation is about (for a Rule B violation: the
-    /// key of the named attribute the default group was stacked outside of).
+    /// key of the named attribute the default group was stacked outside of;
+    /// for a Rule C violation: the key that does not sort after the one
+    /// before it).
     key: String,
 }
 
@@ -148,6 +158,9 @@ fn scan_source(src: &str) -> Scan {
             // the stack, if any. A named attribute stacked after it puts the
             // default group OUTER and the named key INNER.
             let mut default_group: Option<(usize, String)> = None;
+            // Rule C anchor: the key before the one being judged, in the
+            // flattened named-key sequence of the stack.
+            let mut last_key: Option<String> = None;
             for (attr_line, attr) in &stack {
                 let Some(keys) = lock_attribute_keys(attr) else {
                     continue;
@@ -172,6 +185,22 @@ fn scan_source(src: &str) -> Scan {
                         attribute: attribute.clone(),
                         key: keys[0].clone(),
                     });
+                }
+
+                // Rule C: `serial_test` sorts the keys inside one attribute
+                // only, so across stacked ones the textual order is the lock
+                // order and must itself be strictly increasing.
+                let mut sorted = keys;
+                sorted.sort();
+                for key in &sorted {
+                    if last_key.as_ref().is_some_and(|last| last >= key) {
+                        scan.violations.push(Violation {
+                            line: *attr_line,
+                            attribute: attr.clone(),
+                            key: key.clone(),
+                        });
+                    }
+                    last_key = Some(key.clone());
                 }
             }
         } else {
@@ -230,11 +259,13 @@ fn tracked_files(root: &Path) -> Option<Vec<String>> {
 /// The gate, run against every tracked `loom-daemon/src/**/*.rs` file.
 ///
 /// Fails if a function that is not a test carries any NAMED key in a
-/// `serial`/`parallel` attribute (Rule A), or if one function's attribute
-/// stack puts the crate-default `#[serial]` group textually before an
-/// attribute naming a key (Rule B) — the reverse of the crate-wide order
-/// "named keys OUTER, default group INNER". Either shape is a lock cycle
-/// that hangs the test binary instead of failing it.
+/// `serial`/`parallel` attribute (Rule A), if one function's attribute stack
+/// puts the crate-default `#[serial]` group textually before an attribute
+/// naming a key (Rule B) — the reverse of the crate-wide order "named keys
+/// OUTER, default group INNER" — or if the named keys on one stack are not
+/// strictly increasing in textual order, each attribute's own keys sorted
+/// (Rule C). Every one of these shapes is a lock cycle that hangs the test
+/// binary instead of failing it.
 ///
 /// The test's name preserves the #14404 incident's spelling; it is cited in
 /// comments across the crate
@@ -278,13 +309,15 @@ fn loom_config_env_is_only_ever_the_outer_lock() {
     assert!(
         problems.is_empty(),
         "named `serial`/`parallel` keys must stay OUTER and the crate-default `#[serial]` \
-         group INNER. Two mechanical rules: (1) a function carrying a NAMED key must itself \
+         group INNER. Three mechanical rules: (1) a function carrying a NAMED key must itself \
          be a test (`#[test]` / `#[tokio::test]`) — a helper holding the key can be reached \
          from inside the default group, which is a lock cycle that hangs the test binary \
          instead of failing it; (2) on one function's attribute stack, a bare `#[serial]` / \
          `#[parallel]` must not sit textually before an attribute naming a key — the outer \
-         attribute expands first, so that inverts the order against every named-outer site. \
-         Offending site(s), key in brackets:\n  {}",
+         attribute expands first, so that inverts the order against every named-outer site; \
+         (3) the named attributes on one function's attribute stack must be in strictly \
+         increasing key order, each attribute's own keys sorted — nothing else orders two \
+         stacked named keys. Offending site(s), key in brackets:\n  {}",
         problems.join("\n  ")
     );
 }
@@ -398,6 +431,96 @@ fn the_named_outside_default_order_passes() {
     let scan = scan_source(src);
     assert_eq!(scan.attributes, 1);
     assert!(scan.violations.is_empty());
+}
+
+#[test]
+fn stacked_named_keys_out_of_order_fail_the_scan() {
+    // Two named attributes are ordered by nothing but their source position,
+    // so this takes `opencode_db_env` OUTER: the reverse of the in-order
+    // stack in the test below, and a lock cycle against it.
+    let src = "#[test]\n#[serial(opencode_db_env)]\n#[serial(codex_home_env)]\nfn t() {}\n";
+    let scan = scan_source(src);
+    assert_eq!(scan.attributes, 2);
+    assert_eq!(
+        scan.violations,
+        vec![Violation {
+            line: 3,
+            attribute: "#[serial(codex_home_env)]".to_string(),
+            key: "codex_home_env".to_string(),
+        }]
+    );
+}
+
+#[test]
+fn stacked_named_keys_in_lexicographic_order_pass() {
+    let src = "#[test]\n#[serial(codex_home_env)]\n#[serial(opencode_db_env)]\nfn t() {}\n";
+    let scan = scan_source(src);
+    assert_eq!(scan.attributes, 2);
+    assert!(scan.violations.is_empty());
+}
+
+#[test]
+fn a_multi_key_attribute_is_judged_on_its_sorted_keys() {
+    // `serial_test` sorts the keys inside one attribute, so `#[serial(b, a)]`
+    // takes `a` then `b`: in order under `#[serial(c)]`, not under a later
+    // `#[serial(a)]`.
+    let src = "#[test]\n#[serial(b, a)]\n#[serial(c)]\nfn t() {}\n";
+    let scan = scan_source(src);
+    assert_eq!(scan.attributes, 2);
+    assert!(scan.violations.is_empty());
+
+    let src = "#[test]\n#[serial(b, a)]\n#[serial(c)]\n#[serial(a)]\nfn t() {}\n";
+    let scan = scan_source(src);
+    assert_eq!(scan.attributes, 3);
+    assert_eq!(
+        scan.violations,
+        vec![Violation {
+            line: 4,
+            attribute: "#[serial(a)]".to_string(),
+            key: "a".to_string(),
+        }]
+    );
+}
+
+#[test]
+fn the_same_named_key_twice_fails_the_scan() {
+    // Strictly increasing rejects a repeated key as well: whether
+    // `serial_test` re-enters a key it already holds was never traced, so
+    // the scan does not bet on it.
+    let src = "#[test]\n#[serial(opencode_db_env)]\n#[serial(opencode_db_env)]\nfn t() {}\n";
+    let scan = scan_source(src);
+    assert_eq!(
+        scan.violations,
+        vec![Violation {
+            line: 3,
+            attribute: "#[serial(opencode_db_env)]".to_string(),
+            key: "opencode_db_env".to_string(),
+        }]
+    );
+}
+
+#[test]
+fn rule_c_reads_the_split_path_and_parallel_forms() {
+    // Rule C judges the key list `lock_attribute_keys` already derives, so an
+    // attribute split across lines, the `serial_test::` path form and
+    // `parallel` stacked with `serial` are all ordered by it.
+    let inner = "#[serial(opencode_db_env)]";
+    for outer in [
+        "#[serial(\n    codex_home_env,\n)]",
+        "#[serial_test::serial(codex_home_env)]",
+        "#[parallel(codex_home_env)]",
+    ] {
+        let src = format!("#[test]\n{outer}\n{inner}\nfn t() {{}}\n");
+        let scan = scan_source(&src);
+        assert_eq!(scan.attributes, 2, "{outer} then {inner}");
+        assert!(scan.violations.is_empty(), "{outer} then {inner}");
+
+        let src = format!("#[test]\n{inner}\n{outer}\nfn t() {{}}\n");
+        let scan = scan_source(&src);
+        assert_eq!(scan.violations.len(), 1, "{inner} then {outer}");
+        assert_eq!(scan.violations[0].line, 3, "{inner} then {outer}");
+        assert_eq!(scan.violations[0].key, "codex_home_env", "{inner} then {outer}");
+    }
 }
 
 #[test]
