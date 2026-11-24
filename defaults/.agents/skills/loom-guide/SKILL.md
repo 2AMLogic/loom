@@ -2751,7 +2751,7 @@ render_plan_body() {
     "| Important | $(count "$imp") |" \
     "| Ready (\`loom:issue\`, net of holds/building/open-linked-PRs) | $(count "$ready") |" \
     "| In Progress (\`loom:building\`) | $(count "$building") |" \
-    "| Held, no other bucket | $held_unbucketed |" \
+    "| Held, no other bucket | ${held_unbucketed:-0} |" \
     "| PRs awaiting review | $(count "$review") |" \
     "| Approved PRs awaiting merge | $(count "$approved") |" \
     "| Curated | $(count "$curated") |" \
