@@ -631,6 +631,10 @@ fn daemon_write_paths_are_scoped() {
         ),
         ("claim_reconciliation/pass_loop/building_heal.rs", Via(PASS, "heal pass")),
         (
+            "claim_reconciliation/pass_loop/merge_observation.rs",
+            Via(PASS, "merge-observation pass: issue close, label strip and audit comments (#14902)"),
+        ),
+        (
             "claim_reconciliation/ci_gate_recovery.rs",
             Via(PASS, "CI-gate recovery pass: audit comment + label swap"),
         ),
