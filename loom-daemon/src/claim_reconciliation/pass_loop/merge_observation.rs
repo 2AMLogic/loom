@@ -1,6 +1,7 @@
-//! Observe confirmed merges and finish the issue bookkeeping they skipped
-//! (#14902, child of #14900): the daemon-side counterpart of
-//! `merge-pr.sh`'s three post-merge passes and Champion's Step 4.
+//! Observe confirmed merges and finish what they skipped (#14902, child of
+//! #14900): the daemon-side counterpart of `merge-pr.sh`'s three post-merge
+//! issue-bookkeeping passes, Champion's Step 4, and — since #14904 — the
+//! script's post-merge worktree cleanup.
 //!
 //! # The gap this closes
 //!
@@ -28,7 +29,7 @@
 //! The first observation of a merged PR pins a [`MergeRecord`] under
 //! `.loom/state/merge-bookkeeping/pr-<N>.json`: repository, PR, landed head
 //! (`head.sha`), merge commit (`merge_commit_sha`), merged-at, branch and
-//! the PR body, plus which of the four passes have completed. Subsequent
+//! the PR body, plus which of the passes have completed. Subsequent
 //! actions and retries read the record, never the listing again — a retry
 //! refers to the same merge identity even after the PR has fallen out of the
 //! discovery window. A partial failure (a pass that could not establish its
@@ -92,6 +93,41 @@
 //! on the same issue state, labels and one comment each, with no duplicate
 //! comments and no lost eligible work.
 //!
+//! # The worktree/branch cleanup pass (#14904)
+//!
+//! The four passes above are forge bookkeeping; the fifth is the local half
+//! the script's merge also performed: `merge-pr.sh`'s whole post-merge
+//! worktree-cleanup block, replayed in-process through
+//! [`post_merge_cleanup::run`] — the same orchestrator, the same gates, the
+//! same order. A merge made on the forge ran no script anywhere, so the
+//! issue worktree, a co-existing Judge `pr-<N>` review worktree (#6264) and
+//! a branch-discovered worktree (#3334) would otherwise wait for the
+//! periodic reaper's grace period, or forever on a host the reaper's
+//! naming filters do not cover.
+//!
+//! **Eligibility is decided per workspace** ([`CleanupWorld`]): the tick
+//! runs once per registered root, the record store is per root, and every
+//! gate the orchestrator applies — worktree paths, sentinels, porcelain,
+//! dirty state, branch tips — reads THIS checkout. A merge completed in one
+//! checkout (or a record already complete in another host's store) is no
+//! evidence at all about the contents or ownership of a second checkout, so
+//! it neither suppresses nor forces cleanup there.
+//!
+//! What a forge observation cannot supply stays unsupplied: the
+//! `--worktree-path` override and `--remove-ignored` are the shell's
+//! CLI-only knobs, and an external merge conveys no explicit user
+//! authorization to clean a user-supplied path — so the override path (the
+//! only one that can remove an unmanaged directory, #13599) is unreachable
+//! here. The workspace's own preserve setting (`LOOM_PRESERVE_WORKTREE=1`)
+//! IS passed through. The three `LOOM-NEED` facts the orchestrator asks its
+//! caller for arrive exactly as the shell fetched them: the close targets
+//! the pass already read, the issue state re-read on demand (empty on a
+//! failed read — which the #4186 gate reads as Preserve, never as
+//! "closed"), and `branch_has_landed` answered from the #7812 ladder with
+//! the record's pinned head as the known-merged-head hint, so a local
+//! branch that advanced past the merged head is `not-landed` and its
+//! worktree is preserved rather than guessed at.
+//!
 //! # Fail direction
 //!
 //! Every pass is best-effort, exactly as in the shell: nothing here can
@@ -111,6 +147,7 @@ use crate::merge_pr::closed_by_merge;
 use crate::merge_pr::partial_comment::now_timestamp;
 use crate::merge_pr::partial_reset::{self, IssueView, PreMerge};
 use crate::merge_pr::post_merge_bookkeeping::{self as bookkeeping, Host};
+use crate::merge_pr::post_merge_cleanup as cleanup;
 use crate::merge_pr::refs::{
     closing_ref_negation_status, closing_refs, partial_increment_refs, ClosingRefNegationStatus,
 };
@@ -121,12 +158,21 @@ use crate::merge_pr::refs::{
 const MERGED_WINDOW: usize = 15;
 
 /// Pass tokens, in run order. The relative order of `partial-reset`,
-/// `branch-close` and `strip` is the shell's own and load-bearing.
+/// `branch-close` and `strip` is the shell's own and load-bearing;
+/// `worktree-cleanup` runs last, as `_post_merge_cleanup` did after the
+/// bookkeeping in `merge-pr.sh` (#14904).
 const PARTIAL_RESET: &str = "partial-reset";
 const CLOSE_CHECK: &str = "close-check";
 const BRANCH_CLOSE: &str = "branch-close";
 const STRIP: &str = "strip";
-const PASSES: [&str; 4] = [PARTIAL_RESET, CLOSE_CHECK, BRANCH_CLOSE, STRIP];
+const WORKTREE_CLEANUP: &str = "worktree-cleanup";
+const PASSES: [&str; 5] = [
+    PARTIAL_RESET,
+    CLOSE_CHECK,
+    BRANCH_CLOSE,
+    STRIP,
+    WORKTREE_CLEANUP,
+];
 
 /// One row of the merged-PR discovery listing.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -452,6 +498,130 @@ fn mk_rec(level: &str, text: impl Into<String>) -> bookkeeping::Record {
     (level.to_string(), text.into())
 }
 
+/// The local world the observation's worktree-cleanup pass cleans (#14904):
+/// the registered root this tick is reconciling, the cleanup orchestrator's
+/// host binding, and the two git-only facts that stay with the caller —
+/// everything the orchestrator's own `LOOM-NEED` protocol leaves to whoever
+/// invoked it.
+///
+/// A bundle of closures rather than more [`Forge`] methods: these are LOCAL
+/// workspace facts, not forge reads, and the production bindings are
+/// one-liners over `worktree_cli` that tests replace whole, in the injected
+/// style `run_reconciliation_pass_over_roots` injects its breaker check.
+pub struct CleanupWorld<'a> {
+    /// The registered root this tick is reconciling. Eligibility is decided
+    /// per workspace: the paths, sentinels, porcelain and branch tips the
+    /// gates read are THIS checkout's, so a merge completed elsewhere (or a
+    /// record already complete in another host's store) neither suppresses
+    /// nor forces cleanup here.
+    pub root: &'a Path,
+    /// The cleanup orchestrator's host binding. Production is
+    /// [`cleanup::SystemHost::MERGE_OBSERVATION`]; the ledger mechanism it
+    /// records is the observation pass's, not the shell's.
+    pub host: &'a dyn cleanup::Host,
+    /// `LOOM_PRESERVE_WORKTREE=1` — the workspace's preserve setting, read
+    /// once by the caller so tests need not mutate process environment.
+    pub preserve: bool,
+    /// The checkout's default branch, resolved lazily on the pass's first
+    /// run for a record (the resolver's third rung is a network call; a
+    /// tick with no record reaching this pass must not pay for it).
+    pub default_branch: &'a dyn Fn() -> Option<String>,
+    /// `branch_has_landed` for a record's branch: `(branch, default,
+    /// merged-head hint)` → the #7812 ladder's answer. The hint is the
+    /// record's pinned `head`, so rung 2 answers without a forge round-trip
+    /// and a branch whose local tip moved past the merged head reads
+    /// `not-landed` — preserved, never guessed.
+    pub landed: &'a dyn Fn(&str, Option<&str>, &str) -> cleanup::Landed,
+}
+
+/// The worktree/branch cleanup a direct-forge merge skipped (#14904):
+/// `merge-pr.sh`'s whole post-merge cleanup block, replayed in-process from
+/// the pinned record against THIS workspace through [`cleanup::run`] — the
+/// same orchestrator, gates and order the shell's verb runs.
+///
+/// This pass supplies only what a forge observation legitimately can: the
+/// record's pinned identity, the close targets the tick already fetched,
+/// the issue state re-read on demand, and the landed ladder with the pinned
+/// head as its hint. It never supplies `--worktree-path` or
+/// `--remove-ignored`: those are the shell's CLI-only knobs, and an
+/// external merge conveys no explicit user authorization to clean a
+/// user-supplied path — so the override path (the only one that can remove
+/// an unmanaged directory, #13599) stays unreachable here.
+///
+/// Returns false only when the `LOOM-NEED` loop could not converge (a fact
+/// stayed unanswered); the caller leaves the pass unmarked and a later tick
+/// retries. Every failure INSIDE the run is a warning record — the merge is
+/// already confirmed and nothing here can un-merge it or unpick the
+/// bookkeeping passes that already ran.
+fn worktree_cleanup(
+    f: &impl Forge,
+    world: &CleanupWorld<'_>,
+    rec: &MergeRecord,
+    targets: &str,
+    out: &mut Vec<bookkeeping::Record>,
+) -> bool {
+    let default_branch = (world.default_branch)();
+    let inputs = cleanup::Inputs {
+        repo_root: world.root.to_string_lossy().into_owned(),
+        pr_number: rec.pr.to_string(),
+        pr_branch: rec.branch.clone(),
+        pr_head_sha: rec.head.clone(),
+        default_branch: default_branch.clone(),
+        // No CLI exists to turn these off for an observed merge; the
+        // workspace's own preserve setting is the one opt-out passed
+        // through, exactly as the script's default arm would see it.
+        cleanup_worktree: true,
+        cleanup_primary: true,
+        preserve_env: world.preserve,
+        worktree_path_override: String::new(),
+        remove_ignored: false,
+    };
+    let mut facts = cleanup::Facts {
+        close_targets: Some(targets.to_string()),
+        ..cleanup::Facts::default()
+    };
+    // The shell's `for _ in 1 2 3 4` fact loop: at most one issue-state and
+    // one landed answer exist (one issue number ever reaches the gate), so
+    // four calls bound the loop with the same room to spare the shell kept.
+    for _ in 0..4 {
+        let need = match cleanup::run(&inputs, &facts, world.host) {
+            cleanup::Outcome::Done { records, .. } => {
+                // The `CD` record is the shell's: an in-process caller has
+                // already been moved out of a removed cwd by the host's own
+                // chdir, so there is nothing left to act on.
+                out.extend(records);
+                return true;
+            }
+            cleanup::Outcome::Need(need) => need,
+        };
+        match need {
+            cleanup::Need::CloseTargets => {
+                facts.close_targets = Some(targets.to_string());
+            }
+            cleanup::Need::IssueState(issue) => {
+                // `forge_get_issue_state` semantics: `OPEN`/`CLOSED`, empty
+                // on a failed read — which the #4186 gate reads as Preserve,
+                // never as "closed, clean up".
+                let view = IssueView::from_json(&f.read_issue(&rec.repo, &issue));
+                facts.issue_state = Some(view.state.to_uppercase());
+            }
+            cleanup::Need::Landed => {
+                facts.landed =
+                    Some((world.landed)(&rec.branch, default_branch.as_deref(), &rec.head));
+            }
+        }
+    }
+    out.push(mk_rec(
+        "WARNING",
+        format!(
+            "Post-merge worktree cleanup for PR #{} did not finish — a fact stayed \
+             unanswered; nothing was removed and the pass retries next tick (#14904)",
+            rec.pr
+        ),
+    ));
+    false
+}
+
 fn log_records(rec: &MergeRecord, records: &[bookkeeping::Record]) {
     for (level, text) in records {
         let line = format!("merge_observation: PR #{} in {}: {text}", rec.pr, rec.repo);
@@ -506,6 +676,30 @@ impl RecordStore {
         out
     }
 
+    /// Every stored record, complete or not, sorted by PR number. Corrupt or
+    /// absent files read as unobserved, as [`Self::load`]. The merged-stack
+    /// pass (#14903) reads this to find parents whose merge was observed here
+    /// regardless of bookkeeping completion.
+    #[must_use]
+    pub fn all(&self) -> Vec<MergeRecord> {
+        let Ok(rd) = std::fs::read_dir(&self.dir) else {
+            return Vec::new();
+        };
+        let mut out: Vec<MergeRecord> = rd
+            .flatten()
+            .filter(|e| {
+                let n = e.file_name();
+                let n = n.to_string_lossy();
+                n.starts_with("pr-") && n.ends_with(".json")
+            })
+            .filter_map(|e| {
+                serde_json::from_str::<MergeRecord>(&std::fs::read_to_string(e.path()).ok()?).ok()
+            })
+            .collect();
+        out.sort_by_key(|r| r.pr);
+        out
+    }
+
     /// Write the record atomically (temp file + rename).
     ///
     /// # Errors
@@ -528,6 +722,7 @@ impl RecordStore {
 /// completed record run the bookkeeping it may have missed.
 pub fn run_pass(
     f: &impl Forge,
+    world: &CleanupWorld<'_>,
     store: &RecordStore,
     ac_gate_on: bool,
     is_suppressed: impl Fn() -> bool,
@@ -586,7 +781,7 @@ pub fn run_pass(
         if rec.complete() {
             continue;
         }
-        process(f, store, &mut rec, ac_gate_on);
+        process(f, world, store, &mut rec, ac_gate_on);
         if rec.complete() {
             stats.records_completed += 1;
         }
@@ -600,7 +795,7 @@ pub fn run_pass(
         if listed.contains(&rec.pr) {
             continue;
         }
-        process(f, store, &mut rec, ac_gate_on);
+        process(f, world, store, &mut rec, ac_gate_on);
         if rec.complete() {
             stats.records_completed += 1;
         }
@@ -608,9 +803,15 @@ pub fn run_pass(
     stats
 }
 
-/// Run the four passes over one pinned record, marking each as done — and
+/// Run the passes over one pinned record, marking each as done — and
 /// persisting the mark — only once it has run.
-fn process(f: &impl Forge, store: &RecordStore, rec: &mut MergeRecord, ac_gate_on: bool) {
+fn process(
+    f: &impl Forge,
+    world: &CleanupWorld<'_>,
+    store: &RecordStore,
+    rec: &mut MergeRecord,
+    ac_gate_on: bool,
+) {
     // The close targets gate every close-dependent pass (the close check,
     // the branch close's "already a target" skip and the strip's target
     // list), and the partial-reset's reconstruction consults them as one of
@@ -661,6 +862,21 @@ fn process(f: &impl Forge, store: &RecordStore, rec: &mut MergeRecord, ac_gate_o
         log_records(rec, &out);
         rec.mark(token);
         let _ = store.store(rec);
+    }
+
+    // #14904: last, as `_post_merge_cleanup` ran last in the script — the
+    // bookkeeping above must not act on an issue whose worktree state this
+    // is about to change, and the cleanup's own issue gates read the state
+    // the passes above converged to.
+    if !rec.done.iter().any(|d| d == WORKTREE_CLEANUP) {
+        let mut out = Vec::new();
+        if worktree_cleanup(f, world, rec, &targets, &mut out) {
+            log_records(rec, &out);
+            rec.mark(WORKTREE_CLEANUP);
+            let _ = store.store(rec);
+        } else {
+            log_records(rec, &out);
+        }
     }
 }
 
@@ -1047,9 +1263,22 @@ pub(super) fn reconcile(gh_bin: &Path, root: &Path) {
         );
         return;
     };
-    let stats = run_pass(&forge, &RecordStore::for_root(root), ac_gate_enabled(root), || {
-        crate::rate_limit_breaker::global_skip_pass("claim_reconciliation")
-    });
+    let host = cleanup::SystemHost::MERGE_OBSERVATION;
+    let world = CleanupWorld {
+        root,
+        host: &host,
+        preserve: std::env::var("LOOM_PRESERVE_WORKTREE").as_deref() == Ok("1"),
+        default_branch: &|| crate::worktree_cli::default_branch::resolve(root),
+        landed: &|branch, default, hint| {
+            landed_from_answer(crate::worktree_cli::branch_landed::probe(
+                root, branch, default, hint,
+            ))
+        },
+    };
+    let stats =
+        run_pass(&forge, &world, &RecordStore::for_root(root), ac_gate_enabled(root), || {
+            crate::rate_limit_breaker::global_skip_pass("claim_reconciliation")
+        });
     if stats.merges_seen > 0 {
         log::info!(
             "merge_observation: {} merged PR(s) in the window at {}, {} record(s) completed this \
@@ -1058,6 +1287,19 @@ pub(super) fn reconcile(gh_bin: &Path, root: &Path) {
             root.display(),
             stats.records_completed
         );
+    }
+}
+
+/// Map the #7812 ladder's [`Answer`] onto the orchestrator's [`cleanup::Landed`]
+/// fact — the same three fields the shell captured from `branch_has_landed`'s
+/// globals. `landed` is true only of a `landed` verdict: `not-landed` and the
+/// fail-closed `unknown` both count as not landed, as the shell's rc did.
+fn landed_from_answer(a: crate::worktree_cli::branch_landed::Answer) -> cleanup::Landed {
+    use crate::worktree_cli::branch_landed::Verdict;
+    cleanup::Landed {
+        landed: a.verdict == Verdict::Landed,
+        verdict: a.verdict.as_str().to_string(),
+        evidence: a.evidence.as_str().to_string(),
     }
 }
 

@@ -245,6 +245,11 @@ path = "loom-daemon/src/claim_reconciliation/ci_gate_recovery.rs"
 [[operation.callers]]
 kind = "rust"
 path = "loom-daemon/src/claim_reconciliation/orphan_stack.rs"
+
+[[operation.callers]]
+kind = "rust"
+path = "loom-daemon/src/claim_reconciliation/merged_stack.rs"
+
 [[operation.callers]]
 kind = "rust"
 path = "loom-daemon/src/fleet/drain_reset.rs"
@@ -451,6 +456,11 @@ path = "loom-daemon/src/claim_reconciliation/ci_gate_recovery.rs"
 [[operation.callers]]
 kind = "rust"
 path = "loom-daemon/src/claim_reconciliation/orphan_stack.rs"
+
+[[operation.callers]]
+kind = "rust"
+path = "loom-daemon/src/claim_reconciliation/merged_stack.rs"
+
 [[operation.callers]]
 kind = "rust"
 path = "loom-daemon/src/intake_reconcile/demote.rs"

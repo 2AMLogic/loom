@@ -76,7 +76,7 @@
 //!   from [`Answer::evidence`] so `clean --aggressive` keeps its two removal
 //!   reasons.
 
-use crate::fs_util::is_executable;
+use crate::fs_util::is_on_path;
 use crate::git_merge_tree::merge_tree_in_version;
 use std::path::Path;
 use std::process::Command;
@@ -435,9 +435,9 @@ pub fn forge_probe(repo: &Path, branch: &str) -> ForgeProbe {
         return ForgeProbe::unavailable();
     }
 
-    let (program, leading): (&str, &[&str]) = if on_path("loom-daemon") {
+    let (program, leading): (&str, &[&str]) = if is_on_path("loom-daemon") {
         ("loom-daemon", &["forge"])
-    } else if on_path("gh") {
+    } else if is_on_path("gh") {
         ("gh", &[])
     } else {
         return ForgeProbe::unavailable();
@@ -495,16 +495,6 @@ pub fn forge_probe(repo: &Path, branch: &str) -> ForgeProbe {
             number: None,
         },
     }
-}
-
-fn on_path(program: &str) -> bool {
-    let Some(path) = std::env::var_os("PATH") else {
-        return false;
-    };
-    std::env::split_paths(&path).any(|dir| {
-        let candidate = dir.join(program);
-        candidate.is_file() && is_executable(&candidate)
-    })
 }
 
 /// Accept a local branch, a remote branch, a bare ref name, or any rev —

@@ -326,15 +326,6 @@ impl SystemEnv {
             stderr: String::from_utf8_lossy(&out.stderr).to_string(),
         })
     }
-
-    fn on_path(binary: &str) -> bool {
-        Command::new("sh")
-            .arg("-c")
-            .arg(format!("command -v {binary} >/dev/null 2>&1"))
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false)
-    }
 }
 
 impl AgentEnv for SystemEnv {
@@ -387,11 +378,11 @@ impl AgentEnv for SystemEnv {
     }
 
     fn tmux_available(&self) -> bool {
-        Self::on_path("tmux")
+        crate::fs_util::is_on_path("tmux")
     }
 
     fn claude_cli_available(&self) -> bool {
-        Self::on_path("claude")
+        crate::fs_util::is_on_path("claude")
     }
 
     fn git_repo_ok(&self, path: &Path) -> bool {
