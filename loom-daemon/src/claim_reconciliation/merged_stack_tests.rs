@@ -445,6 +445,175 @@ fn a_retargeted_child_with_two_merged_ancestors_uses_the_newest_parent() {
     assert!(posted[0].contains("parent=2"), "reported against the newest parent");
 }
 
+/// A `--no-ff`-merged parent's landed head is ON the default branch (the
+/// merge commit's second parent), so the shape-B ancestry match runs through
+/// the best-common-ancestors set, not the child's own commits — pinned here
+/// beside the squash shape above (#15209).
+#[test]
+fn a_no_ff_merged_parent_is_matched_through_the_merge_base() {
+    let fx = Fixture::new();
+    let a = fx.branch(A, "main", 1, "a.txt", "parent\n");
+    let b = fx.branch(B, A, 2, "b.txt", "child\n");
+    // GitHub's merge button with --no-ff: main gains a real merge commit
+    // whose second parent is the parent branch's head.
+    run(&fx.author, &["checkout", "-q", "main"]);
+    run(&fx.author, &["merge", "-q", "--no-ff", "-m", "Merge A", A]);
+    let merged = run(&fx.author, &["rev-parse", "HEAD"]);
+    run(&fx.author, &["push", "-q", "origin", "main"]);
+    run(&fx.author, &["push", "-q", "origin", "--delete", A]);
+    fx.clone_repo();
+    assert_eq!(
+        run(&fx.repo, &["rev-parse", &format!("{merged}^2")]),
+        a,
+        "the --no-ff merge carries the parent head on the default branch"
+    );
+
+    let records = vec![rec(1, A, &a, &merged, "2026-11-24T09:00:00Z")];
+    let parents = parents_from_records(&records);
+    let forge = FakeForge::default();
+    let stats = reconcile_with(&forge, &fx.repo, "main", &[open_pr(2, B, &b, "main")], &parents);
+
+    assert_eq!((stats.restacked, stats.retargeted), (1, 0), "{stats:?}");
+    let new_b = fx.origin_rev(B);
+    assert_eq!(fx.origin_rev(&format!("{B}^")), merged, "B sits on the post-merge main");
+    assert_eq!(fx.origin_count(&format!("main..{B}")), 1, "only B's own commit");
+    let posted = forge.comments.borrow().get(&2).cloned().unwrap_or_default();
+    assert_eq!(posted.len(), 1);
+    assert!(posted[0].starts_with(RESTACKED_MARKER_PREFIX));
+    assert!(posted[0].contains("parent=1"), "{}", posted[0].as_str());
+
+    // Idempotent: the restacked head contains the merge commit, so the same
+    // record never matches it again.
+    let after = vec![open_pr(2, B, &new_b, "main")];
+    let again = reconcile_with(&forge, &fx.repo, "main", &after, &parents);
+    assert_eq!(again, MergedStats::default());
+    assert_eq!(fx.origin_rev(B), new_b, "nothing pushed again");
+}
+
+/// A child that merged an older `main` into itself (the #13593 Doctor shape)
+/// has SEVERAL best common ancestors with the merged default branch: the
+/// `--no-ff` parent's head and the older `main` point it merged. git's
+/// single-answer `merge-base` picks between them by commit date, so the
+/// match must run against ALL of them — with the parent head committed
+/// earlier, the single answer names the `main` side and the parent would be
+/// missed (#15209).
+#[test]
+#[serial_test::serial]
+fn a_child_that_merged_main_before_a_no_ff_parent_merge_still_matches() {
+    let fx = Fixture::new();
+    // Date-skew the fixture so the parent head is older than the `main`
+    // point the child merges: the single-answer merge-base then names the
+    // (newer) `main` point, not the parent head.
+    std::env::set_var("GIT_AUTHOR_DATE", "2026-01-01T10:00:00");
+    std::env::set_var("GIT_COMMITTER_DATE", "2026-01-01T10:00:00");
+    let a = fx.branch(A, "main", 1, "a.txt", "parent\n");
+    std::env::set_var("GIT_AUTHOR_DATE", "2026-01-01T10:05:00");
+    std::env::set_var("GIT_COMMITTER_DATE", "2026-01-01T10:05:00");
+    fx.branch(B, A, 2, "b.txt", "child\n");
+    std::env::remove_var("GIT_AUTHOR_DATE");
+    std::env::remove_var("GIT_COMMITTER_DATE");
+    // `main` moves, and the child merges that point into itself.
+    let p = fx.advance_main("m1.txt", "main move\n");
+    run(&fx.author, &["checkout", "-q", B]);
+    run(
+        &fx.author,
+        &[
+            "merge",
+            "-q",
+            "--no-ff",
+            "-m",
+            "Merge main into child",
+            "main",
+        ],
+    );
+    let b2 = run(&fx.author, &["rev-parse", "HEAD"]);
+    run(&fx.author, &["push", "-q", "-f", "origin", &format!("{B}:{B}")]);
+    run(
+        &fx.author,
+        &[
+            "push",
+            "-q",
+            "-f",
+            "origin",
+            &format!("{B}:refs/pull/2/head"),
+        ],
+    );
+    // The parent merges --no-ff afterwards.
+    run(&fx.author, &["checkout", "-q", "main"]);
+    run(&fx.author, &["merge", "-q", "--no-ff", "-m", "Merge A", A]);
+    let merged = run(&fx.author, &["rev-parse", "HEAD"]);
+    run(&fx.author, &["push", "-q", "origin", "main"]);
+    run(&fx.author, &["push", "-q", "origin", "--delete", A]);
+    fx.clone_repo();
+
+    // The premise this test exists for: two best common ancestors, and the
+    // single-answer merge-base names the `main` side — the shape a
+    // singular-merge-base matcher would miss.
+    let all: Vec<String> = run(&fx.repo, &["merge-base", "--all", &b2, "origin/main"])
+        .lines()
+        .map(str::to_string)
+        .collect();
+    assert!(all.contains(&a), "the parent head is a best common ancestor: {all:?}");
+    assert!(all.contains(&p), "so is the merged-in main point: {all:?}");
+    assert_ne!(run(&fx.repo, &["merge-base", &b2, "origin/main"]), a);
+
+    let records = vec![rec(1, A, &a, &merged, "2026-11-24T09:00:00Z")];
+    let parents = parents_from_records(&records);
+    let forge = FakeForge::default();
+    let stats = reconcile_with(&forge, &fx.repo, "main", &[open_pr(2, B, &b2, "main")], &parents);
+
+    assert_eq!((stats.restacked, stats.retargeted), (1, 0), "{stats:?}");
+    // Only the child's own commit survives the replay: the merged-in `main`
+    // side is already upstream.
+    assert_eq!(fx.origin_count(&format!("main..{B}")), 1, "only B's own commit");
+    assert_eq!(fx.origin_rev(&format!("{B}^")), merged, "B sits on the post-merge main");
+    let posted = forge.comments.borrow().get(&2).cloned().unwrap_or_default();
+    assert_eq!(posted.len(), 1);
+    assert!(posted[0].starts_with(RESTACKED_MARKER_PREFIX));
+}
+
+/// A child cut from a MID-branch commit of the parent does not carry the
+/// recorded head (the pre-merge TIP), so no record matches and nothing is
+/// written — the fail direction of the shape-B filter, under both merge
+/// shapes (#15209).
+#[test]
+fn a_child_cut_from_a_mid_branch_parent_commit_does_not_match() {
+    let fx = Fixture::new();
+    let a1 = fx.branch(A, "main", 1, "a.txt", "parent\n");
+    // The parent advances past the point the child will be cut from; the
+    // record pins the two-commit tip.
+    run(&fx.author, &["checkout", "-q", A]);
+    let a2 = commit_file(&fx.author, "a2.txt", "parent2\n", "parent work 2");
+    run(&fx.author, &["push", "-q", "-f", "origin", &format!("{A}:{A}")]);
+    run(
+        &fx.author,
+        &[
+            "push",
+            "-q",
+            "-f",
+            "origin",
+            &format!("{A}:refs/pull/1/head"),
+        ],
+    );
+    let b = fx.branch(B, &a1, 2, "b.txt", "child\n");
+    fx.clone_repo();
+    let squash = fx.advance_main("a.txt", "parent\nparent2\n");
+    run(&fx.author, &["push", "-q", "origin", "--delete", A]);
+
+    let records = vec![rec(1, A, &a2, &squash, "2026-11-24T09:00:00Z")];
+    let parents = parents_from_records(&records);
+    let forge = FakeForge::default();
+    let stats = reconcile_with(&forge, &fx.repo, "main", &[open_pr(2, B, &b, "main")], &parents);
+
+    assert_eq!(stats, MergedStats::default(), "{stats:?}");
+    assert_eq!(fx.origin_rev(B), b, "nothing pushed");
+    assert!(forge.comments.borrow().is_empty());
+    // The record WAS evaluated (its merge commit is in `behind`) and the
+    // ancestry leg is what refused it: the mid-branch cut's own commit is
+    // not the recorded tip.
+    assert_ne!(a1, a2);
+}
+
 /// A Builder-active child (loom:building + a live lease) gets its rebase
 /// DEFERRED with one comment and nothing pushed — the stacked-reconcile
 /// decision — and neither this pass's nor the shell's earlier deferral is
