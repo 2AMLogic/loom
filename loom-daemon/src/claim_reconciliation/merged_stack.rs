@@ -176,8 +176,15 @@ pub fn parents_from_records(records: &[merge_observation_record::Record]) -> Vec
     // `merged_at` is RFC-3339, so lexicographic order is chronological; the
     // PR number breaks ties (same second merges).
     parents.sort_by(|a, b| (b.merged_at.as_str(), b.pr).cmp(&(a.merged_at.as_str(), a.pr)));
+    // The store is never pruned: bound the working set so a pass's cost cannot
+    // grow with the repository's whole merge history.
+    parents.truncate(MAX_MERGED_RECORDS);
     parents
 }
+
+/// The newest merge records a pass considers (older ones belong to stacks that
+/// closed long ago).
+pub const MAX_MERGED_RECORDS: usize = 300;
 
 /// The slice of [`super::pass_loop::merge_observation::MergeRecord`] this
 /// module reads, named so the mapping function above can stay pure-testable
@@ -277,11 +284,17 @@ pub struct FlagContext<'a> {
     pub default_branch: &'a str,
     /// The base to retarget to afterwards (`None` for a cascade).
     pub retarget_to: Option<&'a str>,
+    /// `Some(new_head)`: a cascade — `parent_pr` is still OPEN and was rewritten
+    /// to this head; this PR keeps its base and must be replayed onto it.
+    pub cascade_onto: Option<&'a str>,
 }
 
 /// The flag comment body.
 #[must_use]
 pub fn flag_comment_body(ctx: &FlagContext<'_>, reason: &FlagReason) -> String {
+    if let Some(new_head) = ctx.cascade_onto {
+        return cascade_flag_comment_body(ctx, reason, new_head);
+    }
     let pin = pin_ref(ctx.parent_branch);
     let why = match reason {
         FlagReason::Conflict(paths) => format!(
@@ -342,6 +355,91 @@ pub fn flag_comment_body(ctx: &FlagContext<'_>, reason: &FlagReason) -> String {
         head = ctx.head,
         branch = ctx.branch,
         default = ctx.default_branch,
+    )
+}
+
+/// The marker of a cascade flag. Keyed by the rewritten parent's new head too,
+/// so it can never be mistaken for the "parent merged" flag
+/// ([`flagged_marker`]) that `process_child` honours once that parent itself
+/// merges.
+#[must_use]
+pub fn cascade_flagged_marker(parent: u32, head: &str, onto: &str) -> String {
+    format!("{FLAGGED_MARKER_PREFIX} parent={parent} head={head} onto={onto} -->")
+}
+
+/// The flag comment for a grandchild whose parent is still OPEN and was only
+/// rewritten (restacked) — not merged. The recipe replays onto the parent's
+/// new head and leaves the base alone.
+fn cascade_flag_comment_body(ctx: &FlagContext<'_>, reason: &FlagReason, new_head: &str) -> String {
+    let why = match reason {
+        FlagReason::Conflict(paths) => format!(
+            "replaying only this branch's own commits stopped on conflicts in: {}.",
+            paths
+                .iter()
+                .map(|p| format!("`{p}`"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+        FlagReason::ParentRewritten => format!(
+            "the parent's previous head `{}` is not an ancestor of this branch's head `{}`, so \
+             the replay range cannot be established positively.",
+            ctx.upstream, ctx.head
+        ),
+        FlagReason::Refused(why) => format!("Loom could not establish the replay: {why}."),
+        FlagReason::NotLoomBranch => format!(
+            "this PR's head branch `{}` is not a Loom branch in this repository (a human's \
+             branch or a fork's), and Loom never rewrites those.",
+            ctx.branch
+        ),
+    };
+    format!(
+        "{}\n\
+         ## Stacked parent rewritten — this branch could not be restacked automatically\n\n\
+         #{} (`{}`), the PR this one is stacked on, is still open but Loom rewrote it (new head \
+         `{new_head}`, previously `{}`), and did not restack this branch: {why}\n\n\
+         This PR's base stays `{}`. To finish by hand, from a clean checkout:\n\n\
+         ```\n\
+         git fetch origin\n\
+         git checkout --detach {head}\n\
+         git rebase --onto {new_head} {}\n\
+         # resolve any conflicts, then:\n\
+         git push --force-with-lease=refs/heads/{branch}:{head} origin HEAD:refs/heads/{branch}\n\
+         ```\n\n\
+         ---\n\
+         *Automated by loom-daemon claim reconciliation (#14903)*",
+        cascade_flagged_marker(ctx.parent_pr, ctx.head, new_head),
+        ctx.parent_pr,
+        ctx.parent_branch,
+        ctx.upstream,
+        ctx.parent_branch,
+        ctx.upstream,
+        head = ctx.head,
+        branch = ctx.branch,
+    )
+}
+
+/// The comment on a grandchild restacked because its still-open parent was
+/// rewritten (base unchanged).
+#[must_use]
+pub fn cascaded_comment_body(
+    parent: u32,
+    parent_branch: &str,
+    old_head: &str,
+    new_head: &str,
+    parent_new_head: &str,
+) -> String {
+    let marker =
+        format!("{RESTACKED_MARKER_PREFIX} parent={parent} old={old_head} new={new_head} -->");
+    format!(
+        "{marker}\n\
+         ## Stacked parent rewritten — replayed onto its new head\n\n\
+         #{parent} (`{parent_branch}`), the open PR this one is stacked on, was rewritten by \
+         Loom (new head `{parent_new_head}`). Loom replayed only this branch's own commits onto \
+         it, kept this PR's base, and pushed the result with a lease pinned to `{old_head}`.\n\n\
+         - Old head: `{old_head}`\n\
+         - New head: `{new_head}`\n\n\
+         ---\n\
+         *Automated by loom-daemon claim reconciliation (#14903)*"
     )
 }
 
@@ -579,6 +677,12 @@ pub fn reconcile_with(
                     .is_some_and(is_stackable_parent_branch)
         })
         .collect();
+    // Merge mode can only retarget a base, and a shape-B child's base is
+    // already the default branch: nothing it may do, so no per-tick reads.
+    let merge_mode = forge.strategy() != Strategy::Rebase;
+    if merge_mode || records.is_empty() {
+        return stats;
+    }
     for child in shape_b {
         if settled.contains(&child.number) {
             continue;
@@ -587,58 +691,45 @@ pub fn reconcile_with(
         if !crate::merge_pr::sequence::is_full_sha(head) {
             continue;
         }
-        if matches!(git::ensure_pr_head(repo, child.number, head), git::HeadFetch::Present) {
-            for rec in records {
-                if !matches!(git::ensure_pr_head(repo, rec.pr, &rec.head), git::HeadFetch::Present)
-                    || !git::is_ancestor(repo, &rec.head, head).unwrap_or(false)
-                {
-                    continue;
-                }
-                // Contains the merge commit ⇒ already reconciled (by the
-                // shell, by hand, or by an earlier tick). The commit lives
-                // on the default branch, so an unfetched one is fetched by
-                // the shared target pin below; a still-unanswerable check
-                // skips the record rather than guess.
-                if !contains_commit(&mut target, repo, default_branch, &rec.merge_commit, head) {
-                    process_child(
-                        forge,
-                        repo,
-                        default_branch,
-                        open,
-                        child,
-                        rec,
-                        false,
-                        &mut target,
-                        &mut repo_identity,
-                        &mut stats,
-                    );
-                    settled.insert(child.number);
-                    break;
-                }
+        if !matches!(git::ensure_pr_head(repo, child.number, head), git::HeadFetch::Present) {
+            continue;
+        }
+        let Some(onto) = fetched_target(&mut target, repo, default_branch) else {
+            continue;
+        };
+        // Two local rev-lists per child bound the records worth a closer look:
+        // a merged parent's merge commit is on the default branch but not in
+        // the child (`child..onto`). Everything else was reconciled or is
+        // unrelated, and costs no further subprocess.
+        let Ok(behind) = git::rev_list(repo, &format!("{head}..{onto}")) else {
+            continue;
+        };
+        for rec in records {
+            if !behind.contains(&rec.merge_commit) {
+                continue;
             }
+            // A child that carries the parent's landed head has its objects
+            // locally, so no fetch is needed to ask.
+            if !git::is_ancestor(repo, &rec.head, head).unwrap_or(false) {
+                continue;
+            }
+            process_child(
+                forge,
+                repo,
+                default_branch,
+                open,
+                child,
+                rec,
+                false,
+                &mut target,
+                &mut repo_identity,
+                &mut stats,
+            );
+            settled.insert(child.number);
+            break;
         }
     }
     stats
-}
-
-/// Does `descendant` contain `commit`? `Err` from `merge-base` (the commit
-/// not fetched here yet) resolves by fetching the default branch once — a
-/// recorded merge's commit is reachable from its tip — and re-asking; still
-/// unanswerable reads as "contains" (fail safe: the record is skipped).
-fn contains_commit(
-    target: &mut Option<Result<String, String>>,
-    repo: &Path,
-    default_branch: &str,
-    commit: &str,
-    descendant: &str,
-) -> bool {
-    match git::is_ancestor(repo, commit, descendant) {
-        Ok(v) => v,
-        Err(_) => {
-            fetched_target(target, repo, default_branch);
-            git::is_ancestor(repo, commit, descendant).unwrap_or(true)
-        }
-    }
 }
 
 /// The memoized default-branch tip fetch shared by discovery and the restack.
@@ -696,6 +787,56 @@ fn process_child(
         return;
     };
     if already_flagged(&bodies, parent.pr, head) {
+        return;
+    }
+
+    // Merge mode (#10771): never rewrite a pushed branch. The parent's content
+    // already reached the default branch through the merge, so a base-only
+    // retarget is safe and is all the policy allows — it races no Builder and
+    // needs no replay evidence, so it runs before the rebase-only deferral and
+    // parent-tip checks below.
+    if forge.strategy() != Strategy::Rebase {
+        if !retarget_needed {
+            return;
+        }
+        if let Err(e) = forge.retarget(child.number, default_branch) {
+            log::warn!(
+                "claim_reconciliation (merged stack): PR #{}: merge-mode retarget to \
+                 '{default_branch}' failed (retrying next tick): {e}",
+                child.number
+            );
+            stats.skipped += 1;
+            return;
+        }
+        stats.retargeted += 1;
+        log::info!(
+            "claim_reconciliation (merged stack): PR #{} was stacked on merged #{}; \
+             merge-mode repository, retargeted the base only (#14903)",
+            child.number,
+            parent.pr
+        );
+        // Best effort: keep the operator's `reconcile-stack.sh` fallback pin
+        // when the recorded head is positively fetchable.
+        if crate::merge_pr::sequence::is_full_sha(&parent.head)
+            && matches!(git::ensure_pr_head(repo, parent.pr, &parent.head), git::HeadFetch::Present)
+        {
+            if let Err(e) = try_establish_pin(repo, &parent.branch, &parent.head) {
+                log::debug!(
+                    "claim_reconciliation (merged stack): PR #{}: pin {} not refreshed: {e}",
+                    child.number,
+                    pin_ref(&parent.branch)
+                );
+            }
+        }
+        if let Err(e) = forge.comment(
+            child.number,
+            &retargeted_comment_body(parent.pr, &parent.branch, default_branch),
+        ) {
+            log::warn!(
+                "claim_reconciliation (merged stack): PR #{}: merge-mode comment failed: {e}",
+                child.number
+            );
+        }
         return;
     }
 
@@ -785,47 +926,6 @@ fn process_child(
             pin_ref(&parent.branch),
             parent.pr
         );
-    }
-
-    if forge.strategy() != Strategy::Rebase {
-        // Merge mode: never rewrite a pushed branch (#10771). The parent's
-        // content already reached the default branch through the merge, so a
-        // base-only retarget is safe and is all the policy allows.
-        if retarget_needed {
-            if let Err(e) = forge.retarget(child.number, default_branch) {
-                log::warn!(
-                    "claim_reconciliation (merged stack): PR #{}: merge-mode retarget to \
-                     '{default_branch}' failed (retrying next tick): {e}",
-                    child.number
-                );
-                stats.skipped += 1;
-                return;
-            }
-            stats.retargeted += 1;
-            log::info!(
-                "claim_reconciliation (merged stack): PR #{} was stacked on merged #{}; \
-                 merge-mode repository, retargeted the base only (#14903)",
-                child.number,
-                parent.pr
-            );
-            if let Err(e) = forge.comment(
-                child.number,
-                &retargeted_comment_body(parent.pr, &parent.branch, default_branch),
-            ) {
-                log::warn!(
-                    "claim_reconciliation (merged stack): PR #{}: merge-mode comment failed: {e}",
-                    child.number
-                );
-            }
-        } else {
-            log::debug!(
-                "claim_reconciliation (merged stack): PR #{}: merge-mode repository and the \
-                 base is already '{default_branch}' — nothing this policy may do",
-                child.number
-            );
-            stats.skipped += 1;
-        }
-        return;
     }
 
     match loom_owned(forge, child, default_branch, repo_identity) {
@@ -993,6 +1093,7 @@ fn flag_ctx<'a>(
         upstream,
         default_branch,
         retarget_to: Some(default_branch),
+        cascade_onto: None,
     }
 }
 
@@ -1094,6 +1195,7 @@ fn cascade(
             upstream: old_head,
             default_branch,
             retarget_to: None,
+            cascade_onto: Some(new_head),
         };
         let reason = if depth > MAX_CASCADE_DEPTH {
             Some(FlagReason::Refused(format!(
@@ -1159,15 +1261,7 @@ fn cascade(
                 );
                 if let Err(e) = forge.comment(
                     g.number,
-                    &restacked_comment_body(
-                        child.number,
-                        child_branch,
-                        head,
-                        &g_new,
-                        default_branch,
-                        new_head,
-                        false,
-                    ),
+                    &cascaded_comment_body(child.number, child_branch, head, &g_new, new_head),
                 ) {
                     log::warn!(
                         "claim_reconciliation (merged stack): PR #{}: cascade comment failed: {e}",

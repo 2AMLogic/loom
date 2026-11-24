@@ -84,6 +84,7 @@ fn flag_marker_is_keyed_by_parent_and_head() {
         upstream: "abc",
         default_branch: "main",
         retarget_to: Some("main"),
+        cascade_onto: None,
     };
     let body = flag_comment_body(&ctx, &FlagReason::Conflict(vec!["a.txt".to_string()]));
     assert!(body.starts_with(&flagged_marker(4, &head)));
@@ -760,6 +761,84 @@ fn a_childs_own_children_are_replayed_onto_its_new_head() {
     assert_eq!(fx.origin_count(&format!("{B}..{C}")), 1, "only C's own commit");
     assert!(!fx.origin_files(C).contains(&"a.txt".to_string()));
     assert!(fx.origin_files(C).contains(&"b.txt".to_string()));
+    // The grandchild's note says its still-open parent was rewritten, not merged.
+    let posted = forge.comments.borrow().get(&3).cloned().unwrap_or_default();
+    assert_eq!(posted.len(), 1, "{posted:?}");
+    assert!(posted[0].contains("Stacked parent rewritten"), "{}", posted[0]);
+    assert!(!posted[0].contains("merged while"), "{}", posted[0]);
+    assert!(!posted[0].contains("refs/loom/parent"), "{}", posted[0]);
+}
+
+/// A cascade flag is keyed apart from the parent-merged flag, so it cannot
+/// suppress reconciliation once that parent itself merges, and its recipe
+/// replays onto the parent's new head rather than the default branch.
+#[test]
+fn a_cascade_flag_is_distinct_from_the_parent_merged_flag() {
+    let head = "f".repeat(40);
+    let ctx = FlagContext {
+        pr: 3,
+        branch: "feature/issue-903",
+        head: &head,
+        parent_pr: 2,
+        parent_branch: "feature/issue-902",
+        upstream: "oldparenthead",
+        default_branch: "main",
+        retarget_to: None,
+        cascade_onto: Some("newparenthead"),
+    };
+    let body = flag_comment_body(&ctx, &FlagReason::Refused("x".to_string()));
+    assert!(!body.contains(&flagged_marker(2, &head)), "{body}");
+    assert!(!already_flagged(std::slice::from_ref(&body), 2, &head));
+    assert!(body.contains("git rebase --onto newparenthead oldparenthead"), "{body}");
+    assert!(!body.contains("origin/main"), "{body}");
+}
+
+/// Merge mode, shape A, Builder lease held: the base-only retarget still
+/// happens (it races no Builder) and no rebase deferral is promised.
+#[test]
+fn merge_mode_retargets_even_when_a_builder_is_active() {
+    let fx = Fixture::new();
+    let a = fx.branch(A, "main", 1, "a.txt", "parent\n");
+    let b = fx.branch(B, A, 2, "b.txt", "child\n");
+    fx.clone_repo();
+    fx.advance_main("m.txt", "merged parent\n");
+    run(&fx.author, &["push", "-q", "origin", "--delete", A]);
+    let forge = FakeForge {
+        parents: [(A.to_string(), FakeForge::merged_parent(1, &a))]
+            .into_iter()
+            .collect(),
+        building_labels: [(902u32, true)].into_iter().collect(),
+        lease: Some(LeaseState::Held),
+        strategy_merge: true,
+        ..FakeForge::default()
+    };
+    let stats = reconcile_with(&forge, &fx.repo, "main", &[open_pr(2, B, &b, A)], &[]);
+    assert_eq!((stats.retargeted, stats.deferred), (1, 0), "{stats:?}");
+    assert_eq!(*forge.retargets.borrow(), vec![(2, "main".to_string())]);
+    let posted = forge.comments.borrow().get(&2).cloned().unwrap_or_default();
+    assert_eq!(posted.len(), 1);
+    assert!(posted[0].starts_with(RETARGETED_MARKER_PREFIX), "{}", posted[0]);
+}
+
+/// Merge mode, shape B: nothing the policy may do, so no comments, no
+/// retargets and an all-zero pass.
+#[test]
+fn merge_mode_shape_b_does_nothing() {
+    let fx = Fixture::new();
+    let a = fx.branch(A, "main", 1, "a.txt", "parent\n");
+    let b = fx.branch(B, A, 2, "b.txt", "child\n");
+    fx.clone_repo();
+    let merged = fx.advance_main("a.txt", "parent\n");
+    run(&fx.author, &["push", "-q", "origin", "--delete", A]);
+    let records = parents_from_records(&[rec(1, A, &a, &merged, "2026-11-24T09:00:00Z")]);
+    let forge = FakeForge {
+        strategy_merge: true,
+        ..FakeForge::default()
+    };
+    let stats = reconcile_with(&forge, &fx.repo, "main", &[open_pr(2, B, &b, "main")], &records);
+    assert_eq!(stats, MergedStats::default());
+    assert!(forge.comments.borrow().is_empty());
+    assert!(forge.retargets.borrow().is_empty());
 }
 
 #[test]
