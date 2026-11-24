@@ -671,6 +671,7 @@ fn write_opencode_step_log(root: &Path, role: &str, item: u32, session_id: &str)
 /// the session id in the step log, so a neighbouring session in the same
 /// (workspace-root) directory is not counted.
 #[test]
+#[serial(opencode_db_env)]
 #[serial]
 fn a_step_dispatched_merge_attributes_an_opencode_builder_and_a_claude_judge() {
     let dir = tempfile::tempdir().unwrap();
@@ -708,7 +709,8 @@ fn a_step_dispatched_merge_attributes_an_opencode_builder_and_a_claude_judge() {
             .unwrap();
         }
     }
-    std::env::set_var(crate::opencode_usage::OPENCODE_DB_ENV, &db);
+    let _db_env =
+        crate::env_test_support::EnvGuard::set(crate::opencode_usage::OPENCODE_DB_ENV, &db);
 
     let gh = FakeGh::new(dir.path());
     gh.serve_view(&pr_row(700, 14018, Some(1)));
@@ -731,7 +733,6 @@ fn a_step_dispatched_merge_attributes_an_opencode_builder_and_a_claude_judge() {
         .await
     }));
     std::env::remove_var("CLAUDE_CONFIG_DIR");
-    std::env::remove_var(crate::opencode_usage::OPENCODE_DB_ENV);
 
     let meta = envelope.expect("a completion").meta.unwrap();
     assert_eq!(meta["runtime"], "opencode");
@@ -795,18 +796,19 @@ fn codex_rollout_lines(cwd: &str, created: &str, id: &str, model: &str) -> Vec<S
 /// shape #14540 ruled cannot be attributed by directory — and the ambient home
 /// is empty, so only profile discovery can find it.
 #[test]
-#[serial_test::serial(codex_home_env)]
+#[serial_test::serial(codex_home_env, opencode_db_env)]
 fn a_step_dispatched_merge_attributes_an_opencode_builder_and_a_codex_judge() {
     a_step_dispatched_merge_attributes_an_opencode_builder_and_a_codex_judge_body();
 }
 
 /// The default-group body of
 /// [`a_step_dispatched_merge_attributes_an_opencode_builder_and_a_codex_judge`]:
-/// it also mutates `GH_BIN_ENV`/`OPENCODE_DB_ENV`, whose writers hold the
-/// crate-default `#[serial]` lock. The named `codex_home_env` lock is the
-/// outer one and the default lock the inner, the mandatory nesting order
-/// (`lock_order_tests`, #14404) — a test cannot name both keys in one
-/// attribute.
+/// it also mutates `GH_BIN_ENV`, whose writers hold the crate-default
+/// `#[serial]` lock, on top of `OPENCODE_DB_ENV`/`CODEX_HOME_ENV`, whose
+/// writers hold the named `opencode_db_env`/`codex_home_env` locks. The named
+/// locks are the outer ones and the default lock the inner, the mandatory
+/// nesting order (`lock_order_tests`, #14404) — the default group's key is the
+/// empty string, so a test cannot name it in a multi-key attribute.
 #[serial]
 fn a_step_dispatched_merge_attributes_an_opencode_builder_and_a_codex_judge_body() {
     let dir = tempfile::tempdir().unwrap();
@@ -855,7 +857,8 @@ fn a_step_dispatched_merge_attributes_an_opencode_builder_and_a_codex_judge_body
         )
         .unwrap();
     }
-    std::env::set_var(crate::opencode_usage::OPENCODE_DB_ENV, &db);
+    let _db_env =
+        crate::env_test_support::EnvGuard::set(crate::opencode_usage::OPENCODE_DB_ENV, &db);
 
     let gh = FakeGh::new(dir.path());
     gh.serve_view(&pr_row(701, 14883, Some(1)));
@@ -885,7 +888,6 @@ fn a_step_dispatched_merge_attributes_an_opencode_builder_and_a_codex_judge_body
         )
         .await
     }));
-    std::env::remove_var(crate::opencode_usage::OPENCODE_DB_ENV);
     std::env::remove_var(crate::codex_usage::CODEX_NATIVE_HOME_ENV);
 
     let meta = envelope.expect("a completion").meta.unwrap();
@@ -931,14 +933,15 @@ fn a_step_dispatched_merge_attributes_an_opencode_builder_and_a_codex_judge_body
 /// figure — the serialized usage surface is byte-identical to the no-Codex
 /// result.
 #[test]
-#[serial_test::serial(codex_home_env)]
+#[serial_test::serial(codex_home_env, opencode_db_env)]
 fn a_codex_banner_naming_no_rollout_leaves_the_envelope_byte_identical() {
     a_codex_banner_naming_no_rollout_leaves_the_envelope_byte_identical_body();
 }
 
 /// The default-group body of
 /// [`a_codex_banner_naming_no_rollout_leaves_the_envelope_byte_identical`]
-/// (same two-lock nesting order as the mixed-runtime test above).
+/// (same named-locks-outside-default-inside nesting order as the
+/// mixed-runtime test above).
 #[serial]
 fn a_codex_banner_naming_no_rollout_leaves_the_envelope_byte_identical_body() {
     let usage_surface = |with_banner: bool| -> serde_json::Value {
@@ -971,7 +974,8 @@ fn a_codex_banner_naming_no_rollout_leaves_the_envelope_byte_identical_body() {
             )
             .unwrap();
         }
-        std::env::set_var(crate::opencode_usage::OPENCODE_DB_ENV, &db);
+        let _db_env =
+            crate::env_test_support::EnvGuard::set(crate::opencode_usage::OPENCODE_DB_ENV, &db);
         // An empty Codex home: the banner names a rollout nothing holds.
         let empty_home = dir.path().join("empty-codex");
         std::fs::create_dir_all(empty_home.join("sessions")).unwrap();
@@ -998,7 +1002,6 @@ fn a_codex_banner_naming_no_rollout_leaves_the_envelope_byte_identical_body() {
             )
             .await
         }));
-        std::env::remove_var(crate::opencode_usage::OPENCODE_DB_ENV);
         let meta = envelope.expect("a completion").meta.unwrap();
         serde_json::json!({
             "runtime": meta["runtime"],
