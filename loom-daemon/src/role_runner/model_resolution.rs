@@ -316,12 +316,18 @@ fn resolve_role_runner_effort_with_tier(
 /// log header as `<source> (profile default for <runtime>:<profile>)` and
 /// logs an `info!` line, so `role_tick.outcome` and `loom-daemon logs` both
 /// name what was dropped and why.
+///
+/// Issue #15205: `model` is the final model the launch carries (after any
+/// selection-time fallback). With no explicit profile, a qualified
+/// `provider/model` there is honoured by `profiles::select` before any profile
+/// lookup, so the effort is kept — see `profile_rejects_effort`.
 #[must_use]
 pub fn resolve_role_runner_effort_for_launch(
     repo_root: &Path,
     role: &str,
     runtime: Option<&str>,
     model_profile: Option<&str>,
+    model: Option<&str>,
 ) -> (String, String) {
     let (effort, source, tier) = resolve_role_runner_effort_with_tier(repo_root, role, runtime);
     if effort.is_empty() || tier != EffortTier::Unqualified {
@@ -337,6 +343,7 @@ pub fn resolve_role_runner_effort_for_launch(
     let Some(profile) = crate::worker_spawn::profiles::profile_rejects_effort(
         runtime,
         model_profile,
+        model,
         &effort,
         &config,
     ) else {

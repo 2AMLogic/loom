@@ -26,10 +26,15 @@ struct Fixture {
     prior: Vec<(&'static str, Option<std::ffi::OsString>)>,
     /// Crate-wide `LOOM_CODEX_PROFILE_ROOT` lock (#9964); released after `Drop`.
     _profile_root_lock: crate::tokens_pool::profile_root_env::ProfileRootLock,
+    /// Crate-wide `LOOM_CODEX_HOME` lock (#15174); released after `Drop` and
+    /// after the profile-root lock above (acquired before it — see
+    /// `codex_home_env`'s documented lock order).
+    _codex_home_lock: crate::tokens_pool::codex_home_env::CodexHomeLock,
 }
 
 impl Fixture {
     fn new() -> Self {
+        let codex_home_lock = crate::tokens_pool::codex_home_env::lock();
         let profile_root_lock = crate::tokens_pool::profile_root_env::lock();
         let repo = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
         let root = tempfile::tempdir().unwrap();
@@ -92,6 +97,7 @@ impl Fixture {
             _shared: shared,
             prior,
             _profile_root_lock: profile_root_lock,
+            _codex_home_lock: codex_home_lock,
         };
         guard_ready(&fixture.profile("ready"), None);
         // Installed, but its only trust was taken somewhere Codex won't look.

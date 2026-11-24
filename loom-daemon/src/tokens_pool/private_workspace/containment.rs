@@ -70,7 +70,7 @@ fn untrusted(why: &str) -> String {
     )
 }
 const NOT_IN_CONTAINER: &str = "container identity: this process is not running inside the bound private session container, or the clone's identity record does not match the bound job; refusing to claim containment";
-const NOT_OWNED_CLONE: &str = "host, sibling and peer repository isolation: the selected clone is not an owned, independent Git root (missing, symlinked, or carrying object alternates)";
+const NOT_OWNED_CLONE: &str = "host, sibling and peer repository isolation: the selected clone is not an owned, independent Git root (missing, symlinked, or borrowing objects through anything other than its own read-only origin mirror)";
 const MALFORMED: &str = "container identity: the bound container, control identity or base revision is malformed, absent, or predates loom-private-control-v1";
 /// A proof is valid for the one clone it was measured against (#10796).
 pub(super) const WRONG_CLONE: &str = "host, sibling and peer repository isolation: the containment proof or lease is bound to a different repository clone than the one this execution acts on; refusing to reuse another clone's evidence";
@@ -690,7 +690,9 @@ pub(super) fn identity_record(repository: &str, clone: &str) -> Result<PathBuf> 
 /// identity record at `/workspace`, a hostname equal to the bound container's
 /// short ID, a read-only root filesystem (one of the settings
 /// `docker::validate_settings` requires of the session), and an owned
-/// `/workspace/repo` with no object alternates.
+/// `/workspace/repo` whose only possible object alternate is its own
+/// read-only origin mirror (#14680): exactly the canonical mirror path for
+/// THIS repository, mounted read-only, never indirect.
 fn in_bound_container(revision: &str, repository: &str, clone: &str) -> Result<String> {
     let record: serde_json::Value =
         serde_json::from_slice(&std::fs::read(identity_record(repository, clone)?)?)?;
@@ -704,21 +706,42 @@ fn in_bound_container(revision: &str, repository: &str, clone: &str) -> Result<S
         bail!("{NOT_IN_CONTAINER}");
     }
     let hostname = std::fs::read_to_string("/proc/sys/kernel/hostname")?;
-    if hostname.trim() != &id[..12] || !read_only_root()? {
+    if hostname.trim() != &id[..12] || !path_read_only(Path::new("/"))? {
         bail!("{NOT_IN_CONTAINER}");
     }
     let repo = Path::new(clone);
-    if repo.canonicalize()? != repo
-        || !std::fs::symlink_metadata(repo.join(".git"))?.is_dir()
-        || repo.join(".git/objects/info/alternates").exists()
+    if repo.canonicalize()? != repo || !std::fs::symlink_metadata(repo.join(".git"))?.is_dir() {
+        bail!("{NOT_OWNED_CLONE}");
+    }
+    repository::verify_alternates(repo, repository, mirror_alternate(repository).as_deref())?;
+    // With an alternate present, prove it is the read-only mirror bind it
+    // claims to be — from inside the worker, where the proof counts (#14680).
+    if let Ok(content) = std::fs::read_to_string(repo.join(".git/objects/info/alternates")) {
+        let mirror = PathBuf::from(content.trim());
+        let metadata = std::fs::symlink_metadata(&mirror)?;
+        if !metadata.is_dir()
+            || mirror.canonicalize()? != mirror
+            || mirror.join("info/alternates").exists()
+            || !path_read_only(&mirror)?
+        {
+            bail!("{NOT_OWNED_CLONE}");
+        }
+    }
+    // No process environment may widen the object stores this clone reads.
+    if std::env::var("GIT_ALTERNATE_OBJECT_DIRECTORIES")
+        .map(|value| !value.trim().is_empty())
+        .unwrap_or(false)
     {
         bail!("{NOT_OWNED_CLONE}");
     }
     Ok(id.to_owned())
 }
 
-fn read_only_root() -> Result<bool> {
-    let path = std::ffi::CString::new("/")?;
+/// Whether the filesystem at `path` is mounted read-only, as the container's
+/// own mount table reports it: the root filesystem for the container check,
+/// and the origin mirror bind for the alternate check (#14680).
+fn path_read_only(path: &Path) -> Result<bool> {
+    let path = std::ffi::CString::new(path.to_string_lossy().as_bytes())?;
     let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
     if unsafe { libc::statvfs(path.as_ptr(), &mut stat) } != 0 {
         return Err(std::io::Error::last_os_error().into());

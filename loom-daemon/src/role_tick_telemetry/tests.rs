@@ -1294,6 +1294,11 @@ fn a_codex_step_selects_tokens_by_the_session_id_its_log_names() {
             writeln!(file, "{line}").unwrap();
         }
     }
+    // Crate-wide `LOOM_CODEX_HOME` lock (#15174): the clear-list helpers
+    // coordinate via this mutex, not a `serial_test` key, so the named key
+    // alone does not exclude them. Declared before `_staged` so the variable
+    // is restored before the lock releases (locals drop in reverse order).
+    let _codex_home_lock = crate::tokens_pool::codex_home_env::lock();
     let _staged = crate::env_test_support::EnvGuard::set(
         crate::codex_usage::CODEX_HOME_ENV,
         codex_home.path(),

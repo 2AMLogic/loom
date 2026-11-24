@@ -14,13 +14,17 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-/// The second field holds the crate-wide `LOOM_CODEX_PROFILE_ROOT` lock (#9964).
+/// The second field holds the crate-wide `LOOM_CODEX_PROFILE_ROOT` lock (#9964);
+/// the third the crate-wide `LOOM_CODEX_HOME` lock (#15174), acquired before it
+/// and released after (see `codex_home_env`'s documented lock order).
 struct Environment(
     Vec<(&'static str, Option<std::ffi::OsString>)>,
     #[allow(dead_code)] crate::tokens_pool::profile_root_env::ProfileRootLock,
+    #[allow(dead_code)] crate::tokens_pool::codex_home_env::CodexHomeLock,
 );
 impl Environment {
     fn isolated(root: &Path) -> Self {
+        let codex_home_lock = crate::tokens_pool::codex_home_env::lock();
         let lock = crate::tokens_pool::profile_root_env::lock();
         let keys = [
             "LOOM_RUNTIME",
@@ -59,7 +63,7 @@ impl Environment {
         }
         std::env::set_var("LOOM_CODEX_PROFILE_ROOT", root.join("codex-profiles"));
         std::env::set_var("LOOM_BACKSTOP_LEASE_DIR", root.join("backstop"));
-        Self(prior, lock)
+        Self(prior, lock, codex_home_lock)
     }
 }
 impl Drop for Environment {

@@ -108,6 +108,7 @@ fn a_drift_recreate_uses_the_configured_image_not_the_recorded_start_image() {
     let config = SessionImageConfig {
         image: Some("ghcr.io/example/session-mine@sha256:aa55".into()),
         extra_mounts: Vec::new(),
+        object_mirrors: false,
     };
     let mut state = ReconcileState::default();
     let out = pass_named_with_session_config(

@@ -996,6 +996,7 @@ mod tests {
                 container_id: "test-container".into(),
                 branch: None,
                 slug: None,
+                mirror_objects: None,
             };
             repository::prepare(&root, &args).unwrap();
             Self {

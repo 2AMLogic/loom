@@ -1982,10 +1982,16 @@ pub mod review_conflict;
 pub mod orphan_stack;
 pub(crate) mod orphan_stack_git;
 
+/// Retarget the stacked children of a parent that merged outside
+/// `merge-pr.sh` — including the ones GitHub already retargeted (#14903) —
+/// a sibling of [`orphan_stack`] reusing its git mechanics.
+pub mod merged_stack;
+
 /// The per-repo loop of one reconciliation pass, plus the #8953 mid-pass
 /// rate-limit-breaker re-check that stops it early — a sibling file rather
-/// than more inline logic here.
-mod pass_loop;
+/// than more inline logic here. `pub(crate)` for `merge_observation`'s
+/// predicates, which the merge-pr bookkeeping shares (#15145).
+pub(crate) mod pass_loop;
 
 /// The ETag-cached `loom:building` listing [`forge`] reconciles against — a
 /// sibling file, attributed to `claim_reconciliation` in the #9251 forge-call

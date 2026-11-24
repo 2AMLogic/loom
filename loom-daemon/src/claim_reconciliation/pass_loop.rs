@@ -9,7 +9,7 @@
 use std::path::Path;
 
 pub(super) mod building_heal;
-pub(super) mod merge_observation;
+pub(crate) mod merge_observation;
 
 use super::{forge, merge_sequence, review_conflict, VerdictReconcileStats};
 
@@ -130,11 +130,18 @@ pub(super) fn run_reconciliation_pass_over_roots(
         // #14902: observe confirmed merges regardless of who made them and
         // finish the issue bookkeeping they skipped — the partial-increment
         // reset, Champion's close check, the branch-derived close and the
-        // closed-issue strip. Last in the tick so nothing above re-adopts a
-        // state this pass just wrote; like everything here it makes no
-        // merge-mode check, so it runs on direct-mode workspaces too (the
-        // merge-queue hook above returns early there).
+        // closed-issue strip. It makes no merge-mode check, so it runs on
+        // direct-mode workspaces too (the merge-queue hook above returns
+        // early there). The merged-stack pass below reads only the merge
+        // records this wrote, not any state it mutated.
         merge_observation::reconcile(gh_bin, root);
+        // #14903: stacked children of a parent that merged outside
+        // merge-pr.sh — still based on the merged parent's branch, or
+        // already retargeted onto the default branch by GitHub's
+        // delete-on-merge flow and recoverable only through git ancestry
+        // against a recorded merge. Runs after merge_observation so a merge
+        // observed this tick is reconciled this tick.
+        super::merged_stack::reconcile(gh_bin, root, open_prs.as_deref());
         stats.roots_processed += 1;
     }
     stats

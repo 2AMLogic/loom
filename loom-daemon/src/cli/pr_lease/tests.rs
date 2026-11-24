@@ -551,6 +551,7 @@ case " $* " in
     printf '{{"id":%s,"updated_at":"%s","body":"%s",%s}}\n' "$cid" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$first" '{AUTHOR}' >> "$D/rows.tmp"
     mv "$D/rows.tmp" "$D/rows" ;;
   *"/check-runs"*) [ -f "$D/checks" ] || exit 1; cat "$D/checks" ;;
+  *"pulls?state=open"*) cat "$D/prs" 2>/dev/null || echo "" ;;
   *"/pulls/"*) echo "$*" >> "$D/pulled"; cat "$D/pull" 2>/dev/null || echo "" ;;
   *"/comments"*)
     n=$(cat "$D/reads" 2>/dev/null || echo 0); echo $((n + 1)) > "$D/reads"
@@ -1749,6 +1750,200 @@ fn the_lib_role_lease_reader_agrees_with_parse_record() {
 
 #[path = "step_claim_tests.rs"]
 mod step_claim;
+
+// ---- the operator's release of a backstop hold (#15096) -------------------
+
+/// A trusted no-verdict record row at `at` (the fake's own NDJSON shape).
+fn no_verdict_row(id: u64, at: DateTime<Utc>, fields: &str) -> String {
+    row_at(
+        id,
+        at,
+        &format!("<!-- loom:pr-lease-released role=judge host=old sweep=prior{fields} -->"),
+    )
+}
+
+/// A no-verdict record row written by an untrusted author.
+fn untrusted_no_verdict_row(id: u64, at: DateTime<Utc>, fields: &str) -> String {
+    format!(
+        r#"{{"id":{id},"updated_at":"{}","body":"<!-- loom:pr-lease-released role=judge host=evil sweep=e{fields} -->","user":{{"login":"rjwalters","type":"User"}},"author_association":"NONE"}}"#,
+        stamp(at)
+    ) + "\n"
+}
+
+#[test]
+fn backstop_clear_releases_the_hold_and_a_judge_claims_without_a_push() {
+    let dir = TempDir::new().unwrap();
+    fake_gh(dir.path());
+    waiting_pr(dir.path());
+    // Three in-window no-verdict records at the head: every host's Judge is
+    // held for the rest of the window.
+    let now = Utc::now();
+    let mut rows = String::new();
+    for (id, min) in [(301, 40), (302, 200), (303, 700)] {
+        rows.push_str(&no_verdict_row(
+            id,
+            now - chrono::Duration::minutes(min),
+            &format!(" head={HEAD} verdict=none labels=review-requested"),
+        ));
+    }
+    fs::write(dir.path().join("rows"), rows).unwrap();
+    let judge = on("host-b", "run-2");
+    assert_eq!(ctx(dir.path(), judge.clone()).check(), backstop::EXIT_BACKSTOP);
+    assert_eq!(ctx(dir.path(), judge.clone()).claim(), backstop::EXIT_BACKSTOP);
+
+    let c = ctx(dir.path(), judge.clone());
+    assert_eq!(
+        backstop::backstop_clear_on(&c.gh, &c.policy, backstop::ClearTarget::Pr(77), c.ttl),
+        EXIT_HELD
+    );
+    let patch = patched(dir.path());
+    for id in [301, 302, 303] {
+        assert!(patch.contains(&format!("comments/{id}")), "{patch}");
+    }
+    assert!(patch.contains("verdict=cleared"), "{patch}");
+    assert!(!patch.contains("verdict=none"), "{patch}");
+    // No new comment, no push, no label change: only rewrites.
+    assert!(posted(dir.path()).is_empty(), "nothing was posted");
+    // The hold is gone: check answers free and a Judge claims at once.
+    assert_eq!(ctx(dir.path(), judge.clone()).check(), EXIT_HELD);
+    assert_eq!(ctx(dir.path(), judge).claim(), EXIT_HELD);
+}
+
+#[test]
+fn backstop_clear_rewrites_only_trusted_in_window_records_at_the_head() {
+    let dir = TempDir::new().unwrap();
+    fake_gh(dir.path());
+    waiting_pr(dir.path());
+    let now = Utc::now();
+    let fields = |head: &str| format!(" head={head} verdict=none labels=review-requested");
+    let mut rows = String::new();
+    // Clearable: at the head, in window, plain and reaped alike.
+    rows.push_str(&no_verdict_row(401, now - chrono::Duration::minutes(30), &fields(HEAD)));
+    rows.push_str(&no_verdict_row(
+        402,
+        now - chrono::Duration::minutes(60),
+        &format!("{} reaped=timeout", fields(HEAD)),
+    ));
+    // Not clearable: another head, out of window, already cleared, or an
+    // untrusted author's. A record at another label digest still clears
+    // (the labels could revert and hold the PR again).
+    rows.push_str(&no_verdict_row(411, now - chrono::Duration::minutes(30), &fields("4444")));
+    rows.push_str(&no_verdict_row(412, now - chrono::Duration::hours(25), &fields(HEAD)));
+    rows.push_str(&no_verdict_row(
+        413,
+        now - chrono::Duration::minutes(30),
+        &format!(" head={HEAD} verdict=cleared labels=review-requested"),
+    ));
+    rows.push_str(&no_verdict_row(
+        414,
+        now - chrono::Duration::minutes(30),
+        &format!(" head={HEAD} verdict=none labels=important,review-requested refused=stale-read"),
+    ));
+    rows.push_str(&untrusted_no_verdict_row(
+        415,
+        now - chrono::Duration::minutes(30),
+        &fields(HEAD),
+    ));
+    fs::write(dir.path().join("rows"), rows).unwrap();
+    // The read itself drops the untrusted row before any rewrite is decided.
+    let c = ctx(dir.path(), on("host-b", "run-2"));
+    let read = c.gh.read_rows(77, &c.policy).unwrap();
+    assert_eq!(read.len(), 6, "the untrusted author's row is not even read");
+    let mut ids = backstop::clearable(&read, HEAD, now);
+    ids.sort_unstable();
+    assert_eq!(ids, vec![401, 402, 414]);
+    assert_eq!(
+        backstop::backstop_clear_on(&c.gh, &c.policy, backstop::ClearTarget::Pr(77), c.ttl),
+        EXIT_HELD
+    );
+    let patch = patched(dir.path());
+    for id in [401, 402, 414] {
+        assert!(patch.contains(&format!("comments/{id}")), "{patch}");
+    }
+    for id in [411, 412, 413, 415] {
+        assert!(!patch.contains(&format!("comments/{id}")), "{patch}");
+    }
+}
+
+#[test]
+fn a_failed_rewrite_fails_backstop_clear() {
+    let dir = TempDir::new().unwrap();
+    fake_gh(dir.path());
+    waiting_pr(dir.path());
+    fs::write(
+        dir.path().join("rows"),
+        no_verdict_row(
+            501,
+            Utc::now(),
+            &format!(" head={HEAD} verdict=none labels=review-requested"),
+        ),
+    )
+    .unwrap();
+    fs::write(dir.path().join("fail_patch"), "").unwrap();
+    let c = ctx(dir.path(), on("host-b", "run-2"));
+    assert_eq!(
+        backstop::backstop_clear_on(&c.gh, &c.policy, backstop::ClearTarget::Pr(77), c.ttl),
+        backstop::EXIT_CLEAR_FAILED
+    );
+    // The rewrite was attempted (and recorded) before failing.
+    assert!(patched(dir.path()).contains("verdict=cleared"));
+}
+
+#[test]
+fn all_clears_only_what_check_would_answer_held_backstop() {
+    // Held: three in-window records, no live Judge lease — --all rewrites.
+    let dir = TempDir::new().unwrap();
+    fake_gh(dir.path());
+    waiting_pr(dir.path());
+    let now = Utc::now();
+    let mut rows = String::new();
+    for id in [601, 602, 603] {
+        rows.push_str(&no_verdict_row(
+            id,
+            now - chrono::Duration::minutes(30),
+            &format!(" head={HEAD} verdict=none labels=review-requested"),
+        ));
+    }
+    fs::write(dir.path().join("rows"), rows).unwrap();
+    fs::write(dir.path().join("prs"), "77\n").unwrap();
+    let c = ctx(dir.path(), on("host-b", "run-2"));
+    let read = c.gh.read_rows(77, &c.policy).unwrap();
+    let state = c.gh.pr_head(77);
+    assert!(backstop::held_backstop(&read, state, now, c.ttl));
+    assert_eq!(
+        backstop::backstop_clear_on(&c.gh, &c.policy, backstop::ClearTarget::All, c.ttl),
+        EXIT_HELD
+    );
+    let patch = patched(dir.path());
+    assert!(patch.contains("comments/601"), "{patch}");
+    assert!(patch.contains("comments/603"), "{patch}");
+
+    // A live Judge lease takes the PR out of the held-backstop answer, the
+    // same precedence `check` applies — so --all leaves it alone.
+    let dir = TempDir::new().unwrap();
+    fake_gh(dir.path());
+    waiting_pr(dir.path());
+    let mut rows = String::new();
+    for id in [611, 612] {
+        rows.push_str(&no_verdict_row(
+            id,
+            now - chrono::Duration::minutes(30),
+            &format!(" head={HEAD} verdict=none labels=review-requested"),
+        ));
+    }
+    rows.push_str(&live_row(700, &on("host-z", "run-9")));
+    fs::write(dir.path().join("rows"), rows).unwrap();
+    fs::write(dir.path().join("prs"), "77\n").unwrap();
+    let c = ctx(dir.path(), on("host-b", "run-2"));
+    let read = c.gh.read_rows(77, &c.policy).unwrap();
+    let state = c.gh.pr_head(77);
+    assert!(!backstop::held_backstop(&read, state, now, c.ttl));
+    assert_eq!(
+        backstop::backstop_clear_on(&c.gh, &c.policy, backstop::ClearTarget::All, c.ttl),
+        EXIT_HELD
+    );
+    assert!(patched(dir.path()).is_empty(), "a live lease keeps --all away");
+}
 
 // ---- the pass's own skip reason on release (#11972) ---------------------
 

@@ -10481,6 +10481,7 @@ through `.loom-local/local.json`):
 |---|---|---|
 | — | `accounts.session.image` | The image a session container is created from, **digest-pinned** (`repo@sha256:<64 hex>`). A tag-only reference is refused at parse. Unset = today's behaviour byte for byte. |
 | — | `accounts.session.extraMounts` | A list of `{ "host": …, "container": … }` bind mounts, **always read-only**. An entry carrying any other key (`rw`/`mode`/…) is refused at parse. A container target must lie outside the mounted workspace (the `--mount-workspace` path, not only the registered repositories beneath it); one inside it is refused at `create`. |
+| — | `accounts.session.objectMirrors` | `true` to create new private-session containers with one read-only bind per registered repository, at `/mirrors/<slug>/objects`, from this host's origin-only object mirror (#14680); each bound clone's sole object alternate names exactly that path. Unset/`false` (the default) keeps fully private clones. A mirror that cannot be proved or fetched skips that repository, never the session. |
 
 **Precedence**: `accounts session start --image IMAGE` (the operator's own
 invocation) beats `accounts.session.image`, which beats the stock default.
