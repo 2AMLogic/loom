@@ -1,5 +1,7 @@
 //! Paginated conditional REST reads retain author association/type, unlike
 //! the reduced issue listing. Cache keys include repo and credential scope.
+//! On a Gitea checkout the same pages are read from the Gitea API instead
+//! (`crate::gitea_read`, #14939).
 use super::*;
 use crate::forge_call_stats::{ops, ForgeOp};
 use crate::forge_etag_store as store;
@@ -15,6 +17,14 @@ fn read(root: &Path, gh: &Path, op: ForgeOp, suffix: &str) -> Result<Value> {
     let repo = std::env::var("LOOM_REPO").ok();
     let target = store::resolve_target(Some(root), repo.as_deref());
     let url = format!("repos/{}/{}", target.repo.as_deref().unwrap_or("{owner}/{repo}"), suffix);
+    // #14939: a Gitea checkout is read through its own API. `gh` cannot
+    // resolve the remote, and refuses the `host:port` of its origin as a
+    // hostname. The transport is chosen here alone: the planner, the hold
+    // checks and the guard decisions downstream see the same pages.
+    if crate::gitea_read::on_gitea(root) {
+        return crate::gitea_read::read_page(root, &url)
+            .map_err(|e| anyhow!("PR queue read failed: {e}"));
+    }
     let key = store::cache_key(Some(root), &target, &url);
     let path = store::disk_cache_path(&key);
     let sent = store::read_disk_entry(&path);

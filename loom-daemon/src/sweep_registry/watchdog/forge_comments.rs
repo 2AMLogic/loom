@@ -1,14 +1,14 @@
 //! The watchdogs' two forge comments: the startup watchdog's give-up notice
 //! (#5302) and the stale-sweep backstop's reap notice (#7529).
 //!
-//! Moved out of `watchdog.rs`, which is at its file-size ratchet baseline,
-//! when #11743 gave both a `loom:frozen` gate: a human can freeze an issue
-//! while its sweep is in flight, and no daemon path may then comment on it.
-//! Neither path read the issue's labels, so each pays one REST label read
-//! ([`SweepRegistry::frozen_blocks_write`]) right before posting. Fail-open,
-//! like every other step of these best-effort notices: a failed read posts the
-//! comment as before. The claim restore the stale-sweep reap performs goes
-//! through `restore_label_to_ready`, which already leaves a frozen issue alone.
+//! Moved out of `watchdog.rs` when #11743 gave both a `loom:frozen` gate: a
+//! human can freeze an issue while its sweep is in flight, and no daemon path
+//! may then comment on it. Neither path read the issue's labels, so each pays
+//! one REST label read ([`SweepRegistry::frozen_blocks_write`]) right before
+//! posting. Fail-open, like every other step of these best-effort notices: a
+//! failed read posts the comment as before. The claim restore the stale-sweep
+//! reap performs goes through `restore_label_to_ready`, which already leaves
+//! a frozen issue alone.
 
 use super::*;
 

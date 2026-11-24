@@ -9,7 +9,10 @@ use std::rc::Rc;
 #[derive(Default)]
 struct State {
     view: IssueView,
-    comments: Vec<Value>,
+    /// Comments per issue: `(issue, comment)` pairs, oldest first.
+    comments: Vec<(u64, Value)>,
+    /// The body's edit history, any order (the fallback sorts it).
+    history: Vec<BodyEdit>,
     /// Author JSON stamped on a comment this fake posts.
     poster: Value,
     log: Vec<String>,
@@ -24,15 +27,27 @@ impl ResolveForge for Fake {
     fn view(&mut self, _: u64) -> Result<IssueView, String> {
         Ok(self.0.borrow().view.clone())
     }
-    fn comments(&mut self, _: u64) -> Result<Vec<Value>, String> {
-        Ok(self.0.borrow().comments.clone())
+    fn comments(&mut self, issue: u64) -> Result<Vec<Value>, String> {
+        Ok(self
+            .0
+            .borrow()
+            .comments
+            .iter()
+            .filter(|(n, _)| *n == issue)
+            .map(|(_, c)| c.clone())
+            .collect())
     }
-    fn post_comment(&mut self, _: u64, b: &str) -> Result<(), String> {
+    fn body_history(&mut self, _: u64) -> Result<Vec<BodyEdit>, String> {
+        let mut s = self.0.borrow_mut();
+        s.log.push("history".into());
+        Ok(s.history.clone())
+    }
+    fn post_comment(&mut self, issue: u64, b: &str) -> Result<(), String> {
         let mut s = self.0.borrow_mut();
         s.log.push("post".into());
         let mut c = s.poster.clone();
         c["body"] = json!(b);
-        s.comments.push(c);
+        s.comments.push((issue, c));
         Ok(())
     }
     fn remove_label(&mut self, _: u64, l: &str) -> Result<(), String> {
@@ -187,7 +202,7 @@ fn a_label_or_comment_change_between_review_and_recording_is_not_a_scope_change(
         let mut st = racer.borrow_mut();
         st.view.labels.push("loom:important".into());
         st.comments
-            .push(json!({"body": "hello", "user": {"login": "x", "type": "User"}}));
+            .push((7, json!({"body": "hello", "user": {"login": "x", "type": "User"}})));
         true
     });
     assert_eq!(o.code, 0, "{}", o.err);
@@ -209,7 +224,8 @@ fn an_unreadable_decision_is_refused_and_names_why() {
     let o = run(&s, &req("keep"), &mut yes);
     assert_eq!(o.code, exit::REFUSED);
     assert!(o.err.contains("decision"), "{}", o.err);
-    assert!(s.borrow().log.is_empty());
+    // A block-less body may read the edit history (#15108); it records nothing.
+    assert!(s.borrow().log.iter().all(|l| *l != "post"), "{:?}", s.borrow().log);
 }
 
 #[test]
@@ -241,4 +257,230 @@ fn a_non_proceed_resolution_is_recorded_without_release() {
     let o = run(&s, &r, &mut yes);
     assert_eq!(o.code, 0, "{}", o.err);
     assert!(s.borrow().view.labels.iter().any(|l| l == DECISION_LABEL));
+}
+
+// --- #15108: the history fallback and the batch form ---
+
+/// The issue body after an attended ruling replaced the decision block.
+fn ruled_body() -> String {
+    "## Operator ruling\n\nkeep: the design stands.\n".into()
+}
+
+fn edit(at: &str, login: &str, assoc: &str, body: String) -> BodyEdit {
+    BodyEdit {
+        body,
+        edited_at: at.into(),
+        editor: json!({"user": {"login": login, "type": "User"}, "author_association": assoc}),
+    }
+}
+
+fn history_state(poster: Value) -> Rc<RefCell<State>> {
+    let s = state(poster);
+    s.borrow_mut().view.body = ruled_body();
+    s.borrow_mut().history = vec![
+        // Newest first, as the GraphQL `last:` window returns them: the
+        // ruling edit's own snapshot has no block; the one before it does.
+        edit("2026-11-23T20:09:12Z", "rjwalters", "OWNER", ruled_body()),
+        edit("2026-11-23T17:44:00Z", "rjwalters", "OWNER", body("w")),
+    ];
+    s
+}
+
+#[test]
+fn a_body_with_a_block_never_reads_the_edit_history() {
+    let s = state(operator());
+    assert_eq!(run(&s, &req("keep"), &mut yes).code, 0);
+    assert!(!s.borrow().log.iter().any(|l| l == "history"), "{:?}", s.borrow().log);
+}
+
+#[test]
+fn a_ruling_that_replaced_the_block_resolves_from_the_history() {
+    let s = history_state(operator());
+    let o = run(&s, &req("keep"), &mut yes);
+    assert_eq!(o.code, 0, "{}", o.err);
+    assert!(o.out.contains("RECORDED=true") && o.out.contains("VERIFIED=true"), "{}", o.out);
+    // The digests bind to the exact text the operator reviewed: the version
+    // that carried the block, not the ruling that replaced it.
+    let cur = current("acme/widgets", 7, "hermit: drop the legacy cache", &body("w")).unwrap();
+    assert!(
+        o.out
+            .contains(&format!("DECISION_DIGEST={}", cur.decision_digest)),
+        "{}",
+        o.out
+    );
+    assert!(
+        o.out
+            .contains(&format!("SCOPE_DIGEST={}", cur.scope_digest)),
+        "{}",
+        o.out
+    );
+}
+
+#[test]
+fn no_block_and_no_recoverable_history_refuses_naming_the_fix() {
+    let s = state(operator());
+    s.borrow_mut().view.body = "just a ruling, the block is gone".into();
+    let o = run(&s, &req("keep"), &mut yes);
+    assert_eq!(o.code, exit::REFUSED);
+    assert!(
+        o.err.contains("edit history") && o.err.contains("operator-decision apply"),
+        "{}",
+        o.err
+    );
+    assert!(s.borrow().log.iter().all(|l| *l != "post"));
+}
+
+#[test]
+fn a_history_block_from_an_untrusted_editor_is_refused_and_named() {
+    let s = history_state(operator());
+    s.borrow_mut().history[1] = edit("2026-11-23T17:44:00Z", "rando", "NONE", body("w"));
+    let o = run(&s, &req("keep"), &mut yes);
+    assert_eq!(o.code, exit::REFUSED);
+    assert!(o.err.contains("`rando`"), "{}", o.err);
+    assert!(s.borrow().log.iter().all(|l| *l != "post"));
+}
+
+#[test]
+fn a_body_that_still_carries_a_block_stays_authoritative() {
+    let s = history_state(operator());
+    // A malformed block in the body must NOT fall back to the history.
+    s.borrow_mut().view.body = "```decision\nnot json\n```\n".into();
+    let o = run(&s, &req("keep"), &mut yes);
+    assert_eq!(o.code, exit::REFUSED);
+    assert!(
+        !s.borrow().log.iter().any(|l| l == "history"),
+        "a present block must not read the history: {:?}",
+        s.borrow().log
+    );
+}
+
+fn batch(items: &[(u64, &str)], dry_run: bool) -> BatchRequest {
+    BatchRequest {
+        items: items
+            .iter()
+            .map(|(n, opt)| ResolveItem {
+                repo: "acme/widgets".into(),
+                issue: *n,
+                option: (*opt).into(),
+            })
+            .collect(),
+        effect: Effect::Proceed,
+        release: false,
+        dry_run,
+    }
+}
+
+fn run_batch(
+    s: &Rc<RefCell<State>>,
+    req: &BatchRequest,
+    confirm: &mut dyn FnMut(&str) -> bool,
+) -> Out {
+    let (mut o, mut e) = (Vec::new(), Vec::new());
+    let policy = policy();
+    let mut forge_for = |_: &str| -> Box<dyn ResolveForge> { Box::new(Fake(s.clone())) };
+    let code = resolve_batch(&mut forge_for, &policy, req, confirm, &mut o, &mut e);
+    Out {
+        code,
+        out: String::from_utf8(o).unwrap(),
+        err: String::from_utf8(e).unwrap(),
+    }
+}
+
+#[test]
+fn a_batch_reviews_every_item_then_records_with_one_confirmation() {
+    let s = state(operator());
+    let r = batch(&[(7, "keep"), (8, "ghost"), (9, "drop")], false);
+    let mut asked = None;
+    let o = run_batch(&s, &r, &mut |e| {
+        asked = Some(e.to_string());
+        true
+    });
+    // The refused middle item does not stop the others.
+    assert_eq!(o.code, exit::REFUSED);
+    assert_eq!(
+        asked.as_deref(),
+        Some("resolve 2"),
+        "one confirmation, naming the reviewed count"
+    );
+    assert!(o.out.contains("ITEM=1/3") && o.out.contains("ITEM=3/3"), "{}", o.out);
+    assert!(
+        o.out.contains("BATCH_ITEMS=3") && o.out.contains("BATCH_REVIEWED=2"),
+        "{}",
+        o.out
+    );
+    assert!(o.out.contains("BATCH_RECORDED=2"), "{}", o.out);
+    assert_eq!(posts(&s), 2);
+    assert!(o.err.contains("ghost"), "{}", o.err);
+}
+
+#[test]
+fn a_batch_confirmation_a_single_option_id_cannot_satisfy() {
+    let s = state(operator());
+    let r = batch(&[(7, "keep")], false);
+    // Even an option id literally spelled `resolve` cannot match: the batch
+    // expects `resolve <count>`, and ids carry no spaces.
+    let o = run_batch(&s, &r, &mut |e| {
+        assert!(e.starts_with("resolve "));
+        false
+    });
+    assert_eq!(o.code, exit::REFUSED);
+    assert_eq!(posts(&s), 0);
+}
+
+#[test]
+fn a_batch_dry_run_reviews_everything_and_records_nothing() {
+    let s = state(operator());
+    let r = batch(&[(7, "keep"), (8, "ghost")], true);
+    let o = run_batch(&s, &r, &mut |_| panic!("a dry run asks nothing"));
+    assert_eq!(o.code, exit::REFUSED, "the refused item still fails the run");
+    assert!(
+        o.out.contains("BATCH_REVIEWED=1") && o.out.contains("DRY_RUN=true"),
+        "{}",
+        o.out
+    );
+    assert!(s.borrow().log.iter().all(|l| *l != "post"), "{:?}", s.borrow().log);
+}
+
+#[test]
+fn an_unconfirmed_batch_records_nothing() {
+    let s = state(operator());
+    let r = batch(&[(7, "keep"), (8, "keep")], false);
+    let o = run_batch(&s, &r, &mut |_| false);
+    assert_eq!(o.code, exit::REFUSED);
+    assert!(o.err.contains("not confirmed"), "{}", o.err);
+    assert_eq!(posts(&s), 0);
+}
+
+#[test]
+fn parse_items_reads_lines_comments_and_blank_lines() {
+    let items = parse_items(
+        "# slate for 2026-11-23\n\nAcme/Widgets#7 = keep\nother/repo#12=drop\n# done\n",
+    )
+    .unwrap();
+    assert_eq!(
+        items,
+        vec![
+            ResolveItem {
+                repo: "acme/widgets".into(),
+                issue: 7,
+                option: "keep".into()
+            },
+            ResolveItem {
+                repo: "other/repo".into(),
+                issue: 12,
+                option: "drop".into()
+            },
+        ]
+    );
+    for bad in [
+        "acme/widgets#7",
+        "acme#7=keep",
+        "acme/widgets#0=keep",
+        "acme/widgets#seven=keep",
+        "justtext=keep",
+        "acme/widgets#7=",
+        "#only comments\n\n",
+    ] {
+        assert!(parse_items(bad).is_err(), "{bad}");
+    }
 }

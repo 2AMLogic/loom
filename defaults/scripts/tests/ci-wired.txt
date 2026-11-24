@@ -133,6 +133,7 @@ test-guide-docs-telemetry.sh
 test-guide-operator-attention-fold.sh
 test-guide-awaiting-revision-park.sh
 test-guide-blocked-unblock-limit.sh
+test-guide-pr-unblock-conflict-handoff.sh
 test-guide-operator-hold-exclude.sh
 test-guide-plan-body-stable-sort.sh
 test-guide-pool-pressure-defer.sh
@@ -149,6 +150,7 @@ test-guide-work-log-issue-out-of-order.sh
 test-guide-work-log-issue-pagination.sh
 test-guide-work-log-out-of-order-merge.sh
 test-guide-work-log-pr-pagination.sh
+test-guide-work-log-provenance.sh
 test-guide-work-log-self-loop.sh
 test-guide-work-plan-approved-review-label-fidelity.sh
 test-guide-work-plan-debounce.sh
@@ -165,6 +167,7 @@ test-install-active-session.sh
 test-install-agents-md-reapply.sh
 test-install-full-reinstall-no-target-mutation.sh
 test-install-lock.sh
+test-install-package-json-stub.sh
 test-install-pr-markers.sh
 test-install-source-guard.sh
 test-install-stash-scope.sh
@@ -207,6 +210,7 @@ test-require-daemon-bin-provenance.sh
 test-resync-installed-agent-skills-guard.sh
 test-resync-installed-agents-hooks.sh
 test-resync-installed-gh-config-guard.sh
+test-resync-installed-gitignore-stub.sh
 test-resync-installed-guard-check.sh
 test-resync-installed-host-optout.sh
 test-resync-installed-labels-block.sh
@@ -218,6 +222,7 @@ test-resync-installed-dogfood-symlink.sh
 test-resync-installed-stamp.sh
 test-resync-installed-agents-md-create.sh
 test-resync-installed-output-staging.sh
+test-resync-installed-source.sh
 test-resync-installed.sh
 test-resync-installed-payload-fallback.sh
 test-review-feedback-reconciliation.sh
@@ -328,6 +333,7 @@ tests/install/test-hooks-preserve.sh
 tests/install/test-initial-commit-credential-exclusion.sh
 tests/install/test-lint-ignore-configs.sh
 tests/install/test-manifest-freshness-after-hook-wiring.sh
+tests/install/test-no-old-owner-slug.sh
 tests/install/test-pnpm-runnable-check.sh
 tests/install/test-provision-daemon.sh
 tests/install/test-provision-tools.sh

@@ -378,6 +378,12 @@ pub const TOOLS_COMMANDS: &[&str] = &[
     "resolve-model",
     "resolve-role-model",
     "capabilities",
+    "champion-hold classify",
+    "champion-hold merge-failed-marker",
+    "champion-hold ratification",
+    "champion-hold self-release-calibration",
+    "curation-complete",
+    "notify-cleared-blockers",
     "forge issue",
     "forge pr",
     "forge auth",
@@ -427,6 +433,7 @@ pub const TOOLS_COMMANDS: &[&str] = &[
     "forge claim-liveness",
     "forge verdict-stale-notice",
     "forge verdict-body-check",
+    "forge workflow-write-all-check",
     "forge verdict-gate",
     "forge may-write",
     "forge calls",
@@ -439,6 +446,7 @@ pub const TOOLS_COMMANDS: &[&str] = &[
     "park-record apply",
     "park-record released",
     "park-record decision",
+    "park-record guide-conflict-route",
     "park-record retract",
     "operator-decision validate",
     "operator-decision apply",
@@ -446,6 +454,7 @@ pub const TOOLS_COMMANDS: &[&str] = &[
     "lease ensure",
     "lease co-occupancy",
     "lease release",
+    "lease read",
     "lease renewer",
     "lease pr claim",
     "lease pr check",
@@ -470,6 +479,11 @@ pub const TOOLS_COMMANDS: &[&str] = &[
     "install-compat",
     "hooks-home",
     "claim",
+    // #14884: the session-mode gateway publisher. Daemon-free; `refresh`
+    // gates on mode = session, `status`/`clean` run ungated.
+    "gateway refresh",
+    "gateway status",
+    "gateway clean",
 ];
 
 /// The identity of the installed-file payload this binary was built against:

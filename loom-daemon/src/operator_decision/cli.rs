@@ -608,6 +608,37 @@ impl super::resolve::ResolveForge for GhForge {
             .ok_or_else(|| format!("gh api {path}: unparseable or empty listing"))
     }
 
+    fn body_history(&mut self, issue: u64) -> Result<Vec<super::resolution::BodyEdit>, String> {
+        // GraphQL-only data (REST exposes no body versions), like the
+        // comments fallback (#10025). Read on the #15108 fallback path only.
+        let repo = super::resolve::ResolveForge::repo(self)?;
+        let (owner, name) = repo
+            .split_once('/')
+            .ok_or_else(|| format!("repository `{repo}` is not owner/repo"))?;
+        let query = super::resolution::body_history_query();
+        let f_owner = format!("owner={owner}");
+        let f_name = format!("name={name}");
+        let f_number = format!("number={issue}");
+        let args = [
+            "api",
+            "graphql",
+            "-f",
+            &format!("query={query}"),
+            "-f",
+            &f_owner,
+            "-f",
+            &f_name,
+            "-F",
+            &f_number,
+        ];
+        let r = self.gh_for(Some(&repo), AccessIntent::Read, &args);
+        let Some(o) = r.ok_output() else {
+            return Err(r.failure_reason("gh api graphql userContentEdits"));
+        };
+        super::resolution::parse_body_history(&o.stdout)
+            .ok_or_else(|| "the userContentEdits response does not parse".to_string())
+    }
+
     fn post_comment(&mut self, issue: u64, body: &str) -> Result<(), String> {
         self.check_write()?;
         let path = format!("{}/comments", self.issue_path(issue));

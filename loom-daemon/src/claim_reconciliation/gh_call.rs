@@ -96,6 +96,8 @@ pub(crate) fn forge_op_for(op: &str) -> Option<ForgeOp> {
         "guard.open_pr_graphql" => ops::PR_CLOSING_ISSUE_REFERENCES,
         "claim.lease_comments"
         | "guard.lease_comments"
+        | "guard.finished_builder_lease"
+        | "claim.curating_comments"
         | "claim.pr_activity_comments"
         | "verdict.pr_comments"
         | "quarantine.issue_comments"
@@ -109,7 +111,9 @@ pub(crate) fn forge_op_for(op: &str) -> Option<ForgeOp> {
         "park_hold.issue_view"
         | "release_veto.issue_labels"
         | "intake.recheck"
-        | "landed.issue_labels" => ops::ISSUE_VIEW_STATE,
+        | "landed.issue_labels"
+        | "claim.labels_rest" => ops::ISSUE_VIEW_STATE,
+        "parent_link.marker_children_rest" => ops::ISSUE_SEARCH,
         "park_hold.issue_body" => ops::ISSUE_EDIT_BODY,
         "quarantine.issue_list" => ops::ISSUE_LIST,
         "claim.issue_reclaim"
@@ -125,6 +129,7 @@ pub(crate) fn forge_op_for(op: &str) -> Option<ForgeOp> {
         | "landed.remove_issue"
         | "verdict.clear_labels"
         | "ci_gate.recovery_labels"
+        | "ci_gate.update_branch"
         | "verdict.requeue_unanchored"
         | "sequence.pr_edit"
         | "review_conflict.pr_edit"
@@ -134,7 +139,8 @@ pub(crate) fn forge_op_for(op: &str) -> Option<ForgeOp> {
         | "restore.label"
         | "prless.hold_label"
         | "park_hold.issue_labels"
-        | "orphan_stack.label" => ops::ISSUE_EDIT_LABELS,
+        | "orphan_stack.label"
+        | "claim.curating_release" => ops::ISSUE_EDIT_LABELS,
         "verdict.anchor_comment"
         | "verdict.reanchor_comment"
         | "verdict.stale_comment"
@@ -152,7 +158,8 @@ pub(crate) fn forge_op_for(op: &str) -> Option<ForgeOp> {
         | "prless.comment"
         | "intake.demote_comment"
         | "landed.comment"
-        | "orphan_stack.comment" => ops::COMMENT_CREATE,
+        | "orphan_stack.comment"
+        | "claim.curating_recuration_comment" => ops::COMMENT_CREATE,
         "roster.delete" | "roster.patch" | "sequence.comment_patch" | "sequence.comment_delete" => {
             ops::COMMENT_EDIT_DELETE
         }
@@ -209,4 +216,26 @@ pub(crate) fn ok_stdout(inv: GhInvocation) -> Option<Vec<u8>> {
 /// The trimmed stderr of a failed run, for error messages.
 pub(crate) fn stderr(out: &Output) -> String {
     String::from_utf8_lossy(&out.stderr).trim().to_string()
+}
+
+/// Run a known GraphQL admission read. `None` specifically means its primary
+/// GraphQL budget is exhausted, whether reported by gh or by the reader router.
+pub(crate) fn graphql_output(inv: GhInvocation) -> Result<Option<Output>> {
+    let op = inv.operation().as_str();
+    match inv.run() {
+        CmdOutcome::Ran(out) if graphql_budget_exhausted(&out) => Ok(None),
+        CmdOutcome::Ran(out) => Ok(Some(out)),
+        CmdOutcome::Unavailable(crate::cmd_out::Unavailable::Shed {
+            graphql_budget_exhausted: true,
+            ..
+        }) => Ok(None),
+        CmdOutcome::Unavailable(why) => Err(anyhow!("failed to invoke gh ({op}): {why}")),
+    }
+}
+
+fn graphql_budget_exhausted(out: &Output) -> bool {
+    let diagnostic = String::from_utf8_lossy(&out.stderr);
+    !out.status.success()
+        && crate::rate_limit_breaker::indicates_rate_limit(&diagnostic)
+        && !crate::rate_limit_breaker::evidence::is_secondary_limit(&diagnostic)
 }

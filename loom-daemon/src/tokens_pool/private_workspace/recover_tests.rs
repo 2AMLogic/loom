@@ -48,6 +48,11 @@ struct Engine {
     /// The verbatim body the fake returns for `private-workspace recover`
     /// execs; `None` answers with an empty published report (#14030).
     recover_response: Option<String>,
+    /// Exec records as the Engine API `/exec/{id}/json` would report them
+    /// (#14943), keyed by exec id.
+    execs: BTreeMap<String, Value>,
+    /// Every exec inspection fails: the engine API is unreachable.
+    exec_inspect_unreachable: bool,
     /// The verbatim body for `private-workspace rebind` execs (#14357).
     rebind_response: Option<String>,
     /// What the sealed-bundle probe of a configured override image prints
@@ -111,6 +116,16 @@ impl Engine {
             ["inspect", target] => {
                 let container = self.find(target).context("no such container")?;
                 Ok(json!([container]).to_string())
+            }
+            // The Engine API exec probe's pseudo-argv (docker.rs
+            // `exec_inspect_body`): the body of `/exec/{id}/json`, or an
+            // error for an inspection that could not answer (#14943).
+            ["exec-inspect", id] => {
+                if self.exec_inspect_unreachable {
+                    bail!("fake Docker: engine API unreachable");
+                }
+                let record = self.execs.get(*id).context("fake Docker: no such exec")?;
+                Ok(record.to_string())
             }
             ["ps", "-a", "--filter", filter, "--format", "{{.Names}}"] => {
                 let source = filter
@@ -277,6 +292,43 @@ fn idle_processes() -> Vec<String> {
     ]
 }
 
+/// A valid engine exec id for fixtures (`seed` rendered as 64 hex digits).
+fn exec_id(seed: u64) -> String {
+    format!("{seed:064x}")
+}
+
+/// One Engine API exec record as `/exec/{id}/json` reports it (#14943). The
+/// `ProcessConfig` payload is deliberately present: classification and the
+/// refusal clause must never lean on it.
+fn exec_record(id: &str, container: &str, running: bool, exit_code: Value, pid: i64) -> Value {
+    json!({
+        "ID": id,
+        "Running": running,
+        "ExitCode": exit_code,
+        "Pid": pid,
+        "ContainerID": container,
+        "ProcessConfig": {"entrypoint": "loom-daemon",
+                          "arguments": ["private-workspace", "snapshot"]}
+    })
+}
+
+/// The stale job of the reported incident (#14943): a finished step's
+/// durable lease naming the still-running container, with a live host pid,
+/// so only the idle proof can retire it.
+fn stale_job(container: &str) -> lease::Job {
+    lease::Job {
+        owner: "sweep-1".into(),
+        kind: JobKind::Sweep,
+        issue: None,
+        branch: None,
+        container_id: container.into(),
+        base_revision: "a".repeat(40),
+        host_pid: std::process::id(),
+        control: String::new(),
+        repository: String::new(),
+    }
+}
+
 fn labels_of(args: &[&str]) -> BTreeMap<String, String> {
     args.windows(2)
         .filter(|w| w[0] == "--label")
@@ -394,7 +446,7 @@ fn parse_run(args: &[&str]) -> Run {
                 run.labels.insert(k.into(), v.into());
                 i += 2;
             }
-            "--tmpfs" | "--env" | "--network" | "--cap-add" => i += 2,
+            "--tmpfs" | "--env" | "--network" | "--cap-add" | "--restart" => i += 2,
             "--entrypoint" => {
                 run.entrypoint = args[i + 1].into();
                 i += 2;
@@ -491,6 +543,20 @@ impl Env {
             e.volumes
                 .insert(self.config.volume.clone(), volume_json(&self.config.volume, &labels));
         });
+    }
+    /// List one exec record under the session container's `ExecIDs` and
+    /// answer the engine API's `/exec/{id}/json` with `record` (#14943).
+    fn seed_exec_for(&self, container: &str, id: &str, record: Value) {
+        self.with(|e| {
+            e.execs.insert(id.to_owned(), record);
+            let state = e.containers.get_mut(container).unwrap();
+            let mut ids = state["ExecIDs"].as_array().cloned().unwrap_or_default();
+            ids.push(json!(id));
+            state["ExecIDs"] = json!(ids);
+        });
+    }
+    fn seed_exec(&self, id: &str, record: Value) {
+        self.seed_exec_for(&self.config.container.clone(), id, record);
     }
     fn mutations(&self) -> Vec<String> {
         self.engine().mutations()
@@ -647,6 +713,40 @@ fn a_missing_private_session_is_recreated_only_against_its_surviving_volume() {
     let run: Vec<&str> = run.iter().map(String::as_str).collect();
     let created = parse_run(&run[1..]);
     assert_eq!(created.name, env.config.container);
+    // Exactly one restart policy, before the image (#14912): on a
+    // session-only host no daemon reconciles the seat, so Docker's own
+    // policy is what brings it back after an engine restart. `unless-stopped`
+    // (not `always`) like the host-mounted seat (#10452), because `stop`
+    // removes the container — the policy never fights an operator's
+    // deliberate stop.
+    let at = run
+        .iter()
+        .position(|a| *a == "--restart")
+        .expect("the persistent private seat sets a restart policy");
+    assert_eq!(run[at + 1], "unless-stopped");
+    assert_eq!(
+        run.iter().filter(|a| **a == "--restart").count(),
+        1,
+        "exactly one restart policy: {run:?}"
+    );
+    let image_at = run
+        .iter()
+        .position(|a| *a == IMAGE)
+        .expect("the detached run names the image");
+    assert!(at < image_at, "the policy precedes the image: {run:?}");
+    // The `--rm` helper runs (control provisioning here; the fresh-volume
+    // initializer and bundle probe on other paths) stay ephemeral.
+    for call in env
+        .engine()
+        .calls
+        .iter()
+        .filter(|c| c.first().is_some_and(|v| v == "run") && c.contains(&"--rm".to_owned()))
+    {
+        assert!(
+            !call.iter().any(|a| a == "--restart"),
+            "an ephemeral helper run must not set a restart policy: {call:?}"
+        );
+    }
     assert!(created.mounts.iter().any(|m| {
         m["Type"] == "volume" && m["Name"] == env.config.volume && m["Destination"] == ROOT
     }));
@@ -659,6 +759,28 @@ fn a_missing_private_session_is_recreated_only_against_its_surviving_volume() {
         .collect();
     assert!(
         envs.contains(&"LOOM_LEASE_RENEW_STATE_DIR=/workspace/cache/lease-renew"),
+        "{envs:?}"
+    );
+    // Every long-lived cache and Loom state dir the seat's 512 MB `/tmp`
+    // tmpfs grew across days (#14929) is pinned to the persistent cache
+    // volume instead — uv's cache alone was 395 MB after two days, and the
+    // forge listing / call-stats / write-scope state dirs surfaced untracked
+    // in the clone when the tmpfs filled.
+    for pinned in [
+        "UV_CACHE_DIR=/workspace/cache/uv",
+        "GH_CACHE_DIR=/workspace/cache/gh",
+        "LOOM_LISTING_CACHE_DIR=/workspace/cache/forge-listing",
+        "LOOM_FORGE_CALL_STATS_DIR=/workspace/cache/forge-call-stats",
+        "LOOM_WRITE_SCOPE_CACHE_DIR=/workspace/cache/write-scope",
+    ] {
+        assert!(envs.contains(&pinned), "missing cache-volume pin {pinned}: {envs:?}");
+    }
+    // The per-container venv is NOT a growing cache and stays on /tmp
+    // (curator scope: `UV_PROJECT_ENVIRONMENT` unchanged).
+    assert!(
+        !envs
+            .iter()
+            .any(|e| e.starts_with("UV_PROJECT_ENVIRONMENT=")),
         "{envs:?}"
     );
     // What it made passes the same validation a reused container must.
@@ -794,6 +916,131 @@ fn recovery_never_breaks_the_exclusive_account_lease() {
     assert!(!env.dir.join("job.json").exists());
     assert!(env.dir.join("last-job.json").exists());
     assert_eq!(env.mutations()[0], format!("start {}", env.config.container));
+}
+
+#[test]
+#[serial]
+fn a_never_started_or_exited_exec_no_longer_wedges_stale_job_recovery() {
+    // The reported incident (#14943): the snapshot exec's create succeeded
+    // and its start never came (`Running=false`, `ExitCode=null`, `Pid=0`),
+    // and the record refused every later idle proof forever. A confirmed
+    // exited record is equally ignorable; each is inspected through the
+    // engine API, never assumed.
+    for (name, exit_code, pid) in [
+        ("never-started", json!(null), 0),
+        ("exited", json!(0), 4242),
+    ] {
+        let env = setup();
+        env.seed_volume();
+        env.seed_container(CONTAINER_ID, true);
+        save(&env.dir.join("job.json"), &stale_job(CONTAINER_ID)).unwrap();
+        let id = exec_id(1);
+        env.seed_exec(&id, exec_record(&id, CONTAINER_ID, false, exit_code, pid));
+        let status = env.recover(Some(IMAGE)).unwrap();
+        assert!(status.running, "{name}");
+        // The old job was archived — not deleted — and the seat stayed on
+        // the original container, with no restart of anything.
+        assert!(!env.dir.join("job.json").exists(), "{name}");
+        assert!(env.dir.join("last-job.json").exists(), "{name}");
+        assert_eq!(status.container_id.as_deref(), Some(CONTAINER_ID), "{name}");
+        assert!(
+            !env.mutations()
+                .iter()
+                .any(|m| m.starts_with("start ") || m.starts_with("rm ") || m.starts_with("run ")),
+            "{name}: {:?}",
+            env.mutations()
+        );
+        assert!(
+            env.engine()
+                .calls
+                .iter()
+                .any(|call| call.first().is_some_and(|arg| arg == "exec-inspect")),
+            "{name}: the record was inspected, not assumed"
+        );
+    }
+}
+
+#[test]
+#[serial]
+fn an_active_pending_or_foreign_exec_still_blocks_stale_job_recovery() {
+    for (name, running, exit_code, pid, clause) in [
+        ("running", true, json!(null), 99, "is running"),
+        ("pending", false, json!(null), 99, "has not started and has not exited"),
+    ] {
+        let env = setup();
+        env.seed_volume();
+        env.seed_container(CONTAINER_ID, true);
+        save(&env.dir.join("job.json"), &stale_job(CONTAINER_ID)).unwrap();
+        // A stranded never-started record next to the blocking one: each is
+        // classified, and the active one still holds the seat (#14943).
+        let stranded = exec_id(1);
+        env.seed_exec(&stranded, exec_record(&stranded, CONTAINER_ID, false, json!(null), 0));
+        let blocking = exec_id(2);
+        env.seed_exec(&blocking, exec_record(&blocking, CONTAINER_ID, running, exit_code, pid));
+        let error = env.recover(Some(IMAGE)).unwrap_err();
+        let text = message(&error);
+        assert!(text.contains(&blocking), "{name}: {text}");
+        assert!(text.contains(clause), "{name}: {text}");
+        assert!(!text.contains(&stranded), "{name}: {text}");
+        assert!(!text.contains("arguments"), "{name}: {text}");
+        // The durable lease and the workspace survive the refusal intact.
+        assert!(env.dir.join("job.json").exists(), "{name}");
+        assert!(!env.dir.join("last-job.json").exists(), "{name}");
+        assert_eq!(env.mutations(), Vec::<String>::new(), "{name}");
+        drop(super::tests::reacquire(&env.dir));
+    }
+
+    // A record the engine answers for another container is not this
+    // proof's to use.
+    let env = setup();
+    env.seed_volume();
+    env.seed_container(CONTAINER_ID, true);
+    save(&env.dir.join("job.json"), &stale_job(CONTAINER_ID)).unwrap();
+    let foreign = exec_id(3);
+    env.seed_exec(&foreign, exec_record(&foreign, OTHER_ID, true, json!(null), 7));
+    let error = env.recover(Some(IMAGE)).unwrap_err();
+    let text = message(&error);
+    assert!(text.contains(&foreign), "{text}");
+    assert!(text.contains("belongs to another container"), "{text}");
+    assert!(env.dir.join("job.json").exists());
+    drop(super::tests::reacquire(&env.dir));
+}
+
+#[test]
+#[serial]
+fn an_unresolvable_exec_inspection_blocks_with_an_explicit_unknown() {
+    // The engine API unreachable: the refusal says unknown, and the job and
+    // workspace survive (#14943).
+    let env = setup();
+    env.seed_volume();
+    env.seed_container(CONTAINER_ID, true);
+    save(&env.dir.join("job.json"), &stale_job(CONTAINER_ID)).unwrap();
+    let id = exec_id(1);
+    env.seed_exec(&id, exec_record(&id, CONTAINER_ID, false, json!(null), 0));
+    env.with(|e| e.exec_inspect_unreachable = true);
+    let error = env.recover(Some(IMAGE)).unwrap_err();
+    let text = message(&error);
+    assert!(
+        text.contains(&id) && text.contains("state unknown (exec inspect failed)"),
+        "{text}"
+    );
+    assert!(env.dir.join("job.json").exists());
+    assert_eq!(env.mutations(), Vec::<String>::new());
+
+    // A body the classifier does not recognize is the same explicit
+    // unknown, never a guess.
+    let env = setup();
+    env.seed_volume();
+    env.seed_container(CONTAINER_ID, true);
+    save(&env.dir.join("job.json"), &stale_job(CONTAINER_ID)).unwrap();
+    env.seed_exec(&id, json!({"ID": id}));
+    let error = env.recover(Some(IMAGE)).unwrap_err();
+    let text = message(&error);
+    assert!(
+        text.contains(&id) && text.contains("state unknown (exec state unrecognized)"),
+        "{text}"
+    );
+    assert!(env.dir.join("job.json").exists());
 }
 
 #[test]
@@ -1145,6 +1392,9 @@ fn session_recover_publish_without_a_github_credential_is_refused_before_exec() 
     let text = message(&error);
     assert!(text.contains("no GitHub write credential"), "{text}");
     assert!(text.contains("GH_TOKEN") && text.contains("gh-config-by-owner"), "{text}");
+    // #14534: the export is an override, not the normal route.
+    assert!(text.contains("override"), "{text}");
+    assert!(!text.contains("set LOOM_MACHINE_CHECKOUT to that root"), "{text}");
     assert_eq!(recover_calls(&env), 0, "refused before any exec");
 
     // Listing pushes nothing: it still reaches the worker (both clones).
@@ -3068,6 +3318,173 @@ fn an_idle_seat_that_cannot_prove_containment_is_never_counted_as_busy() {
     drop(super::tests::reacquire(&bob.dir));
     drop(held);
     drop(super::tests::reacquire(&env.dir));
+}
+
+#[test]
+#[serial]
+fn a_blocking_exec_is_named_by_the_admission_refusal_and_the_explain_view() {
+    use crate::runtime_preference::role_draw;
+    let _runtime_env = crate::env_test_support::EnvGuard::clear(&[
+        "CODEX_HOME",
+        "LOOM_CODEX_HOME",
+        "LOOM_CODEX_PROFILE",
+        "LOOM_CODEX_NO_EXEC",
+        "LOOM_CODEX_SESSION_EXEC",
+        "LOOM_RUNTIME",
+        "LOOM_RUNTIME_BUILDER",
+        "LOOM_SPAWN_NO_EXPORT",
+    ]);
+    let _probe = crate::env_test_support::EnvGuard::set("LOOM_CODEX_SESSION_PROBE", "0");
+    let env = setup();
+    env.seed_volume();
+    env.seed_container(CONTAINER_ID, true);
+    let bob = builder_draw_env(&env, true);
+    let tokens = tempfile::tempdir().unwrap();
+    std::fs::write(tokens.path().join("fixture.token"), "sk-ant-oat-fixture\n").unwrap();
+    let _tokens_env = crate::env_test_support::EnvGuard::set(
+        crate::tokens_pool::paths::SHARED_TOKENS_DIR_ENV,
+        tokens.path(),
+    );
+    let root = env.workspace.path();
+
+    // Both seats carry the incident's shape (#14943): a stale job plus a
+    // stranded never-started snapshot exec next to one live exec. The live
+    // one holds the seat; the stranded one is named nowhere. Exec ids are
+    // engine-global, so each seat gets its own pair.
+    let stranded = exec_id(1);
+    let live = exec_id(2);
+    let bob_stranded = exec_id(3);
+    let bob_live = exec_id(4);
+    save(&env.dir.join("job.json"), &stale_job(CONTAINER_ID)).unwrap();
+    env.seed_exec(&stranded, exec_record(&stranded, CONTAINER_ID, false, json!(null), 0));
+    env.seed_exec(&live, exec_record(&live, CONTAINER_ID, true, json!(null), 9));
+    let bob_container = container_name("bob");
+    save(&bob.dir.join("job.json"), &stale_job(OTHER_ID)).unwrap();
+    env.seed_exec_for(
+        &bob_container,
+        &bob_stranded,
+        exec_record(&bob_stranded, OTHER_ID, false, json!(null), 0),
+    );
+    env.seed_exec_for(
+        &bob_container,
+        &bob_live,
+        exec_record(&bob_live, OTHER_ID, true, json!(null), 9),
+    );
+
+    // The real dispatch falls through to the configured fallback. The walk's
+    // one-line marker names the seat and the stale-lease refusal (its
+    // wording is capped by design, resolve.rs `SUMMARY_DETAIL_MAX`).
+    let mut draw = builder_draw(root);
+    let (runtime, record, selection, seat_unavailable) = draw("builder-11".into());
+    assert_eq!(runtime, "claude");
+    assert!(selection.is_none());
+    assert!(!seat_unavailable, "a proof failure is not a busy pool");
+    let passed = record
+        .passed_over
+        .iter()
+        .find(|reason| reason.contains("no eligible seat could be prepared"))
+        .expect("the codex refusal names the walk");
+    assert!(passed.contains("alice failed: stale lease"), "{passed}");
+    assert!(!passed.contains(&stranded), "{passed}");
+    assert!(!passed.contains("arguments"), "{passed}");
+
+    // `roles draw --explain` reads the same refusal through the real
+    // admission probe, uncapped: the exec id and its known state, and
+    // nothing of the record's payload (#14943).
+    let doc = role_draw::explain::explain_json(root);
+    let codex = &builder_stage_of(&doc)["roleDraw"][0]["candidates"][0];
+    assert_eq!(codex["candidate"], "codex");
+    assert_eq!(codex["admitted"], false);
+    let reason = codex["reason"].as_str().unwrap();
+    assert!(
+        reason.contains(&format!(
+            "alice failed: stale lease still has a surviving or unverified container worker \
+             (container exec {live} is running); retain lease and workspace"
+        )),
+        "{reason}"
+    );
+    assert!(
+        reason.contains(&format!(
+            "bob failed: stale lease still has a surviving or unverified container worker \
+             (container exec {bob_live} is running); retain lease and workspace"
+        )),
+        "{reason}"
+    );
+    assert!(!reason.contains(&stranded), "{reason}");
+    assert!(!reason.contains(&bob_stranded), "{reason}");
+    assert!(!reason.contains("arguments"), "{reason}");
+}
+
+#[test]
+#[serial]
+fn a_failed_or_timed_out_snapshot_records_an_operation_diagnostic() {
+    // The stub `docker`s spawn, and the stripped PATH must not leak into a
+    // concurrently forking `git` fixture (mirror tests hold their own lock).
+    let _fork = super::tests::fork_guard();
+    let env = setup();
+    env.seed_volume();
+    env.seed_container(CONTAINER_ID, true);
+    let root = env.workspace.path().to_path_buf();
+    let job = lease::Job {
+        issue: Some(31),
+        branch: Some("feature/issue-31".into()),
+        ..stale_job(CONTAINER_ID)
+    };
+    let record = export::record_prepared(&root, &env.config, &job).unwrap();
+    drop(record);
+    let record_path = root.join(".loom/private-jobs/issue-31.json");
+    let read_record = || -> export::Record {
+        serde_json::from_slice(&std::fs::read(&record_path).unwrap()).unwrap()
+    };
+
+    // A snapshot exec whose start failed, and one that never answered in
+    // time — the incident's own shape (#14943) — each record the operation
+    // by name, and never the payload. The stub dir is the whole PATH, so
+    // nothing external is callable from the stubs.
+    for (stub, expected) in [
+        ("#!/bin/sh\nexit 1\n", "private-workspace snapshot failed"),
+        ("#!/bin/sh\n/bin/sleep 5\n", "private-workspace snapshot timed out after 2s"),
+    ] {
+        let stubs = tempfile::tempdir().unwrap();
+        crate::exec_test_support::write_executable(&stubs.path().join("docker"), stub);
+        let _path = crate::env_test_support::EnvGuard::set("PATH", stubs.path().to_str().unwrap());
+        export::update(&root, &env.config, &job, "completed").unwrap();
+        let record = read_record();
+        assert_eq!(record.snapshot_diagnostic.as_deref(), Some(expected));
+        // An uncertified completion stays uncertified.
+        assert_eq!(record.outcome, "recovery-required");
+    }
+
+    // A snapshot that never started at all records the same way. An empty
+    // PATH no longer expresses "docker is unreachable" — the shared lookup's
+    // absolute fallbacks (`/usr/bin`, …) can still find a host docker (#14885)
+    // — so pin `LOOM_DOCKER_BIN` at a path that is not an executable file.
+    let empty = tempfile::tempdir().unwrap();
+    let _path = crate::env_test_support::EnvGuard::set("PATH", empty.path().to_str().unwrap());
+    {
+        let _docker = crate::env_test_support::EnvGuard::set(
+            crate::docker_bin::DOCKER_BIN_ENV,
+            empty.path().join("docker"),
+        );
+        export::update(&root, &env.config, &job, "running").unwrap();
+        assert_eq!(
+            read_record().snapshot_diagnostic.as_deref(),
+            Some("private-workspace snapshot could not be executed")
+        );
+    }
+
+    // A fresh snapshot clears the diagnostic and certifies the completion.
+    let stubs = tempfile::tempdir().unwrap();
+    crate::exec_test_support::write_executable(
+        &stubs.path().join("docker"),
+        "#!/bin/sh\nprintf '%s\\n' '{\"issue\":31,\"branch\":\"feature/issue-31\",\"revision\":null,\"published\":true,\"dirty\":false,\"checkpoint\":null}'\n",
+    );
+    let _path = crate::env_test_support::EnvGuard::set("PATH", stubs.path().to_str().unwrap());
+    export::update(&root, &env.config, &job, "completed").unwrap();
+    let record = read_record();
+    assert_eq!(record.snapshot_diagnostic, None);
+    assert_eq!(record.outcome, "completed");
+    assert!(record.snapshot.is_some());
 }
 
 #[test]

@@ -143,7 +143,7 @@ const FETCH_SITES: &[(&str, &str, &str)] = &[
     // #11898: a dead step's role-keyed lease holder.
     (
         "sweep_registry/step_lease_owner.rs",
-        "read_role_lease_rows",
+        "read_role_lease_rows_with_policy",
         "policy.trusted_ndjson(",
     ),
     // #9062: the PR timeline read carries base-conflict flag comments.
@@ -171,7 +171,10 @@ const FETCH_SITES: &[(&str, &str, &str)] = &[
         "parse_open_linked_pr_timeline_trusted(",
     ),
     // #10514: leg 0 (the open-PR listing) first; the old union is the fallback.
-    ("worktree_ops/gh.rs", "probe_open_linked_pr", "linked_pr_listing::probe("),
+    ("worktree_ops/gh.rs", "probe_open_linked_pr", "probe_linked_pr_at("),
+    // #14799: the lease-gate reader shares the same helper, so it inherits the trust call.
+    ("worktree_ops/gh.rs", "probe_open_linked_pr_for_lease", "probe_linked_pr_at("),
+    ("worktree_ops/gh.rs", "probe_linked_pr_at", "linked_pr_listing::probe("),
     ("worktree_ops/gh.rs", "legacy_union", "parse_open_linked_pr_timeline_trusted("),
     (
         "worktree_ops/linked_pr_listing.rs",

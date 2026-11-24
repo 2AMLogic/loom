@@ -211,6 +211,111 @@ fn an_oversize_contained_file_is_removed() {
     assert!(!big.exists());
 }
 
+/// Host-only names accepted by `is_sink_entry` (the parent dir's mount
+/// gate) but never written by a front into the contained dir: the bucket
+/// book snapshot, its legacy staging branch, and the `write_atomic`
+/// staging shape of #14978. Only `calls-<hour>.jsonl` is non-foreign
+/// there (#14993).
+#[test]
+fn host_only_sink_names_are_foreign_in_the_contained_dir() {
+    let sink = tempfile::tempdir().unwrap();
+    let contained = sink.path().join(CONTAINED_SUBDIR);
+    std::fs::create_dir(&contained).unwrap();
+    let keep = file(&contained, HOUR);
+    std::fs::write(&keep, "").unwrap();
+    for name in ["bucket-book.json", ".bucket-book.json.123", ".tmpAbC123"] {
+        std::fs::write(contained.join(name), "x").unwrap();
+    }
+    // A negative hour parses and is stale, exactly as before.
+    std::fs::write(file(&contained, -5), "").unwrap();
+    // A subdirectory is never touched.
+    std::fs::create_dir(contained.join("adir")).unwrap();
+    assert_eq!(
+        sweep_contained(&contained, HOUR),
+        4,
+        "the three host-only names and the stale hour"
+    );
+    assert!(keep.exists(), "the in-window hour file stays");
+    assert!(contained.join("adir").exists(), "a subdirectory is left alone");
+    assert!(!file(&contained, -5).exists(), "calls--5.jsonl is stale");
+    for name in ["bucket-book.json", ".bucket-book.json.123", ".tmpAbC123"] {
+        assert!(!contained.join(name).exists(), "{name} removed");
+    }
+}
+
+/// A spelling that parses to an in-window hour but is not byte-equal to
+/// what [`super::sink::append`] writes is foreign residue, not an hour
+/// file: removed and counted, while the canonical name stays (#15000).
+#[test]
+fn padded_hour_spellings_are_foreign_and_counted() {
+    let sink = tempfile::tempdir().unwrap();
+    let contained = sink.path().join(CONTAINED_SUBDIR);
+    std::fs::create_dir(&contained).unwrap();
+    let keep = file(&contained, HOUR);
+    std::fs::write(&keep, "").unwrap();
+    let padded = [
+        format!("calls-0{HOUR}.jsonl"),
+        format!("calls-00{HOUR}.jsonl"),
+        format!("calls-+{HOUR}.jsonl"),
+        format!("calls-+0{HOUR}.jsonl"),
+        format!("calls-0{}.jsonl", HOUR - RETAIN_HOURS),
+    ];
+    for name in &padded {
+        std::fs::write(contained.join(name), "x").unwrap();
+    }
+    assert_eq!(sweep_contained(&contained, HOUR), padded.len() as u64);
+    assert!(keep.exists(), "the canonical name the sink writes stays");
+    let survivors: Vec<String> = std::fs::read_dir(&contained)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(survivors, vec![format!("calls-{HOUR}.jsonl")]);
+}
+
+/// A container cannot starve the [`MAX_DIR_ENTRIES`] scan budget with
+/// padded `calls-<hour>.jsonl` spellings: every one is foreign, so
+/// repeated ticks remove them all while the canonical hour file a front
+/// writes survives (#15000). The 255-byte name limit caps one hour's
+/// spellings well below the budget, so the fill spans the whole retained
+/// window to get past it.
+#[test]
+fn padded_spellings_beyond_the_scan_budget_cannot_starve_the_sweep() {
+    let sink = tempfile::tempdir().unwrap();
+    let contained = sink.path().join(CONTAINED_SUBDIR);
+    std::fs::create_dir(&contained).unwrap();
+    let keep = file(&contained, HOUR);
+    std::fs::write(&keep, "").unwrap();
+    let mut filled = 0usize;
+    for h in HOUR - RETAIN_HOURS..=HOUR + 1 {
+        let digits = h.to_string();
+        let room = 255 - "calls-".len() - ".jsonl".len() - digits.len();
+        for pad in 1..=room {
+            let name = format!("calls-{}{digits}.jsonl", "0".repeat(pad));
+            std::fs::write(contained.join(name), "").unwrap();
+            filled += 1;
+        }
+    }
+    assert!(filled > MAX_DIR_ENTRIES, "the fill ({filled}) must exceed the scan budget");
+    let mut ticks = 0;
+    let mut total_removed = 0u64;
+    loop {
+        ticks += 1;
+        let removed = sweep_contained(&contained, HOUR);
+        total_removed += removed;
+        if removed == 0 {
+            break;
+        }
+        assert!(ticks < 10, "the sweep must converge");
+    }
+    assert!(ticks >= 2, "the capped scan forces more than one tick");
+    assert_eq!(total_removed, filled as u64, "every padded spelling goes");
+    let survivors: Vec<String> = std::fs::read_dir(&contained)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(survivors, vec![format!("calls-{HOUR}.jsonl")]);
+}
+
 #[test]
 fn a_line_longer_than_a_read_is_skipped_not_stuck_on() {
     let sink = tempfile::tempdir().unwrap();

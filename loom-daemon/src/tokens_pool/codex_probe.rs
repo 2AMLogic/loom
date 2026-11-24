@@ -40,16 +40,16 @@
 //!
 //! Nothing secret is read or emitted: no token, no email, no raw reply body.
 
-use std::io::Read;
 use std::path::Path;
 use std::process::{Command, Stdio};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use anyhow::Result;
 use chrono::{DateTime, Utc};
 
 use super::codex_check::{epoch_to_datetime, slot_by_duration, RateLimitWindow, UsageSnapshot};
 use super::session_lifecycle::{self, ContainerRunner, ExecOutput, ProcessContainerRunner};
+use crate::proc_exec::{Completion, ExecError};
 
 /// Seconds stdin stays open after the requests are written. The app-server
 /// answers in about a second; this is the ceiling before EOF ends it.
@@ -91,9 +91,12 @@ pub enum ProbeOutcome {
     NotLoggedIn,
     /// The CLI does not implement `account/rateLimits/read`.
     CapabilityAbsent,
-    /// Session-managed, but its session container is not running (or the
-    /// container runtime is unavailable). Not evidence about the account.
+    /// The session container is missing or stopped.
     SessionUnavailable,
+    /// The runtime executable could not start.
+    RuntimeUnavailable(std::io::ErrorKind),
+    /// The executable started, but its inspection or execution failed.
+    SessionProbeError(String),
     /// The probe ran but produced no usable answer.
     Failed(&'static str),
 }
@@ -108,18 +111,70 @@ impl ProbeOutcome {
             Self::NotLoggedIn => Some("not_logged_in"),
             Self::CapabilityAbsent => Some("rate_limits_unsupported_by_codex_cli"),
             Self::SessionUnavailable => Some("session_unavailable"),
+            Self::RuntimeUnavailable(_) => Some("container_runtime_unavailable"),
+            Self::SessionProbeError(_) => Some("session_probe_error"),
             Self::Failed(why) => Some(why),
         }
     }
+
+    pub(super) fn diagnostic(&self) -> Option<String> {
+        match self {
+            Self::RuntimeUnavailable(kind) => {
+                let search = crate::docker_bin::search_description();
+                Some(format!(
+                    "container_runtime_unavailable: docker could not start ({kind:?}), {search}"
+                ))
+            }
+            Self::SessionProbeError(category) => {
+                Some(format!("session_probe_error: docker {category}"))
+            }
+            _ => None,
+        }
+    }
+}
+
+/// Keep the underlying spawn error distinct from a command that ran. Only
+/// the bounded category is reported: Docker stderr may contain private data.
+pub(super) fn session_error(err: &anyhow::Error, operation: &str) -> ProbeOutcome {
+    use crate::proc_exec::ExecError;
+    match err.downcast_ref::<ExecError>() {
+        Some(ExecError::Spawn(io)) => return ProbeOutcome::RuntimeUnavailable(io.kind()),
+        Some(ExecError::Collect(io)) => {
+            return ProbeOutcome::SessionProbeError(format!(
+                "{operation} output collection: {:?}",
+                io.kind()
+            ));
+        }
+        None => {}
+    }
+    if let Some(io) = err.downcast_ref::<std::io::Error>() {
+        return match io.kind() {
+            std::io::ErrorKind::NotFound | std::io::ErrorKind::PermissionDenied => {
+                ProbeOutcome::RuntimeUnavailable(io.kind())
+            }
+            kind => ProbeOutcome::SessionProbeError(format!("{operation} I/O: {kind:?}")),
+        };
+    }
+    let kind = if err.is::<super::docker_cli::DockerTimedOut>() {
+        "timeout"
+    } else {
+        "command failed"
+    };
+    ProbeOutcome::SessionProbeError(format!("{operation}: {kind}"))
 }
 
 /// How a probe program is run. Split out so tests can prove the ownership
 /// rule (a session-managed profile never reaches [`ProbeTransport::host`]).
 pub trait ProbeTransport {
+    /// Check executable availability once before inspecting session profiles.
+    fn check_runtime(&self) -> Result<()> {
+        Ok(())
+    }
+
     /// Run the probe host-directly with `CODEX_HOME=profile`.
     fn host(&self, profile: &Path) -> Result<ExecOutput>;
     /// Run the probe inside `container`. `Ok(None)` = no probe was possible
-    /// (not running, or no container runtime).
+    /// (the container is missing or stopped). Spawn errors remain typed.
     fn container(&self, container: &str) -> Result<Option<ExecOutput>>;
 }
 
@@ -128,12 +183,18 @@ pub trait ProbeTransport {
 pub struct ProcessProbeTransport;
 
 impl ProbeTransport for ProcessProbeTransport {
+    fn check_runtime(&self) -> Result<()> {
+        // Only the spawn matters here. Inspect each container separately when
+        // the executable runs, even if its version command exits nonzero.
+        ProcessContainerRunner::run_capture(&["--version"]).map(|_| ())
+    }
+
     fn host(&self, profile: &Path) -> Result<ExecOutput> {
-        run_bounded(
-            Command::new("sh")
-                .args(["-c", &probe_script()])
-                .env("CODEX_HOME", profile),
-        )
+        let mut command = Command::new("sh");
+        command
+            .args(["-c", &probe_script()])
+            .env("CODEX_HOME", profile);
+        run_bounded(command)
     }
 
     fn container(&self, container: &str) -> Result<Option<ExecOutput>> {
@@ -144,7 +205,12 @@ impl ProbeTransport for ProcessProbeTransport {
         }
         let script = probe_script();
         let out = runner.exec_capture(container, &["sh", "-c", &script], PROBE_TIMEOUT)?;
-        Ok((!out.unavailable).then_some(out))
+        if out.unavailable {
+            // exec_capture sets this bit when spawning Docker returned ENOENT,
+            // including if the executable disappeared after the initial check.
+            return Err(std::io::Error::from(std::io::ErrorKind::NotFound).into());
+        }
+        Ok(Some(out))
     }
 }
 
@@ -159,7 +225,7 @@ pub fn probe_account<T: ProbeTransport + ?Sized>(
         match transport.container(&session_lifecycle::container_name(name)) {
             Ok(Some(out)) => out,
             Ok(None) => return ProbeOutcome::SessionUnavailable,
-            Err(_) => return ProbeOutcome::Failed("session_probe_error"),
+            Err(err) => return session_error(&err, "inspect/exec"),
         }
     } else {
         match transport.host(profile) {
@@ -275,55 +341,45 @@ pub fn window_not_started(
     used_percent == 0.0 && (reset - expected).num_seconds().abs() <= NOT_STARTED_TOLERANCE_SECS
 }
 
-/// Run a host command to completion under [`PROBE_TIMEOUT`], reading stdout on
-/// a thread so a chatty child can never deadlock on a full pipe.
-fn run_bounded(command: &mut Command) -> Result<ExecOutput> {
-    let mut child = match command
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-    {
-        Ok(child) => child,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return Ok(ExecOutput {
+/// Run a host command to completion under [`PROBE_TIMEOUT`].
+fn run_bounded(command: Command) -> Result<ExecOutput> {
+    run_bounded_within(command, PROBE_TIMEOUT)
+}
+
+fn run_bounded_within(mut command: Command, timeout: Duration) -> Result<ExecOutput> {
+    command.stdin(Stdio::null());
+    let output = match crate::proc_exec::run_bounded(command, timeout) {
+        Ok(Completion::Exited(output)) => ExecOutput {
+            success: output.status.success(),
+            unavailable: false,
+            timed_out: false,
+            exit_code: output.status.code(),
+            output: probe_text(&output.stdout),
+        },
+        Ok(Completion::TimedOut { stdout, .. }) => ExecOutput {
+            success: false,
+            unavailable: false,
+            timed_out: true,
+            exit_code: None,
+            output: probe_text(&stdout),
+        },
+        Err(ExecError::Spawn(error)) if error.kind() == std::io::ErrorKind::NotFound => {
+            ExecOutput {
                 success: false,
                 unavailable: true,
                 timed_out: false,
                 exit_code: None,
                 output: String::new(),
-            });
+            }
         }
-        Err(error) => return Err(error.into()),
+        Err(ExecError::Spawn(error) | ExecError::Collect(error)) => return Err(error.into()),
     };
-    let stdout = child.stdout.take();
-    let reader = std::thread::spawn(move || {
-        let mut bytes = Vec::new();
-        if let Some(stdout) = stdout {
-            let _ = stdout.take(MAX_OUTPUT_BYTES).read_to_end(&mut bytes);
-        }
-        bytes
-    });
-    let started = Instant::now();
-    let status = loop {
-        if let Some(status) = child.try_wait()? {
-            break Some(status);
-        }
-        if started.elapsed() >= PROBE_TIMEOUT {
-            let _ = child.kill();
-            let _ = child.wait();
-            break None;
-        }
-        std::thread::sleep(Duration::from_millis(50));
-    };
-    let bytes = reader.join().unwrap_or_default();
-    Ok(ExecOutput {
-        success: status.is_some_and(|s| s.success()),
-        unavailable: false,
-        timed_out: status.is_none(),
-        exit_code: status.and_then(|s| s.code()),
-        output: String::from_utf8_lossy(&bytes).into_owned(),
-    })
+    Ok(output)
+}
+
+fn probe_text(bytes: &[u8]) -> String {
+    let cut = bytes.len().min(MAX_OUTPUT_BYTES as usize);
+    String::from_utf8_lossy(&bytes[..cut]).into_owned()
 }
 
 #[cfg(test)]

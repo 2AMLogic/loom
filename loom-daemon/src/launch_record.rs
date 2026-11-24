@@ -428,6 +428,57 @@ fn session_ids_in(region: &str) -> Vec<String> {
     ids
 }
 
+/// Every Codex session id named by a launch banner in a step log's
+/// `contents` — **every** dispatch region — first-seen order, de-duplicated
+/// (#14883).
+///
+/// The Codex counterpart of [`opencode_session_ids`], for the same PR-keyed
+/// step logs (Doctor, Judge, `champion_merge`): each dispatch region is a
+/// completed round on the PR, and all of them are counted.
+///
+/// A banner is Codex's own `session id: <uuid>` stderr line, captured whole by
+/// the step log — so the read is **line-anchored**: only a line that IS a
+/// banner (after leading whitespace) counts. A banner quoted inside a tool
+/// output or an agent's text — mid-line, or inside a JSON event string — is
+/// data about a launch, not evidence of one, exactly like the nested
+/// `sessionID` keys [`session_ids_in`] refuses. The token shape is
+/// [`crate::usage_source`]'s own `codex_session_token` check — the same
+/// hex/dash, ≥8-character shape `spawn-codex.sh`'s transcript join greps for.
+#[must_use]
+pub fn codex_session_ids(contents: &str) -> Vec<String> {
+    codex_ids_in(contents)
+}
+
+/// [`codex_session_ids`] restricted to the **last dispatch** of a step log
+/// (#14883): the read for the issue-keyed Builder log.
+///
+/// The Codex counterpart of [`opencode_session_ids_last_dispatch`], for the
+/// same reason: `step-builder-<issue>.log` is append-mode and issue-keyed, so
+/// every dispatch region but the last is an abandoned attempt whose spend must
+/// not be charged to the PR. A log with no dispatch header is read whole.
+#[must_use]
+pub fn codex_session_ids_last_dispatch(contents: &str) -> Vec<String> {
+    codex_ids_in(last_dispatch_region(contents))
+}
+
+fn codex_ids_in(region: &str) -> Vec<String> {
+    let mut seen = std::collections::HashSet::new();
+    let mut ids = Vec::new();
+    for line in region.lines() {
+        let Some(token) = line
+            .trim_start()
+            .strip_prefix("session id:")
+            .and_then(crate::usage_source::codex_session_token)
+        else {
+            continue;
+        };
+        if seen.insert(token.clone()) {
+            ids.push(token);
+        }
+    }
+    ids
+}
+
 /// Parse the credential attribution out of a per-sweep log's `contents`,
 /// scanning only the region at/after this dispatch's header (`header_anchor`,
 /// e.g. `sweep_id=<id>`).
@@ -1183,6 +1234,77 @@ mod tests {
         ]
         .join("\n");
         assert_eq!(opencode_session_ids_last_dispatch(&log), vec!["ses_one", "ses_two"]);
+    }
+
+    /// #14883: a banner is evidence of a launch only when a line IS one — the
+    /// line-anchored counterpart of [`session_ids_in`]'s top-level-key rule.
+    /// A banner quoted in tool output or agent text, a `cosession id:` prefix,
+    /// and a too-short token are all data, not launches.
+    #[test]
+    fn codex_session_ids_come_only_from_line_anchored_banners() {
+        let log = [
+            "==== loom-daemon dispatch: 2026-11-18 sweep_id=step-judge-7-1 item=7 step=judge ====",
+            "# LOOM_RUNTIME_RESOLVED runtime=codex",
+            "spawn-codex: waiting for session",
+            "session id: 3f2a9c1e-77b2-4d0a-9c1e-2f6a8b4d5e01",
+            "tokens used: 1,234 input (1,000 cached)",
+            // A banner quoted inside an OpenCode-style event string: data.
+            r#"{"type":"text","sessionID":"ses_x","part":{"text":"session id: deadbeef-aaaa-bbbb-cccc-dddddddddddd"}}"#,
+            // A banner mid-line in prose, and a look-alike prefix.
+            "the runner echoed: session id: 11111111-2222-3333-4444-555555555555",
+            "cosession id: 99999999-8888-7777-6666-555555555555",
+            // Real banner shape, too-short token.
+            "session id: abc",
+            // A second real banner, then the first one again: deduped.
+            "  session id: 77777777-8888-9999-aaaa-bbbbccccdddd",
+            "session id: 3f2a9c1e-77b2-4d0a-9c1e-2f6a8b4d5e01",
+        ]
+        .join("\n");
+        assert_eq!(
+            codex_session_ids(&log),
+            vec![
+                "3f2a9c1e-77b2-4d0a-9c1e-2f6a8b4d5e01".to_string(),
+                "77777777-8888-9999-aaaa-bbbbccccdddd".to_string(),
+            ]
+        );
+        assert!(codex_session_ids("").is_empty());
+    }
+
+    /// #14883: the issue-keyed Builder log counts only its LAST dispatch's
+    /// banners — an abandoned attempt's session is not charged to the PR —
+    /// while the PR-keyed whole-log read keeps every round (#14210's split).
+    #[test]
+    fn codex_session_ids_last_dispatch_counts_only_the_last_region() {
+        let log = [
+            "==== loom-daemon dispatch: 2026-11-16T14:27:46+00:00 sweep_id=a item=7 ====",
+            "session id: 11111111-2222-3333-4444-555555555555",
+            "==== loom-daemon dispatch: 2026-11-16T17:04:20+00:00 sweep_id=b item=7 ====",
+            "session id: aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+            // A header echoed mid-line never splits the region.
+            "agent echoed ==== loom-daemon dispatch: z ==== mid-line",
+            "session id: ffffffff-1111-2222-3333-444444444444",
+        ]
+        .join("\n");
+        assert_eq!(
+            codex_session_ids_last_dispatch(&log),
+            vec![
+                "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee".to_string(),
+                "ffffffff-1111-2222-3333-444444444444".to_string(),
+            ]
+        );
+        assert_eq!(codex_session_ids(&log).len(), 3, "the whole-log read keeps every round");
+    }
+
+    /// #14883: a headerless Builder log is one undivided launch.
+    #[test]
+    fn codex_session_ids_last_dispatch_without_a_header_reads_the_whole_log() {
+        let log = [
+            "session id: 11111111-2222-3333-4444-555555555555",
+            "session id: aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+        ]
+        .join("\n");
+        assert_eq!(codex_session_ids_last_dispatch(&log), codex_session_ids(&log));
+        assert_eq!(codex_session_ids_last_dispatch(&log).len(), 2);
     }
 
     // ========================================================================

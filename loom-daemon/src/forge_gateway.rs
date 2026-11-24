@@ -58,9 +58,25 @@
 //! `.loom/gh-config-gateway/` is removed on the next pass, agents are not told
 //! about it, and [`route_read`] is exactly [`crate::forge_identity::route_read`].
 //! Below gh 2.100.0 the same holds (logged once): `api_host` would be
-//! ignored and the gateway key sent to `api.github.com`. The fleet store
-//! fetch ([`crate::fleet_store`]) never uses the gateway, so `fleet.json` can
-//! always be read to unset it.
+//! ignored and the gateway key sent to `api.github.com`.
+//!
+//! The fleet store ([`crate::fleet_store`]) never *depends* on the gateway
+//! (2am#15098, which replaced "never uses"): its cacheable reads (`fleet.json`
+//! and the other tree/blob reads, with their `If-None-Match`) try the gateway
+//! first so the relay can answer an unchanged file from its ETag cache, and a
+//! gateway that is down, refuses or cannot see the repository falls back to
+//! the reader pool, then the writer, so `fleet.json` can always be read to
+//! unset it. Still exempt, and never routed through the gateway: the fresh
+//! claim read (a claim must not be answered from a relay cache), every store
+//! write, and the repository-visibility probe.
+//!
+//! Residual risk: fallback covers a gateway that is *down*, not one that
+//! answers *wrongly*. `forge.gateway` can be set in the per-repo fleet tier,
+//! which is materialized from this very store's `fleet.json`, so a gateway
+//! serving a stale `fleet.json` that still says it is on cannot be unset by
+//! editing the store alone. The store-independent unset is the host-local
+//! `.loom-local/local.json` (`"forge": {"gateway": null}`), which outranks
+//! the fleet tier ([`crate::config_resolver::resolve_effective_config`]).
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
@@ -76,6 +92,8 @@ use crate::forge_identity::{ExhaustCause, Placement, RouteDecision, RouteRequest
 pub mod outage;
 #[path = "forge_gateway/publish.rs"]
 mod publish;
+#[path = "forge_gateway/session.rs"]
+pub mod session;
 pub use publish::{
     gateway_hosts_yaml, parse_gh_version, profile_api_host, publish_profile, refresh,
     spawn_refresh, teardown, Deps, GhVersion, PassOutcome, Refresher, GATEWAY_CONFIG_YAML,
@@ -513,10 +531,35 @@ pub fn route_read(req: &RouteRequest<'_>, now: SystemTime) -> RouteDecision {
     }
     let pool = crate::forge_identity::route_read(req, now);
     let owner = crate::credential_preflight::owner_of_nwo(req.owner_repo).to_ascii_lowercase();
-    let gateway_until = if owner.is_empty() || profile_for(&owner).is_none() {
-        None
-    } else {
-        withdrawn_until(&owner, req, now)
+    let gateway_configured = !owner.is_empty() && profile_for(&owner).is_some();
+    let gateway_until = gateway_configured
+        .then(|| withdrawn_until(&owner, req, now))
+        .flatten();
+    let pool = match pool {
+        // The gateway was part of this route. A non-primary gateway hold
+        // must veto the stronger proof from the readers behind it.
+        RouteDecision::Exhausted {
+            until,
+            cause: ExhaustCause::GraphqlPrimaryBudget,
+        } if gateway_configured
+            && (crate::forge_read_pool::is_withdrawn_at(GATEWAY_APP_ID, now)
+                || crate::forge_identity::repo_withdrawn_at(
+                    GATEWAY_APP_ID,
+                    req.owner_repo,
+                    now,
+                )
+                || !crate::forge_identity::route::primary_graphql_withdrawn_at(
+                    GATEWAY_APP_ID,
+                    &owner,
+                    now,
+                )) =>
+        {
+            RouteDecision::Exhausted {
+                until,
+                cause: ExhaustCause::Budget,
+            }
+        }
+        decision => decision,
     };
     match past_withdrawn_gateway(pool, gateway_until) {
         RouteDecision::NoPool if cli_read_route_required() => RouteDecision::Exhausted {

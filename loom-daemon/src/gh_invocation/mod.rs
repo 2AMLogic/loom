@@ -310,6 +310,9 @@ pub enum GhCompletion {
         owner: String,
         resource: crate::forge_bucket_book::Resource,
         until: std::time::SystemTime,
+        /// A gate read exhausted its primary GraphQL reader budget.
+        /// Other sheds give no evidence that another transport can read.
+        graphql_budget_exhausted: bool,
     },
     /// Not run (#12641): the work-finder tick stopped this read (deadline
     /// passed, or discovery ended). No request was sent and no reader budget
@@ -442,9 +445,13 @@ pub struct GhInvocation {
     /// (`facade.cwd_route.disagree`), so its accounting row must not count
     /// it again (one counter, one count per call).
     disagree_counted: bool,
-    /// Never route this read through the forge gateway (2am#4367 P4): the
-    /// fleet store fetch, which must work while the gateway is broken so the
-    /// gateway can be unset ([`GhInvocation::gateway_exempt`]).
+    /// Never let the facade route this call through the forge gateway
+    /// (2am#4367 P4): the fleet store's requests, which must work while the
+    /// gateway is broken so the gateway can be unset
+    /// ([`GhInvocation::gateway_exempt`]). The store's cacheable reads reach
+    /// the gateway only through their own explicit, fall-back-to-readers
+    /// attempt (2am#15098, `fleet_store::gh`); its fresh claim reads and
+    /// writes never do.
     gateway_exempt: bool,
     /// A listing the daemon makes to find work (#12310): the site said so
     /// ([`GhInvocation::discovery`]) or built the call inside a

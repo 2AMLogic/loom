@@ -48,7 +48,6 @@
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime};
 
@@ -939,19 +938,6 @@ pub fn read_credential_in_for(
         now,
     )
     .into_credential()
-}
-
-/// Point `cmd` at a reader for a read of `owner_repo`, returning the reader's
-/// app id when it did. `None` leaves `cmd` untouched for the caller's writer
-/// path (`apply_gh_config_for_*`).
-pub fn apply_read_credential(
-    cmd: &mut Command,
-    owner_repo: &str,
-    host: Option<&str>,
-) -> Option<String> {
-    let (dir, app_id) = read_credential(owner_repo, host)?;
-    cmd.env("GH_CONFIG_DIR", dir);
-    Some(app_id)
 }
 
 /// Which identity served one attempt of a read (#9872): recorded on the

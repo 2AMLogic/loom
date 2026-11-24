@@ -214,13 +214,19 @@ a *released* fleet sweep's lease (last renewed 12:14:54Z, claim dropped
 a fresh lease"), `lease ensure` stopped there, and no attended lease ever
 appeared; when the leftover aged out, another host's recovery correctly found
 only a stale lease and reclaimed at 12:35:51Z. Now an exit 4 or 2 spawns one
-detached **deferred publisher** per issue per checkout. It re-runs the same
-publish (same trusted format, same peer rules, so a live peer is never
-superseded) every 60 s, slowing to 300 s once the peer has outlived the TTL. It
-stops when a publish settles (then starts the normal renewer with the time left
-of the original cap), when the watched session dies, or at the cap. Every
-outcome is appended to `.loom/logs/lease-ensure/issue-<N>.log`. An attended
-lease's sweep id is stable per watched session
+detached **deferred publisher** per issue per checkout. It wakes every 60 s
+to retry the same publish (same trusted format and peer rules, so a live peer
+is never superseded), slowing to 300 s once the peer has outlived the TTL.
+Before an eligible retry, it checks for an open PR linked to the issue in the
+repository where it would publish. If it finds one, it logs the PR number and
+stops. If the probe cannot determine whether such a PR exists, it skips that
+wake without attempting a publish or starting a renewer. The publisher also
+stops when an attempt settles, the watched session ends, or the original age
+cap is reached. A renewer started after publication gets only the time
+remaining under that cap. Repeated indeterminate probes can exhaust the cap
+before any deferred publish attempt. Every outcome is appended to
+`.loom/logs/lease-ensure/issue-<N>.log`. An attended lease's sweep id is stable
+per watched session
 (`sweep-insession-s<pid>-<start-time>`), so a second `lease ensure` from the
 same session re-attaches to its own lease. Without that, the session's first
 lease would read as a live peer and block the second call. An in-session
@@ -499,11 +505,16 @@ the REST comments endpoint (NDJSON output across `--paginate` pages, the same
 #4637 workaround `SweepRegistry::read_lease_comments` uses), locally picks
 the one with the freshest `updated_at`, and confirms BOTH (a) that comment is
 still within `ttl_minutes` of now (default 15, same TTL Phase 2 uses) and (b)
-its `host=` field still names this sweep's own host. It is wired into the
+its `host=` field still names this sweep's own host (an optional
+`--sweep-id ID` — which the Builder recipe passes as `$LOOM_SWEEP_ID` when
+set, #15043 — additionally requires the lease's `sweep=` to equal `ID`, so
+same-host peer dispatches on a shared worker are told apart; callers
+omitting the flag keep host-only matching). It is wired into the
 Builder phase immediately before `git push` + opening the PR
 (`defaults/roles/builder-pr.md` § "Lease Fencing: Confirm You Still Own the
 Claim") — on either failure (expired AND owned by this sweep's own host,
-exit `3`; superseded by a *fresh* lease from a different host, exit `4`) the
+exit `3`; superseded by a *fresh* lease from a different host — or, with
+`--sweep-id`, a different dispatch on this same host — exit `4`) the
 Builder aborts before doing anything externally-visible, without touching
 the `loom:building` label or contesting the peer's claim. Absence of a
 matching lease comment, a malformed marker, a `gh` fetch failure, or an
@@ -812,11 +823,22 @@ the same lease semantics, **keyed by role**:
   earliest live lease, or if there is no evidence either way (an unreadable
   list, or a claimant on an older prompt that never leased). Exit 3 if its own
   lease is no longer live. Exit 4 if a peer's live lease is earliest.
-- **`release`** tombstones and signals the renewer, then rewrites the lease's
-  first line to `loom:pr-lease-released`. The claim frees at once, without
-  waiting out the TTL.
+- **`release`** tombstones and signals the renewer, then rewrites the lease
+  comment: its first line to `loom:pr-lease-released`, and its prose to the
+  released wording (#14807) — `reaped` when the role runner released it for a
+  claimant that ended without releasing — so a human reading the PR never sees
+  a live-looking claim behind a released marker. That lease stops blocking
+  immediately. Other live leases and any Judge no-verdict hold still apply.
 - **`check`** prints `PR_LEASE_STATE=free|held-self|held-peer|unknown`: the
   PR-phase shape of #11118's `claim_state(item)`.
+  This read-only command exits 0 for `free` or `held-self`, 4 for `held-peer`
+  (including the holder's host and sweep), and 5 for an unreadable lease list
+  (`unknown`). When a Judge has no live lease and the backstop holds the PR,
+  `check` exits 6 with `PR_LEASE_STATE=held-backstop` and
+  `PR_LEASE_BACKSTOP_UNTIL=<RFC3339>`. A gate-refusal
+  cooldown also includes `PR_LEASE_BACKSTOP_REFUSED=<token>`. A live lease
+  takes precedence. Other roles, a disabled backstop, and an unreadable PR
+  head report `free` when the lease is free.
 - **Judge no-verdict backstop (#11855).** A Judge `release` that finds the PR
   open, still `loom:review-requested` and carrying neither `loom:pr` nor
   `loom:changes-requested` appends `head=<sha> verdict=none labels=<digest>`

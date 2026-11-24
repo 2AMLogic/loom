@@ -1,8 +1,7 @@
 //! [`TickReport`] and the per-candidate `dispatch()` outcome classification
-//! (Issue #8907), split out of `work_finder.rs`, which is frozen by the
-//! file-size ratchet. Both tick loops call [`record_dispatch_outcome`], so
-//! the single- and multi-workspace ticks cannot drift apart on how a typed
-//! refusal is counted, logged or exported.
+//! (Issue #8907), split out of `work_finder.rs`. Both tick loops call
+//! [`record_dispatch_outcome`], so the single- and multi-workspace ticks
+//! cannot drift apart on how a typed refusal is counted, logged or exported.
 
 use anyhow::Result;
 use chrono::{DateTime, Utc};

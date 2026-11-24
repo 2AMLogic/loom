@@ -241,6 +241,10 @@ const SHARED_VERB_HELP: &str = "Act on the shared machine-level pool \
 
 pub(crate) fn handle_api_keys_command(action: ApiKeysAction, workspace: &str) -> Result<()> {
     let workspace = resolve_tokens_workspace(workspace)?;
+    // The workspace's `runtimes.apiKeyLimits` block, resolved once (#14932):
+    // every verb below reports the limits the pool enforces — the host's
+    // `.limits.json` merged with it — with each one's source.
+    let configured = limits::ConfiguredLimits::from_workspace(&workspace);
     match action {
         ApiKeysAction::Add {
             provider,
@@ -279,7 +283,7 @@ pub(crate) fn handle_api_keys_command(action: ApiKeysAction, workspace: &str) ->
                 limits::set_max_concurrent(&root, &provider, &name, max_concurrent)
                     .map_err(anyhow::Error::msg)?;
             }
-            let account = registry::describe_account(&root, &provider, &name);
+            let account = registry::describe_account(&root, &provider, &name, &configured);
             // A registration `add` itself cannot describe as usable must not
             // exit 0 — e.g. a bare all-uppercase base32 key gets its `=`
             // padding split off and only the padding is stored (issue #8450
@@ -307,7 +311,7 @@ pub(crate) fn handle_api_keys_command(action: ApiKeysAction, workspace: &str) ->
             let roots = acting_roots(&workspace, shared)?;
             // `?`: an unreadable pool is reported as such, never as "no
             // accounts registered".
-            let accounts = select::list_accounts_in(&roots, provider.as_deref())?;
+            let accounts = select::list_accounts_in(&roots, provider.as_deref(), &configured)?;
             if json {
                 println!("{}", serde_json::to_string_pretty(&accounts)?);
             } else if accounts.is_empty() {
@@ -392,7 +396,7 @@ pub(crate) fn handle_api_keys_command(action: ApiKeysAction, workspace: &str) ->
                 limits::set_plan_token_limit(&root, &provider, &name, plan_token_limit)
                     .map_err(anyhow::Error::msg)?;
             }
-            print_account(&registry::describe_account(&root, &provider, &name), json)
+            print_account(&registry::describe_account(&root, &provider, &name, &configured), json)
         }
         ApiKeysAction::Sync {
             from,
@@ -422,7 +426,7 @@ pub(crate) fn handle_api_keys_command(action: ApiKeysAction, workspace: &str) ->
             json,
         } => {
             let roots = acting_roots(&workspace, shared)?;
-            let snapshot = select::health_in(&roots, provider.as_deref())?;
+            let snapshot = select::health_in(&roots, provider.as_deref(), &configured)?;
             let unreadable: Vec<String> = snapshot
                 .iter()
                 .filter(|p| p.unreadable.is_some())
@@ -558,9 +562,19 @@ fn set_enabled(
     json: bool,
 ) -> Result<()> {
     let root = provider_root(workspace, provider, shared)?;
-    let account =
-        registry::set_enabled(&root, provider, name, enabled).map_err(anyhow::Error::msg)?;
-    print_account(&account, json)
+    registry::set_enabled(&root, provider, name, enabled).map_err(anyhow::Error::msg)?;
+    // Re-described with the workspace's config: the mutation returns a
+    // file-only view (#14932), and this line is where the operator reads the
+    // cap now in force.
+    print_account(
+        &registry::describe_account(
+            &root,
+            provider,
+            name,
+            &limits::ConfiguredLimits::from_workspace(workspace),
+        ),
+        json,
+    )
 }
 
 /// The root a *writing* verb (`add`, `sync`) targets: the shared machine-level
@@ -771,7 +785,15 @@ fn print_account(account: &ApiKeyAccount, json: bool) -> Result<()> {
         println!("{}", serde_json::to_string_pretty(account)?);
         return Ok(());
     }
-    println!(
+    println!("{}", account_line(account));
+    Ok(())
+}
+
+/// One account as a human reads it. Cannot print key material:
+/// [`ApiKeyAccount`] does not carry it.
+#[must_use]
+fn account_line(account: &ApiKeyAccount) -> String {
+    format!(
         "{}/{}: {} (variable={}, permissions={}{}{})",
         account.provider,
         account.name,
@@ -789,21 +811,31 @@ fn print_account(account: &ApiKeyAccount, json: bool) -> Result<()> {
         } else {
             "TOO OPEN"
         },
-        account
-            .max_concurrent
-            .map_or(String::new(), |cap| format!(", maxConcurrent={cap}"))
-            + &account
-                .exhaustion_window_secs
-                .map_or(String::new(), |secs| format!(", exhaustionWindowSecs={secs}"))
-            + &account
-                .plan_token_limit
-                .map_or(String::new(), |tokens| format!(", planTokenLimit={tokens}")),
+        declared_limit(
+            "maxConcurrent",
+            account.max_concurrent.map(|cap| cap.to_string()),
+            account.max_concurrent_source,
+        ) + &declared_limit(
+            "exhaustionWindowSecs",
+            account.exhaustion_window_secs.map(|secs| secs.to_string()),
+            account.exhaustion_window_secs_source,
+        ) + &declared_limit(
+            "planTokenLimit",
+            account.plan_token_limit.map(|tokens| tokens.to_string()),
+            account.plan_token_limit_source,
+        ),
         account
             .problem
             .as_ref()
             .map_or(String::new(), |p| format!(", problem={p}")),
-    );
-    Ok(())
+    )
+}
+
+/// A declared limit followed by where it came from (#14932) —
+/// `maxConcurrent=1 (config)` — or nothing, when the limit is not declared.
+#[must_use]
+fn declared_limit(name: &str, value: Option<String>, source: limits::LimitSource) -> String {
+    value.map_or(String::new(), |value| format!(", {name}={value} ({})", source.label()))
 }
 
 /// `<N>[s|m|h|d]` as seconds (#11286's `--exhaustion-window`). A bare number
@@ -904,6 +936,44 @@ mod tests {
         for bad in ["0", "0d", "", "d", "7w", "-1h", "1.5h"] {
             assert!(parse_window(bad).is_err(), "{bad:?}");
         }
+    }
+
+    /// #14932: every declared limit says where it came from — in the text
+    /// line and in the JSON — and one nothing declares is reported `absent`.
+    #[test]
+    fn a_listed_limit_names_its_source() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = per_repo_api_keys_dir(tmp.path());
+        registry::add(&root, "zai", "alice", "ZAI_API_KEY", "fake-key", false).unwrap();
+        limits::set_max_concurrent(&root, "zai", "alice", Some(1)).unwrap();
+        let configured = limits::ConfiguredLimits::from_config(&serde_json::json!({
+            "runtimes": {
+                "apiKeyLimits": {
+                    "zai": { "alice": { "maxConcurrent": 2, "exhaustionWindowSecs": 604_800 } }
+                }
+            }
+        }));
+        let alice =
+            &select::list_accounts_in(std::slice::from_ref(&root), Some("zai"), &configured)
+                .unwrap()[0];
+
+        let line = account_line(alice);
+        assert!(line.contains("maxConcurrent=1 (both, file wins)"), "{line}");
+        assert!(line.contains("exhaustionWindowSecs=604800 (config)"), "{line}");
+        assert!(!line.contains("planTokenLimit="), "{line}");
+        assert!(!line.contains("fake-key"), "{line}");
+        let json = serde_json::to_value(alice).unwrap();
+        assert_eq!(json["maxConcurrent"], 1);
+        assert_eq!(json["maxConcurrentSource"], "both-file");
+        assert_eq!(json["exhaustionWindowSecsSource"], "config");
+        assert_eq!(json["planTokenLimitSource"], "absent");
+
+        // No config block: the line is the old one with the source appended.
+        let file_only =
+            registry::describe_account(&root, "zai", "alice", &limits::ConfiguredLimits::EMPTY);
+        let line = account_line(&file_only);
+        assert!(line.contains("maxConcurrent=1 (file)"), "{line}");
+        assert!(!line.contains("exhaustionWindowSecs="), "{line}");
     }
 
     #[test]
@@ -1072,8 +1142,12 @@ mod tests {
         assert!(shadowed.is_err(), "the shared account must be shadowed without --shared");
 
         // `list --shared` sees it...
-        let listed =
-            select::list_accounts_in(std::slice::from_ref(&shared_root), Some("loomtest")).unwrap();
+        let listed = select::list_accounts_in(
+            std::slice::from_ref(&shared_root),
+            Some("loomtest"),
+            &limits::ConfiguredLimits::EMPTY,
+        )
+        .unwrap();
         assert_eq!(listed.iter().map(|a| a.name.as_str()).collect::<Vec<_>>(), vec!["shared-one"]);
         // ...and `disable --shared` manages it, without touching the per-repo
         // account of the same provider.
@@ -1088,11 +1162,23 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            registry::describe_account(&shared_root, "loomtest", "shared-one").ineligible,
+            registry::describe_account(
+                &shared_root,
+                "loomtest",
+                "shared-one",
+                &limits::ConfiguredLimits::EMPTY
+            )
+            .ineligible,
             Some(registry::Ineligible::Disabled)
         );
         assert_eq!(
-            registry::describe_account(&repo_root, "loomtest", "local-one").ineligible,
+            registry::describe_account(
+                &repo_root,
+                "loomtest",
+                "local-one",
+                &limits::ConfiguredLimits::EMPTY
+            )
+            .ineligible,
             None,
             "--shared must not reach into the per-repo pool"
         );
@@ -1135,7 +1221,8 @@ mod tests {
             registry::describe_account(
                 &per_repo_api_keys_dir(repo.path()),
                 "loomtest",
-                "local-one"
+                "local-one",
+                &limits::ConfiguredLimits::EMPTY
             )
             .env_name
             .is_some(),
@@ -1161,7 +1248,12 @@ mod tests {
         )
         .unwrap();
         let root = per_repo_api_keys_dir(&workspace);
-        let account = registry::describe_account(&root, "zai-metered", "acct");
+        let account = registry::describe_account(
+            &root,
+            "zai-metered",
+            "acct",
+            &limits::ConfiguredLimits::EMPTY,
+        );
         assert_eq!(account.env_name.as_deref(), Some("ZAI_API_KEY"));
         assert_eq!(account.ineligible, None, "{account:?}");
     }

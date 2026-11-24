@@ -665,6 +665,10 @@ pub struct Resolved {
     pub params: Hyperparameters,
     /// Per-field provenance, keyed by dotted field name.
     pub sources: BTreeMap<String, Source>,
+    /// The registered prompt modifier this run was launched under
+    /// (`$LOOM_PROMPT_MODIFIER`, Issue #15017), when one is set. Part of the
+    /// digest, not of [`Hyperparameters`]: it is a per-run label, not a tunable.
+    pub prompt_modifier: Option<String>,
 }
 
 impl Resolved {
@@ -673,14 +677,39 @@ impl Resolved {
     /// ⇒ same digest, any two runs.
     #[must_use]
     pub fn digest(&self) -> String {
-        digest_of(&self.params)
+        digest_with(&self.params, self.prompt_modifier.as_deref())
     }
 }
 
 /// `sha256:<hex>` over the canonical JSON of a vector.
 #[must_use]
 pub fn digest_of(params: &Hyperparameters) -> String {
-    let serialized = serde_json::to_string(params).unwrap_or_default();
+    digest_with(params, None)
+}
+
+/// [`digest_of`], with the run's prompt modifier folded in (Issue #15017).
+///
+/// With no modifier the serialization is byte-identical to the bare vector's,
+/// so every existing digest is unchanged. With one, `promptModifier` is
+/// appended after the last group, so two runs that differ only in the modifier
+/// hash differently.
+#[must_use]
+pub fn digest_with(params: &Hyperparameters, prompt_modifier: Option<&str>) -> String {
+    #[derive(Serialize)]
+    struct WithModifier<'a> {
+        #[serde(flatten)]
+        params: &'a Hyperparameters,
+        #[serde(rename = "promptModifier")]
+        prompt_modifier: &'a str,
+    }
+    let serialized = match prompt_modifier {
+        None => serde_json::to_string(params),
+        Some(name) => serde_json::to_string(&WithModifier {
+            params,
+            prompt_modifier: name,
+        }),
+    }
+    .unwrap_or_default();
     let hash = Sha256::digest(serialized.as_bytes());
     format!("sha256:{}", hex::encode(hash))
 }
@@ -951,7 +980,11 @@ pub fn resolve_effective(root: &Path) -> Resolved {
         },
     };
     sources.extend(item_sources);
-    Resolved { params, sources }
+    Resolved {
+        params,
+        sources,
+        prompt_modifier: crate::prompt_modifier::current().map(str::to_owned),
+    }
 }
 
 /// The vector captured at daemon startup, when [`startup_init`] has run.
@@ -1054,7 +1087,8 @@ pub fn startup_init(root: &Path) -> Result<()> {
 /// vector (#9768).
 #[derive(Debug, Args)]
 pub struct HyperparamsArgs {
-    /// Emit machine-readable JSON (`params`, `sources`, `digest`) instead of
+    /// Emit machine-readable JSON (`params`, `sources`, `digest`, plus
+    /// `promptModifier` when `$LOOM_PROMPT_MODIFIER` is set) instead of
     /// a human-readable table. With `--validate`, emit the violations as a
     /// JSON array instead of prose lines.
     #[arg(long)]
@@ -1123,7 +1157,7 @@ impl HyperparamsArgs {
         let resolved = resolve_effective(&self.workspace);
         let digest = resolved.digest();
         if self.json {
-            let out = serde_json::json!({
+            let mut out = serde_json::json!({
                 "params": resolved.params,
                 "sources": resolved
                     .sources
@@ -1132,10 +1166,17 @@ impl HyperparamsArgs {
                     .collect::<BTreeMap<_, _>>(),
                 "digest": digest,
             });
+            // Only when set (#15017): an unmodified run's output is unchanged.
+            if let (Some(name), Some(map)) = (&resolved.prompt_modifier, out.as_object_mut()) {
+                map.insert("promptModifier".into(), Value::String(name.clone()));
+            }
             println!("{out}");
             return Ok(());
         }
         println!("digest: {digest}");
+        if let Some(name) = &resolved.prompt_modifier {
+            println!("promptModifier                 = {name}  [env]");
+        }
         println!(
             "dispatch.tickIntervalSecs      = {:>6}  [{}]",
             resolved.params.dispatch.tick_interval_secs,
