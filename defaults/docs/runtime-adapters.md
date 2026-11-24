@@ -1439,11 +1439,14 @@ nothing, and nothing about the role draw or fleet dispatch changes.
   (`claude`, `codex`, ...) gets the modified `-p` / `--prompt` value in the argv it is
   exec'd with; a native harness (`pi`, `opencode`, `kimi`) gets it after the expanded
   role prompt, on its stdin.
-- **Fails closed at preflight.** A name that is malformed, not registered, registered
-  but with no entry for the launch's runtime, or paired with an argv that has no
-  prompt to modify is refused with exit 78 and `stage=prompt_modifier`
-  (`loom.admission.stage` on the preflight span, ledger reason
-  `preflight_prompt_modifier`). It never runs plain under the modifier's name.
+- **Fails closed at preflight.** A name that is malformed, not registered, or
+  registered but with no entry for the launch's runtime is refused with exit 78 and
+  `stage=prompt_modifier` (`loom.admission.stage` on the preflight span, ledger
+  reason `preflight_prompt_modifier`). So is a legacy adapter (`claude`, `codex`,
+  ...) paired with an argv that has no `-p` / `--prompt` to modify. A native
+  harness (`pi`, `opencode`, `kimi`) refuses a missing `--prompt` earlier still,
+  at `stage=worker_options` (ledger reason `preflight_worker_options`). Either way
+  it never runs plain under the modifier's name.
 - **Recorded.** `loom.prompt_modifier` is stamped like the other provenance keys,
   so it is on `loom.dispatch.step`, `loom.role_attempt` and `loom.runtime.usage`
   (and the other spans of that process), and is absent when no modifier is set. It is

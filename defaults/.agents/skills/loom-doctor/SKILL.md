@@ -890,7 +890,8 @@ Use this reclaim comment:
 # The lease first: a live peer lease (exit 4) means stand down, label untouched.
 loom-daemon lease pr claim $N --role doctor --watch-pid "${LOOM_AGENT_SESSION_PID:-${CLAUDE_PID:-$PPID}}"; [[ $? =~ ^[02]$ ]] &&
 gh pr edit $N --remove-label "loom:treating" &&
-./.loom/scripts/post-comment.sh $N --pr --body "Reclaiming loom:treating claim: $STANDDOWN_COUNT stand-down passes, no fix progress for ${LOOM_STALE_TREATING_MINUTES:-60}m (bounded by LOOM_MAX_STANDDOWN_STREAK=${LOOM_MAX_STANDDOWN_STREAK:-3}) — breaking the livelock." &&
+./.loom/scripts/post-comment.sh $N --pr --body "Reclaiming loom:treating claim: $STANDDOWN_COUNT stand-down passes, no fix progress for ${LOOM_STALE_TREATING_MINUTES:-60}m (bounded by LOOM_MAX_STANDDOWN_STREAK=${LOOM_MAX_STANDDOWN_STREAK:-3}) — breaking the livelock.
+<!-- loom:reclaim claim=$CLAIMED_AT -->" &&
 gh pr edit $N --add-label "loom:treating"
 CLAIM_HEAD_SHA=$(gh pr view $N --json headRefOid --jq '.headRefOid')
 # Continue to step 3 (Check PR details) and fix normally
@@ -902,11 +903,19 @@ CLAIM_HEAD_SHA=$(gh pr view $N --json headRefOid --jq '.headRefOid')
 # The lease first: a live peer lease (exit 4) means stand down, label untouched.
 loom-daemon lease pr claim $N --role doctor --watch-pid "${LOOM_AGENT_SESSION_PID:-${CLAUDE_PID:-$PPID}}"; [[ $? =~ ^[02]$ ]] &&
 gh pr edit $N --remove-label "loom:treating" &&
-./.loom/scripts/post-comment.sh $N --pr --body "Reclaiming stale loom:treating claim (idle ${IDLE_MINUTES}m > ${LOOM_STALE_TREATING_MINUTES:-60}m, no claimant activity) — the prior process likely died mid-fix." &&
+./.loom/scripts/post-comment.sh $N --pr --body "Reclaiming stale loom:treating claim (idle ${IDLE_MINUTES}m > ${LOOM_STALE_TREATING_MINUTES:-60}m, no claimant activity) — the prior process likely died mid-fix.
+<!-- loom:reclaim claim=$CLAIMED_AT -->" &&
 gh pr edit $N --add-label "loom:treating"
 CLAIM_HEAD_SHA=$(gh pr view $N --json headRefOid --jq '.headRefOid')
 # Continue to step 3 (Check PR details) and fix normally
 ```
+
+**Both reclaim comments end with the `loom:reclaim` claim marker
+keyed to `$CLAIMED_AT` (#15044)**: the forge timeline can lag the label remove + re-add above,
+and `claim-staleness.sh` then matches this marker against the stale verdict it
+computed from the pre-reclaim timestamp — so your replacement claim reads
+`fresh` while you are active and is not reclaimed in turn (and `unknown`, never
+stale, once you go idle).
 
 **Env vars**: `LOOM_STALE_TREATING_MINUTES` (default **60**) — deliberately
 longer than the Judge's `LOOM_STALE_REVIEWING_MINUTES` (45): a Doctor's fix

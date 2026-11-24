@@ -260,6 +260,10 @@ renewer_pids() { ps -axww -o pid= -o ppid= -o stat= -o command= | renewer_roots;
 renewers() { renewer_pids | wc -l | tr -d ' '; }
 has_renewer() { [[ "$(renewers)" -ge 1 ]]; }
 no_renewers() { [[ "$(renewers)" -eq 0 ]]; }
+# A repeat `ensure` can return while a transient foreground `start` shell of its
+# own still matches the census (#15147). Wait for the census to settle to exactly
+# the expected root; a genuine second detached loop never settles, so it still fails.
+sole_renewer_is() { [[ "$(renewer_pids)" == "$1" ]]; }
 has_patch() { [[ "$(patches)" -ge 1 ]]; }
 deferred_publishers() { pgrep -f "loom-tools lease ensure $ISSUE --deferred .*--watch-pid $SESSION_PID( |$)"; }
 no_deferred_publishers() { ! deferred_publishers > /dev/null; }
@@ -321,6 +325,7 @@ assert_eq 1 "$(renewers)" "(b) one renewer is running"
 FIRST_LOOP="$(sed -n 's/.*renewal loop \([0-9]*\) is running.*/\1/p' <<< "$OUT")"
 OUT2="$(ensure)"
 assert_eq 1 "$(posts)" "(b) the repeat posted no second lease"
+wait_for 5 sole_renewer_is "$FIRST_LOOP"
 assert_eq "$FIRST_LOOP" "$(renewer_pids)" "(b) the repeat left the original renewer as the only loop root"
 OWNERS="$(find "$LOOM_LEASE_RENEW_STATE_DIR" -type f ! -name '.lock' ! -name '*.tmp*' 2> /dev/null | wc -l | tr -d ' ')"
 assert_eq 1 "$OWNERS" "(b) exactly one owner record exists"
@@ -512,6 +517,7 @@ routed_lifecycle() {
     assert_eq "$loop" "$(owner_pids)" "$LOOM_MODE ensure records its exact renewer as owner"
     OUT="$(ensure)"
     assert_match "renewal loop $loop is running" "$OUT" "$LOOM_MODE repeat reuses its renewer"
+    wait_for 5 sole_renewer_is "$loop"
     assert_eq "$loop" "$(renewer_pids)" "$LOOM_MODE repeat leaves the same single detached process"
     assert_eq 1 "$(posts)" "$LOOM_MODE repeat reuses its lease"
     assert_eq "$loop" "$(owner_pids)" "$LOOM_MODE repeat leaves the same owner record"

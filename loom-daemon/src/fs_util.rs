@@ -2,9 +2,10 @@
 //! (`target_dir_gc`, `tmpfs_reclaim`, `scratch_reclaim`, `git_tmp_reclaim`,
 //! `docker_image_clean`, `target_orphan_reclaim`).
 
+use std::ffi::OsStr;
 use std::fs;
 use std::io::{self, Write as _};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, Utc};
 
@@ -150,6 +151,33 @@ pub(crate) fn check_executable(path: &Path) -> io::Result<()> {
     Ok(())
 }
 
+/// Find `name` as an executable file in `search_path` (a `$PATH`-shaped
+/// `OsStr`), returning the first matching candidate. Mirrors a shell's
+/// `command -v` lookup without spawning one: the first directory holding a
+/// regular file (symlinks followed) with any execute bit set wins, so a
+/// non-executable stub earlier in the path cannot shadow a real executable
+/// further on. [`find_executable_on_path`] is the process-`$PATH` form.
+#[must_use]
+pub fn find_executable_in(name: &str, search_path: &OsStr) -> Option<PathBuf> {
+    std::env::split_paths(search_path)
+        .map(|dir| dir.join(name))
+        .find(|candidate| is_executable(candidate))
+}
+
+/// [`find_executable_in`] against the process `$PATH`: `None` when `$PATH` is
+/// unset or nothing resolves to an executable file.
+#[must_use]
+pub fn find_executable_on_path(name: &str) -> Option<PathBuf> {
+    std::env::var_os("PATH").and_then(|paths| find_executable_in(name, &paths))
+}
+
+/// Whether `name` resolves to an executable file on the process `$PATH` —
+/// `command -v <name>` without the shell.
+#[must_use]
+pub fn is_on_path(name: &str) -> bool {
+    find_executable_on_path(name).is_some()
+}
+
 /// Keep only the last `max` bytes of captured output, snapped forward to a
 /// char boundary and trimmed of surrounding whitespace (the failure detail is
 /// usually last).
@@ -193,6 +221,50 @@ mod tests {
             fs::set_permissions(&f, fs::Permissions::from_mode(0o755)).unwrap();
             assert!(is_executable(&f));
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn find_executable_in_skips_non_executable_shadows_and_directories() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let td = tempfile::tempdir().unwrap();
+        let early = td.path().join("early");
+        let late = td.path().join("late");
+        let dir_collision = td.path().join("collision");
+        for d in [&early, &late, &dir_collision.join("tool")] {
+            fs::create_dir_all(d).unwrap();
+        }
+
+        // A non-executable regular file earlier on the path must not shadow
+        // the real executable further on.
+        fs::write(early.join("tool"), b"stub").unwrap();
+        let real = late.join("tool");
+        fs::write(&real, b"#!/bin/sh\n").unwrap();
+        fs::set_permissions(&real, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let joined = std::env::join_paths([&early, &late]).expect("join_paths of two temp dirs");
+        assert_eq!(find_executable_in("tool", &joined), Some(real.clone()));
+
+        // Without the executable further on, nothing resolves at all.
+        let only_early = std::env::join_paths([&early]).unwrap();
+        assert_eq!(find_executable_in("tool", &only_early), None);
+        // A directory named like the tool is not a candidate either.
+        let only_collision = std::env::join_paths([&dir_collision]).unwrap();
+        assert_eq!(find_executable_in("tool", &only_collision), None);
+        // An empty search path finds nothing.
+        let empty = std::env::join_paths(std::iter::empty::<&Path>()).unwrap();
+        assert_eq!(find_executable_in("tool", &empty), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn is_on_path_matches_the_shared_lookup() {
+        // `sh` exists on every supported host; the bool form must agree with
+        // the resolving form on the same process `$PATH`.
+        assert_eq!(is_on_path("sh"), find_executable_on_path("sh").is_some());
+        assert!(is_on_path("sh"), "sh must resolve on a supported host's PATH");
+        assert!(!is_on_path("definitely-not-a-real-tool-loom-fs-util"));
     }
 
     #[test]

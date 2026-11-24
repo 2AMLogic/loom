@@ -33,7 +33,12 @@ extract() { awk -v re="^$1\\\\(\\\\) \\\\{" '$0 ~ re {f=1} f{print} /^\}/{if(f) 
 
 VPP="$(extract verify_plan_provenance)"
 SPB="$(extract splice_plan_body)"
-[[ -n "$VPP" && -n "$SPB" ]] || { echo "FATAL: helpers not found in guide.md"; exit 1; }
+HELPERS="$(extract open_pr_linkage_rows; extract open_pr_annotation)"
+[[ -n "$VPP" && -n "$SPB" && -n "$HELPERS" ]] || { echo "FATAL: helpers not found in guide.md"; exit 1; }
+# #14785: verify_plan_provenance() gates the open-PR listing through the
+# same open_pr_linkage_rows()/open_pr_annotation() helpers the render uses,
+# so they must be in scope wherever the gate runs.
+eval "$HELPERS"
 pass "helpers extracted from $GUIDE_MD"
 
 echo "Test 1: queries are pinned"
@@ -52,7 +57,19 @@ cat >"$GH_STUB" <<'EOF'
 #!/usr/bin/env bash
 [[ "${FAIL_LOOKUP:-}" == 1 ]] && exit 1
 if [[ "$2" == list ]]; then
-  if [[ "$1 $3 $4" == "pr --label loom:pr" ]]; then
+  # #14785: render_plan_body()/the gate fetch ONE unlabelled open-PR
+  # inventory (`pr list --state open`); the gate's Approved closing-refs
+  # check keeps its own `--label "loom:pr"` query. Both serve the fixture
+  # rows (state-filtered when --state is passed; rows without a state field
+  # count as open, matching the pre-#14785 fixtures). The ready query serves
+  # #1 "Add widget" so the render's open-PR listing section has a row.
+  state=""
+  prev=""
+  for a in "$@"; do
+    if [[ "$prev" == "--state" ]]; then state="$a"; fi
+    prev="$a"
+  done
+  if [[ "$1 $3 $4" == "pr --label loom:pr" || "$1 $3 $4" == "pr --state open" ]]; then
     fields="${!#}"
     filter='.'
     if [[ "${*: -2:1}" == --jq ]]; then
@@ -60,6 +77,9 @@ if [[ "$2" == list ]]; then
       filter="${!#}"
     fi
     rows="$APPROVED_PRS"
+    if [[ -n "$state" ]]; then
+      rows="$(printf '%s' "$rows" | jq --arg s "$state" '[.[] | select((.state // "open") == $s)]')"
+    fi
     if [[ ",$fields," != *,title,* ]]; then
       echo lookup >> "$0.calls"
       [[ "${FAIL_REFS:-}" == 1 ]] && exit 1
@@ -68,11 +88,16 @@ if [[ "$2" == list ]]; then
       [[ "${EMPTY_REFS:-}" == 1 ]] && exit 0
       [[ "${WS_REFS:-}" == 1 ]] && { printf '  \n\t '; exit 0; }
       rows="${VERIFY_PRS:-$APPROVED_PRS}"
+      if [[ -n "$state" ]]; then
+        rows="$(printf '%s' "$rows" | jq --arg s "$state" '[.[] | select((.state // "open") == $s)]')"
+      fi
     fi
     # Apply the requested field projection before the actual gh --jq filter.
     jq -r --arg fields "$fields" \
       'map(with_entries(select(.key as $key | ($fields | split(",") | index($key))))) | '"$filter" \
       <<< "$rows"
+  elif [[ "$1 $3 $4" == "issue --label loom:issue" ]]; then
+    printf '%s' '[{"number":1,"title":"Add widget","labels":[{"name":"loom:issue"}]}]'
   else
     jq -r "${!#}" <<< '[]'
   fi
@@ -84,6 +109,7 @@ case "$2" in
   repos/owner/mine/issues/3) echo "Odd title *(held)*" ;;
   repos/owner/mine/issues/4) echo "Title — closes #42" ;;
   repos/owner/mine/issues/5) echo "Frozen pull request" ;;
+  repos/owner/mine/issues/9) echo "Partial widget work" ;;
   repos/owner/mine/issues/13582) echo "fix: honour a trusted loom:issue adoption in the promotion author gate" ;;
   *) exit 1 ;;
 esac
@@ -136,14 +162,21 @@ FAIL_LOOKUP=1 verify_plan_provenance '- **#1**: Add widget *(held)*' 2>/dev/null
 echo "Test 2c: verify the rendered Approved section against forge closing refs"
 # #13582 is the reported PR (title and closing ref captured with gh pr view).
 # The other rows exercise unsorted refs and a literal title with no annotation.
+# #14785: every row now carries its labels (approved_json is a filter of the
+# broadened inventory, not a pre-filtered `--label loom:pr` query), and PR #9
+# partially closes #1 — the ready query serves #1, so the render's open-PR
+# listing section has a row for the gate to verify.
 export APPROVED_PRS='[
-  {"number":13582,"title":"fix: honour a trusted loom:issue adoption in the promotion author gate","closingIssuesReferences":[{"number":13578}]},
-  {"number":1,"title":"Add widget","closingIssuesReferences":[{"number":42},{"number":7}]},
-  {"number":4,"title":"Title — closes #42","closingIssuesReferences":[]},
-  {"number":5,"title":"Frozen pull request","labels":[{"name":"loom:pr"},{"name":"loom:frozen"}],"closingIssuesReferences":[{"number":12}]}
+  {"number":13582,"title":"fix: honour a trusted loom:issue adoption in the promotion author gate","labels":[{"name":"loom:pr"}],"closingIssuesReferences":[{"number":13578}]},
+  {"number":1,"title":"Add widget","labels":[{"name":"loom:pr"}],"closingIssuesReferences":[{"number":42},{"number":7}]},
+  {"number":4,"title":"Title — closes #42","labels":[{"name":"loom:pr"}],"closingIssuesReferences":[]},
+  {"number":5,"title":"Frozen pull request","labels":[{"name":"loom:pr"},{"name":"loom:frozen"}],"closingIssuesReferences":[{"number":12}]},
+  {"number":9,"title":"Partial widget work","labels":[{"name":"loom:pr"}],"closingIssuesReferences":[{"number":1}]}
 ]'
 eval "$RPB"
-approved_body="$(render_plan_body | awk '/^## / {approved=($0 == "## Approved (Awaiting Merge)")} approved')"
+RENDERED="$(render_plan_body)"
+approved_body="$(awk '/^## / {approved=($0 == "## Approved (Awaiting Merge)")} approved' <<<"$RENDERED")"
+openpr_body="$(awk '/^## Issues with Open PRs/{f=1;next} /^## /{f=0} f' <<<"$RENDERED")"
 assert_contains "$approved_body" 'Add widget — closes #7, #42' "rendered both refs in numeric order"
 assert_contains "$approved_body" 'gate — closes #13578' "rendered the reported single-ref row"
 assert_contains "$approved_body" '- **#4**: Title — closes #42' "rendered literal closes title"
@@ -164,6 +197,22 @@ FAIL_REFS=1 no "$approved_body" "unavailable refs"
 VERIFY_PRS='[]' no "$approved_body" "missing PRs"
 VERIFY_PRS="$(jq 'map(if .number == 4 then del(.closingIssuesReferences) else . end)' <<<"$APPROVED_PRS")" \
   no "$approved_body" "missing refs field on a plain-title row"
+
+echo "Test 2d (#14785): verify the rendered open-PR listing through the same helpers"
+assert_contains "$openpr_body" '- **#1**: Add widget — open PR #9 (approved)' \
+  "rendered the linked ready issue with its PR and stage"
+ok "$RENDERED" "the full render (Approved + open-PR listing together) passes the gate"
+for changed in ' — open PR #9 (in review)' ' — open PR #9' ' — open PRs #9 (approved)' \
+  ' — open PR #8 (approved)' ' *(held)* — open PR #9 (approved)'; do
+  no "${RENDERED/- **#1**: Add widget — open PR #9 (approved)/- **#1**: Add widget$changed}" \
+    "altered open-PR annotation [$changed]"
+done
+no "${RENDERED/- **#1**: Add widget — open PR #9 (approved)/- **#1**: Foreign title — open PR #9 (approved)}" \
+  "open-PR row with a foreign title"
+# An annotation the fresh inventory does not derive must be refused, even
+# when the title itself is genuine.
+VERIFY_PRS="$APPROVED_PRS" no "${RENDERED/- **#1**: Add widget — open PR #9 (approved)/- **#1**: Add widget — open PR #9 (approved), #4 (approved)}" \
+  "invented extra linking PR in the annotation"
 # #14575: a single bare Approved row needs closing-reference evidence even when
 # the forge lookup succeeds — a zero-byte or whitespace-only response carries no
 # JSON value for the matching PR (jq 1.6 exits 0 on it). A jq 1.6 emulator on

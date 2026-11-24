@@ -197,17 +197,38 @@ recording run needs the terminal on stdin for its confirmation.
 | repository and issue | it is copied to another issue or repo |
 | decision digest (question, context, every option's id/label/why, ranking, recommendation, deadline, links) | the decision is edited or superseded, **even with the same option ids** |
 | option digest | the approved option's text changes under the same id |
-| scope digest (title + body, minus the managed decision section, the `## Original report` heading and standalone `<!-- loom:… -->` bookkeeping markers such as `loom:estimate`) | the proposal is edited |
+| scope digest (title + body, minus the managed decision section, the `## Original report` heading and standalone `<!-- loom:… -->` bookkeeping markers such as `loom:estimate`) | the proposal is edited (not for a history-recovered decision: see below) |
 | the option id and effect | a second, different resolution appears (conflict: the gate stays closed until one is deleted) |
 
 Labels, new comments, an un-park and `loom:estimate`/`loom:points` markers are
 not inputs, so a routine queue transition keeps a valid resolution valid.
 Re-publishing a byte-identical decision on the same unedited issue is the same
 decision instance. If a Curator enrichment rewrites the body after approval,
-the resolution goes stale: enrich through a comment, or resolve again. When
+the resolution goes stale: enrich through a comment, or resolve again (this
+holds while the body carries its ` ```decision ` block). When
 the block was recovered from the edit history (#15108), both digests are
 computed over that recovered version's text — the exact decision the operator
 reviewed — together with the issue's current title.
+
+**A ruled issue's scope stays pinned to the ruling.** The history fallback
+fires only while the body carries no ` ```decision ` block, and for a ruled
+issue that is permanent (bounded by the 100-edit history window: past it the
+resolution reads unreadable, not pinned): the block was replaced by the "Operator ruling"
+section and does not come back. So for a history-recovered decision the scope
+digest is fixed to the recovered snapshot plus the issue's **current title**,
+and a later rewrite of the **body** — a Curator enrichment, or a rescope —
+does **not** stale the resolution. That is intended for enrichment (it must
+not bounce a ruling back for re-confirmation), but the gate cannot tell an
+enrichment from a material rescope: both leave the resolution valid, and a
+rescoped proposal passes the gate as `proceed` on text the operator never
+saw. The title is the only part of the scope that still moves the digest.
+Only accounts that can edit an issue body (the operator and fleet roles) can
+do this. Resolving again does not help — it recovers the same snapshot. If a
+ruled issue's body is materially rescoped, re-publish a decision with
+`apply`: the body then carries a block, the fallback no longer fires, and the
+digests bind to the current text, so the old resolution goes stale. A
+second digest that makes a post-ruling rescope visible would change the
+resolution record format and needs its own design decision (#15148).
 
 ### Who counts
 

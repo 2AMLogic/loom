@@ -482,14 +482,6 @@ pub fn global() -> &'static DemandLedger {
     LEDGER.get_or_init(DemandLedger::default)
 }
 
-/// Open pull requests in a REST issue listing (which also returns issues).
-#[must_use]
-pub fn count_pr_rows(rows: &[RestIssue]) -> usize {
-    rows.iter()
-        .filter(|r| r.is_pull_request && r.state.eq_ignore_ascii_case("open"))
-        .count()
-}
-
 /// Labels that make a `loom:pr` PR one Champion will not merge — held for a
 /// human (#9410). The authoritative set is `champion-pr-merge.md`'s
 /// "`loom:blocked` / `loom:operator` PRs ... are still not merge-eligible".

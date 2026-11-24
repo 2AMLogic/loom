@@ -18,13 +18,12 @@
 //! | `other` | [`Route::Fail`]: "Failed to merge PR #P: <response>" |
 //! | `head-mismatch` | [`Route::Fail`], quoting the response |
 //!
-//! `head-mismatch` never reaches this verb in practice: the loop hands it to
-//! `_head_moved_or_resync` first, which either spends #8164's single
-//! self-sync retry (`continue`) or exits 3. It is routed anyway, to exactly
-//! what the retired loop did had that function ever returned non-zero — fall
-//! past the base-modified test into the terminal `error` — so the verb is
-//! total over every token the classifier can print and never retries a head
-//! that moved (#5579).
+//! `head-mismatch` never reaches this verb in practice: the loop sends it
+//! straight to `error_head_moved` (exit 3) first — no self-sync exists any
+//! more (#12063 slice 2). It is routed anyway, to exactly what the retired
+//! loop did had that path ever fallen through — past the base-modified test
+//! into the terminal `error` — so the verb is total over every token the
+//! classifier can print and never retries a head that moved (#5579).
 //!
 //! # Arithmetic fidelity
 //!
