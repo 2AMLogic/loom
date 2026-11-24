@@ -8,10 +8,10 @@ use std::process::Output;
 #[path = "../support/write_scope_root.rs"]
 mod write_scope_root;
 
-struct Forge(tempfile::TempDir);
+pub(super) struct Forge(tempfile::TempDir);
 
 impl Forge {
-    fn new() -> Self {
+    pub(super) fn new() -> Self {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
         write_scope_root::writable_env(root);
@@ -24,17 +24,17 @@ impl Forge {
         forge
     }
 
-    fn root(&self) -> &Path {
+    pub(super) fn root(&self) -> &Path {
         self.0.path()
     }
-    fn set(&self, name: &str, value: &str) {
+    pub(super) fn set(&self, name: &str, value: &str) {
         fs::write(self.root().join(name), value).unwrap()
     }
-    fn get(&self, name: &str) -> String {
+    pub(super) fn get(&self, name: &str) -> String {
         fs::read_to_string(self.root().join(name)).unwrap()
     }
 
-    fn call(&self, bin: &str, args: &[&str], env: &[(&str, &str)]) -> Output {
+    pub(super) fn call(&self, bin: &str, args: &[&str], env: &[(&str, &str)]) -> Output {
         let mut cmd = base(bin, self.root(), self.root());
         cmd.env("LOOM_GH_BIN", self.root().join("gh"))
             .env("LOOM_LISTING_CACHE_DIR", self.root().join("etag"))
@@ -52,7 +52,7 @@ fn compare(scenario: impl Fn(&Forge, &str) -> Vec<Output>) {
     assert_eq!(tools, daemon, "status, stdout or stderr differed");
 }
 
-const CURATE: &[&str] = &[
+pub(super) const CURATE: &[&str] = &[
     "curation-complete",
     "--repo",
     "acme/role-probe",
@@ -67,8 +67,9 @@ const CURATE: &[&str] = &[
     "--workspace-root",
     ".",
 ];
-const NOTIFY: &[&str] = &["notify-cleared-blockers", "--closed", "10"];
-const PARK: &str = "<!-- loom:park Blocked by: #10 by=curator at=2026-01-01T00:00:00Z -->";
+pub(super) const NOTIFY: &[&str] = &["notify-cleared-blockers", "--closed", "10"];
+pub(super) const PARK: &str =
+    "<!-- loom:park Blocked by: #10 by=curator at=2026-01-01T00:00:00Z -->";
 
 #[test]
 fn hold_diagnostics_read_only_parity() {
@@ -221,7 +222,10 @@ fn scope_and_mode_gate_precede_mutations() {
                 ("LOOM_GH_GATEWAY_DIR", f.root().to_str().unwrap()),
             ],
         );
-        assert!(String::from_utf8_lossy(&fleet.stderr).contains("scoped fleet write broker"));
+        // #14465: fleet writes are no longer refused outright — they route to
+        // the scoped curation broker. A gateway that cannot be adopted still
+        // stops the run before any forge call: no usable fleet read route.
+        assert!(String::from_utf8_lossy(&fleet.stderr).contains("no usable fleet read route"));
         assert!(!f.root().join("calls").exists());
         f.set("body", &format!("{PARK}\n<!-- loom:points=5 -->"));
         f.set("labels", r#"["loom:blocked"]"#);
