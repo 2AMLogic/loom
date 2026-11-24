@@ -618,7 +618,7 @@ pub enum Landed {
 /// Narrowed by operator ruling r7-q35: a Judge verdict alone never enqueues.
 /// The landing needs (a) `proven`, the byte-identity proof held at this head,
 /// or (b) a Champion clear recorded at the live head
-/// ([`super::clear_gate::champion_clear_at`]); otherwise [`Landed::Waiting`].
+/// ([`super::clear_gate::gate`]); otherwise [`Landed::Waiting`].
 /// Any read failure is `Waiting` too.
 #[must_use]
 pub fn land_for_root(gh: &Path, root: &Path, pr: u32, proven: bool) -> Landed {

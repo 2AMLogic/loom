@@ -1,6 +1,6 @@
 //! Issue #10348: the `sweep-lease-renew.sh start` command a dispatched sweep
-//! runs, extracted from `dispatch.rs`. The
-//! `LOOM_SWEEP_LEASE_RENEW_SOURCE=dispatch` marker lets the loop skip its
+//! runs, extracted from `dispatch.rs`.
+//! The `LOOM_SWEEP_LEASE_RENEW_SOURCE=dispatch` marker lets the loop skip its
 //! per-cycle issue-state read.
 
 use std::path::Path;

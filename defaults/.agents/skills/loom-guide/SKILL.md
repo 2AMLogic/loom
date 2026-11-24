@@ -572,9 +572,20 @@ parse_dependencies() {
     return
   fi
   # Two-stage parse (#4508): select dependency lines (checkbox UNCHECKED-only,
-  # #7973), then extract every N / OWNER/REPO#N.
+  # #7973), then extract every N / OWNER/REPO#N. The sed stage between them
+  # is the #14732/#14750 parent-reference rule, identical to
+  # champion-common.md's extract_blocker_refs: a reference introduced by
+  # `Part of` (case-insensitive, optionally followed by the one bounded word
+  # `Epic` — Loom's generated `Part of Epic #N` vocabulary) names the issue's
+  # PARENT, not a blocker, and is masked before extraction. The bound is
+  # deliberate: no wider word run, so "Part of issue #2" and prose keep the
+  # established whole-line capture. It keys off the introducing phrase, never
+  # the number, so a parent genuinely declared again as a dependency still
+  # counts. This branch only — the park-record branch above keeps its own
+  # precedence (#13414).
   echo "$body" \
     | grep -E '(Blocked by|Depends on|Requires|\- \[ \])[*_:[:space:]]*([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)?#[0-9]+' \
+    | sed -E 's/[Pp][Aa][Rr][Tt] [Oo][Ff][*_:.[:space:]]*([Ee][Pp][Ii][Cc][*_:.[:space:]]*)?([A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+)?#[0-9]+/ /g' \
     | grep -oE '([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)?#[0-9]+' | sed 's/^#//' | sort -u
 }
 ```
@@ -831,11 +842,16 @@ and leaves **alone** anything that:
 
 ```bash
 awaiting_revision_park() {  # $1=body [$2=ISO time of latest loom:blocked label]; 0 = convertible
-  local body="$1" blocked_at="${2:-}" rec at a b
+  local body="$1" blocked_at="${2:-}" rec reason at a b
   rec=$(grep -E '^[[:space:]]*<!-- loom:park ' <<<"$body" | tail -1)
   [ -n "$rec" ] || return 1
   grep -qE 'Blocked by:[*_[:space:]]*\(unstated\)' <<<"$rec" || return 1  # any named ref => normal sweep
-  grep -qiE 'reason="[^"]*(awaiting[^"]*revision|awaiting[^"]*design epic)' <<<"$rec" || return 1
+  reason=$(sed -nE 's/.* reason="([^"]*)".*/\1/p' <<<"$rec")
+  # A bare revision request must stand alone: “awaiting revision <sha>” waits for a commit.
+  # The “revision of the <noun>” shape is end-anchored: “revision of the issue
+  # tracker config” (#15050) is an evidence wait, not a revise-path park.
+  grep -qiE '^[[:space:]]*awaiting[[:space:]]+((an?|the)[[:space:]]+)?revision[.!]?[[:space:]]*$' <<<"$reason" ||
+    grep -qiwE 'awaiting[[:space:]]+((an?|the)[[:space:]]+)?(((architect|proposal)[[:space:]]+revisions?|design[[:space:]]+epics?)|revisions?[[:space:]]+of[[:space:]]+(the|this)[[:space:]]+(proposal|scope|issue)[[:space:]]*[.!]?[[:space:]]*$)' <<<"$reason" || return 1
   if [ -n "$blocked_at" ]; then
     at=$(sed -nE 's/.* at=([^ ]+).*/\1/p' <<<"$rec")
     a=$(date -u -d "$at" +%s 2>/dev/null || date -u -j -f %Y-%m-%dT%H:%M:%SZ "$at" +%s 2>/dev/null) || return 1
@@ -3263,13 +3279,13 @@ Automated document maintenance by the Guide triage agent.
 
 ### Context
 This PR is generated automatically by the Guide role as part of its triage cycle.
-See rjwalters/loom#1784 for the feature specification (this template ships to every Loom-managed repo, so the reference must be fully qualified).
+See 2AMLogic/loom#1784 for the feature specification (this template ships to every Loom-managed repo, so the reference must be fully qualified).
 
 This PR normally stages only `WORK_LOG.md`/`WORK_PLAN.md`/`README.md` (see
 `create_docs_pr()`'s `git add` above), so it qualifies for the docs-only fast
-path (rjwalters/loom#6134) Judge and Champion apply to any PR whose
+path (2AMLogic/loom#6134) Judge and Champion apply to any PR whose
 changed-file list matches that exact set — EXCEPT when the repo's
-`.loom/docs-post-stage.sh` hook (rjwalters/loom#13892) reported additional
+`.loom/docs-post-stage.sh` hook (2AMLogic/loom#13892) reported additional
 files (e.g. a regenerated integrity envelope): those land in the same PR,
 which simply falls off the fast path to a full review. The
 `<!-- loom:docs-only-fast-path -->` marker above is informational only —
@@ -3417,7 +3433,7 @@ it expresses it.
   would fail the repo's integrity check anyway; the next tick retries.
 - **No script** ⇒ behaviour byte-identical to a repo without the hook.
 - **Review impact**: a PR carrying hook-produced files falls off the docs-only
-  fast path (rjwalters/loom#6134) to a full review — by design; Judge and
+  fast path (2AMLogic/loom#6134) to a full review — by design; Judge and
   Champion re-derive eligibility from the PR's own file list.
 
 ### Document Maintenance Summary

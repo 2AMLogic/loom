@@ -54,7 +54,8 @@ pub struct PostureArgs {
     /// profile controls is compared with these files.
     #[arg(long)]
     pub codex_home: Option<PathBuf>,
-    /// Docker binary (test seam; `LOOM_CODEX_SESSION_DOCKER`).
+    /// Docker binary (test seam; `LOOM_CODEX_SESSION_DOCKER`). The default
+    /// `docker` resolves through the shared lookup (#14885).
     #[arg(long, default_value = "docker")]
     pub docker: String,
 }
@@ -401,9 +402,13 @@ pub fn run(args: &PostureArgs) -> i32 {
         gh_config_dir: std::env::var("GH_CONFIG_DIR").ok(),
         leased: std::env::var_os("LOOM_PRIVATE_LEASE_FD").is_some(),
     };
-    let state = inspect(&args.docker, &args.container);
+    // The argument's `default_value` literal means "the shared lookup"
+    // (#14885); an explicit program stays verbatim, and an unresolvable
+    // docker stays unlaunchable so the reads below answer "cannot ask".
+    let docker = crate::docker_bin::cli_arg_or_fail_open(&args.docker);
+    let state = inspect(&docker, &args.container);
     let d = decide(args, state.as_ref(), &env, || {
-        control_drift(&args.docker, &args.container, args.codex_home.as_deref())
+        control_drift(&docker, &args.container, args.codex_home.as_deref())
     });
     for line in &d.messages {
         eprintln!("session-exec posture: {line}");

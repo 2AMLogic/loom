@@ -479,6 +479,11 @@ pub const TOOLS_COMMANDS: &[&str] = &[
     "install-compat",
     "hooks-home",
     "claim",
+    // #14884: the session-mode gateway publisher. Daemon-free; `refresh`
+    // gates on mode = session, `status`/`clean` run ungated.
+    "gateway refresh",
+    "gateway status",
+    "gateway clean",
 ];
 
 /// The identity of the installed-file payload this binary was built against:

@@ -378,7 +378,7 @@ impl SharedRateLimitBreaker {
     /// disabled, or a cooldown is already running (re-trips while cooling are
     /// absorbed silently — the window already covers them).
     ///
-    /// `budget` is the caller-supplied probe result ([`forge::probe_budget`]);
+    /// `budget` is the caller-supplied probe result ([`forge::probe_budget_ctx`]);
     /// passing it in keeps the network side effect outside the lock and makes
     /// the trip path fully testable.
     pub fn observe_failure(
@@ -751,13 +751,6 @@ pub mod forge {
     /// Deadline for the probe. It runs inside a gh error arm, so a wedged
     /// `gh` must not hang that caller (#9985: it used to have no deadline).
     const PROBE_TIMEOUT: Duration = Duration::from_secs(30);
-
-    /// The ambient credential's budget, from the process-wide cache
-    /// ([`probe_budget_ctx`] with the default context).
-    #[must_use]
-    pub fn probe_budget(now: DateTime<Utc>) -> Option<BudgetSnapshot> {
-        probe_budget_ctx(&FailureContext::default(), now)
-    }
 
     /// The budget of the credential `ctx` names (#8997: same working
     /// directory → per-owner `GH_CONFIG_DIR`, same `gh` program, same

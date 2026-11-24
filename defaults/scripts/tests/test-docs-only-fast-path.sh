@@ -409,16 +409,40 @@ assert_contains "$(printf '%s\n' "$WL_FN" | grep -v '^[[:space:]]*#')" "docs_onl
     "judge.md ships docs_only_fast_path_worklog_check()"
 
 # Stub `gh`: the PR's base repository is owner/mine (a second, foreign repo
-# owner/other exists but the gate must NEVER query it); the diff comes from
-# WL_DIFF; the issues/N reads are recorded to WL_CALL_LOG so the tests assert
-# the target actually queried. FAIL_LOOKUP=1 simulates a temporary forge
-# failure on the record reads.
+# owner/other exists but the gate must NEVER query it), reached through
+# WL_BASE_URL — the PR's own URL, answered for `pr view --json url` and then
+# run through the caller's --jq filter with real jq, exactly as gh does. gh
+# has no `baseRepository` field (#15005): any other --json field fails like
+# real gh, so this suite can no longer pass against a field gh does not have
+# (the earlier stub answered every `gh pr view` with the final value). The
+# diff comes from WL_DIFF; the issues/N reads are recorded to WL_CALL_LOG so
+# the tests assert the target actually queried. FAIL_LOOKUP=1 simulates a
+# temporary forge failure on the record reads.
 WL_CALL_LOG="$(mktemp)"
 gh() {
     case "$1" in
         pr)
             case "$2" in
-                view) printf '%s' "${WL_BASE_OUT-owner/mine}"; return "${WL_BASE_RC:-0}" ;;
+                view)
+                    local json='' filter=''
+                    shift 2
+                    while [ $# -gt 0 ]; do
+                        case "$1" in
+                            --json) json="${2-}" ;;
+                            --jq) filter="${2-}" ;;
+                        esac
+                        shift
+                    done
+                    if [ "$json" != url ]; then
+                        echo "Unknown JSON field: \"$json\"" >&2
+                        return 1
+                    fi
+                    [ "${WL_BASE_RC:-0}" -eq 0 ] || return "$WL_BASE_RC"
+                    local url="${WL_BASE_URL-https://github.com/owner/mine/pull/1}"
+                    [ -n "$url" ] || return 0
+                    jq -rn --arg url "$url" '{url: $url} | '"${filter:-.}"
+                    return $?
+                    ;;
                 diff) printf '%s' "${WL_DIFF:-}"; return "${WL_DIFF_RC:-0}" ;;
             esac ;;
         api)
@@ -750,10 +774,29 @@ assert_eq "NOT ELIGIBLE: WORK_LOG record #11 is not a closed issue in owner/mine
 # Reads that fail must not read as eligible: the target and the diff.
 out="$(WL_BASE_RC=1 WL_DIFF="$GOOD_DIFF" docs_only_fast_path_worklog_check 1)"
 assert_eq "NOT ELIGIBLE: base repository read failed" "$out" "a failed base-repository read is not eligible"
-out="$(WL_BASE_OUT='' WL_DIFF="$GOOD_DIFF" docs_only_fast_path_worklog_check 1)"
+out="$(WL_BASE_URL='' WL_DIFF="$GOOD_DIFF" docs_only_fast_path_worklog_check 1)"
 assert_eq "NOT ELIGIBLE: base repository read failed" "$out" "an empty base-repository read is not eligible"
 out="$(WL_DIFF_RC=1 WL_DIFF="$GOOD_DIFF" docs_only_fast_path_worklog_check 1)"
 assert_eq "NOT ELIGIBLE: PR diff read failed" "$out" "a failed diff read is not eligible"
+
+# #15005: gh has no `baseRepository` field, so the target is derived from the
+# PR's own URL — always its base repository's. Only the PR-URL shape is
+# assumed, never the host, so a GH_HOST deployment resolves the same way.
+: >"$WL_CALL_LOG"
+out="$(WL_BASE_URL='https://github.example.test/owner/mine/pull/185' WL_DIFF="$GOOD_DIFF" docs_only_fast_path_worklog_check 1)"
+assert_eq "ELIGIBLE" "$out" "a PR URL on a non-GitHub host (GH_HOST) still resolves the base repository"
+assert_eq "repos/owner/mine/issues/5
+repos/owner/mine/issues/7" "$(cat "$WL_CALL_LOG")" \
+    "a GH_HOST PR URL binds the record reads to the URL's owner/mine"
+
+# A URL that is not a PR URL derives no repository, so the fail-closed guard
+# fires with its own reason — a message only that guard prints, i.e. before
+# any diff or record read.
+for bad_url in 'not-a-url' 'https://github.com/owner/mine' 'https://github.com/owner/mine/issues/5'; do
+    out="$(WL_BASE_URL="$bad_url" WL_DIFF="$GOOD_DIFF" docs_only_fast_path_worklog_check 1)"
+    assert_eq "NOT ELIGIBLE: base repository read failed" "$out" \
+        "a URL that is not a PR URL ('$bad_url') fails closed"
+done
 
 unset -f gh
 
@@ -775,9 +818,15 @@ assert_doc_contains "$JUDGE_MD" \
 assert_doc_contains "$JUDGE_MD" \
     'gh pr diff --repo "$repo" "$pr"' \
     "judge.md reads the exact reviewed diff against the PR's base repository (not the cwd remote, not Guide's receipts or the PR prose)"
+# #15005: gh has no `baseRepository` field, so the target comes from the PR's
+# own URL; a URL of any other shape derives nothing and the fail-closed
+# `[ -z "$out" ]` guard on that read fires.
 assert_doc_contains "$JUDGE_MD" \
+    '--json url --jq '"'"'.url | capture("^https://[^/]+/(?<r>[^/]+/[^/]+)/pull/[0-9]+/?$").r'"'"'' \
+    "judge.md derives the target repository from the PR's own URL (#15005)"
+assert_doc_lacks "$JUDGE_MD" \
     "baseRepository" \
-    "judge.md derives the target from the PR's base repository"
+    "judge.md no longer reads the nonexistent baseRepository field (#15005)"
 
 # The Guide-side gate is the counterpart — guide.md must ship it and wire it.
 assert_doc_contains "$GUIDE_MD" \

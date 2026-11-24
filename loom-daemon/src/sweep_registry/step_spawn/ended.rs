@@ -88,6 +88,9 @@ pub(crate) fn note_post(
 
 /// The post-state noted for `sweep_id`: `Some(read)` when its release took
 /// one (`read` is `None` for a failed read), `None` when none was noted.
+/// A noted failed read is not final (#14899): `step_end::settle` reads the
+/// item itself when the note is absent *or* failed, so only no successful
+/// read at all classifies `probe_failed`.
 #[must_use]
 pub fn take_post(
     root: &Path,

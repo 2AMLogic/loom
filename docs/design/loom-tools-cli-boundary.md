@@ -34,6 +34,7 @@ re-reading the source it names. Counts are from the pinned tree below.
 14. [Phase 3b: park records and operator decisions (#14464)](#14-phase-3b-park-records-and-operator-decisions-14464)
 15. [Phase 3c: issue leases (#14488)](#15-phase-3c-issue-leases-14488)
 16. [Phase 3b: the remaining merge-queue actions (#14520)](#16-phase-3b-the-remaining-merge-queue-actions-14520)
+17. [The session gateway publisher (#14884)](#17-the-session-gateway-publisher-14884)
 
 ## 1. Pinned inputs
 
@@ -1142,3 +1143,49 @@ repository with disposable PRs, and recording the resulting queue entry and
 status state, needs that repository and a writer credential. It is recorded on
 the PR and the issue for an operator with that access; no repo permission is
 broadened here.
+
+## 17. The session gateway publisher (#14884)
+
+Not a port of a daemon command: `loom-tools gateway refresh|status|clean` is
+new surface, `loom-tools`-only, with no `loom-daemon` counterpart. A
+session-only host (#8884, epic #12708) runs no daemon, so the gateway
+refresh loop never publishes there and its fleet reads fell back to a direct
+App token (#14884).
+
+### 17.1 Mechanism
+
+`forge_gateway::session` reuses the publisher's write half
+(`forge_gateway/publish.rs::write_all`, extracted from `Refresher::publish_all`
+with no behavior change) into a session-owned base
+`~/.local/share/loom/session/.loom/gh-config-gateway` (override
+`LOOM_SESSION_GATEWAY_ROOT`; refused inside a git checkout) — the same suffix
+and `gh-ok` marker readers validate. The `forge.gateway` block is read from
+the private defaults tier **only** (`host_tier_config`): a repository tier or
+an inherited `LOOM_GH_GATEWAY_DIR` cannot redirect a host key. The pass never
+touches the process-global `Active` state: a one-shot tool owns no route.
+
+Mode gate, classified by effect: `refresh` resolves `mode` and requires
+`session` (it discards inherited fleet routing like every session command);
+`status` and `clean` run ungated — a leftover publication is reported and
+removed whatever the mode, and `status` prints nothing when there is no
+publication and the host is not in session mode (so `loom status` on a fleet
+host stays quiet; `scripts/loom` delegates to it verbatim). `loom`-level docs:
+`defaults/docs/session-mode.md` § "Gateway read profiles".
+
+### 17.2 Served commands and tests
+
+`gateway refresh`, `gateway status`, `gateway clean`
+(`install_compat::TOOLS_COMMANDS`; `src/bin/loom_tools.rs`'s clap-tree test
+enforces the listing). Unit: `forge_gateway/session_tests.rs` (publication,
+rotation, withdrawal, the checkout refusal, cleanup scope, status classes,
+the host-tier-only source). Integration: `tests/loom_tools_slice.rs`
+(`gateway_*`: the real binary against a fake `gh`, a host-tier fixture with
+0600 key files and the daemon absent from PATH — publish/rotate/withdraw,
+status current/due/missing, off-session quietness, cleanup preserving a
+workspace publication, and the refusals).
+
+**Live verification NOT performed in the implementing worktree**: the
+uncached fleet-store read through the gateway from a separately launched
+reader on a session-only host (issue #14884's fourth criterion) needs the
+live fleet reader and gateway; it is tracked in 2AMLogic/2am#8152, whose
+receipt the issue accepts.
