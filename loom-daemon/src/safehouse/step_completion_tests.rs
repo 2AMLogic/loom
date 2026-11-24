@@ -862,6 +862,9 @@ fn a_step_dispatched_merge_attributes_an_opencode_builder_and_a_codex_judge_body
 
     let gh = FakeGh::new(dir.path());
     gh.serve_view(&pr_row(701, 14883, Some(1)));
+    // Crate-wide `LOOM_CODEX_HOME` lock (#15174), taken before the profile-root
+    // redirect below (its documented lock order).
+    let _codex_home_lock = crate::tokens_pool::codex_home_env::lock();
     let _home_env = crate::env_test_support::EnvGuard::clear(&[
         crate::codex_usage::CODEX_HOME_ENV,
         crate::codex_usage::CODEX_NATIVE_HOME_ENV,
@@ -976,9 +979,12 @@ fn a_codex_banner_naming_no_rollout_leaves_the_envelope_byte_identical_body() {
         }
         let _db_env =
             crate::env_test_support::EnvGuard::set(crate::opencode_usage::OPENCODE_DB_ENV, &db);
-        // An empty Codex home: the banner names a rollout nothing holds.
+        // An empty Codex home: the banner names a rollout nothing holds. The
+        // crate-wide `LOOM_CODEX_HOME` lock (#15174) makes the pin race-free
+        // against the isolation helpers clearing the variable.
         let empty_home = dir.path().join("empty-codex");
         std::fs::create_dir_all(empty_home.join("sessions")).unwrap();
+        let _codex_home_lock = crate::tokens_pool::codex_home_env::lock();
         let _home_env =
             crate::env_test_support::EnvGuard::set(crate::codex_usage::CODEX_HOME_ENV, &empty_home);
 

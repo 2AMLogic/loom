@@ -2387,6 +2387,9 @@ fn idle_refusal_uses_the_draw_snapshot_when_inventory_changes() {
     use crate::tokens_pool::health::{self, TerminalClassification};
     use crate::tokens_pool::session_lifecycle::liveness::test_support::set_selector_docker;
 
+    // Crate-wide `LOOM_CODEX_HOME` lock (#15174): the clear-list below takes it
+    // so it cannot race the `codex_home_env`-keyed tests that pin the variable.
+    let _codex_home_lock = crate::tokens_pool::codex_home_env::lock();
     let _environment = crate::env_test_support::EnvGuard::clear(&[
         "CODEX_HOME",
         "LOOM_CODEX_HOME",
@@ -2452,6 +2455,9 @@ fn legacy_sweep_prepares_one_target_and_hands_its_selection_to_launch() {
     };
     use crate::types::SweepKind;
 
+    // Crate-wide `LOOM_CODEX_HOME` lock (#15174): the clear-list below takes it
+    // so it cannot race the `codex_home_env`-keyed tests that pin the variable.
+    let _codex_home_lock = crate::tokens_pool::codex_home_env::lock();
     let _environment = crate::env_test_support::EnvGuard::clear(&[
         "CODEX_HOME",
         "LOOM_CODEX_HOME",
@@ -2587,6 +2593,9 @@ fn idle_reservation_retries_a_busy_weekly_favorite_and_hands_off_the_next_lease(
 
     let _fork = super::tests::fork_guard();
     let home = tempfile::tempdir().unwrap();
+    // Crate-wide `LOOM_CODEX_HOME` lock (#15174): the clear-list below takes it
+    // so it cannot race the `codex_home_env`-keyed tests that pin the variable.
+    let _codex_home_lock = crate::tokens_pool::codex_home_env::lock();
     let _runtime_env = EnvGuard::clear(&[
         "CODEX_HOME",
         "LOOM_CODEX_HOME",
@@ -2707,6 +2716,9 @@ fn concurrent_judge_draws_share_one_idle_seat() {
     use std::os::unix::fs::PermissionsExt;
     use std::sync::Barrier;
 
+    // Crate-wide `LOOM_CODEX_HOME` lock (#15174): the clear-list below takes it
+    // so it cannot race the `codex_home_env`-keyed tests that pin the variable.
+    let _codex_home_lock = crate::tokens_pool::codex_home_env::lock();
     let _runtime_env = crate::env_test_support::EnvGuard::clear(&[
         "CODEX_HOME",
         "LOOM_CODEX_HOME",
@@ -3124,6 +3136,9 @@ fn builder_stage_of(doc: &serde_json::Value) -> &serde_json::Value {
 #[serial]
 fn a_builder_draw_admits_the_idle_seat_while_another_seat_is_busy() {
     use crate::runtime_preference::role_draw;
+    // Crate-wide `LOOM_CODEX_HOME` lock (#15174): the clear-list below takes it
+    // so it cannot race the `codex_home_env`-keyed tests that pin the variable.
+    let _codex_home_lock = crate::tokens_pool::codex_home_env::lock();
     let _runtime_env = crate::env_test_support::EnvGuard::clear(&[
         "CODEX_HOME",
         "LOOM_CODEX_HOME",
@@ -3183,6 +3198,9 @@ fn a_builder_draw_admits_the_idle_seat_while_another_seat_is_busy() {
 #[serial]
 fn a_builder_draw_names_every_tried_seat_when_all_are_busy() {
     use crate::runtime_preference::role_draw;
+    // Crate-wide `LOOM_CODEX_HOME` lock (#15174): the clear-list below takes it
+    // so it cannot race the `codex_home_env`-keyed tests that pin the variable.
+    let _codex_home_lock = crate::tokens_pool::codex_home_env::lock();
     let _runtime_env = crate::env_test_support::EnvGuard::clear(&[
         "CODEX_HOME",
         "LOOM_CODEX_HOME",
@@ -3258,6 +3276,9 @@ fn reacquire_probe(dir: &Path, holder: lease::Lease) -> lease::Lease {
 #[test]
 #[serial]
 fn an_explicit_profile_pin_keeps_binding_while_its_seat_is_busy() {
+    // Crate-wide `LOOM_CODEX_HOME` lock (#15174): the clear-list below takes it
+    // so it cannot race the `codex_home_env`-keyed tests that pin the variable.
+    let _codex_home_lock = crate::tokens_pool::codex_home_env::lock();
     let _runtime_env = crate::env_test_support::EnvGuard::clear(&[
         "CODEX_HOME",
         "LOOM_CODEX_HOME",
@@ -3303,6 +3324,9 @@ fn an_explicit_profile_pin_keeps_binding_while_its_seat_is_busy() {
 #[test]
 #[serial]
 fn an_idle_seat_that_cannot_prove_containment_is_never_counted_as_busy() {
+    // Crate-wide `LOOM_CODEX_HOME` lock (#15174): the clear-list below takes it
+    // so it cannot race the `codex_home_env`-keyed tests that pin the variable.
+    let _codex_home_lock = crate::tokens_pool::codex_home_env::lock();
     let _runtime_env = crate::env_test_support::EnvGuard::clear(&[
         "CODEX_HOME",
         "LOOM_CODEX_HOME",
@@ -3352,6 +3376,9 @@ fn an_idle_seat_that_cannot_prove_containment_is_never_counted_as_busy() {
 #[serial]
 fn a_blocking_exec_is_named_by_the_admission_refusal_and_the_explain_view() {
     use crate::runtime_preference::role_draw;
+    // Crate-wide `LOOM_CODEX_HOME` lock (#15174): the clear-list below takes it
+    // so it cannot race the `codex_home_env`-keyed tests that pin the variable.
+    let _codex_home_lock = crate::tokens_pool::codex_home_env::lock();
     let _runtime_env = crate::env_test_support::EnvGuard::clear(&[
         "CODEX_HOME",
         "LOOM_CODEX_HOME",
@@ -3522,6 +3549,9 @@ fn a_named_manual_exec_refuses_on_its_own_busy_seat_never_another() {
     use std::ffi::OsStr;
     use std::os::unix::fs::PermissionsExt;
 
+    // Crate-wide `LOOM_CODEX_HOME` lock (#15174): the clear-list below takes it
+    // so it cannot race the `codex_home_env`-keyed tests that pin the variable.
+    let _codex_home_lock = crate::tokens_pool::codex_home_env::lock();
     let _runtime_env = EnvGuard::clear(&[
         "CODEX_HOME",
         "LOOM_CODEX_HOME",

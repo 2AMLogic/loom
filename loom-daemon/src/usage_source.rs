@@ -986,6 +986,7 @@ mod tests {
         let close = |ids: &NativeSessionIds| {
             native_close_usage(Some("codex"), tmp.path(), None, &log, window, ids)
         };
+        let _codex_home_lock = crate::tokens_pool::codex_home_env::lock();
         let _guard =
             crate::env_test_support::EnvGuard::set(crate::codex_usage::CODEX_HOME_ENV, &home);
 
@@ -1024,6 +1025,7 @@ mod tests {
 
         // A store that does not exist at all.
         let absent = tmp.path().join("no-such-codex-home");
+        let _codex_home_lock = crate::tokens_pool::codex_home_env::lock();
         let _absent =
             crate::env_test_support::EnvGuard::set(crate::codex_usage::CODEX_HOME_ENV, &absent);
         assert_eq!(close(&ids("11111111-2222-3333-4444-555555555555")), Err(M::StoreUnreadable));
@@ -1049,6 +1051,7 @@ mod tests {
                 &[(500, 0, 50)],
             ),
         );
+        let _codex_home_lock = crate::tokens_pool::codex_home_env::lock();
         let _guard =
             crate::env_test_support::EnvGuard::set(crate::codex_usage::CODEX_HOME_ENV, &home);
         let window = Some((at("2026-09-21T01:00:00Z"), at("2026-09-21T03:00:00Z")));
@@ -1184,6 +1187,7 @@ mod tests {
                 &[(8_000_000, 0, 800_000)],
             ),
         );
+        let _codex_home_lock = crate::tokens_pool::codex_home_env::lock();
         let _guard =
             crate::env_test_support::EnvGuard::set(crate::codex_usage::CODEX_HOME_ENV, &home);
 
@@ -1618,6 +1622,7 @@ mod tests {
         )
         .unwrap();
 
+        let _codex_home_lock = crate::tokens_pool::codex_home_env::lock();
         std::env::remove_var(crate::codex_usage::CODEX_HOME_ENV);
         std::env::set_var(crate::codex_usage::CODEX_NATIVE_HOME_ENV, &ambient);
         let _profile_root = crate::tokens_pool::profile_root_env::ProfileRootEnv::set(&profiles);
