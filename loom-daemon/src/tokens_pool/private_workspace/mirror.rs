@@ -27,11 +27,12 @@
 //! fresh verification against the forge.
 //!
 //! Seat-side borrowing — the read-only objects bind, the single verified
-//! alternate in seat clones, and idle in-place migration — is the next
-//! slice of #14680 and consumes [`MirrorStore::attach`],
-//! [`MirrorStore::detach`] and [`MirrorStore::objects_dir`] for that.
-//! Until it lands, seats keep fully private clones with no alternate,
-//! exactly as before.
+//! alternate in seat clones, and idle in-place migration — landed with
+//! #14680's seat-side slice: [`MirrorStore::attach`] records the
+//! borrowing seat, [`MirrorStore::objects_dir`] names the bind source,
+//! and [`MirrorStore::detach`] retires a borrower record (still unwired;
+//! see #15168). A clone with no alternate — the shape every seat had
+//! before #14680 — stays supported and admitted.
 use super::forge_auth::ProvedReader;
 use super::read_authority::{
     self, Admission, BorrowerAuthority, Credential, LiveProviderHttp, Provider, Publication,
@@ -161,9 +162,8 @@ impl MirrorStore {
         self.dir.join(GIT_DIR)
     }
 
-    /// The objects directory a seat-side read-only bind mounts (the next
-    /// slice of #14680). Nothing in this module ever exposes it writable.
-    #[allow(dead_code)] // seat binds land with #14680's seat-side slice
+    /// The objects directory a seat-side read-only bind mounts. Nothing
+    /// in this module ever exposes it writable.
     pub(super) fn objects_dir(&self) -> PathBuf {
         self.git_dir().join("objects")
     }
@@ -264,13 +264,12 @@ impl MirrorStore {
         Ok(created)
     }
 
-    /// Admit one seat as a borrower of this store under `proof` (the
-    /// seat-side slice of #14680 calls this at bind time). A refused
+    /// Admit one seat as a borrower of this store under `proof`
+    /// (`plan_one` calls this at bind time). A refused
     /// admission writes nothing and the seat stays on its private clone.
     ///
     /// # Errors
     /// [`read_authority::admit_borrower`]'s refusal, or a write failure.
-    #[allow(dead_code)] // seat binds land with #14680's seat-side slice
     pub(super) fn attach(
         &self,
         account: &str,
@@ -299,7 +298,7 @@ impl MirrorStore {
 
     /// Retire one borrower's record (a seat that stopped borrowing). Absent
     /// is success: there is nothing to retire.
-    #[allow(dead_code)] // seat binds land with #14680's seat-side slice
+    #[allow(dead_code)] // no non-test caller yet; seat-side lifecycle follow-up #15168
     pub(super) fn detach(&self, account: &str) -> Result<()> {
         let path = self
             .dir

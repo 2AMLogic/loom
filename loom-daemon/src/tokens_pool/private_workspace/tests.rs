@@ -2488,11 +2488,11 @@ fn the_only_allowed_alternate_is_the_repositorys_own_mirror() {
     let info = repo.join(".git/objects/info");
     std::fs::create_dir_all(&info).unwrap();
     // No alternate: a private clone, always supported.
-    assert!(repository::verify_alternates(&repo, repository, None).is_ok());
+    assert!(repository::verify_alternates(&repo, None).is_ok());
     // Exactly the repository's own mirror path.
     let expected = mirror_alternate(repository).unwrap();
     std::fs::write(info.join("alternates"), format!("{expected}\n")).unwrap();
-    assert!(repository::verify_alternates(&repo, repository, Some(&expected)).is_ok());
+    assert!(repository::verify_alternates(&repo, Some(&expected)).is_ok());
     // Another repository's mirror, an arbitrary path, or a second entry.
     for body in [
         "/mirrors/other-repo-00000000/objects\n",
@@ -2501,7 +2501,7 @@ fn the_only_allowed_alternate_is_the_repositorys_own_mirror() {
     ] {
         std::fs::write(info.join("alternates"), body).unwrap();
         assert!(
-            repository::verify_alternates(&repo, repository, Some(&expected)).is_err(),
+            repository::verify_alternates(&repo, Some(&expected)).is_err(),
             "{body:?} must be refused"
         );
     }
@@ -2509,12 +2509,12 @@ fn the_only_allowed_alternate_is_the_repositorys_own_mirror() {
     // `None` whenever the host bound no mirror, and must refuse every
     // alternate then — even one that happens to name the canonical path.
     std::fs::write(info.join("alternates"), format!("{expected}\n")).unwrap();
-    let error = repository::verify_alternates(&repo, repository, None)
+    let error = repository::verify_alternates(&repo, None)
         .unwrap_err()
         .to_string();
     assert!(error.contains("private Git objects"), "{error}");
     std::fs::write(info.join("alternates"), "/tmp/objects\n").unwrap();
-    let error = repository::verify_alternates(&repo, "/tmp/remote", None)
+    let error = repository::verify_alternates(&repo, None)
         .unwrap_err()
         .to_string();
     assert!(error.contains("private Git objects"), "{error}");
