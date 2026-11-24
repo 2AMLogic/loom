@@ -20,7 +20,7 @@
 # uses. ONE derivation feeds the Ready filter, the listing section and the
 # Backlog Balance count. A failed inventory read renders an unfiltered
 # Ready plus a visible note, and `update_work_plan()` refuses to write over
-# it (WORK_PLAN_OPEN_PR_INVENTORY_OK / the "inventory-unreadable" receipt).
+# it (the in-band unreadable note / the "inventory-unreadable" receipt).
 #
 # Verifies that:
 #   1. STRUCTURE: exactly one inventory `pr list --state open` fetch; zero
@@ -160,10 +160,10 @@ else
     fail "expected verify_plan_provenance() to verify the listing via open_pr_annotation()"
 fi
 
-if grep -qF 'WORK_PLAN_OPEN_PR_INVENTORY_OK' <<<"$UWP_BODY" && grep -qF 'inventory-unreadable' <<<"$UWP_BODY"; then
-    pass "update_work_plan() refuses to write when the inventory read failed (receipt: inventory-unreadable)"
+if grep -qF 'inventory-unreadable' <<<"$UWP_BODY" && ! grep -qF 'WORK_PLAN_OPEN_PR_INVENTORY_OK' <<<"$UWP_BODY$RPB_BODY"; then
+    pass "update_work_plan() carries the inventory-unreadable gate with no cross-subshell flag variable (behavior: Test 8)"
 else
-    fail "expected update_work_plan() to check WORK_PLAN_OPEN_PR_INVENTORY_OK and record inventory-unreadable"
+    fail "expected update_work_plan() to record inventory-unreadable and no WORK_PLAN_OPEN_PR_INVENTORY_OK global (subshell-lost, #14785)"
 fi
 
 if ! command -v jq >/dev/null 2>&1; then
@@ -503,16 +503,37 @@ echo ""
 echo "Test 8: inventory read failure and truncation are visible"
 
 FAIL_RENDER="$(FAIL_INVENTORY=1 LOOM_FIXTURE_DIR="$FIX" GH_READ="$GH_STUB" HELPERS_SRC="$HELPERS_BODY" RPB_SRC="$RPB_BODY" \
-    bash -c "$RPB_RUN"' ; printf "FLAG=[%s]\n" "${WORK_PLAN_OPEN_PR_INVENTORY_OK-UNSET}"' 2>/dev/null || true)"
+    bash -c "$RPB_RUN" 2>/dev/null || true)"
 if grep -qF 'Open-PR inventory unreadable — Ready is NOT net of open-PR admission this tick' <<<"$FAIL_RENDER"; then
     pass "a failed inventory read renders the unreadable note visibly"
 else
     fail "expected the 'Open-PR inventory unreadable' note on a failed read"
 fi
-if grep -qF 'FLAG=[]' <<<"$FAIL_RENDER"; then
-    pass "a failed inventory read clears WORK_PLAN_OPEN_PR_INVENTORY_OK (update_work_plan refuses the write)"
+# The gate must work ACROSS the subshell boundary production uses
+# (`new_body="$(render_plan_body)"` in update_work_plan, then the check): run the
+# real gate text extracted from update_work_plan() against both renders.
+GATE_SRC="$(awk '/new_body="\$\(render_plan_body\)"/{f=1} f{print} f&&/^  fi$/&&seen{exit} f&&/inventory-unreadable/{seen=1}' <<<"$UWP_BODY")"
+GATE_RUN='eval "$HELPERS_SRC"; eval "$RPB_SRC"; record_work_plan_receipt() { echo "RECEIPT=$1"; }
+  gate() { '"$GATE_SRC"'
+    echo PASSED_GATE; return 0; }
+  gate; echo "RC=$?"'
+if [[ -z "$GATE_SRC" ]]; then
+    fail "could not extract the inventory gate from update_work_plan() (harness broken)"
 else
-    fail "expected WORK_PLAN_OPEN_PR_INVENTORY_OK to be empty after a failed read, got: $(grep '^FLAG=' <<<"$FAIL_RENDER")"
+    GATE_BAD="$(FAIL_INVENTORY=1 LOOM_FIXTURE_DIR="$FIX" GH_READ="$GH_STUB" HELPERS_SRC="$HELPERS_BODY" RPB_SRC="$RPB_BODY" GATE_SRC="$GATE_SRC" \
+        bash -c "$GATE_RUN" 2>/dev/null || true)"
+    GATE_OK="$(LOOM_FIXTURE_DIR="$FIX" GH_READ="$GH_STUB" HELPERS_SRC="$HELPERS_BODY" RPB_SRC="$RPB_BODY" GATE_SRC="$GATE_SRC" \
+        bash -c "$GATE_RUN" 2>/dev/null || true)"
+    if grep -qF 'RECEIPT=inventory-unreadable' <<<"$GATE_BAD" && grep -qF 'RC=1' <<<"$GATE_BAD" && ! grep -qF PASSED_GATE <<<"$GATE_BAD"; then
+        pass "a failed inventory read is REFUSED by the write gate across the render subshell (inventory-unreadable receipt)"
+    else
+        fail "expected the gate to refuse a failed read; got: $GATE_BAD"
+    fi
+    if grep -qF 'PASSED_GATE' <<<"$GATE_OK" && ! grep -qF 'RECEIPT=' <<<"$GATE_OK"; then
+        pass "a healthy inventory read passes the write gate (no refusal, no receipt)"
+    else
+        fail "expected the gate to pass a healthy read; got: $GATE_OK"
+    fi
 fi
 FAIL_READY="$(awk '/^## Ready/{flag=1; next} /^## /{flag=0} flag' <<<"$FAIL_RENDER")"
 if grep -q '#7102' <<<"$FAIL_READY" && grep -q '#7106' <<<"$FAIL_READY"; then

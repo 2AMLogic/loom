@@ -2565,18 +2565,22 @@ render_plan_body() {
   # counting work a Builder cannot claim. `approved_json` stays a jq filter
   # of this single fetch (label + not frozen), so the Approved/held renders
   # are byte-identical to the labelled query and the #6457/#6993
-  # one-query/one-sort invariants hold. A failed read fails the whole
+  # one-query/one-sort invariants hold (byte-identical only while the repo has
+  # <=200 open PRs: the 200 limit now spans ALL open PRs, so past that the
+  # Approved/held sections can under-report; the truncation note renders in the
+  # Issues-with-Open-PRs blurb). A failed read fails the whole
   # classification visibly — the note below lands in the rendered section
-  # and update_work_plan() refuses to write over it
-  # (WORK_PLAN_OPEN_PR_INVENTORY_OK) — rather than silently rendering an
-  # unfiltered Ready.
-  local pr_inventory
-  WORK_PLAN_OPEN_PR_INVENTORY_OK=1
+  # and update_work_plan() refuses to write over it — rather than silently
+  # rendering an unfiltered Ready. The signal is IN BAND (the rendered body
+  # carries the unreadable note): render_plan_body() runs in a $(...) subshell
+  # in update_work_plan(), so a flag variable set here would never reach the
+  # caller. Do not replace this with a cross-function global.
+  local pr_inventory inventory_ok=1
   pr_inventory=$("$GH_READ" pr list --state open --limit 200 \
     --json number,title,labels,isDraft,headRefName,isCrossRepository,body,closingIssuesReferences \
-    --jq 'sort_by(.number)') || { pr_inventory="[]"; WORK_PLAN_OPEN_PR_INVENTORY_OK=""; }
+    --jq 'sort_by(.number)') || { pr_inventory="[]"; inventory_ok=""; }
   local inventory_note=""
-  if [ -z "$WORK_PLAN_OPEN_PR_INVENTORY_OK" ]; then
+  if [ -z "$inventory_ok" ]; then
     inventory_note="_Open-PR inventory unreadable — Ready is NOT net of open-PR admission this tick (native admission still applies at claim time)._"
   elif [ "$(printf '%s' "$pr_inventory" | jq 'length')" -ge 200 ]; then
     inventory_note="_Open-PR inventory hit its 200-PR read limit — open-PR linkage below may be incomplete._"
@@ -2763,7 +2767,9 @@ update_work_plan() {
   # unsubstantiated — refuse to rewrite the plan over it. The last good plan
   # is preserved, and the failure stays visible in this tick's output and
   # its receipt classification instead of silently over-stating Ready.
-  if [ -z "${WORK_PLAN_OPEN_PR_INVENTORY_OK:-}" ]; then
+  # In-band check: render_plan_body() ran in a subshell, so its unreadable
+  # note (the only channel that crosses that boundary) is the signal.
+  if [[ "$new_body" == *"Open-PR inventory unreadable"* ]]; then
     record_work_plan_receipt "inventory-unreadable"
     echo "WORK_PLAN.md NOT written: open-PR inventory unreadable — preserving the last good plan (#14785)." >&2
     return 1
