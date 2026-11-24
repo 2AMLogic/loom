@@ -349,6 +349,7 @@ pub mod priority_pick;
 pub mod private_control_gate;
 pub mod proc_exec;
 pub mod promotion_author;
+pub mod prompt_modifier;
 pub mod provenance;
 pub mod quarantine_reconciliation;
 pub mod quarantine_stash_status;

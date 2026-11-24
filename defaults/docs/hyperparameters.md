@@ -226,6 +226,11 @@ canonical JSON — in a process global. The trace provenance stamper
 reproducible from the exact hyperparameter vector it ran under: re-set the
 same `$LOOM_HYPERPARAMS` (or config block), get the same digest.
 
+A single-step run that names a prompt modifier (`LOOM_PROMPT_MODIFIER`, #15017) has
+its name folded into the digest as a trailing `promptModifier` member, so runs that
+differ only in the modifier digest differently; with none set the serialization, and
+so every existing digest, is unchanged. `loom-daemon hyperparams` prints it.
+
 The digest covers the whole resolved vector including inherited defaults —
 two runs with identical digests ran identical tunables, even if they got
 there by different tiers.
