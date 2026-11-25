@@ -454,6 +454,44 @@ or routing default changes here. Efficiency/parallelism exploration is #8788.
 See the [mount contract](../../docker/worker/MOUNT-CONTRACT.md) and
 [session CLI/migration guide](../../docker/session/README.md#private-clone-workspaces).
 
+## Addendum: Claude per-seat session containers (#14371)
+
+The operator's 2026-11-18 ruling (2AMLogic/2am#7380) is that every runtime's
+steps may run in one operator-built session image with one login per container.
+Decision 1 above chose ephemeral for Claude because its token is a stateless
+bearer credential; that reasoning about *auth* still holds, but the operator
+weighed a different property, namely identical tools and one login model across
+providers, and so Claude gains a second, **opt-in** lifetime. Decision 1's
+"no new dispatch path" rule is kept.
+
+- **A seat** is a Claude token-pool account with a persistent container
+  `loom-claude-session-<name>` from the session image (including the
+  `accounts.session.image` override, #14019). The seat's private
+  `CLAUDE_CONFIG_DIR` is mounted at `/home/loom/.claude`; two seats share no
+  directory. The OAuth token is passed by name in the `docker exec` process
+  environment only, never mounted or written to the container filesystem.
+- **Token choice moves ahead of the container.** The host's existing selector
+  (bad tokens, ranking, allowlist) picks the account; if that account is a
+  registered seat, the step `docker exec`s into its container, otherwise it runs
+  on the host or per-sweep exactly as before. An empty pool still exits `78`.
+  A selected seat that is unavailable refuses the step; there is no silent
+  fallback to host dispatch.
+- **Cost.** Compared with ephemeral: an idle persistent container per enrolled
+  account and lifecycle operations (recreate at an image roll is #14112), no
+  clean filesystem per sweep, and no per-sweep cgroup limit payload. In return:
+  one image, one login per container and cross-step state for that account.
+  Start-time effect is measured by the `# LOOM_SEAT_DISPATCH` /
+  `# LOOM_SEAT_FIRST_ACTIVITY` markers rather than asserted.
+- **Soak (#7767).** That issue gates flipping the *fleet default* of the
+  ephemeral shape on soak evidence. Seats are opt-in per account, change no
+  default, and neither use nor satisfy those criteria; `containment=claude-session`
+  versus `claude-ephemeral` keeps the evidence separable. #7767 stays blocked.
+- **Claude CLI.** Inherited from the `loom-worker` base at the same release
+  tag, not separately pinned, consistent with `harness-pins.yml`.
+
+Operating details and the telemetry format are in
+[runtime-adapters.md](../../defaults/docs/runtime-adapters.md#claude-per-seat-session-containers-issue-14371).
+
 ## References
 
 - Epic **#6896** — Session containers: persistent Codex auth, mandatory

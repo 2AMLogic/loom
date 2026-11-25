@@ -1888,8 +1888,10 @@ unknown to known did not weaken this guard for other names.)
 
 Containers as a session-persistence and containment boundary for worker
 runtimes — per-account persistent session containers for runtimes with
-mutable interactive auth (Codex), per-sweep ephemeral containers for
-stateless-auth runtimes (Claude, Pi/OpenCode) — are specified in
+mutable interactive auth (Codex) and, opt-in per account, for Claude
+([below](#claude-per-seat-session-containers-issue-14371)); per-sweep
+ephemeral containers for stateless-auth runtimes (Claude by default,
+Pi/OpenCode) — are specified in
 [ADR-0017: Session-Container Architecture](https://github.com/2AMLogic/loom/blob/main/docs/adr/0017-session-container-architecture.md)
 (epic #6896). Both container lifetimes dispatch through the existing
 `spawn-worker.sh` → `spawn-<runtime>.sh` seam described above with **no new
@@ -1899,8 +1901,82 @@ This is a pointer only — no contract-point changes ship with it.
 | Runtime | Lifetime | Image | Enable with | Telemetry `containment=` |
 |---|---|---|---|---|
 | Claude | per-sweep **ephemeral** | `ghcr.io/2amlogic/loom-worker` | `runtimes.containment.enabled: true` (#7429) | `claude-ephemeral` |
+| Claude | per-seat **persistent session** (opt-in per account) | `ghcr.io/2amlogic/loom-worker-session` (or the `accounts.session.image` override, #14019) | `loom-daemon accounts session start <name> --provider claude` (#14371) | `claude-session` |
 | Codex | per-account **persistent session** | `ghcr.io/2amlogic/loom-worker-session` | ADR-0017 Phase 2 | — |
 | Pi, OpenCode | per-sweep **ephemeral** | `ghcr.io/2amlogic/loom-worker-native` | `runtimes.containment.native: "ephemeral"` (#8403) | `native-ephemeral` |
+
+#### Claude per-seat session containers (issue #14371)
+
+The operator ruled (2AMLogic/2am#7380) that every runtime's steps may run in one
+operator-built session image with **one login per container**. For Claude that
+is a *seat*: a Claude token-pool account whose persistent container
+`loom-claude-session-<name>` is managed like Codex's `loom-codex-session-<name>`
+and started from the same session image. It is a second **opt-in** shape beside
+`claude-ephemeral`, not a replacement, and it adds no dispatch path.
+
+**How a step reaches a seat.** `spawn-claude.sh` runs the existing token
+selector first (bad-token skipping, `.ranking`, `.allowlist`, then random). Only
+if the *selected* account is a registered seat does it `exec`
+`loom-daemon session-exec claude-seat`, which runs `spawn-claude.sh` inside that
+seat's container through the same supervised `docker exec` transport Codex uses.
+So seat selection is the pool selector's choice of account; there is no second
+selector and no in-container pool read. An exhausted or dead account is skipped
+exactly as on the host, and an empty or fully-excluded pool still exits `78`
+(`EX_CONFIG`) before any container is touched. A selected seat that is stopped,
+missing the workspace mount, or on an incompatible `session-exec` protocol
+**refuses the step** (named reason, no silent fall back to host dispatch). A
+credential-proxied dispatch is also refused for a seat, because the token must
+travel in the exec's process environment.
+
+**What lives where.**
+
+| | Per-sweep ephemeral (`claude-ephemeral`) | Per-seat session (`claude-session`) |
+|---|---|---|
+| Lifetime | one sweep, then removed | persistent; survives steps, daemon restarts, host reboots |
+| Token | process env, pool re-read inside the container | process env of the `docker exec` only; the pool is never mounted and the token is on no container path |
+| Claude state (config, sessions, transcripts) | clean filesystem per sweep | the seat's own `<seat root>/<name>/home`, mounted at `/home/loom/.claude`; two seats share no directory |
+| Resource limits | per-sweep CPU / memory cgroup payload | none per seat today (a seat is shared by that account's steps) |
+| Operator surface | none (config flag) | `accounts session start`, `stop`, `status` with `--provider claude`; `accounts list --provider claude` |
+
+What each shape costs: ephemeral pays a container create and teardown per sweep
+and gives up cross-step state; a seat pays an idle persistent container per
+enrolled account plus lifecycle operations (start, stop, recreate when the
+image rolls — #14112 will automate that), and its filesystem is **not** clean
+between steps. Which one starts a step sooner is measured, not assumed: a seat
+step's stderr log carries `# LOOM_SEAT_DISPATCH dispatched_at=<RFC 3339>` (the
+instant before `docker exec` is spawned) and `# LOOM_SEAT_FIRST_ACTIVITY
+dispatched_at=<..> first_activity_at=<..> elapsed_ms=<n>` (the first byte the
+worker writes to stderr; `first_activity_at=none` if it never wrote one).
+Stdout is not observable by the supervisor, so first activity is a stderr
+signal, not a first-model-token signal.
+
+**Telemetry.** The `# LOOM_DISPATCH_MODE` marker for a seat step reads
+`containment=claude-session` and adds `container_id=` and `image_digest=`
+(`sha256:…`) of the container instance the step was bound to, so a run record
+names the exact container and image. `accounts list --provider claude` and
+`accounts session status <name> --provider claude` show each seat's runtime,
+containment, container and image.
+
+**The Claude CLI in the image.** The session image does not install Claude
+itself: it is `FROM` the `loom-worker` image at the same release tag, which
+installs the CLI with `claude.ai/install.sh`. The CLI version is therefore the
+one that install served when that base image was built, and the image tag pins
+the pair together; it is **not** separately version-pinned. That follows
+`.github/workflows/harness-pins.yml`, which keeps Claude Code out of the pinned
+harnesses on purpose (the fleet tracks latest). Whether the in-container CLI
+self-updates past the built version is not asserted here.
+
+**Relation to the #7767 soak.** #7767 gates flipping the *fleet default* of
+`runtimes.containment.enabled` (the `claude-ephemeral` shape) on soak evidence.
+Per-seat sessions are opt-in per account, flip no default, and neither consume
+nor count toward those criteria; because the `containment=` value differs,
+soak data for one shape cannot be mistaken for the other. #7767 stays blocked
+on its own evidence.
+
+**Status.** Registration, supervised dispatch, selection, isolation and the
+fake-Docker/image-smoke tests are merged (#14499, #14596). A provider-backed
+Builder step inside a real seat on a fleet host has not been run as part of this
+documentation change.
 
 #### Why native harnesses do NOT reuse Codex's session container
 
