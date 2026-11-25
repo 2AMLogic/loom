@@ -24,7 +24,9 @@ use std::path::Path;
 
 use chrono::{DateTime, Utc};
 
-use crate::telemetry::trace::{SpanName, SpanRecord, SpanStatus, TraceAttributes, TraceContext};
+use crate::telemetry::trace::{
+    SpanName, SpanRecord, SpanStatus, TraceAttributes, TraceContext, TraceId,
+};
 
 /// The removal pass.
 pub const PHASE_REAP: &str = "reap";
@@ -180,6 +182,89 @@ pub fn publish(repo_root: &Path, p: &Pass<'_>) {
     }
 }
 
+/// One item a seat pass removed (#14889): the volume-relative path, the
+/// worktree's branch and full pre-removal tip, or the scratch entry's byte
+/// count — what a wrong removal leaves behind for an operator to find.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Removal<'a> {
+    /// `worktree` / `scratch`.
+    pub kind: &'a str,
+    /// The item's path relative to the seat volume, never a host path.
+    pub path: &'a str,
+    /// The removed worktree's branch (worktree removals only).
+    pub branch: Option<&'a str>,
+    /// The removed worktree's full pre-removal tip SHA (worktrees only).
+    pub tip: Option<&'a str>,
+    /// The bytes the removal freed.
+    pub bytes: Option<u64>,
+}
+
+/// The span for one removal `r` over `repo_root` (the seat pseudo-root),
+/// at `at`: its own root like a `reaper.pass`, one per removed item.
+#[must_use]
+pub fn removal_span(repo_root: &Path, r: &Removal<'_>, at: DateTime<Utc>) -> SpanRecord {
+    let name = SpanName::ReaperRemoval;
+    let repo = repo_name(repo_root);
+    let instant = crate::telemetry::trace::instant(at);
+    let pid = std::process::id().to_string();
+    let context = TraceContext::derived(
+        name.as_str(),
+        &[
+            repo.as_str(),
+            r.kind,
+            r.path,
+            instant.as_str(),
+            pid.as_str(),
+        ],
+    );
+    let mut attributes = TraceAttributes::new();
+    attributes.insert("loom.repo".into(), repo);
+    attributes.insert("loom.reaper.class".into(), "seat".into());
+    attributes.insert("loom.reaper.removal.kind".into(), r.kind.to_string());
+    attributes.insert("loom.reaper.removal.path".into(), r.path.to_string());
+    // Keep a readable base name when the raw path is long or contains controls.
+    // The host logs this span's trace ID even when the escaped name is too long.
+    if let Some(base) = Path::new(r.path)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .filter(|n| !n.is_empty())
+    {
+        attributes.insert("loom.reaper.removal.name".into(), base.escape_debug().to_string());
+    }
+    if let Some(branch) = r.branch {
+        attributes.insert("loom.reaper.removal.branch".into(), branch.to_string());
+    }
+    if let Some(tip) = r.tip {
+        attributes.insert("loom.reaper.removal.tip".into(), tip.to_string());
+    }
+    if let Some(bytes) = r.bytes {
+        attributes.insert("loom.reaper.removal.bytes".into(), bytes.to_string());
+    }
+    crate::telemetry::trace::provenance::stamp(&mut attributes);
+    SpanRecord {
+        context,
+        parent_span_id: None,
+        name,
+        started_at: at,
+        ended_at: at,
+        status: SpanStatus::Ok,
+        attributes,
+        events: Vec::new(),
+        links: Vec::new(),
+    }
+}
+
+/// Return the emitted span's trace ID so the host can name it in the audit log.
+pub fn publish_removal(repo_root: &Path, r: &Removal<'_>) -> Option<TraceId> {
+    if !super::spans_exported() {
+        return None;
+    }
+    let span = removal_span(repo_root, r, Utc::now());
+    let trace_id = span.context.trace_id.clone();
+    super::emit_span(span);
+    Some(trace_id)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -227,10 +312,58 @@ mod tests {
                 "backup_failed",
             ),
             ("something nobody categorised", "other"),
+            // #14678: the in-volume seat pass's preserve wordings, so the
+            // seat spans land in the same fixed categories.
+            ("uncommitted changes in worktree", "uncommitted"),
+            ("unpushed commits on HEAD", "not_merged"),
+            ("PR closed without merging (not merged)", "not_merged"),
+            ("no merged PR for the branch at this tip", "not_merged"),
+            ("merged PR grace period not passed", "grace"),
+            ("worktree locked (in use)", "in_use"),
         ] {
             assert_eq!(preserve_reason(wording), want, "{wording}");
             assert!(PRESERVE_REASONS.contains(&preserve_reason(wording)));
         }
+    }
+
+    /// #14678: a seat pass's span names the seat (never a host path) and
+    /// carries the seat class beside the workspace classes.
+    #[test]
+    fn a_seat_pass_span_names_the_seat_and_its_class() {
+        let p = Pass {
+            class: "seat",
+            phase: PHASE_REAP,
+            scanned: 6,
+            removed: 1,
+            failed: 0,
+            preserved: vec![
+                "uncommitted changes in worktree",
+                "unpushed commits on HEAD",
+                "PR still open",
+                "PR closed without merging (not merged)",
+                "merged PR grace period not passed",
+            ],
+            bytes: 2048,
+            backed_up: 0,
+            backup_refs: Vec::new(),
+        };
+        let span = pass_span(Path::new("/private-workspace-seats/agent-1"), &p, at());
+        assert!(span.validate().is_ok());
+        let bounded = span.clone().bounded();
+        for (key, want) in [
+            ("loom.repo", "agent-1"),
+            ("loom.reaper.class", "seat"),
+            ("loom.reaper.preserved.uncommitted", "1"),
+            ("loom.reaper.preserved.not_merged", "2"),
+            ("loom.reaper.preserved.pr_open", "1"),
+            ("loom.reaper.preserved.grace", "1"),
+        ] {
+            assert_eq!(bounded.attributes.get(key).map(String::as_str), Some(want), "{key}");
+        }
+        assert!(!span
+            .attributes
+            .values()
+            .any(|v| v.contains("/private-workspace-seats")));
     }
 
     #[test]
@@ -318,5 +451,99 @@ mod tests {
         });
         assert_eq!(captured.spans.len(), 1);
         assert_eq!(captured.spans[0].name.as_str(), "reaper.pass");
+    }
+
+    /// #14889: the removal span — one per item a seat pass removed.
+    #[test]
+    fn a_removal_span_names_the_seat_item_branch_and_tip() {
+        let tip = "a".repeat(40);
+        let r = Removal {
+            kind: "worktree",
+            path: "repo/.loom/worktrees/issue-9",
+            branch: Some("feature/issue-9"),
+            tip: Some(tip.as_str()),
+            bytes: Some(4096),
+        };
+        let span = removal_span(Path::new("/private-workspace-seats/agent-1"), &r, at());
+        assert_eq!(span.name.as_str(), "reaper.removal");
+        assert_eq!(span.status, SpanStatus::Ok);
+        assert!(span.parent_span_id.is_none());
+        assert!(span.validate().is_ok());
+        let bounded = span.clone().bounded();
+        for (key, want) in [
+            ("loom.repo", "agent-1"),
+            ("loom.reaper.class", "seat"),
+            ("loom.reaper.removal.kind", "worktree"),
+            ("loom.reaper.removal.path", "repo/.loom/worktrees/issue-9"),
+            ("loom.reaper.removal.name", "issue-9"),
+            ("loom.reaper.removal.branch", "feature/issue-9"),
+            ("loom.reaper.removal.tip", tip.as_str()),
+            ("loom.reaper.removal.bytes", "4096"),
+        ] {
+            assert_eq!(bounded.attributes.get(key).map(String::as_str), Some(want), "{key}");
+            assert!(
+                key == "loom.repo" || crate::telemetry::ops::OPS_SPAN_ATTRIBUTE_KEYS.contains(&key),
+                "{key}"
+            );
+        }
+        assert!(!span
+            .attributes
+            .values()
+            .any(|v| v.contains("/private-workspace-seats")));
+        assert_eq!(
+            span.context,
+            removal_span(Path::new("/private-workspace-seats/agent-1"), &r, at()).context,
+            "deterministic"
+        );
+        // A scratch item carries name and bytes only.
+        let scratch = Removal {
+            kind: "scratch",
+            path: "cache/sta-6421",
+            branch: None,
+            tip: None,
+            bytes: Some(4),
+        };
+        let bounded = removal_span(Path::new("/r/agent-1"), &scratch, at()).bounded();
+        assert_eq!(bounded.attributes["loom.reaper.removal.name"], "sta-6421");
+        assert_eq!(bounded.attributes["loom.reaper.removal.bytes"], "4");
+        assert!(!bounded
+            .attributes
+            .contains_key("loom.reaper.removal.branch"));
+    }
+
+    /// #14889: an over-long path is dropped by the export bound, but the
+    /// base name keeps the span correlatable with the item's local log line.
+    #[test]
+    fn an_over_long_path_keeps_a_bounded_correlation_name() {
+        let long = format!("repo/.loom/worktrees/issue-9/{}", vec!["branch-xyz"; 24].join("/"));
+        assert!(long.len() > 256);
+        let tip = "b".repeat(40);
+        let r = Removal {
+            kind: "worktree",
+            path: &long,
+            branch: Some("feature/issue-9"),
+            tip: Some(tip.as_str()),
+            bytes: Some(4096),
+        };
+        let bounded = removal_span(Path::new("/r/agent-1"), &r, at()).bounded();
+        assert!(!bounded.attributes.contains_key("loom.reaper.removal.path"));
+        assert_eq!(bounded.attributes["loom.reaper.removal.name"], "branch-xyz");
+        assert_eq!(bounded.attributes["loom.reaper.removal.tip"], tip);
+    }
+
+    #[test]
+    fn removal_publish_goes_to_the_ops_sink_when_one_is_registered() {
+        let r = Removal {
+            kind: "scratch",
+            path: "cache/sta-6421",
+            branch: None,
+            tip: None,
+            bytes: Some(4),
+        };
+        let (trace_id, captured) =
+            super::super::capture::capture(|| publish_removal(Path::new("/r/agent-1"), &r));
+        assert_eq!(captured.spans.len(), 1);
+        assert_eq!(trace_id.as_ref(), Some(&captured.spans[0].context.trace_id));
+        assert_eq!(captured.spans[0].name.as_str(), "reaper.removal");
     }
 }

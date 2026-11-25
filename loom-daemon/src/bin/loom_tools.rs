@@ -24,7 +24,19 @@
 //! `forge-probe --live-write`, `forge-inventory gate --update`) refused with
 //! exit 64 before any handler runs.
 //!
-//! Worktree commands (#14474, §13.9) resolve mode at a nested forge read.
+//! `champion-hold`, `curation-complete` and `notify-cleared-blockers` (#14465, §13.9)
+//! apply the same mode gate. On the local route the workflow writes run on the
+//! caller's scoped `gh` credential; on the fleet route they go to the scoped
+//! curation-write broker (`complete_curation`, `notify_cleared_blocker`),
+//! never an ambient credential, with no local fallback on broker failure.
+//!
+//! `gateway refresh|status|clean` (#14884) is the session-mode gateway
+//! publisher: a daemon-free pass of the same profile publisher the daemon's
+//! loop runs, into a session-owned destination. `refresh` resolves `mode`
+//! and requires `session`; `status` and `clean` run ungated (a leftover
+//! publication is reported and removed whatever the mode). No forge call.
+//!
+//! Worktree commands (#14474, §13.10) resolve mode at a nested forge read.
 //! Local worktree operations remain available offline.
 
 use std::io::Write;
@@ -36,16 +48,16 @@ use loom_daemon::cli::{
     handle_forge_probe_read_command, handle_forge_read_command, handle_labels_read_command,
     handle_lease_command, handle_operator_decision_command, handle_park_record_command,
     handle_resolve_model_command, handle_resolve_role_model_command, handle_strip_ansi_command,
-    AffectedFilesCommand, CheckPointsMarkerArgs, CheckpointAction, ConfigArgs, DuplicateScanArgs,
-    ForgeInventoryCommand, ForgeProbeArgs, ForgeReadCli, GuardsCommand, HooksHomeArgs,
-    InstallBinaryCommand, InstallCompatCommand, LabelDuplicatesArgs, LabelsArgs, LeaseCli,
-    OperatorDecisionCli, ParkRecordCli, PrQueueArgs, PremiseCheckArgs, ReleaseFetchArgs,
-    ResolveModelArgs, ResolveRoleModelArgs, ResyncPayloadArgs, RolesCommand, SkipLabelsArgs,
-    StaleBlockedArgs, WorktreeCommands,
+    AffectedFilesCommand, ChampionHoldCommand, CheckPointsMarkerArgs, CheckpointAction, ConfigArgs,
+    CurationCompleteArgs, DuplicateScanArgs, ForgeInventoryCommand, ForgeProbeArgs, ForgeReadCli,
+    GuardsCommand, HooksHomeArgs, InstallBinaryCommand, InstallCompatCommand, LabelDuplicatesArgs,
+    LabelsArgs, LeaseCli, NotifyClearedBlockersArgs, OperatorDecisionCli, ParkRecordCli,
+    PrQueueArgs, PremiseCheckArgs, ReleaseFetchArgs, ResolveModelArgs, ResolveRoleModelArgs,
+    ResyncPayloadArgs, RolesCommand, SkipLabelsArgs, StaleBlockedArgs, WorktreeCommands,
 };
 use loom_daemon::install_compat;
 use loom_daemon::script_helpers;
-use loom_daemon::tools_mode;
+use loom_daemon::tools_mode::{self, Route};
 
 #[derive(Parser)]
 #[command(
@@ -100,6 +112,14 @@ enum ToolsCommands {
     /// reach the forge resolves `mode` first. Local verbs, including
     /// `verdict-lock` and `journal-ci-refusal`, run offline.
     Forge(ForgeReadCli),
+    /// Read Champion hold evidence for a pull request.
+    #[command(subcommand)]
+    ChampionHold(ChampionHoldCommand),
+    /// Project the trusted points estimate and curation labels.
+    CurationComplete(CurationCompleteArgs),
+    /// Notify dependents whose cited blockers have closed.
+    NotifyClearedBlockers(NotifyClearedBlockersArgs),
+
     /// Render, read, apply and retract the `loom:blocked` park record: the
     /// same arguments, stdin, stdout and exit codes as `loom-daemon
     /// park-record` (#14464). `render`, `parse`, `retract --file`, `released`
@@ -217,6 +237,39 @@ enum ToolsCommands {
         #[arg(long, value_name = "PATH")]
         repo: Option<std::path::PathBuf>,
     },
+    /// The session-mode gateway read profiles (#14884): `refresh` publishes,
+    /// `status` inspects and `clean` withdraws the profiles a session-only
+    /// host publishes for itself — no daemon loop runs there, so its fleet
+    /// reads would otherwise fall back to a direct App token and its smaller
+    /// quota. Daemon-free, no forge call, and no credential in argv or
+    /// output; the profiles are the same read-only ones the daemon
+    /// publishes, at `<session root>/.loom/gh-config-gateway` (default root
+    /// `~/.local/share/loom/session`).
+    Gateway {
+        #[command(subcommand)]
+        action: GatewayAction,
+    },
+}
+
+/// The `gateway` verbs (#14884).
+#[derive(Subcommand)]
+enum GatewayAction {
+    /// Publish the gateway read profile of every owner configured in the
+    /// host defaults tier (`~/.local/share/loom/config/defaults.json`; a
+    /// repository setting cannot redirect it). Run at session start and
+    /// after a key rotation: a second invocation picks up a rotated key,
+    /// drops removed owners and withdraws a profile whose key no longer
+    /// resolves. Requires `mode` = session.
+    Refresh,
+    /// Report the publication — per owner current, due for refresh, stray or
+    /// missing, plus the `gh-ok` marker readers validate. Read-only; prints
+    /// no credentials. Freshness is the age of each owner's `hosts.yml`
+    /// against the 5-minute republish cadence the daemon's loop uses.
+    Status,
+    /// Remove the session publication (leaving session mode). That directory
+    /// only: a daemon host's workspace publication is never touched.
+    /// Idempotent.
+    Clean,
 }
 
 /// `capabilities`: one JSON object on stdout. Read-only, no forge call.
@@ -234,10 +287,146 @@ fn capabilities(repo: Option<&std::path::Path>) -> Result<()> {
     Ok(())
 }
 
+/// `gateway refresh|status|clean` (#14884): the session-mode publication, a
+/// daemon-free pass of the same publisher the daemon's loop runs. `refresh`
+/// resolves `mode` first and requires `session` (it applies the session
+/// route like every gated command, discarding inherited fleet routing);
+/// `status` and `clean` run without the gate — a leftover publication is
+/// reported and removed whatever the mode. `status` prints nothing when
+/// there is no publication and the host is not in session mode, so a fleet
+/// host's `loom status` stays quiet.
+fn gateway(action: GatewayAction) -> Result<()> {
+    use loom_daemon::forge_gateway::{session, PassOutcome};
+
+    let cwd = std::env::current_dir().unwrap_or_else(|_| ".".into());
+    match action {
+        GatewayAction::Refresh => {
+            let mode = tools_mode::configure_forge_read_route(&cwd).map_err(anyhow::Error::msg)?;
+            if mode != "session" {
+                anyhow::bail!(
+                    "`gateway refresh` publishes the session profiles, but mode is {mode:?}; a \
+                     daemon or fleet host gets its profiles from its own route. Set mode to \
+                     \"session\" (env `LOOM_MODE` or the `mode` key in .loom-local/local.json) \
+                     to publish them here"
+                );
+            }
+            let base = session::checked_base().map_err(anyhow::Error::msg)?;
+            let host = session::host_tier_config();
+            let (outcome, warnings) = session::refresh_real(&base, &host);
+            for w in &warnings {
+                eprintln!("loom-tools gateway: {w}");
+            }
+            match outcome {
+                PassOutcome::Published { ref owners, .. } if !owners.is_empty() => {
+                    println!(
+                        "gateway read profiles published for [{}] into {}",
+                        owners.join(", "),
+                        base.display()
+                    );
+                    Ok(())
+                }
+                PassOutcome::Published { failed, .. } => anyhow::bail!(
+                    "no gateway profile could be published ({}); fix the key sources named \
+                     above and run 'loom-tools gateway refresh' again",
+                    failed.join(", ")
+                ),
+                PassOutcome::Off => anyhow::bail!(
+                    "forge.gateway is not set in the host defaults tier ({}); nothing \
+                     published. Configure it there — a repository tier cannot redirect a host \
+                     key",
+                    crate_defaults_path()
+                ),
+                PassOutcome::GhTooOld(seen) => anyhow::bail!(
+                    "gh {} is below the minimum {}; nothing published (an older gh ignores \
+                     api_host and would send the key to GitHub)",
+                    seen.map_or_else(|| "missing".to_string(), |v| v.to_string()),
+                    loom_daemon::forge_gateway::MIN_GH_VERSION
+                ),
+                PassOutcome::Unchanged => Ok(()),
+            }
+        }
+        GatewayAction::Status => {
+            let base = session::session_root()
+                .map(|root| session::session_base_at(&root))
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "no session root resolves: {} is explicitly empty or no home directory \
+                         is set",
+                        session::SESSION_ROOT_ENV
+                    )
+                })?;
+            let st =
+                session::status(&base, &session::host_tier_config(), std::time::SystemTime::now());
+            let on_session_host = tools_mode::quiet_mode(&cwd).as_deref() == Some("session");
+            if st.exists || on_session_host {
+                for line in session::render_status(&st) {
+                    println!("{line}");
+                }
+            }
+            Ok(())
+        }
+        GatewayAction::Clean => {
+            let base = session::checked_base().map_err(anyhow::Error::msg)?;
+            if session::clean(&base) {
+                println!("removed the session gateway profiles at {}", base.display());
+            } else {
+                println!("no session gateway profiles at {}", base.display());
+            }
+            Ok(())
+        }
+    }
+}
+
+/// Where `gateway refresh` expected `forge.gateway`: the private defaults
+/// path, for its refusal text.
+fn crate_defaults_path() -> String {
+    loom_daemon::config_resolver::private_defaults_path()
+        .map_or_else(|| "(no host defaults file resolves)".to_string(), |p| p.display().to_string())
+}
+
 /// Resolve `mode`, then (fleet route only) adopt the exported read routing.
 fn mode_gate() -> Result<()> {
     let cwd = std::env::current_dir().unwrap_or_else(|_| ".".into());
     tools_mode::configure_forge_reads(&cwd).map_err(anyhow::Error::msg)
+}
+
+/// Resolve mode and adopt the read routing for a workflow command. `writes`
+/// names whether the invocation mutates: only then is a conflicting mode
+/// tier a refusal. Returns whether the fleet route was chosen — the caller
+/// then routes its writes to the scoped curation broker (#14465) instead of
+/// an ambient `gh` credential.
+fn workflow_gate(root: &std::path::Path, writes: bool) -> Result<bool> {
+    let checkout = loom_daemon::repo_root::find_repo_root(root);
+    check_workflow_route(checkout.as_deref().unwrap_or(root), writes)
+}
+
+fn check_workflow_route(root: &std::path::Path, writes: bool) -> Result<bool> {
+    if writes
+        && loom_daemon::config_resolver::tier_conflicts(root)
+            .iter()
+            .any(|c| c.key == "mode")
+    {
+        anyhow::bail!(
+            "conflicting fleet and workspace mode settings; reconcile them before a workflow write"
+        );
+    }
+    if tools_mode::configure_forge_reads_with_route(root).map_err(anyhow::Error::msg)?
+        == Route::Fleet
+    {
+        anyhow::ensure!(
+            loom_daemon::forge_gateway::cli_reads_reader_only(),
+            "no usable fleet read route"
+        );
+        return Ok(true);
+    }
+    Ok(false)
+}
+
+/// The fleet curation-write broker handle (#14465): resolved before any
+/// forge read, so a missing caller key is the actionable error and nothing
+/// else runs.
+fn curation_broker() -> Result<loom_daemon::fleet_curation_broker::Broker> {
+    loom_daemon::fleet_curation_broker::Broker::resolve_from_env().map_err(anyhow::Error::msg)
 }
 
 /// `apply --new` files through `create-issue.sh`, which calls `$LOOM_DAEMON_BIN
@@ -254,6 +443,7 @@ fn use_this_binary_for_nested_filing() {
 }
 
 fn run() -> Result<()> {
+    let cwd = std::env::current_dir().unwrap_or_else(|_| ".".into());
     match ToolsCli::parse().command {
         ToolsCommands::StripAnsi { file } => handle_strip_ansi_command(file.as_deref()),
         ToolsCommands::Checkpoint { action } => {
@@ -277,6 +467,27 @@ fn run() -> Result<()> {
                 mode_gate()?;
             }
             handle_forge_read_command(cli)
+        }
+        ToolsCommands::ChampionHold(cmd) => {
+            cmd.run_with_gate(|root| check_workflow_route(root, false).map(|_| ()))
+        }
+        ToolsCommands::CurationComplete(args) => {
+            if workflow_gate(&args.workspace_root, true)? {
+                args.run_fleet(&curation_broker()?)
+            } else {
+                args.run()
+            }
+        }
+        ToolsCommands::NotifyClearedBlockers(args) => {
+            let root = args.repo_root.clone().unwrap_or_else(|| cwd.clone());
+            // One gate call: its notes and env side effects happen once. A
+            // dry run evaluates it with `writes = false`, so a preview is
+            // never refused, and never takes the broker route (#15260).
+            if workflow_gate(&root, !args.dry_run)? && !args.dry_run {
+                args.run_fleet(&curation_broker()?)
+            } else {
+                args.run()
+            }
         }
         ToolsCommands::ParkRecord(cli) => handle_park_record_command(cli),
         ToolsCommands::OperatorDecision(cli) => {
@@ -359,6 +570,7 @@ fn run() -> Result<()> {
         }
         ToolsCommands::Worktree(commands) => commands.run_tools(),
         ToolsCommands::Capabilities { json: _, repo } => capabilities(repo.as_deref()),
+        ToolsCommands::Gateway { action } => gateway(action),
     }
 }
 

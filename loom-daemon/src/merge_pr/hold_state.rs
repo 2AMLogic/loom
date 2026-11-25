@@ -59,6 +59,7 @@
 //! anchor above already excludes the far more common prose/backtick shapes.
 //! Recorded here rather than left to be rediscovered.
 
+use crate::merge_pr::sequence::html_comment_spans;
 use regex::Regex;
 use std::sync::OnceLock;
 
@@ -82,26 +83,6 @@ fn marker_re() -> &'static Regex {
         Regex::new(r"champion:hold-state head=([0-9a-f]+)(?: auth=([0-9a-f]+))?")
             .expect("static hold-state pattern")
     })
-}
-
-/// The inner text of every HTML comment that both opens and closes on `line`.
-///
-/// Line-local by construction: a `<!--` with no `-->` after it on the same
-/// line yields nothing. That is the point — the input is many comment bodies
-/// concatenated, so any multi-line scan lets one malformed comment change how
-/// a later one is read.
-fn html_comment_spans(line: &str) -> Vec<&str> {
-    let mut spans = Vec::new();
-    let mut rest = line;
-    while let Some(open) = rest.find("<!--") {
-        let after = &rest[open + 4..];
-        let Some(close) = after.find("-->") else {
-            break;
-        };
-        spans.push(&after[..close]);
-        rest = &after[close + 3..];
-    }
-    spans
 }
 
 /// The most recent `champion:hold-state` marker: its head and, when the

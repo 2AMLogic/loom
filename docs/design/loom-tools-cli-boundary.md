@@ -34,6 +34,7 @@ re-reading the source it names. Counts are from the pinned tree below.
 14. [Phase 3b: park records and operator decisions (#14464)](#14-phase-3b-park-records-and-operator-decisions-14464)
 15. [Phase 3c: issue leases (#14488)](#15-phase-3c-issue-leases-14488)
 16. [Phase 3b: the remaining merge-queue actions (#14520)](#16-phase-3b-the-remaining-merge-queue-actions-14520)
+17. [The session gateway publisher (#14884)](#17-the-session-gateway-publisher-14884)
 
 ## 1. Pinned inputs
 
@@ -771,12 +772,12 @@ The remaining merge-queue verbs (#14520) are listed in §16.
 
 | Verb or family | Reason |
 | --- | --- |
-| `merge-pr*`, `champion-hold`, `curation-complete`, `notify-cleared-blockers` | writes; merge integration is #14396 / #8191 (`park-record` and `operator-decision` moved in #14464, §14) |
+| `merge-pr*` | writes; merge integration is #14396 / #8191 (`park-record` and `operator-decision` moved in #14464, §14) |
 | `peer-claims`, `queue`, `status` | daemon round trip (class C) |
 | `fleet-config` | reaches the workspace registry (§3.6) |
 | Top-level reads `labels`, `pr-queue`, `premise-check`, `duplicate-scan`, `check-points-marker`, `label-duplicates`, `forge-probe`, `forge-inventory`, `affected-files`, `check-stale-blocked` | moved in #14429 — see §13.7 |
 | Config inspection `skip-labels`, `roles`, `guards`, `install-compat`, `hooks-home` (`config get` shipped in #12939) | moved in #14429 — see §13.7 |
-| Worktree operations | Shared worktree commands are listed in §13.9 (#14474). |
+| Worktree operations | Shared worktree commands are listed in §13.10 (#14474). |
 | Checkout-local claims | Available through `loom-tools claim` (#14487, §13.8). |
 | Issue lease commands (`lease ensure\|co-occupancy\|release\|renewer`) | Served in `loom-tools` by #14488 (§15). |
 | Role-keyed PR leases | Available through `loom-tools lease pr` (#14489, §13.6). |
@@ -892,7 +893,63 @@ or `release` leaves the owner's `claim.json` unchanged.
 split into reads and writes, so no sub-verbs are listed). Forge claim checks
 (§13.2) and role-keyed PR leases (§13.6) use their own dispatch paths.
 
-### 13.9 Phase 3c worktree operations (#14474)
+### 13.9 Hold evidence, curation and blocker notification (#14465)
+
+Both binaries dispatch these commands to the same Rust handlers. All four
+`champion-hold` verbs read evidence. The caller posts the marker printed by
+`merge-failed-marker`. A notification dry run also requires only read access.
+
+In session and local-daemon modes, `curation-complete` checks write scope on
+the explicit repository before projecting points. `notify-cleared-blockers`
+checks the scan's repository and sends each eligible label edit and comment
+to the discovered dependent. These GitHub handlers decline Gitea with exit 3.
+
+**Fleet routing (the operator's `scoped` ruling of 2026-11-23, 2am#8390 /
+2am#8397).** In fleet mode the writes do not run on an ambient `gh`
+credential — the fleet writer Apps hold no label or conversation scope.
+`curation-complete` routes its label projection to the broker's
+`POST /v1/complete_curation` (`{repo, number, points, idempotency_key}`;
+points are resolved locally from trusted sources first, so an invalid
+estimate is refused before the broker is contacted), and
+`notify-cleared-blockers` sends `POST /v1/notify_cleared_blocker`
+(`{repo, number, closed, idempotency_key}`) once per (dependent, cited
+closed blocker) — a resweep sends the cited numbers the evidence shows
+resolved. The reads and discovery stay on the fleet reader. There is no
+write-scope probe on this route: it would consult the reader for a
+credential that never carries the write. The broker verifies the caller
+(`fleet-roles` profile), the repository (`curation-policy.json`) and the
+target server-side before its first mutation, performs the eligible issue's
+`loom:blocked` → `loom:curated` transition itself (label edit first; a
+failed edit posts no comment), and deduplicates the marker comment by
+loom's own `<!-- loom:blocker-cleared:#N -->` marker — so a comment posted
+locally and one posted through the broker suppress each other, under any
+idempotency key. Loom's idempotency keys are stable per projection: one
+hash per `(repo, issue, points)` and per `(repo, dependent, closed)`, so a
+retry replays (or finishes a partial cleanup) instead of double-posting.
+
+Fail closed, no fallback: a missing caller key, an unreachable broker, or
+a refusal fails `curation-complete` and is reported per dependent by
+`notify-cleared-blockers` (whose best-effort exit-0 contract is unchanged);
+nothing ever retries as a local `gh` write. Provisioning uses the names the
+merge-queue status poster already uses (#12679): `GITHUB_WRITE_BROKER_URL`
+(default `https://bot-issues.2amlogic.com`) and the `fleet-roles` key by
+`FLEET_ROLES_GITHUB_WRITE_KEY` or its 0600 key file
+(`FLEET_ROLES_GITHUB_WRITE_KEY_FILE`, default
+`~/.config/2am/github-write-fleet-roles.key`); the key travels only in the
+`Authorization` header. The key resolves before any forge read, so its
+absence is the actionable error.
+
+Documented divergences from the local writer, all forced by the scoped op
+contract: the broker's comment carries the shared opening line and Unparked
+wording but not loom's per-reason bullets; the broker's transition gate
+(`loom:blocked` and none of `loom:operator`/`loom:frozen`/`external`) is
+looser than loom's `unpark_eligible`, so a fleet notification may unpark an
+issue a local run would leave held; and one comment lands per closed
+blocker rather than one comment carrying several markers. Everything else —
+`loom-tools`-only mode resolution, the four read-only hold verbs, the
+dry-run preview — is unchanged.
+
+### 13.10 Phase 3c worktree operations (#14474)
 
 Both binaries mount the same Clap commands and dispatch to the same Rust
 handlers. These are the worktree entries in both capability reports.
@@ -1013,6 +1070,7 @@ The whole process chain stays on the binary that was selected:
 | --- | --- |
 | `lease ensure` -> `sweep-lease-publish.sh`, `sweep-lease-renew.sh start` | `pin_running_binary` gives both scripts `LOOM_DAEMON_BIN=<current_exe>` unless the caller already exported one |
 | the scripts' `forge may-write`, `forge trusted-comments`, `forge token`, `forge check-branch`, `lease renewer ...` | read `${LOOM_DAEMON_BIN:-loom-daemon}`; `loom-tools` serves each of those verbs |
+| issue-state and lease-comment GETs in the scripts | when the selected `loom-tools` serves `lease read`, it routes those GETs through the mode gate and the forge facade; the daemon and older binaries retain the scripts' original read adapters |
 | the re-exec through `lease renewer sanitize-exec` and the detached renewal loop | inherit the exported variable |
 | the deferred retry (`lease ensure --deferred`) | `deferred::launch_process` starts `current_exe()` |
 | `renewer stop` and `release` | `is_renewer_argv` recognises `loom-tools lease renewer` as well as `loom-daemon lease renewer`, so the ownership check does not refuse the process it started |
@@ -1031,14 +1089,17 @@ fail-closed (fence, exit 6) answers.
 
 | Verb | `fleet` | `local-daemon` / `session` | Mode gate | A mode error |
 | --- | --- | --- | --- | --- |
-| `ensure` | reads and posts on the exported gateway / reader pool | reads and posts on the person's own credential; inherited fleet variables are dropped before any child sees them | yes, unless the environment settles it (no agent session, or already dispatched: the message prints and nothing starts) | printed, exit **0** (it "always exits 0"; a lease is evidence, never a precondition) |
+| `ensure` | reads on the exported gateway / reader pool and publishes on the scoped writer | reads and posts on the person's own credential; inherited fleet variables are dropped before any child sees them | yes, unless the environment settles it (no agent session, or already dispatched: the message prints and nothing starts) | printed, exit **0** (it "always exits 0"; a lease is evidence, never a precondition) |
 | `co-occupancy` | reads the lease comments | same, own credential | yes | printed, exit **0** (its exit 1 means "refuse the shared worktree" to `worktree.sh`, so a mode error must not alias it) |
-| `release` | reads, stops this host's renewers, posts the yield (write-scoped, #9548) | same, own credential | yes | exit **1** (it already exits 1 when the comments are unreadable) |
+| `release` | reads on the gateway / reader pool, stops this host's renewers, posts the yield on the scoped writer (#9548) | same operations on the person's own credential | yes | exit **1** (it already exits 1 when the comments are unreadable) |
 | `renewer claim\|check\|release\|stop\|sanitize-exec` | local files and the process table only | same | no | n/a |
 
 A session-mode `ensure` is the same code as the fleet one: the route only
 changes which credential the `gh` calls the scripts and handlers run on, and
 `write_scope` vets every write the same way on either route.
+The detached `loom-tools` renewer reads issue state and comments through the
+selected read route and PATCHes the exact lease on the scoped writer. The
+pre-push fence reads comments through the same route.
 
 ### 15.3 Consumers
 
@@ -1051,7 +1112,7 @@ changes which credential the `gh` calls the scripts and handlers run on, and
 ### 15.4 Served commands and tests
 
 `install_compat::TOOLS_COMMANDS` gains `lease ensure`, `lease co-occupancy`,
-`lease release` and `lease renewer`; the unit test in `bin/loom_tools.rs` fails
+`lease release`, the script delegate `lease read`, and `lease renewer`; the unit test in `bin/loom_tools.rs` fails
 if the list and the clap tree disagree. `loom_tools_slice.rs` checks the
 issue-lease capability entries and exercises both lease families.
 
@@ -1063,7 +1124,12 @@ deferred retry, renew, release, co-occupancy and fence paths: one owner and one
 renewer for a repeated `ensure`; a live peer's record kept and never posted
 over; renewal and the deferred publisher stopping when the watched process
 ends; `release` idempotent and refusing a live peer; the fence's branch probe
-answered by `loom-tools` against a local origin; an inherited gateway visible to the children on the `fleet` route and dropped on a `session` route; and a read-only credential refused by `forge may-write` (no lease posted, no yield posted). The existing
+answered by `loom-tools` against a local origin. With an inherited synthetic
+gateway, the fixture records the effective identity for comments, issue
+state, permission checks, and writes through the lifecycle in all three
+modes. A successful co-occupancy check using the wrong identity demonstrates
+that valid data alone cannot pass the route assertions. A read-only
+credential is refused by `forge may-write` (no lease posted or yielded). The existing
 `test-sweep-lease-{publish,renew,renew-lifecycle,renew-fd-hygiene,fence,
 fence-race,convergence}.sh` and `test-worktree-lease-co-occupancy.sh` suites
 run unchanged.
@@ -1149,3 +1215,49 @@ repository with disposable PRs, and recording the resulting queue entry and
 status state, needs that repository and a writer credential. It is recorded on
 the PR and the issue for an operator with that access; no repo permission is
 broadened here.
+
+## 17. The session gateway publisher (#14884)
+
+Not a port of a daemon command: `loom-tools gateway refresh|status|clean` is
+new surface, `loom-tools`-only, with no `loom-daemon` counterpart. A
+session-only host (#8884, epic #12708) runs no daemon, so the gateway
+refresh loop never publishes there and its fleet reads fell back to a direct
+App token (#14884).
+
+### 17.1 Mechanism
+
+`forge_gateway::session` reuses the publisher's write half
+(`forge_gateway/publish.rs::write_all`, extracted from `Refresher::publish_all`
+with no behavior change) into a session-owned base
+`~/.local/share/loom/session/.loom/gh-config-gateway` (override
+`LOOM_SESSION_GATEWAY_ROOT`; refused inside a git checkout) — the same suffix
+and `gh-ok` marker readers validate. The `forge.gateway` block is read from
+the private defaults tier **only** (`host_tier_config`): a repository tier or
+an inherited `LOOM_GH_GATEWAY_DIR` cannot redirect a host key. The pass never
+touches the process-global `Active` state: a one-shot tool owns no route.
+
+Mode gate, classified by effect: `refresh` resolves `mode` and requires
+`session` (it discards inherited fleet routing like every session command);
+`status` and `clean` run ungated — a leftover publication is reported and
+removed whatever the mode, and `status` prints nothing when there is no
+publication and the host is not in session mode (so `loom status` on a fleet
+host stays quiet; `scripts/loom` delegates to it verbatim). `loom`-level docs:
+`defaults/docs/session-mode.md` § "Gateway read profiles".
+
+### 17.2 Served commands and tests
+
+`gateway refresh`, `gateway status`, `gateway clean`
+(`install_compat::TOOLS_COMMANDS`; `src/bin/loom_tools.rs`'s clap-tree test
+enforces the listing). Unit: `forge_gateway/session_tests.rs` (publication,
+rotation, withdrawal, the checkout refusal, cleanup scope, status classes,
+the host-tier-only source). Integration: `tests/loom_tools_slice.rs`
+(`gateway_*`: the real binary against a fake `gh`, a host-tier fixture with
+0600 key files and the daemon absent from PATH — publish/rotate/withdraw,
+status current/due/missing, off-session quietness, cleanup preserving a
+workspace publication, and the refusals).
+
+**Live verification NOT performed in the implementing worktree**: the
+uncached fleet-store read through the gateway from a separately launched
+reader on a session-only host (issue #14884's fourth criterion) needs the
+live fleet reader and gateway; it is tracked in 2AMLogic/2am#8152, whose
+receipt the issue accepts.

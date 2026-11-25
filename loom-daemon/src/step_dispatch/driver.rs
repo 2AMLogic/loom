@@ -710,6 +710,7 @@ impl StepDriver {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let gather = walk.stats(Instant::now());
         self.next_start = walk.next_start();
+        let deadline_skipped: Vec<usize> = walk.skipped_indices().to_vec();
         if gather.truncated {
             log::warn!(
                 "work_finder: step gather truncated by the tick deadline after {}ms: {} repo(s) \
@@ -777,7 +778,10 @@ impl StepDriver {
                 input.spawn_concurrency.max(1),
             )
         });
-        let result = tick::run_with_offers(
+        let local_role_holds = input.roots.first().map_or_else(BTreeSet::new, |root| {
+            crate::fleet_dispatch::worker::local_role_holds(root, Instant::now())
+        });
+        let result = tick::run_with_role_holds(
             workspaces,
             StepTickLimits {
                 free_slots,
@@ -788,6 +792,7 @@ impl StepDriver {
             &knobs,
             &mut spawner,
             &offers,
+            &local_role_holds,
         );
         // An offer the tick did not claim failed a gate or found no slot:
         // give it back so its row does not sit out the captain's TTL.
@@ -827,6 +832,15 @@ impl StepDriver {
         });
         for (idx, failed, listing, held) in &notes {
             note_listing(&mut report, *idx, failed.as_ref(), *listing, *held);
+        }
+        // #15182: a repo the gather deadline skipped was never listed this
+        // tick — its ready queue is unread, not empty. Recording the listing
+        // incomplete gives it the same #11139 treatment a partial listing
+        // already gets, so consumers that read a missing row as a departure
+        // (the disposition tracker, dwell, dispatch eligibility) preserve its
+        // rows instead of emitting false `left_queue` observations.
+        for idx in &deadline_skipped {
+            report.note_listing(*idx, false);
         }
         report.occupancy = Some(total + report.dispatched);
         report.note_halts(input.halted, Some(input.halt_causes), input.roots.len());

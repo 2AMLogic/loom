@@ -511,7 +511,7 @@ pub const EXPERIMENT_ENV_ALLOWLIST: &[&str] = &[
 /// `SCCACHE_SERVER_PORT` is on the list for a non-obvious reason worth
 /// stating: `sccache` is a per-user *server*, and whichever process starts it
 /// first fixes the storage backend for every later client. An operator who
-/// ssh'es in and runs one `cargo build` (or even `sccache --show-stats`)
+/// ssh'es in and runs one `cargo build` (or `sccache --start-server`)
 /// starts a local-disk server on the default port, and every daemon build
 /// after that silently gets local disk instead of the shared bucket — a
 /// degraded cache that looks identical to a working one. Pinning the daemon
@@ -2289,26 +2289,20 @@ pub(crate) fn dispatch_model_releasing_poll_lock(
 mod tests;
 
 // Issue #9572's in-flight idempotency-key coverage. A plain child module
-// declared here rather than an inline `mod` on `dispatch/tests.rs`, which is
-// over the file-size ratchet threshold — see that file's own top-of-file
-// note on this pattern.
+// declared here rather than an inline `mod` on `dispatch/tests.rs` — see that
+// file's own top-of-file note on this pattern.
 #[cfg(test)]
 mod idempotency_inflight_tests;
 
-// Issue #9928's fleet-aware noop-cooldown guard coverage. A sibling module for
-// the same reason as `idempotency_inflight_tests` above: `dispatch/tests.rs` is
-// over the file-size ratchet threshold.
-#[cfg(test)]
-// Issue #8997's rate-limited label-flip breaker coverage (same reason).
+// Issue #8997's rate-limited label-flip breaker coverage.
 #[cfg(test)]
 mod rate_limit_tests;
 
 // Issue #11304's post-claim closed-issue re-verification coverage — a sibling
-// module for the same reason as the ones above.
+// module.
 #[cfg(test)]
 mod closed_after_claim_tests;
 
-// Issue #9573's lock-scope coverage — a sibling module for the same reason as
-// the ones above.
+// Issue #9573's lock-scope coverage — a sibling module.
 #[cfg(test)]
 mod lock_scope_tests;

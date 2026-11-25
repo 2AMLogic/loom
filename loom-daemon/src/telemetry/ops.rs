@@ -408,6 +408,16 @@ pub const OPS_SPAN_ATTRIBUTE_KEYS: &[&str] = &[
     "loom.reaper.backed_up",
     "loom.reaper.backup_refs",
     "loom.reaper.preserved.backup_failed",
+    // #14889: `reaper.removal` spans — one per item a seat pass removed:
+    // kind, volume-relative path, the base name that keeps an over-long
+    // path correlatable with the local log, and the worktree's branch/tip
+    // or the scratch entry's bytes.
+    "loom.reaper.removal.kind",
+    "loom.reaper.removal.path",
+    "loom.reaper.removal.name",
+    "loom.reaper.removal.branch",
+    "loom.reaper.removal.tip",
+    "loom.reaper.removal.bytes",
 ];
 
 /// Longest label value kept, in bytes.

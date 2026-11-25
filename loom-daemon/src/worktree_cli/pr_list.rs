@@ -4,7 +4,7 @@ use std::path::Path;
 use std::process::{Command, Output};
 
 use crate::forge_cmd::{detect_forge, ForgeType, FORGE_CMD_TIMEOUT};
-use crate::fs_util::is_executable;
+use crate::fs_util::is_on_path;
 use crate::gh_invocation::{AccessIntent, GhCompletion, GhInvocation, GhTarget, Operation};
 use crate::proc_exec::Completion;
 
@@ -51,9 +51,9 @@ impl PrList {
 
 fn legacy_output(repo: &Path, args: &[&str]) -> Result<Output, String> {
     // Keep the existing daemon/gh selection for callers of the legacy CLI.
-    let (program, leading): (&str, &[&str]) = if on_path("loom-daemon") {
+    let (program, leading): (&str, &[&str]) = if is_on_path("loom-daemon") {
         ("loom-daemon", &["forge"])
-    } else if on_path("gh") {
+    } else if is_on_path("gh") {
         ("gh", &[])
     } else {
         return Err("no forge client on PATH".into());
@@ -83,13 +83,4 @@ fn tools_output(repo: &Path, args: &[&str]) -> Result<Output, String> {
         GhCompletion::Captured(Completion::Exited(output)) => Ok(output),
         _ => Err("forge PR list was unavailable".into()),
     }
-}
-
-fn on_path(program: &str) -> bool {
-    std::env::var_os("PATH").is_some_and(|path| {
-        std::env::split_paths(&path).any(|dir| {
-            let candidate = dir.join(program);
-            candidate.is_file() && is_executable(&candidate)
-        })
-    })
 }

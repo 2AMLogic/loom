@@ -323,7 +323,8 @@ fn command_is_configured_in(root: &Path) -> bool {
 
 /// The tier that supplied [`CONFIG_KEY`] in `root`, when any did.
 fn command_tier(root: &Path) -> Option<&'static str> {
-    crate::config_resolver::source_of(root, CONFIG_KEY).map(|s| tier_name(root, &s))
+    crate::config_resolver::source_of(root, CONFIG_KEY)
+        .map(|s| crate::config_resolver::tier_name(root, &s))
 }
 
 /// One bounded route observation (#14632). Field names are the contract; the
@@ -374,26 +375,6 @@ pub fn opaque_root_id(root: &Path) -> String {
     let mut h = Sha256::new();
     h.update(canonical(root).to_string_lossy().as_bytes());
     format!("sha256:{}", &hex::encode(h.finalize())[..12])
-}
-
-/// Name the tier a config source file belongs to — the same mapping
-/// `loom-daemon config get` reports.
-fn tier_name(repo_root: &Path, source: &Path) -> &'static str {
-    use crate::config_resolver::{
-        FLEET_REPO_CONFIG_REL, LEGACY_CONFIG_REL, LOCAL_CONFIG_REL, PROJECT_CONFIG_REL,
-    };
-    let is = |rel: &str| source == repo_root.join(rel);
-    if is(LOCAL_CONFIG_REL) {
-        "local"
-    } else if is(FLEET_REPO_CONFIG_REL) {
-        "fleet-repo"
-    } else if is(PROJECT_CONFIG_REL) {
-        "project"
-    } else if is(LEGACY_CONFIG_REL) {
-        "committed"
-    } else {
-        "defaults"
-    }
 }
 
 /// Bound on the route log (#14632): above `MAX_LOG_BYTES` the file is cut to

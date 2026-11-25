@@ -80,6 +80,73 @@ candidate file. An unreadable list never authorizes a rerun — treating it as
 "no markers" would duplicate completed keys. A successfully read empty list
 selects both keys as missing.
 
+## Tick outcome counts
+
+The existing `ratification_lane.tick` span reports one final outcome per
+attempted key. Each entry below is a count at
+`loom.ratification.<ee|market>.<outcome>`. All twelve fields are present,
+including zeroes. Review content and diagnostic details stay off the span.
+
+| Outcome | When it is counted |
+|---|---|
+| `posted` | The marker was posted for a valid verdict, including a negative review. |
+| `pre_launch_failed` | An instruction pin failed or the runner reported a known pre-launch refusal. |
+| `invocation_failed` | An invocation did not succeed, including interruption or failure with an unknown launch stage. |
+| `output_missing` | The invocation succeeded without captured output. |
+| `verdict_invalid` | The captured output did not parse as a review for that key. |
+| `post_failed` | The review parsed and the forge did not accept the marker post. |
+
+The two `posted` fields sum to `loom.ratification.posted`. The other
+ten sum to `loom.ratification.withheld`. A trusted marker for the current
+head skips that key, and an unreadable candidate counts once in
+`loom.ratification.unreadable`. Neither case adds a key outcome.
+
+### Check retained counts after rollout
+
+After ordinary rollout, substitute the exact deployed daemon SHA and a
+bounded UTC interval with retained work in the query below. It collapses
+replayed spans by trace and span ID before comparing and summing the same
+tick rows. Rows missing fields are counted separately from genuine zeroes.
+Require nonzero `ticks`, zero `incomplete_ticks`, and zero
+`unreconciled_ticks`. Use a window with nonzero posted or withheld counts
+to observe actual outcomes. Check the fields remain present through the
+collector route if any are missing.
+
+```sql
+WITH
+  ['ee', 'market'] AS review_keys,
+  ['posted', 'pre_launch_failed', 'invocation_failed', 'output_missing',
+   'verdict_invalid', 'post_failed'] AS outcomes,
+  arrayConcat(
+    ['loom.ratification.posted', 'loom.ratification.withheld'],
+    arrayFlatten(arrayMap(k -> arrayMap(o -> concat('loom.ratification.', k, '.', o),
+                                        outcomes), review_keys))
+  ) AS fields,
+  per_tick AS (
+    SELECT argMax(attributes_string, timestamp) AS attrs
+    FROM signoz_traces.signoz_index_v3
+    WHERE name = 'ratification_lane.tick'
+      AND attributes_string['loom.daemon.revision'] = '<deployed-sha>'
+      AND timestamp >= toDateTime64('<start-utc>', 9, 'UTC')
+      AND timestamp < toDateTime64('<end-utc>', 9, 'UTC')
+    GROUP BY trace_id, span_id
+  ),
+  decoded AS (
+    SELECT arrayMap(f -> toUInt64OrNull(attrs[f]), fields) AS parsed,
+           arrayAll(x -> isNotNull(x), parsed) AS complete,
+           arrayMap(x -> ifNull(x, toUInt64(0)), parsed) AS n
+    FROM per_tick
+  )
+SELECT count() AS ticks,
+       countIf(NOT complete) AS incomplete_ticks,
+       countIf(complete AND (n[1] != n[3] + n[9]
+         OR n[2] != arraySum(arraySlice(n, 3)) - n[3] - n[9])) AS unreconciled_ticks,
+       mapFromArrays(fields,
+         arrayResize(sumForEach(arrayMap(x -> if(complete, x, toUInt64(0)), n)),
+                     length(fields), toUInt64(0))) AS totals
+FROM decoded;
+```
+
 ## Marker format
 
 ```
@@ -109,6 +176,75 @@ is logged as withheld. The text is at most 4000 characters — the head is
 kept on truncation, so the heading and verdict line survive — with an
 explicit notice when cut; its `<!--` and `-->` are escaped, so it cannot
 form or alter a marker.
+
+## Reading the markers: `ratification-lane status`
+
+A held PR can carry dozens of key-marker comments at one head — daemons
+older than the missing-key retry fix (#14797/#14800) re-dispatched both keys
+every tick — and the markers exist in two formats. The read-only report
+
+```
+loom-daemon ratification-lane status <PR> [--repo owner/name] [--root PATH]
+```
+
+fetches the PR's current head and its complete, paginated comment history
+(trusted authors only, `.loom/docs/comment-trust.md`), then prints the
+reviewed head and one row per key: the **effective** marker — the review to
+read first — with a link, one indented `superseded` link for every other
+eligible marker at the same head, and an explicit `MISSING` line when a
+complete read finds no marker for a key. An on-demand report also works for
+historical PR threads where both keys are already present and the lane has
+stopped posting. The command performs only reads: it never dispatches,
+posts, edits, minimises or deletes anything, and it never releases a hold —
+the human retains the ratification decision. If the PR head or the comment
+history cannot be read (including a torn later page or a malformed record),
+it reports the error and exits non-zero rather than guessing.
+
+### Which marker is effective
+
+- A marker is **eligible** for a head when a trusted author posted it, it
+  names the PR's current head with a full 40-hex SHA, and — when the marker
+  carries a `block=owner/repo#<n>` identity — that identity names exactly
+  this PR. Markers for another head or another PR are neither effective nor
+  superseded: they are not this head's markers.
+- The **effective** marker for a key is the newest eligible one by the forge
+  comment's **creation time**, with the numeric comment id as the
+  tie-breaker. Both formats compete on exactly the same terms; an edit, a
+  date written inside the review, or a more favourable verdict gives a
+  comment no priority. Every other eligible comment for that key is listed
+  as **superseded** and linked once. No review text is deleted.
+- A marker inside a fenced code block or on a block-quote line is a quoted
+  example, not a marker: review prose cannot establish a head or a key.
+
+Both wire formats are recognized:
+
+| Format | Shape | Posted by |
+|--------|-------|-----------|
+| Lane | `<!-- ratify:key=<ee\|market> sha=<40-hex head> -->` | the lane (`marker_body`) |
+| Hand | `<!-- RATIFY-KEY: <ee\|market> verdict=… block=owner/repo#<pr> sha=<40-hex head> reviewer=… date=… -->` | a hand-run key-apply |
+
+### A mixed-format example
+
+Suppose a part repo's PR #98 carried both Market formats at head `6a3cd2c4…`
+(#14834): the lane posted
+`<!-- ratify:key=market sha=6a3cd2c43c31821fe93bbc18828c0eb6e06aa063 -->`
+(created 19:00:37Z), then a hand-applied
+`<!-- RATIFY-KEY: market verdict=adequate-for-catalog
+block=example-org/part-repo#98 sha=6a3cd2c… -->`
+followed (created 19:14:25Z). The report prints:
+
+```
+example-org/part-repo#98
+Reviewed head: 6a3cd2c43c31821fe93bbc18828c0eb6e06aa063
+
+ee: MISSING — no trusted ee marker names this head
+
+market: effective 2026-11-20T19:14:25Z https://github.com/example-org/part-repo/pull/98#issuecomment-7048390167 (RATIFY-KEY)
+  superseded 2026-11-20T19:00:37Z https://github.com/example-org/part-repo/pull/98#issuecomment-7048105117 (ratify:key)
+```
+
+The RATIFY-KEY review is the one to read first; the earlier `ratify:key`
+review is still linked, still complete, just superseded.
 
 ## Trust model
 

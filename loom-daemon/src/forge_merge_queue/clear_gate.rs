@@ -18,21 +18,6 @@ fn is_clear(body: &str) -> bool {
         || body.starts_with(crate::champion_hold::ratification::RELEASED_MARKER)
 }
 
-/// True when the newest `champion:hold-state` record is for `head`, a clear
-/// or release marker follows it (or shares its comment), and no hold stands.
-/// `trusted` is the PR's trusted comment bodies, oldest first (an untrusted
-/// quote of a marker is prose, not state). A clear is head-bound only through
-/// the hold-state record it follows: with no record at `head` it is not one.
-///
-/// A record written in the *same* comment as the clear carries the head at
-/// Champion's tick, not the head the human cleared (the head may have moved in
-/// between). Such a clear covers `head` only when the hold it released was
-/// itself recorded at `head`: the previous record must equal `head` too.
-#[must_use]
-pub fn champion_clear_at<C: AsRef<str>>(trusted: &[C], head: &str) -> bool {
-    clear_verdict(trusted, head) == ClearVerdict::Covers
-}
-
 #[derive(Debug, PartialEq, Eq)]
 enum ClearVerdict {
     Covers,

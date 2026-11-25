@@ -325,8 +325,9 @@ pub(crate) fn classify_gitea_permissions(body: &str) -> Option<Permission> {
 
 /// Split curl's `-o - -w "\n%{http_code}"` output into the response body and
 /// the numeric status. The marker is the *last* newline: a JSON body never
-/// contains a raw one.
-fn split_body_and_status(raw: &str) -> Option<(&str, u16)> {
+/// contains a raw one. Shared with the Gitea comment transport (#14940), so
+/// the two curl callers cannot drift on the convention.
+pub(crate) fn split_body_and_status(raw: &str) -> Option<(&str, u16)> {
     let (body, code) = raw.rsplit_once('\n')?;
     Some((body, code.trim().parse().ok()?))
 }
@@ -353,6 +354,16 @@ pub(crate) struct GiteaProbe {
 }
 
 impl GiteaProbe {
+    /// The Gitea connection a write from `root` carries (#14940): the same
+    /// resolution this probe authenticates with (env overrides, then config),
+    /// so a vetted write uses the instance, repository and credential the
+    /// permission check approved — never a second, differently-resolved one.
+    /// `Err` carries why it could not resolve (no credential, a malformed
+    /// config, …), which the caller fails closed on.
+    pub(crate) fn writer_connection(root: &Path) -> Result<crate::forge_cmd::GiteaConfig, String> {
+        Self::resolve(root)
+    }
+
     /// Resolve the credential writes from `root` will carry. `GITEA_URL`
     /// beats `.loom/config.json`'s `forge.gitea.url`; the token falls back
     /// `GITEA_TOKEN`, then config, then `FORGE_TOKEN` (the generic fallback
@@ -378,6 +389,12 @@ impl GiteaProbe {
             })
             .unwrap_or_default();
         Self { resolved, id }
+    }
+
+    /// The connection this probe resolved and authenticates with, for a caller
+    /// that must write with exactly it (#14940); `None` when unresolved.
+    pub(crate) fn connection(&self) -> Option<crate::forge_cmd::GiteaConfig> {
+        self.resolved.as_ref().ok().cloned()
     }
 
     /// The resolved connection's digest; empty when the connection could not
@@ -431,77 +448,92 @@ impl GiteaProbe {
     }
 
     fn probe(&self, cfg: &crate::forge_cmd::GiteaConfig, repo: &str) -> Permission {
-        let auth = match &cfg.username {
-            // base64 of `user:password`, computed here so the credential
-            // still never reaches argv (curl's own `-u` would put it there).
-            Some(u) => {
-                use base64::engine::general_purpose;
-                use base64::Engine as _;
-                format!(
-                    "Authorization: Basic {}\n",
-                    general_purpose::STANDARD.encode(format!("{u}:{}", cfg.token))
-                )
-            }
-            None => format!("Authorization: token {}\n", cfg.token),
+        let (status, body) = match gitea_get(cfg, &format!("repos/{repo}")) {
+            Ok(answer) => answer,
+            Err(why) => return Permission::Unknown(why),
         };
-        let mut cmd = Command::new("curl");
-        // `-q` must come first: it stops `~/.curlrc` adding `--location`, a
-        // proxy or anything else to a credentialed request. `--globoff`
-        // keeps `{}`/`[]` in the interpolated repo slug literal.
-        cmd.args(["-q", "--globoff", "--silent", "--show-error", "--max-time"])
-            .arg(PROBE_TIMEOUT.as_secs_f64().to_string())
-            .arg("-o")
-            .arg("-")
-            .arg("-w")
-            .arg("\n%{http_code}")
-            .arg("-H")
-            .arg("@-")
-            .arg(format!("{}/api/v1/repos/{repo}", cfg.base_url))
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-        let Ok(mut child) = cmd.spawn() else {
-            return Permission::Unknown("could not spawn curl".into());
-        };
-        if let Some(mut stdin) = child.stdin.take() {
-            use std::io::Write as _;
-            let _ = stdin.write_all(auth.as_bytes());
-        }
-        let output = match child.wait_with_output() {
-            Ok(o) => o,
-            Err(e) => return Permission::Unknown(format!("curl: {e}")),
-        };
-        if !output.status.success() {
-            let why = String::from_utf8_lossy(&output.stderr);
-            return Permission::Unknown(format!(
-                "curl exit {}: {}",
-                output.status.code().unwrap_or(-1),
-                why.trim().lines().next().unwrap_or_default()
-            ));
-        }
-        let raw = String::from_utf8_lossy(&output.stdout);
         // A 200 with a parseable `permissions` object is the only definitive
         // answer; every other status (a wrong URL 404s, a refused credential
         // 401/403s) is `Unknown` — the issue's fail-closed rule.
-        let Some((_, 200)) = split_body_and_status(&raw) else {
-            let status = raw.rsplit('\n').next().unwrap_or("").trim();
-            return Permission::Unknown(format!(
-                "the Gitea API answered {}",
-                if status.is_empty() {
-                    "nothing parseable"
-                } else {
-                    status
-                }
-            ));
-        };
-        classify_gitea_permissions(body_of(&raw))
+        if status != 200 {
+            return Permission::Unknown(format!("the Gitea API answered {status}"));
+        }
+        classify_gitea_permissions(&body)
             .unwrap_or_else(|| Permission::Unknown("unparseable repo payload".into()))
     }
 }
 
-/// The response body from combined `-o - -w "\n%{http_code}"` output.
-fn body_of(raw: &str) -> &str {
-    raw.rsplit_once('\n').map_or(raw, |(body, _)| body)
+/// The Gitea connection a read or a write from `root` carries: the one
+/// resolver for the write-scope probe and for the native reads
+/// ([`crate::gitea_read`]), so a read never runs under a credential a write
+/// would not carry.
+pub(crate) fn gitea_connection(root: &Path) -> Result<crate::forge_cmd::GiteaConfig, String> {
+    GiteaProbe::resolve(root)
+}
+
+/// One authenticated `GET {base}/api/v1/{path}` on a resolved connection.
+/// House style is the sync `curl` subprocess (`tokens_pool::check`,
+/// `script_helpers::usage`): the credential is never placed in argv, where it
+/// would be world-readable via `/proc/<pid>/cmdline` and `ps` (#5982); the
+/// `Authorization` header is written to curl's stdin (`-H @-`).
+///
+/// `Err` is why nothing was read: curl could not run, or answered no status
+/// line. A refusal from the server is `Ok` with its status and body, which
+/// every caller fails closed on.
+pub(crate) fn gitea_get(
+    cfg: &crate::forge_cmd::GiteaConfig,
+    path: &str,
+) -> Result<(u16, String), String> {
+    let auth = match &cfg.username {
+        // base64 of `user:password`, computed here so the credential
+        // still never reaches argv (curl's own `-u` would put it there).
+        Some(u) => {
+            use base64::engine::general_purpose;
+            use base64::Engine as _;
+            format!(
+                "Authorization: Basic {}\n",
+                general_purpose::STANDARD.encode(format!("{u}:{}", cfg.token))
+            )
+        }
+        None => format!("Authorization: token {}\n", cfg.token),
+    };
+    let mut cmd = Command::new("curl");
+    // `-q` must come first: it stops `~/.curlrc` adding `--location`, a
+    // proxy or anything else to a credentialed request. `--globoff` keeps
+    // `{}`/`[]` in the interpolated repo slug literal.
+    cmd.args(["-q", "--globoff", "--silent", "--show-error", "--max-time"])
+        .arg(PROBE_TIMEOUT.as_secs_f64().to_string())
+        .arg("-o")
+        .arg("-")
+        .arg("-w")
+        .arg("\n%{http_code}")
+        .arg("-H")
+        .arg("@-")
+        .arg(format!("{}/api/v1/{path}", cfg.base_url))
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let Ok(mut child) = cmd.spawn() else {
+        return Err("could not spawn curl".into());
+    };
+    if let Some(mut stdin) = child.stdin.take() {
+        use std::io::Write as _;
+        let _ = stdin.write_all(auth.as_bytes());
+    }
+    let output = child.wait_with_output().map_err(|e| format!("curl: {e}"))?;
+    if !output.status.success() {
+        let why = String::from_utf8_lossy(&output.stderr);
+        return Err(format!(
+            "curl exit {}: {}",
+            output.status.code().unwrap_or(-1),
+            why.trim().lines().next().unwrap_or_default()
+        ));
+    }
+    let raw = String::from_utf8_lossy(&output.stdout);
+    let Some((body, status)) = split_body_and_status(&raw) else {
+        return Err("the Gitea API answered nothing parseable".into());
+    };
+    Ok((status, body.to_string()))
 }
 
 impl PermissionProbe for GiteaProbe {
@@ -766,23 +798,7 @@ impl<P: PermissionProbe> PermissionProbe for Cached<P> {
 }
 
 fn write_entry(path: &Path, entry: &DiskEntry) {
-    use std::io::Write;
-    let Some(dir) = path.parent() else { return };
-    if !crate::forge_etag_store::private_dir(dir, true) {
-        return;
-    }
-    let Ok(body) = serde_json::to_string(entry) else {
-        return;
-    };
-    let tmp = dir.join(format!(".tmp-{}-{}", std::process::id(), now_epoch_secs()));
-    let Ok(mut f) = crate::forge_etag_store::create_private_file(&tmp) else {
-        return;
-    };
-    if f.write_all(body.as_bytes()).is_ok() {
-        let _ = std::fs::rename(&tmp, path);
-    } else {
-        let _ = std::fs::remove_file(&tmp);
-    }
+    crate::forge_etag_store::write_private_json(path, entry);
 }
 
 /// Forget every in-memory answer (tests).
@@ -790,5 +806,32 @@ fn write_entry(path: &Path, entry: &DiskEntry) {
 pub(crate) fn clear_memory() {
     if let Ok(mut m) = memory().lock() {
         m.clear();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_failed_disk_write_leaves_no_temp_file_behind() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(crate::forge_etag_store::private_dir(dir.path(), true));
+        let path = dir.path().join("entry.json");
+        std::fs::create_dir(&path).unwrap();
+        let entry = DiskEntry {
+            write: true,
+            detail: String::new(),
+            at: 0,
+            cred: String::new(),
+        };
+
+        write_entry(&path, &entry);
+
+        let names: Vec<String> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, ["entry.json"]);
     }
 }

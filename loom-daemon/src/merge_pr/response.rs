@@ -8,8 +8,8 @@
 //! | route | what `merge-pr.sh` does next |
 //! |---|---|
 //! | [`MergeResponseKind::MergeInProgress`] | HTTP 405 — sleep, re-read `.merged`, then keep retrying |
-//! | [`MergeResponseKind::HeadMismatch`] | #5579 — never retry-and-merge; `_head_moved_or_resync` either spends #8164's single self-sync retry or exits 3 |
-//! | [`MergeResponseKind::BaseModified`] | `forge_update_branch`, wait, re-read the head SHA, retry |
+//! | [`MergeResponseKind::HeadMismatch`] | #5579 — never retry-and-merge; `error_head_moved` exits 3 (no self-sync exists any more, #12063 slice 2) |
+//! | [`MergeResponseKind::BaseModified`] | sleep, then retry the merge within the attempt budget |
 //! | [`MergeResponseKind::Other`] | hard stop, exit 1, quoting the response |
 //!
 //! # Why this is the dangerous one
@@ -92,9 +92,12 @@ pub enum MergeResponseKind {
     /// HTTP 405 "Merge already in progress": a concurrent merger holds the PR.
     MergeInProgress,
     /// The PR's OWN head moved past the gated SHA (#5579). Never
-    /// retry-and-merge; `_head_moved_or_resync` adjudicates (#8164).
+    /// retry-and-merge; `error_head_moved` exits 3 (#12063 slice 2 retired the
+    /// self-sync that #8164 once allowed).
     HeadMismatch,
-    /// The PR's BASE branch fell behind. Sync the head, re-read its SHA, retry.
+    /// The PR's BASE branch fell behind. Sleep and retry the merge within the
+    /// attempt budget — which still spends another merge attempt, so a head
+    /// mismatch must never be routed here (#5579).
     BaseModified,
     /// No marker matched. The shell's terminal `error`, quoting the response.
     Other,
