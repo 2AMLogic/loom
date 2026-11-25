@@ -179,7 +179,7 @@ fn report(outcome: Outcome) -> Option<hb::Outcome> {
         Outcome::Interrupted => Some(hb::Outcome::Failed(
             "held repair remains pending; verify the head, hold, and merge admission state before retrying".into(),
         )),
-        Outcome::Ineligible => None,
+        Outcome::NoIntent | Outcome::Ineligible => None,
     }
 }
 

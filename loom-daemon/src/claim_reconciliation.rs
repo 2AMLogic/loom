@@ -2976,11 +2976,17 @@ pub mod forge {
         crate::comment_trust::TrustPolicy::for_root(root).trusted_bodies(&out)
     }
 
+    struct ListedVerdict {
+        pr: VerdictPr,
+        held_repair: bool,
+        updated_at: Option<String>,
+    }
+
     fn list_verdict_prs(
         gh_bin: &Path,
         root: &Path,
         kind: VerdictKind,
-    ) -> Result<Vec<(VerdictPr, bool)>> {
+    ) -> Result<Vec<ListedVerdict>> {
         let label = kind.label();
         let rows = super::open_pr_listing::list_with_label(gh_bin, root, label)?;
         Ok(rows
@@ -3022,8 +3028,8 @@ pub mod forge {
                 };
                 let held_repair = kind == VerdictKind::Approved
                     && crate::doctor_handback::held_review::candidate(&r.labels);
-                (
-                    VerdictPr {
+                ListedVerdict {
+                    pr: VerdictPr {
                         number: r.number,
                         kind,
                         head_sha: r.head_sha,
@@ -3033,7 +3039,8 @@ pub mod forge {
                         invalidation_recorded,
                     },
                     held_repair,
-                )
+                    updated_at: r.updated_at,
+                }
             })
             .collect())
     }
@@ -3117,11 +3124,16 @@ pub mod forge {
             };
             stats.checked += prs.len();
 
-            for (pr, held_repair) in prs {
-                if held_repair {
-                    if let Some(head) = pr.head_sha.as_deref() {
-                        use crate::doctor_handback::held_review::Outcome;
-                        match crate::cli::forge_verdict_cmd::held_review::recover(gh_bin, root, pr.number, head) {
+            for listed in prs {
+                let pr = listed.pr;
+                if let Some(head) = pr.head_sha.as_deref().filter(|_| listed.held_repair) {
+                    use crate::cli::forge_verdict_cmd::held_review::recover;
+                    use crate::doctor_handback::held_review::Outcome;
+                    let key =
+                        super::read_cache::key(root, pr.number, head, listed.updated_at.as_deref());
+                    super::read_cache::NO_HELD_INTENT.get_or(key, || {
+                        match recover(gh_bin, root, pr.number, head) {
+                            Outcome::NoIntent => return Some(()),
                             Outcome::Requeued => stats.invalidated += 1,
                             Outcome::Interrupted => log::warn!(
                                 "claim_reconciliation: held Doctor repair for PR #{} remains pending",
@@ -3129,7 +3141,8 @@ pub mod forge {
                             ),
                             Outcome::Ineligible => {}
                         }
-                    }
+                        None
+                    });
                 }
                 match decide_verdict(&pr) {
                     VerdictAction::Invalidate {

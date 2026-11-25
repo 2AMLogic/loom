@@ -152,7 +152,7 @@ fn retry_after_the_queue_add_uses_the_same_intent_and_never_acts_with_a_peer() {
 fn blocked_approval_with_no_exact_intent_is_never_recovered() {
     let mut forge = Fixture::new(HoldKind::CriticalFile);
     forge.owner = false;
-    assert_eq!(route(&mut forge, Mode::Recover, B), Outcome::Ineligible);
+    assert_eq!(route(&mut forge, Mode::Recover, B), Outcome::NoIntent);
     assert!(forge.writes.is_empty());
 }
 

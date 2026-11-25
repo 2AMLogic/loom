@@ -133,6 +133,8 @@ pub(crate) trait Forge {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Outcome {
+    /// A successful recovery observation confirmed the absence of a repair record.
+    NoIntent,
     Ineligible,
     Interrupted,
     Requeued,
@@ -162,6 +164,19 @@ pub(crate) fn route(forge: &mut impl Forge, mode: Mode, expected: &str) -> Outco
             Outcome::Ineligible
         };
     };
+    // Most held approvals still name their approved head, so classify() cannot
+    // construct a repair. A complete read with no intent marker proves absence
+    // even in that case. A failed read or a different head must be retried.
+    if mode == Mode::Recover
+        && same_sha(&obs.snapshot.head_sha, expected)
+        && obs.trusted.iter().all(|row| {
+            row.get("body")
+                .and_then(Value::as_str)
+                .is_some_and(|body| !body.starts_with(PREFIX))
+        })
+    {
+        return Outcome::NoIntent;
+    }
     // A qualifying repair this caller does not own is retryable, not
     // ineligible: the ordinary path would release another Doctor's claim.
     let not_owner = mode == Mode::Doctor
@@ -177,7 +192,7 @@ pub(crate) fn route(forge: &mut impl Forge, mode: Mode, expected: &str) -> Outco
     };
     if !recorded {
         if mode == Mode::Recover {
-            return Outcome::Ineligible;
+            return Outcome::NoIntent;
         }
         match forge.content_changed(&intent, expected) {
             Some(true) => {}
