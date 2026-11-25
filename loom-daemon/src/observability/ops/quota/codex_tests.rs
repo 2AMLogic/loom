@@ -121,6 +121,9 @@ fn without_codex_env<T>(f: impl FnOnce() -> T) -> T {
         crate::codex_usage::CODEX_NATIVE_HOME_ENV,
         crate::tokens_pool::paths::CODEX_PROFILE_ROOT_ENV,
     ];
+    // Crate-wide `LOOM_CODEX_HOME` lock for the whole scope (#15174), taken
+    // before the profile-root lock below it (its documented lock order).
+    let _codex_home_lock = crate::tokens_pool::codex_home_env::lock();
     // Crate-wide `LOOM_CODEX_PROFILE_ROOT` lock for the whole scope (#9964).
     let _profile_root_lock = crate::tokens_pool::profile_root_env::lock();
     let saved: Vec<_> = keys.iter().map(|k| std::env::var_os(k)).collect();

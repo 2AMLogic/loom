@@ -262,7 +262,7 @@ alias it asked for).
 New template keys reach existing consumer configs via the installer deep-merge
 (template is the base, existing values win) — no migration needed. The tier
 ownership of the block is noted in
-[`docs/design/config-resolution-tiers.md`](https://github.com/rjwalters/loom/blob/main/docs/design/config-resolution-tiers.md).
+[`docs/design/config-resolution-tiers.md`](https://github.com/2AMLogic/loom/blob/main/docs/design/config-resolution-tiers.md).
 
 ## Operator setup: provisioning the persona (requires a safehoused restart)
 
@@ -600,7 +600,7 @@ issue `0` for a host-level condition.
 ```
 @operator:example.org: loom#9268 · OPERATOR NEEDED · merge-refused at needs-operator
 Allow merge commits on the repository, or re-run the merge with squash.
-https://github.com/rjwalters/loom/issues/9268 · observed by host-a
+https://github.com/2AMLogic/loom/issues/9268 · observed by host-a
 ```
 
 - **The mention** comes from `safehouse.operatorMention` above; unset ⇒ the same
@@ -941,7 +941,7 @@ what feeds the public fleet feed. Loom is the producer:
     > **`tokens` and `tokens_by_model` are deduped on `message.id` as of
     > 2026-09-28 (#9303).** A streamed assistant message is written once per
     > chunk, each chunk repeating the same `message.id` with **cumulative**
-    > usage; `sum_transcript_usage`/`sum_transcript_usage_by_model` now keep
+    > usage; `sum_transcript_usage` and the per-model `UsageFold` rows now keep
     > the max of each counter per id instead of summing every block. Before
     > that date both figures were raw block-sums, roughly 2x high (51% of
     > usage blocks were repeats, measured 2026-09-18; #8186) — so a series

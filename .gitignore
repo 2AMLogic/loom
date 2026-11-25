@@ -255,3 +255,20 @@ Thumbs.db
 # EPHEMERAL_PATTERNS in loom-daemon/src/init/post_init.rs, not from this file.
 # It now lives in that list (and therefore in the block above), with the
 # rationale for ignoring it recorded alongside the pattern there.
+
+# Stray XDG/gh CLI state (e.g. `.local/state/gh/device-id`) written into the
+# repo root when a tool resolves $HOME/$XDG_STATE_HOME to the checkout. Anchored
+# so it never matches a nested `.local/` that a project tree ships on purpose.
+# Measured (#15125, gh 2.102.0): with HOME unset or empty, gh resolves its state
+# dir relative to the CWD and writes `.local/state/gh/device-id` there; an
+# unwritable-but-set HOME writes nothing, and a normal HOME writes under $HOME.
+# IMPORTANT: this lives ONLY in loom's own committed .gitignore — it must NOT be
+# added to EPHEMERAL_PATTERNS in loom-daemon/src/init/post_init.rs. Unlike
+# `.claude/worktrees/` and `.loom-local/` (state Loom itself creates, so they ARE
+# in that list), a root `.local/` is the SYMPTOM of a misresolved $HOME /
+# $XDG_STATE_HOME, not designed runtime state. Ignoring it in every consumer's
+# managed block would hide that symptom fleet-wide and make a recurrence silent.
+# Treat this as a backstop only; the fix is the HOME misresolution, not the ignore.
+# Do NOT widen it to `.config/`, `.cache/` or `.npm/`: `.config/nextest.toml` is
+# tracked here, so a `.config/` rule would hide a real config directory.
+/.local/

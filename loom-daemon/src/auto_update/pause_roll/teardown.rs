@@ -60,7 +60,6 @@
 //! between `SIGTERM` and `SIGKILL` is what gives that trap time to run.
 
 use std::collections::{HashMap, HashSet};
-use std::io::Read;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
@@ -195,44 +194,20 @@ pub fn parse_ps(out: &str, now: DateTime<Utc>) -> Vec<Proc> {
         .collect()
 }
 
-/// Run `cmd` to completion or kill it at `timeout`. `Some(stdout)` when it
-/// exited (whatever its status), `None` when it could not be spawned or was
-/// killed for running long.
+/// Run `cmd` to completion or kill it at `timeout`. `Some((success, stdout))`
+/// when it exited (whatever its status), `None` when it could not be spawned,
+/// was killed for running long, or its output could not be collected.
 ///
-/// Stdout is drained on its own thread while the child runs. A process table
-/// is larger than a pipe buffer, so a wait that only polls the exit status
-/// would deadlock against a `ps` blocked on a full pipe.
+/// Everything hard here is [`crate::proc_exec::run_bounded`]'s: stdout is
+/// drained while the child runs (a process table is larger than a pipe
+/// buffer), and the deadline terminates the child's whole process group, not
+/// just the leader.
 #[must_use]
 pub fn run_bounded(mut cmd: Command, timeout: Duration) -> Option<(bool, Vec<u8>)> {
-    cmd.stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null());
-    let mut child = cmd.spawn().ok()?;
-    let mut stdout = child.stdout.take()?;
-    let (tx, rx) = std::sync::mpsc::channel();
-    std::thread::spawn(move || {
-        let mut buf = Vec::new();
-        let _ = stdout.read_to_end(&mut buf);
-        let _ = tx.send(buf);
-    });
-    let deadline = Instant::now() + timeout;
-    loop {
-        match child.try_wait() {
-            Ok(Some(status)) => {
-                // The child is gone, so the pipe closes and the reader ends.
-                // The short wait only covers a grandchild holding the pipe.
-                let out = rx.recv_timeout(Duration::from_secs(2)).ok()?;
-                return Some((status.success(), out));
-            }
-            Ok(None) if Instant::now() < deadline => {
-                std::thread::sleep(Duration::from_millis(10));
-            }
-            _ => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return None;
-            }
-        }
+    cmd.stdin(Stdio::null());
+    match crate::proc_exec::run_bounded(cmd, timeout) {
+        Ok(crate::proc_exec::Completion::Exited(out)) => Some((out.status.success(), out.stdout)),
+        _ => None,
     }
 }
 

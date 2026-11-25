@@ -183,9 +183,13 @@ pub fn marker_text(marker: &SequenceMarker) -> String {
 
 /// The inner text of every HTML comment that both opens and closes on `line`.
 ///
-/// Line-local by construction — the same rule as `hold_state::html_comment_spans`,
-/// for the same reason: many bodies are scanned together, and a multi-line
-/// scan lets one malformed comment change how a later one is read.
+/// Line-local by construction — a `<!--` with no `-->` after it on the same
+/// line yields nothing. One shared implementation of that rule (#15035) for
+/// every marker reader that scans many comment bodies together — sequencing,
+/// merge reconciliation and consolidation, and the Champion hold-state
+/// reader — because a multi-line scan lets one malformed comment change how
+/// a later one is read. Each reader interprets the span text with its own
+/// marker grammar.
 pub(crate) fn html_comment_spans(line: &str) -> Vec<&str> {
     let mut spans = Vec::new();
     let mut rest = line;

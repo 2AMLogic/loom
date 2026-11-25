@@ -149,8 +149,19 @@ impl Drop for TwoOwners {
 /// (the process credential) is never asked about B's repository, and no
 /// other credential (a reader's included) carries the write.
 #[test]
-#[serial_test::serial]
+// Two keys, nested as `write_scope_test_support` documents: the
+// `write_scope_cache` group outside, because `TwoOwners` sets the
+// process-global `LOOM_WRITE_SCOPE_CACHE_DIR` every writer in that group
+// shares, and the default key inside, because the gate reads `LOOM_REPO` /
+// `GH_REPO`, whose writers hold it. The five wrappers below nest the same
+// two keys for the same reasons.
+#[serial_test::serial(write_scope_cache)]
 fn the_ladder_write_on_a_cross_owner_repo_runs_and_is_vetted_under_the_item_owners_writer() {
+    the_ladder_write_on_a_cross_owner_repo_runs_and_is_vetted_under_the_item_owners_writer_body();
+}
+
+#[serial_test::serial]
+fn the_ladder_write_on_a_cross_owner_repo_runs_and_is_vetted_under_the_item_owners_writer_body() {
     for register_root in [true, false] {
         let h = TwoOwners::new(register_root, true);
         let mut forge = GhForge::new(h.root_b.clone(), Some(h.repo_b.clone()))
@@ -186,8 +197,13 @@ fn the_ladder_write_on_a_cross_owner_repo_runs_and_is_vetted_under_the_item_owne
 /// targets the work item's repo, so a checkout registered only under its repo
 /// owner writes under that owner's writer, not the process credential.
 #[test]
-#[serial_test::serial]
+#[serial_test::serial(write_scope_cache)]
 fn the_refusal_ledger_write_targets_the_item_repo_and_runs_under_the_owners_writer() {
+    the_refusal_ledger_write_targets_the_item_repo_and_runs_under_the_owners_writer_body();
+}
+
+#[serial_test::serial]
+fn the_refusal_ledger_write_targets_the_item_repo_and_runs_under_the_owners_writer_body() {
     for register_root in [true, false] {
         let h = TwoOwners::new(register_root, true);
         let _repo = EnvGuard::set("LOOM_REPO", &h.repo_b);
@@ -211,8 +227,13 @@ fn the_refusal_ledger_write_targets_the_item_repo_and_runs_under_the_owners_writ
 /// The gate's own decision names the credential it probed: B's writer for
 /// B's checkout, whether the checkout or only B's owner slug is registered.
 #[test]
-#[serial_test::serial]
+#[serial_test::serial(write_scope_cache)]
 fn may_write_from_probes_the_credential_the_write_carries() {
+    may_write_from_probes_the_credential_the_write_carries_body();
+}
+
+#[serial_test::serial]
+fn may_write_from_probes_the_credential_the_write_carries_body() {
     let h = TwoOwners::new(true, true);
     let (d, dir) = may_write_decision(&h.root_b, Some(&h.repo_b), &default_gh());
     assert_eq!(d.verdict, Verdict::Allow(h.repo_b.clone()));
@@ -227,8 +248,13 @@ fn may_write_from_probes_the_credential_the_write_carries() {
 /// Nothing registered (a CLI process, a single-owner host): the gate keeps
 /// probing this process's own credential, as before.
 #[test]
-#[serial_test::serial]
+#[serial_test::serial(write_scope_cache)]
 fn with_nothing_registered_the_process_credential_is_probed() {
+    with_nothing_registered_the_process_credential_is_probed_body();
+}
+
+#[serial_test::serial]
+fn with_nothing_registered_the_process_credential_is_probed_body() {
     let h = TwoOwners::new(false, true);
     crate::credential_preflight::clear_owner_root_registry();
     let (d, dir) = may_write_decision(&h.root_b, Some(&h.repo_b), &default_gh());
@@ -246,8 +272,13 @@ fn with_nothing_registered_the_process_credential_is_probed() {
 /// naming the call site, the repository and its owner, and the credential and
 /// whose writer it is, so a cross-owner refusal is visible in telemetry.
 #[test]
-#[serial_test::serial]
+#[serial_test::serial(write_scope_cache)]
 fn a_refused_ladder_write_exports_a_record_with_both_owners() {
+    a_refused_ladder_write_exports_a_record_with_both_owners_body();
+}
+
+#[serial_test::serial]
+fn a_refused_ladder_write_exports_a_record_with_both_owners_body() {
     let h = TwoOwners::new(true, false);
     let ((), captured) = crate::observability::ops::capture::capture(|| {
         let mut forge = GhForge::new(h.root_b.clone(), Some(h.repo_b.clone()))
@@ -281,8 +312,13 @@ fn a_refused_ladder_write_exports_a_record_with_both_owners() {
 /// The per-call checks export too, with the process credential named as
 /// `process` when nothing is registered.
 #[test]
-#[serial_test::serial]
+#[serial_test::serial(write_scope_cache)]
 fn a_refused_may_write_from_names_the_process_credential() {
+    a_refused_may_write_from_names_the_process_credential_body();
+}
+
+#[serial_test::serial]
+fn a_refused_may_write_from_names_the_process_credential_body() {
     let h = TwoOwners::new(false, true);
     crate::credential_preflight::clear_owner_root_registry();
     let (v, captured) = crate::observability::ops::capture::capture(|| {

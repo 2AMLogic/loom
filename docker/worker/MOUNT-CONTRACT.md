@@ -2,7 +2,7 @@
 
 This is the **normative** filesystem contract for anything that runs a Loom
 worker (or a Loom-daemon-managed session) inside a container built `FROM`
-[`ghcr.io/rjwalters/loom-worker`](README.md). It replaces the informal
+[`ghcr.io/2amlogic/loom-worker`](README.md). It replaces the informal
 "Bootstrap seams" table that used to be the only documentation of these
 mounts — that table now links here instead of duplicating this content (see
 [README.md § Bootstrap seams](README.md#bootstrap-seams-mounts-not-baked-content)).
@@ -25,12 +25,12 @@ does not import host worktree pointers.
 docker run --rm \
   -v /home/loom/workspaces:/home/loom/workspaces \
   -w /home/loom/workspaces/loom \
-  ghcr.io/rjwalters/loom-worker:<version> ...
+  ghcr.io/2amlogic/loom-worker:<version> ...
 
 # WRONG — remaps the host path to something else
 docker run --rm \
   -v /home/loom/workspaces:/workspace \
-  ghcr.io/rjwalters/loom-worker:<version> ...
+  ghcr.io/2amlogic/loom-worker:<version> ...
 ```
 
 ### Why this is load-bearing
@@ -83,8 +83,29 @@ normal daemon dispatch and Codex capability admission follow in #8786/#8787.
 
 - No host checkout, sibling repository, shared Git objects, or cross-account
   writable cache is mounted. Git metadata must be real private directories,
-  without alternates or symlinks. Existing issue worktrees stay inside the
-  private volume and use their container paths throughout.
+  without symlinks. Existing issue worktrees stay inside the private volume
+  and use their container paths throughout. One exception, per #14680's
+  operator ruling of 2026-11-19: each host keeps ONE origin-only object
+  mirror per registered repository — host-owned, never pruned, fetched only
+  through the #14716 proved read authority — whose `objects/` directory a
+  seat borrows through a read-only bind at `/mirrors/<slug>/objects` as that
+  clone's single verified alternate (opt-in per host via
+  `accounts.session.objectMirrors`). Nothing else may widen a clone's object
+  stores: Docker's own mount inventory re-verifies each bind's exact source,
+  destination and read-only mode, worker admission re-verifies the alternate
+  inside the container (exactly the repository's own canonical mirror path,
+  never a second entry, a symlink, an indirect mirror or a writable mount),
+  and a clone with no alternate — the shape every seat had before #14680 —
+  stays supported and admitted. Opting in is one-way per seat: once a
+  clone borrows, a recreation without the bind (flag
+  `accounts.session.objectMirrors` off) is refused fail-closed at
+  preparation — "workspace must own a real clone and private Git objects;
+  its object alternate is not authorized for this session (a clone that
+  already borrows needs its mirror bind back: restore the
+  mirror, or re-enable accounts.session.objectMirrors)" — and the supported
+  remedies are restoring the mirror / re-enabling the flag, or discarding
+  that seat's clone and re-cloning; no supported path un-borrows a live
+  clone.
 - The volume MUST use Docker's ordinary `local` driver without driver options
   (a named bind-backed volume is not isolation). Actual mounts, volume ownership,
   peer attachments and containment settings are verified on every reuse/job.

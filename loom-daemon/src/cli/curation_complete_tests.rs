@@ -47,8 +47,11 @@ esac
 
     fn run(&self, id: &str) -> Result<()> {
         let policy = TrustPolicy::default();
-        self.args(id)
-            .run_with(self.dir.path().join("fake-gh").as_os_str(), &policy, &|| Ok(()))
+        let args = self.args(id);
+        let gh = self.dir.path().join("fake-gh");
+        args.run_with(gh.as_os_str(), &policy, Some(&|| Ok(())), &|issue, points| {
+            args.project_labels(gh.as_os_str(), issue, points)
+        })
     }
 
     /// Run a fresh completion and assert it was refused with nothing written.
@@ -216,9 +219,126 @@ fn unwritable_repo_is_refused_before_any_read_or_write() {
     let gh = forge.dir.path().join("fake-gh");
     let err = forge
         .args(&uuid::Uuid::new_v4().to_string())
-        .run_with(gh.as_os_str(), &TrustPolicy::default(), &|| Err("not managed".into()))
+        .run_with(
+            gh.as_os_str(),
+            &TrustPolicy::default(),
+            Some(&|| Err("not managed".into())),
+            &|_, _| Ok(()),
+        )
         .unwrap_err();
     assert!(format!("{err:#}").contains("not managed"));
     assert!(forge.log().is_empty());
     assert!(forge.journal().is_empty());
+}
+
+#[test]
+fn stale_label_names_are_a_single_path_segment() {
+    let forge = Forge::new(
+        &issue("<!-- loom:points=5 -->", "OWNER", &["points:old/label?x"]),
+        &serde_json::json!([]),
+    );
+    forge.run("retry").unwrap();
+    assert!(forge.label_writes()[1].ends_with("labels/points%3Aold%2Flabel%3Fx --silent"));
+}
+
+// ---- #14465: the fleet broker route ---------------------------------------
+
+use crate::fleet_curation_broker::{Broker, Transport};
+
+/// Records every broker request as the (repo, number, points) projection it
+/// carried, and answers from a scripted result.
+struct FakeBroker {
+    calls: std::sync::Mutex<Vec<(String, u32, u32)>>,
+    answer: Result<(u16, String), String>,
+}
+
+impl FakeBroker {
+    fn ok() -> Self {
+        Self {
+            calls: Default::default(),
+            answer: Ok((
+                200,
+                r#"{"number":42,"points":"5","previous_points":["points:2"],
+                    "curated":true,"changed":true,"replayed":false}"#
+                    .to_owned(),
+            )),
+        }
+    }
+
+    fn refusing(status: u16, body: &'static str) -> Self {
+        Self {
+            calls: Default::default(),
+            answer: Ok((status, body.to_owned())),
+        }
+    }
+
+    fn handle(&self) -> Broker<&Self> {
+        Broker::with_transport("http://broker.test", "test-key", self)
+    }
+}
+
+fn fake_gh(forge: &Forge) -> std::path::PathBuf {
+    forge.dir.path().join("fake-gh")
+}
+
+impl Transport for &FakeBroker {
+    fn post_json(&self, _url: &str, _key: &str, body: &str) -> Result<(u16, String), String> {
+        let v: serde_json::Value = serde_json::from_str(body).unwrap();
+        self.calls.lock().unwrap().push((
+            v["repo"].as_str().unwrap_or_default().to_owned(),
+            v["number"].as_u64().unwrap_or_default() as u32,
+            v["points"]
+                .as_str()
+                .and_then(|p| p.parse().ok())
+                .unwrap_or_default(),
+        ));
+        self.answer.clone()
+    }
+}
+
+#[test]
+fn fleet_route_projects_resolved_points_through_the_broker() {
+    let forge = Forge::new(
+        &issue("<!-- loom:points=5 -->", "OWNER", &["points:2"]),
+        &serde_json::json!([]),
+    );
+    let broker = FakeBroker::ok();
+    forge
+        .args("fleet-1")
+        .run_fleet_with(fake_gh(&forge).as_os_str(), &broker.handle())
+        .unwrap();
+    assert_eq!(broker.calls.lock().unwrap().clone(), vec![("fixture/repo".to_string(), 42, 5)]);
+    // Reads only: no label mutation ever reached a gh credential.
+    assert!(forge.label_writes().is_empty(), "{}", forge.log());
+    assert!(forge.log().contains("issues/42"));
+}
+
+#[test]
+fn fleet_route_refusal_fails_the_command_with_no_local_fallback() {
+    let forge = Forge::new(&issue("<!-- loom:points=5 -->", "OWNER", &[]), &serde_json::json!([]));
+    let broker =
+        FakeBroker::refusing(403, r#"{"error":"label_refused","message":"carries loom:operator"}"#);
+    let err = forge
+        .args("fleet-2")
+        .run_fleet_with(fake_gh(&forge).as_os_str(), &broker.handle())
+        .unwrap_err();
+    let text = format!("{err:#}");
+    assert!(text.contains("label_refused") && text.contains("fleet"), "{text}");
+    assert!(forge.label_writes().is_empty(), "{}", forge.log());
+}
+
+#[test]
+fn fleet_route_refuses_invalid_points_before_contacting_the_broker() {
+    let forge = Forge::new(
+        &issue("<!-- loom:points=x -->", "OWNER", &["points:2"]),
+        &serde_json::json!([]),
+    );
+    let broker = FakeBroker::ok();
+    let err = forge
+        .args("fleet-3")
+        .run_fleet_with(fake_gh(&forge).as_os_str(), &broker.handle())
+        .unwrap_err();
+    assert!(format!("{err:#}").contains("malformed"));
+    assert!(broker.calls.lock().unwrap().is_empty());
+    assert!(forge.label_writes().is_empty(), "{}", forge.log());
 }

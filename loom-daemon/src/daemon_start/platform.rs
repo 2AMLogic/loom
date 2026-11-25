@@ -11,32 +11,16 @@
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 
+use crate::fs_util::is_on_path;
+
 fn non_empty(name: &str) -> Option<String> {
     std::env::var(name).ok().filter(|s| !s.is_empty())
-}
-
-fn on_path(name: &str) -> bool {
-    std::env::var_os("PATH").is_some_and(|paths| {
-        std::env::split_paths(&paths).any(|d| {
-            let c = d.join(name);
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                std::fs::metadata(&c)
-                    .is_ok_and(|m| !m.is_dir() && m.permissions().mode() & 0o111 != 0)
-            }
-            #[cfg(not(unix))]
-            {
-                c.is_file()
-            }
-        })
-    })
 }
 
 /// `command -v <name>` — is this tool resolvable?
 #[must_use]
 pub fn have(tool: &str) -> bool {
-    on_path(tool)
+    is_on_path(tool)
 }
 
 /// `resolve_launchd_label()` — `$LOOM_LAUNCHD_LABEL`, else the production label.
@@ -56,7 +40,7 @@ pub fn launchd_domain() -> String {
     if let Some(explicit) = non_empty("LOOM_LAUNCHD_DOMAIN") {
         return explicit;
     }
-    if on_path("launchctl") {
+    if is_on_path("launchctl") {
         let ok = Command::new("launchctl")
             .arg("print")
             .arg(format!("gui/{uid}"))
@@ -101,12 +85,12 @@ pub fn systemd_user_manager_reachable() -> bool {
 #[must_use]
 pub fn is_linux_systemd() -> bool {
     if std::env::var("LOOM_SYSTEMD_FORCE").as_deref() == Ok("1") {
-        return on_path("systemctl");
+        return is_on_path("systemctl");
     }
     if !cfg!(target_os = "linux") {
         return false;
     }
-    if !on_path("systemctl") {
+    if !is_on_path("systemctl") {
         return false;
     }
     systemd_user_manager_reachable()

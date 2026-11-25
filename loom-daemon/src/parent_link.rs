@@ -38,6 +38,38 @@ fn has_red_main(body: &str) -> bool {
         .any(|l| l.trim_start().starts_with(RED_MAIN_MARKER))
 }
 
+/// Written alone on a line in a split parent's body by the reviser (Curator
+/// answering a Champion send-back) when the revision adds work the closed
+/// children do not cover. [`split_state`] then treats the parent as buildable
+/// rather than a finished tracker (#15242).
+pub const SPLIT_RESCOPED_MARKER: &str = "<!-- loom:split-rescoped -->";
+
+/// Does `body` carry [`SPLIT_RESCOPED_MARKER`] alone on a line, outside a
+/// fenced code block? An inline mention or a fenced example does not count.
+fn has_split_rescoped(body: &str) -> bool {
+    // `(fence char, opening length)` while inside a fenced block.
+    let mut fence: Option<(char, usize)> = None;
+    for line in body.lines() {
+        let t = line.trim();
+        let lead = t.chars().next();
+        let run = lead.map_or(0, |c| t.chars().take_while(|&x| x == c).count());
+        if matches!(lead, Some('`' | '~')) && run >= 3 {
+            let c = lead.unwrap_or('`');
+            match fence {
+                None => fence = Some((c, run)),
+                // A closing fence: same char, at least as long, nothing after.
+                Some((fc, n)) if fc == c && run >= n && t.chars().all(|x| x == c) => fence = None,
+                Some(_) => {}
+            }
+            continue;
+        }
+        if fence.is_none() && t == SPLIT_RESCOPED_MARKER {
+            return true;
+        }
+    }
+    false
+}
+
 /// `body` with the parent marker (and the parent's red-main marker, when
 /// `parent_body` carries one) appended. A marker already present is not
 /// repeated, so re-running a filing is harmless.
@@ -79,8 +111,12 @@ pub fn sub_issue_link_args(slug: &str, parent: u32, child_db_id: u64) -> Vec<Str
 /// skipped).
 #[must_use]
 pub fn fetch_parent_body(root: &Path, slug: &str, parent: u32) -> Option<String> {
+    fetch_parent_body_with_gh(&gh_program(), root, slug, parent)
+}
+
+fn fetch_parent_body_with_gh(gh: &Path, root: &Path, slug: &str, parent: u32) -> Option<String> {
     let path = format!("repos/{slug}/issues/{parent}");
-    let inv = gh_call::read("parent_link.parent_body", &gh_program(), root).args([
+    let inv = gh_call::read("parent_link.parent_body", gh, root).args([
         "api",
         &path,
         "--jq",
@@ -202,15 +238,23 @@ fn parse_marker_output(text: &str, parent: u32) -> Result<Vec<(u32, bool)>> {
 /// Enumerate `parent`'s children from the native sub-issue list and from
 /// `<!-- loom:parent #N -->` markers, and classify them.
 ///
+/// A parent whose body carries [`SPLIT_RESCOPED_MARKER`] is not a finished
+/// tracker even when every child is closed: it was revised after the split to
+/// carry work the children do not (#15242).
+///
 /// # Errors
-/// Either read failed, was malformed, or filled a whole page. An unreadable
-/// list is never evidence that the parent is split and finished.
+/// Either read failed, was malformed, or filled a whole page, or the children
+/// are all closed and the parent body could not be read. An unreadable list or
+/// body is never evidence that the parent is split and finished.
 pub fn split_state(root: &Path, slug: &str, parent: u32) -> Result<SplitState> {
-    let gh = gh_program();
+    split_state_with_gh(&gh_program(), root, slug, parent)
+}
+
+fn split_state_with_gh(gh: &Path, root: &Path, slug: &str, parent: u32) -> Result<SplitState> {
     let mut all: Vec<(u32, bool)> = Vec::new();
 
     let path = format!("repos/{slug}/issues/{parent}/sub_issues?per_page={CHILD_PAGE}&state=all");
-    let sub = gh_call::read("parent_link.sub_issues", &gh, root).args([
+    let sub = gh_call::read("parent_link.sub_issues", gh, root).args([
         "api",
         &path,
         "--jq",
@@ -233,7 +277,7 @@ pub fn split_state(root: &Path, slug: &str, parent: u32) -> Result<SplitState> {
         parent_marker(parent)
     );
     let limit = MARKER_LIMIT.to_string();
-    let marker = gh_call::read("parent_link.marker_children", &gh, root).args([
+    let marker = gh_call::read("parent_link.marker_children", gh, root).args([
         "issue",
         "list",
         "--repo",
@@ -249,11 +293,126 @@ pub fn split_state(root: &Path, slug: &str, parent: u32) -> Result<SplitState> {
         "--jq",
         &jq,
     ]);
-    let out = gh_call::ok_stdout(marker)
-        .ok_or_else(|| anyhow::anyhow!("could not search marker children of #{parent}"))?;
-    let rows = parse_marker_output(&String::from_utf8_lossy(&out), parent)?;
+    let out = gh_call::graphql_output(marker)
+        .map_err(|_| anyhow::anyhow!("could not search marker children of #{parent}"))?;
+    let rows = match out {
+        Some(out) if out.status.success() => {
+            parse_marker_output(&String::from_utf8_lossy(&out.stdout), parent)?
+        }
+        None => rest_marker_children(gh, root, slug, parent, &query)?,
+        Some(_) => anyhow::bail!("could not search marker children of #{parent}"),
+    };
     all.extend(rows.into_iter().filter(|&(n, _)| n != parent));
-    Ok(classify_children(&all))
+    let state = classify_children(&all);
+    // Only an all-closed verdict can be flipped by the marker, so only then
+    // is the body read (and its failure fatal).
+    if matches!(state, SplitState::AllClosed(_)) {
+        let body = fetch_parent_body_with_gh(gh, root, slug, parent)
+            .ok_or_else(|| anyhow::anyhow!("could not read the body of #{parent}"))?;
+        if has_split_rescoped(&body) {
+            return Ok(SplitState::NoChildren);
+        }
+    }
+    Ok(state)
+}
+
+#[derive(serde::Deserialize)]
+struct RestMarkerPage {
+    total_count: usize,
+    incomplete_results: bool,
+    items: Vec<RestMarkerItem>,
+}
+
+#[derive(serde::Deserialize)]
+struct RestMarkerItem {
+    number: u32,
+    state: RestIssueState,
+    // A null body is normal. A missing or non-string body could hide a marker.
+    body: serde_json::Value,
+    repository_url: String,
+    #[serde(default, rename = "pull_request", deserialize_with = "field_present")]
+    has_pull_request: bool,
+}
+
+fn field_present<'de, D: serde::Deserializer<'de>>(value: D) -> Result<bool, D::Error> {
+    let _: serde::de::IgnoredAny = serde::Deserialize::deserialize(value)?;
+    Ok(true)
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum RestIssueState {
+    Open,
+    Closed,
+}
+
+fn rest_marker_children(
+    gh: &Path,
+    root: &Path,
+    slug: &str,
+    parent: u32,
+    query: &str,
+) -> Result<Vec<(u32, bool)>> {
+    let query_arg = format!("q={query} repo:{slug} is:issue");
+    let per_page = format!("per_page={CHILD_PAGE}");
+    let marker = parent_marker(parent);
+    let mut first_total = None;
+    let mut seen = std::collections::HashSet::new();
+    let mut rows = Vec::new();
+    for page in 1..=MARKER_LIMIT.div_ceil(CHILD_PAGE) {
+        let page_arg = format!("page={page}");
+        // The scoped query carries its repo in q, not in the REST path.
+        // Name the target explicitly so the normal reader routing sees it.
+        let read = gh_call::read("parent_link.marker_children_rest", gh, root)
+            .reader_repo(slug)
+            .args([
+                "api",
+                "search/issues",
+                "--method",
+                "GET",
+                "-f",
+                &query_arg,
+                "-F",
+                &per_page,
+                "-F",
+                &page_arg,
+            ]);
+        let reply = gh_call::ok_stdout(read)
+            .ok_or_else(|| anyhow::anyhow!("could not search REST marker children of #{parent}"))?;
+        let malformed = || anyhow::anyhow!("malformed REST marker-child list for #{parent}");
+        let response: RestMarkerPage = serde_json::from_slice(&reply).map_err(|_| malformed())?;
+        if response.incomplete_results
+            || response.total_count >= MARKER_LIMIT
+            || first_total.is_some_and(|total| total != response.total_count)
+            || response.items.len()
+                != response
+                    .total_count
+                    .saturating_sub(seen.len())
+                    .min(CHILD_PAGE)
+        {
+            anyhow::bail!("REST marker-child search of #{parent} may be truncated");
+        }
+        for item in response.items {
+            let scoped = item
+                .repository_url
+                .rsplit_once("/repos/")
+                .is_some_and(|(_, repo)| repo.eq_ignore_ascii_case(slug));
+            if item.number == 0 || !scoped || item.has_pull_request || !seen.insert(item.number) {
+                return Err(malformed());
+            }
+            if item.body.is_null() {
+                continue;
+            }
+            if item.body.as_str().ok_or_else(malformed)?.contains(&marker) {
+                rows.push((item.number, matches!(item.state, RestIssueState::Closed)));
+            }
+        }
+        if seen.len() == response.total_count {
+            return Ok(rows);
+        }
+        first_total = Some(response.total_count);
+    }
+    anyhow::bail!("REST marker-child search of #{parent} may be truncated");
 }
 
 #[cfg(test)]
@@ -312,6 +471,201 @@ mod tests {
         assert!(parse_marker_output("7 CLOSED\n", 1).is_err());
         assert!(parse_marker_output("", 1).is_err());
         assert!(parse_marker_output("RAW x\n", 1).is_err());
+    }
+
+    #[cfg(unix)]
+    fn mocked_split(
+        native: &str,
+        graphql_diagnostic: &str,
+        pages: &[serde_json::Value],
+    ) -> Result<SplitState> {
+        mocked_split_body(native, graphql_diagnostic, pages, Some("A plain tracker body.\n"))
+    }
+
+    /// `parent_body` is what `gh api repos/o/r/issues/12 --jq ...` prints;
+    /// `None` makes that read fail.
+    #[cfg(unix)]
+    fn mocked_split_body(
+        native: &str,
+        graphql_diagnostic: &str,
+        pages: &[serde_json::Value],
+        parent_body: Option<&str>,
+    ) -> Result<SplitState> {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir()?;
+        let gh = dir.path().join("gh-marker-fixture.sh");
+        let script = r#"#!/bin/sh
+case "$1 $2" in
+  "api repos/o/r/issues/12/sub_issues?per_page=100&state=all") cat native ;;
+  "api repos/o/r/issues/12") if test -f parent_body; then cat parent_body; else exit 1; fi ;;
+  "issue list") cat diagnostic >&2; exit 1 ;;
+  "api search/issues")
+    test "$3" = "--method" && test "$4" = "GET" &&
+    test "$6" = 'q="loom:parent #12" in:body repo:o/r is:issue' &&
+    test "$8" = "per_page=100" || exit 76
+    if test -f "${10}"; then cat "${10}"; else exit 1; fi
+    ;;
+  *) exit 76 ;;
+esac"#;
+        std::fs::write(&gh, script)?;
+        std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o700))?;
+        std::fs::write(dir.path().join("native"), native)?;
+        std::fs::write(dir.path().join("diagnostic"), graphql_diagnostic)?;
+        if let Some(body) = parent_body {
+            std::fs::write(dir.path().join("parent_body"), body)?;
+        }
+        for (index, page) in pages.iter().enumerate() {
+            std::fs::write(dir.path().join(format!("page={}", index + 1)), page.to_string())?;
+        }
+        split_state_with_gh(&gh, dir.path(), "o/r", 12)
+    }
+
+    #[cfg(unix)]
+    const GRAPHQL_EXHAUSTED: &str =
+        "GraphQL: API rate limit already exceeded for installation ID 1";
+
+    #[cfg(unix)]
+    fn marker_row(number: u32, state: &str, body: serde_json::Value) -> serde_json::Value {
+        serde_json::json!({
+            "number": number, "state": state, "body": body,
+            "repository_url": "https://api.github.com/repos/o/r"
+        })
+    }
+
+    #[cfg(unix)]
+    fn marker_page(total: usize, items: Vec<serde_json::Value>) -> serde_json::Value {
+        serde_json::json!({"total_count": total, "incomplete_results": false, "items": items})
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rest_marker_search_preserves_the_exact_union_and_filters_self_links() {
+        assert_eq!(
+            mocked_split("", GRAPHQL_EXHAUSTED, &[marker_page(0, Vec::new())]).unwrap(),
+            SplitState::NoChildren,
+        );
+        let closed = marker_row(7, "closed", parent_marker(12).into());
+        let matches = marker_page(
+            4,
+            vec![
+                closed.clone(),
+                marker_row(8, "open", parent_marker(123).into()),
+                marker_row(12, "open", parent_marker(12).into()),
+                marker_row(99, "open", serde_json::Value::Null),
+            ],
+        );
+        assert_eq!(
+            mocked_split("7 CLOSED\n9 CLOSED\n", GRAPHQL_EXHAUSTED, &[matches]).unwrap(),
+            SplitState::AllClosed(vec![7, 9])
+        );
+        let open = marker_page(1, vec![marker_row(7, "open", parent_marker(12).into())]);
+        assert_eq!(
+            mocked_split("7 CLOSED\n9 CLOSED\n", GRAPHQL_EXHAUSTED, &[open]).unwrap(),
+            SplitState::OpenChildren(1)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rest_marker_search_checks_both_pages_before_classifying() {
+        let first = marker_page(
+            CHILD_PAGE + 1,
+            (1..=100)
+                .map(|n| marker_row(n, "open", serde_json::Value::Null))
+                .collect(),
+        );
+        let second = marker_page(101, vec![marker_row(101, "open", parent_marker(12).into())]);
+        assert_eq!(
+            mocked_split("", GRAPHQL_EXHAUSTED, &[first.clone(), second]).unwrap(),
+            SplitState::OpenChildren(1)
+        );
+        assert!(mocked_split("", GRAPHQL_EXHAUSTED, std::slice::from_ref(&first)).is_err());
+        let duplicate = marker_page(101, vec![marker_row(100, "open", parent_marker(12).into())]);
+        assert!(mocked_split("", GRAPHQL_EXHAUSTED, &[first, duplicate]).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rest_marker_search_fails_closed_on_missing_or_truncated_evidence() {
+        let mut wrong_repo = marker_row(7, "open", parent_marker(12).into());
+        wrong_repo["repository_url"] = "https://api.github.com/repos/other/r".into();
+        let mut malformed = marker_row(7, "open", parent_marker(12).into());
+        malformed.as_object_mut().unwrap().remove("body");
+        let mut wrong_kind = marker_row(7, "open", parent_marker(12).into());
+        wrong_kind["pull_request"] = serde_json::json!({});
+        let mut malformed_kind = wrong_kind.clone();
+        malformed_kind["pull_request"] = serde_json::Value::Null;
+        for page in [
+            marker_page(MARKER_LIMIT, Vec::new()),
+            marker_page(1, Vec::new()),
+            marker_page(1, vec![wrong_repo]),
+            marker_page(1, vec![malformed]),
+            marker_page(1, vec![wrong_kind]),
+            marker_page(1, vec![malformed_kind]),
+            serde_json::json!({"total_count": 0, "incomplete_results": true, "items": []}),
+            serde_json::json!({"total_count": 0, "items": []}),
+        ] {
+            assert!(mocked_split("7 CLOSED\n", GRAPHQL_EXHAUSTED, &[page]).is_err());
+        }
+        assert!(mocked_split("7 CLOSED\n", GRAPHQL_EXHAUSTED, &[]).is_err());
+        assert!(mocked_split(
+            "",
+            "HTTP 403: Resource not accessible by integration",
+            &[marker_page(0, Vec::new())],
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn split_rescoped_marker_must_be_alone_on_a_line_outside_a_fence() {
+        let m = SPLIT_RESCOPED_MARKER;
+        assert!(has_split_rescoped(m));
+        assert!(has_split_rescoped(&format!("Revised.\n\n  {m}  \r\nMore.\n")));
+        assert!(!has_split_rescoped("plain tracker"));
+        assert!(!has_split_rescoped(&format!("see {m} for the idea")));
+        assert!(!has_split_rescoped(&format!("{m} trailing")));
+        assert!(!has_split_rescoped(&format!("```\n{m}\n```\n")));
+        assert!(!has_split_rescoped(&format!("~~~md\n{m}\n~~~\n")));
+        // A longer fence is not closed by a shorter one, nor by another char.
+        assert!(!has_split_rescoped(&format!("````\n```\n{m}\n~~~\n````\n")));
+        // After the fence closes, the marker counts again.
+        assert!(has_split_rescoped(&format!("```\nx\n```\n{m}\n")));
+        // An unterminated fence swallows the rest.
+        assert!(!has_split_rescoped(&format!("```\n{m}\n")));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rescoped_marker_makes_an_all_closed_parent_not_split() {
+        let pages = [marker_page(0, Vec::new())];
+        let split = |body: Option<&str>| {
+            mocked_split_body("7 CLOSED\n9 CLOSED\n", GRAPHQL_EXHAUSTED, &pages, body)
+        };
+        let marked = format!("Residue work.\n{SPLIT_RESCOPED_MARKER}\n");
+        assert_eq!(split(Some(&marked)).unwrap(), SplitState::NoChildren);
+        // Regression guard (#13635): no marker => still a finished tracker.
+        assert_eq!(split(Some("Tracker.\n")).unwrap(), SplitState::AllClosed(vec![7, 9]));
+        // Fenced or inline mentions do not count.
+        for body in [
+            format!("```\n{SPLIT_RESCOPED_MARKER}\n```\n"),
+            format!("write {SPLIT_RESCOPED_MARKER} to rescope"),
+        ] {
+            assert_eq!(split(Some(&body)).unwrap(), SplitState::AllClosed(vec![7, 9]));
+        }
+        // Fail closed: an unreadable body is never an all-clear.
+        assert!(split(None).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rescoped_marker_changes_nothing_when_a_child_is_open() {
+        let none = marker_page(0, Vec::new());
+        let marked = format!("{SPLIT_RESCOPED_MARKER}\n");
+        assert_eq!(
+            mocked_split_body("7 CLOSED\n9 OPEN\n", GRAPHQL_EXHAUSTED, &[none], Some(&marked))
+                .unwrap(),
+            SplitState::OpenChildren(1)
+        );
     }
 
     #[test]

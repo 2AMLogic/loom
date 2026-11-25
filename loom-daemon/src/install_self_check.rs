@@ -64,7 +64,7 @@
 //!   explicitly ([`resolve_tool_path`]) rather than trusting a non-login ssh
 //!   `PATH`.
 
-use crate::fs_util::{is_executable, truncate_tail};
+use crate::fs_util::{find_executable_in, is_executable, truncate_tail};
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -719,13 +719,8 @@ pub fn resolve_tool_path(tool: &str) -> Option<PathBuf> {
 /// concurrently-running test that spawns a bare-name `git`/`gh` (#5961).
 #[must_use]
 fn resolve_tool_path_in(tool: &str, search_path: Option<&std::ffi::OsStr>) -> Option<PathBuf> {
-    if let Some(path) = search_path {
-        for dir in std::env::split_paths(path) {
-            let candidate = dir.join(tool);
-            if is_executable(&candidate) {
-                return Some(candidate);
-            }
-        }
+    if let Some(found) = search_path.and_then(|path| find_executable_in(tool, path)) {
+        return Some(found);
     }
     for dir in ["/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/bin"] {
         let candidate = Path::new(dir).join(tool);

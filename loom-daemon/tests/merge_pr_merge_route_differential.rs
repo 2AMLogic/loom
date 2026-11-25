@@ -5,19 +5,17 @@
 //!
 //! This compares the CALL SHAPE, not just the Rust function: both loops run
 //! under bash with the same recording stubs for every side effect
-//! (`forge_merge_pr`, `forge_get_pr_nocache`, `forge_update_branch`, `sleep`,
-//! `_refresh_precondition_sha`, `error_head_moved`, the narration
-//! helpers and `error`), driven by the same scripted forge, with the real
-//! binary (behind a recording wrapper for `record-rework`) answering
-//! `classify-response` and `merge-route`. Every scenario's trace — each merge
-//! call and the precondition SHA it gated on, each sleep, sync, head re-read,
-//! rework marker, narrated line and refusal — and its exit code must be
-//! identical byte for byte.
+//! (`forge_merge_pr`, `forge_get_pr_nocache`, `sleep`, `error_head_moved`,
+//! the narration helpers and `error`), driven by the same scripted forge,
+//! with the real binary answering `classify-response` and `merge-route`.
+//! Every scenario's trace — each merge call and the precondition SHA it
+//! gated on, each sleep, narrated line and refusal — and its exit code must
+//! be identical byte for byte.
 //!
 //! A second pass makes the wrapper refuse `merge-route` (a binary predating
 //! the verb) and checks the live loop's fail-open fallback reproduces the
-//! retired CONTROL FLOW exactly — same merges, sleeps, syncs, re-reads,
-//! backoff durations and exit code — with only the wording allowed to differ.
+//! retired CONTROL FLOW exactly — same merges, sleeps, backoff durations
+//! and exit code — with only the wording allowed to differ.
 //!
 //! One once-generated corpus (verification-recipes §6) feeds both sides.
 
@@ -51,8 +49,6 @@ sleep() { printf 'SLEEP %s\n' "$1" >>"$T"; }
 _next() { local n; n=$(( $(cat "$D/$1.n" 2>/dev/null || echo 0) + 1 )); echo "$n" >"$D/$1.n"; echo "$n"; }
 forge_merge_pr() { local n; n="$(_next merge)"; printf 'MERGE %s %s\n' "$n" "$3" >>"$T"; [[ -f "$D/merge.$n" ]] || return 0; cat "$D/merge.$n"; return 1; }
 forge_get_pr_nocache() { local n; n="$(_next get)"; if [[ -f "$D/get.$n" ]]; then echo '{"merged":true}'; else echo '{}'; fi; }
-forge_update_branch() { echo UPDATE >>"$T"; [[ ! -f "$D/update-fails" ]] || { echo "boom: HTTP 422"; return 1; }; }
-_refresh_precondition_sha() { echo REFRESH >>"$T"; MERGE_PRECONDITION_SHA="synced$MERGE_ATTEMPT"; }
 error_head_moved() { echo HEAD-MISMATCH >>"$T"; exit 3; }
 _mp_daemon_roll_hint() { :; }
 eval "$(grep '^_classify_merge_response()' "$mp")"
@@ -78,7 +74,6 @@ struct Scenario {
     responses: Vec<Vec<u8>>,
     /// 1-based `forge_get_pr_nocache` calls that report `merged: true`.
     merged_reads: Vec<usize>,
-    update_fails: bool,
 }
 
 fn run_side(mode: &str, sc: &Scenario, no_route: bool, root: &Path, tag: &str) -> (i32, Vec<u8>) {
@@ -91,18 +86,13 @@ fn run_side(mode: &str, sc: &Scenario, no_route: bool, root: &Path, tag: &str) -
     for n in &sc.merged_reads {
         fs::write(d.join(format!("get.{n}")), "").unwrap();
     }
-    if sc.update_fails {
-        fs::write(d.join("update-fails"), "").unwrap();
-    }
     let real = env!("CARGO_BIN_EXE_loom-daemon");
     let refuse = if no_route {
         "[[ \"$1 $2\" != \"merge-pr merge-route\" ]] || exit 2\n"
     } else {
         ""
     };
-    let wrapper = format!(
-        "#!/usr/bin/env bash\nif [[ \"$1\" == record-rework ]]; then shift; printf 'REWORK %s\\n' \"$*\" >>\"$(dirname \"$0\")/trace\"; exit 0; fi\n{refuse}exec '{real}' \"$@\"\n"
-    );
+    let wrapper = format!("#!/usr/bin/env bash\n{refuse}exec '{real}' \"$@\"\n");
     let bin = d.join("bin");
     fs::write(&bin, wrapper).unwrap();
     fs::set_permissions(&bin, fs::Permissions::from_mode(0o755)).unwrap();
@@ -124,8 +114,8 @@ fn run_side(mode: &str, sc: &Scenario, no_route: bool, root: &Path, tag: &str) -
 }
 
 /// The degraded (no `merge-route`) comparison keeps every side effect and
-/// drops only wording: narration lines go, a refusal keeps only that it
-/// happened, and a rework marker keeps only the duration it recorded.
+/// drops only wording: narration lines go, and a refusal keeps only that it
+/// happened.
 fn control_flow(trace: &[u8]) -> Vec<String> {
     String::from_utf8_lossy(trace)
         .lines()
@@ -135,11 +125,6 @@ fn control_flow(trace: &[u8]) -> Vec<String> {
         .map(|l| {
             if l.starts_with("ERROR\t") {
                 "ERROR".to_string()
-            } else if let Some(rest) = l.strip_prefix("REWORK ") {
-                format!(
-                    "REWORK {}",
-                    rest.rsplit("--duration-sec").next().unwrap_or("").trim()
-                )
             } else {
                 l.to_string()
             }
@@ -148,12 +133,9 @@ fn control_flow(trace: &[u8]) -> Vec<String> {
         .filter(|l| {
             l == "ERROR"
                 || l == "LOOP-END"
-                || l == "UPDATE"
-                || l == "REFRESH"
                 || l == "HEAD-MISMATCH"
                 || l.starts_with("MERGE ")
                 || l.starts_with("SLEEP ")
-                || l.starts_with("REWORK ")
         })
         .collect()
 }
@@ -188,31 +170,25 @@ fn corpus() -> Vec<Scenario> {
         }
     }
     let is_405 = |r: &[u8]| String::from_utf8_lossy(r).contains("Merge already in progress");
-    let is_base = |r: &[u8]| String::from_utf8_lossy(r).contains("Base branch was modified");
     let mut out = Vec::new();
     for s in seqs {
         let len = s.len();
         let first_405 = is_405(&s[0]);
-        let syncs = s.iter().any(|r| is_base(r));
-        let mut push = |merged_reads: Vec<usize>, update_fails: bool| {
+        let mut push = |merged_reads: Vec<usize>| {
             out.push(Scenario {
                 responses: s.clone(),
                 merged_reads,
-                update_fails,
             });
         };
-        push(vec![], false);
+        push(vec![]);
         // forge_get_pr_nocache call 1 is the first failure's merged-despite-
         // error re-read; call 2 is a leading 405's post-wait re-read.
         if len == 1 {
-            push(vec![1], false);
+            push(vec![1]);
         }
         if first_405 {
-            push(vec![2], false);
-            push(vec![3], false);
-        }
-        if syncs && len <= 2 {
-            push(vec![], true);
+            push(vec![2]);
+            push(vec![3]);
         }
     }
     out
@@ -259,13 +235,12 @@ fn live_loop_and_retired_loop_agree_byte_for_byte() {
         assert_eq!(
             (rc_old, String::from_utf8_lossy(&t_old)),
             (rc_new, String::from_utf8_lossy(&t_new)),
-            "scenario {i} diverged (responses {:?}, merged reads {:?}, update fails {})",
+            "scenario {i} diverged (responses {:?}, merged reads {:?})",
             sc.responses
                 .iter()
                 .map(|r| String::from_utf8_lossy(r).into_owned())
                 .collect::<Vec<_>>(),
-            sc.merged_reads,
-            sc.update_fails
+            sc.merged_reads
         );
         assert_eq!(t_old, t_new, "scenario {i}: traces differ in raw bytes");
         let t = String::from_utf8_lossy(&t_new);

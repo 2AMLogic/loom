@@ -59,14 +59,17 @@ use std::path::{Path, PathBuf};
 use anyhow::Result;
 
 use crate::cmd_out::CmdOutcome;
+use crate::fleet_curation_broker::{Broker, Transport};
+use crate::gh_invocation::GhTarget;
 use crate::script_helpers::{gh_read, gh_write};
 use crate::stale_blocked::notify::{self, marker_for};
 use crate::stale_blocked::{batch, budget, classify, resolved, Artifact, Evidence, Verdict};
+use crate::write_scope::Verdict as Scope;
 
 use super::stale_blocked::DEFAULT_LIMIT;
 
 #[derive(clap::Args)]
-pub(crate) struct NotifyClearedBlockersArgs {
+pub struct NotifyClearedBlockersArgs {
     /// Issue/PR number(s) that just closed or merged. Repeatable, and also
     /// accepts several values after one flag, so one merge is one scan.
     #[arg(long, value_name = "N", num_args = 1.., required_unless_present_any = ["pr", "resweep"])]
@@ -123,21 +126,82 @@ struct Notified {
     posted: bool,
     /// `loom:blocked` was swapped for `loom:curated` (or would be, `--dry-run`).
     unparked: bool,
+    /// On a fleet-route failure, why the broker call did not land.
+    why: Option<String>,
+}
+
+/// How one dependent's writes went, per route (#14465): the local `gh`
+/// writer or the fleet broker's scoped `notify_cleared_blocker` operation.
+enum WriteOutcome {
+    /// `--dry-run`: nothing was written and the report renders the preview.
+    Preview,
+    /// Nothing was written and the dependent was not notified; the caller
+    /// reports this already-worded line on stderr and moves on.
+    Skipped(String),
+    /// The writes ran: `posted` is whether the marker comment is on the
+    /// dependent, `unparked` whether the `loom:blocked` swap happened.
+    Done {
+        posted: bool,
+        unparked: bool,
+        why: Option<String>,
+    },
+}
+
+/// Everything one dependent's write dispatch needs, gathered where the
+/// discovery loop produced it (#14465): the artifact, its evidence and the
+/// route's target context.
+struct Dispatch<'a> {
+    kind: Artifact,
+    number: i64,
+    cited: &'a [i64],
+    reasons: &'a [String],
+    evidence: &'a Evidence,
+    eligible: bool,
+    root: &'a Path,
+    repo: Option<&'a str>,
+    scanned: Option<&'a str>,
+    permission: &'a std::cell::OnceCell<Scope>,
 }
 
 impl NotifyClearedBlockersArgs {
     /// Always `Ok(())` — see the module doc's "Best-effort" section.
-    pub(crate) fn run(self) -> Result<()> {
+    pub fn run(self) -> Result<()> {
+        self.run_routed::<crate::fleet_curation_broker::Reqwest>(None)
+    }
+
+    /// The fleet route (#14465): reads and discovery stay on the fleet
+    /// reader the mode gate configured, and every write goes to the
+    /// broker's scoped `notify_cleared_blocker` operation — one call per
+    /// (dependent, closed blocker) — instead of a local `gh` edit. There is
+    /// no write-scope probe here (it would consult the reader for a
+    /// credential that never carries the write); the broker verifies the
+    /// repository, the closed trigger and the citation server-side before
+    /// its first mutation, and performs the eligible issue's
+    /// `loom:blocked` -> `loom:curated` transition itself. A broker failure
+    /// is reported per dependent — nothing falls back to a local writer.
+    pub fn run_fleet<T: Transport>(&self, broker: &Broker<T>) -> Result<()> {
+        self.run_routed(Some(broker))
+    }
+
+    fn run_routed<T: Transport>(&self, broker: Option<&Broker<T>>) -> Result<()> {
         let root = match &self.repo_root {
             Some(r) => r.clone(),
             None => std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
         };
-        let repo = self.repo.as_deref();
+        crate::forge_cmd::decline_gitea(Some(&root));
+        let repo = self.repo.clone().or_else(|| {
+            std::env::var("LOOM_REPO")
+                .ok()
+                .filter(|r| !r.trim().is_empty())
+        });
+        let repo = repo.as_deref();
+        let scanned = crate::forge_etag_store::resolve_target(Some(&root), repo).repo;
+        let permission = std::cell::OnceCell::new();
         let mut closed = self.closed.clone();
         let mut unread: Vec<String> = Vec::new();
         if let Some(pr) = self.pr {
             closed.push(pr);
-            match pr_close_targets(pr, repo, &root) {
+            match pr_close_targets(pr, scanned.as_deref(), &root) {
                 Ok(targets) => closed.extend(targets),
                 Err(why) => unread.push(format!("PR #{pr} closing references: {why}")),
             }
@@ -205,22 +269,31 @@ impl NotifyClearedBlockersArgs {
             if self.resweep && !eligible {
                 continue;
             }
-            // Label first, comment second: the comment is the audit trail and
-            // must only claim a transition that actually happened.
-            let unparked = eligible && (self.dry_run || unpark(g.number, repo, &root));
-            // Resweep has no marker short-circuit, so a comment posted after a
-            // failed unpark would repeat on every run. Report it instead.
-            if resweep_skips_comment(self.resweep, self.dry_run, unparked) {
-                unread.push(format!(
-                    "{} #{}: unpark failed; no comment posted",
-                    g.kind.label(),
-                    g.number
-                ));
-                continue;
-            }
-            let posted = !self.dry_run && {
-                let body = comment_body_for(g.kind, &cited, &reasons, unparked, self.resweep);
-                post_comment(g.kind, g.number, &body, repo, &root)
+            let (posted, unparked, why) = match self.dispatch_writes(
+                broker,
+                Dispatch {
+                    kind: g.kind,
+                    number: g.number,
+                    cited: &cited,
+                    reasons: &reasons,
+                    evidence: &evidence,
+                    eligible,
+                    root: &root,
+                    repo,
+                    scanned: scanned.as_deref(),
+                    permission: &permission,
+                },
+            ) {
+                WriteOutcome::Preview => (false, eligible, None),
+                WriteOutcome::Skipped(line) => {
+                    unread.push(line);
+                    continue;
+                }
+                WriteOutcome::Done {
+                    posted,
+                    unparked,
+                    why,
+                } => (posted, unparked, why),
             };
             notified.push(Notified {
                 kind: g.kind,
@@ -229,11 +302,116 @@ impl NotifyClearedBlockersArgs {
                 reasons,
                 posted,
                 unparked,
+                why,
             });
         }
 
         report(&notified, &closed, &unread, self.dry_run, self.quiet, self.resweep);
         Ok(())
+    }
+
+    /// Run one dependent's writes on the resolved route. The local route is
+    /// the original flow: the write-scope gate names the one target both
+    /// mutations carry, the label edit goes first, and a failed resweep edit
+    /// posts no comment. The fleet route sends the broker's scoped op once
+    /// per cited closed blocker, and reports its outcome.
+    fn dispatch_writes<T: Transport>(
+        &self,
+        broker: Option<&Broker<T>>,
+        d: Dispatch<'_>,
+    ) -> WriteOutcome {
+        let Dispatch {
+            kind,
+            number,
+            cited,
+            reasons,
+            evidence,
+            eligible,
+            root,
+            repo,
+            scanned,
+            permission,
+        } = d;
+        let kind_label = kind.label();
+        if self.dry_run {
+            return WriteOutcome::Preview;
+        }
+        let Some(broker) = broker else {
+            // The local route: scope both mutations to the resolved target.
+            let target = match permission.get_or_init(|| {
+                crate::write_scope::may_write_from_at(root, repo, "notify-cleared-blockers")
+            }) {
+                Scope::Allow(nwo) if scanned.is_some_and(|r| r.eq_ignore_ascii_case(nwo)) => {
+                    Some(nwo.as_str())
+                }
+                Scope::Allow(nwo) => {
+                    let scanned = scanned.unwrap_or("unresolved");
+                    return WriteOutcome::Skipped(format!(
+                        "{kind_label} #{number}: write target {nwo} differs from scanned repository {scanned}"
+                    ));
+                }
+                Scope::Deny(why) => {
+                    return WriteOutcome::Skipped(format!("{kind_label} #{number}: {why}"));
+                }
+            };
+            // Label first, comment second: the comment is the audit trail and
+            // must only claim a transition that actually happened.
+            let unparked = eligible && target.is_none_or(|r| unpark(number, r, root));
+            // Resweep has no marker short-circuit, so a comment posted after a
+            // failed unpark would repeat on every run. Report it instead.
+            if resweep_skips_comment(self.resweep, self.dry_run, unparked) {
+                return WriteOutcome::Skipped(format!(
+                    "{kind_label} #{number}: unpark failed; no comment posted"
+                ));
+            }
+            let posted = target.is_some_and(|r| {
+                let body = comment_body_for(kind, cited, reasons, unparked, self.resweep);
+                post_comment(kind, number, &body, r, root)
+            });
+            return WriteOutcome::Done {
+                posted,
+                unparked,
+                why: None,
+            };
+        };
+        // The fleet route (#14465): one broker call per (dependent, closed).
+        let Some(repo) = scanned else {
+            return WriteOutcome::Skipped(format!(
+                "{kind_label} #{number}: no resolved repository to name for the fleet broker"
+            ));
+        };
+        // A resweep has no closed set: send the cited numbers the evidence
+        // shows resolved (the broker verifies closure server-side; a
+        // ticked-but-open dependency entry is not a closed blocker).
+        let closed_set: Vec<i64> = if self.resweep {
+            resolved_cited(evidence)
+        } else {
+            cited.to_vec()
+        };
+        let mut posted = true;
+        let mut unparked = false;
+        let mut why: Option<String> = None;
+        for closed in closed_set {
+            match broker.notify_cleared_blocker(repo, number, closed) {
+                Ok(outcome) => unparked |= outcome.unblocked,
+                Err(e) => {
+                    posted = false;
+                    why.get_or_insert_with(|| format!("#{closed}: {e}"));
+                }
+            }
+        }
+        if resweep_skips_comment(self.resweep, self.dry_run, unparked) {
+            let mut line = format!("{kind_label} #{number}: unpark failed; no comment posted");
+            if let Some(w) = &why {
+                line.push_str(&format!(" ({w})"));
+            }
+            return WriteOutcome::Skipped(line);
+        }
+        WriteOutcome::Done {
+            posted,
+            unparked,
+            why,
+        }
     }
 }
 
@@ -255,6 +433,29 @@ fn resweep_cited(ev: &Evidence) -> Vec<i64> {
             ev.named
                 .iter()
                 .filter(|d| d.repo.is_none())
+                .map(|d| d.number),
+        )
+        .collect();
+    v.sort_unstable();
+    v.dedup();
+    v
+}
+
+/// The cited local numbers the evidence shows **resolved**: what a fleet
+/// resweep may hand the broker's `notify_cleared_blocker` as `closed` (the
+/// broker verifies closure server-side; a ticked-but-open `## Dependencies`
+/// entry has no looked-up state and is not one). Sorted, deduplicated.
+/// Pure, so tested.
+fn resolved_cited(ev: &Evidence) -> Vec<i64> {
+    let mut v: Vec<i64> = ev
+        .prose
+        .iter()
+        .filter(|r| resolved(&r.state))
+        .map(|r| r.number)
+        .chain(
+            ev.named
+                .iter()
+                .filter(|d| d.repo.is_none() && d.state.as_deref().is_some_and(resolved))
                 .map(|d| d.number),
         )
         .collect();
@@ -367,21 +568,24 @@ fn comment_body_for(
     body
 }
 
+/// Both mutations carry the admitted repository and the discovered dependent.
+fn write(number: i64, repo: &str, root: &Path, op: &'static str, args: &[&str]) -> bool {
+    if GhTarget::repo(repo).is_err() || u32::try_from(number).is_err() {
+        return false;
+    }
+    let mut routed = args.to_vec();
+    routed.extend(["--repo", repo]);
+    gh_write(op, &routed, root, false).succeeded()
+}
+
 /// Post the notification comment. Returns whether `gh` reported success.
-fn post_comment(kind: Artifact, number: i64, body: &str, repo: Option<&str>, root: &Path) -> bool {
+fn post_comment(kind: Artifact, number: i64, body: &str, repo: &str, root: &Path) -> bool {
     let entity = match kind {
         Artifact::Issue => "issue",
         Artifact::Pr => "pr",
     };
     let n = number.to_string();
-    let mut args = vec![entity, "comment", n.as_str(), "--body", body];
-    if let Some(r) = repo {
-        args.extend(["--repo", r]);
-    }
-    matches!(
-        gh_write("notify.comment", &args, root, false),
-        CmdOutcome::Ran(o) if o.status.success()
-    )
+    write(number, repo, root, "notify.comment", &[entity, "comment", &n, "--body", body])
 }
 
 /// Whether a newly-cleared artifact may be unparked mechanically (#13331).
@@ -422,23 +626,22 @@ fn unpark_eligible(kind: Artifact, labels: &[String], body: &str, ev: &Evidence)
 }
 
 /// Swap `loom:blocked` for `loom:curated`. Returns whether `gh` reported success.
-fn unpark(number: i64, repo: Option<&str>, root: &Path) -> bool {
+fn unpark(number: i64, repo: &str, root: &Path) -> bool {
     let n = number.to_string();
-    let mut args = vec![
-        "issue",
-        "edit",
-        n.as_str(),
-        "--remove-label",
-        "loom:blocked",
-        "--add-label",
-        "loom:curated",
-    ];
-    if let Some(r) = repo {
-        args.extend(["--repo", r]);
-    }
-    matches!(
-        gh_write("notify.unpark", &args, root, false),
-        CmdOutcome::Ran(o) if o.status.success()
+    write(
+        number,
+        repo,
+        root,
+        "notify.unpark",
+        &[
+            "issue",
+            "edit",
+            &n,
+            "--remove-label",
+            "loom:blocked",
+            "--add-label",
+            "loom:curated",
+        ],
     )
 }
 
@@ -489,7 +692,10 @@ fn report(
             cited.join(", ")
         );
         if !dry_run && !n.posted {
-            let _ = writeln!(err, "{line}");
+            let _ = match &n.why {
+                Some(why) => writeln!(err, "{line} ({why})"),
+                None => writeln!(err, "{line}"),
+            };
         } else {
             let _ = writeln!(out, "{line}");
             for r in &n.reasons {

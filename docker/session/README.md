@@ -1,9 +1,9 @@
 # `loom-worker-session` image
 
-`ghcr.io/rjwalters/loom-worker-session:<version>` (+ `:latest`) is the
+`ghcr.io/2amlogic/loom-worker-session:<version>` (+ `:latest`) is the
 **session-capable** image layer Epic #6896 Phase 2's per-account persistent
 Codex session containers run — published by `.github/workflows/release.yml`
-FROM the same-version `ghcr.io/rjwalters/loom-worker:<version>` base image, so
+FROM the same-version `ghcr.io/2amlogic/loom-worker:<version>` base image, so
 the two version in lockstep by construction: `<version>` always matches the
 loom version both images ship at.
 
@@ -26,7 +26,7 @@ This layer adds exactly these things:
 | Node.js + npm | Codex CLI's only distribution channel is npm, so a Node runtime is a genuine transitive dependency — installed from the official upstream tarball (checksum-verified), not `apt-get install nodejs npm`, which pulls Ubuntu's entire Debian-packaged build-from-source dependency chain for a footprint this image never uses. |
 | tmux-server entrypoint | `tini` (PID 1) → a thin entrypoint script that starts (or resumes) a detached tmux session named `session`, then blocks forever. This is what makes the container *persistent* — see "Entrypoint behavior" below. |
 | `CODEX_HOME` convention | `ENV CODEX_HOME=/home/loom/.codex-profile` — an empty, read-write directory owned by uid `1000` at build time. A per-account Codex profile volume binds over this path at container-start time (Phase 2's session lifecycle); it is never baked with content. |
-| `uv` + `UV_PROJECT_ENVIRONMENT` | Pinned static `uv` binary (multi-arch, from `ghcr.io/astral-sh/uv`) so Judge/Auditor sessions can `uv run pytest` a Python repo; `python3` and `git` already come from loom-worker. `UV_PROJECT_ENVIRONMENT=/tmp/loom-uv-venv` (and `UV_CACHE_DIR=/tmp/loom-uv-cache`) keep uv's venv out of the mounted checkout, whose `.venv` may be a macOS one. `/tmp` is chosen because private-workspace containers run `--read-only --user 1000:1000` with only `/tmp` and the workspace volume writable. The env dir is shared by all projects in the container, so uv recreates it when switching repos. |
+| `uv` + `UV_PROJECT_ENVIRONMENT` | Pinned static `uv` binary (multi-arch, from `ghcr.io/astral-sh/uv`) so Judge/Auditor sessions can `uv run pytest` a Python repo; `python3` and `git` already come from loom-worker. `UV_PROJECT_ENVIRONMENT=/tmp/loom-uv-venv` (and `UV_CACHE_DIR=/tmp/loom-uv-cache`) keep uv's venv out of the mounted checkout, whose `.venv` may be a macOS one. `/tmp` is chosen because private-workspace containers run `--read-only --user 1000:1000` with only `/tmp` and the workspace volume writable. The env dir is shared by all projects in the container, so uv recreates it when switching repos. These image defaults serve the non-private shape; a private-workspace seat overrides `UV_CACHE_DIR` (plus `GH_CACHE_DIR` and the Loom state dirs) to `/workspace/cache/*` at container create (#14929) — the seat's 512 MB `/tmp` tmpfs otherwise filled with multi-day caches. Only the per-container venv stays on `/tmp`. |
 
 **Zero secrets in this image**, same guarantee as the base image — verified
 by [`test-image.sh`](test-image.sh)'s `docker history` scan (extended with
@@ -160,8 +160,9 @@ time:
 
 ```bash
 docker run -d --name codex-session-<account> \
+  --restart unless-stopped \
   -v "/path/to/codex-profiles/<account>:/home/loom/.codex-profile" \
-  ghcr.io/rjwalters/loom-worker-session:<version>
+  ghcr.io/2amlogic/loom-worker-session:<version>
 ```
 
 The volume, not the image, is what makes a session container
@@ -185,7 +186,7 @@ top of this one, named by two config keys (`accounts.session.image`,
 
 ```dockerfile
 # Dockerfile for the derived image
-FROM ghcr.io/rjwalters/loom-worker-session:<version>
+FROM ghcr.io/2amlogic/loom-worker-session:<version>
 RUN apt-get update && apt-get install -y --no-install-recommends \
       gdsci-yosys ngspice \
     && rm -rf /var/lib/apt/lists/*
@@ -287,6 +288,63 @@ The Claude token pool and the operator's `~/.config/gh` are no longer mounted.
 has the full reach audit, the residual exposures (cloud metadata, host
 services) and the rollout steps.
 
+## Seat restart policy and engine-restart recovery (issue #14912)
+
+Every persistent seat container is created `--restart unless-stopped` —
+host-mounted seats since #10452, private-clone seats since #14912. Before
+that, the private-clone `docker run` omitted the flag, so on a host with no
+`loom-daemon` (session-only mode, #12708) — where no reconcile pass runs —
+a Docker engine restart left every seat `Exited` until someone ran
+`docker start` on each by hand. `unless-stopped`, not `always`, because
+`accounts session stop` writes the operator hold and then removes the
+container: the policy returns a seat after an engine restart or host reboot
+and never resurrects one an operator retired. The disposable `--rm` helpers
+of a private-clone create (control provisioning, the fresh-volume `chown`
+initializer, the image bundle probe) carry no policy and stay ephemeral.
+
+**One-time migration of a running legacy seat.** A binary upgrade does not
+change an existing container's policy: both start paths reuse a running
+seat or resume a stopped one as-is, so a seat created before #14912 keeps
+its old `no` policy until it is recreated or migrated. For each account on
+a session-only host, while its seat is running and not held:
+
+```bash
+seat="loom-codex-session-ACCOUNT"
+docker inspect -f '{{.Id}} {{.HostConfig.RestartPolicy.Name}} {{.State.Running}}' "$seat"
+# policy "no" → migrate in place (same container, no workspace churn):
+docker update --restart unless-stopped "$seat"
+docker inspect -f '{{.Id}} {{.HostConfig.RestartPolicy.Name}} {{.State.Running}}' "$seat"
+```
+
+The re-inspect must show the **same container ID** with the new policy. An
+account deliberately stopped (`accounts session stop`, which holds it) or a
+missing seat needs no migration: the next `accounts session start` recreates
+the container with the policy. ([Docker restart
+policies](https://docs.docker.com/engine/containers/start-containers-automatically/).)
+
+**What an attended host recovers through Docker alone.** On a session-only
+host Docker's policy is the whole recovery story:
+
+- A healthy running seat returns after a Docker engine restart or host
+  reboot with no Loom command.
+- An account deliberately stopped through `accounts session stop` stays
+  held and down — the container is removed and the hold stands until an
+  operator `start`.
+- A **missing** container is not something Docker can recover: recreating
+  one is a separate lifecycle operation — the daemon's reconcile pass on a
+  daemon host
+  ([daemon-reference](../../defaults/docs/daemon-reference.md#codex-session-container-reconciler-10453)),
+  the operator's `accounts session start` on a session-only host.
+
+**Check on a disposable host** (the acceptance check for this issue): start
+a healthy seat and let it run at least 10 s; deliberately stop a second
+account with `accounts session stop`; restart Docker with no Loom daemon
+running; then, before invoking any Loom start or shell command, inspect
+each seat with the `docker inspect` line above. Expect the healthy seat's
+original container ID, `unless-stopped`, and `running=true`; the stopped
+account stays held and down. Repeat the healthy-seat check once more on a
+pre-existing seat after the one-time migration.
+
 ## Re-authenticating a session-managed account (the ownership rule, issue #7389)
 
 Once `session start` adopts a profile (writes its
@@ -339,7 +397,7 @@ docker build -f docker/session/Dockerfile \
 ./docker/session/test-image.sh loom-worker-session:dev
 ```
 
-`BASE_IMAGE` defaults to `ghcr.io/rjwalters/loom-worker:latest` if omitted,
+`BASE_IMAGE` defaults to `ghcr.io/2amlogic/loom-worker:latest` if omitted,
 for a quick pull-and-build without a local base image.
 
 Manual smoke check beyond what `test-image.sh` automates:
@@ -355,11 +413,11 @@ docker rm -f session-dev
 ## Versioning and publishing
 
 `.github/workflows/release.yml`'s `build-session-image` job builds and
-pushes `ghcr.io/rjwalters/loom-worker-session:<version>` and `:latest` on
+pushes `ghcr.io/2amlogic/loom-worker-session:<version>` and `:latest` on
 every GitHub Release, immediately after (and depending on) the
 `build-worker-image` job — `<version>` is the same `scripts/version.sh`
 value the base image and every other version-bearing file in the repo share,
-passed as `--build-arg BASE_IMAGE=ghcr.io/rjwalters/loom-worker:<version>` so
+passed as `--build-arg BASE_IMAGE=ghcr.io/2amlogic/loom-worker:<version>` so
 the pair is always built against each other's exact matching version, never
 `:latest`-to-`:latest` drift.
 
@@ -369,7 +427,7 @@ manifest under the same tags, mirroring `docker/worker/README.md`'s own
 from the already-published multi-arch `loom-worker` manifest rather than a
 locally-built, single-arch one, so each platform's session layer builds FROM
 the matching platform's base layer. Verify post-release with `docker
-manifest inspect ghcr.io/rjwalters/loom-worker-session:<version>`. As with
+manifest inspect ghcr.io/2amlogic/loom-worker-session:<version>`. As with
 the base image, CI's own smoke test only runs natively against the
 `linux/amd64` leg (no native arm64 GitHub Actions runner here); verify an
 arm64 build/run manually on an Apple Silicon or other arm64 host if you need

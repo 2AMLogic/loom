@@ -252,7 +252,7 @@ fn write_secret_replaces_atomically_and_stays_0600() {
         .unwrap()
         .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
         .collect();
-    assert!(names.iter().all(|n| !n.contains(".tmp-")), "{names:?}");
+    assert!(names.iter().all(|n| !crate::fs_util::is_staging_name(n)), "{names:?}");
 }
 
 /// A failed write must leave the previous contents intact (the `ENOSPC` /
@@ -313,6 +313,102 @@ fn an_unparsable_marks_file_withholds_accounts() {
         .as_deref()
         .unwrap()
         .contains("not a valid bad-marks file"));
+}
+
+// ---- `runtimes.apiKeyLimits`: the second source (#14932) ----
+
+/// The block as a workspace's resolved config carries it.
+fn configured(block: serde_json::Value) -> limits::ConfiguredLimits {
+    limits::ConfiguredLimits::from_config(
+        &serde_json::json!({ "runtimes": { "apiKeyLimits": block } }),
+    )
+}
+
+/// A described account carries the limits the pool enforces and, for each
+/// one, where it came from — the acceptance criterion for `api-keys list`.
+#[test]
+fn a_description_reports_each_limit_with_its_source() {
+    let tmp = pool();
+    add(tmp.path(), "zai", "alpha", "ZAI_API_KEY", FAKE_KEY, false).unwrap();
+    add(tmp.path(), "zai", "beta", "ZAI_API_KEY", FAKE_KEY, false).unwrap();
+    limits::set_max_concurrent(tmp.path(), "zai", "alpha", Some(2)).unwrap();
+    limits::set_plan_token_limit(tmp.path(), "zai", "alpha", Some(50_000_000)).unwrap();
+    let configured = configured(serde_json::json!({
+        "zai": {
+            "alpha": { "maxConcurrent": 1, "exhaustionWindowSecs": 604_800 },
+            "beta": { "maxConcurrent": 3 }
+        }
+    }));
+    let accounts = list_provider_for_class(tmp.path(), "zai", None, &configured).unwrap();
+    let [alpha, beta] = [&accounts[0], &accounts[1]];
+    assert_eq!(
+        (alpha.max_concurrent, alpha.max_concurrent_source),
+        (Some(1), limits::LimitSource::BothConfig)
+    );
+    assert_eq!(
+        (alpha.exhaustion_window_secs, alpha.exhaustion_window_secs_source),
+        (Some(604_800), limits::LimitSource::Config)
+    );
+    assert_eq!(
+        (alpha.plan_token_limit, alpha.plan_token_limit_source),
+        (Some(50_000_000), limits::LimitSource::File)
+    );
+    assert_eq!(
+        (beta.max_concurrent, beta.max_concurrent_source),
+        (Some(3), limits::LimitSource::Config)
+    );
+    assert_eq!(beta.exhaustion_window_secs_source, limits::LimitSource::Absent);
+    assert_eq!(beta.plan_token_limit_source, limits::LimitSource::Absent);
+    // A declared cap is a bound, not an exclusion.
+    assert!(alpha.selectable() && beta.selectable());
+    // The wire form: a source for every limit, on every account.
+    let wire = serde_json::to_value(&accounts).unwrap();
+    assert_eq!(wire[0]["maxConcurrent"], 1);
+    assert_eq!(wire[0]["maxConcurrentSource"], "both-config");
+    assert_eq!(wire[0]["exhaustionWindowSecsSource"], "config");
+    assert_eq!(wire[0]["planTokenLimitSource"], "file");
+    assert_eq!(wire[1]["exhaustionWindowSecsSource"], "absent");
+    // The management-verb read stays file-only, and says so.
+    let file_only = describe_account(tmp.path(), "zai", "alpha", &limits::ConfiguredLimits::EMPTY);
+    assert_eq!(
+        (file_only.max_concurrent, file_only.max_concurrent_source),
+        (Some(2), limits::LimitSource::File)
+    );
+}
+
+/// A block that cannot be understood withholds the provider's accounts like
+/// an unreadable `.limits.json` does, naming the config key — and, like it,
+/// never outranks a stronger reason the account already has.
+#[test]
+fn a_malformed_config_block_withholds_its_provider_naming_the_key() {
+    let tmp = pool();
+    add(tmp.path(), "zai", "alpha", "ZAI_API_KEY", FAKE_KEY, false).unwrap();
+    add(tmp.path(), "zai", "beta", "ZAI_API_KEY", FAKE_KEY, false).unwrap();
+    add(tmp.path(), "openai", "gamma", "OPENAI_API_KEY", FAKE_KEY, false).unwrap();
+    set_enabled(tmp.path(), "zai", "beta", false).unwrap();
+    // An account the pool does not even hold: the offence is the provider's.
+    let configured = configured(serde_json::json!({ "zai": { "nobody": { "maxConcurrent": 0 } } }));
+    let zai = list_provider_for_class(tmp.path(), "zai", None, &configured).unwrap();
+    assert_eq!(zai[0].ineligible, Some(Ineligible::Unverifiable));
+    assert!(
+        zai[0]
+            .problem
+            .as_deref()
+            .unwrap()
+            .contains("runtimes.apiKeyLimits.zai.nobody.maxConcurrent"),
+        "{zai:?}"
+    );
+    // An unknown limit is reported as unknown — never as a number, never as
+    // "none declared".
+    assert_eq!(zai[0].max_concurrent, None);
+    assert_eq!(zai[0].max_concurrent_source, limits::LimitSource::Unknown);
+    assert_eq!(zai[0].exhaustion_window_secs_source, limits::LimitSource::Unknown);
+    assert_eq!(zai[0].plan_token_limit_source, limits::LimitSource::Unknown);
+    // A stronger reason keeps its own name: disabled outranks unreadable limits.
+    assert_eq!(zai[1].ineligible, Some(Ineligible::Disabled));
+    // Scoped to the provider the block names.
+    let openai = list_provider_for_class(tmp.path(), "openai", None, &configured).unwrap();
+    assert!(openai[0].selectable(), "{openai:?}");
 }
 
 /// Judge nit: `remove` left the bad mark and `.allowlist` entry behind, so an

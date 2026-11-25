@@ -480,52 +480,6 @@ pub fn resolve_interval(config: &TokenRankingRefreshConfig) -> Duration {
 // Runtime wiring
 // ============================================================================
 
-/// Spawn the token-ranking refresh loop for a single workspace on the shared
-/// daemon runtime. Intended for tests; production uses
-/// [`spawn_multi_token_ranking_refresh_task`] (the multi-workspace entry
-/// point wired into `main.rs`).
-///
-/// Unlike [`crate::main_health_gate::spawn_multi_main_health_gate_task`] /
-/// [`crate::work_finder`]'s loops, the **first tick is not skipped**: a ranking
-/// probe is a handful of cheap read-only HTTP calls with no dispatch side
-/// effect, so refreshing immediately at boot (rather than waiting a full
-/// cadence for the first data) is strictly better — there is no "churn on
-/// startup" cost to avoid here.
-pub fn spawn_token_ranking_refresh_task<R>(
-    mut runner: R,
-    interval: Duration,
-) -> tokio::task::JoinHandle<()>
-where
-    R: RankingRefreshRunner + Send + 'static,
-{
-    log::info!("token_ranking_refresh: starting loop (interval={}s)", interval.as_secs());
-    tokio::spawn(async move {
-        let mut ticker = tokio::time::interval(interval);
-        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        loop {
-            ticker.tick().await;
-            let joined = tokio::task::spawn_blocking(move || {
-                let outcome = runner.refresh();
-                (outcome, runner)
-            })
-            .await;
-            match joined {
-                Ok((outcome, r)) => {
-                    runner = r;
-                    log_outcome(&outcome);
-                }
-                Err(e) => {
-                    log::error!(
-                        "token_ranking_refresh: refresh task panicked ({e}); stopping loop \
-                         (the last-written .ranking, if any, is left as-is)"
-                    );
-                    return;
-                }
-            }
-        }
-    })
-}
-
 /// Spawn the **multi-workspace** token-ranking refresh loop (mirrors
 /// [`crate::main_health_gate::spawn_multi_main_health_gate_task`]) on the
 /// shared daemon runtime.
@@ -538,9 +492,41 @@ where
 /// every root). Probes run **sequentially** per tick (matches the health
 /// gate's sequencing rationale — no shared mutable state to leak across repos,
 /// and it avoids bursting several accounts' rate-limit probes at once).
+///
+/// Unlike [`crate::main_health_gate::spawn_multi_main_health_gate_task`] /
+/// [`crate::work_finder`]'s loops, the **first tick is not skipped**: a ranking
+/// probe is a handful of cheap read-only HTTP calls with no dispatch side
+/// effect, so refreshing immediately at boot (rather than waiting a full
+/// cadence for the first data) is strictly better — there is no "churn on
+/// startup" cost to avoid here.
 pub fn spawn_multi_token_ranking_refresh_task(
     fallback_root: PathBuf,
     interval: Duration,
+) -> tokio::task::JoinHandle<()> {
+    spawn_multi_token_ranking_refresh_task_with(
+        fallback_root,
+        interval,
+        std::sync::Arc::new(|root| Box::new(ScriptRankingRefreshRunner::new(root))),
+    )
+}
+
+/// Builds the refresh runner for one root.
+pub(crate) type RankingRunnerFactory =
+    std::sync::Arc<dyn Fn(PathBuf) -> Box<dyn RankingRefreshRunner + Send> + Send + Sync>;
+
+/// The runner seam behind [`spawn_multi_token_ranking_refresh_task`] (#14986,
+/// the #13832 pattern): the identical production loop with the per-root runner
+/// factory injected, so tests drive the loop the daemon actually runs instead
+/// of a second hand-maintained copy of it (the removed
+/// single-workspace refresh loop, which stopped on a panic where this loop
+/// records it and continues, and skipped the registry, enable gate and
+/// telemetry). The public entry point passes [`ScriptRankingRefreshRunner::new`];
+/// everything else — the registry re-read, the per-root enable gate, telemetry,
+/// panic survival and outcome logging — is the production path unchanged.
+pub(crate) fn spawn_multi_token_ranking_refresh_task_with(
+    fallback_root: PathBuf,
+    interval: Duration,
+    runner_factory: RankingRunnerFactory,
 ) -> tokio::task::JoinHandle<()> {
     log::info!(
         "token_ranking_refresh: starting multi-workspace loop (interval={}s)",
@@ -575,9 +561,10 @@ pub fn spawn_multi_token_ranking_refresh_task(
                 }
                 let root_for_task = root.clone();
                 let started_at = chrono::Utc::now();
+                let factory = runner_factory.clone();
                 let joined = tokio::task::spawn_blocking(move || {
-                    let mut runner = ScriptRankingRefreshRunner::new(root_for_task.clone());
-                    telemetry::refresh_and_record(&root_for_task, &mut runner)
+                    let mut runner = factory(root_for_task.clone());
+                    telemetry::refresh_and_record(&root_for_task, &mut *runner)
                 })
                 .await;
                 match joined {
@@ -595,17 +582,6 @@ pub fn spawn_multi_token_ranking_refresh_task(
             log_tick_outcomes(&outcomes);
         }
     })
-}
-
-/// Log a single-workspace refresh outcome at a severity matching its
-/// significance. Never escalates to `error!` — a probe failure is never fatal.
-fn log_outcome(outcome: &RefreshOutcome) {
-    match outcome {
-        RefreshOutcome::Success => log::debug!("token_ranking_refresh: ranking refreshed"),
-        RefreshOutcome::Failure(reason) => log::warn!(
-            "token_ranking_refresh: probe failed (logged and skipped, never fatal): {reason}"
-        ),
-    }
 }
 
 /// Log every root's outcome for one multi-workspace tick, **collapsing**
@@ -1217,17 +1193,73 @@ mod tests {
         }
     }
 
+    /// Points the machine-level workspace registry at a not-yet-created file
+    /// and clears the enable override for the guard's lifetime, so the
+    /// multi-workspace loop resolves exactly its `fallback_root` (enabled by
+    /// default) and never reads the host's real `~/.loom/workspaces.json`.
+    /// Tests holding one must be `#[serial]`.
+    struct IsolatedLoop {
+        prev_registry: Option<std::ffi::OsString>,
+        prev_enable: Option<std::ffi::OsString>,
+        root: tempfile::TempDir,
+    }
+    impl IsolatedLoop {
+        fn new() -> Self {
+            let root = tempfile::tempdir().unwrap();
+            let prev_registry = std::env::var_os(crate::workspace_registry::REGISTRY_PATH_ENV);
+            let prev_enable = std::env::var_os(TOKEN_RANKING_REFRESH_ENABLE_ENV);
+            std::env::set_var(
+                crate::workspace_registry::REGISTRY_PATH_ENV,
+                root.path().join("workspaces.json"),
+            );
+            std::env::remove_var(TOKEN_RANKING_REFRESH_ENABLE_ENV);
+            Self {
+                prev_registry,
+                prev_enable,
+                root,
+            }
+        }
+        fn root(&self) -> PathBuf {
+            self.root.path().to_path_buf()
+        }
+    }
+    impl Drop for IsolatedLoop {
+        fn drop(&mut self) {
+            for (key, prev) in [
+                (crate::workspace_registry::REGISTRY_PATH_ENV, &self.prev_registry),
+                (TOKEN_RANKING_REFRESH_ENABLE_ENV, &self.prev_enable),
+            ] {
+                match prev {
+                    Some(v) => std::env::set_var(key, v),
+                    None => std::env::remove_var(key),
+                }
+            }
+        }
+    }
+
+    // #14986: the loop tests drive the production multi-workspace loop through
+    // its `spawn_multi_token_ranking_refresh_task_with` seam (the removed
+    // single-workspace refresh loop was a drifted copy).
+
     #[tokio::test]
+    #[serial]
     async fn test_loop_refreshes_immediately_without_skipping_first_tick() {
+        let isolated = IsolatedLoop::new();
         let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let runner = FakeRunner {
-            outcomes: vec![RefreshOutcome::Success; 3],
-            calls: calls.clone(),
-        };
+        let factory_calls = calls.clone();
         // A short real interval so the test completes quickly without needing
         // a paused virtual clock (which can't observe a genuine spawn_blocking
         // OS thread completing).
-        let handle = spawn_token_ranking_refresh_task(runner, Duration::from_millis(20));
+        let handle = spawn_multi_token_ranking_refresh_task_with(
+            isolated.root(),
+            Duration::from_millis(20),
+            std::sync::Arc::new(move |_root| {
+                Box::new(FakeRunner {
+                    outcomes: vec![RefreshOutcome::Success; 3],
+                    calls: factory_calls.clone(),
+                })
+            }),
+        );
 
         wait_for_calls(&calls, 1, SCHEDULER_WAIT).await;
         wait_for_calls(&calls, 3, SCHEDULER_WAIT).await;
@@ -1236,18 +1268,38 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_loop_stops_cleanly_when_runner_panics() {
-        struct PanicOnceRunner;
-        impl RankingRefreshRunner for PanicOnceRunner {
+    #[serial]
+    async fn test_loop_survives_a_panicking_runner_and_keeps_ticking() {
+        /// Panics on its first refresh, then succeeds — production records the
+        /// panic and continues to the next tick rather than ending the loop.
+        struct PanicFirstRunner {
+            calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        }
+        impl RankingRefreshRunner for PanicFirstRunner {
             fn refresh(&mut self) -> RefreshOutcome {
-                panic!("boom");
+                let n = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                assert!(n > 0, "boom");
+                RefreshOutcome::Success
             }
         }
-        let handle = spawn_token_ranking_refresh_task(PanicOnceRunner, Duration::from_millis(20));
-        // The loop should observe the panicked blocking task and return
-        // (rather than hang or propagate the panic to the caller).
-        let result = tokio::time::timeout(SCHEDULER_WAIT, handle).await;
-        assert!(result.is_ok(), "loop task should finish (not hang) after the runner panics");
+        let isolated = IsolatedLoop::new();
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let factory_calls = calls.clone();
+        let handle = spawn_multi_token_ranking_refresh_task_with(
+            isolated.root(),
+            Duration::from_millis(20),
+            std::sync::Arc::new(move |_root| {
+                Box::new(PanicFirstRunner {
+                    calls: factory_calls.clone(),
+                })
+            }),
+        );
+
+        // The first refresh panicked; the loop must still run later ticks.
+        wait_for_calls(&calls, 3, SCHEDULER_WAIT).await;
+        assert!(!handle.is_finished(), "loop must survive a panicking runner, not stop");
+
+        handle.abort();
     }
 
     // ===================================================================

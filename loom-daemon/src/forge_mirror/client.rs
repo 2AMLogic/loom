@@ -215,16 +215,6 @@ impl MirrorItem {
     }
 }
 
-/// One page of `/v1/mirror/items`.
-#[derive(Debug, Clone, Default, Deserialize)]
-pub struct ItemsPage {
-    #[serde(default)]
-    pub items: Vec<MirrorItem>,
-    #[serde(default)]
-    pub next_after: Option<u64>,
-    pub watermark: Watermark,
-}
-
 /// One repo's part of a `/v1/changes` answer.
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct RepoChanges {
@@ -481,30 +471,6 @@ fn wait<T>(rx: &std::sync::mpsc::Receiver<T>, deadline: Duration) -> Option<T> {
     } else {
         rx.recv_timeout(deadline).ok()
     }
-}
-
-/// [`get_json`] from synchronous code, bounded by `deadline` whatever the
-/// network does.
-///
-/// # Errors
-///
-/// [`MirrorError`]; a missed deadline is [`MirrorError::Transport`].
-pub fn get_json_blocking(
-    active: &Active,
-    path: &str,
-    query: &[(String, String)],
-    deadline: Duration,
-) -> Result<Value, MirrorError> {
-    let Some((rt, http)) = runtime() else {
-        return Err(MirrorError::Transport("no runtime".into()));
-    };
-    let (tx, rx) = std::sync::mpsc::sync_channel(1);
-    let (http, active, path, query) =
-        (http.clone(), active.clone(), path.to_string(), query.to_vec());
-    rt.spawn(async move {
-        let _ = tx.send(get_json(&http, &active, &path, &query).await);
-    });
-    wait(&rx, deadline).unwrap_or_else(|| Err(MirrorError::Transport("deadline".into())))
 }
 
 /// [`get_json_conditional`] from synchronous code, bounded by `deadline`

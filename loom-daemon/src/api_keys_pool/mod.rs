@@ -47,6 +47,7 @@ pub mod limits;
 pub mod live_watch;
 pub mod paths;
 pub mod registry;
+pub mod reservation;
 pub mod reset;
 pub mod select;
 pub mod sync;
@@ -57,7 +58,7 @@ pub use bad_marks::{
 };
 pub use classify::{classify, Classification};
 pub use ingest::{ingest_launch_log, LaunchFeedback};
-pub use limits::AccountLimits;
+pub use limits::{AccountLimits, ConfiguredLimits, LimitSource};
 pub use paths::PoolReadError;
 pub use registry::{ApiKeyAccount, Credential, Ineligible};
 pub use select::{
