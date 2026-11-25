@@ -1282,61 +1282,96 @@ fn test_handle_request_dispatch_sweep_exports_claim_ownership_marker() {
 /// epic supervisor, and role runner, which all read it in-process each
 /// tick. These tests exercise [`drain_dispatch_refusal`] — the exact
 /// decision `handle_client` makes before ever calling `handle_request` —
-/// directly with a plain `bool`, matching the
+/// directly with a plain [`DispatchHold`], matching the
 /// [`rate_limit_dispatch_refusal_tests`] pattern just above (a real
 /// `DrainState` is a `Mutex`-guarded singleton per daemon process, not
 /// something a unit test wants to mutate to exercise one decision).
 mod drain_dispatch_refusal_tests {
     use super::*;
+    use crate::ipc::DispatchHold;
 
-    /// Not draining ⇒ never refuses, regardless of `force`. This is the
-    /// overwhelmingly common case (no drain in progress) and must be a
-    /// complete no-op.
-    #[test]
-    fn not_draining_never_refuses() {
-        let kind = SweepKind::Issue(5340);
-        assert!(drain_dispatch_refusal(&kind, false, false).is_none());
-        assert!(drain_dispatch_refusal(&kind, false, true).is_none());
-    }
+    /// The pre-#15300 drain refusal, byte for byte.
+    const DRAIN_MESSAGE: &str = "dispatch_sweep refused: an active drain (`restart --drain`) is \
+         pausing new dispatch pending a supervised restart (#4090/#5340). Check progress with \
+         `loom-daemon status`, cancel the drain with `loom-daemon restart --abort-drain` to \
+         resume normal dispatch immediately, or re-run with force to override.";
 
-    /// The core #5340 fix: an active drain refuses a plain (non-forced)
-    /// explicit dispatch, with a message that names the drain, points at
-    /// `loom-daemon status` to check progress, and `restart --abort-drain`
-    /// to resume dispatch immediately.
-    #[test]
-    fn draining_refuses_without_force() {
-        let kind = SweepKind::Issue(5340);
-        let response = drain_dispatch_refusal(&kind, true, false);
-        match response {
-            Some(Response::Error { message }) => {
-                assert!(
-                    message.contains("drain"),
-                    "expected the drain refusal message, got: {message}"
-                );
-                assert!(
-                    message.contains("loom-daemon status"),
-                    "expected a pointer to checking status, got: {message}"
-                );
-                assert!(
-                    message.contains("--abort-drain"),
-                    "expected the abort-drain escape hatch, got: {message}"
-                );
-            }
+    fn refusal_message(hold: &DispatchHold) -> String {
+        match drain_dispatch_refusal(&SweepKind::Issue(5340), hold, false) {
+            Some(Response::Error { message }) => message,
             other => panic!("Expected Some(Response::Error), got: {other:?}"),
         }
     }
 
-    /// `force: true` overrides the drain refusal independently of the
-    /// host-distress/rate-limit breakers' own `force` handling, even while
-    /// `is_draining` remains `true` throughout — an operator can still push
-    /// an urgent dispatch through a drain window.
+    /// No hold ⇒ never refuses, regardless of `force`. This is the
+    /// overwhelmingly common case and must be a complete no-op.
     #[test]
-    fn force_true_overrides_active_drain() {
+    fn not_draining_never_refuses() {
         let kind = SweepKind::Issue(5340);
-        assert!(
-            drain_dispatch_refusal(&kind, true, true).is_none(),
-            "force: true must bypass the drain refusal"
+        assert!(drain_dispatch_refusal(&kind, &DispatchHold::None, false).is_none());
+        assert!(drain_dispatch_refusal(&kind, &DispatchHold::None, true).is_none());
+    }
+
+    /// The #5340 fix, pinned by #15300: a genuine drain's refusal text is
+    /// unchanged byte for byte.
+    #[test]
+    fn draining_refuses_without_force() {
+        assert_eq!(refusal_message(&DispatchHold::Drain), DRAIN_MESSAGE);
+    }
+
+    /// #15300: a fleet hold names the fleet store and carries the hold note,
+    /// and never suggests the drain remedies (which would override the
+    /// operator's pause) or `force`.
+    #[test]
+    fn a_fleet_hold_names_the_fleet_store_not_a_drain() {
+        let note = "fleet-state hold: paused by op since 2026-10-13: maintenance; set it \
+                    running in the store";
+        let message = refusal_message(&DispatchHold::FleetHold(note.to_string()));
+        assert_eq!(
+            message,
+            format!("dispatch_sweep refused: host is paused in the fleet store: {note}")
         );
+        assert!(!message.contains("restart --drain"), "{message}");
+        assert!(!message.contains("--abort-drain"), "{message}");
+        assert!(!message.contains("force"), "{message}");
+    }
+
+    /// #15300: a local operator stop names the stop record (via its note).
+    #[test]
+    fn an_operator_stop_names_the_stop_record() {
+        let note = "dispatch HELD at startup: an operator stop is on record (/x/stop at t: r)";
+        let message = refusal_message(&DispatchHold::OperatorStop(note.to_string()));
+        assert_eq!(
+            message,
+            format!("dispatch_sweep refused: an operator stop is on record: {note}")
+        );
+        assert!(!message.contains("an active drain"), "{message}");
+    }
+
+    /// An H5 resume hold names itself, not a drain.
+    #[test]
+    fn a_roll_resume_hold_is_not_called_a_drain() {
+        let message = refusal_message(&DispatchHold::RollResume("verifying".to_string()));
+        assert!(message.contains("verifying"), "{message}");
+        assert!(!message.contains("an active drain"), "{message}");
+    }
+
+    /// `force: true` overrides every hold, including a fleet hold (unchanged
+    /// behaviour — #15300 is a wording fix, not a policy change).
+    #[test]
+    fn force_true_overrides_every_hold() {
+        let kind = SweepKind::Issue(5340);
+        for hold in [
+            DispatchHold::Drain,
+            DispatchHold::FleetHold("n".to_string()),
+            DispatchHold::OperatorStop("n".to_string()),
+            DispatchHold::RollResume("n".to_string()),
+        ] {
+            assert!(
+                drain_dispatch_refusal(&kind, &hold, true).is_none(),
+                "force: true must bypass {hold:?}"
+            );
+        }
     }
 }
 

@@ -126,6 +126,11 @@ pub struct DrainRollStatus {
     /// operator-stop record existed (#9588).
     #[serde(default)]
     pub startup_hold: bool,
+    /// `true` when the hold was placed by the fleet store's `paused` state
+    /// (#9598), not a local operator stop or a drain (#15300). Always
+    /// accompanied by `startup_hold`.
+    #[serde(default)]
+    pub fleet_hold: bool,
     /// The H4 pause's progress, for a `pause-roll` drain (#10831). `None` for
     /// any other drain, and from a pre-#10831 daemon.
     #[serde(default)]
@@ -158,6 +163,7 @@ pub fn roll_status(
         origin: snap.origin.as_str().to_string(),
         timed_out: snap.timed_out,
         startup_hold: snap.startup_hold,
+        fleet_hold: snap.fleet_hold,
         pause: snap.pause.clone(),
     })
 }
