@@ -13,7 +13,8 @@
 //! `/loom:release` skill was retired by #3563 / PR #3571, but existing consumer
 //! copies were deliberately not swept. This module removes such strays narrowly
 //! and safely, mirroring the shell-side block landed in
-//! `scripts/install-loom.sh` (PR #3575, the `LOOM_RETIRED_FILES` allowlist).
+//! `scripts/install/retired-files.sh` (PR #3575, the `LOOM_RETIRED_FILES`
+//! allowlist; moved out of `install-loom.sh` by #14846).
 //!
 //! # Gate
 //!
@@ -31,7 +32,7 @@
 //!
 //! [`RETIRED_FILES`] is the Rust source of truth. A `#[cfg(test)]` drift guard
 //! (see the `tests` module) parses the shell `LOOM_RETIRED_FILES` heredoc out
-//! of `scripts/install-loom.sh` and asserts set-equality with [`RETIRED_FILES`]
+//! of `scripts/install/retired-files.sh` and asserts set-equality with [`RETIRED_FILES`]
 //! in both directions, so neither surface can change without the other.
 
 use std::fs;
@@ -45,7 +46,7 @@ use crate::tokens_pool::profile_ledger::sha256_hex;
 /// One row per shipped version; multiple rows per path enumerate every version
 /// Loom ever shipped at that path. Append-only — never remove a historical
 /// digest. This is the Rust mirror of the `LOOM_RETIRED_FILES` heredoc in
-/// `scripts/install-loom.sh`; the two are kept identical by a drift-guard test.
+/// `scripts/install/retired-files.sh`; the two are kept identical by a drift-guard test.
 ///
 /// `.claude/commands/loom/release.md` — every version shipped in the
 /// #3495 → #3563 window (retired by #3563 / PR #3571). release.md's only
@@ -363,11 +364,14 @@ mod tests {
     }
 
     /// Parse the shell `LOOM_RETIRED_FILES` heredoc out of
-    /// `scripts/install-loom.sh` into a `(path, digest)` set.
+    /// `scripts/install/retired-files.sh` into a `(path, digest)` set.
     fn parse_shell_allowlist() -> HashSet<(String, String)> {
         let manifest_dir = env!("CARGO_MANIFEST_DIR"); // .../loom-daemon
         let repo_root = Path::new(manifest_dir).parent().unwrap();
-        let script = repo_root.join("scripts").join("install-loom.sh");
+        let script = repo_root
+            .join("scripts")
+            .join("install")
+            .join("retired-files.sh");
         let text = fs::read_to_string(&script)
             .unwrap_or_else(|e| panic!("failed to read {}: {e}", script.display()));
 
@@ -419,7 +423,7 @@ mod tests {
         assert!(
             only_rust.is_empty() && only_shell.is_empty(),
             "retired-file allowlist DRIFT between Rust const and \
-             scripts/install-loom.sh.\n  Only in Rust: {only_rust:?}\n  Only in shell: {only_shell:?}\n\
+             scripts/install/retired-files.sh.\n  Only in Rust: {only_rust:?}\n  Only in shell: {only_shell:?}\n\
              Update both surfaces together (append-only)."
         );
         // Cardinality sanity: both sides carry the frozen 11 release.md digests

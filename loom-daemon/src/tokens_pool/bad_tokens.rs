@@ -1076,14 +1076,12 @@ pub fn cleanup_bad_tokens_in_dir(
         });
     }
 
-    let tmp = bad_file.with_extension("tmp");
     let body = if kept.is_empty() {
         String::new()
     } else {
         format!("{}\n", kept.join("\n"))
     };
-    std::fs::write(&tmp, body).map_err(|e| e.to_string())?;
-    std::fs::rename(&tmp, &bad_file).map_err(|e| e.to_string())?;
+    super::allowlist::atomic_write(&bad_file, &body)?;
 
     Ok(CleanupOutcome {
         kept: kept.len(),
@@ -1196,14 +1194,12 @@ pub fn unblock_in_dir(
         kept.push(line.to_string());
     }
 
-    let tmp = bad_file.with_extension("tmp");
     let body = if kept.is_empty() {
         String::new()
     } else {
         format!("{}\n", kept.join("\n"))
     };
-    std::fs::write(&tmp, body).map_err(|e| e.to_string())?;
-    std::fs::rename(&tmp, &bad_file).map_err(|e| e.to_string())?;
+    super::allowlist::atomic_write(&bad_file, &body)?;
 
     Ok(UnblockOutcome {
         removed,

@@ -1,5 +1,7 @@
 //! Paginated conditional REST reads retain author association/type, unlike
 //! the reduced issue listing. Cache keys include repo and credential scope.
+//! On a Gitea checkout the same pages are read from the Gitea API instead
+//! (`crate::gitea_read`, #14939).
 use super::*;
 use crate::forge_call_stats::{ops, ForgeOp};
 use crate::forge_etag_store as store;
@@ -15,9 +17,26 @@ fn read(root: &Path, gh: &Path, op: ForgeOp, suffix: &str) -> Result<Value> {
     let repo = std::env::var("LOOM_REPO").ok();
     let target = store::resolve_target(Some(root), repo.as_deref());
     let url = format!("repos/{}/{}", target.repo.as_deref().unwrap_or("{owner}/{repo}"), suffix);
+    // #14939: a Gitea checkout is read through its own API. `gh` cannot
+    // resolve the remote, and refuses the `host:port` of its origin as a
+    // hostname. The transport is chosen here alone: the planner, the hold
+    // checks and the guard decisions downstream see the same pages.
+    if crate::gitea_read::on_gitea(root) {
+        return crate::gitea_read::read_page(root, &url)
+            .map_err(|e| anyhow!("PR queue read failed: {e}"));
+    }
     let key = store::cache_key(Some(root), &target, &url);
     let path = store::disk_cache_path(&key);
     let sent = store::read_disk_entry(&path);
+    // Gateway-first, not exempt (#15103): `fetch_conditional` offers the gateway
+    // profile ahead of any reader App, so a `route=direct_read` row here is a
+    // fallback. Either the gateway was withdrawn when the read was routed, by
+    // any caller's refused or faulted request (#15134), or its own attempt
+    // faulted and the read was rerun on a reader; with no live profile in this
+    // process (a CLI that adopted no `LOOM_GH_GATEWAY_DIR`) or an unresolved
+    // repo, a reader App or the writer serves it. The daemon log's `gateway
+    // withdrawn` and `gateway did not answer` lines mark the first case.
+    // `defaults/docs/github-authentication.md`, "Reads through a read gateway".
     let (status, response, stderr) = store::fetch_conditional(
         store::ConditionalRead::new("pr_planning", op),
         gh,

@@ -82,9 +82,10 @@
 //! same bases once per registered repo per tick.
 
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, OnceLock};
 
 use chrono::{DateTime, Utc};
+
+use crate::host_wide_cooldown::HostWideCooldown;
 
 // ============================================================================
 // Constants
@@ -307,6 +308,21 @@ pub fn pinned_tmp_base() -> PathBuf {
         .filter(|value| !value.is_empty())
         .map(PathBuf::from)
         .unwrap_or_else(|| platform_tmp_root().join(PINNED_TMPDIR_LEAF))
+}
+
+/// Leaf name, under [`pinned_tmp_base`], of the host-level temp root the shared
+/// `sccache` server runs with (#15139). Deliberately **not** hex-shaped: the
+/// sweep above reclaims only [`is_pinned_tmp_entry_id`] (16 hex) and
+/// [`is_launch_id`] (full uuid) names, so this entry is never an orphan
+/// candidate and outlives every per-run `TMPDIR`. Keep it neither 16 nor 36
+/// characters of hex; a test pins that.
+pub const SHARED_SCCACHE_LEAF: &str = "sccache";
+
+/// The stable temp root for the host's shared `sccache` server:
+/// `<pinned_tmp_base>/sccache`. See [`SHARED_SCCACHE_LEAF`].
+#[must_use]
+pub fn shared_sccache_tmp() -> PathBuf {
+    pinned_tmp_base().join(SHARED_SCCACHE_LEAF)
 }
 
 /// Bytes held by everything under `path`. Best effort — an unreadable entry
@@ -540,42 +556,25 @@ pub fn log_report(report: &NativeStateReclaimReport) {
 /// Process-global "when did a pass last actually walk the bases" — host-wide
 /// (not per-repo): both directories this module reclaims are keyed outside
 /// any one repo, so a host with several registered repos ticking on the same
-/// reaper cadence must not re-walk them once per repo.
-static LAST_EVALUATED_AT: OnceLock<Mutex<Option<DateTime<Utc>>>> = OnceLock::new();
-
-fn last_evaluated_slot() -> &'static Mutex<Option<DateTime<Utc>>> {
-    LAST_EVALUATED_AT.get_or_init(|| Mutex::new(None))
-}
+/// reaper cadence must not re-walk them once per repo. The elapsed/record
+/// logic lives in the shared [`HostWideCooldown`]; the instance is this
+/// module's own, so a pass here never suppresses the Docker or tmpfs passes.
+static COOLDOWN: HostWideCooldown = HostWideCooldown::new();
 
 #[must_use]
 fn cooldown_elapsed(now: DateTime<Utc>, min_interval_secs: u64) -> bool {
-    let guard = last_evaluated_slot()
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    match *guard {
-        None => true,
-        Some(last) => {
-            let since = (now - last).num_seconds();
-            since < 0 || since >= i64::try_from(min_interval_secs).unwrap_or(i64::MAX)
-        }
-    }
+    COOLDOWN.elapsed(now, min_interval_secs)
 }
 
 fn record_evaluated(now: DateTime<Utc>) {
-    let mut guard = last_evaluated_slot()
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    *guard = Some(now);
+    COOLDOWN.record(now);
 }
 
 /// Drop cooldown state. Test-only seam (the process-global would otherwise
 /// leak between `#[serial]` tests in the same binary).
 #[doc(hidden)]
 pub fn reset_state_for_test() {
-    let mut guard = last_evaluated_slot()
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    *guard = None;
+    COOLDOWN.reset();
 }
 
 /// Run one production native-state-reclaim pass, honoring the host-wide
@@ -777,6 +776,33 @@ mod tests {
         assert_eq!(removed, 0, "neither a foreign name nor a plain file is a candidate");
         assert!(pinned_base.join("not-a-uuid").exists());
         assert!(pinned_base.join(LAUNCH).exists());
+    }
+
+    #[test]
+    fn shared_sccache_leaf_is_not_a_reclaimable_entry_name() {
+        assert!(!is_pinned_tmp_entry_id(SHARED_SCCACHE_LEAF));
+        assert!(!is_launch_id(SHARED_SCCACHE_LEAF));
+        assert_eq!(shared_sccache_tmp(), pinned_tmp_base().join(SHARED_SCCACHE_LEAF));
+    }
+
+    #[test]
+    fn sweep_pinned_tmp_keeps_the_shared_sccache_root_but_reclaims_orphans() {
+        let temp = tempfile::tempdir().unwrap();
+        let session_base = temp.path().join("native-tools");
+        let pinned_base = temp.path().join("pinned-tmp");
+        std::fs::create_dir_all(&session_base).unwrap();
+        let stable = pinned_base.join(SHARED_SCCACHE_LEAF);
+        std::fs::create_dir_all(&stable).unwrap();
+        std::fs::write(stable.join("sccache-scratch"), b"in use").unwrap();
+        let orphan_hex = pinned_base.join(pinned_tmp_entry_id(LAUNCH));
+        std::fs::create_dir_all(&orphan_hex).unwrap();
+        std::fs::create_dir_all(pinned_base.join(LAUNCH)).unwrap();
+
+        let (removed, _bytes) = sweep_pinned_tmp(&pinned_base, &[session_base]);
+
+        assert_eq!(removed, 2, "both orphaned shapes are still reclaimed");
+        assert!(!orphan_hex.exists());
+        assert!(stable.join("sccache-scratch").is_file(), "the stable root is never reaped");
     }
 
     #[test]

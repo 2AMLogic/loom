@@ -359,6 +359,19 @@ fn a_champion_hold_round_trip_never_strands_and_never_merges_while_held() {
     let at_doctor = ["loom:changes-requested", "loom:blocked"];
     stage(&at_doctor, &marker);
     let s2 = (served_by(), probe(root, &["loom:changes-requested"]), refused(&at_doctor));
+    // 2b. #14862: a trusted audit after the hold quotes the legacy cap phrase
+    // in prose while denying any cap. Doctor still serves the PR, and the
+    // hold still refuses the merge.
+    let audit = json!({"body": "Audit: no Doctor cap exists on this PR. The phrase \"doctor cycle exhausted\" was quoting the cap rule, not recording one, so the capped-PR recovery pass did not apply.",
+        "user": {"login": "maintainer", "type": "User"}, "author_association": "OWNER"});
+    stage(&at_doctor, &json!([marker[0].clone(), audit]));
+    let s2b = (served_by(), probe(root, &["loom:changes-requested"]), refused(&at_doctor));
+    // 2c. A genuine trusted historical sweep report (#10406) later than the
+    // hold keeps the PR out of Doctor's queue and keeps its merge refused.
+    let cap = json!({"body": "Sweep (run sweep-20261005T094112Z-3364552-5dbe0b3b): PR #42 blocked: doctor cycle exhausted after 2 Doctor→Judge rounds (one grace cycle granted); human attention required. Two Judges disagreed at head 7c03fea1c.",
+        "user": {"login": "maintainer", "type": "User"}, "author_association": "OWNER"});
+    stage(&at_doctor, &json!([marker[0].clone(), cap]));
+    let s2c = (served_by(), probe(root, &["loom:changes-requested"]), refused(&at_doctor));
     // 3. Doctor hands it back: Judge's, and the Judge spawn gate opens on it.
     let at_judge = ["loom:review-requested", "loom:blocked"];
     stage(&at_judge, &marker);
@@ -384,9 +397,69 @@ fn a_champion_hold_round_trip_never_strands_and_never_merges_while_held() {
 
     assert_eq!(s1, (vec![PrRole::Champion], true), "held at approval");
     assert_eq!(s2, (vec![PrRole::Doctor], Ok(true), true), "out at Doctor");
+    assert_eq!(s2b, (vec![PrRole::Doctor], Ok(true), true), "audit prose is not a cap (#14862)");
+    // The gate's coarse body hint still opens (the body's hold record stands;
+    // the cap lives in comments) — the Doctor queue itself is what excludes
+    // the capped PR, the documented hint/queue split (#11861).
+    assert_eq!(s2c, (vec![], Ok(true), true), "a genuine later cap still blocks Doctor");
     assert_eq!(s3, (vec![PrRole::Judge], Ok(true), true), "handed back to Judge");
     assert_eq!(s4, (vec![PrRole::Champion], true), "re-approved, still held");
     assert_eq!(s5, (vec![PrRole::Champion], false), "released by a human");
     assert_eq!(s6, (vec![], Ok(false)), "an untrusted marker serves nothing at review");
     assert!(s7.0.is_empty(), "an untrusted marker serves nothing at Doctor");
+}
+
+/// #15185: a terminal verdict label beside `loom:review-requested` is the
+/// debris of a half-applied verdict transition. Judge's queue refuses it
+/// (naming the pair) while every valid label set is served exactly as before.
+#[test]
+fn judge_queue_refuses_a_half_applied_verdict_transition() {
+    // The incident's exact set: `loom:pr` was added, the
+    // `loom:review-requested` removal was lost. Judge must not serve it.
+    assert!(ordered_queue(
+        vec![pr(1, "autonomous", &["loom:pr", "loom:review-requested"])],
+        PrRole::Judge,
+        true,
+        &policy()
+    )
+    .is_empty());
+    // The changes-requested shape of the same debris.
+    assert!(ordered_queue(
+        vec![pr(
+            2,
+            "autonomous",
+            &["loom:changes-requested", "loom:review-requested"]
+        )],
+        PrRole::Judge,
+        true,
+        &policy()
+    )
+    .is_empty());
+    // An empty judge queue is not a fallback trigger: the contradictory row
+    // is not `labeled_review` work, and it is not fallback either.
+    // Valid sets are unchanged: queued-for-review alone is served…
+    assert_eq!(
+        ids(&ordered_queue(
+            vec![pr(3, "autonomous", &["loom:review-requested"])],
+            PrRole::Judge,
+            true,
+            &policy()
+        )),
+        vec![3]
+    );
+    // …an approved PR stays Champion/Doctor work, never Judge's…
+    assert!(
+        ordered_queue(vec![pr(4, "autonomous", &["loom:pr"])], PrRole::Judge, true, &policy())
+            .is_empty()
+    );
+    // …and Doctor and Champion keep the contradictory row (each of them acts
+    // on its own verdict label; only Judge's two readings collide).
+    let row = pr(5, "autonomous", &["loom:pr", "loom:review-requested"]);
+    assert_eq!(
+        ids(&ordered_queue(vec![row.clone()], PrRole::Champion, true, &policy())),
+        vec![5]
+    );
+    let mut conflicted = row;
+    conflicted["mergeable"] = json!(false);
+    assert_eq!(ids(&ordered_queue(vec![conflicted], PrRole::Doctor, true, &policy())), vec![5]);
 }

@@ -572,6 +572,20 @@ contents at the PR head SHA) holds any file that carries a privilege and
 covers any file that does not, whatever it is called. `forbiddenDiffPatterns`
 still catches a PR that adds a privilege. Example list for `ci-steps`:
 `["secrets\\.(?!GITHUB_TOKEN\\b)", "secrets:\\s*inherit", "^\\s*environment:", ":\\s*write\\b", "write-all", "id-token", "pull_request_target", "workflow_run", "^\\s*release:", "types:.*released", "wrangler\\s+deploy", "npm\\s+publish", "gh\\s+release"]`.
+For a class that covers only GitHub workflow YAML, set `"checkWorkflowWriteAll": true`
+to check `write-all` at workflow and job scope instead of matching that text
+in a test name or command. Keep exactly one literal `write-all` pattern as
+the older Champion's fallback. The opt-in requires the native YAML check and
+holds when that check cannot read or classify the file. Custom regexes keep
+their ordinary matching behavior.
+Set `"checkWorkflowSecrets": true` for the same substitution on the two
+secrets entries: an evaluated `${{ secrets.NAME }}` reference (other than the
+built-in `secrets.GITHUB_TOKEN`) or a `secrets: inherit` key holds, while
+literal text — a `deploy_secrets.py` path filter, a `secrets.sh tests` step
+name, a YAML comment naming either — clears (#14915). Keep at least one of
+the literal `secrets\\.(?!GITHUB_TOKEN\\b)` / `secrets:\\s*inherit` patterns
+as the fallback; other regexes are untouched. The vetted CI-workflow check
+uses this classifier for its own list unconditionally.
 Unreadable or empty content, an oversized or removed file, an invalid regex or
 a head SHA that moved fails closed. Whole-line YAML comments are not scanned
 (a comment grants nothing; the 2026-10-20 fixtures say "no id-token: write"

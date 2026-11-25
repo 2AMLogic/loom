@@ -48,8 +48,8 @@ impl PrSource for Prs {
             head_content: Some("Ratified only on operator merge.".into()),
         }]
     }
-    fn trusted_comments(&self, _pr: u64) -> Vec<Comment> {
-        Vec::new()
+    fn trusted_comments(&self, _pr: u64) -> Result<Vec<Comment>, String> {
+        Ok(Vec::new())
     }
 }
 
@@ -183,9 +183,14 @@ fn failed_closed_key_posts_nothing_and_other_key_is_unaffected() {
         Sink::default(),
         ok_runner(),
     );
-    run_lane(&cfg(), None, "o/r", &prs, &Instr { fail_market: true }, &sink, &mut r);
+    let results = run_lane(&cfg(), None, "o/r", &prs, &Instr { fail_market: true }, &sink, &mut r);
     assert_eq!(keys_marked(&comments(&sink), HEAD), vec![Key::Ee]);
     assert_eq!(sink.posted.borrow().len(), 1);
+    assert_eq!(r.calls, 1);
+    assert_buckets(
+        &TickOutcome::from_run(&results, 0),
+        &[("ee", "posted"), ("market", "pre_launch_failed")],
+    );
 }
 
 #[test]
@@ -203,9 +208,13 @@ fn non_success_session_fails_closed_without_marker() {
         output: None,
         last_key: std::cell::Cell::new(None),
     };
-    run_lane(&cfg(), None, "o/r", &prs, &Instr { fail_market: false }, &sink, &mut r);
+    let results = run_lane(&cfg(), None, "o/r", &prs, &Instr { fail_market: false }, &sink, &mut r);
     assert_eq!(r.calls, 2);
     assert!(sink.posted.borrow().is_empty());
+    assert_buckets(
+        &TickOutcome::from_run(&results, 0),
+        &[("ee", "invocation_failed"), ("market", "invocation_failed")],
+    );
 }
 
 #[test]
@@ -401,7 +410,7 @@ fn success_without_a_parsed_verdict_withholds_and_posts_nothing() {
         results[0]
             .1
             .iter()
-            .all(|(_, p)| matches!(p, KeyPost::Withheld(_))),
+            .all(|(_, p)| matches!(p, KeyPost::Withheld(..))),
         "{:?}",
         results
     );
@@ -425,11 +434,17 @@ fn a_withheld_key_does_not_suppress_a_later_rerun_at_the_same_head() {
         last_key: std::cell::Cell::new(None),
     };
     let instr = Instr { fail_market: false };
-    run_lane(&cfg(), None, "o/r", &live, &instr, &sink, &mut r);
+    // The bounded lane, as the tick runs it: a withheld key is a counted
+    // attempt, and below the cap the same head is dispatched again (#15315).
+    let bench = bound::Bench::new();
+    let t0 = bound::t0();
+    bench.run(&live, &instr, &sink, &mut r, &move || t0);
     assert_eq!((r.calls, sink.posted.borrow().len()), (2, 0));
-    run_lane(&cfg(), None, "o/r", &live, &instr, &sink, &mut r);
+    let later = t0 + chrono::TimeDelta::minutes(5);
+    bench.run(&live, &instr, &sink, &mut r, &move || later);
     assert_eq!(r.calls, 4, "no marker exists, so the same head is selected again");
     assert!(sink.posted.borrow().is_empty());
+    assert_eq!(bench.records().len(), 4, "each withheld key is one counted attempt");
 }
 
 #[test]
@@ -442,7 +457,9 @@ fn one_key_with_a_verdict_and_one_without_post_independently() {
         fn last_output(&self) -> Option<String> {
             match self.0.last_key.get() {
                 Some(Key::Market) => Some("declined: disclosure problem".into()),
-                _ => Some(valid_review(Key::Ee)),
+                _ => Some(
+                    "## EE-key review: fixture\n\n**Overall verdict:** request-changes\n".into(),
+                ),
             }
         }
     }
@@ -465,7 +482,73 @@ fn one_key_with_a_verdict_and_one_without_post_independently() {
     assert_eq!(keys_marked(&comments(&sink), HEAD), vec![Key::Ee]);
     assert_eq!(sink.posted.borrow().len(), 1);
     assert_eq!(results[0].1[0].1, KeyPost::Posted);
-    assert!(matches!(results[0].1[1].1, KeyPost::Withheld(_)));
+    assert!(matches!(results[0].1[1].1, KeyPost::Withheld(..)));
+    assert!(sink.posted.borrow()[0].1.contains("request-changes"));
+    assert_buckets(
+        &TickOutcome::from_run(&results, 0),
+        &[("ee", "posted"), ("market", "verdict_invalid")],
+    );
+}
+
+#[test]
+fn positive_prelaunch_evidence_is_captured_before_the_next_key() {
+    use crate::observability::lifecycle::{
+        pre_launch, RoleFailure, ROLL_INTERRUPTED, UNCLASSIFIED_PRE_LAUNCH,
+    };
+
+    struct AdmissionOnce {
+        ee_outcome: RoleTickOutcome,
+        evidence: Option<&'static str>,
+        last_ee: bool,
+    }
+    impl RoleInvocationRunner for AdmissionOnce {
+        fn invoke(&mut self, role: &str, _prompt: &str) -> RoleTickOutcome {
+            self.last_ee = role == "ratification-ee";
+            if self.last_ee {
+                self.ee_outcome.clone()
+            } else {
+                RoleTickOutcome::Success
+            }
+        }
+        fn unlaunched_failure(&self) -> Option<RoleFailure> {
+            self.evidence
+                .filter(|_| self.last_ee)
+                .map(|class| RoleFailure::new(class, None, "local fixture detail"))
+        }
+    }
+
+    let failure = RoleTickOutcome::Failure("local admission detail".into());
+    for (ee_outcome, evidence, expected) in [
+        (
+            failure.clone(),
+            Some(pre_launch::WRITE_SCOPE_REFUSED.class),
+            "pre_launch_failed",
+        ),
+        (RoleTickOutcome::NoTokenPool, None, "pre_launch_failed"),
+        (failure.clone(), None, "invocation_failed"),
+        (failure.clone(), Some(UNCLASSIFIED_PRE_LAUNCH), "invocation_failed"),
+        (failure, Some(ROLL_INTERRUPTED), "invocation_failed"),
+    ] {
+        let sink = Sink::default();
+        let results = run_lane(
+            &cfg(),
+            None,
+            "o/r",
+            &Feed::new(),
+            &CountingInstr::default(),
+            &sink,
+            &mut AdmissionOnce {
+                ee_outcome,
+                evidence,
+                last_ee: false,
+            },
+        );
+        assert!(sink.posted.borrow().is_empty());
+        assert_buckets(
+            &TickOutcome::from_run(&results, 0),
+            &[("ee", expected), ("market", "output_missing")],
+        );
+    }
 }
 
 #[test]
@@ -512,26 +595,405 @@ fn parse_review_ends_at_the_wrapper_tail_not_end_of_output() {
 
 #[test]
 fn parse_review_rejects_missing_heading_or_verdict_line() {
-    let e = parse_review(Key::Ee, "stopped without a verdict").unwrap_err();
+    let e = parse_review(Key::Ee, "stopped without a verdict")
+        .unwrap_err()
+        .to_string();
     assert!(e.contains("## EE-key review:"), "{e}");
     // The other key's heading is not this key's.
-    let e = parse_review(Key::Ee, &valid_review(Key::Market)).unwrap_err();
+    let e = parse_review(Key::Ee, &valid_review(Key::Market))
+        .unwrap_err()
+        .to_string();
     assert!(e.contains("## EE-key review:"), "{e}");
-    let e = parse_review(Key::Market, "## Market-key review: b\nno verdict line\n").unwrap_err();
+    let e = parse_review(Key::Market, "## Market-key review: b\nno verdict line\n")
+        .unwrap_err()
+        .to_string();
     assert!(e.contains("**Overall verdict:**"), "{e}");
 }
 
 #[test]
 fn parse_review_rejects_unknown_or_conflicting_tokens() {
     let review = |t: &str| format!("## EE-key review: b\n**Overall verdict:** {t}, why\n");
-    let e = parse_review(Key::Ee, &review("thumbs-up")).unwrap_err();
+    let e = parse_review(Key::Ee, &review("thumbs-up"))
+        .unwrap_err()
+        .to_string();
     assert!(e.contains("thumbs-up"), "{e}");
     // A market token on an ee review is unknown, and vice versa.
     assert!(parse_review(Key::Ee, &review("competitive")).is_err());
     assert!(parse_review(Key::Market, &valid_review(Key::Ee)).is_err());
     let both = "## EE-key review: b\n**Overall verdict:** approve, a\n**Overall verdict:** request-changes, b\n";
-    let e = parse_review(Key::Ee, both).unwrap_err();
+    let e = parse_review(Key::Ee, both).unwrap_err().to_string();
     assert!(e.contains("conflicting"), "{e}");
+}
+
+// ---- #15315: harmless verdict formatting and the echoed template -----------
+
+use crate::role_runner::ratification_lane::ReviewError;
+
+/// The pinned EE instructions' output template (2am
+/// `ratification/ee-key/SKILL.md@fed7a23` ~:249-255, as quoted in #15315):
+/// the intro line names the heading mid-line, then the fenced block.
+pub(super) const EE_TEMPLATE: &str = "Write only the human text, starting at the \
+`## EE-key review:` heading, with this structure:\n\n```\n\
+## EE-key review: <block name / class>\n\n\
+**Overall verdict:** <approve|request-changes>, one sentence why.\n```\n";
+
+/// The pinned market instructions' output template (product
+/// `ratification/market-key/SKILL.md@d4a4862` ~:266-272, as quoted in #15315).
+pub(super) const MARKET_TEMPLATE: &str = "Write only the human text, starting at the \
+`## Market-key review:` heading, with this structure:\n\n```\n\
+## Market-key review: <block name / class>\n\n\
+**Overall verdict:** <competitive|adequate-for-catalog|uncompetitive|escalate>, one sentence why.\n```\n";
+
+/// A one-line review for `key` whose verdict line reads `verdict`.
+fn review_with(key: Key, verdict: &str) -> String {
+    format!("{} b\n**Overall verdict:** {verdict}\n", key.review_heading())
+}
+
+fn token_of(key: Key, verdict: &str) -> String {
+    match parse_review(key, &review_with(key, verdict)) {
+        Ok(r) => r.token,
+        Err(e) => panic!("{verdict:?} on {key:?}: {e}"),
+    }
+}
+
+#[test]
+fn parse_review_accepts_trailing_sentence_punctuation() {
+    for key in [Key::Ee, Key::Market] {
+        for token in key.allowed_tokens() {
+            for suffix in [".", "!", ";", ":", ".."] {
+                assert_eq!(token_of(key, &format!("{token}{suffix}")), *token, "{suffix}");
+                assert_eq!(token_of(key, &format!("{token}{suffix} why")), *token, "{suffix}");
+            }
+        }
+    }
+    assert_eq!(token_of(Key::Ee, "approve. Small and sane."), "approve");
+}
+
+#[test]
+fn parse_review_unwraps_balanced_emphasis() {
+    for (key, verdict, token) in [
+        (Key::Market, "**escalate**.", "escalate"),
+        (Key::Market, "`escalate`.", "escalate"),
+        (Key::Market, "**escalate.**", "escalate"),
+        (Key::Ee, "*approve*", "approve"),
+        (Key::Ee, "__approve__", "approve"),
+        (Key::Ee, "_approve_.", "approve"),
+        (Key::Ee, "**request-changes**, why", "request-changes"),
+    ] {
+        assert_eq!(token_of(key, verdict), token, "{verdict}");
+    }
+}
+
+#[test]
+fn parse_review_folds_ascii_case() {
+    assert_eq!(token_of(Key::Ee, "Approve."), "approve");
+    assert_eq!(token_of(Key::Market, "ESCALATE"), "escalate");
+    // A non-ASCII lookalike (Cyrillic а) is not folded into a token.
+    let e = parse_review(Key::Ee, &review_with(Key::Ee, "\u{430}pprove, why"))
+        .unwrap_err()
+        .to_string();
+    assert!(e.contains("unknown verdict token"), "{e}");
+}
+
+#[test]
+fn parse_review_still_rejects_non_tokens() {
+    for (key, verdict) in [
+        (Key::Ee, "none"),
+        (Key::Ee, "approved"),
+        (Key::Ee, "approves"),
+        (Key::Ee, "approve?"),
+        (Key::Ee, "approve-ish"),
+        (Key::Ee, "**approve"),
+        (Key::Ee, "approve**"),
+        (Key::Ee, "."),
+        (Key::Ee, "**"),
+        (Key::Ee, "*"),
+        (Key::Ee, "__"),
+        (Key::Ee, "`"),
+        (Key::Ee, "competitive."),
+        (Key::Market, "approve."),
+        (Key::Market, "adequate for catalog"),
+    ] {
+        assert!(
+            matches!(parse_review(key, &review_with(key, verdict)), Err(ReviewError::Invalid(_))),
+            "{verdict:?} on {key:?} must be withheld as invalid"
+        );
+    }
+}
+
+#[test]
+fn parse_review_conflict_uses_normalized_tokens() {
+    let same = "## EE-key review: b\n**Overall verdict:** approve.\n**Overall verdict:** approve\n";
+    assert_eq!(parse_review(Key::Ee, same).unwrap().token, "approve");
+    let differ = "## EE-key review: b\n**Overall verdict:** approve.\n**Overall verdict:** **request-changes**\n";
+    let e = parse_review(Key::Ee, differ).unwrap_err().to_string();
+    assert!(e.contains("conflicting"), "{e}");
+    // The reason keeps both raw strings for diagnosis.
+    assert!(e.contains("\"approve.\"") && e.contains("\"**request-changes**\""), "{e}");
+}
+
+#[test]
+fn measured_14956_tokens_now_parse() {
+    for (key, verdict, token) in [
+        (Key::Ee, "request-changes.", "request-changes"),
+        (Key::Market, "adequate-for-catalog.", "adequate-for-catalog"),
+        (Key::Market, "escalate.", "escalate"),
+        (Key::Ee, "approve.", "approve"),
+        (Key::Market, "`escalate`.", "escalate"),
+        (Key::Market, "**escalate**.", "escalate"),
+    ] {
+        assert_eq!(token_of(key, &format!("{verdict} One sentence why.")), token);
+    }
+}
+
+#[test]
+fn parse_review_accepts_harmless_verdict_label_variants() {
+    for label in [
+        "**Overall verdict**:",
+        "**Overall Verdict:**",
+        "**OVERALL VERDICT:**",
+        "Overall verdict:",
+        "  **overall verdict:**",
+    ] {
+        let out = format!("## EE-key review: b\n{label} approve, why\n");
+        assert_eq!(parse_review(Key::Ee, &out).unwrap().token, "approve", "{label}");
+    }
+    for not_a_label in [
+        "*Overall verdict:*",
+        "Overall verdict",
+        "**Overall verdict**",
+        "- **Overall verdict:**",
+    ] {
+        let out = format!("## EE-key review: b\n{not_a_label} approve, why\n");
+        let e = parse_review(Key::Ee, &out).unwrap_err().to_string();
+        assert!(e.contains("no **Overall verdict:** line"), "{not_a_label}: {e}");
+    }
+}
+
+#[test]
+fn parse_review_withholds_an_ambiguous_first_clause() {
+    for verdict in [
+        "approve or request-changes, depending on CI",
+        "approve / request-changes.",
+        "Approve OR Request-Changes",
+        "**approve** or **request-changes**",
+    ] {
+        let e = parse_review(Key::Ee, &review_with(Key::Ee, verdict)).unwrap_err();
+        assert!(
+            matches!(e, ReviewError::Invalid(ref r) if r.contains("ambiguous")),
+            "{verdict}: {e}"
+        );
+    }
+    assert!(matches!(
+        parse_review(Key::Ee, &review_with(Key::Ee, "approve | request-changes, why")),
+        Err(ReviewError::Placeholder(_))
+    ));
+    // The sentence of reasoning after the first clause is not part of it.
+    for (key, verdict, token) in [
+        (Key::Ee, "approve, though request-changes was considered", "approve"),
+        (Key::Ee, "approve — no request-changes needed", "approve"),
+        (Key::Ee, "approve — the margin is > 3 dB and < 5 dB", "approve"),
+        (Key::Ee, "approve. Delay < 5 ns.", "approve"),
+        (Key::Market, "uncompetitive (competitive parts exist)", "uncompetitive"),
+    ] {
+        assert_eq!(token_of(key, verdict), token, "{verdict}");
+    }
+}
+
+#[test]
+fn a_mark_normalization_strips_never_ends_the_first_clause() {
+    // Normalization drops a trailing `.` `;` `:` `!` from the first word, so
+    // that mark must not also end the clause the ambiguity and placeholder
+    // scans read: `approve. request-changes`, which the gate before #15315
+    // rejected (`approve.` was unknown), would otherwise post as `approve`.
+    // The clause then runs to the first comma, critique A5's boundary.
+    for (key, verdict) in [
+        (Key::Ee, "approve. request-changes"),
+        (Key::Ee, "approve; request-changes"),
+        (Key::Ee, "approve: request-changes is what I mean"),
+        (Key::Ee, "request-changes. approve"),
+        (Key::Ee, "**approve.** request-changes"),
+        (Key::Ee, "`approve`: request-changes"),
+        (Key::Market, "competitive. escalate"),
+        (Key::Market, "competitive. Not uncompetitive at all."),
+    ] {
+        let got = parse_review(key, &review_with(key, verdict));
+        assert!(
+            matches!(got, Err(ReviewError::Invalid(ref r)) if r.contains("ambiguous")),
+            "{verdict}: {got:?}"
+        );
+    }
+    for (key, verdict) in [
+        (Key::Ee, "approve. <approve|request-changes>"),
+        (Key::Ee, "approve! <approve|request-changes>, one sentence why."),
+        (Key::Market, "competitive. <competitive|escalate>"),
+    ] {
+        let got = parse_review(key, &review_with(key, verdict));
+        assert!(matches!(got, Err(ReviewError::Placeholder(_))), "{verdict}: {got:?}");
+    }
+    // The comma still ends the verdict: what follows it is the template's
+    // "one sentence why", as it always was.
+    assert_eq!(token_of(Key::Ee, "approve. Small and sane, unlike request-changes"), "approve");
+}
+
+#[test]
+fn the_template_alternatives_are_a_placeholder_anywhere_on_the_line() {
+    // `<a|b>` is the template's own shape, so it fails the line closed even
+    // after the comma, where the first-word rule alone read `approve`.
+    for verdict in [
+        "approve, <approve|request-changes>",
+        "approve, one sentence why <approve | request-changes>",
+    ] {
+        let got = parse_review(Key::Ee, &review_with(Key::Ee, verdict));
+        assert!(matches!(got, Err(ReviewError::Placeholder(_))), "{verdict}: {got:?}");
+    }
+}
+
+#[test]
+fn comparisons_and_magnitudes_in_the_reasoning_are_not_placeholders() {
+    // A `<` or `>` in the reasoning is a comparison, and `|x|` a magnitude:
+    // only the template's shapes (a leading `<`, `<a|b>`, a `|` beside an
+    // allowed word) are placeholders. Each of these posted before #15315.
+    for (key, verdict, token) in [
+        (Key::Ee, "approve - margin > 3 dB", "approve"),
+        (Key::Ee, "approve because Vth < 0.4 V", "approve"),
+        (Key::Ee, "approve because the IR drop is < 5% of VDD", "approve"),
+        (Key::Ee, "approve as phase margin > 60 deg at all corners", "approve"),
+        (Key::Ee, "approve because |S11| < -10 dB across the band", "approve"),
+        (Key::Ee, "approve. Delay < 5 ns and slew > 1 V/ns.", "approve"),
+        (Key::Ee, "request-changes since Vos > 2 mV, see the sweep", "request-changes"),
+        (Key::Market, "competitive as cost > peers but area < theirs", "competitive"),
+    ] {
+        assert_eq!(token_of(key, verdict), token, "{verdict}");
+    }
+    // A `|` beside an allowed word is still the template's alternation.
+    for verdict in [
+        "approve | request-changes",
+        "**approve** |request-changes, why",
+    ] {
+        let got = parse_review(Key::Ee, &review_with(Key::Ee, verdict));
+        assert!(matches!(got, Err(ReviewError::Placeholder(_))), "{verdict}: {got:?}");
+    }
+}
+
+#[test]
+fn a_plain_label_sentence_beside_a_bold_verdict_line_is_prose() {
+    // Critique A12 accepts an unbolded `Overall verdict:` label, but beside a
+    // bold verdict line a plain one whose first word is no verdict word is a
+    // sentence, not a second verdict.
+    let out = "## EE-key review: blk / analog\n**Overall verdict:** approve, fine\n\n\
+               Overall verdict: the design holds at every corner.\n";
+    assert_eq!(parse_review(Key::Ee, out).unwrap().token, "approve");
+    // A plain line that does name a different verdict word still conflicts.
+    let out = "## EE-key review: b\n**Overall verdict:** approve, fine\n\
+               Overall verdict: request-changes, on reflection\n";
+    let e = parse_review(Key::Ee, out).unwrap_err().to_string();
+    assert!(e.contains("conflicting"), "{e}");
+    // With no bold line, a plain label line is the verdict line.
+    let out = "## EE-key review: b\nOverall verdict: the design holds.\n";
+    let e = parse_review(Key::Ee, out).unwrap_err().to_string();
+    assert!(e.contains("unknown verdict token"), "{e}");
+}
+
+#[test]
+fn parse_review_classifies_template_echo_as_placeholder() {
+    for (key, template) in [(Key::Ee, EE_TEMPLATE), (Key::Market, MARKET_TEMPLATE)] {
+        assert!(
+            matches!(parse_review(key, template), Err(ReviewError::Placeholder(_))),
+            "{key:?}: {:?}",
+            parse_review(key, template)
+        );
+    }
+}
+
+#[test]
+fn placeholder_survives_formatting() {
+    for verdict in [
+        "`<approve|request-changes>`",
+        "**<approve|request-changes>**",
+        "<approve|request-changes>.",
+        "approve|request-changes",
+        "<approve>",
+    ] {
+        let got = parse_review(Key::Ee, &review_with(Key::Ee, &format!("{verdict}, why")));
+        assert!(matches!(got, Err(ReviewError::Placeholder(_))), "{verdict}: {got:?}");
+    }
+}
+
+#[test]
+fn placeholder_heading_with_filled_verdict_is_placeholder() {
+    let out = "## EE-key review: <block name / class>\n**Overall verdict:** approve, fine\n";
+    let got = parse_review(Key::Ee, out);
+    assert!(
+        matches!(got, Err(ReviewError::Placeholder(ref r)) if r.contains("heading")),
+        "{got:?}"
+    );
+}
+
+#[test]
+fn placeholder_takes_precedence_over_a_valid_line() {
+    let out = "## EE-key review: b\n**Overall verdict:** approve, x\n\
+               **Overall verdict:** <approve|request-changes>, one sentence why.\n";
+    assert!(matches!(parse_review(Key::Ee, out), Err(ReviewError::Placeholder(_))));
+}
+
+#[test]
+fn a_template_before_the_real_review_does_not_make_it_a_placeholder() {
+    // Only the review block (from the last heading) is read.
+    for key in [Key::Ee, Key::Market] {
+        let template = if key == Key::Ee {
+            EE_TEMPLATE
+        } else {
+            MARKET_TEMPLATE
+        };
+        let out = format!("{template}\n{}", valid_review(key));
+        assert!(parse_review(key, &out).is_ok(), "{key:?}");
+    }
+}
+
+#[test]
+fn placeholder_withheld_counts_in_its_own_bucket() {
+    let (prs, sink) = (
+        Prs {
+            author: "alice",
+            listed: 0.into(),
+        },
+        Sink::default(),
+    );
+    let mut r = KeyedRunner {
+        ee: EE_TEMPLATE.into(),
+        market: valid_review(Key::Market),
+        calls: Vec::new(),
+    };
+    let results = run_lane(&cfg(), None, "o/r", &prs, &Instr { fail_market: false }, &sink, &mut r);
+    let o = TickOutcome::from_run(&results, 0);
+    assert_buckets(&o, &[("ee", "verdict_placeholder"), ("market", "posted")]);
+    assert_eq!((o.posted, o.withheld), (1, 1));
+    assert_eq!(keys_marked(&comments(&sink), HEAD), vec![Key::Market]);
+}
+
+#[test]
+fn trailing_stop_review_posts_marker_with_raw_text() {
+    let (prs, sink) = (
+        Prs {
+            author: "alice",
+            listed: 0.into(),
+        },
+        Sink::default(),
+    );
+    let mut r = KeyedRunner {
+        ee: "## EE-key review: x\n**Overall verdict:** request-changes.\n".into(),
+        market: valid_review(Key::Market),
+        calls: Vec::new(),
+    };
+    run_lane(&cfg(), None, "o/r", &prs, &Instr { fail_market: false }, &sink, &mut r);
+    let posted = sink.posted.borrow();
+    let ee: Vec<_> = posted
+        .iter()
+        .filter(|(_, b)| b.starts_with("<!-- ratify:key=ee "))
+        .collect();
+    assert_eq!(ee.len(), 1, "{posted:?}");
+    assert!(ee[0].1.contains("**Overall verdict:** request-changes."), "{}", ee[0].1);
 }
 
 fn page(range: std::ops::Range<u32>) -> String {
@@ -556,11 +1018,541 @@ fn unreadable_second_page_fails_closed() {
     assert!(parse_listing(b"").is_none());
 }
 
+// ---- #14797: a completed key is not rerun on the same head ------------------
+
+/// A runner whose output depends on the key that ran last.
+struct KeyedRunner {
+    ee: String,
+    market: String,
+    calls: Vec<String>,
+}
+
+impl RoleInvocationRunner for KeyedRunner {
+    fn invoke(&mut self, role: &str, _prompt: &str) -> RoleTickOutcome {
+        self.calls.push(role.to_string());
+        RoleTickOutcome::Success
+    }
+    fn last_output(&self) -> Option<String> {
+        Some(match self.calls.last() {
+            Some(r) if r == "ratification-market" => self.market.clone(),
+            _ => self.ee.clone(),
+        })
+    }
+}
+
+/// An instruction source that counts fetches (by pin path) and visibility
+/// reads, so a partial-key retry can prove it reads only the missing key's
+/// instructions and does market-only visibility work only when market runs.
+#[derive(Default)]
+struct CountingInstr {
+    fetches: RefCell<Vec<String>>,
+    visibility: RefCell<u32>,
+    private: Option<bool>,
+}
+
+impl InstructionSource for CountingInstr {
+    fn fetch(&self, pin: &crate::role_runner::ratification_lane::Pin) -> Result<String, String> {
+        self.fetches.borrow_mut().push(pin.path.clone());
+        Ok("INSTR".into())
+    }
+    fn repo_is_private(&self, _repo: &str) -> Option<bool> {
+        *self.visibility.borrow_mut() += 1;
+        self.private
+    }
+}
+
+#[test]
+fn partial_key_retry_runs_and_posts_only_the_missing_key() {
+    let sink = Sink::default();
+    let live = Live {
+        inner: Prs {
+            author: "alice",
+            listed: 0.into(),
+        },
+        sink: &sink,
+    };
+    let instr = Instr { fail_market: false };
+    // Tick 1: both keys missing; market ends in a valid verdict, ee declines.
+    let mut r = KeyedRunner {
+        ee: "declined without a verdict".into(),
+        market: valid_review(Key::Market),
+        calls: Vec::new(),
+    };
+    run_lane(&cfg(), None, "o/r", &live, &instr, &sink, &mut r);
+    assert_eq!(r.calls, vec!["ratification-ee", "ratification-market"]);
+    assert_eq!(sink.posted.borrow().len(), 1);
+    assert!(sink.posted.borrow()[0].1.contains("ratify:key=market"));
+
+    // Tick 2: the trusted market marker is visible on the same head, so only
+    // the missing ee key may run again — not the completed market key.
+    run_lane(&cfg(), None, "o/r", &live, &instr, &sink, &mut r);
+    assert_eq!(r.calls.len(), 3, "only the missing key reruns; calls so far: {:?}", r.calls);
+    assert_eq!(r.calls[2], "ratification-ee");
+    assert_eq!(sink.posted.borrow().len(), 1, "no duplicate market marker");
+}
+
+#[test]
+fn unreadable_forge_comment_rows_stop_dispatch() {
+    use crate::comment_trust::TrustPolicy;
+    use crate::forge_identity::{FleetLogins, Placement, RouteDecision};
+    use crate::gh_invocation::cwd_route::{CwdAnswer, DeriveEnv};
+    use crate::gh_invocation::{test_routing, test_support};
+    use crate::role_runner::ratification_lane::{marker_body, run_lane_stats, GhPrSource};
+
+    struct CommentReader<'a> {
+        prs: Prs,
+        forge: GhPrSource<'a>,
+    }
+
+    impl PrSource for CommentReader<'_> {
+        fn open_prs(&self) -> Vec<OpenPr> {
+            self.prs.open_prs()
+        }
+        fn files(
+            &self,
+            pr: u64,
+            hold: &crate::champion_hold::ratification::Config,
+        ) -> Vec<ChangedFile> {
+            self.prs.files(pr, hold)
+        }
+        fn trusted_comments(&self, pr: u64) -> Result<Vec<Comment>, String> {
+            self.forge.trusted_comments(pr)
+        }
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let reader = dir.path().join("reader");
+    std::fs::create_dir(&reader).unwrap();
+    let program = test_support::stub(
+        dir.path(),
+        "gh-comments",
+        r#"test "$1" = api && test "$2" = 'repos/o/r/issues/7/comments?per_page=100' && test "$3" = --paginate || exit 64
+cat "${0%/*}/reply"
+test ! -f "${0%/*}/failed""#,
+    );
+    let _routing = test_routing::install_with_program(
+        test_routing::TestRouting {
+            decision: RouteDecision::Reader {
+                dir: reader,
+                app_id: "fixture-reader".into(),
+                placement: Placement::Home,
+            },
+            env: DeriveEnv::default(),
+            checkout: CwdAnswer::Unresolved,
+        },
+        program,
+    );
+    let cfg = cfg();
+    let policy = TrustPolicy::new(FleetLogins::single("fleet-bot"), None, Vec::new());
+    let source = CommentReader {
+        prs: Prs {
+            author: "alice",
+            listed: 0.into(),
+        },
+        forge: GhPrSource::new(dir.path(), "o/r", &policy),
+    };
+    let marker =
+        marker_body(Key::Market, HEAD, "ratification-market", Some(&valid_review(Key::Market)));
+    let marked = json!([{
+        "user":{"login":"fixture-owner","type":"User"}, "author_association":"OWNER", "body":marker
+    }]);
+    let ordinary = json!([
+        {"user":{"login":"fixture-owner","type":"User"}, "author_association":"OWNER", "body":"ordinary discussion"},
+        {"user":{"login":"unknown[bot]","type":"Bot"}, "author_association":"NONE", "body":marker},
+        {"user":null, "author_association":"NONE", "body":marker}
+    ]);
+    let missing_body = json!([{
+        "user":{"login":"fixture-owner","type":"User"}, "author_association":"OWNER", "body":null
+    }]);
+    let bare_row = json!([{"message":"incomplete comment record"}]);
+    let run =
+        |label, listing: String, failed: bool, expected_pins: &[&str], expected_unreadable| {
+            std::fs::write(dir.path().join("reply"), listing).unwrap();
+            let failure = dir.path().join("failed");
+            if failed {
+                std::fs::write(&failure, "").unwrap();
+            }
+            let instructions = CountingInstr {
+                private: Some(true),
+                ..Default::default()
+            };
+            let sink = Sink::default();
+            let mut runner = ok_runner();
+            let (_, _, unreadable) =
+                run_lane_stats(&cfg, None, "o/r", &source, &instructions, &sink, &mut runner);
+            if failed {
+                std::fs::remove_file(failure).unwrap();
+            }
+            assert_eq!(unreadable, expected_unreadable, "{label}: unreadable PRs");
+            assert_eq!(*instructions.fetches.borrow(), expected_pins, "{label}: instructions");
+            assert_eq!(
+                *instructions.visibility.borrow(),
+                u32::from(expected_pins.contains(&"market.md")),
+                "{label}: visibility reads"
+            );
+            assert_eq!(runner.calls as usize, expected_pins.len(), "{label}: sessions");
+            assert_eq!(sink.posted.borrow().len(), expected_pins.len(), "{label}: marker posts");
+        };
+    let both = ["ee.md", "market.md"];
+    run("empty listing", "[]".into(), false, &both, 0);
+    run("readable ordinary and untrusted rows", ordinary.to_string(), false, &both, 0);
+    run("trusted marker", marked.to_string(), false, &["ee.md"], 0);
+    run("failed read", marked.to_string(), true, &[], 1);
+    run("invalid later page", format!("{marked}\n[{{"), false, &[], 1);
+    run("malformed row", bare_row.to_string(), false, &[], 1);
+    run("trusted row without a readable body", missing_body.to_string(), false, &[], 1);
+    run(
+        "valid marker before malformed row",
+        format!("{marked}\n{missing_body}"),
+        false,
+        &[],
+        1,
+    );
+}
+
+#[test]
+fn partial_key_retry_reads_only_the_missing_keys_instructions() {
+    let sink = Sink::default();
+    let live = Live {
+        inner: Prs {
+            author: "alice",
+            listed: 0.into(),
+        },
+        sink: &sink,
+    };
+    let instr = CountingInstr {
+        private: Some(false),
+        ..Default::default()
+    };
+    let mut r = KeyedRunner {
+        ee: "declined without a verdict".into(),
+        market: valid_review(Key::Market),
+        calls: Vec::new(),
+    };
+    let run = |r: &mut KeyedRunner| {
+        run_lane(&cfg(), None, "o/r", &live, &instr, &sink, r);
+    };
+    // Tick 1: both keys missing — both instructions read, EE first.
+    run(&mut r);
+    assert_eq!(*instr.fetches.borrow(), vec!["ee.md", "market.md"]);
+    assert_eq!(*instr.visibility.borrow(), 1, "one market visibility read");
+    assert_eq!(sink.posted.borrow().len(), 1);
+
+    // Tick 2: market complete, ee still declining. One missing-key
+    // instruction fetch, one role call, no new marker, no visibility read.
+    run(&mut r);
+    assert_eq!(*instr.fetches.borrow(), vec!["ee.md", "market.md", "ee.md"]);
+    assert_eq!(r.calls.last().map(String::as_str), Some("ratification-ee"));
+    assert_eq!(sink.posted.borrow().len(), 1);
+    assert_eq!(*instr.visibility.borrow(), 1);
+
+    // Tick 3: ee finally reviews — only its marker, at the captured head.
+    r.ee = valid_review(Key::Ee);
+    run(&mut r);
+    assert_eq!(sink.posted.borrow().len(), 2);
+    assert!(sink.posted.borrow()[1].1.contains("ratify:key=ee"));
+    assert!(sink.posted.borrow()[1].1.contains(HEAD));
+
+    // Tick 4: both keys complete — zero instruction reads, role calls, posts.
+    let fetches_before = instr.fetches.borrow().len();
+    let calls_before = r.calls.len();
+    run(&mut r);
+    assert_eq!(instr.fetches.borrow().len(), fetches_before);
+    assert_eq!(r.calls.len(), calls_before);
+    assert_eq!(sink.posted.borrow().len(), 2);
+}
+
+#[test]
+fn partial_key_retry_works_in_both_directions() {
+    // The other direction: ee completes first, market withholds and is then
+    // retried alone; its session keeps the public-source constraint.
+    let sink = Sink::default();
+    let live = Live {
+        inner: Prs {
+            author: "alice",
+            listed: 0.into(),
+        },
+        sink: &sink,
+    };
+    let instr = CountingInstr {
+        private: Some(false),
+        ..Default::default()
+    };
+    let mut r = KeyedRunner {
+        ee: valid_review(Key::Ee),
+        market: "declined without a verdict".into(),
+        calls: Vec::new(),
+    };
+    run_lane(&cfg(), None, "o/r", &live, &instr, &sink, &mut r);
+    assert_eq!(sink.posted.borrow().len(), 1);
+    assert!(sink.posted.borrow()[0].1.contains("ratify:key=ee"));
+
+    run_lane(&cfg(), None, "o/r", &live, &instr, &sink, &mut r);
+    assert_eq!(r.calls.len(), 3, "only market reruns: {:?}", r.calls);
+    assert_eq!(r.calls[2], "ratification-market");
+    assert_eq!(*instr.fetches.borrow(), vec!["ee.md", "market.md", "market.md"]);
+    assert_eq!(*instr.visibility.borrow(), 2, "each market session reads visibility");
+    assert_eq!(sink.posted.borrow().len(), 1, "no duplicate ee marker");
+}
+
+/// A forge whose comment read can fail, and whose trusted comments can be
+/// seeded with raw records filtered through the real trust policy.
+struct Feed {
+    author: &'static str,
+    head: std::cell::Cell<String>,
+    /// Raw REST comment records, filtered through `TrustPolicy` on read.
+    records: RefCell<Vec<serde_json::Value>>,
+    fail_comments: Option<String>,
+}
+
+impl PrSource for Feed {
+    fn open_prs(&self) -> Vec<OpenPr> {
+        vec![OpenPr {
+            number: 7,
+            author: self.author.into(),
+            head_sha: self.head.replace(String::new()),
+        }]
+    }
+    fn files(
+        &self,
+        _pr: u64,
+        _hold: &crate::champion_hold::ratification::Config,
+    ) -> Vec<ChangedFile> {
+        vec![ChangedFile {
+            filename: "ratification/requests/a.md".into(),
+            previous_filename: None,
+            status: "added".into(),
+            head_content: Some("Ratified only on operator merge.".into()),
+        }]
+    }
+    fn trusted_comments(&self, _pr: u64) -> Result<Vec<Comment>, String> {
+        if let Some(why) = &self.fail_comments {
+            return Err(why.clone());
+        }
+        let policy = crate::comment_trust::TrustPolicy::new(
+            crate::forge_identity::FleetLogins::single("fleet-bot"),
+            None,
+            Vec::new(),
+        );
+        Ok(self
+            .records
+            .borrow()
+            .iter()
+            .filter(|c| policy.trusts_json(c))
+            .filter_map(Comment::from_record)
+            .collect())
+    }
+}
+
+impl Feed {
+    fn new() -> Self {
+        Feed {
+            author: "alice",
+            head: std::cell::Cell::new(HEAD.into()),
+            records: RefCell::new(Vec::new()),
+            fail_comments: None,
+        }
+    }
+
+    /// A raw comment record as the REST listing reports it.
+    fn record(login: &str, association: &str, body: &str) -> serde_json::Value {
+        serde_json::json!({
+            "user": {"login": login, "type": "Bot"},
+            "author_association": association,
+            "body": body,
+        })
+    }
+
+    /// A hand-lane marker in the accepted wire format (#14797), optionally
+    /// carrying a recorded review.
+    fn seed_marker(
+        &self,
+        login: &str,
+        association: &str,
+        key: &str,
+        sha: &str,
+        verdict: Option<&str>,
+    ) {
+        let body = match verdict {
+            Some(v) => format!(
+                "<!-- ratify:key={key} sha={sha} -->\nreviewer=hand-run-lane\n\nVerdict:\n\n{v}\n"
+            ),
+            None => format!("<!-- ratify:key={key} sha={sha} -->\nreviewer=hand-run-lane\n"),
+        };
+        self.records
+            .borrow_mut()
+            .push(Self::record(login, association, &body));
+    }
+}
+
+#[test]
+fn a_trusted_hand_lane_marker_completes_only_its_key() {
+    let feed = Feed::new();
+    // A trusted fleet App's hand-run marker completes market — even though
+    // its recorded review was negative (`escalate`).
+    feed.seed_marker(
+        "fleet-bot[bot]",
+        "NONE",
+        "market",
+        HEAD,
+        Some("## Market-key review: x\n\n**Overall verdict:** escalate, niche.\n"),
+    );
+    // An otherwise identical lookalike from an untrusted author is prose and
+    // completes nothing: it goes through the actual trust filter above.
+    feed.seed_marker("stranger[bot]", "NONE", "ee", HEAD, None);
+
+    let sink = Sink::default();
+    let instr = CountingInstr::default();
+    let mut r = KeyedRunner {
+        ee: valid_review(Key::Ee),
+        market: valid_review(Key::Market),
+        calls: Vec::new(),
+    };
+    let results = run_lane(&cfg(), None, "o/r", &feed, &instr, &sink, &mut r);
+    assert_eq!(r.calls, vec!["ratification-ee"], "only ee was missing");
+    assert_eq!(sink.posted.borrow().len(), 1);
+    assert!(sink.posted.borrow()[0].1.contains("ratify:key=ee"));
+    // The completed key contributes neither a post nor a withheld count.
+    assert_eq!(results[0].1.len(), 1);
+    assert_eq!(results[0].1[0], (Key::Ee, KeyPost::Posted));
+}
+
+#[test]
+fn unreadable_comment_list_runs_posts_and_counts_nothing() {
+    let feed = Feed {
+        fail_comments: Some("exit 1: HTTP 502".into()),
+        ..Feed::new()
+    };
+    let sink = Sink::default();
+    let instr = CountingInstr::default();
+    let mut r = ok_runner();
+    // A failed or malformed paginated read: zero instruction fetches, role
+    // calls and posts, and the PR counts as unreadable (degraded), never as
+    // "no markers" authorizing a duplicate run.
+    let (results, skipped, unreadable) =
+        run_lane_stats(&cfg(), None, "o/r", &feed, &instr, &sink, &mut r);
+    assert_eq!((results.len(), skipped, unreadable), (0, 0, 1));
+    assert_eq!(r.calls, 0);
+    assert!(sink.posted.borrow().is_empty());
+    assert!(instr.fetches.borrow().is_empty());
+    let o = TickOutcome::from_run_stats(&results, skipped, unreadable);
+    assert_eq!(o.reason, "degraded");
+    assert_buckets(&o, &[]);
+}
+
+#[test]
+fn a_verified_empty_comment_list_still_selects_both_keys() {
+    // `Ok(vec![])` is a successfully read empty list, not an unreadable one.
+    let feed = Feed::new();
+    let sink = Sink::default();
+    let instr = CountingInstr::default();
+    let mut r = KeyedRunner {
+        ee: valid_review(Key::Ee),
+        market: valid_review(Key::Market),
+        calls: Vec::new(),
+    };
+    run_lane(&cfg(), None, "o/r", &feed, &instr, &sink, &mut r);
+    assert_eq!(r.calls, vec!["ratification-ee", "ratification-market"]);
+    assert_eq!(sink.posted.borrow().len(), 2);
+}
+
+#[test]
+fn a_moved_head_loses_both_keys_even_with_old_markers() {
+    let feed = Feed::new();
+    feed.seed_marker("fleet-bot[bot]", "NONE", "ee", HEAD, None);
+    feed.seed_marker("fleet-bot[bot]", "NONE", "market", HEAD, None);
+    let new_head = "f".repeat(40);
+    feed.head.set(new_head.clone());
+
+    let sink = Sink::default();
+    let instr = CountingInstr::default();
+    let mut r = KeyedRunner {
+        ee: valid_review(Key::Ee),
+        market: valid_review(Key::Market),
+        calls: Vec::new(),
+    };
+    run_lane(&cfg(), None, "o/r", &feed, &instr, &sink, &mut r);
+    assert_eq!(r.calls.len(), 2, "both keys are missing at the new head");
+    assert_eq!(sink.posted.borrow().len(), 2);
+    for (_, body) in sink.posted.borrow().iter() {
+        assert!(body.contains(&new_head), "markers name the new head: {body}");
+    }
+}
+
+#[test]
+fn a_failed_post_for_the_missing_key_leaves_the_completed_key_alone() {
+    /// A sink that refuses every post.
+    struct Refusing;
+    impl CommentSink for Refusing {
+        fn post(&self, _pr: u64, _body: &str) -> Result<(), String> {
+            Err("HTTP 403".into())
+        }
+    }
+
+    let feed = Feed::new();
+    feed.seed_marker("fleet-bot[bot]", "NONE", "market", HEAD, None);
+    let sink = Refusing;
+    let instr = CountingInstr::default();
+    let mut r = KeyedRunner {
+        ee: valid_review(Key::Ee),
+        market: valid_review(Key::Market),
+        calls: Vec::new(),
+    };
+    let results = run_lane(&cfg(), None, "o/r", &feed, &instr, &sink, &mut r);
+    assert_eq!(r.calls, vec!["ratification-ee"]);
+    match results[0].1.as_slice() {
+        [(Key::Ee, KeyPost::Withheld(WithheldClass::PostFailed, reason))] => {
+            assert!(reason.contains("post failed"), "{reason}")
+        }
+        other => panic!("expected the failed ee post, got {other:?}"),
+    }
+    // Withheld stays scoped to the attempted key: the completed market key
+    // contributes nothing, and a later tick retries ee alone.
+    let o = TickOutcome::from_run_stats(&results, 0, 0);
+    assert_eq!((o.reason, o.selected, o.ran, o.posted, o.withheld), ("ran", 1, 1, 0, 1));
+    assert_buckets(&o, &[("ee", "post_failed")]);
+}
+
 // ---- tick outcome + shared entry points (#13707) ----
 
 use crate::role_runner::ratification_lane::{
-    run_lane_counted, tick_span, KeyPost, TickOutcome, STEP_TICK_INTERVAL,
+    run_lane_counted, run_lane_stats, run_lane_stats_with, tick_span, KeyPost, LaneState,
+    TickOutcome, WithheldClass, STEP_TICK_INTERVAL,
 };
+
+fn assert_buckets(o: &TickOutcome, expected: &[(&str, &str)]) {
+    let span =
+        tick_span(std::path::Path::new("/fixture"), "role_tick", o, chrono::Utc::now()).bounded();
+    let mut posted = 0;
+    let mut withheld = 0;
+    for key in ["ee", "market"] {
+        for class in [
+            "posted",
+            "pre_launch_failed",
+            "invocation_failed",
+            "output_missing",
+            "verdict_invalid",
+            "verdict_placeholder",
+            "post_failed",
+        ] {
+            let name = format!("loom.ratification.{key}.{class}");
+            let expected = if expected.contains(&(key, class)) {
+                "1"
+            } else {
+                "0"
+            };
+            let value = &span.attributes[&name];
+            assert_eq!(value, expected, "{name}");
+            let count: usize = value.parse().unwrap();
+            if class == "posted" {
+                posted += count;
+            } else {
+                withheld += count;
+            }
+        }
+    }
+    assert_eq!((posted, withheld), (o.posted, o.withheld));
+}
 
 /// A forge whose trusted comments are whatever the sink has posted so far.
 struct Live<'a> {
@@ -579,8 +1571,8 @@ impl PrSource for Live<'_> {
     ) -> Vec<ChangedFile> {
         self.inner.files(pr, hold)
     }
-    fn trusted_comments(&self, _pr: u64) -> Vec<Comment> {
-        comments(self.sink)
+    fn trusted_comments(&self, _pr: u64) -> Result<Vec<Comment>, String> {
+        Ok(comments(self.sink))
     }
 }
 
@@ -621,9 +1613,10 @@ fn second_pass_over_a_marked_head_posts_nothing() {
     let instr = Instr { fail_market: false };
     run_lane(&cfg(), None, "o/r", &live, &instr, &sink, &mut r);
     assert_eq!(sink.posted.borrow().len(), 2);
-    run_lane(&cfg(), None, "o/r", &live, &instr, &sink, &mut r);
+    let results = run_lane(&cfg(), None, "o/r", &live, &instr, &sink, &mut r);
     assert_eq!(sink.posted.borrow().len(), 2, "no double-posting of keys");
     assert_eq!(r.calls, 2, "no second reviewer dispatch");
+    assert_buckets(&TickOutcome::from_run(&results, 0), &[]);
 }
 
 #[test]
@@ -703,7 +1696,10 @@ fn withheld_keys_are_counted() {
     let results = vec![(
         5,
         vec![
-            (Key::Ee, KeyPost::Withheld("could not resolve".into())),
+            (
+                Key::Ee,
+                KeyPost::Withheld(WithheldClass::PreLaunchFailed, "could not resolve".into()),
+            ),
             (Key::Market, KeyPost::Posted),
         ],
     )];
@@ -753,5 +1749,1462 @@ mod gh_failure {
         assert!(timeout.starts_with("timed out"));
         assert_ne!(spawn, timeout);
         assert!(!spawn.starts_with("exit"));
+    }
+}
+
+// ---- #14834: the read-only status report -------------------------------------
+
+use crate::role_runner::ratification_lane::{
+    resolve_status, scan_markers, GhPrSource, MarkerComment, MarkerFormat,
+};
+
+/// The head both real PR #98 fixture markers name.
+const DROP_HEAD: &str = "6a3cd2c43c31821fe93bbc18828c0eb6e06aa063";
+
+/// The lane's own wire marker, as the daemon posts it (PR #98 shape).
+fn lane_marker(key: &str) -> String {
+    format!("<!-- ratify:key={key} sha={DROP_HEAD} -->\nreviewer=ratification-{key}\n")
+}
+
+/// The hand-applied marker, as observed on PR #98.
+fn hand_marker(key: &str, verdict: &str) -> String {
+    format!(
+        "<!-- RATIFY-KEY: {key} verdict={verdict} block=o/r#98 \
+sha={DROP_HEAD} reviewer=01a1fa5f-0873-7071-a338-184a562cfa55 date=2026-11-20T19:14:24Z -->"
+    )
+}
+
+fn mc(id: u64, at: &str, body: &str) -> MarkerComment {
+    MarkerComment {
+        id,
+        created_at: chrono::DateTime::parse_from_rfc3339(at)
+            .unwrap()
+            .with_timezone(&chrono::Utc),
+        url: format!("https://example/pull/98#issuecomment-{id}"),
+        body: body.into(),
+    }
+}
+
+#[test]
+fn status_picks_the_newest_marker_per_key_and_links_the_rest_once_as_superseded() {
+    let comments = vec![
+        mc(1, "2026-11-20T19:00:37Z", &lane_marker("market")),
+        mc(2, "2026-11-20T19:05:00Z", &lane_marker("market")),
+        mc(3, "2026-11-20T19:14:25Z", &hand_marker("market", "adequate-for-catalog")),
+        mc(4, "2026-11-20T18:00:00Z", &lane_marker("ee")),
+    ];
+    let s = resolve_status(DROP_HEAD, "o/r", 98, &comments);
+    let market = &s.market;
+    assert_eq!(market.effective.as_ref().unwrap().comment_id, 3);
+    assert_eq!(market.effective.as_ref().unwrap().format, MarkerFormat::Hand);
+    assert_eq!(
+        market
+            .superseded
+            .iter()
+            .map(|l| l.comment_id)
+            .collect::<Vec<_>>(),
+        vec![1, 2],
+        "superseded links are exact and oldest first"
+    );
+    assert_eq!(s.ee.effective.as_ref().unwrap().comment_id, 4);
+    assert!(s.ee.superseded.is_empty());
+
+    // Reversing the fixture moves nothing: ordering is the forge's creation
+    // time, never the listing's order.
+    let mut reversed = comments.clone();
+    reversed.reverse();
+    assert_eq!(resolve_status(DROP_HEAD, "o/r", 98, &reversed), s);
+}
+
+#[test]
+fn equal_creation_times_are_broken_by_comment_id_across_zone_formats() {
+    // 20:00:00+01:00 is 19:00:00Z: same instant, different notation — the
+    // numeric id decides.
+    let comments = vec![
+        mc(11, "2026-11-20T19:00:00Z", &lane_marker("ee")),
+        mc(12, "2026-11-20T20:00:00+01:00", &lane_marker("ee")),
+    ];
+    let s = resolve_status(DROP_HEAD, "o/r", 98, &comments);
+    assert_eq!(s.ee.effective.as_ref().unwrap().comment_id, 12);
+    assert_eq!(
+        s.ee.superseded
+            .iter()
+            .map(|l| l.comment_id)
+            .collect::<Vec<_>>(),
+        vec![11]
+    );
+}
+
+#[test]
+fn a_more_favorable_verdict_gives_a_comment_no_priority() {
+    let comments = vec![
+        mc(1, "2026-11-20T19:00:00Z", &hand_marker("ee", "approve")),
+        mc(2, "2026-11-20T19:30:00Z", &hand_marker("ee", "request-changes")),
+    ];
+    let s = resolve_status(DROP_HEAD, "o/r", 98, &comments);
+    assert_eq!(s.ee.effective.as_ref().unwrap().comment_id, 2);
+}
+
+#[test]
+fn both_marker_formats_compete_on_the_same_terms_in_either_direction() {
+    let nwo = "o/r";
+    // The real #98 pair: the lane marker came first, the hand marker later.
+    let a = vec![
+        mc(7048105117, "2026-11-20T19:00:37Z", &lane_marker("market")),
+        mc(
+            7048390167,
+            "2026-11-20T19:14:25Z",
+            &hand_marker("market", "adequate-for-catalog"),
+        ),
+    ];
+    let s = resolve_status(DROP_HEAD, nwo, 98, &a);
+    assert_eq!(s.market.effective.as_ref().unwrap().comment_id, 7048390167);
+    assert_eq!(
+        s.market
+            .superseded
+            .iter()
+            .map(|l| l.comment_id)
+            .collect::<Vec<_>>(),
+        vec![7048105117]
+    );
+    // The mirror: a lane marker newer than a hand marker wins the same way.
+    let b = vec![
+        mc(1, "2026-11-20T19:00:37Z", &hand_marker("market", "competitive")),
+        mc(2, "2026-11-20T19:14:25Z", &lane_marker("market")),
+    ];
+    let s = resolve_status(DROP_HEAD, nwo, 98, &b);
+    assert_eq!(s.market.effective.as_ref().unwrap().format, MarkerFormat::Lane);
+}
+
+#[test]
+fn stale_head_and_foreign_pr_markers_are_neither_effective_nor_superseded() {
+    let stale = format!("<!-- ratify:key=ee sha={} -->", "f".repeat(40));
+    let foreign_repo =
+        format!("<!-- RATIFY-KEY: ee verdict=approve block=other/repo#98 sha={DROP_HEAD} -->");
+    let foreign_pr =
+        format!("<!-- RATIFY-KEY: ee verdict=approve block=o/r#99 sha={DROP_HEAD} -->");
+    let own = format!("<!-- RATIFY-KEY: ee verdict=approve block=o/r#98 sha={DROP_HEAD} -->");
+    let comments = vec![
+        mc(1, "2026-11-20T19:00:00Z", &stale),
+        mc(2, "2026-11-20T19:01:00Z", &foreign_repo),
+        mc(3, "2026-11-20T19:02:00Z", &foreign_pr),
+        mc(4, "2026-11-20T19:03:00Z", &own),
+    ];
+    let s = resolve_status(DROP_HEAD, "o/r", 98, &comments);
+    assert_eq!(s.ee.effective.as_ref().unwrap().comment_id, 4);
+    assert!(
+        s.ee.superseded.is_empty(),
+        "markers for another head or PR are not this head's markers"
+    );
+}
+
+#[test]
+fn quoted_and_fenced_lookalikes_never_establish_a_head_or_key() {
+    let quoted = format!("> quoted example:\n> <!-- ratify:key=ee sha={DROP_HEAD} -->");
+    let fenced = format!("```\n<!-- RATIFY-KEY: ee verdict=approve sha={DROP_HEAD} -->\n```");
+    let lane_body = lane_marker("ee");
+    let lane = lane_body.lines().next().unwrap();
+    let hand = hand_marker("ee", "approve");
+    let examples = [
+        quoted,
+        fenced,
+        format!("Example: `{lane}`"),
+        format!("`{hand}`"),
+        format!("{lane} trailing prose"),
+        format!("{hand} {lane}"),
+    ];
+    for example in &examples {
+        assert!(scan_markers(example).is_empty(), "{example}");
+    }
+    let comments = vec![
+        mc(1, "2026-11-20T19:00:00Z", &lane_body),
+        mc(2, "2026-11-20T19:01:00Z", &examples.join("\n")),
+    ];
+    let s = resolve_status(DROP_HEAD, "o/r", 98, &comments);
+    assert_eq!(s.ee.effective.unwrap().comment_id, 1);
+    assert!(s.ee.superseded.is_empty());
+    assert_eq!(scan_markers(&hand).len(), 1);
+}
+
+#[test]
+fn indented_markdown_code_cannot_select_a_marker() {
+    let lane_body = lane_marker("ee");
+    let lane = lane_body.lines().next().unwrap();
+    let hand = hand_marker("market", "approve");
+    for marker in [lane, hand.as_str()] {
+        assert_eq!(scan_markers(&format!("   {marker}")).len(), 1);
+        for indent in ["    ", "     ", "\t", " \t", "   \t"] {
+            assert!(scan_markers(&format!("{indent}{marker}")).is_empty());
+        }
+        assert_eq!(scan_markers(&format!("    ```\n\n{marker}")).len(), 1);
+        assert!(scan_markers(&format!("```\n    ```\n{marker}\n```")).is_empty());
+    }
+
+    let comments = vec![
+        mc(1, "2026-11-20T19:00:00Z", &format!("{lane}\n{hand}")),
+        mc(2, "2026-11-20T19:01:00Z", &format!("Example:\n\n    {lane}\n\n\t{hand}")),
+    ];
+    let status = resolve_status(DROP_HEAD, "o/r", 98, &comments);
+    for key in [status.ee, status.market] {
+        assert_eq!(key.effective.unwrap().comment_id, 1);
+        assert!(key.superseded.is_empty());
+    }
+}
+
+#[test]
+fn fenced_examples_end_only_at_a_matching_markdown_close() {
+    let lane_body = lane_marker("ee");
+    let lane = lane_body.lines().next().unwrap();
+    let hand = hand_marker("market", "approve");
+    for (opening, example, closing) in [
+        ("````text", "~~~~", "`````  "),
+        ("````text", "```", "````"),
+        ("~~~~text", "~~~~ ordinary text", "~~~~\t"),
+        ("~~~text", "~~~\u{a0}", "~~~"),
+        ("- ````text", "  ```", "  ````"),
+    ] {
+        let indent = if opening.starts_with('-') { "  " } else { "" };
+        let inside = format!("{opening}\n{example}\n{indent}{lane}\n{indent}{hand}");
+        assert!(scan_markers(&inside).is_empty(), "{opening} / {example}");
+        let marks = scan_markers(&format!("{inside}\n{closing}\n\n{lane}\n{hand}"));
+        assert_eq!(marks.len(), 2, "{opening} / {closing}");
+        assert_eq!(marks[0].format, MarkerFormat::Lane);
+        assert_eq!(marks[1].format, MarkerFormat::Hand);
+    }
+}
+
+#[test]
+fn markdown_context_does_not_create_or_hide_a_standalone_marker() {
+    let hand = hand_marker("market", "approve");
+    assert!(scan_markers(&format!("`inline example` {hand}")).is_empty());
+    assert_eq!(
+        scan_markers(&format!("Ordinary paragraph `\n{hand}\nNext paragraph `")).len(),
+        1
+    );
+    assert_eq!(scan_markers(&format!("```invalid ` fence opener\n{hand}")).len(), 1);
+}
+
+#[test]
+fn a_hand_marker_without_a_full_matching_sha_is_not_a_marker() {
+    let short = format!("<!-- RATIFY-KEY: ee verdict=approve sha={} -->", "abc".repeat(7));
+    let no_sha = "<!-- RATIFY-KEY: ee verdict=approve -->\n";
+    assert!(scan_markers(&short).is_empty());
+    assert!(scan_markers(no_sha).is_empty());
+}
+
+#[test]
+fn a_missing_key_is_explicit_and_a_verified_empty_history_is_no_marker() {
+    let empty = resolve_status(DROP_HEAD, "o/r", 98, &[]);
+    assert!(empty.ee.effective.is_none() && empty.market.effective.is_none());
+    let comments = vec![mc(1, "2026-11-20T19:00:00Z", &lane_marker("market"))];
+    let s = resolve_status(DROP_HEAD, "o/r", 98, &comments);
+    assert!(s.ee.effective.is_none(), "ee is missing at this head");
+    assert!(s.market.effective.is_some());
+}
+
+#[test]
+fn a_comment_carrying_several_markers_for_one_key_links_once() {
+    let body = format!("{}\n{}", lane_marker("ee"), hand_marker("ee", "approve"));
+    let comments = vec![mc(1, "2026-11-20T19:00:00Z", &body)];
+    let s = resolve_status(DROP_HEAD, "o/r", 98, &comments);
+    assert_eq!(s.ee.effective.as_ref().unwrap().comment_id, 1);
+    assert!(s.ee.superseded.is_empty());
+}
+
+#[test]
+fn status_reads_head_and_history_through_the_forge_and_performs_only_reads() {
+    use crate::cli::ratification_lane_cmd::{handle, Action};
+    use crate::comment_trust::TrustPolicy;
+    use crate::forge_identity::{FleetLogins, Placement, RouteDecision};
+    use crate::gh_invocation::cwd_route::{CwdAnswer, DeriveEnv};
+    use crate::gh_invocation::{test_routing, test_support};
+
+    let dir = tempfile::tempdir().unwrap();
+    let reader = dir.path().join("reader");
+    std::fs::create_dir(&reader).unwrap();
+    let calls = dir.path().join("calls");
+    let program = test_support::stub(
+        dir.path(),
+        "gh-status",
+        &format!(
+            r#"printf '%s\n' "$*" >> '{calls}'
+test "$1" = api || exit 64
+case "$2" in
+  repos/o/r/pulls/98) test ! -f "${{0%/*}}/prfail" || exit 1; cat "${{0%/*}}/pr" ;;
+  'repos/o/r/issues/98/comments?per_page=100') test "$3" = --paginate || exit 64; cat "${{0%/*}}/reply"; test ! -f "${{0%/*}}/failed" ;;
+  *) exit 64 ;;
+esac"#,
+            calls = calls.display(),
+        ),
+    );
+    let _routing = test_routing::install_with_program(
+        test_routing::TestRouting {
+            decision: RouteDecision::Reader {
+                dir: reader,
+                app_id: "fixture-reader".into(),
+                placement: Placement::Home,
+            },
+            env: DeriveEnv::default(),
+            checkout: CwdAnswer::Unresolved,
+        },
+        program,
+    );
+    let policy = TrustPolicy::new(FleetLogins::single("fleet-bot"), None, Vec::new());
+    let source = GhPrSource::new(dir.path(), "o/r", &policy);
+
+    let record = |id: u64, at: &str, login: &str, assoc: &str, r#type: &str, body: &str| {
+        json!({
+            "id": id,
+            "created_at": at,
+            "html_url": format!("https://example/o/r/pull/98#issuecomment-{id}"),
+            "user": {"login": login, "type": r#type},
+            "author_association": assoc,
+            "body": body,
+        })
+    };
+    let pr = json!({"number": 98, "head": {"sha": DROP_HEAD}, "base": {"sha": "0".repeat(40)}});
+
+    // Two pages carrying several market AND ee markers. The newest market
+    // marker (the hand marker) is on page one, the newest ee marker on page
+    // two: page and listing position never decide, creation time does.
+    let page_one = json!([
+        record(3, "2026-11-20T19:14:25Z", "fixture-owner", "OWNER", "User", &hand_marker("market", "adequate-for-catalog")),
+        { "id": 4, "created_at": "2026-11-20T19:20:00Z", "html_url": "u4",
+          "user": {"login": "unknown[bot]", "type": "Bot"}, "author_association": "NONE",
+          "body": lane_marker("market") },
+        { "id": 5, "created_at": "2026-11-20T19:21:00Z", "html_url": "u5",
+          "user": null, "author_association": "NONE", "body": lane_marker("ee") }
+    ]);
+    let page_two = json!([
+        record(
+            7048105117,
+            "2026-11-20T19:00:37Z",
+            "fixture-owner",
+            "OWNER",
+            "User",
+            &lane_marker("market")
+        ),
+        record(
+            7048105999,
+            "2026-11-20T18:30:00Z",
+            "fixture-owner",
+            "OWNER",
+            "User",
+            &hand_marker("ee", "approve")
+        ),
+        record(
+            7048106111,
+            "2026-11-20T18:40:00Z",
+            "fixture-owner",
+            "OWNER",
+            "User",
+            &lane_marker("ee")
+        )
+    ]);
+    std::fs::write(dir.path().join("pr"), pr.to_string()).unwrap();
+    std::fs::write(dir.path().join("reply"), format!("{page_one}\n{page_two}")).unwrap();
+
+    let head = source.pr_head(98).expect("head");
+    assert_eq!(head, DROP_HEAD);
+    let comments = source.marker_comments(98).expect("comments");
+    // Untrusted and deleted-author rows are gone; trusted identity survives.
+    assert_eq!(
+        comments.iter().map(|c| c.id).collect::<Vec<_>>(),
+        vec![3, 7048105117, 7048105999, 7048106111]
+    );
+    assert_eq!(comments[0].url, "https://example/o/r/pull/98#issuecomment-3");
+    let s = resolve_status(&head, "o/r", 98, &comments);
+    // Market: the hand marker on page one is newer than the lane marker on
+    // page two — creation time, not page or listing position, decides.
+    assert_eq!(s.market.effective.as_ref().unwrap().comment_id, 3);
+    assert_eq!(
+        s.market
+            .superseded
+            .iter()
+            .map(|l| l.comment_id)
+            .collect::<Vec<_>>(),
+        vec![7048105117]
+    );
+    // EE: the newest ee marker is on page two and wins; the deleted-author
+    // ee marker (id 5) never counted.
+    assert_eq!(s.ee.effective.as_ref().unwrap().comment_id, 7048106111);
+    assert_eq!(
+        s.ee.superseded
+            .iter()
+            .map(|l| l.comment_id)
+            .collect::<Vec<_>>(),
+        vec![7048105999]
+    );
+
+    // A torn second page fails the whole read closed.
+    std::fs::write(dir.path().join("reply"), format!("{page_one}\n[{{")).unwrap();
+    assert!(source.marker_comments(98).is_err());
+
+    // A verified empty listing reads as empty — both keys genuinely missing,
+    // not unreadable.
+    std::fs::write(dir.path().join("reply"), "[]").unwrap();
+    let empty = source
+        .marker_comments(98)
+        .expect("empty history is readable");
+    assert!(empty.is_empty());
+    let s = resolve_status(&head, "o/r", 98, &empty);
+    assert!(s.ee.effective.is_none() && s.market.effective.is_none());
+
+    // A malformed trusted record (no id to link) fails the read closed.
+    let malformed = json!([
+        { "created_at": "2026-11-20T19:00:00Z", "html_url": "u9",
+          "user": {"login": "fixture-owner", "type": "User"},
+          "author_association": "OWNER", "body": lane_marker("market") }
+    ]);
+    std::fs::write(dir.path().join("reply"), malformed.to_string()).unwrap();
+    let err = source.marker_comments(98).unwrap_err();
+    assert!(err.contains("malformed"), "{err}");
+
+    // A failed gh read of either endpoint is an error, never empty.
+    std::fs::write(dir.path().join("reply"), format!("{page_one}\n{page_two}")).unwrap();
+    std::fs::write(dir.path().join("failed"), "").unwrap();
+    assert!(source.marker_comments(98).is_err());
+    std::fs::remove_file(dir.path().join("failed")).unwrap();
+    std::fs::write(dir.path().join("prfail"), "").unwrap();
+    assert!(source.pr_head(98).is_err());
+    std::fs::remove_file(dir.path().join("prfail")).unwrap();
+
+    // A malformed captured head stops the actual status command before it
+    // reads comment history, even when that history is readable.
+    std::fs::write(dir.path().join("reply"), "[]").unwrap();
+    for invalid in [
+        "".to_string(),
+        "a".repeat(39),
+        "a".repeat(41),
+        "g".repeat(40),
+    ] {
+        let pr = json!({"head": {"sha": invalid}});
+        std::fs::write(dir.path().join("pr"), pr.to_string()).unwrap();
+        let before = std::fs::read_to_string(&calls).unwrap();
+        let error = handle(Action::Status {
+            pr: 98,
+            repo: Some("o/r".to_string()),
+            root: Some(dir.path().to_path_buf()),
+        })
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("head could not be read") && error.contains("40-hex"), "{error}");
+        let after = std::fs::read_to_string(&calls).unwrap();
+        assert_eq!(after.strip_prefix(&before), Some("api repos/o/r/pulls/98\n"));
+    }
+
+    // Every forge call was a read: `gh api <endpoint>` with no method verb.
+    let seen = std::fs::read_to_string(&calls).unwrap();
+    for line in seen.lines() {
+        assert!(line.starts_with("api "), "non-api call: {line}");
+        assert!(!line.contains("-X") && !line.contains("--method"), "write call: {line}");
+    }
+}
+
+// ---- #15315: an echoed prompt is cut out before parsing ---------------------
+
+/// Pinned instructions that are the real templates (by pin path).
+struct TemplateInstr;
+
+impl InstructionSource for TemplateInstr {
+    fn fetch(&self, pin: &crate::role_runner::ratification_lane::Pin) -> Result<String, String> {
+        Ok(if pin.path == "ee.md" {
+            EE_TEMPLATE
+        } else {
+            MARKET_TEMPLATE
+        }
+        .into())
+    }
+    fn repo_is_private(&self, _repo: &str) -> Option<bool> {
+        Some(true)
+    }
+}
+
+/// A Codex-like runner: its captured output carries the prompt it was given
+/// (the `user` block on stderr) before or after what the model wrote.
+struct EchoRunner {
+    prompt: String,
+    last_key: Option<Key>,
+    /// What the model wrote, per key.
+    wrote: fn(Key) -> String,
+    echo_after: bool,
+}
+
+impl RoleInvocationRunner for EchoRunner {
+    fn invoke(&mut self, role: &str, prompt: &str) -> RoleTickOutcome {
+        self.prompt = prompt.to_string();
+        self.last_key = Some(if role == "ratification-market" {
+            Key::Market
+        } else {
+            Key::Ee
+        });
+        RoleTickOutcome::Success
+    }
+    fn last_output(&self) -> Option<String> {
+        let wrote = (self.wrote)(self.last_key.unwrap_or(Key::Ee));
+        let echo = format!("user\n{}\n", self.prompt);
+        Some(if self.echo_after {
+            format!("{LAUNCHER_NOISE}{wrote}{echo}{WRAPPER_TAIL}")
+        } else {
+            format!("{LAUNCHER_NOISE}{echo}codex\n{wrote}{WRAPPER_TAIL}")
+        })
+    }
+}
+
+fn run_echo(wrote: fn(Key) -> String, echo_after: bool) -> (LaneResults, Vec<(u64, String)>) {
+    let (prs, sink) = (
+        Prs {
+            author: "alice",
+            listed: 0.into(),
+        },
+        Sink::default(),
+    );
+    let mut r = EchoRunner {
+        prompt: String::new(),
+        last_key: None,
+        wrote,
+        echo_after,
+    };
+    let results = run_lane(&cfg(), None, "o/r", &prs, &TemplateInstr, &sink, &mut r);
+    let posted = sink.posted.borrow().clone();
+    (results, posted)
+}
+
+use crate::role_runner::ratification_lane::LaneResults;
+
+#[test]
+fn echoed_prompt_then_review_posts_only_the_review() {
+    for echo_after in [false, true] {
+        let (results, posted) = run_echo(valid_review, echo_after);
+        assert_eq!(posted.len(), 2, "echo_after={echo_after}: {results:?}");
+        for (_, body) in &posted {
+            assert!(!body.contains("<approve|request-changes>"), "{body}");
+            assert!(!body.contains("<competitive|"), "{body}");
+            assert!(!body.contains("Lane output contract"), "{body}");
+            assert!(!body.contains("<block name / class>"), "{body}");
+        }
+    }
+}
+
+#[test]
+fn review_then_echoed_prompt_still_posts_the_review() {
+    // Critique A6: Codex stderr is tee'd live, so the echo can land after
+    // the review; it must not turn a valid verdict into a withhold.
+    let (results, posted) = run_echo(valid_review, true);
+    assert_buckets(&TickOutcome::from_run(&results, 0), &[("ee", "posted"), ("market", "posted")]);
+    assert_eq!(posted.len(), 2);
+}
+
+#[test]
+fn echoed_prompt_without_review_is_no_heading() {
+    fn prose(_: Key) -> String {
+        "I could not finish the review.\n".into()
+    }
+    for echo_after in [false, true] {
+        let (results, posted) = run_echo(prose, echo_after);
+        assert!(posted.is_empty());
+        assert_buckets(
+            &TickOutcome::from_run(&results, 0),
+            &[("ee", "verdict_invalid"), ("market", "verdict_invalid")],
+        );
+        match results[0].1.as_slice() {
+            [(Key::Ee, KeyPost::Withheld(_, ee)), (Key::Market, KeyPost::Withheld(_, mk))] => {
+                assert!(ee.contains("no ## EE-key review: heading"), "{ee}");
+                assert!(mk.contains("no ## Market-key review: heading"), "{mk}");
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+}
+
+// ---- #15315: a launch the child refused is pre-launch, through the real ----
+// ---- classifier ------------------------------------------------------------
+
+#[cfg(unix)]
+mod launch_refusal {
+    use super::*;
+    use crate::observability::lifecycle::{RoleFailure, RoleTrace};
+
+    const ANCHOR: &str = "2026-11-22T10:05:11.123Z";
+
+    /// One tick's region of `role-ratification-ee.log` as the role runner
+    /// writes it: its header line (carrying the anchor), then `body`.
+    fn tick(body: &str) -> String {
+        format!(
+            "\n==== loom-daemon role_runner: {ANCHOR} role=ratification-ee model=default ====\n{body}\n"
+        )
+    }
+
+    /// The EE session is a launched child that exited `code` with role log
+    /// `log`; its trace carries the class the **production** classifier
+    /// gives that log (critique A3: never a class injected by hand).
+    struct LaunchedEe {
+        log: String,
+        failure: RoleFailure,
+        last_ee: bool,
+    }
+
+    impl LaunchedEe {
+        fn new(code: i32, body: &str) -> Self {
+            let log = tick(body);
+            let failure = crate::role_runner::launch::exited_failure_for_test(code, &log, ANCHOR);
+            Self {
+                log,
+                failure,
+                last_ee: false,
+            }
+        }
+    }
+
+    impl RoleInvocationRunner for LaunchedEe {
+        fn invoke(&mut self, role: &str, _prompt: &str) -> RoleTickOutcome {
+            self.last_ee = role == "ratification-ee";
+            if self.last_ee {
+                RoleTickOutcome::Failure("`.../spawn-worker.sh` exited with exit status: 78".into())
+            } else {
+                RoleTickOutcome::Success
+            }
+        }
+        fn trace_context(&self) -> Option<RoleTrace> {
+            self.last_ee.then(|| RoleTrace {
+                context: crate::telemetry::trace::TraceContext::derived("fixture", &["ee"]),
+                execution: "fixture-ee".into(),
+                started_at: chrono::Utc::now(),
+                failure: Some(self.failure.clone()),
+                judge: None,
+            })
+        }
+        fn last_output(&self) -> Option<String> {
+            Some(if self.last_ee {
+                self.log.clone()
+            } else {
+                valid_review(Key::Market)
+            })
+        }
+    }
+
+    fn ee_bucket(runner: &mut LaunchedEe) -> (TickOutcome, usize) {
+        let sink = Sink::default();
+        let results =
+            run_lane(&cfg(), None, "o/r", &Feed::new(), &CountingInstr::default(), &sink, runner);
+        let ee_posts = sink
+            .posted
+            .borrow()
+            .iter()
+            .filter(|(_, b)| b.starts_with("<!-- ratify:key=ee "))
+            .count();
+        (TickOutcome::from_run(&results, 0), ee_posts)
+    }
+
+    const REJECTED: &str = "# LOOM_LAUNCH_REJECTED code=78 stage=credential";
+
+    #[test]
+    fn launched_cli_never_started_failure_is_pre_launch() {
+        // The loom#14944 shape: the launcher child refused the capped pool at
+        // its credential stage and exited 78 before any CLI started.
+        let mut r = LaunchedEe::new(78, &format!("spawn-worker: launching\n{REJECTED}"));
+        assert_eq!(r.failure.class(), "preflight-no-cli-start", "the real classifier");
+        let (o, ee_posts) = ee_bucket(&mut r);
+        assert_buckets(&o, &[("ee", "pre_launch_failed"), ("market", "posted")]);
+        assert_eq!(ee_posts, 0);
+
+        // The classifier can name an account class for the same refusal
+        // (the pool listing quotes exhaustion prose); the launcher's own
+        // marker with no CLI start is still positive pre-launch evidence.
+        let mut r = LaunchedEe::new(
+            78,
+            &format!("spawn-worker: account a: You've hit your usage limit\n{REJECTED}"),
+        );
+        assert!(
+            !crate::role_runner::ratification_dispatch::LAUNCH_REFUSAL_CLASSES
+                .contains(&r.failure.class()),
+            "{}",
+            r.failure.class()
+        );
+        let (o, _) = ee_bucket(&mut r);
+        assert_buckets(&o, &[("ee", "pre_launch_failed"), ("market", "posted")]);
+    }
+
+    #[test]
+    fn launched_real_failure_stays_invocation_failed() {
+        for (code, body) in [
+            (1, "# LOOM_CLI_START runtime=codex\nError: something codex said".to_string()),
+            (78, "# LOOM_CLI_START runtime=opencode\nprovider refused".to_string()),
+            (78, "# CLAUDE_CLI_START\n# ACCOUNT_POOL_EXHAUSTED".to_string()),
+            // A rejection marker after the CLI started is not a launch refusal.
+            (78, format!("# LOOM_CLI_START runtime=opencode\n{REJECTED}")),
+        ] {
+            let mut r = LaunchedEe::new(code, &body);
+            assert!(
+                !crate::role_runner::ratification_dispatch::LAUNCH_REFUSAL_CLASSES
+                    .contains(&r.failure.class()),
+                "{body}: {}",
+                r.failure.class()
+            );
+            let (o, ee_posts) = ee_bucket(&mut r);
+            assert_buckets(&o, &[("ee", "invocation_failed"), ("market", "posted")]);
+            assert_eq!(ee_posts, 0);
+        }
+    }
+
+    /// The EE session's runs in a bounded pass at minute `at`.
+    fn ee_runs(bench: &super::bound::Bench, r: &mut LaunchedEe, at: i64) -> usize {
+        let prs = super::bound::Heads(RefCell::new(vec![(7, HEAD.into()), (8, "d".repeat(40))]));
+        let mut runs = 0;
+        struct Counting<'a>(&'a mut LaunchedEe, &'a mut usize);
+        impl RoleInvocationRunner for Counting<'_> {
+            fn invoke(&mut self, role: &str, prompt: &str) -> RoleTickOutcome {
+                *self.1 += usize::from(role == "ratification-ee");
+                self.0.invoke(role, prompt)
+            }
+            fn trace_context(&self) -> Option<RoleTrace> {
+                self.0.trace_context()
+            }
+            fn last_output(&self) -> Option<String> {
+                self.0.last_output()
+            }
+        }
+        let now = super::bound::t0() + chrono::TimeDelta::minutes(at);
+        bench.pass(&prs, &mut Counting(r, &mut runs), now);
+        runs
+    }
+
+    #[test]
+    fn host_class_failure_is_not_counted_and_backs_off_the_key() {
+        // A launched session the account pool ran dry under (the real
+        // classifier's `account-pool-exhausted`): not the PR's fault, so no
+        // counted attempt, and the EE key backs off for the whole repo.
+        let bench = super::bound::Bench::new();
+        let mut r = LaunchedEe::new(78, "# CLAUDE_CLI_START\n# ACCOUNT_POOL_EXHAUSTED");
+        assert_eq!(r.failure.class(), "account-pool-exhausted", "the real classifier");
+        assert_eq!(ee_runs(&bench, &mut r, 0), 1, "PR #8's EE run is deferred");
+        assert_eq!(ee_runs(&bench, &mut r, 1), 0);
+        assert_eq!(ee_runs(&bench, &mut r, 16), 1, "tried again after the backoff");
+        assert!(bench.records().is_empty(), "never counted");
+    }
+
+    #[test]
+    fn a_launched_failure_the_pr_may_cause_is_counted_and_capped() {
+        // Review finding: a session that launched and failed with a class
+        // the PR may cause (here the role timeout, and the real classifier's
+        // bare exit code) must count, or the same head is re-dispatched
+        // after every backoff without end (#15315 scope 4).
+        let timeout = || LaunchedEe {
+            log: tick("# LOOM_CLI_START runtime=codex\nstill reviewing"),
+            failure: RoleFailure::new(
+                "timeout-ceiling",
+                None,
+                "role child ran past the 1800 s role timeout and was terminated",
+            ),
+            last_ee: false,
+        };
+        let exit_1 = || LaunchedEe::new(1, "# LOOM_CLI_START runtime=codex\nError: boom");
+        for (name, mut r) in [("timeout-ceiling", timeout()), ("exit-1", exit_1())] {
+            assert_eq!(r.failure.class(), name);
+            let bench = super::bound::Bench::new();
+            for (i, at) in [0, 16, 32].into_iter().enumerate() {
+                assert_eq!(ee_runs(&bench, &mut r, at), 2, "{name} pass {i}: both PRs run");
+            }
+            let records = bench.records();
+            assert_eq!(records.len(), 6, "{name}: one counted attempt per PR per pass");
+            assert!(records.iter().all(|a| a.class == "invocation_failed"), "{records:?}");
+            assert_eq!(ee_runs(&bench, &mut r, 48), 0, "{name}: capped at both heads");
+            assert_eq!(ee_runs(&bench, &mut r, 64), 0, "{name}: and stays capped");
+        }
+    }
+}
+
+// ---- the attempt bound (#15315) ----
+
+mod bound {
+    use super::*;
+    use crate::observability::lifecycle::{RoleFailure, ROLL_INTERRUPTED};
+    use crate::role_runner::ratification_attempts::{
+        ledger_path, load, save, AttemptRecord, LaneMemory, Ledger, LEDGER_RULES,
+        MAX_COUNTED_ATTEMPTS_PER_WINDOW,
+    };
+    use crate::role_runner::ratification_lane::LanePass;
+    use chrono::{DateTime, TimeDelta, Utc};
+
+    pub(super) fn t0() -> DateTime<Utc> {
+        DateTime::parse_from_rfc3339("2026-11-22T10:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc)
+    }
+
+    fn mins(n: i64) -> DateTime<Utc> {
+        t0() + TimeDelta::minutes(n)
+    }
+
+    /// One workspace's bound: a ledger file in a temp root and a fresh
+    /// process memory, as `tick_inner` wires them.
+    pub(super) struct Bench {
+        _dir: tempfile::TempDir,
+        pub(super) ledger: std::path::PathBuf,
+        pub(super) memory: std::sync::Mutex<LaneMemory>,
+        pub(super) sink: Sink,
+        pub(super) instr: CountingInstr,
+    }
+
+    impl Bench {
+        pub(super) fn new() -> Self {
+            let dir = tempfile::tempdir().unwrap();
+            Self {
+                ledger: ledger_path(dir.path()),
+                _dir: dir,
+                memory: std::sync::Mutex::default(),
+                sink: Sink::default(),
+                instr: CountingInstr::default(),
+            }
+        }
+
+        pub(super) fn pass(
+            &self,
+            prs: &dyn PrSource,
+            runner: &mut dyn RoleInvocationRunner,
+            now: DateTime<Utc>,
+        ) -> LanePass {
+            self.run(prs, &self.instr, &self.sink, runner, &move || now)
+        }
+
+        /// One bounded pass with this bench's ledger and memory, the given
+        /// sources and `clock`.
+        pub(super) fn run(
+            &self,
+            prs: &dyn PrSource,
+            instr: &dyn InstructionSource,
+            sink: &dyn CommentSink,
+            runner: &mut dyn RoleInvocationRunner,
+            clock: &dyn Fn() -> DateTime<Utc>,
+        ) -> LanePass {
+            run_lane_stats_with(
+                &cfg(),
+                None,
+                "o/r",
+                prs,
+                instr,
+                sink,
+                runner,
+                &LaneState {
+                    memory: &self.memory,
+                    ledger: Some(&self.ledger),
+                    clock,
+                },
+            )
+        }
+
+        pub(super) fn records(&self) -> Vec<AttemptRecord> {
+            load(&self.ledger).unwrap().attempts
+        }
+
+        fn seed(&self, attempts: Vec<AttemptRecord>) {
+            save(
+                &self.ledger,
+                &Ledger {
+                    rules: LEDGER_RULES,
+                    attempts,
+                },
+            )
+            .unwrap();
+        }
+    }
+
+    fn rec(pr: u64, head: &str, key: Key, at: DateTime<Utc>) -> AttemptRecord {
+        AttemptRecord {
+            repo: "o/r".into(),
+            pr,
+            head_sha: head.into(),
+            key: key.wire().into(),
+            class: "verdict_invalid".into(),
+            at,
+        }
+    }
+
+    /// Open PRs whose heads a test can move; no marker is ever read back, so
+    /// every key stays missing.
+    pub(super) struct Heads(pub(super) RefCell<Vec<(u64, String)>>);
+
+    impl Heads {
+        pub(super) fn one() -> Self {
+            Self(RefCell::new(vec![(7, HEAD.into())]))
+        }
+    }
+
+    impl PrSource for Heads {
+        fn open_prs(&self) -> Vec<OpenPr> {
+            self.0
+                .borrow()
+                .iter()
+                .map(|(number, head)| OpenPr {
+                    number: *number,
+                    author: "alice".into(),
+                    head_sha: head.clone(),
+                })
+                .collect()
+        }
+        fn files(
+            &self,
+            pr: u64,
+            hold: &crate::champion_hold::ratification::Config,
+        ) -> Vec<ChangedFile> {
+            Prs {
+                author: "alice",
+                listed: 0.into(),
+            }
+            .files(pr, hold)
+        }
+        fn trusted_comments(&self, _pr: u64) -> Result<Vec<Comment>, String> {
+            Ok(Vec::new())
+        }
+    }
+
+    /// How a scripted key session ends.
+    #[derive(Clone, Copy, Debug)]
+    enum Ends {
+        /// A valid review: the marker is posted.
+        Review,
+        /// The session ran and wrote no verdict: a counted attempt.
+        NoVerdict,
+        /// Refused before launch (no token pool).
+        PreLaunch,
+        /// Stopped by a version roll.
+        Rolled,
+        /// Stopped by the role timeout on a saturated host.
+        LoadSkipped,
+    }
+
+    struct Scripted {
+        ee: Ends,
+        market: Ends,
+        calls: Vec<String>,
+    }
+
+    impl Scripted {
+        fn new(ee: Ends, market: Ends) -> Self {
+            Self {
+                ee,
+                market,
+                calls: Vec::new(),
+            }
+        }
+
+        fn last(&self) -> (Key, Ends) {
+            match self.calls.last() {
+                Some(r) if r == "ratification-market" => (Key::Market, self.market),
+                _ => (Key::Ee, self.ee),
+            }
+        }
+
+        fn ran(&self, role: &str) -> usize {
+            self.calls.iter().filter(|r| *r == role).count()
+        }
+
+        /// Sessions run since the last call.
+        fn take(&mut self) -> Vec<String> {
+            std::mem::take(&mut self.calls)
+        }
+    }
+
+    impl RoleInvocationRunner for Scripted {
+        fn invoke(&mut self, role: &str, _prompt: &str) -> RoleTickOutcome {
+            self.calls.push(role.to_string());
+            match self.last().1 {
+                Ends::Review | Ends::NoVerdict => RoleTickOutcome::Success,
+                Ends::PreLaunch => RoleTickOutcome::NoTokenPool,
+                Ends::Rolled => RoleTickOutcome::Failure("stopped for the version roll".into()),
+                Ends::LoadSkipped => RoleTickOutcome::LoadSkipped {
+                    load_per_core: 2.5,
+                    detail: "still reviewing".into(),
+                },
+            }
+        }
+        fn last_output(&self) -> Option<String> {
+            match self.last() {
+                (key, Ends::Review) => Some(valid_review(key)),
+                (_, Ends::NoVerdict) => Some("I stopped without writing a verdict.".into()),
+                _ => None,
+            }
+        }
+        fn unlaunched_failure(&self) -> Option<RoleFailure> {
+            matches!(self.last().1, Ends::Rolled)
+                .then(|| RoleFailure::new(ROLL_INTERRUPTED, None, "fixture roll"))
+        }
+    }
+
+    const EE: &str = "ratification-ee";
+    const MARKET: &str = "ratification-market";
+
+    #[test]
+    fn cap_stops_redispatch_at_the_same_head() {
+        let bench = Bench::new();
+        let prs = Heads::one();
+        let mut r = Scripted::new(Ends::NoVerdict, Ends::NoVerdict);
+        for i in 0..MAX_COUNTED_ATTEMPTS_PER_WINDOW {
+            let pass = bench.pass(&prs, &mut r, mins(i as i64 * 5));
+            assert_eq!((pass.capped, pass.held, pass.results.len()), (0, 0, 1), "pass {i}");
+        }
+        assert_eq!(r.take().len(), 2 * MAX_COUNTED_ATTEMPTS_PER_WINDOW);
+        assert_eq!(bench.records().len(), 2 * MAX_COUNTED_ATTEMPTS_PER_WINDOW);
+
+        let pass = bench.pass(&prs, &mut r, mins(20));
+        assert!(r.take().is_empty(), "a capped head runs no session");
+        assert!(bench.sink.posted.borrow().is_empty(), "and posts nothing");
+        assert_eq!((pass.capped, pass.deferred, pass.held), (2, 0, 1));
+        let o = TickOutcome::from_pass(&pass);
+        assert_eq!(
+            (o.reason, o.selected, o.ran, o.posted, o.withheld, o.capped),
+            ("held", 1, 0, 0, 0, 2)
+        );
+        assert_eq!(bench.records().len(), 6, "a capped pass records nothing");
+    }
+
+    #[test]
+    fn cap_is_per_key() {
+        let bench = Bench::new();
+        bench.seed((0..3).map(|i| rec(7, HEAD, Key::Ee, mins(i))).collect());
+        let mut r = Scripted::new(Ends::NoVerdict, Ends::NoVerdict);
+        let pass = bench.pass(&Heads::one(), &mut r, mins(10));
+        assert_eq!(r.take(), [MARKET], "only the capped key is held back");
+        assert_eq!((pass.capped, pass.held, pass.results.len()), (1, 0, 1));
+        assert_buckets(&TickOutcome::from_pass(&pass), &[("market", "verdict_invalid")]);
+    }
+
+    #[test]
+    fn cap_resets_on_a_new_head() {
+        let bench = Bench::new();
+        let mut seeded: Vec<_> = (0..3).map(|i| rec(7, HEAD, Key::Ee, mins(i))).collect();
+        seeded.extend((0..3).map(|i| rec(7, HEAD, Key::Market, mins(i))));
+        bench.seed(seeded);
+        let moved = "c".repeat(40);
+        let prs = Heads(RefCell::new(vec![(7, moved.clone())]));
+        let mut r = Scripted::new(Ends::NoVerdict, Ends::NoVerdict);
+        let pass = bench.pass(&prs, &mut r, mins(10));
+        assert_eq!(r.take(), [EE, MARKET], "a new head is dispatched at once");
+        assert_eq!(pass.capped, 0);
+        // The old head is no longer a candidate, so its records are pruned.
+        let records = bench.records();
+        assert_eq!(records.len(), 2);
+        assert!(records.iter().all(|r| r.head_sha == moved), "{records:?}");
+    }
+
+    #[test]
+    fn cap_releases_when_the_oldest_ages_out() {
+        let bench = Bench::new();
+        let hours = |h: i64| t0() + TimeDelta::hours(h);
+        bench.seed(vec![
+            rec(7, HEAD, Key::Ee, hours(0)),
+            rec(7, HEAD, Key::Ee, hours(1)),
+            rec(7, HEAD, Key::Ee, hours(2)),
+        ]);
+        let prs = Heads::one();
+        let mut r = Scripted::new(Ends::NoVerdict, Ends::Review);
+
+        let pass = bench.pass(&prs, &mut r, hours(23));
+        assert_eq!(r.take(), [MARKET], "still capped inside the window");
+        assert_eq!(pass.capped, 1);
+
+        let pass = bench.pass(&prs, &mut r, hours(24));
+        assert_eq!(r.take(), [EE, MARKET], "the oldest aged out: one more attempt");
+        assert_eq!(pass.capped, 0);
+        let ledger = load(&bench.ledger).unwrap();
+        assert_eq!(ledger.attempts.len(), 3, "the aged record is pruned");
+        assert_eq!(
+            ledger.capped_until("o/r", 7, HEAD, Key::Ee, hours(24)),
+            Some(hours(25)),
+            "capped again until the next oldest ages out"
+        );
+    }
+
+    #[test]
+    fn cap_does_not_change_selection() {
+        let bench = Bench::new();
+        let mut seeded: Vec<_> = (0..3).map(|i| rec(7, HEAD, Key::Ee, mins(i))).collect();
+        seeded.extend((0..3).map(|i| rec(7, HEAD, Key::Market, mins(i))));
+        bench.seed(seeded);
+        let prs = Heads::one();
+        let (selections, unreadable) =
+            crate::role_runner::ratification_lane::find_candidates_counted(&cfg(), None, &prs);
+        let pass = bench.pass(&prs, &mut Scripted::new(Ends::Review, Ends::Review), mins(10));
+        // Selection still names the PR with both keys missing; the pass
+        // holds it rather than refusing or dropping it.
+        assert_eq!((selections.len(), unreadable), (1, 0));
+        assert!(matches!(
+            &selections[0],
+            crate::role_runner::ratification_lane::Selection::Candidate { missing, .. }
+                if missing.len() == 2
+        ));
+        assert_eq!((pass.refused, pass.unreadable, pass.held, pass.capped), (0, 0, 1, 2));
+        let o = TickOutcome::from_pass(&pass);
+        assert_eq!((o.selected, o.skipped), (1, 0));
+    }
+
+    #[test]
+    fn prelaunch_failure_posts_no_record_and_defers_the_key() {
+        let bench = Bench::new();
+        let prs = Heads(RefCell::new(vec![(7, HEAD.into()), (8, "d".repeat(40))]));
+        let mut r = Scripted::new(Ends::PreLaunch, Ends::Review);
+
+        let pass = bench.pass(&prs, &mut r, mins(0));
+        // PR #7's EE refusal backs the EE key off for the repo, so PR #8's
+        // EE session is not even launched in the same pass.
+        assert_eq!(r.take(), [EE, MARKET, MARKET]);
+        assert_eq!((pass.deferred, pass.capped, pass.held), (1, 0, 0));
+        assert!(bench.records().is_empty(), "a launch refusal is never counted");
+
+        let pass = bench.pass(&prs, &mut r, mins(1));
+        assert_eq!(r.take(), [MARKET, MARKET], "EE still backed off");
+        assert_eq!(pass.deferred, 2);
+
+        bench.pass(&prs, &mut r, mins(16));
+        assert_eq!(r.ran(EE), 1, "after the backoff the key is tried again");
+        assert!(bench.records().is_empty());
+    }
+
+    /// An instruction source whose market pin read fails (the `reader
+    /// budget low` shed), counting reads by pin path.
+    #[derive(Default)]
+    struct ShedMarket {
+        fetches: RefCell<Vec<String>>,
+    }
+
+    impl InstructionSource for ShedMarket {
+        fn fetch(
+            &self,
+            pin: &crate::role_runner::ratification_lane::Pin,
+        ) -> Result<String, String> {
+            self.fetches.borrow_mut().push(pin.path.clone());
+            if pin.path == "market.md" {
+                Err("deferred: reader budget low".into())
+            } else {
+                Ok("INSTR".into())
+            }
+        }
+        fn repo_is_private(&self, _repo: &str) -> Option<bool> {
+            Some(false)
+        }
+    }
+
+    #[test]
+    fn a_pin_read_failure_defers_that_pin_without_counting() {
+        let bench = Bench::new();
+        let mut r = Scripted::new(Ends::Review, Ends::Review);
+        let shed = ShedMarket::default();
+        let prs = Heads(RefCell::new(vec![(7, HEAD.into()), (8, "d".repeat(40))]));
+        let run = |r: &mut Scripted, now: DateTime<Utc>| {
+            bench.run(&prs, &shed, &bench.sink, r, &move || now)
+        };
+        let market_reads = || {
+            shed.fetches
+                .borrow()
+                .iter()
+                .filter(|p| *p == "market.md")
+                .count()
+        };
+
+        // Pass 1: one market read fails; PR #8's market key is deferred
+        // without a second read.
+        let pass = run(&mut r, mins(0));
+        assert_eq!(market_reads(), 1);
+        assert_eq!(pass.deferred, 1);
+        assert_eq!(r.take(), [EE, EE], "market never launched; EE unaffected");
+        // A minute later: no market read at all, both deferred, EE runs.
+        let pass = run(&mut r, mins(1));
+        assert_eq!(market_reads(), 1);
+        assert_eq!(pass.deferred, 2, "the market pin is backed off");
+        assert_eq!(r.take(), [EE, EE]);
+        // After the backoff the pin is read again.
+        run(&mut r, mins(16));
+        assert_eq!(market_reads(), 2);
+        assert!(bench.records().is_empty(), "a pin failure is never counted");
+    }
+
+    #[test]
+    fn roll_interrupted_attempt_is_not_counted() {
+        let bench = Bench::new();
+        let prs = Heads::one();
+        let mut r = Scripted::new(Ends::Rolled, Ends::Review);
+        for i in 0..4 {
+            let pass = bench.pass(&prs, &mut r, mins(i));
+            assert_eq!((pass.capped, pass.deferred), (0, 0), "pass {i}");
+            assert_buckets(
+                &TickOutcome::from_pass(&pass),
+                &[("ee", "invocation_failed"), ("market", "posted")],
+            );
+        }
+        assert_eq!(r.ran(EE), 4, "a roll stop is neither counted nor backed off");
+        assert!(bench.records().is_empty());
+    }
+
+    /// A runner whose every session takes `minutes` on `clock`.
+    struct Slow<'a> {
+        inner: Scripted,
+        clock: &'a std::cell::Cell<DateTime<Utc>>,
+        minutes: i64,
+    }
+
+    impl RoleInvocationRunner for Slow<'_> {
+        fn invoke(&mut self, role: &str, prompt: &str) -> RoleTickOutcome {
+            self.clock
+                .set(self.clock.get() + TimeDelta::minutes(self.minutes));
+            self.inner.invoke(role, prompt)
+        }
+        fn last_output(&self) -> Option<String> {
+            self.inner.last_output()
+        }
+        fn unlaunched_failure(&self) -> Option<RoleFailure> {
+            self.inner.unlaunched_failure()
+        }
+    }
+
+    #[test]
+    fn records_and_backoffs_are_stamped_when_the_sessions_end() {
+        // Review finding: a pass runs its sessions one after another, each up
+        // to the role timeout, so a backoff stamped with the pass's start
+        // time can be over before it is set, and a record's window ends
+        // early by the length of the pass.
+        let bench = Bench::new();
+        let clock = std::cell::Cell::new(t0());
+        let prs = Heads::one();
+        // EE writes a review whose post fails (a PR backoff); market writes
+        // no verdict (a counted attempt). Each session takes 30 minutes.
+        let mut r = Slow {
+            inner: Scripted::new(Ends::Review, Ends::NoVerdict),
+            clock: &clock,
+            minutes: 30,
+        };
+        bench.run(&prs, &bench.instr, &FailingSink, &mut r, &|| clock.get());
+        assert_eq!(r.inner.take(), [EE, MARKET]);
+        let records = bench.records();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].at, mins(60), "stamped when its session ended");
+        // One minute after the pass ended, the EE backoff (15 minutes from
+        // the failed post) still holds; market is below the cap and runs.
+        clock.set(mins(61));
+        let pass = bench.run(&prs, &bench.instr, &FailingSink, &mut r, &|| clock.get());
+        assert_eq!(r.inner.take(), [MARKET], "EE is still backed off");
+        assert_eq!(pass.deferred, 1);
+    }
+
+    #[test]
+    fn a_timeout_on_a_saturated_host_is_not_counted_and_backs_off_the_key() {
+        // The role timeout under host load is the host's, not the PR's: no
+        // counted attempt, and the key backs off for the repo.
+        let bench = Bench::new();
+        let prs = Heads::one();
+        let mut r = Scripted::new(Ends::LoadSkipped, Ends::Review);
+        let pass = bench.pass(&prs, &mut r, mins(0));
+        assert_eq!(r.take(), [EE, MARKET]);
+        assert_buckets(
+            &TickOutcome::from_pass(&pass),
+            &[("ee", "invocation_failed"), ("market", "posted")],
+        );
+        let pass = bench.pass(&prs, &mut r, mins(1));
+        assert_eq!(r.take(), [MARKET], "EE backed off");
+        assert_eq!(pass.deferred, 1);
+        bench.pass(&prs, &mut r, mins(16));
+        assert_eq!(r.take(), [EE, MARKET], "tried again after the backoff");
+        assert!(bench.records().is_empty(), "never counted");
+    }
+
+    struct FailingSink;
+
+    impl CommentSink for FailingSink {
+        fn post(&self, _pr: u64, _body: &str) -> Result<(), String> {
+            Err("HTTP 502".into())
+        }
+    }
+
+    #[test]
+    fn post_failed_backs_off_without_counting() {
+        let bench = Bench::new();
+        let prs = Heads(RefCell::new(vec![(7, HEAD.into()), (8, "d".repeat(40))]));
+        let mut r = Scripted::new(Ends::Review, Ends::Review);
+        let pass = |r: &mut Scripted, now: DateTime<Utc>| {
+            bench.run(&prs, &bench.instr, &FailingSink, r, &move || now)
+        };
+        let first = pass(&mut r, mins(0));
+        assert_eq!(r.take().len(), 4, "a post failure backs off only its own PR");
+        assert_eq!(first.deferred, 0);
+        let second = pass(&mut r, mins(1));
+        assert!(r.take().is_empty());
+        assert_eq!((second.deferred, second.held), (4, 2));
+        assert_eq!(TickOutcome::from_pass(&second).reason, "held");
+        pass(&mut r, mins(16));
+        assert_eq!(r.take().len(), 4);
+        assert!(bench.records().is_empty(), "a post failure is never counted");
+    }
+
+    #[test]
+    fn failed_ledger_save_still_caps_in_this_process() {
+        let dir = tempfile::tempdir().unwrap();
+        // The ledger's parent is a regular file: every read and save fails.
+        let blocker = dir.path().join("not-a-dir");
+        std::fs::write(&blocker, "x").unwrap();
+        let ledger = blocker.join("attempts.json");
+        let memory = std::sync::Mutex::new(LaneMemory::default());
+        let (prs, sink, instr) = (Heads::one(), Sink::default(), CountingInstr::default());
+        let mut r = Scripted::new(Ends::NoVerdict, Ends::Review);
+        for i in 0..=MAX_COUNTED_ATTEMPTS_PER_WINDOW {
+            let now = mins(i as i64);
+            let state = LaneState {
+                memory: &memory,
+                ledger: Some(&ledger),
+                clock: &move || now,
+            };
+            run_lane_stats_with(&cfg(), None, "o/r", &prs, &instr, &sink, &mut r, &state);
+        }
+        assert_eq!(r.ran(EE), MAX_COUNTED_ATTEMPTS_PER_WINDOW, "the fourth EE run is capped");
+        assert_eq!(r.ran(MARKET), MAX_COUNTED_ATTEMPTS_PER_WINDOW + 1);
+    }
+
+    #[test]
+    fn counted_attempts_are_saved_before_the_next_candidate_runs() {
+        // Review finding: a pass can run for hours (two sessions per
+        // candidate, each up to the role timeout). Saving only at its end
+        // loses every counted attempt when the daemon exits mid-pass (a
+        // roll restart, say), so the cap may never build on such a host.
+        struct Reads<'a> {
+            inner: Scripted,
+            ledger: &'a std::path::Path,
+            seen: Vec<usize>,
+        }
+        impl RoleInvocationRunner for Reads<'_> {
+            fn invoke(&mut self, role: &str, prompt: &str) -> RoleTickOutcome {
+                self.seen.push(load(self.ledger).unwrap().attempts.len());
+                self.inner.invoke(role, prompt)
+            }
+            fn last_output(&self) -> Option<String> {
+                self.inner.last_output()
+            }
+        }
+        let bench = Bench::new();
+        let prs = Heads(RefCell::new(vec![(7, HEAD.into()), (8, "d".repeat(40))]));
+        let mut r = Reads {
+            inner: Scripted::new(Ends::NoVerdict, Ends::NoVerdict),
+            ledger: &bench.ledger,
+            seen: Vec::new(),
+        };
+        bench.pass(&prs, &mut r, mins(0));
+        assert_eq!(r.seen, [0, 0, 2, 2], "PR #7's attempts are on disk before PR #8 runs");
+        assert_eq!(bench.records().len(), 4);
+    }
+
+    #[test]
+    fn a_corrupt_ledger_fails_open_and_is_rewritten() {
+        let bench = Bench::new();
+        std::fs::create_dir_all(bench.ledger.parent().unwrap()).unwrap();
+        std::fs::write(&bench.ledger, "{\"rules\": 1, \"attempts\": [oops").unwrap();
+        let mut r = Scripted::new(Ends::NoVerdict, Ends::NoVerdict);
+        let pass = bench.pass(&Heads::one(), &mut r, mins(0));
+        assert_eq!(r.take(), [EE, MARKET], "an unreadable ledger never blocks dispatch");
+        assert_eq!(pass.capped, 0);
+        assert_eq!(bench.records().len(), 2, "the file is valid again");
+    }
+
+    /// The open PRs `heads` lists, where `files`' file list reads empty (how
+    /// `GhPrSource` reports a failed `pulls/<n>/files` read: no files, so
+    /// no ratification PR) and `comments`' comment list is unreadable.
+    struct Shed {
+        heads: Heads,
+        files: Option<u64>,
+        comments: Option<u64>,
+    }
+
+    impl PrSource for Shed {
+        fn open_prs(&self) -> Vec<OpenPr> {
+            self.heads.open_prs()
+        }
+        fn files(
+            &self,
+            pr: u64,
+            hold: &crate::champion_hold::ratification::Config,
+        ) -> Vec<ChangedFile> {
+            if self.files == Some(pr) {
+                Vec::new()
+            } else {
+                self.heads.files(pr, hold)
+            }
+        }
+        fn trusted_comments(&self, pr: u64) -> Result<Vec<Comment>, String> {
+            if self.comments == Some(pr) {
+                Err("HTTP 502".into())
+            } else {
+                self.heads.trusted_comments(pr)
+            }
+        }
+    }
+
+    #[test]
+    fn prune_follows_the_open_pr_listing_not_the_candidates() {
+        let bench = Bench::new();
+        let capped: Vec<_> = (0..3).map(|i| rec(7, HEAD, Key::Ee, mins(i))).collect();
+        let mut seeded = capped.clone();
+        seeded.push(rec(99, HEAD, Key::Ee, mins(0)));
+        bench.seed(seeded);
+        let mut r = Scripted::new(Ends::Review, Ends::Review);
+        let open = || Heads(RefCell::new(vec![(7, HEAD.into()), (9, "e".repeat(40))]));
+        // An empty listing may be a failed read: nothing is forgotten.
+        bench.pass(&Heads(RefCell::new(Vec::new())), &mut r, mins(10));
+        assert_eq!(bench.records().len(), 4);
+        // Review finding: PR #7's file list fails to read, so it is no
+        // candidate, while PR #9 is one. PR #7 is still open at the same
+        // head, so its cap must stay; PR #99, no longer listed, goes.
+        let shed_files = Shed {
+            heads: open(),
+            files: Some(7),
+            comments: None,
+        };
+        let pass = bench.pass(&shed_files, &mut r, mins(11));
+        assert_eq!(pass.results.len(), 1, "only PR #9 is dispatched");
+        assert_eq!(bench.records(), capped, "PR #7's cap survives the failed read");
+        // An unreadable comment list keeps it too.
+        let shed_comments = Shed {
+            heads: open(),
+            files: None,
+            comments: Some(7),
+        };
+        let pass = bench.pass(&shed_comments, &mut r, mins(12));
+        assert_eq!(pass.unreadable, 1);
+        assert_eq!(bench.records(), capped);
+        // Read again, PR #7's EE key is still capped.
+        let pass = bench.pass(&open(), &mut r, mins(13));
+        assert_eq!(pass.capped, 1);
+        // Listed at a new head, the old head's records are forgotten.
+        bench.pass(&Heads(RefCell::new(vec![(7, "c".repeat(40))])), &mut r, mins(14));
+        assert!(bench.records().is_empty(), "{:?}", bench.records());
+    }
+
+    #[test]
+    fn pinned_instructions_are_fetched_once_per_memory() {
+        let bench = Bench::new();
+        let prs = Heads(RefCell::new(vec![(7, HEAD.into()), (8, "d".repeat(40))]));
+        let mut r = Scripted::new(Ends::NoVerdict, Ends::NoVerdict);
+        bench.pass(&prs, &mut r, mins(0));
+        bench.pass(&prs, &mut r, mins(1));
+        assert_eq!(r.take().len(), 8, "2 PRs x 2 keys x 2 passes");
+        assert_eq!(*bench.instr.fetches.borrow(), ["ee.md", "market.md"]);
+        assert_eq!(*bench.instr.visibility.borrow(), 2, "visibility: once per pass");
+    }
+
+    #[test]
+    fn tick_span_carries_capped_and_deferred() {
+        let pass = LanePass {
+            held: 2,
+            capped: 3,
+            deferred: 1,
+            ..LanePass::default()
+        };
+        let o = TickOutcome::from_pass(&pass);
+        assert_eq!((o.reason, o.selected), ("held", 2));
+        let span = tick_span(std::path::Path::new("/r"), "step_dispatch", &o, Utc::now()).bounded();
+        assert_eq!(span.attributes["loom.ratification.capped"], "3");
+        assert_eq!(span.attributes["loom.ratification.deferred"], "1");
+        assert_eq!(span.attributes["loom.ratification.reason"], "held");
+        // An unreadable PR still outranks a hold.
+        let o = TickOutcome::from_pass(&LanePass {
+            unreadable: 1,
+            ..pass
+        });
+        assert_eq!(o.reason, "degraded");
     }
 }

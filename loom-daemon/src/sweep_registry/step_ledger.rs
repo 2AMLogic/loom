@@ -260,10 +260,11 @@ impl SweepRegistry {
             return;
         }
         let path = self.step_ledger_path();
-        let tmp = path.with_extension("json.tmp");
-        let written = std::fs::create_dir_all(self.config.logs_dir())
-            .and_then(|()| std::fs::write(&tmp, &json))
-            .and_then(|()| std::fs::rename(&tmp, &path));
+        let written = crate::fs_util::write_atomic(
+            &path,
+            json.as_bytes(),
+            crate::fs_util::AtomicOpts::default(),
+        );
         match written {
             Ok(()) => self.step_ledger_persisted = json,
             Err(e) => log::debug!("step_ledger: could not persist {}: {e}", path.display()),

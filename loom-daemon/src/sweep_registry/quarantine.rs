@@ -1172,6 +1172,7 @@ impl SweepRegistry {
 )]
 mod tests {
     use super::*;
+    use crate::env_test_support::EnvGuard;
     use crate::sweep_registry::test_support::*;
     use serial_test::serial;
     use std::os::unix::fs::PermissionsExt;
@@ -2527,7 +2528,7 @@ exit 0
         // process-wide for the daemon, #4458) and the assertion below fails
         // even though the no-op production behavior it exercises is
         // unaffected.
-        let _env_guard = ClearedGhConfigDirEnv::new();
+        let _env_guard = EnvGuard::clear(&["GH_CONFIG_DIR"]);
         crate::credential_preflight::clear_owner_root_registry();
         let dir = tempdir().unwrap();
         let gh_log = dir.path().join("gh.log");
@@ -2567,7 +2568,7 @@ mod empty_pool_tests;
 mod dispatch_scope_tests;
 
 /// The quarantine-*release* retry policy (#4110 + the #8953 breaker check and
-/// attempt ceiling) — a sibling file per the file-size ratchet, same reason
-/// `provider_health_feedback.rs` was split out of this module.
+/// attempt ceiling) — a sibling file, like `provider_health_feedback.rs`
+/// split out of this module.
 #[path = "quarantine_release.rs"]
 mod quarantine_release;

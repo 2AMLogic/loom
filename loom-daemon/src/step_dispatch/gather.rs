@@ -25,7 +25,16 @@
 //!   the step path's copy of the #12003 role-runner gate (`pr_planning`'s
 //!   `has_judge_work`), with its rule (started under 6 h ago) and its per-head
 //!   60 s cache. At most [`MAX_CI_READS`] uncached heads are read per repo per
-//!   tick; the reads are conditional.
+//!   tick; the reads are conditional;
+//! - **the Judge no-verdict backstop** (#15097): a Judge step whose PR's
+//!   passes at its head and label set already ended without a verdict often
+//!   enough becomes a [`PassReason::BackstopHeld`] pass
+//!   ([`hold_judge_backstop`]), the step path's copy of `pr_planning`'s
+//!   `backstop_holds` rule — one rule, [`crate::judge_backstop`]'s
+//!   `hold_from_comments` — from the PR's trusted comments, cached per
+//!   `updated_at`, at most [`MAX_MARKER_READS`] reads per tick. The read
+//!   fails open: a held PR without its records is drawn, and the pre-claim
+//!   still stands it down.
 //!
 //! A read that fails or runs out of budget leaves its fact at the value that
 //! passes the item (a held PR without its marker reads as `blocked`): never a
@@ -223,6 +232,7 @@ pub fn pull_from_row(row: &RestIssue, markers: PullMarkers) -> PullInput {
         base_ref: None,
         same_repo: false,
         author_untrusted: false,
+        linkage_unverified: true,
         queued: false,
         draft: row.draft,
         markers,
@@ -399,6 +409,54 @@ pub fn hold_ci_pending(
         });
         if pending {
             item.verdict = Verdict::Pass(PassReason::CiPending);
+            held += 1;
+        }
+    }
+    held
+}
+
+/// Turn every Judge step whose PR the no-verdict backstop holds (#11855,
+/// #15097) into a [`PassReason::BackstopHeld`] pass, and return how many it
+/// held — the step draw's copy of `pr_planning`'s `backstop_holds` rule, so
+/// a held PR stops spending the tick's draw slots and a pre-claim subprocess
+/// only to be refused `EXIT_BACKSTOP`. One rule, not a second: the hold is
+/// [`crate::judge_backstop::hold_from_comments`] over the PR's trusted
+/// comments. `heads` maps a PR to its head SHA and `labels` to its label
+/// set; `known` asks the cache for a PR's trusted comments (free), `read`
+/// asks the forge and is called at most `max_reads` times. Fails open: a PR
+/// with no head or labels, past the budget, or whose comments cannot be
+/// read is drawn — the pre-claim's own backstop still stands it down. Pure.
+pub fn hold_judge_backstop(
+    items: &mut [Item],
+    heads: &HashMap<u32, String>,
+    labels: &HashMap<u32, Vec<String>>,
+    max_reads: usize,
+    now: DateTime<Utc>,
+    mut known: impl FnMut(u32) -> Option<Vec<serde_json::Value>>,
+    mut read: impl FnMut(u32) -> Option<Vec<serde_json::Value>>,
+) -> usize {
+    let mut reads = 0usize;
+    let mut held = 0usize;
+    for item in items.iter_mut() {
+        if item.step() != Some(Step::Judge) {
+            continue;
+        }
+        let Some(pr) = item.target() else { continue };
+        let (Some(head), Some(labels)) = (heads.get(&pr), labels.get(&pr)) else {
+            continue;
+        };
+        let comments: Option<Vec<serde_json::Value>> = match known(pr) {
+            Some(cached) => Some(cached),
+            None if reads < max_reads => {
+                reads += 1;
+                read(pr)
+            }
+            None => None,
+        };
+        let Some(comments) = comments else { continue };
+        let names: Vec<&str> = labels.iter().map(String::as_str).collect();
+        if crate::judge_backstop::hold_from_comments(&comments, head, &names, now).is_some() {
+            item.verdict = Verdict::Pass(PassReason::BackstopHeld);
             held += 1;
         }
     }
@@ -648,6 +706,50 @@ fn gate_stamps(
     out
 }
 
+type BackstopCache = HashMap<(String, u32), (Option<String>, Vec<serde_json::Value>)>;
+
+fn backstop_cache() -> &'static Mutex<BackstopCache> {
+    static CACHE: OnceLock<Mutex<BackstopCache>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// The trusted comments of PR `pr` of `slug` cached for its row's
+/// `updated_at` ([`pull_markers`]' cache rule), for the backstop check
+/// (#15097); `None` when not cached. The lock is held for the lookup only.
+fn backstop_comments_cached(
+    slug: &str,
+    pr: u32,
+    updated_at: &Option<String>,
+) -> Option<Vec<serde_json::Value>> {
+    backstop_cache()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(&(slug.to_string(), pr))
+        .filter(|(at, _)| at == updated_at)
+        .map(|(_, comments)| comments.clone())
+}
+
+/// The trusted comments of PR `pr` of `slug`, read from the forge and cached
+/// for its row's `updated_at` (#15097); `None` when they cannot be read (the
+/// step is drawn). The lock is held for the insert only, never across the
+/// comment read.
+fn backstop_comments_read(
+    slug: &str,
+    root: &Path,
+    pr: u32,
+    updated_at: &Option<String>,
+) -> Option<Vec<serde_json::Value>> {
+    // #12310: the backstop comment reads are discovery.
+    let _discovery = crate::gh_invocation::purpose::discovery();
+    let comments =
+        crate::comment_trust::records::fetch_trusted_comments(slug, &pr.to_string(), root, true)?;
+    backstop_cache()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert((slug.to_string(), pr), (updated_at.clone(), comments.clone()));
+    Some(comments)
+}
+
 /// One workspace's items, read from the forge (module docs). `Ok(None)` when
 /// the workspace has no forge target (a hermetic fixture). `main_red` gets
 /// the repo's red-main-fix issues (trusted or promoted) and answers whether
@@ -737,7 +839,11 @@ pub fn list(
         .map(|r| {
             let m = markers.get(&r.number).cloned().unwrap_or_default();
             match full.get(&r.number) {
-                Some(p) => PullInput::from_rest(p, &slug, &policy, false, m),
+                Some(p) => {
+                    let mut pull = PullInput::from_rest(p, &slug, &policy, false, m);
+                    pull.linkage_unverified |= !pulls_complete || stale_listing;
+                    pull
+                }
                 None => pull_from_row(r, m),
             }
         })
@@ -833,10 +939,53 @@ pub fn list(
             crate::pr_planning::ci_pending_at_sha(&root_dir, &gh_bin, sha)
         },
     );
-    snapshot.note_live_reads(landed_reads, marker_reads, ci_fallbacks.get());
     if held > 0 {
         log::debug!("work_finder: {slug}: {held} Judge step(s) held while CI runs at the head");
     }
+    // #15097: the no-verdict backstop at the draw itself — the step path's
+    // copy of `pr_planning::listing`'s rule, so a held PR's Judge step stops
+    // spending a draw and a pre-claim only to be refused `EXIT_BACKSTOP`.
+    let judge_prs: Vec<u32> = items
+        .iter()
+        .filter(|i| i.step() == Some(Step::Judge))
+        .filter_map(Item::target)
+        .collect();
+    let backstop_reads = std::cell::Cell::new(0u64);
+    if !judge_prs.is_empty() && crate::judge_backstop::enabled() {
+        let rows_of: HashMap<u32, &RestIssue> = rows
+            .iter()
+            .filter(|r| judge_prs.contains(&r.number))
+            .map(|r| (r.number, r))
+            .collect();
+        let labels: HashMap<u32, Vec<String>> = rows_of
+            .values()
+            .map(|r| (r.number, r.labels.clone()))
+            .collect();
+        let backstop = hold_judge_backstop(
+            &mut items,
+            &heads,
+            &labels,
+            MAX_MARKER_READS,
+            Utc::now(),
+            |pr| {
+                rows_of
+                    .get(&pr)
+                    .and_then(|r| backstop_comments_cached(&slug, pr, &r.updated_at))
+            },
+            |pr| {
+                backstop_reads.set(backstop_reads.get() + 1);
+                rows_of
+                    .get(&pr)
+                    .and_then(|r| backstop_comments_read(&slug, root, pr, &r.updated_at))
+            },
+        );
+        if backstop > 0 {
+            log::debug!(
+                "work_finder: {slug}: {backstop} Judge step(s) held by the no-verdict backstop"
+            );
+        }
+    }
+    snapshot.note_live_reads(landed_reads, marker_reads + backstop_reads.get(), ci_fallbacks.get());
     let released: HashSet<u32> = rows
         .iter()
         .filter(|r| r.is_pull_request && has(&r.labels, "loom:auto-merge-ok"))

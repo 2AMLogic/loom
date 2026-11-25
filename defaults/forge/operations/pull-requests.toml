@@ -96,6 +96,10 @@ path = "loom-daemon/src/forge_pull_listing.rs"
 kind = "rust"
 path = "loom-daemon/src/claim_reconciliation/orphan_stack.rs"
 
+[[operation.callers]]
+kind = "rust"
+path = "loom-daemon/src/claim_reconciliation/merged_stack.rs"
+
 [[operation]]
 id = "pr.edit-base"
 group = "pr-creation-discovery-state"
@@ -135,6 +139,9 @@ path = "loom-daemon/src/merge_pr/retarget_children.rs"
 [[operation.callers]]
 kind = "rust"
 path = "loom-daemon/src/claim_reconciliation/orphan_stack.rs"
+[[operation.callers]]
+kind = "rust"
+path = "loom-daemon/src/claim_reconciliation/merged_stack.rs"
 
 [[operation]]
 id = "pr.list-open"
@@ -594,3 +601,6 @@ path = "loom-daemon/src/cli/merge_pr_refs.rs"
 [[operation.callers]]
 kind = "role-prompt"
 path = "defaults/.claude/commands/loom/curator.md"
+[[operation.callers]]
+kind = "rust"
+path = "loom-daemon/src/claim_reconciliation/pass_loop/merge_observation.rs"

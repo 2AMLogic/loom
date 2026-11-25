@@ -99,11 +99,12 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::time::Duration;
 
-/// Env var overriding the docker CLI binary the cancellation path invokes
-/// (`LOOM_DOCKER_BIN`). Mirrors [`SPAWN_BIN_ENV`](crate::sweep_registry::SPAWN_BIN_ENV)'s
-/// role for the spawn path: production resolves `docker` from `PATH`; tests
-/// inject a fake that records its argv.
-pub(crate) const DOCKER_BIN_ENV: &str = "LOOM_DOCKER_BIN";
+/// Env var overriding the docker CLI binary every docker-launching path
+/// invokes (`LOOM_DOCKER_BIN`) — the reaper's historical override, now the
+/// shared [`crate::docker_bin`] lookup's explicit-override leg (#14885).
+/// Production resolves `docker` from `$PATH` plus the fallback directories;
+/// tests inject a fake that records its argv.
+pub(crate) use crate::docker_bin::DOCKER_BIN_ENV;
 
 /// Docker label naming the issue a containerized sweep was dispatched for.
 pub(crate) const SWEEP_ISSUE_LABEL: &str = "loom.sweep.issue";
@@ -148,9 +149,11 @@ pub(crate) struct IssueContainer {
 #[cfg(test)]
 pub(crate) const TEST_DOCKER_DISABLED: &str = "/nonexistent/loom-test-docker-disabled-11449";
 
-/// Resolve the docker CLI binary: [`DOCKER_BIN_ENV`] override, else `docker`
-/// from `PATH` — except in a `cfg(test)` build, where the fallback is
-/// [`TEST_DOCKER_DISABLED`] so no unit test can reach the real CLI (#11449).
+/// Resolve the docker CLI binary: [`DOCKER_BIN_ENV`] override, else the
+/// shared [`crate::docker_bin`] lookup (`$PATH`, then the absolute fallback
+/// directories, #14885) — except in a `cfg(test)` build, where the fallback
+/// is [`TEST_DOCKER_DISABLED`] so no unit test can reach the real CLI
+/// (#11449).
 pub(crate) fn docker_program() -> PathBuf {
     std::env::var(DOCKER_BIN_ENV)
         .ok()
@@ -161,7 +164,10 @@ pub(crate) fn docker_program() -> PathBuf {
 
 #[cfg(not(test))]
 fn default_docker_program() -> PathBuf {
-    PathBuf::from("docker")
+    // No override is set, so resolution can only succeed or find nothing;
+    // on nothing, keep the bare name so the spawn fails exactly as it
+    // always did and the teardown's fail-safe logs and skips (#14885).
+    crate::docker_bin::resolve().unwrap_or_else(|_| PathBuf::from("docker"))
 }
 
 #[cfg(test)]

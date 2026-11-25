@@ -157,7 +157,14 @@ impl<'de> Deserialize<'de> for Node {
 /// duplicate step ids per job. Each returned line is job/id/key specific but
 /// file-agnostic — the caller prefixes the path.
 fn lint_document(content: &str) -> Vec<String> {
-    let root: Node = match serde_yaml_ng::from_str(content) {
+    // `PassThrough` forwards repeated explicit mapping keys to the visitor
+    // above unchanged (merge keys stay expanded and suppressed), so the
+    // duplicate detection and its error text remain this file's own.
+    let options = serde_saphyr::options! {
+        with_snippet: false,
+        duplicate_keys: serde_saphyr::DuplicateKeyPolicy::PassThrough,
+    };
+    let root: Node = match serde_saphyr::from_str_with_options(content, options) {
         Ok(root) => root,
         Err(err) => return vec![format!("parse error: {err}")],
     };

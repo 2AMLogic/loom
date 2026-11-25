@@ -17,16 +17,27 @@ use std::process::Command;
 /// `git rebase --update-refs` also holds every other branch of the stack it
 /// will rewrite (`rebase-merge/update-refs`, #10851).
 pub(crate) fn branch_holders(repo_root: &Path) -> HashMap<String, PathBuf> {
+    branch_holders_checked(repo_root).unwrap_or_default()
+}
+
+/// [`branch_holders`], but `None` when holder state cannot be established
+/// (git failed, or a worktree admin directory is unreadable). Deletion sites
+/// that bypass git's own "used by worktree" refusal (`update-ref -d`) must
+/// keep the branch on `None` rather than treat it as "no holders".
+///
+/// Rebase / bisect state is read from the common git directory's
+/// `worktrees/<id>/` admin dirs (plus the main git dir), not by running git
+/// inside each checkout, so a locked or offline linked worktree still holds
+/// its branch (it is the same state git's own refusal consults).
+pub(crate) fn branch_holders_checked(repo_root: &Path) -> Option<HashMap<String, PathBuf>> {
     let mut holders = HashMap::new();
-    let Ok(out) = Command::new("git")
+    let out = Command::new("git")
         .args(["worktree", "list", "--porcelain"])
         .current_dir(repo_root)
         .output()
-    else {
-        return holders;
-    };
+        .ok()?;
     if !out.status.success() {
-        return holders;
+        return None;
     }
     let stdout = String::from_utf8_lossy(&out.stdout);
     let mut current: Option<PathBuf> = None;
@@ -43,7 +54,60 @@ pub(crate) fn branch_holders(repo_root: &Path) -> HashMap<String, PathBuf> {
             }
         }
     }
-    holders
+    let common = common_git_dir(repo_root)?;
+    for (dir, owner) in admin_dirs(&common)? {
+        let owner = owner.unwrap_or_else(|| dir.clone());
+        for b in in_progress_branches_in(&dir) {
+            holders.entry(b).or_insert_with(|| owner.clone());
+        }
+    }
+    Some(holders)
+}
+
+/// Absolute common git directory of the repository at `repo_root`.
+fn common_git_dir(repo_root: &Path) -> Option<PathBuf> {
+    let out = Command::new("git")
+        .args(["rev-parse", "--git-common-dir"])
+        .current_dir(repo_root)
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let raw = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if raw.is_empty() {
+        return None;
+    }
+    Some(if Path::new(&raw).is_absolute() {
+        PathBuf::from(raw)
+    } else {
+        repo_root.join(raw)
+    })
+}
+
+/// Every git-state directory of the repository: the common dir itself and each
+/// `<common>/worktrees/<id>/`, paired with the checkout path recorded in its
+/// `gitdir` file when readable. `None` when the `worktrees` dir exists but
+/// cannot be listed.
+fn admin_dirs(common: &Path) -> Option<Vec<(PathBuf, Option<PathBuf>)>> {
+    let mut dirs = vec![(common.to_path_buf(), None)];
+    match std::fs::read_dir(common.join("worktrees")) {
+        Ok(rd) => {
+            for entry in rd {
+                let dir = entry.ok()?.path();
+                if !dir.is_dir() {
+                    continue;
+                }
+                let owner = std::fs::read_to_string(dir.join("gitdir"))
+                    .ok()
+                    .and_then(|c| Path::new(c.trim()).parent().map(Path::to_path_buf));
+                dirs.push((dir, owner));
+            }
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(_) => return None,
+    }
+    Some(dirs)
 }
 
 /// Branches a worktree is holding while "detached": the branch being rebased
@@ -68,6 +132,11 @@ fn in_progress_branches(worktree: &Path) -> Vec<String> {
     } else {
         worktree.join(raw)
     };
+    in_progress_branches_in(&git_dir)
+}
+
+/// [`in_progress_branches`] for an already-resolved git state directory.
+fn in_progress_branches_in(git_dir: &Path) -> Vec<String> {
     let mut names = Vec::new();
     for rel in ["rebase-merge/head-name", "rebase-apply/head-name"] {
         if let Ok(c) = std::fs::read_to_string(git_dir.join(rel)) {

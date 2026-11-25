@@ -67,6 +67,15 @@ pub const NO_PR_GRACE_PERIOD_SECS: i64 = 30 * 24 * 60 * 60;
 /// of forge probes a single clean pass can issue.
 pub const SWEEP_TRANSIENT_MIN_AGE_SECS: u64 = 48 * 60 * 60;
 
+/// How old a worktree registration's `initializing` lock must be before
+/// [`cleanup_worktree`] / [`cleanup_pr_worktree`] may treat it as crash
+/// debris and unlock it for removal (issue #14878). `git worktree add`
+/// holds that lock only for the duration of the checkout, so one aged past
+/// this grace cannot belong to a live add — the creating process is gone
+/// (SIGKILL, OOM, reboot) and the residue would otherwise accumulate
+/// forever, since `git worktree remove --force` refuses locked worktrees.
+pub const STALE_INITIALIZING_LOCK_SECS: u64 = 24 * 60 * 60;
+
 /// Prompt on stdout/stdin for a `[y/N]` confirmation. EOF (no TTY attached,
 /// e.g. under cron) is treated as "no" — matches
 /// `clean.py`'s `except (EOFError, KeyboardInterrupt): response = ""` fallback.
@@ -434,9 +443,9 @@ pub fn check_pr_status_for_branch(repo_root: &Path, branch: &str) -> PrStatus {
 /// (`gh api repos/{owner}/{repo} --jq .owner.login`, `GH_REPO` stripped so
 /// gh names the checkout's own repo — W6).
 ///
-/// Used to build the `head=<owner>:<branch>` filter [`check_pr_merged_rest`]
-/// needs. Returns `None` on any failure so callers can fall back to the
-/// GraphQL-backed [`check_pr_merged`].
+/// Used to build the `head=<owner>:<branch>` filter
+/// [`check_pr_status_for_branch_rest`] needs. Returns `None` on any failure
+/// so callers can fall back to the GraphQL-backed [`check_pr_merged`].
 #[must_use]
 pub fn repo_owner_rest(repo_root: &Path) -> Option<String> {
     let out = gh::bounded_via(
@@ -461,25 +470,15 @@ pub fn repo_owner_rest(repo_root: &Path) -> Option<String> {
     }
 }
 
-/// REST variant of [`check_pr_merged`] (issue #4876).
-///
-/// `gh pr list` goes through GraphQL, whose quota is routinely exhausted on a
-/// host running several agents concurrently; the REST quota is separate and
-/// much less contended. The daemon-side reaper probes unattended on a cadence,
-/// so it must not compete with interactive agents for the scarcer pool.
-///
-/// Queries `repos/{owner}/{repo}/pulls?state=all&head=<owner>:<branch>`. Falls
-/// back to nothing on its own — the caller decides whether an `Unknown` should
-/// be retried through [`check_pr_merged`].
-#[must_use]
-pub fn check_pr_merged_rest(repo_root: &Path, owner: &str, issue_num: u32) -> PrStatus {
-    check_pr_status_for_branch_rest(repo_root, owner, &naming::branch_name(issue_num))
-}
-
-/// REST variant of [`check_pr_status_for_branch`] — an arbitrary-branch
-/// counterpart to [`check_pr_merged_rest`] for callers that do not have (or
-/// cannot assume) a `feature/issue-<n>` branch name, e.g. a primary checkout
-/// parked on a hand-created branch (#5268).
+/// REST variant of [`check_pr_status_for_branch`] for callers that do not
+/// have (or cannot assume) a `feature/issue-<n>` branch name, e.g. a primary
+/// checkout parked on a hand-created branch (#5268). `gh pr list` goes
+/// through GraphQL, whose quota is routinely exhausted on a host running
+/// several agents concurrently; the REST quota is separate and much less
+/// contended (issue #4876). The daemon-side reaper probes unattended on a
+/// cadence, so it must not compete with interactive agents for the scarcer
+/// pool. Falls back to nothing on its own — the caller decides whether an
+/// `Unknown` should be retried through [`check_pr_status_for_branch`].
 ///
 /// Queries `repos/{owner}/{repo}/pulls?state=all&head=<owner>:<branch>`. Not
 /// capped to a single row (issue #6746): the REST list endpoint defaults to
@@ -518,16 +517,17 @@ pub fn classify_pr_row(state: &str, merged_at: Option<&str>, closed_at: Option<&
 }
 
 /// REST PR-status lookup keyed **directly on a PR number**, for `pr-<N>`
-/// worktrees (issue #5939) — the counterpart of [`check_pr_merged_rest`] for
-/// worktrees that were never created from an issue number to begin with, so
-/// there is no `feature/issue-<N>` branch name to search by. Unlike
+/// worktrees (issue #5939) that were never created from an issue number to
+/// begin with, so there is no `feature/issue-<N>` branch name to search by.
+/// Unlike
 /// [`check_pr_status_for_branch_rest`], this needs no `owner` parameter: the
 /// single-PR endpoint resolves `{owner}/{repo}` from the invoking repo just
 /// like [`super::gh::issue_state_rest`] does, with no `head=<owner>:<branch>`
 /// filter to construct.
 ///
 /// Queries `repos/{owner}/{repo}/pulls/<n>` (a single object, not the search
-/// list [`check_pr_merged_rest`] and friends page through). A 404 (PR number
+/// list [`check_pr_status_for_branch_rest`] and friends page through). A 404
+/// (PR number
 /// does not exist against this repo) or any other failure resolves to
 /// [`PrStatus::Unknown`] — a probe failure is always a skip, never a removal.
 #[must_use]
@@ -747,14 +747,6 @@ pub enum WorktreeDecision {
     /// Non-`--safe` mode: the issue is closed and the caller decides
     /// (interactive prompt, or `--force`).
     ConfirmClosedIssue,
-}
-
-impl WorktreeDecision {
-    /// True only for [`WorktreeDecision::Remove`].
-    #[must_use]
-    pub fn is_remove(&self) -> bool {
-        matches!(self, Self::Remove)
-    }
 }
 
 /// Injected probes for [`classify_worktree`], so the safety decision is
@@ -1404,6 +1396,180 @@ pub fn should_force_remove_orphan_dir(cause: &str, is_managed: bool, under_root:
     is_untracked_worktree_error(cause) && is_managed && under_root
 }
 
+/// Whether a `git worktree remove` failure means "this working tree is
+/// locked" — the refusal git gives for ANY locked worktree, single
+/// `--force` included (overriding a lock takes `--force --force`, which
+/// this module never passes). The stale-`initializing` recovery
+/// (issue #14878) keys off this signature; every other failure keeps
+/// today's behavior.
+#[must_use]
+pub fn is_locked_worktree_error(cause: &str) -> bool {
+    cause
+        .to_ascii_lowercase()
+        .contains("cannot remove a locked working tree")
+}
+
+/// Whether a worktree lock qualifies for the stale-`initializing` recovery
+/// (issue #14878). The reason must be exactly git's own transient
+/// `initializing` marker — anything else (empty, an operator's free-text
+/// hold, git accepting `initializing` as a user-supplied reason) is treated
+/// as a deliberate lock, since the reason alone cannot prove how the lock
+/// was created. The lock must also be strictly older than
+/// [`STALE_INITIALIZING_LOCK_SECS`]: `age` is `None` when the lock's mtime
+/// is in the future (clock skew), which is "not stale" — preserve it.
+#[must_use]
+pub fn is_stale_initializing_lock(reason: &str, age: Option<Duration>) -> bool {
+    reason.trim() == "initializing"
+        && age.is_some_and(|a| a.as_secs() > STALE_INITIALIZING_LOCK_SECS)
+}
+
+/// Resolve the per-worktree git directory (`<repo>/.git/worktrees/<id>`)
+/// git registered for `worktree_path`, by reading the worktree's own `.git`
+/// pointer file — never by deriving `<id>` from the directory basename,
+/// which git does not guarantee (issue #14878). `None` when the pointer is
+/// missing, a directory (the primary checkout), or unreadable (an add
+/// interrupted before the pointer was written): callers must treat that as
+/// unverifiable and preserve the lock.
+#[must_use]
+fn registered_worktree_git_dir(worktree_path: &Path) -> Option<PathBuf> {
+    let dot_git = worktree_path.join(".git");
+    if !dot_git.is_file() {
+        return None;
+    }
+    let pointer = std::fs::read_to_string(&dot_git).ok()?;
+    let git_dir = pointer.trim().strip_prefix("gitdir:")?.trim();
+    if git_dir.is_empty() {
+        return None;
+    }
+    let git_dir = Path::new(git_dir);
+    Some(if git_dir.is_absolute() {
+        git_dir.to_path_buf()
+    } else {
+        worktree_path.join(git_dir)
+    })
+}
+
+/// The unlock half of [`remove_worktree_force`] (issue #14878): re-read the
+/// registered lock file's reason and mtime immediately before acting, and
+/// unlock only when [`is_stale_initializing_lock`] proves the lock is
+/// git-crash debris rather than an operator hold.
+///
+/// `Ok(true)` — a verified stale lock was unlocked; the caller retries the
+/// removal. `Ok(false)` — not eligible (different reason, too fresh,
+/// future-dated, or metadata that cannot be resolved): the worktree and its
+/// lock stay exactly as they are. `Err` — the lock qualified but
+/// `git worktree unlock` itself failed.
+fn unlock_stale_initializing_lock(repo_root: &Path, worktree_path: &Path) -> Result<bool, String> {
+    let Some(git_dir) = registered_worktree_git_dir(worktree_path) else {
+        return Ok(false);
+    };
+    let lock_file = git_dir.join("locked");
+    let Ok(reason) = std::fs::read_to_string(&lock_file) else {
+        return Ok(false);
+    };
+    let age = std::fs::metadata(&lock_file)
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|mtime| SystemTime::now().duration_since(mtime).ok());
+    if !is_stale_initializing_lock(&reason, age) {
+        return Ok(false);
+    }
+    let mut unlock = Command::new("git");
+    unlock
+        .args(["worktree", "unlock"])
+        .arg(worktree_path)
+        .current_dir(repo_root);
+    run_checked(unlock).map_err(|unlock_cause| {
+        format!("git worktree unlock failed for a stale 'initializing' lock: {unlock_cause}")
+    })?;
+    Ok(true)
+}
+
+/// One checked `git worktree remove --force` attempt, shared by
+/// [`cleanup_worktree`] and [`cleanup_pr_worktree`] (issue #14878).
+///
+/// A plain success returns `Ok(())`. When git refuses because the worktree
+/// is locked, the refusal is offered to [`unlock_stale_initializing_lock`]:
+/// a lock proven to be stale `initializing` crash debris is unlocked and the
+/// ordinary single-force removal retried exactly once — a failed unlock or
+/// retry surfaces its own error. Any other lock (a deliberate operator hold,
+/// a fresh add, unverifiable metadata) propagates the original refusal
+/// untouched, so branch cleanup, removal accounting, and the existing orphan
+/// handling in the callers behave exactly as before.
+fn remove_worktree_force(repo_root: &Path, worktree_path: &Path) -> Result<(), String> {
+    let mut remove = Command::new("git");
+    remove
+        .args(["worktree", "remove"])
+        .arg(worktree_path)
+        .arg("--force")
+        .current_dir(repo_root);
+    if let Err(cause) = run_checked(remove) {
+        if !is_locked_worktree_error(&cause) {
+            return Err(cause);
+        }
+        if !unlock_stale_initializing_lock(repo_root, worktree_path)? {
+            return Err(cause);
+        }
+        let mut retry = Command::new("git");
+        retry
+            .args(["worktree", "remove"])
+            .arg(worktree_path)
+            .arg("--force")
+            .current_dir(repo_root);
+        run_checked(retry).map_err(|retry_cause| {
+            format!(
+                "git worktree remove failed after unlocking a stale 'initializing' lock \
+                 ({cause}); retry failed: {retry_cause}"
+            )
+        })?;
+        println!(
+            "  Recovered a stale 'initializing' lock (crash debris older than {}h) by \
+             unlocking before removal: {}",
+            STALE_INITIALIZING_LOCK_SECS / 3600,
+            worktree_path.display()
+        );
+    }
+    Ok(())
+}
+
+/// #5177 fallback for a failed `git worktree remove`: the directory still
+/// exists on disk but git no longer tracks it. Removes it directly — but
+/// ONLY when [`should_force_remove_orphan_dir`] proves this is a
+/// Loom-managed worktree path (git error + `.loom-managed` sentinel +
+/// containment under the managed root), never a blanket rm — then prunes
+/// the stale registration best-effort. Returns `Err(cause)` (the original
+/// git failure) on an ineligible path, or the combined diagnostic when the
+/// direct removal itself fails. Shared by [`cleanup_worktree`] and
+/// [`cleanup_pr_worktree`].
+fn remove_untracked_worktree_dir(
+    repo_root: &Path,
+    worktree_path: &Path,
+    cause: &str,
+) -> Result<(), String> {
+    if !should_force_remove_orphan_dir(
+        cause,
+        is_loom_managed(worktree_path),
+        is_under_worktree_root(repo_root, worktree_path),
+    ) {
+        return Err(cause.to_string());
+    }
+    std::fs::remove_dir_all(worktree_path).map_err(|e| {
+        format!(
+            "git worktree remove failed ({cause}); direct removal of the untracked \
+             worktree directory also failed: {e}"
+        )
+    })?;
+    println!(
+        "  Removed untracked worktree directory (no git worktree entry): {}",
+        worktree_path.display()
+    );
+    let _ = Command::new("git")
+        .args(["worktree", "prune"])
+        .current_dir(repo_root)
+        .status();
+    Ok(())
+}
+
 /// What [`cleanup_worktree`] actually did on success.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CleanupOutcome {
@@ -1418,10 +1584,10 @@ pub enum CleanupOutcome {
     AlreadyGone,
 }
 
-/// Remove a worktree and delete its feature branch.
+/// Remove an issue worktree and clean up its feature branch.
 ///
 /// Exposed (issue #4876) so the daemon-side reaper performs the *same*
-/// removal the CLI does, including the `git branch -d` → `-D` fallback.
+/// removal the CLI does, with the same safe branch-retention policy.
 ///
 /// `Err` carries the underlying cause (git's stderr) so the caller can name it
 /// in a diagnostic (issue #4877).
@@ -1433,7 +1599,7 @@ pub fn cleanup_worktree(
     repo_root: &Path,
     worktree_path: &Path,
     issue_num: u32,
-    dry_run: bool,
+    opts: &CleanOptions,
     mechanism: &str,
 ) -> Result<CleanupOutcome, String> {
     let branch_name = naming::branch_name(issue_num);
@@ -1443,9 +1609,13 @@ pub fn cleanup_worktree(
     // default in-worktree path unless a redirect is actually possible, so an
     // ordinary host pays no cargo invocation per removal.
     let resolved_target_dir = super::cargo_target::resolve_for_worktree(worktree_path);
-    if dry_run {
+    if opts.dry_run {
         println!("Would remove: {}", worktree_path.display());
-        println!("Would delete branch: {branch_name}");
+        if opts.safe {
+            let _ = clean_safe_issue_branch(repo_root, &branch_name, true);
+        } else {
+            println!("Would delete branch: {branch_name}");
+        }
         if let Some(line) =
             super::cargo_target::reclaim(repo_root, worktree_path, &resolved_target_dir, true)
                 .report_line()
@@ -1454,13 +1624,7 @@ pub fn cleanup_worktree(
         }
         return Ok(CleanupOutcome::Removed);
     }
-    let mut remove = Command::new("git");
-    remove
-        .args(["worktree", "remove"])
-        .arg(worktree_path)
-        .arg("--force")
-        .current_dir(repo_root);
-    let outcome = if let Err(cause) = run_checked(remove) {
+    let outcome = if let Err(cause) = remove_worktree_force(repo_root, worktree_path) {
         // #5895: git has no record of this path as a worktree at all. Two
         // physical states are possible: the directory still exists on disk
         // (the #5177 untracked-orphan shape, handled below) or it has
@@ -1479,35 +1643,12 @@ pub fn cleanup_worktree(
                 .current_dir(repo_root)
                 .status();
             CleanupOutcome::AlreadyGone
-        } else if should_force_remove_orphan_dir(
-            // #5177: an orphaned `.loom/worktrees/*` directory git no longer
-            // tracks fails `git worktree remove` with "is not a working
-            // tree" and could never be cleaned by the normal path. Fall back
-            // to a direct removal — but ONLY when we can prove this is a
-            // Loom-managed worktree path (the specific git error + the
-            // `.loom-managed` sentinel + containment under the managed
-            // worktree root), never a blanket rm on any failure.
-            &cause,
-            is_loom_managed(worktree_path),
-            is_under_worktree_root(repo_root, worktree_path),
-        ) {
-            std::fs::remove_dir_all(worktree_path).map_err(|e| {
-                format!(
-                    "git worktree remove failed ({cause}); direct removal of the untracked \
-                     worktree directory also failed: {e}"
-                )
-            })?;
-            println!(
-                "  Removed untracked worktree directory (no git worktree entry): {}",
-                worktree_path.display()
-            );
-            let _ = Command::new("git")
-                .args(["worktree", "prune"])
-                .current_dir(repo_root)
-                .status();
-            CleanupOutcome::Removed
         } else {
-            return Err(cause);
+            // #5177: an orphaned `.loom/worktrees/*` directory git no longer
+            // tracks falls back to the shared direct removal; any other git
+            // failure comes back out of it unchanged.
+            remove_untracked_worktree_dir(repo_root, worktree_path, &cause)?;
+            CleanupOutcome::Removed
         }
     } else {
         println!("  Removed worktree: {}", worktree_path.display());
@@ -1524,17 +1665,22 @@ pub fn cleanup_worktree(
         "classify_worktree=Remove",
     );
 
-    let deleted = skip_if_held(repo_root, &branch_name)
-        || Command::new("git")
+    if opts.safe {
+        if let Err(cause) = clean_safe_issue_branch(repo_root, &branch_name, false) {
+            eprintln!("  Could not delete {branch_name}: {cause}");
+        }
+    } else if !skip_if_held(repo_root, &branch_name) {
+        let deleted = Command::new("git")
             .args(["branch", "-d", &branch_name])
             .current_dir(repo_root)
             .status()
             .is_ok_and(|s| s.success());
-    if !deleted {
-        let _ = Command::new("git")
-            .args(["branch", "-D", &branch_name])
-            .current_dir(repo_root)
-            .status();
+        if !deleted {
+            let _ = Command::new("git")
+                .args(["branch", "-D", &branch_name])
+                .current_dir(repo_root)
+                .status();
+        }
     }
 
     // #7239: now that the worktree is actually off disk (so it cannot count as
@@ -1838,36 +1984,9 @@ pub fn cleanup_pr_worktree(
         }
         return Ok(());
     }
-    let mut remove = Command::new("git");
-    remove
-        .args(["worktree", "remove"])
-        .arg(worktree_path)
-        .arg("--force")
-        .current_dir(repo_root);
-    if let Err(cause) = run_checked(remove) {
+    if let Err(cause) = remove_worktree_force(repo_root, worktree_path) {
         // #5177: same orphaned-directory fallback as `cleanup_worktree`.
-        if should_force_remove_orphan_dir(
-            &cause,
-            is_loom_managed(worktree_path),
-            is_under_worktree_root(repo_root, worktree_path),
-        ) {
-            std::fs::remove_dir_all(worktree_path).map_err(|e| {
-                format!(
-                    "git worktree remove failed ({cause}); direct removal of the untracked \
-                     worktree directory also failed: {e}"
-                )
-            })?;
-            println!(
-                "  Removed untracked worktree directory (no git worktree entry): {}",
-                worktree_path.display()
-            );
-            let _ = Command::new("git")
-                .args(["worktree", "prune"])
-                .current_dir(repo_root)
-                .status();
-        } else {
-            return Err(cause);
-        }
+        remove_untracked_worktree_dir(repo_root, worktree_path, &cause)?;
     } else {
         println!("  Removed worktree: {}", worktree_path.display());
     }
@@ -2072,8 +2191,7 @@ pub fn clean_worktrees(repo_root: &Path, stats: &mut CleanupStats, opts: &CleanO
                 );
             }
             WorktreeDecision::Remove => {
-                let result =
-                    cleanup_worktree(repo_root, &worktree_path, issue_num, opts.dry_run, "clean");
+                let result = cleanup_worktree(repo_root, &worktree_path, issue_num, opts, "clean");
                 record_cleanup_result(stats, &worktree_path, result);
             }
             WorktreeDecision::RemoveWithBackup => {
@@ -2107,7 +2225,7 @@ pub fn clean_worktrees(repo_root: &Path, stats: &mut CleanupStats, opts: &CleanO
                                 repo_root,
                                 &worktree_path,
                                 issue_num,
-                                opts.dry_run,
+                                opts,
                                 "clean",
                             );
                             record_cleanup_result(stats, &worktree_path, result);
@@ -2129,22 +2247,12 @@ pub fn clean_worktrees(repo_root: &Path, stats: &mut CleanupStats, opts: &CleanO
                     stats.cleaned_worktrees += 1;
                 } else if opts.force {
                     println!("  Auto-removing: {}", entry.path().display());
-                    let result = cleanup_worktree(
-                        repo_root,
-                        &worktree_path,
-                        issue_num,
-                        opts.dry_run,
-                        "clean",
-                    );
+                    let result =
+                        cleanup_worktree(repo_root, &worktree_path, issue_num, opts, "clean");
                     record_cleanup_result(stats, &worktree_path, result);
                 } else if confirm("  Force remove this worktree? [y/N] ") {
-                    let result = cleanup_worktree(
-                        repo_root,
-                        &worktree_path,
-                        issue_num,
-                        opts.dry_run,
-                        "clean",
-                    );
+                    let result =
+                        cleanup_worktree(repo_root, &worktree_path, issue_num, opts, "clean");
                     record_cleanup_result(stats, &worktree_path, result);
                 } else {
                     println!("  Skipping: {}", entry.path().display());
@@ -2380,9 +2488,80 @@ pub fn branch_reachable_from_remotes(repo_root: &Path, branch: &str) -> bool {
         .is_ok_and(|n| n == 0)
 }
 
+/// Clean an issue branch only when a remote contains its current tip or a
+/// same-repository merged PR identifies that exact tip (including squash merges).
+/// The expected old object ID keeps a concurrent commit on the branch intact.
+fn clean_safe_issue_branch(repo_root: &Path, branch: &str, dry_run: bool) -> Result<bool, String> {
+    let Some(tip) = local_branch_tip(repo_root, branch) else {
+        println!("  Cannot resolve local tip - keeping {branch}");
+        return Ok(false);
+    };
+    let reason = if branch_reachable_from_remotes(repo_root, &tip) {
+        "tip reachable from a remote"
+    } else if crate::forge_repo_facts::origin_identity(repo_root).is_some_and(|(host, slug)| {
+        matches!(
+            super::clean_owner::pr_at_head(repo_root, &host, &slug, branch, &tip),
+            super::clean_owner::PrAtHead::Merged(_)
+        )
+    }) {
+        "tip matches merged PR head"
+    } else {
+        println!("  No remote or merged PR covers tip {tip} - keeping {branch}");
+        return Ok(false);
+    };
+    if dry_run {
+        println!("  Would delete branch: {branch} ({tip}, {reason})");
+    } else {
+        let Some(holders) = super::branch_holders::branch_holders_checked(repo_root) else {
+            println!("  Cannot establish worktree holders - keeping {branch}");
+            return Ok(false);
+        };
+        if super::branch_holders::skip_if_held_in(&holders, branch) {
+            return Ok(false);
+        }
+        let mut delete = Command::new("git");
+        delete.current_dir(repo_root).args([
+            "update-ref",
+            "--no-deref",
+            "-d",
+            &format!("refs/heads/{branch}"),
+            &tip,
+        ]);
+        run_checked(delete)?;
+        // update-ref deletes the ref and reflog. Remove the tracking settings
+        // that git branch -D normally removes as well.
+        let _ = Command::new("git")
+            .current_dir(repo_root)
+            .args([
+                "config",
+                "--local",
+                "--remove-section",
+                &format!("branch.{branch}"),
+            ])
+            .output();
+        println!("  Deleted branch: {branch} ({tip}, {reason})");
+    }
+    Ok(true)
+}
+
+/// Record the branch-only pass independently of worktree removal accounting.
+fn count_safe_issue_branch(
+    repo_root: &Path,
+    branch: &str,
+    stats: &mut CleanupStats,
+    dry_run: bool,
+) {
+    match clean_safe_issue_branch(repo_root, branch, dry_run) {
+        Ok(true) => stats.cleaned_branches += 1,
+        Ok(false) => stats.kept_branches += 1,
+        Err(cause) => stats.record_error(branch, "git update-ref -d", &cause),
+    }
+}
+
 /// Whether `branch`'s PR is merged (including squash-merged, whose original
 /// commits are never reachable from a remote ref). REST first (the daemon's
-/// separate, less-contended pool — see [`check_pr_merged_rest`]'s docs),
+/// separate, less-contended pool — see
+/// [`check_pr_status_for_branch_rest`]'s docs),
 /// falling back to the GraphQL-backed [`check_pr_status_for_branch`] only
 /// when REST cannot answer. Mirrors
 /// [`super::landed`]'s `forge_probe_rest_first` for an arbitrary branch name
@@ -2440,6 +2619,11 @@ fn handle_stale_branch(
             stats.kept_branches += 1;
             return;
         }
+    }
+
+    if naming::issue_from_branch(branch).is_some() {
+        count_safe_issue_branch(repo_root, branch, stats, opts.dry_run);
+        return;
     }
 
     let reachable = branch_reachable_from_remotes(repo_root, branch);
@@ -2525,6 +2709,9 @@ pub fn clean_branches(repo_root: &Path, stats: &mut CleanupStats, opts: &CleanOp
         // `CLOSED` deletes the branch: confirmed by a fresh read (W6 PR2).
         let status = super::hygiene_pass::branch_issue_state(repo_root, issue_num, opts.dry_run);
         match status.as_str() {
+            "CLOSED" if opts.safe => {
+                count_safe_issue_branch(repo_root, branch, stats, opts.dry_run)
+            }
             "CLOSED" => {
                 let hint = sha_hint(repo_root, branch);
                 println!("  Issue #{issue_num} CLOSED - deleting {branch}{hint}");
@@ -3308,7 +3495,9 @@ pub(super) fn dir_size_human(path: &Path) -> String {
 /// `loom-daemon clean --deep` has always removed from `repo_root` itself.
 ///
 /// Deliberately narrower than [`super::orphan_recovery::BUILD_ARTIFACT_PATTERNS`]
-/// (which [`reclaim_worktree_artifacts`] walks inside a throwaway worktree): the
+/// (which the worktree reaper's kept-worktree reclaim
+/// [`crate::worktree_reaper::reclaim_kept_worktree_artifacts`] walks inside a
+/// kept worktree): the
 /// primary checkout is a human's working clone, so the automatic pass added in
 /// #5919 must never remove more than the `clean --deep --safe` an operator would
 /// run by hand. Keeping one list means the manual and scheduled paths can never
@@ -3381,9 +3570,9 @@ fn keep_build_artifacts(repo_root: &Path) -> bool {
         .unwrap_or(false)
 }
 
-/// Remove [`PRIMARY_CHECKOUT_ARTIFACTS`] from `repo_root` **itself** (not from a
-/// worktree — that is [`reclaim_worktree_artifacts`]), reporting each entry's
-/// outcome instead of printing it.
+/// Remove [`PRIMARY_CHECKOUT_ARTIFACTS`] from `repo_root` **itself** (not from
+/// a worktree — that is [`crate::worktree_reaper::reclaim_kept_worktree_artifacts`]),
+/// reporting each entry's outcome instead of printing it.
 ///
 /// This is the shared engine behind both deep-clean paths: the interactive
 /// [`clean_build_artifacts`] (which renders these outcomes to stdout) and the
@@ -3486,57 +3675,14 @@ pub fn clean_build_artifacts(repo_root: &Path, dry_run: bool) {
     }
 }
 
-/// One build-artifact directory [`reclaim_worktree_artifacts`] removed (or
-/// would remove, under `dry_run`).
+/// One build-artifact directory [`sweep_primary_checkout_artifacts`] removed
+/// (or would remove, under `dry_run`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReclaimedArtifact {
-    /// Top-level directory name relative to the worktree root, e.g. `"target"`.
+    /// Top-level directory name relative to the repo root, e.g. `"target"`.
     pub name: String,
     /// Human-readable size, matching [`clean_build_artifacts`]'s report format.
     pub size_human: String,
-}
-
-/// Reclaim regenerable build-artifact directories (`target/`, `node_modules`,
-/// `.venv`, `coverage/`, ...) from **inside one worktree** without removing
-/// the worktree itself — the AC3 follow-up carved out of #5177 into #5187.
-///
-/// Unlike [`clean_build_artifacts`] (which only ever reclaims from
-/// `repo_root` itself, wired to `--deep`), this walks
-/// [`super::orphan_recovery::BUILD_ARTIFACT_PATTERNS`] against
-/// `worktree_path`'s **top-level** entries, trims a trailing `/`, and removes
-/// only entries that are directories — a same-named file (`Cargo.lock`,
-/// `pnpm-lock.yaml`, `.loom-checkpoint`, `.loom-in-use`) is never touched, so
-/// reusing the dirty-detection pattern list here is safe even though most of
-/// its entries are files rather than reclaimable directories.
-///
-/// Pure I/O, no eligibility gate of its own — callers (the worktree reaper's
-/// artifact-reclaim pass) decide *whether* a worktree is eligible via
-/// [`classify_worktree`] / [`WorktreeDecision`] before calling this.
-#[must_use]
-pub fn reclaim_worktree_artifacts(worktree_path: &Path, dry_run: bool) -> Vec<ReclaimedArtifact> {
-    let mut reclaimed = Vec::new();
-    for pattern in super::orphan_recovery::BUILD_ARTIFACT_PATTERNS {
-        let name = pattern.trim_end_matches('/');
-        let dir = worktree_path.join(name);
-        if !dir.is_dir() {
-            continue;
-        }
-        let size_human = dir_size_human(&dir);
-        if dry_run {
-            reclaimed.push(ReclaimedArtifact {
-                name: name.to_string(),
-                size_human,
-            });
-            continue;
-        }
-        if std::fs::remove_dir_all(&dir).is_ok() {
-            reclaimed.push(ReclaimedArtifact {
-                name: name.to_string(),
-                size_human,
-            });
-        }
-    }
-    reclaimed
 }
 
 fn spawn_loop_locks_dir(repo_root: &Path) -> std::path::PathBuf {

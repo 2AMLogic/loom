@@ -9,13 +9,18 @@ use super::*;
 /// module's `ClearedLoomRuntimeEnv` points `LOOM_CODEX_PROFILE_ROOT` at an empty
 /// tempdir, and the pins below are cleared so a developer shell's `CODEX_HOME`
 /// cannot short-circuit the path CI takes. Restored on drop, panic included.
+/// The whole scope also holds the crate-wide `LOOM_CODEX_HOME` lock (#15174),
+/// acquired before the profile-root lock inside `ClearedLoomRuntimeEnv` (see
+/// `codex_home_env`'s documented lock order).
 struct IsolatedCodexEnv(
     Vec<(&'static str, Option<std::ffi::OsString>)>,
     #[allow(dead_code)] ClearedLoomRuntimeEnv,
+    #[allow(dead_code)] crate::tokens_pool::codex_home_env::CodexHomeLock,
 );
 
 impl IsolatedCodexEnv {
     fn new() -> Self {
+        let codex_home_lock = crate::tokens_pool::codex_home_env::lock();
         let profile_root = ClearedLoomRuntimeEnv::new();
         let pins = [
             "CODEX_HOME",
@@ -32,7 +37,7 @@ impl IsolatedCodexEnv {
                 (*key, prior)
             })
             .collect();
-        Self(prior, profile_root)
+        Self(prior, profile_root, codex_home_lock)
     }
 }
 

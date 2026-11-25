@@ -182,16 +182,14 @@ pub fn read_handle(path: &Path) -> Option<CapturedHandle> {
     serde_json::from_str(&std::fs::read_to_string(path).ok()?).ok()
 }
 
-/// The first `session id: <uuid>` in a Codex stderr capture.
+/// The first `session id: <uuid>` in a Codex stderr capture: a line that IS
+/// the banner ([`crate::usage_source::codex_session_banner`]'s line-anchored
+/// rule, shared by every Codex banner reader) carrying a uuid-shaped id
+/// ([`valid_session_id`]).
 #[must_use]
 pub fn parse_codex_session_id(text: &str) -> Option<String> {
     text.lines().find_map(|line| {
-        let rest = line.split("session id:").nth(1)?.trim();
-        let id: String = rest
-            .chars()
-            .take_while(|c| c.is_ascii_hexdigit() || *c == '-')
-            .collect();
-        valid_session_id(&id).then_some(id)
+        crate::usage_source::codex_session_banner(line).filter(|id| valid_session_id(id))
     })
 }
 
