@@ -350,8 +350,16 @@ pub fn profile_rejects_effort(
     if !resolved.providers.contains_key(runtime) {
         return None;
     }
-    (!resolved.allowed_efforts.is_empty() && !resolved.allowed_efforts.iter().any(|a| a == effort))
-        .then_some(name)
+    effort_outside_allowed(effort, &resolved.allowed_efforts).then_some(name)
+}
+
+/// The predicate [`select`] refuses a launch on (`reasoning effort is
+/// unsupported by the selected model profile`): a non-empty `allowedEfforts`
+/// that does not list `effort`. One definition shared by `select`,
+/// [`profile_rejects_effort`] and [`check_model_profile_overrides_config`]
+/// (#15268), so `validate` and the launch refusal cannot drift.
+fn effort_outside_allowed(effort: &str, allowed: &[String]) -> bool {
+    !allowed.is_empty() && !allowed.iter().any(|a| a == effort)
 }
 
 /// Issue #14962: the model profile a native launch of `runtime` would
@@ -542,6 +550,39 @@ pub fn check_model_profile_overrides_config(config: &Value) -> Vec<String> {
                     "{at}.{other}: unknown override key (allowed: model, effort, allowedEfforts, \
                      excludedRolesAdd)"
                 )),
+            }
+        }
+        // #15268: each field is valid alone, but the effective pair (override,
+        // else the bundled sibling) must satisfy the predicate `select` refuses
+        // a launch on. A non-bundled name is left to the finding above.
+        if let Some(base) = bundled.get(name) {
+            let effort = match fields.get("effort") {
+                None | Some(Value::Null) => base.effort.as_deref(),
+                Some(value) => value.as_str().filter(|s| !s.trim().is_empty()),
+            };
+            let allowed: Option<Vec<String>> = match fields.get("allowedEfforts") {
+                None | Some(Value::Null) => Some(base.allowed_efforts.clone()),
+                Some(value) => value.as_array().and_then(|items| {
+                    items
+                        .iter()
+                        .map(|i| {
+                            i.as_str()
+                                .filter(|s| !s.trim().is_empty())
+                                .map(str::to_string)
+                        })
+                        .collect()
+                }),
+            };
+            // A malformed field was already reported above; don't double-report.
+            if let (Some(effort), Some(allowed)) = (effort, allowed) {
+                if effort_outside_allowed(effort, &allowed) {
+                    findings.push(format!(
+                        "{at}: effective effort `{effort}` is not in the effective allowedEfforts \
+                         [{}]; every launch of `{name}` would be refused (exit 78) — set effort \
+                         and allowedEfforts consistently",
+                        allowed.join(", ")
+                    ));
+                }
             }
         }
     }
@@ -821,7 +862,7 @@ pub fn select(runtime: &str, options: &Options, config: &Value) -> Result<Select
         selection.effort = Some(effort);
     }
     if let Some(e) = &selection.effort {
-        if !profile.allowed_efforts.is_empty() && !profile.allowed_efforts.contains(e) {
+        if effort_outside_allowed(e, &profile.allowed_efforts) {
             return Err(LaunchError::config(
                 "reasoning effort is unsupported by the selected model profile",
             ));
@@ -1476,6 +1517,73 @@ mod tests {
                 assert_eq!(got.model, "glm-5.3", "{value}");
                 assert_eq!(got.excluded_roles, ["judge", "curator"], "{value}");
             }
+        });
+    }
+
+    /// #15268: the effective (override, else bundled) `effort` must be in the
+    /// effective `allowedEfforts`, the predicate `select` refuses a launch on.
+    #[test]
+    fn an_override_leaving_effort_outside_allowed_efforts_is_rejected_by_validate_and_launch() {
+        with_no_profile_env(|| {
+            // Bundled `zai-full`: effort "max", allowedEfforts [low, high, max].
+            let bad = [
+                (serde_json::json!({"effort": "medium"}), "`medium`", "[low, high, max]"),
+                (serde_json::json!({"allowedEfforts": ["low", "high"]}), "`max`", "[low, high]"),
+                (
+                    serde_json::json!({"effort": "high", "allowedEfforts": ["low", "max"]}),
+                    "`high`",
+                    "[low, max]",
+                ),
+            ];
+            for (fields, effort, allowed) in bad {
+                let config = overrides(serde_json::json!({"zai-full": fields.clone()}));
+                let findings = check_model_profile_overrides_config(&config);
+                assert_eq!(findings.len(), 1, "{fields}: {findings:?}");
+                for part in ["zai-full", effort, allowed] {
+                    assert!(findings[0].contains(part), "{fields}: {findings:?}");
+                }
+                // The same config makes `select` refuse an unqualified launch
+                // (via `lookup`, which re-runs the check, for any profile).
+                assert!(lookup(Some("zai-full"), &config).is_err(), "{fields}");
+            }
+        });
+    }
+
+    #[test]
+    fn consistent_noop_and_empty_allowed_efforts_overrides_report_no_effort_finding() {
+        with_no_profile_env(|| {
+            for value in [
+                // Both fields set, consistently.
+                serde_json::json!({"zai-full": {"effort": "medium",
+                    "allowedEfforts": ["low", "medium"]}}),
+                // Only a field that stays consistent with the bundled sibling.
+                serde_json::json!({"zai-full": {"allowedEfforts": ["max"]}}),
+                serde_json::json!({"zai-full": {"effort": "low"}}),
+                // Neither, or only `model`.
+                serde_json::json!({"zai-full": {}}),
+                serde_json::json!({"zai-full": {"model": "glm-5.4"}}),
+                // An empty effective allowedEfforts never rejects an effort.
+                serde_json::json!({"zai-full": {"allowedEfforts": []}}),
+                serde_json::json!({"zai-full": {"effort": "medium", "allowedEfforts": []}}),
+                // `null` falls back to the bundled value.
+                serde_json::json!({"zai-full": {"effort": null, "allowedEfforts": null}}),
+            ] {
+                let config = overrides(value.clone());
+                assert!(check_model_profile_overrides_config(&config).is_empty(), "{value}");
+                assert!(lookup(Some("zai-full"), &config).is_ok(), "{value}");
+            }
+        });
+    }
+
+    #[test]
+    fn a_non_bundled_override_gets_no_extra_effort_finding() {
+        with_no_profile_env(|| {
+            let config = overrides(serde_json::json!({
+                "not-bundled": {"effort": "medium", "allowedEfforts": ["low"]}
+            }));
+            let findings = check_model_profile_overrides_config(&config);
+            assert_eq!(findings.len(), 1, "{findings:?}");
+            assert!(findings[0].contains("not a bundled model profile"), "{findings:?}");
         });
     }
 
