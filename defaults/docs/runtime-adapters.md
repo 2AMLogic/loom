@@ -1622,7 +1622,8 @@ so the launch record shows the real runtime and model profile. A `claude`
 resolution prints `outcome=delegate-to-claude` and exits 0 without launching.
 Exit codes: 0 artifact, 1 no artifact, 2 usage (Judge/Curator refused),
 75 no eligible runtime/seat, 78 config, 124 timeout. The `/loom:sweep`
-orchestrator calls it before Builder/Doctor Task dispatch; see
+orchestrator calls it before Builder/Doctor Task dispatch only when it is a daemon-dispatched child
+(`LOOM_SWEEP_CLAIM_OWNED` / `--claim-owned`); an attended in-session sweep skips it (#15299); see
 `native-sweep.md` and `sweep-execution-model.md`.
 
 Because a phase can outlast the Bash tool cap (120s default / 600s max), the
