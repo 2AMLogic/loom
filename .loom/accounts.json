@@ -112,6 +112,30 @@
       "credential_reference": "agent-12",
       "enabled": true,
       "email": null
+    },
+    {
+      "provider": "codex",
+      "name": "agent-14",
+      "credential_kind": "codex_home",
+      "credential_reference": "agent-14",
+      "enabled": true,
+      "email": null
+    },
+    {
+      "provider": "codex",
+      "name": "agent-15",
+      "credential_kind": "codex_home",
+      "credential_reference": "agent-15",
+      "enabled": true,
+      "email": null
+    },
+    {
+      "provider": "codex",
+      "name": "agent-16",
+      "credential_kind": "codex_home",
+      "credential_reference": "agent-16",
+      "enabled": true,
+      "email": null
     }
   ]
 }
