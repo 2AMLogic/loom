@@ -675,8 +675,10 @@ fn runtime_run_spans_carry_identity_and_only_reported_launch_facts() {
         cmd.env("LOOM_RUNTIME", runtime)
             .env("LOOM_ROLE", "builder")
             .env("LOOM_SWEEP_ID", "legacy-sweep")
-            // The account the launch would run on is an env fact; a span must
-            // carry the pool KIND, never this name.
+            // The account the launch would run on is an env fact. A span
+            // carries the pool KIND, never this name -- with one sanctioned
+            // exception (#15291): a Codex launch stamps it as the value of
+            // `loom.codex.account` and nowhere else.
             .env("LOOM_ACCOUNT_NAME", "SECRET-ACCOUNT-NAME")
             .env_remove("LOOM_MODEL")
             .env_remove("LOOM_EFFORT");
@@ -715,7 +717,29 @@ fn runtime_run_spans_carry_identity_and_only_reported_launch_facts() {
             expect_effort,
             "{runtime} {env_tier} effort"
         );
-        let bytes = serde_json::to_string(&records).unwrap();
-        assert!(!bytes.contains("SECRET-ACCOUNT-NAME"), "{runtime} leaks an account name");
+        // The name may appear only as the value of `loom.codex.account`, and
+        // only on a Codex launch: strip that one attribute, then the name must
+        // be gone everywhere else (any other attribute, any other span).
+        let mut value = serde_json::to_value(&records).unwrap();
+        let mut seat_spans = 0;
+        for record in value.as_array_mut().unwrap() {
+            if let Some(seat) = record["attributes"]
+                .as_object_mut()
+                .and_then(|attrs| attrs.remove("loom.codex.account"))
+            {
+                assert_eq!(runtime, "codex", "{runtime} carries a Codex seat");
+                assert_eq!(seat, "SECRET-ACCOUNT-NAME", "{runtime} seat value");
+                seat_spans += 1;
+            }
+        }
+        if runtime == "codex" {
+            assert!(seat_spans > 0, "codex carries no seat");
+        } else {
+            assert_eq!(seat_spans, 0, "{runtime} carries a Codex seat");
+        }
+        assert!(
+            !value.to_string().contains("SECRET-ACCOUNT-NAME"),
+            "{runtime} leaks an account name outside loom.codex.account"
+        );
     }
 }
