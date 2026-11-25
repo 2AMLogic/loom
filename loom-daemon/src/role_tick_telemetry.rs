@@ -272,6 +272,19 @@ pub fn is_session_mount_stale_reason(reason: &str) -> bool {
     reason.starts_with(SESSION_MOUNT_STALE_REASON_PREFIX)
 }
 
+/// The seat a Codex session refusal names (#15291): the account in a
+/// `session-down` / `session-mount-stale` reason's `for account <name> ` clause.
+/// `None` when the reason names no account or one that is not a valid account
+/// name, so no raw text is ever exported.
+#[must_use]
+pub fn session_refusal_account(reason: &str) -> Option<&str> {
+    const MARKER: &str = "Codex session container for account ";
+    let rest = &reason[reason.find(MARKER)? + MARKER.len()..];
+    // Exactly the token after the marker: an empty name must not borrow the next word.
+    let name = rest.split(' ').next()?;
+    crate::worker_spawn::egress_proxy::rotation::is_account_name(name).then_some(name)
+}
+
 /// Project one [`crate::role_runner::RoleTickOutcome`] onto the
 /// `(result, detail)` pair the record carries.
 ///

@@ -359,12 +359,14 @@ pub fn admission_attributes(outcome: &crate::role_runner::RoleTickOutcome) -> Tr
             if crate::role_tick_telemetry::is_session_down_reason(reason) =>
         {
             attrs.insert("loom.admission.reason".into(), "session-down".into());
+            insert_refused_seat(&mut attrs, reason);
         }
         // #10364: so is a refusal because the container lacks the workdir mount.
         RoleTickOutcome::Failure(reason)
             if crate::role_tick_telemetry::is_session_mount_stale_reason(reason) =>
         {
             attrs.insert("loom.admission.reason".into(), "session-mount-stale".into());
+            insert_refused_seat(&mut attrs, reason);
         }
         // #10640: any other failure was admitted and launched — no admission
         // reason; its cause is the `loom.failure_class` stamped on the close.
@@ -405,6 +407,13 @@ pub fn admission_attributes(outcome: &crate::role_runner::RoleTickOutcome) -> Tr
         }
     }
     attrs
+}
+
+/// #15291: the seat a Codex session refusal names, beside its admission reason.
+fn insert_refused_seat(attrs: &mut TraceAttributes, reason: &str) {
+    if let Some(seat) = crate::role_tick_telemetry::session_refusal_account(reason) {
+        attrs.insert(super::codex_seat::KEY.into(), seat.to_owned());
+    }
 }
 
 fn insert_u64(attrs: &mut TraceAttributes, key: &str, value: Option<u64>) {

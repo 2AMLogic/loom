@@ -365,6 +365,12 @@ pub fn journal_phase_usage(
         let parent = &attempt.context;
         let mut common = TraceAttributes::new();
         billing::attempt(&trace, &runs, attempt).stamp(&mut common);
+        crate::observability::codex_seat::stamp_agreed(
+            &mut common,
+            billing::runs_for_attempt(&trace, &runs, attempt)
+                .into_iter()
+                .map(|run| &run.attributes),
+        );
         common.insert("loom.sweep_id".into(), execution.to_string());
         common.insert("loom.role".into(), phase.role.to_string());
         common.insert("loom.phase".into(), phase.role.to_string());
@@ -451,6 +457,10 @@ pub fn journal_usage(
     // #10749: the per-model totals span every launch of the execution, so
     // they carry only a class all launches share (mixed: `unknown`).
     billing::execution(&runs).stamp(&mut common);
+    crate::observability::codex_seat::stamp_agreed(
+        &mut common,
+        runs.iter().map(|run| &run.attributes),
+    );
     let spans = spans::model_usage_spans(
         parent,
         (started_at, ended_at),

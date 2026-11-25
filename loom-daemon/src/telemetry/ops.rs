@@ -322,6 +322,10 @@ pub const OPS_SPAN_ATTRIBUTE_KEYS: &[&str] = &[
     // `loom.egress.request` spans (#11300): one proxied provider request.
     // Counts, classified codes and ids only, never a body or credential.
     "loom.egress.seat",
+    // #15291: the Codex seat a run used, on `loom.runtime.run` /
+    // `.preflight` / `.usage` and a seat-refused tick. A validated account
+    // name only (`observability::codex_seat`), never a path or credential.
+    "loom.codex.account",
     "loom.egress.tap",
     "loom.egress.profile",
     "loom.egress.launch_id",

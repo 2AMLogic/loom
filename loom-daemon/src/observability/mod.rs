@@ -84,6 +84,7 @@ pub mod agent_relay;
 pub mod backfill;
 pub mod champion_run;
 pub mod claude_code_telemetry;
+pub mod codex_seat;
 pub mod collector;
 pub mod daemon_event;
 pub mod daemon_exit;

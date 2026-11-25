@@ -1355,6 +1355,8 @@ fn run_preflight(
         )
         .stamp(&mut trace_identity);
     }
+    // #15291: a Codex launch names its seat (valid account names only).
+    crate::observability::codex_seat::stamp_from_env(&mut trace_identity, &runtime);
     // Host memory state at the runtime's launch (this span's begin boundary;
     // the daemon stamps the end boundary when the child exits or is observed
     // gone). Clones of this identity carry the snapshot onto the RuntimeRun
