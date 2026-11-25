@@ -730,6 +730,8 @@ pub(crate) fn reset_forge_credential_streaks() {
     *forge_credential_streaks()
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner) = CredentialStreaks::default();
+    primary_token::reset(); // #15327
+    loom_ui::reset_expired_for_tests();
 }
 
 /// Resolve the stale-credential grace window: **env >
@@ -791,10 +793,13 @@ pub fn record_forge_credential_success(source: &str) {
 #[must_use]
 pub fn forge_credential_stale() -> bool {
     let grace = resolve_forge_credential_stale_grace();
-    forge_credential_streaks()
+    let streak_stale = forge_credential_streaks()
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .is_stale_at(Instant::now(), grace)
+        .is_stale_at(Instant::now(), grace);
+    // #15327: a published primary token past its `expires_at` is stale whether
+    // or not any refresh tick is still running to record a failure.
+    streak_stale || primary_token::stale_hold(grace)
 }
 
 /// A short, non-secret human-readable summary of the current stale window, or
@@ -803,10 +808,17 @@ pub fn forge_credential_stale() -> bool {
 #[must_use]
 pub fn forge_credential_stale_summary() -> Option<String> {
     let grace = resolve_forge_credential_stale_grace();
-    forge_credential_streaks()
+    let streaks = forge_credential_streaks()
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .summary_at(Instant::now(), grace)
+        .summary_at(Instant::now(), grace);
+    // #15327: expiry of the published primary token, when no streak explains it.
+    streaks.or_else(|| {
+        primary_token::stale_hold(grace)
+            .then(primary_token::expiry_reason)
+            .flatten()
+            .map(|reason| format!("{CREDENTIAL_SOURCE_PRIMARY}: {reason}"))
+    })
 }
 
 /// Resolve the `github-app-token.sh` path: prefer the installed
@@ -1717,6 +1729,7 @@ pub mod owner_drift;
 pub mod pool;
 pub use pool::attach as attach_pool;
 mod minted;
+pub mod primary_token;
 pub use minted::{publish_minted, publish_outcome, Minted, ScopedIssuance};
 
 #[cfg(test)]
