@@ -2155,13 +2155,24 @@ Builder and Doctor work in `.loom/worktrees/issue-<N>`.
   `git commit`, `git switch <x>`/`-c`, `git checkout -b|-B <x>`, `--detach`,
   and `git checkout <branch|sha>`. The message names
   `./.loom/scripts/worktree.sh <issue-number>` and this toggle.
+- **Denied, #14973** (review sessions parking primary checkouts on PR heads):
+  `git fetch origin pull/N/head:prN && git checkout prN` and the
+  `refs/review/prN` variant — a `git checkout <target>` whose target is no ref
+  git can name and no path at hook time (the ref is created by the same
+  compound command, or does not exist at all, as with a `FETCH_HEAD` chained
+  after a fetch) — and `gh pr checkout <N>`, which fetches the PR head and
+  moves the checkout onto it. git errors on a pathspec matching no tracked
+  file, so denying these costs no working invocation.
 - **Allowed**: everything inside a linked worktree; checkout/switch whose target
   is `main`/`master` (the Auditor's `git checkout -B main origin/main`);
-  `git checkout -- <path>` and `git checkout <path>` file restores; `-h/--help`;
+  `git checkout -- <path>` and `git checkout <path>` file restores (a path
+  present in the working tree, or tracked — including one deleted from the
+  worktree); `-h/--help`;
   read-only git. `worktree.sh`, `check-main-clean.sh --quarantine`,
   `resync-installed.sh`, `merge-pr.sh` and `scripts/version.sh` are unaffected:
   the hook only sees the top-level command text, not their internal git calls.
-- **Decision-log tag**: `primary-checkout-mutation:<commit|switch|checkout>`.
+- **Decision-log tag**:
+  `primary-checkout-mutation:<commit|switch|checkout|gh-pr-checkout>`.
 - **Toggle**: `LOOM_GUARD_PRIMARY_CHECKOUT_MUTATION=0` (env, agent's own
   environment) or `"guards": {"primaryCheckoutMutation": false}` in
   `.loom/config.json`. Default on.
