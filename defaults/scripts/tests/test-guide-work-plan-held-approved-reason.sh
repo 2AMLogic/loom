@@ -5,8 +5,8 @@
 # "Approved (Awaiting Merge)" as "queued for Champion auto-merge", and listed
 # the held ones (`loom:blocked` / `loom:operator`) under "Operator Attention"
 # as missing "only a human merge decision". Both were false for a PR whose
-# park record names a prerequisite (klayout-tools #7859: the bridge release PR
-# must land and the v0.10.0 tag must exist), and the next refresh dropped a
+# park record names a prerequisite (tool-repo #7859: the prerequisite release PR
+# must land and the release tag must exist), and the next refresh dropped a
 # prerequisite a reviewer had restored by hand.
 #
 # THE FIX: one shared helper, `approved_hold_suffix()`, prints the row suffix
@@ -166,7 +166,7 @@ if [[ "${1:-}" == park-record && "${2:-}" == parse ]]; then
   rec() { printf '{"records":[%s],"declared":true}\n' "$1"; }
   case "$body" in
     *PARK:RELEASE*) rec '{"blocker":null,"blocker_repo":null,"at":"2026-11-25T10:00:00Z","reason":"bridge release PR must land and the v0.10.0 tag must exist"}'; exit 0 ;;
-    *PARK:BLOCKER*) rec '{"blocker":8322,"blocker_repo":"2AMLogic/klayout-tools","at":"2026-11-25T10:00:00Z","reason":null}'; exit 0 ;;
+    *PARK:BLOCKER*) rec '{"blocker":8322,"blocker_repo":"example-org/tool-repo","at":"2026-11-25T10:00:00Z","reason":null}'; exit 0 ;;
     *PARK:BARE*)    rec '{"blocker":null,"blocker_repo":null,"at":"2026-11-25T10:00:00Z","reason":null}'; exit 0 ;;
     *PARK:MULTI*)   rec '{"blocker":null,"at":"2026-11-24T10:00:00Z","reason":"first reason"},{"blocker":null,"at":"2026-11-25T10:00:00Z","reason":"second reason wins"}'; exit 0 ;;
     *PARK:HOSTILE*) jq -nc '{records:[{blocker:null,at:"2026-11-25T10:00:00Z",
@@ -264,9 +264,9 @@ expect_row "$APPROVED" 9003 '- **#9003**: Held with no record *(held)*' \
     "held, no record: visible *(held)*, no reason inferred from prose/title (Approved)"
 expect_row "$OPATT" 9003 '- **#9003**: Held with no record *(held)*' \
     "held, no record: visible *(held)* (Operator Attention)"
-expect_row "$APPROVED" 9004 '- **#9004**: Held on a blocker only *(held: blocked by 2AMLogic/klayout-tools#8322)*' \
+expect_row "$APPROVED" 9004 '- **#9004**: Held on a blocker only *(held: blocked by example-org/tool-repo#8322)*' \
     "blocker-only record: 'blocked by repo#N' form"
-expect_row "$OPATT" 9004 '- **#9004**: Held on a blocker only *(held: blocked by 2AMLogic/klayout-tools#8322)*' \
+expect_row "$OPATT" 9004 '- **#9004**: Held on a blocker only *(held: blocked by example-org/tool-repo#8322)*' \
     "blocker-only record: same form under Operator Attention"
 expect_row "$APPROVED" 9006 '- **#9006**: Unheld PR with a stale record' \
     "unheld PR carrying a record: record ignored, row byte-identical"
