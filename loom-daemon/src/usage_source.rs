@@ -534,7 +534,7 @@ fn combine_model_totals(
 }
 
 /// The flat token total of `rows`: every counter summed, the same figure
-/// [`crate::transcript_tokens::sum_sweep_tokens`] reports for the same
+/// [`crate::transcript_tokens::sum_item_tokens`] reports for the same
 /// transcripts. `None` for a zero total, so an absent figure omits the key
 /// rather than publishing `0`.
 #[must_use]

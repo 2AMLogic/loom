@@ -468,7 +468,7 @@ pub struct TranscriptUsage {
 /// counters count each streamed message once — see
 /// [`super::transcript_usage::UsageFold`] (issue #8186, fixed by #9303). The
 /// cache-write total is the 5-minute + 1-hour split, so it reconciles with
-/// [`sum_transcript_usage_by_model`] exactly.
+/// [`super::transcript_usage::UsageFold::rows`] exactly.
 #[must_use]
 pub fn sum_transcript_usage(path: &Path) -> TranscriptUsage {
     let mut out = TranscriptUsage::default();
@@ -540,28 +540,6 @@ pub struct ModelUsageTotals {
     pub cache_write_5m: i64,
     pub cache_write_1h: i64,
     pub output: i64,
-}
-
-/// A subagent transcript's usage grouped by the `(model, speed,
-/// service_tier)` tuple instead of collapsed into one running total (issue
-/// #5740) — see the rationale on [`ModelUsageTotals`]. Same best-effort
-/// semantics as [`sum_transcript_usage`]; a missing file yields an empty
-/// result.
-///
-/// Deduped on `message.id` (issue #8186, fixed by #9303): a streamed message
-/// counts once, at its per-counter maximum. Decoding is
-/// [`super::transcript_usage::usage_from_record`] and the fold is
-/// [`super::transcript_usage::UsageFold`], shared with every other token path.
-///
-/// Returned sorted by the grouping tuple, so callers get stable output.
-#[must_use]
-pub fn sum_transcript_usage_by_model(path: &Path) -> Vec<ModelUsageTotals> {
-    let Ok(text) = std::fs::read_to_string(path) else {
-        return Vec::new();
-    };
-    let mut fold = super::transcript_usage::UsageFold::default();
-    fold.add_text(&text);
-    fold.rows()
 }
 
 // --------------------------------------------------------------------------
@@ -1537,10 +1515,17 @@ mod tests {
         assert_eq!(missing.cost_usd, 0.0);
     }
 
-    // ===== sum_transcript_usage_by_model (#5740) =====
+    // ===== UsageFold per-(model, speed, tier) rows (#5740) =====
+
+    /// Fold one transcript file into per-`(model, speed, service_tier)` rows.
+    fn fold_rows(path: &Path) -> Vec<ModelUsageTotals> {
+        let mut fold = crate::script_helpers::transcript_usage::UsageFold::default();
+        fold.add_text(&std::fs::read_to_string(path).unwrap());
+        fold.rows()
+    }
 
     #[test]
-    fn sum_transcript_usage_by_model_groups_by_model_speed_and_tier() {
+    fn usage_fold_groups_by_model_speed_and_tier() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("t.jsonl");
         std::fs::write(
@@ -1567,7 +1552,7 @@ mod tests {
         )
         .unwrap();
 
-        let rows = sum_transcript_usage_by_model(&path);
+        let rows = fold_rows(&path);
         assert_eq!(rows.len(), 2, "two distinct (model, speed, service_tier) tuples: {rows:?}");
 
         let sonnet = rows
@@ -1594,45 +1579,7 @@ mod tests {
     }
 
     #[test]
-    fn sum_transcript_usage_by_model_buckets_missing_or_synthetic_model_under_the_sentinel() {
-        let dir = tempdir().unwrap();
-        let path = dir.path().join("t.jsonl");
-        std::fs::write(
-            &path,
-            concat!(
-                "{\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}\n",
-                "{\"message\":{\"model\":\"<synthetic>\",\"usage\":{\"input_tokens\":2,\"output_tokens\":2}}}\n",
-            ),
-        )
-        .unwrap();
-
-        let rows = sum_transcript_usage_by_model(&path);
-        assert_eq!(rows.len(), 1, "both records fall under the one sentinel bucket: {rows:?}");
-        assert_eq!(rows[0].model, UNATTRIBUTED_MODEL);
-        assert_eq!(rows[0].input, 3);
-        assert_eq!(rows[0].output, 3);
-    }
-
-    #[test]
-    fn sum_transcript_usage_by_model_falls_back_to_the_1h_bucket_without_a_cache_creation_split() {
-        // An older transcript format that only ever wrote the flat
-        // `cache_creation_input_tokens` (no nested `cache_creation` object).
-        let dir = tempdir().unwrap();
-        let path = dir.path().join("t.jsonl");
-        std::fs::write(
-            &path,
-            "{\"message\":{\"model\":\"claude-sonnet-5\",\"usage\":{\"cache_creation_input_tokens\":99}}}\n",
-        )
-        .unwrap();
-
-        let rows = sum_transcript_usage_by_model(&path);
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].cache_write_5m, 0);
-        assert_eq!(rows[0].cache_write_1h, 99);
-    }
-
-    #[test]
-    fn sum_transcript_usage_by_model_reconciles_against_the_flat_total() {
+    fn usage_fold_rows_reconcile_against_the_flat_total() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("t.jsonl");
         std::fs::write(
@@ -1655,18 +1602,12 @@ mod tests {
             + flat.cache_read_input_tokens
             + flat.cache_creation_input_tokens;
 
-        let rows = sum_transcript_usage_by_model(&path);
+        let rows = fold_rows(&path);
         let grouped_total: i64 = rows
             .iter()
             .map(|r| r.input + r.output + r.cache_read + r.cache_write_5m + r.cache_write_1h)
             .sum();
         assert_eq!(grouped_total, flat_total, "per-model rows must reconcile to the flat sum");
-    }
-
-    #[test]
-    fn sum_transcript_usage_by_model_yields_empty_for_a_missing_file() {
-        let dir = tempdir().unwrap();
-        assert!(sum_transcript_usage_by_model(&dir.path().join("nope.jsonl")).is_empty());
     }
 
     // ===== banner + misc =====
