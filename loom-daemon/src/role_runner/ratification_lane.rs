@@ -463,21 +463,25 @@ const VERDICT_LINE: &str = "**Overall verdict:**";
 /// wrapper tail.
 ///
 /// A verdict line starts with the `**Overall verdict:**` label or one of its
-/// harmless variants ([`verdict_label_rest`]). Its verdict is the **first
-/// word** after the label (terminated by a comma or whitespace, so
-/// `approve. Actually request-changes` reads as `approve` exactly as
-/// `approve, actually request-changes` always has), normalized by
+/// harmless variants ([`verdict_label`]); beside a bold one, an unbolded
+/// `Overall verdict:` line whose first word is no verdict word is prose and
+/// is not read. Its verdict is the **first word** after the label
+/// ([`first_word`], terminated by a comma or whitespace), normalized by
 /// [`normalize_verdict_token`] — a trailing `.` `;` `:` `!`, a balanced
 /// `**` `__` `` ` `` `*` `_` wrapping and ASCII case are harmless (#15315) —
 /// and must then **exactly** equal one of [`Key::allowed_tokens`].
 ///
 /// Only the review block is read, and the template is checked first: a
-/// heading whose title starts with `<`, or a verdict line that still carries
-/// the `<…>` placeholder or a `|` list, is [`ReviewError::Placeholder`]
-/// whatever else the block says. Anything else that is not a verdict — no
-/// heading, no verdict line, an empty or unknown token, a first clause that
-/// names a second allowed token (`approve or request-changes`), or two lines
-/// whose normalized tokens differ — is [`ReviewError::Invalid`].
+/// heading whose title starts with `<`, or a verdict line in one of the
+/// template's shapes ([`is_placeholder_verdict`]: the `<…>` placeholder or a
+/// `|` list of verdict words), is [`ReviewError::Placeholder`] whatever else
+/// the block says. Anything else that is not a verdict — no heading, no
+/// verdict line, an empty or unknown token, a first clause
+/// ([`verdict_clause`]) that names a second allowed token
+/// (`approve or request-changes`, `approve. request-changes`), or two lines
+/// whose normalized tokens differ — is [`ReviewError::Invalid`]. Text after
+/// the first comma is the template's "one sentence why" and is not read for
+/// a second verdict word.
 ///
 /// # Errors
 ///
@@ -502,19 +506,31 @@ pub fn parse_review(key: Key, output: &str) -> Result<ParsedReview, ReviewError>
     if title.trim().starts_with('<') {
         return Err(Placeholder("review heading is the template placeholder".into()));
     }
-    let verdicts: Vec<&str> = review.lines().filter_map(verdict_label_rest).collect();
+    let labelled: Vec<(bool, &str)> = review.lines().filter_map(verdict_label).collect();
+    // Beside a bold verdict line, an unbolded `Overall verdict:` line whose
+    // first word is no verdict word is a sentence, not a second verdict.
+    let bold = labelled.iter().any(|(b, _)| *b);
+    let verdicts: Vec<&str> = labelled
+        .into_iter()
+        .filter(|(b, rest)| {
+            *b || !bold
+                || key
+                    .allowed_tokens()
+                    .contains(&normalize_verdict_token(first_word(rest)).as_str())
+        })
+        .map(|(_, rest)| rest)
+        .collect();
     // Placeholder outranks every other check: a block that holds both a
     // template line and a valid token is still the template.
-    if verdicts.iter().any(|rest| is_placeholder_verdict(rest)) {
+    if verdicts
+        .iter()
+        .any(|rest| is_placeholder_verdict(key, rest))
+    {
         return Err(Placeholder("verdict line is the template placeholder".into()));
     }
     let mut token: Option<(String, String)> = None;
     for rest in verdicts {
-        let raw: String = rest
-            .trim_start()
-            .chars()
-            .take_while(|c| *c != ',' && !c.is_whitespace())
-            .collect();
+        let raw = first_word(rest).to_string();
         let normalized = normalize_verdict_token(&raw);
         if normalized.is_empty() {
             return Err(Invalid(format!("empty verdict token on an {VERDICT_LINE} line")));
@@ -546,10 +562,11 @@ pub fn parse_review(key: Key, output: &str) -> Result<ParsedReview, ReviewError>
 }
 
 /// The text after a verdict label at the start of `line` (leading
-/// whitespace allowed): the pinned `**Overall verdict:**`, the harmless
-/// variants `**Overall verdict**:` and the unbolded `Overall verdict:`, the
-/// words in any ASCII case (#15315). `None` for any other line.
-fn verdict_label_rest(line: &str) -> Option<&str> {
+/// whitespace allowed), and whether the label is bold: the pinned
+/// `**Overall verdict:**`, the harmless variants `**Overall verdict**:` and
+/// the unbolded `Overall verdict:`, the words in any ASCII case (#15315).
+/// `None` for any other line.
+fn verdict_label(line: &str) -> Option<(bool, &str)> {
     const WORDS: &str = "overall verdict";
     let line = line.trim_start();
     let (bold, after) = match line.strip_prefix("**") {
@@ -560,43 +577,87 @@ fn verdict_label_rest(line: &str) -> Option<&str> {
         return None;
     }
     let tail = &after[WORDS.len()..];
-    if bold {
+    let rest = if bold {
         tail.strip_prefix(":**")
             .or_else(|| tail.strip_prefix("**:"))
     } else {
         tail.strip_prefix(':')
-    }
+    }?;
+    Some((bold, rest))
+}
+
+/// The first word of a verdict line (the text after its label): up to the
+/// first comma or whitespace. It decides the verdict.
+fn first_word(rest: &str) -> &str {
+    let rest = rest.trim_start();
+    let end = rest
+        .find(|c: char| c == ',' || c.is_whitespace())
+        .unwrap_or(rest.len());
+    &rest[..end]
 }
 
 /// Whether a verdict line (the text after its label) is the template's
-/// placeholder: after any leading `` ` `` / `*` it starts with `<`, its
-/// first word carries `|`, `<` or `>`, or its first clause
-/// ([`verdict_clause`]) carries one — so `<approve|request-changes>`, its
-/// bold, backticked or full-stopped forms and a spaced
-/// `approve | request-changes` can never be normalized into a token.
-fn is_placeholder_verdict(rest: &str) -> bool {
-    const MARKS: [char; 3] = ['|', '<', '>'];
+/// placeholder, in one of the template's own shapes: after any leading
+/// `` ` `` / `*` it starts with `<`; its first word carries `|`, `<` or `>`;
+/// its first clause ([`verdict_clause`]) puts a `|` beside one of `key`'s
+/// verdict words (`approve | request-changes`); or the line anywhere holds a
+/// `<word|word>` list. A `<` or `>` elsewhere is a comparison and a `|x|` a
+/// magnitude (`approve because Vth < 0.4 V`), never a placeholder.
+fn is_placeholder_verdict(key: Key, rest: &str) -> bool {
+    static TEMPLATE_LIST: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
+    let template_list = TEMPLATE_LIST.get_or_init(|| {
+        Regex::new(r"(?i)<\s*[a-z][a-z-]*(?:\s*\|\s*[a-z][a-z-]*)+\s*>").expect("static")
+    });
     let rest = rest.trim_start();
-    let first_word: String = rest
-        .chars()
-        .take_while(|c| *c != ',' && !c.is_whitespace())
-        .collect();
     rest.trim_start_matches(['`', '*']).starts_with('<')
-        || first_word.contains(MARKS)
-        || verdict_clause(rest).contains(MARKS)
+        || first_word(rest).contains(['|', '<', '>'])
+        || names_alternatives(key, verdict_clause(rest))
+        || template_list.is_match(rest)
 }
 
-/// The first clause of a verdict line: up to the first comma, sentence
-/// punctuation, dash or parenthesis. Wide enough to catch alternatives
-/// written as one clause (`approve | request-changes`,
-/// `approve or request-changes`), narrow enough that the sentence of
-/// reasoning after the verdict (`approve — the margin is > 3 dB`) is not
-/// read as part of it.
+/// Whether a `|` in `clause` sits directly beside one of `key`'s verdict
+/// words (emphasis and whitespace aside): the template's list of
+/// alternatives, written out.
+fn names_alternatives(key: Key, clause: &str) -> bool {
+    let clause = clause.to_ascii_lowercase();
+    let is_token = |word: Option<&str>| {
+        word.is_some_and(|w| {
+            key.allowed_tokens()
+                .contains(&w.trim_matches(|c: char| !(c.is_ascii_alphanumeric() || c == '-')))
+        })
+    };
+    let parts: Vec<&str> = clause.split('|').collect();
+    parts.windows(2).any(|pair| {
+        is_token(pair[0].split_whitespace().last()) || is_token(pair[1].split_whitespace().next())
+    })
+}
+
+/// What ends the first clause after a bare first word: a comma, sentence
+/// punctuation, a parenthesis or a Unicode dash.
+const CLAUSE_ENDS: [char; 9] = [',', '.', ';', ':', '!', '?', '(', '\u{2014}', '\u{2013}'];
+
+/// The first clause of a verdict line: its first word ([`first_word`]),
+/// then the text up to the next comma, sentence punctuation, dash or
+/// parenthesis. Wide enough to catch alternatives written as one clause
+/// (`approve | request-changes`, `approve or request-changes`), narrow
+/// enough that the sentence of reasoning after a bare verdict word
+/// (`approve — the margin is > 3 dB`) is not read as part of it.
+///
+/// When the first word itself carries one of those marks (`approve.`,
+/// `**approve.**`, `` `approve`: ``) — which [`normalize_verdict_token`]
+/// strips, and which the gate before #15315 rejected outright — the clause
+/// runs on to the first comma or the end of the line instead (critique A5's
+/// boundary), so normalization can never hide a second verdict behind the
+/// mark it stripped (`approve. request-changes`).
 fn verdict_clause(rest: &str) -> &str {
     let rest = rest.trim_start();
-    let end = rest
-        .find([',', '.', ';', ':', '!', '?', '(', '\u{2014}', '\u{2013}'])
-        .unwrap_or(rest.len());
+    let word = first_word(rest).len();
+    let ends: &[char] = if rest[..word].contains(&CLAUSE_ENDS[1..]) {
+        &CLAUSE_ENDS[..1]
+    } else {
+        &CLAUSE_ENDS
+    };
+    let end = rest[word..].find(ends).map_or(rest.len(), |i| word + i);
     &rest[..end]
 }
 

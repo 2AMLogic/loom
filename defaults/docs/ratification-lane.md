@@ -236,16 +236,27 @@ line whose first token is one of the key's verdicts: `approve` /
 `request-changes` for `ee`; `competitive` / `adequate-for-catalog` /
 `uncompetitive` / `escalate` for `market`. The label may also be written
 `**Overall verdict**:`, in any letter case, or unbolded (`Overall verdict:`)
-at the start of a line. The first word after the label decides, whether a
-comma, a space or a sentence follows it. That word is normalized before it
-is compared (#15315): trailing `.` `;` `:` `!` are dropped, one balanced
-wrapping of `**`, `__`, `` ` ``, `*` or `_` is removed (repeatedly, and only
-around a non-empty word), and ASCII case is folded — so `**approve**.`,
-`` `Competitive` `` and `APPROVE;` all read as their token. Still withheld:
-a placeholder verdict or heading (`<…>`, a `|` list — counted as
-`verdict_placeholder`), a first clause naming two allowed tokens (`approve
-or request-changes`), a `?` or any other unknown word, unbalanced emphasis,
-and two lines that normalize to different tokens. Anything else — the
+at the start of a line; beside a bold verdict line, an unbolded one whose
+first word is not a verdict word is a sentence and is not read. The first
+word after the label decides. That word is normalized before it is compared
+(#15315): trailing `.` `;` `:` `!` are dropped, one balanced wrapping of
+`**`, `__`, `` ` ``, `*` or `_` is removed (repeatedly, and only around a
+non-empty word), and ASCII case is folded — so `**approve**.`,
+`` `Competitive` `` and `APPROVE;` all read as their token. The verdict's
+first clause must not name a second allowed token: after a bare word the
+clause ends at the next comma, sentence punctuation, parenthesis or dash
+(`approve — no request-changes needed` reads as `approve`), but after a word
+that carried one of those marks it runs to the first comma or the end of the
+line, so normalization never hides a second verdict behind the mark it
+dropped (`approve. request-changes` is withheld). Text after the first comma
+is the "one sentence why" and is not read for a verdict. Still withheld: a
+placeholder heading (its title starts with `<`) or verdict in the template's
+shapes — a leading `<`, a `<a|b>` list anywhere on the line, or a `|` beside
+a verdict word (`approve | request-changes`), counted as
+`verdict_placeholder`; a comparison (`Vth < 0.4 V`) or a magnitude (`|S11|`)
+in the reasoning is not one — a first clause naming two allowed tokens
+(`approve or request-changes`), a `?` or any other unknown word, unbalanced
+emphasis, and two lines that normalize to different tokens. Anything else — the
 reviewer declined, authored the PR or reported a disclosure problem (all no
 verdict), or no heading — also posts no marker and is logged as withheld. The text is at most 4000 characters — the head is
 kept on truncation, so the heading and verdict line survive — with an

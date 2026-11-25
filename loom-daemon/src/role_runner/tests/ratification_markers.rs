@@ -799,11 +799,105 @@ fn parse_review_withholds_an_ambiguous_first_clause() {
         (Key::Ee, "approve — no request-changes needed", "approve"),
         (Key::Ee, "approve — the margin is > 3 dB and < 5 dB", "approve"),
         (Key::Ee, "approve. Delay < 5 ns.", "approve"),
-        (Key::Market, "competitive. Not uncompetitive at all.", "competitive"),
         (Key::Market, "uncompetitive (competitive parts exist)", "uncompetitive"),
     ] {
         assert_eq!(token_of(key, verdict), token, "{verdict}");
     }
+}
+
+#[test]
+fn a_mark_normalization_strips_never_ends_the_first_clause() {
+    // Normalization drops a trailing `.` `;` `:` `!` from the first word, so
+    // that mark must not also end the clause the ambiguity and placeholder
+    // scans read: `approve. request-changes`, which the gate before #15315
+    // rejected (`approve.` was unknown), would otherwise post as `approve`.
+    // The clause then runs to the first comma, critique A5's boundary.
+    for (key, verdict) in [
+        (Key::Ee, "approve. request-changes"),
+        (Key::Ee, "approve; request-changes"),
+        (Key::Ee, "approve: request-changes is what I mean"),
+        (Key::Ee, "request-changes. approve"),
+        (Key::Ee, "**approve.** request-changes"),
+        (Key::Ee, "`approve`: request-changes"),
+        (Key::Market, "competitive. escalate"),
+        (Key::Market, "competitive. Not uncompetitive at all."),
+    ] {
+        let got = parse_review(key, &review_with(key, verdict));
+        assert!(
+            matches!(got, Err(ReviewError::Invalid(ref r)) if r.contains("ambiguous")),
+            "{verdict}: {got:?}"
+        );
+    }
+    for (key, verdict) in [
+        (Key::Ee, "approve. <approve|request-changes>"),
+        (Key::Ee, "approve! <approve|request-changes>, one sentence why."),
+        (Key::Market, "competitive. <competitive|escalate>"),
+    ] {
+        let got = parse_review(key, &review_with(key, verdict));
+        assert!(matches!(got, Err(ReviewError::Placeholder(_))), "{verdict}: {got:?}");
+    }
+    // The comma still ends the verdict: what follows it is the template's
+    // "one sentence why", as it always was.
+    assert_eq!(token_of(Key::Ee, "approve. Small and sane, unlike request-changes"), "approve");
+}
+
+#[test]
+fn the_template_alternatives_are_a_placeholder_anywhere_on_the_line() {
+    // `<a|b>` is the template's own shape, so it fails the line closed even
+    // after the comma, where the first-word rule alone read `approve`.
+    for verdict in [
+        "approve, <approve|request-changes>",
+        "approve, one sentence why <approve | request-changes>",
+    ] {
+        let got = parse_review(Key::Ee, &review_with(Key::Ee, verdict));
+        assert!(matches!(got, Err(ReviewError::Placeholder(_))), "{verdict}: {got:?}");
+    }
+}
+
+#[test]
+fn comparisons_and_magnitudes_in_the_reasoning_are_not_placeholders() {
+    // A `<` or `>` in the reasoning is a comparison, and `|x|` a magnitude:
+    // only the template's shapes (a leading `<`, `<a|b>`, a `|` beside an
+    // allowed word) are placeholders. Each of these posted before #15315.
+    for (key, verdict, token) in [
+        (Key::Ee, "approve - margin > 3 dB", "approve"),
+        (Key::Ee, "approve because Vth < 0.4 V", "approve"),
+        (Key::Ee, "approve because the IR drop is < 5% of VDD", "approve"),
+        (Key::Ee, "approve as phase margin > 60 deg at all corners", "approve"),
+        (Key::Ee, "approve because |S11| < -10 dB across the band", "approve"),
+        (Key::Ee, "approve. Delay < 5 ns and slew > 1 V/ns.", "approve"),
+        (Key::Ee, "request-changes since Vos > 2 mV, see the sweep", "request-changes"),
+        (Key::Market, "competitive as cost > peers but area < theirs", "competitive"),
+    ] {
+        assert_eq!(token_of(key, verdict), token, "{verdict}");
+    }
+    // A `|` beside an allowed word is still the template's alternation.
+    for verdict in [
+        "approve | request-changes",
+        "**approve** |request-changes, why",
+    ] {
+        let got = parse_review(Key::Ee, &review_with(Key::Ee, verdict));
+        assert!(matches!(got, Err(ReviewError::Placeholder(_))), "{verdict}: {got:?}");
+    }
+}
+
+#[test]
+fn a_plain_label_sentence_beside_a_bold_verdict_line_is_prose() {
+    // Critique A12 accepts an unbolded `Overall verdict:` label, but beside a
+    // bold verdict line a plain one whose first word is no verdict word is a
+    // sentence, not a second verdict.
+    let out = "## EE-key review: blk / analog\n**Overall verdict:** approve, fine\n\n\
+               Overall verdict: the design holds at every corner.\n";
+    assert_eq!(parse_review(Key::Ee, out).unwrap().token, "approve");
+    // A plain line that does name a different verdict word still conflicts.
+    let out = "## EE-key review: b\n**Overall verdict:** approve, fine\n\
+               Overall verdict: request-changes, on reflection\n";
+    let e = parse_review(Key::Ee, out).unwrap_err().to_string();
+    assert!(e.contains("conflicting"), "{e}");
+    // With no bold line, a plain label line is the verdict line.
+    let out = "## EE-key review: b\nOverall verdict: the design holds.\n";
+    let e = parse_review(Key::Ee, out).unwrap_err().to_string();
+    assert!(e.contains("unknown verdict token"), "{e}");
 }
 
 #[test]
