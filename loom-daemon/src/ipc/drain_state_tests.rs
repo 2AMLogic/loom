@@ -403,3 +403,33 @@ fn test_drain_then_exit_escalates_one_way() {
     }
     assert!(!drain.snapshot().then_exit, "a fresh drain honors its own then_exit");
 }
+
+/// #15300: each way of holding dispatch maps to its own [`DispatchHold`], so
+/// the admission refusal can name the real source.
+#[test]
+fn dispatch_hold_distinguishes_fleet_stop_and_drain() {
+    assert_eq!(DrainState::new().dispatch_hold(), DispatchHold::None);
+
+    let fleet = DrainState::new();
+    assert!(fleet.hold_for_fleet_state("paused by op".to_string()));
+    assert_eq!(fleet.dispatch_hold(), DispatchHold::FleetHold("paused by op".to_string()));
+    assert!(fleet.release_fleet_hold());
+    assert_eq!(fleet.dispatch_hold(), DispatchHold::None);
+
+    let dir = tempfile::tempdir().unwrap();
+    let marker = dir.path().join("autonomy-desired");
+    std::fs::write(&marker, MARKER_BODY).unwrap();
+    crate::operator_stop::record(&marker, "restart --drain --then-exit").unwrap();
+    let stopped = DrainState::new().with_stop_marker(marker);
+    match stopped.dispatch_hold() {
+        DispatchHold::OperatorStop(note) => assert!(note.contains("HELD at startup"), "{note}"),
+        other => panic!("expected OperatorStop, got {other:?}"),
+    }
+
+    let drain = DrainState::new();
+    assert!(matches!(
+        drain.begin(Duration::from_secs(60), false, false),
+        DrainBegin::Started { .. }
+    ));
+    assert_eq!(drain.dispatch_hold(), DispatchHold::Drain);
+}

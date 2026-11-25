@@ -971,7 +971,17 @@ cadence. Two more per-account gauges ride the same pass:
 `loom.codex_session.record{account,kind,container}` (`hold`, `drift_removal`:
 1 while that on-disk record stands) and
 `loom.codex_session.mount_drift{account,kind,container}` (`missing`, `extra`,
-`denied`: path counts). `loom-daemon status` shows the same per-account view
+`denied`: path counts). Seat signals (#15292) ride the same pass:
+`loom.codex_session.login` (1 signed in, 0 signed out), `hold_age` (seconds,
+`reason` ∈ `operator_stop`, `other`), `hook_trust` (`state` ∈ `recorded`,
+`sealed`, `missing`), and the latest rate limits (`quota_used` as a 0-1
+fraction and `quota_resets_at` by `kind` ∈ `5h`, `7d`, `quota_observed_at`,
+`reset_credits`). Login and live limits come from one bounded in-container
+`codex app-server` round trip per running seat; hold, hook trust and the local
+rollout snapshot are files and still export while docker is down. A source that
+cannot be read emits nothing for its field, never a false value, so a held or
+signed-out seat with weekly quota left is a join of `record{kind=hold}` or
+`login=0` with `quota_used{kind=7d}`. `loom-daemon status` shows the same per-account view
 (state, mounts, posture, hold, removal record, the reconciler's last action)
 under `Session containers:`. If docker cannot be queried at all
 (CLI missing, Docker daemon unreachable, timeout), nothing about any container

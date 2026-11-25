@@ -70,14 +70,27 @@ const NOT_STARTED_TOLERANCE_SECS: i64 = 180;
 /// environment. stderr is discarded: it carries only diagnostics.
 #[must_use]
 pub fn probe_script() -> String {
+    script("{}")
+}
+
+/// [`probe_script`] for the daemon's background sampling (#15292): the
+/// rate-limit read asks Codex to leave out the per-credit detail rows, which
+/// are never kept, so only the available count crosses the wire.
+#[must_use]
+pub fn background_probe_script() -> String {
+    script("{\"excludeResetCreditDetails\":true}")
+}
+
+fn script(rate_limit_params: &str) -> String {
     format!(
         "(printf '%s\\n' \
          '{{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{{\"clientInfo\":{{\"name\":\"loom-daemon-probe\",\"version\":\"{version}\"}}}}}}' \
          '{{\"jsonrpc\":\"2.0\",\"method\":\"initialized\",\"params\":{{}}}}' \
          '{{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"account/read\",\"params\":{{}}}}' \
-         '{{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"account/rateLimits/read\",\"params\":{{}}}}'; \
+         '{{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"account/rateLimits/read\",\"params\":{rate}}}'; \
          sleep {hold}) | codex -s read-only -a never app-server 2>/dev/null",
         version = env!("CARGO_PKG_VERSION"),
+        rate = rate_limit_params,
         hold = STDIN_HOLD_SECS,
     )
 }
@@ -176,6 +189,11 @@ pub trait ProbeTransport {
     /// Run the probe inside `container`. `Ok(None)` = no probe was possible
     /// (the container is missing or stopped). Spawn errors remain typed.
     fn container(&self, container: &str) -> Result<Option<ExecOutput>>;
+    /// [`Self::container`] for the daemon's background sampling (#15292),
+    /// which asks for reset-credit counts without their detail rows.
+    fn container_background(&self, container: &str) -> Result<Option<ExecOutput>> {
+        self.container(container)
+    }
 }
 
 /// The real transport: `sh -c` on the host, `docker exec` via the session
@@ -198,20 +216,27 @@ impl ProbeTransport for ProcessProbeTransport {
     }
 
     fn container(&self, container: &str) -> Result<Option<ExecOutput>> {
-        let runner = ProcessContainerRunner;
-        match runner.inspect(container)? {
-            Some(state) if state.running => {}
-            _ => return Ok(None),
-        }
-        let script = probe_script();
-        let out = runner.exec_capture(container, &["sh", "-c", &script], PROBE_TIMEOUT)?;
-        if out.unavailable {
-            // exec_capture sets this bit when spawning Docker returned ENOENT,
-            // including if the executable disappeared after the initial check.
-            return Err(std::io::Error::from(std::io::ErrorKind::NotFound).into());
-        }
-        Ok(Some(out))
+        exec_in_container(container, &probe_script())
     }
+
+    fn container_background(&self, container: &str) -> Result<Option<ExecOutput>> {
+        exec_in_container(container, &background_probe_script())
+    }
+}
+
+fn exec_in_container(container: &str, script: &str) -> Result<Option<ExecOutput>> {
+    let runner = ProcessContainerRunner;
+    match runner.inspect(container)? {
+        Some(state) if state.running => {}
+        _ => return Ok(None),
+    }
+    let out = runner.exec_capture(container, &["sh", "-c", script], PROBE_TIMEOUT)?;
+    if out.unavailable {
+        // exec_capture sets this bit when spawning Docker returned ENOENT,
+        // including if the executable disappeared after the initial check.
+        return Err(std::io::Error::from(std::io::ErrorKind::NotFound).into());
+    }
+    Ok(Some(out))
 }
 
 /// Probe one account, honoring ADR-0017's ownership rule.
@@ -245,7 +270,30 @@ pub fn probe_account<T: ProbeTransport + ?Sized>(
 /// Interpret the app-server's replies. Pure, for the tests.
 #[must_use]
 pub fn parse_probe_output(text: &str, now: DateTime<Utc>) -> ProbeOutcome {
-    let mut account_null = false;
+    parse_probe_replies(text, now).outcome
+}
+
+/// What the replies establish about one seat, each part independently of the
+/// others (#15292). Only verdicts and numbers: no account payload, reset-credit
+/// detail row or raw reply text is kept.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SeatReading {
+    /// `account/read`'s verdict: `Some(true)` a valid account object,
+    /// `Some(false)` an explicit `account: null`, `None` no usable reply.
+    pub login: Option<bool>,
+    /// `rateLimitResetCredits.availableCount` when the reply carries it,
+    /// whatever the windows say. Older CLIs omit it.
+    pub reset_credits: Option<u64>,
+    /// The quota outcome, as `accounts check --live` reads it.
+    pub outcome: ProbeOutcome,
+}
+
+/// [`parse_probe_output`] with the login verdict and reset-credit count kept.
+/// Pure, for the tests.
+#[must_use]
+pub fn parse_probe_replies(text: &str, now: DateTime<Utc>) -> SeatReading {
+    let mut login: Option<bool> = None;
+    let mut reset_credits: Option<u64> = None;
     let mut limits: Option<serde_json::Value> = None;
     let mut capability_absent = false;
     for line in text.lines() {
@@ -254,11 +302,12 @@ pub fn parse_probe_output(text: &str, now: DateTime<Utc>) -> ProbeOutcome {
         };
         match message.get("id").and_then(serde_json::Value::as_i64) {
             Some(2) => {
-                if message
-                    .get("result")
-                    .is_some_and(|r| r.get("account").is_some_and(serde_json::Value::is_null))
-                {
-                    account_null = true;
+                if let Some(account) = message.get("result").and_then(|r| r.get("account")) {
+                    if account.is_null() {
+                        login = Some(false);
+                    } else if account.is_object() {
+                        login = Some(true);
+                    }
                 }
             }
             Some(3) => {
@@ -268,13 +317,33 @@ pub fn parse_probe_output(text: &str, now: DateTime<Utc>) -> ProbeOutcome {
                     .and_then(serde_json::Value::as_i64)
                 {
                     capability_absent = code == -32600 || code == -32601;
-                } else if let Some(rl) = message.get("result").and_then(|r| r.get("rateLimits")) {
-                    limits = Some(rl.clone());
+                } else if let Some(result) = message.get("result") {
+                    reset_credits = result
+                        .get("rateLimitResetCredits")
+                        .and_then(|c| c.get("availableCount"))
+                        .and_then(serde_json::Value::as_u64);
+                    if let Some(rl) = result.get("rateLimits") {
+                        limits = Some(rl.clone());
+                    }
                 }
             }
             _ => {}
         }
     }
+    let outcome = quota_outcome(login == Some(false), capability_absent, limits.as_ref(), now);
+    SeatReading {
+        login,
+        reset_credits,
+        outcome,
+    }
+}
+
+fn quota_outcome(
+    account_null: bool,
+    capability_absent: bool,
+    limits: Option<&serde_json::Value>,
+    now: DateTime<Utc>,
+) -> ProbeOutcome {
     // An unauthenticated home answers `account: null` *and* -32600 on the
     // rate-limit call; the null account is the real finding.
     if account_null {
@@ -296,6 +365,23 @@ pub fn parse_probe_output(text: &str, now: DateTime<Utc>) -> ProbeOutcome {
         primary,
         secondary,
     })
+}
+
+/// One bounded in-container round trip for a session seat's background
+/// sampling (#15292): login, live limits and the reset-credit count from one
+/// `codex app-server`. Never host-direct: the container owns the seat's
+/// `auth.json` (ADR-0017). `None` when no reading was possible (container
+/// missing or stopped, docker or the CLI unavailable, the probe timed out).
+pub fn probe_seat<T: ProbeTransport + ?Sized>(
+    transport: &T,
+    container: &str,
+    now: DateTime<Utc>,
+) -> Option<SeatReading> {
+    let run = transport.container_background(container).ok()??;
+    if run.unavailable || run.timed_out {
+        return None;
+    }
+    Some(parse_probe_replies(&run.output, now))
 }
 
 fn parse_live_window(value: &serde_json::Value, now: DateTime<Utc>) -> Option<RateLimitWindow> {
