@@ -1320,9 +1320,7 @@ mod tests {
         let live = reading(
             r#"{"account":{"type":"chatgpt","email":"x@example.com"}}"#,
             &format!(
-                r#"{{"rateLimits":{{"primary":{{"usedPercent":0,"windowDurationMins":300,"resetsAt":{}}},
-                   "secondary":{{"usedPercent":42.5,"windowDurationMins":10080,"resetsAt":{}}}}},
-                   "rateLimitResetCredits":{{"availableCount":2,"credits":[{{"id":"c1"}}]}}}}"#,
+                r#"{{"rateLimits":{{"primary":{{"usedPercent":0,"windowDurationMins":300,"resetsAt":{}}},"secondary":{{"usedPercent":42.5,"windowDurationMins":10080,"resetsAt":{}}}}},"rateLimitResetCredits":{{"availableCount":2,"credits":[{{"id":"c1"}}]}}}}"#,
                 NOW_SECS + 1_000,
                 NOW_SECS + 5_000
             ),
