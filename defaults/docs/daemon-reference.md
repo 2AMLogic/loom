@@ -10008,7 +10008,7 @@ re-walk `.loom/claude-config/*/tmp` every 60 seconds.
         "enabled": true,
         "maxAgeHours": 24,
         "minIntervalSecs": 1800,
-        "dryRun": false
+        "dryRun": true
       }
     }
   }
@@ -10020,7 +10020,7 @@ re-walk `.loom/claude-config/*/tmp` every 60 seconds.
 | `LOOM_SCRATCH_RECLAIM` | `autonomous.worktreeReaper.scratchReclaim.enabled` | env > config > default | `true` (on) |
 | `LOOM_SCRATCH_RECLAIM_MAX_AGE_HOURS` | `autonomous.worktreeReaper.scratchReclaim.maxAgeHours` | env > config > default | `24` |
 | `LOOM_SCRATCH_RECLAIM_MIN_INTERVAL_SECS` | `autonomous.worktreeReaper.scratchReclaim.minIntervalSecs` | env > config > default | `1800` (30 min) |
-| `LOOM_SCRATCH_RECLAIM_DRY_RUN` | `autonomous.worktreeReaper.scratchReclaim.dryRun` | env > config > default | `false` (live; gates the scratch-**root** pass below only) |
+| `LOOM_SCRATCH_RECLAIM_DRY_RUN` | `autonomous.worktreeReaper.scratchReclaim.dryRun` | env > config > default | `true` (preview for per-ticket scratch roots) |
 
 See `loom-daemon/src/scratch_reclaim.rs`.
 
@@ -10043,17 +10043,17 @@ parent (a volume mounted at the candidate path) is preserved. A root is
 removed only when **every** gate proves eligibility; any unreadable answer
 preserves (fail closed):
 
-1. the linked ticket is `CLOSED`/`MERGED` on the repo resolved from a
-   worktree's `origin` remote (worktrees are found by a bounded recursive
-   search — they sit as deep as `worktrees/loom/issue-<N>/.git`; no worktree
-   or a non-GitHub origin preserves the root; a probe failure is `UNKNOWN`,
-   which preserves);
+1. the linked ticket is `CLOSED`/`MERGED` on the repo identified by a
+   worktree's `origin` remote. The search covers the root and six directory
+   levels below it. A missing worktree, a non-GitHub origin or a failed
+   ticket lookup preserves the root.
 2. a `watch-pid` file at the root's top level names a dead process (absent
    passes; unreadable/unparseable counts as alive);
 3. no process has its cwd or an open file under the root;
-4. nothing under the root changed in the last 24 h (full walk; an unreadable
-   subtree preserves);
-5. every git worktree inside is clean (`git --no-optional-locks status
+4. the idle walk finds no writes in the last 24 h. An unreadable subtree
+   preserves the root. The walk stops descending after 50,000 directories,
+   so a recent write in an unexamined subtree can be missed.
+5. every git worktree found by the search is clean (`git --no-optional-locks status
    --porcelain` must succeed — a failed status, e.g. a worktree whose parent
    repo is gone, is "not safe", never clean — and report no **tracked**
    change) and its `HEAD` is reachable from a remote ref
@@ -10067,12 +10067,20 @@ preserves (fail closed):
 Removal runs `chmod -R u+w` first (Go module caches and cert stores are
 read-only), then `remove_dir_all`, then `git worktree prune` on every parent
 repo that still exists (deleting a worktree dir leaves a stale entry behind).
-Each removal is logged and published as `daemon.scratch_root.reaped` with
-`{path, bytes, ticket, repo, dry_run}`; the pass summary logs removed
-count/bytes and every preserved root with its reason. `dryRun` (`LOOM_SCRATCH_RECLAIM_DRY_RUN=1`)
-plans and reports without deleting. `dryRun` is the only brake specific to
-this pass: `scratchReclaim.enabled` is shared with the TMPDIR pass, so
-setting it `false` switches both off.
+By default, the pass evaluates the gates and keeps eligible roots on disk.
+For each eligible root it publishes `daemon.scratch_root.reaped` with
+`path`, `bytes`, `ticket`, `repo` and `dry_run: true`. The summary
+includes the planned count and bytes, and the reason for each preserved
+root. A preview that frees no space still counts as an empty eager pass
+when the other reclaim tiers also finish empty.
+
+Live removal requires an explicit `dryRun: false` or
+`LOOM_SCRATCH_RECLAIM_DRY_RUN=0`. The environment override takes
+precedence. It accepts `0`, `false`, `no` or `off` for live removal and
+selects preview for all other values. Live removal events have
+`dry_run: false`. During rollout, review at least one day of fleet preview
+telemetry before enabling deletion in a separate change. The shared
+`scratchReclaim.enabled` switch controls both scratch passes.
 
 **Where it runs.** The scheduled `worktreeReaper` tick and the eager tier-1
 pass, sharing the `scratchReclaim` block above (`enabled`, `maxAgeHours`, the

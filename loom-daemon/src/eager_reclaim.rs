@@ -313,7 +313,7 @@ impl EagerReclaimReport {
             || self
                 .scratch_roots
                 .as_ref()
-                .is_some_and(|r| !r.removed.is_empty() || !r.planned.is_empty())
+                .is_some_and(|r| !r.removed.is_empty())
             || self
                 .seats
                 .as_ref()

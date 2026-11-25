@@ -473,6 +473,27 @@ fn test_backoff_resets_once_a_pass_reclaims_something() {
 }
 
 #[test]
+fn test_planned_scratch_root_alerts_and_advances_empty_streak() {
+    let (mut report, _) = run_tiered(&[Some(15)]);
+    let roots = report.scratch_roots.as_mut().unwrap();
+    roots.dry_run = true;
+    roots.candidates = 1;
+    roots
+        .planned
+        .push(crate::scratch_root_reaper::RemovalRecord {
+            path: "/tmp/loom-200-builder.cafe".into(),
+            ticket: 200,
+            repo: "acme/widgets".into(),
+            bytes: 4096,
+            dry_run: true,
+        });
+    let mut ledger = PassLedger::default();
+    ledger.record(&report);
+    assert_eq!(ledger.empty_streak, 1);
+    assert!(report.empty_pass_alert(ledger.empty_streak).is_some());
+}
+
+#[test]
 fn test_a_skipped_pass_neither_alerts_nor_moves_the_ledger() {
     let (mut report, _) = run_tiered(&[Some(15)]);
     report.skipped = Some("cooldown".to_string());

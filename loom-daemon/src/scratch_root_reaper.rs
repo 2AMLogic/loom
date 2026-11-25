@@ -36,8 +36,8 @@
 //!    passes; unparseable is treated as alive);
 //! 3. no process has its cwd or an open fd under the root
 //!    ([`crate::worktree_ops::safety::find_processes_using_directory`]);
-//! 4. nothing under the root changed within the idle window (24 h), verified
-//!    by a full walk — an unreadable subtree is `Unknown` → preserve;
+//! 4. the bounded idle walk finds no change within the idle window (24 h).
+//!    An unreadable subtree is `Unknown` and preserves the root.
 //! 5. every git worktree inside is clean **and** its `HEAD` is reachable from
 //!    a remote ref (`git rev-list --count HEAD --not --remotes` == 0, the
 //!    canonical [`crate::worktree_ops::clean::branch_reachable_from_remotes`]
@@ -97,11 +97,8 @@ pub const IDLE_WINDOW_SECS: i64 = 24 * 3600;
 /// trees to their bottom.
 const WORKTREE_SEARCH_MAX_DEPTH: usize = 6;
 
-/// Bound on entries one idle walk visits. Examining this many entries
-/// without finding a recent write is positive evidence of idleness, not a
-/// failure to answer — the same rationale as
-/// `worktree_activity::MAX_ENTRIES_SCANNED`, at a larger bound because a
-/// scratch root holds whole worktrees, not one source tree.
+/// Maximum directories one idle walk examines. Once the budget is spent,
+/// the walk skips remaining subtrees and can miss recent writes there.
 const IDLE_WALK_ENTRY_CAP: usize = 50_000;
 
 // ============================================================================
@@ -233,7 +230,7 @@ pub fn discover_candidates(roots: &[PathBuf]) -> Vec<PathBuf> {
 // Gates
 // ============================================================================
 
-/// Whether anything under `root` changed within `window_secs`, from a full
+/// Whether anything under `root` changed within `window_secs`, from a bounded
 /// recursive walk. Symlinks are never followed (a link's own mtime is still
 /// examined); a future-dated mtime reads as age zero (maximally recent), the
 /// same clock-skew convention as `worktree_activity`.
@@ -242,9 +239,8 @@ pub enum IdleProbe {
     /// Something under the root was written within the window (payload:
     /// how long ago, in seconds; 0 for a future mtime).
     Recent(u64),
-    /// The walk completed and found nothing within the window — including
-    /// the capped-walk case, where examining [`IDLE_WALK_ENTRY_CAP`] entries
-    /// without a recent write is positive evidence of idleness.
+    /// The walk found no recent change in the directories it examined,
+    /// including when it reached [`IDLE_WALK_ENTRY_CAP`].
     Idle,
     /// The walk could not answer (unreadable root/subtree) — preserved,
     /// never treated as idle.
@@ -2012,7 +2008,12 @@ mod tests {
     }
 
     #[test]
-    fn fixture_dry_run_removes_nothing() {
+    #[serial]
+    fn fixture_unconfigured_pass_previews_eligible_root() {
+        use crate::scratch_reclaim::{
+            read_scratch_reclaim_config, resolve_dry_run, SCRATCH_RECLAIM_DRY_RUN_ENV,
+        };
+        let _env = crate::env_test_support::EnvGuard::clear(&[SCRATCH_RECLAIM_DRY_RUN_ENV]);
         let tmp = tempfile::tempdir().unwrap();
         let base = tmp.path();
         let now = Utc::now();
@@ -2042,15 +2043,23 @@ mod tests {
             device_of: &same_device,
         };
         let recorder = Mutex::new(Vec::new());
-        let report = sweep(base, &[base.to_path_buf()], &probes, true, &recorder);
+        let config = read_scratch_reclaim_config(base);
+        assert_eq!(config.dry_run, None);
+        let bytes = dir_size_bytes(&root);
+        assert!(bytes > 0);
+        let report =
+            sweep(base, &[base.to_path_buf()], &probes, resolve_dry_run(&config), &recorder);
         assert!(root.exists(), "dry-run removes nothing");
         assert!(report.removed.is_empty());
         assert_eq!(report.planned.len(), 1);
         assert_eq!(report.planned[0].ticket, 200);
         let records = recorder.into_inner().unwrap();
         assert_eq!(records.len(), 1);
-        assert!(records[0].dry_run);
-        assert_eq!(records[0].payload()["dry_run"], true);
+        assert_eq!(records, report.planned);
+        let payload = records[0].payload();
+        assert_eq!(payload["path"], root.to_str().unwrap());
+        assert_eq!(payload["bytes"], bytes);
+        assert_eq!(payload["dry_run"], true);
     }
 
     // ===================================================================
@@ -2085,9 +2094,14 @@ mod tests {
     fn test_run_for_dry_run_env() {
         reset_state_for_test();
         let tmp = tempfile::tempdir().unwrap();
-        std::env::set_var(crate::scratch_reclaim::SCRATCH_RECLAIM_DRY_RUN_ENV, "1");
-        let report = run_for_roots(tmp.path(), &[tmp.path().to_path_buf()]);
-        std::env::remove_var(crate::scratch_reclaim::SCRATCH_RECLAIM_DRY_RUN_ENV);
-        assert!(report.dry_run);
+        let roots = [tmp.path().to_path_buf()];
+        let _env = crate::env_test_support::EnvGuard::clear(&[
+            crate::scratch_reclaim::SCRATCH_RECLAIM_DRY_RUN_ENV,
+        ]);
+        assert!(run_for_roots(tmp.path(), &roots).dry_run);
+
+        std::env::set_var(crate::scratch_reclaim::SCRATCH_RECLAIM_DRY_RUN_ENV, "0");
+        reset_state_for_test();
+        assert!(!run_for_roots(tmp.path(), &roots).dry_run);
     }
 }
