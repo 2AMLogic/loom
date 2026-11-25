@@ -200,6 +200,16 @@ commit object that matches both forge reads and sets tracking only after a
 successful fast-forward. The `+` refreshes only the named remote-tracking ref when its
 cache is stale. The local branch advances by fast-forward after verification.
 
+For a dirty worktree, the refusal is the disposition: the snapshot (when one was
+taken) preserved the WIP as a patch under
+`<worktree-root>/.snapshots/issue-<N>-<UTC-timestamp>.patch`. In the PR comment
+name only the relative `.snapshots/issue-<N>-<UTC-timestamp>.patch` under the
+managed worktree root; keep the absolute path (the helper's `patchPath` output
+carries the workstation username and directory layout) and the patch contents
+local, never pasted into the PR. Then stop, release the PR lease
+and `loom:treating`, and park the PR instead (same shape as the
+detached-`pr-<N>` read-only rule, #14403).
+
 For a fork or a nonstandard head, use the existing `pr-worktree.sh` route and
 check the exact head and clean state there. The named `origin` recovery
 applies only to the matching same-repository issue branch. If the dedicated
