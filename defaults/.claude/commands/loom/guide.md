@@ -1502,7 +1502,7 @@ write immediately regardless of the window (see "WORK_LOG debounce" in
 
 **First creation (#14009).** If `$DOCS_WT/WORK_LOG.md` does not exist (the
 repo has never tracked it — presence, not recency), this pass **creates it
-without asking**: write the standard preamble and `## Archives` index shape
+without asking**: write the standard preamble, `## Archives` index and `## Entries` heading shape
 (mirror the WORK_LOG.md template in `defaults/.claude/commands/loom/imagine.md`)
 followed by this tick's entries. Creation itself bypasses the debounce and
 min-entries gates below — a first creation with nothing to record yet is
@@ -2153,7 +2153,9 @@ update_work_log() {
   fi
 
   # Group entries by date and prepend them to "$DOCS_WT/WORK_LOG.md" (below the
-  # header/comment block, above the newest existing `### ` section).
+  # header/comment block and `## Archives` index, under the `## Entries`
+  # heading, above the newest existing `### ` section; when a file has no
+  # `## Entries` heading, add one after the index first (#15271)).
   # Format: ### YYYY-MM-DD
   #         - **PR #N**: Title
   #         - **Issue #N** (closed): Title
