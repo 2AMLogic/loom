@@ -9,7 +9,7 @@
 //! line, the summary, the dispatch plan, `pick.decision`) reads.
 
 use std::collections::{BTreeSet, HashMap};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -363,6 +363,31 @@ fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
+/// A recent pool refusal applies to a whole role only while its current
+/// draw has no way to serve it. Probe once per marked role, outside the lock
+/// and without reserving a seat. The real launch still proves containment
+/// and checks the selected runtime.
+pub(crate) fn exhausted_roles_for_draw(
+    root: &Path,
+    registry: &Mutex<SweepRegistry>,
+    now: chrono::DateTime<Utc>,
+) -> BTreeSet<String> {
+    use crate::runtime_preference::{resolve_runtime_for, Decision, DispatchContext, Intent};
+
+    let mut marked = lock(registry).pool_exhausted_roles(now);
+    let at = u64::try_from(now.timestamp()).unwrap_or(0);
+    let probe = DispatchContext {
+        intent: Intent::Probe,
+        role_tick: true,
+    };
+    marked.retain(|role| {
+        !matches!(resolve_runtime_for(root, role, None, at, probe),
+            Ok(Decision::Preference { resolution, .. })
+                if resolution.chosen.is_some() || resolution.any_containment_liftable_skip())
+    });
+    marked
+}
+
 /// One repo the tick lists (#12256), set aside by the serial first pass.
 struct GatherJob {
     idx: usize,
@@ -518,7 +543,7 @@ impl StepDriver {
                 fixes_only,
                 repo,
                 weight,
-                pool_exhausted_roles: lock(&registries[idx]).pool_exhausted_roles(now),
+                pool_exhausted_roles: exhausted_roles_for_draw(root, &registries[idx], now),
                 escalated: self.starvation.escalate(root),
             });
         }

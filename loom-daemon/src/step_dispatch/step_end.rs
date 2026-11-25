@@ -185,7 +185,7 @@ pub fn run_of(
 }
 
 /// The ledger's refusal reason for a spawn-time refusal
-/// (`sweep_registry::step_spawn::StepRefusal::reason`): the pool gate and a
+/// (`sweep_registry::step_spawn::StepRefusal::reason`): a child failing token selection and a
 /// claim held elsewhere cool the `(item, step)` down; a lost claim is a
 /// counted redraw. A standing admission refusal (#14032: the runtime will
 /// not take the launch — a rejected runtime, a model/runtime mismatch, or
@@ -197,7 +197,10 @@ pub fn run_of(
 #[must_use]
 pub fn ledger_reason(spawn_reason: &str) -> Option<&'static str> {
     match spawn_reason {
-        "pool_exhausted" | "no_token_pool" | "token_selection_failed" => Some("pool_gate"),
+        // The registry already records pre-spawn pool refusals against the
+        // role. An additional item cooldown would outlive a recovered draw.
+        "pool_exhausted" | "no_token_pool" => None,
+        "token_selection_failed" => Some("pool_gate"),
         "claimed" | "claim_unverified" | "backstop_hold" | "peer_active" => Some("claimed"),
         // A failed spawn cools down like a gate, so it is not respawned on
         // every tick. A missing `/loom:<role>` command is refused before the
@@ -401,7 +404,8 @@ mod tests {
 
     #[test]
     fn spawn_refusals_map_onto_the_ledgers_reasons() {
-        assert_eq!(ledger_reason("pool_exhausted"), Some("pool_gate"));
+        assert_eq!(ledger_reason("pool_exhausted"), None);
+        assert_eq!(ledger_reason("no_token_pool"), None);
         assert_eq!(ledger_reason("token_selection_failed"), Some("pool_gate"));
         assert_eq!(ledger_reason("backstop_hold"), Some("claimed"));
         // #12105: another actor working the PR cools the Doctor down.
