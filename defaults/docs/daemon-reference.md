@@ -22,6 +22,7 @@
 - [Delegated daemon administration (`daemon.delegatedTo`, #5345)](#delegated-daemon-administration-daemondelegatedto-5345)
 - [Fleet — operator-triggered multi-host worker fanout (`fleet`, #4340)](#fleet--operator-triggered-multi-host-worker-fanout-fleet-4340)
 - [Fleet store — `fleet-config` (`fleet.repo`)](#fleet-store--fleet-config-fleetrepo)
+- [Changing a bundled model profile's model (`runtimes.modelProfileOverrides`, #15252)](#changing-a-bundled-model-profiles-model-runtimesmodelprofileoverrides-15252)
 - [Fleet model A/B — `sweep-experiment plan` (#8055 phase 1)](#fleet-model-ab--sweep-experiment-plan-8055-phase-1)
 - [Token pool provisioning for managed repos (#3938)](#token-pool-provisioning-for-managed-repos-3938)
 - [Per-repo status breakdown + per-repo main-health gate (#3930 — phase d)](#per-repo-status-breakdown--per-repo-main-health-gate-3930--phase-d)
