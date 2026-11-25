@@ -733,7 +733,7 @@ fn judge_recovers_from_claude_exhaustion_on_gemini() {
 /// Weigh the same review-requested PR on both ticks, with both registry gates.
 fn judge_draw(root: &Path, registry: &Mutex<SweepRegistry>, pr: u32) -> Option<u32> {
     use crate::step_dispatch::{
-        driver::exhausted_roles_for_draw,
+        driver::probe_exhausted_roles,
         gather::draw_inputs,
         item_draw::{weigh, ItemWeights, WeighContext},
     };
@@ -753,7 +753,7 @@ fn judge_draw(root: &Path, registry: &Mutex<SweepRegistry>, pr: u32) -> Option<u
     let ctx = WeighContext {
         now,
         build_backoff_engaged: false,
-        pool_exhausted_roles: exhausted_roles_for_draw(root, registry, now),
+        pool_exhausted_roles: probe_exhausted_roles(root, registry, now).0,
         workspace_idx: 0,
         cooldowns: registry.lock().unwrap().step_cooldowns(now),
     };
@@ -807,10 +807,9 @@ fn judge_pool_recovery(runtime: &str) {
         crate::step_dispatch::step_end::record_refusal(
             root,
             &registry,
-            request.item,
-            request.role,
-            refusal.reason,
-            Some(&refusal.detail),
+            &request,
+            Some(refusal),
+            false,
         );
     };
     assert_refused();

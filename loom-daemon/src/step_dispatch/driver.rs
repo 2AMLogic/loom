@@ -188,6 +188,8 @@ struct RegistrySpawner {
     recheck: Option<crate::discovery::recheck::Shared>,
     /// Evidence captured before applying the per-route draw gate.
     writer_holds_before_draw: HashMap<BucketKey, i64>,
+    /// Previously exhausted roles the draw let through on this tick, by workspace.
+    retried_roles: HashMap<usize, BTreeSet<String>>,
 }
 
 fn refusal_reason(e: &anyhow::Error) -> String {
@@ -345,10 +347,11 @@ impl RegistrySpawner {
                     super::step_end::record_refusal(
                         root,
                         registry,
-                        request.item,
-                        request.role,
-                        &reason,
-                        e.downcast_ref::<StepRefusal>().map(|r| r.detail.as_str()),
+                        request,
+                        e.downcast_ref::<StepRefusal>(),
+                        self.retried_roles
+                            .get(&idx)
+                            .is_some_and(|roles| roles.contains(request.role.role_name())),
                     );
                 }
                 self.report_stale_draw(idx, request.item, &e);
@@ -363,29 +366,43 @@ fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
-/// A recent pool refusal applies to a whole role only while its current
-/// draw has no way to serve it. Probe once per marked role, outside the lock
-/// and without reserving a seat. The real launch still proves containment
-/// and checks the selected runtime.
-pub(crate) fn exhausted_roles_for_draw(
+/// Split marked roles into those still excluded and those allowed to retry.
+/// Probe once outside the registry lock. If launch then refuses a retry,
+/// the spawner uses the second set to cool the item without probing again.
+pub(crate) fn probe_exhausted_roles(
     root: &Path,
     registry: &Mutex<SweepRegistry>,
     now: chrono::DateTime<Utc>,
-) -> BTreeSet<String> {
-    use crate::runtime_preference::{resolve_runtime_for, Decision, DispatchContext, Intent};
+) -> (BTreeSet<String>, BTreeSet<String>) {
+    use crate::role_runner::runtime_preflight::codex_pool_state_for;
+    use crate::runtime_preference::{
+        resolve_runtime_for, sandbox_hold, Decision, DispatchContext, Intent,
+    };
+    use crate::tokens_pool::codex_hooks::is_private_clone;
 
-    let mut marked = lock(registry).pool_exhausted_roles(now);
+    let marked = lock(registry).pool_exhausted_roles(now);
     let at = u64::try_from(now.timestamp()).unwrap_or(0);
     let probe = DispatchContext {
         intent: Intent::Probe,
         role_tick: true,
     };
-    marked.retain(|role| {
-        !matches!(resolve_runtime_for(root, role, None, at, probe),
-            Ok(Decision::Preference { resolution, .. })
-                if resolution.chosen.is_some() || resolution.any_containment_liftable_skip())
-    });
-    marked
+    // Private-account health is shared by this workspace's mutable roles.
+    // Their draw tables, active attempts and operator pins are role-specific.
+    let private_codex_available = std::cell::OnceCell::new();
+    marked.into_iter().partition(|role| {
+        let Ok(Decision::Preference { resolution, .. }) =
+            resolve_runtime_for(root, role, None, at, probe)
+        else {
+            return true;
+        };
+        let may_launch = resolution.chosen.is_some()
+            || (resolution.any_containment_liftable_skip()
+                && *private_codex_available.get_or_init(|| {
+                    sandbox_hold::active("codex", at).is_none()
+                        && codex_pool_state_for(root, at, false, is_private_clone).spawnable > 0
+                }));
+        !may_launch
+    })
 }
 
 /// One repo the tick lists (#12256), set aside by the serial first pass.
@@ -506,6 +523,7 @@ impl StepDriver {
         // Pass 1, serial and local: settle each repo's ended steps (so the
         // cooldowns they arm hold for this draw) and set the held repos aside.
         let mut jobs: Vec<GatherJob> = Vec::new();
+        let mut retried_roles = HashMap::new();
         for idx in order {
             let root = &input.roots[idx];
             super::step_end::settle(root, &registries[idx]);
@@ -538,12 +556,17 @@ impl StepDriver {
                 });
                 continue;
             }
+            let (pool_exhausted_roles, retried) =
+                probe_exhausted_roles(root, &registries[idx], now);
+            if !retried.is_empty() {
+                retried_roles.insert(idx, retried);
+            }
             jobs.push(GatherJob {
                 idx,
                 fixes_only,
                 repo,
                 weight,
-                pool_exhausted_roles: exhausted_roles_for_draw(root, &registries[idx], now),
+                pool_exhausted_roles,
                 escalated: self.starvation.escalate(root),
             });
         }
@@ -779,6 +802,7 @@ impl StepDriver {
             parts: StepSpawnTimings::default(),
             recheck: input.discovery.is_worklist().then(|| self.recheck.clone()),
             writer_holds_before_draw,
+            retried_roles,
         };
         self.recheck.begin_tick();
         let minute = u64::try_from(now.timestamp() / 60).unwrap_or(0);
