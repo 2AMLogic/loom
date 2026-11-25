@@ -974,6 +974,34 @@ pub struct LanePass {
     pub deferred: usize,
 }
 
+/// A [`PrSource`] that keeps the `(pr, head)` of every PR its listing
+/// served (head lowercase), so a pass can tell a PR the forge no longer
+/// lists open at that head from one it merely could not read.
+struct Listed<'a> {
+    inner: &'a dyn PrSource,
+    listed: std::cell::RefCell<std::collections::HashSet<(u64, String)>>,
+}
+
+impl PrSource for Listed<'_> {
+    fn open_prs(&self) -> Vec<OpenPr> {
+        let prs = self.inner.open_prs();
+        self.listed.borrow_mut().extend(
+            prs.iter()
+                .map(|p| (p.number, p.head_sha.to_ascii_lowercase())),
+        );
+        prs
+    }
+    fn files(&self, pr: u64, hold: &ratification::Config) -> Vec<ChangedFile> {
+        self.inner.files(pr, hold)
+    }
+    fn trusted_comments(&self, pr: u64) -> Result<Vec<Comment>, String> {
+        self.inner.trusted_comments(pr)
+    }
+    fn read_failure(&self, pr: u64, path: &str) -> Option<String> {
+        self.inner.read_failure(pr, path)
+    }
+}
+
 /// The bounded lane pass (#15315): selection exactly as
 /// [`find_candidates_counted`] makes it, then, per candidate, only the
 /// missing keys that are neither **capped** (at
@@ -1005,12 +1033,15 @@ pub fn run_lane_stats_with(
     };
     let (mut ledger, mut dirty) = load_ledger(state);
     let instructions = ratification_attempts::CachedInstructions::new(instructions, state.memory);
-    let (selections, unreadable) = find_candidates_counted(cfg, lane_session, prs);
+    let prs = Listed {
+        inner: prs,
+        listed: std::cell::RefCell::default(),
+    };
+    let (selections, unreadable) = find_candidates_counted(cfg, lane_session, &prs);
     let mut pass = LanePass {
         unreadable,
         ..LanePass::default()
     };
-    let mut current = std::collections::HashSet::new();
     for sel in selections {
         match sel {
             Selection::Refused { pr, reason } => {
@@ -1022,7 +1053,6 @@ pub fn run_lane_stats_with(
                 head_sha,
                 missing,
             } => {
-                current.insert((pr, head_sha.to_ascii_lowercase()));
                 let slot = |key: Key| KeySlot {
                     repo: target_repo,
                     pr,
@@ -1092,14 +1122,16 @@ pub fn run_lane_stats_with(
             }
         }
     }
-    // Forget closed PRs and moved heads only when this pass read the whole
-    // open-PR set: an unreadable PR (or an empty listing, which may be a
-    // failed read) must not release a cap (critique A10).
-    let complete = unreadable == 0 && !current.is_empty();
-    let current = complete.then_some(&current);
+    // Forget a PR's records and backoffs once the forge lists it closed or
+    // at another head (critique A10): judged against the open-PR listing,
+    // never the candidates, since a PR whose file list or comments failed to
+    // read this pass is still open and must keep its cap. An empty listing
+    // may be a failed read, so it forgets nothing.
+    let listed = prs.listed.into_inner();
+    let listed = (!listed.is_empty()).then_some(&listed);
     let now = (state.clock)();
-    dirty |= ledger.prune(now, current);
-    lock(state.memory).prune(target_repo, now, current);
+    dirty |= ledger.prune(now, listed);
+    lock(state.memory).prune(target_repo, now, listed);
     if dirty {
         save_ledger(state, &ledger);
     }

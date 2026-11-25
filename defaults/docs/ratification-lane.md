@@ -87,9 +87,11 @@ dispatch, and posts nothing to the PR.
 - **The ledger.** Counted attempts are recorded per host and workspace in
   `.loom/state/ratification-lane/attempts.json` (`{repo, pr, head_sha, key,
   class, at}` per attempt, written atomically; `.loom/state/` is never
-  tracked). Each pass drops attempts older than the window and, when it read
-  the whole open-PR set, attempts for a PR or head that is no longer a
-  candidate. It is an efficiency guard, not a gate, and it fails open: an
+  tracked). Each pass drops attempts older than the window and attempts for
+  a PR the forge's open-PR listing no longer shows at that head (closed, or
+  pushed). A PR whose files or comments could not be read this pass is still
+  listed, so it keeps its attempts, and an empty listing (which may be a
+  failed read) forgets nothing. It is an efficiency guard, not a gate, and it fails open: an
   unreadable or corrupt ledger counts as empty (logged once), and a failed
   save keeps the attempts in daemon memory, so this host still stops at the
   cap. A ledger written under other parse rules counts nothing. Each host

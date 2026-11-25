@@ -3069,26 +3069,77 @@ mod bound {
         assert_eq!(bench.records().len(), 2, "the file is valid again");
     }
 
+    /// The open PRs `heads` lists, where `files`' file list reads empty (how
+    /// `GhPrSource` reports a failed `pulls/<n>/files` read: no files, so
+    /// no ratification PR) and `comments`' comment list is unreadable.
+    struct Shed {
+        heads: Heads,
+        files: Option<u64>,
+        comments: Option<u64>,
+    }
+
+    impl PrSource for Shed {
+        fn open_prs(&self) -> Vec<OpenPr> {
+            self.heads.open_prs()
+        }
+        fn files(
+            &self,
+            pr: u64,
+            hold: &crate::champion_hold::ratification::Config,
+        ) -> Vec<ChangedFile> {
+            if self.files == Some(pr) {
+                Vec::new()
+            } else {
+                self.heads.files(pr, hold)
+            }
+        }
+        fn trusted_comments(&self, pr: u64) -> Result<Vec<Comment>, String> {
+            if self.comments == Some(pr) {
+                Err("HTTP 502".into())
+            } else {
+                self.heads.trusted_comments(pr)
+            }
+        }
+    }
+
     #[test]
-    fn prune_needs_a_complete_read_of_the_open_prs() {
+    fn prune_follows_the_open_pr_listing_not_the_candidates() {
         let bench = Bench::new();
-        let gone = rec(99, HEAD, Key::Ee, mins(0));
-        bench.seed(vec![gone.clone()]);
+        let capped: Vec<_> = (0..3).map(|i| rec(7, HEAD, Key::Ee, mins(i))).collect();
+        let mut seeded = capped.clone();
+        seeded.push(rec(99, HEAD, Key::Ee, mins(0)));
+        bench.seed(seeded);
         let mut r = Scripted::new(Ends::Review, Ends::Review);
+        let open = || Heads(RefCell::new(vec![(7, HEAD.into()), (9, "e".repeat(40))]));
         // An empty listing may be a failed read: nothing is forgotten.
-        bench.pass(&Heads(RefCell::new(Vec::new())), &mut r, mins(1));
-        assert_eq!(bench.records(), std::slice::from_ref(&gone));
-        // An unreadable candidate makes the read incomplete too.
-        let unreadable = Feed {
-            fail_comments: Some("HTTP 502".into()),
-            ..Feed::new()
+        bench.pass(&Heads(RefCell::new(Vec::new())), &mut r, mins(10));
+        assert_eq!(bench.records().len(), 4);
+        // Review finding: PR #7's file list fails to read, so it is no
+        // candidate, while PR #9 is one. PR #7 is still open at the same
+        // head, so its cap must stay; PR #99, no longer listed, goes.
+        let shed_files = Shed {
+            heads: open(),
+            files: Some(7),
+            comments: None,
         };
-        let pass = bench.pass(&unreadable, &mut r, mins(2));
+        let pass = bench.pass(&shed_files, &mut r, mins(11));
+        assert_eq!(pass.results.len(), 1, "only PR #9 is dispatched");
+        assert_eq!(bench.records(), capped, "PR #7's cap survives the failed read");
+        // An unreadable comment list keeps it too.
+        let shed_comments = Shed {
+            heads: open(),
+            files: None,
+            comments: Some(7),
+        };
+        let pass = bench.pass(&shed_comments, &mut r, mins(12));
         assert_eq!(pass.unreadable, 1);
-        assert_eq!(bench.records(), [gone]);
-        // A complete read that no longer sees PR #99 forgets it.
-        bench.pass(&Heads::one(), &mut r, mins(3));
-        assert!(bench.records().is_empty());
+        assert_eq!(bench.records(), capped);
+        // Read again, PR #7's EE key is still capped.
+        let pass = bench.pass(&open(), &mut r, mins(13));
+        assert_eq!(pass.capped, 1);
+        // Listed at a new head, the old head's records are forgotten.
+        bench.pass(&Heads(RefCell::new(vec![(7, "c".repeat(40))])), &mut r, mins(14));
+        assert!(bench.records().is_empty(), "{:?}", bench.records());
     }
 
     #[test]
