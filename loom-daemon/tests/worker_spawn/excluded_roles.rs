@@ -111,3 +111,39 @@ fn explicit_allowed_profile_overrides_an_excluding_default_or_env() {
         assert!(String::from_utf8_lossy(&out.stderr).contains("excludedRoles"));
     }
 }
+
+/// #15252: a `modelProfileOverrides` model change on the bundled `zai-full`
+/// profile launches the new model for an allowed role and still refuses Judge
+/// and Curator — the overlay cannot lift the bundled `excludedRoles`.
+#[test]
+fn a_model_override_on_zai_full_keeps_judge_and_curator_refused() {
+    let d = tempfile::tempdir().unwrap();
+    roles(d.path());
+    std::fs::write(
+        d.path().join(".loom/config.json"),
+        r#"{"runtimes":{"modelProfileOverrides":{"zai-full":{"model":"glm-5.4"}}}}"#,
+    )
+    .unwrap();
+    for runtime in ["pi", "opencode"] {
+        for role in ["judge", "curator"] {
+            let out = worker(d.path(), runtime)
+                .env("LOOM_ROLE", role)
+                .args(["--profile", "zai-full", "-p", "hello"])
+                .output()
+                .unwrap();
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            assert_eq!(out.status.code(), Some(78), "{runtime} {role}: {stderr}");
+            assert!(stderr.contains("excludedRoles"), "{runtime} {role}: {stderr}");
+            assert!(stderr.contains("zai-full"), "{runtime} {role}: {stderr}");
+            assert!(out.stdout.is_empty(), "{runtime} {role}: the harness must never start");
+        }
+        let out = worker(d.path(), runtime)
+            .env("LOOM_ROLE", "doctor")
+            .args(["--profile", "zai-full", "-p", "hello"])
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(out.status.success(), "{runtime}: {stderr}");
+        assert!(stderr.contains("glm-5.4"), "{runtime}: {stderr}");
+    }
+}

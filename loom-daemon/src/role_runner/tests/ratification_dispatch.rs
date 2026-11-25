@@ -238,3 +238,143 @@ fn lane_sessions_pass_real_runtime_admission() {
     assert_eq!(out.get(Key::Ee), Some(&KeyOutcome::Ran(RoleTickOutcome::Success)));
     assert_eq!(out.get(Key::Market), Some(&KeyOutcome::Ran(RoleTickOutcome::Success)));
 }
+
+// ---- #15315: Loom's output contract and the echoed prompt ---------------------
+
+use super::ratification_markers::{EE_TEMPLATE, MARKET_TEMPLATE};
+use crate::role_runner::ratification_dispatch::{build_prompt, lane_contract, strip_prompt_echo};
+use crate::role_runner::ratification_lane::{parse_review, ReviewError};
+
+const KEYS: [Key; 2] = [Key::Ee, Key::Market];
+
+fn other(key: Key) -> Key {
+    match key {
+        Key::Ee => Key::Market,
+        Key::Market => Key::Ee,
+    }
+}
+
+#[test]
+fn prompt_contract_is_last_and_names_exactly_the_allowed_tokens() {
+    for key in KEYS {
+        let contract = lane_contract(key);
+        for token in key.allowed_tokens() {
+            assert!(contract.contains(token), "{key:?} contract lacks {token}");
+        }
+        for token in other(key).allowed_tokens() {
+            assert!(!contract.contains(token), "{key:?} contract names {token}");
+        }
+        for public in [false, true] {
+            let prompt = build_prompt(key, "INSTR", PR_REF, public);
+            assert!(prompt.trim_end().ends_with(contract.as_str()), "{key:?}/{public}");
+            if public {
+                let at = prompt.find(PUBLIC_SOURCES_ONLY).unwrap();
+                assert!(at < prompt.find(&contract).unwrap(), "contract after public line");
+            }
+        }
+    }
+    // The real dispatch sends it last, after the public line on a public market repo.
+    let src = Src::ok(Some(false));
+    let (_, r) = run(&src, &pin("ee.md", EE_SHA), &pin("market.md", MKT_SHA));
+    assert!(r.calls[0].1.trim_end().ends_with(&lane_contract(Key::Ee)));
+    assert!(r.calls[1]
+        .1
+        .trim_end()
+        .ends_with(&lane_contract(Key::Market)));
+    assert!(r.calls[1].1.contains(PUBLIC_SOURCES_ONLY));
+}
+
+#[test]
+fn lane_contract_never_carries_a_heading_or_a_verdict_line() {
+    for key in KEYS {
+        let contract = lane_contract(key);
+        // Critique A4: the heading is a substring search target, so the
+        // contract must not contain either key's heading literal at all.
+        for k in KEYS {
+            assert!(!contract.contains(k.review_heading()), "{key:?} has {k:?}'s heading");
+        }
+        assert!(!contract.contains(&other(key).review_heading()[3..]), "{key:?}");
+        // Even placed inside a review block, it supplies no verdict line.
+        let block = format!("{} fixture\n{contract}\n", key.review_heading());
+        let e = parse_review(key, &block).unwrap_err().to_string();
+        assert!(e.contains("no **Overall verdict:** line"), "{key:?}: {e}");
+    }
+}
+
+#[test]
+fn prompt_echo_never_parses_as_a_verdict() {
+    for (key, template) in [(Key::Ee, EE_TEMPLATE), (Key::Market, MARKET_TEMPLATE)] {
+        let before = format!("{}\n\nPR: {PR_REF}\n", template.trim_end());
+        for public in [false, true] {
+            let after = build_prompt(key, template, PR_REF, public);
+            for prompt in [&before, &after] {
+                assert!(
+                    matches!(parse_review(key, prompt), Err(ReviewError::Placeholder(_))),
+                    "{key:?}: {:?}",
+                    parse_review(key, prompt)
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn strip_prompt_echo_cuts_every_verbatim_echo_and_keeps_both_sides() {
+    let prompt = build_prompt(Key::Ee, EE_TEMPLATE, PR_REF, false);
+    let review = "## EE-key review: comparator\n**Overall verdict:** approve, fine.\n";
+    for out in [
+        format!("user\n{prompt}\n{review}"),
+        format!("{review}user\n{prompt}"),
+        format!("user\n{prompt}\n{review}user\n{prompt}"),
+    ] {
+        let cut = strip_prompt_echo(&out, &prompt);
+        assert!(!cut.contains("<approve|request-changes>"), "{cut}");
+        assert!(cut.contains(review.trim_end()), "{cut}");
+        assert_eq!(parse_review(Key::Ee, &cut).unwrap().token, "approve");
+    }
+    // No echo: unchanged.
+    assert_eq!(strip_prompt_echo(review, &prompt), review);
+    assert_eq!(strip_prompt_echo(review, "  \n"), review);
+}
+
+#[test]
+fn roll_interrupted_key_is_flagged_rolled() {
+    use crate::observability::lifecycle::{RoleFailure, ROLL_INTERRUPTED};
+
+    struct RolledEe {
+        last_ee: bool,
+    }
+    impl RoleInvocationRunner for RolledEe {
+        fn invoke(&mut self, role: &str, _prompt: &str) -> RoleTickOutcome {
+            self.last_ee = role == role_name(Key::Ee);
+            if self.last_ee {
+                RoleTickOutcome::Failure("stopped by the version roll".into())
+            } else {
+                RoleTickOutcome::Failure("exit 1".into())
+            }
+        }
+        fn unlaunched_failure(&self) -> Option<RoleFailure> {
+            self.last_ee
+                .then(|| RoleFailure::new(ROLL_INTERRUPTED, None, "fixture roll"))
+        }
+    }
+
+    let src = Src::ok(Some(true));
+    let mut r = RolledEe { last_ee: false };
+    let d = dispatch(
+        Some(&pin("ee.md", EE_SHA)),
+        Some(&pin("market.md", MKT_SHA)),
+        "owner/repo",
+        PR_REF,
+        &src,
+        &mut r,
+    );
+    assert!(d.rolled(Key::Ee));
+    assert!(!d.rolled(Key::Market));
+    // Telemetry classification is unchanged: both still ran and failed.
+    assert!(matches!(d.ee, Some(KeyOutcome::Ran(RoleTickOutcome::Failure(_)))));
+    assert_eq!(
+        d.failure(Key::Market),
+        Some(&crate::role_runner::ratification_dispatch::AttemptFailure::Launched(None))
+    );
+}

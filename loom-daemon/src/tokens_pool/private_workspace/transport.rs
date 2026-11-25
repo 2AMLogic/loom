@@ -359,6 +359,7 @@ mod tests {
             gh_config: None,
             session_image: None,
             extra_mounts: Vec::new(),
+            mirror_binds: Vec::new(),
         };
         let job = lease::Job {
             owner: "sweep-7".into(),
@@ -418,6 +419,7 @@ mod tests {
             gh_config: None,
             session_image: None,
             extra_mounts: Vec::new(),
+            mirror_binds: Vec::new(),
         };
         let job = lease::Job {
             owner: "step-builder-20-1".into(),
@@ -484,6 +486,7 @@ mod tests {
             gh_config: None,
             session_image: None,
             extra_mounts: Vec::new(),
+            mirror_binds: Vec::new(),
         };
         let id = identify("https://example.invalid/o/second").unwrap();
         config.repositories.push(Registered {
@@ -527,6 +530,7 @@ mod tests {
             gh_config: None,
             session_image: None,
             extra_mounts: Vec::new(),
+            mirror_binds: Vec::new(),
         }
     }
 
@@ -665,6 +669,7 @@ mod tests {
             gh_config: None,
             session_image: None,
             extra_mounts: Vec::new(),
+            mirror_binds: Vec::new(),
         };
         let job = lease::Job {
             owner: "o".into(),

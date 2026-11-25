@@ -49,7 +49,7 @@ const DELETED_SUFFIX: &str = " (deleted)";
 pub fn resolve_daemon_bin() -> Result<PathBuf, String> {
     let exe =
         std::env::current_exe().map_err(|e| format!("could not resolve current_exe(): {e}"))?;
-    resolve_from_current_exe(&exe, which_on_path)
+    resolve_from_current_exe(&exe, crate::fs_util::find_executable_on_path)
 }
 
 /// Testable core: takes the raw `current_exe()` result and a PATH-lookup
@@ -93,17 +93,6 @@ pub(crate) fn strip_deleted_suffix(path: &Path) -> Option<PathBuf> {
     let file_name = path.file_name()?.to_str()?;
     let stripped_name = file_name.strip_suffix(DELETED_SUFFIX)?;
     Some(path.with_file_name(stripped_name))
-}
-
-/// Locate `name` on `$PATH`, mirroring a shell's lookup (no shell spawned) —
-/// the last-resort fallback when neither `current_exe()` nor its de-suffixed
-/// sibling resolves to an existing file.
-fn which_on_path(name: &str) -> Option<PathBuf> {
-    let path_var = std::env::var_os("PATH")?;
-    std::env::split_paths(&path_var).find_map(|dir| {
-        let candidate = dir.join(name);
-        candidate.is_file().then_some(candidate)
-    })
 }
 
 #[cfg(test)]
@@ -214,10 +203,7 @@ mod tests {
         touch_executable(&bin);
 
         let joined = std::env::join_paths([tmp.path()]).unwrap();
-        let found = std::env::split_paths(&joined).find_map(|dir| {
-            let candidate = dir.join("loom-daemon");
-            candidate.is_file().then_some(candidate)
-        });
+        let found = crate::fs_util::find_executable_in("loom-daemon", &joined);
         assert_eq!(found, Some(bin));
     }
 

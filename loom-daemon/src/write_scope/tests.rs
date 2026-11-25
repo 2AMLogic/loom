@@ -609,6 +609,10 @@ fn daemon_write_paths_are_scoped() {
     let reviewed: &[(&str, Scope)] = &[
         (PASS, Gated),
         ("claim_reconciliation.rs", Via(PASS, "reclaim + anchor passes")),
+        (
+            "claim_reconciliation/curating_reclaim.rs",
+            Via(PASS, "Curator claim recovery: label release and re-curation comment (#14816)"),
+        ),
         ("claim_reconciliation/verdict_invalidation.rs", Via(PASS, "verdict pass")),
         (
             "claim_reconciliation/unanchored_verdict.rs",
@@ -627,6 +631,10 @@ fn daemon_write_paths_are_scoped() {
         ),
         ("claim_reconciliation/pass_loop/building_heal.rs", Via(PASS, "heal pass")),
         (
+            "claim_reconciliation/pass_loop/merge_observation.rs",
+            Via(PASS, "merge-observation pass: issue close, label strip and audit comments (#14902)"),
+        ),
+        (
             "claim_reconciliation/ci_gate_recovery.rs",
             Via(PASS, "CI-gate recovery pass: audit comment + label swap"),
         ),
@@ -636,6 +644,14 @@ fn daemon_write_paths_are_scoped() {
                 PASS,
                 "orphan-stack pass (#12760): base retarget PATCH, conflict label, flag \
                  comment; its scratch-worktree push (orphan_stack_git.rs) rides the same gate",
+            ),
+        ),
+        (
+            "claim_reconciliation/merged_stack.rs",
+            Via(
+                PASS,
+                "merged-stack pass (#14903): base retarget PATCH and reconcile comments; its \
+                 scratch-worktree push (orphan_stack_git.rs) rides the same gate",
             ),
         ),
         (

@@ -440,6 +440,17 @@ pub(crate) enum ScriptPortCommand {
     #[command(subcommand)]
     WorkDocs(super::work_docs_archive::WorkDocsCommand),
 
+    /// Guide Step 3's WORK_PLAN.md write path (#15219): `work-plan-receipt
+    /// record|reset|read` owns the `.loom-work-plan-receipt` file, and
+    /// `work-plan-splice` replaces the `guide:plan-body` marker region from
+    /// stdin. Behind a verb because the role prompt pastes Step 3 into a
+    /// Bash tool call verbatim: the inline `rm`/redirect/`mktemp` shapes it
+    /// used were denied by the default guard before execution, leaving the
+    /// #13923 provenance gate unreachable from a guarded shell. Not a port:
+    /// the shell it replaces lived inline in the role prompt.
+    #[command(subcommand)]
+    Guide(super::guide_work_plan::GuideCommand),
+
     /// The fleet singleton-job captain gate (#8848), shell-facing half: is
     /// THIS host the one declared to run `<job-name>`? Exit 0 arm, 3 another
     /// host is the captain, 4 no `fleet.captain` declared at all — three
@@ -749,6 +760,7 @@ impl ScriptPortCommand {
             ScriptPortCommand::GitBlobLines(args) => args.run(),
             ScriptPortCommand::AffectedFiles(cmd) => cmd.run(),
             ScriptPortCommand::WorkDocs(cmd) => cmd.run(),
+            ScriptPortCommand::Guide(cmd) => cmd.run(),
             ScriptPortCommand::FleetCaptain(args) => args.run(),
             ScriptPortCommand::RoleToolPolicy(cmd) => cmd.run(),
             ScriptPortCommand::CommandAnalysis(cmd) => cmd.run(),

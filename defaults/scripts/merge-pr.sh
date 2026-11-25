@@ -190,8 +190,8 @@ _check_expected_head() { [[ -z "$EXPECTED_HEAD_SHA" || "$1" == "$EXPECTED_HEAD_S
 #
 # This replaces three separate `grep` matchers in three separate `if` blocks
 # whose relative ORDER was the entire safety property: a head-mismatch reaching
-# the base-modified arm answers a moved head with forge_update_branch and another
-# merge attempt. Nothing asserted that order except an `awk` scan over THIS
+# the base-modified arm answers a moved head with a sleep and another merge
+# attempt. Nothing asserted that order except an `awk` scan over THIS
 # FILE's source text looking for which `grep` appeared first. It is now one
 # ordered `match` in loom-daemon/src/merge_pr/response.rs, pinned by a
 # differential against the frozen retired ladder

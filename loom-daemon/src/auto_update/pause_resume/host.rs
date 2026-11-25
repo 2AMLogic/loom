@@ -203,9 +203,11 @@ pub(crate) fn session_checks(
 
 /// Whether the session container `name` is running with `cwd` mounted.
 fn docker_container_ready(name: &str, cwd: &str) -> Result<(), String> {
-    let mut cmd = std::process::Command::new(
-        std::env::var("LOOM_CODEX_SESSION_DOCKER").unwrap_or_else(|_| "docker".to_string()),
-    );
+    // Scoped override verbatim, else the shared lookup (#14885); an
+    // unresolvable docker stays unlaunchable so this fails closed.
+    let mut cmd = std::process::Command::new(crate::docker_bin::scoped_or_fail_open(
+        std::env::var("LOOM_CODEX_SESSION_DOCKER").ok().as_deref(),
+    ));
     cmd.args(["inspect", "--type", "container", name]);
     let out = crate::sweep_registry::reaper::output_with_timeout(cmd, Duration::from_secs(15))
         .map_err(|e| format!("docker inspect {name}: {e}"))?

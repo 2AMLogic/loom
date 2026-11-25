@@ -31,9 +31,9 @@
 //!
 //! Both input lists are forge reads the shell already performs for the wait
 //! loop's other branches: `failing`/`pending` come from the check-runs
-//! rollup already fetched (`forge_get_check_runs`), and `required` from
-//! `forge_get_required_status_check_contexts` — the two-source (rulesets +
-//! classic branch protection) lookup that also backs GitHub AND Gitea, unlike
+//! rollup already fetched (`forge_get_check_runs`), and `required` from the
+//! shell's retired two-source (rulesets + classic branch protection) lookup,
+//! which also covered GitHub AND Gitea, unlike
 //! the GitHub-only `stale_checks::fetch::required_contexts` lookup (which
 //! backs `required-checks`) this deliberately does not reuse. A failure of THAT lookup is refused by the shell before
 //! this classification ever runs (fails closed, mirroring the #6104 UNSTABLE

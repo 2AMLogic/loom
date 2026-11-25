@@ -325,6 +325,173 @@ mod ci_hold {
     }
 }
 
+// --------------------------------- the Judge backstop hold (#15097)
+
+mod backstop_hold {
+    use super::*;
+    use chrono::TimeZone;
+    use serde_json::{json, Value};
+
+    const HEAD: &str = "0123456789abcdef0123456789abcdef01234567";
+
+    fn now() -> DateTime<Utc> {
+        Utc.with_ymd_and_hms(2026, 11, 23, 12, 0, 0).unwrap()
+    }
+
+    /// A no-verdict Judge release record `hours_ago` at `HEAD` under the PR's
+    /// current label digest (`["loom:review-requested"]` →
+    /// `review-requested`), as the forge returns it.
+    fn record(hours_ago: i64) -> Value {
+        let at = (now() - chrono::Duration::hours(hours_ago)).to_rfc3339();
+        json!({
+            "body": format!(
+                "<!-- loom:pr-lease-released role=judge host=h sweep=s \
+                 head={HEAD} verdict=none labels=review-requested -->"
+            ),
+            "updated_at": at,
+        })
+    }
+
+    /// Three records inside the 24 h window: past `MAX_PER_WINDOW`, held
+    /// until the oldest of them ages out.
+    fn held_records() -> Vec<Value> {
+        vec![record(1), record(2), record(3)]
+    }
+
+    /// A review-requested PR (a Judge step) and a curated issue.
+    fn judge_and_issue() -> Vec<Item> {
+        let rows = vec![
+            row(5, &["loom:review-requested"], "", true),
+            row(2, &["loom:curated"], "", false),
+        ];
+        let items = classify_rows(&rows, &IssueFacts::default());
+        assert!(items.iter().any(|i| i.step() == Some(Step::Judge)), "{items:?}");
+        items
+    }
+
+    fn judge(items: &[Item]) -> Verdict {
+        items.iter().find(|i| i.pr == Some(5)).unwrap().verdict
+    }
+
+    fn heads() -> HashMap<u32, String> {
+        HashMap::from([(5, HEAD.to_string())])
+    }
+
+    fn labels() -> HashMap<u32, Vec<String>> {
+        HashMap::from([(5, vec!["loom:review-requested".to_string()])])
+    }
+
+    #[test]
+    fn a_judge_step_held_by_the_backstop_is_not_drawn() {
+        let mut items = judge_and_issue();
+        let held = hold_judge_backstop(
+            &mut items,
+            &heads(),
+            &labels(),
+            4,
+            now(),
+            |_| None,
+            |_| Some(held_records()),
+        );
+        assert_eq!(held, 1);
+        assert_eq!(judge(&items), Verdict::Pass(PassReason::BackstopHeld));
+        assert_eq!(PassReason::BackstopHeld.as_str(), "backstop_held");
+        assert!(
+            items
+                .iter()
+                .any(|i| i.issue == Some(2) && i.step().is_some()),
+            "only the Judge step is held"
+        );
+    }
+
+    #[test]
+    fn it_is_drawn_once_the_hold_ends() {
+        let mut items = judge_and_issue();
+        // The same records a day later: aged out of the 24 h window, and the
+        // one survivor's 1 h cooldown has passed.
+        let held = hold_judge_backstop(
+            &mut items,
+            &heads(),
+            &labels(),
+            4,
+            now() + chrono::Duration::hours(22),
+            |_| None,
+            |_| Some(held_records()),
+        );
+        assert_eq!(held, 0);
+        assert_eq!(judge(&items), Verdict::Step(Step::Judge));
+    }
+
+    #[test]
+    fn a_pr_that_is_not_held_stays_drawn() {
+        let mut items = judge_and_issue();
+        let held = hold_judge_backstop(
+            &mut items,
+            &heads(),
+            &labels(),
+            4,
+            now(),
+            |_| None,
+            |_| Some(vec![record(10)]),
+        );
+        assert_eq!(held, 0, "one record's 1 h cooldown has passed");
+        assert_eq!(judge(&items), Verdict::Step(Step::Judge));
+    }
+
+    #[test]
+    fn an_unreadable_record_list_stays_drawn() {
+        let mut items = judge_and_issue();
+        let held =
+            hold_judge_backstop(&mut items, &heads(), &labels(), 4, now(), |_| None, |_| None);
+        assert_eq!(held, 0, "a failed comment read fails open");
+        assert_eq!(judge(&items), Verdict::Step(Step::Judge));
+    }
+
+    #[test]
+    fn a_read_past_the_per_tick_budget_stays_drawn() {
+        let mut items = judge_and_issue();
+        let held = hold_judge_backstop(
+            &mut items,
+            &heads(),
+            &labels(),
+            0,
+            now(),
+            |_| None,
+            |_| panic!("no read"),
+        );
+        assert_eq!(held, 0, "past the budget the step is drawn unread");
+        assert_eq!(judge(&items), Verdict::Step(Step::Judge));
+    }
+
+    #[test]
+    fn a_cached_comment_list_holds_without_a_read() {
+        let mut items = judge_and_issue();
+        let held = hold_judge_backstop(
+            &mut items,
+            &heads(),
+            &labels(),
+            0,
+            now(),
+            |_| Some(held_records()),
+            |_| panic!("no read"),
+        );
+        assert_eq!(held, 1, "a cached comment list holds without a read");
+
+        let mut items = judge_and_issue();
+        let held = hold_judge_backstop(
+            &mut items,
+            &HashMap::new(),
+            &labels(),
+            4,
+            now(),
+            |_| None,
+            |_| panic!("no read"),
+        );
+        assert_eq!(held, 0, "a PR with no known head is drawn unread");
+        assert_eq!(judge(&items), Verdict::Step(Step::Judge));
+    }
+}
+
 /// #12074: a failed open-PR listing keeps the last good PR set but never
 /// vouches for a Builder step (the flag stays false); with nothing cached it
 /// is empty, as before.

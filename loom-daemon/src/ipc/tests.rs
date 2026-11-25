@@ -53,6 +53,9 @@ fn setup_test_context() -> TestContext {
     let db = Arc::new(Mutex::new(db));
     let mut sr_config = SweepRegistryConfig::new(dir.path().to_path_buf());
     sr_config.skip_label_flip = true;
+    // Confine the #3953 sweep journal to this fixture's tempdir — never the
+    // real machine-level `~/.loom/sweeps.json`.
+    sr_config.journal_path = Some(dir.path().join("test-sweeps-journal.json"));
     let bus = Arc::new(EventBus::new());
     let mut registry = SweepRegistry::new(sr_config);
     registry.set_event_bus(bus.clone());
@@ -472,8 +475,7 @@ fn test_dispatch_sweep_still_dispatches_under_synthetic_low_headroom() {
 
 #[test]
 fn test_handle_request_list_sweeps_empty() {
-    let (_context_dir, tm, db, _, bus) = setup_test_context();
-    let (sr, _dir, _rec) = setup_sweep_registry_in_tempdir();
+    let (_context_dir, tm, db, sr, bus) = setup_test_context();
     let response = handle_request(
         Request::ListSweeps {
             state_filter: None,
@@ -1280,61 +1282,96 @@ fn test_handle_request_dispatch_sweep_exports_claim_ownership_marker() {
 /// epic supervisor, and role runner, which all read it in-process each
 /// tick. These tests exercise [`drain_dispatch_refusal`] — the exact
 /// decision `handle_client` makes before ever calling `handle_request` —
-/// directly with a plain `bool`, matching the
+/// directly with a plain [`DispatchHold`], matching the
 /// [`rate_limit_dispatch_refusal_tests`] pattern just above (a real
 /// `DrainState` is a `Mutex`-guarded singleton per daemon process, not
 /// something a unit test wants to mutate to exercise one decision).
 mod drain_dispatch_refusal_tests {
     use super::*;
+    use crate::ipc::DispatchHold;
 
-    /// Not draining ⇒ never refuses, regardless of `force`. This is the
-    /// overwhelmingly common case (no drain in progress) and must be a
-    /// complete no-op.
-    #[test]
-    fn not_draining_never_refuses() {
-        let kind = SweepKind::Issue(5340);
-        assert!(drain_dispatch_refusal(&kind, false, false).is_none());
-        assert!(drain_dispatch_refusal(&kind, false, true).is_none());
-    }
+    /// The pre-#15300 drain refusal, byte for byte.
+    const DRAIN_MESSAGE: &str = "dispatch_sweep refused: an active drain (`restart --drain`) is \
+         pausing new dispatch pending a supervised restart (#4090/#5340). Check progress with \
+         `loom-daemon status`, cancel the drain with `loom-daemon restart --abort-drain` to \
+         resume normal dispatch immediately, or re-run with force to override.";
 
-    /// The core #5340 fix: an active drain refuses a plain (non-forced)
-    /// explicit dispatch, with a message that names the drain, points at
-    /// `loom-daemon status` to check progress, and `restart --abort-drain`
-    /// to resume dispatch immediately.
-    #[test]
-    fn draining_refuses_without_force() {
-        let kind = SweepKind::Issue(5340);
-        let response = drain_dispatch_refusal(&kind, true, false);
-        match response {
-            Some(Response::Error { message }) => {
-                assert!(
-                    message.contains("drain"),
-                    "expected the drain refusal message, got: {message}"
-                );
-                assert!(
-                    message.contains("loom-daemon status"),
-                    "expected a pointer to checking status, got: {message}"
-                );
-                assert!(
-                    message.contains("--abort-drain"),
-                    "expected the abort-drain escape hatch, got: {message}"
-                );
-            }
+    fn refusal_message(hold: &DispatchHold) -> String {
+        match drain_dispatch_refusal(&SweepKind::Issue(5340), hold, false) {
+            Some(Response::Error { message }) => message,
             other => panic!("Expected Some(Response::Error), got: {other:?}"),
         }
     }
 
-    /// `force: true` overrides the drain refusal independently of the
-    /// host-distress/rate-limit breakers' own `force` handling, even while
-    /// `is_draining` remains `true` throughout — an operator can still push
-    /// an urgent dispatch through a drain window.
+    /// No hold ⇒ never refuses, regardless of `force`. This is the
+    /// overwhelmingly common case and must be a complete no-op.
     #[test]
-    fn force_true_overrides_active_drain() {
+    fn not_draining_never_refuses() {
         let kind = SweepKind::Issue(5340);
-        assert!(
-            drain_dispatch_refusal(&kind, true, true).is_none(),
-            "force: true must bypass the drain refusal"
+        assert!(drain_dispatch_refusal(&kind, &DispatchHold::None, false).is_none());
+        assert!(drain_dispatch_refusal(&kind, &DispatchHold::None, true).is_none());
+    }
+
+    /// The #5340 fix, pinned by #15300: a genuine drain's refusal text is
+    /// unchanged byte for byte.
+    #[test]
+    fn draining_refuses_without_force() {
+        assert_eq!(refusal_message(&DispatchHold::Drain), DRAIN_MESSAGE);
+    }
+
+    /// #15300: a fleet hold names the fleet store and carries the hold note,
+    /// and never suggests the drain remedies (which would override the
+    /// operator's pause) or `force`.
+    #[test]
+    fn a_fleet_hold_names_the_fleet_store_not_a_drain() {
+        let note = "fleet-state hold: paused by op since 2026-10-13: maintenance; set it \
+                    running in the store";
+        let message = refusal_message(&DispatchHold::FleetHold(note.to_string()));
+        assert_eq!(
+            message,
+            format!("dispatch_sweep refused: host is paused in the fleet store: {note}")
         );
+        assert!(!message.contains("restart --drain"), "{message}");
+        assert!(!message.contains("--abort-drain"), "{message}");
+        assert!(!message.contains("force"), "{message}");
+    }
+
+    /// #15300: a local operator stop names the stop record (via its note).
+    #[test]
+    fn an_operator_stop_names_the_stop_record() {
+        let note = "dispatch HELD at startup: an operator stop is on record (/x/stop at t: r)";
+        let message = refusal_message(&DispatchHold::OperatorStop(note.to_string()));
+        assert_eq!(
+            message,
+            format!("dispatch_sweep refused: an operator stop is on record: {note}")
+        );
+        assert!(!message.contains("an active drain"), "{message}");
+    }
+
+    /// An H5 resume hold names itself, not a drain.
+    #[test]
+    fn a_roll_resume_hold_is_not_called_a_drain() {
+        let message = refusal_message(&DispatchHold::RollResume("verifying".to_string()));
+        assert!(message.contains("verifying"), "{message}");
+        assert!(!message.contains("an active drain"), "{message}");
+    }
+
+    /// `force: true` overrides every hold, including a fleet hold (unchanged
+    /// behaviour — #15300 is a wording fix, not a policy change).
+    #[test]
+    fn force_true_overrides_every_hold() {
+        let kind = SweepKind::Issue(5340);
+        for hold in [
+            DispatchHold::Drain,
+            DispatchHold::FleetHold("n".to_string()),
+            DispatchHold::OperatorStop("n".to_string()),
+            DispatchHold::RollResume("n".to_string()),
+        ] {
+            assert!(
+                drain_dispatch_refusal(&kind, &hold, true).is_none(),
+                "force: true must bypass {hold:?}"
+            );
+        }
     }
 }
 
@@ -2227,8 +2264,7 @@ async fn test_handle_request_publish_event_malformed_and_unknown_stay_generic() 
 
 #[test]
 fn test_handle_request_get_sweep_status_missing() {
-    let (_context_dir, tm, db, _, bus) = setup_test_context();
-    let (sr, _dir, _rec) = setup_sweep_registry_in_tempdir();
+    let (_context_dir, tm, db, sr, bus) = setup_test_context();
     let response = handle_request(
         Request::GetSweepStatus {
             sweep_id: "no-such-sweep".to_string(),
@@ -2248,8 +2284,7 @@ fn test_handle_request_get_sweep_status_missing() {
 
 #[test]
 fn test_handle_request_tail_sweep_log_missing_sweep_returns_error() {
-    let (_context_dir, tm, db, _, bus) = setup_test_context();
-    let (sr, _dir, _rec) = setup_sweep_registry_in_tempdir();
+    let (_context_dir, tm, db, sr, bus) = setup_test_context();
     let response = handle_request(
         Request::TailSweepLog {
             sweep_id: "no-such-sweep".to_string(),
@@ -2277,8 +2312,7 @@ fn test_handle_request_tail_sweep_log_missing_sweep_returns_error() {
 fn test_handle_request_clear_quarantine_noop() {
     // Issue #3939/#3960: clearing an issue that is not quarantined is an
     // idempotent no-op success routed through the full IPC dispatcher.
-    let (_context_dir, tm, db, _, bus) = setup_test_context();
-    let (sr, _dir, _rec) = setup_sweep_registry_in_tempdir();
+    let (_context_dir, tm, db, sr, bus) = setup_test_context();
     let response = handle_request(
         Request::ClearQuarantine {
             issue: 4242,
@@ -2306,8 +2340,7 @@ fn test_handle_request_clear_quarantine_noop() {
 fn test_handle_request_clear_quarantine_clears_existing() {
     // Seed a quarantine directly, then clear it via the IPC dispatcher and
     // assert the in-memory state was released (was_quarantined: true).
-    let (_context_dir, tm, db, _, bus) = setup_test_context();
-    let (sr, _dir, _rec) = setup_sweep_registry_in_tempdir();
+    let (_context_dir, tm, db, sr, bus) = setup_test_context();
     {
         let mut reg = sr.lock().unwrap();
         reg.seed_quarantine_for_test(808);
@@ -2345,8 +2378,7 @@ fn test_handle_request_record_dispatch_failure_arms_backoff() {
     // caller with no direct registry access) records a failed dispatch
     // via IPC and gets back the resulting consecutive count + window,
     // mirroring the reaper's own automatic bookkeeping (#4485).
-    let (_context_dir, tm, db, _, bus) = setup_test_context();
-    let (sr, _dir, _rec) = setup_sweep_registry_in_tempdir();
+    let (_context_dir, tm, db, sr, bus) = setup_test_context();
     let response = handle_request(
         Request::RecordDispatchFailure {
             issue: 6192,
@@ -2382,8 +2414,7 @@ fn test_handle_request_record_dispatch_failure_arms_backoff() {
 fn test_handle_request_record_dispatch_failure_accumulates_consecutive() {
     // Two calls for the same issue accumulate — mirrors the reaper
     // calling `record_dispatch_failure` on repeated failed dispatches.
-    let (_context_dir, tm, db, _, bus) = setup_test_context();
-    let (sr, _dir, _rec) = setup_sweep_registry_in_tempdir();
+    let (_context_dir, tm, db, sr, bus) = setup_test_context();
     for _ in 0..2 {
         handle_request(
             Request::RecordDispatchFailure {
@@ -2424,8 +2455,7 @@ fn test_handle_request_record_dispatch_failure_disabled_is_noop() {
     // idempotent no-op: `consecutive` stays 0 and `backoff_secs` is None,
     // never a hard error — mirrors `record_dispatch_failure`'s own early
     // return when `dispatch_backoff_config.enabled` is false.
-    let (_context_dir, tm, db, _, bus) = setup_test_context();
-    let (sr, _dir, _rec) = setup_sweep_registry_in_tempdir();
+    let (_context_dir, tm, db, sr, bus) = setup_test_context();
     {
         let mut reg = sr.lock().unwrap();
         let mut cfg = reg.dispatch_backoff_config();
@@ -2466,8 +2496,7 @@ fn test_handle_request_record_noop_release_arms_cooldown() {
     // access) records a self-reported no-op release via IPC and gets back
     // the resulting consecutive count + window, mirroring
     // `RecordDispatchFailure`'s own contract.
-    let (_context_dir, tm, db, _, bus) = setup_test_context();
-    let (sr, _dir, _rec) = setup_sweep_registry_in_tempdir();
+    let (_context_dir, tm, db, sr, bus) = setup_test_context();
     let response = handle_request(
         Request::RecordNoopRelease {
             issue: 6670,
@@ -2507,8 +2536,7 @@ fn test_handle_request_record_noop_release_arms_cooldown() {
 fn test_handle_request_record_noop_release_accumulates_consecutive() {
     // Two calls for the same issue accumulate — mirrors the sweep
     // orchestrator reporting "still nothing to do" on repeated passes.
-    let (_context_dir, tm, db, _, bus) = setup_test_context();
-    let (sr, _dir, _rec) = setup_sweep_registry_in_tempdir();
+    let (_context_dir, tm, db, sr, bus) = setup_test_context();
     for _ in 0..2 {
         handle_request(
             Request::RecordNoopRelease {
@@ -2549,8 +2577,7 @@ fn test_handle_request_record_noop_release_disabled_is_noop() {
     // idempotent no-op: `consecutive` stays 0 and `cooldown_secs` is None,
     // never a hard error — mirrors `record_noop_release`'s own early
     // return when `noop_cooldown_config.enabled` is false.
-    let (_context_dir, tm, db, _, bus) = setup_test_context();
-    let (sr, _dir, _rec) = setup_sweep_registry_in_tempdir();
+    let (_context_dir, tm, db, sr, bus) = setup_test_context();
     {
         let mut reg = sr.lock().unwrap();
         let mut cfg = reg.noop_cooldown_config();
@@ -2723,8 +2750,7 @@ fn test_record_noop_release_routes_to_explicit_non_default_workspace() {
 /// `workspace_root` calls.
 #[test]
 fn test_record_noop_release_none_workspace_root_still_targets_default() {
-    let (_context_dir, tm, db, _, bus) = setup_test_context();
-    let (sr, _dir, _rec) = setup_sweep_registry_in_tempdir();
+    let (_context_dir, tm, db, sr, bus) = setup_test_context();
 
     let response = handle_request(
         Request::RecordNoopRelease {
@@ -2894,8 +2920,7 @@ fn test_handle_request_list_quarantines_ttl_clamps_to_zero() {
 
 #[test]
 fn test_handle_request_cancel_sweep_unknown_returns_error() {
-    let (_context_dir, tm, db, _, bus) = setup_test_context();
-    let (sr, _dir, _rec) = setup_sweep_registry_in_tempdir();
+    let (_context_dir, tm, db, sr, bus) = setup_test_context();
     let response = handle_request(
         Request::CancelSweep {
             sweep_id: "no-such-sweep".to_string(),

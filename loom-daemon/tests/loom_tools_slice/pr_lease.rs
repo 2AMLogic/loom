@@ -162,6 +162,22 @@ impl Fixture {
         run(command, None)
     }
 
+    /// `lease pr backstop-clear --pr 77` on `binary` (#15096) — its own arg
+    /// shape (a `--pr` flag, no positional).
+    fn backstop_clear(&self, binary: &str) -> Output {
+        let path = self.tmp.path();
+        let mut command = base(binary, path, &self.launcher);
+        command
+            .env_remove("LOOM_MODE")
+            .env("LOOM_GH_BIN", &self.gh)
+            .env("LOOM_GH_GATEWAY_DIR", &self.gateway)
+            .env("GH_CONFIG_DIR", path.join("writer"))
+            .env("LOOM_TEST_PR_LEASE", path)
+            .args(["lease", "pr", "backstop-clear", "--pr", "77", "--workspace"])
+            .arg(&self.root);
+        run(command, None)
+    }
+
     fn renewer_log(&self) -> String {
         fs::read_to_string(self.root.join(".loom/logs/pr-lease/pr-77-judge.log"))
             .unwrap_or_default()
@@ -424,8 +440,18 @@ fn unreadable_expired_and_unconfigured_routes_keep_their_contracts() {
 
     assert_code(&f.lease(TOOLS, "claim", "judge", "me", &[]), 5);
     let check = f.lease(TOOLS, "check", "judge", "me", &[]);
-    assert_code(&check, 5);
-    assert!(check.stdout.starts_with(b"PR_LEASE_STATE=unknown"));
+    // #15105: the cause is on stderr (last line), stdout stays exactly the state.
+    let stderr = assert_code(&check, 5);
+    assert_eq!(check.stdout, b"PR_LEASE_STATE=unknown\n");
+    let last = stderr
+        .lines()
+        .rev()
+        .find(|l| !l.trim().is_empty())
+        .unwrap_or("");
+    assert!(last.contains("could not read this PR's lease records"), "{stderr}");
+    // This route sheds the read, so the cause is the shed reason
+    // (`bounded_reason(&u.to_string())`), not a `gh exited` line.
+    assert!(last.contains("reader budget low"), "{stderr}");
     assert_code(&f.lease(TOOLS, "fence", "judge", "me", &[]), 0);
     assert!(!f.read("calls").contains("writer comments"));
     assert!(!f.read("calls").contains("writer post"));
@@ -454,8 +480,9 @@ fn fleet_mode_without_an_eligible_reader_never_reaches_the_writer() {
     fs::remove_file(f.gateway.join("acme/hosts.yml")).unwrap();
     assert_code(&f.lease(TOOLS, "claim", "judge", "me", &[]), 5);
     let check = f.lease(TOOLS, "check", "judge", "me", &[]);
-    assert_code(&check, 5);
-    assert!(check.stdout.starts_with(b"PR_LEASE_STATE=unknown"));
+    let stderr = assert_code(&check, 5);
+    assert_eq!(check.stdout, b"PR_LEASE_STATE=unknown\n");
+    assert!(stderr.contains("could not read this PR's lease records"), "{stderr}");
     let calls = f.read("calls");
     assert!(!calls.contains("comments"), "{calls}");
     assert!(!calls.lines().any(|line| line.ends_with(" post")), "{calls}");
@@ -472,8 +499,9 @@ fn fleet_mode_without_an_eligible_reader_never_reaches_the_writer() {
     git.args(["remote", "remove", "origin"]);
     assert!(run(git, None).status.success());
     let check = f.lease(TOOLS, "check", "judge", "me", &[]);
-    assert_code(&check, 5);
-    assert!(check.stdout.starts_with(b"PR_LEASE_STATE=unknown"));
+    let stderr = assert_code(&check, 5);
+    assert_eq!(check.stdout, b"PR_LEASE_STATE=unknown\n");
+    assert!(stderr.contains("could not read this PR's lease records"), "{stderr}");
     assert!(f.read("calls").is_empty(), "{}", f.read("calls"));
 
     // The positive route: origin, matching marker and the owner profile in
@@ -483,6 +511,19 @@ fn fleet_mode_without_an_eligible_reader_never_reaches_the_writer() {
     assert_code(&check, 0);
     assert!(check.stdout.starts_with(b"PR_LEASE_STATE=free"));
     assert!(f.read("calls").contains("gateway comments"));
+}
+
+/// #15105: a transient read failure is retried and the resolved state is
+/// reported with a clean stderr (no "could not read" line).
+#[test]
+fn a_transient_check_read_failure_recovers_without_a_cause_line() {
+    let f = Fixture::new("fleet");
+    fs::write(f.tmp.path().join("fail-comments-once"), "").unwrap();
+    let check = f.lease(TOOLS, "check", "judge", "me", &[]);
+    let stderr = assert_code(&check, 0);
+    assert_eq!(check.stdout, b"PR_LEASE_STATE=free\n");
+    assert!(!stderr.contains("could not read"), "{stderr}");
+    assert!(!f.tmp.path().join("fail-comments-once").exists());
 }
 
 #[test]
@@ -531,4 +572,31 @@ fn daemon_service_actions_are_refused_by_tools_before_routing() {
     let rows = f.read("rows");
     assert!(rows.contains("loom:pr-lease-released role=judge"), "{rows}");
     assert!(rows.contains("reaped=timeout"), "{rows}");
+}
+
+/// #15096: the tools binary refuses the operator write verb before any
+/// routing, and the daemon's own `backstop-clear` releases a held PR without
+/// a push or a label change — `check` answers `held-backstop` before and
+/// `free` after, with only a comment rewrite in between.
+#[test]
+fn backstop_clear_is_an_operator_verb_that_releases_the_hold() {
+    let f = Fixture::new("fleet");
+    assert!(assert_code(&f.backstop_clear(TOOLS), 64).contains("use loom-daemon"));
+    assert!(f.read("calls").is_empty());
+
+    let body = "<!-- loom:pr-lease-released role=judge host=old sweep=prior \
+                head=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa verdict=none \
+                labels=review-requested -->";
+    f.seed_row(100, body, Utc::now());
+    assert_code(&f.check("judge", "me", "1"), 6);
+    assert!(f.read("rows").contains("verdict=none"));
+
+    assert_code(&f.backstop_clear(DAEMON), 0);
+    let rows = f.read("rows");
+    assert!(rows.contains("verdict=cleared"), "{rows}");
+    assert!(!rows.contains("verdict=none"), "{rows}");
+
+    let check = f.check("judge", "me", "1");
+    assert_code(&check, 0);
+    assert_eq!(check.stdout, b"PR_LEASE_STATE=free\n");
 }

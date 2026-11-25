@@ -1148,11 +1148,15 @@ pub fn run_tick(fallback_root: &Path, state: &mut ReconcileState, now: u64) -> V
             binding_account(&acting_inventories, reference).is_some()
         });
     // One container read for the whole pass (every root), taken lazily,
-    // classified with the shared drift definition (#10600).
+    // classified with the shared drift definition (#10600). The program is
+    // the shared lookup (#14885); an unresolvable docker stays unlaunchable,
+    // so the read is Unavailable and the pass ends without marking anything
+    // down (fail open).
+    let docker = crate::docker_bin::scoped_or_fail_open(None);
     let drift_inputs = DriftInputs::new(readable.then_some(registered.as_slice()));
     let read = || {
         session_state::binding_snapshot(
-            "docker",
+            &docker,
             &drift_inputs,
             session_state::SNAPSHOT_DEADLINE,
             attest_engine,
@@ -1261,7 +1265,7 @@ pub fn run_tick(fallback_root: &Path, state: &mut ReconcileState, now: u64) -> V
         // Selection reads the published snapshot: show it the start now.
         let started = std::time::Instant::now();
         let published =
-            session_state::snapshot("docker", &drift_inputs, session_state::SNAPSHOT_DEADLINE);
+            session_state::snapshot(&docker, &drift_inputs, session_state::SNAPSHOT_DEADLINE);
         session_state::publish(std::sync::Arc::new(published), started);
     }
     crate::session_status::record_pass(&all, now);

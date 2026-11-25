@@ -617,6 +617,7 @@ fn refreshing_a_session_skips_unproved_mirrors_without_creating_anything() {
         gh_config: None,
         session_image: None,
         extra_mounts: Vec::new(),
+        mirror_binds: Vec::new(),
     };
     refresh_session_mirrors(root.path(), &config);
     std::env::remove_var(MIRROR_ROOT_ENV);

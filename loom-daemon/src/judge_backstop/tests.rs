@@ -285,3 +285,47 @@ fn stuck_in_progress_run_with_conclusion_is_not_pending() {
     ]});
     assert_eq!(pending_check_runs(&page), vec!["b".to_string()]);
 }
+
+/// #15096: `clear_record` swaps exactly the `verdict=none` token, keeps every
+/// other field and the prose below the marker, and leaves anything that is
+/// not a live no-verdict record alone.
+#[test]
+fn clear_record_swaps_only_the_verdict_token() {
+    let labels = ["loom:review-requested"];
+    for fields in [
+        released_fields(HEAD, &labels),
+        refused_fields(HEAD, &labels, "stale-read"),
+        reaped_fields(HEAD, &labels, "timeout"),
+    ] {
+        let body = format!(
+            "{RELEASED_JUDGE_PREFIX}host=host-1 sweep=s-1 step=judge{fields} -->\nPR #1's claim…",
+        );
+        let cleared = clear_record(&body).unwrap_or_else(|| panic!("not cleared: {body}"));
+        assert_eq!(cleared, body.replace("verdict=none", "verdict=cleared"), "{body}");
+        assert_eq!(parse(&cleared), None, "no reader sees the record again");
+        // Idempotent: an already-cleared record is not rewritten again.
+        assert_eq!(clear_record(&cleared), None);
+        // A trailing newline survives the rewrite.
+        assert_eq!(clear_record(&format!("{body}\n")).unwrap(), format!("{cleared}\n"));
+    }
+}
+
+/// #15096: only a record [`parse`] would count is clearable, and a cleared
+/// record no longer holds the PR.
+#[test]
+fn clear_record_leaves_non_records_alone_and_ends_the_hold() {
+    assert_eq!(clear_record("<!-- loom:pr-lease-released role=judge host=h sweep=s -->"), None);
+    assert_eq!(clear_record("an ordinary comment"), None);
+    assert_eq!(clear_record(""), None);
+    let doctor = marker(HEAD, &["loom:review-requested"]).replace("role=judge", "role=doctor");
+    assert_eq!(clear_record(&doctor), None);
+    // The hold the record carried is gone once it is cleared.
+    let labels = ["loom:review-requested", "loom:reviewing"];
+    let body = marker(HEAD, &labels);
+    let cleared = clear_record(&body).unwrap();
+    let comments = vec![serde_json::json!({
+        "body": cleared,
+        "updated_at": "2026-10-13T00:00:00Z",
+    })];
+    assert_eq!(hold_from_comments(&comments, HEAD, &labels, t(0)), None);
+}

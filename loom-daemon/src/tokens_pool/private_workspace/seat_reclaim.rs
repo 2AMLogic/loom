@@ -93,6 +93,63 @@ pub struct SeatReclaimArgs {
     pub grace_secs: i64,
 }
 
+/// One item the pass removed (#14889): what the host logs per item and
+/// exports as one `reaper.removal` span. `path` is relative to the seat
+/// volume (`cache/judge-42`, `repo/.loom/worktrees/issue-7`), so an operator
+/// can tell a cached scratch entry from a top-level one without ever seeing
+/// a host path.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RemovedItem {
+    /// `worktree` or `scratch`.
+    pub kind: String,
+    /// The item's path relative to the seat volume.
+    pub path: String,
+    /// The removed worktree's branch (worktree removals only).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub branch: Option<String>,
+    /// The removed worktree's full pre-removal tip SHA (worktree removals
+    /// only).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tip: Option<String>,
+    /// The bytes the removal freed — the count scratch reclaim already
+    /// computed, or the held size a worktree removal already adds up.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bytes: Option<u64>,
+}
+
+impl RemovedItem {
+    /// The item's one-line audit description for the host log (#14889).
+    /// Every free-form field is Debug-escaped, so a crafted name cannot
+    /// forge or split the line; a long path rides here in full even when the
+    /// span's bounded attributes drop it.
+    #[must_use]
+    pub fn describe(&self) -> String {
+        let mut line = format!("{} {:?}", self.kind, self.path);
+        if let Some(branch) = &self.branch {
+            line.push_str(&format!(", branch {branch:?}"));
+        }
+        if let Some(tip) = &self.tip {
+            line.push_str(&format!(", tip {tip}"));
+        }
+        if let Some(bytes) = self.bytes {
+            line.push_str(&format!(", {}", crate::fs_util::human_size(bytes)));
+        }
+        line
+    }
+
+    /// The item as the reaper's removal span carries it (#14889).
+    #[must_use]
+    pub fn removal(&self) -> crate::observability::ops::reaper::Removal<'_> {
+        crate::observability::ops::reaper::Removal {
+            kind: &self.kind,
+            path: &self.path,
+            branch: self.branch.as_deref(),
+            tip: self.tip.as_deref(),
+            bytes: self.bytes,
+        }
+    }
+}
+
 /// One pass's outcome, reported to the host as the protocol `outcome`.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SeatReclaimOutcome {
@@ -110,6 +167,17 @@ pub struct SeatReclaimOutcome {
     pub scratch_scanned: usize,
     /// Bytes freed by scratch removals alone.
     pub scratch_bytes: u64,
+    /// One record per successful removal, worktrees and scratch alike
+    /// (#14889). Absent from a counts-only seat image (serde default), which
+    /// still yields the summaries and counts above.
+    #[serde(default)]
+    pub removed: Vec<RemovedItem>,
+    /// A Git error that stopped the worktree half's inspection (#14889).
+    /// Inspection stops there exactly as before, but the removals already
+    /// recorded are complete and stand: the host reports both the failure
+    /// and every earlier removal.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inspection_error: Option<String>,
 }
 
 /// The PR-state lookup the worktree half consults, injected so tests never
@@ -129,7 +197,7 @@ pub(super) fn seat_reclaim(
     let root = root.canonicalize()?;
     let mut outcome = SeatReclaimOutcome::default();
     reclaim_scratch(&root, args.max_age_secs, now, &mut outcome);
-    reap_merged_worktrees(&root, args, pr_at_head, now, &mut outcome)?;
+    reap_merged_worktrees(&root, args, pr_at_head, now, &mut outcome);
     Ok(outcome)
 }
 
@@ -163,6 +231,17 @@ pub fn is_step_scratch_name(name: &str) -> bool {
 #[must_use]
 pub fn is_tmp_step_name(name: &str) -> bool {
     name.len() > 4 && name.ends_with("-tmp")
+}
+
+/// The item's path relative to the volume root (#14889): the record names
+/// the item without a host path, and `cache/judge-42` stays distinct from a
+/// top-level `judge-42`.
+fn relative(root: &Path, path: &Path) -> String {
+    let path = path.strip_prefix(root).unwrap_or(path);
+    // JSON paths are strings. Preserve the byte escapes of a non-UTF-8 name
+    // so distinct files don't collapse to the same replacement character.
+    path.to_str()
+        .map_or_else(|| format!("{path:?}"), str::to_owned)
 }
 
 fn reclaim_scratch(
@@ -216,6 +295,13 @@ fn reclaim_scratch(
             outcome.scratch_removed += 1;
             outcome.scratch_bytes += bytes;
             outcome.bytes += bytes;
+            outcome.removed.push(RemovedItem {
+                kind: "scratch".into(),
+                path: relative(root, &path),
+                branch: None,
+                tip: None,
+                bytes: Some(bytes),
+            });
         } else {
             log::debug!("seat_reclaim: could not remove {}: {:?}", path.display(), removed);
         }
@@ -275,92 +361,137 @@ fn volume_clones(root: &Path) -> Vec<(PathBuf, String)> {
     clones
 }
 
+/// The merged-only reap. A Git error no longer aborts the verb past the
+/// accumulated outcome (#14889): inspection stops at the first error exactly
+/// as before — never guessing at unreadable state — but the error is
+/// recorded in [`SeatReclaimOutcome::inspection_error`] so the host reports
+/// both it and every removal already completed (scratch included, which the
+/// old `?` propagated away).
 fn reap_merged_worktrees(
     root: &Path,
     args: &SeatReclaimArgs,
     pr_at_head: &PrLookup<'_>,
     now: DateTime<Utc>,
     outcome: &mut SeatReclaimOutcome,
+) {
+    'pass: for (repo, repository) in volume_clones(root) {
+        let clone = CloneUnderInspection {
+            root,
+            path: &repo,
+            repository: &repository,
+        };
+        let entries = match repository::worktree_entries(clone.path) {
+            Ok(entries) => entries,
+            Err(error) => {
+                outcome.inspection_error = Some(error.to_string());
+                break 'pass;
+            }
+        };
+        for entry in entries {
+            if let Err(error) = inspect_entry(&clone, &entry, args, pr_at_head, now, outcome) {
+                outcome.inspection_error = Some(error.to_string());
+                break 'pass;
+            }
+        }
+    }
+}
+
+/// One enumerated clone under inspection: the volume root it belongs to
+/// (for the containment gate and relative record paths), the clone's path
+/// and its recorded repository.
+struct CloneUnderInspection<'a> {
+    root: &'a Path,
+    path: &'a Path,
+    repository: &'a str,
+}
+
+/// One worktree's gates and, when every gate passes, its removal. Preserve
+/// decisions land in `outcome.preserved`; an `Err` is a Git inspection
+/// failure, which stops the whole pass.
+fn inspect_entry(
+    clone: &CloneUnderInspection<'_>,
+    entry: &repository::WorktreeEntry,
+    args: &SeatReclaimArgs,
+    pr_at_head: &PrLookup<'_>,
+    now: DateTime<Utc>,
+    outcome: &mut SeatReclaimOutcome,
 ) -> anyhow::Result<()> {
-    for (repo, repository) in volume_clones(root) {
-        for entry in repository::worktree_entries(&repo)? {
-            let path = &entry.path;
-            outcome.worktrees_scanned += 1;
-            let Some(canonical) = path.canonicalize().ok() else {
-                outcome.preserved.push("worktree state unreadable".into());
-                continue;
+    let (root, repo, path) = (clone.root, clone.path, &entry.path);
+    outcome.worktrees_scanned += 1;
+    let Some(canonical) = path.canonicalize().ok() else {
+        outcome.preserved.push("worktree state unreadable".into());
+        return Ok(());
+    };
+    if canonical == repo {
+        // The main checkout is what the seat IS; never a candidate.
+        outcome.worktrees_scanned -= 1;
+        return Ok(());
+    }
+    if entry.locked {
+        outcome.preserved.push("worktree locked (in use)".into());
+        return Ok(());
+    }
+    if !canonical.starts_with(root) {
+        outcome
+            .preserved
+            .push("worktree outside the private volume".into());
+        return Ok(());
+    }
+    let Some(branch) = repository::current_branch(path)? else {
+        outcome
+            .preserved
+            .push("detached HEAD (unnamed work)".into());
+        return Ok(());
+    };
+    if repository::ahead_of_origin(path, "HEAD")? > 0 {
+        outcome.preserved.push("unpushed commits on HEAD".into());
+        return Ok(());
+    }
+    if !repository::worktree_status(path)?.is_empty() {
+        outcome
+            .preserved
+            .push("uncommitted changes in worktree".into());
+        return Ok(());
+    }
+    let tip = repository::git(path, &["rev-parse", "HEAD"])?
+        .trim()
+        .to_owned();
+    match pr_at_head(repo, clone.repository, &branch, &tip) {
+        PrAtHead::Open => outcome.preserved.push("PR still open".into()),
+        PrAtHead::ClosedNoMerge => outcome
+            .preserved
+            .push("PR closed without merging (not merged)".into()),
+        PrAtHead::NoPr => outcome
+            .preserved
+            .push("no merged PR for the branch at this tip".into()),
+        PrAtHead::Unknown => outcome.preserved.push("PR status unknown".into()),
+        PrAtHead::Merged(merged_at) => {
+            let Ok(merged) = DateTime::parse_from_rfc3339(&merged_at) else {
+                outcome
+                    .preserved
+                    .push("PR status unknown (unparseable merge time)".into());
+                return Ok(());
             };
-            if canonical == repo {
-                // The main checkout is what the seat IS; never a candidate.
-                outcome.worktrees_scanned -= 1;
-                continue;
-            }
-            if entry.locked {
-                outcome.preserved.push("worktree locked (in use)".into());
-                continue;
-            }
-            if !canonical.starts_with(root) {
+            let (past, _) = check_grace_period(merged.with_timezone(&Utc), args.grace_secs, now);
+            if !past {
                 outcome
                     .preserved
-                    .push("worktree outside the private volume".into());
-                continue;
+                    .push("merged PR grace period not passed".into());
+                return Ok(());
             }
-            let branch = repository::git(path, &["rev-parse", "--abbrev-ref", "HEAD"])?
-                .trim()
-                .to_owned();
-            if branch == "HEAD" {
-                outcome
-                    .preserved
-                    .push("detached HEAD (unnamed work)".into());
-                continue;
-            }
-            if repository::ahead_of_origin(path, "HEAD")? > 0 {
-                outcome.preserved.push("unpushed commits on HEAD".into());
-                continue;
-            }
-            if !repository::worktree_status(path)?.is_empty() {
-                outcome
-                    .preserved
-                    .push("uncommitted changes in worktree".into());
-                continue;
-            }
-            let tip = repository::git(path, &["rev-parse", "HEAD"])?
-                .trim()
-                .to_owned();
-            match pr_at_head(&repo, &repository, &branch, &tip) {
-                PrAtHead::Open => outcome.preserved.push("PR still open".into()),
-                PrAtHead::ClosedNoMerge => outcome
-                    .preserved
-                    .push("PR closed without merging (not merged)".into()),
-                PrAtHead::NoPr => outcome
-                    .preserved
-                    .push("no merged PR for the branch at this tip".into()),
-                PrAtHead::Unknown => outcome.preserved.push("PR status unknown".into()),
-                PrAtHead::Merged(merged_at) => {
-                    let Ok(merged) = DateTime::parse_from_rfc3339(&merged_at) else {
-                        outcome
-                            .preserved
-                            .push("PR status unknown (unparseable merge time)".into());
-                        continue;
-                    };
-                    let (past, _) =
-                        check_grace_period(merged.with_timezone(&Utc), args.grace_secs, now);
-                    if !past {
-                        outcome
-                            .preserved
-                            .push("merged PR grace period not passed".into());
-                        continue;
-                    }
-                    let held = tree_bytes(path);
-                    if repository::git(&repo, &["worktree", "remove", &path.display().to_string()])
-                        .is_ok()
-                    {
-                        outcome.worktrees_removed += 1;
-                        outcome.bytes += held;
-                    } else {
-                        outcome.worktrees_failed += 1;
-                    }
-                }
+            let held = tree_bytes(&canonical);
+            if repository::git(repo, &["worktree", "remove", &path.display().to_string()]).is_ok() {
+                outcome.worktrees_removed += 1;
+                outcome.bytes += held;
+                outcome.removed.push(RemovedItem {
+                    kind: "worktree".into(),
+                    path: relative(root, &canonical),
+                    branch: Some(branch),
+                    tip: Some(tip),
+                    bytes: Some(held),
+                });
+            } else {
+                outcome.worktrees_failed += 1;
             }
         }
     }
@@ -457,6 +588,84 @@ impl SeatReclaimReport {
             self.scratch_removed(),
             crate::fs_util::human_size(self.bytes())
         )
+    }
+}
+
+/// Publish one seat's completed outcome (#14889): the two per-seat
+/// `reaper.pass` summaries (phases, counts and byte totals exactly as
+/// before), one `reaper.removal` span and one info line per removed item,
+/// and a warning when a Git error stopped the worktree half mid-pass — the
+/// removals recorded before it stand and are each reported once.
+pub(super) fn report_seat(
+    account: &str,
+    outcome: &SeatReclaimOutcome,
+    elapsed: std::time::Duration,
+) {
+    use crate::observability::ops::reaper;
+
+    // The span's repo label is the seat's account name: one path-shaped
+    // carrier, never a host path (`reaper::pass_span` takes the final
+    // component only).
+    let seat = Path::new("/private-workspace-seats").join(account);
+    let worktree_bytes = outcome.bytes.saturating_sub(outcome.scratch_bytes);
+    let preserved: Vec<&str> = outcome.preserved.iter().map(String::as_str).collect();
+    reaper::publish(
+        &seat,
+        &reaper::Pass {
+            class: "seat",
+            phase: reaper::PHASE_REAP,
+            scanned: outcome.worktrees_scanned,
+            removed: outcome.worktrees_removed,
+            failed: outcome.worktrees_failed,
+            preserved: preserved.clone(),
+            bytes: worktree_bytes,
+            backed_up: 0,
+            backup_refs: Vec::new(),
+        },
+    );
+    reaper::publish(
+        &seat,
+        &reaper::Pass {
+            class: "seat",
+            phase: reaper::PHASE_RECLAIM,
+            scanned: outcome.scratch_scanned,
+            removed: outcome.scratch_removed,
+            failed: 0,
+            preserved: Vec::new(),
+            bytes: outcome.scratch_bytes,
+            backed_up: 0,
+            backup_refs: Vec::new(),
+        },
+    );
+    for item in &outcome.removed {
+        let mut line = item.describe();
+        if let Some(trace_id) = reaper::publish_removal(&seat, &item.removal()) {
+            line.push_str(", trace_id=");
+            line.push_str(trace_id.as_str());
+        }
+        log::info!("private_workspace seat_reclaim: seat {account} removed {line}");
+    }
+    if let Some(error) = &outcome.inspection_error {
+        log::warn!(
+            "private_workspace seat_reclaim: seat {account} stopped at a Git inspection error \
+             after {} completed removal(s); the removals above stand: {error}",
+            outcome.removed.len()
+        );
+    }
+    if outcome.worktrees_removed > 0 || outcome.scratch_removed > 0 {
+        log::info!(
+            "private_workspace seat_reclaim: seat {account} removed {} worktree(s) and {} \
+             scratch entries ({}) — preserved {preserved:?}",
+            outcome.worktrees_removed,
+            outcome.scratch_removed,
+            crate::fs_util::human_size(outcome.bytes),
+        );
+    } else {
+        log::debug!(
+            "private_workspace seat_reclaim: seat {account} (took {:?}s) nothing to reclaim — \
+             preserved {preserved:?}",
+            elapsed.as_secs(),
+        );
     }
 }
 
@@ -595,8 +804,6 @@ type WalkBody = Arc<dyn Fn(PathBuf) -> SeatReclaimReport + Send + Sync>;
 /// The production walk body: the sequential seat walk with its existing
 /// lease, running/idle and reporting behavior, on this blocking worker.
 fn run_walk(workspace: &Path) -> SeatReclaimReport {
-    use crate::observability::ops::reaper;
-
     let config = crate::scratch_reclaim::read_scratch_reclaim_config(workspace);
     let max_age_secs =
         i64::try_from(crate::scratch_reclaim::resolve_max_age_hours(&config).saturating_mul(3600))
@@ -607,65 +814,14 @@ fn run_walk(workspace: &Path) -> SeatReclaimReport {
     let seats = super::lifecycle::seat_reclaim(workspace, max_age_secs, grace_secs);
 
     for walk in &seats {
-        let Ok(outcome) = &walk.result else {
-            log::debug!(
+        match &walk.result {
+            Ok(outcome) => report_seat(&walk.account, outcome, walk.elapsed),
+            Err(_) => log::debug!(
                 "private_workspace seat_reclaim: {} skipped after {:?}s: {:?}",
                 walk.account,
                 walk.elapsed.as_secs(),
                 walk.result
-            );
-            continue;
-        };
-        // The span's repo label is the seat's account name: one path-shaped
-        // carrier, never a host path (`reaper::pass_span` takes the final
-        // component only).
-        let seat = Path::new("/private-workspace-seats").join(&walk.account);
-        let worktree_bytes = outcome.bytes.saturating_sub(outcome.scratch_bytes);
-        let preserved: Vec<&str> = outcome.preserved.iter().map(String::as_str).collect();
-        reaper::publish(
-            &seat,
-            &reaper::Pass {
-                class: "seat",
-                phase: reaper::PHASE_REAP,
-                scanned: outcome.worktrees_scanned,
-                removed: outcome.worktrees_removed,
-                failed: outcome.worktrees_failed,
-                preserved: preserved.clone(),
-                bytes: worktree_bytes,
-                backed_up: 0,
-                backup_refs: Vec::new(),
-            },
-        );
-        reaper::publish(
-            &seat,
-            &reaper::Pass {
-                class: "seat",
-                phase: reaper::PHASE_RECLAIM,
-                scanned: outcome.scratch_scanned,
-                removed: outcome.scratch_removed,
-                failed: 0,
-                preserved: Vec::new(),
-                bytes: outcome.scratch_bytes,
-                backed_up: 0,
-                backup_refs: Vec::new(),
-            },
-        );
-        if outcome.worktrees_removed > 0 || outcome.scratch_removed > 0 {
-            log::info!(
-                "private_workspace seat_reclaim: seat {} removed {} worktree(s) and {} \
-                 scratch entries ({}) — preserved {preserved:?}",
-                walk.account,
-                outcome.worktrees_removed,
-                outcome.scratch_removed,
-                crate::fs_util::human_size(outcome.bytes),
-            );
-        } else {
-            log::debug!(
-                "private_workspace seat_reclaim: seat {} (took {:?}s) nothing to reclaim — \
-                 preserved {preserved:?}",
-                walk.account,
-                walk.elapsed.as_secs(),
-            );
+            ),
         }
     }
 
@@ -837,6 +993,7 @@ mod tests {
                 container_id: "test-container".into(),
                 branch: None,
                 slug: None,
+                mirror_objects: None,
             };
             repository::prepare(&root, &args).unwrap();
             Self {
@@ -985,6 +1142,50 @@ mod tests {
         );
     }
 
+    /// PR-fetch residue shadowing a merged branch: the pass must hand the
+    /// branch's true name to the PR lookup (so the checkout is reclaimed),
+    /// skip a detached sibling, and leave every ref it does not own — the
+    /// branch ref and the residue — exactly where it was (#15027).
+    #[test]
+    fn residue_shadowed_worktrees_pass_their_true_branch_to_the_pr_lookup() {
+        let _fork = super::super::tests::fork_guard();
+        let volume = Volume::new();
+        let shadowed = volume.worktree("issue-344", true);
+        let detached = volume.repo().join(".loom/worktrees").join("detached");
+        raw_git(
+            &volume.repo(),
+            &[
+                "worktree",
+                "add",
+                "--detach",
+                detached.to_string_lossy().as_ref(),
+            ],
+        );
+        let repo = volume.repo();
+        let tip = raw_git(&repo, &["rev-parse", "refs/heads/feature/issue-344"]);
+        raw_git(&repo, &["update-ref", "refs/feature/issue-344", &tip]);
+        raw_git(&repo, &["update-ref", "refs/remotes/feature/issue-344", &tip]);
+        let lookup = |_: &Path, _: &str, branch: &str, _: &str| -> PrAtHead {
+            if branch == "feature/issue-344" {
+                PrAtHead::Merged(merged_days_ago(30))
+            } else {
+                PrAtHead::NoPr
+            }
+        };
+        let outcome = seat_reclaim(&volume.root, &args(0, 0), &lookup, Utc::now()).unwrap();
+        assert!(!shadowed.exists(), "the shadowed checkout is reclaimed by its true name");
+        assert!(detached.exists(), "a detached worktree is never a candidate");
+        assert_eq!(outcome.worktrees_removed, 1);
+        let reasons = outcome.preserved.join("\n");
+        assert!(reasons.contains("detached HEAD (unnamed work)"), "{reasons}");
+        assert!(
+            raw_git(&repo, &["rev-parse", "--verify", "refs/heads/feature/issue-344"]).len() == 40,
+            "the branch ref survives the checkout's removal"
+        );
+        assert_eq!(raw_git(&repo, &["rev-parse", "refs/feature/issue-344"]), tip);
+        assert_eq!(raw_git(&repo, &["rev-parse", "refs/remotes/feature/issue-344"]), tip);
+    }
+
     #[test]
     fn main_checkout_and_foreign_worktrees_are_never_candidates() {
         let _fork = super::super::tests::fork_guard();
@@ -1081,18 +1282,10 @@ mod tests {
 
     /// Stamp an mtime (files and directories) the way the age gates read it.
     fn set_mtime(path: &Path, when: DateTime<Utc>) {
-        let out = std::process::Command::new("touch")
-            .arg("-d")
-            .arg(when.to_rfc3339())
-            .arg(path)
-            .output()
-            .expect("touch must spawn");
-        assert!(
-            out.status.success(),
-            "touch {} failed: {}",
-            path.display(),
-            String::from_utf8_lossy(&out.stderr)
-        );
+        std::fs::File::open(path)
+            .unwrap()
+            .set_modified(when.into())
+            .unwrap();
     }
 
     #[test]
@@ -1114,6 +1307,254 @@ mod tests {
         assert_eq!(outcome.scratch_removed, 1);
         assert_eq!(outcome.worktrees_removed, 0);
         assert!(volume.repo().join("stray").exists(), "the dirty main checkout is untouched");
+    }
+
+    // ===================================================================
+    // Removal records (#14889): every successful removal names what went,
+    // with the volume-relative path keeping `cache/judge-42` distinct from
+    // `judge-42`; preserved items produce none.
+    // ===================================================================
+
+    #[test]
+    fn removal_records_name_each_removed_item_and_nothing_preserved() {
+        let _fork = super::super::tests::fork_guard();
+        let volume = Volume::new();
+        let eligible = volume.worktree("issue-30", true);
+        let expected_tip = raw_git(&eligible, &["rev-parse", "HEAD"]).trim().to_owned();
+        let preserved = volume.worktree("issue-31", true);
+
+        // Same-named scratch at the volume root and under cache/, plus a
+        // live (preserved) sibling: the records must tell them apart.
+        let cache = volume.root.join("cache");
+        std::fs::create_dir_all(&cache).unwrap();
+        std::fs::write(cache.join("sta-6421"), "1234").unwrap();
+        std::fs::write(volume.root.join("sta-6421"), "12").unwrap();
+        std::fs::write(cache.join("live-7777"), "fresh").unwrap();
+        let now = Utc::now();
+        for path in [cache.join("sta-6421"), volume.root.join("sta-6421")] {
+            set_mtime(&path, now - Duration::hours(48));
+        }
+
+        let lookup = |_: &Path, _: &str, branch: &str, _: &str| -> PrAtHead {
+            match branch {
+                "feature/issue-30" => PrAtHead::Merged(merged_days_ago(30)),
+                "feature/issue-31" => PrAtHead::Open,
+                _ => PrAtHead::NoPr,
+            }
+        };
+        let outcome = seat_reclaim(&volume.root, &args(24 * 3600, 3600), &lookup, now).unwrap();
+
+        assert_eq!(outcome.removed.len(), 3, "{:?}", outcome.removed);
+        // The worktree record: relative path, branch and the FULL
+        // pre-removal tip captured before deletion.
+        let worktree = outcome
+            .removed
+            .iter()
+            .find(|item| item.kind == "worktree")
+            .expect("a worktree record");
+        assert_eq!(worktree.path, "repo/.loom/worktrees/issue-30");
+        assert_eq!(worktree.branch.as_deref(), Some("feature/issue-30"));
+        assert_eq!(worktree.tip.as_deref(), Some(expected_tip.as_str()));
+        assert_eq!(worktree.tip.as_deref().map(str::len), Some(40));
+        assert_eq!(worktree.bytes, Some(outcome.bytes - outcome.scratch_bytes));
+
+        // The scratch records: relative names, the byte counts reclaim
+        // already computed, and the same name distinguishable by location.
+        let scratch: Vec<_> = outcome
+            .removed
+            .iter()
+            .filter(|item| item.kind == "scratch")
+            .collect();
+        assert_eq!(scratch.len(), 2);
+        let by_path = |p: &str| {
+            scratch
+                .iter()
+                .find(|item| item.path == p)
+                .unwrap_or_else(|| panic!("no record for {p}"))
+        };
+        assert_eq!(by_path("cache/sta-6421").bytes, Some(4));
+        assert_eq!(by_path("sta-6421").bytes, Some(2));
+        assert_eq!(scratch.iter().filter(|item| item.bytes.is_some()).count(), 2);
+        // The records' byte totals agree with the outcome's counters.
+        assert_eq!(
+            scratch
+                .iter()
+                .map(|item| item.bytes.unwrap_or(0))
+                .sum::<u64>(),
+            outcome.scratch_bytes
+        );
+        // Preserved items — the open-PR worktree and the live scratch
+        // entry — produce zero records.
+        assert!(
+            outcome
+                .removed
+                .iter()
+                .all(|item| !item.path.contains("issue-31") && !item.path.contains("live-7777")),
+            "{:?}",
+            outcome.removed
+        );
+        assert!(preserved.exists());
+        assert!(cache.join("live-7777").exists());
+        // The describe() line keeps the record auditable: path, branch, tip.
+        let line = worktree.describe();
+        assert!(
+            line.contains("repo/.loom/worktrees/issue-30")
+                && line.contains("feature/issue-30")
+                && line.contains(&expected_tip),
+            "{line}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn non_utf8_removal_names_remain_distinct_in_the_audit_record() {
+        use std::{ffi::OsStr, os::unix::ffi::OsStrExt};
+
+        let root = Path::new("/volume");
+        let one = root.join(OsStr::from_bytes(b"cache/judge-42-\xfe"));
+        let two = root.join(OsStr::from_bytes(b"cache/judge-42-\xff"));
+        assert_ne!(relative(root, &one), relative(root, &two));
+        assert!(!relative(root, &one).contains('\u{fffd}'));
+        let valid = "cache/judge-42-\u{fffd}";
+        assert_eq!(relative(root, &root.join(valid)), valid);
+    }
+
+    #[test]
+    fn bounded_removal_spans_identify_each_escaped_scratch_path_in_the_log() {
+        let volume = tempfile::tempdir().unwrap();
+        let cache = volume.path().join("cache");
+        std::fs::create_dir(&cache).unwrap();
+        let long = format!("judge-42-{}", "\u{1}".repeat(70));
+        let names = ["judge-42-a\nb", "judge-42-c\nd", &long, "judge-42-plain"];
+        for name in names {
+            std::fs::write(cache.join(name), b"same").unwrap();
+        }
+        let mut outcome = SeatReclaimOutcome::default();
+        reclaim_scratch(volume.path(), 86_400, Utc::now() + Duration::days(2), &mut outcome);
+        assert_eq!(outcome.scratch_removed, names.len());
+        let (logs, captured) = crate::observability::ops::capture::capture(|| {
+            crate::test_log_capture::capture_logs(|| {
+                report_seat("fixture-seat", &outcome, std::time::Duration::from_secs(1))
+            })
+        });
+        let spans: Vec<_> = captured
+            .spans
+            .into_iter()
+            .filter(|span| span.name.as_str() == "reaper.removal")
+            .map(|span| span.bounded())
+            .collect();
+        assert_eq!(spans.len(), names.len());
+        for name in names {
+            assert!(!cache.join(name).exists());
+            let path = format!("cache/{name}");
+            let matches: Vec<_> = logs
+                .iter()
+                .filter(|(_, line)| line.contains(&format!("{path:?}")))
+                .collect();
+            assert_eq!(matches.len(), 1, "one full escaped log line for {path:?}");
+            let (_, line) = matches[0];
+            assert!(!line.contains('\n'));
+            let matching: Vec<_> = spans
+                .iter()
+                .filter(|span| {
+                    line.contains(&format!("trace_id={}", span.context.trace_id.as_str()))
+                })
+                .collect();
+            assert_eq!(matching.len(), 1, "one exported record matches {line}");
+            let attrs = &matching[0].attributes;
+            assert_eq!(attrs["loom.reaper.removal.bytes"], "4");
+            assert_eq!(
+                attrs.get("loom.reaper.removal.path"),
+                (!name.chars().any(char::is_control)).then_some(&path)
+            );
+            let escaped = name.escape_debug().to_string();
+            assert_eq!(
+                attrs.get("loom.reaper.removal.name"),
+                (escaped.len() <= 256).then_some(&escaped)
+            );
+        }
+    }
+
+    /// #14889: a Git inspection error no longer throws away the outcome —
+    /// inspection stops exactly as before, but the scratch removals already
+    /// completed and the failure indication reach the host together.
+    #[test]
+    fn a_git_inspection_failure_still_reports_the_completed_removals() {
+        let _fork = super::super::tests::fork_guard();
+        let volume = Volume::new();
+        // An eligible scratch entry: reclaimed before the worktree half runs.
+        let cache = volume.root.join("cache");
+        std::fs::create_dir_all(&cache).unwrap();
+        std::fs::write(cache.join("sta-6421"), "4 GB").unwrap();
+        set_mtime(&cache.join("sta-6421"), Utc::now() - Duration::hours(48));
+        // A recorded clone that is not a git repository: the worktree half's
+        // Git inspection fails on it.
+        let work = volume.root.join("work");
+        std::fs::create_dir_all(work.join(".identity")).unwrap();
+        std::fs::create_dir_all(work.join("broken-clone")).unwrap();
+        std::fs::write(
+            work.join(".identity").join("broken-clone.json"),
+            serde_json::json!({
+                "protocol": super::super::PROTOCOL,
+                "account": "fixture",
+                "repository": volume.remote.to_string_lossy(),
+                "container_id": "test-container",
+                "revision": "0".repeat(40),
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let outcome = seat_reclaim(
+            &volume.root,
+            &args(24 * 3600, 3600),
+            &|_, _, _, _| PrAtHead::NoPr,
+            Utc::now(),
+        )
+        .unwrap();
+        assert_eq!(outcome.scratch_removed, 1, "{:?}", outcome);
+        assert!(
+            outcome
+                .inspection_error
+                .as_deref()
+                .is_some_and(|e| !e.is_empty()),
+            "the failure is carried alongside the removals: {:?}",
+            outcome.inspection_error
+        );
+        assert_eq!(outcome.removed.len(), 1);
+
+        // Drive the partial outcome through the host reporting path: the
+        // failure is reported AND each earlier removal published once.
+        let logs = crate::test_log_capture::capture_logs(|| {
+            let ((), captured) = crate::observability::ops::capture::capture(|| {
+                report_seat("agent-1", &outcome, std::time::Duration::from_secs(1));
+            });
+            let removals: Vec<_> = captured
+                .spans
+                .iter()
+                .filter(|span| span.name.as_str() == "reaper.removal")
+                .collect();
+            assert_eq!(removals.len(), 1, "each earlier removal exactly once");
+            let summaries: Vec<_> = captured
+                .spans
+                .iter()
+                .filter(|span| span.name.as_str() == "reaper.pass")
+                .map(|span| span.attributes["loom.reaper.phase"].as_str())
+                .collect();
+            assert_eq!(summaries, ["reap", "reclaim"], "both summaries stand");
+            assert_eq!(removals[0].attributes["loom.reaper.removal.path"], "cache/sta-6421");
+        });
+        assert!(
+            logs.iter().any(|(level, line)| *level == log::Level::Warn
+                && line.contains("agent-1")
+                && line.contains("Git inspection error")),
+            "the host reports the failure: {logs:?}"
+        );
+        assert!(
+            logs.iter()
+                .any(|(_, line)| line.contains("agent-1") && line.contains("cache/sta-6421")),
+            "the host still logs the removed item: {logs:?}"
+        );
     }
 
     // ===================================================================
@@ -1205,6 +1646,8 @@ mod tests {
             scratch_removed: 2,
             scratch_scanned: 2,
             scratch_bytes: 40,
+            removed: Vec::new(),
+            inspection_error: None,
         };
         let report = SeatReclaimReport {
             skipped: None,

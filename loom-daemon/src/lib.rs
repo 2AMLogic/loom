@@ -192,6 +192,7 @@ pub mod dep_recheck;
 /// from the mirror's worklist or per-repo listings.
 pub mod discovery;
 pub mod disk_headroom;
+pub mod docker_bin;
 pub mod docker_image_clean;
 pub mod doctor_escalation;
 /// Doctor hand-back as a conditional, verified label transition (#9388).
@@ -211,6 +212,7 @@ pub mod filing_lock;
 pub mod fleet;
 pub mod fleet_alert;
 pub mod fleet_captain;
+pub mod fleet_curation_broker;
 pub mod fleet_dispatch;
 pub mod fleet_singletons;
 pub mod fleet_state;
@@ -348,6 +350,7 @@ pub mod priority_pick;
 pub mod private_control_gate;
 pub mod proc_exec;
 pub mod promotion_author;
+pub mod prompt_modifier;
 pub mod provenance;
 pub mod quarantine_reconciliation;
 pub mod quarantine_stash_status;

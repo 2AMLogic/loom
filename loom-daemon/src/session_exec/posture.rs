@@ -54,7 +54,8 @@ pub struct PostureArgs {
     /// profile controls is compared with these files.
     #[arg(long)]
     pub codex_home: Option<PathBuf>,
-    /// Docker binary (test seam; `LOOM_CODEX_SESSION_DOCKER`).
+    /// Docker binary (test seam; `LOOM_CODEX_SESSION_DOCKER`). The default
+    /// `docker` resolves through the shared lookup (#14885).
     #[arg(long, default_value = "docker")]
     pub docker: String,
 }
@@ -97,7 +98,7 @@ fn strings(value: &Value) -> Vec<&str> {
 /// Every way `state`'s actual settings fall short of the container boundary.
 /// Empty means hardened.
 #[must_use]
-pub fn violations(state: &Value) -> Vec<String> {
+pub(super) fn container_violations(state: &Value) -> Vec<String> {
     let hc = &state["HostConfig"];
     let mut found = Vec::new();
     if hc["Privileged"] != Value::Bool(false) {
@@ -148,6 +149,17 @@ pub fn violations(state: &Value) -> Vec<String> {
     }) {
         found.push("docker-socket-mounted".into());
     }
+    found
+}
+
+/// Codex also requires immutable controls inside its profile.
+#[must_use]
+pub fn violations(state: &Value) -> Vec<String> {
+    let mut found = container_violations(state);
+    let mounts = state["Mounts"]
+        .as_array()
+        .map(Vec::as_slice)
+        .unwrap_or_default();
     for name in PROFILE_CONTROLS {
         let destination = profile_control_destination(name);
         let frozen = mounts.iter().any(|m| {
@@ -401,9 +413,13 @@ pub fn run(args: &PostureArgs) -> i32 {
         gh_config_dir: std::env::var("GH_CONFIG_DIR").ok(),
         leased: std::env::var_os("LOOM_PRIVATE_LEASE_FD").is_some(),
     };
-    let state = inspect(&args.docker, &args.container);
+    // The argument's `default_value` literal means "the shared lookup"
+    // (#14885); an explicit program stays verbatim, and an unresolvable
+    // docker stays unlaunchable so the reads below answer "cannot ask".
+    let docker = crate::docker_bin::cli_arg_or_fail_open(&args.docker);
+    let state = inspect(&docker, &args.container);
     let d = decide(args, state.as_ref(), &env, || {
-        control_drift(&args.docker, &args.container, args.codex_home.as_deref())
+        control_drift(&docker, &args.container, args.codex_home.as_deref())
     });
     for line in &d.messages {
         eprintln!("session-exec posture: {line}");

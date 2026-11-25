@@ -229,6 +229,18 @@ impl DriftWatch {
         }
     }
 
+    /// When the startup baseline is empty (the registry read failed at
+    /// startup, or no root had a GitHub remote), adopt `current` — an
+    /// authoritative snapshot — as the baseline. Returns whether it did, so
+    /// the caller skips drift detection for that tick (#14450).
+    pub fn adopt_baseline_if_unset(&mut self, current: &[(PathBuf, String)]) -> bool {
+        if !self.startup_roots.is_empty() || current.is_empty() {
+            return false;
+        }
+        self.startup_roots = current.to_vec();
+        true
+    }
+
     /// The lines to log for `(key, line)` entries not warned yet, marking
     /// each — one warn per repo+owner pair, never per tick (#14223 AC).
     pub fn take_warn_lines(&mut self, entries: Vec<(WarnKey, String)>) -> Vec<String> {
@@ -263,7 +275,21 @@ fn check_blocking(
     script_path: &Path,
     watch: &mut DriftWatch,
 ) {
-    let current = cross_owner::managed_roots(workspace_root);
+    let (current, registry_loaded) = cross_owner::managed_roots(workspace_root);
+    // A failed registry read yields only the workspace-root fallback, which is
+    // not authoritative: comparing it (or forge-checking it) could report
+    // drift that is really a failed read. Skip the tick; the next one retries
+    // (#14450).
+    if !registry_loaded {
+        log::debug!("credential_preflight: owner-drift check skipped, registry unreadable");
+        return;
+    }
+    // A startup baseline captured from a failed read is empty; adopt the
+    // first authoritative snapshot instead of watching nothing for the whole
+    // process lifetime (#14450).
+    if watch.adopt_baseline_if_unset(&current) {
+        return;
+    }
     let drift = detect_owner_drift(&watch.startup_roots, &current);
     if drift.is_empty() {
         // Canonical-name case, only when no owner drifted — a re-point

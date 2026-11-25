@@ -150,7 +150,20 @@ impl RoleInvocationRunner for ScriptRoleInvocationRunner {
                     .and_then(|p| p.model.clone());
                 let (model, model_source) = match drawn_model {
                     Some(drawn) => (drawn, "role-draw".to_string()),
-                    None => resolve_role_runner_model(&self.workspace_root, role),
+                    // #14962: through the launch form, which drops a
+                    // *configured-tier* model the admitted native profile's
+                    // own model differs from (the profile's model launches
+                    // instead of a `profile_selection` refusal); a drawn pin
+                    // is forwarded verbatim and keeps its refusal.
+                    None => resolve_role_runner_model_for_launch(
+                        &self.workspace_root,
+                        role,
+                        admission.as_ref().map(|a| a.runtime.as_str()),
+                        admission
+                            .as_ref()
+                            .and_then(|a| a.preference.as_ref())
+                            .and_then(|p| p.model_profile.as_deref()),
+                    ),
                 };
                 // Issue #7894: an UNPINNED model that conflicts with the admitted
                 // runtime degrades to the runtime CLI's own default rather than being
@@ -247,6 +260,8 @@ impl RoleInvocationRunner for ScriptRoleInvocationRunner {
                         .as_ref()
                         .and_then(|a| a.preference.as_ref())
                         .and_then(|p| p.model_profile.as_deref()),
+                    // #15205: the post-fallback model `select` will see.
+                    Some(model.as_str()),
                 );
                 // Issue #8056: the launched values, captured for the durable
                 // `role_tick.outcome` record. Set here — after every pre-spawn bail-out
