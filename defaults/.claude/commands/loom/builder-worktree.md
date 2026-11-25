@@ -140,7 +140,9 @@ pop or drop each other's edits (#4821).
 - **Save a patch.** Run `./.loom/scripts/worktree.sh snapshot <issue-number>`.
   It writes staged and unstaged tracked changes to
   `<worktree-root>/.snapshots/issue-<N>-<timestamp>.patch` and leaves your
-  edits in place. Add `--include-untracked` to include new files in the patch.
+  edits in place. Add `--include-untracked` to capture new text files too.
+  A `Binary files … differ` line contains no bytes for `git apply` to restore.
+  Keep a separate, verified copy of each such file before removing the worktree.
 - **Compare against a clean baseline.** Run
   `./.loom/scripts/worktree.sh stash-push <issue-number>`. It saves tracked
   edits under `refs/loom/stash-baseline/issue-<N>` and resets that worktree
@@ -217,7 +219,7 @@ if [ "$BRANCH_UPDATE" = rebase ]; then git push "$LEASE" origin "HEAD:$BRANCH"; 
 If conflicts are too complex or main has changed significantly:
 
 ```bash
-git diff HEAD > ~/my-changes.patch            # 1. optional: save your work as a patch
+git diff --binary HEAD > ~/my-changes.patch   # 1. save tracked changes (copy untracked files separately)
 cd /path/to/main/repo                         # 2. back to the main repository
 git worktree remove .loom/worktrees/issue-XX --force   # 3. remove the stale worktree
 git branch -D feature/issue-XX                # 4. delete the old branch
