@@ -65,7 +65,7 @@
 //!    deduplicated per child issue number.
 
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -1190,96 +1190,16 @@ fn sleep_interruptible(total: Duration, shutdown: &AtomicBool) {
     }
 }
 
-/// Spawn the supervisor loop on a dedicated OS thread and return its
-/// [`SupervisorHandle`].
-///
-/// The thread builds a private current-thread Tokio runtime and, every
-/// `interval`, `block_on`s [`EpicSupervisor::tick`]. Because the blocking
-/// spawn-and-wait dispatch executes on this thread's runtime — never the shared
-/// daemon runtime — a minutes-long role process cannot starve the daemon's
-/// event bus, reaper, sweep registry, or IPC listener (#3872).
-///
-/// # Errors
-///
-/// Returns an error if the OS thread cannot be spawned.
-pub fn spawn_supervisor_thread<S, D>(
-    mut supervisor: EpicSupervisor<S, D>,
-    interval: Duration,
-) -> Result<SupervisorHandle>
-where
-    S: EpicSource + Send + 'static,
-    D: EpicDispatcher + Send + 'static,
-{
-    let shutdown = Arc::new(AtomicBool::new(false));
-    let shutdown_thread = shutdown.clone();
-    let join = std::thread::Builder::new()
-        .name("loom-epic-supervisor".to_string())
-        .spawn(move || {
-            // Private current-thread runtime: `tick()` awaits the tokio
-            // IssueCreationMutex, but the blocking Command::status() inside a
-            // dispatch runs here, off the shared daemon runtime (#3872).
-            let rt = match tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-            {
-                Ok(rt) => rt,
-                Err(e) => {
-                    log::error!("epic_supervisor: failed to build loop runtime: {e}");
-                    return;
-                }
-            };
-            log::info!("epic_supervisor: loop started (interval={}s)", interval.as_secs());
-            while !shutdown_thread.load(Ordering::Relaxed) {
-                // Shared GitHub rate limit exhausted (#4429): skip the round.
-                if crate::rate_limit_breaker::global_skip_pass("epic_supervisor") {
-                    log::debug!("epic_supervisor: round skipped — rate-limit cooldown (#4429)");
-                    sleep_interruptible(interval, &shutdown_thread);
-                    continue;
-                }
-                match rt.block_on(supervisor.tick()) {
-                    Ok(report) => {
-                        if report.roles_dispatched > 0
-                            || report.sweeps_dispatched > 0
-                            || report.errors > 0
-                        {
-                            log::info!(
-                                "epic_supervisor: tick — {} epic(s) seen, {} role(s), \
-                                 {} sweep(s), {} skipped, {} error(s)",
-                                report.epics_seen,
-                                report.roles_dispatched,
-                                report.sweeps_dispatched,
-                                report.skipped_in_flight,
-                                report.errors
-                            );
-                        }
-                    }
-                    Err(e) => {
-                        log::warn!("epic_supervisor: tick failed to list epics: {e}");
-                        crate::rate_limit_breaker::global_observe_failure(
-                            &e.to_string(),
-                            "epic_supervisor",
-                        );
-                    }
-                }
-                sleep_interruptible(interval, &shutdown_thread);
-            }
-            log::info!("epic_supervisor: loop stopped");
-        })
-        .context("failed to spawn epic supervisor thread")?;
-    Ok(SupervisorHandle {
-        shutdown,
-        join: Some(join),
-    })
-}
-
 /// Spawn the **multi-workspace** epic supervisor loop (#3928) on a dedicated OS
 /// thread and return its [`SupervisorHandle`].
 ///
-/// This is the multi-repo replacement for [`spawn_supervisor_thread`]. Like the
-/// single-workspace loop it runs on its own OS thread with a private
-/// current-thread runtime (the concrete [`forge::SpawnDispatcher`] is
-/// spawn-and-wait and holds the #3707 mutex across a minutes-long role process —
-/// see the module rationale). The multi-repo additions:
+/// The loop runs on its own OS thread with a private current-thread runtime
+/// that `block_on`s [`tick_multi`] every `interval`. The concrete
+/// [`forge::SpawnDispatcher`] is spawn-and-wait and holds the #3707 mutex across
+/// a minutes-long role process, so executing it on this thread's runtime —
+/// never the shared daemon runtime — keeps that role process from starving the
+/// daemon's event bus, reaper, sweep registry, or IPC listener (#3872). The
+/// multi-repo behaviour:
 ///
 /// - Each tick re-reads the machine-level [`WorkspaceRegistry`] and resolves
 ///   [`effective_roots`](WorkspaceRegistry::effective_roots) against
@@ -1309,6 +1229,63 @@ pub fn spawn_multi_supervisor_thread(
     interval: Duration,
     drain_flag: Arc<AtomicBool>,
 ) -> Result<SupervisorHandle> {
+    spawn_multi_supervisor_thread_with(fallback_root, interval, move |root| {
+        match SweepRegistryConfig::new(root.to_path_buf()).resolve_spawn_bin() {
+            Ok(spawn_bin) => {
+                let registry = pool.get_or_provision(root);
+                let source = forge::GhEpicSource::for_root(root);
+                let dispatcher = forge::SpawnDispatcher::new(spawn_bin, registry);
+                // Per-repo main-health gate (#3930): each root gets its own
+                // halt state, so a red `main` in repo A halts only A's epic
+                // dispatch, never the siblings'.
+                Some(
+                    EpicSupervisor::new(source, dispatcher, IssueCreationMutex::for_root(root))
+                        .with_event_bus(event_bus.clone())
+                        .with_health_gate(health_states.get_or_create(root))
+                        .with_drain_flag(drain_flag.clone())
+                        .with_hold_root(root.to_path_buf()),
+                )
+            }
+            Err(e) => {
+                log::warn!(
+                    "epic_supervisor: skipping workspace {} this tick — spawn binary \
+                     unavailable: {e}",
+                    root.display()
+                );
+                None
+            }
+        }
+    })
+}
+
+/// The supervisor-construction seam behind [`spawn_multi_supervisor_thread`]
+/// (#14986, the #13832 pattern): the identical production loop with the
+/// per-root [`EpicSupervisor`] factory injected, so tests drive the loop the
+/// daemon actually runs instead of a second hand-maintained copy of it (the
+/// removed single-workspace supervisor loop, which had drifted from
+/// this loop's registry reconciliation, weight ordering and rate-limit skip).
+///
+/// `build_supervisor` is called once for each newly-registered root and returns
+/// `None` to skip the root this tick (it is retried on the next one). The public
+/// entry point passes the factory that wires the live forge, the root's
+/// [`SweepRegistry`](crate::sweep_registry::SweepRegistry), event bus, health
+/// gate and drain flag; everything else — the registry re-read, dropping of
+/// deregistered roots, workspace-weight ordering, the rate-limit skip, [`tick_multi`]
+/// and the shutdown handling — is the production path unchanged.
+///
+/// # Errors
+///
+/// Returns an error if the OS thread cannot be spawned.
+pub(crate) fn spawn_multi_supervisor_thread_with<S, D, F>(
+    fallback_root: PathBuf,
+    interval: Duration,
+    mut build_supervisor: F,
+) -> Result<SupervisorHandle>
+where
+    S: EpicSource + Send + 'static,
+    D: EpicDispatcher + Send + 'static,
+    F: FnMut(&Path) -> Option<EpicSupervisor<S, D>> + Send + 'static,
+{
     let shutdown = Arc::new(AtomicBool::new(false));
     let shutdown_thread = shutdown.clone();
     let join = std::thread::Builder::new()
@@ -1332,8 +1309,7 @@ pub fn spawn_multi_supervisor_thread(
             // Parallel vectors keyed by workspace root: one cached supervisor per
             // root, preserving each supervisor's per-epic ledger across ticks.
             let mut roots: Vec<PathBuf> = Vec::new();
-            let mut supervisors: Vec<EpicSupervisor<forge::GhEpicSource, forge::SpawnDispatcher>> =
-                Vec::new();
+            let mut supervisors: Vec<EpicSupervisor<S, D>> = Vec::new();
 
             while !shutdown_thread.load(Ordering::Relaxed) {
                 // Resolve the current workspace set fresh each tick (hot-apply).
@@ -1365,34 +1341,10 @@ pub fn spawn_multi_supervisor_thread(
                     if roots.contains(root) {
                         continue;
                     }
-                    match SweepRegistryConfig::new(root.clone()).resolve_spawn_bin() {
-                        Ok(spawn_bin) => {
-                            let registry = pool.get_or_provision(root);
-                            let source = forge::GhEpicSource::for_root(root);
-                            let dispatcher = forge::SpawnDispatcher::new(spawn_bin, registry);
-                            // Per-repo main-health gate (#3930): each root gets
-                            // its own halt state, so a red `main` in repo A halts
-                            // only A's epic dispatch, never the siblings'.
-                            let supervisor = EpicSupervisor::new(
-                                source,
-                                dispatcher,
-                                IssueCreationMutex::for_root(root),
-                            )
-                            .with_event_bus(event_bus.clone())
-                            .with_health_gate(health_states.get_or_create(root))
-                            .with_drain_flag(drain_flag.clone())
-                            .with_hold_root(root.clone());
-                            roots.push(root.clone());
-                            supervisors.push(supervisor);
-                            log::info!("epic_supervisor: watching workspace {}", root.display());
-                        }
-                        Err(e) => {
-                            log::warn!(
-                                "epic_supervisor: skipping workspace {} this tick — spawn binary \
-                                 unavailable: {e}",
-                                root.display()
-                            );
-                        }
+                    if let Some(supervisor) = build_supervisor(root) {
+                        roots.push(root.clone());
+                        supervisors.push(supervisor);
+                        log::info!("epic_supervisor: watching workspace {}", root.display());
                     }
                 }
 
@@ -2679,8 +2631,43 @@ mod tests {
         cond()
     }
 
+    /// Points the machine-level workspace registry at a not-yet-created file
+    /// for the guard's lifetime, so the multi-workspace loop resolves exactly
+    /// its `fallback_root` and never reads the host's real
+    /// `~/.loom/workspaces.json`. Tests holding one must be `#[serial]`.
+    struct IsolatedRegistry {
+        prev: Option<std::ffi::OsString>,
+        _dir: tempfile::TempDir,
+    }
+    impl IsolatedRegistry {
+        fn new() -> Self {
+            let dir = tempfile::tempdir().unwrap();
+            let prev = std::env::var_os(crate::workspace_registry::REGISTRY_PATH_ENV);
+            std::env::set_var(
+                crate::workspace_registry::REGISTRY_PATH_ENV,
+                dir.path().join("workspaces.json"),
+            );
+            Self { prev, _dir: dir }
+        }
+    }
+    impl Drop for IsolatedRegistry {
+        fn drop(&mut self) {
+            match &self.prev {
+                Some(v) => std::env::set_var(crate::workspace_registry::REGISTRY_PATH_ENV, v),
+                None => std::env::remove_var(crate::workspace_registry::REGISTRY_PATH_ENV),
+            }
+        }
+    }
+
+    // #14986: the loop tests drive the production multi-workspace loop through
+    // its `spawn_multi_supervisor_thread_with` seam (the removed
+    // single-workspace supervisor loop was a drifted copy of it).
+
     #[test]
-    fn test_spawn_supervisor_thread_ticks_then_shuts_down() {
+    #[serial]
+    fn test_multi_supervisor_thread_ticks_then_shuts_down() {
+        let _registry = IsolatedRegistry::new();
+        let root = tempfile::tempdir().unwrap();
         let roles = Arc::new(AtomicUsize::new(0));
         let sweeps = Arc::new(AtomicUsize::new(0));
         let dispatch_thread = Arc::new(Mutex::new(None));
@@ -2694,10 +2681,20 @@ mod tests {
         let source = SharedSource {
             epics: vec![EpicSnapshot::new(1, "flat body", vec![], vec![])],
         };
-        let sup = EpicSupervisor::new(source, dispatcher, IssueCreationMutex::new());
+        let mut pending = Some(EpicSupervisor::new(source, dispatcher, IssueCreationMutex::new()));
+        let built = Arc::new(AtomicUsize::new(0));
+        let built_in_factory = built.clone();
 
         let caller_thread = std::thread::current().id();
-        let mut handle = spawn_supervisor_thread(sup, Duration::from_millis(20)).unwrap();
+        let mut handle = spawn_multi_supervisor_thread_with(
+            root.path().to_path_buf(),
+            Duration::from_millis(20),
+            move |_root| {
+                built_in_factory.fetch_add(1, Ordering::SeqCst);
+                pending.take()
+            },
+        )
+        .unwrap();
         assert!(handle.is_running());
 
         // The loop should dispatch the singleton architect transition promptly.
@@ -2713,6 +2710,9 @@ mod tests {
         // that ran before shutdown); no sweeps for a needs_decomp epic.
         assert_eq!(roles.load(Ordering::SeqCst), 1, "singleton dedup held across ticks");
         assert_eq!(sweeps.load(Ordering::SeqCst), 0);
+        // The supervisor is built once per root and cached across ticks (its
+        // in-flight ledger is what produced the dedup above).
+        assert_eq!(built.load(Ordering::SeqCst), 1, "supervisor cached per root, not rebuilt");
 
         // The blocking dispatch ran on the dedicated supervisor thread, NOT the
         // test's (caller's) thread — the core #3872 guarantee.
@@ -2724,11 +2724,22 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_supervisor_handle_shutdown_is_idempotent() {
+        let _registry = IsolatedRegistry::new();
+        let root = tempfile::tempdir().unwrap();
         let source = SharedSource { epics: vec![] };
-        let sup =
-            EpicSupervisor::new(source, RecordingDispatcher::default(), IssueCreationMutex::new());
-        let mut handle = spawn_supervisor_thread(sup, Duration::from_millis(20)).unwrap();
+        let mut pending = Some(EpicSupervisor::new(
+            source,
+            RecordingDispatcher::default(),
+            IssueCreationMutex::new(),
+        ));
+        let mut handle = spawn_multi_supervisor_thread_with(
+            root.path().to_path_buf(),
+            Duration::from_millis(20),
+            move |_root| pending.take(),
+        )
+        .unwrap();
         let token = handle.shutdown_token();
         // An external subsystem (e.g. the signal handler) can request stop via
         // the shared token.
