@@ -67,6 +67,25 @@ pub enum KeyOutcome {
     FailedClosed(String),
 }
 
+/// How a key's attempt failed, as the lane's attempt accounting reads it
+/// (#15315). Captured per key before the next key reuses the runner, beside
+/// the evidence [`KeyOutcome`] is classified from; telemetry classification
+/// is unchanged by it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AttemptFailure {
+    /// The pinned instructions could not be read: no session was launched.
+    Pin,
+    /// The runner, or the launcher child, refused the session before its CLI
+    /// ran ([`KeyOutcome::FailedClosed`] after an invocation).
+    PreLaunch,
+    /// A planned version roll stopped the launched session
+    /// ([`crate::observability::lifecycle::ROLL_INTERRUPTED`]).
+    Rolled,
+    /// The session ran and did not succeed; its `loom.failure_class` when the
+    /// runner recorded one.
+    Launched(Option<String>),
+}
+
 /// Per-key results for one PR. `None` means the key was **not attempted**
 /// this pass: its pin was already complete (a trusted current-head marker
 /// exists, #14797), so no instruction was read, no session launched and
@@ -79,6 +98,9 @@ pub struct Dispatched {
     /// (#13502), with any verbatim echo of its prompt cut out (#15315).
     pub ee_output: Option<String>,
     pub market_output: Option<String>,
+    /// Why the EE attempt failed, when it did (#15315).
+    pub ee_failure: Option<AttemptFailure>,
+    pub market_failure: Option<AttemptFailure>,
 }
 
 impl Dispatched {
@@ -88,6 +110,22 @@ impl Dispatched {
             Key::Ee => self.ee.as_ref(),
             Key::Market => self.market.as_ref(),
         }
+    }
+
+    /// Why `key`'s attempt failed, when it was attempted and failed.
+    #[must_use]
+    pub fn failure(&self, key: Key) -> Option<&AttemptFailure> {
+        match key {
+            Key::Ee => self.ee_failure.as_ref(),
+            Key::Market => self.market_failure.as_ref(),
+        }
+    }
+
+    /// Whether a version roll stopped `key`'s launched session (#15315):
+    /// still counted as `invocation_failed`, never as a review attempt.
+    #[must_use]
+    pub fn rolled(&self, key: Key) -> bool {
+        self.failure(key) == Some(&AttemptFailure::Rolled)
     }
 }
 
@@ -203,9 +241,10 @@ pub fn dispatch(
     src: &dyn InstructionSource,
     runner: &mut dyn RoleInvocationRunner,
 ) -> Dispatched {
-    let mut run_key = |key: Key, pin: &Pin| -> (KeyOutcome, Option<String>) {
+    type KeyRun = (KeyOutcome, Option<String>, Option<AttemptFailure>);
+    let mut run_key = |key: Key, pin: &Pin| -> KeyRun {
         match fetch_pinned(src, pin) {
-            Err(reason) => (KeyOutcome::FailedClosed(reason), None),
+            Err(reason) => (KeyOutcome::FailedClosed(reason), None, Some(AttemptFailure::Pin)),
             Ok(text) => {
                 // Visibility decides the market constraint only, so it is
                 // read only when a market session actually runs (#14797).
@@ -214,35 +253,84 @@ pub fn dispatch(
                 let prompt = build_prompt(key, &text, pr_ref, public_only);
                 let outcome = runner.invoke(role_name(key), &prompt);
                 // Read the evidence now: the next key reuses the same runner.
-                let result = if failed_before_launch(&outcome, runner) {
-                    KeyOutcome::FailedClosed(format!("session did not succeed: {outcome:?}"))
+                let raw = runner.last_output();
+                let (result, failure) = if failed_before_launch(&outcome, runner, raw.as_deref()) {
+                    (
+                        KeyOutcome::FailedClosed(format!("session did not succeed: {outcome:?}")),
+                        Some(AttemptFailure::PreLaunch),
+                    )
                 } else {
-                    KeyOutcome::Ran(outcome)
+                    let failure = launched_failure(&outcome, runner);
+                    (KeyOutcome::Ran(outcome), failure)
                 };
-                let output = runner
-                    .last_output()
-                    .map(|out| strip_prompt_echo(&out, &prompt));
-                (result, output)
+                let output = raw.map(|out| strip_prompt_echo(&out, &prompt));
+                (result, output, failure)
             }
         }
     };
-    let (ee, ee_output) = ee.map_or((None, None), |pin| {
-        let (o, out) = run_key(Key::Ee, pin);
-        (Some(o), out)
+    let (ee, ee_output, ee_failure) = ee.map_or((None, None, None), |pin| {
+        let (o, out, failure) = run_key(Key::Ee, pin);
+        (Some(o), out, failure)
     });
-    let (market, market_output) = market.map_or((None, None), |pin| {
-        let (o, out) = run_key(Key::Market, pin);
-        (Some(o), out)
+    let (market, market_output, market_failure) = market.map_or((None, None, None), |pin| {
+        let (o, out, failure) = run_key(Key::Market, pin);
+        (Some(o), out, failure)
     });
     Dispatched {
         ee,
         market,
         ee_output,
         market_output,
+        ee_failure,
+        market_failure,
     }
 }
 
-fn failed_before_launch(outcome: &RoleTickOutcome, runner: &dyn RoleInvocationRunner) -> bool {
+/// The `loom.failure_class` values [`super::launch`]'s classifier gives a
+/// launched child that died **before its CLI ran** (#15315): the wrapper's
+/// auth pre-flight, a `session-exec` refusal, and the sweep pre-flight
+/// classifier's labels. Bare `exit-78` is deliberately absent:
+/// `claude-wrapper` can exit 78 after its CLI started.
+pub const LAUNCH_REFUSAL_CLASSES: &[&str] = &[
+    "preflight-no-cli-start",
+    "preflight-token-selection-failed",
+    "preflight-auth-failed",
+    "preflight-mcp-failed",
+    "session-down",
+    "session-mount-stale",
+];
+
+/// Whether a session's captured output is the launcher's own refusal: it
+/// carries the launcher's `# LOOM_LAUNCH_REJECTED ` marker
+/// ([`crate::worker_spawn::LAUNCH_REJECTED_MARKER`], written the moment a
+/// preflight rejection reaches the launcher's exit) and no CLI-start marker
+/// at all — positive evidence that the CLI never ran (critique A3).
+#[must_use]
+pub fn launch_rejected_before_cli(output: &str) -> bool {
+    use crate::sweep_registry::crash_signals::{CLAUDE_CLI_START_MARKER, CLI_START_MARKER};
+    output.contains(crate::worker_spawn::LAUNCH_REJECTED_MARKER)
+        && !output.contains(CLI_START_MARKER)
+        && !output.contains(CLAUDE_CLI_START_MARKER)
+}
+
+/// Whether the invocation was refused before the session's CLI ran, so the
+/// key fails closed as `pre_launch_failed` and is never charged to the PR.
+///
+/// A [`RoleTickOutcome::Failure`] qualifies only on positive evidence: a
+/// pre-launch site the runner noted ([`pre_launch::ALL`]), a launched
+/// child's failure class in [`LAUNCH_REFUSAL_CLASSES`] (the trace's own
+/// class, which the production runner reports for a child the launcher
+/// refused with exit 78, #15315), or the launcher's rejection marker in the
+/// session's own output with no CLI start ([`launch_rejected_before_cli`]).
+/// A launched version-roll stop (its trace carries no failure) and an
+/// unclassified failure stay `invocation_failed`.
+///
+/// [`pre_launch::ALL`]: crate::observability::lifecycle::pre_launch::ALL
+fn failed_before_launch(
+    outcome: &RoleTickOutcome,
+    runner: &dyn RoleInvocationRunner,
+    output: Option<&str>,
+) -> bool {
     use crate::observability::lifecycle::pre_launch;
     match outcome {
         RoleTickOutcome::RuntimeRejected(_)
@@ -253,12 +341,45 @@ fn failed_before_launch(outcome: &RoleTickOutcome, runner: &dyn RoleInvocationRu
         // The runner also uses this channel for a launched version-roll stop
         // and for an unclassified failure without a launch span. Neither is
         // positive evidence that the invocation was refused before launch.
-        RoleTickOutcome::Failure(_) => runner.unlaunched_failure().is_some_and(|failure| {
-            pre_launch::ALL
-                .iter()
-                .any(|site| site.class == failure.class())
-        }),
+        RoleTickOutcome::Failure(_) => {
+            runner.unlaunched_failure().is_some_and(|failure| {
+                pre_launch::ALL
+                    .iter()
+                    .any(|site| site.class == failure.class())
+            }) || runner
+                .trace_context()
+                .and_then(|t| t.failure)
+                .is_some_and(|f| LAUNCH_REFUSAL_CLASSES.contains(&f.class()))
+                || output.is_some_and(launch_rejected_before_cli)
+        }
         RoleTickOutcome::Success | RoleTickOutcome::LoadSkipped { .. } => false,
+    }
+}
+
+/// How a session that ran (was not refused before launch) failed, if it did.
+fn launched_failure(
+    outcome: &RoleTickOutcome,
+    runner: &dyn RoleInvocationRunner,
+) -> Option<AttemptFailure> {
+    use crate::observability::lifecycle::ROLL_INTERRUPTED;
+    match outcome {
+        RoleTickOutcome::Success => None,
+        RoleTickOutcome::Failure(_) => {
+            let unlaunched = runner.unlaunched_failure();
+            if unlaunched
+                .as_ref()
+                .is_some_and(|f| f.class() == ROLL_INTERRUPTED)
+            {
+                return Some(AttemptFailure::Rolled);
+            }
+            let class = runner
+                .trace_context()
+                .and_then(|t| t.failure)
+                .or(unlaunched)
+                .map(|f| f.class().to_string());
+            Some(AttemptFailure::Launched(class))
+        }
+        _ => Some(AttemptFailure::Launched(None)),
     }
 }
 

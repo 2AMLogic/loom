@@ -1564,6 +1564,10 @@ impl<R: super::RoleInvocationRunner + ?Sized> super::RoleInvocationRunner for Ru
     fn unlaunched_failure(&self) -> Option<crate::observability::lifecycle::RoleFailure> {
         self.0.unlaunched_failure()
     }
+    /// Forwarded so the lane sees a launched child's failure class (#15315).
+    fn trace_context(&self) -> Option<crate::observability::lifecycle::RoleTrace> {
+        self.0.trace_context()
+    }
 }
 
 /// Roots with a lane tick in flight, process-wide: the role-tick and
@@ -1841,6 +1845,71 @@ mod tests {
                 .values()
                 .all(|value| !value.contains("fixture-only typed detail")));
         }
+    }
+
+    #[test]
+    fn runner_ref_forwards_trace_context() {
+        use crate::observability::lifecycle::{RoleFailure, RoleTrace};
+        use crate::role_runner::{RoleInvocationRunner, RoleTickOutcome};
+
+        #[derive(Default)]
+        struct Sink;
+        impl CommentSink for Sink {
+            fn post(&self, _pr: u64, _body: &str) -> Result<(), String> {
+                Ok(())
+            }
+        }
+
+        /// A launched EE child whose trace names a launch-refusal class; its
+        /// output carries no rejection marker, so only the forwarded trace
+        /// can classify it.
+        struct Traced {
+            last_ee: bool,
+        }
+        impl RoleInvocationRunner for Traced {
+            fn invoke(&mut self, role: &str, _prompt: &str) -> RoleTickOutcome {
+                self.last_ee = role == "ratification-ee";
+                RoleTickOutcome::Failure("exit 78".into())
+            }
+            fn trace_context(&self) -> Option<RoleTrace> {
+                self.last_ee.then(|| RoleTrace {
+                    context: crate::telemetry::trace::TraceContext::derived("fixture", &["t"]),
+                    execution: "fixture".into(),
+                    started_at: chrono::Utc::now(),
+                    failure: Some(RoleFailure::new("preflight-no-cli-start", Some(78), "x")),
+                    judge: None,
+                })
+            }
+        }
+
+        struct Instr;
+        impl crate::role_runner::ratification_dispatch::InstructionSource for Instr {
+            fn fetch(&self, _pin: &Pin) -> Result<String, String> {
+                Ok("fixture instructions".into())
+            }
+            fn repo_is_private(&self, _repo: &str) -> Option<bool> {
+                Some(true)
+            }
+        }
+
+        let mut cfg = enabled();
+        cfg.ee.as_mut().unwrap().commit = SHA.into();
+        cfg.market.as_mut().unwrap().commit = SHA.into();
+        let prs = one_pr("alice", request(), vec![]);
+        let mut runner = Traced { last_ee: false };
+        let mut adapter = RunnerRef(&mut runner as &mut dyn RoleInvocationRunner);
+        let (results, _, _) =
+            run_lane_stats(&cfg, None, "fixture/example", &prs, &Instr, &Sink, &mut adapter);
+        assert!(
+            matches!(
+                results[0].1.as_slice(),
+                [
+                    (Key::Ee, KeyPost::Withheld(WithheldClass::PreLaunchFailed, _)),
+                    (Key::Market, KeyPost::Withheld(WithheldClass::InvocationFailed, _)),
+                ]
+            ),
+            "{results:?}"
+        );
     }
 
     fn file(name: &str, head: &str) -> ChangedFile {

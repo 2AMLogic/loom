@@ -336,3 +336,45 @@ fn strip_prompt_echo_cuts_every_verbatim_echo_and_keeps_both_sides() {
     assert_eq!(strip_prompt_echo(review, &prompt), review);
     assert_eq!(strip_prompt_echo(review, "  \n"), review);
 }
+
+#[test]
+fn roll_interrupted_key_is_flagged_rolled() {
+    use crate::observability::lifecycle::{RoleFailure, ROLL_INTERRUPTED};
+
+    struct RolledEe {
+        last_ee: bool,
+    }
+    impl RoleInvocationRunner for RolledEe {
+        fn invoke(&mut self, role: &str, _prompt: &str) -> RoleTickOutcome {
+            self.last_ee = role == role_name(Key::Ee);
+            if self.last_ee {
+                RoleTickOutcome::Failure("stopped by the version roll".into())
+            } else {
+                RoleTickOutcome::Failure("exit 1".into())
+            }
+        }
+        fn unlaunched_failure(&self) -> Option<RoleFailure> {
+            self.last_ee
+                .then(|| RoleFailure::new(ROLL_INTERRUPTED, None, "fixture roll"))
+        }
+    }
+
+    let src = Src::ok(Some(true));
+    let mut r = RolledEe { last_ee: false };
+    let d = dispatch(
+        Some(&pin("ee.md", EE_SHA)),
+        Some(&pin("market.md", MKT_SHA)),
+        "owner/repo",
+        PR_REF,
+        &src,
+        &mut r,
+    );
+    assert!(d.rolled(Key::Ee));
+    assert!(!d.rolled(Key::Market));
+    // Telemetry classification is unchanged: both still ran and failed.
+    assert!(matches!(d.ee, Some(KeyOutcome::Ran(RoleTickOutcome::Failure(_)))));
+    assert_eq!(
+        d.failure(Key::Market),
+        Some(&crate::role_runner::ratification_dispatch::AttemptFailure::Launched(None))
+    );
+}

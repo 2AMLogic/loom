@@ -2216,3 +2216,134 @@ fn echoed_prompt_without_review_is_no_heading() {
         }
     }
 }
+
+// ---- #15315: a launch the child refused is pre-launch, through the real ----
+// ---- classifier ------------------------------------------------------------
+
+#[cfg(unix)]
+mod launch_refusal {
+    use super::*;
+    use crate::observability::lifecycle::{RoleFailure, RoleTrace};
+
+    const ANCHOR: &str = "2026-11-22T10:05:11.123Z";
+
+    /// One tick's region of `role-ratification-ee.log` as the role runner
+    /// writes it: its header line (carrying the anchor), then `body`.
+    fn tick(body: &str) -> String {
+        format!(
+            "\n==== loom-daemon role_runner: {ANCHOR} role=ratification-ee model=default ====\n{body}\n"
+        )
+    }
+
+    /// The EE session is a launched child that exited `code` with role log
+    /// `log`; its trace carries the class the **production** classifier
+    /// gives that log (critique A3: never a class injected by hand).
+    struct LaunchedEe {
+        log: String,
+        failure: RoleFailure,
+        last_ee: bool,
+    }
+
+    impl LaunchedEe {
+        fn new(code: i32, body: &str) -> Self {
+            let log = tick(body);
+            let failure = crate::role_runner::launch::exited_failure_for_test(code, &log, ANCHOR);
+            Self {
+                log,
+                failure,
+                last_ee: false,
+            }
+        }
+    }
+
+    impl RoleInvocationRunner for LaunchedEe {
+        fn invoke(&mut self, role: &str, _prompt: &str) -> RoleTickOutcome {
+            self.last_ee = role == "ratification-ee";
+            if self.last_ee {
+                RoleTickOutcome::Failure("`.../spawn-worker.sh` exited with exit status: 78".into())
+            } else {
+                RoleTickOutcome::Success
+            }
+        }
+        fn trace_context(&self) -> Option<RoleTrace> {
+            self.last_ee.then(|| RoleTrace {
+                context: crate::telemetry::trace::TraceContext::derived("fixture", &["ee"]),
+                execution: "fixture-ee".into(),
+                started_at: chrono::Utc::now(),
+                failure: Some(self.failure.clone()),
+                judge: None,
+            })
+        }
+        fn last_output(&self) -> Option<String> {
+            Some(if self.last_ee {
+                self.log.clone()
+            } else {
+                valid_review(Key::Market)
+            })
+        }
+    }
+
+    fn ee_bucket(runner: &mut LaunchedEe) -> (TickOutcome, usize) {
+        let sink = Sink::default();
+        let results =
+            run_lane(&cfg(), None, "o/r", &Feed::new(), &CountingInstr::default(), &sink, runner);
+        let ee_posts = sink
+            .posted
+            .borrow()
+            .iter()
+            .filter(|(_, b)| b.starts_with("<!-- ratify:key=ee "))
+            .count();
+        (TickOutcome::from_run(&results, 0), ee_posts)
+    }
+
+    const REJECTED: &str = "# LOOM_LAUNCH_REJECTED code=78 stage=credential";
+
+    #[test]
+    fn launched_cli_never_started_failure_is_pre_launch() {
+        // The loom#14944 shape: the launcher child refused the capped pool at
+        // its credential stage and exited 78 before any CLI started.
+        let mut r = LaunchedEe::new(78, &format!("spawn-worker: launching\n{REJECTED}"));
+        assert_eq!(r.failure.class(), "preflight-no-cli-start", "the real classifier");
+        let (o, ee_posts) = ee_bucket(&mut r);
+        assert_buckets(&o, &[("ee", "pre_launch_failed"), ("market", "posted")]);
+        assert_eq!(ee_posts, 0);
+
+        // The classifier can name an account class for the same refusal
+        // (the pool listing quotes exhaustion prose); the launcher's own
+        // marker with no CLI start is still positive pre-launch evidence.
+        let mut r = LaunchedEe::new(
+            78,
+            &format!("spawn-worker: account a: You've hit your usage limit\n{REJECTED}"),
+        );
+        assert!(
+            !crate::role_runner::ratification_dispatch::LAUNCH_REFUSAL_CLASSES
+                .contains(&r.failure.class()),
+            "{}",
+            r.failure.class()
+        );
+        let (o, _) = ee_bucket(&mut r);
+        assert_buckets(&o, &[("ee", "pre_launch_failed"), ("market", "posted")]);
+    }
+
+    #[test]
+    fn launched_real_failure_stays_invocation_failed() {
+        for (code, body) in [
+            (1, "# LOOM_CLI_START runtime=codex\nError: something codex said".to_string()),
+            (78, "# LOOM_CLI_START runtime=opencode\nprovider refused".to_string()),
+            (78, "# CLAUDE_CLI_START\n# ACCOUNT_POOL_EXHAUSTED".to_string()),
+            // A rejection marker after the CLI started is not a launch refusal.
+            (78, format!("# LOOM_CLI_START runtime=opencode\n{REJECTED}")),
+        ] {
+            let mut r = LaunchedEe::new(code, &body);
+            assert!(
+                !crate::role_runner::ratification_dispatch::LAUNCH_REFUSAL_CLASSES
+                    .contains(&r.failure.class()),
+                "{body}: {}",
+                r.failure.class()
+            );
+            let (o, ee_posts) = ee_bucket(&mut r);
+            assert_buckets(&o, &[("ee", "invocation_failed"), ("market", "posted")]);
+            assert_eq!(ee_posts, 0);
+        }
+    }
+}
