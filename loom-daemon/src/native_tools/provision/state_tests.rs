@@ -491,3 +491,83 @@ fn guarded_launch_keeps_gh_pointed_at_the_ambient_login() {
     let env = env_of(vec![("XDG_CONFIG_HOME", xdg.path().display().to_string())]);
     assert_eq!(ambient_gh_config_dir(env, Some(home.path())), Some(xdg.path().join("gh")));
 }
+
+#[cfg(unix)]
+mod private_directory_policy {
+    use super::*;
+    use std::os::unix::fs::{symlink, PermissionsExt};
+
+    fn mode_of(path: &Path) -> u32 {
+        fs::metadata(path).unwrap().permissions().mode() & 0o777
+    }
+
+    /// The default policy refuses a loose directory: existing callers keep
+    /// their fail-closed behaviour (#15187).
+    #[test]
+    fn refuse_still_rejects_a_loose_existing_directory() {
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path().join("state");
+        fs::create_dir_all(&dir).unwrap();
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(private_directory(&dir).is_err());
+        assert_eq!(mode_of(&dir), 0o755, "nothing was chmod-ed");
+        assert_eq!(
+            private_directory_with(&dir, OnLoose::Refuse)
+                .unwrap_err()
+                .to_string(),
+            "native state directory must have permissions 0700"
+        );
+    }
+
+    /// Every ancestor the call creates is `0700`, not just the leaf, and a
+    /// pre-existing loose ancestor is left untouched. The guarantee is
+    /// carried implicitly by `DirBuilder::recursive(true).mode(0o700)` since
+    /// #15234 folded the copies together; this pins it so a
+    /// `create_dir_all` + leaf-only chmod refactor cannot silently leave a
+    /// umask-default, group-writable ancestor (#15240). The loose ancestor
+    /// is set explicitly, so the test does not depend on the process umask.
+    #[test]
+    fn missing_ancestors_are_created_private_and_loose_ones_are_left_alone() {
+        let temp = tempfile::tempdir().unwrap();
+        let loose = temp.path().join("loose");
+        fs::create_dir_all(&loose).unwrap();
+        fs::set_permissions(&loose, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let leaf = loose.join("a").join("b");
+        private_directory_with(&leaf, OnLoose::Refuse).unwrap();
+
+        assert_eq!(mode_of(&loose), 0o755, "pre-existing ancestor was chmod-ed");
+        assert_eq!(mode_of(&loose.join("a")), 0o700, "created ancestor is not 0700");
+        assert_eq!(mode_of(&leaf), 0o700, "created leaf is not 0700");
+    }
+
+    /// `Tighten` repairs a `0755` directory, and the odd modes the
+    /// `& 0o077`-style threshold would have left neither tightened nor
+    /// accepted (`0600`, `0500`): the condition is `!= 0o700`.
+    #[test]
+    fn tighten_repairs_group_bits_and_odd_modes() {
+        for loose in [0o755u32, 0o770, 0o600, 0o500] {
+            let temp = tempfile::tempdir().unwrap();
+            let dir = temp.path().join("state");
+            fs::create_dir_all(&dir).unwrap();
+            fs::set_permissions(&dir, fs::Permissions::from_mode(loose)).unwrap();
+            private_directory_with(&dir, OnLoose::Tighten).unwrap();
+            assert_eq!(mode_of(&dir), 0o700, "mode {loose:o} was not tightened to 0700");
+        }
+    }
+
+    /// `Tighten` refuses a symlink without chmod-ing its target: the chmod
+    /// runs only after the symlink and ownership checks (#15187).
+    #[test]
+    fn tighten_refuses_a_symlink_without_chmodding_its_target() {
+        let temp = tempfile::tempdir().unwrap();
+        let target = temp.path().join("target");
+        fs::create_dir_all(&target).unwrap();
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o755)).unwrap();
+        let alias = temp.path().join("alias");
+        symlink(&target, &alias).unwrap();
+
+        assert!(private_directory_with(&alias, OnLoose::Tighten).is_err());
+        assert_eq!(mode_of(&target), 0o755, "the symlink target was chmod-ed through the symlink");
+    }
+}

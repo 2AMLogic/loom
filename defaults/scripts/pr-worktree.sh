@@ -161,6 +161,28 @@ is_primary_clone() {
     [[ "$a" == "$b" ]]
 }
 
+# True when worktree path $1 is registered in `git worktree list` — matched by
+# pwd -P-canonicalized PHYSICAL path, never by substring (#15196): the porcelain
+# listing always prints git's resolved real_path while $1 may be spelled through
+# a symlink (a logical REPO_ROOT, #15121, or a symlinked LOOM_WORKTREE_ROOT), so
+# an unanchored grep both missed a live registered worktree (refusing re-entry
+# with an rm -rf hint on it) and falsely matched a prefix-colliding sibling
+# (pr-1 beside pr-10). A porcelain entry whose directory no longer exists
+# (stale until `git worktree prune`) keeps its literal spelling instead of
+# aborting the scan.
+is_registered_worktree() {
+    [[ -n "$1" ]] || return 1
+    local target_p wt wt_p
+    target_p="$(cd "$1" 2>/dev/null && pwd -P)" || return 1
+    while IFS= read -r wt; do
+        wt_p="$(cd "$wt" 2>/dev/null && pwd -P)" || wt_p="$wt"
+        if [[ "$wt_p" == "$target_p" ]]; then
+            return 0
+        fi
+    done < <(git -C "$REPO_ROOT" worktree list --porcelain | awk '/^worktree / { print substr($0, 10) }')
+    return 1
+}
+
 # Print the PR head sha, making sure the commit exists locally. Empty on failure.
 resolve_pr_head_sha() {
     local sha
@@ -181,12 +203,27 @@ resolve_pr_head_sha() {
 # Print the first NON-primary worktree (other than this PR's own pr-<N>) that
 # has branch $1 checked out, e.g. the builder's issue-<N> worktree. Empty if none.
 # The builder wins over a detached review checkout (#14391).
+# The own-worktree exclusion compares PHYSICAL paths (#15121): `git worktree
+# list --porcelain` prints physical spellings (/private/tmp/... on macOS) while
+# WORKTREE_PATH keeps the logical spelling the repo was reached by (/tmp/...),
+# so a raw string compare reports the PR's own pr-<N> as a foreign builder
+# holder and re-entry dies with the builder-wins error. Same pwd -P idiom as
+# is_primary_clone above.
 builder_holder() {
     [[ -n "$1" ]] || return 0
-    git -C "$REPO_ROOT" worktree list --porcelain | awk -v branch="refs/heads/$1" -v own="$WORKTREE_PATH" '
+    local own_p
+    own_p="$(cd "$WORKTREE_PATH" 2>/dev/null && pwd -P)" || own_p="$WORKTREE_PATH"
+    git -C "$REPO_ROOT" worktree list --porcelain | awk -v branch="refs/heads/$1" '
         /^worktree / { wt = substr($0, 10) }
-        /^branch /   { if ($2 == branch && wt != own) print wt }
+        /^branch /   { if ($2 == branch) print wt }
     ' | while IFS= read -r w; do
+        # A porcelain path may itself be a logical spelling (registered by an
+        # older git); canonicalise before the own-worktree exclusion.
+        local w_p
+        w_p="$(cd "$w" 2>/dev/null && pwd -P)" || w_p="$w"
+        if [[ "$w_p" == "$own_p" ]]; then
+            continue
+        fi
         is_primary_clone "$w" || { echo "$w"; break; }
     done
 }
@@ -263,7 +300,7 @@ create_detached_pr_worktree() {
 # If the worktree already exists, treat it as reusable. The doctor may
 # re-enter for the same PR across multiple iterations.
 if [[ -d "$WORKTREE_PATH" ]]; then
-    if git -C "$REPO_ROOT" worktree list | grep -q "$WORKTREE_PATH"; then
+    if is_registered_worktree "$WORKTREE_PATH"; then
         HEAD_BRANCH="$(gh pr view "$PR_NUMBER" --json headRefName --jq .headRefName 2>/dev/null || true)"
         BUILDER_WT="$(builder_holder "$HEAD_BRANCH")"
         [[ -z "$BUILDER_WT" ]] || fail_builder_holds "$BUILDER_WT"

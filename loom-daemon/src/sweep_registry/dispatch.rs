@@ -511,7 +511,7 @@ pub const EXPERIMENT_ENV_ALLOWLIST: &[&str] = &[
 /// `SCCACHE_SERVER_PORT` is on the list for a non-obvious reason worth
 /// stating: `sccache` is a per-user *server*, and whichever process starts it
 /// first fixes the storage backend for every later client. An operator who
-/// ssh'es in and runs one `cargo build` (or even `sccache --show-stats`)
+/// ssh'es in and runs one `cargo build` (or `sccache --start-server`)
 /// starts a local-disk server on the default port, and every daemon build
 /// after that silently gets local disk instead of the shared bucket — a
 /// degraded cache that looks identical to a working one. Pinning the daemon

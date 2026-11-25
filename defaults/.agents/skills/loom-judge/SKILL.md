@@ -462,7 +462,7 @@ Full policy, TTL/invalidation semantics, and the manual verification steps:
    fi
    ```
 4. **Understand context** (first capture `REVIEW_STARTED=$(date -u +%Y-%m-%dT%H:%M:%SZ)`, before reading anything — and for each linked issue `N` the hash of the body you read: `ISSUE_HASH_N=$(printf %s "$(gh api repos/<owner>/<repo>/issues/N --jq .body)" | sha256sum | cut -d' ' -f1)` (a hash that keeps jq's trailing newline is accepted too, as is the raw body's own hash with or without that newline); see "Stale-Read Gate" under Verdict SHA Marker): Read PR description and linked issues, and run the "Spec Reconciliation" step below on each `Closes`/`Fixes`/`Resolves`/`Part of`/`Contributes to` reference (current body + trusted comments, not the PR's account of them)
-4b. **Check docs-only fast-path eligibility** (see "Docs-Only Fast Path (WORK_LOG / WORK_PLAN / README, #6134)" below) — if the changed-file list is an exact match against the fast-path allowlist **and the PR has no closing-issue reference** (Step 3 below, #14182 — both conditions are required, and a failed closing-reference read counts as a reference) **and every WORK_LOG record the diff adds verifies against the base repository** (Step 4 below, #13760 — number, kind and title; a failed diff or target read is not eligible), skip steps 5-7b and the "Evaluation Focus Areas" review entirely; go straight to CI Status Check (step 8), the formal-review reconciliation gate (step 8b — **not** skipped: a docs-only diff can still carry an unresolved formal review, #7647) and the fast-path approval write. Otherwise continue normally.
+4b. **Check docs-only fast-path eligibility** (see "Docs-Only Fast Path (WORK_LOG / WORK_PLAN / README, #6134)" below) — if the changed-file list is an exact match against the fast-path allowlist **and the PR has no closing-issue reference** (Step 3 below, #14182 — both conditions are required, and a failed closing-reference read counts as a reference) **and every WORK_LOG record the diff adds verifies against the base repository** (Step 4 below, #13760 — number, kind and title; a failed diff or target read is not eligible) **and any change to WORK_PLAN.md's `guide:plan-body` region carries the machine-rendered `written` receipt with a matching render-hash** (Step 5 below, #15220 — a stamp-only region edit, free prose in place of the receipt line, or a missing/mismatched hash is not eligible), skip steps 5-7b and the "Evaluation Focus Areas" review entirely; go straight to CI Status Check (step 8), the formal-review reconciliation gate (step 8b — **not** skipped: a docs-only diff can still carry an unresolved formal review, #7647) and the fast-path approval write. Otherwise continue normally.
 5. **Check out code**: Use the existing builder worktree, else `./.loom/scripts/pr-worktree.sh <number>` — never a bare `gh pr checkout` in the main checkout (see "PR Branch Isolation" and Worktree-Aware Code Access below). Capture `REVIEW_HEAD_SHA=$(gh pr view <number> --json headRefOid --jq '.headRefOid')` here — step 11's recheck compares against it, and your verdict marker records it.
 6. **Rebase check**: Verify PR has no merge conflicts with main (see Rebase Check section below)
 7. **Targeted checks only**: read the diff and trust the green CI from step 2b. At most run scoped tests for a specific doubt (Scoped Test Execution below); never the full suite or `buildGate.command`. If the *environment* cannot run a command you need for a verdict, see "Environment Gap: Cannot Verify Here" below
@@ -588,7 +588,8 @@ reclaim comment:
 # The lease first: a live peer lease (exit 4) means stand down, label untouched.
 [[ -n "$CLAIMED_AT" ]] && loom-daemon lease pr claim $N --role judge --watch-pid "${LOOM_AGENT_SESSION_PID:-${CLAUDE_PID:-$PPID}}"; [[ $? =~ ^[02]$ ]] &&
 gh pr edit $N --remove-label "loom:reviewing" &&
-gh pr comment $N --body "Reclaiming loom:reviewing claim: $STANDDOWN_COUNT stand-down passes against claim $CLAIMED_AT (age ≥ ${LOOM_STALE_REVIEWING_MINUTES:-45}m) with no actual review progress (bounded fallback, LOOM_MAX_STANDDOWN_STREAK=${LOOM_MAX_STANDDOWN_STREAK:-3}) — breaking the livelock." &&
+gh pr comment $N --body "Reclaiming loom:reviewing claim: $STANDDOWN_COUNT stand-down passes against claim $CLAIMED_AT (age ≥ ${LOOM_STALE_REVIEWING_MINUTES:-45}m) with no actual review progress (bounded fallback, LOOM_MAX_STANDDOWN_STREAK=${LOOM_MAX_STANDDOWN_STREAK:-3}) — breaking the livelock.
+<!-- loom:reclaim claim=$CLAIMED_AT -->" &&
 gh pr edit $N --add-label "loom:reviewing"
 # Continue to step 3 (Check merge state) and evaluate normally
 ```
@@ -599,10 +600,18 @@ gh pr edit $N --add-label "loom:reviewing"
 # The lease first: a live peer lease (exit 4) means stand down, label untouched.
 [[ -n "$CLAIMED_AT" ]] && loom-daemon lease pr claim $N --role judge --watch-pid "${LOOM_AGENT_SESSION_PID:-${CLAUDE_PID:-$PPID}}"; [[ $? =~ ^[02]$ ]] &&
 gh pr edit $N --remove-label "loom:reviewing" &&
-gh pr comment $N --body "Reclaiming stale loom:reviewing claim (idle ${IDLE_MINUTES}m > ${LOOM_STALE_REVIEWING_MINUTES:-45}m with no claimant activity) — the prior Judge likely died mid-review." &&
+gh pr comment $N --body "Reclaiming stale loom:reviewing claim (idle ${IDLE_MINUTES}m > ${LOOM_STALE_REVIEWING_MINUTES:-45}m with no claimant activity) — the prior Judge likely died mid-review.
+<!-- loom:reclaim claim=$CLAIMED_AT -->" &&
 gh pr edit $N --add-label "loom:reviewing"
 # Continue to step 3 (Check merge state) and evaluate normally
 ```
+
+**Both reclaim comments end with the `loom:reclaim` claim marker
+keyed to `$CLAIMED_AT` (#15044)**: the forge timeline can lag the label remove + re-add above,
+and `claim-staleness.sh` then matches this marker against the stale verdict it
+computed from the pre-reclaim timestamp — so your replacement claim reads
+`fresh` while you are active and is not reclaimed in turn (and `unknown`, never
+stale, once you go idle).
 
 **Env vars**: `LOOM_STALE_REVIEWING_MINUTES` (default **45**) — named to
 mirror `LOOM_STALE_BUILDING_HOURS` (`loom-daemon/src/claim_reconciliation.rs`,
@@ -1090,6 +1099,16 @@ Proceed with reviewing once the final checks pass. The recovery uses the fetched
 commit object that matches both forge reads and sets tracking only after a
 successful fast-forward. The `+` refreshes only the named remote-tracking ref when its
 cache is stale. The local branch advances by fast-forward after verification.
+
+For a dirty worktree, the refusal is the disposition: the snapshot (when one was
+taken) preserved the WIP as a patch under
+`<worktree-root>/.snapshots/issue-<N>-<UTC-timestamp>.patch`. In the PR comment
+name only the relative `.snapshots/issue-<N>-<UTC-timestamp>.patch` under the
+managed worktree root; keep the absolute path (the helper's `patchPath` output
+carries the workstation username and directory layout) and the patch contents
+local, never pasted into the PR. Then fall back to read-only
+review (`gh pr diff` / `git merge-tree`) per "PR Branch Isolation", or park the
+PR per "Environment Gap: Cannot Verify Here".
 
 For a fork or a nonstandard head, use the existing `pr-worktree.sh` route and
 check the exact head and clean state there. The named `origin` recovery
@@ -1868,8 +1887,13 @@ its receipts, or anything the PR body claims:
 # right state (a PR merged, an issue closed), under exactly the recorded
 # title. Any foreign/missing/wrong-kind/wrong-state/mismatched or unreadable
 # record echoes "NOT ELIGIBLE: <reason>" naming it — the caller must then take
-# the normal review flow and report the reason. Distinct numbers are READ once
-# each, but every record is VERIFIED: a repeated number's later records (a
+# the normal review flow and report the reason. A READ failure on the base
+# repository or the diff echoes "NOT ELIGIBLE: ENVIRONMENT: …" instead: an
+# environment failure is never a passed or waived content check. A record
+# fetch cannot tell a 404 (a content verdict) from a transport failure, so
+# its refusal states both readings and waives neither.
+# Distinct numbers are READ once each, but every record is VERIFIED: a
+# repeated number's later records (a
 # duplicate with a different title or kind included) are checked against the
 # cached fetch, not skipped; bullets outside WORK_LOG.md and its monthly
 # archives (WORK_PLAN/README prose, `- **#N**: …` backlog rows included) and
@@ -1887,12 +1911,12 @@ docs_only_fast_path_worklog_check() {
   local -A fetched=()
   local -a new_records=()
   if ! out=$(gh pr view "$pr" --json url --jq '.url | capture("^https://[^/]+/(?<r>[^/]+/[^/]+)/pull/[0-9]+/?$").r' 2>/dev/null) || [ -z "$out" ]; then
-    echo "NOT ELIGIBLE: base repository read failed"
+    echo "NOT ELIGIBLE: ENVIRONMENT: base repository read failed (gh error, not a PR-content verdict) — take the normal review flow; do NOT treat this as a passed or waived #13760 content check"
     return 0
   fi
   local repo="$out"
   if ! raw=$(gh pr diff --repo "$repo" "$pr" 2>/dev/null); then
-    echo "NOT ELIGIBLE: PR diff read failed"
+    echo "NOT ELIGIBLE: ENVIRONMENT: PR diff read failed (gh error, not a PR-content verdict) — take the normal review flow; do NOT treat this as a passed or waived #13760 content check"
     return 0
   fi
   # Added canonical records: `+`-prefixed `- **PR/Issue ...` bullet lines,
@@ -1951,7 +1975,7 @@ docs_only_fast_path_worklog_check() {
     # title or kind — is still verified against the cached tuple (#14532).
     if [ -z "${fetched[$num]:-}" ]; then
       if ! got=$(gh api "repos/$repo/issues/$num" --jq '"\(.title)\t\(.pull_request != null)\t\(.state)\t\((.pull_request.merged_at != null))"' 2>/dev/null) || [ -z "$got" ]; then
-        echo "NOT ELIGIBLE: WORK_LOG record #$num does not exist in $repo (or the read failed)"
+        echo "NOT ELIGIBLE: WORK_LOG record #$num does not exist in $repo, or the read failed — if the record does not exist this IS a content verdict (#13760); if the read failed it is an environment failure. Either way, do NOT treat this as a passed or waived #13760 content check"
         return 0
       fi
       fetched[$num]="$got"
@@ -1992,18 +2016,195 @@ if [ "$ELIGIBILITY" = "ELIGIBLE" ]; then
 fi
 ```
 
+**Step 5: Verify a WORK_PLAN plan-body region change carries the machine
+receipt (#15220).** The file list, the closing-reference check and the record
+gate above verify *what* the diff contains; this check verifies *how* the
+`WORK_PLAN.md` `guide:plan-body` region changed. #14204 makes the
+`WORK_PLAN check:` PR-body line machine-recorded — but only once Guide's
+`update_work_plan()` actually runs, and a tick observed in the wild skipped
+the function, hand-wrote the region with scripted substitutions, and put free
+prose where the receipt line belongs. On such a tick nothing mechanical stands
+behind the line, so the reviewing side re-derives it: a diff that changes the
+region must carry exactly one `- **WORK_PLAN check**: written (render-hash
+<12hex>, <UTC>)` line whose hash is the first 12 hex of the sha256 of the
+head region's stamp-stripped body — the same normalization
+`WORK_PLAN_RENDER_HASH` hashes — and a **stamp-only** region edit is never
+eligible (`update_work_plan()` records `current` and never writes one, so a
+`written` line over an unchanged body is a hand-made claim). A diff that does
+not change the region passes untouched — including WORK_LOG-only/README-only
+diffs, edits confined to text outside the markers, and the monthly
+`work_plan/WORK_PLAN_YYYY-MM.md` archives, which carry no plan-body region.
+Everything else fails closed.
+
+```bash
+# #15220: the plan-body region gate. docs_only_fast_path_plan_region reads a
+# file's content on stdin and prints the lines strictly between the
+# exactly-once, in-order `guide:plan-body` marker pair; it exits non-zero when
+# the markers are missing, duplicated or unordered on that side (fail closed).
+docs_only_fast_path_plan_region() {
+  awk '/^<!-- guide:plan-body:start -->$/ { if (s) exit 1; s = NR; next }
+       /^<!-- guide:plan-body:end -->$/   { if (!s || e) exit 1; e = NR; next }
+       s && !e { print }
+       END { if (!s || !e) exit 1 }'
+}
+
+# #15220: verify the WORK_PLAN.md plan-body region a docs-only diff changes.
+# Echoes "ELIGIBLE" when the diff does not touch WORK_PLAN.md, does not change
+# the region between the markers, or changes it behind the #14204 machine
+# receipt: exactly one `- **WORK_PLAN check**: written (render-hash <12hex>,
+# <UTC>)` line in the PR body whose hash equals the first 12 hex of the sha256
+# of the head region's stamp-stripped body. A stamp-only region edit, free
+# prose in place of the receipt, a wrong/absent hash, a WORK_PLAN.md newly
+# created or deleted by the PR, missing/duplicated/unordered markers on either
+# side, or more than one `WORK_PLAN check:` line echo "NOT ELIGIBLE: <reason>"
+# — the caller takes the normal review flow and reports the reason. A failed
+# read echoes "NOT ELIGIBLE: ENVIRONMENT: …" instead: an environment failure
+# is never a passed or waived content check. Base and head WORK_PLAN.md are
+# read from the forge at the PR's baseRefOid/headRefOid (no local checkout);
+# the base repository is derived from the PR's own URL exactly as the worklog
+# check does (#15005); creation/deletion is classified from the diff itself,
+# so a contents 404 can never be read as a content verdict.
+docs_only_fast_path_plan_check() {
+  # $1 = PR number.
+  local pr="$1" out repo raw l in_plan=0 touched=0 created=0 deleted=0
+  local shas base_sha head_sha base_file head_file body
+  local base_region head_region base_body head_body head_hash hash
+  local -a receipt_lines=()
+  local receipt_re='^- \*\*WORK_PLAN check\*\*: written \(render-hash ([0-9a-f]{12}), [0-9TZ:-]+\)$'
+  if ! out=$(gh pr view "$pr" --json url --jq '.url | capture("^https://[^/]+/(?<r>[^/]+/[^/]+)/pull/[0-9]+/?$").r' 2>/dev/null) || [ -z "$out" ]; then
+    echo "NOT ELIGIBLE: ENVIRONMENT: base repository read failed (gh error, not a PR-content verdict) — take the normal review flow; do NOT treat this as a passed or waived #15220 content check"
+    return 0
+  fi
+  repo="$out"
+  if ! raw=$(gh pr diff --repo "$repo" "$pr" 2>/dev/null); then
+    echo "NOT ELIGIBLE: ENVIRONMENT: PR diff read failed (gh error, not a PR-content verdict) — take the normal review flow; do NOT treat this as a passed or waived #15220 content check"
+    return 0
+  fi
+  # Exact root-file scoping, same header discipline as the worklog check: the
+  # monthly work_plan/WORK_PLAN_YYYY-MM.md archives are not the live file, and
+  # a non-WORK_PLAN hunk can neither trigger this gate nor produce a refusal.
+  while IFS= read -r l; do
+    case "$l" in
+      'diff --git '*)
+        case "$l" in
+          *' b/WORK_PLAN.md') in_plan=1; touched=1 ;;
+          *) in_plan=0 ;;
+        esac
+        continue ;;
+    esac
+    [ "$in_plan" = 1 ] || continue
+    case "$l" in
+      'new file mode'*) created=1 ;;
+      'deleted file mode'*) deleted=1 ;;
+    esac
+  done < <(printf '%s\n' "$raw")
+  if [ "$touched" -eq 0 ]; then
+    echo "ELIGIBLE"
+    return 0
+  fi
+  if [ "$created" -eq 1 ]; then
+    echo "NOT ELIGIBLE: WORK_PLAN.md newly created by this PR — the plan-body region cannot be verified (#15220)"
+    return 0
+  fi
+  if [ "$deleted" -eq 1 ]; then
+    echo "NOT ELIGIBLE: WORK_PLAN.md deleted by this PR — the plan-body region cannot be verified (#15220)"
+    return 0
+  fi
+  if ! shas=$(gh pr view "$pr" --json baseRefOid,headRefOid --jq '"\(.baseRefOid)\t\(.headRefOid)"' 2>/dev/null) || [ -z "$shas" ]; then
+    echo "NOT ELIGIBLE: ENVIRONMENT: PR ref-SHA read failed (gh error, not a PR-content verdict) — take the normal review flow; do NOT treat this as a passed or waived #15220 content check"
+    return 0
+  fi
+  base_sha="${shas%%$'\t'*}"
+  head_sha="${shas##*$'\t'}"
+  if [ -z "$base_sha" ] || [ -z "$head_sha" ]; then
+    echo "NOT ELIGIBLE: ENVIRONMENT: PR ref-SHA read failed (gh error, not a PR-content verdict) — take the normal review flow; do NOT treat this as a passed or waived #15220 content check"
+    return 0
+  fi
+  if ! body=$(gh pr view "$pr" --json body --jq '.body' 2>/dev/null); then
+    echo "NOT ELIGIBLE: ENVIRONMENT: PR body read failed (gh error, not a PR-content verdict) — take the normal review flow; do NOT treat this as a passed or waived #15220 content check"
+    return 0
+  fi
+  if ! base_file=$(gh api -H "Accept: application/vnd.github.raw" "repos/$repo/contents/WORK_PLAN.md?ref=$base_sha" 2>/dev/null); then
+    echo "NOT ELIGIBLE: ENVIRONMENT: WORK_PLAN.md base contents read failed (gh error, not a PR-content verdict) — take the normal review flow; do NOT treat this as a passed or waived #15220 content check"
+    return 0
+  fi
+  if ! head_file=$(gh api -H "Accept: application/vnd.github.raw" "repos/$repo/contents/WORK_PLAN.md?ref=$head_sha" 2>/dev/null); then
+    echo "NOT ELIGIBLE: ENVIRONMENT: WORK_PLAN.md head contents read failed (gh error, not a PR-content verdict) — take the normal review flow; do NOT treat this as a passed or waived #15220 content check"
+    return 0
+  fi
+  if ! base_region=$(printf '%s\n' "$base_file" | docs_only_fast_path_plan_region); then
+    echo "NOT ELIGIBLE: WORK_PLAN.md base has missing, duplicated or unordered guide:plan-body markers (#15220)"
+    return 0
+  fi
+  if ! head_region=$(printf '%s\n' "$head_file" | docs_only_fast_path_plan_region); then
+    echo "NOT ELIGIBLE: WORK_PLAN.md head has missing, duplicated or unordered guide:plan-body markers (#15220)"
+    return 0
+  fi
+  # Raw regions equal → the diff did not change the region (an edit outside
+  # the markers); pass without touching the receipt.
+  if [ "$base_region" = "$head_region" ]; then
+    echo "ELIGIBLE"
+    return 0
+  fi
+  # strip_plan_stamp's exact shape (guide.md #13909): drop line 1 when it is
+  # the generated-at stamp. The $() captures above already normalized trailing
+  # newlines on both sides, the same normalization WORK_PLAN_RENDER_HASH's
+  # input gets.
+  base_body="$(printf '%s\n' "$base_region" | sed -e '1{/^_Generated: .* (snapshot; compare against live labels)_$/d;}')"
+  head_body="$(printf '%s\n' "$head_region" | sed -e '1{/^_Generated: .* (snapshot; compare against live labels)_$/d;}')"
+  if [ "$base_body" = "$head_body" ]; then
+    echo "NOT ELIGIBLE: stamp-only edit to the WORK_PLAN guide:plan-body region — update_work_plan() records 'current' and never writes one (#15220)"
+    return 0
+  fi
+  # The hash the receipt must carry: sha256 of the head region's
+  # stamp-stripped body plus one trailing newline, first 12 hex — the same
+  # computation as guide.md's WORK_PLAN_RENDER_HASH (sha256sum on Linux,
+  # shasum on macOS).
+  head_hash="$(printf '%s\n' "$head_body" | { sha256sum 2>/dev/null || shasum -a 256; } 2>/dev/null | cut -c1-12)"
+  while IFS= read -r l; do
+    receipt_lines+=("$l")
+  done < <(printf '%s\n' "$body" | grep -E '^- \*\*WORK_PLAN check\*\*: ' || true)
+  if [ "${#receipt_lines[@]}" -ne 1 ]; then
+    echo "NOT ELIGIBLE: PR body carries ${#receipt_lines[@]} 'WORK_PLAN check:' lines where exactly one is required (#15220)"
+    return 0
+  fi
+  if ! [[ "${receipt_lines[0]}" =~ $receipt_re ]]; then
+    echo "NOT ELIGIBLE: the PR body's 'WORK_PLAN check:' line is not a machine-rendered 'written' receipt (render-hash <12hex>, <UTC>) — free prose, 'NOT RUN' or 'render-hash none' cannot verify a changed region (#15220)"
+    return 0
+  fi
+  hash="${BASH_REMATCH[1]}"
+  if [ "$hash" != "$head_hash" ]; then
+    echo "NOT ELIGIBLE: WORK_PLAN render-hash mismatch — PR body claims '$hash', the head region recomputes '$head_hash' (#15220)"
+    return 0
+  fi
+  echo "ELIGIBLE"
+}
+
+if [ "$ELIGIBILITY" = "ELIGIBLE" ]; then
+  ELIGIBILITY=$(docs_only_fast_path_plan_check "$PR_NUMBER")
+fi
+```
+
 If `$ELIGIBILITY` is anything other than the literal string `ELIGIBLE`
 (including an empty diff, a diff that mixes an allowlisted file with
 anything else — a source file, a nested README, `.github/workflows/*.yml`,
 `.loom/config.json`, or any other path — a PR whose body carries a closing
-reference such as `Closes #N`, a PR whose closing-reference read failed, or
-a PR whose new WORK_LOG records failed the base-repository verification:
+reference such as `Closes #N`, a PR whose closing-reference read failed, a
+PR whose new WORK_LOG records failed the base-repository verification:
 missing number, wrong kind, wrong state (an unmerged PR or an open issue),
-title mismatch, foreign repository identity, or
-an unreadable diff/target read) — **do not use this fast path.** Report the
+title mismatch, foreign repository identity, or an unreadable diff/target
+read, or a PR whose `WORK_PLAN.md` `guide:plan-body` region changed without
+the machine-rendered `written` receipt: a stamp-only edit, free prose in
+place of the `WORK_PLAN check:` line, a wrong or missing render-hash, a
+region the PR created or deleted, malformed markers, an unreadable
+contents/body read, or a duplicated receipt line (#15220)) — **do not use
+this fast path.** Report the
 `NOT ELIGIBLE` reason verbatim in the verdict comment, and proceed with the
 normal Primary Queue steps 5-11 (checkout, quality checks, test plan
-execution, full code evaluation).
+execution, full code evaluation). A refusal prefixed
+`NOT ELIGIBLE: ENVIRONMENT:` means a `gh` read failed and the check could not
+run — an environment failure, never a passed or waived #13760/#15220 content
+check; report it as such and still take the normal flow.
 
 ### Fast-Path Evaluation Process
 

@@ -82,18 +82,6 @@ pub fn dashboard_base_url() -> String {
     trimmed.trim_end_matches('/').to_string()
 }
 
-/// The dashboard page for `number` in `nwo`: `…/pull/N` for a PR, `…/issues/N`
-/// otherwise. loom-ui's resolver lands both on the same issue page; the link
-/// itself stays truthful about which object it names.
-#[must_use]
-pub fn forge_dashboard_url(nwo: &str, number: impl fmt::Display, is_pr: bool) -> String {
-    format!(
-        "{base}/github.com/{nwo}/{kind}/{number}",
-        base = dashboard_base_url(),
-        kind = if is_pr { "pull" } else { "issues" },
-    )
-}
-
 /// `body` with the dashboard footer appended — the canonical format, pinned
 /// by the shell twin's test (#9774). Idempotent: a body already carrying
 /// [`FOOTER_MARKER`] is returned unchanged.

@@ -93,6 +93,9 @@ pub(crate) enum AccountsAction {
         provider: String,
         #[arg(value_name = "NAME")]
         name: String,
+        /// Apply to the machine-level registry for all workspaces on this host.
+        #[arg(long, conflicts_with = "workspace")]
+        shared: bool,
         #[arg(long)]
         json: bool,
     },
@@ -102,6 +105,9 @@ pub(crate) enum AccountsAction {
         provider: String,
         #[arg(value_name = "NAME")]
         name: String,
+        /// Apply to the machine-level registry for all workspaces on this host.
+        #[arg(long, conflicts_with = "workspace")]
+        shared: bool,
         #[arg(long)]
         json: bool,
     },

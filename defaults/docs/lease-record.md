@@ -839,6 +839,22 @@ the same lease semantics, **keyed by role**:
   cooldown also includes `PR_LEASE_BACKSTOP_REFUSED=<token>`. A live lease
   takes precedence. Other roles, a disabled backstop, and an unreadable PR
   head report `free` when the lease is free.
+- **`backstop-clear` (the operator's release, #15096).** `loom-daemon lease pr
+  backstop-clear (--pr N | --all) --workspace <root>` releases Judge
+  no-verdict holds without a push or a label change: it rewrites each
+  **trusted** in-window no-verdict record on the PR at its current head from
+  `verdict=none` to `verdict=cleared` (a token no hold reader counts; the
+  rest of the marker — `head=`, `labels=`, `reaped=`, `refused=` — stays as
+  the audit trail). Records at another head, out of window, or from an
+  untrusted author are left alone. `--all` walks the open
+  `loom:review-requested` PRs `check` would answer `held-backstop` (an
+  active hold, no live Judge lease) and clears only those; a live lease or a
+  disabled backstop (`LOOM_JUDGE_BACKSTOP=0`) keeps it away. Exit 0 = done
+  (a `BACKSTOP_CLEAR pr=<n> cleared=<k>` line per PR); 1 = a read, the write
+  target or a rewrite failed. `loom-tools` refuses the verb — it is an
+  operator write verb of `loom-daemon`. The use case: after a runtime fault
+  that no-verdict-recorded many PRs at once is fixed, one command releases
+  them all instead of touching every PR.
 - **Judge no-verdict backstop (#11855).** A Judge `release` that finds the PR
   open, still `loom:review-requested` and carrying neither `loom:pr` nor
   `loom:changes-requested` appends `head=<sha> verdict=none labels=<digest>`
@@ -861,8 +877,9 @@ the same lease semantics, **keyed by role**:
   the first, four after the second, and after the third until the oldest of
   the last three is 24 h old, so an unchanged PR gets at most three Judge
   runs a day. A push, or a change to the `loom:*` label set, releases the
-  hold at once. Removing and re-adding the same label does not (the set is
-  unchanged); to force a re-review, push or run with
+  hold at once; so does `lease pr backstop-clear`, by rewriting the records
+  to `verdict=cleared`. Removing and re-adding the same label does not (the
+  set is unchanged); to force a re-review, push or run with
   `LOOM_JUDGE_BACKSTOP=0`, which turns the backstop off. An unreadable record
   list serves the PR. A pass a verdict gate refused (`post-verdict.sh` exit 7,
   e.g. the stale-read gate) releases with `--skip-reason gate-refused:<token>`
@@ -885,7 +902,20 @@ the same lease semantics, **keyed by role**:
   `reaped=timeout` appended, and with no CI exemption: a pass that burned the
   whole ceiling is the re-run the backstop exists to bound. Every host's next
   Judge is then held (1 h, 4 h, then the window), so a PR that keeps timing
-  out gets at most three Judge runs a day. Who runs next is still decided by
+  out gets at most three Judge runs a day. Not every reap reason records
+  (#14951): `seat_busy` (the seat refused the run),
+  `launch_rejected` (a typed `LOOM_LAUNCH_REJECTED` report, or an untyped
+  exit 78, a spawn script's preflight refusal, inside the fast-fail window
+  with no outcome line) and `provider_exhausted` (#13966: the run died on
+  the provider, not on the PR) each say the step never reached a review, so
+  its reap writes no no-verdict record at all and counts toward neither
+  the 1 h / 4 h ladder nor the window cap: the backstop bounds re-runs of
+  a Judge that ran and ended without a verdict (`exited`, `timeout`), not
+  a runtime fault unrelated to the PR. The skip goes further than the
+  release-side exemptions above: a gate-refused pass still writes a record
+  (`refused=<token>`) that holds the PR for only 15 minutes (#13135), and
+  a CI-exempt release skips the record only for a pass that ran — CI, not
+  a fault, is why it reached no verdict. Who runs next is still decided by
   the lease: concurrent reclaimers of the same stale claim each post a lease,
   and the earliest comment `id` is the only winner. Rules:
   `loom-daemon/src/pr_lease_reap.rs`.

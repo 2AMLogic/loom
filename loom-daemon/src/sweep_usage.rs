@@ -30,7 +30,7 @@
 //! It is **not** a new usage scraper. Every count still comes from
 //! [`crate::usage_source::sweep_tokens_by_model`] (which dispatches per runtime
 //! to the OpenCode / Kimi / Codex / Pi stores or the Claude transcripts) and
-//! [`crate::transcript_tokens::sum_sweep_tokens_split`]. This module adds
+//! [`crate::transcript_tokens::sum_sweep_tokens_by_model`]. This module adds
 //! exactly one thing on top: the three-way decision about what an empty read
 //! *means*, stated once so the two emit sites cannot disagree.
 //!
@@ -146,8 +146,8 @@ pub fn never_spawned_reason(failure_class: Option<&str>) -> Option<&str> {
 /// Flatten a per-model breakdown onto the `(tokens_in, tokens_out)` axes the
 /// record's flat pair uses: `tokens_in` is the three billing-input counters
 /// summed (input + cache read + both cache-write horizons), `tokens_out` is
-/// `output` alone — byte-identical to what
-/// [`crate::transcript_tokens::sum_sweep_tokens_split`] computes from the same
+/// `output` alone — byte-identical to the same split computed over
+/// [`crate::transcript_tokens::sum_sweep_tokens_by_model`]'s rows for the same
 /// transcripts, so the two sources cannot report different totals for one
 /// sweep.
 #[must_use]
@@ -217,7 +217,7 @@ pub fn resolve(
     // non-Claude arms slice their whole-session stores per window (a session
     // db row has no finer public grain), which is the store's own semantics —
     // unchanged here. The Claude flat pair is now `flatten` of the per-record
-    // rows rather than `sum_sweep_tokens_split`'s whole-file fold: for a
+    // rows rather than the retired whole-file fold: for a
     // sweep whose transcripts contain only in-window records the two agree
     // exactly, and where they disagree the per-record number is the honest
     // one.

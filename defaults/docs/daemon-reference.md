@@ -2624,6 +2624,40 @@ blocker is Loom-owned:
   a log line naming the repo path. Carrying
   these to SigNoz is #11386.
 
+## Changing a bundled model profile's model (`runtimes.modelProfileOverrides`, #15252)
+
+A config tier (fleet defaults, `fleet/hosts/<host>/`, or `.loom-local/local.json`)
+can change the model a **bundled** profile runs without a Loom release:
+
+```jsonc
+"runtimes": { "modelProfileOverrides": { "zai-full": { "model": "glm-5.4" } } }
+```
+
+The override is overlaid on the bundled profile inside `profiles::lookup` — it never
+replaces it — so `excludedRoles` (`judge`, `curator` on the GLM profiles), providers,
+credentials, `credentialProxy` and billing are inherited unchanged.
+
+| Key | Effect |
+|-----|--------|
+| `model`, `effort` | replaces the bundled value |
+| `allowedEfforts` | replaces the bundled list |
+| `excludedRolesAdd` | known role names **added** to the bundled `excludedRoles` (never removes) |
+
+Anything else is an error: `loom-daemon validate` reports it, and a launch refuses
+at exit 78 with the same text. That covers an unknown key (`excludedRoles`
+included), a name that is not in `defaults/model-profiles.json`, the same name under
+both `runtimes.modelProfiles` and `runtimes.modelProfileOverrides`, a blank
+`model`/`effort`/`allowedEfforts` entry, and an unknown `excludedRolesAdd` role.
+An explicit `null` clears a lower tier's entry or field. Tier precedence is the
+ordinary `deep_merge` order (local > fleet-repo > project > committed > machine
+defaults), and `fleet-config render` applies a host overlay over the fleet default
+the same way, so a per-host override is a canary.
+
+`loom-daemon worker profile-check <name>` prints `model: <id> (source: <tier>)`,
+where `<tier>` is `local`, `fleet-repo`, `project`, `committed`, `defaults` or
+`bundled`. Full semantics: [`runtime-adapters.md`](runtime-adapters.md)
+§ "Changing a bundled profile's model without a release".
+
 ## Fleet model A/B — `sweep-experiment plan` (#8055 phase 1)
 
 `loom-daemon sweep-experiment` already randomizes **per issue**, by parity
@@ -10538,6 +10572,7 @@ through `.loom-local/local.json`):
 |---|---|---|
 | — | `accounts.session.image` | The image a session container is created from, **digest-pinned** (`repo@sha256:<64 hex>`). A tag-only reference is refused at parse. Unset = today's behaviour byte for byte. |
 | — | `accounts.session.extraMounts` | A list of `{ "host": …, "container": … }` bind mounts, **always read-only**. An entry carrying any other key (`rw`/`mode`/…) is refused at parse. A container target must lie outside the mounted workspace (the `--mount-workspace` path, not only the registered repositories beneath it); one inside it is refused at `create`. |
+| — | `accounts.session.objectMirrors` | `true` to create new private-session containers with one read-only bind per registered repository, at `/mirrors/<slug>/objects`, from this host's origin-only object mirror (#14680); each bound clone's sole object alternate names exactly that path. Unset/`false` (the default) keeps fully private clones. A mirror that cannot be proved or fetched skips that repository, never the session. Opting in is one-way per seat: a clone that already borrows keeps needing its bind, so with the flag back off the seat's next recreation carries no bind and preparation refuses fail-closed — "workspace must own a real clone and private Git objects; its object alternate is not authorized for this session (a clone that already borrows needs its mirror bind back: restore the mirror, or re-enable accounts.session.objectMirrors)". The supported remedies are (a) restore the mirror / re-enable the flag, or (b) discard that seat's clone and re-clone; there is no supported un-borrow of a live clone. |
 
 **Precedence**: `accounts session start --image IMAGE` (the operator's own
 invocation) beats `accounts.session.image`, which beats the stock default.
@@ -11255,6 +11290,38 @@ The same pass-through can be requested deliberately with
 `autonomous.roleRunner.roleModels.<role> = "default"` (or the global
 `autonomous.roleRunner.model`); see
 [`runtime-adapters.md` § "Per-role model override"](runtime-adapters.md#per-role-model-override-autonomousrolerunnerrolemodels).
+
+**A configured tier reconciles against a native profile's own model
+(#14962).** A `roleModels.<role>` pin (or the global
+`autonomous.roleRunner.model` / `autonomous.model`) is a runtime-neutral
+default, so it may name a model the native pick the draw landed on does not
+run: an `opencode:<profile>` candidate pins a *profile*, and
+`worker_spawn::profiles::select` refuses a launch whose `--model` differs
+from that profile's own `model` (`bare model differs from the selected
+profile`, `profile_selection`, exit 78) — before #14962 this lost whole
+Judge/Guide steps whose `roleModels.<role>` was aimed at the Claude picks.
+Both launch sites (the sweep step spawn and the role runner's invocation) now
+resolve the model through `resolve_role_runner_model_for_launch`: when the
+admitted runtime is native (`opencode`, `pi`, `kimi`) and the profile the
+launch will select (the preference tap's `modelProfile`, then
+`LOOM_MODEL_PROFILE`, `runtimes.defaultModelProfile`, then the bundled
+`zai-flash`) declares a different `model`, the configured pin is dropped and
+the child launches with the profile's own model instead of the launch being
+refused. **A qualified `provider/model` pin is kept** when no profile was
+requested (no tap `modelProfile`, no `LOOM_MODEL_PROFILE`): `select` honours it
+verbatim before any profile lookup — the documented
+`"roleModels": {"judge": "google/gemini-2.5-pro"}` shape
+(`configuring-resources.md`) — so only a bare tier name (or a qualified value
+differing from an *explicitly requested* profile's model) is dropped. The drop
+is logged, and the per-tick header's source names it, e.g.
+`model=<runtime CLI default> (source=autonomous.roleRunner.roleModels.judge (profile model for opencode:zai-flash))`.
+A model the pick itself pins (`claude/opus`, `opencode:<profile>/<model>`)
+is an explicit statement of intent about that launch and is **never** dropped:
+a value the profile disallows is still forwarded and still refused loudly —
+pin `opencode:<profile>/<the profile's model>` (or nothing) instead. Claude
+and Codex launches are unaffected, so #5028's
+`model_runtime_mismatch` refusal of a genuinely wrong cross-family pin
+survives verbatim.
 
 **Pinned models fall back one rung at selection time when their class limit
 is hit (#13873).** A model pin has no answer to an org-wide class ceiling:

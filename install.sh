@@ -23,6 +23,9 @@
 #                              (forwarded to scripts/install-loom.sh)
 #   --repo-only                Write only the target repo's files; skip the machine-level daemon
 #                              binary and user-scope hooks (env: LOOM_INSTALL_REPO_ONLY=1)
+#   --allow-downgrade          Let the machine-level loom-daemon provisioning replace a NEWER
+#                              installed daemon with this (older) checkout's build
+#                              (env: LOOM_INSTALL_ALLOW_DOWNGRADE=1; default: refused)
 #   --tools-only [ARGS]        Install only loom-tools (no loom-daemon); see scripts/install/provision-tools.sh
 #   -h, --help                 Show this help message
 #
@@ -1206,6 +1209,10 @@ SOURCE_OVERRIDE_FLAGS=()
 # appended to SOURCE_OVERRIDE_FLAGS below so the delegation is explicit.
 REPO_ONLY=false
 case "${LOOM_INSTALL_REPO_ONLY:-}" in 1|true|yes) REPO_ONLY=true ;; esac
+# --allow-downgrade / LOOM_INSTALL_ALLOW_DOWNGRADE=1 (issue #15261): permit the
+# machine-level daemon provisioning to replace a newer installed daemon with an
+# older source build. Exported so the delegated install-loom.sh sees it too.
+case "${LOOM_INSTALL_ALLOW_DOWNGRADE:-}" in 1|true|yes) export LOOM_INSTALL_ALLOW_DOWNGRADE=1 ;; esac
 # Install-time workspace mode (--mode session, issue #8884). Held as the literal
 # `loom-daemon init` argv pair so it can be spliced into both the direct init
 # calls below and the Full-Install delegation exec without re-deriving anything.
@@ -1256,6 +1263,7 @@ while [[ "${1:-}" == -* ]]; do
     # forwarded to scripts/install-loom.sh at the Full-Install delegation execs.
     --allow-non-main-source|--allow-stale-target) SOURCE_OVERRIDE_FLAGS+=("$1"); shift ;;
     --repo-only) REPO_ONLY=true; SOURCE_OVERRIDE_FLAGS+=("$1"); shift ;;
+    --allow-downgrade) export LOOM_INSTALL_ALLOW_DOWNGRADE=1; SOURCE_OVERRIDE_FLAGS+=("$1"); shift ;;
     -h|--help)
       echo "Usage: ./install.sh [OPTIONS] [TARGET_PATH]"
       echo ""
@@ -1291,6 +1299,9 @@ while [[ "${1:-}" == -* ]]; do
       echo "                             Loom source (forwarded to scripts/install-loom.sh)"
       echo "  --allow-stale-target       Permit installing over a newer/stale target"
       echo "                             (forwarded to scripts/install-loom.sh)"
+      echo "  --allow-downgrade          Let machine-level provisioning replace a newer installed"
+      echo "                             loom-daemon with this older build (env:"
+      echo "                             LOOM_INSTALL_ALLOW_DOWNGRADE=1; default: refused)."
       echo "  --repo-only                Write only the target repository's files (env:"
       echo "                             LOOM_INSTALL_REPO_ONLY=1; forwarded to scripts/install-loom.sh)."
       echo "                             Skips the machine-level steps and prints one line per skip:"
@@ -2033,7 +2044,8 @@ elif [[ -d "$TARGET_PATH/.loom" ]]; then
     if [[ "$REPO_ONLY" == "true" ]]; then
       info "Skipping machine-level loom-daemon provisioning (--repo-only)"
     else
-      provision_machine_daemon "$LOOM_CARGO_TARGET_DIR/release/loom-daemon" "" "$LOOM_ROOT/defaults" || true
+      provision_machine_change_notice "$LOOM_CARGO_TARGET_DIR/release/loom-daemon" || true
+      LOOM_PROVISION_REFUSE_DOWNGRADE=1 provision_machine_daemon "$LOOM_CARGO_TARGET_DIR/release/loom-daemon" "" "$LOOM_ROOT/defaults" || true
     fi
 
     # Guard-hook wiring (#4401). MUST run after install_hooks_and_cli (which
@@ -2541,7 +2553,8 @@ case "$METHOD" in
     if [[ "$REPO_ONLY" == "true" ]]; then
       info "Skipping machine-level loom-daemon provisioning (--repo-only)"
     else
-      provision_machine_daemon "$LOOM_CARGO_TARGET_DIR/release/loom-daemon" "" "$LOOM_ROOT/defaults" || true
+      provision_machine_change_notice "$LOOM_CARGO_TARGET_DIR/release/loom-daemon" || true
+      LOOM_PROVISION_REFUSE_DOWNGRADE=1 provision_machine_daemon "$LOOM_CARGO_TARGET_DIR/release/loom-daemon" "" "$LOOM_ROOT/defaults" || true
     fi
 
     # Guard-hook wiring (#4401) — same call as the --confirm-reinstall branch

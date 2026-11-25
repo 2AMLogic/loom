@@ -66,8 +66,18 @@ impl Probed {
     }
 }
 
+/// The docker CLI the preflight probes launch (#14885): the shared override →
+/// `$PATH` → fallback resolution. Failure is reported as an io `NotFound`
+/// error so the caller's existing not-found arm (exit 127) fires for a
+/// missing docker and a broken explicit override alike.
+fn probe_program() -> Result<std::path::PathBuf> {
+    crate::docker_bin::resolve().map_err(|error| {
+        anyhow::Error::new(std::io::Error::new(std::io::ErrorKind::NotFound, error.to_string()))
+    })
+}
+
 fn probe(args: &[&str], parent: i32) -> Result<Probed> {
-    let mut child = Command::new("docker")
+    let mut child = Command::new(probe_program()?)
         .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -131,7 +141,7 @@ pub(super) enum Preflight {
     /// inspect object, for the operator's recreate command.
     MountStale(serde_json::Value),
     /// Running and the workdir is mounted.
-    Ready,
+    Ready(serde_json::Value),
 }
 
 /// Read both pre-exec answers from one `docker inspect --type container`.
@@ -156,7 +166,7 @@ pub(super) fn preflight(inspect: &Probed, workdir: &str) -> Preflight {
     match state {
         Some(state) if !container_running(&state) => Preflight::NotRunning,
         Some(state) if workdir_unmounted(&state, workdir) => Preflight::MountStale(state),
-        Some(_) => Preflight::Ready,
+        Some(state) => Preflight::Ready(state),
         None => Preflight::NotRunning,
     }
 }
@@ -185,7 +195,10 @@ pub(super) fn mount_stale_line(
 /// arguments; `child_env` values are set on this `docker` child only, never in
 /// argv, for the bare `--env NAME` entries that copy them (#13916).
 pub(crate) fn exec_command(args: &HostArgs, id: &str) -> Command {
-    let mut command = Command::new("docker");
+    // Shared lookup (#14885); a resolution failure keeps an unlaunchable
+    // name carrying the reason, so the spawn below fails rather than
+    // falling back to a PATH docker an invalid override forbids.
+    let mut command = Command::new(crate::docker_bin::scoped_or_fail_open(None));
     command.args(["exec", "-i", "--workdir", &args.workdir]);
     for env in &args.env {
         command.args(["--env", env]);
@@ -206,6 +219,13 @@ pub(crate) fn exec_command(args: &HostArgs, id: &str) -> Command {
 }
 
 pub fn run(args: HostArgs) -> Result<i32> {
+    run_with_seat(args, None)
+}
+
+pub(super) fn run_with_seat(
+    mut args: HostArgs,
+    seat_home: Option<(&std::path::Path, &std::path::Path)>,
+) -> Result<i32> {
     signals();
     let parent = unsafe { libc::getppid() };
     // A unique temporary marker revokes the captured shell's invocation without
@@ -258,22 +278,39 @@ pub fn run(args: HostArgs) -> Result<i32> {
                 .downcast_ref::<std::io::Error>()
                 .is_some_and(|e| e.kind() == std::io::ErrorKind::NotFound) =>
         {
-            eprintln!("session-exec: 'docker' command not found in PATH");
+            eprintln!("session-exec: docker CLI could not be resolved: {error}");
             return Ok(127);
         }
         Ok(inspect) => preflight(&inspect, &args.workdir),
         Err(_) => Preflight::Unknown,
     };
     match preflight {
-        Preflight::Ready => {}
+        Preflight::Ready(state) => {
+            if let Some((home, workspace)) = seat_home {
+                claude::bind_launch(&mut args, &state, home, workspace)?;
+            }
+        }
         not_ready @ (Preflight::NotRunning | Preflight::Unknown) => {
             if not_ready == Preflight::NotRunning {
                 refusal::announce(TerminalClassification::SessionDown);
+            }
+            if seat_home.is_some() {
+                bail!(
+                    "Claude seat {} unavailable; check accounts session status --provider claude",
+                    args.container
+                );
             }
             bail!("Session container '{}' is not running. Start it with: loom-daemon accounts session start {}", args.container, args.container.trim_start_matches("loom-codex-session-"))
         }
         Preflight::MountStale(state) => {
             refusal::announce(TerminalClassification::SessionMountStale);
+            if seat_home.is_some() {
+                eprintln!(
+                    "Claude seat {} does not mount {}; recreate the seat with this workspace",
+                    args.container, args.workdir
+                );
+                return Ok(refusal::REFUSAL_EXIT_CODE);
+            }
             eprintln!("{}", mount_stale_line(&args.container, &args.workdir, &state));
             return Ok(refusal::REFUSAL_EXIT_CODE);
         }

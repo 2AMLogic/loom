@@ -211,6 +211,42 @@ fn digest_is_stable_and_distinct() {
     assert_ne!(a, digest_of(&tweaked));
 }
 
+/// #15017: the prompt modifier is part of the digest, but an unset one leaves
+/// the canonical serialization — and so every existing digest — untouched.
+#[test]
+fn the_prompt_modifier_enters_the_digest_only_when_set() {
+    let params = Hyperparameters::default();
+    // Unset: byte-identical to the bare vector's serialization, computed here
+    // independently of `digest_with` so the pin does not follow a refactor.
+    let canonical = serde_json::to_string(&params).unwrap();
+    let bare = format!("sha256:{}", hex::encode(Sha256::digest(canonical.as_bytes())));
+    assert_eq!(digest_of(&params), bare);
+    assert_eq!(digest_with(&params, None), bare);
+
+    // Set: differs from unset, and from a different modifier; stable per name.
+    let deep = digest_with(&params, Some("deep"));
+    assert_ne!(deep, bare);
+    assert_ne!(deep, digest_with(&params, Some("wide")));
+    assert_eq!(deep, digest_with(&params, Some("deep")));
+    // Same modifier, different vector: still distinct (it is folded in, not
+    // substituted for the vector).
+    let mut tweaked = params;
+    tweaked.dispatch.max_concurrent += 1;
+    assert_ne!(deep, digest_with(&tweaked, Some("deep")));
+}
+
+#[test]
+#[serial]
+fn a_resolved_vector_digests_through_its_modifier() {
+    let tmp = empty_workspace();
+    let mut resolved = resolve_effective(tmp.path());
+    // The process env carries no modifier in the unit-test binary.
+    assert_eq!(resolved.prompt_modifier, None);
+    assert_eq!(resolved.digest(), digest_of(&resolved.params));
+    resolved.prompt_modifier = Some("deep".into());
+    assert_eq!(resolved.digest(), digest_with(&resolved.params, Some("deep")));
+}
+
 #[test]
 #[serial]
 fn startup_init_fails_fast_naming_the_offending_path() {

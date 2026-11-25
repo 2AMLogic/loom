@@ -164,6 +164,8 @@ mod tests {
     /// (#10249), and a spawn that checks its target first can never reach the
     /// real `gh`. Do not "simplify" this back to a bare `gh` spawn.
     fn resolve_bare(path: &std::ffi::OsStr) -> Option<PathBuf> {
+        // Self-contained on purpose: this file is `#[path]`-included into
+        // many integration-test crates, so it cannot reach `crate::fs_util`.
         use std::os::unix::fs::PermissionsExt;
         std::env::split_paths(path).map(|d| d.join("gh")).find(|p| {
             p.metadata()

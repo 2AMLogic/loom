@@ -103,9 +103,7 @@ pub(super) fn canonical_program(program: &str) -> Option<PathBuf> {
     let found = if p.components().count() > 1 {
         Some(p.to_path_buf())
     } else {
-        std::env::split_paths(&std::env::var_os("PATH")?)
-            .map(|d| d.join(program))
-            .find(|c| crate::agent_gh::next_gh::is_executable(c))
+        crate::fs_util::find_executable_on_path(program)
     }?;
     std::fs::canonicalize(found).ok()
 }
