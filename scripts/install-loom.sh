@@ -1414,7 +1414,7 @@ info "loom-daemon binary: $DAEMON_VERSION"
 if [[ "$REPO_ONLY" == "true" ]]; then
   info "Skipping machine-level loom-daemon provisioning (--repo-only)"
 else
-  provision_machine_change_notice "$TARGET_DIR/release/loom-daemon"
+  provision_machine_change_notice "$TARGET_DIR/release/loom-daemon" || true
   info "Provisioning machine-level loom-daemon binary..."
   LOOM_PROVISION_REFUSE_DOWNGRADE=1 provision_machine_daemon "$TARGET_DIR/release/loom-daemon" "" "$LOOM_ROOT/defaults" || \
     warning "Machine-level loom-daemon not provisioned (see note above); autonomous daemon mode needs LOOM_DAEMON_BIN or a binary on PATH."

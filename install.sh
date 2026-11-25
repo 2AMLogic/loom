@@ -2044,7 +2044,7 @@ elif [[ -d "$TARGET_PATH/.loom" ]]; then
     if [[ "$REPO_ONLY" == "true" ]]; then
       info "Skipping machine-level loom-daemon provisioning (--repo-only)"
     else
-      provision_machine_change_notice "$LOOM_CARGO_TARGET_DIR/release/loom-daemon"
+      provision_machine_change_notice "$LOOM_CARGO_TARGET_DIR/release/loom-daemon" || true
       LOOM_PROVISION_REFUSE_DOWNGRADE=1 provision_machine_daemon "$LOOM_CARGO_TARGET_DIR/release/loom-daemon" "" "$LOOM_ROOT/defaults" || true
     fi
 
@@ -2553,7 +2553,7 @@ case "$METHOD" in
     if [[ "$REPO_ONLY" == "true" ]]; then
       info "Skipping machine-level loom-daemon provisioning (--repo-only)"
     else
-      provision_machine_change_notice "$LOOM_CARGO_TARGET_DIR/release/loom-daemon"
+      provision_machine_change_notice "$LOOM_CARGO_TARGET_DIR/release/loom-daemon" || true
       LOOM_PROVISION_REFUSE_DOWNGRADE=1 provision_machine_daemon "$LOOM_CARGO_TARGET_DIR/release/loom-daemon" "" "$LOOM_ROOT/defaults" || true
     fi
 

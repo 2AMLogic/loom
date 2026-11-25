@@ -360,6 +360,9 @@ SHIM
     printf '%s() { echo %s >> "$FIXTURE_MACHINE"; }\n' "$function_name" "$name" \
       > "$source/scripts/install/provision-$name.sh" || return
   done
+  # The notice is cosmetic and must stay silent: the machine record is asserted exactly.
+  printf 'provision_machine_change_notice() { :; }\n' \
+    >> "$source/scripts/install/provision-daemon.sh" || return
   cat > "$source/scripts/setup-mcp.sh" <<'SHIM' || return
 #!/usr/bin/env bash
 echo setup-mcp >> "$FIXTURE_MACHINE"
