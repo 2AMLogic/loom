@@ -1403,3 +1403,9 @@ mod tests;
 #[cfg(test)]
 #[path = "select_affinity_tests.rs"]
 mod affinity_tests;
+
+/// Account-pinned selection for a session resume (#14981). A child module so
+/// it reuses this file's private eligibility helpers.
+#[path = "select_pin.rs"]
+mod pin;
+pub use pin::select_pinned_token;
