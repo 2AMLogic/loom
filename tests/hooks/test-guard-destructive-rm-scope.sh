@@ -1383,6 +1383,12 @@ assert_deny "#15112 review: non-literal cd arg still denies" \
     'cd $D && rm -rf x' "$REPO_ROOT"
 assert_allow "#15112 review: 2>&1 redirect after cd is not a background operator" \
     'cd -- /tmp/x/work >/dev/null 2>&1 && rm -f ../note.md' "$REPO_ROOT"
+# Subshell cd containment must survive the #15221 opener strip: `lead` is
+# computed from the pre-strip segment, so `(cd X) && rm ...` never leaks X.
+assert_allow "#15221 merge: (cd /tmp) && rm -rf data keeps the subshell cd contained" \
+    '(cd /tmp) && rm -rf data' "$REPO_ROOT"
+assert_allow "#15221 merge: (cd \"\$HOME\") && rm -rf scratch keeps the subshell cd contained" \
+    '(cd "$HOME") && rm -rf scratch' "$REPO_ROOT"
 echo ""
 
 # =========================================================================
