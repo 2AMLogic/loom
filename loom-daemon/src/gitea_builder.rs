@@ -10,7 +10,7 @@ use serde_json::Value;
 use crate::comment_trust::{allowlist_from_config, trusted_by, Author};
 use crate::forge_check_claim::{classify_claim_labels, lease_leg, LabelLeg, LeaseLeg, LeaseRow};
 use crate::forge_cmd::GiteaConfig;
-use crate::parent_link::{classify_children, parent_marker, SplitState};
+use crate::parent_link::{parent_marker, split_state_from_children, SplitState};
 use crate::worktree_ops::gh::{
     linkage_phrase_regex, merged_since, MergedBranchPrProbe, OpenPrProbe,
 };
@@ -86,7 +86,8 @@ impl Repository {
     }
 
     pub(crate) fn split_state(&self, parent: u32) -> Result<SplitState> {
-        ensure!(!is_pull(&self.issue(parent)?)?, "split parent is a pull request");
+        let parent_issue = self.issue(parent)?;
+        ensure!(!is_pull(&parent_issue)?, "split parent is a pull request");
         let marker = parent_marker(parent);
         let mut children = Vec::new();
         // Gitea 1.24 has dependency and blocker edges but no native sub-issue
@@ -99,7 +100,7 @@ impl Repository {
             }
             Ok(())
         })?;
-        Ok(classify_children(&children))
+        split_state_from_children(&children, || body(&parent_issue))
     }
 
     pub(crate) fn labels(&self, number: u32, owned: bool) -> Result<LabelLeg> {

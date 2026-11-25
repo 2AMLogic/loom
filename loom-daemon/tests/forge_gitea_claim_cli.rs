@@ -125,6 +125,34 @@ fn split_reads_marker_children_in_both_states_and_all_pages() {
     }
 }
 
+#[test]
+fn split_rescoped_parent_body_only_matters_when_all_children_are_closed() {
+    let marker = "<!-- loom:split-rescoped -->";
+    for (mut parent, child_state, code, stdout) in [
+        (json!({"body": format!("New work.\n\n{marker}")}), "closed", 1, "NOT_SPLIT\n"),
+        (
+            json!({"body": format!("```md\n{marker}\n```")}),
+            "closed",
+            0,
+            "SPLIT_ALL_CLOSED #14\n",
+        ),
+        (json!({"body": null}), "closed", 0, "SPLIT_ALL_CLOSED #14\n"),
+        (json!({}), "closed", 2, ""),
+        (json!({"body": 42}), "closed", 2, ""),
+        (json!({}), "open", 1, "NOT_SPLIT\n"),
+    ] {
+        let f = Fixture::new();
+        parent["number"] = json!(12);
+        f.route("/issues/12", parent);
+        f.route(
+            "/issues?state=all&type=issues&limit=50&page=1",
+            json!([{"number":14,"state":child_state,"body":"<!-- loom:parent #12 -->"}]),
+        );
+        f.route("/issues?state=all&type=issues&limit=50&page=2", json!([]));
+        f.expect(SPLIT, false, code, stdout);
+    }
+}
+
 const FORCE: &[&str] = &["forge", "check-claim", "12", "--force-claim"];
 const PULLS: &str = "/pulls?state=all&limit=50&page=";
 
