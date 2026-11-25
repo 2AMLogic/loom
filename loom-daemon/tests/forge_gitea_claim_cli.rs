@@ -42,6 +42,24 @@ impl Fixture {
         self.route("/issues/12/comments", json!([]));
     }
 
+    fn merged_issue_branch(&self) {
+        let mut pr = pull(8, "closed", &[], "abc");
+        // Gitea substitutes a pull ref after deletion but retains the original branch label.
+        pr["head"]["label"] = json!("feature/issue-12");
+        pr["head"]["ref"] = json!("refs/pull/8/head");
+        pr["merged"] = json!(true);
+        pr["merged_at"] = json!("2026-11-20T10:00:00Z");
+        self.route(&format!("{PULLS}1"), json!([pr]));
+        self.route(&format!("{PULLS}2"), json!([]));
+    }
+
+    fn timeline(&self, query: &str, rows: Value, count: Option<usize>) {
+        let mut reply = Reply::json("200 OK", rows);
+        reply.total_count = count;
+        self.stub
+            .route(&format!("{REPO}/issues/12/timeline{query}"), reply);
+    }
+
     fn expect(&self, args: &[&str], owned: bool, code: i32, stdout: &str) {
         let dir = self.dir.path();
         let mut cmd = daemon(dir, &self.stub, "synthetic-token");
@@ -155,6 +173,29 @@ fn linked_open_pulls_and_mandatory_read_failures_on_a_later_page() {
 }
 
 #[test]
+fn an_unlinked_open_issue_branch_blocks_only_in_its_own_repository() {
+    for (repo, branch, code, token) in [
+        ("qual/consumer", "feature/issue-12", 0, "OPEN_PR #8\n"),
+        ("alice/fork", "feature/issue-12", 1, ""),
+        ("qual/consumer", "feature/issue-123", 1, ""),
+    ] {
+        let f = Fixture::new();
+        let mut pr = pull(8, "open", &[], "abc");
+        pr["body"] = json!("");
+        pr["head"]["ref"] = json!(branch);
+        pr["head"]["label"] = json!(branch);
+        pr["head"]["repo"]["full_name"] = json!(repo);
+        f.route(&format!("{PULLS}1"), json!([pr]));
+        f.route(&format!("{PULLS}2"), json!([]));
+        f.route("/assignees", json!([{"login":"alice"}]));
+        f.defaults();
+        std::fs::write(f.dir.path().join("branch"), "abc refs/heads/feature/issue-12\n").unwrap();
+        f.expect(FORCE, false, code, token);
+        f.expect(CLAIM, true, code, token);
+    }
+}
+
+#[test]
 fn merged_issue_branch_only_blocks_until_repromotion() {
     for (events, code, token) in [
         (json!([]), 0, "MERGED_PR #8\n"),
@@ -175,22 +216,9 @@ fn merged_issue_branch_only_blocks_until_repromotion() {
         ),
     ] {
         let f = Fixture::new();
-        let mut merged = pull(8, "closed", &[], "abc");
-        // After deletion Gitea keeps the source branch in label and substitutes a pull ref.
-        merged["head"]["label"] = json!("feature/issue-12");
-        merged["head"]["ref"] = json!("refs/pull/8/head");
-        merged["merged"] = json!(true);
-        merged["merged_at"] = json!("2026-11-20T10:00:00Z");
-        f.route(&format!("{PULLS}1"), json!([merged]));
-        f.route(&format!("{PULLS}2"), json!([]));
-        let mut first = Reply::json("200 OK", events.clone());
-        first.total_count = events.as_array().map(Vec::len);
-        f.stub
-            .route(&format!("{REPO}/issues/12/timeline?limit=50&page=1"), first);
-        let mut last = Reply::json("200 OK", Value::Null);
-        last.total_count = Some(0);
-        f.stub
-            .route(&format!("{REPO}/issues/12/timeline?limit=50&page=2"), last);
+        f.merged_issue_branch();
+        let count = events.as_array().map(Vec::len);
+        f.timeline("", events, count);
         f.defaults();
         f.expect(FORCE, false, code, token);
     }
@@ -298,24 +326,35 @@ fn a_link_from_a_fork_requires_a_trusted_author() {
 }
 
 #[test]
-fn empty_gitea_timeline_is_null_with_an_explicit_total() {
-    for (count, code, token) in [
-        (Some(0), 0, "MERGED_PR #8\n"),
-        (Some(1), 5, ""),
-        (None, 5, ""),
+fn a_filtered_timeline_page_cannot_hide_a_later_promotion() {
+    let promotion = json!([{"id":51,"type":"label","label":{"name":"loom:issue"},
+                            "body":"1","created_at":"2026-11-21T10:00:00Z"}]);
+    for filtered in [Value::Null, json!([])] {
+        let f = Fixture::new();
+        f.merged_issue_branch();
+        // Gitea paginates before filtering. Without a page it returns all visible rows.
+        f.timeline("?limit=50&page=1", filtered, Some(0));
+        f.timeline("?limit=50&page=2", promotion.clone(), Some(1));
+        f.timeline("", promotion.clone(), Some(1));
+        f.defaults();
+        f.expect(FORCE, false, 1, "");
+    }
+}
+
+#[test]
+fn the_unpaged_timeline_must_account_for_every_visible_row() {
+    for (events, count, code, token) in [
+        (Value::Null, Some(0), 0, "MERGED_PR #8\n"),
+        (Value::Null, Some(1), 5, ""),
+        (Value::Null, None, 5, ""),
+        (json!([]), Some(1), 5, ""),
+        (json!([]), None, 5, ""),
+        (json!([{"id":1,"type":"comment"}]), Some(2), 5, ""),
+        (json!([{"id":1,"type":"comment"},{"id":1,"type":"comment"}]), Some(2), 5, ""),
     ] {
         let f = Fixture::new();
-        let mut pr = pull(8, "closed", &[], "abc");
-        pr["head"]["label"] = json!("feature/issue-12");
-        pr["head"]["ref"] = json!("refs/pull/8/head");
-        pr["merged"] = json!(true);
-        pr["merged_at"] = json!("2026-11-20T10:00:00Z");
-        f.route(&format!("{PULLS}1"), json!([pr]));
-        f.route(&format!("{PULLS}2"), json!([]));
-        let mut end = Reply::json("200 OK", Value::Null);
-        end.total_count = count;
-        f.stub
-            .route(&format!("{REPO}/issues/12/timeline?limit=50&page=1"), end);
+        f.merged_issue_branch();
+        f.timeline("", events, count);
         f.defaults();
         f.expect(FORCE, false, code, token);
     }

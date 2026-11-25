@@ -54,26 +54,15 @@ impl Repository {
         let mut expected = None;
         for page in 1u32.. {
             let (response, count) = self.get(&format!("{path}{separator}limit=50&page={page}"))?;
-            // The 1.24 timeline reports the *page's* visible row count, and
-            // serializes an empty page as null. Issues and pulls instead
-            // repeat the repository-wide total on every page.
-            let timeline = path.ends_with("/timeline");
-            if timeline && response.is_null() && count == Some(0) {
-                return Ok(());
-            }
             let rows = response
                 .as_array()
                 .with_context(|| format!("expected a Gitea {path} listing"))?;
             if let Some(count) = count {
-                if timeline {
-                    ensure!(count == rows.len(), "incomplete Gitea timeline page");
-                } else {
-                    ensure!(
-                        expected.is_none_or(|n| n == count),
-                        "Gitea {path} count changed while reading"
-                    );
-                    expected = Some(count);
-                }
+                ensure!(
+                    expected.is_none_or(|n| n == count),
+                    "Gitea {path} count changed while reading"
+                );
+                expected = Some(count);
             }
             if rows.is_empty() {
                 ensure!(
@@ -83,11 +72,7 @@ impl Repository {
                 return Ok(());
             }
             for row in rows {
-                let id = row[key]
-                    .as_u64()
-                    .filter(|n| *n > 0)
-                    .context("missing Gitea row identity")?;
-                ensure!(seen.insert(id), "repeated Gitea {path} row {id}");
+                record_identity(&mut seen, row, key, path)?;
                 visit(row)?;
             }
         }
@@ -149,15 +134,17 @@ impl Repository {
             let pr = issue_number(row)?;
             let linked = reference.is_match(body(row)?);
             if !closed(row)? {
-                if linked && (self.same_head_repo(row)? || trust.contains(self, row)?) {
+                let blocks = if linked {
+                    self.same_head_repo(row)? || trust.contains(self, row)?
+                } else {
+                    self.matches_head_branch(row, &branch)?
+                };
+                if blocks {
                     open = Some(open.map_or(pr, |old| old.min(pr)));
                 }
             } else if !linked
                 && row["merged"].as_bool().context("missing PR merge state")?
-                // Gitea substitutes refs/pull/N/head in ref after branch deletion.
-                // The label retains the original branch name (empty for AGit).
-                && row["head"]["label"].as_str().context("missing Gitea head branch")? == branch
-                && self.same_head_repo(row)?
+                && self.matches_head_branch(row, &branch)?
             {
                 merged.push((pr, string(row, "merged_at")?.to_owned()));
             }
@@ -169,8 +156,25 @@ impl Repository {
         if merged.is_empty() {
             return Ok((OpenPrProbe::NoneOpen, MergedBranchPrProbe::NoneMerged));
         }
+        let promoted = self.latest_promotion(number)?;
+        Ok((OpenPrProbe::NoneOpen, merged_since(&merged, promoted)))
+    }
+
+    fn latest_promotion(&self, number: u32) -> Result<Option<DateTime<Utc>>> {
+        // Gitea 1.24 FindComments paginates only for page > 0. Omit page to
+        // read the entire visible timeline: a paged read can hide every row
+        // on one page while a later page still contains a label addition.
+        let (timeline, count) = self.get(&format!("issues/{number}/timeline"))?;
+        let rows = match &timeline {
+            Value::Null => &[][..],
+            Value::Array(rows) => rows,
+            _ => anyhow::bail!("expected a Gitea timeline listing"),
+        };
+        ensure!(count == Some(rows.len()), "incomplete Gitea timeline listing");
+        let mut seen = HashSet::new();
         let mut promoted = None;
-        self.each_page(&format!("issues/{number}/timeline"), "id", |row| {
+        for row in rows {
+            record_identity(&mut seen, row, "id", "timeline")?;
             if string(row, "type")? == "label" && string(&row["label"], "name")? == "loom:issue" {
                 // Gitea records label addition as "1" and removal as "".
                 match row["body"].as_str() {
@@ -182,9 +186,17 @@ impl Repository {
                     _ => anyhow::bail!("unrecognised Gitea label event"),
                 }
             }
-            Ok(())
-        })?;
-        Ok((OpenPrProbe::NoneOpen, merged_since(&merged, promoted)))
+        }
+        Ok(promoted)
+    }
+
+    fn matches_head_branch(&self, row: &Value, branch: &str) -> Result<bool> {
+        // Gitea retains the original branch in label (empty for AGit), even
+        // when branch deletion replaces ref with refs/pull/N/head.
+        let name = row["head"]["label"]
+            .as_str()
+            .context("missing Gitea head branch")?;
+        Ok(name == branch && self.same_head_repo(row)?)
     }
 
     fn same_head_repo(&self, row: &Value) -> Result<bool> {
@@ -202,7 +214,7 @@ impl Repository {
         now: DateTime<Utc>,
         ttl: f64,
     ) -> Result<LeaseLeg> {
-        // Unlike the timeline, the issue comments endpoint is unpaginated in Gitea 1.24.
+        // The issue comments endpoint is unpaginated in Gitea 1.24.
         let (response, count) = self.get(&format!("issues/{issue}/comments"))?;
         let comments = response.as_array().context("expected issue comments")?;
         ensure!(count.is_none_or(|n| n == comments.len()), "incomplete issue comments");
@@ -273,6 +285,15 @@ impl TrustedAuthors {
             .as_ref()
             .is_some_and(|writers| writers.iter().any(|w| w.eq_ignore_ascii_case(login))))
     }
+}
+
+fn record_identity(seen: &mut HashSet<u64>, row: &Value, key: &str, path: &str) -> Result<()> {
+    let id = row[key]
+        .as_u64()
+        .filter(|n| *n > 0)
+        .context("missing Gitea row identity")?;
+    ensure!(seen.insert(id), "repeated Gitea {path} row {id}");
+    Ok(())
 }
 
 fn issue_number(row: &Value) -> Result<u32> {
