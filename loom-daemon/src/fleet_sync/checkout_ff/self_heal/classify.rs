@@ -340,8 +340,8 @@ pub(super) struct Strand {
     pub from: Option<String>,
     /// HEAD, for the rescue ref and the log.
     pub head: String,
-    /// Commits on HEAD that are not on `origin/<branch>` (all of them a merged
-    /// pull request's).
+    /// Commits on HEAD that are not on `origin/<branch>` (all of them a pull
+    /// request's — open or merged, #14973).
     pub unique: usize,
 }
 
@@ -406,9 +406,9 @@ pub(super) fn stranded(
     // answer that can still change the outcome. Before the reorder a checkout
     // parked on an unmerged branch spent one `commits/<sha>/pulls` read per
     // pass that a local refusal then threw away.
-    if unique > 0 && (env.pr_merged)(root, &head) != Some(true) {
+    if unique > 0 && (env.pr_head)(root, &head) != Some(true) {
         return Err(format!(
-            "{unique} commit(s) are not on {tracking} and HEAD is not a merged pull request's head"
+            "{unique} commit(s) are not on {tracking} and HEAD is not a pull request's head"
         ));
     }
     Ok(Some(Strand {
