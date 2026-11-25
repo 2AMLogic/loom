@@ -293,6 +293,22 @@ DIR="$(new_store)"
 ) && CASE_RC=0 || CASE_RC=$?
 assert_true "$CASE_RC" "an aged holder with NO owner record is reaped by mtime"
 
+# Regression (#15265 review): with LOOM_FILING_LOCK_DIAG unset, reaping a holder
+# that has no owner.json must not leak a failed-redirect error onto stderr.
+DIR="$(new_store)"
+(
+    export LOOM_FILING_LOCK_DIR="$DIR"
+    export LOOM_FILING_LOCK_STALE_SECS=1
+    unset LOOM_FILING_LOCK_DIAG
+    mkdir -p "$DIR/holder"
+    sleep 1.1
+    ERR="$(loom_filing_lock_acquire "next" 2>&1 >/dev/null)" || exit 1
+    loom_filing_lock_release >/dev/null 2>&1
+    [[ "$ERR" != *"No such file or directory"* ]] || { echo "$ERR" >&2; exit 1; }
+    exit 0
+) && CASE_RC=0 || CASE_RC=$?
+assert_true "$CASE_RC" "reaping an owner-less holder is silent about owner.json when DIAG is off"
+
 DIR="$(new_store)"
 (
     export LOOM_FILING_LOCK_DIR="$DIR"

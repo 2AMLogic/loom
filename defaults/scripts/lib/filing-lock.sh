@@ -363,7 +363,12 @@ loom_filing_lock_acquire() {
         fi
         vanished=0
         if _loom_filing_lock_abandoned "$store" "$self_host" "$stale"; then
-            _loom_filing_lock_diag "reap decision (age=$(_loom_filing_lock_age_secs "$holder") stale=${stale} self_host=${self_host} owner=$(tr -d '\n' < "$holder/owner.json" 2>/dev/null || echo none))" "$holder"
+            # Gate the whole call: the argument's command substitutions expand
+            # BEFORE the callee's own early return, so an ungated call would run
+            # them (and leak a failed `<` redirect's error) on the default path.
+            if _loom_filing_lock_diag_on; then
+                _loom_filing_lock_diag "reap decision (age=$(_loom_filing_lock_age_secs "$holder") stale=${stale} self_host=${self_host} owner=$({ tr -d '\n' < "$holder/owner.json"; } 2>/dev/null || echo none))" "$holder"
+            fi
             echo "[filing-lock] reaping abandoned hold at ${holder} ($(_loom_filing_lock_blocker "$store"))" >&2
             rm -f "$holder/owner.json" 2>/dev/null || true
             rmdir "$holder" 2>/dev/null || true
