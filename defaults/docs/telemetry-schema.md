@@ -193,7 +193,7 @@ cycle) is added only when loom-ui's error tracking shows it is needed.
 | [`checkout.external_change`](#checkoutexternal_change) | log, OTLP only | `fleet_sync/checkout_ff/external_change.rs` |
 | [`roster.change`](#rosterchange) | log, OTLP only | `fleet_sync/roster_clone.rs` |
 | [`daemon.run_state_request`](#daemonrun_state_request--who-asked-the-daemon-to-pause-drain-stop-or-restart) | log, OTLP only | `ipc.rs` (`handle_client` run-state verbs), `observability/run_state_request.rs` |
-| [`completion.narrated`](#completionnarrated--a-public-feed-completion-the-narration-sink-built) | log, OTLP only | `safehouse/completion_runtime.rs` (`emit_narration_record`, from `build_and_narrate_completion`) |
+| [`completion.narrated`](#completionnarrated--a-public-feed-completion-the-narration-sink-built) | log, OTLP only | *none: no longer emitted since #13946; the kind stays defined* |
 | [`write_scope.refused`](#write_scoperefused--a-daemon-pass-write-the-9548-gate-refused) | log, OTLP only | `write_scope.rs` (`gate()` and the per-call checks, `emit_refused`) |
 | [`merge_queue.event`](#merge_queueevent--a-merge-queue-record-exported-to-otlp) | log, OTLP only | `forge_merge_queue/events.rs` (`FileEventSink::record`, after the JSONL append) |
 | [`merge.authorization.evaluated`](#mergeauthorizationevaluated--one-merge-group-authorization-evaluation) | log, OTLP only | `forge_merge_queue/group_run.rs` (`run_group_check`) |
@@ -4274,6 +4274,10 @@ then did: `champion.run` on `loom.champion.sweep_id` = the span's
 
 
 ### `completion.narrated` — a public-feed completion the narration sink built
+
+**No longer emitted (#13946).** The narration sink and its `completion` envelope were
+retired, so nothing builds this record any more; the kind and its OTLP mapping stay
+defined until a follow-up removes them, and historical records stay queryable.
 
 One OTLP log (INFO) per `completion` envelope the safehouse narration sink builds
 (Issue #13287), from `build_and_narrate_completion`, the core all three trigger

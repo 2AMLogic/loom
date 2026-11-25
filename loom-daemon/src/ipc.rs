@@ -1843,8 +1843,7 @@ pub fn build_daemon_status_for(
         // no pool is held, which is the steady state.
         pool_exhaustion_holds: crate::work_finder::pool_preflight::active_hold_statuses(),
         // Live safehouse connection state (#4345) — the pool's shared cell is
-        // updated by the narration sink / completion-dedup tasks
-        // `start_safehouse_narration`/`start_completion_dedup` spawn, and
+        // updated by the merged-PR reporter `start_merge_reporter` spawns, and
         // read back here on every status call (no second connection).
         safehouse: Some(workspace_pool.safehouse_status()),
         // Whether the work-finder loop is enabled for THIS running daemon
@@ -3270,8 +3269,8 @@ fn handle_request(
             //
             // Issue #4466: the two documented child-published topics
             // (`sweep.issue.{N}.phase` / `.blocker`) are upgraded to their
-            // typed variants here so the narration sink can emit the documented
-            // room lines — an `Event::Generic` is never narrated. Unknown
+            // typed variants here so subscribers match the documented
+            // phase/blocker payloads instead of a raw `Event::Generic`. Unknown
             // topics and malformed payloads fall through to `Event::Generic`
             // unchanged (publish is fire-and-forget advisory).
             let topic_ack = topic.clone();

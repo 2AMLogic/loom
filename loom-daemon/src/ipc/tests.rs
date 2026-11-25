@@ -2044,8 +2044,7 @@ async fn test_handle_request_publish_event_routes_to_subscribers() {
 
     // Issue #4466: the documented child-published `sweep.issue.{N}.phase`
     // topic is upgraded to the typed `Event::SweepPhase` variant (was
-    // previously delivered as `Event::Generic`, which the narration sink
-    // never narrated).
+    // previously delivered as `Event::Generic`).
     let ev = sub.recv().await.unwrap();
     match ev {
         Event::SweepPhase {
@@ -3652,8 +3651,7 @@ fn test_build_daemon_status_reports_halt_and_in_flight() {
         report.dynamic_cap, expected_configured_max,
         "the cap is configured_max regardless of the empty token pool (#12406)"
     );
-    // #4345: a pool that never called start_safehouse_narration /
-    // start_completion_dedup still reports a live safehouse state — the
+    // #4345: a pool that never called start_merge_reporter still reports a live safehouse state — the
     // cell's own default, not a missing/`None` field.
     let safehouse = report
         .safehouse
