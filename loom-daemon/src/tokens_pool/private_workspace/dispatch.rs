@@ -176,6 +176,7 @@ impl Selection {
             gh_config: None,
             session_image: None,
             extra_mounts: Vec::new(),
+            mirror_binds: Vec::new(),
         };
         Selection {
             name: "fixture".into(),
@@ -711,6 +712,7 @@ mod tests {
             gh_config: None,
             session_image: None,
             extra_mounts: Vec::new(),
+            mirror_binds: Vec::new(),
         };
         save(&dir.join("workspace.json"), &config).unwrap();
         profile
@@ -938,6 +940,7 @@ mod tests {
             gh_config: None,
             session_image: None,
             extra_mounts: Vec::new(),
+            mirror_binds: Vec::new(),
         }
     }
     fn reservation(dir: &Path) -> Selection {

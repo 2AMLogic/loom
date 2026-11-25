@@ -436,7 +436,9 @@ fi
   echo "For daemon code, an operator-specific value belongs in an operator-supplied"
   echo "input (a required flag / an overlay), not a compiled-in default."
   echo ""
-  echo "If an identifier is genuinely public and belongs here, add it to"
-  echo "ALLOWED_OWNERS / ALLOWED_HOST_SUFFIXES at the top of this script."
+  echo "If an identifier is genuinely public and belongs here: prefer adding a"
+  echo "single repository to ALLOWED_REPOS over widening owner-wide"
+  echo "ALLOWED_OWNERS for it; a whole public owner goes in ALLOWED_OWNERS and"
+  echo "a public host in ALLOWED_HOST_SUFFIXES, at the top of this script."
 } >&2
 exit 1

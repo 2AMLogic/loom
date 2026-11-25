@@ -184,6 +184,12 @@ pub fn parse_query(entity: &str, args: &[String]) -> Option<ViewQuery> {
         "pr" => PR_FIELDS,
         _ => return None,
     };
+    parse_query_for(args, supported)
+}
+
+/// [`parse_query`] over another reader's supported field set (the native
+/// Gitea view, [`crate::forge_gitea_view`]).
+pub(crate) fn parse_query_for(args: &[String], supported: &[&str]) -> Option<ViewQuery> {
     let mut number: Option<u32> = None;
     let mut json_fields: Vec<String> = Vec::new();
     let mut jq = None;

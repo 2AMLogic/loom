@@ -40,6 +40,11 @@ esac
 until mkdir "$fixture/lock" 2>/dev/null; do sleep 0.01; done
 trap 'rmdir "$fixture/lock"' 0
 printf '%s %s\n' "$backend" "$operation" >> "$fixture/calls"
+if [ -f "$fixture/fail-comments-once" ] && [ "$operation" = comments ]; then
+    rm -f "$fixture/fail-comments-once"
+    echo 'gh: Server Error (HTTP 502)' >&2
+    exit 1
+fi
 if [ -f "$fixture/fail-comments" ] && [ "$operation" = comments ]; then
     echo 'gh: Server Error (HTTP 502)' >&2
     exit 1

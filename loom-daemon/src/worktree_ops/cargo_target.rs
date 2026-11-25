@@ -66,14 +66,18 @@
 //!   actually covers that case (the building worktree is still live); this one
 //!   catches a program *running out of* the target dir.
 //!
-//! # Relationship to the bash implementation
+//! # Relationship to the bash library
 //!
-//! `defaults/scripts/lib/cargo-target-dir.sh` implements the same rules for
-//! `worktree.sh remove`. The two are parallel implementations on purpose: the
-//! daemon reaps worktrees in repositories where Loom's bash library may not be
-//! installed at all, so shelling out to it would silently no-op exactly where
-//! the leak was observed. Both mirror the resolution order of the standalone
-//! `scripts/cargo-target-dir.sh`, and both have a parity test against it
+//! This module is the ONLY reclaim implementation: every removal surface —
+//! `worktree.sh remove` (#8471), `merge-pr.sh`'s post-merge cleanup (#9153),
+//! `loom-daemon clean` and the periodic reaper — runs it, and the parallel
+//! bash reclaim stack that used to live in
+//! `defaults/scripts/lib/cargo-target-dir.sh` for the first two was deleted
+//! (#15075). That library keeps only resolution
+//! (`loom_resolve_cargo_target_dir`, used by `spawn-claude.sh`) and the two
+//! `cargo-target-dir` predicate wrappers. Both resolvers mirror the
+//! resolution order of the standalone `scripts/cargo-target-dir.sh`, and both
+//! have a parity test against it
 //! ([`tests::resolution_matches_the_standalone_bash_resolver`] here;
 //! `defaults/scripts/tests/test-cargo-target-dir-reclaim.sh` there) so a change
 //! to one that is not made to the others fails CI.

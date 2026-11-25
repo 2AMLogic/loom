@@ -37,7 +37,8 @@
 //! contract is "Claude accounts the selector may pick", and an account with
 //! no probe adapter is never selectable, so it is omitted there while still
 //! appearing in `--json` and the human table — see [`format_ranking_lines`].
-//! The file is written atomically (`<path>.tmp` + rename in the same directory).
+//! The file is written atomically ([`crate::fs_util::write_atomic`]: a unique
+//! temp file + rename in the same directory).
 //!
 //! # Provider-dispatched probing (design D6a, issue #5608)
 //!
@@ -1135,8 +1136,8 @@ fn format_ranking_lines_with_preserve(
     out
 }
 
-/// Write `report` to `ranking_path` atomically (`<path>.tmp` + rename in the
-/// same directory). Mirrors `check.write_ranking_atomic`.
+/// Write `report` to `ranking_path` atomically (unique temp file + rename in
+/// the same directory via [`crate::fs_util::write_atomic`]). Mirrors `check.write_ranking_atomic`.
 ///
 /// Issue #14145: before overwriting, the file's current `exhausted` rows are
 /// read and a fresh row that carries no probe evidence
@@ -2079,7 +2080,11 @@ mod tests {
         fs::write(&target, "old contents").unwrap();
         write_ranking_atomic(&report, &target).unwrap();
         assert_eq!(fs::read_to_string(&target).unwrap(), "new|available\n");
-        assert!(!target.with_extension("ranking.tmp").exists());
+        let names: Vec<String> = fs::read_dir(tmp.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, vec![".ranking".to_string()], "no staging file left behind");
     }
 
     // ---- #14145: a failed probe round must not destroy hold evidence ----

@@ -890,3 +890,14 @@ fn unavailable_of_only_reports_unreadable_failures() {
     assert_eq!(unavailable_of(&missing), None);
     assert_eq!(unavailable_of(&Ok(1u8)), None);
 }
+
+/// #15134: the checksum download is a release read, and releases never use the
+/// forge gateway. Offered to it, the relay's refusal classifies as
+/// `Failure::Credential` and withdraws the gateway for the whole owner.
+#[test]
+fn the_checksum_download_is_exempt_from_the_gateway_and_stays_reader_only() {
+    let tmp = tempfile::tempdir().unwrap();
+    let inv = checksum_invocation("v1.2.3", "acme/loom", "loom-daemon.sha256", tmp.path(), "/x");
+    assert!(inv.is_gateway_exempt());
+    assert!(inv.is_reader_only());
+}

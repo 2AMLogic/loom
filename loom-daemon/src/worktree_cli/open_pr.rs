@@ -104,7 +104,7 @@
 //! creates a genuinely NEW branch, so a hard dependency would strand that
 //! path on any host running a daemon that predates this slice.
 
-use crate::fs_util::is_executable;
+use crate::fs_util::is_on_path;
 use std::path::Path;
 use std::process::Command;
 
@@ -225,9 +225,9 @@ pub fn query(repo: &Path, branch: &str) -> Probe {
     if !has_forge_remote(repo) {
         return Probe::status_only(Status::NoForgeRemote);
     }
-    let (program, leading): (&str, &[&str]) = if on_path("loom-daemon") {
+    let (program, leading): (&str, &[&str]) = if is_on_path("loom-daemon") {
         ("loom-daemon", &["forge"])
-    } else if on_path("gh") {
+    } else if is_on_path("gh") {
         ("gh", &[])
     } else {
         return Probe::status_only(Status::Unavailable);
@@ -337,16 +337,6 @@ fn parse_probe(text: &str) -> Probe {
             url,
         }),
     }
-}
-
-fn on_path(program: &str) -> bool {
-    let Some(path) = std::env::var_os("PATH") else {
-        return false;
-    };
-    std::env::split_paths(&path).any(|dir| {
-        let candidate = dir.join(program);
-        candidate.is_file() && is_executable(&candidate)
-    })
 }
 
 /// Run the query and print the `TOKEN<TAB>text` record stream

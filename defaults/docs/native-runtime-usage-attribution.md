@@ -67,8 +67,11 @@ caller-supplied set) plus the caller's wall-clock window:
   names any — OpenCode's event stream carries `sessionID` on every event and
   Codex prints a `session id: <uuid>` banner, both captured in the step's
   per-item log. For OpenCode the id is the whole key (no directory, no window:
-  it cannot name another launch's session); the Codex arm still ANDs the
-  workspace directory and window on top of the ids. This is what separates two concurrent
+  it cannot name another launch's session); the Codex arm
+  (`codex_usage::lookup_ids`) keys on id + window with no directory (#14540 —
+  deliberately no directory retry, which could fold a sibling launch's spend
+  into this one). The merged-PR join below is a different key: id alone, no
+  window (#14883). This is what separates two concurrent
   same-role steps dispatched in one workspace. No ids in the log (a Claude
   step, an unreadable log, a Kimi launch) falls back to directory+window on
   the workspace root, the role-tick key.
@@ -81,9 +84,17 @@ zero-token badge for a model that was never called.
 workspace root, so directory+window would fold in whichever neighbouring session
 overlapped. A step's log (`.loom/logs/step-<role>-<item>.log`) captures the
 launch's native JSON event stream, whose events carry a top-level
-`"sessionID":"ses_…"`; a step-dispatched completion reads exactly those sessions
-(`opencode_usage::tokens_by_session_ids`) and sums them with the Claude
-transcripts of the same PR's Judge/Doctor/`champion --pr` steps. **Builder
+`"sessionID":"ses_…"`, and a Codex launch prints a `session id: <uuid>` banner
+in the same log. A step-dispatched completion sums **three** sources (#14883),
+because the steps of one PR can run on different runtimes (an OpenCode Builder,
+a Claude Judge, a Codex Doctor): the Claude transcripts of the same PR's
+Judge/Doctor/`champion --pr` steps; the OpenCode sessions named by the log's
+`sessionID`s (`opencode_usage::tokens_by_session_ids`); and the Codex rollouts
+named by the banners (`codex_usage::tokens_by_session_ids`). The OpenCode and
+Codex reads are by exact id — no directory, no window: the OpenCode store's
+`directory` is shared repo-wide, a Codex rollout's `cwd` is container-local on
+a private-clone seat (#14540), and a Builder rollout can start before the PR's
+`createdAt`, so the merge window must not bound it. **Builder
 retries vs. PR rounds (#14210).** Step logs are append-mode, with one
 `==== loom-daemon dispatch:` region per dispatch, and the two keyings mean
 different things. The Builder log is keyed by *issue*: an earlier region is an
@@ -93,8 +104,10 @@ Claude side drops it too), so only the **last** region
 `champion_merge` logs are keyed by *PR*: an earlier region is a completed round on
 this PR (e.g. a Doctor run after a changes-requested verdict), inside the Claude
 side's `(PR createdAt, mergedAt)` window, so **every** region counts
-(`launch_record::opencode_session_ids`) — the same stance as the Claude side. A
-Builder log with no dispatch header is read whole. The published
+(`launch_record::opencode_session_ids`) — the same stance as the Claude side.
+Codex banners take the same split (`launch_record::codex_session_ids_last_dispatch`
+vs `launch_record::codex_session_ids`, #14883); a Builder log with no dispatch
+header is read whole. The published
 `runtime`/`provider`/`profile` come from the first step log present on the
 narrating host (Builder, else Doctor, Judge, `champion_merge`). Steps that ran
 on another host left nothing here, so the total stays partial until the

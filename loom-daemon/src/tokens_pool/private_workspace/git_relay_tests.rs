@@ -384,6 +384,7 @@ impl RelayFixture {
             container_id: "test-container".into(),
             branch: None,
             slug: None,
+            mirror_objects: None,
         }
     }
 
@@ -406,7 +407,13 @@ impl RelayFixture {
         &self,
         relay: Option<&RelayRead>,
     ) -> std::result::Result<repository::PrepareOutcome, repository::PrepareFailure> {
-        repository::prepare_with_relay(&self.volume, &self.args(), &|_, _, _, _| false, relay)
+        repository::prepare_with_relay(
+            &self.volume,
+            &self.args(),
+            &|_, _, _, _| false,
+            self._temp.path(),
+            relay,
+        )
     }
 
     /// Add one commit to the repository the relay serves.
@@ -515,9 +522,16 @@ fn a_refused_repository_is_an_actionable_refusal_with_no_direct_read() {
         container_id: "test-container".into(),
         branch: None,
         slug: None,
+        mirror_objects: None,
     };
-    let failure = repository::prepare_with_relay(&volume, &args, &|_, _, _, _| false, Some(&relay))
-        .expect_err("a refused repository must refuse preparation");
+    let failure = repository::prepare_with_relay(
+        &volume,
+        &args,
+        &|_, _, _, _| false,
+        temp.path(),
+        Some(&relay),
+    )
+    .expect_err("a refused repository must refuse preparation");
     let message = failure.to_string();
     assert!(
         message.contains("refused the Git read") && message.contains("repo_not_permitted"),
@@ -566,9 +580,16 @@ fn an_unreachable_relay_is_an_actionable_error() {
         container_id: "test-container".into(),
         branch: None,
         slug: None,
+        mirror_objects: None,
     };
-    let failure = repository::prepare_with_relay(&volume, &args, &|_, _, _, _| false, Some(&relay))
-        .expect_err("an unreachable relay must refuse preparation");
+    let failure = repository::prepare_with_relay(
+        &volume,
+        &args,
+        &|_, _, _, _| false,
+        temp.path(),
+        Some(&relay),
+    )
+    .expect_err("an unreachable relay must refuse preparation");
     let message = failure.to_string();
     assert!(
         message.contains("unreachable"),
@@ -644,9 +665,11 @@ fn the_unset_route_keeps_today_s_direct_path() {
         container_id: "test-container".into(),
         branch: None,
         slug: None,
+        mirror_objects: None,
     };
-    let outcome = repository::prepare_with_relay(&volume, &args, &|_, _, _, _| false, None)
-        .expect("direct preparation still works");
+    let outcome =
+        repository::prepare_with_relay(&volume, &args, &|_, _, _, _| false, temp.path(), None)
+            .expect("direct preparation still works");
     assert!(!outcome.revision.is_empty());
 }
 

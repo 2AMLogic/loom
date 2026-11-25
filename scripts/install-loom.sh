@@ -64,6 +64,10 @@ DRY_RUN=false
 # machine's daemon or ~/.claude state. The env var and the flag set one variable.
 REPO_ONLY=false
 case "${LOOM_INSTALL_REPO_ONLY:-}" in 1|true|yes) REPO_ONLY=true ;; esac
+# --allow-downgrade / LOOM_INSTALL_ALLOW_DOWNGRADE=1 (issue #15261): permit the
+# machine-level daemon provisioning to replace a newer installed daemon with an
+# older source build (default: refused, repo install still completes).
+case "${LOOM_INSTALL_ALLOW_DOWNGRADE:-}" in 1|true|yes) export LOOM_INSTALL_ALLOW_DOWNGRADE=1 ;; esac
 # Install-time workspace mode (--mode session, issue #8884), held as the literal
 # `loom-daemon init` argv pair so it can be spliced into the init call below
 # without re-deriving anything. Empty (the default) reproduces the pre-#8884
@@ -113,6 +117,7 @@ while [[ $# -gt 0 ]]; do
       ;;
     --untrack) UNTRACK=true; shift ;;
     --repo-only) REPO_ONLY=true; shift ;;
+    --allow-downgrade) export LOOM_INSTALL_ALLOW_DOWNGRADE=1; shift ;;
     --mode)
       # `default` is accepted as an explicit no-op; it does NOT remove a
       # `"mode": "session"` marker already on disk (defaults/docs/session-mode.md).
@@ -158,6 +163,9 @@ while [[ $# -gt 0 ]]; do
       echo "                             .loom/config.json. See defaults/docs/session-mode.md."
       echo "  --dry-run                  Print what would be written and exit 0; creates, modifies, and"
       echo "                             removes nothing. Implies --yes (never prompts). Composes with --local."
+      echo "  --allow-downgrade          Let machine-level provisioning replace a newer installed"
+      echo "                             loom-daemon with this older build (env:"
+      echo "                             LOOM_INSTALL_ALLOW_DOWNGRADE=1; default: refused)."
       echo "  --repo-only                Write only the target repository's files. Skips the machine-level"
       echo "                             steps (env: LOOM_INSTALL_REPO_ONLY=1) and prints one line per skip:"
       echo "                               - loom-daemon binary + defaults mirror (~/.local/bin, ~/.local/share)"
@@ -1406,8 +1414,9 @@ info "loom-daemon binary: $DAEMON_VERSION"
 if [[ "$REPO_ONLY" == "true" ]]; then
   info "Skipping machine-level loom-daemon provisioning (--repo-only)"
 else
+  provision_machine_change_notice "$TARGET_DIR/release/loom-daemon" || true
   info "Provisioning machine-level loom-daemon binary..."
-  provision_machine_daemon "$TARGET_DIR/release/loom-daemon" "" "$LOOM_ROOT/defaults" || \
+  LOOM_PROVISION_REFUSE_DOWNGRADE=1 provision_machine_daemon "$TARGET_DIR/release/loom-daemon" "" "$LOOM_ROOT/defaults" || \
     warning "Machine-level loom-daemon not provisioned (see note above); autonomous daemon mode needs LOOM_DAEMON_BIN or a binary on PATH."
 fi
 

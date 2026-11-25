@@ -8,12 +8,16 @@ use super::*;
 fn dashboard_url_issues_vs_pull() {
     let _env = DefaultDashboardEnv::hold();
     assert_eq!(
-        forge_dashboard_url("o/r", 42, false),
-        format!("{DEFAULT_DASHBOARD_BASE_URL}/github.com/o/r/issues/42")
+        append_dashboard_footer("o/r", 42, false, "body"),
+        format!(
+            "body\n\n[loom dashboard]({DEFAULT_DASHBOARD_BASE_URL}/github.com/o/r/issues/42)\n{FOOTER_MARKER}\n"
+        )
     );
     assert_eq!(
-        forge_dashboard_url("o/r", 42, true),
-        format!("{DEFAULT_DASHBOARD_BASE_URL}/github.com/o/r/pull/42")
+        append_dashboard_footer("o/r", 42, true, "body"),
+        format!(
+            "body\n\n[loom dashboard]({DEFAULT_DASHBOARD_BASE_URL}/github.com/o/r/pull/42)\n{FOOTER_MARKER}\n"
+        )
     );
 }
 
@@ -54,8 +58,8 @@ fn env_override_changes_the_base_and_trims_trailing_slashes() {
     std::env::set_var(ENV_DASHBOARD_BASE_URL, "https://d.example.com///");
     assert_eq!(dashboard_base_url(), "https://d.example.com");
     assert_eq!(
-        forge_dashboard_url("o/r", 1, false),
-        "https://d.example.com/github.com/o/r/issues/1"
+        append_dashboard_footer("o/r", 1, false, "body"),
+        "body\n\n[loom dashboard](https://d.example.com/github.com/o/r/issues/1)\n<!-- loom:dashboard-link -->\n"
     );
     match previous {
         Some(value) => std::env::set_var(ENV_DASHBOARD_BASE_URL, value),
@@ -347,6 +351,8 @@ fn cli_entrypoint_refuses_a_lone_at_body_without_posting() {
         body_file: None,
         is_pr: false,
         patch_created: None,
+        authorized: None,
+        authorized_connection: None,
     })
     .expect_err("a lone @-token body must be refused")
     .to_string();
@@ -365,4 +371,311 @@ fn short_and_mention_bodies_still_pass() {
     ] {
         assert!(reject_lone_at_body(body).is_ok(), "{body:?} must not be refused");
     }
+}
+
+// ── #14940: the Gitea transport ───────────────────────────────────────────
+//
+// The loopback fixture mirrors `write_scope/gitea_tests.rs`'s stub: a
+// one-request TCP listener that answers `status` + `body` and hands back the
+// raw request bytes, so the tests assert the exact POST path, the
+// stdin-ridden `Authorization` header, and the decoded JSON body.
+
+/// A temp checkout configured as Gitea (`forge.type` + `forge.gitea.{url,
+/// token}` in `.loom/config.json`), the shape a Gitea consumer install has.
+/// Callers must hold the `loom_config_env` serial group (`isolate_gitea_env`
+/// below) so env overrides cannot beat the config.
+fn gitea_root(url: &str, token: Option<&str>) -> tempfile::TempDir {
+    let dir = tempfile::tempdir().unwrap();
+    let loom = dir.path().join(".loom");
+    std::fs::create_dir_all(&loom).unwrap();
+    let gitea = match token {
+        Some(t) => serde_json::json!({ "url": url, "token": t }),
+        None => serde_json::json!({ "url": url }),
+    };
+    std::fs::write(
+        loom.join("config.json"),
+        serde_json::json!({ "forge": { "type": "gitea", "gitea": gitea } }).to_string(),
+    )
+    .unwrap();
+    dir
+}
+
+/// Clear the Gitea env (the way `write_scope`'s gitea tests do) and pin the
+/// config resolver to no defaults file, so a host credential or fleet default
+/// can neither answer for the stub nor override the fixture's config.
+fn isolate_gitea_env() {
+    std::env::set_var("LOOM_CONFIG_DEFAULTS_FILE", "");
+    std::env::remove_var("LOOM_FORGE_TYPE");
+    for k in ["GITEA_TOKEN", "FORGE_TOKEN", "GITEA_URL", "GITEA_USERNAME"] {
+        std::env::remove_var(k);
+    }
+}
+
+fn clear_gitea_env() {
+    std::env::remove_var("LOOM_CONFIG_DEFAULTS_FILE");
+    std::env::remove_var("LOOM_FORGE_TYPE");
+    for k in ["GITEA_TOKEN", "FORGE_TOKEN", "GITEA_URL", "GITEA_USERNAME"] {
+        std::env::remove_var(k);
+    }
+}
+
+/// One-request loopback Gitea stub: answers with `status` + `body` and hands
+/// back the raw request bytes (headers + body), so a test can assert the
+/// `Authorization` header arrived on curl's stdin, never its argv.
+fn gitea_post_stub(
+    status: &'static str,
+    body: &'static str,
+) -> (String, std::thread::JoinHandle<String>) {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let handle = std::thread::spawn(move || {
+        use std::io::{Read, Write};
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut request = String::new();
+        let mut buf = [0u8; 8192];
+        // Read until the headers end and Content-Length body bytes arrived
+        // (bounded: the fixture's bodies are small).
+        while request.len() < 64 * 1024 {
+            let header_end = request.find("\r\n\r\n").map(|i| i + 4);
+            let complete = header_end.is_some_and(|start| {
+                let cl = request
+                    .lines()
+                    .find_map(|l| {
+                        let (k, v) = l.split_once(':')?;
+                        k.trim()
+                            .eq_ignore_ascii_case("content-length")
+                            .then(|| v.trim().to_string())
+                    })
+                    .and_then(|v| v.parse::<usize>().ok())
+                    .unwrap_or(0);
+                request.len() >= start + cl
+            });
+            if complete {
+                break;
+            }
+            let n = match stream.read(&mut buf) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => n,
+            };
+            request.push_str(&String::from_utf8_lossy(&buf[..n]));
+        }
+        let response = format!(
+            "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\
+             Connection: close\r\n\r\n{body}",
+            body.len()
+        );
+        let _ = stream.write_all(response.as_bytes());
+        request
+    });
+    (format!("http://{addr}"), handle)
+}
+
+/// A `gh` stand-in that records every invocation to `<dir>/gh.log` and exits
+/// non-zero: on the Gitea transport the log must stay absent (zero `gh`
+/// calls), and had `gh` run it would fail loudly anyway.
+fn recording_gh_stub() -> tempfile::TempDir {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let script = dir.path().join("gh");
+    let log = dir.path().join("gh.log");
+    std::fs::write(&script, format!("#!/bin/sh\necho \"$@\" >> {}\nexit 1\n", log.display()))
+        .unwrap();
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    dir
+}
+
+/// The JSON body of a recorded HTTP request: the bytes after the blank line.
+fn request_body(request: &str) -> &str {
+    request.split_once("\r\n\r\n").map_or("", |(_, b)| b)
+}
+
+#[test]
+#[serial_test::serial(loom_config_env)]
+fn gitea_root_posts_through_the_gitea_api_without_gh() {
+    isolate_gitea_env();
+    let _env = DefaultDashboardEnv::hold();
+    let stub = recording_gh_stub();
+    let (base, request) = gitea_post_stub(
+        "201 Created",
+        r#"{"id":11,"html_url":"http://gitea.test/acme/w/issues/42#issuecomment-11"}"#,
+    );
+    let root = gitea_root(&base, Some("stub-token"));
+    let body = "multi-line\n\n- with `markdown` and \"quotes\"\n<!-- loom:builder-note -->\n";
+    let response =
+        post_comment(stub.path().join("gh"), Some(root.path()), "acme/w", 42, false, body)
+            .expect("the Gitea transport posts");
+
+    // The created comment's JSON is returned verbatim, so `html_url`
+    // printing works unchanged.
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&response).unwrap()["html_url"],
+        "http://gitea.test/acme/w/issues/42#issuecomment-11"
+    );
+
+    let request = request.join().unwrap();
+    assert!(
+        request.starts_with("POST /api/v1/repos/acme/w/issues/42/comments HTTP/1.1"),
+        "the exact Gitea comments endpoint: {request}"
+    );
+    assert!(
+        request.contains("Authorization: token stub-token"),
+        "the credential rides the request (curl's stdin, never argv): {request}"
+    );
+    assert!(
+        request.contains("Content-Type: application/json"),
+        "JSON, not form-urlencoded: {request}"
+    );
+    let posted: serde_json::Value =
+        serde_json::from_str(request_body(&request)).expect("the posted body is JSON");
+    assert_eq!(
+        posted["body"].as_str().unwrap(),
+        append_dashboard_footer("acme/w", 42, false, body),
+        "multiline markdown and the role marker survive byte-for-byte, footer applied once"
+    );
+    assert!(!stub.path().join("gh.log").exists(), "the Gitea transport never invokes gh");
+    clear_gitea_env();
+}
+
+#[test]
+#[serial_test::serial(loom_config_env)]
+fn gitea_post_does_not_double_an_existing_footer() {
+    isolate_gitea_env();
+    let _env = DefaultDashboardEnv::hold();
+    let stub = recording_gh_stub();
+    let (base, request) = gitea_post_stub("201 Created", r#"{"id":12,"html_url":"u"}"#);
+    let root = gitea_root(&base, Some("stub-token"));
+    let once = append_dashboard_footer("acme/w", 42, true, "already footered");
+    post_comment(stub.path().join("gh"), Some(root.path()), "acme/w", 42, true, &once)
+        .expect("posts");
+    let request = request.join().unwrap();
+    let posted: serde_json::Value = serde_json::from_str(request_body(&request)).unwrap();
+    assert_eq!(
+        posted["body"].as_str().unwrap(),
+        once,
+        "idempotent on the marker, and --pr picks /pull/N in the link"
+    );
+    assert!(once.contains("/pull/42"));
+    clear_gitea_env();
+}
+
+#[test]
+#[serial_test::serial(loom_config_env)]
+fn a_gitea_root_without_a_credential_refuses_before_any_request() {
+    isolate_gitea_env();
+    let _env = DefaultDashboardEnv::hold();
+    let stub = recording_gh_stub();
+    // A URL that would answer if any request were made; none is, because the
+    // connection cannot resolve without a token.
+    let root = gitea_root("http://127.0.0.1:9", None);
+    let error = post_comment(stub.path().join("gh"), Some(root.path()), "acme/w", 42, false, "b")
+        .expect_err("no credential: refuse, never fall through to gh");
+    assert!(error.contains("token is required"), "names the missing credential: {error}");
+    assert!(!error.contains("stub"), "no credential value to leak: {error}");
+    assert!(
+        !stub.path().join("gh.log").exists(),
+        "a refused Gitea post must not reach for gh either"
+    );
+    clear_gitea_env();
+}
+
+#[test]
+#[serial_test::serial(loom_config_env)]
+fn a_rejected_gitea_post_reports_failure_without_leaking_the_credential() {
+    isolate_gitea_env();
+    let _env = DefaultDashboardEnv::hold();
+    let stub = recording_gh_stub();
+    // The error body quotes the token back; the transport must redact it.
+    let (base, request) = gitea_post_stub(
+        "403 Forbidden",
+        r#"{"message":"token stub-token is not allowed to comment"}"#,
+    );
+    let root = gitea_root(&base, Some("stub-token"));
+    let error = post_comment(stub.path().join("gh"), Some(root.path()), "acme/w", 42, false, "b")
+        .expect_err("a 403 is a failure");
+    assert!(
+        error.contains("403") && error.contains("failed"),
+        "names the rejected POST: {error}"
+    );
+    assert!(!error.contains("stub-token"), "credential redacted: {error}");
+    assert!(error.contains("[redacted]"), "the leak site is visibly redacted: {error}");
+    request.join().unwrap();
+    clear_gitea_env();
+}
+
+#[test]
+#[serial_test::serial(loom_config_env)]
+fn the_backend_is_github_without_a_gitea_checkout() {
+    isolate_gitea_env();
+    assert!(matches!(comment_backend(None), Ok(CommentBackend::GitHub)));
+    let plain = tempfile::tempdir().unwrap();
+    assert!(
+        matches!(comment_backend(Some(plain.path())), Ok(CommentBackend::GitHub)),
+        "a checkout with no Gitea config stays on gh"
+    );
+    let base = gitea_root("http://127.0.0.1:9", Some("t"));
+    assert!(matches!(comment_backend(Some(base.path())), Ok(CommentBackend::Gitea(_))));
+    clear_gitea_env();
+}
+
+#[test]
+#[serial_test::serial(loom_config_env)]
+fn an_authorized_post_uses_the_vetted_connection_not_a_fresh_resolution() {
+    isolate_gitea_env();
+    let _env = DefaultDashboardEnv::hold();
+    let stub = recording_gh_stub();
+    // The checkout's own config now points at a dead instance (the config
+    // "changed" after the check); the connection the check approved is the
+    // live stub, and the POST must go there.
+    let root = gitea_root("http://127.0.0.1:9", Some("changed-token"));
+    let (base, request) = gitea_post_stub("201 Created", r#"{"id":1,"html_url":"u"}"#);
+    let vetted = crate::forge_cmd::GiteaConfig {
+        base_url: base,
+        token: "vetted-token".into(),
+        username: None,
+    };
+    post_comment_authorized(
+        stub.path().join("gh"),
+        Some(root.path()),
+        "acme/w",
+        42,
+        false,
+        "b",
+        Some(vetted),
+    )
+    .expect("posts to the vetted connection");
+    let request = request.join().unwrap();
+    assert!(request.contains("token vetted-token"), "the vetted credential: {request}");
+    assert!(!request.contains("changed-token"), "never the re-resolved one: {request}");
+    clear_gitea_env();
+}
+
+#[test]
+#[serial_test::serial(loom_config_env)]
+fn basic_auth_credential_forms_are_redacted_from_error_text() {
+    use base64::engine::general_purpose;
+    use base64::Engine as _;
+    isolate_gitea_env();
+    let _env = DefaultDashboardEnv::hold();
+    let stub = recording_gh_stub();
+    let encoded = general_purpose::STANDARD.encode("alice:s3cr3t-pw");
+    // The error body echoes the Authorization value and the raw pair back.
+    let (base, request) = gitea_post_stub(
+        "401 Unauthorized",
+        Box::leak(
+            format!(r#"{{"message":"bad Basic {encoded} for alice:s3cr3t-pw"}}"#).into_boxed_str(),
+        ),
+    );
+    let cfg = crate::forge_cmd::GiteaConfig {
+        base_url: base,
+        token: "s3cr3t-pw".into(),
+        username: Some("alice".into()),
+    };
+    let error =
+        post_comment_authorized(stub.path().join("gh"), None, "acme/w", 42, false, "b", Some(cfg))
+            .expect_err("401 is a failure");
+    assert!(!error.contains(&encoded), "base64 header value redacted: {error}");
+    assert!(!error.contains("s3cr3t-pw"), "password redacted: {error}");
+    assert!(error.contains("[redacted]"), "{error}");
+    request.join().unwrap();
+    clear_gitea_env();
 }

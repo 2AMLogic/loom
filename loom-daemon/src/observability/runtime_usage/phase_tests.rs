@@ -267,7 +267,7 @@ fn an_unmatched_phase_or_unmeasured_usage_journals_nothing() {
 /// `TokenUsage::split` is `sweep.outcome`'s `tokens_in`/`tokens_out` definition:
 /// every input-side counter (uncached input, cache reads, cache writes) against
 /// `output` alone. It has to agree with
-/// `transcript_tokens::sum_sweep_tokens_split`, or Σ phases would not reconcile
+/// `sweep_usage::flatten`, or Σ phases would not reconcile
 /// against the sweep totals.
 #[test]
 fn the_token_split_puts_every_cache_counter_on_the_input_axis() {
