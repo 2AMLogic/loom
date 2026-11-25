@@ -1204,6 +1204,106 @@ assert_deny "#10422: live rm after a python3 heredoc still denies" \
     "$RM10422_LIVE_AFTER" "$REPO_ROOT"
 echo ""
 
+echo -e "${YELLOW}--- rm target resolved against an earlier cd in the same command (#15112) ---${NC}"
+# The scanner used to emit bare target tokens and the caller joined them to the
+# hook's session cwd, ignoring a `cd` earlier in the command: a false block when
+# the cd moved INTO scope's allowed area, a false allow when it moved OUT.
+# Default rmScope (repo); session cwd is the repo root throughout.
+#
+# Allowed direction: a relative target is judged against the cd directory.
+assert_allow "#15112: cd <abs tmp dir> && rm -f ../note.md resolves to /tmp/x/note.md (allowed)" \
+    "cd /tmp/x/work && rm -f ../note.md" "$REPO_ROOT"
+assert_allow "#15112: cd <abs tmp dir> && rm -rf relative target allowed" \
+    "cd /tmp/x && rm -rf sub/dir" "$REPO_ROOT"
+assert_allow "#15112: quoted cd arg and quoted relative target resolve the same way" \
+    "cd \"/tmp/x/work\" && rm -f '../note.md'" "$REPO_ROOT"
+assert_allow "#15112: cd with -- and a redirection still resolves" \
+    "cd -- /tmp/x/work >/dev/null 2>&1 && rm -f ../note.md" "$REPO_ROOT"
+assert_allow "#15112: relative cd chains join onto the previous directory" \
+    "cd /tmp/x && cd work && rm -f ../note.md" "$REPO_ROOT"
+assert_allow "#15112: cd into the repo makes an otherwise out-of-scope ../ target in scope" \
+    "cd $REPO_ROOT/.loom/tmp && rm -rf ../scratch" "$REPO_ROOT"
+assert_allow "#15112: a later absolute cd makes an earlier unresolved cd irrelevant" \
+    "cd \"\$UNKNOWN\" && cd /tmp/x && rm -f note.md" "$REPO_ROOT"
+# Blocked direction: the cd moves the target OUT of scope; the message names the
+# RESOLVED path, not $REPO_ROOT/<target>.
+assert_deny_reason_matches "#15112: cd to an outside dir then relative rm denies with the resolved path" \
+    "cd /opt/vendor && rm -rf important" "outside repo scope.*/opt/vendor/important" "$REPO_ROOT"
+assert_deny_reason_matches "#15112: ../ climbing out of the cd dir is normalized and denied" \
+    "cd /opt/vendor/sub && rm -f ../keep.txt" "outside repo scope.*/opt/vendor/keep.txt" "$REPO_ROOT"
+assert_deny "#15112: cd / then relative rm of a top-level dir denies (protected path)" \
+    "cd / && rm -rf tmp" "$REPO_ROOT"
+assert_deny "#15112: cd out of scope, then in-scope-looking relative target, still denies" \
+    "cd /opt/vendor && rm -rf .loom/tmp/x" "$REPO_ROOT"
+# Unresolvable cd: fail closed and say so; never print a $CWD-joined path.
+assert_deny_reason_matches "#15112: cd \"\$VAR\" && rm relative denies as unresolved directory" \
+    'cd "$WORK" && rm -f ../note.md' "could not resolve" "$REPO_ROOT"
+assert_deny_reason_matches "#15112: cd - denies as unresolved directory" \
+    "cd - && rm -rf scratch" "could not resolve" "$REPO_ROOT"
+assert_deny_reason_matches "#15112: bare cd denies as unresolved directory" \
+    "cd && rm -rf scratch" "could not resolve" "$REPO_ROOT"
+assert_deny_reason_matches "#15112: cd \$(cmd) denies as unresolved directory" \
+    'cd $(mktemp -d) && rm -rf scratch' "could not resolve" "$REPO_ROOT"
+assert_deny_reason_matches "#15112: unresolved cd then relative cd stays unresolved" \
+    'cd "$A" && cd sub && rm -rf x' "could not resolve" "$REPO_ROOT"
+assert_allow "#15112: unresolved cd does not affect an absolute in-scope rm target" \
+    'cd "$WORK" && rm -rf /tmp/x/file' "$REPO_ROOT"
+# No cd => verdicts unchanged (existing cases above/below cover the bulk).
+assert_allow "#15112: no cd, relative in-repo target still allowed" \
+    "rm -rf .loom/tmp/x" "$REPO_ROOT"
+assert_deny "#15112: no cd, relative target resolved against session cwd outside the repo still denies" \
+    "rm -rf important" "/opt/vendor"
+# rmScope off: an unresolved cd keeps today's behavior (no new deny).
+assert_allow_env "#15112 rmScope off: unresolved cd does not newly deny" "LOOM_RM_SCOPE=off" \
+    'cd "$WORK" && rm -rf ./scratch/x' "$REPO_ROOT"
+# Review findings (#15169): a cd that does not reliably move the shell that runs
+# the rm, or a session cwd that breaks the word split, must fail closed.
+assert_deny "#15112 review: relative cd from a cwd with whitespace fails closed" \
+    "cd .. && rm -rf outside_wt" "/opt/ven dor/sub"
+assert_deny "#15112 review: cd inside \$( ) does not leak to the outer rm" \
+    'x="$(true; cd /tmp/a/b/c/d/e && pwd)" && rm -rf ../../../../etc' "/a/b/c/d"
+assert_deny "#15112 review: cd inside a ( ) subshell does not leak to the outer rm" \
+    '(true; cd /tmp/a/b/c/d/e; true); rm -rf ../../../../etc' "/a/b/c/d"
+assert_deny "#15112 review: cd on the left of a pipe does not move the rm" \
+    'cd /tmp/a/b/c/d/e | rm -rf ../../../../etc' "/a/b/c/d"
+assert_deny "#15112 review: cd before & does not move the rm" \
+    'cd /tmp/a/b/c/d/e & rm -rf ../../../../etc' "/a/b/c/d"
+assert_deny "#15112 review: cd before || does not move the rm" \
+    'cd /tmp/a/b/c/d/e || rm -rf ../../../../etc' "/a/b/c/d"
+assert_deny "#15112 review: brace-group cd is honoured (rm lands out of scope)" \
+    '{ cd /opt/vendor && rm -rf important; }' "$REPO_ROOT"
+assert_deny "#15112 review: heredoc span rm after an outer cd is not judged against the session cwd" \
+    $'cd /opt/vendor && cat <<EOF\n$(rm -rf important)\nEOF' "$REPO_ROOT"
+assert_deny "#15112 review: cd -- -P /dir is not a plain cd (fails closed)" \
+    'cd -- -P /tmp/x; rm -rf important' "/opt/vendor"
+assert_deny "#15112 review: sudo cd does not move the shell" \
+    'sudo cd /tmp/x; rm -rf important' "/opt/vendor"
+assert_allow "#15112 review: ( cd dir && rm ) inside a subshell still resolves" \
+    '(cd /tmp/x && rm -rf note.md)' "$REPO_ROOT"
+# A cd moves a later rm only when every operator between them is `&&`; otherwise
+# the target keeps the session-cwd verdict (never looser than main) (#15169 review).
+assert_deny "#15112 review: cd && true ; rm - the ; drops the cd link" \
+    'cd /tmp/x && true ; rm -rf important' "/opt/vendor"
+assert_deny "#15112 review: cd <missing dir> ; rm does not trust the cd" \
+    'cd /tmp/x/missing-dir ; rm -rf important' "/opt/vendor"
+assert_deny "#15112 review: newline-separated cd does not move the rm" \
+    $'cd /tmp/x\nrm -rf important' "/opt/vendor"
+assert_allow "#15112 review: benign cd build ; rm keeps main's allow" \
+    'cd build ; rm -rf x' "$REPO_ROOT"
+# Literal cd args whose base/link is merely untrusted fall back to main's verdict
+# (bare token), not a deny blaming a non-literal cd (#15169 review, finding 5).
+assert_allow "#15112 review: cd build ; cd src && rm keeps main's allow" \
+    'cd build ; cd src && rm -rf x' "$REPO_ROOT"
+assert_allow "#15112 review: newline-separated cds then && rm keep main's allow" \
+    $'cd build\ncd src && rm -rf x' "$REPO_ROOT"
+assert_allow "#15112 review: true | cd dir && rm keeps main's allow" \
+    'true | cd /tmp/x && rm -rf x' "$REPO_ROOT"
+assert_deny "#15112 review: non-literal cd arg still denies" \
+    'cd $D && rm -rf x' "$REPO_ROOT"
+assert_allow "#15112 review: 2>&1 redirect after cd is not a background operator" \
+    'cd -- /tmp/x/work >/dev/null 2>&1 && rm -f ../note.md' "$REPO_ROOT"
+echo ""
+
 # =========================================================================
 
 print_summary

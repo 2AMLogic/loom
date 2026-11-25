@@ -7662,11 +7662,27 @@ fi
 # explicit literal path.
 # =============================================================================
 _RM_SPAN_MARK=$'\036'
+# `cd` provenance marks (#15112), emitted by _extract_rm_targets_scan() AFTER
+# the span mark: `$_RM_CD_MARK<dir>$_RM_CD_MARK<target>` carries the directory a
+# preceding `cd` put in effect; `$_RM_CDUNRES_MARK<target>` says a preceding
+# `cd` could not be resolved. Neither is IFS whitespace, so the caller's
+# `for target in $RM_TARGETS` word split is unaffected.
+_RM_CD_MARK=$'\037'
+_RM_CDUNRES_MARK=$'\035'
 
 extract_rm_targets() {
-    _extract_rm_targets_scan "$1" ""
+    _extract_rm_targets_scan "$1" "" "$CWD"
     heredoc_subst_span_text "$1"
-    [[ -n "$_HD_SPAN_TEXT" ]] && _extract_rm_targets_scan "$_HD_SPAN_TEXT" "$_RM_SPAN_MARK"
+    if [[ -n "$_HD_SPAN_TEXT" ]]; then
+        # An unquoted heredoc body's `$( … )` runs in whatever directory the
+        # OUTER command had reached by then. The span pass cannot see that
+        # state, so when the outer command contains any `cd` word it starts
+        # UNRESOLVED (relative span targets fail closed) instead of assuming
+        # the session cwd (#15169 review).
+        local _span_unres=0
+        printf '%s' "$1" | grep -qE '(^|[;&|({[:space:]])cd([[:space:]]|$)' && _span_unres=1
+        _extract_rm_targets_scan "$_HD_SPAN_TEXT" "$_RM_SPAN_MARK" "$CWD" "$_span_unres"
+    fi
     return 0
 }
 
@@ -7680,26 +7696,160 @@ _extract_rm_targets_scan() {
     # heredoc-substitution-span pass). It is a PREFIX and not a separate
     # channel so the caller's existing `for target in $RM_TARGETS` word split
     # keeps working unchanged.
-    printf '%s' "$1" | awk -v mark="$2" "$_QSPLIT_AWK"'
+    #
+    # $3 is the hook's session cwd, the starting point for `cd` tracking
+    # (#15112). A relative target that follows an earlier `cd <dir>` in the
+    # same command is judged against THAT directory, not the session cwd, so
+    # the scanner prefixes it with the directory in effect:
+    #   no `cd` seen before the rm       -> `<target>`                  (unchanged)
+    #   `cd` resolved to an absolute dir -> `$_RM_CD_MARK<dir>$_RM_CD_MARK<target>`
+    #   `cd` could not be resolved       -> `$_RM_CDUNRES_MARK<target>`
+    # The caller strips the prefix (after the #8217 span mark) and uses the
+    # directory in place of $CWD. A `cd` argument is resolvable only when it is
+    # a literal path (optionally quoted, `~`/`$HOME` expanded as the other
+    # cd-tracking scans do): a variable, command substitution, glob, `cd -`,
+    # bare `cd`, a path containing whitespace, or a relative path with no known
+    # base is left UNRESOLVED, which the caller fails closed on rather than
+    # guessing. A later resolvable ABSOLUTE `cd` makes the directory known again.
+    printf '%s' "$1" | awk -v mark="$2" -v startcwd="$3" -v startunres="${4:-0}" -v home="$HOME" "$_QSPLIT_AWK""$_CDEXPAND_AWK""$_CDQUOTE_AWK"'
+    BEGIN {
+        curcwd = startcwd; cdseen = 0; cdunres = 0; cdlink = 0; argbad = 0; brokebase = 0
+        if (startunres == 1) { cdseen = 1; cdunres = 1; cdlink = 1 }
+        sdepth = 0
+        CDM = sprintf("%c", 31); UNRM = sprintf("%c", 29); RSM = sprintf("%c", 30)
+        SQ = sprintf("%c", 39); DQ = sprintf("%c", 34); BS = sprintf("%c", 92)
+        BAD = "$`*?[ \t" SQ DQ BS CDM UNRM RSM
+    }
+    # True if `s` has a byte that makes a cd path non-literal (expansion, glob,
+    # quote, escape, whitespace) or collides with an output mark.
+    function nonliteral(s,   q) {
+        for (q = 1; q <= length(BAD); q++)
+            if (index(s, substr(BAD, q, 1)) > 0) return 1
+        return 0
+    }
+    # Resolve one `cd` segment (toks[1..m]); updates curcwd/cdunres/cdseen.
+    function track_cd(   k, arg, cls, bad, wasbroken) {
+        # A prior cd whose effect no longer reliably reaches this point (a `;`,
+        # newline, `|`, `||` or `&` followed it) makes a relative base unknowable.
+        wasbroken = (cdseen && !cdlink)
+        cdseen = 1
+        # argbad: this cd has a non-literal argument (the deny message is then
+        # accurate). brokebase: every argument is literal but the base is
+        # untrusted (a `;`/newline/`|`/`||`/`&` broke the link), so the target
+        # falls back to the session-cwd verdict like main, not a false deny.
+        argbad = 0; brokebase = 0
+        k = 2
+        # Skip option words (`cd -P dir`); a lone `-` is `cd -`. `--` ends the
+        # options: whatever follows is the operand even if it looks like an
+        # option, and any other `-x` word is not a plain `cd <dir>`.
+        while (k <= m && toks[k] ~ /^-[LPe@]+$/) k++
+        if (k <= m && toks[k] == "--") k++
+        else if (k <= m && toks[k] ~ /^-./) { cdunres = 1; argbad = 1; return }
+        if (k > m || toks[k] == "-" || toks[k] == "") { cdunres = 1; argbad = 1; return }
+        arg = expand_cd_arg(toks[k], home)
+        # Anything after the directory other than a redirection is not a plain
+        # `cd <dir>` (e.g. an unquoted space in the path): unresolved.
+        for (bad = k + 1; bad <= m; bad++)
+            if (toks[bad] != "" && toks[bad] !~ /^[0-9]*[<>&]/) { cdunres = 1; argbad = 1; return }
+        cls = strip_cd_quoting(arg)
+        # Literal paths only: no expansion/quote/escape/glob/tilde-user/space,
+        # and no control bytes that collide with the output marks.
+        if (cls == "" || nonliteral(cls) || cls ~ /^~/) { cdunres = 1; argbad = 1; return }
+        if (cls ~ /^\//) { curcwd = cls; cdunres = 0; return }
+        # A relative join needs a literal base: a session cwd with whitespace or
+        # quote/glob bytes would corrupt the word split in the caller.
+        if (wasbroken) { cdunres = 1; brokebase = 1; return }
+        if (cdunres || curcwd == "" || curcwd !~ /^\// || nonliteral(curcwd)) { cdunres = 1; argbad = 1; return }
+        curcwd = curcwd "/" cls
+    }
     {
+        # A new input record is a newline boundary, i.e. a `;`: an earlier cd
+        # does not reliably move this record (#15169 review).
+        if (startunres != 1) cdlink = 0
         $0 = qsplit($0)   # quote-aware segmentation (#3755)
         n = split($0, segs, "\n")
+        # qsplit_op[k] is the operator between segments k and k+1, but a literal
+        # newline records none: when the counts disagree the operators cannot be
+        # trusted, so every cd below fails closed.
+        opsok = (qsplit_nops == n - 1)
         for (i = 1; i <= n; i++) {
             seg = segs[i]
+            # Only `&&` guarantees the previous segment (and so any cd in it)
+            # succeeded and ran in this shell; any other separator drops the
+            # cd link and the target falls back to the session-cwd verdict.
+            if (i > 1 && startunres != 1 && (!opsok || (qsplit_op[i - 1] != "&&" &&
+                !(qsplit_op[i - 1] == "&" && segs[i - 1] ~ /[<>][ \t]*$/)))) cdlink = 0
             sub(/^[ \t]+/, "", seg)
-            sub(/^sudo[ \t]+/, "", seg)
+            sudo = sub(/^sudo[ \t]+/, "", seg)
             sub(/^[ \t]+/, "", seg)
-            if (seg !~ /^rm([ \t]|$)/) continue
-            m = split(seg, toks, /[ \t]+/)
-            has_rf = 0
-            for (j = 2; j <= m; j++)
-                if (toks[j] ~ /^-/ && toks[j] ~ /[rRfF]/) has_rf = 1
-            if (!has_rf) continue
-            for (j = 2; j <= m; j++) {
-                if (toks[j] == "") continue
-                if (toks[j] ~ /^-/) continue
-                print mark toks[j]
+            # Grouping: `{ ` runs in the current shell (stripped); `(` and `$(`
+            # open a subshell whose cd never leaks out, so save the state on
+            # each open paren and restore it on each close (#12082 analogue).
+            # Quoted spans are blanked before counting.
+            while (seg ~ /^\{[ \t]/) sub(/^\{[ \t]+/, "", seg)
+            pq = segs[i]
+            gsub(/"[^"]*"/, "", pq)
+            gsub(/\047[^\047]*\047/, "", pq)
+            popen = gsub(/\(/, "", pq)
+            pclose = gsub(/\)/, "", pq)
+            # A leading `(` encloses this segment, so the state is saved before
+            # it; a `$(` later in the segment opens AFTER the segment own
+            # command ran in the outer shell, so that save happens after it.
+            lead = (seg ~ /^\(/ && seg !~ /^\(\(/) ? 1 : 0
+            npush = (popen - pclose > lead) ? popen - pclose : lead
+            if (npush > popen) npush = popen
+            npop = pclose - (popen - npush)
+            if (lead > npush) lead = npush
+            if (lead) {
+                sdepth++
+                st_cwd[sdepth] = curcwd; st_seen[sdepth] = cdseen; st_unres[sdepth] = cdunres; st_link[sdepth] = cdlink
             }
+            while (seg ~ /^\([ \t]*/ && seg !~ /^\(\(/) sub(/^\([ \t]*/, "", seg)
+            if (!sudo && seg ~ /^cd([ \t]|$)/) {
+                m = split(seg, toks, /[ \t]+/)
+                track_cd()
+                # Literal args but an untrusted base: unlink so the emit falls
+                # back to the bare token (the main-branch verdict), not a false deny.
+                cdlink = brokebase ? 0 : 1
+                # A cd on either side of `|` / `&` runs in a child shell, and one
+                # after `||` (or before it) may not run at all: it does not
+                # reliably move the next command, so fail closed.
+                if (!opsok || (i > 1 && (qsplit_op[i - 1] == "|" || qsplit_op[i - 1] == "||")) ||
+                    (i < n && (qsplit_op[i] == "|" || qsplit_op[i] == "||" ||
+                               (qsplit_op[i] == "&" && seg !~ /[<>]$/)))) {
+                    cdunres = 1
+                    # Literal args: separator adjacency alone -> the main-branch verdict.
+                    if (!argbad && opsok) cdlink = 0
+                }
+            }
+            else if (seg ~ /^rm([ \t]|$)/) {
+                emit_rm()
+            }
+            for (q = lead; q < npush; q++) {
+                sdepth++
+                st_cwd[sdepth] = curcwd; st_seen[sdepth] = cdseen; st_unres[sdepth] = cdunres; st_link[sdepth] = cdlink
+            }
+            for (q = 0; q < npop && sdepth > 0; q++) {
+                curcwd = st_cwd[sdepth]; cdseen = st_seen[sdepth]; cdunres = st_unres[sdepth]; cdlink = st_link[sdepth]
+                sdepth--
+            }
+        }
+    }
+    function emit_rm(   j, has_rf) {
+        m = split(seg, toks, /[ \t]+/)
+        has_rf = 0
+        for (j = 2; j <= m; j++)
+            if (toks[j] ~ /^-/ && toks[j] ~ /[rRfF]/) has_rf = 1
+        if (!has_rf) return
+        for (j = 2; j <= m; j++) {
+            if (toks[j] == "") continue
+            if (toks[j] ~ /^-/) continue
+            if (cdlink && !cdunres && curcwd ~ /^\//)
+                print mark CDM curcwd CDM toks[j]
+            else if (cdlink || index(toks[j], CDM) > 0 || index(toks[j], UNRM) > 0)
+                print mark UNRM toks[j]
+            else
+                print mark toks[j]
         }
     }'
 }
@@ -9762,6 +9912,24 @@ if echo "$COMMAND_RM_SCAN" | grep -qE 'rm[[:space:]]+-[a-zA-Z]*[rf]'; then
                 ;;
         esac
 
+        # Strip the #15112 `cd` provenance prefix, if any: the directory an
+        # earlier `cd` in this command put in effect for this target
+        # (_rm_cd_dir), or a flag that such a `cd` could not be resolved
+        # (_rm_cd_unres). Everything downstream sees the plain token.
+        _rm_cd_dir=""
+        _rm_cd_unres=0
+        case "$target" in
+            "$_RM_CD_MARK"*)
+                _rm_cd_dir="${target#"$_RM_CD_MARK"}"
+                _rm_cd_dir="${_rm_cd_dir%%"$_RM_CD_MARK"*}"
+                target="${target#"$_RM_CD_MARK"*"$_RM_CD_MARK"}"
+                ;;
+            "$_RM_CDUNRES_MARK"*)
+                _rm_cd_unres=1
+                target="${target#"$_RM_CDUNRES_MARK"}"
+                ;;
+        esac
+
         # Skip empty targets
         [[ -z "$target" ]] && continue
 
@@ -9808,6 +9976,20 @@ if echo "$COMMAND_RM_SCAN" | grep -qE 'rm[[:space:]]+-[a-zA-Z]*[rf]'; then
         ABS_PATH=""
         if [[ "$_rmclassify" = /* ]]; then
             ABS_PATH="$_rmclassify"
+        elif [[ -n "$_rm_cd_dir" ]]; then
+            # A preceding `cd <dir>` moved the shell: resolve against it, not
+            # the session cwd (#15112).
+            ABS_PATH="$_rm_cd_dir/$_rmclassify"
+        elif [[ "$_rm_cd_unres" == 1 ]] && rm_scope_repo_enabled; then
+            # A preceding `cd` could not be resolved, so "$CWD/<target>" would
+            # be a path computed from the wrong base. Fail closed and say so,
+            # unless the target is `$`-rooted: those take the variable
+            # fast-path/deny flow below, which never prints a cwd-joined path.
+            mark_expandable_dollars "$target"
+            if ! [[ "$_MARKED_TOKEN" == $'\001'* || "$_MARKED_TOKEN" == /$'\001'* ]]; then
+                deny "BLOCKED: rm target '${target}' is relative to a directory this guard could not resolve (guards.rmScope=repo). An earlier cd in the same command has an argument that is not a plain literal path (a variable, command substitution, glob, 'cd -', a bare 'cd', or a path with whitespace), so where '${target}' lands is unknown. Use a literal cd path, or an absolute rm target." "rm-scope-unresolved-var"  # scan-reads: COMMAND_ASK_SCAN
+            fi
+            [[ -n "$CWD" ]] && ABS_PATH="$CWD/$_rmclassify"
         elif [[ -n "$CWD" ]]; then
             ABS_PATH="$CWD/$_rmclassify"
         fi
