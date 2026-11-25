@@ -3,8 +3,7 @@
 //! backup of its whole state has been verified, kept otherwise.
 //!
 //! A sibling of `worktree_reaper.rs`'s own `mod tests` (whose fixtures it
-//! inherits through `use super::*`) because that file is at its file-size
-//! ratchet baseline.
+//! inherits through `use super::*`).
 
 use super::*;
 use std::process::Command;
@@ -385,7 +384,8 @@ fn run_live_pass(live: &Live) -> ReapReport {
     let backup =
         |path: &Path, issue: u32| backup_open_worktree(repo_root, path, &format!("issue-{issue}"));
     let remover = |path: &Path, issue: u32| {
-        clean::cleanup_worktree(repo_root, path, issue, false, "worktree_reaper_test").is_ok()
+        clean::cleanup_worktree(repo_root, path, issue, &idle_open_opts(), "worktree_reaper_test")
+            .is_ok()
     };
     // The fixture's writes are seconds old; in production the idle gate has
     // already established 24 h of silence, so the #8413 mtime veto is moot.

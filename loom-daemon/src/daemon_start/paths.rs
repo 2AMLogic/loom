@@ -4,6 +4,7 @@
 use std::path::{Path, PathBuf};
 
 use super::out;
+use crate::fs_util::{find_executable_on_path, is_executable};
 use crate::repo_root::main_checkout_from_gitdir_file;
 
 /// `find_repo_root()` — walk up from `$PWD` looking for a `.loom` directory,
@@ -69,18 +70,6 @@ fn same_dir(a: &Path, b: &Path) -> bool {
             }
         }
         _ => false,
-    }
-}
-
-fn executable(p: &Path) -> bool {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::metadata(p).is_ok_and(|m| !m.is_dir() && m.permissions().mode() & 0o111 != 0)
-    }
-    #[cfg(not(unix))]
-    {
-        p.is_file()
     }
 }
 
@@ -160,19 +149,19 @@ pub fn locate_daemon_bin(root: &Path) -> Option<PathBuf> {
 
     if let Some(explicit) = non_empty("LOOM_DAEMON_BIN") {
         let p = PathBuf::from(&explicit);
-        if executable(&p) {
+        if is_executable(&p) {
             resolved = Some((p, "$LOOM_DAEMON_BIN".to_string()));
         }
     }
 
     if resolved.is_none() && std::env::var("LOOM_PREFER_REPO_BUILD").as_deref() == Ok("1") {
-        if let Some(c) = repo_candidates(root).into_iter().find(|c| executable(c)) {
+        if let Some(c) = repo_candidates(root).into_iter().find(|c| is_executable(c)) {
             resolved = Some((c, "repo-local build ($LOOM_PREFER_REPO_BUILD=1)".to_string()));
         }
     }
 
     if resolved.is_none() {
-        if let Some(p) = on_path("loom-daemon") {
+        if let Some(p) = find_executable_on_path("loom-daemon") {
             resolved = Some((p, "$PATH".to_string()));
         }
     }
@@ -181,7 +170,7 @@ pub fn locate_daemon_bin(root: &Path) -> Option<PathBuf> {
         let dir =
             non_empty("LOOM_DAEMON_BIN_DIR").unwrap_or_else(|| format!("{}/.local/bin", home()));
         let machine_bin = PathBuf::from(dir).join("loom-daemon");
-        if executable(&machine_bin) {
+        if is_executable(&machine_bin) {
             resolved = Some((
                 machine_bin,
                 "machine-level install (${LOOM_DAEMON_BIN_DIR:-$HOME/.local/bin})".to_string(),
@@ -190,7 +179,7 @@ pub fn locate_daemon_bin(root: &Path) -> Option<PathBuf> {
     }
 
     if resolved.is_none() {
-        if let Some(c) = repo_candidates(root).into_iter().find(|c| executable(c)) {
+        if let Some(c) = repo_candidates(root).into_iter().find(|c| is_executable(c)) {
             resolved = Some((c, "repo-local build".to_string()));
         }
     }
@@ -205,15 +194,6 @@ pub fn locate_daemon_bin(root: &Path) -> Option<PathBuf> {
         }
     }
     resolved.map(|(p, _)| p)
-}
-
-fn on_path(name: &str) -> Option<PathBuf> {
-    // `command -v` resolves against $PATH and requires an executable file.
-    std::env::var_os("PATH").and_then(|paths| {
-        std::env::split_paths(&paths)
-            .map(|d| d.join(name))
-            .find(|c| executable(c))
-    })
 }
 
 /// `_loom_daemon_bin_mtime_human` — best-effort local-time mtime, `unknown`
@@ -322,6 +302,6 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let f = dir.path().join("loom-daemon");
         std::fs::write(&f, b"text").expect("write");
-        assert!(!executable(&f));
+        assert!(!is_executable(&f));
     }
 }

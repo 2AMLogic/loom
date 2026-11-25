@@ -7,7 +7,7 @@
 //! "codex"`) never fed anything back into `.loom/account-health.json`: the
 //! adapter (`spawn-codex.sh`) prints the record on every exit, but
 //! `sweep_registry::provider_health_feedback`'s doc comment names itself
-//! "the only production caller of `tokens_pool::record_terminal_for_model`"
+//! "the only production caller of `tokens_pool::record_terminal_for_model_with_reset`"
 //! — and it is keyed on a `sweep_id=` anchor that only exists in a sweep's
 //! own log. A role tick's own child never had anything reading its
 //! terminal line back into health, so #8408's pre-spawn codex gate
@@ -104,6 +104,17 @@ pub(super) fn apply_role_tick_provider_health_feedback(
     if let Some(requested) = &result.requested_model {
         log::warn!(
             "role_runner: spawn-codex dropped the pinned model '{requested}' before exec (issue #14121); the step ran on the profile's default model"
+        );
+    }
+    // #14141: a v4 record names the effort and service tier the adapter
+    // actually applied; log them so a configured-but-ignored speed setting is
+    // visible next to the account-health outcome. Informational only.
+    if result.effort.is_some() || result.tier.is_some() {
+        log::info!(
+            "role_runner: spawn-codex applied effort={} tier={} for role={}",
+            result.effort.as_deref().unwrap_or("none"),
+            result.tier.as_deref().unwrap_or("none"),
+            admission.role
         );
     }
     let id = AccountId {

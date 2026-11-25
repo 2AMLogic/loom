@@ -31,12 +31,12 @@
 #
 # FROM contract: same-version pin. `BASE_IMAGE` defaults to `:latest` for
 # convenient local/manual builds, but the release workflow always passes
-# --build-arg BASE_IMAGE=ghcr.io/rjwalters/loom-worker:<version> so the pair
+# --build-arg BASE_IMAGE=ghcr.io/2amlogic/loom-worker:<version> so the pair
 # locksteps exactly the way loom-worker locksteps with loom-daemon. See
 # docker/session/README.md for the full contract, entrypoint behavior, and
 # attach/exec usage.
 
-ARG BASE_IMAGE=ghcr.io/rjwalters/loom-worker:latest
+ARG BASE_IMAGE=ghcr.io/2amlogic/loom-worker:latest
 FROM ${BASE_IMAGE}
 
 # SHELL (bash -o pipefail -c, #6409) is inherited from the base image's own
@@ -54,7 +54,7 @@ ARG DEBIAN_FRONTEND=noninteractive
 # test-image.sh, including the real-engine hook check, against the new CLI. CODEX_MIN_VERSION is the
 # runtime-adapter floor this build enforces regardless of which version is
 # pinned above it; bump both deliberately together when the floor moves.
-ARG CODEX_VERSION=0.170.0
+ARG CODEX_VERSION=0.172.0
 ARG CODEX_MIN_VERSION=0.146.0
 
 # Node.js LTS release, pinned + checksum-verified below — Codex CLI's only

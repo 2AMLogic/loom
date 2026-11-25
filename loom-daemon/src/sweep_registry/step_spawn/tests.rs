@@ -4,9 +4,9 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use super::capture::{
-    emit_step_capture, parse_outcome_line, read_outcome_line, release_class_fallback,
-    release_class_of_line, step_failure, step_outcome_projection, tick_outcome, StepCapture,
-    StepEnd, StepOutcomeClass, StepOutcomeLine,
+    emit_step_capture, launch_rejection_of, never_started_reason, parse_outcome_line,
+    read_outcome_line, release_class_fallback, release_class_of_line, step_failure,
+    step_outcome_projection, tick_outcome, StepCapture, StepEnd, StepOutcomeClass, StepOutcomeLine,
 };
 use super::lease::{claim_args, claim_verdict, ClaimRun};
 use super::timeout::timed_out;
@@ -502,6 +502,66 @@ fn a_champion_steps_release_class_is_its_champion_line_folded() {
     assert_eq!(release_class_fallback(&dir.path().join("none.log"), "s-1", role, 7), "failed");
 }
 
+/// #14874: the release fallback reads only the requested dispatch's own
+/// section. A `requeued` line of a later dispatch is not this step's
+/// `ci_wait`; a requested section that wrote no line releases `failed`, and
+/// so does a sweep the log's headers do not name.
+#[test]
+fn the_release_fallback_reads_only_the_requested_dispatchs_section() {
+    let dir = tempdir().unwrap();
+    let log = dir.path().join("step.log");
+    let header = |id: &str| {
+        format!("==== loom-daemon dispatch: t sweep_id={id} item=7 step=champion_merge ====\n")
+    };
+    let role = StepRole::ChampionMerge;
+    std::fs::write(
+        &log,
+        format!(
+            "{}CHAMPION-STEP mode=pr item=7 outcome=merged\n\
+             {}CHAMPION-STEP mode=pr item=7 outcome=requeued\n",
+            header("c-7-1"),
+            header("c-7-2"),
+        ),
+    )
+    .unwrap();
+    assert_eq!(release_class_fallback(&log, "c-7-1", role, 7), "verdict");
+    assert_eq!(release_class_fallback(&log, "c-7-2", role, 7), "ci_wait");
+    // The `requeued` line only in the later dispatch, the requested section
+    // empty: not this step's `ci_wait` — `failed`, the no-line release.
+    std::fs::write(
+        &log,
+        format!(
+            "{}{}CHAMPION-STEP mode=pr item=7 outcome=requeued\n",
+            header("c-7-1"),
+            header("c-7-2"),
+        ),
+    )
+    .unwrap();
+    assert_eq!(release_class_fallback(&log, "c-7-1", role, 7), "failed");
+    assert_eq!(release_class_fallback(&log, "c-7-3", role, 7), "failed");
+}
+
+/// #14874 + #14168: a bare, backticked and JSON-framed current-dispatch
+/// outcome line all reach trace capture with the same class and reason.
+#[test]
+fn wrapped_outcome_lines_read_through_capture() {
+    let dir = tempdir().unwrap();
+    let log = dir.path().join("step.log");
+    let header = "==== loom-daemon dispatch: t sweep_id=j-2-1 item=2 step=judge ====\n";
+    for line in [
+        "LOOM_STEP_OUTCOME role=judge target=2 class=noop reason=ci-pending",
+        "`LOOM_STEP_OUTCOME role=judge target=2 class=noop reason=ci_pending`",
+        "{\"type\":\"text\",\"text\":\"LOOM_STEP_OUTCOME role=judge target=2 class=noop \
+         reason=ci_pending\\n\"}",
+    ] {
+        std::fs::write(&log, format!("{header}{line}\n")).unwrap();
+        let read = read_outcome_line(&log, "j-2-1", StepRole::Judge, 2)
+            .unwrap_or_else(|| panic!("no line read: {line}"));
+        assert_eq!(read.class, StepOutcomeClass::Noop, "{line}");
+        assert_eq!(read.reason, "ci_pending", "{line}");
+    }
+}
+
 #[test]
 fn the_outcome_line_is_read_after_this_steps_own_header_only() {
     let dir = tempdir().unwrap();
@@ -514,13 +574,133 @@ fn the_outcome_line_is_read_after_this_steps_own_header_only() {
          LOOM_STEP_OUTCOME role=judge target=4 class=noop reason=already_judged\n",
     )
     .unwrap();
-    assert_eq!(read_outcome_line(&log, "step-judge-4-2").unwrap().class, StepOutcomeClass::Noop);
-    assert_eq!(
-        read_outcome_line(&log, "step-judge-4-1").unwrap().class,
-        StepOutcomeClass::Noop,
-        "the earlier run's anchor reads to the end of the log"
+    let read = |id: &str| read_outcome_line(&log, id, StepRole::Judge, 4);
+    assert_eq!(read("step-judge-4-2").unwrap().class, StepOutcomeClass::Noop);
+    // #14874: the earlier run's own dispatch section bounds its read — a
+    // later dispatch's result for the same item is not its (this was the
+    // defect: the earlier sweep read the later `noop`).
+    assert_eq!(read("step-judge-4-1").unwrap().class, StepOutcomeClass::Failed);
+    assert!(read("step-judge-4-3").is_none());
+}
+
+/// #14874: trace capture takes only its own dispatch's section — bounded by
+/// the next dispatch header, its `sweep_id` matched as a complete field (an
+/// id that is a prefix of another's is not a match), never a transcript
+/// mention of one — and within it the last line naming this step's role and
+/// item.
+#[test]
+fn trace_capture_reads_only_its_own_dispatch_and_target() {
+    let dir = tempdir().unwrap();
+    let log = dir.path().join("step.log");
+    std::fs::write(
+        &log,
+        "==== loom-daemon dispatch: t sweep_id=judge-9-1 item=9 step=judge ====\n\
+         LOOM_STEP_OUTCOME role=judge target=9 class=failed reason=crash\n\
+         ==== loom-daemon dispatch: t sweep_id=judge-9-2 item=9 step=judge ====\n\
+         the transcript mentions sweep_id=judge-9-2 scheduling a rerun\n\
+         LOOM_STEP_OUTCOME role=curator target=9 class=verdict reason=curated\n\
+         LOOM_STEP_OUTCOME role=judge target=8 class=verdict reason=reviewed\n\
+         LOOM_STEP_OUTCOME role=judge target=9 class=refused reason=claimed\n\
+         ==== loom-daemon dispatch: t sweep_id=judge-9-21 item=9 step=judge ====\n\
+         LOOM_STEP_OUTCOME role=judge target=9 class=noop reason=already_judged\n",
+    )
+    .unwrap();
+    // The requested section's own last matching line: the mention of
+    // `sweep_id=judge-9-2` in the transcript is not a header, the lines for
+    // another role or target are not this step's, and the later dispatch's
+    // `noop` is beyond the section bound.
+    let line = read_outcome_line(&log, "judge-9-2", StepRole::Judge, 9).unwrap();
+    assert_eq!((line.class.as_str(), line.reason.as_str()), ("refused", "claimed"));
+    // `judge-9-2` is a prefix of `judge-9-21`: each reads its own section.
+    let later = read_outcome_line(&log, "judge-9-21", StepRole::Judge, 9).unwrap();
+    assert_eq!(later.reason, "already_judged");
+    assert!(read_outcome_line(&log, "judge-9-3", StepRole::Judge, 9).is_none());
+}
+
+#[test]
+fn a_launch_rejection_is_spent_only_on_a_genuine_exit_78_without_a_line() {
+    let reported = Some("preflight_role_admission");
+    let end = StepEnd::Exited(Some(78));
+    assert_eq!(launch_rejection_of(end, None, reported), reported);
+    let line =
+        parse_outcome_line("LOOM_STEP_OUTCOME role=builder target=2 class=failed reason=no_pr");
+    assert_eq!(launch_rejection_of(end, line.as_ref(), reported), None);
+    assert_eq!(launch_rejection_of(end, None, None), None);
+    for other in [
+        StepEnd::TimedOut,
+        StepEnd::Cancelled,
+        StepEnd::Exited(None),
+        StepEnd::Exited(Some(1)),
+    ] {
+        assert_eq!(launch_rejection_of(other, None, reported), None);
+    }
+}
+
+/// #14951: each way a Judge step ends without ever reaching the model reaps
+/// with a reason that writes no no-verdict record; a Judge that ran and ended
+/// without a verdict still records (`exited`, `timeout`).
+#[test]
+fn a_judge_step_that_never_started_writes_no_no_verdict_record() {
+    use crate::cli::pr_lease::backstop::reaped_release_fields;
+    use crate::cli::pr_lease::Role;
+    use crate::pr_lease_reap::{REASON_LAUNCH_REJECTED, REASON_PROVIDER_EXHAUSTED, REASON_TIMEOUT};
+    use std::time::Duration;
+
+    let window = Duration::from_secs(120);
+    let fast = Duration::from_secs(1);
+    let slow = Duration::from_secs(900);
+    let exit78 = StepEnd::Exited(Some(78));
+    let line = parse_outcome_line(
+        "LOOM_STEP_OUTCOME role=judge target=7 class=noop reason=already_judged",
     );
-    assert!(read_outcome_line(&log, "step-judge-4-3").is_none());
+
+    // The reap reason `end_step` picks, as it picks it.
+    let reason = |end, line, typed, exhausted, ran_for| {
+        never_started_reason(end, line, typed, exhausted, ran_for, window).unwrap_or(match end {
+            StepEnd::TimedOut => REASON_TIMEOUT,
+            StepEnd::Cancelled => "cancelled",
+            StepEnd::Exited(_) => "exited",
+        })
+    };
+    let state = || {
+        Some((
+            true,
+            "3".repeat(40),
+            vec![
+                "loom:review-requested".to_string(),
+                "loom:reviewing".to_string(),
+            ],
+        ))
+    };
+    let recorded = |reason: &str| !reaped_release_fields(Role::Judge, state(), reason).is_empty();
+
+    // A typed rejection (exit 78 + the launcher's report), however long it took.
+    assert_eq!(reason(exit78, None, true, false, slow), REASON_LAUNCH_REJECTED);
+    // Codex hook trust / empty Claude pool: a spawn script's own `exit 78`,
+    // untyped, inside the window (the incident's sub-second exits).
+    assert_eq!(reason(exit78, None, false, false, fast), REASON_LAUNCH_REJECTED);
+    // A provider-exhausted run, whatever its exit.
+    assert_eq!(
+        reason(StepEnd::Exited(Some(1)), None, false, true, slow),
+        REASON_PROVIDER_EXHAUSTED
+    );
+    // Typed rejection wins over exhaustion.
+    assert_eq!(reason(exit78, None, true, true, fast), REASON_LAUNCH_REJECTED);
+    for r in [REASON_LAUNCH_REJECTED, REASON_PROVIDER_EXHAUSTED] {
+        assert!(!recorded(r), "{r} must not stamp a record");
+    }
+
+    // A Judge that ran stays bounded: a late exit 78, an exit 78 that wrote a
+    // line, any other fast exit, a timeout (even a flagged one) and a cancel.
+    assert_eq!(reason(exit78, None, false, false, slow), "exited");
+    assert_eq!(reason(exit78, line.as_ref(), false, false, fast), "exited");
+    assert_eq!(reason(StepEnd::Exited(Some(1)), None, false, false, fast), "exited");
+    assert_eq!(reason(StepEnd::Exited(Some(0)), None, false, false, fast), "exited");
+    assert_eq!(reason(StepEnd::TimedOut, None, false, true, slow), REASON_TIMEOUT);
+    assert_eq!(reason(StepEnd::Cancelled, None, true, true, fast), "cancelled");
+    for r in ["exited", REASON_TIMEOUT] {
+        assert!(recorded(r), "{r} must still stamp a record");
+    }
 }
 
 #[test]
@@ -694,10 +874,12 @@ fn a_steps_end_writes_the_role_ticks_outcome_record() {
     let dir = tempdir().unwrap();
     std::env::remove_var(crate::sweep_outcomes::ROLE_TICK_TELEMETRY_JOURNAL_PATH_ENV);
     emit_step_capture(&StepCapture {
+        runtime: None,
         root: dir.path().to_path_buf(),
         role: StepRole::ChampionMerge,
         item: 8,
         sweep_id: "step-champion_merge-8-1".into(),
+        trace_context: None,
         started_at: Utc::now() - chrono::Duration::seconds(30),
         outcome: RoleTickOutcome::Success,
         step_outcome: Some(("noop".into(), "already_judged".into())),
@@ -729,10 +911,12 @@ fn a_step_with_no_outcome_line_records_none_on_its_record() {
     let dir = tempdir().unwrap();
     std::env::remove_var(crate::sweep_outcomes::ROLE_TICK_TELEMETRY_JOURNAL_PATH_ENV);
     emit_step_capture(&StepCapture {
+        runtime: None,
         root: dir.path().to_path_buf(),
         role: StepRole::Judge,
         item: 9,
         sweep_id: "step-judge-9-1".into(),
+        trace_context: None,
         started_at: Utc::now() - chrono::Duration::seconds(30),
         outcome: RoleTickOutcome::Success,
         step_outcome: Some(step_outcome_projection(None)),
@@ -1093,6 +1277,478 @@ fn a_failed_rollback_still_returns_the_original_refusal() {
     assert_eq!(rollback_of(&refusal), Some("failed"));
 }
 
+// ---- #14482: a terminal Builder yields only its own issue lease -----------
+
+mod builder_terminal_cleanup {
+    use super::*;
+    use crate::forge_check_claim::{self as guard, BranchLeg, ClaimEvidence};
+    use crate::worktree_ops::gh::MergedBranchPrProbe;
+
+    const MINE: &str = "step-builder-12133-terminal";
+
+    /// Extend the existing claim fixture with persisted labels and yield reads.
+    /// The cleanup and admission readers consume the same forge state.
+    fn fixture(ws: &Path) -> (SweepRegistry, PathBuf) {
+        let (reg, _, _, store) =
+            crate::sweep_registry::test_support::lease_order_dispatch_registry(ws, &[]);
+        std::fs::write(ws.join("labels.json"), r#"["loom:issue"]"#).unwrap();
+        let fake = ws.join("fake-gh.sh");
+        let script = std::fs::read_to_string(&fake).unwrap();
+        let prefix = format!(
+            r#"#!/usr/bin/env bash
+labels='{root}/labels.json'
+if [[ "$1 $2" == 'api graphql' && -f '{root}/open-pr' ]]; then
+  echo '{{"data":{{"repository":{{"issue":{{"closedByPullRequestsReferences":{{"nodes":[{{"number":999,"state":"OPEN"}}]}}}}}}}}}}'
+  exit 0
+fi
+if [[ "$1 $2" == 'issue edit' ]]; then
+  printf '%s\n' "$*" >> '{root}/gh-invocations.log'
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --remove-label) shift; jq --arg l "$1" 'map(select(. != $l))' "$labels" > "$labels.next"; mv "$labels.next" "$labels" ;;
+      --add-label) shift; jq --arg l "$1" '. + [$l] | unique' "$labels" > "$labels.next"; mv "$labels.next" "$labels" ;;
+    esac
+    shift
+  done
+  exit 0
+fi
+if [[ "$1 $2" == 'issue view' ]]; then
+  [[ -f '{root}/unreadable' ]] && exit 1
+  jq '{{state:"OPEN",url:"https://github.com/rjwalters/loom/issues/12133",labels:map({{name:.}})}}' "$labels"
+  exit 0
+fi
+if [[ "$1" == api && "$*" == *closed_at* ]]; then
+  [[ -f '{root}/unreadable' ]] && exit 1
+  jq '{{state:"open",body:"",closed_at:null,labels:.}}' "$labels"
+  exit 0
+fi
+if [[ "$1" == api && "$2" == */issues/12133 && "$*" == *'.pull_request != null'* ]]; then echo false; exit 0; fi
+"#,
+            root = ws.display(),
+        );
+        std::fs::write(fake, prefix + &script).unwrap();
+        (reg, store)
+    }
+
+    /// The public check-claim verdict, using its real label/lease readers and
+    /// the registry's linked-PR probe. This fixture has no merged PR or branch.
+    fn admission(reg: &SweepRegistry) -> guard::Verdict {
+        let root = &reg.config.workspace_root;
+        let gh = reg.resolved_gh();
+        guard::decide(
+            BUILDER_ITEM,
+            &ClaimEvidence {
+                open_pr: reg.probe_open_linked_pr(BUILDER_ITEM),
+                merged_pr: Some(MergedBranchPrProbe::NoneMerged),
+                labels: Some(guard::read_claim_labels(&gh, root, BUILDER_ITEM)),
+                lease: Some(guard::read_freshest_live_lease(
+                    &gh,
+                    root,
+                    BUILDER_ITEM,
+                    Utc::now(),
+                    15.0,
+                )),
+                branch: Some(BranchLeg::Absent),
+            },
+            false,
+        )
+    }
+
+    fn finish(reg: &mut SweepRegistry) {
+        reg.release_dead_step(
+            MINE,
+            BUILDER_ITEM,
+            StepRole::Builder,
+            Utc::now(),
+            StepEnd::Exited(Some(1)),
+        );
+    }
+
+    fn released_peer_history(author: &str, host: &str, sweep: &str, renewed: bool) -> String {
+        let now = Utc::now();
+        let started = now - chrono::Duration::seconds(164);
+        let terminal = now - chrono::Duration::seconds(56);
+        let lease = serde_json::json!({
+            "id": 1, "created_at": started, "updated_at": if renewed { now } else { started },
+            "user": {"login": "loom-fleet-dispatch[bot]", "type": "Bot"},
+            "body": "<!-- loom:lease host=peer-host sweep=peer-old -->"
+        });
+        let release = serde_json::json!({
+            "id": 2, "created_at": terminal, "updated_at": terminal,
+            "user": {"login": author, "type": "Bot"},
+            "body": format!("<!-- loom:lease-yield host={host} sweep={sweep} earliest_host=terminal earliest_sweep=terminal -->")
+        });
+        format!("{lease}\n{release}\n")
+    }
+
+    #[test]
+    #[serial]
+    fn a_builder_proceeds_after_another_hosts_terminal_yield() {
+        let (peer, later) = (tempdir().unwrap(), tempdir().unwrap());
+        let (_, shared_store) = fixture(peer.path());
+        let (mut registry, later_store) = fixture(later.path());
+        let history =
+            released_peer_history("loom-fleet-dispatch[bot]", "peer-host", "peer-old", false);
+        std::fs::write(&shared_store, &history).unwrap();
+        let labels = peer.path().join("labels.json");
+        let later_fake = later.path().join("fake-gh.sh");
+        let script = std::fs::read_to_string(&later_fake)
+            .unwrap()
+            .replace(later_store.to_str().unwrap(), shared_store.to_str().unwrap())
+            .replace(later.path().join("labels.json").to_str().unwrap(), labels.to_str().unwrap());
+        std::fs::write(later_fake, script).unwrap();
+        let result = builder_claim(&mut registry, MINE);
+        let stored = stored_comments(&shared_store);
+        assert!(result.is_ok(), "later claim refused: {result:?}; {stored}");
+        let labels: Vec<String> =
+            serde_json::from_str(&std::fs::read_to_string(labels).unwrap()).unwrap();
+        assert_eq!(labels, ["loom:building"]);
+        assert!(stored
+            .contains(&format!("loom:lease host={} sweep={MINE}", registry.published_host_id())));
+        assert!(!stored.contains(&format!(
+            "loom:lease-yield host={} sweep={MINE}",
+            registry.published_host_id()
+        )));
+    }
+
+    #[test]
+    #[serial]
+    fn a_released_peer_appearing_during_confirmation_cannot_win_by_late_renewal() {
+        let dir = tempdir().unwrap();
+        let (mut registry, store) = fixture(dir.path());
+        let history = dir.path().join("late-comments");
+        std::fs::write(
+            &history,
+            released_peer_history("loom-fleet-dispatch[bot]", "peer-host", "peer-old", true),
+        )
+        .unwrap();
+        let fake = dir.path().join("fake-gh.sh");
+        let script = std::fs::read_to_string(&fake).unwrap().replacen(
+            COMMENT_READ_ARM,
+            &format!(
+                "{COMMENT_READ_ARM}if [[ -f '{first}' && ! -f '{added}' ]]; then\n\
+                 cat '{history}' >> '{store}'\n\
+                 touch '{added}'\n\
+                 fi\n\
+                 touch '{first}'\n",
+                first = dir.path().join("first-read").display(),
+                added = dir.path().join("peer-added").display(),
+                history = history.display(),
+                store = store.display(),
+            ),
+            1,
+        );
+        std::fs::write(fake, script).unwrap();
+        // Reserve the earlier IDs without exposing either peer marker.
+        std::fs::write(&store, "{\"body\":\"\"}\n{\"body\":\"\"}\n").unwrap();
+        assert!(builder_claim(&mut registry, MINE).is_ok());
+        assert!(dir.path().join("peer-added").is_file(), "peer must appear in confirmation");
+    }
+
+    #[test]
+    #[serial]
+    fn an_untrusted_or_nonmatching_yield_cannot_exclude_a_live_peer() {
+        for (author, host, sweep) in [
+            ("untrusted[bot]", "peer-host", "peer-old"),
+            ("loom-fleet-dispatch[bot]", "other-host", "peer-old"),
+            ("loom-fleet-dispatch[bot]", "peer-host", "other-sweep"),
+        ] {
+            let dir = tempdir().unwrap();
+            let (mut registry, store) = fixture(dir.path());
+            std::fs::write(&store, released_peer_history(author, host, sweep, false)).unwrap();
+            let refusal = builder_claim(&mut registry, MINE).unwrap_err();
+            assert_eq!(refusal.reason, "claim_lost");
+            assert!(stored_comments(&store).contains("earliest_sweep=peer-old"));
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn unverified_builder_claim_restores_label_behind_only_a_released_peer() {
+        let dir = tempdir().unwrap();
+        let (mut registry, store) = fixture(dir.path());
+        std::fs::write(
+            &store,
+            released_peer_history("loom-fleet-dispatch[bot]", "peer-host", "peer-old", false),
+        )
+        .unwrap();
+        break_gh_arm(dir.path(), COMMENT_WRITE_ARM);
+        let refusal = builder_claim(&mut registry, MINE).unwrap_err();
+        assert_eq!(refusal.reason, "claim_unverified");
+        assert_eq!(rollback_of(&refusal), Some("label_restored"));
+        assert_eq!(admission(&registry).code, guard::EX_SAFE_TO_CLAIM);
+    }
+
+    #[test]
+    #[serial]
+    fn terminal_builder_is_immediately_admissible_and_cleanup_is_idempotent() {
+        let dir = tempdir().unwrap();
+        let (mut reg, store) = fixture(dir.path());
+        builder_claim(&mut reg, MINE).unwrap();
+        assert_eq!(admission(&reg).stdout, "BUILDING");
+        // Retain a real exited child, using the existing reaper fixture.
+        let old_id = crate::sweep_registry::test_support::insert_clean_exit_running(
+            &mut reg,
+            BUILDER_ITEM,
+            1,
+        );
+        let mut entry = reg.entries.remove(&old_id).unwrap();
+        entry.sweep_id = MINE.into();
+        entry.kind = SweepKind::Step {
+            item: BUILDER_ITEM,
+            role: StepRole::Builder,
+        };
+        entry.log_path = reg.compute_step_log_path(BUILDER_ITEM, StepRole::Builder);
+        reg.entries.insert(MINE.into(), entry);
+        let child = reg.children.remove(&old_id).unwrap();
+        reg.children.insert(MINE.into(), child);
+        assert_eq!(reg.reap_once(), 1);
+        assert!(reg.entries[MINE].state.is_terminal());
+        let verdict = admission(&reg);
+        assert_eq!(verdict.code, guard::EX_SAFE_TO_CLAIM, "{verdict:?}");
+        let comments = stored_comments(&store);
+        assert!(comments
+            .contains(&format!("loom:lease-yield host={} sweep={MINE}", reg.published_host_id())));
+        finish(&mut reg);
+        assert_eq!(stored_comments(&store), comments, "repeat cleanup posts no duplicate yield");
+        assert_eq!(reg.reap_once(), 0);
+        assert_eq!(admission(&reg).code, guard::EX_SAFE_TO_CLAIM);
+    }
+
+    #[test]
+    #[serial]
+    fn terminal_builder_reads_the_canonical_repo_without_ambient_routing() {
+        use crate::forge_identity::{Placement, RouteDecision};
+        use crate::gh_invocation::cwd_route::{CwdAnswer, DeriveEnv};
+        use crate::gh_invocation::test_routing::{install, seen, TestRouting};
+
+        let dir = tempdir().unwrap();
+        let (mut reg, store) = fixture(dir.path());
+        // The router knows this checkout has a pool, but cannot derive its
+        // reader route from ambient facts. The registry has the canonical repo.
+        for args in [
+            &["init", "--quiet"][..],
+            &[
+                "remote",
+                "add",
+                "origin",
+                "https://github.com/rjwalters/loom",
+            ],
+        ] {
+            assert!(Command::new("git")
+                .current_dir(dir.path())
+                .args(args)
+                .status()
+                .unwrap()
+                .success());
+        }
+        builder_claim(&mut reg, MINE).unwrap();
+        // The ordinary reaper restores the label before attempting the yield.
+        reg.restore_step_claim(BUILDER_ITEM, StepRole::Builder, MINE)
+            .unwrap();
+        let before = admission(&reg);
+        assert!(before.stdout.starts_with("LEASE_ALREADY_HELD "), "{before:?}");
+        let reader = dir.path().join("reader");
+        std::fs::create_dir(&reader).unwrap();
+        {
+            let _router = install(TestRouting {
+                decision: RouteDecision::Reader {
+                    dir: reader,
+                    app_id: "fixture-reader".into(),
+                    placement: Placement::Home,
+                },
+                env: DeriveEnv::default(),
+                checkout: CwdAnswer::Unresolved,
+            })
+            .with_program(&reg.resolved_gh());
+            assert!(reg.read_order_lease_comments(BUILDER_ITEM).is_some());
+            let yielded = reg.yield_finished_builder_lease(BUILDER_ITEM, MINE, "exited");
+            let calls = seen();
+            for op in ["guard.lease_comments", "guard.finished_builder_lease"] {
+                let call = calls.iter().find(|call| call.op == op).unwrap();
+                assert_eq!(call.route_slug.as_deref(), Some("rjwalters/loom"), "{call:?}");
+                assert!(!call.shed, "{call:?}");
+            }
+            assert!(yielded, "{calls:?}");
+        }
+        assert!(stored_comments(&store)
+            .contains(&format!("loom:lease-yield host={} sweep={MINE}", reg.published_host_id())));
+        assert_eq!(admission(&reg).code, guard::EX_SAFE_TO_CLAIM);
+    }
+
+    #[test]
+    #[serial]
+    fn exhausted_reader_keeps_the_terminal_builder_lease_without_a_forge_call() {
+        use crate::forge_identity::{ExhaustCause, RouteDecision};
+        use crate::gh_invocation::cwd_route::{CwdAnswer, DeriveEnv};
+        use crate::gh_invocation::test_routing::{install, seen, TestRouting};
+
+        let dir = tempdir().unwrap();
+        let (mut reg, store) = fixture(dir.path());
+        builder_claim(&mut reg, MINE).unwrap();
+        reg.restore_step_claim(BUILDER_ITEM, StepRole::Builder, MINE)
+            .unwrap();
+        let log = dir.path().join("gh-invocations.log");
+        let before = std::fs::read(&log).unwrap();
+        {
+            let _router = install(TestRouting {
+                decision: RouteDecision::Exhausted {
+                    until: std::time::SystemTime::now() + Duration::from_secs(60),
+                    cause: ExhaustCause::Budget,
+                },
+                env: DeriveEnv::default(),
+                checkout: CwdAnswer::Unresolved,
+            })
+            .with_program(&reg.resolved_gh());
+            assert!(!reg.yield_finished_builder_lease(BUILDER_ITEM, MINE, "exited"));
+            let calls = seen();
+            let [call] = calls.as_slice() else {
+                panic!("expected one cleanup read, got {calls:?}");
+            };
+            assert_eq!(call.op, "guard.finished_builder_lease");
+            assert_eq!(call.route_slug.as_deref(), Some("rjwalters/loom"));
+            assert!(call.shed, "{call:?}");
+        }
+        assert_eq!(std::fs::read(&log).unwrap(), before, "no writer fallback");
+        assert!(!stored_comments(&store).contains("loom:lease-yield"));
+        assert!(admission(&reg).stdout.ends_with(MINE));
+    }
+
+    #[test]
+    #[serial]
+    fn unresolved_terminal_builder_repo_never_reads_or_yields_a_lease() {
+        let dir = tempdir().unwrap();
+        let (reg, store) = fixture(dir.path());
+        break_gh_arm(dir.path(), "if [[ \"$1\" == \"repo\" && \"$2\" == \"view\" ]]; then\n");
+
+        assert!(!reg.yield_finished_builder_lease(BUILDER_ITEM, MINE, "exited"));
+
+        let calls = std::fs::read_to_string(dir.path().join("gh-invocations.log")).unwrap();
+        assert!(calls.starts_with("repo view "), "{calls}");
+        assert!(!calls.contains("/comments"), "{calls}");
+        assert!(stored_comments(&store).is_empty());
+    }
+
+    #[test]
+    #[serial]
+    fn won_builder_claim_spawn_failure_yields_its_lease() {
+        let dir = tempdir().unwrap();
+        let (mut reg, _) = fixture(dir.path());
+        builder_claim(&mut reg, MINE).unwrap();
+        reg.unwind_step_claim(BUILDER_ITEM, StepRole::Builder, MINE, true);
+        let verdict = admission(&reg);
+        assert_eq!(verdict.code, guard::EX_SAFE_TO_CLAIM, "{verdict:?}");
+    }
+
+    #[test]
+    #[serial]
+    fn terminal_builder_never_yields_a_newer_peer_lease() {
+        let dir = tempdir().unwrap();
+        let (mut reg, store) = fixture(dir.path());
+        builder_claim(&mut reg, MINE).unwrap();
+        let original = stored_comments(&store);
+        let peer = original
+            .lines()
+            .next()
+            .unwrap()
+            .replace(MINE, "new-peer")
+            .replace(&reg.published_host_id(), "peer-host");
+        std::fs::write(&store, format!("{original}{peer}\n")).unwrap();
+        finish(&mut reg);
+        let verdict = admission(&reg);
+        assert_eq!(verdict.code, 0, "{verdict:?}");
+        assert!(verdict.stdout.ends_with(" new-peer"), "{verdict:?}");
+        assert!(!stored_comments(&store).contains("lease-yield host=peer-host sweep=new-peer"));
+    }
+
+    #[test]
+    #[serial]
+    fn failed_terminal_yield_keeps_the_fresh_lease_effective() {
+        let dir = tempdir().unwrap();
+        let (mut reg, store) = fixture(dir.path());
+        builder_claim(&mut reg, MINE).unwrap();
+        break_gh_arm(dir.path(), COMMENT_WRITE_ARM);
+        finish(&mut reg);
+        let verdict = admission(&reg);
+        assert_eq!(verdict.code, 0, "{verdict:?}");
+        assert!(verdict.stdout.ends_with(MINE), "{verdict:?}");
+        assert!(!stored_comments(&store).contains("loom:lease-yield"));
+        let calls = std::fs::read_to_string(dir.path().join("gh-invocations.log")).unwrap();
+        assert!(
+            calls
+                .lines()
+                .any(|l| l.starts_with("issue comment") && l.contains("loom:lease-yield")),
+            "the failed write was attempted"
+        );
+        assert!(
+            !reg.yield_finished_builder_lease(BUILDER_ITEM, MINE, "exited"),
+            "the failed yield is reported, not treated as success"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn unreadable_terminal_lease_history_is_not_a_successful_yield() {
+        let dir = tempdir().unwrap();
+        let (mut reg, store) = fixture(dir.path());
+        builder_claim(&mut reg, MINE).unwrap();
+        break_gh_arm(dir.path(), COMMENT_READ_ARM);
+        assert!(!reg.yield_finished_builder_lease(BUILDER_ITEM, MINE, "exited"));
+        finish(&mut reg);
+        assert!(!stored_comments(&store).contains("loom:lease-yield"));
+        assert_eq!(admission(&reg).code, guard::EX_PROBE_FAILED);
+    }
+
+    #[test]
+    #[serial]
+    fn an_untrusted_yield_does_not_suppress_terminal_cleanup() {
+        let dir = tempdir().unwrap();
+        let (mut reg, store) = fixture(dir.path());
+        builder_claim(&mut reg, MINE).unwrap();
+        let original = stored_comments(&store);
+        let mut forged: serde_json::Value =
+            serde_json::from_str(original.lines().next().unwrap()).unwrap();
+        forged["user"] = serde_json::json!({"login":"outsider", "type":"User"});
+        forged["body"] =
+            format!("<!-- loom:lease-yield host={} sweep={MINE} -->", reg.published_host_id())
+                .into();
+        std::fs::write(&store, format!("{original}{forged}\n")).unwrap();
+        finish(&mut reg);
+        assert_eq!(stored_comments(&store).matches("loom:lease-yield").count(), 2);
+        assert_eq!(admission(&reg).code, guard::EX_SAFE_TO_CLAIM);
+    }
+
+    #[test]
+    #[serial]
+    fn terminal_cleanup_preserves_open_pr_hold_and_unreadable_vetoes() {
+        for (veto, spawn_failed) in ["open-pr", "loom:frozen", "loom:operator", "unreadable"]
+            .into_iter()
+            .flat_map(|veto| [(veto, false), (veto, true)])
+        {
+            let dir = tempdir().unwrap();
+            let (mut reg, _) = fixture(dir.path());
+            builder_claim(&mut reg, MINE).unwrap();
+            match veto {
+                "open-pr" => std::fs::write(dir.path().join("open-pr"), "").unwrap(),
+                "unreadable" => std::fs::write(dir.path().join("unreadable"), "").unwrap(),
+                label => std::fs::write(
+                    dir.path().join("labels.json"),
+                    format!(r#"["loom:building","{label}"]"#),
+                )
+                .unwrap(),
+            }
+            if spawn_failed {
+                reg.unwind_step_claim(BUILDER_ITEM, StepRole::Builder, MINE, true);
+            } else {
+                finish(&mut reg);
+            }
+            let labels = std::fs::read_to_string(dir.path().join("labels.json")).unwrap();
+            assert!(!labels.contains("loom:issue"), "{veto}: {labels}");
+            assert_ne!(admission(&reg).code, guard::EX_SAFE_TO_CLAIM, "{veto}");
+        }
+    }
+}
+
 // ---- #12450: the captain's claim ------------------------------------------
 
 mod captain {
@@ -1313,6 +1969,22 @@ mod captain {
         assert!(!span.attributes.contains_key("loom.assignment.id"));
         cancel_all(&mut reg);
     }
+}
+
+#[test]
+fn the_late_seat_busy_release_requires_the_matching_exit_and_outcome() {
+    use super::capture::seat_busy_exit_reason;
+    use crate::session_exec::refusal::{REFUSAL_EXIT_CODE, SEAT_BUSY_REASON};
+
+    let busy =
+        parse_outcome_line("LOOM_STEP_OUTCOME role=judge target=7 class=refused reason=seat_busy");
+    let refused = StepEnd::Exited(Some(REFUSAL_EXIT_CODE));
+    let classified = |role, item, end| seat_busy_exit_reason(role, item, end, busy.as_ref());
+    assert_eq!(classified(StepRole::Judge, 7, refused), Some(SEAT_BUSY_REASON));
+    assert_eq!(classified(StepRole::Judge, 7, StepEnd::Exited(Some(1))), None);
+    assert_eq!(classified(StepRole::Judge, 7, StepEnd::TimedOut), None);
+    assert_eq!(classified(StepRole::Judge, 8, refused), None);
+    assert_eq!(classified(StepRole::Curator, 7, refused), None);
 }
 
 /// #12551: a step that ended waiting on CI releases as `ci_wait`, not `noop`.

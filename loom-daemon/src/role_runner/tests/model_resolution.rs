@@ -805,9 +805,9 @@ fn test_invoke_per_role_effort_override_reaches_argv_body() {
 /// Issue #8054: the per-role log header reports the resolved effort and the
 /// tier that supplied it, alongside the pre-existing model fields — the surface
 /// the transcript-side cost telemetry (#8052/#8059) attributes a tick's spend
-/// to. Both the set and the unset rendering are pinned here.
+/// to. Cover both the configured service tier and the original unset shape.
 #[test]
-fn test_role_log_header_reports_model_and_effort_with_sources() {
+fn test_role_log_header_reports_configured_values_with_sources() {
     use crate::role_runner::model_resolution::role_log_header;
 
     let set = role_log_header(
@@ -817,12 +817,14 @@ fn test_role_log_header_reports_model_and_effort_with_sources() {
         "autonomous.roleRunner.roleModels.curator",
         "low",
         "autonomous.roleRunner.roleEfforts.curator",
+        Some(("flex", "autonomous.roleRunner.serviceTier")),
     );
     assert_eq!(
         set,
         "==== loom-daemon role_runner: 2026-09-17T00:00:00+00:00 role=curator model=haiku \
          (source=autonomous.roleRunner.roleModels.curator) effort=low \
-         (source=autonomous.roleRunner.roleEfforts.curator) ===="
+         (source=autonomous.roleRunner.roleEfforts.curator) \
+         service_tier=flex (source=autonomous.roleRunner.serviceTier) ===="
     );
 
     // Unset effort renders as a NAME, not as `effort=` followed by nothing —
@@ -835,14 +837,13 @@ fn test_role_log_header_reports_model_and_effort_with_sources() {
         "default",
         "",
         UNSET_EFFORT_SOURCE,
+        None,
     );
-    assert!(
-        unset.contains("effort=<runtime CLI default> (source=unset)"),
-        "an unset effort must read like a name, not a bug: {unset}"
+    assert_eq!(
+        unset,
+        "==== loom-daemon role_runner: 2026-09-17T00:00:00+00:00 role=curator model=sonnet \
+         (source=default) effort=<runtime CLI default> (source=unset) ===="
     );
-    assert!(!unset.contains("effort= "), "never an empty rendered value: {unset}");
-    // The pre-#8054 model fields are untouched.
-    assert!(unset.contains("model=sonnet (source=default)"), "{unset}");
 }
 
 /// Issue #8054: the header is actually written to `role-<role>.log` by a real
@@ -917,4 +918,577 @@ fn autonomous_role_overrides_interactive_parent_origin_body() {
     }
     assert_eq!(result, RoleTickOutcome::Success);
     assert_eq!(fs::read_to_string(tmp.path().join("origin.txt")).unwrap(), "autonomous");
+}
+
+/// Issue #14454: `serviceTier` / `roleServiceTiers` parse with `roleEfforts`'s
+/// contract and resolve `<role>@<runtime>` > `<role>` > global > unset.
+#[test]
+#[serial(loom_config_env)]
+fn test_resolve_role_runner_service_tier_precedence_and_unset() {
+    std::env::set_var(crate::config_resolver::PRIVATE_DEFAULTS_ENV, "");
+    let at = |root: &Path, role: &str, rt: Option<&str>| {
+        resolve_role_runner_service_tier_for_runtime(root, role, rt)
+    };
+    let src = |k: &str| format!("autonomous.roleRunner.{k}");
+
+    // Unset at every tier resolves to nothing: no export, not even for Codex.
+    let none = tempfile::tempdir().unwrap();
+    write_config(none.path(), r#"{"autonomous": {"roleRunner": {"effort": "low"}}}"#);
+    assert_eq!(at(none.path(), "builder", Some("codex")), None);
+    assert_eq!(at(none.path(), "builder", None), None);
+
+    let full = tempfile::tempdir().unwrap();
+    write_config(
+        full.path(),
+        r#"{"autonomous": {"roleRunner": {"serviceTier": " flex ",
+            "roleServiceTiers": {"Builder": "default", " Builder@Codex ": "priority"}}}}"#,
+    );
+    assert_eq!(
+        at(full.path(), "builder", Some("codex")),
+        Some(("priority".into(), src("roleServiceTiers.builder@codex")))
+    );
+    assert_eq!(at(full.path(), "builder", Some(" CODEX ")).unwrap().0, "priority");
+    assert_eq!(
+        at(full.path(), "builder", Some("claude")),
+        Some(("default".into(), src("roleServiceTiers.builder")))
+    );
+    assert_eq!(
+        at(full.path(), "builder", None),
+        Some(("default".into(), src("roleServiceTiers.builder")))
+    );
+    assert_eq!(
+        at(full.path(), "judge", Some("codex")),
+        Some(("flex".into(), src("serviceTier")))
+    );
+
+    // Malformed keys and blank values drop per entry; siblings and the global hold.
+    let bad = tempfile::tempdir().unwrap();
+    write_config(
+        bad.path(),
+        r#"{"autonomous": {"roleRunner": {"serviceTier": "  ",
+            "roleServiceTiers": {"builder": "fast", "builder@": "x", "@codex": "x",
+            "a@b@c": "x", "judge": "  ", "doctor": 7, "curator@ghost": "slow"}}}}"#,
+    );
+    let cfg = read_role_runner_config(bad.path());
+    assert_eq!(cfg.service_tier, None);
+    assert_eq!(
+        cfg.role_service_tiers
+            .keys()
+            .map(String::as_str)
+            .collect::<Vec<_>>(),
+        ["builder", "curator@ghost"]
+    );
+    assert_eq!(at(bad.path(), "judge", Some("codex")), None);
+
+    // A non-object map soft-fails to empty.
+    let odd = tempfile::tempdir().unwrap();
+    write_config(
+        odd.path(),
+        r#"{"autonomous": {"roleRunner": {"roleServiceTiers": "priority"}}}"#,
+    );
+    assert!(read_role_runner_config(odd.path())
+        .role_service_tiers
+        .is_empty());
+}
+
+// ===================================================================
+// Launch-time effort reconciliation against native profiles (#14963)
+// ===================================================================
+
+/// Issue #14963: `resolve_role_runner_effort_for_launch` drops an
+/// **unqualified** effort (`roleEfforts.<role>` or the global
+/// `roleRunner.effort`) that the native model profile the launch will select
+/// does not allow, while a runtime-qualified pin, an allowed value, a profile
+/// without an `allowedEfforts` vocabulary, an unknown profile and every
+/// non-native runtime keep the resolved effort verbatim.
+///
+/// NOTE: `#[serial(loom_config_env)]` + the emptied private-defaults env for
+/// the same reason `test_resolve_role_runner_effort_precedence_chain` needs
+/// them — both the role-runner keys and the profile definitions are read from
+/// the full effective config, so a machine-level `defaults.json` on the host
+/// running the suite would otherwise leak in. `LOOM_MODEL_PROFILE` is
+/// save/cleared/restored because the profile fallback reads it.
+#[test]
+#[serial(loom_config_env)]
+fn test_launch_effort_reconciles_unqualified_effort_with_native_profile() {
+    std::env::set_var(crate::config_resolver::PRIVATE_DEFAULTS_ENV, "");
+    let saved_profile = std::env::var_os("LOOM_MODEL_PROFILE");
+    std::env::remove_var("LOOM_MODEL_PROFILE");
+    let launch = |root: &Path, role: &str, rt: Option<&str>, profile: Option<&str>| {
+        resolve_role_runner_effort_for_launch(root, role, rt, profile, None)
+    };
+
+    // The reported incident, verbatim: a bare `roleEfforts.builder` meant for
+    // the Claude and Codex picks meeting the bundled zai-flash profile
+    // (allowedEfforts low/high/max) on an OpenCode draw. The effort is dropped
+    // (the profile's own `effort` launches) instead of the launch being
+    // refused at profile_selection, and the source label names the drop.
+    let bare = tempfile::tempdir().unwrap();
+    write_config(
+        bare.path(),
+        r#"{"autonomous": {"roleRunner": {"roleEfforts": {"builder": "medium"}}}}"#,
+    );
+    assert_eq!(
+        launch(bare.path(), "builder", Some("opencode"), None),
+        (
+            String::new(),
+            "autonomous.roleRunner.roleEfforts.builder (profile default for opencode:zai-flash)"
+                .to_string(),
+        ),
+        "an unqualified effort the native profile disallows is dropped, not refused"
+    );
+    // The same bare value on a non-native runtime is forwarded untouched.
+    assert_eq!(
+        launch(bare.path(), "builder", Some("claude"), None),
+        ("medium".to_string(), "autonomous.roleRunner.roleEfforts.builder".to_string(),),
+        "a Claude launch keeps the bare role effort verbatim"
+    );
+
+    // The global `roleRunner.effort` tier is unqualified too — same drop.
+    let global = tempfile::tempdir().unwrap();
+    write_config(global.path(), r#"{"autonomous": {"roleRunner": {"effort": "medium"}}}"#);
+    assert_eq!(
+        launch(global.path(), "builder", Some("opencode"), None),
+        (
+            String::new(),
+            "autonomous.roleRunner.effort (profile default for opencode:zai-flash)".to_string(),
+        ),
+        "the global effort tier reconciles exactly like the bare role tier"
+    );
+
+    // A runtime-qualified pin is an explicit statement of intent about that
+    // runtime: forwarded verbatim even when the profile disallows it, so
+    // `worker_spawn::profiles::select` still refuses it loudly (exit 78).
+    let qualified = tempfile::tempdir().unwrap();
+    write_config(
+        qualified.path(),
+        r#"{"autonomous": {"roleRunner": {"roleEfforts": {"builder@opencode": "medium"}}}}"#,
+    );
+    assert_eq!(
+        launch(qualified.path(), "builder", Some("opencode"), None),
+        (
+            "medium".to_string(),
+            "autonomous.roleRunner.roleEfforts.builder@opencode".to_string(),
+        ),
+        "a runtime-qualified pin is never silently dropped"
+    );
+
+    // An unqualified effort the profile DOES allow is kept and forwarded.
+    let allowed = tempfile::tempdir().unwrap();
+    write_config(
+        allowed.path(),
+        r#"{"autonomous": {"roleRunner": {"roleEfforts": {"builder": "high"}}}}"#,
+    );
+    assert_eq!(
+        launch(allowed.path(), "builder", Some("opencode"), None),
+        ("high".to_string(), "autonomous.roleRunner.roleEfforts.builder".to_string(),),
+        "an allowed unqualified effort keeps the documented override behaviour"
+    );
+
+    // A profile whose `allowedEfforts` is empty/absent expresses no
+    // vocabulary: the unqualified effort is kept for it too.
+    let open = tempfile::tempdir().unwrap();
+    write_config(
+        open.path(),
+        r#"{"autonomous": {"roleRunner": {"roleEfforts": {"builder": "medium"}}},
+             "runtimes": {"modelProfiles": {"open": {
+                "model": "glm-5.3", "providers": {"opencode": "zai-coding-plan"}
+             }}}}"#,
+    );
+    assert_eq!(
+        launch(open.path(), "builder", Some("opencode"), Some("open")),
+        ("medium".to_string(), "autonomous.roleRunner.roleEfforts.builder".to_string(),),
+        "a profile without an allowedEfforts vocabulary keeps the effort"
+    );
+
+    // The preference tap's own modelProfile names the judged profile.
+    let strict = tempfile::tempdir().unwrap();
+    write_config(
+        strict.path(),
+        r#"{"autonomous": {"roleRunner": {"roleEfforts": {"builder": "medium"}}},
+             "runtimes": {"modelProfiles": {"strict": {
+                "model": "glm-5.3", "providers": {"opencode": "zai-coding-plan"},
+                "allowedEfforts": ["low", "high", "max"]
+             }}}}"#,
+    );
+    assert_eq!(
+        launch(strict.path(), "builder", Some("opencode"), Some("strict")),
+        (
+            String::new(),
+            "autonomous.roleRunner.roleEfforts.builder (profile default for opencode:strict)"
+                .to_string(),
+        ),
+        "the tap's modelProfile is the profile the effort is judged against"
+    );
+    // A value that profile allows is kept.
+    write_config(
+        strict.path(),
+        r#"{"autonomous": {"roleRunner": {"roleEfforts": {"builder": "low"}}},
+             "runtimes": {"modelProfiles": {"strict": {
+                "model": "glm-5.3", "providers": {"opencode": "zai-coding-plan"},
+                "allowedEfforts": ["low", "high", "max"]
+             }}}}"#,
+    );
+    assert_eq!(
+        launch(strict.path(), "builder", Some("opencode"), Some("strict")),
+        ("low".to_string(), "autonomous.roleRunner.roleEfforts.builder".to_string(),)
+    );
+
+    // `LOOM_MODEL_PROFILE` names the profile a bare tap is judged against.
+    let env_pinned = tempfile::tempdir().unwrap();
+    write_config(
+        env_pinned.path(),
+        r#"{"autonomous": {"roleRunner": {"roleEfforts": {"builder": "medium"}}},
+             "runtimes": {"modelProfiles": {"strict": {
+                "model": "glm-5.3", "providers": {"opencode": "zai-coding-plan"},
+                "allowedEfforts": ["low", "high", "max"]
+             }}}}"#,
+    );
+    std::env::set_var("LOOM_MODEL_PROFILE", "strict");
+    assert_eq!(
+        launch(env_pinned.path(), "builder", Some("opencode"), None),
+        (
+            String::new(),
+            "autonomous.roleRunner.roleEfforts.builder (profile default for opencode:strict)"
+                .to_string(),
+        ),
+        "LOOM_MODEL_PROFILE picks the judged profile for a bare tap"
+    );
+    std::env::remove_var("LOOM_MODEL_PROFILE");
+
+    // `runtimes.defaultModelProfile` does the same when the env is unset.
+    let defaulted = tempfile::tempdir().unwrap();
+    write_config(
+        defaulted.path(),
+        r#"{"autonomous": {"roleRunner": {"roleEfforts": {"builder": "medium"}}},
+             "runtimes": {"defaultModelProfile": "strict", "modelProfiles": {"strict": {
+                "model": "glm-5.3", "providers": {"opencode": "zai-coding-plan"},
+                "allowedEfforts": ["low", "high", "max"]
+             }}}}"#,
+    );
+    assert_eq!(
+        launch(defaulted.path(), "builder", Some("opencode"), None),
+        (
+            String::new(),
+            "autonomous.roleRunner.roleEfforts.builder (profile default for opencode:strict)"
+                .to_string(),
+        ),
+        "runtimes.defaultModelProfile picks the judged profile for a bare tap"
+    );
+
+    // An unknown profile is left to the launch's own fail-closed diagnostic
+    // (`profiles::select` reports it), never judged — the effort survives.
+    let unknown = tempfile::tempdir().unwrap();
+    write_config(
+        unknown.path(),
+        r#"{"autonomous": {"roleRunner": {"roleEfforts": {"builder": "medium"}}}}"#,
+    );
+    assert_eq!(
+        launch(unknown.path(), "builder", Some("opencode"), Some("nope")),
+        ("medium".to_string(), "autonomous.roleRunner.roleEfforts.builder".to_string(),),
+        "an unknown profile is untouched here; select refuses it at launch"
+    );
+
+    // Unset stays byte-identical: nothing configured, nothing dropped, and
+    // the Codex default is never reconciled (Codex is not native anyway).
+    let unset = tempfile::tempdir().unwrap();
+    assert_eq!(
+        launch(unset.path(), "builder", Some("opencode"), None),
+        (String::new(), UNSET_EFFORT_SOURCE.to_string())
+    );
+    assert_eq!(
+        launch(unset.path(), "builder", Some("codex"), None),
+        (CODEX_DEFAULT_EFFORT.to_string(), CODEX_DEFAULT_EFFORT_SOURCE.to_string())
+    );
+
+    // Issue #15205: a qualified `provider/model` pin on a bare native pick is
+    // honoured by `select` before any profile lookup — effort included — so
+    // the unqualified `roleEfforts` value (`medium`, which zai-flash
+    // disallows) is kept rather than dropped.
+    let pinned = tempfile::tempdir().unwrap();
+    write_config(
+        pinned.path(),
+        r#"{"autonomous": {"roleRunner": {"roleEfforts": {"builder": "medium"}}}}"#,
+    );
+    let launch_with_model = |model: Option<&str>, profile: Option<&str>| {
+        resolve_role_runner_effort_for_launch(
+            pinned.path(),
+            "builder",
+            Some("opencode"),
+            profile,
+            model,
+        )
+    };
+    let kept = ("medium".to_string(), "autonomous.roleRunner.roleEfforts.builder".to_string());
+    assert_eq!(
+        launch_with_model(Some("google/gemini-2.5-pro"), None),
+        kept,
+        "a qualified pin with no explicit profile keeps the unqualified effort"
+    );
+    let dropped = (
+        String::new(),
+        "autonomous.roleRunner.roleEfforts.builder (profile default for opencode:zai-flash)"
+            .to_string(),
+    );
+    assert_eq!(
+        launch_with_model(Some("google/gemini-2.5-pro"), Some("zai-flash")),
+        dropped,
+        "an explicit tap profile still judges the effort even with a qualified model"
+    );
+    assert_eq!(
+        launch_with_model(Some("glm-5.3"), None),
+        dropped,
+        "a bare model falls through to the profile judgment"
+    );
+    assert_eq!(
+        launch_with_model(Some("google/"), None),
+        dropped,
+        "a malformed qualified model falls through to the profile judgment"
+    );
+
+    std::env::remove_var(crate::config_resolver::PRIVATE_DEFAULTS_ENV);
+    if let Some(v) = saved_profile {
+        std::env::set_var("LOOM_MODEL_PROFILE", v);
+    }
+}
+
+// ===================================================================
+// Launch-time model reconciliation against native profiles (#14962)
+// ===================================================================
+
+/// Issue #14962: `resolve_role_runner_model_for_launch` drops a
+/// **configured-tier** model (`roleModels.<role>`, `roleRunner.model`,
+/// `autonomous.model`) that differs from the native model profile the launch
+/// will select, while the shipped default, the CLI-default sentinel, an
+/// allowed value, an unknown profile and every non-native runtime keep the
+/// resolved model verbatim (the launch sites forward a drawn pin untouched,
+/// outside this resolver).
+///
+/// NOTE: `#[serial(loom_config_env)]` + the emptied private-defaults env for
+/// the same reason the #14963 effort test needs them — both the role-runner
+/// keys and the profile definitions are read from the full effective config,
+/// so a machine-level `defaults.json` on the host running the suite would
+/// otherwise leak in. `LOOM_MODEL_PROFILE` is save/clear/restored because the
+/// profile fallback reads it.
+#[test]
+#[serial(loom_config_env)]
+fn test_launch_model_reconciles_configured_tier_with_native_profile() {
+    std::env::set_var(crate::config_resolver::PRIVATE_DEFAULTS_ENV, "");
+    let saved_profile = std::env::var_os("LOOM_MODEL_PROFILE");
+    std::env::remove_var("LOOM_MODEL_PROFILE");
+    let launch = |root: &Path, role: &str, rt: Option<&str>, profile: Option<&str>| {
+        resolve_role_runner_model_for_launch(root, role, rt, profile)
+    };
+
+    // The reported incident, verbatim: a `roleModels.judge = "opus"` meant for
+    // the Claude picks meeting the bundled zai-flash profile (model glm-5.3)
+    // on an OpenCode profile draw. `opus` reaches the alias ladder first
+    // (#3982), so the compared value is `claude-opus-5`; either way it differs
+    // from the profile's model, and the pin is dropped (the profile's own
+    // model launches) instead of the launch being refused at
+    // profile_selection, with the source label naming the drop.
+    let bare = tempfile::tempdir().unwrap();
+    write_config(
+        bare.path(),
+        r#"{"autonomous": {"roleRunner": {"roleModels": {"judge": "opus"}}}}"#,
+    );
+    assert_eq!(
+        launch(bare.path(), "judge", Some("opencode"), None),
+        (
+            String::new(),
+            "autonomous.roleRunner.roleModels.judge (profile model for opencode:zai-flash)"
+                .to_string(),
+        ),
+        "a configured tier the native profile's model differs from is dropped, not refused"
+    );
+    // The same pin on a non-native runtime is forwarded untouched — Claude
+    // launches with the alias-resolved pin, and Codex keeps #5028's
+    // `model_runtime_mismatch` refusal at the launch site.
+    assert_eq!(
+        launch(bare.path(), "judge", Some("claude"), None),
+        (
+            "claude-opus-5".to_string(),
+            "autonomous.roleRunner.roleModels.judge".to_string(),
+        ),
+        "a Claude launch keeps the configured model verbatim"
+    );
+    assert_eq!(
+        launch(bare.path(), "judge", Some("codex"), None),
+        (
+            "claude-opus-5".to_string(),
+            "autonomous.roleRunner.roleModels.judge".to_string(),
+        ),
+        "a Codex launch keeps the pin so the mismatch refusal still fires"
+    );
+
+    // The global `roleRunner.model` tier reconciles exactly the same way.
+    let global = tempfile::tempdir().unwrap();
+    write_config(global.path(), r#"{"autonomous": {"roleRunner": {"model": "opus"}}}"#);
+    assert_eq!(
+        launch(global.path(), "judge", Some("opencode"), None),
+        (
+            String::new(),
+            "autonomous.roleRunner.model (profile model for opencode:zai-flash)".to_string(),
+        ),
+        "the role-runner global model tier reconciles like the per-role tier"
+    );
+
+    // The shared `autonomous.model` tier does too.
+    let shared = tempfile::tempdir().unwrap();
+    write_config(shared.path(), r#"{"autonomous": {"model": "opus"}}"#);
+    assert_eq!(
+        launch(shared.path(), "judge", Some("opencode"), None),
+        (
+            String::new(),
+            "autonomous.model (profile model for opencode:zai-flash)".to_string(),
+        ),
+        "the shared autonomous.model tier reconciles like the per-role tier"
+    );
+
+    // A configured model equal to the profile's own model is kept (a no-op:
+    // `profiles::select` accepts `--model` that literally matches).
+    let matching = tempfile::tempdir().unwrap();
+    write_config(
+        matching.path(),
+        r#"{"autonomous": {"roleRunner": {"roleModels": {"judge": "glm-5.3-flash"}}}}"#,
+    );
+    assert_eq!(
+        launch(matching.path(), "judge", Some("opencode"), None),
+        (
+            "glm-5.3-flash".to_string(),
+            "autonomous.roleRunner.roleModels.judge".to_string(),
+        ),
+        "the profile's own model is forwarded verbatim"
+    );
+
+    // The preference tap's own modelProfile names the judged profile.
+    let strict = tempfile::tempdir().unwrap();
+    write_config(
+        strict.path(),
+        r#"{"autonomous": {"roleRunner": {"roleModels": {"judge": "opus"}}},
+             "runtimes": {"modelProfiles": {"strict": {
+                "model": "glm-5.3", "providers": {"opencode": "zai-coding-plan"}
+             }}}}"#,
+    );
+    assert_eq!(
+        launch(strict.path(), "judge", Some("opencode"), Some("strict")),
+        (
+            String::new(),
+            "autonomous.roleRunner.roleModels.judge (profile model for opencode:strict)"
+                .to_string(),
+        ),
+        "the tap's modelProfile is the profile the model is judged against"
+    );
+
+    // `runtimes.defaultModelProfile` names it for a bare tap too.
+    let defaulted = tempfile::tempdir().unwrap();
+    write_config(
+        defaulted.path(),
+        r#"{"autonomous": {"roleRunner": {"roleModels": {"judge": "opus"}}},
+             "runtimes": {"defaultModelProfile": "strict", "modelProfiles": {"strict": {
+                "model": "glm-5.3", "providers": {"opencode": "zai-coding-plan"}
+             }}}}"#,
+    );
+    assert_eq!(
+        launch(defaulted.path(), "judge", Some("opencode"), None),
+        (
+            String::new(),
+            "autonomous.roleRunner.roleModels.judge (profile model for opencode:strict)"
+                .to_string(),
+        ),
+        "runtimes.defaultModelProfile picks the judged profile for a bare tap"
+    );
+
+    // A qualified `provider/model` configured tier is the documented native
+    // shape (configuring-resources.md): with no profile requested, `select`
+    // honours it verbatim before any profile lookup, so it must be kept — not
+    // dropped for the fallback profile's model (which would also swap the
+    // credentials the launch needs).
+    let qualified = tempfile::tempdir().unwrap();
+    write_config(
+        qualified.path(),
+        r#"{"autonomous": {"roleRunner": {"roleModels": {"judge": "google/gemini-2.5-pro"}}}}"#,
+    );
+    assert_eq!(
+        launch(qualified.path(), "judge", Some("opencode"), None),
+        (
+            "google/gemini-2.5-pro".to_string(),
+            "autonomous.roleRunner.roleModels.judge".to_string(),
+        ),
+        "a qualified pin on a bare native pick is forwarded verbatim"
+    );
+    // ...but once the tap names a profile, `select` compares the full string
+    // against that profile's model, so the differing qualified pin is dropped.
+    assert_eq!(
+        launch(qualified.path(), "judge", Some("opencode"), Some("zai-flash")),
+        (
+            String::new(),
+            "autonomous.roleRunner.roleModels.judge (profile model for opencode:zai-flash)"
+                .to_string(),
+        ),
+        "a qualified pin that differs from an explicitly requested profile is dropped"
+    );
+
+    // An unknown profile is left to the launch's own fail-closed diagnostic
+    // (`profiles::select` reports it), never judged — the model survives.
+    let unknown = tempfile::tempdir().unwrap();
+    write_config(
+        unknown.path(),
+        r#"{"autonomous": {"roleRunner": {"roleModels": {"judge": "opus"}}}}"#,
+    );
+    assert_eq!(
+        launch(unknown.path(), "judge", Some("opencode"), Some("nope")),
+        (
+            "claude-opus-5".to_string(),
+            "autonomous.roleRunner.roleModels.judge".to_string(),
+        ),
+        "an unknown profile is untouched here; select refuses it at launch"
+    );
+
+    // The shipped default tier is not this resolver's to touch: it is never
+    // operator-configured, and the launch sites' follow-up
+    // `reconcile_unpinned_model_with_runtime` (#7894) already drops it for a
+    // native runtime.
+    let unpinned = tempfile::tempdir().unwrap();
+    assert_eq!(
+        launch(unpinned.path(), "judge", Some("opencode"), None),
+        (sweep_registry::DEFAULT_DISPATCH_MODEL.to_string(), "default".to_string()),
+        "the shipped default passes through for the #7894 reconciliation"
+    );
+
+    // The CLI-default pass-through sentinel (#7894) is already an empty model
+    // — nothing to drop, and the source keeps naming the requesting tier.
+    let sentinel = tempfile::tempdir().unwrap();
+    write_config(
+        sentinel.path(),
+        r#"{"autonomous": {"roleRunner": {"roleModels": {"judge": "default"}}}}"#,
+    );
+    assert_eq!(
+        launch(sentinel.path(), "judge", Some("opencode"), None),
+        (
+            String::new(),
+            "autonomous.roleRunner.roleModels.judge (CLI default)".to_string(),
+        ),
+        "the CLI-default sentinel resolves unchanged"
+    );
+
+    // No runtime known (a hermetic fixture shape): nothing to reconcile.
+    let no_runtime = tempfile::tempdir().unwrap();
+    write_config(
+        no_runtime.path(),
+        r#"{"autonomous": {"roleRunner": {"roleModels": {"judge": "opus"}}}}"#,
+    );
+    assert_eq!(
+        launch(no_runtime.path(), "judge", None, None),
+        (
+            "claude-opus-5".to_string(),
+            "autonomous.roleRunner.roleModels.judge".to_string(),
+        ),
+        "an unknown runtime leaves the resolution untouched"
+    );
+
+    std::env::remove_var(crate::config_resolver::PRIVATE_DEFAULTS_ENV);
+    if let Some(v) = saved_profile {
+        std::env::set_var("LOOM_MODEL_PROFILE", v);
+    }
 }

@@ -43,12 +43,13 @@ use std::path::Path;
 
 use super::capture::{StepEnd, StepOutcomeClass, StepOutcomeLine};
 use crate::observability::lifecycle::{self, roll_interruption, RoleFailure};
+use crate::observability::step_verdict::Projection;
 use crate::role_runner::RoleTickOutcome;
 use crate::step_dispatch::outcome_ledger::{self, OutcomeClass, PostState, StepOutcome};
 use crate::step_role::StepRole;
 use crate::sweep_registry::reaper::pid_identity;
 use crate::sweep_registry::{LockOwner, SweepRegistry};
-use crate::telemetry::trace::TraceAttributes;
+use crate::telemetry::trace::{TraceAttributes, TraceContext};
 
 /// Why a step failed, on its `loom.sweep` close. A step whose provider
 /// feedback said its api-key seat was exhausted (`provider_exhausted`,
@@ -132,7 +133,15 @@ pub(crate) fn step_failure(
 /// close, absent when none was (#14234): with a line and a post-state the
 /// close adds `loom.step.outcome.agrees`, whether the ledger's class for the
 /// two ([`crate::step_dispatch::outcome_ledger::classify`]) is the class the
-/// step claimed. Pure.
+/// step claimed. `verdict` (#14898) is the Judge verdict of record — the
+/// same projection the step's `pass.verdict` record carries, built by
+/// [`crate::observability::step_verdict::judge_verdict_of_record`] from the
+/// same step-scoped evidence — stamped on the close as
+/// `loom.step.outcome.verdict` (with `.reason_set` and `.head_sha`) so a
+/// trace-only reader recovers it; the raw line class below is unchanged, so
+/// a posted verdict that survived a missing line reads `class=none` with its
+/// verdict beside it. `None` for any other role, or a Judge step whose
+/// projection is not a verdict. Pure.
 #[must_use]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn sweep_close(
@@ -147,6 +156,7 @@ pub(crate) fn sweep_close(
     pr_number: Option<u32>,
     provider_exhausted: bool,
     post: Option<PostState>,
+    verdict: Option<&Projection>,
 ) -> (String, TraceAttributes) {
     let (result, _) = crate::role_tick_telemetry::classify(outcome);
     let result = crate::role_tick_telemetry::result_label(result);
@@ -165,6 +175,17 @@ pub(crate) fn sweep_close(
     }
     if let (Some(l), Some(post)) = (line, post.filter(|_| !provider_exhausted)) {
         close.insert("loom.step.outcome.agrees".into(), outcome_agrees(l, post).to_string());
+    }
+    // #14898: the verdict of record beside the raw line class, so a
+    // trace-only reader recovers both what the session claimed and what the
+    // Judge actually recorded. `pass.verdict` stays the record of record;
+    // the two join by repository and `loom.sweep_id`.
+    if let Some(v) = verdict {
+        close.insert("loom.step.outcome.verdict".into(), v.reason.clone());
+        close.insert("loom.step.outcome.reason_set".into(), v.reason_set.to_owned());
+        if let Some(sha) = &v.head_sha {
+            close.insert("loom.step.outcome.head_sha".into(), (*sha).clone());
+        }
     }
     for (key, value) in [("loom.configured_model", model), ("loom.effort", effort)] {
         if let Some(value) = value.filter(|v| !v.is_empty()) {
@@ -210,14 +231,14 @@ impl SweepRegistry {
     /// Close a finished step's `loom.sweep` span with its real outcome, at
     /// the moment its end is seen. A step a roll stopped (`pid`, the leader
     /// H4 noted) closes as `interrupted_by_roll` instead. A no-op when
-    /// tracing is off, or when the span was already closed.
+    /// tracing is off. Return the root context for the asynchronous usage capture.
     pub(crate) fn close_step_span(
         &self,
         sweep_id: &str,
         pid: Option<u32>,
         result: String,
         mut close: TraceAttributes,
-    ) {
+    ) -> Option<TraceContext> {
         let result = match pid.and_then(roll_interruption::take_stopped) {
             Some(roll) => {
                 roll.apply(&mut close);
@@ -225,7 +246,28 @@ impl SweepRegistry {
             }
             None => result,
         };
-        lifecycle::finish_execution(&self.config.workspace_root, sweep_id, &result, close);
+        // #14407: this close saw the step end, so the step's phase and attempt
+        // spans mirror it (result + launch runtime) instead of reading
+        // `exit_unobserved`. Not when a roll stopped the step, or when the step
+        // exited with no observed status and no outcome line: those exits were
+        // not observed, and keep the unobserved label.
+        let observed = (result != roll_interruption::RESULT
+            && close.get(lifecycle::FAILURE_CLASS).map(String::as_str) != Some("exit-unobserved"))
+        .then(|| lifecycle::StepEndObserved {
+            result: result.clone(),
+            // The registry's word for the launch; `unknown` is no runtime.
+            runtime: close
+                .get(lifecycle::role_runtime::RUNTIME)
+                .filter(|r| r.as_str() != "unknown")
+                .cloned(),
+        });
+        lifecycle::finish_execution_observing(
+            &self.config.workspace_root,
+            sweep_id,
+            &result,
+            close,
+            observed.as_ref(),
+        )
     }
 }
 

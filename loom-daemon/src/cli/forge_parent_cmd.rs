@@ -36,8 +36,12 @@ pub enum ParentAction {
     /// Is `--parent` a split tracker whose children are all closed? Prints
     /// `SPLIT_ALL_CLOSED #a #b` and exits 0 when so (do NOT build it, do NOT
     /// promote it to `loom:issue`); exits 1 with `NOT_SPLIT` when there are no
-    /// children or one is still open; exits 2 when the children could not be
-    /// read (unanswered, never an all-clear for promotion). #13635.
+    /// children or one is still open, or when the parent body carries
+    /// `<!-- loom:split-rescoped -->` alone on a line outside a code fence (a
+    /// parent revised after the split to carry work the children do not
+    /// cover, #15242); exits 2 when the children (or, with all children
+    /// closed, the parent body) could not be read (unanswered, never an
+    /// all-clear for promotion). #13635.
     SplitState {
         /// The parent issue number.
         #[arg(long)]

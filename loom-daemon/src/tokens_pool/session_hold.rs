@@ -96,10 +96,12 @@ pub fn now_unix_ms() -> u64 {
 
 pub(super) fn write_json_atomic<T: Serialize>(dir: &Path, file: &str, value: &T) -> Result<()> {
     let path = dir.join(file);
-    let temp = dir.join(format!("{file}.tmp-{}", std::process::id()));
-    std::fs::write(&temp, serde_json::to_vec_pretty(value)?)
-        .with_context(|| format!("failed to stage {}", path.display()))?;
-    std::fs::rename(&temp, &path).with_context(|| format!("failed to commit {}", path.display()))
+    crate::fs_util::write_atomic(
+        &path,
+        &serde_json::to_vec_pretty(value)?,
+        crate::fs_util::AtomicOpts::default(),
+    )
+    .with_context(|| format!("failed to write {}", path.display()))
 }
 
 /// Record an operator hold in `profile` (atomic replace), stamped
@@ -166,6 +168,24 @@ pub fn latest_start(profiles: &[PathBuf]) -> Option<LastStart> {
         .iter()
         .filter_map(|p| read_last_start(p))
         .max_by_key(|s| s.started_at_unix_ms)
+}
+
+/// The hold recorded in `profile`, when its sidecar exists and decodes.
+/// Details only: whether the account is held is [`held_across`], which a
+/// malformed sidecar still satisfies (#15292).
+#[must_use]
+pub fn read_hold(profile: &Path) -> Option<Hold> {
+    let bytes = std::fs::read(profile.join(HOLD_FILE)).ok()?;
+    serde_json::from_slice(&bytes).ok()
+}
+
+/// The newest decodable hold in any of `profiles`, by `held_at_unix_ms`.
+#[must_use]
+pub fn newest_hold(profiles: &[PathBuf]) -> Option<Hold> {
+    profiles
+        .iter()
+        .filter_map(|p| read_hold(p))
+        .max_by_key(|h| h.held_at_unix_ms)
 }
 
 /// Whether the account whose profile directories are `profiles` is held: a

@@ -4,7 +4,7 @@
 //! `PremiseCheckArgs` gives.
 
 use crate::operator_decision::cli::{
-    self, apply, default_repo_root, read_input, validate_cmd, ApplyRequest, GhForge, Target,
+    self, apply, default_repo_root, read_input, validate_cmd, ApplyRequest, Target, WorkflowWriter,
 };
 use anyhow::Result;
 use std::path::PathBuf;
@@ -56,11 +56,117 @@ pub(crate) enum OperatorDecisionCommand {
         #[arg(long, value_name = "OWNER/REPO")]
         repo: Option<String>,
     },
+    /// Record the operator's choice of one ranked option on an issue's
+    /// published decision (#14399), bound to the exact decision and proposal
+    /// reviewed. Attended only: needs a terminal and a typed confirmation, and
+    /// refuses under a dispatched sweep. `premise-check` then lets a deliberate
+    /// reversal proceed for an `--effect proceed` resolution it can verify.
+    Resolve {
+        /// Issue whose published decision is being resolved.
+        #[arg(value_name = "ISSUE", required_unless_present = "from")]
+        issue: Option<u64>,
+
+        /// The approved option's `id` from the decision block.
+        #[arg(long, value_name = "ID", required_unless_present = "from")]
+        option: Option<String>,
+
+        /// Batch mode (#15108): a file of `owner/repo#issue=option` lines
+        /// (blank lines and `#` comments ignored; `-` reads stdin, which only
+        /// works with `--dry-run` — a recording run needs the terminal on
+        /// stdin for its confirmation). Every item is reviewed, ONE typed
+        /// confirmation (`resolve <reviewed count>`) records them all.
+        #[arg(
+            long,
+            value_name = "FILE|-",
+            conflicts_with_all = ["issue", "option", "repo"]
+        )]
+        from: Option<PathBuf>,
+
+        /// What the choice means: `proceed` approves the proposal as filed;
+        /// `reject`, `defer` and `rescope` are recorded but never open the gate.
+        #[arg(long, value_name = "EFFECT", default_value = "proceed")]
+        effect: String,
+
+        /// After the resolution verifies, remove the loom:operator hold
+        /// (`--effect proceed` only).
+        #[arg(long)]
+        release: bool,
+
+        /// Show the review (option, scope digests) and record nothing.
+        #[arg(long = "dry-run")]
+        dry_run: bool,
+
+        /// Target repository; defaults to the checkout's remote.
+        #[arg(long, value_name = "OWNER/REPO")]
+        repo: Option<String>,
+    },
+}
+
+/// `loom-tools operator-decision <action>`: the [`OperatorDecisionCommand`]
+/// tree, unchanged (#14464, epic #12708 Phase 3b); see
+/// [`ParkRecordCli`](super::park_record::ParkRecordCli).
+#[derive(clap::Args)]
+pub struct OperatorDecisionCli {
+    #[command(subcommand)]
+    command: OperatorDecisionCommand,
+}
+
+impl OperatorDecisionCli {
+    /// Whether this invocation can reach the forge, and so must pass the mode
+    /// gate (design §10.3) before it runs. See
+    /// [`OperatorDecisionCommand::reaches_forge`].
+    #[must_use]
+    pub fn reaches_forge(&self) -> bool {
+        self.command.reaches_forge()
+    }
+
+    /// Whether this invocation files a new issue, which runs
+    /// `create-issue.sh` (duplicate check, filing lock) and a nested
+    /// `forge create-issue`.
+    #[must_use]
+    pub fn files_new_issue(&self) -> bool {
+        matches!(
+            self.command,
+            OperatorDecisionCommand::Apply {
+                new: true,
+                dry_run: false,
+                ..
+            }
+        )
+    }
+}
+
+/// Run the operator-decision action through the one shared handler.
+///
+/// # Errors
+/// Whatever the handler returns; it exits the process with its own code.
+pub fn handle_operator_decision_command(cli: OperatorDecisionCli) -> Result<()> {
+    let writer = WorkflowWriter::for_tools(cli.reaches_forge())?;
+    cli.command.run(writer)
 }
 
 impl OperatorDecisionCommand {
+    /// Whether this invocation can reach the forge. `validate` and
+    /// `apply --new --dry-run` render offline; an existing-issue `apply`
+    /// (including its preview) reads the body and labels; `apply --new` files.
+    /// `resolve` reads the decision even as a preview, but a recording run that
+    /// is not attended, or names an unknown effect, refuses before any forge
+    /// call, so it must not be turned into a mode error first (exit 5/2 stay).
+    pub(crate) fn reaches_forge(&self) -> bool {
+        match self {
+            OperatorDecisionCommand::Validate { .. } => false,
+            OperatorDecisionCommand::Apply { new, dry_run, .. } => !(*new && *dry_run),
+            OperatorDecisionCommand::Resolve {
+                effect, dry_run, ..
+            } => {
+                crate::operator_decision::resolution::Effect::parse(effect).is_ok()
+                    && (*dry_run || crate::operator_decision::resolve::require_attended().is_ok())
+            }
+        }
+    }
+
     /// Never returns: exits with the command's own code.
-    pub(crate) fn run(self) -> Result<()> {
+    pub(crate) fn run(self, writer: WorkflowWriter) -> Result<()> {
         let mut out = std::io::stdout();
         let mut err = std::io::stderr();
         let code = match self {
@@ -91,7 +197,7 @@ impl OperatorDecisionCommand {
                 };
                 match read_input(&input) {
                     Ok(text) => {
-                        let mut forge = GhForge::new(default_repo_root(), repo);
+                        let mut forge = writer.forge(default_repo_root(), repo);
                         let req = ApplyRequest {
                             target,
                             also_labels: also_label,
@@ -109,7 +215,144 @@ impl OperatorDecisionCommand {
                     }
                 }
             }
+            OperatorDecisionCommand::Resolve {
+                issue,
+                option,
+                from,
+                effect,
+                release,
+                dry_run,
+                repo,
+            } => match (issue, option, from) {
+                (Some(n), Some(opt), None) => {
+                    run_resolve(writer, n, opt, &effect, release, dry_run, repo, &mut out, &mut err)
+                }
+                (None, None, Some(path)) => {
+                    run_resolve_batch(writer, path, &effect, release, dry_run, &mut out, &mut err)
+                }
+                _ => {
+                    eprintln!("ERROR: pass an ISSUE and --option ID, or --from FILE|- (not both)");
+                    cli::exit::USAGE
+                }
+            },
         };
         std::process::exit(code)
     }
+}
+
+/// The `resolve` shim: parse the effect, insist on an attended session unless
+/// this is a read-only `--dry-run`, and confirm by having the operator type the
+/// option id.
+#[allow(clippy::too_many_arguments)]
+fn run_resolve(
+    writer: WorkflowWriter,
+    issue: u64,
+    option: String,
+    effect: &str,
+    release: bool,
+    dry_run: bool,
+    repo: Option<String>,
+    out: &mut dyn std::io::Write,
+    err: &mut dyn std::io::Write,
+) -> i32 {
+    use crate::operator_decision::{resolution::Effect, resolve};
+    let effect = match Effect::parse(effect) {
+        Ok(e) => e,
+        Err(e) => {
+            eprintln!("ERROR: {e}");
+            return cli::exit::USAGE;
+        }
+    };
+    if !dry_run {
+        if let Err(why) = resolve::require_attended() {
+            eprintln!(
+                "operator-decision: REFUSED - an operator resolution is an attended action: {why}"
+            );
+            return resolve::UNATTENDED;
+        }
+    }
+    let root = default_repo_root();
+    let policy = crate::comment_trust::TrustPolicy::for_root(&root);
+    let mut forge = writer
+        .forge(root, repo)
+        .with_call_site("operator_decision.resolve");
+    let req = resolve::ResolveRequest {
+        issue,
+        option,
+        effect,
+        release,
+        dry_run,
+    };
+    let mut confirm = |expected: &str| {
+        eprint!("Type the option id `{expected}` to record this resolution: ");
+        let mut line = String::new();
+        std::io::stdin().read_line(&mut line).is_ok() && line.trim() == expected
+    };
+    resolve::resolve(&mut forge, &policy, &req, &mut confirm, out, err)
+}
+
+/// The batch `resolve` shim (#15108): parse the effect, insist on an attended
+/// session (checked ONCE, before the slate is read) unless this is a
+/// read-only `--dry-run`, parse the `owner/repo#issue=option` lines, and
+/// confirm the whole reviewed batch with one typed `resolve <N>`.
+fn run_resolve_batch(
+    writer: WorkflowWriter,
+    from: PathBuf,
+    effect: &str,
+    release: bool,
+    dry_run: bool,
+    out: &mut dyn std::io::Write,
+    err: &mut dyn std::io::Write,
+) -> i32 {
+    use crate::operator_decision::{resolution::Effect, resolve};
+    let effect = match Effect::parse(effect) {
+        Ok(e) => e,
+        Err(e) => {
+            eprintln!("ERROR: {e}");
+            return cli::exit::USAGE;
+        }
+    };
+    if !dry_run {
+        if let Err(why) = resolve::require_attended() {
+            eprintln!(
+                "operator-decision: REFUSED - an operator resolution is an attended action: {why}"
+            );
+            return resolve::UNATTENDED;
+        }
+    }
+    let text = match read_input(&from) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("ERROR: {e}");
+            return cli::exit::USAGE;
+        }
+    };
+    let items = match resolve::parse_items(&text) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("ERROR: --from: {e}");
+            return cli::exit::USAGE;
+        }
+    };
+    let root = default_repo_root();
+    let policy = crate::comment_trust::TrustPolicy::for_root(&root);
+    let mut forge_for = |repo: &str| -> Box<dyn resolve::ResolveForge> {
+        Box::new(
+            writer
+                .forge(root.clone(), Some(repo.to_string()))
+                .with_call_site("operator_decision.resolve"),
+        )
+    };
+    let req = resolve::BatchRequest {
+        items,
+        effect,
+        release,
+        dry_run,
+    };
+    let mut confirm = |expected: &str| {
+        eprint!("Type `{expected}` to record these resolutions: ");
+        let mut line = String::new();
+        std::io::stdin().read_line(&mut line).is_ok() && line.trim() == expected
+    };
+    resolve::resolve_batch(&mut forge_for, &policy, &req, &mut confirm, out, err)
 }

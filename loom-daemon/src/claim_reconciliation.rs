@@ -27,12 +27,11 @@
 //! host-scoped rules below concluded. This is the SOLE fleet-scoped gate as
 //! of Epic #6165 Phase 4 (#6317) — an earlier, now-removed gate additionally
 //! consulted whether the peer-claim/safehouse advertisement channel itself
-//! looked healthy (Issue #6157); that channel is fleet-scoped in principle
-//! but only *eventually consistent* (`peer_claims.rs`'s own "soft claim, not
-//! a mutex" framing), so treating its silence — degraded or otherwise — as
-//! reclamation-relevant evidence was itself the drift Epic #6165 set out to
-//! fix. The lease's forge-assigned `updated_at` needs no receipt at all,
-//! which is strictly stronger.
+//! looked healthy (Issue #6157); that channel (retired entirely in #13945) was
+//! fleet-scoped in principle but only *eventually consistent*, so treating its
+//! silence — degraded or otherwise — as reclamation-relevant evidence was
+//! itself the drift Epic #6165 set out to fix. The lease's forge-assigned
+//! `updated_at` needs no receipt at all, which is strictly stronger.
 //!
 //! ## Decision rule (host-scoped evidence only — see the lease gate above)
 //!
@@ -332,13 +331,11 @@ pub const DEFAULT_RECONCILE_INTERVAL_SECS: u64 = 600;
 /// (e.g. `5` meaning "5 minutes") cannot turn this into a `gh`-API busy loop.
 pub const MIN_RECONCILE_INTERVAL_SECS: u64 = 60;
 
-/// Default periodic reconciliation interval when safehouse peer-claims are
-/// live (Issue #4431): 30 minutes. With claims advertised at dispatch and
-/// re-advertised every reaper tick (`sweep_registry::readvertise_peer_claims`),
-/// the fleet room — not the `loom:building` label — is the fast in-flight
-/// claim signal, and this pass demotes to a slow *healing* sweep for the
-/// divergence cases safehouse cannot see (a host that crashed without
-/// retracting, a stranded label from a pre-safehouse dispatch). Hosts without
+/// Default periodic reconciliation interval on a `safehouse.enabled` host
+/// (Issue #4431): 30 minutes. It was chosen while peer claims, re-advertised
+/// every reaper tick, were the fast in-flight signal and this pass was only a
+/// *healing* sweep. That channel was retired in #13945 (the lease record is the
+/// fast signal now), but the cadence is unchanged. Hosts without
 /// `safehouse.enabled` keep [`DEFAULT_RECONCILE_INTERVAL_SECS`] unchanged.
 pub const DEFAULT_SAFEHOUSE_RECONCILE_INTERVAL_SECS: u64 = 1800;
 
@@ -368,8 +365,7 @@ pub fn resolve_reconcile_interval() -> Duration {
 /// 2. `.loom/config.json → safehouse.claimReconcileIntervalSecs` — a per-repo
 ///    override of the safehouse-mode cadence (zero/invalid ignored).
 /// 3. [`DEFAULT_SAFEHOUSE_RECONCILE_INTERVAL_SECS`] when `safehouse.enabled`
-///    resolves true for `root` — peer-claims carry the fast signal, labels
-///    demote to a healing cadence.
+///    resolves true for `root` (see that constant for the history).
 /// 4. [`DEFAULT_RECONCILE_INTERVAL_SECS`] otherwise — byte-for-byte the
 ///    pre-#4431 behavior for hosts without safehouse (e.g. robb-pro).
 ///
@@ -1292,7 +1288,7 @@ pub const VERDICT_ANCHOR_ENABLED_ENV: &str = "LOOM_VERDICT_ANCHOR";
 
 // The #9124 tree-identical carve-out's own kill switch
 // (`LOOM_VERDICT_TREE_CARVEOUT`) lives beside the logic it gates, in
-// `verdict_invalidation` — this module has no file-size ratchet headroom.
+// `verdict_invalidation`.
 
 /// The marker Judge stamps into every verdict comment
 /// (`defaults/.claude/commands/loom/judge.md` -> "Verdict SHA Marker"),
@@ -1939,8 +1935,7 @@ pub fn spawn_periodic_reconciliation_task(
 
 /// The `gh pr view --json labels,isDraft` lookup [`forge::reclaim_pr`] uses to
 /// decide whether its `loom:review-requested` safety net may fire — split
-/// into its own file per the file-size ratchet (`.loom/docs/file-size-policy.md`)
-/// rather than growing `forge` inline.
+/// into its own file rather than growing `forge` inline.
 mod liveness;
 pub use liveness::{
     claim_activity_marker, extra_liveness_at, live_pr_lease_at, most_recent_claim_activity_at,
@@ -1953,51 +1948,58 @@ mod pr_label_info;
 
 /// The #8900 auto-merge disarm hook
 /// [`verdict_invalidation::invalidate_verdict`] calls before posting its
-/// stale-verdict comment — a sibling file per the file-size ratchet
-/// (`.loom/docs/file-size-policy.md`) rather than more inline logic here.
+/// stale-verdict comment — a sibling file rather than more inline logic here.
 mod auto_merge_disarm;
 
 /// The stale-verdict audit comment's body and its #9124 idempotence test —
-/// a sibling file per the file-size ratchet. The measurement behind it (25% of
+/// a sibling file. The measurement behind it (25% of
 /// this repo's invalidation comments were duplicates) is in that module's own
 /// header.
 mod verdict_stale_comment;
 
 /// Everything [`forge::reconcile_pr_verdicts`] does once [`decide_verdict`]
 /// answers `Invalidate`: the #9124 tree-identical re-anchor carve-out and the
-/// #5686 clear it falls through to — a sibling file per the file-size ratchet,
-/// leaving a single dispatch call in the match arm here.
+/// #5686 clear it falls through to — a sibling file, leaving a single
+/// dispatch call in the match arm here.
 mod verdict_invalidation;
 
 /// Return a PR held only by a machine CI gate to review once its exact head is
-/// green (#10178) — a sibling file per the file-size ratchet.
+/// green (#10178) — a sibling file.
 pub(crate) mod ci_gate_recovery;
 
 /// The `Keep(Unverifiable)` arm of [`forge::reconcile_pr_verdicts`]: anchor an
 /// unmarked rejection (#6319), re-queue an unmarked approval (#9258) — a
-/// sibling file per the file-size ratchet.
+/// sibling file.
 mod unanchored_verdict;
 
 pub mod merge_sequence;
 /// The #8922 base-conflict pass for `loom:review-requested` PRs — a sibling
-/// file per the file-size ratchet, run on the same tick right after
-/// [`forge::reconcile_pr_verdicts`].
+/// file, run on the same tick right after [`forge::reconcile_pr_verdicts`].
 pub mod review_conflict;
 
 /// Retarget open PRs stacked on a parent closed unmerged (#12760) — and its
-/// scratch-worktree git mechanics — sibling files per the file-size ratchet.
+/// scratch-worktree git mechanics — sibling files.
 pub mod orphan_stack;
 pub(crate) mod orphan_stack_git;
 
+/// Retarget the stacked children of a parent that merged outside
+/// `merge-pr.sh` — including the ones GitHub already retargeted (#14903) —
+/// a sibling of [`orphan_stack`] reusing its git mechanics.
+pub mod merged_stack;
+
 /// The per-repo loop of one reconciliation pass, plus the #8953 mid-pass
-/// rate-limit-breaker re-check that stops it early — a sibling file per the
-/// file-size ratchet rather than more inline logic here.
-mod pass_loop;
+/// rate-limit-breaker re-check that stops it early — a sibling file rather
+/// than more inline logic here. `pub(crate)` for `merge_observation`'s
+/// predicates, which the merge-pr bookkeeping shares (#15145).
+pub(crate) mod pass_loop;
 
 /// The ETag-cached `loom:building` listing [`forge`] reconciles against — a
-/// sibling file per the file-size ratchet, attributed to `claim_reconciliation`
-/// in the #9251 forge-call accounting.
+/// sibling file, attributed to `claim_reconciliation` in the #9251 forge-call
+/// accounting.
 mod building_listing;
+/// Issue-side `loom:curating` claims left stale by the #14811 roll-requeue
+/// bug — lease-evidenced release with a re-curation record (#14816).
+mod curating_reclaim;
 /// Keep `loom:building` on an issue whose PR is open (#11852).
 pub(crate) mod open_pr_hold;
 /// The ETag-cached REST open-PR listing the PR-side passes share (#10349).
@@ -2006,7 +2008,7 @@ pub(crate) mod open_pr_listing;
 mod startup_cutoff;
 
 /// The facade glue every `gh` call below goes through (#10089), and the
-/// version-keyed reuse of its per-PR reads — sibling files per the ratchet.
+/// version-keyed reuse of its per-PR reads — sibling files.
 pub(crate) mod gh_call;
 pub(crate) mod read_cache;
 
@@ -2108,8 +2110,9 @@ pub mod forge {
     }
 
     /// Fetch `issue`'s current label names (best-effort). Mirrors
-    /// `pr_label_names` below, for the issue side.
-    fn issue_label_names(gh_bin: &Path, root: &Path, issue: u32) -> Result<Vec<String>> {
+    /// `pr_label_names` below, for the issue side. Shared with the
+    /// `loom:curating` pass (#14816) for its pre-write fresh-label read.
+    pub(crate) fn issue_label_names(gh_bin: &Path, root: &Path, issue: u32) -> Result<Vec<String>> {
         #[derive(Debug, Deserialize)]
         struct GhLabel {
             name: String,
@@ -2244,11 +2247,8 @@ pub mod forge {
     /// while peer coordination looked DEGRADED (sustained advertising with
     /// no receive); that gate has been removed, because a healthy-vs-
     /// degraded *advertisement channel* was never meant to be load-bearing
-    /// for correctness in the first place (`peer_claims.rs`'s own "soft
-    /// claim, not a mutex" framing, and this epic's own root-cause finding).
-    /// The peer-claim channel keeps its #4028 fast-backoff role at dispatch
-    /// time ([`crate::sweep_registry::SweepRegistry::dispatch`]'s
-    /// `peer_claimed_issues` check) — advisory only, never consulted here.
+    /// for correctness in the first place (this epic's own root-cause finding).
+    /// That channel was retired in #13945.
     pub fn reconcile_workspace(gh_bin: &Path, root: &Path, is_startup: bool) -> (usize, usize) {
         let repo = root.display().to_string();
 
@@ -3139,13 +3139,11 @@ pub mod forge {
 #[allow(clippy::unwrap_used)]
 mod tests;
 
-// Issue #8263's `gh api` GH_REPO regression coverage, in its own sibling file
-// so this over-threshold module does not grow (scripts/file-size-baseline.txt).
+// Issue #8263's `gh api` GH_REPO regression coverage, in its own sibling file.
 #[cfg(test)]
 mod repo_env_tests;
 
-// Issue #9124's verdict-dedup coverage, in its own sibling file for the same
-// reason: neither this module nor `tests.rs` has ratchet headroom.
+// Issue #9124's verdict-dedup coverage, in its own sibling file.
 #[cfg(test)]
 mod verdict_dedup_tests;
 

@@ -73,6 +73,9 @@ pub const CI_CHECK_RUNS_FOR_SHA: ForgeOp = ForgeOp::inventoried("ci.check-runs-f
 pub const CI_COMMIT_STATUS: ForgeOp = ForgeOp::inventoried("ci.commit-status");
 /// `GET repos/{o}/{r}/actions/runs…` (and the jobs of one run).
 pub const CI_WORKFLOW_RUNS_FOR_SHA: ForgeOp = ForgeOp::inventoried("ci.workflow-runs-for-sha");
+/// Effective repository rules and the revision of an active ruleset.
+pub const PROTECTION_READ_EFFECTIVE_RULES: ForgeOp =
+    ForgeOp::inventoried("protection.read-effective-rules");
 /// Job logs, run artifacts and artifact downloads.
 pub const CI_RUN_LOGS_AND_ARTIFACTS: ForgeOp = ForgeOp::inventoried("ci.run-logs-and-artifacts");
 /// `GET orgs/{o}/repos` / `GET users/{u}/repos`.
@@ -118,6 +121,14 @@ pub const RELEASE_RESOLVE_AND_FETCH: ForgeOp = ForgeOp::inventoried("release.res
 /// Re-run a workflow run or job in place (`forge rerun`, #10633).
 pub const CI_RERUN: ForgeOp = ForgeOp::inventoried("ci.rerun");
 
+/// `GET repos/{o}/{r}/compare/{base}...{head}` — the compare read the
+/// ci-gate update path uses for a PR's merge base and base tip (#14813).
+pub const PR_COMMITS_AND_COMPARE: ForgeOp = ForgeOp::inventoried("pr.commits-and-compare");
+
+/// `PUT repos/{o}/{r}/pulls/{n}/update-branch` — the server-side,
+/// expected-head-guarded update of a PR branch from its base (#14813).
+pub const BRANCH_UPDATE_FROM_BASE: ForgeOp = ForgeOp::inventoried("branch.update-from-base");
+
 /// Every inventoried constant above — the set the inventory test checks.
 pub const ALL_INVENTORIED: &[ForgeOp] = &[
     ISSUE_LIST,
@@ -132,6 +143,7 @@ pub const ALL_INVENTORIED: &[ForgeOp] = &[
     CI_CHECK_RUNS_FOR_SHA,
     CI_COMMIT_STATUS,
     CI_WORKFLOW_RUNS_FOR_SHA,
+    PROTECTION_READ_EFFECTIVE_RULES,
     CI_RUN_LOGS_AND_ARTIFACTS,
     CI_RERUN,
     REPO_LIST_FOR_OWNER,
@@ -152,4 +164,6 @@ pub const ALL_INVENTORIED: &[ForgeOp] = &[
     COMMENT_EDIT_DELETE,
     PR_DIFF_AND_FILES,
     RELEASE_RESOLVE_AND_FETCH,
+    PR_COMMITS_AND_COMPARE,
+    BRANCH_UPDATE_FROM_BASE,
 ];

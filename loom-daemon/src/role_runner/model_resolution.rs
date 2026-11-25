@@ -1,6 +1,5 @@
 //! Role-runner model resolution (#4501 / #5001) and its runtime reconciliation
-//! (#7894), split out of `role_runner.rs` so the over-threshold parent file
-//! shrinks rather than grows (`.loom/docs/file-size-policy.md`).
+//! (#7894), split out of `role_runner.rs`.
 //!
 //! Three questions live here, and only here:
 //!
@@ -16,7 +15,16 @@
 //!    cross-family conflict to the runtime CLI's own default instead of letting
 //!    `ScriptRoleInvocationRunner::invoke`'s #5028 preflight skip the tick
 //!    forever. An explicit pin is never touched, so that refusal survives
-//!    intact.
+//!    intact. [`resolve_role_runner_effort_for_launch`] (#14963) asks the same
+//!    question of the *effort*: an unqualified tier's level that the selected
+//!    native model profile's `allowedEfforts` does not include is dropped to
+//!    the profile's own effort instead of losing the launch, while a
+//!    runtime-qualified pin keeps its refusal.
+//!    [`resolve_role_runner_model_for_launch`] (#14962) asks it of the *model*
+//!    against the profile's own `model`: a configured tier's value a native
+//!    profile pick would be refused for (`bare model differs from the selected
+//!    profile`) is dropped to the profile's model instead of losing the launch,
+//!    while a drawn pin keeps its refusal.
 
 use super::*;
 
@@ -27,8 +35,7 @@ pub struct ModelRuntimeMismatch {
     pub role: String,
     /// The admitted runtime (e.g. `"codex"`).
     pub runtime: String,
-    /// The model resolved by [`resolve_role_runner_model`] (or the test-only
-    /// `with_model` override) for this role.
+    /// The model resolved by [`resolve_role_runner_model`] for this role.
     pub model: String,
     /// The config/env tier label [`resolve_role_runner_model`] attributes the
     /// model to (e.g. `"default"`, `"autonomous.roleRunner.model"`), unchanged
@@ -212,6 +219,34 @@ pub fn resolve_role_runner_effort_for_runtime(
     role: &str,
     runtime: Option<&str>,
 ) -> (String, String) {
+    let (effort, source, _tier) = resolve_role_runner_effort_with_tier(repo_root, role, runtime);
+    (effort, source)
+}
+
+/// Issue #14963: which kind of tier supplied a resolved effort — the
+/// structural fact the launch-time reconciliation
+/// ([`resolve_role_runner_effort_for_launch`]) keys on. A runtime-qualified
+/// `roleEfforts.<role>@<runtime>` entry is an explicit statement of intent
+/// about *that* runtime and is never dropped; the unqualified tiers (bare
+/// `roleEfforts.<role>`, global `effort`) are runtime-neutral defaults that
+/// may predate a native model profile's `allowedEfforts` vocabulary; the
+/// shipped Codex default and unset carry no operator intent at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EffortTier {
+    RuntimeQualified,
+    Unqualified,
+    Default,
+}
+
+/// The shared body of [`resolve_role_runner_effort_for_runtime`] and
+/// [`resolve_role_runner_effort_for_launch`]: the precedence chain above,
+/// returning the effort, its source label, and the [`EffortTier`] that
+/// supplied it. One body so the two public resolvers can never drift.
+fn resolve_role_runner_effort_with_tier(
+    repo_root: &Path,
+    role: &str,
+    runtime: Option<&str>,
+) -> (String, String, EffortTier) {
     let config = read_role_runner_config(repo_root);
     let role_key = role.trim().to_ascii_lowercase();
     let runtime_key = runtime
@@ -220,19 +255,106 @@ pub fn resolve_role_runner_effort_for_runtime(
     if let Some(rt) = &runtime_key {
         let qualified = format!("{role_key}@{rt}");
         if let Some(e) = config.role_efforts.get(&qualified) {
-            return (e.clone(), format!("autonomous.roleRunner.roleEfforts.{qualified}"));
+            return (
+                e.clone(),
+                format!("autonomous.roleRunner.roleEfforts.{qualified}"),
+                EffortTier::RuntimeQualified,
+            );
         }
     }
     if let Some(e) = config.role_efforts.get(&role_key) {
-        return (e.clone(), format!("autonomous.roleRunner.roleEfforts.{role_key}"));
+        return (
+            e.clone(),
+            format!("autonomous.roleRunner.roleEfforts.{role_key}"),
+            EffortTier::Unqualified,
+        );
     }
     if let Some(e) = config.effort {
-        return (e, "autonomous.roleRunner.effort".to_string());
+        return (e, "autonomous.roleRunner.effort".to_string(), EffortTier::Unqualified);
     }
     if runtime_key.as_deref() == Some(CODEX_RUNTIME_ID) {
-        return (CODEX_DEFAULT_EFFORT.to_string(), CODEX_DEFAULT_EFFORT_SOURCE.to_string());
+        return (
+            CODEX_DEFAULT_EFFORT.to_string(),
+            CODEX_DEFAULT_EFFORT_SOURCE.to_string(),
+            EffortTier::Default,
+        );
     }
-    (String::new(), UNSET_EFFORT_SOURCE.to_string())
+    (String::new(), UNSET_EFFORT_SOURCE.to_string(), EffortTier::Default)
+}
+
+/// Issue #14963: [`resolve_role_runner_effort_for_runtime`] for a launch that
+/// is about to happen, reconciling an **unqualified** effort against the
+/// native model profile that launch will select.
+///
+/// The bug this closes: an operator sets a bare `roleEfforts.<role>` (or the
+/// global `autonomous.roleRunner.effort`) with the Claude/Codex runtimes in
+/// mind — say `"medium"` — and a step's preference walk draws a native
+/// profile (`opencode`/`pi`/`kimi`) whose `allowedEfforts` does not include
+/// that level (`zai-flash` allows `low`/`high`/`max` only). The daemon
+/// forwarded `--effort medium` regardless, and `worker_spawn::profiles::select`
+/// — correctly, on the evidence it has — refused the whole launch before the
+/// CLI started (`LOOM_LAUNCH_REJECTED code=78 stage=profile_selection`),
+/// losing the step over a default nobody aimed at that runtime.
+///
+/// The resolution mirrors [`reconcile_unpinned_model_with_runtime`]: an
+/// **unqualified** tier's value that the selected native profile does not
+/// allow is dropped (the child launches with the profile's own `effort`, the
+/// same outcome omitting `--effort` produces in `profiles::select`) instead of
+/// refusing the launch. A **runtime-qualified** `roleEfforts.<role>@<runtime>`
+/// entry is an explicit statement of intent about that exact runtime and is
+/// never touched: if its value is outside `allowedEfforts`, `--effort` is
+/// still forwarded and `profiles::select` still refuses it loudly. Non-native
+/// runtimes, empty efforts, unknown profiles (the launch fails closed on
+/// those with its own diagnostic) and profiles without a provider for the
+/// runtime are all left exactly as resolved.
+///
+/// `model_profile` is the admitted preference tap's `modelProfile`; `None`
+/// falls back exactly as the launch's own profile lookup does
+/// (`LOOM_MODEL_PROFILE`, `runtimes.defaultModelProfile`, the bundled
+/// `zai-flash`), so the reconciliation judges the profile the child would
+/// actually select. Dropping an effort re-labels its source for the per-role
+/// log header as `<source> (profile default for <runtime>:<profile>)` and
+/// logs an `info!` line, so `role_tick.outcome` and `loom-daemon logs` both
+/// name what was dropped and why.
+///
+/// Issue #15205: `model` is the final model the launch carries (after any
+/// selection-time fallback). With no explicit profile, a qualified
+/// `provider/model` there is honoured by `profiles::select` before any profile
+/// lookup, so the effort is kept — see `profile_rejects_effort`.
+#[must_use]
+pub fn resolve_role_runner_effort_for_launch(
+    repo_root: &Path,
+    role: &str,
+    runtime: Option<&str>,
+    model_profile: Option<&str>,
+    model: Option<&str>,
+) -> (String, String) {
+    let (effort, source, tier) = resolve_role_runner_effort_with_tier(repo_root, role, runtime);
+    if effort.is_empty() || tier != EffortTier::Unqualified {
+        return (effort, source);
+    }
+    let Some(runtime) = runtime.map(str::trim).filter(|r| !r.is_empty()) else {
+        return (effort, source);
+    };
+    if !crate::worker_spawn::is_native(runtime) {
+        return (effort, source);
+    }
+    let config = crate::config_resolver::resolve_effective_config(repo_root);
+    let Some(profile) = crate::worker_spawn::profiles::profile_rejects_effort(
+        runtime,
+        model_profile,
+        model,
+        &effort,
+        &config,
+    ) else {
+        return (effort, source);
+    };
+    log::info!(
+        "role_runner: dropping unqualified effort {effort:?} from {source} for the \
+         {runtime}:{profile} model profile (not in its allowedEfforts); launching with the \
+         profile's own effort instead of refusing the launch (#14963)"
+    );
+    (String::new(), format!("{source} (profile default for {runtime}:{profile})"))
 }
 
 /// Issue #14017: the runtime id the shipped default effort applies to.
@@ -254,9 +376,7 @@ pub const CODEX_DEFAULT_EFFORT_SOURCE: &str = "codex-default";
 /// [`effort`](RoleRunnerConfig::effort) /
 /// [`role_efforts`](RoleRunnerConfig::role_efforts) fields. Called by
 /// [`read_role_runner_config`]; it lives here rather than inline in the parser
-/// so the module that *resolves* these keys also owns their parse contract (and
-/// so the over-threshold `role_runner.rs` shrinks rather than grows —
-/// `.loom/docs/file-size-policy.md`).
+/// so the module that *resolves* these keys also owns their parse contract.
 ///
 /// The contract is `roleModels`'s, verbatim:
 ///
@@ -282,30 +402,95 @@ pub(super) fn parse_effort_config(
         .map(str::trim)
         .filter(|e| !e.is_empty())
         .map(String::from);
-    let role_efforts = block
-        .get("roleEfforts")
+    let role_efforts = parse_role_keyed_map(block, "roleEfforts");
+    (effort, role_efforts)
+}
+
+/// Parse one `autonomous.roleRunner` object of `{"<role>[@<runtime>]": "<value>"}`
+/// entries: keys normalised by [`normalize_role_runtime_key`], blank or
+/// non-string values dropped, each **per entry**; absent / non-object soft-fails
+/// to an empty map. Shared by `roleEfforts` and `roleServiceTiers` (#14454).
+fn parse_role_keyed_map(block: &serde_json::Value, name: &str) -> BTreeMap<String, String> {
+    block
+        .get(name)
         .and_then(serde_json::Value::as_object)
         .map(|obj| {
             obj.iter()
                 .filter_map(|(k, v)| {
-                    let key = normalize_role_effort_key(k)?;
+                    let key = normalize_role_runtime_key(k, name)?;
                     let val = v.as_str().map(str::trim).filter(|e| !e.is_empty())?;
                     Some((key, val.to_string()))
                 })
                 .collect::<BTreeMap<String, String>>()
         })
-        .unwrap_or_default();
-    (effort, role_efforts)
+        .unwrap_or_default()
 }
 
-/// Issue #14017: normalise one `roleEfforts` key — `"<role>"` or the
+/// Issue #14454: parse the two service-tier keys out of an `autonomous.roleRunner`
+/// block, returning `(service_tier, role_service_tiers)` — the exact contract of
+/// [`parse_effort_config`] (trim, blank-is-unset, per-entry soft-fail,
+/// `"<role>@<runtime>"` keys). Values are trimmed but neither lower-cased nor
+/// validated: the spawn scripts own the tier vocabulary and its validation.
+#[must_use]
+pub(super) fn parse_service_tier_config(
+    block: &serde_json::Value,
+) -> (Option<String>, BTreeMap<String, String>) {
+    let tier = block
+        .get("serviceTier")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|e| !e.is_empty())
+        .map(String::from);
+    (tier, parse_role_keyed_map(block, "roleServiceTiers"))
+}
+
+/// Issue #14454: resolve the service tier (the runtime-neutral speed setting of
+/// #14141) a role child is launched with — the producer of the spawn scripts'
+/// `LOOM_SERVICE_TIER` contract.
+///
+/// **`roleServiceTiers.<role>@<runtime>` > `roleServiceTiers.<role>` >
+/// `autonomous.roleRunner.serviceTier` > unset**, i.e. the effort chain
+/// ([`resolve_role_runner_effort_for_runtime`]) minus the Codex default. Returns
+/// `None` when nothing is configured, in which case the caller exports nothing
+/// and an inherited `LOOM_SERVICE_TIER` stays as the operator set it; otherwise
+/// the tier plus a label naming the config key that supplied it.
+#[must_use]
+pub fn resolve_role_runner_service_tier_for_runtime(
+    repo_root: &Path,
+    role: &str,
+    runtime: Option<&str>,
+) -> Option<(String, String)> {
+    let config = read_role_runner_config(repo_root);
+    let role_key = role.trim().to_ascii_lowercase();
+    let runtime_key = runtime
+        .map(|r| r.trim().to_ascii_lowercase())
+        .filter(|r| !r.is_empty());
+    if let Some(rt) = &runtime_key {
+        let qualified = format!("{role_key}@{rt}");
+        if let Some(t) = config.role_service_tiers.get(&qualified) {
+            return Some((
+                t.clone(),
+                format!("autonomous.roleRunner.roleServiceTiers.{qualified}"),
+            ));
+        }
+    }
+    if let Some(t) = config.role_service_tiers.get(&role_key) {
+        return Some((t.clone(), format!("autonomous.roleRunner.roleServiceTiers.{role_key}")));
+    }
+    config
+        .service_tier
+        .map(|t| (t, "autonomous.roleRunner.serviceTier".to_string()))
+}
+
+/// Issue #14017: normalise one `roleEfforts` (or, #14454, `roleServiceTiers`)
+/// key — `"<role>"` or the
 /// runtime-qualified `"<role>@<runtime>"` — to its trimmed, lower-cased form.
 /// A blank key, or a qualified key that is not exactly one `@` between two
 /// non-blank halves (`"builder@"`, `"@codex"`, `"a@b@c"`), returns `None`; the
 /// qualified case warns, since it is a typo that would otherwise silently
 /// fall back to the per-role value. A well-formed key naming a runtime that
 /// never launches is kept: it simply never matches.
-fn normalize_role_effort_key(raw: &str) -> Option<String> {
+fn normalize_role_runtime_key(raw: &str, map_name: &str) -> Option<String> {
     let key = raw.trim().to_ascii_lowercase();
     if key.is_empty() {
         return None;
@@ -322,7 +507,7 @@ fn normalize_role_effort_key(raw: &str) -> Option<String> {
         }
         _ => {
             log::warn!(
-                "role_runner: ignoring malformed autonomous.roleRunner.roleEfforts key \
+                "role_runner: ignoring malformed autonomous.roleRunner.{map_name} key \
                  {raw:?}; expected \"<role>\" or \"<role>@<runtime>\""
             );
             None
@@ -332,16 +517,17 @@ fn normalize_role_effort_key(raw: &str) -> Option<String> {
 
 /// The `==== loom-daemon role_runner: … ====` header line
 /// [`run_role_with_timeout`] appends to `role-<role>.log` at the start of every
-/// real invocation — the ONE artifact an operator inspects to confirm which
-/// model *and*, since #8054, which reasoning effort a scheduled child actually
-/// ran with, and which config tier supplied each (#4501 / #8054). The
-/// transcript-side cost telemetry (#8052/#8059) attributes a tick's spend to
-/// this line.
+/// real invocation. It reports the model, reasoning effort, and configured
+/// service tier for the launch with their respective configuration sources.
+/// The transcript-side cost telemetry (#8052/#8059) attributes a tick's spend
+/// to this line.
 ///
 /// An empty `model` is the deliberate CLI-default pass-through (#7894) and an
 /// empty `effort` is the (overwhelmingly common) unconfigured case; both render
 /// as the [`RUNTIME_CLI_DEFAULT_PLACECARD`] name rather than as `model=` /
 /// `effort=` followed by nothing, which reads like a bug in the header itself.
+/// An unconfigured service tier keeps the header's existing shape and leaves
+/// any inherited tier to the child environment.
 #[must_use]
 pub(super) fn role_log_header(
     timestamp: &str,
@@ -350,6 +536,7 @@ pub(super) fn role_log_header(
     model_source: &str,
     effort: &str,
     effort_source: &str,
+    service_tier: Option<(&str, &str)>,
 ) -> String {
     let model_display = if model.is_empty() {
         RUNTIME_CLI_DEFAULT_PLACECARD
@@ -361,9 +548,12 @@ pub(super) fn role_log_header(
     } else {
         effort
     };
+    let service_tier_display = service_tier
+        .map(|(tier, source)| format!(" service_tier={tier} (source={source})"))
+        .unwrap_or_default();
     format!(
         "==== loom-daemon role_runner: {timestamp} role={role} model={model_display} \
-         (source={model_source}) effort={effort_display} (source={effort_source}) ===="
+         (source={model_source}) effort={effort_display} (source={effort_source}){service_tier_display} ===="
     )
 }
 
@@ -452,4 +642,75 @@ pub(crate) fn reconcile_unpinned_model_with_runtime(
         String::new(),
         format!("{SHIPPED_DEFAULT_MODEL_SOURCE} (CLI default for {runtime})"),
     )
+}
+
+/// Issue #14962: [`resolve_role_runner_model`] for a launch that is about to
+/// happen, reconciling a **configured-tier** model against the native model
+/// profile that launch will select.
+///
+/// The bug this closes: an operator sets `roleModels.<role>` (or the global
+/// `autonomous.roleRunner.model` / `autonomous.model`) with the Claude and
+/// Codex picks in mind — say `"opus"` — and a step's preference walk draws a
+/// native profile pick (`opencode:<profile>`), which pins a profile, not a
+/// model. The daemon forwarded `--model opus --profile <profile>` regardless,
+/// and `worker_spawn::profiles::select` — correctly, on the evidence it has —
+/// refused the whole launch before the CLI started (`bare model differs from
+/// the selected profile`, `LOOM_LAUNCH_REJECTED code=78
+/// stage=profile_selection`), losing the step over a default nobody aimed at
+/// that runtime.
+///
+/// The resolution mirrors [`resolve_role_runner_effort_for_launch`] (#14963):
+/// a **configured tier's** model that the selected native profile's own
+/// `model` differs from is dropped (the child launches with the profile's
+/// model, the same outcome omitting `--model` produces in `profiles::select`)
+/// instead of refusing the launch. A **drawn** `role-draw` pin never reaches
+/// this function — the launch sites forward it verbatim, keeping `select`'s
+/// loud refusal, because a pick's own pin is an explicit statement of intent.
+/// The **shipped default** tier is also untouched here: it is never
+/// operator-configured, and [`reconcile_unpinned_model_with_runtime`] (#7894)
+/// — which every launch site runs after this — already drops it for a native
+/// runtime. Non-native runtimes are left exactly as resolved, so #5028's
+/// refusal of a genuinely mismatched explicit pin (`codex` +
+/// `roleModels.<role> = "sonnet"`) survives verbatim.
+///
+/// `model_profile` is the admitted preference tap's `modelProfile`; `None`
+/// falls back exactly as the launch's own profile lookup does
+/// (`LOOM_MODEL_PROFILE`, `runtimes.defaultModelProfile`, the bundled
+/// `zai-flash`), so the reconciliation judges the profile the child would
+/// actually select. Dropping a model re-labels its source for the per-role
+/// log header as `<source> (profile model for <runtime>:<profile>)` and logs
+/// an `info!` line, so `role_tick.outcome` and `loom-daemon logs` both name
+/// what was dropped and why.
+#[must_use]
+pub fn resolve_role_runner_model_for_launch(
+    repo_root: &Path,
+    role: &str,
+    runtime: Option<&str>,
+    model_profile: Option<&str>,
+) -> (String, String) {
+    let (model, source) = resolve_role_runner_model(repo_root, role);
+    if model.is_empty() || source == SHIPPED_DEFAULT_MODEL_SOURCE {
+        return (model, source);
+    }
+    let Some(runtime) = runtime.map(str::trim).filter(|r| !r.is_empty()) else {
+        return (model, source);
+    };
+    if !crate::worker_spawn::is_native(runtime) {
+        return (model, source);
+    }
+    let config = crate::config_resolver::resolve_effective_config(repo_root);
+    let Some(profile) = crate::worker_spawn::profiles::profile_rejects_model(
+        runtime,
+        model_profile,
+        &model,
+        &config,
+    ) else {
+        return (model, source);
+    };
+    log::info!(
+        "role_runner: dropping configured model {model:?} from {source} for the \
+         {runtime}:{profile} model profile (differs from its model); launching with the \
+         profile's own model instead of refusing the launch (#14962)"
+    );
+    (String::new(), format!("{source} (profile model for {runtime}:{profile})"))
 }

@@ -58,9 +58,25 @@
 //! `.loom/gh-config-gateway/` is removed on the next pass, agents are not told
 //! about it, and [`route_read`] is exactly [`crate::forge_identity::route_read`].
 //! Below gh 2.100.0 the same holds (logged once): `api_host` would be
-//! ignored and the gateway key sent to `api.github.com`. The fleet store
-//! fetch ([`crate::fleet_store`]) never uses the gateway, so `fleet.json` can
-//! always be read to unset it.
+//! ignored and the gateway key sent to `api.github.com`.
+//!
+//! The fleet store ([`crate::fleet_store`]) never *depends* on the gateway
+//! (2am#15098, which replaced "never uses"): its cacheable reads (`fleet.json`
+//! and the other tree/blob reads, with their `If-None-Match`) try the gateway
+//! first so the relay can answer an unchanged file from its ETag cache, and a
+//! gateway that is down, refuses or cannot see the repository falls back to
+//! the reader pool, then the writer, so `fleet.json` can always be read to
+//! unset it. Still exempt, and never routed through the gateway: the fresh
+//! claim read (a claim must not be answered from a relay cache), every store
+//! write, and the repository-visibility probe.
+//!
+//! Residual risk: fallback covers a gateway that is *down*, not one that
+//! answers *wrongly*. `forge.gateway` can be set in the per-repo fleet tier,
+//! which is materialized from this very store's `fleet.json`, so a gateway
+//! serving a stale `fleet.json` that still says it is on cannot be unset by
+//! editing the store alone. The store-independent unset is the host-local
+//! `.loom-local/local.json` (`"forge": {"gateway": null}`), which outranks
+//! the fleet tier ([`crate::config_resolver::resolve_effective_config`]).
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
@@ -76,6 +92,8 @@ use crate::forge_identity::{ExhaustCause, Placement, RouteDecision, RouteRequest
 pub mod outage;
 #[path = "forge_gateway/publish.rs"]
 mod publish;
+#[path = "forge_gateway/session.rs"]
+pub mod session;
 pub use publish::{
     gateway_hosts_yaml, parse_gh_version, profile_api_host, publish_profile, refresh,
     spawn_refresh, teardown, Deps, GhVersion, PassOutcome, Refresher, GATEWAY_CONFIG_YAML,
@@ -352,6 +370,18 @@ pub fn cli_reads_reader_only() -> bool {
     CLI_READER_ONLY.get().copied().unwrap_or(false)
 }
 
+/// A tools CLI in explicit fleet mode still expects a reader when a configured
+/// gateway is unavailable or its reader pool cannot serve this repository.
+static REQUIRE_CLI_READER: OnceLock<()> = OnceLock::new();
+
+pub(crate) fn require_cli_read_route() {
+    let _ = REQUIRE_CLI_READER.set(());
+}
+
+pub(crate) fn cli_read_route_required() -> bool {
+    REQUIRE_CLI_READER.get().is_some()
+}
+
 /// [`enable_cli`]'s decision: `program` is a path or a bare name looked up
 /// on `PATH`, as the facade will run it.
 #[cfg(test)]
@@ -501,12 +531,54 @@ pub fn route_read(req: &RouteRequest<'_>, now: SystemTime) -> RouteDecision {
     }
     let pool = crate::forge_identity::route_read(req, now);
     let owner = crate::credential_preflight::owner_of_nwo(req.owner_repo).to_ascii_lowercase();
-    let gateway_until = if owner.is_empty() || profile_for(&owner).is_none() {
-        None
-    } else {
-        withdrawn_until(&owner, req, now)
+    let gateway_configured = !owner.is_empty() && profile_for(&owner).is_some();
+    let gateway_until = gateway_configured
+        .then(|| withdrawn_until(&owner, req, now))
+        .flatten();
+    let pool = match pool {
+        // The gateway was part of this route. A non-primary gateway hold
+        // must veto the stronger proof from the readers behind it.
+        RouteDecision::Exhausted {
+            until,
+            cause: ExhaustCause::GraphqlPrimaryBudget,
+        } if gateway_configured
+            && (crate::forge_read_pool::is_withdrawn_at(GATEWAY_APP_ID, now)
+                || crate::forge_identity::repo_withdrawn_at(
+                    GATEWAY_APP_ID,
+                    req.owner_repo,
+                    now,
+                )
+                || !crate::forge_identity::route::primary_graphql_withdrawn_at(
+                    GATEWAY_APP_ID,
+                    &owner,
+                    now,
+                )) =>
+        {
+            RouteDecision::Exhausted {
+                until,
+                cause: ExhaustCause::Budget,
+            }
+        }
+        decision => decision,
     };
-    past_withdrawn_gateway(pool, gateway_until)
+    match (req.cooldown(GATEWAY_APP_ID, now), gateway_until, &pool) {
+        (Some(_), Some(gateway_until), RouteDecision::Exhausted { until, .. })
+            if gateway_until < *until =>
+        {
+            return RouteDecision::Exhausted {
+                until: gateway_until,
+                cause: ExhaustCause::Withdrawn,
+            };
+        }
+        _ => {}
+    }
+    match past_withdrawn_gateway(pool, gateway_until) {
+        RouteDecision::NoPool if cli_read_route_required() => RouteDecision::Exhausted {
+            until: now + crate::forge_read_pool::DEFAULT_WITHDRAWAL,
+            cause: ExhaustCause::Unavailable,
+        },
+        decision => decision,
+    }
 }
 
 /// The reader pool's answer `pool`, unless it is [`RouteDecision::NoPool`]
@@ -530,6 +602,7 @@ pub fn past_withdrawn_gateway(
 /// is live (a coverage withdrawal from one repo is not counted).
 fn withdrawn_until(owner: &str, req: &RouteRequest<'_>, now: SystemTime) -> Option<SystemTime> {
     [
+        req.cooldown(GATEWAY_APP_ID, now),
         crate::forge_read_pool::withdrawn_until(GATEWAY_APP_ID, now),
         crate::forge_read_pool::scoped_withdrawal_until(GATEWAY_APP_ID, owner, req.resource, now),
     ]
@@ -584,7 +657,8 @@ pub fn past_gateway(
 /// A gateway failure withdraws it through the reader tables
 /// ([`crate::forge_identity::withdraw_after`]); honour every scope.
 fn is_withdrawn(owner: &str, req: &RouteRequest<'_>, now: SystemTime) -> bool {
-    crate::forge_read_pool::is_withdrawn_at(GATEWAY_APP_ID, now)
+    req.cooldown(GATEWAY_APP_ID, now).is_some()
+        || crate::forge_read_pool::is_withdrawn_at(GATEWAY_APP_ID, now)
         || crate::forge_identity::repo_withdrawn_at(GATEWAY_APP_ID, req.owner_repo, now)
         || crate::forge_read_pool::is_withdrawn_scoped_at(GATEWAY_APP_ID, owner, req.resource, now)
 }

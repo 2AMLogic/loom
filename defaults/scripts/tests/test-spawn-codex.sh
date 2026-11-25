@@ -48,10 +48,40 @@ SCRIPTS_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 SPAWN_CODEX="$SCRIPTS_DIR/spawn-codex.sh"
 CLASSIFY_LIB="$SCRIPTS_DIR/lib/classify-error.sh"
 
+# The suite's result must not depend on the caller's session (#15140). A
+# daemon-dispatched Builder exports LOOM_ROLE (the adapter's mutable-role
+# hook-trust preflight then exits 78 on every case), LOOM_MODEL and
+# LOOM_CODEX_AUTH_MODE_CHECK (model-pin and auth-mode cases) and LOOM_RUNTIME
+# (classify-error.sh's default provider table); CI's runner has none of them.
+# Scrub them once here. Every case that needs one sets it on its own run_* /
+# env line, and the per-case `env -u` lists below stay as belt and braces.
+# LOOM_DAEMON_BIN is the caller's managed/probed daemon, never this suite's
+# subject, and section 13 sets its own per case.
+unset LOOM_ROLE LOOM_MODEL LOOM_CODEX_AUTH_MODE_CHECK LOOM_RUNTIME LOOM_DAEMON_BIN
+
 # Every case runs spawn-codex.sh, which execs loom-daemon: pin THIS checkout's
 # build up front, before the first case, never the installed one (#10662).
 # shellcheck source=lib/require-daemon-bin.sh
 source "$SCRIPT_DIR/lib/require-daemon-bin.sh"
+
+# A dispatched session pins LOOM_DAEMON_SELF_BIN to the host's installed daemon,
+# and the helper honours that pin without asking whose build it is, so it would
+# then fail its own #10662 provenance check. Honour a pin only when it names a
+# build of THIS checkout; otherwise drop it and let the helper resolve this
+# checkout's build. Not in a checkout without daemon source (an installed
+# consumer repo has nothing to resolve, so the pin is the only answer), and not
+# under LOOM_TEST_ALLOW_DAEMON_MISMATCH=1 (a deliberate cross-version pin).
+# CI exports no pin for this suite, so it is unaffected.
+if [[ -n "${LOOM_DAEMON_SELF_BIN:-}" \
+      && -f "$SCRIPTS_DIR/../../loom-daemon/Cargo.toml" \
+      && "${LOOM_TEST_ALLOW_DAEMON_MISMATCH:-}" != "1" ]]; then
+    _pin_src="$(_loom_test_version_source "$(_loom_test_daemon_bin_version "$LOOM_DAEMON_SELF_BIN")" || true)"
+    _checkout_head="$(git -C "$SCRIPTS_DIR" rev-parse --verify HEAD 2>/dev/null || true)"
+    if [[ -z "$_pin_src" || "${_pin_src%% *}" != "$_checkout_head" ]]; then
+        unset LOOM_DAEMON_SELF_BIN
+    fi
+    unset _pin_src _checkout_head
+fi
 loom_test_require_daemon_bin --self-only --path "$SCRIPTS_DIR" spawn-worker session-exec private-workspace
 
 # shellcheck source=lib/assert.sh
@@ -829,7 +859,8 @@ if [[ -n "\$_stdin" ]]; then echo "MOCK-SAW-STDIN:\$_stdin" >&2; fi
   echo "OpenAI Codex v0.146.0"
   echo "--------"
   echo "sandbox: read-only"
-  echo "session id: $MOCK_SESSION"
+  [[ -z "\${MOCK_QUOTED_BANNER:-}" ]] || echo "\$MOCK_QUOTED_BANNER"
+  [[ -n "\${MOCK_NO_BANNER:-}" ]] || echo "session id: $MOCK_SESSION"
   echo "--------"
   echo "tokens used"
   echo "2,502"
@@ -935,6 +966,26 @@ assert_contains "transcript=unresolved" "$mock_stderr" \
     "an unresolvable transcript is reported, not guessed"
 assert_eq "0" "$unresolved_rc" \
     "an unresolvable transcript does NOT fail the spawn"
+
+# The transcript join key is line-anchored (#15023), the rule every Rust banner
+# reader shares: a banner quoted mid-line is data about a launch, not evidence
+# of one. It never answers for a missing banner and never shadows the real one.
+QUOTED_SESSION="11111111-2222-3333-4444-555555555555"
+mock_stderr="$({ run_mock MOCK_NO_BANNER=1 \
+    MOCK_QUOTED_BANNER="the runner echoed: session id: $QUOTED_SESSION" -- -p "hi" >/dev/null; } 2>&1)"
+assert_contains "session id: $QUOTED_SESSION" "$mock_stderr" \
+    "a banner quoted mid-line still reaches the caller's stderr"
+assert_not_contains "spawn-codex: session=" "$mock_stderr" \
+    "a banner quoted mid-line is not used as the transcript join key"
+assert_contains "transcript=unresolved (no 'session id:' line in codex output)" "$mock_stderr" \
+    "a quoted banner alone leaves the transcript unresolved"
+
+mock_stderr="$({ run_mock \
+    MOCK_QUOTED_BANNER="the runner echoed: session id: $QUOTED_SESSION" -- -p "hi" >/dev/null; } 2>&1)"
+assert_contains "spawn-codex: session=$MOCK_SESSION" "$mock_stderr" \
+    "the real banner, not an earlier quoted one, is the transcript join key"
+assert_not_contains "spawn-codex: session=$QUOTED_SESSION" "$mock_stderr" \
+    "a quoted banner never shadows the real one"
 
 # LOOM_CODEX_NO_CAPTURE takes the plain exec path (no session reporting).
 mock_stderr="$({ run_mock LOOM_CODEX_NO_CAPTURE=1 -- -p "hi" >/dev/null; } 2>&1)"
@@ -1589,39 +1640,18 @@ assert_contains "session attach" "$interactive_out" \
 
 # --- missing docker binary -> 127 (session-exec's runtime-missing facet) ---
 #
-# `/usr/bin:/bin` alone isn't enough here, unlike Section 7's analogous
-# missing-`codex` check: GitHub Actions Ubuntu runners ship a real `docker`
-# at /usr/bin/docker, so appending those dirs verbatim would still resolve
-# `command -v docker` successfully in CI even though this test wants it to
-# fail (it only "worked" locally because dev machines don't keep `docker` in
-# /usr/bin or /bin). Build a PATH that mirrors every dir on the real PATH but
-# with any `docker` executable filtered out, so every other coreutils
-# dependency spawn-codex.sh needs before reaching the binary check stays
-# resolvable, while `docker` itself genuinely cannot be found anywhere.
-NODOCKER_BIN="$TMPROOT/no-docker-bin"
-mkdir -p "$NODOCKER_BIN"
-IFS=':' read -r -a _real_path_dirs <<< "$PATH"
-for _dir in "${_real_path_dirs[@]}"; do
-    [[ -d "$_dir" ]] || continue
-    for _f in "$_dir"/*; do
-        [[ -e "$_f" ]] || continue
-        _base="$(basename "$_f")"
-        [[ "$_base" == "docker" ]] && continue
-        [[ -e "$NODOCKER_BIN/$_base" ]] && continue
-        ln -s "$_f" "$NODOCKER_BIN/$_base" 2>/dev/null || true
-    done
-done
-
+# An explicit missing executable keeps this deterministic even when Docker
+# is installed in a fallback directory outside PATH.
 set +e
 nodocker_out="$(env -u CODEX_HOME -u LOOM_CODEX_PROFILE LOOM_SWEEP_NICE=0 \
     LOOM_CODEX_HOME="$SESSION_PROFILE" \
-    PATH="$NODOCKER_BIN" \
+    LOOM_DOCKER_BIN="$TMPROOT/missing-docker" \
     bash "$SPAWN_CODEX" -p "hi" 2>&1)"
 nodocker_rc=$?
 set -e
 assert_eq "127" "$nodocker_rc" \
     "a missing docker binary in session-exec mode exits 127, NOT 78"
-assert_contains "'docker' command not found in PATH" "$nodocker_out" \
+assert_contains "LOOM_DOCKER_BIN=\"$TMPROOT/missing-docker\" does not name an executable file" "$nodocker_out" \
     "the missing-docker message names the binary"
 
 # --- session container not running -> named 78, not a raw docker error ---
@@ -1759,6 +1789,95 @@ else
     TESTS_FAILED=$((TESTS_FAILED + 1))
     echo -e "  ${RED}FAIL${NC}: the session-exec dispatch invocation must never reference tmux"
 fi
+
+# ============================================================
+# Section: service tier (issue #14141)
+#
+#   1. LOOM_SERVICE_TIER maps to `-c service_tier=<id>` (fast -> priority)
+#   2. explicit `-c service_tier=` wins; standard/unset/empty emit nothing
+#   3. the terminal record carries effort= and tier= on a v4 record, and an
+#      unset launch keeps the v2 record unchanged
+# ============================================================
+
+echo ""
+echo "Testing spawn-codex.sh service tier (#14141)..."
+
+out="$(run_argv LOOM_SERVICE_TIER=fast -- -p x)"
+assert_contains "-c service_tier=priority" "$out" "LOOM_SERVICE_TIER=fast maps to -c service_tier=priority"
+out="$(run_argv LOOM_SERVICE_TIER=Ultrafast -- -p x)"
+assert_contains "-c service_tier=ultrafast" "$out" "a catalog id passes through (lower-cased)"
+err="$(run_argv_stderr LOOM_SERVICE_TIER=fast -- -p x)"
+assert_contains "spawn-codex: service_tier=priority" "$err" "the applied tier is logged"
+
+out="$(run_argv LOOM_SERVICE_TIER=fast -- -p x -c service_tier=flex)"
+assert_contains "service_tier=flex" "$out" "an explicit -c service_tier= is kept"
+assert_not_contains "service_tier=priority" "$out" "an explicit -c service_tier= wins over LOOM_SERVICE_TIER"
+
+out="$(run_argv LOOM_SERVICE_TIER=standard -- -p x)"
+assert_not_contains "service_tier" "$out" "standard emits no override"
+out="$(run_argv LOOM_SERVICE_TIER= -- -p x)"
+assert_not_contains "service_tier" "$out" "an empty LOOM_SERVICE_TIER is unset"
+out="$(run_argv -- -p x)"
+assert_not_contains "service_tier" "$out" "no tier configured emits no override"
+err="$(run_argv_stderr LOOM_SERVICE_TIER='bad value!' -- -p x)"
+assert_contains "not a valid tier id" "$err" "a malformed tier warns and is ignored"
+
+# Terminal record (v4): effort + tier applied.
+_tr4() { printf '# LOOM_TERMINAL_RESULT v=4 provider=codex account=%s category=%s exit_code=%s model=%s effort=%s tier=%s' "$1" "$2" "$3" "$4" "$5" "$6"; }
+mk_authmode_codex "Logged in using an API key"
+out="$(run_authmode LOOM_SERVICE_TIER=fast LOOM_EFFORT=high -- -p x -m gpt-5-codex)"
+assert_contains "$(_tr4 unknown SUCCESS 0 gpt-5-codex high priority)" "$out" \
+    "the record names the applied model, effort and tier (v4)"
+out="$(run_authmode LOOM_EFFORT=high -- -p x -m gpt-5-codex)"
+assert_contains "$(_tr4 unknown SUCCESS 0 gpt-5-codex high none)" "$out" \
+    "an unset tier is recorded as tier=none"
+out="$(run_authmode -- -p x -m gpt-5-codex)"
+assert_contains "$(_tr unknown SUCCESS 0 gpt-5-codex)" "$out" \
+    "nothing applied keeps the v2 record unchanged"
+# The dropped-pin behaviour is unchanged: model=none plus requested_model=, now
+# with the applied settings appended.
+mk_authmode_codex "Logged in using ChatGPT"
+out="$(run_authmode LOOM_SERVICE_TIER=fast -- -p x -m gpt-5-codex)"
+assert_contains "model=none requested_model=gpt-5-codex effort=none tier=priority" "$out" \
+    "a dropped pin still reports model=none (+ requested_model) alongside the tier"
+
+# Compare config arguments in order, one per line, with the record from the
+# same mock launch. A substring inside an instruction is not an effort key.
+assert_effort_launch() {
+    local description="$1" expected_record="$2" expected_config="$3"
+    shift 3
+    local output config
+    output="$(run_mock LOOM_ROLE= LOOM_ACCOUNT_NAME= LOOM_MODEL= LOOM_CODEX_MODEL= \
+        LOOM_EFFORT= LOOM_SERVICE_TIER= -- -p x "$@" 2>&1)"
+    config="$(awk '/^(-c|--config)$/ { print; getline; print; next }
+                   /^(-c|--config)=/ { print }' "$MOCK_ARGV_FILE")"
+    assert_eq "$expected_config" "$config" "$description forwards the expected config arguments"
+    assert_eq "$expected_record" "$(grep '^# LOOM_TERMINAL_RESULT ' <<< "$output")" \
+        "$description emits the expected terminal record"
+}
+
+quoted_data='--config=developer_instructions="model_reasoning_effort=low"'
+plain_data='-c=developer_instructions=model_reasoning_effort=low'
+medium='model_reasoning_effort=medium'
+high_record="$(_tr4 unknown SUCCESS 0 none high none)"
+medium_record="$(_tr4 unknown SUCCESS 0 none medium none)"
+for data in "$quoted_data" "$plain_data"; do
+    assert_effort_launch "inline $data with --effort" "$high_record" \
+        "$(printf '%s\n' "$data" -c model_reasoning_effort=high)" --effort high "$data"
+done
+assert_effort_launch "explicit effort before inline data" "$medium_record" \
+    "$(printf '%s\n' "-c=$medium" "$quoted_data")" --effort high "-c=$medium" "$quoted_data"
+assert_effort_launch "last explicit effort after inline data" "$medium_record" \
+    "$(printf '%s\n' -c model_reasoning_effort=low "$plain_data" "--config=$medium")" \
+    --effort high -c model_reasoning_effort=low "$plain_data" "--config=$medium"
+assert_effort_launch "inline data without an effort source" "$(_tr unknown SUCCESS 0 none)" \
+    "$plain_data" "$plain_data"
+mixed_data='--config=developer_instructions=model_reasoning_effort=low,service_tier=priority'
+assert_effort_launch "instruction mentioning effort and tier" "$(_tr unknown SUCCESS 0 none)" \
+    "$mixed_data" "$mixed_data"
+assert_effort_launch "separate-value instruction" "$high_record" \
+    "$(printf '%s\n' --config "${quoted_data#--config=}" -c model_reasoning_effort=high)" \
+    --effort high --config "${quoted_data#--config=}"
 
 # ============================================================
 # Summary

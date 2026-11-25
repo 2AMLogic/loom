@@ -122,7 +122,15 @@ toolless launch, a non-zero exit and a timeout. A success resets it to 1. A
 pre-spawn skip counts neither way. The count lives in daemon memory, so a
 restart starts every role at attempt 1.
 
-Sweep dispatch and `worker run` phases draw attempt 1.
+Sweep dispatch and `worker run` phases draw attempt 1. So do stage steps
+(Curator, Builder, Judge, Doctor, Champion): nothing feeds a step's failure
+into the count today, so `loom.role_draw.attempt` on a `loom.dispatch.step`
+span reads `1`. Only role ticks feed it, and the count is keyed by workspace
+and role. A step failure feed is a separate design (#14235).
+
+Do not confuse it with `loom.step.draw_attempt` on the same span: that is the
+1-based count of item redraws within one dispatch slot, and has nothing to do
+with the role draw's attempt.
 
 ### Which launch paths honor the drawn `/<model>` (#12748)
 
@@ -170,7 +178,18 @@ What reaches SigNoz (#11726 follow-up):
   `loom.step.model_selected` (the model the draw's pick named) and
   `loom.step.model_launched` (the `--model` the child was given). Selected is a
   fact about the draw record only; launched is what ran. Either is absent when
-  there is none.
+  there is none. For a spawned step decided by a draw, `loom.role_draw.pick`
+  is the winning key, `.first_pick` is the first roll, and `.attempt`,
+  `.table_attempt` and `.layer` identify the table. `.table` is a compact JSON
+  array of candidate-key and decimal-weight pairs in declaration order.
+  `.passed_over` is a compact JSON array of candidate-key and reason pairs
+  in walk order. Its reasons are `not-admitted`, `no-credential`,
+  `launch-hold`, `ceiling` and `runtime-unavailable` (missing executable).
+  A walk with no skips has no `.passed_over` attribute. An unsafe or
+  oversized first pick, table or skip list is omitted as a whole. A missing
+  table, or a missing skip list when the first and final picks differ, is
+  unavailable for comparison.
+  Steps without a draw carry none of these fields.
 
 ## Explain view
 

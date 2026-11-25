@@ -8,8 +8,7 @@
 //!
 //! They are gathered into one flattened enum for two reasons. They are one
 //! family, added and reviewed together as the epic lands each port; and
-//! `main.rs` is over `.loom/docs/file-size-policy.md`'s threshold and frozen,
-//! so each new port must cost it nothing. Flattening keeps every subcommand
+//! each new port must cost `main.rs` nothing. Flattening keeps every subcommand
 //! top-level on the CLI (`loom-daemon classify-dependency-block`, not
 //! `loom-daemon script-ports classify-dependency-block`) while `main.rs` holds
 //! a single variant and a single dispatch arm for all of them.
@@ -441,6 +440,17 @@ pub(crate) enum ScriptPortCommand {
     #[command(subcommand)]
     WorkDocs(super::work_docs_archive::WorkDocsCommand),
 
+    /// Guide Step 3's WORK_PLAN.md write path (#15219): `work-plan-receipt
+    /// record|reset|read` owns the `.loom-work-plan-receipt` file, and
+    /// `work-plan-splice` replaces the `guide:plan-body` marker region from
+    /// stdin. Behind a verb because the role prompt pastes Step 3 into a
+    /// Bash tool call verbatim: the inline `rm`/redirect/`mktemp` shapes it
+    /// used were denied by the default guard before execution, leaving the
+    /// #13923 provenance gate unreachable from a guarded shell. Not a port:
+    /// the shell it replaces lived inline in the role prompt.
+    #[command(subcommand)]
+    Guide(super::guide_work_plan::GuideCommand),
+
     /// The fleet singleton-job captain gate (#8848), shell-facing half: is
     /// THIS host the one declared to run `<job-name>`? Exit 0 arm, 3 another
     /// host is the captain, 4 no `fleet.captain` declared at all — three
@@ -655,6 +665,9 @@ pub(crate) enum ScriptPortCommand {
     #[command(subcommand)]
     ForgeInventory(super::forge_inventory_cmd::ForgeInventoryCommand),
 
+    /// Classify the exact GitHub CI tree using the installed docs-only policy.
+    CiDocsOnly(super::ci_docs_only::CiDocsOnlyArgs),
+
     /// Combined-tree CI qualification for the merge queue (#10257): `audit`
     /// reports relied-on suites that do not validate the merge-group commit;
     /// `eligibility` decides whether a repository may pilot queue mode.
@@ -736,7 +749,9 @@ impl ScriptPortCommand {
             ScriptPortCommand::WorktreeState(cmd) => cmd.run(),
             ScriptPortCommand::DuplicateScan(args) => args.run(),
             ScriptPortCommand::PremiseCheck(args) => args.run(),
-            ScriptPortCommand::OperatorDecision(cmd) => cmd.run(),
+            ScriptPortCommand::OperatorDecision(cmd) => {
+                cmd.run(crate::operator_decision::cli::WorkflowWriter::Gh)
+            }
             ScriptPortCommand::ReconcileStack(args) => args.run(),
             ScriptPortCommand::OrphanReplace(cmd) => cmd.run(),
             ScriptPortCommand::PushLease(cmd) => cmd.run(),
@@ -745,6 +760,7 @@ impl ScriptPortCommand {
             ScriptPortCommand::GitBlobLines(args) => args.run(),
             ScriptPortCommand::AffectedFiles(cmd) => cmd.run(),
             ScriptPortCommand::WorkDocs(cmd) => cmd.run(),
+            ScriptPortCommand::Guide(cmd) => cmd.run(),
             ScriptPortCommand::FleetCaptain(args) => args.run(),
             ScriptPortCommand::RoleToolPolicy(cmd) => cmd.run(),
             ScriptPortCommand::CommandAnalysis(cmd) => cmd.run(),
@@ -757,7 +773,9 @@ impl ScriptPortCommand {
             ScriptPortCommand::CheckRenovateLabels(args) => args.run(),
             ScriptPortCommand::Guards(cmd) => cmd.run(),
             ScriptPortCommand::PrLatency(args) => args.run(),
-            ScriptPortCommand::ParkRecord(cmd) => cmd.run(),
+            ScriptPortCommand::ParkRecord(cmd) => {
+                cmd.run(crate::operator_decision::cli::WorkflowWriter::Gh)
+            }
             ScriptPortCommand::ChampionHold(cmd) => cmd.run(),
             ScriptPortCommand::CheckPointsMarker(args) => args.run(),
             ScriptPortCommand::RamScopeLimit(args) => args.run(),
@@ -765,6 +783,7 @@ impl ScriptPortCommand {
             ScriptPortCommand::NotifyClearedBlockers(args) => args.run(),
             ScriptPortCommand::LabelDuplicates(args) => args.run(),
             ScriptPortCommand::ForgeInventory(cmd) => cmd.run(),
+            ScriptPortCommand::CiDocsOnly(args) => args.run(),
             ScriptPortCommand::MergeGroupCi(cmd) => cmd.run(),
             ScriptPortCommand::ForgeProbe(args) => args.run(),
             ScriptPortCommand::ResyncPin(cmd) => cmd.run(),

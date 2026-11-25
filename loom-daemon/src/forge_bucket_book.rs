@@ -190,7 +190,7 @@ pub enum Source {
     Header,
     /// A `gh api rate_limit` probe.
     Probe,
-    /// A rate-limit refusal of a real call ([`mark_exhausted`], W4-A): the
+    /// A rate-limit refusal of a real call ([`mark_exhausted_at`], W4-A): the
     /// bucket answered "no budget left" until its reset.
     Refusal,
 }
@@ -284,14 +284,10 @@ pub fn observe_at(key: BucketKey, headers: &RateLimitHeaders, source: Source, no
     );
 }
 
-/// Book `key` as exhausted until `reset_epoch` (W4-A): a call it served was
-/// refused with a primary rate limit. `limit` is kept from the held reading
-/// when one exists, so the projection reads it as 100 % used.
-pub fn mark_exhausted(key: BucketKey, reset_epoch: i64) {
-    mark_exhausted_at(key, reset_epoch, chrono::Utc::now().timestamp());
-}
-
-/// [`mark_exhausted`] at an explicit instant.
+/// Book `key` as exhausted until `reset_epoch` (W4-A) at an explicit
+/// instant: a call it served was refused with a primary rate limit. `limit`
+/// is kept from the held reading when one exists, so the projection reads it
+/// as 100 % used.
 pub fn mark_exhausted_at(key: BucketKey, reset_epoch: i64, now: i64) {
     if reset_epoch <= now {
         return;
@@ -408,7 +404,6 @@ struct Entry {
 ///
 /// When `dir` is not a private directory or the write fails.
 pub fn persist(dir: &Path, now: i64) -> std::io::Result<()> {
-    use std::io::Write;
     if !crate::forge_etag_store::private_dir(dir, true) {
         return Err(std::io::Error::other("untrusted sink dir"));
     }
@@ -417,11 +412,14 @@ pub fn persist(dir: &Path, now: i64) -> std::io::Result<()> {
         .map(|(key, reading)| Entry { key, reading })
         .collect();
     let body = serde_json::to_vec(&entries)?;
-    let tmp = dir.join(format!(".{SNAPSHOT_FILE}.{}", std::process::id()));
-    let _ = std::fs::remove_file(&tmp);
-    let mut file = crate::forge_etag_store::create_private_file(&tmp)?;
-    file.write_all(&body)?;
-    std::fs::rename(&tmp, dir.join(SNAPSHOT_FILE))
+    crate::fs_util::write_atomic(
+        &dir.join(SNAPSHOT_FILE),
+        &body,
+        crate::fs_util::AtomicOpts {
+            private: true,
+            sync_dir: true,
+        },
+    )
 }
 
 /// The readings in `dir`'s [`SNAPSHOT_FILE`] still believed at `now`. A
@@ -442,6 +440,108 @@ pub fn load(dir: &Path, now: i64) -> Vec<(BucketKey, Reading)> {
         .collect();
     out.sort_by(|a, b| a.0.cmp(&b.0));
     out
+}
+
+// ---------------------------------------------------------------------------
+// Confirmed writer-exhaustion holds (#13746)
+// ---------------------------------------------------------------------------
+
+/// The confirmed-exhaustion hold of each bucket (`writer_limit`): the reset
+/// epoch a confirmed primary rate-limit refusal of that writer installation
+/// carried, retained here — independently of the ordinary reading going
+/// stale ([`MAX_AGE_SECS`]) — until the reset passes. Keyed by
+/// [`BucketKey`], so a route is held for the exact account, owner and
+/// installation the refused write would spend, and a changed effective
+/// writer simply has a different, unheld key.
+struct WriterHold {
+    reset_epoch: i64,
+    reported_miss: bool,
+}
+
+fn holds() -> &'static Mutex<HashMap<BucketKey, WriterHold>> {
+    static HOLDS: OnceLock<Mutex<HashMap<BucketKey, WriterHold>>> = OnceLock::new();
+    HOLDS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Arm `key`'s route hold until `reset_epoch`, at `now`: only a future reset
+/// for an attributable account holds a route (an unknown ambient identity —
+/// `app-unknown` — never does, and a reset that already passed is refused).
+/// `false` when nothing was armed.
+pub fn arm_writer_hold(key: BucketKey, reset_epoch: i64, now: i64) -> bool {
+    if reset_epoch <= now || key.account == "app-unknown" {
+        return false;
+    }
+    let Ok(mut holds) = holds().lock() else {
+        return false;
+    };
+    let reported_miss = holds
+        .get(&key)
+        .is_some_and(|hold| hold.reset_epoch > now && hold.reported_miss);
+    holds.insert(
+        key,
+        WriterHold {
+            reset_epoch,
+            reported_miss,
+        },
+    );
+    true
+}
+
+/// `key`'s active hold at `now`: the reset epoch while it stands, `None`
+/// once the reset has passed (the route is reconsidered) or was never armed.
+#[must_use]
+pub fn writer_hold(key: &BucketKey, now: i64) -> Option<i64> {
+    holds()
+        .lock()
+        .ok()?
+        .get(key)
+        .map(|hold| hold.reset_epoch)
+        .filter(|&reset| reset > now)
+}
+
+/// Record the first draw that received a refusal for this already-held
+/// writer. An expired pre-draw observation or a later arm cannot prove a miss.
+pub(crate) fn note_missed_writer_hold(
+    key: &BucketKey,
+    reset_before_draw: Option<i64>,
+    now: i64,
+) -> Option<i64> {
+    if reset_before_draw? <= now {
+        return None;
+    }
+    let mut holds = holds().lock().ok()?;
+    let hold = holds.get_mut(key)?;
+    if hold.reset_epoch <= now || hold.reported_miss {
+        return None;
+    }
+    hold.reported_miss = true;
+    Some(hold.reset_epoch)
+}
+
+/// Every active hold at `now`: the `status` Forge-calls section lists them, and
+/// the work finder uses one snapshot to check the next claim and to establish
+/// whether an observed refusal was already held before the draw (#14559).
+#[must_use]
+pub fn writer_holds_snapshot(now: i64) -> Vec<(BucketKey, i64)> {
+    let mut out: Vec<(BucketKey, i64)> = holds()
+        .lock()
+        .map(|h| {
+            h.iter()
+                .filter(|(_, hold)| hold.reset_epoch > now)
+                .map(|(k, hold)| (k.clone(), hold.reset_epoch))
+                .collect()
+        })
+        .unwrap_or_default();
+    out.sort_by(|a, b| a.0.cmp(&b.0));
+    out
+}
+
+/// Test builds: drop every hold, so cases isolate the store.
+#[cfg(test)]
+pub fn clear_writer_holds_for_test() {
+    if let Ok(mut holds) = holds().lock() {
+        holds.clear();
+    }
 }
 
 // ---------------------------------------------------------------------------

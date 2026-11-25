@@ -1107,14 +1107,218 @@ fn a_toolless_guarded_completion_is_classified_as_a_failed_launch() {
     assert!(!used.observed_a_toolless_run());
 }
 
+/// #14634: a known launcher preflight rejection carries the typed
+/// `# LOOM_LAUNCH_REJECTED` marker (exit 78 + boundary stage) on the same
+/// stream the step log captures, names the runtime it resolved before
+/// rejecting, and never reaches the harness: stdout stays empty (the fake
+/// harness's own sentinel — every real launch prints its argv there).
+#[test]
+fn a_rejected_preflight_writes_the_typed_marker_and_never_launches() {
+    let d = tempfile::tempdir().unwrap();
+    // Worker-options rejection (an unsupported flag fails the argv parser).
+    let out = worker(d.path(), "pi")
+        .args(["-p", "hello", "--api-key", "never-print-this"])
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(78), "{stderr}");
+    assert!(
+        stderr.contains("# LOOM_LAUNCH_REJECTED code=78 stage=worker_options"),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("never-print-this"));
+    // An argv-parse rejection precedes the launch record by contract (the
+    // parser cannot have read `--log` yet); the record itself is asserted on
+    // the post-parse rejections below.
+    assert!(
+        out.stdout.is_empty(),
+        "the harness never ran: {:?}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+
+    // Runner-missing rejection: a legacy runtime with no spawn script.
+    let out = worker(d.path(), "grail")
+        .args(["-p", "hello"])
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(78), "{stderr}");
+    assert!(
+        stderr.contains("# LOOM_LAUNCH_REJECTED code=78 stage=runner_missing"),
+        "{stderr}"
+    );
+    let resolved_at = stderr
+        .find("# LOOM_RUNTIME_RESOLVED runtime=grail")
+        .expect("resolved runtime recorded");
+    let rejected_at = stderr.find("# LOOM_LAUNCH_REJECTED").unwrap();
+    assert!(
+        resolved_at < rejected_at,
+        "the resolved runtime precedes the rejection: {stderr}"
+    );
+    assert!(out.stdout.is_empty());
+
+    // A missing harness binary is 127 (spawn mechanics, not preflight): no
+    // rejection marker, or the step end would classify a post-start-shaped
+    // failure as a preflight rejection.
+    let out = worker(d.path(), "pi")
+        .env("LOOM_PI_BIN", d.path().join("missing"))
+        .args(["-p", "hello"])
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(127), "{stderr}");
+    assert!(!stderr.contains("LOOM_LAUNCH_REJECTED"), "{stderr}");
+}
+
+/// #14634: the OpenCode CLI-qualification guard (an unqualified major, or a
+/// version probe that fails) is a typed preflight boundary, so the recurrence
+/// receipt can name it instead of `unclassified`.
+#[test]
+fn an_unqualified_opencode_cli_refuses_at_the_cli_qualification_stage() {
+    let d = tempfile::tempdir().unwrap();
+    // A version the launcher cannot qualify (unsupported major), and a
+    // version probe that fails outright.
+    for (version, exit) in [("3.0.0", "0"), (OPENCODE_V1, "1")] {
+        let out = worker(d.path(), "opencode")
+            .env("FIXTURE_VERSION", version)
+            .env("FIXTURE_VERSION_EXIT", exit)
+            .args(["-p", "hello"])
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(78), "{version:?}: {stderr}");
+        assert!(
+            stderr.contains("# LOOM_LAUNCH_REJECTED code=78 stage=cli_qualification"),
+            "{version:?}: {stderr}"
+        );
+        assert!(stderr.contains("# LOOM_RUNTIME_RESOLVED runtime=opencode"), "{stderr}");
+        assert!(out.stdout.is_empty(), "{version:?}");
+    }
+    // The guarded-2.x refusal (no live guarded-canary receipt) is the same
+    // typed boundary — the shape the observed exit-78 receipts could not
+    // name.
+    let d2 = tempfile::tempdir().unwrap();
+    builder_role(d2.path());
+    std::fs::write(d2.path().join(".loom/roles/builder.md"), "Role task: $ARGUMENTS").unwrap();
+    let out = worker(d2.path(), "opencode")
+        .env("FIXTURE_VERSION", OPENCODE_V2)
+        .args([
+            "--dangerously-skip-permissions",
+            "-p",
+            "/loom:builder 14634",
+        ])
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(78), "{stderr}");
+    assert!(
+        stderr.contains("# LOOM_LAUNCH_REJECTED code=78 stage=cli_qualification"),
+        "{stderr}"
+    );
+    assert!(out.stdout.is_empty());
+}
+
 #[path = "worker_spawn/cargo_debuginfo.rs"]
 mod cargo_debuginfo;
 #[path = "worker_spawn/excluded_roles.rs"]
 mod excluded_roles;
 #[path = "worker_spawn/native_sweep.rs"]
 mod native_sweep;
+#[path = "worker_spawn/prompt_modifier.rs"]
+mod prompt_modifier;
 
 // Fail this test binary on any spawn of the real `gh` (#10225, extends #10138).
 #[allow(dead_code)]
 #[path = "../src/live_gh_guard.rs"]
 mod live_gh_guard;
+
+/// #15252: a `runtimes.modelProfileOverrides` entry changes the launched model
+/// of a bundled profile with no release, while the bundled `excludedRoles`
+/// still refuses Judge and Curator.
+#[test]
+fn a_model_profile_override_changes_the_launched_model_and_keeps_excluded_roles() {
+    let d = tempfile::tempdir().unwrap();
+    config(
+        d.path(),
+        serde_json::json!({"runtimes": {"modelProfileOverrides": {"zai-full": {"model": "glm-5.4"}}}}),
+    );
+    let out = worker(d.path(), "opencode")
+        .args(["--profile", "zai-full", "-p", "hello"])
+        .env("ZAI_API_KEY", "test-not-a-secret")
+        .env("ZHIPU_API_KEY", "test-not-a-secret")
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{stderr}");
+    assert!(stderr.contains("\"model\":\"glm-5.4\""), "{stderr}");
+    assert!(!stderr.contains("glm-5.3"), "{stderr}");
+
+    // (Judge/Curator refusal under an override: `worker_spawn/excluded_roles.rs`.)
+    let check = profile_check(d.path(), &["zai-full"]);
+    assert!(check.status.success(), "{}", String::from_utf8_lossy(&check.stdout));
+    let text = String::from_utf8_lossy(&check.stdout);
+    assert!(text.contains("model: glm-5.4 (source: committed)"), "{text}");
+}
+
+#[test]
+fn an_invalid_model_profile_override_fails_closed_at_78() {
+    let d = tempfile::tempdir().unwrap();
+    for (bad, expect) in [
+        (
+            serde_json::json!({"zai-full": {"excludedRoles": []}}),
+            "never replaced or reduced",
+        ),
+        (serde_json::json!({"zai-full": {"providers": {}}}), "unknown override key"),
+        (serde_json::json!({"made-up": {"model": "m"}}), "not a bundled model profile"),
+    ] {
+        config(d.path(), serde_json::json!({"runtimes": {"modelProfileOverrides": bad}}));
+        let out = worker(d.path(), "opencode")
+            .args(["--profile", "zai-full", "-p", "hello"])
+            .output()
+            .unwrap();
+        assert_eq!(out.status.code(), Some(78), "{}", String::from_utf8_lossy(&out.stderr));
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(stderr.contains(expect), "{expect}: {stderr}");
+        let check = profile_check(d.path(), &["zai-full"]);
+        assert_eq!(check.status.code(), Some(78));
+    }
+}
+
+/// #15252: `worker profile-check` names the effective model and the tier that
+/// decided it, and a higher tier's override beats a lower one.
+#[test]
+fn profile_check_reports_the_effective_model_and_its_source_tier() {
+    let d = tempfile::tempdir().unwrap();
+    let source_line = |root: &std::path::Path| {
+        let out = profile_check(root, &["zai-full"]);
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stdout));
+        String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .find(|l| l.starts_with("model: "))
+            .unwrap()
+            .to_string()
+    };
+    assert_eq!(source_line(d.path()), "model: glm-5.3 (source: bundled)");
+
+    config(
+        d.path(),
+        serde_json::json!({"runtimes": {"modelProfileOverrides": {"zai-full": {"model": "glm-5.4"}}}}),
+    );
+    assert_eq!(source_line(d.path()), "model: glm-5.4 (source: committed)");
+
+    std::fs::create_dir_all(d.path().join(".loom-local")).unwrap();
+    std::fs::write(
+        d.path().join(".loom-local/local.json"),
+        r#"{"runtimes":{"modelProfileOverrides":{"zai-full":{"model":"glm-5.5"}}}}"#,
+    )
+    .unwrap();
+    assert_eq!(source_line(d.path()), "model: glm-5.5 (source: local)");
+
+    // A higher tier's explicit null clears the field; the lower tier shows through.
+    std::fs::write(
+        d.path().join(".loom-local/local.json"),
+        r#"{"runtimes":{"modelProfileOverrides":{"zai-full":{"model":null}}}}"#,
+    )
+    .unwrap();
+    assert_eq!(source_line(d.path()), "model: glm-5.3 (source: bundled)");
+}

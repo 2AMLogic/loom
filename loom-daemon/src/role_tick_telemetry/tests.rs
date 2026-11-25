@@ -134,12 +134,12 @@ fn attributed_transcripts_filters_by_role_and_window() {
 
     // The window is anchored on "now" because the fixtures' mtimes are now.
     let now = Utc::now();
-    let found = attributed_transcripts(&projects, &root, "judge", now, now);
+    let found = attributed_transcripts(&projects, &root, "judge", None, now, now);
     assert_eq!(found, vec![mine.clone()]);
 
     // A window far in the past excludes everything, even the right role —
     // the mtime half of the key is load-bearing.
-    let stale = attributed_transcripts(&projects, &root, "judge", at(0), at(1));
+    let stale = attributed_transcripts(&projects, &root, "judge", None, at(0), at(1));
     assert!(stale.is_empty(), "out-of-window transcript must not attribute");
 }
 
@@ -510,7 +510,12 @@ fn build_record_clamps_a_negative_duration_to_zero() {
 
 /// Stage a fake `$CLAUDE_CONFIG_DIR/projects/<slug>/<uuid>.jsonl` for `root`
 /// and point the role-tick journal at a temp file. Returns the journal path.
-fn stage_tick_env(dir: &Path, root: &Path, role: &str, transcript: &str) -> PathBuf {
+fn stage_tick_env(
+    dir: &Path,
+    root: &Path,
+    role: &str,
+    transcript: &str,
+) -> (PathBuf, crate::env_test_support::EnvGuard) {
     let config = dir.join("claude-config");
     let project = config
         .join("projects")
@@ -518,15 +523,12 @@ fn stage_tick_env(dir: &Path, root: &Path, role: &str, transcript: &str) -> Path
     fs::create_dir_all(&project).unwrap();
     fs::write(project.join("session-uuid.jsonl"), transcript).unwrap();
     let journal = dir.join("role-tick-telemetry.jsonl");
-    std::env::set_var("CLAUDE_CONFIG_DIR", &config);
-    std::env::set_var(crate::sweep_outcomes::ROLE_TICK_TELEMETRY_JOURNAL_PATH_ENV, &journal);
+    let env = crate::env_test_support::EnvGuard::set("CLAUDE_CONFIG_DIR", &config).and_set(
+        crate::sweep_outcomes::ROLE_TICK_TELEMETRY_JOURNAL_PATH_ENV,
+        Some(journal.as_os_str()),
+    );
     let _ = role; // the transcript already names it; kept for call-site clarity
-    journal
-}
-
-fn clear_tick_env() {
-    std::env::remove_var("CLAUDE_CONFIG_DIR");
-    std::env::remove_var(crate::sweep_outcomes::ROLE_TICK_TELEMETRY_JOURNAL_PATH_ENV);
+    (journal, env)
 }
 
 /// Issue #8056 test plan, integration case: drive a role tick to its terminal
@@ -534,6 +536,7 @@ fn clear_tick_env() {
 /// and "what did it do?" **without touching any other file** — no
 /// `sweep-outcomes.jsonl` join, no transcript re-read by the consumer.
 #[test]
+#[serial_test::serial(opencode_db_env, codex_home_env)]
 #[serial_test::serial]
 fn a_successful_tick_writes_a_self_sufficient_journal_record() {
     let dir = tempdir().unwrap();
@@ -544,7 +547,7 @@ fn a_successful_tick_writes_a_self_sufficient_journal_record() {
     transcript.push_str(&usage_line("claude-sonnet-5", 900, 120));
     transcript.push_str(&bash_line("gh issue edit 42 --add-label loom:pr"));
     transcript.push_str(&bash_line("gh pr comment 42 --body approved"));
-    let journal = stage_tick_env(dir.path(), &root, "judge", &restamp_now(&transcript));
+    let (journal, _env) = stage_tick_env(dir.path(), &root, "judge", &restamp_now(&transcript));
 
     emit_for_tick(
         &root,
@@ -555,7 +558,6 @@ fn a_successful_tick_writes_a_self_sufficient_journal_record() {
     );
 
     let records = crate::sweep_outcomes::read_all_role_tick_outcomes(&journal);
-    clear_tick_env();
 
     assert_eq!(records.len(), 1, "exactly one record per tick");
     let r = &records[0];
@@ -583,6 +585,7 @@ fn a_successful_tick_writes_a_self_sufficient_journal_record() {
 /// The counterpart: a pre-spawn skip writes a record too — the skip class is
 /// the point — but must not borrow the neighbouring transcript's numbers.
 #[test]
+#[serial_test::serial(opencode_db_env, codex_home_env)]
 #[serial_test::serial]
 fn a_pool_exhausted_skip_writes_a_record_without_borrowing_tokens() {
     let dir = tempdir().unwrap();
@@ -591,7 +594,7 @@ fn a_pool_exhausted_skip_writes_a_record_without_borrowing_tokens() {
 
     let mut transcript = role_head("champion");
     transcript.push_str(&usage_line("claude-sonnet-5", 5_000, 500));
-    let journal = stage_tick_env(dir.path(), &root, "champion", &restamp_now(&transcript));
+    let (journal, _env) = stage_tick_env(dir.path(), &root, "champion", &restamp_now(&transcript));
 
     emit_for_tick(
         &root,
@@ -607,7 +610,6 @@ fn a_pool_exhausted_skip_writes_a_record_without_borrowing_tokens() {
     );
 
     let records = crate::sweep_outcomes::read_all_role_tick_outcomes(&journal);
-    clear_tick_env();
 
     assert_eq!(records.len(), 1);
     let r = &records[0];
@@ -655,6 +657,7 @@ fn write_role_log(root: &Path, role: &str, body: &str) {
 }
 
 #[test]
+#[serial_test::serial(opencode_db_env, codex_home_env)]
 #[serial_test::serial]
 fn a_successful_tick_carries_runtime_provider_and_profile_from_its_own_log() {
     let dir = tempdir().unwrap();
@@ -662,7 +665,7 @@ fn a_successful_tick_carries_runtime_provider_and_profile_from_its_own_log() {
     fs::create_dir_all(&root).unwrap();
     write_role_log(&root, "judge", &launch_line("pi", "zai-coding-plan", "zai-flash"));
 
-    let journal = stage_tick_env(dir.path(), &root, "judge", &role_head("judge"));
+    let (journal, _env) = stage_tick_env(dir.path(), &root, "judge", &role_head("judge"));
     emit_for_tick(
         &root,
         "judge",
@@ -671,7 +674,6 @@ fn a_successful_tick_carries_runtime_provider_and_profile_from_its_own_log() {
         Some(ResolvedLaunch::new("claude-sonnet-5", "high")),
     );
     let records = crate::sweep_outcomes::read_all_role_tick_outcomes(&journal);
-    clear_tick_env();
 
     assert_eq!(records.len(), 1);
     assert_eq!(records[0].runtime.as_deref(), Some("pi"));
@@ -680,6 +682,7 @@ fn a_successful_tick_carries_runtime_provider_and_profile_from_its_own_log() {
 }
 
 #[test]
+#[serial_test::serial(opencode_db_env, codex_home_env)]
 #[serial_test::serial]
 fn a_tick_with_no_launch_record_leaves_runtime_provider_profile_absent() {
     let dir = tempdir().unwrap();
@@ -687,10 +690,9 @@ fn a_tick_with_no_launch_record_leaves_runtime_provider_profile_absent() {
     fs::create_dir_all(&root).unwrap();
     // No role log at all — mirrors a Claude-runtime tick, which writes none.
 
-    let journal = stage_tick_env(dir.path(), &root, "judge", &role_head("judge"));
+    let (journal, _env) = stage_tick_env(dir.path(), &root, "judge", &role_head("judge"));
     emit_for_tick(&root, "judge", Utc::now(), &RoleTickOutcome::Success, None);
     let records = crate::sweep_outcomes::read_all_role_tick_outcomes(&journal);
-    clear_tick_env();
 
     assert_eq!(records.len(), 1);
     assert_eq!(records[0].runtime, None);
@@ -702,6 +704,7 @@ fn a_tick_with_no_launch_record_leaves_runtime_provider_profile_absent() {
 /// PREVIOUS tick's launch record still sits in the role log — mirroring the
 /// module's own never-borrow-a-neighbour's-transcript contract for tokens.
 #[test]
+#[serial_test::serial(opencode_db_env, codex_home_env)]
 #[serial_test::serial]
 fn a_pre_spawn_skip_never_borrows_a_previous_ticks_runtime_attribution() {
     let dir = tempdir().unwrap();
@@ -709,10 +712,9 @@ fn a_pre_spawn_skip_never_borrows_a_previous_ticks_runtime_attribution() {
     fs::create_dir_all(&root).unwrap();
     write_role_log(&root, "champion", &launch_line("opencode", "friendli", "glm-flash"));
 
-    let journal = stage_tick_env(dir.path(), &root, "champion", &role_head("champion"));
+    let (journal, _env) = stage_tick_env(dir.path(), &root, "champion", &role_head("champion"));
     emit_for_tick(&root, "champion", Utc::now(), &RoleTickOutcome::NoTokenPool, None);
     let records = crate::sweep_outcomes::read_all_role_tick_outcomes(&journal);
-    clear_tick_env();
 
     assert_eq!(records.len(), 1);
     assert_eq!(records[0].runtime, None, "a skip never spawned, so it has nothing to attribute");
@@ -723,6 +725,7 @@ fn a_pre_spawn_skip_never_borrows_a_previous_ticks_runtime_attribution() {
 /// and the tick's own window — not from (in this test, absent) Claude
 /// transcripts.
 #[test]
+#[serial_test::serial(opencode_db_env, codex_home_env)]
 #[serial_test::serial]
 fn an_opencode_tick_sources_tokens_by_model_from_the_session_db() {
     let dir = tempdir().unwrap();
@@ -753,9 +756,11 @@ fn an_opencode_tick_sources_tokens_by_model_from_the_session_db() {
         )
         .unwrap();
     }
-    std::env::set_var(crate::opencode_usage::OPENCODE_DB_ENV, &db_path);
+    // Crate-wide `LOOM_OPENCODE_DB` lock (#15204): the default-keyed
+    // `step_completion` writers coordinate via this mutex, not the named key.
+    let _staged = crate::tokens_pool::opencode_db_env::OpencodeDbEnv::set(&db_path);
 
-    let journal = stage_tick_env(dir.path(), &root, "judge", &role_head("judge"));
+    let (journal, _env) = stage_tick_env(dir.path(), &root, "judge", &role_head("judge"));
     emit_for_tick(
         &root,
         "judge",
@@ -764,8 +769,6 @@ fn an_opencode_tick_sources_tokens_by_model_from_the_session_db() {
         Some(ResolvedLaunch::new("zai-org/GLM-5.3", "")),
     );
     let records = crate::sweep_outcomes::read_all_role_tick_outcomes(&journal);
-    clear_tick_env();
-    std::env::remove_var(crate::opencode_usage::OPENCODE_DB_ENV);
 
     assert_eq!(records.len(), 1);
     assert_eq!(records[0].runtime.as_deref(), Some("opencode"));
@@ -892,13 +895,14 @@ fn a_pool_skip_record_names_the_pool_that_gated_it() {
 /// `loom-daemon logs`. Tier `0` (nothing fell through) is reported as `0`, not
 /// elided.
 #[test]
+#[serial_test::serial(opencode_db_env, codex_home_env)]
 #[serial_test::serial]
 fn a_preference_resolved_tick_records_the_chosen_tier_and_tap() {
     let dir = tempdir().unwrap();
     let root = dir.path().join("repo");
     fs::create_dir_all(&root).unwrap();
 
-    let journal = stage_tick_env(dir.path(), &root, "judge", &role_head("judge"));
+    let (journal, _env) = stage_tick_env(dir.path(), &root, "judge", &role_head("judge"));
     emit_for_tick(
         &root,
         "judge",
@@ -920,7 +924,6 @@ fn a_preference_resolved_tick_records_the_chosen_tier_and_tap() {
         ),
     );
     let records = crate::sweep_outcomes::read_all_role_tick_outcomes(&journal);
-    clear_tick_env();
 
     assert_eq!(records.len(), 1);
     assert_eq!(records[0].preference_tier, Some(2));
@@ -931,13 +934,14 @@ fn a_preference_resolved_tick_records_the_chosen_tier_and_tap() {
 /// skipped before resolving a launch) reports no tier at all — absent, never a
 /// fabricated `0`, which would read as "chose the most-preferred tap".
 #[test]
+#[serial_test::serial(opencode_db_env, codex_home_env)]
 #[serial_test::serial]
 fn an_unconfigured_tick_records_no_preference_tier() {
     let dir = tempdir().unwrap();
     let root = dir.path().join("repo");
     fs::create_dir_all(&root).unwrap();
 
-    let journal = stage_tick_env(dir.path(), &root, "judge", &role_head("judge"));
+    let (journal, _env) = stage_tick_env(dir.path(), &root, "judge", &role_head("judge"));
     emit_for_tick(
         &root,
         "judge",
@@ -946,7 +950,6 @@ fn an_unconfigured_tick_records_no_preference_tier() {
         Some(ResolvedLaunch::new("claude-sonnet-5", "high")),
     );
     let records = crate::sweep_outcomes::read_all_role_tick_outcomes(&journal);
-    clear_tick_env();
 
     assert_eq!(records.len(), 1);
     assert_eq!(records[0].model.as_deref(), Some("claude-sonnet-5"));
@@ -958,17 +961,17 @@ fn an_unconfigured_tick_records_no_preference_tier() {
 /// pre-spawn skip included, which is the case only this export makes
 /// visible — with a non-slug repo read as `repo_unresolved`, never a path.
 #[test]
+#[serial_test::serial(opencode_db_env, codex_home_env)]
 #[serial_test::serial]
 fn a_tick_record_is_exported_without_a_local_path() {
     let dir = tempdir().unwrap();
     let root = dir.path().join("repo");
     fs::create_dir_all(&root).unwrap();
-    let journal = stage_tick_env(dir.path(), &root, "curator", "");
+    let (journal, _env) = stage_tick_env(dir.path(), &root, "curator", "");
     let ((), captured) = crate::observability::ops::capture::capture(|| {
         emit_for_tick(&root, "curator", Utc::now(), &RoleTickOutcome::QueueEmpty, None);
     });
     let local = crate::sweep_outcomes::read_all_role_tick_outcomes(&journal);
-    clear_tick_env();
     assert_eq!(local.len(), 1, "the journal still gets its record");
     assert_eq!(local[0].repo, root.display().to_string());
     let exported: Vec<_> = captured
@@ -994,7 +997,7 @@ fn failure_class_of_prefers_the_span_then_the_site_then_the_fallback() {
     let failed = RoleTickOutcome::Failure("free-form detail".into());
     let site = RoleFailure::new("resume-refused", None, "m");
     assert_eq!(
-        failure_class_of(&failed, None, Some(site.clone()), false).as_deref(),
+        failure_class_of(&failed, None, Some(&site), false).as_deref(),
         Some("resume-refused")
     );
     assert_eq!(
@@ -1002,7 +1005,7 @@ fn failure_class_of_prefers_the_span_then_the_site_then_the_fallback() {
         Some(UNCLASSIFIED_PRE_LAUNCH)
     );
     assert_eq!(failure_class_of(&failed, None, None, true).as_deref(), Some(UNCLASSIFIED_STEP));
-    assert_eq!(failure_class_of(&RoleTickOutcome::Success, None, Some(site), false), None);
+    assert_eq!(failure_class_of(&RoleTickOutcome::Success, None, Some(&site), false), None);
 }
 
 #[test]
@@ -1047,7 +1050,7 @@ fn emit_one_step(
     sweep_id: &str,
     log_path: &Path,
 ) -> Vec<crate::telemetry::RoleTickOutcomeRecord> {
-    let journal = stage_tick_env(dir, root, role, "");
+    let (journal, _env) = stage_tick_env(dir, root, role, "");
     let started = Utc::now() - chrono::Duration::seconds(30);
     emit_for_step(
         root,
@@ -1056,6 +1059,8 @@ fn emit_one_step(
         &RoleTickOutcome::Success,
         Some(ResolvedLaunch::new("zai-org/GLM-5.3", "high")),
         crate::role_tick_telemetry::StepTelemetry {
+            runtime: None,
+            trace_context: None,
             failure: None,
             sweep_id,
             step_outcome: Some(("verdict".to_string(), "pr_opened".to_string())),
@@ -1064,15 +1069,14 @@ fn emit_one_step(
             log_path,
         },
     );
-    let records = crate::sweep_outcomes::read_all_role_tick_outcomes(&journal);
-    clear_tick_env();
-    records
+    crate::sweep_outcomes::read_all_role_tick_outcomes(&journal)
 }
 
 /// A step's record carries its stage and its launch attribution read from
 /// the STEP'S OWN log — not the per-role log, which this test plants with a
 /// decoy launch record of the same role to prove it is never consulted.
 #[test]
+#[serial_test::serial(opencode_db_env, codex_home_env)]
 #[serial_test::serial]
 fn a_steps_record_reads_stage_and_launch_attribution_from_its_own_log() {
     let dir = tempdir().unwrap();
@@ -1103,6 +1107,7 @@ fn a_steps_record_reads_stage_and_launch_attribution_from_its_own_log() {
 /// `stage = champion_merge` (the lifecycle stage a per-stage usage query
 /// splits on).
 #[test]
+#[serial_test::serial(opencode_db_env, codex_home_env)]
 #[serial_test::serial]
 fn a_champion_merge_steps_stage_is_finer_than_its_role() {
     let dir = tempdir().unwrap();
@@ -1133,6 +1138,7 @@ fn a_champion_merge_steps_stage_is_finer_than_its_role() {
 /// every launch-sourced field absent — runtime, provider, profile AND
 /// `tokens_by_model` — never zeroed, never guessed.
 #[test]
+#[serial_test::serial(opencode_db_env, codex_home_env)]
 #[serial_test::serial]
 fn a_step_with_an_unreadable_log_leaves_every_launch_field_absent() {
     let dir = tempdir().unwrap();
@@ -1159,6 +1165,7 @@ fn a_step_with_an_unreadable_log_leaves_every_launch_field_absent() {
 /// sessions in the same workspace directory, created in the same window, of
 /// which only one is this step's.
 #[test]
+#[serial_test::serial(opencode_db_env, codex_home_env)]
 #[serial_test::serial]
 fn an_opencode_step_selects_tokens_by_the_session_ids_its_log_names() {
     let dir = tempdir().unwrap();
@@ -1193,7 +1200,9 @@ fn an_opencode_step_selects_tokens_by_the_session_ids_its_log_names() {
             .unwrap();
         }
     }
-    std::env::set_var(crate::opencode_usage::OPENCODE_DB_ENV, &db_path);
+    // Crate-wide `LOOM_OPENCODE_DB` lock (#15204): the default-keyed
+    // `step_completion` writers coordinate via this mutex, not the named key.
+    let _staged = crate::tokens_pool::opencode_db_env::OpencodeDbEnv::set(&db_path);
 
     let body = format!(
         "{}{}\n",
@@ -1203,7 +1212,6 @@ fn an_opencode_step_selects_tokens_by_the_session_ids_its_log_names() {
     );
     let log = write_step_log(dir.path(), "step-builder-42-3", &body);
     let records = emit_one_step(dir.path(), &root, "builder", "builder", "step-builder-42-3", &log);
-    std::env::remove_var(crate::opencode_usage::OPENCODE_DB_ENV);
 
     assert_eq!(records.len(), 1);
     let record = &records[0];
@@ -1220,6 +1228,7 @@ fn an_opencode_step_selects_tokens_by_the_session_ids_its_log_names() {
 /// log carries (#14048) — same indistinguishable-by-directory+window shape
 /// as the OpenCode test above, against the rollout store.
 #[test]
+#[serial_test::serial(opencode_db_env, codex_home_env)]
 #[serial_test::serial]
 fn a_codex_step_selects_tokens_by_the_session_id_its_log_names() {
     let dir = tempdir().unwrap();
@@ -1287,7 +1296,15 @@ fn a_codex_step_selects_tokens_by_the_session_id_its_log_names() {
             writeln!(file, "{line}").unwrap();
         }
     }
-    std::env::set_var(crate::codex_usage::CODEX_HOME_ENV, codex_home.path());
+    // Crate-wide `LOOM_CODEX_HOME` lock (#15174): the clear-list helpers
+    // coordinate via this mutex, not a `serial_test` key, so the named key
+    // alone does not exclude them. Declared before `_staged` so the variable
+    // is restored before the lock releases (locals drop in reverse order).
+    let _codex_home_lock = crate::tokens_pool::codex_home_env::lock();
+    let _staged = crate::env_test_support::EnvGuard::set(
+        crate::codex_usage::CODEX_HOME_ENV,
+        codex_home.path(),
+    );
 
     let body = format!(
         "{}codex\nsession id: 3f2a9c1e-77b2-4d0a-9c1e-2f6a8b4d5e01\n",
@@ -1295,7 +1312,6 @@ fn a_codex_step_selects_tokens_by_the_session_id_its_log_names() {
     );
     let log = write_step_log(dir.path(), "step-judge-7-1", &body);
     let records = emit_one_step(dir.path(), &root, "judge", "judge", "step-judge-7-1", &log);
-    std::env::remove_var(crate::codex_usage::CODEX_HOME_ENV);
 
     assert_eq!(records.len(), 1);
     let record = &records[0];
@@ -1315,6 +1331,7 @@ fn a_codex_step_selects_tokens_by_the_session_id_its_log_names() {
 /// launch record and no native store), and the record carries its stage and
 /// resolved model beside them — the Claude row of #14048's per-runtime set.
 #[test]
+#[serial_test::serial(opencode_db_env, codex_home_env)]
 #[serial_test::serial]
 fn a_claude_step_keeps_the_transcript_scan_and_carries_its_stage() {
     let dir = tempdir().unwrap();
@@ -1322,7 +1339,9 @@ fn a_claude_step_keeps_the_transcript_scan_and_carries_its_stage() {
     fs::create_dir_all(&root).unwrap();
     // The transcript scan needs a fresh window; the usage line stamps itself
     // ten seconds after the fixture epoch, so re-stamp it into this step's.
-    let mut transcript = role_head("builder");
+    // #14406: a step's transcript must name its own item (`/loom:builder 42`).
+    let mut transcript = role_head("builder")
+        .replace("<command-args></command-args>", "<command-args>42</command-args>");
     transcript.push_str(
         &"{\"type\":\"assistant\",\"timestamp\":\"REPLACED\",\"message\":{\"model\":\
          \"claude-sonnet-5\",\"usage\":{\"input_tokens\":120,\"output_tokens\":34,\
@@ -1330,7 +1349,7 @@ fn a_claude_step_keeps_the_transcript_scan_and_carries_its_stage() {
          \"ephemeral_5m_input_tokens\":9,\"ephemeral_1h_input_tokens\":4}}}}\n"
             .replace("REPLACED", &(Utc::now() - chrono::Duration::seconds(10)).to_rfc3339()),
     );
-    let journal = stage_tick_env(dir.path(), &root, "builder", &transcript);
+    let (journal, _env) = stage_tick_env(dir.path(), &root, "builder", &transcript);
     let log = write_step_log(dir.path(), "step-builder-42-4", "");
     let started = Utc::now() - chrono::Duration::seconds(30);
     emit_for_step(
@@ -1340,6 +1359,8 @@ fn a_claude_step_keeps_the_transcript_scan_and_carries_its_stage() {
         &RoleTickOutcome::Success,
         Some(ResolvedLaunch::new("claude-sonnet-5", "high")),
         crate::role_tick_telemetry::StepTelemetry {
+            runtime: None,
+            trace_context: None,
             failure: None,
             sweep_id: "step-builder-42-4",
             step_outcome: Some(("verdict".to_string(), "pr_opened".to_string())),
@@ -1349,7 +1370,6 @@ fn a_claude_step_keeps_the_transcript_scan_and_carries_its_stage() {
         },
     );
     let records = crate::sweep_outcomes::read_all_role_tick_outcomes(&journal);
-    clear_tick_env();
 
     assert_eq!(records.len(), 1);
     let record = &records[0];
@@ -1369,4 +1389,103 @@ fn a_claude_step_keeps_the_transcript_scan_and_carries_its_stage() {
     assert_eq!(rows[0].cache_read, 40);
     assert_eq!(rows[0].cache_write_5m, 9);
     assert_eq!(rows[0].cache_write_1h, 4);
+}
+
+#[test]
+#[serial_test::serial(opencode_db_env, codex_home_env)]
+#[serial_test::serial]
+fn opencode_step_close_preserves_launch_runtime_and_writes_newly_available_tokens() {
+    use crate::telemetry::trace::journal::Journal;
+    use crate::telemetry::trace::store::TraceStore;
+    use crate::telemetry::trace::{SpanName, SpanStatus, TraceAttributes};
+
+    let dir = tempdir().unwrap();
+    let root = dir.path().join("repo");
+    fs::create_dir_all(&root).unwrap();
+    let db = dir.path().join("opencode.db");
+    let _db = crate::tokens_pool::opencode_db_env::OpencodeDbEnv::set(&db);
+    let _tick_journal = crate::env_test_support::EnvGuard::set(
+        crate::sweep_outcomes::ROLE_TICK_TELEMETRY_JOURNAL_PATH_ENV,
+        dir.path().join("ticks.jsonl"),
+    );
+    let started = Utc::now() - chrono::Duration::seconds(30);
+    let emit = |sweep_id, log: &Path| {
+        let store = TraceStore::new(&root);
+        let saved = store.load_or_create(&root, sweep_id).unwrap();
+        let journal = Journal::for_context(&store.path(&root, sweep_id));
+        let run = journal
+            .start(
+                saved.context.child(),
+                Some(&saved.context),
+                SpanName::RuntimeRun,
+                started,
+                TraceAttributes::new(),
+            )
+            .unwrap();
+        journal
+            .finish(&run, Utc::now(), SpanStatus::Ok, TraceAttributes::new())
+            .unwrap();
+        emit_for_step(
+            &root,
+            "builder",
+            started,
+            &RoleTickOutcome::Failure("fixture".to_string()),
+            None,
+            StepTelemetry {
+                runtime: Some("opencode"),
+                trace_context: Some(&saved.context),
+                failure: None,
+                sweep_id,
+                step_outcome: None,
+                item: (42, false),
+                stage: "builder",
+                log_path: log,
+            },
+        );
+        journal
+            .completed()
+            .unwrap()
+            .into_iter()
+            .filter(|span| {
+                matches!(span.name, SpanName::RuntimeUsage | SpanName::RuntimeUsageMissing)
+            })
+            .collect::<Vec<_>>()
+    };
+
+    let absent = dir.path().join("absent.log");
+    let header = write_step_log(dir.path(), "header", "");
+    for (id, log, reason) in [
+        ("missing", &absent, "no_step_log"),
+        ("header", &header, "no_session_id"),
+    ] {
+        let spans = emit(id, log);
+        assert_eq!(spans.len(), 1);
+        assert_eq!(spans[0].name, SpanName::RuntimeUsageMissing);
+        assert_eq!(spans[0].attributes["loom.runtime"], "opencode");
+        assert_eq!(spans[0].attributes["loom.usage.missing_reason"], reason);
+    }
+
+    let conn = rusqlite::Connection::open(&db).unwrap();
+    conn.execute_batch(
+        "CREATE TABLE session (id TEXT PRIMARY KEY, model TEXT, tokens_input INTEGER,
+         tokens_output INTEGER, tokens_reasoning INTEGER, tokens_cache_read INTEGER,
+         tokens_cache_write INTEGER, directory TEXT NOT NULL, time_created INTEGER NOT NULL);
+         INSERT INTO session VALUES ('ses_fixture', '{\"id\":\"glm-fixture\",\"providerID\":\"fixture\"}',
+         0, 0, 0, 0, 0, '/unrelated-directory', 1);",
+    )
+    .unwrap();
+    let ids = vec!["ses_fixture".to_string()];
+    assert_eq!(crate::opencode_usage::tokens_by_model_for_ids(&ids, None), None);
+    conn.execute("UPDATE session SET tokens_input = 10 WHERE id = 'ses_fixture'", [])
+        .unwrap();
+    let log = write_step_log(
+        dir.path(),
+        "available",
+        "{\"type\":\"step_finish\",\"sessionID\":\"ses_fixture\"}\n",
+    );
+    let spans = emit("available", &log);
+    assert_eq!(spans.len(), 1);
+    assert_eq!(spans[0].name, SpanName::RuntimeUsage);
+    assert_eq!(spans[0].attributes["loom.runtime"], "opencode");
+    assert_eq!(spans[0].attributes["loom.tokens.input"], "10");
 }

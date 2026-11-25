@@ -329,20 +329,24 @@ fn serve(responses: Vec<(u16, String)>) -> (SocketAddr, Seen) {
     (addr, seen)
 }
 
-#[test]
+#[tokio::test]
 #[serial]
-fn the_client_sends_the_key_as_a_bearer_header_only() {
-    let body = json!({ "items": [{ "number": 4 }] }).to_string();
+async fn the_client_sends_the_key_as_a_bearer_header_only() {
+    let body = json!({ "changes": [{ "number": 4 }] }).to_string();
     let (addr, seen) = serve(vec![(200, body), (401, "{}".into())]);
     let a = Active::for_test(&format!("http://{addr}"), BOUND);
+    let http = client::build_http().unwrap();
     let q = vec![
         ("repo".to_string(), REPO.to_string()),
         ("label".to_string(), "loom:issue".to_string()),
     ];
-    let v = client::get_json_blocking(&a, "/v1/mirror/items", &q, Duration::from_secs(5)).unwrap();
-    assert_eq!(v["items"][0]["number"], 4);
-    let err =
-        client::get_json_blocking(&a, "/v1/mirror/items", &q, Duration::from_secs(5)).unwrap_err();
+    let v = client::get_json(&http, &a, "/v1/changes", &q)
+        .await
+        .unwrap();
+    assert_eq!(v["changes"][0]["number"], 4);
+    let err = client::get_json(&http, &a, "/v1/changes", &q)
+        .await
+        .unwrap_err();
     assert_eq!(err, MirrorError::Auth(401));
     assert!(!err.to_string().contains(a.key()));
     let seen = seen.lock().unwrap().clone();
@@ -350,7 +354,7 @@ fn the_client_sends_the_key_as_a_bearer_header_only() {
     assert!(
         seen[0]
             .0
-            .starts_with("GET /v1/mirror/items?repo=acme%2Fwidgets&label=loom%3Aissue "),
+            .starts_with("GET /v1/changes?repo=acme%2Fwidgets&label=loom%3Aissue "),
         "{}",
         seen[0].0
     );
@@ -367,8 +371,13 @@ fn an_unreachable_mirror_is_a_bounded_error() {
     drop(listener);
     let a = Active::for_test(&format!("http://{addr}"), BOUND);
     let started = Instant::now();
-    let err =
-        client::get_json_blocking(&a, "/v1/mirror/items", &[], Duration::from_secs(3)).unwrap_err();
+    let err = client::get_json_conditional_blocking(
+        &a,
+        "/v1/mirror/worklist",
+        None,
+        Duration::from_secs(3),
+    )
+    .unwrap_err();
     assert!(matches!(err, MirrorError::Transport(_)), "{err:?}");
     assert!(started.elapsed() < Duration::from_secs(4));
 }
@@ -566,13 +575,21 @@ async fn a_mirror_read_from_a_spawned_task_on_a_multi_thread_runtime_works() {
     // The blocking call, from a task.
     let (addr, _) = serve(vec![(200, "{\"ok\":1}".into())]);
     let a = Active::for_test(&format!("http://{addr}"), BOUND);
-    let v = tokio::spawn(async move {
-        client::get_json_blocking(&a, "/v1/mirror/watermark", &[], Duration::from_secs(5))
+    let answer = tokio::spawn(async move {
+        client::get_json_conditional_blocking(
+            &a,
+            "/v1/mirror/worklist",
+            None,
+            Duration::from_secs(5),
+        )
     })
     .await
     .unwrap()
     .unwrap();
-    assert_eq!(v["ok"], 1);
+    match answer {
+        client::Conditional::Modified { body, .. } => assert_eq!(body["ok"], 1),
+        client::Conditional::NotModified => panic!("expected a modified answer with a body"),
+    }
 }
 
 #[test]

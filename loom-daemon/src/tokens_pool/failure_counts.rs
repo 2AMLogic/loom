@@ -6,7 +6,7 @@
 //! as JSON: `{"<account_name>": {"count": <int>, "last_failure": "<ISO8601 UTC>"}}`.
 //!
 //! The counter is reset by `tokens unblock` for that account
-//! ([`record_success`]) or any operator allowlist mutation ([`reset_all`]); a
+//! ([`record_success_in_dir`]) or any operator allowlist mutation ([`reset_all`]); a
 //! successful spawn does not reset it, so the count is not strictly consecutive.
 //! Reaching the threshold (default 5) is checked `>= 5` — idempotent
 //! at-or-above, matching the Python semantics exactly.
@@ -119,22 +119,14 @@ pub fn record_failure(workspace: &Path, name: &str, threshold: u32) -> Result<u3
     Ok(new_count)
 }
 
-/// Reset the counter for `name` (drops the key entirely). No-op if the state
-/// file is missing or the key is absent.
-///
-/// # Errors
-/// Returns an error if the lock cannot be acquired.
-pub fn record_success(workspace: &Path, name: &str) -> Result<(), String> {
-    record_success_in_dir(&tokens_dir(workspace), name)
-}
-
-/// [`record_success`], operating directly on an already-resolved tokens
-/// directory rather than re-deriving one from a workspace root (issue
-/// #6759). Mirrors the `_in_dir` / workspace-anchored split already used by
+/// Reset the counter for `name` (drops the key entirely), operating directly
+/// on an already-resolved tokens directory rather than re-deriving one from a
+/// workspace root (issue #6759). No-op if the state file is missing or the key
+/// is absent. Mirrors the `_in_dir` / workspace-anchored split already used by
 /// [`crate::tokens_pool::bad_tokens::blocking_entry_in_dir`] /
 /// [`crate::tokens_pool::bad_tokens::blocking_entry`] — callers that already
 /// hold the resolved directory (e.g. the shared machine-level pool) must not
-/// pass it back through [`record_success`] as if it were a *workspace*.
+/// have to re-anchor it as a *workspace*.
 ///
 /// # Errors
 /// Returns an error if the lock cannot be acquired.
@@ -187,16 +179,6 @@ pub fn threshold_reached(workspace: &Path, name: &str, threshold: u32) -> bool {
     get_count(workspace, name) >= threshold
 }
 
-/// Return the entire state map (for status/debugging).
-#[must_use]
-pub fn all_counts(workspace: &Path) -> State {
-    let path = state_path(workspace);
-    if !path.is_file() {
-        return State::new();
-    }
-    read_state(&path)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -247,7 +229,7 @@ mod tests {
     fn record_success_drops_key() {
         let tmp = make_pool();
         record_failure(tmp.path(), "a", 5).unwrap();
-        record_success(tmp.path(), "a").unwrap();
+        record_success_in_dir(&tokens_dir(tmp.path()), "a").unwrap();
         assert_eq!(get_count(tmp.path(), "a"), 0);
     }
 
@@ -255,25 +237,8 @@ mod tests {
     fn record_success_removes_file_when_last_key_dropped() {
         let tmp = make_pool();
         record_failure(tmp.path(), "a", 5).unwrap();
-        record_success(tmp.path(), "a").unwrap();
+        record_success_in_dir(&tokens_dir(tmp.path()), "a").unwrap();
         assert!(!state_path(tmp.path()).exists());
-    }
-
-    /// #6759: `record_success_in_dir` operates directly on an already-
-    /// resolved tokens directory — what the `unblock --shared` CLI path
-    /// calls so it can reset a just-unblocked account's failure counter in
-    /// the shared pool without routing it back through the workspace-
-    /// anchored [`record_success`].
-    #[test]
-    fn record_success_in_dir_matches_workspace_wrapper() {
-        let tmp = make_pool();
-        let dir = tmp.path().join(".loom").join("tokens");
-        record_failure(tmp.path(), "a", 5).unwrap();
-        assert_eq!(get_count(tmp.path(), "a"), 1);
-
-        record_success_in_dir(&dir, "a").unwrap();
-
-        assert_eq!(get_count(tmp.path(), "a"), 0);
     }
 
     #[test]
@@ -291,7 +256,7 @@ mod tests {
         let tmp = make_pool();
         fs::write(state_path(tmp.path()), "not json").unwrap();
         assert_eq!(get_count(tmp.path(), "a"), 0);
-        assert!(all_counts(tmp.path()).is_empty());
+        assert!(read_state(&state_path(tmp.path())).is_empty());
     }
 
     #[test]

@@ -73,6 +73,63 @@ fn rotates_multi_month_log_and_conserves() {
     assert!(report.contains("8 entries unique"), "{report}");
 }
 
+const FOOTER: &str = "<!-- Maintained automatically by the Guide triage agent. Manual edits are fine but may be overwritten. -->\n";
+
+/// Recent section, old section (older month), then the trailing maintenance
+/// comment after the last dated section (#15271).
+fn with_trailing_comment() -> String {
+    let mut s = String::from(PREAMBLE);
+    s.push_str(&section("2026-10-16", 9));
+    s.push_str(&section("2026-07-02", 6));
+    s.push_str(FOOTER);
+    s
+}
+
+#[test]
+fn trailing_maintenance_comment_stays_in_active_file() {
+    let dir = setup(&with_trailing_comment());
+    let root = dir.path();
+    run(root).unwrap();
+
+    let active = read(root, "WORK_LOG.md");
+    assert!(active.ends_with(FOOTER), "{active}");
+    assert_eq!(active.matches("Maintained automatically").count(), 1);
+    assert!(!active.contains("2026-07-02"));
+
+    let jul = read(root, "work_log/WORK_LOG_2026-07.md");
+    assert!(jul.ends_with(&section("2026-07-02", 6)), "{jul}");
+    assert!(!jul.contains("Maintained automatically"), "{jul}");
+
+    let report = check(&RootArgs {
+        root: root.to_path_buf(),
+    })
+    .unwrap();
+    assert!(report.contains("entries unique"), "{report}");
+
+    // A second run is a byte-identical no-op.
+    let snapshot = (read(root, "WORK_LOG.md"), jul);
+    run(root).unwrap();
+    assert_eq!(
+        snapshot,
+        (read(root, "WORK_LOG.md"), read(root, "work_log/WORK_LOG_2026-07.md"))
+    );
+}
+
+#[test]
+fn comment_followed_by_more_content_stays_in_its_section() {
+    // Not a trailing region: later content follows, so the comment is part of
+    // the old section and moves with it.
+    let mut s = String::from(PREAMBLE);
+    s.push_str(&section("2026-10-16", 9));
+    s.push_str("### 2026-07-02\n- **PR #6**: t\n\n<!-- note -->\n- **Issue #7** (closed): u\n\n");
+    s.push_str("### 2026-07-01\n- **PR #5**: v\n");
+    let dir = setup(&s);
+    run(dir.path()).unwrap();
+    let jul = read(dir.path(), "work_log/WORK_LOG_2026-07.md");
+    assert!(jul.contains("<!-- note -->\n- **Issue #7**"), "{jul}");
+    assert!(!read(dir.path(), "WORK_LOG.md").contains("note"));
+}
+
 #[test]
 fn second_run_is_byte_identical_noop() {
     let dir = setup(&sample());

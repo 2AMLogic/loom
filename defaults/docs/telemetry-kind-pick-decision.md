@@ -145,7 +145,7 @@ it, only a hold label names a reason; other candidates are undecided.
 | `in_flight` | a live sweep or claim covers it | `in_flight`; roles: a claim label the agent did not write |
 | `backoff` | inside a back-off, cooldown, recheck or retry window | `deferred_build_backoff`, `recheck_interval`, `dispatch_backoff`, `noop_cooldown`, `prless_retry` |
 | `halted` | the repo's dispatch is halted (red main, gate, drain, ...) | `workspace_halted` |
-| `host_constraint` | not for this host | `host_constraint`, `peer_claim`; step engine: `host_skip_label` (an `extraSkipLabels` match, #13891) reads here, where the work-finder mapping above reads the same veto as `operator_hold` |
+| `host_constraint` | not for this host | `host_constraint`, `lease_held`; step engine: `host_skip_label` (an `extraSkipLabels` match, #13891) reads here, where the work-finder mapping above reads the same veto as `operator_hold` |
 | `blocked` | blocked by something specific to the item | `workspace_commands_missing`, `quarantined`, `labelled_blocked`, `unknown`; roles: `loom:blocked`, `loom:ci-failure` |
 | `error` | the dispatch attempt failed | `dispatch_error` |
 | `tick_skipped` | the role tick did not run for another reason | roles: runtime rejected, model/runtime mismatch, load, queue gate |
@@ -206,7 +206,7 @@ SELECT
   JSONExtractUInt(body, 'candidates_total')         AS candidates_total,
   JSONExtractString(body, 'candidate_source')       AS source,
   arrayFirstIndex(
-    c -> JSONExtractString(c, 'repo') = 'rjwalters/loom'
+    c -> JSONExtractString(c, 'repo') = '2AMLogic/loom'
      AND JSONExtractUInt(c, 'number') = 10212,
     JSONExtractArrayRaw(body, 'candidates'))        AS rank
 FROM signoz_logs.distributed_logs_v2
@@ -227,7 +227,7 @@ one tick are not counted as multiple ticks.
 
 ## Record volume
 
-> **Step dispatch (#11894, live since #11909).** Item roles have left the fixed role-runner cadences, so this table no longer holds for Curator, Judge and Doctor. Work-finder records carry `item_draw` (the step, the weight terms, `age_source`, and `weight_overflow`), and each work-finder row's `stage` names its step. See [`docs/design/work-finder-step-dispatch.md`](https://github.com/rjwalters/loom/blob/main/docs/design/work-finder-step-dispatch.md) §12.
+> **Step dispatch (#11894, live since #11909).** Item roles have left the fixed role-runner cadences, so this table no longer holds for Curator, Judge and Doctor. Work-finder records carry `item_draw` (the step, the weight terms, `age_source`, and `weight_overflow`), and each work-finder row's `stage` names its step. See [`docs/design/work-finder-step-dispatch.md`](https://github.com/2AMLogic/loom/blob/main/docs/design/work-finder-step-dispatch.md) §12.
 
 Derived from the shipped default cadences, **not measured on a live fleet**:
 

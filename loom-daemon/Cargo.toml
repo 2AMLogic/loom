@@ -13,6 +13,11 @@ edition = "2021"
 tokio = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true, features = ["preserve_order"] }
+# YAML parsing: Champion reads workflow permission values without interpreting
+# arbitrary workflow text (cli/forge_workflow_permissions.rs), and workflow-lint
+# parses each file through a duplicate-key-rejecting visitor
+# (workflow_lint.rs, #13896) — one maintained parser for both (#14946).
+serde-saphyr = { version = "2.2", default-features = false, features = ["deserialize"] }
 anyhow = { workspace = true }
 log = "0.4"
 env_logger = "0.11"

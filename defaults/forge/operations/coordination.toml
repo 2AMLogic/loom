@@ -145,6 +145,9 @@ path = "loom-daemon/src/intake_reconcile/singleton.rs"
 [[operation.callers]]
 kind = "rust"
 path = "loom-daemon/src/intake_reconcile/demote.rs"
+[[operation.callers]]
+kind = "rust"
+path = "loom-daemon/src/claim_reconciliation/pass_loop/merge_observation.rs"
 
 [[operation]]
 id = "issue.search"
@@ -242,6 +245,11 @@ path = "loom-daemon/src/claim_reconciliation/ci_gate_recovery.rs"
 [[operation.callers]]
 kind = "rust"
 path = "loom-daemon/src/claim_reconciliation/orphan_stack.rs"
+
+[[operation.callers]]
+kind = "rust"
+path = "loom-daemon/src/claim_reconciliation/merged_stack.rs"
+
 [[operation.callers]]
 kind = "rust"
 path = "loom-daemon/src/fleet/drain_reset.rs"
@@ -257,6 +265,12 @@ path = "loom-daemon/src/intake_reconcile/demote.rs"
 [[operation.callers]]
 kind = "rust"
 path = "loom-daemon/src/epic_supervisor.rs"
+[[operation.callers]]
+kind = "rust"
+path = "loom-daemon/src/claim_reconciliation/pass_loop/merge_observation.rs"
+[[operation.callers]]
+kind = "rust"
+path = "loom-daemon/src/claim_reconciliation/curating_reclaim.rs"
 
 [[operation]]
 id = "issue.edit-body"
@@ -337,6 +351,9 @@ path = "defaults/scripts/lib/forge-helpers.sh"
 [[operation.callers]]
 kind = "rust"
 path = "loom-daemon/src/work_finder/main_red_autofile.rs"
+[[operation.callers]]
+kind = "rust"
+path = "loom-daemon/src/claim_reconciliation/pass_loop/merge_observation.rs"
 
 # --- label-catalogue-transitions ---------------------------------------------
 
@@ -439,12 +456,24 @@ path = "loom-daemon/src/claim_reconciliation/ci_gate_recovery.rs"
 [[operation.callers]]
 kind = "rust"
 path = "loom-daemon/src/claim_reconciliation/orphan_stack.rs"
+
+[[operation.callers]]
+kind = "rust"
+path = "loom-daemon/src/claim_reconciliation/merged_stack.rs"
+
 [[operation.callers]]
 kind = "rust"
 path = "loom-daemon/src/intake_reconcile/demote.rs"
 [[operation.callers]]
 kind = "rust"
 path = "loom-daemon/src/epic_supervisor.rs"
+
+[[operation.callers]]
+kind = "rust"
+path = "loom-daemon/src/sweep_registry/step_spawn/builder_rollback.rs"
+[[operation.callers]]
+kind = "rust"
+path = "loom-daemon/src/claim_reconciliation/curating_reclaim.rs"
 
 [[operation]]
 id = "comment.list"
@@ -488,6 +517,15 @@ path = "loom-daemon/src/forge_cached_view.rs"
 [[operation.callers]]
 kind = "rust"
 path = "loom-daemon/src/work_finder/main_red_autofile.rs"
+[[operation.callers]]
+kind = "rust"
+path = "loom-daemon/src/sweep_registry/step_spawn/builder_rollback.rs"
+[[operation.callers]]
+kind = "rust"
+path = "loom-daemon/src/claim_reconciliation/pass_loop/merge_observation.rs"
+[[operation.callers]]
+kind = "rust"
+path = "loom-daemon/src/claim_reconciliation/curating_reclaim.rs"
 
 [[operation]]
 id = "comment.edit-delete"
@@ -569,6 +607,9 @@ path = "loom-daemon/src/observability/ops/stage_events.rs"
 [[operation.callers]]
 kind = "rust"
 path = "loom-daemon/src/intake_reconcile/demote.rs"
+[[operation.callers]]
+kind = "rust"
+path = "loom-daemon/src/claim_reconciliation/pass_loop/merge_observation.rs"
 
 # --- epics-relationships -----------------------------------------------------
 

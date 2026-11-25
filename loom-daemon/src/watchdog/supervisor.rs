@@ -96,8 +96,7 @@ pub fn resolve_with_marker(
 /// Whether `systemctl` is on PATH — the shell's `command -v systemctl`.
 #[must_use]
 pub fn systemctl_available() -> bool {
-    std::env::var_os("PATH")
-        .is_some_and(|paths| std::env::split_paths(&paths).any(|d| d.join("systemctl").is_file()))
+    crate::fs_util::is_on_path("systemctl")
 }
 
 #[cfg(test)]

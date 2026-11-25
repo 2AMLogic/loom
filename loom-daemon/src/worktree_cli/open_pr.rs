@@ -44,10 +44,8 @@
 //!
 //! # Why Rust and not the file that already holds this
 //!
-//! `lib/worktree-forge-pr-check.sh` is not itself frozen by the file-size
-//! ratchet (472 lines, under the 1000-line threshold `scripts/
-//! file-size-baseline.txt` tracks) — but it is exactly the class of code the
-//! sibling ports in this family (`stale_ref`, `closed_pr_branch`) exist to
+//! `lib/worktree-forge-pr-check.sh` is small (472 lines), but it is exactly the
+//! class of code the sibling ports in this family (`stale_ref`, `closed_pr_branch`) exist to
 //! retire: a forge round-trip's success/failure text parsed by `grep -qi`
 //! against two hand-copied substrings, and a `jq` pipeline reparsing the
 //! result field by field. Neither half is destructive — this whole family is
@@ -106,7 +104,7 @@
 //! creates a genuinely NEW branch, so a hard dependency would strand that
 //! path on any host running a daemon that predates this slice.
 
-use crate::fs_util::is_executable;
+use crate::fs_util::is_on_path;
 use std::path::Path;
 use std::process::Command;
 
@@ -227,9 +225,9 @@ pub fn query(repo: &Path, branch: &str) -> Probe {
     if !has_forge_remote(repo) {
         return Probe::status_only(Status::NoForgeRemote);
     }
-    let (program, leading): (&str, &[&str]) = if on_path("loom-daemon") {
+    let (program, leading): (&str, &[&str]) = if is_on_path("loom-daemon") {
         ("loom-daemon", &["forge"])
-    } else if on_path("gh") {
+    } else if is_on_path("gh") {
         ("gh", &[])
     } else {
         return Probe::status_only(Status::Unavailable);
@@ -339,16 +337,6 @@ fn parse_probe(text: &str) -> Probe {
             url,
         }),
     }
-}
-
-fn on_path(program: &str) -> bool {
-    let Some(path) = std::env::var_os("PATH") else {
-        return false;
-    };
-    std::env::split_paths(&path).any(|dir| {
-        let candidate = dir.join(program);
-        candidate.is_file() && is_executable(&candidate)
-    })
 }
 
 /// Run the query and print the `TOKEN<TAB>text` record stream

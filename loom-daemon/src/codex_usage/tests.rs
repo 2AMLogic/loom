@@ -310,7 +310,7 @@ fn read_rollout_refuses_an_unauthorized_path_even_when_handed_one_directly() {
         home.join(SESSIONS_DIR).join("auth.json"),
     ] {
         assert!(path.is_file(), "fixture must exist: {}", path.display());
-        assert_eq!(read_rollout(&home, &path, u64::MAX), None, "{}", path.display());
+        assert!(read_rollout(&home, &path, u64::MAX).is_none(), "{}", path.display());
     }
 }
 
@@ -590,6 +590,42 @@ fn an_explicit_session_id_set_is_a_strictly_narrower_key_than_directory_alone() 
     );
 }
 
+/// An id set NARROWS the directory+window key, it does not replace it: an
+/// id-matched rollout whose `cwd` is outside `directories`, or whose start is
+/// outside the window, is not attributed. `usage_source::role_tick_tokens_by_model`
+/// documents this asymmetry with the OpenCode arm (#14278); only an ids-only
+/// filter drops the directory constraint.
+#[test]
+fn ids_are_anded_with_the_directory_and_window_not_a_replacement_for_them() {
+    let lines =
+        rollout("/elsewhere", "2026-09-21T02:06:31Z", "wanted", "gpt-5", &[(100, 0, 10, 0)]);
+    let anded = SessionFilter {
+        directories: vec![PathBuf::from("/w")],
+        ids: vec!["wanted".to_string()],
+    };
+    assert!(
+        fold_rollout(&lines, &anded, None).is_empty(),
+        "the id names the rollout but its cwd is outside the directory set"
+    );
+    let ids_only = SessionFilter {
+        directories: Vec::new(),
+        ids: vec!["wanted".to_string()],
+    };
+    assert_eq!(fold_rollout(&lines, &ids_only, None).len(), 1);
+
+    let in_dir = rollout("/w", "2026-09-21T02:06:31Z", "wanted", "gpt-5", &[(100, 0, 10, 0)]);
+    let created = instant("2026-09-21T02:06:31Z");
+    assert!(
+        fold_rollout(
+            &in_dir,
+            &anded,
+            Some((created + Duration::seconds(1), created + Duration::hours(1)))
+        )
+        .is_empty(),
+        "the window still applies to an id-matched rollout"
+    );
+}
+
 #[test]
 fn an_id_only_filter_attributes_across_directories() {
     let lines = rollout("/anywhere", "2026-09-21T02:06:31Z", "wanted", "gpt-5", &[(100, 0, 10, 0)]);
@@ -598,6 +634,563 @@ fn an_id_only_filter_attributes_across_directories() {
         ids: vec!["wanted".to_string()],
     };
     assert_eq!(fold_rollout(&lines, &filter, None).len(), 1);
+}
+
+/// #14664: a by-id read says WHY no rows came back, keeping the precedence
+/// the OpenCode store's `lookup_ids` keeps — found rows first, then a store
+/// that could not be read, then a named session without tokens, then an id
+/// nothing holds.
+#[serial_test::serial(codex_home_env)]
+#[test]
+fn lookup_ids_says_why_no_rows_came_back() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = seed_codex_home(
+        tmp.path(),
+        &[
+            (
+                "2026/09/20",
+                "rollout-real.jsonl",
+                rollout(
+                    // A private-clone seat's container path: never a host
+                    // workspace directory, which is the miss #14664 closes.
+                    "/workspace/work/repo-clone",
+                    "2026-09-21T02:06:31Z",
+                    "11111111-2222-3333-4444-555555555555",
+                    "gpt-5",
+                    &[(1_000, 400, 100, 40)],
+                ),
+            ),
+            (
+                "2026/09/20",
+                "rollout-zero.jsonl",
+                rollout(
+                    "/w",
+                    "2026-09-21T02:06:31Z",
+                    "99999999-8888-7777-6666-555555555555",
+                    "gpt-5",
+                    &[],
+                ),
+            ),
+        ],
+    );
+    let window = (instant("2026-09-21T01:00:00Z"), instant("2026-09-21T03:00:00Z"));
+
+    // An empty id set is no key at all.
+    assert_eq!(with_codex_home(&home, || lookup_ids(&[], window, None)), IdLookup::NotFound);
+
+    // No rollout in the window's date directories anywhere: candidate data
+    // absent, so nothing follows about the ids.
+    let far = (instant("2026-01-01T00:00:00Z"), instant("2026-01-02T00:00:00Z"));
+    assert_eq!(
+        with_codex_home(&home, || lookup_ids(
+            &["11111111-2222-3333-4444-555555555555".to_string()],
+            far,
+            None
+        )),
+        IdLookup::NoStore
+    );
+
+    // Stores read, id held by none of them.
+    assert_eq!(
+        with_codex_home(&home, || lookup_ids(
+            &["00000000-0000-0000-0000-000000000000".to_string()],
+            window,
+            None
+        )),
+        IdLookup::NotFound
+    );
+
+    // A named rollout selected by the whole key but with no tokens.
+    assert_eq!(
+        with_codex_home(&home, || lookup_ids(
+            &["99999999-8888-7777-6666-555555555555".to_string()],
+            window,
+            None
+        )),
+        IdLookup::NoUsage
+    );
+
+    // The named rollout is attributed across the directory mismatch…
+    let IdLookup::Found(rows) = with_codex_home(&home, || {
+        lookup_ids(&["11111111-2222-3333-4444-555555555555".to_string()], window, None)
+    }) else {
+        panic!("expected rows");
+    };
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(rows[0].model, "gpt-5");
+    assert_eq!(rows[0].input, 1_000 - 400);
+    assert_eq!(rows[0].cache_read, 400);
+    assert_eq!(rows[0].output, 100);
+
+    // …and the window still applies: an id-named rollout outside it is NOT
+    // selected, so the id + window key never degrades to id-alone.
+    let later = (instant("2026-09-21T03:00:01Z"), instant("2026-09-21T04:00:00Z"));
+    assert_eq!(
+        with_codex_home(&home, || lookup_ids(
+            &["11111111-2222-3333-4444-555555555555".to_string()],
+            later,
+            None
+        )),
+        IdLookup::NotFound
+    );
+}
+
+// ---------------------------------------------------------------------------
+// #14668: an incomplete read is never confirmed absence
+// ---------------------------------------------------------------------------
+
+/// #14883: the merge reader's by-id read — id alone, no window, no directory —
+/// opens only rollouts whose own FILENAME carries an exact id, then re-checks
+/// the id in `session_meta`. A Builder rollout created before any PR window,
+/// an unrelated sibling, and a filename coincidence the metadata rejects all
+/// behave as they must.
+#[serial_test::serial(codex_home_env)]
+#[test]
+fn tokens_by_session_ids_is_keyed_on_the_id_alone_and_reads_only_named_files() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = seed_codex_home(
+        tmp.path(),
+        &[
+            (
+                // The final Builder's rollout: created hours BEFORE the PR
+                // window would open, in a container-local cwd — both would
+                // drop it under the directory+window key (#14540), neither
+                // may under the merge reader's id key.
+                "2026/11/20",
+                "rollout-2026-11-20T09-00-00-aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee.jsonl",
+                rollout(
+                    "/workspace/work/repo-clone",
+                    "2026-11-20T09:00:31Z",
+                    "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+                    "gpt-5",
+                    &[(1_000, 400, 100, 40)],
+                ),
+            ),
+            (
+                // An unrelated rollout in the same profile: never named.
+                "2026/11/20",
+                "rollout-2026-11-20T11-00-00-0123456789abcdef0123456789abcdef.jsonl",
+                rollout(
+                    "/workspace/work/repo-clone",
+                    "2026-11-20T11:00:31Z",
+                    "01234567-89ab-cdef-0123-456789abcdef",
+                    "gpt-5",
+                    &[(9_000_000, 0, 900_000, 0)],
+                ),
+            ),
+            (
+                // A filename that carries the named id as a substring but
+                // whose session metadata names a DIFFERENT session: the
+                // metadata check must reject it.
+                "2026/11/21",
+                "rollout-2026-11-21T04-00-00-xaaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee.jsonl",
+                rollout(
+                    "/workspace/work/repo-clone",
+                    "2026-11-21T04:00:31Z",
+                    "99999999-8888-7777-6666-555555555555",
+                    "gpt-5",
+                    &[(7_000_000, 0, 700_000, 0)],
+                ),
+            ),
+        ],
+    );
+    let id = |s: &str| vec![s.to_string()];
+    let builder = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+
+    // An empty id set skips the read entirely.
+    assert_eq!(with_codex_home(&home, || tokens_by_session_ids(&[], None)), None);
+
+    let rows = with_codex_home(&home, || tokens_by_session_ids(&id(builder), None))
+        .expect("the named rollout is attributed");
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(rows[0].model, "gpt-5");
+    assert_eq!(rows[0].input, 600);
+    assert_eq!(rows[0].cache_read, 400);
+    assert_eq!(rows[0].output, 100);
+    // Disjoint counters, the module doc's mapping: cached input is moved out
+    // of `input` into `cache_read` (this fixture writes no cache-write field,
+    // so `cache_write_5m`/`cache_write_1h` stay 0).
+    assert_eq!(rows[0].cache_write_5m, 0);
+    assert_eq!(rows[0].cache_write_1h, 0);
+    assert_eq!(
+        rows[0].input + rows[0].cache_read + rows[0].cache_write_5m + rows[0].output,
+        1_100,
+        "the four counters sum to the billed total exactly once"
+    );
+
+    // An id no rollout holds contributes no row — unknown, never zero-rows.
+    assert_eq!(
+        with_codex_home(&home, || {
+            tokens_by_session_ids(&id("00000000-0000-0000-0000-000000000000"), None)
+        }),
+        None
+    );
+
+    // A repeated id still reads once.
+    assert_eq!(
+        with_codex_home(&home, || {
+            tokens_by_session_ids(
+                &id(builder)
+                    .into_iter()
+                    .chain(id(builder))
+                    .collect::<Vec<_>>(),
+                None,
+            )
+        })
+        .map(|rows| (rows.len(), rows[0].input)),
+        Some((1, 600))
+    );
+}
+
+/// A `token_count` event truncated mid-write: valid UTF-8, invalid JSON — the
+/// exact shape a Codex killed mid-turn leaves behind.
+fn truncated_token_line() -> String {
+    r#"{"timestamp":"2026-09-21T02:06:34.117Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":50"#
+        .to_string()
+}
+
+#[serial_test::serial(codex_home_env)]
+#[test]
+fn a_selected_rollout_with_an_unparseable_token_line_is_no_store_not_no_usage() {
+    // A rollout selected by the whole id + window key, whose only usage event
+    // was truncated mid-JSON: "zero tokens" cannot be established — the
+    // unread half of the line is where the usage would be (#14668).
+    let tmp = tempfile::tempdir().unwrap();
+    let mut lines = rollout(
+        "/w",
+        "2026-09-21T02:06:31Z",
+        "11111111-2222-3333-4444-555555555555",
+        "gpt-5",
+        &[],
+    );
+    lines.push(truncated_token_line());
+    let home = seed_codex_home(tmp.path(), &[("2026/09/20", "rollout-trunc.jsonl", lines)]);
+    let window = (instant("2026-09-21T01:00:00Z"), instant("2026-09-21T03:00:00Z"));
+    assert_eq!(
+        with_codex_home(&home, || lookup_ids(
+            &["11111111-2222-3333-4444-555555555555".to_string()],
+            window,
+            None
+        )),
+        IdLookup::NoStore
+    );
+    // Control (a fresh store): the same rollout with the line complete
+    // records the tokens and is `Found` — the fixture's key and window
+    // really do select it.
+    let whole_tmp = tempfile::tempdir().unwrap();
+    let whole = rollout(
+        "/w",
+        "2026-09-21T02:06:31Z",
+        "11111111-2222-3333-4444-555555555555",
+        "gpt-5",
+        &[(500, 0, 50, 0)],
+    );
+    let whole_home =
+        seed_codex_home(whole_tmp.path(), &[("2026/09/20", "rollout-whole.jsonl", whole)]);
+    assert!(matches!(
+        with_codex_home(&whole_home, || lookup_ids(
+            &["11111111-2222-3333-4444-555555555555".to_string()],
+            window,
+            None
+        )),
+        IdLookup::Found(_)
+    ));
+}
+
+#[serial_test::serial(codex_home_env)]
+#[test]
+fn an_unparseable_identity_line_is_no_store_not_confirmed_absence() {
+    // An in-window rollout whose ONLY line is a `session_meta` truncated
+    // mid-payload: its session id is unknowable, so nothing can establish
+    // that the requested id is absent from the store (#14668).
+    let tmp = tempfile::tempdir().unwrap();
+    let home = seed_codex_home(
+        tmp.path(),
+        &[(
+            "2026/09/20",
+            "rollout-nameless.jsonl",
+            vec![r#"{"timestamp":"2026-09-21T02:06:31Z","type":"session_meta","payload":{"cwd":"/w","id":"1111"#.to_string()],
+        )],
+    );
+    let window = (instant("2026-09-21T01:00:00Z"), instant("2026-09-21T03:00:00Z"));
+    assert_eq!(
+        with_codex_home(&home, || lookup_ids(
+            &["11111111-2222-3333-4444-555555555555".to_string()],
+            window,
+            None
+        )),
+        IdLookup::NoStore
+    );
+}
+
+#[serial_test::serial(codex_home_env)]
+#[test]
+fn a_rollout_with_unparseable_lines_and_real_rows_stays_found_with_its_totals() {
+    // Rows always win: a rollout with one truncated trailing line AND a valid
+    // usage history is `Found` with exactly the valid rows' totals — the
+    // decode failure costs nothing a caller can see (#14668 precedence).
+    let tmp = tempfile::tempdir().unwrap();
+    let mut lines = rollout(
+        "/w",
+        "2026-09-21T02:06:31Z",
+        "11111111-2222-3333-4444-555555555555",
+        "gpt-5",
+        &[(1_000, 400, 100, 40)],
+    );
+    lines.push(truncated_token_line());
+    let home = seed_codex_home(tmp.path(), &[("2026/09/20", "rollout-mixed.jsonl", lines)]);
+    let window = (instant("2026-09-21T01:00:00Z"), instant("2026-09-21T03:00:00Z"));
+    let IdLookup::Found(rows) = with_codex_home(&home, || {
+        lookup_ids(&["11111111-2222-3333-4444-555555555555".to_string()], window, None)
+    }) else {
+        panic!("valid usage must keep Found precedence over a decode failure");
+    };
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(rows[0].input, 1_000 - 400);
+    assert_eq!(rows[0].cache_read, 400);
+    assert_eq!(rows[0].output, 100);
+}
+
+#[cfg(unix)]
+mod denied_dirs {
+    //! Permission-denied fixtures. Mode bits do not stop root, so each test
+    //! returns early (green, witness skipped) when run as root.
+
+    use super::*;
+    use std::os::unix::fs::PermissionsExt as _;
+
+    fn denials_are_enforced() -> bool {
+        // SAFETY: geteuid only reads the caller's effective user id.
+        let euid = unsafe { libc::geteuid() };
+        euid != 0
+    }
+
+    fn deny(path: &Path) {
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o000)).unwrap();
+    }
+
+    fn restore(path: &Path) {
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    #[serial_test::serial(codex_home_env)]
+    #[test]
+    fn listable_directories_with_denied_candidate_metadata_make_a_miss_no_store() {
+        if !denials_are_enforced() {
+            return;
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let home = seed_codex_home(
+            tmp.path(),
+            &[
+                (
+                    "2026/08/31",
+                    "rollout-readable.jsonl",
+                    rollout("/w", "2026-09-01T02:06:31Z", "unrelated", "gpt-5", &[(500, 0, 50, 0)]),
+                ),
+                (
+                    "2026/09/01",
+                    "rollout-requested.jsonl",
+                    rollout("/w", "2026-09-01T02:06:31Z", "wanted", "gpt-5", &[(500, 0, 50, 0)]),
+                ),
+            ],
+        );
+        let month = home.join(SESSIONS_DIR).join("2026/09");
+        let day = month.join("01");
+        let wanted = day.join("rollout-requested.jsonl");
+        let window = (instant("2026-09-01T01:00:00Z"), instant("2026-09-01T03:00:00Z"));
+        let id = ["wanted".into()];
+        let lookup = || with_codex_home(&home, || lookup_ids(&id, window, None));
+        assert!(matches!(lookup(), IdLookup::Found(_)));
+
+        // Listing succeeds even without the search bit. The eligible child's
+        // metadata is inaccessible, whether it is a rollout or a date directory.
+        for (directory, child) in [(&day, &wanted), (&month, &day)] {
+            std::fs::set_permissions(directory, std::fs::Permissions::from_mode(0o400)).unwrap();
+            let entries = std::fs::read_dir(directory)
+                .and_then(|entries| entries.collect::<std::io::Result<Vec<_>>>());
+            let metadata = std::fs::metadata(child);
+            let result = lookup();
+            restore(directory);
+            assert!(entries.unwrap().iter().any(|entry| entry.path() == *child));
+            assert_eq!(metadata.unwrap_err().kind(), std::io::ErrorKind::PermissionDenied);
+            assert_eq!(result, IdLookup::NoStore);
+            assert!(matches!(lookup(), IdLookup::Found(_)));
+        }
+    }
+
+    #[serial_test::serial(codex_home_env)]
+    #[test]
+    fn invalid_month_is_excluded_before_a_cross_year_lookup_reads_it() {
+        if !denials_are_enforced() {
+            return;
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let home = seed_codex_home(
+            tmp.path(),
+            &[(
+                "2026/12/31",
+                "rollout-complete.jsonl",
+                rollout("/w", "2026-12-31T02:06:31Z", "known-zero", "gpt-5", &[]),
+            )],
+        );
+        let invalid_month = home.join(SESSIONS_DIR).join("2026/13");
+        std::fs::create_dir(&invalid_month).unwrap();
+        let window = (instant("2026-12-31T00:00:00Z"), instant("2027-01-01T03:00:00Z"));
+        deny(&invalid_month);
+        let failed_read = std::fs::read_dir(&invalid_month);
+        let result = with_codex_home(&home, || lookup_ids(&["absent".into()], window, None));
+        restore(&invalid_month);
+        assert_eq!(failed_read.unwrap_err().kind(), std::io::ErrorKind::PermissionDenied);
+        assert_eq!(result, IdLookup::NotFound);
+    }
+
+    #[serial_test::serial(codex_home_env)]
+    #[test]
+    fn an_unreadable_in_window_day_directory_makes_a_by_id_miss_no_store() {
+        if !denials_are_enforced() {
+            return;
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let home = seed_codex_home(
+            tmp.path(),
+            &[
+                // A readable sibling rollout the walk CAN inspect and rule
+                // out — the miss must still not become confirmed absence.
+                (
+                    "2026/09/20",
+                    "rollout-sibling.jsonl",
+                    rollout(
+                        "/w",
+                        "2026-09-21T02:06:31Z",
+                        "99999999-8888-7777-6666-555555555555",
+                        "gpt-5",
+                        &[(100, 0, 10, 0)],
+                    ),
+                ),
+                // The requested session, in a day directory the walk cannot
+                // enumerate once denied.
+                (
+                    "2026/09/21",
+                    "rollout-requested.jsonl",
+                    rollout(
+                        "/w",
+                        "2026-09-21T02:06:31Z",
+                        "11111111-2222-3333-4444-555555555555",
+                        "gpt-5",
+                        &[(500, 0, 50, 0)],
+                    ),
+                ),
+            ],
+        );
+        let window = (instant("2026-09-21T01:00:00Z"), instant("2026-09-21T03:00:00Z"));
+        let id = ["11111111-2222-3333-4444-555555555555".to_string()];
+        // Witness: with the day readable, the requested session is `Found`.
+        assert!(matches!(
+            with_codex_home(&home, || lookup_ids(&id, window, None)),
+            IdLookup::Found(_)
+        ));
+        // #14668: denied, the miss is `NoStore` — the day's contents are
+        // unknown, not absent — not `session_not_found` over a readable
+        // sibling's "no match".
+        let denied_day = home.join(SESSIONS_DIR).join("2026/09/21");
+        deny(&denied_day);
+        assert_eq!(with_codex_home(&home, || lookup_ids(&id, window, None)), IdLookup::NoStore);
+        // Control: the same fixture with the day restored is `Found` again,
+        // so the `NoStore` above was the denial, not the fixture.
+        restore(&denied_day);
+        assert!(matches!(
+            with_codex_home(&home, || lookup_ids(&id, window, None)),
+            IdLookup::Found(_)
+        ));
+    }
+
+    #[serial_test::serial(codex_home_env)]
+    #[test]
+    fn an_unreadable_candidate_rollout_file_makes_a_by_id_miss_no_store() {
+        // The read-side arm (#14664): a discovered rollout that cannot be
+        // OPENED is a failed read, never evidence the id is absent.
+        if !denials_are_enforced() {
+            return;
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let home = seed_codex_home(
+            tmp.path(),
+            &[(
+                "2026/09/20",
+                "rollout-requested.jsonl",
+                rollout(
+                    "/w",
+                    "2026-09-21T02:06:31Z",
+                    "11111111-2222-3333-4444-555555555555",
+                    "gpt-5",
+                    &[(500, 0, 50, 0)],
+                ),
+            )],
+        );
+        let window = (instant("2026-09-21T01:00:00Z"), instant("2026-09-21T03:00:00Z"));
+        let requested = home
+            .join(SESSIONS_DIR)
+            .join("2026/09/20/rollout-requested.jsonl");
+        deny(&requested);
+        assert_eq!(
+            with_codex_home(&home, || lookup_ids(
+                &["11111111-2222-3333-4444-555555555555".to_string()],
+                window,
+                None
+            )),
+            IdLookup::NoStore
+        );
+        restore(&requested);
+    }
+
+    #[serial_test::serial(codex_home_env)]
+    #[test]
+    fn unreadable_out_of_window_directories_do_not_make_a_miss_no_store() {
+        // The flip side of #14668: directories the padded window already
+        // excludes are never read, so their unreadability cannot manufacture
+        // a `store_unreadable` out of a healthy, complete miss.
+        if !denials_are_enforced() {
+            return;
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let home = seed_codex_home(
+            tmp.path(),
+            &[(
+                "2026/09/20",
+                "rollout-present.jsonl",
+                rollout(
+                    "/w",
+                    "2026-09-21T02:06:31Z",
+                    "99999999-8888-7777-6666-555555555555",
+                    "gpt-5",
+                    &[(100, 0, 10, 0)],
+                ),
+            )],
+        );
+        let sessions = home.join(SESSIONS_DIR);
+        // Out-of-window day (window padded to 2026-09-20..2026-09-22), an
+        // out-of-window month of an edge year, and an out-of-window year —
+        // each holding a rollout, each unreadable.
+        for date_dir in ["2026/09/10", "2026/08/15", "2020/09/21"] {
+            let dir = sessions.join(date_dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("rollout-late.jsonl"), "{}\n").unwrap();
+            deny(&dir);
+        }
+        let window = (instant("2026-09-21T01:00:00Z"), instant("2026-09-21T03:00:00Z"));
+        assert_eq!(
+            with_codex_home(&home, || lookup_ids(
+                &["11111111-2222-3333-4444-555555555555".to_string()],
+                window,
+                None
+            )),
+            IdLookup::NotFound
+        );
+        for date_dir in ["2026/09/10", "2026/08/15", "2020/09/21"] {
+            restore(&sessions.join(date_dir));
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -717,6 +1310,9 @@ fn non_date_shaped_children_of_sessions_are_never_descended_into() {
 #[serial_test::serial(codex_home_env)]
 #[test]
 fn codex_home_prefers_the_loom_override_then_codex_own_then_the_default() {
+    // Crate-wide codex-home lock (#15174): this test mutates the variable
+    // directly, so it must not race the isolation helpers clearing it.
+    let _codex_home_lock = crate::tokens_pool::codex_home_env::lock();
     clear_home_env();
     assert_eq!(codex_home(Some(Path::new("/h"))), Some(PathBuf::from("/h/.codex")));
     std::env::set_var(CODEX_NATIVE_HOME_ENV, "/native/codex");
@@ -737,16 +1333,24 @@ fn codex_home_prefers_the_loom_override_then_codex_own_then_the_default() {
 
 /// `LOOM_CODEX_PROFILE_ROOT` cleared too, so an injected `home` decides the
 /// profile root and the operator's real pool is never reached. The returned
-/// guard holds the crate-wide profile-root lock and restores it on drop (#9964).
-fn clear_all_home_env() -> crate::tokens_pool::profile_root_env::ProfileRootEnv {
-    clear_home_env();
-    crate::tokens_pool::profile_root_env::ProfileRootEnv::unset()
+/// guard holds the crate-wide profile-root lock and restores it on drop
+/// (#9964), plus the crate-wide codex-home lock for the `LOOM_CODEX_HOME`
+/// removal (#15174) — codex-home first, profile-root inner, per
+/// `codex_home_env`'s documented lock order.
+fn clear_all_home_env() -> (
+    crate::tokens_pool::profile_root_env::ProfileRootEnv,
+    crate::tokens_pool::codex_home_env::CodexHomeEnv,
+) {
+    let codex_home = crate::tokens_pool::codex_home_env::CodexHomeEnv::unset();
+    let profile_root = crate::tokens_pool::profile_root_env::ProfileRootEnv::unset();
+    std::env::remove_var(CODEX_NATIVE_HOME_ENV);
+    (profile_root, codex_home)
 }
 
 #[serial_test::serial(codex_home_env)]
 #[test]
 fn codex_homes_is_the_ambient_home_plus_every_pooled_profile_unless_pinned() {
-    let _profile_root = clear_all_home_env();
+    let _home_env = clear_all_home_env();
     let tmp = tempfile::tempdir().unwrap();
     let profiles = tmp.path().join(".loom/codex-profiles");
     std::fs::create_dir_all(profiles.join("work-b")).unwrap();
@@ -781,7 +1385,7 @@ fn codex_homes_is_the_ambient_home_plus_every_pooled_profile_unless_pinned() {
 #[serial_test::serial(codex_home_env)]
 #[test]
 fn profile_rollouts_are_read_and_a_symlinked_shared_tree_is_counted_once() {
-    let _profile_root = clear_all_home_env();
+    let _home_env = clear_all_home_env();
     let tmp = tempfile::tempdir().unwrap();
     // The default account's home, holding one session.
     let default_home = seed_codex_home(
@@ -832,8 +1436,12 @@ fn profile_rollouts_are_read_and_a_symlinked_shared_tree_is_counted_once() {
 /// process per test — see `lib.rs`'s "Test isolation convention"), and every
 /// caller additionally carries `#[serial_test::serial(codex_home_env)]` so a
 /// plain `cargo test` run is safe too: the same discipline
-/// `opencode_usage`'s tests apply to `LOOM_OPENCODE_DB`.
+/// `opencode_usage`'s tests apply to `LOOM_OPENCODE_DB`. The pin also holds
+/// the crate-wide codex-home lock for its whole scope (#15174), so it cannot
+/// race the runtime-isolation helpers that clear the variable under other
+/// `serial_test` keys.
 fn with_codex_home<T>(home: &Path, f: impl FnOnce() -> T) -> T {
+    let _codex_home_lock = crate::tokens_pool::codex_home_env::lock();
     clear_home_env();
     std::env::set_var(CODEX_HOME_ENV, home);
     let out = f();
@@ -844,4 +1452,84 @@ fn with_codex_home<T>(home: &Path, f: impl FnOnce() -> T) -> T {
 fn clear_home_env() {
     std::env::remove_var(CODEX_HOME_ENV);
     std::env::remove_var(CODEX_NATIVE_HOME_ENV);
+}
+
+#[serial_test::serial(codex_home_env)]
+#[test]
+fn an_unused_profile_does_not_poison_a_readable_home() {
+    let _home_env = clear_all_home_env();
+    let tmp = tempfile::tempdir().unwrap();
+    let _ambient = seed_codex_home(
+        tmp.path(),
+        &[(
+            "2026/09/20",
+            "rollout-complete.jsonl",
+            rollout("/w", "2026-09-21T02:06:31Z", "known-zero", "gpt-5", &[]),
+        )],
+    );
+    let unused = tmp.path().join(".loom/codex-profiles/unused");
+    std::fs::create_dir_all(&unused).unwrap();
+    assert_eq!(
+        std::fs::read_dir(unused.join(SESSIONS_DIR))
+            .unwrap_err()
+            .kind(),
+        std::io::ErrorKind::NotFound,
+    );
+    let window = (instant("2026-09-21T01:00:00Z"), instant("2026-09-21T03:00:00Z"));
+    assert_eq!(
+        (
+            lookup_ids(&["known-zero".into()], window, Some(tmp.path())),
+            lookup_ids(&["absent".into()], window, Some(tmp.path())),
+        ),
+        (IdLookup::NoUsage, IdLookup::NotFound),
+    );
+}
+
+#[serial_test::serial(codex_home_env)]
+#[test]
+fn blank_records_do_not_poison_a_selected_zero_token_rollout() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut lines = rollout("/w", "2026-09-21T02:06:31Z", "known-zero", "gpt-5", &[]);
+    lines.push(String::new());
+    lines.push(" \t".to_string());
+    let home = seed_codex_home(tmp.path(), &[("2026/09/20", "rollout-spaced.jsonl", lines)]);
+    let window = (instant("2026-09-21T01:00:00Z"), instant("2026-09-21T03:00:00Z"));
+    assert_eq!(
+        with_codex_home(&home, || lookup_ids(&["known-zero".into()], window, None)),
+        IdLookup::NoUsage
+    );
+}
+
+#[serial_test::serial(codex_home_env)]
+#[test]
+fn a_partial_byte_read_refuses_to_print_partial_tokens() {
+    use std::io::Write as _;
+    let tmp = tempfile::tempdir().unwrap();
+    let home = seed_codex_home(
+        tmp.path(),
+        &[(
+            "2026/09/20",
+            "rollout-incomplete.jsonl",
+            rollout("/w", "2026-09-21T02:06:31Z", "known-good", "gpt-5", &[(500, 0, 50, 0)]),
+        )],
+    );
+    let file = home
+        .join(SESSIONS_DIR)
+        .join("2026/09/20/rollout-incomplete.jsonl");
+    let window = (instant("2026-09-21T01:00:00Z"), instant("2026-09-21T03:00:00Z"));
+    let id = ["known-good".into()];
+    assert!(matches!(
+        with_codex_home(&home, || lookup_ids(&id, window, None)),
+        IdLookup::Found(_)
+    ));
+    let mut file_handle = std::fs::OpenOptions::new()
+        .append(true)
+        .open(&file)
+        .unwrap();
+    file_handle.write_all(&[0xff, b'\n']).unwrap();
+    drop(file_handle);
+    let read = read_rollout(&home, &file, u64::MAX).unwrap();
+    assert!(!read.complete);
+    assert!(!read.lines.is_empty());
+    assert_eq!(with_codex_home(&home, || lookup_ids(&id, window, None)), IdLookup::NoStore);
 }

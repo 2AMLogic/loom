@@ -702,6 +702,35 @@ fn a_weekly_capped_seat_stays_out_until_its_configured_window() {
     );
 }
 
+/// #14932: the same weekly horizon, declared in the workspace's config rather
+/// than in the host's limits file — an automatic mark reads the merged window.
+#[test]
+fn a_weekly_capped_seat_stays_out_for_a_config_declared_window() {
+    let clock = bad_marks::test_clock::pin(T0);
+    let tmp = workspace(&["alpha"]);
+    std::fs::create_dir_all(tmp.path().join(".loom")).unwrap();
+    std::fs::write(
+        tmp.path().join(".loom").join("config.json"),
+        serde_json::json!({
+            "runtimes": {
+                "apiKeyLimits": { PROVIDER: { "alpha": { "exhaustionWindowSecs": 7 * 86_400 } } }
+            }
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let contents = log("pool", Some("alpha"), "glm-5.3-flash", "Error: insufficient balance");
+    let feedback = ingest_launch_log(tmp.path(), &contents, ANCHOR, Some(1)).unwrap();
+    let mark = feedback.mark.expect("marked");
+    assert_eq!(mark.resets_at, Some(T0 + 7 * 86_400));
+    assert!(feedback.detail.contains("configured plan window"), "{}", feedback.detail);
+    clock.set(T0 + 6 * 3600 + 1);
+    assert!(
+        active(tmp.path(), "alpha", Some("glm-5.3-flash")).is_some(),
+        "still held after the 6h default"
+    );
+}
+
 /// #11286: a reset instant the provider printed beats both the configured
 /// window and the default. The provider line is SYNTHETIC / UNVERIFIED (no
 /// real Z.ai exhausted output has been captured).

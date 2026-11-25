@@ -80,8 +80,9 @@ fn is_healthy_status(status: &str) -> bool {
 /// retry.
 ///
 /// `exhausted` (a hit weekly/monthly ceiling) is unconditional — it comes
-/// straight from a probe's own 7d-utilization reading, not from
-/// `.bad_tokens`, so there is nothing further to check: handing it out
+/// from a probe's 7d-utilization reading or a carried prior row, not from
+/// `.bad_tokens`. The writer bounds header-less 2xx / `unknown` carry-forward;
+/// this selector does not check its reset. Handing an exhausted account out
 /// "because the pool would otherwise be empty" does not produce a working
 /// spawn, it produces a spawn that burns its retry budget and dies.
 ///
@@ -426,8 +427,8 @@ pub fn spawnable_pool_state_any_class(workspace_root: &Path) -> SpawnablePoolSta
 ///
 /// [`SpawnablePoolState::dir`] is a **local absolute path**, so it is the
 /// wrong shape for any cross-host key — exactly the reason
-/// [`crate::peer_claims::ClaimAd::repo`] carries a
-/// [`crate::peer_claims::repo_slug`] rather than the workspace root. A path
+/// [`crate::host_identity::repo_slug`] exists rather than keying on the
+/// workspace root. A path
 /// key is wrong in *both* directions here:
 ///
 /// - **False negative.** Two hosts sharing the same accounts resolve
@@ -605,7 +606,7 @@ fn shadowed_shared_pool_hint(tokens_dir: &Path) -> String {
     )
 }
 
-fn read_token_file(path: &Path) -> std::io::Result<String> {
+pub(crate) fn read_token_file(path: &Path) -> std::io::Result<String> {
     let raw = std::fs::read_to_string(path)?;
     Ok(raw.split_whitespace().collect::<Vec<_>>().join(""))
 }
@@ -1398,8 +1399,7 @@ fn select_inner(
 mod tests;
 
 /// Integration tests for the cache-affinity preference tier (#8146). A sibling
-/// of [`tests`] rather than a section of it: that file is over the file-size
-/// ratchet, so new tests go in a new module instead of growing it.
+/// of [`tests`] rather than a section of it.
 #[cfg(test)]
 #[path = "select_affinity_tests.rs"]
 mod affinity_tests;

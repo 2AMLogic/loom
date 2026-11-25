@@ -1974,8 +1974,8 @@ assert_contains "containerized dispatch ENABLED" "$output" \
 docker_log="$(cat "$DOCKER_LOG" 2>/dev/null)"
 assert_contains "-v $CONTAIN_WS:$CONTAIN_WS" "$docker_log" \
     "containerized dispatch: workspace mounted at path parity (MOUNT-CONTRACT.md §1, #7429)"
-assert_contains "ghcr.io/rjwalters/loom-worker:latest" "$docker_log" \
-    "containerized dispatch: defaults to the ghcr.io/rjwalters/loom-worker image (#7429)"
+assert_contains "ghcr.io/2amlogic/loom-worker:latest" "$docker_log" \
+    "containerized dispatch: defaults to the ghcr.io/2amlogic/loom-worker image (#7429)"
 assert_contains "$CONTAIN_WS/.loom/scripts/spawn-claude.sh" "$docker_log" \
     "containerized dispatch: re-execs spawn-claude.sh itself as the containerized command (#7429)"
 assert_contains "stub-claude ran, args=-p ping" "$output" \
@@ -2057,7 +2057,7 @@ assert_contains "--label loom.dispatch.cpus=3" "$docker_log" \
     "the applied CPU limit is surfaced as a docker label for observability (#7430)"
 assert_contains "--label loom.dispatch.memory=2g" "$docker_log" \
     "the applied memory limit is surfaced as a docker label for observability (#7430)"
-assert_contains "# LOOM_DISPATCH_MODE mode=container image=ghcr.io/rjwalters/loom-worker:latest cpus=3 memory=2g" "$output" \
+assert_contains "# LOOM_DISPATCH_MODE mode=container image=ghcr.io/2amlogic/loom-worker:latest cpus=3 memory=2g" "$output" \
     "the LOOM_DISPATCH_MODE marker names the exact applied cpus/memory values (#7430)"
 assert_contains "stub-claude ran, args=-p ping" "$output" \
     "the recursed invocation still reaches the claude stub with explicit resource limits applied (#7430)"
@@ -2772,6 +2772,70 @@ fi
 
 rm -rf "$PROVIDER_WS" "$PROVIDER_STUB_DIR"
 rm -f "$PROVIDER_ARGV_LOG"
+
+# ============================================================
+# Section: service tier (issue #14141)
+#
+#   1. LOOM_SERVICE_TIER=fast -> inline --settings '{"fastMode":true}'
+#      (priority is an alias; case-insensitive)
+#   2. an existing inline --settings is MERGED, a file path WINS (warning)
+#   3. standard / unset / empty -> no --settings at all
+#   4. an unknown tier -> one warning, no flag, no failure
+# ============================================================
+
+echo ""
+echo "Testing spawn-claude.sh service tier (#14141)..."
+
+run_tier() {
+    LOOM_WORKSPACE="$TEST_WS" LOOM_DAEMON_BIN="$DAEMON_BIN" PATH="$STUB_DIR:$PATH" \
+        "$@" 2>&1 || true
+}
+
+output=$(run_tier env LOOM_SERVICE_TIER=fast "$SCRIPTS_DIR/spawn-claude.sh" -p "ping")
+assert_contains "--settings {\"fastMode\":true}" "$output" \
+    "LOOM_SERVICE_TIER=fast injects fast mode via inline --settings (#14141)"
+assert_contains "spawn-claude: service_tier=fast" "$output" \
+    "applied tier is logged (#14141)"
+
+output=$(run_tier env LOOM_SERVICE_TIER=Priority "$SCRIPTS_DIR/spawn-claude.sh" -p "ping")
+assert_contains "--settings {\"fastMode\":true}" "$output" \
+    "LOOM_SERVICE_TIER=Priority (alias, any case) also enables fast mode"
+
+if command -v jq >/dev/null 2>&1; then
+    output=$(run_tier env LOOM_SERVICE_TIER=fast "$SCRIPTS_DIR/spawn-claude.sh" -p "ping" --settings '{"a":1}')
+    assert_contains '"fastMode":true' "$output" "fast mode is merged into an existing inline --settings"
+    assert_contains '"a":1' "$output" "the existing inline --settings keys are preserved"
+    # Count flags on the stub's argv line only: the log lines name --settings too.
+    assert_eq_count=$(printf '%s\n' "$output" | grep '^stub-claude args=' | grep -o -- '--settings' | wc -l | tr -d ' ')
+    TESTS_RUN=$((TESTS_RUN + 1))
+    if [[ "$assert_eq_count" == "1" ]]; then
+        TESTS_PASSED=$((TESTS_PASSED + 1))
+        echo -e "  ${GREEN}PASS${NC}: merge keeps exactly one --settings flag"
+    else
+        TESTS_FAILED=$((TESTS_FAILED + 1))
+        echo -e "  ${RED}FAIL${NC}: merge keeps exactly one --settings flag (got $assert_eq_count)"
+        echo "    In: '$output'"
+    fi
+fi
+
+output=$(run_tier env LOOM_SERVICE_TIER=fast "$SCRIPTS_DIR/spawn-claude.sh" -p "ping" --settings /tmp/loom-14141-own-settings.json)
+assert_contains "explicit --settings in args wins over LOOM_SERVICE_TIER" "$output" \
+    "an explicit --settings FILE wins; one warning, no failure"
+assert_not_contains '{"fastMode"' "$(printf '%s\n' "$output" | grep '^stub-claude args=')" \
+    "no fast mode is forced over an explicit --settings file"
+
+output=$(run_tier env LOOM_SERVICE_TIER=standard "$SCRIPTS_DIR/spawn-claude.sh" -p "ping")
+assert_not_contains "--settings" "$output" "LOOM_SERVICE_TIER=standard emits no --settings"
+assert_contains "spawn-claude: service_tier=standard" "$output" "standard tier is logged"
+
+output=$(run_tier env LOOM_SERVICE_TIER= "$SCRIPTS_DIR/spawn-claude.sh" -p "ping")
+assert_not_contains "fastMode" "$output" "empty LOOM_SERVICE_TIER is unset (no flag)"
+assert_not_contains "service_tier" "$output" "empty LOOM_SERVICE_TIER logs nothing"
+
+output=$(run_tier env LOOM_SERVICE_TIER=turbo "$SCRIPTS_DIR/spawn-claude.sh" -p "ping")
+assert_contains "is not a Claude tier" "$output" "an unsupported tier warns once"
+assert_contains "stub-claude args=-p ping" "$output" "an unsupported tier still launches claude"
+assert_not_contains "fastMode" "$output" "an unsupported tier emits no flag"
 
 # ============================================================
 # Summary

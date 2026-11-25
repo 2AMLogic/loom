@@ -157,7 +157,7 @@ fn marks_are_written_atomically_and_leave_no_temp_file() {
     let stranded: Vec<_> = std::fs::read_dir(provider_dir(tmp.path(), "zai"))
         .unwrap()
         .filter_map(Result::ok)
-        .filter(|e| e.file_name().to_string_lossy().contains(".tmp-"))
+        .filter(|e| crate::fs_util::is_staging_name(&e.file_name().to_string_lossy()))
         .collect();
     assert!(stranded.is_empty(), "{stranded:?}");
 }

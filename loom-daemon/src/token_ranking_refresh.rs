@@ -27,7 +27,12 @@
 //! rate-limit headers and atomically rewrites `.ranking` in whichever pool
 //! [`crate::tokens_pool::paths`] resolves for that repo (per-repo
 //! `.loom/tokens/`, or the shared machine-level pool per #3938 when the
-//! per-repo pool is absent/empty).
+//! per-repo pool is absent/empty). The same tick also runs the Codex
+//! availability probe over that repo's local rollout snapshots with ranking +
+//! health feedback enabled (issue #14584) — until then only an operator's
+//! hand-run `accounts check --ranking` ever turned a walled Codex account's
+//! own snapshot into a selection hold, so a host learned it the hard way, one
+//! lost step at a time.
 //!
 //! # Never fatal, never double-writes unsafely
 //!
@@ -46,13 +51,19 @@
 //! [`crate::work_finder`] and [`crate::main_health_gate`] are opt-in because
 //! they have dispatch-affecting side effects (spawning sweeps, halting
 //! dispatch on a red `main`). This loop only ever *reads* rate-limit headers
-//! and rewrites a bookkeeping file nothing else in the daemon consults
-//! synchronously — so leaving it on by default costs nothing beyond a periodic
-//! probe API call, while an absent daemon-side refresher silently regresses
-//! every install back to the stale-ranking failure mode this issue exists to
-//! fix. An operator who wants it off (e.g. no tokens bootstrapped at all, or a
-//! read-only/dry-run daemon) still has a full opt-out knob — see
-//! [`TOKEN_RANKING_REFRESH_ENABLE_ENV`] / `autonomous.tokenRankingRefresh.enabled`.
+//! and rewrites bookkeeping files — plus, since issue #14584, it folds each
+//! Codex account's freshest local rollout snapshot into `account-health.json`
+//! (see `apply_codex_snapshot_feedback`). That write *is* consulted by codex
+//! selection, but only ever in the conservative direction: a measured
+//! at-ceiling snapshot holds an account that would otherwise cost a dispatch
+//! step to discover, and an account with no local snapshot stays selectable
+//! (fail-open, #8539). Leaving the loop on by default therefore costs nothing
+//! beyond a periodic probe API call, while an absent daemon-side refresher
+//! silently regresses every install back to the stale-ranking failure mode
+//! this issue exists to fix. An operator who wants it off (e.g. no tokens
+//! bootstrapped at all, or a read-only/dry-run daemon) still has a full opt-out
+//! knob — see [`TOKEN_RANKING_REFRESH_ENABLE_ENV`] /
+//! `autonomous.tokenRankingRefresh.enabled`.
 //!
 //! # Shape (mirrors [`crate::main_health_gate`] / [`crate::work_finder`])
 //!
@@ -221,23 +232,85 @@ impl ScriptRankingRefreshRunner {
 impl RankingRefreshRunner for ScriptRankingRefreshRunner {
     fn refresh(&mut self) -> RefreshOutcome {
         self.last_summary = None;
-        let bin = match self.resolve_bin() {
-            Ok(p) => p,
-            Err(e) => return RefreshOutcome::Failure(e),
+        let outcome = match self.resolve_bin() {
+            Ok(bin) => {
+                // Issue #10744: the child writes what it probed here (see
+                // `tokens_pool::round_summary`). Absent after an older child or an
+                // early failure, which the record reports as `source: unknown`.
+                let summary_path = std::env::temp_dir()
+                    .join(format!("loom-token-ranking-summary-{}.json", uuid::Uuid::new_v4()));
+                let outcome =
+                    run_probe_with_timeout(&bin, &self.repo_root, self.timeout, &summary_path);
+                self.last_summary = round_summary::read_summary(&summary_path);
+                let _ = std::fs::remove_file(&summary_path);
+                outcome
+            }
+            Err(e) => RefreshOutcome::Failure(e),
         };
-        // Issue #10744: the child writes what it probed here (see
-        // `tokens_pool::round_summary`). Absent after an older child or an
-        // early failure, which the record reports as `source: unknown`.
-        let summary_path = std::env::temp_dir()
-            .join(format!("loom-token-ranking-summary-{}.json", uuid::Uuid::new_v4()));
-        let outcome = run_probe_with_timeout(&bin, &self.repo_root, self.timeout, &summary_path);
-        self.last_summary = round_summary::read_summary(&summary_path);
-        let _ = std::fs::remove_file(&summary_path);
+        // Issue #14584: the same tick also folds each Codex account's freshest
+        // local snapshot into account health, so a walled account is held
+        // before dispatch instead of after losing a step. Independent of the
+        // Claude probe's outcome — never fatal, see the callee.
+        apply_codex_snapshot_feedback(&self.repo_root);
         outcome
     }
 
     fn take_summary(&mut self) -> Option<RoundSummary> {
         self.last_summary.take()
+    }
+}
+
+/// Run the Codex availability probe against `repo_root` with ranking/feedback
+/// enabled (issue #14584) — the [`ScriptRankingRefreshRunner::refresh`] tick's
+/// Codex half, the daemon-side analogue of an operator running `accounts check
+/// --ranking` by hand.
+///
+/// Snapshot mode only ([`super::tokens_pool::codex_check::CheckOptions::live`]
+/// left `false`): it reads the rollout logs each profile's own sessions have
+/// already written — no `codex` process, no billed call — and folds every
+/// conclusive reading into `account-health.json` via
+/// [`super::tokens_pool::codex_check`]'s existing `apply_health_feedback`
+/// path. A host that ran a session on an account learns it is walled at the
+/// next tick instead of at its next dispatch; an account with no local
+/// snapshot reads `unknown` and stays selectable (fail-open, #8539 — the
+/// cross-host case stays open by design, see #14584's close path).
+///
+/// Never fatal and never surfaced through [`RefreshOutcome`]: that outcome
+/// reports the Claude ranking probe this runner exists for, and a Codex-side
+/// failure (no registry, unreadable profiles) only logs — the next tick
+/// retries it.
+fn apply_codex_snapshot_feedback(repo_root: &Path) {
+    use crate::tokens_pool::codex_check::{self, CheckOptions};
+
+    let options = CheckOptions {
+        write_ranking: true,
+        live: false,
+    };
+    match codex_check::run_check(repo_root, options, chrono::Utc::now()) {
+        Ok((_, effects)) => {
+            if !effects.marked_exhausted.is_empty() {
+                log::info!(
+                    "token_ranking_refresh: codex snapshot feedback held {} account(s) until \
+                     their window rolls over: {}",
+                    effects.marked_exhausted.len(),
+                    effects.marked_exhausted.join(", ")
+                );
+            }
+            if !effects.cleared.is_empty() {
+                log::info!(
+                    "token_ranking_refresh: codex snapshot feedback released {} exhaustion \
+                     hold(s) with newer headroom: {}",
+                    effects.cleared.len(),
+                    effects.cleared.join(", ")
+                );
+            }
+        }
+        Err(e) => {
+            log::warn!(
+                "token_ranking_refresh: codex availability feedback failed (logged and \
+                 skipped, never fatal): {e}"
+            );
+        }
     }
 }
 
@@ -407,52 +480,6 @@ pub fn resolve_interval(config: &TokenRankingRefreshConfig) -> Duration {
 // Runtime wiring
 // ============================================================================
 
-/// Spawn the token-ranking refresh loop for a single workspace on the shared
-/// daemon runtime. Intended for tests; production uses
-/// [`spawn_multi_token_ranking_refresh_task`] (the multi-workspace entry
-/// point wired into `main.rs`).
-///
-/// Unlike [`crate::main_health_gate::spawn_multi_main_health_gate_task`] /
-/// [`crate::work_finder`]'s loops, the **first tick is not skipped**: a ranking
-/// probe is a handful of cheap read-only HTTP calls with no dispatch side
-/// effect, so refreshing immediately at boot (rather than waiting a full
-/// cadence for the first data) is strictly better — there is no "churn on
-/// startup" cost to avoid here.
-pub fn spawn_token_ranking_refresh_task<R>(
-    mut runner: R,
-    interval: Duration,
-) -> tokio::task::JoinHandle<()>
-where
-    R: RankingRefreshRunner + Send + 'static,
-{
-    log::info!("token_ranking_refresh: starting loop (interval={}s)", interval.as_secs());
-    tokio::spawn(async move {
-        let mut ticker = tokio::time::interval(interval);
-        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        loop {
-            ticker.tick().await;
-            let joined = tokio::task::spawn_blocking(move || {
-                let outcome = runner.refresh();
-                (outcome, runner)
-            })
-            .await;
-            match joined {
-                Ok((outcome, r)) => {
-                    runner = r;
-                    log_outcome(&outcome);
-                }
-                Err(e) => {
-                    log::error!(
-                        "token_ranking_refresh: refresh task panicked ({e}); stopping loop \
-                         (the last-written .ranking, if any, is left as-is)"
-                    );
-                    return;
-                }
-            }
-        }
-    })
-}
-
 /// Spawn the **multi-workspace** token-ranking refresh loop (mirrors
 /// [`crate::main_health_gate::spawn_multi_main_health_gate_task`]) on the
 /// shared daemon runtime.
@@ -465,9 +492,41 @@ where
 /// every root). Probes run **sequentially** per tick (matches the health
 /// gate's sequencing rationale — no shared mutable state to leak across repos,
 /// and it avoids bursting several accounts' rate-limit probes at once).
+///
+/// Unlike [`crate::main_health_gate::spawn_multi_main_health_gate_task`] /
+/// [`crate::work_finder`]'s loops, the **first tick is not skipped**: a ranking
+/// probe is a handful of cheap read-only HTTP calls with no dispatch side
+/// effect, so refreshing immediately at boot (rather than waiting a full
+/// cadence for the first data) is strictly better — there is no "churn on
+/// startup" cost to avoid here.
 pub fn spawn_multi_token_ranking_refresh_task(
     fallback_root: PathBuf,
     interval: Duration,
+) -> tokio::task::JoinHandle<()> {
+    spawn_multi_token_ranking_refresh_task_with(
+        fallback_root,
+        interval,
+        std::sync::Arc::new(|root| Box::new(ScriptRankingRefreshRunner::new(root))),
+    )
+}
+
+/// Builds the refresh runner for one root.
+pub(crate) type RankingRunnerFactory =
+    std::sync::Arc<dyn Fn(PathBuf) -> Box<dyn RankingRefreshRunner + Send> + Send + Sync>;
+
+/// The runner seam behind [`spawn_multi_token_ranking_refresh_task`] (#14986,
+/// the #13832 pattern): the identical production loop with the per-root runner
+/// factory injected, so tests drive the loop the daemon actually runs instead
+/// of a second hand-maintained copy of it (the removed
+/// single-workspace refresh loop, which stopped on a panic where this loop
+/// records it and continues, and skipped the registry, enable gate and
+/// telemetry). The public entry point passes [`ScriptRankingRefreshRunner::new`];
+/// everything else — the registry re-read, the per-root enable gate, telemetry,
+/// panic survival and outcome logging — is the production path unchanged.
+pub(crate) fn spawn_multi_token_ranking_refresh_task_with(
+    fallback_root: PathBuf,
+    interval: Duration,
+    runner_factory: RankingRunnerFactory,
 ) -> tokio::task::JoinHandle<()> {
     log::info!(
         "token_ranking_refresh: starting multi-workspace loop (interval={}s)",
@@ -502,9 +561,10 @@ pub fn spawn_multi_token_ranking_refresh_task(
                 }
                 let root_for_task = root.clone();
                 let started_at = chrono::Utc::now();
+                let factory = runner_factory.clone();
                 let joined = tokio::task::spawn_blocking(move || {
-                    let mut runner = ScriptRankingRefreshRunner::new(root_for_task.clone());
-                    telemetry::refresh_and_record(&root_for_task, &mut runner)
+                    let mut runner = factory(root_for_task.clone());
+                    telemetry::refresh_and_record(&root_for_task, &mut *runner)
                 })
                 .await;
                 match joined {
@@ -522,17 +582,6 @@ pub fn spawn_multi_token_ranking_refresh_task(
             log_tick_outcomes(&outcomes);
         }
     })
-}
-
-/// Log a single-workspace refresh outcome at a severity matching its
-/// significance. Never escalates to `error!` — a probe failure is never fatal.
-fn log_outcome(outcome: &RefreshOutcome) {
-    match outcome {
-        RefreshOutcome::Success => log::debug!("token_ranking_refresh: ranking refreshed"),
-        RefreshOutcome::Failure(reason) => log::warn!(
-            "token_ranking_refresh: probe failed (logged and skipped, never fatal): {reason}"
-        ),
-    }
 }
 
 /// Log every root's outcome for one multi-workspace tick, **collapsing**
@@ -658,6 +707,10 @@ mod tests {
 
     #[test]
     fn test_refresh_success_on_zero_exit() {
+        // Pin a profile root: `refresh()` now folds Codex snapshots in, and the
+        // #9964 guard panics under cfg(test) when it is unset (#14584).
+        let profiles = tempfile::tempdir().unwrap();
+        let _profile_root = ProfileRootEnv::set(profiles.path());
         let tmp = tempfile::tempdir().unwrap();
         let bin = write_fake_bin(tmp.path(), "fake-daemon.sh", "echo ok; exit 0");
         let mut runner = ScriptRankingRefreshRunner::new(tmp.path().to_path_buf()).with_bin(bin);
@@ -666,6 +719,10 @@ mod tests {
 
     #[test]
     fn test_refresh_failure_on_nonzero_exit_includes_output_tail() {
+        // Pin a profile root: `refresh()` now folds Codex snapshots in, and the
+        // #9964 guard panics under cfg(test) when it is unset (#14584).
+        let profiles = tempfile::tempdir().unwrap();
+        let _profile_root = ProfileRootEnv::set(profiles.path());
         let tmp = tempfile::tempdir().unwrap();
         let bin =
             write_fake_bin(tmp.path(), "fake-daemon.sh", "echo tokens directory missing; exit 1");
@@ -679,6 +736,10 @@ mod tests {
 
     #[test]
     fn test_refresh_invokes_tokens_check_ranking_argv() {
+        // Pin a profile root: `refresh()` now folds Codex snapshots in, and the
+        // #9964 guard panics under cfg(test) when it is unset (#14584).
+        let profiles = tempfile::tempdir().unwrap();
+        let _profile_root = ProfileRootEnv::set(profiles.path());
         let tmp = tempfile::tempdir().unwrap();
         let repo_root = tmp.path().to_path_buf();
         let expected_workspace = repo_root.display().to_string();
@@ -696,6 +757,10 @@ mod tests {
 
     #[test]
     fn test_refresh_times_out_on_hung_bin() {
+        // Pin a profile root: `refresh()` now folds Codex snapshots in, and the
+        // #9964 guard panics under cfg(test) when it is unset (#14584).
+        let profiles = tempfile::tempdir().unwrap();
+        let _profile_root = ProfileRootEnv::set(profiles.path());
         let tmp = tempfile::tempdir().unwrap();
         let bin = write_fake_bin(tmp.path(), "fake-daemon.sh", "sleep 30");
         let mut runner = ScriptRankingRefreshRunner::new(tmp.path().to_path_buf())
@@ -710,6 +775,10 @@ mod tests {
 
     #[test]
     fn test_refresh_spawn_failure_is_reported() {
+        // Pin a profile root: `refresh()` now folds Codex snapshots in, and the
+        // #9964 guard panics under cfg(test) when it is unset (#14584).
+        let profiles = tempfile::tempdir().unwrap();
+        let _profile_root = ProfileRootEnv::set(profiles.path());
         let tmp = tempfile::tempdir().unwrap();
         // A binary path that does not exist and was never `.exists()`-checked
         // because it's an explicit override — spawn itself must fail cleanly.
@@ -717,6 +786,138 @@ mod tests {
         let mut runner = ScriptRankingRefreshRunner::new(tmp.path().to_path_buf()).with_bin(bogus);
         let outcome = runner.refresh();
         assert!(!outcome.is_success());
+    }
+
+    // ===================================================================
+    // Codex snapshot feedback on the tick (issue #14584)
+    // ===================================================================
+
+    use crate::tokens_pool::account_registry::{AccountId, AccountProvider};
+    use crate::tokens_pool::health::{self, HealthReason};
+    use crate::tokens_pool::profile_root_env::ProfileRootEnv;
+
+    /// A workspace registry with a single enabled codex account whose profile
+    /// directory is `<profiles_root>/<name>` (same fixture shape codex_check's
+    /// tests pin).
+    fn codex_registry(workspace: &Path, name: &str) {
+        fs::create_dir_all(workspace.join(".loom")).unwrap();
+        fs::write(
+            workspace.join(".loom").join("accounts.json"),
+            format!(
+                r#"{{"version":1,"accounts":[
+                {{"provider":"codex","name":"{name}","credential_kind":"codex_home","credential_reference":"{name}","enabled":true}}]}}"#
+            ),
+        )
+        .unwrap();
+    }
+
+    /// One `token_count` rollout line carrying a `rate_limits` snapshot, in
+    /// the shape the Codex CLI appends to a session rollout log.
+    fn codex_rollout_line(observed_at: chrono::DateTime<chrono::Utc>, pct: f64) -> String {
+        let ts = observed_at.format("%Y-%m-%dT%H:%M:%SZ").to_string();
+        format!(
+            r#"{{"timestamp":"{ts}","type":"event_msg","payload":{{"type":"token_count","info":{{"total_token_usage":{{"input_tokens":10,"output_tokens":5}}}},"rate_limits":{{"primary":{{"used_percent":{pct},"window_minutes":300,"resets_in_seconds":600}},"secondary":{{"used_percent":{pct},"window_minutes":10080,"resets_in_seconds":3600}}}}}}}}"#
+        )
+    }
+
+    fn write_codex_rollout(profile: &Path, name: &str, lines: &[String]) {
+        let dir = profile.join("sessions").join("2026").join("11").join("19");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join(name), format!("{}\n", lines.join("\n"))).unwrap();
+    }
+
+    fn codex_id(name: &str) -> AccountId {
+        AccountId {
+            provider: AccountProvider::Codex,
+            name: name.into(),
+        }
+    }
+
+    /// The acceptance case: the refresh tick folds each Codex account's own
+    /// local snapshot into `account-health.json`, so an account whose freshest
+    /// reading sits at its ceiling is **held before dispatch** — the Claude
+    /// probe (the fake bin) exits 0, i.e. the hold was applied with no failed
+    /// step. The horizon is the snapshot's own window rollover, not an
+    /// invented default cooldown.
+    #[test]
+    #[serial]
+    fn refresh_holds_a_walled_codex_account_without_a_failed_step() {
+        let workspace = tempfile::tempdir().unwrap();
+        let profiles = tempfile::tempdir().unwrap();
+        let profile = profiles.path().join("walled");
+        fs::create_dir(&profile).unwrap();
+        codex_registry(workspace.path(), "walled");
+        let observed_at = chrono::Utc::now() - chrono::Duration::seconds(60);
+        write_codex_rollout(
+            &profile,
+            "rollout-walled.jsonl",
+            &[codex_rollout_line(observed_at, 100.0)],
+        );
+        let _profile_root = ProfileRootEnv::set(profiles.path());
+        let bin_dir = tempfile::tempdir().unwrap();
+        let bin = write_fake_bin(bin_dir.path(), "fake-daemon.sh", "exit 0");
+        let mut runner =
+            ScriptRankingRefreshRunner::new(workspace.path().to_path_buf()).with_bin(bin);
+
+        assert_eq!(runner.refresh(), RefreshOutcome::Success);
+
+        let stored = health::account_health(workspace.path(), &codex_id("walled"))
+            .unwrap()
+            .expect("a walled local snapshot must reach account-health.json");
+        assert_eq!(stored.reason, HealthReason::PlanExhausted);
+        let now = chrono::Utc::now().timestamp().max(0) as u64;
+        let until = stored.cooldown_until.expect("the hold names its horizon");
+        assert!(until > now, "hold must still be live (until={until}, now={now})");
+        assert!(
+            until <= u64::try_from(observed_at.timestamp()).unwrap() + 3_600 + 5,
+            "horizon is the snapshot window's rollover, not a default: {until}"
+        );
+    }
+
+    /// Fail-open (#8539, unchanged): an account this host has no snapshot for
+    /// reads `unknown` and stays selectable — the tick writes no health
+    /// record for it at all.
+    #[test]
+    #[serial]
+    fn refresh_leaves_a_snapshotless_codex_account_selectable() {
+        let workspace = tempfile::tempdir().unwrap();
+        let profiles = tempfile::tempdir().unwrap();
+        fs::create_dir(profiles.path().join("fresh")).unwrap();
+        codex_registry(workspace.path(), "fresh");
+        let _profile_root = ProfileRootEnv::set(profiles.path());
+        let bin_dir = tempfile::tempdir().unwrap();
+        let bin = write_fake_bin(bin_dir.path(), "fake-daemon.sh", "exit 0");
+        let mut runner =
+            ScriptRankingRefreshRunner::new(workspace.path().to_path_buf()).with_bin(bin);
+
+        assert_eq!(runner.refresh(), RefreshOutcome::Success);
+
+        assert!(
+            health::account_health(workspace.path(), &codex_id("fresh"))
+                .unwrap()
+                .is_none(),
+            "no snapshot ⇒ no evidence ⇒ no hold"
+        );
+    }
+
+    /// The Codex half is never fatal: a Codex-side failure (here, a corrupted
+    /// registry) is logged and retried next tick — it never turns a healthy
+    /// Claude probe into a `Failure`, which would misreport the ranking as
+    /// unrefreshed.
+    #[test]
+    #[serial]
+    fn refresh_survives_a_broken_codex_registry() {
+        let workspace = tempfile::tempdir().unwrap();
+        let profiles = tempfile::tempdir().unwrap();
+        fs::create_dir_all(workspace.path().join(".loom")).unwrap();
+        fs::write(workspace.path().join(".loom").join("accounts.json"), "{not json").unwrap();
+        let _profile_root = ProfileRootEnv::set(profiles.path());
+        let bin_dir = tempfile::tempdir().unwrap();
+        let bin = write_fake_bin(bin_dir.path(), "fake-daemon.sh", "exit 0");
+        let mut runner =
+            ScriptRankingRefreshRunner::new(workspace.path().to_path_buf()).with_bin(bin);
+
+        assert_eq!(runner.refresh(), RefreshOutcome::Success);
     }
 
     // ===================================================================
@@ -992,17 +1193,73 @@ mod tests {
         }
     }
 
+    /// Points the machine-level workspace registry at a not-yet-created file
+    /// and clears the enable override for the guard's lifetime, so the
+    /// multi-workspace loop resolves exactly its `fallback_root` (enabled by
+    /// default) and never reads the host's real `~/.loom/workspaces.json`.
+    /// Tests holding one must be `#[serial]`.
+    struct IsolatedLoop {
+        prev_registry: Option<std::ffi::OsString>,
+        prev_enable: Option<std::ffi::OsString>,
+        root: tempfile::TempDir,
+    }
+    impl IsolatedLoop {
+        fn new() -> Self {
+            let root = tempfile::tempdir().unwrap();
+            let prev_registry = std::env::var_os(crate::workspace_registry::REGISTRY_PATH_ENV);
+            let prev_enable = std::env::var_os(TOKEN_RANKING_REFRESH_ENABLE_ENV);
+            std::env::set_var(
+                crate::workspace_registry::REGISTRY_PATH_ENV,
+                root.path().join("workspaces.json"),
+            );
+            std::env::remove_var(TOKEN_RANKING_REFRESH_ENABLE_ENV);
+            Self {
+                prev_registry,
+                prev_enable,
+                root,
+            }
+        }
+        fn root(&self) -> PathBuf {
+            self.root.path().to_path_buf()
+        }
+    }
+    impl Drop for IsolatedLoop {
+        fn drop(&mut self) {
+            for (key, prev) in [
+                (crate::workspace_registry::REGISTRY_PATH_ENV, &self.prev_registry),
+                (TOKEN_RANKING_REFRESH_ENABLE_ENV, &self.prev_enable),
+            ] {
+                match prev {
+                    Some(v) => std::env::set_var(key, v),
+                    None => std::env::remove_var(key),
+                }
+            }
+        }
+    }
+
+    // #14986: the loop tests drive the production multi-workspace loop through
+    // its `spawn_multi_token_ranking_refresh_task_with` seam (the removed
+    // single-workspace refresh loop was a drifted copy).
+
     #[tokio::test]
+    #[serial]
     async fn test_loop_refreshes_immediately_without_skipping_first_tick() {
+        let isolated = IsolatedLoop::new();
         let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let runner = FakeRunner {
-            outcomes: vec![RefreshOutcome::Success; 3],
-            calls: calls.clone(),
-        };
+        let factory_calls = calls.clone();
         // A short real interval so the test completes quickly without needing
         // a paused virtual clock (which can't observe a genuine spawn_blocking
         // OS thread completing).
-        let handle = spawn_token_ranking_refresh_task(runner, Duration::from_millis(20));
+        let handle = spawn_multi_token_ranking_refresh_task_with(
+            isolated.root(),
+            Duration::from_millis(20),
+            std::sync::Arc::new(move |_root| {
+                Box::new(FakeRunner {
+                    outcomes: vec![RefreshOutcome::Success; 3],
+                    calls: factory_calls.clone(),
+                })
+            }),
+        );
 
         wait_for_calls(&calls, 1, SCHEDULER_WAIT).await;
         wait_for_calls(&calls, 3, SCHEDULER_WAIT).await;
@@ -1011,18 +1268,38 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_loop_stops_cleanly_when_runner_panics() {
-        struct PanicOnceRunner;
-        impl RankingRefreshRunner for PanicOnceRunner {
+    #[serial]
+    async fn test_loop_survives_a_panicking_runner_and_keeps_ticking() {
+        /// Panics on its first refresh, then succeeds — production records the
+        /// panic and continues to the next tick rather than ending the loop.
+        struct PanicFirstRunner {
+            calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        }
+        impl RankingRefreshRunner for PanicFirstRunner {
             fn refresh(&mut self) -> RefreshOutcome {
-                panic!("boom");
+                let n = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                assert!(n > 0, "boom");
+                RefreshOutcome::Success
             }
         }
-        let handle = spawn_token_ranking_refresh_task(PanicOnceRunner, Duration::from_millis(20));
-        // The loop should observe the panicked blocking task and return
-        // (rather than hang or propagate the panic to the caller).
-        let result = tokio::time::timeout(SCHEDULER_WAIT, handle).await;
-        assert!(result.is_ok(), "loop task should finish (not hang) after the runner panics");
+        let isolated = IsolatedLoop::new();
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let factory_calls = calls.clone();
+        let handle = spawn_multi_token_ranking_refresh_task_with(
+            isolated.root(),
+            Duration::from_millis(20),
+            std::sync::Arc::new(move |_root| {
+                Box::new(PanicFirstRunner {
+                    calls: factory_calls.clone(),
+                })
+            }),
+        );
+
+        // The first refresh panicked; the loop must still run later ticks.
+        wait_for_calls(&calls, 3, SCHEDULER_WAIT).await;
+        assert!(!handle.is_finished(), "loop must survive a panicking runner, not stop");
+
+        handle.abort();
     }
 
     // ===================================================================

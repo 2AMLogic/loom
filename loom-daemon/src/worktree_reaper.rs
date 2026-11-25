@@ -87,7 +87,7 @@
 //!
 //! # REST, not GraphQL
 //!
-//! The probes use [`clean::check_pr_merged_rest`] /
+//! The probes use [`clean::check_pr_status_for_branch_rest`] /
 //! `gh::issue_state_rest` rather than the GraphQL-backed
 //! `gh issue view` / `gh pr list`. GraphQL quota exhaustion under concurrent
 //! agents is a live failure mode; an unattended cadence prober must not compete
@@ -355,10 +355,10 @@ impl ReapReport {
 
 // `skip_reason` — the human-readable reason a decision preserved a worktree —
 // moved to the `removal_backoff` sibling module in #7939 (re-exported below as
-// `use removal_backoff::{..., skip_reason}`) purely to make room: this file is
-// over the file-size ratchet's threshold and may not grow, and #7939's fix
-// needs a couple of new lines right at `skip_reason`'s one call site. Its
-// logic and doc comment are unchanged — see `removal_backoff::skip_reason`.
+// `use removal_backoff::{..., skip_reason}`) purely to make room, because
+// #7939's fix needs a couple of new lines right at `skip_reason`'s one call
+// site. Its logic and doc comment are unchanged — see
+// `removal_backoff::skip_reason`.
 
 /// Every direct subdirectory of `repo_root`'s worktree root, sorted by path so
 /// a pass's report order is deterministic.
@@ -597,11 +597,11 @@ pub fn try_enter_reclaim(repo_root: &Path) -> Option<ReclaimGuard> {
 // ============================================================================
 // Removal-failure backoff + stuck-worktree health surfacing (#7590)
 //
-// The state machine itself lives in the `removal_backoff` sibling module (this
-// file is over the file-size ratchet's threshold); only the kind tag, which the
-// reaper's own log lines and classify paths also use, stays here. The names
-// below are re-exported so `crate::worktree_reaper::stuck_worktree_removals`
-// and friends keep resolving exactly as before.
+// The state machine itself lives in the `removal_backoff` sibling module; only
+// the kind tag, which the reaper's own log lines and classify paths also use,
+// stays here. The names below are re-exported so
+// `crate::worktree_reaper::stuck_worktree_removals` and friends keep resolving
+// exactly as before.
 // ============================================================================
 
 mod removal_backoff;
@@ -732,7 +732,7 @@ pub fn reap_worktrees_only(repo_root: &Path, config: &WorktreeReaperConfig) -> R
     // instead — see [`stuck_worktree_removals`].
     let remover = |path: &Path, issue: u32| {
         remove_with_backoff(repo_root, WorktreeKind::Issue, issue, path, || {
-            clean::cleanup_worktree(repo_root, path, issue, false, "worktree_reaper").map(|_| ())
+            clean::cleanup_worktree(repo_root, path, issue, &opts, "worktree_reaper").map(|_| ())
         })
     };
     // #6653: pushes a `loom-quarantine:` stash for a dirty, past-grace,
@@ -1189,8 +1189,7 @@ mod tests {
 
     // #8413's cases — the registry-independent live-worker veto, plus the
     // three dirty-past-grace cases it changed the preconditions of — live in a
-    // sibling file (`worktree_reaper/tests/liveness.rs`) because this file is
-    // at its file-size ratchet baseline; see `.loom/docs/file-size-policy.md`.
+    // sibling file (`worktree_reaper/tests/liveness.rs`).
     mod liveness;
 
     // #12458's idle-open-item cases live in a sibling file for the same reason.
@@ -1582,6 +1581,24 @@ mod tests {
         let (report, removed) = run_pass(tmp.path(), &ProbeSpec::default(), &default_opts());
         assert_eq!(report, ReapReport::default());
         assert!(removed.is_empty());
+    }
+
+    /// #14678: the host reaper keeps skipping a host `issue-N` checkout a
+    /// private-workspace job owns (`private-jobs` record present), even while
+    /// the in-volume seat pass owns the seat's own clones — the unrelated
+    /// host checkout is never touched by either side.
+    #[test]
+    #[serial]
+    fn test_private_workspace_owned_host_worktree_is_never_reaped() {
+        let repo = make_repo(&[(310, true), (311, true)]);
+        fs::create_dir_all(repo.path().join(".loom/private-jobs")).unwrap();
+        fs::write(repo.path().join(".loom/private-jobs/issue-310.json"), "{}").unwrap();
+        let (report, removed) = run_pass(repo.path(), &ProbeSpec::default(), &default_opts());
+        assert_eq!(removed, vec![311], "only the unrelated checkout is removed");
+        assert!(report.skipped.iter().any(|(num, why)| *num == 310
+            && why.contains("private workspace ownership")
+            && why.contains("unrelated")));
+        assert!(repo.path().join(".loom/worktrees/issue-310").exists());
     }
 
     // ===================================================================

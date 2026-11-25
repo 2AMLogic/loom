@@ -153,6 +153,12 @@ pub const OPS_SPAN_ATTRIBUTE_KEYS: &[&str] = &[
     "loom.discovery.live_reads.ci",
     "loom.discovery.stale_repos",
     "loom.discovery.oldest_watermark_age_secs",
+    // #14738: one actual workspace-resync release tag lookup.
+    "loom.workspace_resync.verify.host",
+    "loom.workspace_resync.verify.attempt",
+    "loom.workspace_resync.verify.outcome",
+    "loom.workspace_resync.verify.why",
+    "loom.workspace_resync.verify.retry_at",
     // #12298: the spawn half's concurrency and its sub-phases.
     "loom.dispatch.spawn_concurrency",
     // #12310: what a `invoke github` span was for, and why a discovery read
@@ -200,6 +206,8 @@ pub const OPS_SPAN_ATTRIBUTE_KEYS: &[&str] = &[
     "loom.pricing.verified_on",
     "loom.pricing.source",
     "loom.usage.scope",
+    // `loom.runtime.usage_missing` (#14566): why a run's usage was unreadable.
+    "loom.usage.missing_reason",
     // `loom.pool.hold` (#8931): one pool dispatch hold, armed to cleared.
     "loom.pool.hold.pool",
     "loom.pool.hold.post_mortem",
@@ -400,6 +408,16 @@ pub const OPS_SPAN_ATTRIBUTE_KEYS: &[&str] = &[
     "loom.reaper.backed_up",
     "loom.reaper.backup_refs",
     "loom.reaper.preserved.backup_failed",
+    // #14889: `reaper.removal` spans — one per item a seat pass removed:
+    // kind, volume-relative path, the base name that keeps an over-long
+    // path correlatable with the local log, and the worktree's branch/tip
+    // or the scratch entry's bytes.
+    "loom.reaper.removal.kind",
+    "loom.reaper.removal.path",
+    "loom.reaper.removal.name",
+    "loom.reaper.removal.branch",
+    "loom.reaper.removal.tip",
+    "loom.reaper.removal.bytes",
 ];
 
 /// Longest label value kept, in bytes.
@@ -483,6 +501,12 @@ pub enum MetricName {
     /// Capacity of the worktree-root volume.
     #[serde(rename = "loom.host.worktree_volume.total_bytes")]
     HostWorktreeVolumeTotalBytes,
+    /// Allocated bytes on a measured Codex private workspace volume, by account.
+    #[serde(rename = "loom.host.codex_workspace_volume.used_bytes")]
+    HostCodexWorkspaceVolumeUsedBytes,
+    /// Allocated bytes across all discovered Codex private workspace volumes.
+    #[serde(rename = "loom.host.codex_workspace_volume.total_used_bytes")]
+    HostCodexWorkspaceVolumeTotalUsedBytes,
     // Ready-queue depth (Issue #8852, phase 2) — one contiguous block.
     /// Ready issues on the last work-finder tick, labelled `state` and
     /// `reason` (the queue disposition). Never labelled by issue or repo.
@@ -716,6 +740,40 @@ pub enum MetricName {
     /// `container` (#10600).
     #[serde(rename = "loom.codex_session.mount_drift")]
     CodexSessionMountDrift,
+    /// Per session-managed Codex account whose login was read this pass: 1
+    /// signed in, 0 signed out. Absent while unknown (container stopped,
+    /// docker or the probe unreadable). Labelled `account` and `container`
+    /// (#15292).
+    #[serde(rename = "loom.codex_session.login")]
+    CodexSessionLogin,
+    /// Age in seconds of the operator hold on a held account, by `reason` ∈
+    /// `operator_stop`, `other`. Absent when the account is not held or the
+    /// hold record cannot be decoded (#15292).
+    #[serde(rename = "loom.codex_session.hold_age")]
+    CodexSessionHoldAge,
+    /// Per account whose profile hook trust could be assessed, one point per
+    /// `state` ∈ `recorded`, `sealed`, `missing`: 1 for the current verdict,
+    /// 0 for the rest (#15292).
+    #[serde(rename = "loom.codex_session.hook_trust")]
+    CodexSessionHookTrust,
+    /// Latest rate-limit utilisation (0–1 fraction) per account, by `kind` ∈
+    /// `5h`, `7d`. Absent for a window with no current measurement (#15292).
+    #[serde(rename = "loom.codex_session.quota_used")]
+    CodexSessionQuotaUsed,
+    /// When the window in `loom.codex_session.quota_used` resets (Unix
+    /// seconds), by `kind` ∈ `5h`, `7d`. Absent when the window reports none
+    /// (#15292).
+    #[serde(rename = "loom.codex_session.quota_resets_at")]
+    CodexSessionQuotaResetsAt,
+    /// When the rate-limit reading behind the quota points was taken (Unix
+    /// seconds): now for a live probe, the rollout line's time for a local
+    /// snapshot (#15292).
+    #[serde(rename = "loom.codex_session.quota_observed_at")]
+    CodexSessionQuotaObservedAt,
+    /// Unused limit resets the account holds (`availableCount`). Absent when
+    /// the Codex CLI does not report it (#15292).
+    #[serde(rename = "loom.codex_session.reset_credits")]
+    CodexSessionResetCredits,
     /// Peak memory (`memory.peak`) of one finished agent scope, by `repo`
     /// (#11094).
     #[serde(rename = "loom.agent_scope.peak_memory_bytes")]
@@ -764,6 +822,18 @@ pub enum MetricName {
     /// fallback began), #12450. Host-level: the resource names the host.
     #[serde(rename = "loom.fleet_dispatch.fallback_ticks")]
     FleetDispatchFallbackTicks,
+    /// The captain's published token-probe cycle (#13942): one point per
+    /// account per distinct probe instant, by `account` and `state` (the
+    /// probe's verdict) — the fleet-side record of what every worker was
+    /// told to converge on.
+    #[serde(rename = "loom.tokens.fleet_probe_accounts")]
+    TokensFleetProbeAccounts,
+    /// Age of the fleet token-probe snapshot a worker host has applied
+    /// (#13942): sample time minus the captain's probe instant. The
+    /// fleet-convergence drift signal — equal ages across hosts mean every
+    /// worker is reading the same probe.
+    #[serde(rename = "loom.tokens.fleet_probe_age")]
+    TokensFleetProbeAge,
     // ---- Fleet dispatch, captain side (Issue #12449) ----------------------
     /// Fleet-dispatch refusals since the previous point, by `kind` (`claim`
     /// for a claim the captain refused, `refuse` for a worker's `refuse`
@@ -841,6 +911,12 @@ impl MetricName {
             Self::HostSwapTotalBytes => "loom.host.swap.total_bytes",
             Self::HostWorktreeVolumeFreeBytes => "loom.host.worktree_volume.free_bytes",
             Self::HostWorktreeVolumeTotalBytes => "loom.host.worktree_volume.total_bytes",
+            Self::HostCodexWorkspaceVolumeUsedBytes => {
+                "loom.host.codex_workspace_volume.used_bytes"
+            }
+            Self::HostCodexWorkspaceVolumeTotalUsedBytes => {
+                "loom.host.codex_workspace_volume.total_used_bytes"
+            }
             Self::QueueIssues => "loom.queue.issues",
             Self::QueueListingFailedRepos => "loom.queue.listing_failed_repos",
             Self::QueueListingIncompleteRepos => "loom.queue.listing_incomplete_repos",
@@ -896,6 +972,13 @@ impl MetricName {
             Self::CodexSessionState => "loom.codex_session.state",
             Self::CodexSessionRecord => "loom.codex_session.record",
             Self::CodexSessionMountDrift => "loom.codex_session.mount_drift",
+            Self::CodexSessionLogin => "loom.codex_session.login",
+            Self::CodexSessionHoldAge => "loom.codex_session.hold_age",
+            Self::CodexSessionHookTrust => "loom.codex_session.hook_trust",
+            Self::CodexSessionQuotaUsed => "loom.codex_session.quota_used",
+            Self::CodexSessionQuotaResetsAt => "loom.codex_session.quota_resets_at",
+            Self::CodexSessionQuotaObservedAt => "loom.codex_session.quota_observed_at",
+            Self::CodexSessionResetCredits => "loom.codex_session.reset_credits",
             Self::AgentScopePeakMemoryBytes => "loom.agent_scope.peak_memory_bytes",
             Self::AgentScopeOomKills => "loom.agent_scope.oom_kills",
             Self::ForgeMirrorReads => "loom.forge.mirror.reads",
@@ -913,6 +996,8 @@ impl MetricName {
             Self::CiTelemetryExportCursorOffset => "loom.ci_telemetry.export_cursor_offset",
             Self::CiTelemetryExportLag => "loom.ci_telemetry.export_lag",
             Self::FleetDispatchFallbackTicks => "loom.fleet_dispatch.fallback_ticks",
+            Self::TokensFleetProbeAccounts => "loom.tokens.fleet_probe_accounts",
+            Self::TokensFleetProbeAge => "loom.tokens.fleet_probe_age",
             Self::FleetDispatchRefusals => "loom.fleet_dispatch.refusals",
             Self::FleetDispatchExpired => "loom.fleet_dispatch.expired",
             Self::FleetDispatchClaimLostAfterGrant => "loom.fleet_dispatch.claim_lost_after_grant",
@@ -1034,6 +1119,13 @@ impl MetricName {
             Self::CodexSessionState => "1",
             Self::CodexSessionRecord => "1",
             Self::CodexSessionMountDrift => "{path}",
+            Self::CodexSessionLogin | Self::CodexSessionHookTrust | Self::CodexSessionQuotaUsed => {
+                "1"
+            }
+            Self::CodexSessionHoldAge
+            | Self::CodexSessionQuotaResetsAt
+            | Self::CodexSessionQuotaObservedAt => "s",
+            Self::CodexSessionResetCredits => "{reset}",
             Self::ForgeMirrorReads => "{request}",
             Self::ForgeMirrorChanges => "{change}",
             Self::DiscoveryRecheck => "{request}",
@@ -1048,6 +1140,8 @@ impl MetricName {
             Self::CiTelemetryJournalBytes | Self::CiTelemetryExportCursorOffset => "By",
             Self::AgentScopeOomKills => "{kill}",
             Self::FleetDispatchFallbackTicks => "{tick}",
+            Self::TokensFleetProbeAccounts => "{account}",
+            Self::TokensFleetProbeAge => "s",
             Self::FleetDispatchRefusals | Self::FleetDispatchClaimLostAfterGrant => "{claim}",
             Self::FleetDispatchExpired => "{assignment}",
             _ => "By",
@@ -1080,6 +1174,10 @@ impl MetricName {
             Self::HostSwapTotalBytes => "Swap space configured.",
             Self::HostWorktreeVolumeFreeBytes => "Free space on the worktree-root volume.",
             Self::HostWorktreeVolumeTotalBytes => "Capacity of the worktree-root volume.",
+            Self::HostCodexWorkspaceVolumeUsedBytes => "Allocated bytes on a Codex workspace volume.",
+            Self::HostCodexWorkspaceVolumeTotalUsedBytes => {
+                "Allocated bytes on all discovered Codex workspace volumes when fully measured."
+            }
             Self::QueueIssues => "Ready issues on the last work-finder tick, by state and reason.",
             Self::QueueListingFailedRepos => "Repos whose ready-issue listing failed last tick.",
             Self::QueueSeen => "Ready issues listed on the last work-finder tick.",
@@ -1172,6 +1270,32 @@ impl MetricName {
                 "Workspace paths a Codex session container is missing, mounts extra, or \
                  mounts though denied, by kind."
             }
+            Self::CodexSessionLogin => {
+                "1 when a Codex session account's login was read as signed in, 0 when \
+                 signed out; absent while unknown."
+            }
+            Self::CodexSessionHoldAge => {
+                "Age in seconds of a Codex session account's operator hold, by reason."
+            }
+            Self::CodexSessionHookTrust => {
+                "Codex session account hook trust: 1 for the current state (recorded, \
+                 sealed, missing), 0 for the others."
+            }
+            Self::CodexSessionQuotaUsed => {
+                "Latest Codex rate-limit utilisation (0-1) per session account, by window \
+                 (5h, 7d)."
+            }
+            Self::CodexSessionQuotaResetsAt => {
+                "When a Codex session account's rate-limit window resets (Unix seconds), \
+                 by window."
+            }
+            Self::CodexSessionQuotaObservedAt => {
+                "When the Codex rate-limit reading for a session account was taken (Unix \
+                 seconds)."
+            }
+            Self::CodexSessionResetCredits => {
+                "Unused rate-limit resets a Codex session account holds."
+            }
             Self::AgentScopePeakMemoryBytes => {
                 "Peak memory (cgroup memory.peak) of one finished agent scope, by repo."
             }
@@ -1214,6 +1338,12 @@ impl MetricName {
             }
             Self::FleetDispatchFallbackTicks => {
                 "Step ticks run in fleet-dispatch fallback, by the reason fallback began."
+            }
+            Self::TokensFleetProbeAccounts => {
+                "The captain's published token-probe cycle: one point per account per cycle, by account and state."
+            }
+            Self::TokensFleetProbeAge => {
+                "Age of the fleet token-probe snapshot this host applied (sample time minus the captain's probe)."
             }
             Self::FleetDispatchRefusals => {
                 "Fleet-dispatch refusals at the captain, by kind (claim / refuse) and reason."

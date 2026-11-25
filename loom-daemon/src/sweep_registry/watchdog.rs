@@ -1133,10 +1133,10 @@ impl SweepRegistry {
                         continue;
                     }
 
-                    match self.dispatch_from(
+                    match self.dispatch_with_model(
                         &SweepKind::Issue(issue),
                         idempotency_key,
-                        model.as_deref(),
+                        DispatchModel::Retry(model.as_deref()),
                         effort.as_deref(),
                         depends_on,
                         DispatchOrigin::Watchdog,
@@ -1819,10 +1819,10 @@ impl SweepRegistry {
                     // it is released here rather than left to wedge dispatch.
                     let _ = self.release_lock_owned(issue, &watchdog_lock_id);
 
-                    match self.dispatch_from(
+                    match self.dispatch_with_model(
                         &SweepKind::Issue(issue),
                         None,
-                        model.as_deref(),
+                        DispatchModel::Retry(model.as_deref()),
                         effort.as_deref(),
                         depends_on,
                         DispatchOrigin::Watchdog,
@@ -2027,10 +2027,10 @@ impl SweepRegistry {
                         continue;
                     }
 
-                    match self.dispatch_from(
+                    match self.dispatch_with_model(
                         &SweepKind::Issue(issue),
                         idempotency_key,
-                        model.as_deref(),
+                        DispatchModel::Retry(model.as_deref()),
                         effort.as_deref(),
                         depends_on,
                         DispatchOrigin::Watchdog,
@@ -2250,8 +2250,7 @@ impl SweepRegistry {
 )]
 mod tests;
 
-// #8413's own cases, in a sibling file because `tests.rs` is at its file-size
-// ratchet baseline (`.loom/docs/file-size-policy.md`).
+// #8413's own cases, in a sibling file beside `tests.rs`.
 #[cfg(test)]
 #[allow(
     clippy::unwrap_used,
@@ -2262,7 +2261,7 @@ mod tests;
 mod liveness_tests;
 
 // #9533: the shared-liveness + drain-gate cases, beside (not inside)
-// `tests.rs`, which is at its file-size ratchet baseline.
+// `tests.rs`.
 #[cfg(test)]
 #[allow(
     clippy::unwrap_used,

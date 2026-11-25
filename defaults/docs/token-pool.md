@@ -275,7 +275,54 @@ an operator runs to ask "is this mark still true?". A host that sets
 `max_tokens: 1` request per marked account per cycle. This is **reporting
 only**: a healthy answer never edits `.bad_tokens`, and the account stays
 excluded from selection — and `<name>|blocked` in `.ranking` — until
-`loom-daemon tokens unblock <name>`.
+`loom-daemon tokens unblock <name>`. That holds even if the account was
+`exhausted` in an earlier round: the previous-round carry-forward (below) is
+never applied to an account with a standing `auth` / `malformed-timestamp`
+mark, so its row is `blocked`, not a frozen `exhausted` one (#14317).
+
+**`.ranking` rows can be carried over from the previous round (#14145,
+#14265, #14317).** `tokens check --ranking` (the probe path) does not blindly
+overwrite the file. When an account's previous row was `exhausted` and this
+round's row carries no probe evidence — `error` (timeout, connection, 5xx) or
+`blocked` (empty token, credential-shape mismatch, `401`), or an `available`
+with no 5h-utilization header (#14195), or a codex `unknown` — the last two only
+while the held reset is still in the future and within the eight-day credibility
+horizon (`MAX_WEEKLY_RESET_HORIZON_SECS`) — the previous `exhausted` row is
+written back unchanged, so one failed or header-less probe cannot shorten an
+active weekly hold to the 6h fixed cooldown. Once that reset has passed (or is
+missing, unparseable or beyond the horizon) the fresh row overwrites. Measured
+evidence (`available` with a 5h utilization, `rate_limited`, a fresh
+`exhausted`) overwrites as before. Two consequences for an operator
+reading `.ranking` directly:
+
+- **A row may be a previous round's record, and nothing on disk marks it as
+  carried.** The line format has no "carried" field, and the file's mtime is
+  the write time of the round, not the age of the row. `--json` is the
+  measurement view: its `probed` field says whether a request was sent in *this*
+  run, and a failed round's `status`/`error` show what this round saw even when
+  `.ranking` kept the older `exhausted` row.
+- **What releases a carried row depends on why it was carried.** For `error` /
+  `blocked`, the row stays until a round gets evidence for that account, so
+  while a probe keeps failing the `exhausted` row (with its recorded reset)
+  persists. For a codex `unknown` or a header-less `available`, a later probe
+  that answers the same way does **not** release it — a header-less 2xx is a
+  real answer but carries no 5h-utilization evidence — so the release is the
+  carried reset elapsing (or being missing, unparseable or beyond the eight-day
+  horizon), not the next answered probe. A round that measures (`available`
+  with a 5h utilization, `rate_limited`, a fresh `exhausted`) overwrites at
+  any time.
+  Throughout, the selector's `exhausted` hard exclusion keeps applying to the
+  carried row. Carrying never widens the selectable set, for all four carried
+  statuses: `error` and `blocked` are excluded or ranked after every selectable
+  status anyway, and for `unknown` / header-less `available` the fresh row
+  would have been selectable, so carrying the `exhausted` row can only narrow
+  the set.
+
+The carry-forward does **not** apply to an account with a standing `auth` or
+`malformed-timestamp` mark: that account's `blocked` row comes from the mark,
+not from a failed probe, and it is written as `<name>|blocked` even when the
+previous row was `exhausted`. A self-clearing `exhaustion` mark is probed live
+and keeps the carry-forward.
 
 Every row says whether it is a measurement or a stored record:
 
@@ -394,8 +441,11 @@ precedence env > `.loom/config.json` > default, same as
 `buildGate.loadThreshold`); once at/above threshold, filing is deferred until
 either pressure clears or `guide.docsMaintenance.poolPressureMaxDeferSecs`
 (default `14400` = 4h) has elapsed since the last docs-maintenance PR merged
-— the "never starves permanently" ceiling. Missing/empty/unparseable ranking
-data fails open (proceeds as if there is no pressure). Full mechanism:
+— the "never starves permanently" ceiling. Absent or unparseable ranking
+data is a valid numeric `0` (no pressure), but a read that produces no
+number at all — a denied or failed call, empty or non-numeric output —
+reports `unavailable` and is treated as pressure-UNKNOWN: deferred, bounded
+by the same ceiling, never a silent proceed (#14162). Full mechanism:
 `defaults/.claude/commands/loom/guide.md` → "Step 4b: Check Token-Pool
 Pressure".
 
@@ -877,6 +927,14 @@ closed set (`haiku`/`sonnet`/`opus`/`fable`), so the un-marked ones can be
 named and shown to be fine, while a provider whose class vocabulary is
 open-ended model IDs has no list to enumerate and must not invent one.
 
+The `N exhausted/near-ceiling` figure is `total − healthy`, not a count of
+`exhausted` rows: a `blocked` (e.g. auth-dead), `error`, `rate_limited` or
+`unknown` account is in it too. With a `.ranking` source it can also include an
+account whose row is a previous round's `exhausted` record carried forward
+(see "`.ranking` rows can be carried over from the previous round"); an
+account with a standing `auth` / `malformed-timestamp` mark is never one of
+those (#14317).
+
 Three properties are worth relying on:
 
 - **Degradation is the contract.** The breakdown appears only when
@@ -1106,7 +1164,7 @@ is visible on `kicad-tools#5333` — 287 recorded label events (142 `loom:issue`
 140 `loom:building`), 105 lease acquisitions and 12 yields across three hosts
 over ~16 h, every one of them authored by `loom-fleet-dispatch[bot]`. The same
 pattern ran **89** `loom:issue` ↔ `loom:building` label events deep on
-`rjwalters/loom#7815`.
+`2AMLogic/loom#7815`.
 
 **Which executable this was, and why that matters.** Every token-selection
 death in the 2026-09-16 window logs its own deciding binary (#4643), so the
@@ -1363,25 +1421,10 @@ dispatch for that pool when `total > 0 && usable == 0`
 - A hold outranks #5030's half-open recovery probe: a probe dispatched into a
   pool with zero spawnable accounts tests nothing and costs exactly the label
   flip and lease comment this exists to prevent.
-- **Broadcast to peers, keyed by account set (#8001).** The arm/clear *edge* is
-  advertised over the peer-claim room (`ClaimKind::PoolHoldArmed` /
-  `PoolHoldCleared`), so a peer does not have to rediscover a dead pool the
-  expensive way — one doomed dispatch, one label flip and one permanent lease
-  comment at a time. The original "do not broadcast" caution is preserved as the
-  **key**, not as abstinence: each host resolves its *own* pool (repo-local
-  shadow if it holds `.token` files, else shared — #3938/#7527), so the ad is
-  keyed by `pool_account_fingerprint` — a hash of the pool's sorted account
-  names — never by the pool directory. A path key is wrong in both directions
-  (two hosts sharing accounts resolve different absolute paths; two hosts with
-  genuinely different repo-local shadow pools resolve the *same* relative path),
-  and the second failure is exactly the "suppress a peer whose pool is healthy"
-  hazard. Exhaustion is a property of the **accounts** — a `.bad_tokens` mark or
-  a `.ranking` hard exclusion records an upstream rate-limit state every host
-  holding that credential shares — so an account-set key matches precisely when
-  suppression is correct. Fail-open throughout: a dropped ad, a peer without
-  safehouse, or a host that has not received the ad yet degrades byte-for-byte
-  to the local-only pre-flight, which still stops that host on its own next
-  tick. See [`safehouse.md` → "Fleet-wide token-pool exhaustion hold"](safehouse.md).
+- **Not broadcast to peers (#13945).** The arm/clear edge was once advertised
+  over the safehouse claims room, keyed by account-set fingerprint (#8001); that
+  channel was retired, so the hold is this host's own.
+
 - `total == 0` (no pool provisioned at all) is a *different* condition with a
   different remedy (`loom-daemon tokens bootstrap`) and its own detection
   (#4642). It never arms this hold.
@@ -1519,7 +1562,7 @@ first-class in *generated* systemd units; this section is for bare/unmanaged
 daemon startups and ad hoc CLI invocations from arbitrary cwds — the generated
 units already cover the managed case).
 
-Implementation: [`resolve_tokens_dir_anchored()`](https://github.com/rjwalters/loom/blob/main/loom-daemon/src/tokens_pool/paths.rs)
+Implementation: [`resolve_tokens_dir_anchored()`](https://github.com/2AMLogic/loom/blob/main/loom-daemon/src/tokens_pool/paths.rs)
 delegates step 2/3's "is this candidate a recognized Loom workspace" question
 to the same registry-membership check `#4299` established for CLI
 `--workspace` defaulting (`workspace_registry::resolve_client_workspace_default`)
@@ -1582,7 +1625,7 @@ rotation has not been configured at all.
 
 The `loom-daemon` role runner (`autonomous.roleRunner`, see
 [daemon-reference.md](daemon-reference.md)) pre-checks
-[`tokens::token_pool_size`](https://github.com/rjwalters/loom/blob/main/loom-daemon/src/tokens.rs) for exactly this
+[`tokens::token_pool_size`](https://github.com/2AMLogic/loom/blob/main/loom-daemon/src/tokens.rs) for exactly this
 condition **before** it ever spawns `spawn-claude.sh` (issue #4642): a repo
 with neither pool provisioned skips the doomed spawn entirely instead of
 hitting this hard-fail on every single tick forever. The skip is logged once
@@ -2006,9 +2049,18 @@ under a sibling `mkdir` lock.
 For managed headless runs, `spawn-codex.sh` asks the native selector for an
 eligible profile and exports that profile as `CODEX_HOME`. Selection excludes
 disabled profiles, persistent `reauth_required` holds, and unexpired cooldowns;
-then prefers fewer recent transient failures and round-robins equal candidates.
-If none are healthy, selection exits closed rather than using ambient
-`~/.codex`.
+then prefers fewer recent transient failures. Within that group it prefers the
+seat(s) with the **lowest weekly (7d) utilization** (#14585) and round-robins
+among seats tied for the lowest. Ranking reads the provider's weekly window
+from the seat's own rollout logs because provisioned profiles can share session
+history. A reading expires at its reported reset or after one known window
+from the observation when a reset is unavailable.
+If **any** candidate in the group lacks a live weekly reading, the whole group
+falls back to plain round-robin. A measured `0%` is a reading. Live-session
+preference, repository and model eligibility, and explicit profile pins apply
+first. A seat that turns out busy at lease time is skipped and the next-best
+eligible seat is tried. If none are healthy, selection exits closed rather than using
+ambient `~/.codex`.
 
 Terminal policy is intentionally conservative:
 
@@ -2026,8 +2078,8 @@ Terminal policy is intentionally conservative:
   the tick's working directory) do not poison account health. Those three also
   record no freshness, because nothing ran.
 
-Codex exposes no trustworthy quota-headroom percentage here. Status/capacity
-therefore reports raw, enabled, healthy, cooldown, and reauth-required counts;
+Capacity reporting makes no use of utilization: Status/capacity
+reports raw, enabled, healthy, cooldown, and reauth-required counts;
 transcript token totals remain observability and are never presented as
 remaining quota. Claude's existing global daemon concurrency cap is unchanged.
 
@@ -2342,7 +2394,7 @@ Four properties keep a parser reading an agent's own transcript honest:
 
 The parse happens in `loom-daemon`, not in `spawn-codex.sh`, for two reasons:
 date parsing is new executable logic and belongs in the daemon
-([shell-language-policy.md](https://github.com/rjwalters/loom/blob/main/.loom/docs/shell-language-policy.md)),
+([shell-language-policy.md](https://github.com/2AMLogic/loom/blob/main/.loom/docs/shell-language-policy.md)),
 and a new `LOOM_TERMINAL_RESULT` field
 would be dropped wholesale by an older daemon on a mixed-version host, losing
 the bad-mark along with the horizon. Parsing text the adapter already writes

@@ -6,6 +6,7 @@
 //! in front of every tick).
 
 use super::*;
+use crate::env_test_support::EnvGuard;
 // #9548: gate-reaching tests hold the default serial key; see `crate::write_scope_test_support`.
 
 // ===================================================================
@@ -312,7 +313,7 @@ fn run_role_with_timeout_forwards_owner_gh_config_dir_for_a_registered_root() {
 #[test]
 #[serial]
 fn run_role_with_timeout_leaves_gh_config_dir_untouched_for_an_unregistered_root() {
-    let _env_guard = ClearedGhConfigDirEnv::new();
+    let _env_guard = EnvGuard::clear(&["GH_CONFIG_DIR"]);
     crate::credential_preflight::clear_owner_root_registry();
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path().to_path_buf();
@@ -329,6 +330,125 @@ fn run_role_with_timeout_leaves_gh_config_dir_untouched_for_an_unregistered_root
         .with_spawn_bin(script);
     assert_eq!(runner.invoke("champion", "/loom:champion"), RoleTickOutcome::Success);
     assert_eq!(fs::read_to_string(&observed).unwrap(), "__unset__");
+}
+
+/// A configured service tier reaches the child and is attributed in the role
+/// log. With none configured the child inherits the daemon's environment.
+#[test]
+#[serial(loom_config_env)]
+fn test_invoke_exports_resolved_service_tier_and_leaves_inherited_value_when_unset() {
+    std::env::set_var(crate::config_resolver::PRIVATE_DEFAULTS_ENV, "");
+    use crate::runtime_admission::{ResolvedRuntime, RuntimeSource};
+
+    let run = |config: &str, admission: Option<&ResolvedRuntime>| {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().to_path_buf();
+        write_config(&root, config);
+        let observed = root.join("observed-tier");
+        let script = write_fake_script(
+            &root,
+            "fake-spawn.sh",
+            &format!(
+                "printf '%s' \"${{LOOM_SERVICE_TIER:-__unset__}}\" > '{}'",
+                observed.display()
+            ),
+        );
+        let ws = crate::write_scope_test_support::WritableRoot::register(&root);
+        let outcome = if let Some(admission) = admission {
+            // A spawn override on ScriptRoleInvocationRunner skips admission.
+            // Supply the admitted runtime to the production launcher directly.
+            run_role_with_timeout(
+                &script,
+                &root,
+                &ws.gh,
+                "judge",
+                "/loom:judge",
+                root.join(".loom/logs"),
+                Duration::from_secs(30),
+                "sonnet",
+                "default",
+                "",
+                "unset",
+                Some(admission),
+                None,
+                None,
+                None,
+                None,
+            )
+        } else {
+            ScriptRoleInvocationRunner::new(root.clone())
+                .with_gh_bin(ws.gh.clone())
+                .with_spawn_bin(script)
+                .invoke("judge", "/loom:judge")
+        };
+        assert_eq!(outcome, RoleTickOutcome::Success);
+        let tier = fs::read_to_string(&observed).unwrap();
+        let log = fs::read_to_string(root.join(".loom/logs/role-judge.log")).unwrap();
+        let header = log
+            .lines()
+            .find(|line| line.starts_with("==== loom-daemon role_runner: "))
+            .unwrap()
+            .to_owned();
+        (tier, header)
+    };
+    let assert_launch = |config: &str,
+                         expected_tier: &str,
+                         expected_source: Option<&str>,
+                         admission: Option<&ResolvedRuntime>| {
+        let (tier, header) = run(config, admission);
+        assert_eq!(tier, expected_tier);
+        if let Some(source) = expected_source {
+            assert!(
+                header.contains(&format!(" service_tier={tier} (source={source}) ====")),
+                "header must explain the tier seen by the child: {header}",
+            );
+        } else {
+            assert!(!header.contains(" service_tier="), "{header}");
+        }
+    };
+
+    std::env::remove_var("LOOM_SERVICE_TIER");
+    assert_launch(
+        r#"{"autonomous": {"roleRunner": {"serviceTier": "flex"}}}"#,
+        "flex",
+        Some("autonomous.roleRunner.serviceTier"),
+        None,
+    );
+    assert_launch(
+        r#"{"autonomous": {"roleRunner": {"serviceTier": "flex",
+            "roleServiceTiers": {"judge": "priority"}}}}"#,
+        "priority",
+        Some("autonomous.roleRunner.roleServiceTiers.judge"),
+        None,
+    );
+    let admitted_claude = ResolvedRuntime {
+        role: "judge".into(),
+        runtime: "claude".into(),
+        source: RuntimeSource::RoleConfig,
+        adapter: PathBuf::from("/nonexistent/spawn-claude.sh"),
+        role_manifest: PathBuf::from("/nonexistent/judge.json"),
+        runtime_manifest: PathBuf::from("/nonexistent/claude.json"),
+        suggested_worker_type: None,
+        preference: None,
+        execution: None,
+    };
+    assert_launch(
+        r#"{"autonomous": {"roleRunner": {"serviceTier": "flex",
+            "roleServiceTiers": {"judge": "default", "judge@claude": "fast"}}}}"#,
+        "fast",
+        Some("autonomous.roleRunner.roleServiceTiers.judge@claude"),
+        Some(&admitted_claude),
+    );
+    assert_launch("{}", "__unset__", None, None);
+    std::env::set_var("LOOM_SERVICE_TIER", "operator");
+    assert_launch("{}", "operator", None, None);
+    assert_launch(
+        r#"{"autonomous": {"roleRunner": {"serviceTier": "flex"}}}"#,
+        "flex",
+        Some("autonomous.roleRunner.serviceTier"),
+        None,
+    );
+    std::env::remove_var("LOOM_SERVICE_TIER");
 }
 
 /// Issue #4501: a role spawn pins the model explicitly — a role child must

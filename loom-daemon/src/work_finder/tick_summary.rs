@@ -1,6 +1,6 @@
 //! Last-tick publication (Issue #4761) and per-tick OTLP export (Issue
-//! #8860), split out of `work_finder.rs` (which is frozen by the file-size
-//! ratchet) so both tick loops share one publication seam.
+//! #8860), split out of `work_finder.rs` so both tick loops share one
+//! publication seam.
 
 use std::path::PathBuf;
 use std::sync::{Mutex, OnceLock};
@@ -83,15 +83,12 @@ pub fn tick_summary(
         skipped_quarantined: report.skipped_quarantined,
         skipped_workspace_commands_missing: report.skipped_workspace_commands_missing,
         skipped_pr_open: report.skipped_pr_open,
-        skipped_peer_claim: report.skipped_peer_claim,
         skipped_backoff: report.skipped_backoff,
         skipped_pr_open_backoff: report.skipped_pr_open_backoff,
         skipped_noop_cooldown: report.skipped_noop_cooldown,
         skipped_declined: report.skipped_declined,
         // #7972: `skipped_prless_retry` is deliberately NOT carried on the
-        // cross-process `WorkFinderTickSummary` yet — `types.rs` is over the
-        // file-size ratchet's threshold and frozen at its current size
-        // (.loom/docs/file-size-policy.md), and a wire field is not worth
+        // cross-process `WorkFinderTickSummary` yet — a wire field is not worth
         // displacing unrelated code for. The counter IS on `TickReport` and
         // appears as `prless-retry-skip` on the per-tick summary log line.
         skipped_recheck_interval: report.skipped_recheck_interval,
@@ -170,13 +167,14 @@ pub(super) fn reset_last_tick_summary() {
 /// each ready-queue row's repo (#8852 — empty for the single-workspace loop);
 /// `plan` is the multi-workspace loop's dispatch-plan context (#9288 — `None`
 /// for the single-workspace loop, which records no rows).
+/// Returns the completion stamp and its monotonic counterpart for the local log.
 pub fn publish_tick(
     report: &TickReport,
     max_concurrent: usize,
     started_at: chrono::DateTime<chrono::Utc>,
     roots: &[PathBuf],
     plan: Option<&dispatch_plan::PlanInputs>,
-) {
+) -> (chrono::DateTime<chrono::Utc>, std::time::Instant) {
     // Captured once and threaded through both the summary and the tick span
     // (Issue #9222): `ops::disposition` matches a later sample's
     // `WorkFinderTickSummary::at` against `dispatch::last_tick_context()` to
@@ -184,6 +182,7 @@ pub fn publish_tick(
     // the two "this tick completed at" instants are bit-identical rather than
     // two separate `Utc::now()` reads a few lines apart.
     let completed_at = chrono::Utc::now();
+    let completed = std::time::Instant::now();
     let mut summary = tick_summary(report, max_concurrent, completed_at, roots, plan);
     summary.cap = last_cap().filter(|c| c.configured == max_concurrent);
     crate::observability::ops::queue::record_queue(&summary);
@@ -213,4 +212,24 @@ pub fn publish_tick(
     crate::observability::ops::turnaround::record_tick(report, max_concurrent);
     // #11847: busy slots by role (sweep occupancy and role-runner agents).
     crate::observability::ops::busy_slots::record_tick(report, roots);
+    (completed_at, completed)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serial_test::serial;
+
+    #[test]
+    #[serial(work_finder_last_tick)]
+    fn publication_returns_its_completion_and_a_skip_preserves_it() {
+        reset_last_tick_summary();
+        let started_at = chrono::Utc::now() - chrono::Duration::seconds(1);
+        let (completed_at, _) = publish_tick(&TickReport::default(), 1, started_at, &[], None);
+        assert_eq!(last_tick_summary().unwrap().at, completed_at);
+
+        publish_rate_limit_skip(completed_at + chrono::Duration::seconds(60));
+        assert_eq!(last_tick_summary().unwrap().at, completed_at);
+        reset_last_tick_summary();
+    }
 }

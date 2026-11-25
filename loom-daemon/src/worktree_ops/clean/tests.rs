@@ -178,67 +178,6 @@ fn dir_size_human_handles_missing_dir() {
     assert_eq!(dir_size_human(Path::new("/does/not/exist/at/all")), "0B");
 }
 
-// --- reclaim_worktree_artifacts (#5187) ------------------------------
-
-#[test]
-fn reclaim_removes_target_and_node_modules_but_nothing_else() {
-    let tmp = tempfile::tempdir().unwrap();
-    std::fs::create_dir_all(tmp.path().join("target/debug")).unwrap();
-    std::fs::write(tmp.path().join("target/debug/binary"), b"x").unwrap();
-    std::fs::create_dir_all(tmp.path().join("node_modules/.bin")).unwrap();
-    std::fs::create_dir_all(tmp.path().join("src")).unwrap();
-    std::fs::write(tmp.path().join("src/main.rs"), b"fn main() {}").unwrap();
-    std::fs::write(tmp.path().join("Cargo.lock"), b"lockfile").unwrap();
-
-    let reclaimed = reclaim_worktree_artifacts(tmp.path(), false);
-    let names: Vec<_> = reclaimed.iter().map(|a| a.name.as_str()).collect();
-    assert_eq!(
-        names.into_iter().collect::<std::collections::HashSet<_>>(),
-        std::collections::HashSet::from(["target", "node_modules"])
-    );
-    assert!(!tmp.path().join("target").exists());
-    assert!(!tmp.path().join("node_modules").exists());
-    // Everything else — git history stand-ins, source, lockfiles — is untouched.
-    assert!(tmp.path().join("src/main.rs").is_file());
-    assert!(tmp.path().join("Cargo.lock").is_file());
-}
-
-#[test]
-fn reclaim_never_removes_a_same_named_file() {
-    // `Cargo.lock` and `pnpm-lock.yaml` are both entries in
-    // BUILD_ARTIFACT_PATTERNS, but they are files, not directories — the
-    // reclaim pass must never `remove_dir_all` a file.
-    let tmp = tempfile::tempdir().unwrap();
-    std::fs::write(tmp.path().join("Cargo.lock"), b"lockfile").unwrap();
-    std::fs::write(tmp.path().join("pnpm-lock.yaml"), b"lockfile").unwrap();
-    std::fs::write(tmp.path().join(".loom-in-use"), b"{}").unwrap();
-
-    let reclaimed = reclaim_worktree_artifacts(tmp.path(), false);
-    assert!(reclaimed.is_empty(), "{reclaimed:?}");
-    assert!(tmp.path().join("Cargo.lock").is_file());
-    assert!(tmp.path().join("pnpm-lock.yaml").is_file());
-    assert!(tmp.path().join(".loom-in-use").is_file());
-}
-
-#[test]
-fn reclaim_dry_run_reports_without_removing() {
-    let tmp = tempfile::tempdir().unwrap();
-    std::fs::create_dir_all(tmp.path().join("target")).unwrap();
-
-    let reclaimed = reclaim_worktree_artifacts(tmp.path(), true);
-    assert_eq!(reclaimed.len(), 1);
-    assert_eq!(reclaimed[0].name, "target");
-    assert!(tmp.path().join("target").is_dir(), "dry-run must not remove");
-}
-
-#[test]
-fn reclaim_with_no_artifact_dirs_is_a_clean_no_op() {
-    let tmp = tempfile::tempdir().unwrap();
-    std::fs::write(tmp.path().join("README.md"), b"hi").unwrap();
-    let reclaimed = reclaim_worktree_artifacts(tmp.path(), false);
-    assert!(reclaimed.is_empty());
-}
-
 // --- sweep_primary_checkout_artifacts (#5919) ------------------------
 
 #[test]
@@ -542,7 +481,7 @@ fn cleanup_worktree_removes_untracked_orphan_directory() {
     std::fs::write(orphan.join("some-build-artifact"), "junk").unwrap();
     assert!(orphan.is_dir());
 
-    let result = cleanup_worktree(&repo_root, &orphan, 999, false, "test");
+    let result = cleanup_worktree(&repo_root, &orphan, 999, &CleanOptions::default(), "test");
     assert_eq!(
         result,
         Ok(CleanupOutcome::Removed),
@@ -636,7 +575,7 @@ fn cleanup_worktree_reclaims_a_redirected_cargo_target_dir() {
         return;
     }
 
-    let result = cleanup_worktree(&repo_root, &worktree, 7239, false, "test");
+    let result = cleanup_worktree(&repo_root, &worktree, 7239, &CleanOptions::default(), "test");
     assert_eq!(result, Ok(CleanupOutcome::Removed), "{result:?}");
     assert!(!worktree.exists(), "worktree should be gone");
     assert!(
@@ -726,7 +665,7 @@ fn cleanup_worktree_keeps_a_target_dir_a_live_worktree_still_shares() {
         return;
     }
 
-    let result = cleanup_worktree(&repo_root, &made[0], 7239, false, "test");
+    let result = cleanup_worktree(&repo_root, &made[0], 7239, &CleanOptions::default(), "test");
     assert_eq!(result, Ok(CleanupOutcome::Removed), "{result:?}");
     assert!(!made[0].exists(), "the removed worktree should be gone");
     assert!(
@@ -758,7 +697,7 @@ fn cleanup_worktree_treats_missing_directory_as_already_gone() {
     let gone = crate::worktree_root::worktree_root(&repo_root).join("issue-4525");
     assert!(!gone.exists(), "fixture must not exist on disk");
 
-    let result = cleanup_worktree(&repo_root, &gone, 4525, false, "test");
+    let result = cleanup_worktree(&repo_root, &gone, 4525, &CleanOptions::default(), "test");
     assert_eq!(
         result,
         Ok(CleanupOutcome::AlreadyGone),
@@ -888,7 +827,7 @@ fn cleanup_worktree_does_not_force_remove_on_other_errors() {
     std::fs::create_dir_all(&managed).unwrap();
     std::fs::write(managed.join(".loom-managed"), "test").unwrap();
 
-    let result = cleanup_worktree(&repo_root, &managed, 1000, false, "test");
+    let result = cleanup_worktree(&repo_root, &managed, 1000, &CleanOptions::default(), "test");
     assert!(result.is_err(), "non-orphan failure must propagate");
     assert!(managed.exists(), "directory must be left in place on a non-orphan failure");
 }
@@ -1238,6 +1177,31 @@ fn cleanup_pr_worktree_removes_untracked_orphan_directory() {
     assert!(!orphan.exists(), "orphan directory should be gone");
 }
 
+/// Unlike `cleanup_worktree` (#5895), the `pr-<N>` path has no
+/// already-gone exemption: a directory that is missing on disk while git
+/// also has no record of it must surface as an error, not `Ok(())`.
+#[test]
+#[serial_test::serial]
+fn cleanup_pr_worktree_treats_a_missing_directory_as_an_error() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo_root = tmp.path().canonicalize().unwrap();
+    assert!(Command::new("git")
+        .args(["init", "-q"])
+        .current_dir(&repo_root)
+        .status()
+        .unwrap()
+        .success());
+
+    let gone = crate::worktree_root::worktree_root(&repo_root).join("pr-4525");
+    assert!(!gone.exists(), "fixture must not exist on disk");
+
+    let result = cleanup_pr_worktree(&repo_root, &gone, 4525, false, "test", None);
+    assert!(
+        result.is_err(),
+        "a missing directory must be an error for the pr path: {result:?}"
+    );
+}
+
 #[test]
 fn cleanup_pr_worktree_dry_run_makes_no_changes() {
     let tmp = tempfile::tempdir().unwrap();
@@ -1355,6 +1319,298 @@ fn cleanup_pr_worktree_removes_the_worktree_but_spares_an_integration_branch() {
         String::from_utf8_lossy(&branches.stdout).contains("develop"),
         "an integration branch must survive the pr-<N> worktree that held it"
     );
+}
+
+// --- stale 'initializing' worktree locks (#14878) ----------------------
+
+/// Shared #14878 fixture: a real repo with one linked worktree under the
+/// managed root. Real git, because the whole point is git's genuine
+/// lock/refusal behavior — a mock cannot regress when git's wording moves.
+fn repo_with_worktree(tmp: &tempfile::TempDir, wt_name: &str, detach: bool) -> (PathBuf, PathBuf) {
+    let repo_root = tmp.path().canonicalize().unwrap();
+    git(&repo_root, &["init", "-q", "-b", "main"]);
+    // CI runners have no global git identity — set one explicitly or
+    // `git commit` refuses with "Please tell me who you are."
+    git(&repo_root, &["config", "user.email", "loom@example.com"]);
+    git(&repo_root, &["config", "user.name", "Loom Test"]);
+    git(&repo_root, &["commit", "--allow-empty", "-qm", "init"]);
+
+    let wt_path = crate::worktree_root::worktree_root(&repo_root).join(wt_name);
+    std::fs::create_dir_all(wt_path.parent().unwrap()).unwrap();
+    let wt_str = wt_path.to_str().unwrap();
+    if detach {
+        git(&repo_root, &["worktree", "add", "-q", "--detach", wt_str, "main"]);
+    } else {
+        git(
+            &repo_root,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                &format!("feature/{wt_name}"),
+                wt_str,
+            ],
+        );
+    }
+    (repo_root, wt_path)
+}
+
+/// Write `reason` into the worktree's registered `locked` file (the exact
+/// file `git worktree add` writes its transient `initializing` marker into,
+/// and `git worktree lock --reason` writes operator holds into — trailing
+/// newline included), optionally backdating its mtime, and return the lock
+/// file's path.
+fn set_worktree_lock(wt_path: &Path, reason: &str, age: Option<Duration>) -> PathBuf {
+    let git_dir = std::fs::read_to_string(wt_path.join(".git"))
+        .unwrap()
+        .trim()
+        .strip_prefix("gitdir:")
+        .unwrap()
+        .trim()
+        .to_string();
+    let lock_file = PathBuf::from(git_dir).join("locked");
+    std::fs::write(&lock_file, reason).unwrap();
+    if let Some(age) = age {
+        std::fs::File::open(&lock_file)
+            .unwrap()
+            .set_modified(SystemTime::now() - age)
+            .unwrap();
+    }
+    lock_file
+}
+
+/// The #14878 grace-period boundary, pinned on the pure predicate so the
+/// edge is exact rather than racing a wall clock: at or below 24h the lock
+/// may still belong to a live add and must be preserved; strictly past it,
+/// it is crash debris.
+#[test]
+fn stale_initializing_lock_boundary_and_reason_predicates() {
+    let day = Duration::from_secs(STALE_INITIALIZING_LOCK_SECS);
+    assert!(!is_stale_initializing_lock("initializing", Some(day)));
+    assert!(!is_stale_initializing_lock("initializing", Some(day - Duration::from_secs(1))));
+    assert!(is_stale_initializing_lock("initializing", Some(day + Duration::from_secs(1))));
+    // A future-dated lock (clock skew) answers `None`: preserve.
+    assert!(!is_stale_initializing_lock("initializing", None));
+    // git writes `lock --reason` payloads with a trailing newline; the
+    // transient marker survives exactly that trim — nothing looser.
+    assert!(is_stale_initializing_lock("initializing\n", Some(2 * day)));
+    assert!(!is_stale_initializing_lock("", Some(2 * day)));
+    assert!(!is_stale_initializing_lock("initializing now", Some(2 * day)));
+    assert!(!is_stale_initializing_lock("operator hold", Some(2 * day)));
+}
+
+#[test]
+fn locked_worktree_error_recognizes_gits_message() {
+    // git 2.43's full refusal, hint line included — `run_checked` hands
+    // back the whole trimmed stderr.
+    assert!(is_locked_worktree_error(
+        "fatal: cannot remove a locked working tree, lock reason: initializing\nuse \
+         'remove -f -f' to override or unlock first"
+    ));
+    assert!(is_locked_worktree_error("FATAL: CANNOT REMOVE A LOCKED WORKING TREE"));
+    assert!(!is_locked_worktree_error(
+        "fatal: '/repo/.loom/worktrees/issue-42' is not a working tree"
+    ));
+    assert!(!is_locked_worktree_error("Permission denied (os error 13)"));
+    assert!(!is_locked_worktree_error(""));
+}
+
+/// AC1 (issue path): an otherwise-eligible `issue-N` worktree locked with
+/// git's transient `initializing` marker, aged well past the grace period,
+/// is unlocked and removed — the directory AND the git registration are
+/// both gone afterwards.
+#[test]
+#[serial_test::serial]
+fn cleanup_worktree_recovers_a_stale_initializing_locked_worktree() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (repo_root, wt_path) = repo_with_worktree(&tmp, "issue-14878", false);
+    std::fs::write(wt_path.join(".loom-managed"), "test").unwrap();
+    set_worktree_lock(&wt_path, "initializing", Some(Duration::from_secs(48 * 60 * 60)));
+
+    let result = cleanup_worktree(&repo_root, &wt_path, 14878, &CleanOptions::default(), "test");
+    assert_eq!(result, Ok(CleanupOutcome::Removed), "{result:?}");
+    assert!(!wt_path.exists(), "worktree directory should be gone");
+    let list = git(&repo_root, &["worktree", "list", "--porcelain"]);
+    assert!(
+        !list.contains("issue-14878"),
+        "git registration should be gone with the worktree: {list}"
+    );
+}
+
+/// AC1 (registration id ≠ directory basename): git does not derive the
+/// admin-dir id from the worktree's basename, so recovery must resolve the
+/// registered git dir through the worktree's `.git` pointer — never
+/// construct it from the name. The fixture renames the admin dir after the
+/// add, exactly the shape a colliding re-add leaves behind.
+#[test]
+#[serial_test::serial]
+fn cleanup_worktree_recovers_a_lock_registered_under_a_different_id() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (repo_root, wt_path) = repo_with_worktree(&tmp, "issue-14880", false);
+    std::fs::write(wt_path.join(".loom-managed"), "test").unwrap();
+
+    let pointer = std::fs::read_to_string(wt_path.join(".git")).unwrap();
+    let registered = pointer.trim().strip_prefix("gitdir:").unwrap().trim();
+    let renamed = PathBuf::from(registered).with_file_name("leftover-slot-from-a-collision");
+    std::fs::rename(registered, &renamed).unwrap();
+    std::fs::write(wt_path.join(".git"), format!("gitdir: {}\n", renamed.display())).unwrap();
+    set_worktree_lock(&wt_path, "initializing", Some(Duration::from_secs(48 * 60 * 60)));
+
+    let result = cleanup_worktree(&repo_root, &wt_path, 14880, &CleanOptions::default(), "test");
+    assert_eq!(result, Ok(CleanupOutcome::Removed), "{result:?}");
+    assert!(!wt_path.exists(), "worktree directory should be gone");
+    assert!(!renamed.exists(), "renamed git registration should be gone");
+}
+
+/// AC1 (reaper path): a detached-HEAD `pr-N` review worktree — the exact
+/// `pr-10593` shape from the issue — is recovered the same way through
+/// `cleanup_pr_worktree`.
+#[test]
+#[serial_test::serial]
+fn cleanup_pr_worktree_recovers_a_stale_initializing_locked_detached_worktree() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (repo_root, wt_path) = repo_with_worktree(&tmp, "pr-10593", true);
+    std::fs::write(wt_path.join(".loom-managed"), "test").unwrap();
+    set_worktree_lock(&wt_path, "initializing", Some(Duration::from_secs(30 * 60 * 60)));
+
+    let result = cleanup_pr_worktree(&repo_root, &wt_path, 10593, false, "test", None);
+    assert!(result.is_ok(), "{result:?}");
+    assert!(!wt_path.exists(), "detached-HEAD pr-N worktree should be gone");
+    let list = git(&repo_root, &["worktree", "list", "--porcelain"]);
+    assert!(
+        !list.contains("pr-10593"),
+        "git registration should be gone with the worktree: {list}"
+    );
+}
+
+/// AC2: a fresh `initializing` lock may still belong to a live add — the
+/// worktree, the lock, and git's refusal all stay exactly as they were.
+#[test]
+#[serial_test::serial]
+fn cleanup_worktree_preserves_a_fresh_initializing_lock() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (repo_root, wt_path) = repo_with_worktree(&tmp, "issue-14881", false);
+    std::fs::write(wt_path.join(".loom-managed"), "test").unwrap();
+    let lock_file = set_worktree_lock(&wt_path, "initializing", None);
+
+    let result = cleanup_worktree(&repo_root, &wt_path, 14881, &CleanOptions::default(), "test");
+    let cause = result.expect_err("a fresh lock must still refuse removal");
+    assert!(
+        cause.contains("cannot remove a locked working tree"),
+        "the original git refusal must propagate untouched: {cause}"
+    );
+    assert!(wt_path.exists(), "worktree must be preserved");
+    assert_eq!(
+        std::fs::read_to_string(&lock_file).unwrap(),
+        "initializing",
+        "the lock itself must be preserved"
+    );
+}
+
+/// AC2: a future-dated lock (clock skew) has no verifiable age — it must be
+/// preserved exactly like a fresh one, never treated as "infinitely old".
+#[test]
+#[serial_test::serial]
+fn cleanup_worktree_preserves_a_future_dated_initializing_lock() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (repo_root, wt_path) = repo_with_worktree(&tmp, "issue-14885", false);
+    std::fs::write(wt_path.join(".loom-managed"), "test").unwrap();
+    let lock_file = set_worktree_lock(&wt_path, "initializing", None);
+    std::fs::File::open(&lock_file)
+        .unwrap()
+        .set_modified(SystemTime::now() + Duration::from_secs(60 * 60))
+        .unwrap();
+
+    let result = cleanup_worktree(&repo_root, &wt_path, 14885, &CleanOptions::default(), "test");
+    assert!(
+        result
+            .expect_err("a future-dated lock must refuse removal")
+            .contains("cannot remove a locked working tree"),
+        "the original git refusal must propagate untouched"
+    );
+    assert!(wt_path.exists(), "worktree must be preserved");
+    assert!(lock_file.is_file(), "the lock itself must be preserved");
+}
+
+/// AC2: an operator hold — however old — is never crash debris. Git accepts
+/// `initializing` as a user-supplied reason too, so only reason AND age
+/// together can qualify a lock for recovery.
+#[test]
+#[serial_test::serial]
+fn cleanup_worktree_preserves_an_operator_lock_regardless_of_age() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (repo_root, wt_path) = repo_with_worktree(&tmp, "issue-14882", false);
+    std::fs::write(wt_path.join(".loom-managed"), "test").unwrap();
+    // `git worktree lock --reason` writes the hold with a trailing newline.
+    let lock_file =
+        set_worktree_lock(&wt_path, "operator hold\n", Some(Duration::from_secs(72 * 60 * 60)));
+
+    let result = cleanup_worktree(&repo_root, &wt_path, 14882, &CleanOptions::default(), "test");
+    let cause = result.expect_err("an operator lock must refuse removal");
+    assert!(
+        cause.contains("cannot remove a locked working tree"),
+        "the original git refusal must propagate untouched: {cause}"
+    );
+    assert!(wt_path.exists(), "worktree must be preserved");
+    assert_eq!(
+        std::fs::read_to_string(&lock_file).unwrap(),
+        "operator hold\n",
+        "the operator's lock must be preserved verbatim"
+    );
+}
+
+/// AC3: dry-run never unlocks — a stale lock is left intact for the real
+/// run to act on.
+#[test]
+#[serial_test::serial]
+fn cleanup_worktree_dry_run_leaves_a_stale_initializing_lock_intact() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (repo_root, wt_path) = repo_with_worktree(&tmp, "issue-14883", false);
+    std::fs::write(wt_path.join(".loom-managed"), "test").unwrap();
+    let lock_file =
+        set_worktree_lock(&wt_path, "initializing", Some(Duration::from_secs(48 * 60 * 60)));
+
+    let result = cleanup_worktree(
+        &repo_root,
+        &wt_path,
+        14883,
+        &CleanOptions {
+            dry_run: true,
+            ..CleanOptions::default()
+        },
+        "test",
+    );
+    assert_eq!(result, Ok(CleanupOutcome::Removed), "{result:?}");
+    assert!(wt_path.exists(), "dry-run must not remove anything");
+    assert!(
+        lock_file.is_file(),
+        "dry-run must not unlock — the lock survives for the real run"
+    );
+}
+
+/// AC3: a skip from the existing eligibility checks (here: the in-use gate,
+/// which fires before any forge probe) leaves a worktree carrying a stale
+/// `initializing` lock completely untouched — recovery only ever runs once
+/// removal has already been decided.
+#[test]
+#[serial_test::serial]
+fn clean_worktrees_preserves_a_stale_lock_when_the_classifier_skips() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (repo_root, wt_path) = repo_with_worktree(&tmp, "issue-14884", false);
+    std::fs::write(wt_path.join(".loom-managed"), "test").unwrap();
+    std::fs::write(wt_path.join(".loom-in-use"), r#"{"shepherd_task_id": "test", "pid": 12345}"#)
+        .unwrap();
+    let lock_file =
+        set_worktree_lock(&wt_path, "initializing", Some(Duration::from_secs(48 * 60 * 60)));
+
+    let mut stats = CleanupStats::default();
+    clean_worktrees(&repo_root, &mut stats, &CleanOptions::default());
+
+    assert!(wt_path.exists(), "a skipped worktree must be preserved");
+    assert!(lock_file.is_file(), "a skipped worktree's lock must be preserved");
+    assert_eq!(stats.skipped_in_use, 1, "the in-use gate is what skipped it");
+    assert_eq!(stats.errors, 0, "no removal was attempted, so no error");
 }
 
 // --- tmux cleanup safety gates (#4890) -------------------------------
@@ -2469,6 +2725,68 @@ fn clear_stale_locks_removes_lock_without_live_owner_json() {
     let removed = clear_stale_spawn_loop_locks(dir.path(), false);
     assert_eq!(removed, 1);
     assert!(!locks.join("issue-3").exists());
+}
+
+/// Writes `owner.json` for `issue` naming `owner_pid` and the given
+/// `acquired_at` (RFC3339), the shape `SweepRegistry::acquire_lock` stamps.
+fn write_owner_with_acquired_at(locks: &Path, issue: u32, owner_pid: u32, acquired_at: &str) {
+    let lock = locks.join(format!("issue-{issue}"));
+    std::fs::create_dir_all(&lock).unwrap();
+    std::fs::write(
+        lock.join("owner.json"),
+        format!(r#"{{"issue":{issue},"owner_pid":{owner_pid},"acquired_at":"{acquired_at}","sweep_id":"s-{issue}"}}"#),
+    )
+    .unwrap();
+}
+
+#[test]
+#[cfg(target_os = "linux")] // needs /proc/<pid>/stat start times for the identity check
+fn clear_stale_locks_removes_lock_with_recycled_pid_owner() {
+    // #14056: the pid is LIVE (this test process), but the lock's
+    // `acquired_at` is a day old — the process currently wearing that pid
+    // number started long after the lock was acquired, the exact
+    // recycled-pid shape `pid_identity::pid_was_recycled` guards (#7935).
+    // Bare `pid_is_live_process` keeps such a lock on every pass forever;
+    // the identity-paired check must clear it, like `reconstruct` does.
+    let dir = tempfile::tempdir().unwrap();
+    let locks = spawn_loop_locks_dir(dir.path());
+    let acquired_at = (chrono::Utc::now() - chrono::Duration::days(1)).to_rfc3339();
+    write_owner_with_acquired_at(&locks, 4, std::process::id(), &acquired_at);
+    let removed = clear_stale_spawn_loop_locks(dir.path(), false);
+    assert_eq!(removed, 1);
+    assert!(!locks.join("issue-4").exists());
+}
+
+#[test]
+fn clear_stale_locks_keeps_live_owner_started_before_acquired_at() {
+    // The provisional `acquire_lock` shape: the dispatching daemon stamps
+    // its OWN pid at acquire time, so the owner process started *before*
+    // `acquired_at`. A future `acquired_at` is that relationship with the
+    // widest margin — the identity check must read the owner as the lock's
+    // own process and keep it (mid-flight locks survive cleanup passes).
+    let dir = tempfile::tempdir().unwrap();
+    let locks = spawn_loop_locks_dir(dir.path());
+    let acquired_at = (chrono::Utc::now() + chrono::Duration::hours(1)).to_rfc3339();
+    write_owner_with_acquired_at(&locks, 5, std::process::id(), &acquired_at);
+    let removed = clear_stale_spawn_loop_locks(dir.path(), false);
+    assert_eq!(removed, 0);
+    assert!(locks.join("issue-5").exists());
+}
+
+#[test]
+fn clear_stale_locks_unparseable_acquired_at_degrades_to_bare_liveness() {
+    // A garbage `acquired_at` is "no opinion": the probe degrades to bare
+    // liveness (`owner_pid_alive_since` mirrors `reconstruct`), so a live
+    // owner still keeps its lock. Legacy locks stamped before the field
+    // existed (no `acquired_at` at all) take the same path via
+    // `#[serde(default)]` and are covered by
+    // `clear_stale_locks_keeps_live_and_removes_dead` above.
+    let dir = tempfile::tempdir().unwrap();
+    let locks = spawn_loop_locks_dir(dir.path());
+    write_owner_with_acquired_at(&locks, 6, std::process::id(), "not-a-timestamp");
+    let removed = clear_stale_spawn_loop_locks(dir.path(), false);
+    assert_eq!(removed, 0);
+    assert!(locks.join("issue-6").exists());
 }
 
 // --- quarantine_dirty_worktree (#6653) --------------------------------

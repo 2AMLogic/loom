@@ -623,6 +623,13 @@ pub fn check_runtimes_preference_config(config: &Value) -> Vec<String> {
         Err(message) => vec![format!("runtimes preference: {message}")],
     };
     findings.extend(ceiling::check_config(config));
+    // #14932: a `runtimes.apiKeyLimits` block that cannot be understood
+    // withholds accounts at selection time, so name it here first.
+    findings.extend(
+        crate::api_keys_pool::limits::ConfiguredLimits::check_config(config)
+            .into_iter()
+            .map(|offence| format!("runtimes api-key limits: {offence}")),
+    );
     findings
 }
 
@@ -734,8 +741,17 @@ pub trait ContainmentPreparer {
         drawn_model: Option<&str>,
         rejection: RuntimeRejection,
     ) -> Result<ResolvedRuntime, RuntimeRejection>;
-    /// Release the containment prepared for a candidate the walk passed over,
-    /// so a rejected tap never keeps an account lease reserved.
+    /// Reserve a managed seat for a host-admitted candidate before it can win
+    /// a dispatch. Read-only probes have no launch to carry the lease to.
+    fn reserve_seat(
+        &mut self,
+        _admitted: &ResolvedRuntime,
+        _drawn_model: Option<&str>,
+    ) -> Result<(), RuntimeRejection> {
+        Ok(())
+    }
+
+    /// Return any seat reserved for a candidate the walk passed over.
     fn release(&mut self);
 }
 
@@ -809,10 +825,10 @@ fn gate_admitted_candidate(
     ceiling_config: Option<&ceiling::BackstopCeiling>,
     preparer: &mut dyn ContainmentPreparer,
 ) -> Result<Option<ceiling::Reservation>, SkipReason> {
-    // A contained candidate that is about to be skipped must give its
-    // account lease back before the walk moves on (#8787).
-    let mut release = || {
-        if admitted.execution.is_some() {
+    // A candidate that is about to be skipped must give its account lease
+    // back before the walk moves on.
+    let release = |preparer: &mut dyn ContainmentPreparer| {
+        if admitted.runtime == "codex" {
             preparer.release();
         }
     };
@@ -824,35 +840,89 @@ fn gate_admitted_candidate(
         let key = launch_failure_hold::Key::new(root, role, tap);
         let fingerprint = || launch_failure_hold::fingerprint(config, tap);
         if let Some(hold) = launch_failure_hold::active(&key, fingerprint, now) {
-            release();
+            release(preparer);
             return Err(SkipReason::Unavailable {
                 source: launch_failure_hold::SKIP_SOURCE.to_string(),
                 detail: hold.describe(now),
             });
         }
     }
-    match availability::availability_in(root, tap, admitted, now, binary_env) {
-        state if state.is_spawnable() => {}
-        state => {
-            release();
-            return Err(state
-                .skip_reason()
-                .expect("a non-spawnable availability always yields a skip reason"));
-        }
+    let credential_source =
+        match availability::availability_in(root, tap, admitted, now, binary_env) {
+            state if state.is_spawnable() => state.source().clone(),
+            state => {
+                release(preparer);
+                return Err(state
+                    .skip_reason()
+                    .expect("a non-spawnable availability always yields a skip reason"));
+            }
+        };
+    if context.intent == Intent::Dispatch {
+        preparer
+            .reserve_seat(admitted, tap.model.as_deref())
+            .map_err(|rejection| SkipReason::NotAdmitted {
+                unmet: rejection.unmet_capabilities,
+                detail: rejection.reason,
+            })?;
     }
     // The ceiling is asked LAST, and only for the tiers it governs:
     // credentials first means a tap that could not have run anyway is
     // never charged a metered slot, and asking last means the slot is
     // taken only for a tap the walk is about to return.
-    let Some(bound) = ceiling_config.filter(|c| c.governs(tier)) else {
-        return Ok(None);
+    let backstop = match ceiling_config.filter(|c| c.governs(tier)) {
+        None => None,
+        Some(bound) => match ceiling::admit(bound, role, tap, context.intent) {
+            ceiling::Verdict::Admitted(slot) => slot,
+            ceiling::Verdict::Refused(reason) => {
+                release(preparer);
+                return Err(reason);
+            }
+        },
     };
-    match ceiling::admit(bound, role, tap, context.intent) {
-        ceiling::Verdict::Admitted(slot) => Ok(slot),
-        ceiling::Verdict::Refused(reason) => {
-            release();
-            Err(reason)
-        }
+    // #14983: a dispatching role tick holds the pool slot its pick was drawn
+    // against; the availability read above holds nothing, and a tick admits
+    // several runs of a role before any child has acquired. Taken after every
+    // other gate, so it is only ever held for the tap the walk returns; a
+    // refusal here drops `backstop`, which releases that slot.
+    if let Err(reason) = hold_pool_slot(root, &credential_source, context) {
+        release(preparer);
+        return Err(reason);
+    }
+    Ok(backstop)
+}
+
+/// Hold one slot of the API-key pool a spawnable tap draws from (#14983), when
+/// this is a **dispatching role tick**: the one caller whose pick is followed
+/// by exactly one launch and one acquire. A probe holds nothing. Sweep and
+/// step dispatch do not reserve either: they re-resolve per phase, so a
+/// reservation there would not pair with an acquire and would hold a slot the
+/// sweep's own phases then could not draw.
+///
+/// The hold is not carried to the launch: the launched child's acquire
+/// retires it, and one that is never acquired expires
+/// ([`crate::api_keys_pool::reservation`]).
+///
+/// # Errors
+/// [`SkipReason::Unavailable`] when other draws and live spawns hold every
+/// slot: the walk passes the tap over and continues down its row.
+fn hold_pool_slot(
+    root: &Path,
+    source: &CredentialSource,
+    context: DispatchContext,
+) -> Result<(), SkipReason> {
+    use crate::api_keys_pool::reservation::{try_reserve, Reserve};
+    let CredentialSource::ApiKeys { provider } = source else {
+        return Ok(());
+    };
+    if !(context.role_tick && context.intent == Intent::Dispatch) {
+        return Ok(());
+    }
+    match try_reserve(root, provider) {
+        Reserve::Held(_) | Reserve::Unbounded => Ok(()),
+        Reserve::AtCap { .. } => Err(SkipReason::Unavailable {
+            source: source.wire(),
+            detail: availability::reserved_detail(provider),
+        }),
     }
 }
 
@@ -1067,11 +1137,11 @@ fn resolve_runtime_in(
             Ok(())
         },
     );
-    // A contained candidate is kept only when it is the tap actually chosen.
+    // An account reservation survives only when its runtime is chosen.
     if !resolution
         .chosen
         .as_ref()
-        .is_some_and(|chosen| chosen.admitted.execution.is_some())
+        .is_some_and(|chosen| chosen.admitted.runtime == "codex")
     {
         preparer.borrow_mut().release();
     }
