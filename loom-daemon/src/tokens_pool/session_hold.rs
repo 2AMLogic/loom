@@ -96,10 +96,12 @@ pub fn now_unix_ms() -> u64 {
 
 pub(super) fn write_json_atomic<T: Serialize>(dir: &Path, file: &str, value: &T) -> Result<()> {
     let path = dir.join(file);
-    let temp = dir.join(format!("{file}.tmp-{}", std::process::id()));
-    std::fs::write(&temp, serde_json::to_vec_pretty(value)?)
-        .with_context(|| format!("failed to stage {}", path.display()))?;
-    std::fs::rename(&temp, &path).with_context(|| format!("failed to commit {}", path.display()))
+    crate::fs_util::write_atomic(
+        &path,
+        &serde_json::to_vec_pretty(value)?,
+        crate::fs_util::AtomicOpts::default(),
+    )
+    .with_context(|| format!("failed to write {}", path.display()))
 }
 
 /// Record an operator hold in `profile` (atomic replace), stamped

@@ -279,19 +279,13 @@ pub(crate) fn validate_name(name: &str) -> Result<()> {
 
 fn write_repo_registry(workspace: &Path, entries: Vec<RegistryEntry>) -> Result<()> {
     let path = per_repo_accounts_file(workspace);
-    let parent = path
-        .parent()
-        .ok_or_else(|| anyhow!("account registry has no parent directory"))?;
-    std::fs::create_dir_all(parent).context("failed to create account registry directory")?;
     let file = RegistryFile {
         version: registry_version(),
         accounts: entries,
     };
     let bytes = serde_json::to_vec_pretty(&file)?;
-    let temp =
-        parent.join(format!(".accounts.json.tmp-{}-{}", std::process::id(), uuid::Uuid::new_v4()));
-    std::fs::write(&temp, bytes).context("failed to stage account registry update")?;
-    std::fs::rename(&temp, &path).context("failed to commit account registry update")?;
+    crate::fs_util::write_atomic(&path, &bytes, crate::fs_util::AtomicOpts::default())
+        .context("failed to write account registry")?;
     Ok(())
 }
 
