@@ -603,9 +603,8 @@ pub(crate) fn mark_session_managed(profile: &Path, container_name: &str) -> Resu
             .as_secs(),
     };
     let bytes = serde_json::to_vec_pretty(&marker)?;
-    let temp = profile.join(format!(".session-managed.json.tmp-{}", std::process::id()));
-    std::fs::write(&temp, bytes).context("failed to stage session-managed marker")?;
-    std::fs::rename(&temp, &marker_path).context("failed to commit session-managed marker")?;
+    crate::fs_util::write_atomic(&marker_path, &bytes, crate::fs_util::AtomicOpts::default())
+        .context("failed to write session-managed marker")?;
     Ok(())
 }
 
