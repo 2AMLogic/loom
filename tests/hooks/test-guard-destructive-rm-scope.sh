@@ -1302,6 +1302,47 @@ assert_deny "#15112 review: non-literal cd arg still denies" \
     'cd $D && rm -rf x' "$REPO_ROOT"
 assert_allow "#15112 review: 2>&1 redirect after cd is not a background operator" \
     'cd -- /tmp/x/work >/dev/null 2>&1 && rm -f ../note.md' "$REPO_ROOT"
+
+# The unresolved-directory deny names the condition that actually fired (#15218):
+# the verdict and the rm-scope-unresolved-var tag are the same for every reason,
+# only the explaining sentence differs.
+_assert_reason_lacks() {
+    local description="$1" cmd="$2" pattern="$3" cwd="${4:-$TEST_REPO}"
+    TOTAL=$((TOTAL + 1))
+    local output reason
+    output=$(run_guard "$cmd" "$cwd") || true
+    reason=$(echo "$output" | jq -r '.hookSpecificOutput.permissionDecisionReason // empty' 2>/dev/null)
+    if echo "$output" | jq -e '.hookSpecificOutput.permissionDecision == "deny"' >/dev/null 2>&1 && \
+       [[ -n "$reason" ]] && ! echo "$reason" | grep -qE "$pattern"; then
+        PASS=$((PASS + 1))
+        echo -e "  ${GREEN}PASS${NC}: $description"
+    else
+        FAIL=$((FAIL + 1))
+        echo -e "  ${RED}FAIL${NC}: $description"
+        echo -e "       Command: $cmd"
+        echo -e "       Expected: deny whose reason does NOT match /$pattern/"
+        echo -e "       Got: $output"
+    fi
+}
+_NONLIT_PHRASE='has an argument that is not a plain literal path'
+assert_deny_reason_matches "#15218: non-literal cd arg (\$D) names the non-literal argument" \
+    'cd $D && rm -rf x' "$_NONLIT_PHRASE" "$REPO_ROOT"
+assert_deny_reason_matches "#15218: cd - names the non-literal argument" \
+    'cd - && rm -rf y' "$_NONLIT_PHRASE" "$REPO_ROOT"
+assert_deny_reason_matches "#15218: bare cd names the non-literal argument" \
+    'cd && rm -rf y' "$_NONLIT_PHRASE" "$REPO_ROOT"
+assert_deny_reason_matches "#15218: a non-literal cd followed by a literal relative cd keeps the non-literal reason" \
+    'cd $D && cd sub && rm -rf x' "$_NONLIT_PHRASE" "$REPO_ROOT"
+assert_deny_reason_matches "#15218: literal relative cd + whitespace session cwd names the session cwd" \
+    'cd sub && rm -rf x' 'session working directory it would be joined to is not a plain absolute literal path' "/tmp/loom 15218 cwd"
+_assert_reason_lacks "#15218: whitespace session cwd does not blame a non-literal cd argument" \
+    'cd sub && rm -rf x' "$_NONLIT_PHRASE" "/tmp/loom 15218 cwd"
+assert_deny_reason_matches "#15218: heredoc substitution after a literal cd names the heredoc" \
+    $'cd /opt/vendor && cat <<EOF\n$(rm -rf important)\nEOF' 'heredoc command substitution that follows a cd' "$REPO_ROOT"
+_assert_reason_lacks "#15218: heredoc substitution after a literal cd does not blame a non-literal cd argument" \
+    $'cd /opt/vendor && cat <<EOF\n$(rm -rf important)\nEOF' "$_NONLIT_PHRASE" "$REPO_ROOT"
+assert_deny_reason_matches "#15218: heredoc substitution (relative ../../etc) after a literal cd names the heredoc" \
+    $'cd /opt/vendor && cat <<EOF\n$(rm -rf ../../etc)\nEOF' 'heredoc command substitution that follows a cd' "$REPO_ROOT"
 echo ""
 
 # =========================================================================
