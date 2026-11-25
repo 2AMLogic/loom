@@ -712,7 +712,7 @@ If, during curation, you determine an issue is too large to be a single Builder 
 1. **Create each sub-issue with `create-issue.sh --parent <N> --label loom:triage`** (priority is not inherited). Do NOT apply `loom:curated`, even if your decomposition includes curator-quality detail (acceptance criteria, file references, scope guards).
 2. **Do NOT apply `loom:issue` at creation** (see "Who promotes `loom:curated` → `loom:issue`" above).
 3. **Skip the prose list** — `--parent` links the children.
-4. **Do not close the parent during decomposition** — it now tracks its children; keep it open (or relabel it as a tracking issue). Closing here would orphan the sub-issues. (Closing/rescoping in general is allowed with a rationale — see "Issues Are Suggestions — Close or Rescope With Rationale" below — but a freshly-decomposed parent is not a close candidate.)
+4. **Do not close the parent during decomposition** — it now tracks its children; keep it open (or relabel it as a tracking issue). Closing here would orphan the sub-issues. (Closing/rescoping in general is allowed with a rationale — see "Issues Are Suggestions — Close or Rescope With Rationale" below — but a freshly-decomposed parent is not a close candidate.) **If the parent body carries `<!-- loom:split-rescoped -->` alone on a line, remove that line in the same edit that files the children or parks the parent (#15256)**: the marker describes a revision these children supersede, and a stale one makes `forge parent split-state` print `NOT_SPLIT` after they close, re-opening the #13635 re-dispatch loop.
 5. **Do not self-curate your own sub-issues in the same session.** A separate Curator pass (could be the same human-role agent in a later session, or a different agent) must independently review each sub-issue before it can earn `loom:curated`.
 6. **Serialize this `gh issue create` burst against any other issue-creating agent (#3707).** Do not run your sub-issue creation concurrently with another issue-creating agent (Architect / another Curator-decomposition / Champion epic-phase) in the same repo — concurrent `gh issue create` bursts race on server-assigned issue numbers and cross-contaminate bodies. One filer finishes its full burst before the next starts. See `sweep.md` → "Execution Model → Only Builders parallelize" for the invariant.
 7. **File each sub-issue with `./.loom/scripts/create-issue.sh`, never a bare `gh issue create` (#5047).** `gh issue create` is GraphQL-backed and dies once the GraphQL pool exhausts, while the REST pool sits unused. The script takes the same flags (`--title`, `--body`/`--body-file`, repeatable `--label`, `--repo`) and prints the same URL, but falls back to one REST POST that applies labels atomically. Recipe: `.loom/docs/gh-issue-create-rest-fallback.md`. (`loom-daemon forge issue create` is a `gh` passthrough, NOT a fallback.)
@@ -1671,7 +1671,13 @@ Unanswered: skip the premise gate. Claim it (`loom:curating`), read that trusted
 - **Split** an oversized issue per "Decomposing Oversized Issues", then park
   the parent on its children:
   `loom-daemon park-record apply --issue <N> --blocked-by <children> --by
-  curator --remove-label loom:triage --remove-label loom:curating`.
+  curator --remove-label loom:triage --remove-label loom:curating`. If the
+  parent body carries `<!-- loom:split-rescoped -->` alone on a line, remove
+  that line in the same edit that parks it (#15256; removing it is not the
+  content edit a `champion:revision-disposition` round forbids): the marker describes a
+  revision the new children supersede, and a stale one makes `forge parent
+  split-state` print `NOT_SPLIT` once the new children close, so the Builder
+  is re-dispatched onto an empty parent (the #13635 loop).
 - **Close** an obsolete, duplicate or wrong-approach one.
 - **A PO-level call**: `loom-daemon operator-decision apply` with 2-4 ranked
   options (`.loom/docs/operator-decision.md`), then remove `loom:triage`.
