@@ -348,6 +348,8 @@ pub(super) fn run_with_seat(
         return Ok(143);
     }
     let id = uuid::Uuid::new_v4().to_string();
+    // Claude seats only (#14371 AC7): Codex output stays byte-identical.
+    let timing = seat_home.is_some().then(seat_timing::SeatTiming::dispatch);
     let capture = args.stderr_file.as_ref().map(File::create).transpose()?;
     // Docker's client must survive the caller's process-group TERM so it can
     // deliver cancellation and collect the container cleanup acknowledgement.
@@ -366,9 +368,19 @@ pub(super) fn run_with_seat(
     let clean = Arc::new(AtomicBool::new(false));
     let reader_clean = clean.clone();
     let stderr = child.stderr.take().unwrap();
+    let reader_timing = timing.clone();
     let (reader_done, reader_result) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
-        let result = forward_stderr(stderr, std::io::stderr(), capture, &ack(&id), &reader_clean);
+        let result = match &reader_timing {
+            Some(timing) => forward_stderr(
+                timing.watch(stderr),
+                std::io::stderr(),
+                capture,
+                &ack(&id),
+                &reader_clean,
+            ),
+            None => forward_stderr(stderr, std::io::stderr(), capture, &ack(&id), &reader_clean),
+        };
         let _ = reader_done.send(result);
     });
     let mut last_beat = Instant::now() - Duration::from_secs(1);
@@ -382,6 +394,9 @@ pub(super) fn run_with_seat(
                 // the last lease + TERM grace to expire before returning.
                 std::thread::sleep(Duration::from_millis(LEASE_MS) + GRACE);
                 bail!("container cleanup acknowledgement missing; lease recovery window elapsed; verify container health before redispatch");
+            }
+            if let Some(timing) = &timing {
+                timing.finish();
             }
             return Ok(if stopping.is_some() {
                 143

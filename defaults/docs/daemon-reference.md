@@ -2576,9 +2576,13 @@ blocker is Loom-owned:
   back on the default branch (`checkout`, with a `refs/loom/rescue/<ts>` ref at
   the old HEAD, kind `rehomed`); the ordinary rules then fast-forward it. It
   qualifies only when every commit on HEAD is on `origin/<default>`, or HEAD
-  is the head of a pull request the forge reports as merged. The lookup is
-  `gh api repos/{owner}/{repo}/commits/<sha>/pulls`; no network, an open
-  breaker or any failure means "not merged" and the hold stays (fail closed).
+  is the head of a pull request the forge reports — **open or merged**
+  (#14973: the checkout a reviewer leaves behind is parked on an OPEN PR's
+  head, and `refs/pull/N/head` keeps the commits on the forge either way; a
+  rescue ref is written first regardless). The lookup is
+  `gh api repos/{owner}/{repo}/commits/<sha>/pulls --jq 'any(.[]; .head.sha == "<sha>")'`;
+  no network, an open breaker or any failure means "not known" and the hold
+  stays (fail closed).
   It is the **last** question the rule asks (#13835), after the clean-tree,
   `detached=keep`, six-hour and live-`git` checks, so a checkout any of those
   refuses costs no forge read at all; only one they all pass pays for it.
@@ -2599,7 +2603,9 @@ blocker is Loom-owned:
   A stranded checkout that is not repaired stays `wrong-branch`, and is said
   again as a `still-held` transition (log line plus an event on the checkout
   topic) every hour (`LOOM_CHECKOUT_REREPORT_AFTER_MINUTES`) so it can be
-  counted, instead of once.
+  counted, instead of once. Since #14973 that line names why this pass's
+  self-heal declined the rehome (`not repaired: … (self-heal: stays off
+  \`main\`: HEAD moved recently)`), where the reason used to be `debug`-only.
 - **Repair, in order.** `refs/loom/rescue/<UTC ts>` at HEAD (and `<ts>-branch`
   at the branch tip when an operation moved HEAD); the lock; `stash push` of
   the dirty paths as `loom-rescue-<ts>` (not during an operation, whose abort
@@ -6735,6 +6741,51 @@ the `fleet add-worker` step 9 above — that is the one an operator needs a wake
 path for (provider console/CLI restart, tailnet-identity survival,
 re-registration), documented in full at that step, along with the #4697
 `fleet status` "expected power-off" classification.
+
+### Docker CLI lookup and the `LOOM_DOCKER_BIN` override (#14885)
+
+Every daemon path that launches `docker` — session-container startup and
+teardown, the accounts `check --live` probes, private-workspace exports,
+image cleanup, native containment — resolves the CLI through one shared
+lookup (`loom-daemon/src/docker_bin.rs`), never a bare
+`Command::new("docker")`. Before #14885, a daemon started by launchd (or a
+minimal systemd unit) inherited `PATH=/usr/bin:/bin:/usr/sbin:/sbin`, which
+names none of the directories Docker Desktop installs its CLI into, and
+every docker launch failed at spawn with not-found.
+
+Resolution order:
+
+1. `LOOM_DOCKER_BIN` when set (trimmed; empty/whitespace counts as unset).
+2. Each `$PATH` entry, in order.
+3. Absolute fallback directories, in order: `/usr/local/bin`,
+   `/opt/homebrew/bin`, `~/.docker/bin` (expanded from the process's home),
+   `/Applications/Docker.app/Contents/Resources/bin`, `/usr/bin`.
+
+A candidate qualifies only if it is an existing regular file (symlinks
+followed — how Docker Desktop links its CLI) with an execute bit. The
+caller's `$PATH` is never modified: the child gets the resolved absolute
+path.
+
+**`LOOM_DOCKER_BIN` is fail-closed, fleet-wide.** An override that does not
+name an executable file is a hard error at the call site — it never falls
+through to a working `docker` elsewhere — so a broken explicit override
+fails even when another docker exists. That is deliberate (#14885): an
+operator who points the daemon at a moved CLI wants the misconfiguration to
+surface, not be masked by an incidental fallback. Practically, a stale
+`LOOM_DOCKER_BIN` left on one host disables every daemon Docker launch on
+that host (sessions read `unknown`/`session_probe_error`, containment
+refuses to start), which is the blast radius to check when clearing one.
+
+**The one exception: the sweep reaper's `container_stop::docker_program()`.**
+It takes `LOOM_DOCKER_BIN` verbatim (trimmed, non-empty) with no
+executability check, and only falls back to the shared lookup when the
+override is unset. There the spawn failure itself is the fail-safe: a
+container stop that cannot spawn its docker logs and skips (the teardown
+must never block a cancel), exactly as it did before #14885.
+
+A scoped `--docker` CLI argument (or `LOOM_CODEX_SESSION_DOCKER`) still wins
+verbatim over all of the above at its call sites; the literal `docker`
+default value means "resolve through this shared lookup".
 
 ### Daemon log path override (`LOOM_DAEMON_LOG`, #4010)
 

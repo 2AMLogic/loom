@@ -10,6 +10,7 @@ pub use host::run as run_host;
 mod owner;
 pub mod posture;
 pub mod refusal;
+mod seat_timing;
 #[cfg(target_os = "linux")]
 mod worker;
 

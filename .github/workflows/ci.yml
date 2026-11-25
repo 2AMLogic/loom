@@ -160,10 +160,13 @@ jobs:
         # `quickstarts/` at all, so a PR confined to that tree went green
         # with its 8 vitest files unrun -- and the template had drifted
         # unnoticed five times (#5925, #5926, #5927, #13834, #13850).
-        # `desktop` and `api` stay out: neither has test files and `api`
-        # does not typecheck today (#13850).
+        # `desktop` is in for its `tsc --noEmit` check only (it has no test
+        # files, so no `npm test`); PR #15273 changed its package.json with
+        # nothing verifying that half (#15276). `api` stays out: it has no
+        # test files and does not typecheck today (#13850).
         quickstarts:
           - 'quickstarts/webapp/**'
+          - 'quickstarts/desktop/**'
           - '.github/workflows/ci.yml'
         scripts:
           - 'scripts/**'
@@ -436,10 +439,11 @@ jobs:
     # which is also why the quickstart gates below are steps of this job
     # rather than a job of their own (#13851): grouping Node gates by
     # component is ci-principles.md rule 8, and a new job would need a new
-    # `CI Result` `needs:` entry for three steps.
+    # `CI Result` `needs:` entry for a handful of steps.
     #
     # Each half keeps its OWN gate, so a quickstart-only PR does not rebuild
-    # `mcp-loom` and an MCP-only PR does not install the webapp.
+    # `mcp-loom` and an MCP-only PR does not install the quickstart templates.
+    # The `quickstarts` output covers both `webapp` and `desktop`.
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -471,6 +475,15 @@ jobs:
       - name: Typecheck quickstart webapp
         if: ${{ !cancelled() && (github.event_name == 'push' || github.event_name == 'merge_group' || needs.changes.outputs.quickstarts == 'true') }}
         run: cd quickstarts/webapp && npx tsc --noEmit
+      # --- quickstarts/desktop (#15276) ---
+      # Typecheck only: desktop has no test files, and `vitest run` exits 1
+      # on "no test files". `npm ci` for the same lockfile reason as webapp.
+      - name: Install quickstart desktop dependencies
+        if: ${{ !cancelled() && (github.event_name == 'push' || github.event_name == 'merge_group' || needs.changes.outputs.quickstarts == 'true') }}
+        run: cd quickstarts/desktop && npm ci
+      - name: Typecheck quickstart desktop
+        if: ${{ !cancelled() && (github.event_name == 'push' || github.event_name == 'merge_group' || needs.changes.outputs.quickstarts == 'true') }}
+        run: cd quickstarts/desktop && npx tsc --noEmit
 
   backend-lint-and-check:
     name: Rust Linting & Build Check
@@ -521,6 +534,16 @@ jobs:
         # yields an out-of-range k/N, which fails loudly).
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    env:
+      # #15086: the fallback-docker CLI test must not be able to pass without
+      # executing its body. With this set, its host-docker skip guard becomes
+      # a hard failure, so a runner image change that adds
+      # /usr/local/bin/docker (which precedes the fixture's ~/.docker/bin in
+      # the resolver's fallback order) turns that test red instead of
+      # silently passing. ubuntu-latest never has /opt/homebrew/bin, and its
+      # /usr/bin/docker sits after the fixture in the order, so a healthy
+      # runner is unaffected.
+      LOOM_TEST_REQUIRE_FALLBACK_DOCKER: "1"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
@@ -562,8 +585,27 @@ jobs:
         id: discover
         timeout-minutes: 3
         run: cargo nextest list --workspace --features loom-daemon/otlp --profile ci --partition count:${{ matrix.partition }}/${{ strategy.job-total }}
-      # Evidence for the next stall, captured before the runner tears down. Job
-      # log only; no artifact. `loom-live-gh-guard-*` is the per-process dir
+      - name: Run tests (process-per-test, partition ${{ matrix.partition }}/${{ strategy.job-total }})
+        id: run-tests
+        # Includes merge_group_ci::workflow_identity_tests: native regression
+        # coverage for this repo's cache/release identity guards (#14158).
+        # Healthy discovery plus execution is about 80s per leg (#11121).
+        timeout-minutes: 10
+        run: cargo nextest run --workspace --features loom-daemon/otlp --profile ci --partition count:${{ matrix.partition }}/${{ strategy.job-total }}
+      # Evidence for the next stall, captured before the runner tears down.
+      # Runs AFTER the run step (#15094): a step's `if:` is evaluated when
+      # the runner reaches it in file order, so a condition reading the run
+      # step's outcome must live below the run step. Fires on failure of
+      # EITHER gate -- the explicit discovery step (`steps.discover`) or the
+      # run step (`steps.run-tests`): occurrence 4 (#15094) stalled inside
+      # `nextest run`'s own internal `--list` pass, the run step was capped
+      # at 10 minutes, and this diagnostic was skipped. An ordinary test
+      # failure also fires it, where these captures are harmless noise. In
+      # that occurrence's log the hung pair outlived the timed-out step (the
+      # runner's `Terminate orphan process` lines printed during job cleanup,
+      # after later steps), so a sample taken here can still see them -- one
+      # log's evidence, not a guarantee.
+      # Job log only; no artifact. `loom-live-gh-guard-*` is the per-process dir
       # `live_gh_guard::install` creates pre-`main`: present with a `gh` stub
       # means install got past `write_stub` — the dir CONTENTS (not just the
       # listing) settle whether the stub was written (#14229, #14691). The
@@ -579,7 +621,7 @@ jobs:
       # which honors TMPDIR. Every command is failure-tolerant: this step is
       # continue-on-error evidence gathering, never a verdict.
       - name: Diagnose discovery stall
-        if: failure() && steps.discover.outcome == 'failure'
+        if: failure() && (steps.discover.outcome == 'failure' || steps.run-tests.outcome == 'failure')
         continue-on-error: true
         run: |
           echo "::group::cargo-nextest / loom_daemon-* process state"
@@ -625,12 +667,6 @@ jobs:
             ls -la "$guard_dir" 2>/dev/null || true
           done
           echo "::endgroup::"
-      - name: Run tests (process-per-test, partition ${{ matrix.partition }}/${{ strategy.job-total }})
-        # Includes merge_group_ci::workflow_identity_tests: native regression
-        # coverage for this repo's cache/release identity guards (#14158).
-        # Healthy discovery plus execution is about 80s per leg (#11121).
-        timeout-minutes: 10
-        run: cargo nextest run --workspace --features loom-daemon/otlp --profile ci --partition count:${{ matrix.partition }}/${{ strategy.job-total }}
       - name: Upload per-test timings (#9456)
         # The JUnit XML `.config/nextest.toml`'s `[profile.ci.junit]` writes is
         # the only surface that carries per-test durations out of a finished
@@ -1533,6 +1569,12 @@ jobs:
       - name: check-main-clean build trees (#11149)
         if: ${{ !cancelled() && steps.daemon-bin.outcome == 'success' }}
         run: bash defaults/scripts/tests/test-check-main-clean-build-trees.sh
+      # #14941: the Builder lease on a Gitea checkout runs the publish/renew
+      # scripts against THIS build's `forge comment` / `trusted-comments` and a
+      # loopback Gitea fixture; it needs this job's shared build.
+      - name: sweep-lease on Gitea (#14941)
+        if: ${{ !cancelled() && steps.daemon-bin.outcome == 'success' }}
+        run: bash defaults/scripts/tests/test-sweep-lease-gitea.sh
       # #9517: fleet-send.sh is a thin SILENT stub over `loom-daemon
       # fleet-send` (its whole interface is a best-effort exit 0, so it
       # bypasses lib/script-helper.sh's loud missing-daemon path). The suite
