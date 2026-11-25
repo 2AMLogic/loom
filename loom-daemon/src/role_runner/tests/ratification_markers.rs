@@ -2100,3 +2100,119 @@ esac"#,
         assert!(!line.contains("-X") && !line.contains("--method"), "write call: {line}");
     }
 }
+
+// ---- #15315: an echoed prompt is cut out before parsing ---------------------
+
+/// Pinned instructions that are the real templates (by pin path).
+struct TemplateInstr;
+
+impl InstructionSource for TemplateInstr {
+    fn fetch(&self, pin: &crate::role_runner::ratification_lane::Pin) -> Result<String, String> {
+        Ok(if pin.path == "ee.md" {
+            EE_TEMPLATE
+        } else {
+            MARKET_TEMPLATE
+        }
+        .into())
+    }
+    fn repo_is_private(&self, _repo: &str) -> Option<bool> {
+        Some(true)
+    }
+}
+
+/// A Codex-like runner: its captured output carries the prompt it was given
+/// (the `user` block on stderr) before or after what the model wrote.
+struct EchoRunner {
+    prompt: String,
+    last_key: Option<Key>,
+    /// What the model wrote, per key.
+    wrote: fn(Key) -> String,
+    echo_after: bool,
+}
+
+impl RoleInvocationRunner for EchoRunner {
+    fn invoke(&mut self, role: &str, prompt: &str) -> RoleTickOutcome {
+        self.prompt = prompt.to_string();
+        self.last_key = Some(if role == "ratification-market" {
+            Key::Market
+        } else {
+            Key::Ee
+        });
+        RoleTickOutcome::Success
+    }
+    fn last_output(&self) -> Option<String> {
+        let wrote = (self.wrote)(self.last_key.unwrap_or(Key::Ee));
+        let echo = format!("user\n{}\n", self.prompt);
+        Some(if self.echo_after {
+            format!("{LAUNCHER_NOISE}{wrote}{echo}{WRAPPER_TAIL}")
+        } else {
+            format!("{LAUNCHER_NOISE}{echo}codex\n{wrote}{WRAPPER_TAIL}")
+        })
+    }
+}
+
+fn run_echo(wrote: fn(Key) -> String, echo_after: bool) -> (LaneResults, Vec<(u64, String)>) {
+    let (prs, sink) = (
+        Prs {
+            author: "alice",
+            listed: 0.into(),
+        },
+        Sink::default(),
+    );
+    let mut r = EchoRunner {
+        prompt: String::new(),
+        last_key: None,
+        wrote,
+        echo_after,
+    };
+    let results = run_lane(&cfg(), None, "o/r", &prs, &TemplateInstr, &sink, &mut r);
+    let posted = sink.posted.borrow().clone();
+    (results, posted)
+}
+
+use crate::role_runner::ratification_lane::LaneResults;
+
+#[test]
+fn echoed_prompt_then_review_posts_only_the_review() {
+    for echo_after in [false, true] {
+        let (results, posted) = run_echo(valid_review, echo_after);
+        assert_eq!(posted.len(), 2, "echo_after={echo_after}: {results:?}");
+        for (_, body) in &posted {
+            assert!(!body.contains("<approve|request-changes>"), "{body}");
+            assert!(!body.contains("<competitive|"), "{body}");
+            assert!(!body.contains("Lane output contract"), "{body}");
+            assert!(!body.contains("<block name / class>"), "{body}");
+        }
+    }
+}
+
+#[test]
+fn review_then_echoed_prompt_still_posts_the_review() {
+    // Critique A6: Codex stderr is tee'd live, so the echo can land after
+    // the review; it must not turn a valid verdict into a withhold.
+    let (results, posted) = run_echo(valid_review, true);
+    assert_buckets(&TickOutcome::from_run(&results, 0), &[("ee", "posted"), ("market", "posted")]);
+    assert_eq!(posted.len(), 2);
+}
+
+#[test]
+fn echoed_prompt_without_review_is_no_heading() {
+    fn prose(_: Key) -> String {
+        "I could not finish the review.\n".into()
+    }
+    for echo_after in [false, true] {
+        let (results, posted) = run_echo(prose, echo_after);
+        assert!(posted.is_empty());
+        assert_buckets(
+            &TickOutcome::from_run(&results, 0),
+            &[("ee", "verdict_invalid"), ("market", "verdict_invalid")],
+        );
+        match results[0].1.as_slice() {
+            [(Key::Ee, KeyPost::Withheld(_, ee)), (Key::Market, KeyPost::Withheld(_, mk))] => {
+                assert!(ee.contains("no ## EE-key review: heading"), "{ee}");
+                assert!(mk.contains("no ## Market-key review: heading"), "{mk}");
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+}

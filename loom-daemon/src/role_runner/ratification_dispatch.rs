@@ -15,11 +15,23 @@
 //!
 //! # Independence
 //!
-//! Each session's prompt is built only from (a) that key's pinned instructions
-//! and (b) the PR reference. Nothing else crosses: no shared file, env var or
-//! prior-output argument, and a session never sees the other's outcome. All
-//! selected sessions run before any marker is posted (step 3 is a separate
-//! pass), so a newly posted result is never context for the other key.
+//! Each session's prompt is built only from (a) that key's pinned instructions,
+//! (b) the PR reference, (c) for a public target repo's market session, the
+//! public-sources line, and (d) last, Loom's own output contract for that key
+//! ([`lane_contract`], #15315), generated from the parser's vocabulary. Nothing
+//! else crosses: no shared file, env var or prior-output argument, and a
+//! session never sees the other's outcome. All selected sessions run before
+//! any marker is posted (step 3 is a separate pass), so a newly posted result
+//! is never context for the other key.
+//!
+//! # Echoed prompt
+//!
+//! A runtime that writes the prompt it was given to its log (Codex prints its
+//! `user` block on stderr, which the role log captures) would otherwise put
+//! the template's own heading and `<…>` verdict line into the captured output.
+//! Every verbatim occurrence of the prompt is cut out of the output before it
+//! is parsed ([`strip_prompt_echo`]); text before or after it is kept, so an
+//! echo landing on either side of the review never hides it.
 //!
 //! # Fail closed
 //!
@@ -63,7 +75,8 @@ pub enum KeyOutcome {
 pub struct Dispatched {
     pub ee: Option<KeyOutcome>,
     pub market: Option<KeyOutcome>,
-    /// The EE session's output, when it ran and the runner exposes it (#13502).
+    /// The EE session's output, when it ran and the runner exposes it
+    /// (#13502), with any verbatim echo of its prompt cut out (#15315).
     pub ee_output: Option<String>,
     pub market_output: Option<String>,
 }
@@ -113,14 +126,64 @@ fn fetch_pinned(src: &dyn InstructionSource, pin: &Pin) -> Result<String, String
     Ok(body)
 }
 
-fn build_prompt(instructions: &str, pr_ref: &str, public_only: bool) -> String {
+/// One key session's prompt: the pinned instructions, the PR reference, the
+/// public-sources line when `public_only`, and **last** Loom's own output
+/// contract for `key` ([`lane_contract`]), so it is the final thing read.
+#[must_use]
+pub fn build_prompt(key: Key, instructions: &str, pr_ref: &str, public_only: bool) -> String {
     let mut p = format!("{}\n\nPR: {pr_ref}\n", instructions.trim_end());
     if public_only {
         p.push('\n');
         p.push_str(PUBLIC_SOURCES_ONLY);
         p.push('\n');
     }
+    p.push('\n');
+    p.push_str(&lane_contract(key));
+    p.push('\n');
     p
+}
+
+/// Loom's output contract for `key`'s lane session (#15315). The pinned
+/// instructions tell the reviewer to post with `scripts/ratify-key.sh` and
+/// show a template whose `<…>` parts are easy to copy; inside the lane Loom
+/// posts the final message, and only a filled review with a bare token parses.
+///
+/// Generated from [`Key::allowed_tokens`], so the vocabulary cannot drift from
+/// the parser. It names the heading in prose and **never** contains
+/// [`Key::review_heading`] or a verdict-label line (critique A4): an echoed
+/// prompt must not be able to supply a review block or a verdict of its own.
+#[must_use]
+pub fn lane_contract(key: Key) -> String {
+    let name = match key {
+        Key::Ee => "EE-key",
+        Key::Market => "Market-key",
+    };
+    let tokens = key.allowed_tokens().join(", ");
+    format!(
+        "Lane output contract (from Loom; where it differs from the instruction file, it \
+wins). You are running inside Loom's ratification lane. Do not post a comment and do not \
+run scripts/ratify-key.sh: Loom posts your final message. Your final message must be the \
+completed review, beginning with the {name} review heading the instructions give, followed \
+by the real block name. The angle-bracket parts of the template are placeholders to \
+replace, never to copy. On the bold Overall verdict line write exactly one of these words, \
+bare: {tokens}. No angle brackets, no `|` list, no bold or backticks around the word, no \
+full stop after it; follow it with a comma and one sentence. If you cannot reach a verdict, \
+leave that line out and say why."
+    )
+}
+
+/// `output` with every verbatim occurrence of `prompt` (trailing whitespace
+/// ignored) cut out, each replaced by a line break (#15315). Text on either
+/// side is kept, so a review written before or after an echoed prompt still
+/// parses, and the template inside the echo never does. An output that does
+/// not contain the prompt is returned unchanged.
+#[must_use]
+pub fn strip_prompt_echo(output: &str, prompt: &str) -> String {
+    let needle = prompt.trim_end();
+    if needle.is_empty() || !output.contains(needle) {
+        return output.to_string();
+    }
+    output.replace(needle, "\n")
 }
 
 /// Launch the selected key sessions for one candidate PR (#14797): a `None`
@@ -148,7 +211,7 @@ pub fn dispatch(
                 // read only when a market session actually runs (#14797).
                 let public_only =
                     key == Key::Market && src.repo_is_private(target_repo) != Some(true);
-                let prompt = build_prompt(&text, pr_ref, public_only);
+                let prompt = build_prompt(key, &text, pr_ref, public_only);
                 let outcome = runner.invoke(role_name(key), &prompt);
                 // Read the evidence now: the next key reuses the same runner.
                 let result = if failed_before_launch(&outcome, runner) {
@@ -156,7 +219,10 @@ pub fn dispatch(
                 } else {
                     KeyOutcome::Ran(outcome)
                 };
-                (result, runner.last_output())
+                let output = runner
+                    .last_output()
+                    .map(|out| strip_prompt_echo(&out, &prompt));
+                (result, output)
             }
         }
     };
