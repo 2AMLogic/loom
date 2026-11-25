@@ -551,6 +551,7 @@ case " $* " in
     printf '{{"id":%s,"updated_at":"%s","body":"%s",%s}}\n' "$cid" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$first" '{AUTHOR}' >> "$D/rows.tmp"
     mv "$D/rows.tmp" "$D/rows" ;;
   *"/check-runs"*) [ -f "$D/checks" ] || exit 1; cat "$D/checks" ;;
+  *"pulls?state=open"*) cat "$D/prs" 2>/dev/null || echo "" ;;
   *"/pulls/"*) echo "$*" >> "$D/pulled"; cat "$D/pull" 2>/dev/null || echo "" ;;
   *"/comments"*)
     n=$(cat "$D/reads" 2>/dev/null || echo 0); echo $((n + 1)) > "$D/reads"
@@ -786,6 +787,39 @@ fn the_claim_stand_down_line_carries_the_cause_last() {
 }
 
 #[test]
+fn the_check_stderr_line_carries_the_cause_last() {
+    // #15105: `check` reported `unknown` with empty stderr.
+    let dir = TempDir::new().unwrap();
+    fake_gh(dir.path());
+    fs::write(dir.path().join("fail"), "").unwrap();
+    let c = ctx(dir.path(), who(Role::Judge, "s"));
+    let why = c.gh.read_rows_retrying_why(77, &c.policy).unwrap_err();
+    let line = unreadable_check_line(Some(&why));
+    assert!(line.contains("(state unknown): gh exited "), "{line}");
+    assert!(line.ends_with("HTTP 502"), "{line}");
+    assert!(unreadable_check_line(None).ends_with("(state unknown)"));
+}
+
+#[test]
+fn an_exhausted_check_read_is_unknown_and_exits_unverified() {
+    let dir = TempDir::new().unwrap();
+    fake_gh(dir.path());
+    fs::write(dir.path().join("fail"), "").unwrap();
+    assert_eq!(ctx(dir.path(), who(Role::Judge, "s")).check(), EXIT_UNVERIFIED);
+}
+
+#[test]
+fn a_check_read_that_recovers_on_retry_reports_the_resolved_state() {
+    let dir = TempDir::new().unwrap();
+    fake_gh(dir.path());
+    let me = who(Role::Judge, "sweep-j");
+    fs::write(dir.path().join("rows"), live_row(100, &me)).unwrap();
+    // The first read fails; the retry succeeds and resolves held-self.
+    fs::write(dir.path().join("fail_reads"), "0 0").unwrap();
+    assert_eq!(ctx(dir.path(), me).check(), EXIT_HELD);
+}
+
+#[test]
 fn a_failure_reason_is_bounded_and_free_of_control_characters() {
     let r = bounded_reason(&format!("  a\x1b[31m\tb{}\n", "x".repeat(500)));
     assert!(!r.chars().any(char::is_control), "{r:?}");
@@ -955,6 +989,86 @@ fn a_second_release_reports_already_released_not_zero() {
         release_summary("reaped", 0, 0, 0),
         "reaped 0 lease comment(s); stopped 0 renewer(s)"
     );
+}
+
+/// #14807: after the verdict step's release and the role's own second
+/// release, no row keeps the live prefix, `check` reports the claim free,
+/// and the released row's visible prose no longer says the claim "is held
+/// by" — a human reading the PR must not see a live-looking claim behind a
+/// released marker.
+#[test]
+fn a_released_row_no_longer_reads_as_a_held_claim() {
+    let dir = TempDir::new().unwrap();
+    fake_gh(dir.path());
+    let a = who(Role::Judge, "sweep-j");
+    assert_eq!(ctx(dir.path(), a.clone()).claim(), EXIT_HELD);
+
+    // The fake `gh` keeps only a row's first line; restore the full body
+    // the real forge holds (claim prose plus a renewal line) so the release
+    // is observed against a live-shaped row. The claim's post took id 500.
+    let live = lease_body(&a, 77, Some(Utc::now()));
+    let json = live
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('\n', "\\n");
+    fs::write(
+        dir.path().join("rows"),
+        format!(
+            r#"{{"id":500,"updated_at":"{}","body":"{json}",{AUTHOR}}}"#,
+            Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+        ) + "\n",
+    )
+    .unwrap();
+
+    // The verdict step's release rewrites the row it posted…
+    assert_eq!(ctx(dir.path(), a.clone()).release(None, None, None), EXIT_HELD);
+    let first_patch = patched(dir.path());
+    assert!(first_patch.contains(&a.released_marker()), "{first_patch}");
+    assert!(first_patch.contains("was released"), "{first_patch}");
+    assert!(!first_patch.contains("is held by"), "{first_patch}");
+
+    // …and the role's own second release patches nothing (#14392).
+    fs::remove_file(dir.path().join("patched")).unwrap();
+    assert_eq!(ctx(dir.path(), a.clone()).release(None, None, None), EXIT_HELD);
+    assert!(patched(dir.path()).is_empty(), "an already-released row is not rewritten");
+
+    // No row keeps the live prefix; with no live lease at all, the exit 0
+    // from `check` is the free state, not held-self.
+    let rows = fs::read_to_string(dir.path().join("rows")).unwrap();
+    assert!(!rows.contains(LEASE_PREFIX), "{rows}");
+    assert_eq!(ctx(dir.path(), a).check(), EXIT_HELD);
+}
+
+/// #14807: release and reap only change their own lease record.
+#[test]
+fn release_and_reap_describe_only_the_departing_lease() {
+    for reaped in [false, true] {
+        let dir = TempDir::new().unwrap();
+        fake_gh(dir.path());
+        let departing = on("host-a", "sweep-j");
+        let peer = on("host-b", "sweep-peer");
+        fs::write(dir.path().join("rows"), live_row(100, &departing) + &live_row(101, &peer))
+            .unwrap();
+        let departing_ctx = ctx(dir.path(), departing.clone());
+        let result = if reaped {
+            departing_ctx.reap("timeout")
+        } else {
+            departing_ctx.release(None, None, None)
+        };
+        assert_eq!(result, EXIT_HELD);
+
+        let text = patched(dir.path());
+        assert!(text.contains("issues/comments/100"), "{text}");
+        assert!(text.contains(&departing.released_marker()), "{text}");
+        assert!(!text.contains("issues/comments/101"), "{text}");
+        assert_eq!(departing_ctx.check(), EXIT_PEER);
+        let verb = if reaped { "reaped" } else { "released" };
+        assert!(text.contains(&format!("was {verb}.")), "{text}");
+        assert!(text.contains("This **PR lease record** (#9401) is no longer live."), "{text}");
+        assert!(!text.contains("is held by"), "{text}");
+        assert!(!text.contains("the claim is free"), "{text}");
+        assert!(!text.contains("finished with it"), "{text}");
+    }
 }
 
 /// #13132: a release missing the claim's identity names the claimant and
@@ -1636,6 +1750,200 @@ fn the_lib_role_lease_reader_agrees_with_parse_record() {
 
 #[path = "step_claim_tests.rs"]
 mod step_claim;
+
+// ---- the operator's release of a backstop hold (#15096) -------------------
+
+/// A trusted no-verdict record row at `at` (the fake's own NDJSON shape).
+fn no_verdict_row(id: u64, at: DateTime<Utc>, fields: &str) -> String {
+    row_at(
+        id,
+        at,
+        &format!("<!-- loom:pr-lease-released role=judge host=old sweep=prior{fields} -->"),
+    )
+}
+
+/// A no-verdict record row written by an untrusted author.
+fn untrusted_no_verdict_row(id: u64, at: DateTime<Utc>, fields: &str) -> String {
+    format!(
+        r#"{{"id":{id},"updated_at":"{}","body":"<!-- loom:pr-lease-released role=judge host=evil sweep=e{fields} -->","user":{{"login":"rjwalters","type":"User"}},"author_association":"NONE"}}"#,
+        stamp(at)
+    ) + "\n"
+}
+
+#[test]
+fn backstop_clear_releases_the_hold_and_a_judge_claims_without_a_push() {
+    let dir = TempDir::new().unwrap();
+    fake_gh(dir.path());
+    waiting_pr(dir.path());
+    // Three in-window no-verdict records at the head: every host's Judge is
+    // held for the rest of the window.
+    let now = Utc::now();
+    let mut rows = String::new();
+    for (id, min) in [(301, 40), (302, 200), (303, 700)] {
+        rows.push_str(&no_verdict_row(
+            id,
+            now - chrono::Duration::minutes(min),
+            &format!(" head={HEAD} verdict=none labels=review-requested"),
+        ));
+    }
+    fs::write(dir.path().join("rows"), rows).unwrap();
+    let judge = on("host-b", "run-2");
+    assert_eq!(ctx(dir.path(), judge.clone()).check(), backstop::EXIT_BACKSTOP);
+    assert_eq!(ctx(dir.path(), judge.clone()).claim(), backstop::EXIT_BACKSTOP);
+
+    let c = ctx(dir.path(), judge.clone());
+    assert_eq!(
+        backstop::backstop_clear_on(&c.gh, &c.policy, backstop::ClearTarget::Pr(77), c.ttl),
+        EXIT_HELD
+    );
+    let patch = patched(dir.path());
+    for id in [301, 302, 303] {
+        assert!(patch.contains(&format!("comments/{id}")), "{patch}");
+    }
+    assert!(patch.contains("verdict=cleared"), "{patch}");
+    assert!(!patch.contains("verdict=none"), "{patch}");
+    // No new comment, no push, no label change: only rewrites.
+    assert!(posted(dir.path()).is_empty(), "nothing was posted");
+    // The hold is gone: check answers free and a Judge claims at once.
+    assert_eq!(ctx(dir.path(), judge.clone()).check(), EXIT_HELD);
+    assert_eq!(ctx(dir.path(), judge).claim(), EXIT_HELD);
+}
+
+#[test]
+fn backstop_clear_rewrites_only_trusted_in_window_records_at_the_head() {
+    let dir = TempDir::new().unwrap();
+    fake_gh(dir.path());
+    waiting_pr(dir.path());
+    let now = Utc::now();
+    let fields = |head: &str| format!(" head={head} verdict=none labels=review-requested");
+    let mut rows = String::new();
+    // Clearable: at the head, in window, plain and reaped alike.
+    rows.push_str(&no_verdict_row(401, now - chrono::Duration::minutes(30), &fields(HEAD)));
+    rows.push_str(&no_verdict_row(
+        402,
+        now - chrono::Duration::minutes(60),
+        &format!("{} reaped=timeout", fields(HEAD)),
+    ));
+    // Not clearable: another head, out of window, already cleared, or an
+    // untrusted author's. A record at another label digest still clears
+    // (the labels could revert and hold the PR again).
+    rows.push_str(&no_verdict_row(411, now - chrono::Duration::minutes(30), &fields("4444")));
+    rows.push_str(&no_verdict_row(412, now - chrono::Duration::hours(25), &fields(HEAD)));
+    rows.push_str(&no_verdict_row(
+        413,
+        now - chrono::Duration::minutes(30),
+        &format!(" head={HEAD} verdict=cleared labels=review-requested"),
+    ));
+    rows.push_str(&no_verdict_row(
+        414,
+        now - chrono::Duration::minutes(30),
+        &format!(" head={HEAD} verdict=none labels=important,review-requested refused=stale-read"),
+    ));
+    rows.push_str(&untrusted_no_verdict_row(
+        415,
+        now - chrono::Duration::minutes(30),
+        &fields(HEAD),
+    ));
+    fs::write(dir.path().join("rows"), rows).unwrap();
+    // The read itself drops the untrusted row before any rewrite is decided.
+    let c = ctx(dir.path(), on("host-b", "run-2"));
+    let read = c.gh.read_rows(77, &c.policy).unwrap();
+    assert_eq!(read.len(), 6, "the untrusted author's row is not even read");
+    let mut ids = backstop::clearable(&read, HEAD, now);
+    ids.sort_unstable();
+    assert_eq!(ids, vec![401, 402, 414]);
+    assert_eq!(
+        backstop::backstop_clear_on(&c.gh, &c.policy, backstop::ClearTarget::Pr(77), c.ttl),
+        EXIT_HELD
+    );
+    let patch = patched(dir.path());
+    for id in [401, 402, 414] {
+        assert!(patch.contains(&format!("comments/{id}")), "{patch}");
+    }
+    for id in [411, 412, 413, 415] {
+        assert!(!patch.contains(&format!("comments/{id}")), "{patch}");
+    }
+}
+
+#[test]
+fn a_failed_rewrite_fails_backstop_clear() {
+    let dir = TempDir::new().unwrap();
+    fake_gh(dir.path());
+    waiting_pr(dir.path());
+    fs::write(
+        dir.path().join("rows"),
+        no_verdict_row(
+            501,
+            Utc::now(),
+            &format!(" head={HEAD} verdict=none labels=review-requested"),
+        ),
+    )
+    .unwrap();
+    fs::write(dir.path().join("fail_patch"), "").unwrap();
+    let c = ctx(dir.path(), on("host-b", "run-2"));
+    assert_eq!(
+        backstop::backstop_clear_on(&c.gh, &c.policy, backstop::ClearTarget::Pr(77), c.ttl),
+        backstop::EXIT_CLEAR_FAILED
+    );
+    // The rewrite was attempted (and recorded) before failing.
+    assert!(patched(dir.path()).contains("verdict=cleared"));
+}
+
+#[test]
+fn all_clears_only_what_check_would_answer_held_backstop() {
+    // Held: three in-window records, no live Judge lease — --all rewrites.
+    let dir = TempDir::new().unwrap();
+    fake_gh(dir.path());
+    waiting_pr(dir.path());
+    let now = Utc::now();
+    let mut rows = String::new();
+    for id in [601, 602, 603] {
+        rows.push_str(&no_verdict_row(
+            id,
+            now - chrono::Duration::minutes(30),
+            &format!(" head={HEAD} verdict=none labels=review-requested"),
+        ));
+    }
+    fs::write(dir.path().join("rows"), rows).unwrap();
+    fs::write(dir.path().join("prs"), "77\n").unwrap();
+    let c = ctx(dir.path(), on("host-b", "run-2"));
+    let read = c.gh.read_rows(77, &c.policy).unwrap();
+    let state = c.gh.pr_head(77);
+    assert!(backstop::held_backstop(&read, state, now, c.ttl));
+    assert_eq!(
+        backstop::backstop_clear_on(&c.gh, &c.policy, backstop::ClearTarget::All, c.ttl),
+        EXIT_HELD
+    );
+    let patch = patched(dir.path());
+    assert!(patch.contains("comments/601"), "{patch}");
+    assert!(patch.contains("comments/603"), "{patch}");
+
+    // A live Judge lease takes the PR out of the held-backstop answer, the
+    // same precedence `check` applies — so --all leaves it alone.
+    let dir = TempDir::new().unwrap();
+    fake_gh(dir.path());
+    waiting_pr(dir.path());
+    let mut rows = String::new();
+    for id in [611, 612] {
+        rows.push_str(&no_verdict_row(
+            id,
+            now - chrono::Duration::minutes(30),
+            &format!(" head={HEAD} verdict=none labels=review-requested"),
+        ));
+    }
+    rows.push_str(&live_row(700, &on("host-z", "run-9")));
+    fs::write(dir.path().join("rows"), rows).unwrap();
+    fs::write(dir.path().join("prs"), "77\n").unwrap();
+    let c = ctx(dir.path(), on("host-b", "run-2"));
+    let read = c.gh.read_rows(77, &c.policy).unwrap();
+    let state = c.gh.pr_head(77);
+    assert!(!backstop::held_backstop(&read, state, now, c.ttl));
+    assert_eq!(
+        backstop::backstop_clear_on(&c.gh, &c.policy, backstop::ClearTarget::All, c.ttl),
+        EXIT_HELD
+    );
+    assert!(patched(dir.path()).is_empty(), "a live lease keeps --all away");
+}
 
 // ---- the pass's own skip reason on release (#11972) ---------------------
 

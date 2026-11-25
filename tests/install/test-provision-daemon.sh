@@ -1380,6 +1380,76 @@ assert_eq "untrusted helper output: the candidate source was not moved or remove
   "$( [[ -x "$SRC45_NEWER" ]] && echo 1 || echo 0 )"
 assert_contains "untrusted helper output: says it could not stage" "$out47" "could not stage"
 
+# ---------- tests 48-55: installer downgrade guard (#15261) ----------
+# The guard is installer-only: LOOM_PROVISION_REFUSE_DOWNGRADE=1 is set on the
+# call by install.sh / install-loom.sh and by nothing else, so `loom update`
+# (which calls provision_machine_daemon without it) keeps replacing freely.
+SRC48_OLD="$WORKDIR/src48-old/loom-daemon"; mkdir -p "$WORKDIR/src48-old"
+make_fake_bin "$SRC48_OLD" "0.19.1236"
+SRC48_BAD="$WORKDIR/src48-bad/loom-daemon"; mkdir -p "$WORKDIR/src48-bad"
+make_fake_bin "$SRC48_BAD" "weird-build"
+DEST48="$WORKDIR/dest48"; mkdir -p "$DEST48"
+make_fake_bin "$DEST48/loom-daemon" "0.19.1316"
+sum48_before="$(cksum "$DEST48/loom-daemon")"
+
+# 48: older source is refused, destination byte-identical, both versions named.
+out48=$(LOOM_PROVISION_REFUSE_DOWNGRADE=1 LOOM_DAEMON_BIN_DIR="$DEST48" provision_machine_daemon "$SRC48_OLD" 2>&1)
+rc48=$?
+assert_eq "downgrade guard: older source returns 1" "1" "$rc48"
+assert_eq "downgrade guard: dest byte-identical" "$sum48_before" "$(cksum "$DEST48/loom-daemon")"
+assert_contains "downgrade guard: names the installed version" "$out48" "0.19.1316"
+assert_contains "downgrade guard: names the source version" "$out48" "0.19.1236"
+assert_contains "downgrade guard: names --allow-downgrade" "$out48" "--allow-downgrade"
+
+# 49: numeric (not lexical) ordering: 0.19.999 < 0.19.1316 is refused.
+SRC49="$WORKDIR/src49/loom-daemon"; mkdir -p "$WORKDIR/src49"
+make_fake_bin "$SRC49" "0.19.999"
+LOOM_PROVISION_REFUSE_DOWNGRADE=1 LOOM_DAEMON_BIN_DIR="$DEST48" provision_machine_daemon "$SRC49" >/dev/null 2>&1
+assert_eq "downgrade guard: 0.19.999 < 0.19.1316 compared numerically" "loom-daemon 0.19.1316" "$("$DEST48/loom-daemon" --version)"
+
+# 50: --allow-downgrade (env) permits it.
+out50=$(LOOM_INSTALL_ALLOW_DOWNGRADE=1 LOOM_PROVISION_REFUSE_DOWNGRADE=1 LOOM_DAEMON_BIN_DIR="$DEST48" provision_machine_daemon "$SRC48_OLD" 2>&1)
+rc50=$?
+assert_eq "allow-downgrade: returns 0" "0" "$rc50"
+case "$out50" in
+  *"refusing to replace"*) fail_msg="allow-downgrade: no refusal text emitted"; assert_eq "$fail_msg" "absent" "present" ;;
+  *) assert_eq "allow-downgrade: no refusal text emitted" "absent" "absent" ;;
+esac
+assert_eq "allow-downgrade: older build replaced the newer one" "loom-daemon 0.19.1236" "$("$DEST48/loom-daemon" --version)"
+
+# 51: newer source still upgrades under the guard.
+SRC51="$WORKDIR/src51/loom-daemon"; mkdir -p "$WORKDIR/src51"
+make_fake_bin "$SRC51" "0.20.30"
+LOOM_PROVISION_REFUSE_DOWNGRADE=1 LOOM_DAEMON_BIN_DIR="$DEST48" provision_machine_daemon "$SRC51" >/dev/null 2>&1
+assert_eq "downgrade guard: newer source still upgrades" "loom-daemon 0.20.30" "$("$DEST48/loom-daemon" --version)"
+
+# 52: same version still short-circuits under the guard.
+out52=$(LOOM_PROVISION_REFUSE_DOWNGRADE=1 LOOM_DAEMON_BIN_DIR="$DEST48" provision_machine_daemon "$SRC51" 2>&1)
+assert_contains "downgrade guard: same version is still 'already current'" "$out52" "already current"
+
+# 53: unparseable INSTALLED version is replaced (today's behaviour).
+DEST53="$WORKDIR/dest53"; mkdir -p "$DEST53"
+make_fake_bin "$DEST53/loom-daemon" "broken-install"
+LOOM_PROVISION_REFUSE_DOWNGRADE=1 LOOM_DAEMON_BIN_DIR="$DEST53" provision_machine_daemon "$SRC48_OLD" >/dev/null 2>&1
+assert_eq "downgrade guard: unparseable installed version is replaced" "loom-daemon 0.19.1236" "$("$DEST53/loom-daemon" --version)"
+
+# 54: unparseable SOURCE version with a parseable installed one is refused.
+DEST54="$WORKDIR/dest54"; mkdir -p "$DEST54"
+make_fake_bin "$DEST54/loom-daemon" "0.19.1316"
+out54=$(LOOM_PROVISION_REFUSE_DOWNGRADE=1 LOOM_DAEMON_BIN_DIR="$DEST54" provision_machine_daemon "$SRC48_BAD" 2>&1)
+rc54=$?
+assert_eq "downgrade guard: unparseable source returns 1" "1" "$rc54"
+assert_contains "downgrade guard: unparseable source names the installed version" "$out54" "0.19.1316"
+assert_contains "downgrade guard: unparseable source names --allow-downgrade" "$out54" "--allow-downgrade"
+assert_eq "downgrade guard: unparseable source leaves dest untouched" "loom-daemon 0.19.1316" "$("$DEST54/loom-daemon" --version)"
+
+# 55: without the installer-only env (the `loom update` call shape) an older
+# source still replaces the installed daemon, exactly as before.
+DEST55="$WORKDIR/dest55"; mkdir -p "$DEST55"
+make_fake_bin "$DEST55/loom-daemon" "0.19.1316"
+LOOM_DAEMON_BIN_DIR="$DEST55" provision_machine_daemon "$SRC48_OLD" >/dev/null 2>&1
+assert_eq "no guard env (loom update shape): older source still replaces" "loom-daemon 0.19.1236" "$("$DEST55/loom-daemon" --version)"
+
 # ---------- summary ----------
 echo ""
 echo "-----------------------------------------"

@@ -908,10 +908,6 @@ pub struct ScriptRoleInvocationRunner {
     /// sweeps use.
     spawn_bin: Option<PathBuf>,
     timeout: Duration,
-    /// Explicit model override (tests only). Production leaves this `None` and
-    /// resolves per invocation via [`resolve_role_runner_model`] — the same
-    /// precedence chain sweep dispatch uses (issue #4501).
-    model: Option<String>,
     /// Explicit load-per-core override for the ceiling-hit saturation check
     /// (issue #6637, tests only). Production leaves this `None` and measures
     /// the live host via [`crate::cpu_headroom::load_per_core`] at the
@@ -923,9 +919,9 @@ pub struct ScriptRoleInvocationRunner {
     /// What the most recent [`invoke`] actually resolved (#8056, extended by
     /// #8599 to the preference tier) — recorded rather than re-read so the
     /// `role_tick.outcome` record can never disagree with what was launched
-    /// (the #7894 unpinned reconciliation and the `with_model` test override
-    /// both land here, and neither is visible to a fresh config read). `None`
-    /// until an invocation gets past its pre-spawn preflights.
+    /// (the #7894 unpinned reconciliation lands here, invisible to a fresh
+    /// config read). `None` until an invocation gets past its pre-spawn
+    /// preflights.
     ///
     /// [`invoke`]: RoleInvocationRunner::invoke
     resolved_launch: Option<crate::role_tick_telemetry::ResolvedLaunch>,
@@ -946,7 +942,6 @@ impl ScriptRoleInvocationRunner {
             workspace_root,
             spawn_bin: None,
             timeout: DEFAULT_ROLE_TIMEOUT,
-            model: None,
             load_per_core_override: None,
             gh_bin: None,
             resolved_launch: None,
@@ -961,14 +956,6 @@ impl ScriptRoleInvocationRunner {
     #[must_use]
     pub fn with_spawn_bin(mut self, bin: PathBuf) -> Self {
         self.spawn_bin = Some(bin);
-        self
-    }
-
-    /// Override the resolved model (tests only) — bypasses
-    /// [`resolve_role_runner_model`].
-    #[must_use]
-    pub fn with_model(mut self, model: impl Into<String>) -> Self {
-        self.model = Some(model.into());
         self
     }
 
@@ -3835,7 +3822,8 @@ pub(crate) mod model_resolution;
 use model_resolution::reconcile_unpinned_model_with_runtime;
 pub use model_resolution::{
     is_cli_default_model_sentinel, resolve_role_runner_effort,
-    resolve_role_runner_effort_for_runtime, resolve_role_runner_model,
+    resolve_role_runner_effort_for_launch, resolve_role_runner_effort_for_runtime,
+    resolve_role_runner_model, resolve_role_runner_model_for_launch,
     resolve_role_runner_service_tier_for_runtime, ModelRuntimeMismatch, CLI_DEFAULT_MODEL_SENTINEL,
     CODEX_DEFAULT_EFFORT, CODEX_DEFAULT_EFFORT_SOURCE, UNSET_EFFORT_SOURCE,
 };
@@ -3860,6 +3848,7 @@ pub mod champion_mode;
 
 // Ratification reviewer lane selection layer (#13187); see
 // `role_runner/ratification_lane.rs`.
+pub mod ratification_attempts;
 pub mod ratification_dispatch;
 pub mod ratification_lane;
 

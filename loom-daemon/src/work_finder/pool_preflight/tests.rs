@@ -370,14 +370,18 @@ const PREFERENCE_ENV: [&str; 8] = [
     "LOOM_CODEX_PROFILE_ROOT",
 ];
 
-/// The second field holds the crate-wide `LOOM_CODEX_PROFILE_ROOT` lock (#9964).
+/// The second field holds the crate-wide `LOOM_CODEX_PROFILE_ROOT` lock (#9964);
+/// the third the crate-wide `LOOM_CODEX_HOME` lock (#15174), acquired before it
+/// and released after (see `codex_home_env`'s documented lock order).
 struct PreferenceEnvGuard(
     Vec<(&'static str, Option<String>)>,
     #[allow(dead_code)] crate::tokens_pool::profile_root_env::ProfileRootLock,
+    #[allow(dead_code)] crate::tokens_pool::codex_home_env::CodexHomeLock,
 );
 
 impl PreferenceEnvGuard {
     fn new(profile_root: &Path) -> Self {
+        let codex_home_lock = crate::tokens_pool::codex_home_env::lock();
         let lock = crate::tokens_pool::profile_root_env::lock();
         let prior = PREFERENCE_ENV
             .iter()
@@ -387,7 +391,7 @@ impl PreferenceEnvGuard {
             std::env::remove_var(key);
         }
         std::env::set_var("LOOM_CODEX_PROFILE_ROOT", profile_root);
-        Self(prior, lock)
+        Self(prior, lock, codex_home_lock)
     }
 }
 
@@ -452,6 +456,15 @@ fn a_spawnable_lower_tap_keeps_the_hold_from_arming() {
     );
     bad_mark_all(ws.path(), &["a"]);
 
+    let host = PoolHoldState::new();
+    assert!(
+        host.observe_root(ws.path(), chrono::Utc::now()),
+        "the host-admitted Builder cannot use an untrusted lower tap"
+    );
+    crate::tokens_pool::codex_hooks::test_support::guard_ready_in_workspace(
+        ws.path(),
+        &profiles.path().join("alice"),
+    );
     let host = PoolHoldState::new();
     assert!(
         !host.observe_root(ws.path(), chrono::Utc::now()),
@@ -640,6 +653,10 @@ fn a_wholly_unavailable_sweep_lifecycle_table_does_not_key_the_halt() {
     );
     bad_mark_all(ws.path(), &["a"]);
 
+    crate::tokens_pool::codex_hooks::test_support::guard_ready_in_workspace(
+        ws.path(),
+        &profiles.path().join("alice"),
+    );
     let host = PoolHoldState::new();
     assert!(
         !host.observe_root(ws.path(), chrono::Utc::now()),
@@ -737,8 +754,8 @@ fn a_tapless_root_does_not_flap_the_hold_shared_with_a_spawnable_root() {
 /// exists, B lists `claude` with a spawnable account. Across repeated ticks A
 /// stays held and B stays free, the hold never disappears between A's ticks
 /// (it used to be cleared by B's, flapping the arm WARN / clear INFO per
-/// tick), and nothing is ever offered for broadcast. When a Codex seat
-/// appears A releases exactly once.
+/// tick), and nothing is ever offered for broadcast. A releases once a
+/// Codex seat is both present and ready for its Builder role.
 #[test]
 #[serial]
 fn a_per_workspace_preference_hold_survives_a_sibling_root_on_the_same_pool() {
@@ -782,8 +799,13 @@ fn a_per_workspace_preference_hold_survives_a_sibling_root_on_the_same_pool() {
     );
     assert_eq!(host.active_holds().len(), 1);
 
-    // A Codex seat logs in: the codex-only root releases, once.
+    // Login without guard trust is insufficient for a host-admitted Builder.
     fs::create_dir(profiles.path().join("alice")).unwrap();
+    assert!(host.observe_root(codex_only.path(), chrono::Utc::now()));
+    crate::tokens_pool::codex_hooks::test_support::guard_ready_in_workspace(
+        codex_only.path(),
+        &profiles.path().join("alice"),
+    );
     let obs = host.observe_root_edge(codex_only.path(), chrono::Utc::now());
     assert!(!obs.held && obs.edge.is_none());
     assert_eq!(host.held_pool_count(), 0);

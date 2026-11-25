@@ -57,6 +57,17 @@ UNTRACK=false         # --untrack: run the git rm --cached commands (#3836)
 # short-circuits below -- one ahead of the --local-mode block's mutations, one
 # ahead of the default (worktree+PR) path's first write (create-worktree.sh).
 DRY_RUN=false
+# --repo-only / LOOM_INSTALL_REPO_ONLY=1 (issue #14570): write only the target
+# repository's files. Skips every machine-level provisioning step (daemon binary,
+# `loom` dispatcher, user-scope skills/agents, user-scope guard hooks, and the
+# user-scope MCP registration) so a workstation install does not replace the
+# machine's daemon or ~/.claude state. The env var and the flag set one variable.
+REPO_ONLY=false
+case "${LOOM_INSTALL_REPO_ONLY:-}" in 1|true|yes) REPO_ONLY=true ;; esac
+# --allow-downgrade / LOOM_INSTALL_ALLOW_DOWNGRADE=1 (issue #15261): permit the
+# machine-level daemon provisioning to replace a newer installed daemon with an
+# older source build (default: refused, repo install still completes).
+case "${LOOM_INSTALL_ALLOW_DOWNGRADE:-}" in 1|true|yes) export LOOM_INSTALL_ALLOW_DOWNGRADE=1 ;; esac
 # Install-time workspace mode (--mode session, issue #8884), held as the literal
 # `loom-daemon init` argv pair so it can be spliced into the init call below
 # without re-deriving anything. Empty (the default) reproduces the pre-#8884
@@ -105,6 +116,8 @@ while [[ $# -gt 0 ]]; do
       shift
       ;;
     --untrack) UNTRACK=true; shift ;;
+    --repo-only) REPO_ONLY=true; shift ;;
+    --allow-downgrade) export LOOM_INSTALL_ALLOW_DOWNGRADE=1; shift ;;
     --mode)
       # `default` is accepted as an explicit no-op; it does NOT remove a
       # `"mode": "session"` marker already on disk (defaults/docs/session-mode.md).
@@ -150,6 +163,18 @@ while [[ $# -gt 0 ]]; do
       echo "                             .loom/config.json. See defaults/docs/session-mode.md."
       echo "  --dry-run                  Print what would be written and exit 0; creates, modifies, and"
       echo "                             removes nothing. Implies --yes (never prompts). Composes with --local."
+      echo "  --allow-downgrade          Let machine-level provisioning replace a newer installed"
+      echo "                             loom-daemon with this older build (env:"
+      echo "                             LOOM_INSTALL_ALLOW_DOWNGRADE=1; default: refused)."
+      echo "  --repo-only                Write only the target repository's files. Skips the machine-level"
+      echo "                             steps (env: LOOM_INSTALL_REPO_ONLY=1) and prints one line per skip:"
+      echo "                               - loom-daemon binary + defaults mirror (~/.local/bin, ~/.local/share)"
+      echo "                               - 'loom' dispatcher (~/.local/bin/loom, ~/.local/share/loom)"
+      echo "                               - user-scope skills + agents (~/.claude/commands, ~/.claude/agents)"
+      echo "                               - user-scope guard hooks (~/.claude/settings.json)"
+      echo "                               - user-served MCP bundle build and source config migration"
+      echo "                               - user-scope 'loom' MCP registration (claude mcp add --scope user)"
+      echo "                             Without it, those steps run and change this machine."
       echo "  -h, --help                 Show this help message"
       echo ""
       echo "Default install PR markers (always on — see .loom/docs/ci-integration.md after install):"
@@ -246,6 +271,11 @@ source "$LOOM_ROOT/scripts/install/provision-hooks.sh"
 # exercise the scoped-symlink logic without running the full installer.
 # shellcheck source=scripts/install/dogfood-commands.sh
 source "$LOOM_ROOT/scripts/install/dogfood-commands.sh"
+
+# Retired-file cleanup helper (#3572, #14846) -- own file so Section 5b of the
+# test suite calls the same routine the installer does.
+# shellcheck source=scripts/install/retired-files.sh
+source "$LOOM_ROOT/scripts/install/retired-files.sh"
 
 # install-metadata.json merge=ours wiring (#4528) — extracted so the test
 # suite can exercise it without running the full installer.
@@ -1386,9 +1416,14 @@ info "loom-daemon binary: $DAEMON_VERSION"
 # $LOOM_ROOT/defaults to a machine-level location so `loom-daemon init` has a
 # working recovery path even on a host with no on-host `loom` git checkout
 # to find it via cwd/git-root search (#5389).
-info "Provisioning machine-level loom-daemon binary..."
-provision_machine_daemon "$TARGET_DIR/release/loom-daemon" "" "$LOOM_ROOT/defaults" || \
-  warning "Machine-level loom-daemon not provisioned (see note above); autonomous daemon mode needs LOOM_DAEMON_BIN or a binary on PATH."
+if [[ "$REPO_ONLY" == "true" ]]; then
+  info "Skipping machine-level loom-daemon provisioning (--repo-only)"
+else
+  provision_machine_change_notice "$TARGET_DIR/release/loom-daemon" || true
+  info "Provisioning machine-level loom-daemon binary..."
+  LOOM_PROVISION_REFUSE_DOWNGRADE=1 provision_machine_daemon "$TARGET_DIR/release/loom-daemon" "" "$LOOM_ROOT/defaults" || \
+    warning "Machine-level loom-daemon not provisioned (see note above); autonomous daemon mode needs LOOM_DAEMON_BIN or a binary on PATH."
+fi
 
 # Provision the machine-level `loom` dispatcher (Epic #3835 Phase 3a, #4157).
 # Installs ~/.local/bin/loom and links ~/.local/share/loom -> this Loom source
@@ -1396,9 +1431,13 @@ provision_machine_daemon "$TARGET_DIR/release/loom-daemon" "" "$LOOM_ROOT/defaul
 # runtime with no per-repo copy. Best-effort: a soft failure is logged but never
 # aborts the install. It writes ONLY those two paths — it never touches the
 # ~/.local/bin/loom-* Python console-script symlinks (Epic #4081's scope).
-info "Provisioning machine-level loom dispatcher..."
-provision_loom_dispatcher "$LOOM_ROOT" || \
-  warning "Machine-level loom dispatcher not fully provisioned (see note above); use ./.loom/bin/loom in-repo, or set LOOM_HOME."
+if [[ "$REPO_ONLY" == "true" ]]; then
+  info "Skipping machine-level loom dispatcher provisioning (--repo-only)"
+else
+  info "Provisioning machine-level loom dispatcher..."
+  provision_loom_dispatcher "$LOOM_ROOT" || \
+    warning "Machine-level loom dispatcher not fully provisioned (see note above); use ./.loom/bin/loom in-repo, or set LOOM_HOME."
+fi
 
 # Provision user-scope skills + agents (Epic #3835 Phase 4, #4261). Links
 # ~/.claude/commands/loom (whole dir) and ~/.claude/agents/loom-*.md (per file)
@@ -1408,9 +1447,13 @@ provision_loom_dispatcher "$LOOM_ROOT" || \
 # and best-effort: it never clobbers an operator's real files, and a soft failure
 # is logged but never aborts the install. (Existing per-repo copies are NOT
 # removed here — that is Phase 6 migration territory, #4254.)
-info "Provisioning user-scope loom skills + agents..."
-provision_loom_skills "${PROVISIONED_LOOM_CHECKOUT:-}" || \
-  warning "User-scope loom skills/agents not fully provisioned; /loom:* skills still resolve from any per-repo copy."
+if [[ "$REPO_ONLY" == "true" ]]; then
+  info "Skipping user-scope loom skills + agents provisioning (--repo-only)"
+else
+  info "Provisioning user-scope loom skills + agents..."
+  provision_loom_skills "${PROVISIONED_LOOM_CHECKOUT:-}" || \
+    warning "User-scope loom skills/agents not fully provisioned; /loom:* skills still resolve from any per-repo copy."
+fi
 
 # Provision user-scope guard hooks (Epic #3835 Phase 5, #4262). Wires the Loom
 # guard hooks into ~/.claude/settings.json so they execute from the machine
@@ -1420,9 +1463,13 @@ provision_loom_skills "${PROVISIONED_LOOM_CHECKOUT:-}" || \
 # those; until then the project copy wins, so guards run exactly once). Additive
 # and best-effort — an operator's non-Loom hook entries are preserved and a soft
 # failure is logged but never aborts the install.
-info "Provisioning user-scope loom guard hooks..."
-provision_loom_hooks || \
-  warning "User-scope loom guard hooks not fully provisioned; guards still fire from any per-repo .loom/hooks/ copy + project-level settings entry."
+if [[ "$REPO_ONLY" == "true" ]]; then
+  info "Skipping user-scope loom guard hooks provisioning (--repo-only)"
+else
+  info "Provisioning user-scope loom guard hooks..."
+  provision_loom_hooks || \
+    warning "User-scope loom guard hooks not fully provisioned; guards still fire from any per-repo .loom/hooks/ copy + project-level settings entry."
+fi
 
 # Run loom-daemon init in the worktree
 cd "$TARGET_PATH/$WORKTREE_PATH"
@@ -1727,137 +1774,14 @@ fi
 # --- End stale-file sweep ---
 
 # --- Retired-file cleanup (content-gated) ---
-# A handful of files Loom once shipped were later RETIRED outright (deleted
-# upstream, not renamed). The generic stale-file sweep above deliberately will
-# NOT remove them:
-#   * The #3492 ownership-boundary intersection preserves any stale-manifest
-#     entry that is no longer in the current defaults/ ownership set — a
-#     retired path is by definition not owned, so it lands in
-#     PRESERVED_NOT_OWNED and is never git-rm'd. That defense-in-depth is
-#     correct (it protects consumer-authored files captured by pre-#3450
-#     over-broad manifests) and must stay.
-#   * A retired file that was never in the previous manifest at all is never
-#     even a sweep candidate.
-# So a retired file lingers on disk in every consumer that installed before the
-# retirement. This block removes such strays narrowly and safely.
-#
-# Gate: a frozen allowlist of (retired path -> sha256 of every version Loom
-# ever shipped at that path). A file is removed ONLY when it exists AND its
-# content hash matches a shipped digest — i.e. it is byte-identical to
-# something Loom shipped and therefore unmodified. A consumer who customized
-# the file (hash matches none) is left untouched with an informational line.
-# Absent -> no-op. Idempotent by construction (once removed, the existence
-# check is false on every subsequent run).
-#
-# Issue #3572: retire the stray `.claude/commands/loom/release.md` left behind
-# by #3563 (which deleted the shipped `/loom:release` skill but deliberately
-# did not sweep existing consumer copies). release.md's only placeholder is the
-# Claude-Code *runtime* token {{workspace}} — it is NOT install-time
-# substituted (see substitute_template_variables in
-# loom-daemon/src/init/templates.rs), so the shipped bytes are identical across
-# all consumers and a content-hash gate is exact. The digest set is frozen:
-# release.md will never ship again, so no maintenance burden accrues.
-_loom_sha256() {
-  # Portable sha256 -> bare hex digest (shasum on macOS, sha256sum on Linux).
-  if command -v shasum >/dev/null 2>&1; then
-    shasum -a 256 "$1" 2>/dev/null | awk '{print $1}'
-  elif command -v sha256sum >/dev/null 2>&1; then
-    sha256sum "$1" 2>/dev/null | awk '{print $1}'
-  else
-    echo ""
-  fi
-}
-
-# Frozen retired-file allowlist. One "<relative-path> <sha256>" row per shipped
-# version; multiple rows per path enumerate every version. Comment (#) and
-# blank lines are ignored. Append-only — never remove a historical digest.
-LOOM_RETIRED_FILES=$(cat <<'RETIRED'
-# .claude/commands/loom/release.md — every version shipped in the #3495 -> #3563
-# window (retired by #3563 / PR #3571). Any match is unmodified Loom content.
-.claude/commands/loom/release.md 11aef217942f45bd03d90a24e5efae9209041cb59f09c888df4dc7e8208910dd
-.claude/commands/loom/release.md 0df6c20846c98850413243362c80dea2fd01330c8d97033ef5f7c3989578fe8c
-.claude/commands/loom/release.md c45841f8da42d1bda20bc180c8a93d14242238d9a2c1d9f5a1bdac32b5e9e556
-.claude/commands/loom/release.md d91e198e977ad7799f44fa1a6827c9836bca6d31c9357ed92fc400a3c88381de
-.claude/commands/loom/release.md 0d7030dd14f32f6f382a6430cd04e5f0475825d567aaed7570b73a4c43128ad1
-.claude/commands/loom/release.md 4a077ed25cb44add0afbc4d6bda23cb372f5f3c4c2ef23b7a24b586e66e4f3e7
-.claude/commands/loom/release.md 5f9930dc72a263866122b18018a64b8fed4bd53ef623d0eef27ed1e31fa0502f
-.claude/commands/loom/release.md b7fae9d13d2bfaee3bde514cabe44ac70b6551351a9e49357ede00f82c17cf35
-.claude/commands/loom/release.md f6523d9be058e40397f0ce30c08a8f2b60e9b38adae04bd7c919e0cc840acfec
-.claude/commands/loom/release.md 29a845f7f8912545d23832551753304df6e72dd4a9c8082c2d8ada1f09f449e1
-.claude/commands/loom/release.md 795c1df1d3f3706ba448482b037a0c9e4eb6272a719adb2688b9ddfc91ab4de6
-# .claude/agents/loom-shepherd.md — every version shipped from #1259/#1264
-# (initial subagent files) through #3871, before the v0.10.0 shepherd/daemon
-# deletion (#3884) removed it outright (#4097). .claude/ is merge-copied with
-# no orphan removal, so a pre-#3884 install keeps this stray forever unless
-# swept here.
-.claude/agents/loom-shepherd.md 1cbca10c8b0352fc3db636e0abb6fdf25ddcfb6138b7a21ab5faeb8b21f730a2
-.claude/agents/loom-shepherd.md 2be39b1d7978dbb3a8d502eaed2cfff9a8f9832aae801c8683a425405c0a2753
-.claude/agents/loom-shepherd.md 35830eb68c9ab3ad1cbeaf6ce2b62c7d919f3e06cc5234c46ad2c6c4f637c8ff
-.claude/agents/loom-shepherd.md 6c7e207a5f040675f31447427b4241999adab4d58831e8d5bc605c2ac5d500b2
-.claude/agents/loom-shepherd.md 8cfc89428135cb55c91a6ae768bbd3373dbe2a1d22eb088694bc158ce0091d34
-RETIRED
-)
-
-RETIRED_REMOVE=()
-RETIRED_PRESERVE=()
-# Unique retired paths (a path may have several allowed digests).
-RETIRED_PATHS=$(printf '%s\n' "$LOOM_RETIRED_FILES" \
-  | awk 'NF>=2 && $1 !~ /^#/ {print $1}' | sort -u)
-while IFS= read -r retired_path; do
-  [[ -n "$retired_path" ]] || continue
-  [[ -f "$TARGET_PATH/$retired_path" ]] || continue
-  file_hash=$(_loom_sha256 "$TARGET_PATH/$retired_path")
-  hash_matched=false
-  if [[ -n "$file_hash" ]]; then
-    while read -r allow_path allow_hash; do
-      [[ -n "$allow_path" && "${allow_path:0:1}" != "#" ]] || continue
-      if [[ "$allow_path" == "$retired_path" && "$allow_hash" == "$file_hash" ]]; then
-        hash_matched=true
-        break
-      fi
-    done <<< "$LOOM_RETIRED_FILES"
-  fi
-  if [[ "$hash_matched" == "true" ]]; then
-    RETIRED_REMOVE+=("$retired_path")
-  else
-    RETIRED_PRESERVE+=("$retired_path")
-  fi
-done <<< "$RETIRED_PATHS"
-
-# Preserved: retired path present, but content matches no shipped version.
-if (( ${#RETIRED_PRESERVE[@]} > 0 )); then
-  for f in "${RETIRED_PRESERVE[@]}"; do
-    info "preserving ${f} (retired by Loom, but on-disk content matches no shipped version — likely consumer-customized; leaving in place)"
-  done
+# Logic + frozen digest table live in scripts/install/retired-files.sh (#14846)
+# so Section 5b of test-installer.sh exercises this exact code. We have cd'd
+# into the install worktree, so "$PWD" is the git root `git rm` must run in.
+RETIRED_CONFIRM=yes
+if [[ "$NON_INTERACTIVE" != "true" ]] && [[ "$FORCE_OVERWRITE" != "true" ]]; then
+  RETIRED_CONFIRM=prompt
 fi
-
-# Removed: retired path present with unmodified, shipped-identical content.
-if (( ${#RETIRED_REMOVE[@]} > 0 )); then
-  echo ""
-  info "Retired Loom files still present (deleted upstream, unmodified copy on disk):"
-  for f in "${RETIRED_REMOVE[@]}"; do
-    echo "    - $f"
-  done
-  echo ""
-  PROCEED_RETIRED=true
-  if [[ "$NON_INTERACTIVE" != "true" ]] && [[ "$FORCE_OVERWRITE" != "true" ]]; then
-    read -r -p "Remove these ${#RETIRED_REMOVE[@]} retired file(s)? [y/N] " CONFIRM_RETIRED
-    [[ "$CONFIRM_RETIRED" =~ ^[Yy]$ ]] || PROCEED_RETIRED=false
-  fi
-  if [[ "$PROCEED_RETIRED" == "true" ]]; then
-    RETIRED_DELETED=0
-    for f in "${RETIRED_REMOVE[@]}"; do
-      if git rm --quiet --force "$f" 2>/dev/null; then
-        (( RETIRED_DELETED++ )) || true
-      else
-        warning "Could not remove retired file: $f (may have been removed already or is untracked)"
-      fi
-    done
-    success "Removed $RETIRED_DELETED retired Loom file(s)"
-  else
-    info "Skipping retired file removal (user declined)"
-  fi
-fi
+loom_remove_retired_files "$TARGET_PATH" "$PWD" "$RETIRED_CONFIRM"
 # --- End retired-file cleanup ---
 
 # NOTE (#5624): this file is intentionally NOT gitignored (it records which
@@ -2115,40 +2039,48 @@ echo ""
 # — a single instance serves every repo (it resolves the invoking repo from its
 # CWD), which kills the #3803 per-repo stale-dist drift class.
 #
-# setup-mcp.sh is still run first, but in its DEMOTED role: it builds the bundle
-# (what the user-scope server serves), strips any legacy project-scope `loom`
-# entry so it cannot shadow the user-scope server, and emits a safehouse-only
-# .mcp.json when safehouse is enabled.
-info "Building the mcp-loom bundle and migrating any legacy .mcp.json (demoted setup-mcp.sh)..."
-if "$LOOM_ROOT/scripts/setup-mcp.sh"; then
-  success "mcp-loom bundle built; legacy .mcp.json migrated (loom is now user-scoped)"
+if [[ "$REPO_ONLY" == "true" ]]; then
+  # The source checkout may serve the existing machine registration. Its
+  # bundle and project config are both outside the consumer worktree.
+  info "Skipping machine-level loom MCP bundle build and source config migration (--repo-only)"
+  info "Skipping user-scope 'loom' MCP registration (--repo-only)"
 else
-  warning "setup-mcp.sh failed - the served bundle may be missing"
-  info "Run manually later: $LOOM_ROOT/scripts/setup-mcp.sh"
-fi
-
-# Register the loom MCP server at USER scope, pointing at the machine-level
-# checkout (~/.local/share/loom, overridable via LOOM_HOME). Fall back to the
-# source checkout if the machine checkout's bundle is not present yet.
-MCP_MACHINE_ENTRY="${LOOM_HOME:-$HOME/.local/share/loom}/mcp-loom/dist/index.js"
-if [[ ! -f "$MCP_MACHINE_ENTRY" ]]; then
-  MCP_MACHINE_ENTRY="$LOOM_ROOT/mcp-loom/dist/index.js"
-fi
-if command -v claude >/dev/null 2>&1; then
-  info "Registering the 'loom' MCP server at user scope (machine-level, #4230)..."
-  # Idempotent: drop any existing user-scope entry before re-adding.
-  claude mcp remove --scope user loom >/dev/null 2>&1 || true
-  if claude mcp add --scope user loom -- node "$MCP_MACHINE_ENTRY"; then
-    success "Registered user-scope 'loom' MCP server -> $MCP_MACHINE_ENTRY"
-    info "'loom update' refreshes this bundle for every repo at once (no per-repo action)."
+  # setup-mcp.sh is still run first, but in its DEMOTED role: it builds the bundle
+  # (what the user-scope server serves), strips any legacy project-scope `loom`
+  # entry so it cannot shadow the user-scope server, and emits a safehouse-only
+  # .mcp.json when safehouse is enabled.
+  info "Building the mcp-loom bundle and migrating any legacy .mcp.json (demoted setup-mcp.sh)..."
+  if "$LOOM_ROOT/scripts/setup-mcp.sh"; then
+    success "mcp-loom bundle built; legacy .mcp.json migrated (loom is now user-scoped)"
   else
-    warning "Failed to register the user-scope 'loom' MCP server. Register it manually:"
+    warning "setup-mcp.sh failed - the served bundle may be missing"
+    info "Run manually later: $LOOM_ROOT/scripts/setup-mcp.sh"
+  fi
+
+  # Register the loom MCP server at USER scope, pointing at the machine-level
+  # checkout (~/.local/share/loom, overridable via LOOM_HOME). Fall back to the
+  # source checkout if the machine checkout's bundle is not present yet.
+  MCP_MACHINE_ENTRY="${LOOM_HOME:-$HOME/.local/share/loom}/mcp-loom/dist/index.js"
+  if [[ ! -f "$MCP_MACHINE_ENTRY" ]]; then
+    MCP_MACHINE_ENTRY="$LOOM_ROOT/mcp-loom/dist/index.js"
+  fi
+  if command -v claude >/dev/null 2>&1; then
+    info "Registering the 'loom' MCP server at user scope (machine-level, #4230)..."
+    # Idempotent: drop any existing user-scope entry before re-adding.
+    claude mcp remove --scope user loom >/dev/null 2>&1 || true
+    if claude mcp add --scope user loom -- node "$MCP_MACHINE_ENTRY"; then
+      success "Registered user-scope 'loom' MCP server -> $MCP_MACHINE_ENTRY"
+      info "'loom update' refreshes this bundle for every repo at once (no per-repo action)."
+    else
+      warning "Failed to register the user-scope 'loom' MCP server. Register it manually:"
+      info "  claude mcp add --scope user loom -- node \"$MCP_MACHINE_ENTRY\""
+    fi
+  else
+    warning "'claude' CLI not on PATH — cannot register the user-scope 'loom' MCP server now."
+    info "Once 'claude' is available, register it manually (one time, per machine):"
     info "  claude mcp add --scope user loom -- node \"$MCP_MACHINE_ENTRY\""
   fi
-else
-  warning "'claude' CLI not on PATH — cannot register the user-scope 'loom' MCP server now."
-  info "Once 'claude' is available, register it manually (one time, per machine):"
-  info "  claude mcp add --scope user loom -- node \"$MCP_MACHINE_ENTRY\""
+
 fi
 
 echo ""

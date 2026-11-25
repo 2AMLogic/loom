@@ -116,6 +116,29 @@ pub fn claude_projects_dir() -> Option<PathBuf> {
     Some(base.join("projects"))
 }
 
+/// `projects` directories of the persistent Claude seats (#14371). A seat's
+/// Claude runs with its own private `CLAUDE_CONFIG_DIR`, so its transcripts
+/// are not under [`claude_projects_dir`]; host readers must look here too.
+#[must_use]
+pub fn claude_seat_projects_dirs() -> Vec<PathBuf> {
+    use crate::tokens_pool::claude_seat as seat;
+    let Some(root) = seat::seat_root() else {
+        return Vec::new();
+    };
+    let Ok(entries) = std::fs::read_dir(&root) else {
+        return Vec::new();
+    };
+    let mut dirs: Vec<PathBuf> = entries
+        .flatten()
+        .filter_map(|e| e.file_name().into_string().ok())
+        .filter(|name| seat::is_seat(&root, name))
+        .map(|name| seat::home_dir(&root, &name).join("projects"))
+        .filter(|dir| dir.is_dir())
+        .collect();
+    dirs.sort();
+    dirs
+}
+
 /// Whether `head` — the leading bytes of a Claude Code session transcript —
 /// shows that session being launched as `/loom:sweep <issue> …`.
 ///
@@ -351,26 +374,14 @@ fn fold_files(files: &[PathBuf]) -> UsageFold {
 
 /// Total tokens processed by every `/loom:sweep <issue>` session under
 /// `projects_dir` for `workspace_root`, or `None` when nothing attributable was
-/// found.
+/// found. With `pr: Some(_)` it also counts the sessions of a dispatched Judge,
+/// Doctor or `champion --pr` step for the merged PR `pr` (#14018), which a
+/// step-dispatched completion has and the issue-keyed match cannot reach.
 ///
 /// Blocking file I/O — call from a blocking context. `None` (never `Some(0)`)
 /// is returned for "no attributable transcripts", matching the envelope
 /// contract that an absent total omits the key rather than publishing a
 /// misleading zero.
-#[must_use]
-pub fn sum_sweep_tokens(
-    projects_dir: &Path,
-    workspace_root: &Path,
-    issue: u32,
-    window: Option<(DateTime<Utc>, DateTime<Utc>)>,
-) -> Option<u64> {
-    sum_item_tokens(projects_dir, workspace_root, issue, None, window)
-}
-
-/// [`sum_sweep_tokens`] that also counts the sessions of a dispatched Judge,
-/// Doctor or `champion --pr` step for the merged PR `pr` (#14018), which a
-/// step-dispatched completion has and the issue-keyed match cannot reach.
-/// `pr: None` is exactly [`sum_sweep_tokens`].
 #[must_use]
 pub fn sum_item_tokens(
     projects_dir: &Path,
@@ -400,58 +411,11 @@ pub fn sum_item_tokens(
     (total > 0).then_some(total)
 }
 
-/// Split input/output token totals for `issue`'s `/loom:sweep` sessions
-/// (Issue #5357): same session-matching and per-transcript summation as
-/// [`sum_sweep_tokens`], but keeping the input/output axes separate rather
-/// than collapsing them into one total — the two price very differently, so
-/// a `sweep.outcome` consumer that wants a cost-weighted figure needs both
-/// counts alongside the record's own `model`, not a single pre-mixed number.
-///
-/// "Input" here is the three billing-input counters summed
-/// (`input_tokens` + `cache_read_input_tokens` + `cache_creation_input_tokens`
-/// — see the module doc's "Fidelity" section for why cache tokens count as
-/// input rather than being dropped); "output" is `output_tokens` alone.
-/// Deliberately **raw**, not cost-weighted: `sweep.outcome` already carries
-/// `model`, so a consumer applies whatever per-model pricing table it wants
-/// without this record needing a backfill when that table changes.
-///
-/// `None` (never `Some((0, 0))`) when nothing attributable was found — same
-/// "unknown != zero" contract as [`sum_sweep_tokens`].
-#[must_use]
-pub fn sum_sweep_tokens_split(
-    projects_dir: &Path,
-    workspace_root: &Path,
-    issue: u32,
-    window: Option<(DateTime<Utc>, DateTime<Utc>)>,
-) -> Option<(u64, u64)> {
-    let files = sweep_transcript_files(
-        projects_dir,
-        workspace_root,
-        issue,
-        None,
-        window,
-        "sweep.outcome token split",
-    )?;
-    let mut input_total: u64 = 0;
-    let mut output_total: u64 = 0;
-    for row in fold_files(&files).rows() {
-        let input = row
-            .input
-            .saturating_add(row.cache_read)
-            .saturating_add(row.cache_write_5m)
-            .saturating_add(row.cache_write_1h);
-        input_total = input_total.saturating_add(u64::try_from(input).unwrap_or(0));
-        output_total = output_total.saturating_add(u64::try_from(row.output).unwrap_or(0));
-    }
-    (input_total > 0 || output_total > 0).then_some((input_total, output_total))
-}
-
 /// Per-`(model, speed, service_tier)` token totals for `issue`'s
 /// `/loom:sweep` sessions (#5740): same session-matching and per-transcript
-/// scan as [`sum_sweep_tokens`]/[`sum_sweep_tokens_split`], but grouped by
+/// scan as [`sum_item_tokens`], but grouped by
 /// model/speed/tier instead of collapsed into one running total. See
-/// [`ModelUsageTotals`] and [`sum_transcript_usage_by_model`](crate::script_helpers::sweep_experiment::sum_transcript_usage_by_model) for why a
-/// single flat sum cannot be priced.
+/// [`ModelUsageTotals`] for why a single flat sum cannot be priced.
 ///
 /// Totals from every matching transcript are merged by tuple across the
 /// whole sweep (a re-dispatched issue's several sessions, and a sweep whose
@@ -459,7 +423,7 @@ pub fn sum_sweep_tokens_split(
 /// contribute to the same output row when the tuple matches).
 ///
 /// `None` (never `Some(vec![])`) when nothing attributable was found — same
-/// "unknown != zero" contract as [`sum_sweep_tokens`].
+/// "unknown != zero" contract as [`sum_item_tokens`].
 #[must_use]
 pub fn sum_sweep_tokens_by_model(
     projects_dir: &Path,
@@ -593,6 +557,24 @@ mod tests {
     use chrono::TimeZone as _;
     use std::fs;
 
+    #[test]
+    #[serial_test::serial]
+    fn seat_projects_dirs_find_each_registered_seats_transcripts() {
+        let root = tempfile::tempdir().unwrap();
+        for name in ["alpha", "beta"] {
+            let seat = root.path().join(name);
+            fs::create_dir_all(seat.join("home/projects/-w")).unwrap();
+            if name == "alpha" {
+                fs::write(seat.join(".session-managed.json"), "{}").unwrap();
+            }
+        }
+        std::env::set_var("LOOM_CLAUDE_SEAT_ROOT", root.path());
+        let dirs = claude_seat_projects_dirs();
+        std::env::remove_var("LOOM_CLAUDE_SEAT_ROOT");
+        // Only the registered seat is read; an unregistered directory is not.
+        assert_eq!(dirs, vec![root.path().join("alpha/home/projects")]);
+    }
+
     fn sweep_head(issue_args: &str) -> String {
         format!(
             "{{\"type\":\"queue-operation\"}}\n\
@@ -668,8 +650,7 @@ mod tests {
         // Parent and a resumed copy (subagent file) carry the same message.
         seed_session(dir.path(), workspace, "uuid-a", "4699", line, &[line]);
 
-        assert_eq!(sum_sweep_tokens(dir.path(), workspace, 4699, None), Some(370));
-        assert_eq!(sum_sweep_tokens_split(dir.path(), workspace, 4699, None), Some((350, 20)));
+        assert_eq!(sum_item_tokens(dir.path(), workspace, 4699, None, None), Some(370));
         let rows = sum_sweep_tokens_by_model(dir.path(), workspace, 4699, None).unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!((rows[0].input, rows[0].output, rows[0].cache_read), (10, 20, 300));
@@ -766,7 +747,7 @@ mod tests {
         std::fs::write(project.join("d.jsonl"), session("doctor", "901")).unwrap();
         std::fs::write(project.join("other.jsonl"), session("judge", "902")).unwrap();
         // The issue-keyed total is the Builder alone (1+2+3+4).
-        assert_eq!(sum_sweep_tokens(dir.path(), workspace, 900, None), Some(10));
+        assert_eq!(sum_item_tokens(dir.path(), workspace, 900, None, None), Some(10));
         // Naming the PR adds its Judge and Doctor, and nobody else's.
         assert_eq!(sum_item_tokens(dir.path(), workspace, 900, Some(901), None), Some(30));
         let rows = sum_item_tokens_by_model(dir.path(), workspace, 900, Some(901), None).unwrap();
@@ -784,7 +765,7 @@ mod tests {
             <command-args>4699</command-args>\"}}\n";
         fs::write(project.join("uuid-s.jsonl"), format!("{head}{}", usage_line(1, 2, 3, 4)))
             .unwrap();
-        assert_eq!(sum_sweep_tokens(dir.path(), workspace, 4699, None), Some(10));
+        assert_eq!(sum_item_tokens(dir.path(), workspace, 4699, None, None), Some(10));
         assert!(sum_sweep_tokens_by_model(dir.path(), workspace, 4699, None).is_some());
     }
 
@@ -802,7 +783,7 @@ mod tests {
         );
 
         // 370 (parent) + 37 (agent-0) + 3700 (agent-1)
-        assert_eq!(sum_sweep_tokens(dir.path(), workspace, 4699, None), Some(4107));
+        assert_eq!(sum_item_tokens(dir.path(), workspace, 4699, None, None), Some(4107));
     }
 
     #[test]
@@ -813,8 +794,8 @@ mod tests {
         seed_session(dir.path(), workspace, "uuid-b", "4699", &usage_line(2, 2, 2, 2), &[]);
         seed_session(dir.path(), workspace, "uuid-c", "4242", &usage_line(9, 9, 9, 9), &[]);
 
-        assert_eq!(sum_sweep_tokens(dir.path(), workspace, 4699, None), Some(12));
-        assert_eq!(sum_sweep_tokens(dir.path(), workspace, 4242, None), Some(36));
+        assert_eq!(sum_item_tokens(dir.path(), workspace, 4699, None, None), Some(12));
+        assert_eq!(sum_item_tokens(dir.path(), workspace, 4242, None, None), Some(36));
     }
 
     #[test]
@@ -824,10 +805,10 @@ mod tests {
         seed_session(dir.path(), workspace, "uuid-a", "4699", &usage_line(1, 1, 1, 1), &[]);
 
         // Right project, no such sweep.
-        assert_eq!(sum_sweep_tokens(dir.path(), workspace, 1234, None), None);
+        assert_eq!(sum_item_tokens(dir.path(), workspace, 1234, None, None), None);
         // No project directory at all — the common case on a host that has
         // never run a sweep from this workspace.
-        assert_eq!(sum_sweep_tokens(dir.path(), Path::new("/nope/nowhere"), 4699, None), None);
+        assert_eq!(sum_item_tokens(dir.path(), Path::new("/nope/nowhere"), 4699, None, None), None);
     }
 
     #[test]
@@ -836,7 +817,7 @@ mod tests {
         let workspace = Path::new("/Users/me/GitHub/loom");
         seed_session(dir.path(), workspace, "uuid-a", "4699", "", &[]);
 
-        assert_eq!(sum_sweep_tokens(dir.path(), workspace, 4699, None), None);
+        assert_eq!(sum_item_tokens(dir.path(), workspace, 4699, None, None), None);
     }
 
     #[test]
@@ -848,57 +829,13 @@ mod tests {
         // Freshly written, so a window around "now" keeps it...
         let now = Utc::now();
         let live = Some((now - chrono::Duration::minutes(30), now));
-        assert_eq!(sum_sweep_tokens(dir.path(), workspace, 4699, live), Some(4));
+        assert_eq!(sum_item_tokens(dir.path(), workspace, 4699, None, live), Some(4));
 
         // ...while a window in the distant past (well beyond WINDOW_SLACK)
         // filters it out before the file is ever read.
         let then = Utc.with_ymd_and_hms(2000, 1, 1, 0, 0, 0).unwrap();
         let stale = Some((then, then + chrono::Duration::hours(1)));
-        assert_eq!(sum_sweep_tokens(dir.path(), workspace, 4699, stale), None);
-    }
-
-    // --- sum_sweep_tokens_split (#5357) -------------------------------------
-
-    #[test]
-    fn split_sums_input_and_output_axes_separately_including_cache_as_input() {
-        let dir = tempfile::tempdir().unwrap();
-        let workspace = Path::new("/Users/me/GitHub/loom");
-        seed_session(
-            dir.path(),
-            workspace,
-            "uuid-a",
-            "4699 --claim-owned 4699",
-            &usage_line(10, 20, 300, 40),
-            &[&usage_line(1, 2, 30, 4), &usage_line(100, 200, 3000, 400)],
-        );
-
-        // input = (10+300+40) + (1+30+4) + (100+3000+400) = 350 + 35 + 3500
-        // output = 20 + 2 + 200
-        assert_eq!(sum_sweep_tokens_split(dir.path(), workspace, 4699, None), Some((3885, 222)));
-        // The combined total (sum_sweep_tokens) still matches input+output.
-        assert_eq!(sum_sweep_tokens(dir.path(), workspace, 4699, None), Some(4107));
-    }
-
-    #[test]
-    fn split_returns_none_for_an_unknown_issue_or_project() {
-        let dir = tempfile::tempdir().unwrap();
-        let workspace = Path::new("/Users/me/GitHub/loom");
-        seed_session(dir.path(), workspace, "uuid-a", "4699", &usage_line(1, 1, 1, 1), &[]);
-
-        assert_eq!(sum_sweep_tokens_split(dir.path(), workspace, 1234, None), None);
-        assert_eq!(
-            sum_sweep_tokens_split(dir.path(), Path::new("/nope/nowhere"), 4699, None),
-            None
-        );
-    }
-
-    #[test]
-    fn split_yields_none_not_zero_when_no_usage_blocks_are_present() {
-        let dir = tempfile::tempdir().unwrap();
-        let workspace = Path::new("/Users/me/GitHub/loom");
-        seed_session(dir.path(), workspace, "uuid-a", "4699", "", &[]);
-
-        assert_eq!(sum_sweep_tokens_split(dir.path(), workspace, 4699, None), None);
+        assert_eq!(sum_item_tokens(dir.path(), workspace, 4699, None, stale), None);
     }
 
     // --- sum_sweep_tokens_by_model (#5740) ----------------------------------
@@ -1048,7 +985,7 @@ mod tests {
 
         // Σ windows + remainder == the flat split over the same file set.
         let (total_in, total_out) =
-            sum_sweep_tokens_split(dir.path(), workspace, 9443, None).unwrap();
+            split_of(&sum_sweep_tokens_by_model(dir.path(), workspace, 9443, None).unwrap());
         let attributed_in: i64 = splits.iter().map(|s| s.0).sum();
         let attributed_out: i64 = splits.iter().map(|s| s.1).sum();
         assert_eq!(
@@ -1057,10 +994,7 @@ mod tests {
             "the trailing and clock-less records are attributed to no window"
         );
         assert_eq!(
-            (
-                u64::try_from(attributed_in).unwrap() + 10,
-                u64::try_from(attributed_out).unwrap() + 6
-            ),
+            (attributed_in + 10, attributed_out + 6),
             (total_in, total_out),
             "remainder is the trailing (7,5) plus the clock-less (3,1) record"
         );
@@ -1117,8 +1051,8 @@ mod tests {
         assert_eq!(split_of(per_phase[0].as_deref().unwrap()), (90, 9), "max over chunks, once");
         assert_eq!(per_phase[1], None, "the second chunk is not a second message");
         assert_eq!(
-            sum_sweep_tokens_split(dir.path(), workspace, 9443, None),
-            Some((90, 9)),
+            split_of(&sum_sweep_tokens_by_model(dir.path(), workspace, 9443, None).unwrap()),
+            (90, 9),
             "and the sweep total counts it exactly once too"
         );
     }

@@ -522,7 +522,6 @@ pub(super) fn seed_disk_for(
     write: bool,
     age: std::time::Duration,
 ) {
-    use std::io::Write as _;
     let dir = probe::cache_dir();
     assert!(crate::forge_etag_store::private_dir(&dir, true));
     let key = probe::cache_key(key_dir, scope, repo).expect("a keyed scope");
@@ -533,10 +532,15 @@ pub(super) fn seed_disk_for(
         .saturating_sub(age.as_secs());
     let body = serde_json::json!({"write": write, "detail": "seeded", "at": at}).to_string();
     let path = dir.join(format!("{key}.json"));
-    // Re-seeding replaces the entry (the file is created exclusively).
-    let _ = std::fs::remove_file(&path);
-    let mut f = crate::forge_etag_store::create_private_file(&path).unwrap();
-    f.write_all(body.as_bytes()).unwrap();
+    crate::fs_util::write_atomic(
+        &path,
+        body.as_bytes(),
+        crate::fs_util::AtomicOpts {
+            private: true,
+            sync_dir: false,
+        },
+    )
+    .unwrap();
 }
 
 #[test]
@@ -605,6 +609,10 @@ fn daemon_write_paths_are_scoped() {
     let reviewed: &[(&str, Scope)] = &[
         (PASS, Gated),
         ("claim_reconciliation.rs", Via(PASS, "reclaim + anchor passes")),
+        (
+            "claim_reconciliation/curating_reclaim.rs",
+            Via(PASS, "Curator claim recovery: label release and re-curation comment (#14816)"),
+        ),
         ("claim_reconciliation/verdict_invalidation.rs", Via(PASS, "verdict pass")),
         (
             "claim_reconciliation/unanchored_verdict.rs",
@@ -623,6 +631,10 @@ fn daemon_write_paths_are_scoped() {
         ),
         ("claim_reconciliation/pass_loop/building_heal.rs", Via(PASS, "heal pass")),
         (
+            "claim_reconciliation/pass_loop/merge_observation.rs",
+            Via(PASS, "merge-observation pass: issue close, label strip and audit comments (#14902)"),
+        ),
+        (
             "claim_reconciliation/ci_gate_recovery.rs",
             Via(PASS, "CI-gate recovery pass: audit comment + label swap"),
         ),
@@ -632,6 +644,14 @@ fn daemon_write_paths_are_scoped() {
                 PASS,
                 "orphan-stack pass (#12760): base retarget PATCH, conflict label, flag \
                  comment; its scratch-worktree push (orphan_stack_git.rs) rides the same gate",
+            ),
+        ),
+        (
+            "claim_reconciliation/merged_stack.rs",
+            Via(
+                PASS,
+                "merged-stack pass (#14903): base retarget PATCH and reconcile comments; its \
+                 scratch-worktree push (orphan_stack_git.rs) rides the same gate",
             ),
         ),
         (
@@ -672,7 +692,7 @@ fn daemon_write_paths_are_scoped() {
         ),
         ("role_runner/roster.rs", Gated),
         ("dep_classify/forge.rs", OriginResolved("dep_classify/cli.rs")),
-        ("cli/notify_cleared_blockers.rs", ShellVetted("merge-pr.sh")),
+        ("cli/notify_cleared_blockers.rs", Gated),
         (DISPATCH, Gated),
         ("work_finder/pool_preflight.rs", Gated),
         ("intake_reconcile.rs", Gated),
@@ -934,6 +954,10 @@ fn daemon_write_paths_are_scoped() {
             NotAWrite("read-only probe: its only calls are `api --method GET`"),
         ),
         ("tokens_pool/check.rs", NotAWrite("Anthropic API, not the forge")),
+        (
+            "tokens_pool/private_workspace/read_authority.rs",
+            NotAWrite("read probe: its only curl call is `-X GET`, never a forge write"),
+        ),
         (
             "remote_fleet_exec/mod.rs",
             NotAWrite("scp's `-X` option in a guard's argv vocabulary, runs none"),

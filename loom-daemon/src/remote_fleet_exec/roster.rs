@@ -18,7 +18,7 @@ use std::cell::OnceCell;
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use serde_json::Value;
 
@@ -364,35 +364,96 @@ fn ssh_resolved_hostname(host: &str, ssh_config: Option<&Path>) -> Option<String
 }
 
 fn run_with_timeout(bin: &str, args: &[&str]) -> Option<String> {
-    let mut child = Command::new(bin)
-        .args(args)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .ok()?;
-    // Drain stdout on a thread so a large document cannot fill the pipe and
-    // stall the child past the deadline.
-    let mut stdout = child.stdout.take()?;
-    let reader = std::thread::spawn(move || {
-        let mut s = String::new();
-        std::io::Read::read_to_string(&mut stdout, &mut s)
-            .ok()
-            .map(|_| s)
-    });
-    let deadline = Instant::now() + Duration::from_secs(3);
-    loop {
-        match child.try_wait() {
-            Ok(Some(status)) => {
-                let out = reader.join().ok().flatten()?;
-                return status.success().then_some(out);
-            }
-            Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(10)),
-            _ => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return None;
-            }
+    let mut cmd = Command::new(bin);
+    cmd.args(args).stdin(Stdio::null());
+    match crate::proc_exec::run_bounded(cmd, Duration::from_secs(3)) {
+        Ok(crate::proc_exec::Completion::Exited(out)) if out.status.success() => {
+            // Strict UTF-8, as the old `read_to_string` reader: a document
+            // with invalid bytes is `None`, not lossily decoded.
+            String::from_utf8(out.stdout).ok()
         }
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod run_with_timeout_tests {
+    //! #15007 slice C: the executor-backed `run_with_timeout` behind the
+    //! roster probes. Pins its strict-UTF-8 `Option<String>` contract, the
+    //! `|| true`-style `None` on failure/timeout, and group termination.
+
+    use super::run_with_timeout;
+    use std::os::unix::fs::PermissionsExt;
+    use std::path::PathBuf;
+
+    /// An executable stub binary running `body`.
+    fn stub(dir: &std::path::Path, name: &str, body: &str) -> PathBuf {
+        let bin = dir.join(name);
+        std::fs::write(&bin, format!("#!/bin/sh\n{body}\n")).expect("write stub");
+        let mut perms = std::fs::metadata(&bin).expect("stat stub").permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&bin, perms).expect("chmod stub");
+        bin
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn returns_the_document_of_a_fast_command() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = stub(dir.path(), "probe", r"printf 'line1\nline2\n'");
+        assert_eq!(
+            run_with_timeout(bin.to_str().unwrap(), &["status", "--json"]).as_deref(),
+            Some("line1\nline2\n")
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn none_on_nonzero_exit_missing_binary_and_invalid_utf8() {
+        let dir = tempfile::tempdir().unwrap();
+        let failing = stub(dir.path(), "failing", "exit 3");
+        assert!(run_with_timeout(failing.to_str().unwrap(), &[]).is_none());
+        assert!(run_with_timeout("/nonexistent/loom-canary-roster", &[]).is_none());
+        // Strict UTF-8, as the old `read_to_string` reader: the JSON the
+        // probes parse must never be lossily decoded.
+        let binary = stub(dir.path(), "binary", r"printf 'a\377b'");
+        assert!(run_with_timeout(binary.to_str().unwrap(), &[]).is_none());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn collects_a_document_larger_than_the_pipe_buffer() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = stub(dir.path(), "large", "head -c 262144 /dev/zero | tr '\\0' 'x'");
+        let out =
+            run_with_timeout(bin.to_str().unwrap(), &["status", "--json"]).expect("must complete");
+        assert_eq!(out.len(), 262_144, "every byte must be collected, not a timeout");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn timeout_returns_none_and_kills_the_descendants_too() {
+        let dir = tempfile::tempdir().unwrap();
+        let pidfile = dir.path().join("grandchild.pid");
+        let bin = stub(
+            dir.path(),
+            "hung",
+            &format!("/bin/sleep 120 & echo $! > {}; exec /bin/sleep 120", pidfile.display()),
+        );
+        assert!(run_with_timeout(bin.to_str().unwrap(), &[]).is_none());
+
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        let pid: i32 = std::fs::read_to_string(&pidfile)
+            .expect("grandchild must have recorded its pid")
+            .trim()
+            .parse()
+            .expect("pid must parse");
+        // SAFETY: signal 0 performs error checking only; it never delivers a signal.
+        let alive = unsafe { libc::kill(pid as libc::pid_t, 0) == 0 };
+        if alive {
+            // SAFETY: cleanup kill of a process this test spawned.
+            unsafe { libc::kill(pid, libc::SIGKILL) };
+        }
+        assert!(!alive, "grandchild {pid} outlived the roster timeout");
     }
 }

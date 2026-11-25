@@ -4,9 +4,8 @@
 //! Two consumers read the same records for different reasons and must not
 //! drift apart about what a record cost:
 //!
-//! - [`super::sweep_experiment::sum_transcript_usage_by_model`] folds them into
-//!   per-`(model, speed, service_tier)` totals for the safehouse completion
-//!   feed and `sweep.outcome` (#5740).
+//! - [`UsageFold`] folds them into per-`(model, speed, service_tier)` totals
+//!   for the safehouse completion feed and `sweep.outcome` (#5740).
 //! - [`crate::activity::transcript_ingest`] folds them — deduped on
 //!   `message.id` — into `activity.db`'s `resource_usage` rows (#8059).
 //!
@@ -25,7 +24,7 @@ use super::sweep_experiment::ModelUsageTotals;
 /// Bucket for a usage block whose `model` is absent, or is the literal
 /// `"<synthetic>"` Claude Code stamps on certain internal/tool-echo messages
 /// (issue #5740). Grouped explicitly rather than dropped, so the sum across
-/// every [`super::sweep_experiment::sum_transcript_usage_by_model`] entry still
+/// every [`UsageFold::rows`] entry still
 /// reconciles against the flat total
 /// [`super::sweep_experiment::sum_transcript_usage`] reports for the same file.
 pub const UNATTRIBUTED_MODEL: &str = "<unattributed>";
@@ -155,8 +154,8 @@ pub fn usage_from_record(obj: &Value) -> Option<UsageRecord> {
 /// [`crate::activity::transcript_parse`] applies. A record without an id cannot
 /// collide with another message, so it is counted as its own message.
 ///
-/// The one reader every token path shares: `sum_transcript_usage{,_by_model}`
-/// (sweep outcomes, `loom.runtime.usage` execution spans, attempt
+/// The one reader every token path shares: `sum_transcript_usage`
+/// and the multi-file `transcript_tokens` readers (sweep outcomes, `loom.runtime.usage` execution spans, attempt
 /// spans) and the role-tick transcript scan — so an execution total
 /// and the attempt totals it is compared against can never disagree about how
 /// a message is counted.

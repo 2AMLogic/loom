@@ -4,10 +4,10 @@
 //! reads, parses, serializes, or logs its contents.
 
 use std::fs::{self, OpenOptions};
-use std::io::{Read, Write};
+use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::process::Command;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, bail, Context, Result};
 use serde::Serialize;
@@ -19,6 +19,7 @@ use super::account_registry::{
 };
 use super::paths::codex_profile_root;
 use super::session_lifecycle::{container_name, is_session_managed};
+use crate::proc_exec::{Completion, ExecError};
 
 const AUTH_FILE: &str = "auth.json";
 const STATUS_TIMEOUT: Duration = Duration::from_secs(10);
@@ -81,6 +82,10 @@ pub struct AccountStatus {
     /// indistinguishable from a host-direct one, the mechanism is reported
     /// separately instead of being inferred from a missing probe.
     pub session_managed: bool,
+    /// Codex hook trust for Loom's managed entry (#14105): `recorded`,
+    /// `sealed` (no recorded decision, but a launch vets the registration and
+    /// passes the waiver instead) or `missing`.
+    pub hook_trust: &'static str,
     /// This account's registered private-clone repositories (issue #14298),
     /// read from its private-workspace `workspace.json`. Populated by
     /// `accounts list` only; absent for host-mode accounts and for every
@@ -221,54 +226,11 @@ pub struct ProcessCodexRunner;
 
 impl ProcessCodexRunner {
     fn bounded_status(profile: &Path) -> Result<RunnerOutput> {
-        let mut child = match Command::new("codex")
-            .args(["login", "status"])
-            .env("CODEX_HOME", profile)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-        {
-            Ok(child) => child,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                return Ok(RunnerOutput {
-                    success: false,
-                    unavailable: true,
-                    timed_out: false,
-                    exit_code: None,
-                    summary: "Codex CLI is not installed or not on PATH".into(),
-                });
-            }
-            Err(error) => return Err(error.into()),
-        };
-        let started = Instant::now();
-        loop {
-            if let Some(status) = child.try_wait()? {
-                let mut bytes = Vec::new();
-                if let Some(stdout) = child.stdout.take() {
-                    stdout
-                        .take(MAX_STATUS_BYTES as u64)
-                        .read_to_end(&mut bytes)?;
-                }
-                if bytes.is_empty() {
-                    if let Some(stderr) = child.stderr.take() {
-                        stderr
-                            .take(MAX_STATUS_BYTES as u64)
-                            .read_to_end(&mut bytes)?;
-                    }
-                }
-                let summary =
-                    classify_login_status(status.success(), &String::from_utf8_lossy(&bytes));
-                return Ok(RunnerOutput {
-                    success: status.success(),
-                    unavailable: false,
-                    timed_out: false,
-                    exit_code: status.code(),
-                    summary: summary.into(),
-                });
-            }
-            if started.elapsed() >= STATUS_TIMEOUT {
-                let _ = child.kill();
-                let _ = child.wait();
+        let mut command = Command::new("codex");
+        command.args(["login", "status"]).env("CODEX_HOME", profile);
+        let output = match crate::proc_exec::run_bounded(command, STATUS_TIMEOUT) {
+            Ok(Completion::Exited(output)) => output,
+            Ok(Completion::TimedOut { .. }) => {
                 return Ok(RunnerOutput {
                     success: false,
                     unavailable: false,
@@ -277,8 +239,32 @@ impl ProcessCodexRunner {
                     summary: "Codex login status timed out".into(),
                 });
             }
-            std::thread::sleep(Duration::from_millis(25));
-        }
+            Err(ExecError::Spawn(error)) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(RunnerOutput {
+                    success: false,
+                    unavailable: true,
+                    timed_out: false,
+                    exit_code: None,
+                    summary: "Codex CLI is not installed or not on PATH".into(),
+                });
+            }
+            Err(ExecError::Spawn(error) | ExecError::Collect(error)) => return Err(error.into()),
+        };
+        let text = if output.stdout.is_empty() {
+            &output.stderr
+        } else {
+            &output.stdout
+        };
+        let text = &text[..text.len().min(MAX_STATUS_BYTES)];
+        let summary =
+            classify_login_status(output.status.success(), &String::from_utf8_lossy(text));
+        Ok(RunnerOutput {
+            success: output.status.success(),
+            unavailable: false,
+            timed_out: false,
+            exit_code: output.status.code(),
+            summary: summary.into(),
+        })
     }
 }
 
@@ -836,6 +822,10 @@ impl<R: CodexCommandRunner> AccountLifecycle<R> {
         } else {
             login_state_from(&self.runner.login_status(&account.credential_reference)?)
         };
+        let hook_trust = super::codex_hooks::trust_state(
+            &account.credential_reference,
+            &super::private_workspace::bundle::registration(),
+        );
         Ok(AccountStatus {
             schema_version: 1,
             provider: account.id.provider,
@@ -846,6 +836,7 @@ impl<R: CodexCommandRunner> AccountLifecycle<R> {
             diagnostics,
             login_state,
             session_managed,
+            hook_trust,
             private_clone: None,
             image: None,
         })
@@ -2026,6 +2017,80 @@ mod tests {
         assert_eq!(output.summary, "not logged in");
     }
 
+    #[cfg(unix)]
+    struct FakeCodex {
+        _dir: tempfile::TempDir,
+        _path: crate::env_test_support::EnvGuard,
+    }
+
+    #[cfg(unix)]
+    impl FakeCodex {
+        fn new(script: &str) -> Self {
+            let dir = tempfile::tempdir().unwrap();
+            let bin = dir.path().join("bin");
+            crate::exec_test_support::write_executable(
+                &bin.join("codex"),
+                format!("#!/bin/sh\n{script}\n"),
+            );
+            let rest: Vec<_> = std::env::var_os("PATH")
+                .map(|path| std::env::split_paths(&path).collect())
+                .unwrap_or_default();
+            let path = std::env::join_paths(std::iter::once(bin).chain(rest)).unwrap();
+            Self {
+                _path: crate::env_test_support::EnvGuard::set("PATH", path),
+                _dir: dir,
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    fn bounded_status_of(profile: &Path) -> RunnerOutput {
+        ProcessCodexRunner::bounded_status(profile).unwrap()
+    }
+
+    #[test]
+    #[serial]
+    #[cfg(unix)]
+    fn bounded_status_reads_stdout_or_stderr_up_to_max_status_bytes() {
+        const MARKER: &str = "Not logged in";
+        let padding = "x".repeat(MAX_STATUS_BYTES);
+        let at_cap = &padding[..MAX_STATUS_BYTES - MARKER.len() - 1];
+        let cases = [
+            (format!("printf '%s' '{at_cap}'; printf '{MARKER}\\n'"), "not logged in"),
+            (
+                format!("printf '%s' '{padding}'; printf '{MARKER}\\n'"),
+                "Codex login status failed",
+            ),
+            (format!("printf '{MARKER}\\n' >&2"), "not logged in"),
+            (
+                format!("printf '%s' '{padding}' >&2; printf '{MARKER}\\n' >&2"),
+                "Codex login status failed",
+            ),
+        ];
+        for (script, expected) in cases {
+            let _codex = FakeCodex::new(&script);
+            let output = bounded_status_of(Path::new("/unused-codex-profile"));
+            assert_eq!(output.summary, expected, "script: {script:.40}");
+        }
+    }
+
+    #[test]
+    #[serial]
+    #[cfg(unix)]
+    fn bounded_status_drains_a_child_that_outfills_the_pipe_buffers() {
+        const FLOOD: &str = "head -c 262144 /dev/zero | tr '\\0' 'x'";
+        let cases = [
+            format!("printf 'Not logged in\\n'; {FLOOD}"),
+            format!("{FLOOD} >&2; printf 'Not logged in\\n'"),
+        ];
+        for script in cases {
+            let _codex = FakeCodex::new(&script);
+            let output = bounded_status_of(Path::new("/unused-codex-profile"));
+            assert!(!output.timed_out, "a 256 KiB write read as a hang");
+            assert_eq!(output.summary, "not logged in", "script: {script:.40}");
+        }
+    }
+
     #[test]
     #[serial]
     fn status_maps_missing_timeout_nonzero_and_not_logged_in_without_output_leaks() {
@@ -2163,7 +2228,8 @@ mod tests {
                 "owner_valid": true
             },
             "login_state": "not_checked",
-            "session_managed": false
+            "session_managed": false,
+            "hook_trust": "missing"
         }))
         .unwrap();
         assert_eq!(
@@ -2218,6 +2284,7 @@ mod tests {
                 gh_config: None,
                 session_image: None,
                 extra_mounts: Vec::new(),
+                mirror_binds: Vec::new(),
             })
             .unwrap(),
         )

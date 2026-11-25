@@ -65,7 +65,6 @@
 //! be provider-blind.
 
 use std::collections::{BTreeMap, HashMap};
-use std::io::Write;
 use std::path::Path;
 
 use chrono::{DateTime, Utc};
@@ -414,24 +413,15 @@ pub fn format_ranking_lines(accounts: &[MonitorAccount]) -> String {
     out
 }
 
-/// Atomic write of arbitrary ranking text (`<path>.tmp` + rename in the same
-/// directory). Shared by the probe and monitor writers.
+/// Atomic write of arbitrary ranking text via [`crate::fs_util::write_atomic`]
+/// (uniquely named temp file in the same directory + rename). Shared by the
+/// probe and monitor writers.
 pub fn write_ranking_text(text: &str, ranking_path: &Path) -> std::io::Result<()> {
-    if let Some(parent) = ranking_path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    let tmp = ranking_path.with_file_name(format!(
-        "{}.tmp",
-        ranking_path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or(".ranking")
-    ));
-    {
-        let mut f = std::fs::File::create(&tmp)?;
-        f.write_all(text.as_bytes())?;
-    }
-    std::fs::rename(&tmp, ranking_path)
+    crate::fs_util::write_atomic(
+        ranking_path,
+        text.as_bytes(),
+        crate::fs_util::AtomicOpts::default(),
+    )
 }
 
 /// Write the monitor-sourced `.ranking` (pipe format) atomically. Mirrors

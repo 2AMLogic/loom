@@ -5,11 +5,13 @@
 //! for every root, with the registry lock released:
 //!
 //! 1. take the read the claim release made before its restore write
-//!    (`sweep_registry::step_spawn::ended::take_post`), or, when nothing
-//!    released the claim, read the item once from the forge (the PR for a PR
-//!    step, else the issue): its labels, and whether it is closed;
+//!    (`sweep_registry::step_spawn::ended::take_post`), or — when nothing
+//!    released the claim, or the release noted its own read FAILED
+//!    (#14899: a fail-open release, #11480) — read the item once from the
+//!    forge (the PR for a PR step, else the issue): its labels, and whether
+//!    it is closed;
 //! 2. compute the role's [`PostState`] from that read ([`post_state`]), or
-//!    `None` when the read failed, never a default;
+//!    `None` when no read succeeded, never a default;
 //! 3. read the session's own outcome line from its log
 //!    ([`outcome_ledger::parse_outcome_line`]);
 //! 4. [`outcome_ledger::classify`] the two, and record the result
@@ -66,13 +68,38 @@ pub fn read_object(v: &serde_json::Value) -> Option<(Vec<String>, bool)> {
     Some((labels, closed))
 }
 
-/// The session's outcome line in its log, after its own dispatch header.
+/// The post-state `settle` classifies with (#14899): the claim release's own
+/// read when it made one; otherwise — including when the release noted its
+/// read FAILED (a fail-open release, #11480, notes `Some(None)`) — one read
+/// now, supplied by `read_now`. A noted failed read is the absence of an
+/// observation, not an observation of failure: a confirmed verdict write on
+/// the item survives the release's unavailable readback through the read-now
+/// fallback, and `probe_failed` is reserved for the boundary where no read
+/// of the item succeeded at all. Pure.
+#[must_use]
+fn resolve_post(
+    noted: Option<Option<PostState>>,
+    read_now: impl FnOnce() -> Option<PostState>,
+) -> Option<PostState> {
+    noted.flatten().or_else(read_now)
+}
+
+/// The session's outcome line in its log, read only in its own dispatch's
+/// section of the append-mode per-item log (#14874): text after the next
+/// dispatch header is a later dispatch's, not this step's. A log that never
+/// carried a header is a launch-time refusal's whole text (the headerless
+/// fallback [`seat_dirty_line`] exists for); a log whose headers name only
+/// other dispatches supplies no evidence at all.
 fn outcome_line(step: &EndedStep) -> Option<outcome_ledger::StepOutcome> {
     let text = String::from_utf8_lossy(&std::fs::read(&step.log_path).ok()?).into_owned();
-    let anchor = format!("sweep_id={} ", step.sweep_id);
-    let from = text.rfind(&anchor).unwrap_or(0);
-    let text = &text[from..];
-    outcome_ledger::parse_outcome_line(text, step.role, step.item).or_else(|| seat_dirty_line(text))
+    match outcome_ledger::dispatch_section(&text, &step.sweep_id) {
+        outcome_ledger::DispatchSection::Section(section) => {
+            outcome_ledger::parse_outcome_line(section, step.role, step.item)
+                .or_else(|| seat_dirty_line(section))
+        }
+        outcome_ledger::DispatchSection::Headerless(all) => seat_dirty_line(all),
+        outcome_ledger::DispatchSection::Absent => None,
+    }
 }
 
 /// A step that never ran because its seat's private clone refused preparation
@@ -188,6 +215,27 @@ pub fn ledger_reason(spawn_reason: &str) -> Option<&'static str> {
     }
 }
 
+fn refusal_ledger_reason(spawn_reason: &str, detail: Option<&str>) -> Option<&'static str> {
+    // Match the start of the static Codex containment rejection and its
+    // preparation cause. A path, diagnostic excerpt or preference summary
+    // that mentions the marker is still an ordinary admission refusal.
+    if spawn_reason == "runtime_rejected"
+        && detail
+            .and_then(|detail| {
+                detail.strip_prefix(concat!(
+                    "unmet capabilities: worktreeIsolation; ",
+                    "verified private-clone containment could not satisfy it: ",
+                    "private workspace preparation refused: ",
+                ))
+            })
+            .and_then(|cause| cause.strip_prefix(outcome_ledger::SEAT_DIRTY))
+            .is_some_and(|detail| detail.starts_with(": private clone/worktree is dirty;"))
+    {
+        return Some(outcome_ledger::SEAT_DIRTY);
+    }
+    ledger_reason(spawn_reason)
+}
+
 /// Record a spawn-time refusal of `(item, role)` in the ledger, so the next
 /// draw skips the pair while it cools down and the `claim_lost` counter
 /// counts (the integrated review's M1).
@@ -197,8 +245,9 @@ pub fn record_refusal(
     item: u32,
     role: StepRole,
     spawn_reason: &str,
+    detail: Option<&str>,
 ) {
-    let Some(reason) = ledger_reason(spawn_reason) else {
+    let Some(reason) = refusal_ledger_reason(spawn_reason, detail) else {
         return;
     };
     let run = StepRun {
@@ -249,7 +298,12 @@ pub fn settle(root: &Path, registry: &Arc<Mutex<SweepRegistry>>) {
     for step in steps {
         // The claim release's own read, taken before its restore write; else
         // one read now (nothing restored the claim, so nothing moved it).
-        let post = ended::take_post(root, &step.sweep_id).unwrap_or_else(|| {
+        // #14899: the release's own read when it made one. A noted FAILED
+        // read (#11480 released fail-open without one) is not a verdict
+        // about the item — it is the absence of an observation, so the
+        // read-now fallback runs for it exactly as for a step nothing
+        // released. Only both reads failing together is `probe_failed`.
+        let post = resolve_post(ended::take_post(root, &step.sweep_id), || {
             crate::comment_trust::records::fetch_issue_object(
                 &slug,
                 &step.item.to_string(),
@@ -365,6 +419,29 @@ mod tests {
         assert_eq!(ledger_reason("admission_refused"), Some("admission"));
     }
 
+    #[test]
+    fn only_the_dirty_private_preparation_refusal_gets_the_specific_ledger_reason() {
+        let isolation = "unmet capabilities: worktreeIsolation; verified private-clone \
+                         containment could not satisfy it: ";
+        let dirty = "private workspace preparation refused: seat_dirty: private \
+                     clone/worktree is dirty; retain and recover its work before reuse\n  M file";
+        let refusal = |reason, detail: String| refusal_ledger_reason(reason, Some(&detail));
+        assert_eq!(
+            refusal("runtime_rejected", format!("{isolation}{dirty}")),
+            Some(outcome_ledger::SEAT_DIRTY)
+        );
+        assert_eq!(
+            refusal("runtime_rejected", format!("{isolation}failed to open path: {dirty}")),
+            Some("admission")
+        );
+        assert_eq!(
+            refusal("runtime_rejected", format!("candidate skipped: {isolation}{dirty}")),
+            Some("admission")
+        );
+        assert_eq!(refusal("roll_paused", format!("{isolation}{dirty}")), None);
+        assert_eq!(refusal_ledger_reason("spawn_failed", None), Some("pool_gate"));
+    }
+
     /// #14458: a step that died on its seat's dirty leftover worktree wrote no
     /// outcome line; its log's refusal names the reason instead of leaving it
     /// `unclassified`, and a real outcome line still wins.
@@ -380,6 +457,198 @@ mod tests {
         // Prose that merely mentions the word is not the refusal.
         assert!(seat_dirty_line("the seat_dirty reason is documented").is_none());
         assert!(seat_dirty_line("private workspace preparation refused: base is missing").is_none());
+    }
+
+    #[test]
+    fn headerless_routing_accepts_only_the_launch_refusal() {
+        let dir = tempfile::tempdir().unwrap();
+        let step = EndedStep {
+            sweep_id: "step-judge-4-1".into(),
+            item: 4,
+            role: StepRole::Judge,
+            log_path: dir.path().join("step.log"),
+            ran_for: std::time::Duration::from_secs(60),
+            timed_out: false,
+            provider_exhausted: false,
+            launch_rejection: None,
+        };
+        for (text, evidence, reason) in [
+            (
+                "LOOM_STEP_OUTCOME role=judge target=4 class=noop reason=ci_pending\n",
+                None,
+                outcome_ledger::UNCLASSIFIED,
+            ),
+            (
+                "Error: private workspace preparation refused: seat_dirty: dirty\n",
+                Some(outcome_ledger::SEAT_DIRTY),
+                outcome_ledger::SEAT_DIRTY,
+            ),
+        ] {
+            std::fs::write(&step.log_path, text).unwrap();
+            let line = outcome_line(&step);
+            assert_eq!(line.as_ref().map(|outcome| outcome.reason.as_str()), evidence);
+            let released = post_state(step.role, &labels(&["loom:review-requested"]), false);
+            let run = run_of(&step, line.as_ref(), Some(released));
+            assert_eq!(run.outcome.class, OutcomeClass::Failed);
+            assert_eq!(run.outcome.reason, reason);
+            assert!(outcome_ledger::counts_as_run(&run.outcome));
+        }
+    }
+
+    #[test]
+    fn an_explicit_child_outcome_wins_over_the_dirty_seat_marker_in_its_log() {
+        let dir = tempfile::tempdir().unwrap();
+        let step = EndedStep {
+            sweep_id: "step-curator-14521-1".into(),
+            item: 14521,
+            role: StepRole::Curator,
+            log_path: dir.path().join("step.log"),
+            ran_for: std::time::Duration::from_secs(1),
+            timed_out: false,
+            provider_exhausted: false,
+            launch_rejection: None,
+        };
+        std::fs::write(
+            &step.log_path,
+            "==== loom-daemon dispatch: t sweep_id=step-curator-14521-1 item=14521 step=curator ====\n\
+             Error: private workspace preparation refused: seat_dirty: private clone/worktree is dirty;\n\
+             LOOM_STEP_OUTCOME role=curator target=14521 class=noop reason=already-curated\n",
+        )
+        .unwrap();
+        let outcome = outcome_line(&step).unwrap();
+        assert_eq!(outcome.class, OutcomeClass::Noop);
+        assert_eq!(outcome.reason, "already_curated");
+    }
+
+    /// #14874: routing reads its outcome line only in its own dispatch's
+    /// section of the append-mode per-item log. A later dispatch's result
+    /// for the same item is not this step's, and a log whose headers name
+    /// only other dispatches supplies no evidence at all — not another
+    /// dispatch's outcome, not its dirty-seat message.
+    #[test]
+    fn routing_reads_only_its_own_dispatchs_section() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("step.log");
+        let header =
+            |id: &str| format!("==== loom-daemon dispatch: t sweep_id={id} item=4 step=judge ====");
+        let step = |id: &str| EndedStep {
+            sweep_id: id.into(),
+            item: 4,
+            role: StepRole::Judge,
+            log_path: log.clone(),
+            ran_for: std::time::Duration::from_secs(60),
+            timed_out: false,
+            provider_exhausted: false,
+            launch_rejection: None,
+        };
+        std::fs::write(
+            &log,
+            format!(
+                "{}\nLOOM_STEP_OUTCOME role=judge target=4 class=failed reason=crash\n\
+                 {}\nLOOM_STEP_OUTCOME role=judge target=4 class=noop reason=ci_pending\n\
+                 {}\nError: private workspace preparation refused: seat_dirty: dirty\n",
+                header("j-4-1"),
+                header("j-4-2"),
+                header("j-4-3"),
+            ),
+        )
+        .unwrap();
+        // The requested dispatch's own result — the earlier failure stays
+        // the earlier sweep's, the later dirty-seat message the later one's.
+        let outcome = outcome_line(&step("j-4-2")).unwrap();
+        assert_eq!((outcome.class.as_str(), outcome.reason.as_str()), ("noop", "ci_pending"));
+        assert_eq!(outcome_line(&step("j-4-1")).unwrap().class, OutcomeClass::Failed);
+        // An empty requested section: the later dispatch's dirty-seat text
+        // is not evidence, so there is no line at all.
+        std::fs::write(
+            &log,
+            format!(
+                "{}\nLOOM_STEP_OUTCOME role=judge target=4 class=failed reason=crash\n\
+                 {}\n{}",
+                header("j-4-1"),
+                header("j-4-2"),
+                header("j-4-3"),
+            ),
+        )
+        .unwrap();
+        assert!(outcome_line(&step("j-4-2")).is_none());
+        assert!(outcome_line(&step("j-4-4")).is_none(), "no such dispatch");
+        // The no-line run keeps the ledger's own classification.
+        let run = run_of(&step("j-4-2"), None, None);
+        assert_eq!(
+            (run.outcome.class.as_str(), run.outcome.reason.as_str()),
+            ("failed", outcome_ledger::PROBE_FAILED)
+        );
+    }
+
+    /// #14874: a Champion `requeued` in its own dispatch yields the routing
+    /// line `noop/requeued`; with the line only in a later dispatch and the
+    /// requested section empty, routing gets no line.
+    #[test]
+    fn a_champion_requeued_routes_from_its_own_dispatch_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("step.log");
+        let header = |id: &str| {
+            format!("==== loom-daemon dispatch: t sweep_id={id} item=4 step=champion_merge ====")
+        };
+        let step = |id: &str| EndedStep {
+            sweep_id: id.into(),
+            item: 4,
+            role: StepRole::ChampionMerge,
+            log_path: log.clone(),
+            ran_for: std::time::Duration::from_secs(60),
+            timed_out: false,
+            provider_exhausted: false,
+            launch_rejection: None,
+        };
+        std::fs::write(
+            &log,
+            format!("{}\nCHAMPION-STEP mode=pr item=4 outcome=requeued\n", header("c-4-1")),
+        )
+        .unwrap();
+        let run = run_of(&step("c-4-1"), outcome_line(&step("c-4-1")).as_ref(), None);
+        assert_eq!((run.outcome.class.as_str(), run.outcome.reason.as_str()), ("noop", "requeued"));
+        // The `requeued` only in the later dispatch: no line for the
+        // requested one.
+        std::fs::write(
+            &log,
+            format!(
+                "{}\n{}\nCHAMPION-STEP mode=pr item=4 outcome=requeued\n",
+                header("c-4-1"),
+                header("c-4-2"),
+            ),
+        )
+        .unwrap();
+        assert!(outcome_line(&step("c-4-1")).is_none());
+    }
+
+    /// #14874 + #14168: a bare, backticked and JSON-framed current-dispatch
+    /// outcome line all classify the same through routing.
+    #[test]
+    fn wrapped_outcome_lines_read_through_routing() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("step.log");
+        let header = "==== loom-daemon dispatch: t sweep_id=j-4-1 item=4 step=judge ====\n";
+        for line in [
+            "LOOM_STEP_OUTCOME role=judge target=4 class=noop reason=ci-pending",
+            "`LOOM_STEP_OUTCOME role=judge target=4 class=noop reason=ci_pending`",
+            "{\"type\":\"text\",\"text\":\"LOOM_STEP_OUTCOME role=judge target=4 class=noop \
+             reason=ci_pending\\n\"}",
+        ] {
+            std::fs::write(&log, format!("{header}{line}\n")).unwrap();
+            let step = EndedStep {
+                sweep_id: "j-4-1".into(),
+                item: 4,
+                role: StepRole::Judge,
+                log_path: log.clone(),
+                ran_for: std::time::Duration::from_secs(60),
+                timed_out: false,
+                provider_exhausted: false,
+                launch_rejection: None,
+            };
+            let outcome = outcome_line(&step).unwrap_or_else(|| panic!("no line read: {line}"));
+            assert_eq!((outcome.class.as_str(), outcome.reason.as_str()), ("noop", "ci_pending"));
+        }
     }
 
     fn classify_with(line: Option<&outcome_ledger::StepOutcome>) -> outcome_ledger::StepOutcome {
@@ -554,5 +823,156 @@ mod tests {
         // A probe failure (forge read failed) is not the launcher's word.
         let probe = run_of(&base, None, None);
         assert_eq!(probe.outcome.reason, outcome_ledger::PROBE_FAILED);
+    }
+
+    /// #14899: a noted post-state is final — the fresh read never runs for
+    /// it (a release that read the item already spoke; a second read now
+    /// would see its own restore write).
+    #[test]
+    fn a_noted_read_is_final_without_a_fresh_one() {
+        let moved = post_state(StepRole::Judge, &labels(&["loom:pr"]), false);
+        assert!(moved.moved);
+        assert_eq!(
+            resolve_post(Some(Some(moved)), || panic!("read_now must not run")),
+            Some(moved)
+        );
+    }
+
+    /// #14899: a release that noted its own read FAILED (#11480 released
+    /// fail-open without one) noted the absence of an observation, not an
+    /// observation of failure — the settle-time read runs for it exactly as
+    /// for a step nothing released, and its result classifies.
+    #[test]
+    fn a_noted_failed_release_read_falls_through_to_a_fresh_read() {
+        let unchanged = post_state(StepRole::Judge, &labels(&["loom:review-requested"]), false);
+        assert!(!unchanged.moved && !unchanged.claim_held);
+        assert_eq!(resolve_post(Some(None), || Some(unchanged)), Some(unchanged));
+        assert_eq!(resolve_post(None, || Some(unchanged)), Some(unchanged));
+        // No successful read at all: the honest `probe_failed` boundary.
+        assert_eq!(resolve_post(Some(None), || None), None);
+        assert_eq!(resolve_post(None, || None), None);
+    }
+
+    /// #14899, natural population (this host, 2026-11-20/21): a Judge that
+    /// wrote its verdict and emitted its line, whose release's veto read
+    /// timed out fail-open, classified `failed probe_failed` — the confirmed
+    /// write discarded. With the fresh read at settle, the same note and a
+    /// readable item make the write survive; with no readable item at all,
+    /// the unsupported approval stays `probe_failed` (unverified), and the
+    /// session's line alone still never makes the verdict.
+    #[test]
+    fn a_confirmed_verdict_write_survives_an_unavailable_release_read() {
+        let step = EndedStep {
+            sweep_id: "step-judge-7957-1795152260".into(),
+            item: 7957,
+            role: StepRole::Judge,
+            log_path: "/nonexistent".into(),
+            ran_for: std::time::Duration::from_secs(240),
+            timed_out: false,
+            provider_exhausted: false,
+            launch_rejection: None,
+        };
+        let line = outcome_ledger::StepOutcome::new(OutcomeClass::Verdict, "approved");
+        let approved = post_state(StepRole::Judge, &labels(&["loom:pr"]), false);
+        assert!(approved.moved, "fixture: `loom:pr` is the Judge's write");
+        let post = resolve_post(Some(None), || Some(approved));
+        let run = run_of(&step, Some(&line), post);
+        assert_eq!(run.outcome.class, OutcomeClass::Verdict);
+        assert_eq!(run.outcome.reason, "approved");
+        // Both reads unavailable: the line is not trusted alone.
+        let post = resolve_post(Some(None), || None);
+        let run = run_of(&step, Some(&line), post);
+        assert_eq!(run.outcome.class, OutcomeClass::Failed);
+        assert_eq!(run.outcome.reason, outcome_ledger::PROBE_FAILED);
+    }
+
+    /// #14899: sanitized natural final-output fragments, one per boundary of
+    /// the sampled population. The Claude tails carry an emitted line — a
+    /// markdown-wrapped `noop ci_pending` (the #14814 bounded-CI handback
+    /// vocabulary) and a fenced bare `refused forge-read-shed` — and both
+    /// PARSE: their `probe_failed` records were readback failures, not
+    /// parser rejections. The Codex tail is a launch-time refusal (hook
+    /// trust, exit 1) whose line is genuinely ABSENT: no parse rejects it,
+    /// there is nothing to reject.
+    #[test]
+    fn natural_judge_tails_distinguish_an_absent_line_from_a_parser_rejection() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("step-judge-9764.log");
+        let header = |id: &str, item: u32| {
+            format!("==== loom-daemon dispatch: t sweep_id={id} item={item} step=judge ====")
+        };
+        let step = |id: &str, item: u32| EndedStep {
+            sweep_id: id.into(),
+            item,
+            role: StepRole::Judge,
+            log_path: log.clone(),
+            ran_for: std::time::Duration::from_secs(60),
+            timed_out: false,
+            provider_exhausted: false,
+            launch_rejection: None,
+        };
+        // Claude (kicad-tools #9764): the wrapper's markdown tail.
+        std::fs::write(
+            &log,
+            format!(
+                "{}\n**Not done, and still required before any approval:** `post-verdict.sh`.\n\
+                 **Outcome:** `LOOM_STEP_OUTCOME role=judge target=9764 class=noop \
+                 reason=ci_pending`\n[2026-11-20T09:33:59Z] [INFO] Claude wrapper exiting with \
+                 code 0\n",
+                header("step-judge-9764-1795166921", 9764),
+            ),
+        )
+        .unwrap();
+        let outcome = outcome_line(&step("step-judge-9764-1795166921", 9764))
+            .expect("the wrapped line parses");
+        assert_eq!((outcome.class.as_str(), outcome.reason.as_str()), ("noop", "ci_pending"));
+        // With the release's read failed fail-open, the fresh read now
+        // classifies the item unchanged and the typed line gets its meaning
+        // back: a minute-scale CI cooldown, not the fast-fail ladder.
+        let unchanged = post_state(StepRole::Judge, &labels(&["loom:review-requested"]), false);
+        let run = run_of(
+            &step("step-judge-9764-1795166921", 9764),
+            Some(&outcome),
+            resolve_post(Some(None), || Some(unchanged)),
+        );
+        assert_eq!(
+            (run.outcome.class.as_str(), run.outcome.reason.as_str()),
+            ("noop", "ci_pending")
+        );
+        // Claude (2am #7957): the typed refusal, fenced and bare.
+        std::fs::write(
+            &log,
+            format!(
+                "{}\n```\nLOOM_STEP_OUTCOME role=judge target=7957 class=refused \
+                 reason=forge-read-shed\n```\n",
+                header("step-judge-7957-1795152260", 7957),
+            ),
+        )
+        .unwrap();
+        let outcome = outcome_line(&step("step-judge-7957-1795152260", 7957))
+            .expect("the fenced line parses");
+        assert_eq!(
+            (outcome.class.as_str(), outcome.reason.as_str()),
+            ("refused", "forge_read_shed")
+        );
+        // Codex (kicad-tools #9806): the launch refusal — no session ever
+        // ran, so no line exists. Not a parser rejection: absent.
+        std::fs::write(
+            &log,
+            format!(
+                "{}\nspawn-worker: runtime=codex\nError: role judge merges or issues verdicts, \
+                 and Loom's guard hook is not proven for this private session\n\
+                 # LOOM_TERMINAL_RESULT v=2 provider=codex category=RECOVERABLE exit_code=1\n",
+                header("step-judge-9806-1795230515", 9806),
+            ),
+        )
+        .unwrap();
+        let step = step("step-judge-9806-1795230515", 9806);
+        assert!(outcome_line(&step).is_none(), "no line was emitted");
+        let run = run_of(&step, None, None);
+        assert_eq!(
+            (run.outcome.class.as_str(), run.outcome.reason.as_str()),
+            ("failed", outcome_ledger::PROBE_FAILED)
+        );
     }
 }

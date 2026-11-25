@@ -4,6 +4,7 @@
 
 use std::cell::RefCell;
 use std::path::Path;
+use std::time::Instant;
 
 use chrono::{TimeZone, Utc};
 
@@ -148,6 +149,24 @@ fn mark_session_managed(profile: &Path) {
 }
 
 #[test]
+fn missing_runtime_is_distinct_from_a_missing_container() {
+    struct MissingRuntime;
+    impl ProbeTransport for MissingRuntime {
+        fn host(&self, _: &Path) -> Result<ExecOutput> {
+            panic!("a session profile entered the host probe")
+        }
+
+        fn container(&self, _: &str) -> Result<Option<ExecOutput>> {
+            Err(std::io::Error::from(std::io::ErrorKind::NotFound).into())
+        }
+    }
+    let profile = tempfile::tempdir().unwrap();
+    mark_session_managed(profile.path());
+    let result = probe_account(&MissingRuntime, "agent-1", profile.path(), now());
+    assert_eq!(result.detail(), Some("container_runtime_unavailable"));
+}
+
+#[test]
 fn a_session_managed_profile_with_no_running_container_is_unavailable_and_never_probed_on_the_host()
 {
     let profile = tempfile::tempdir().unwrap();
@@ -224,6 +243,90 @@ fn a_timed_out_probe_is_reported_as_such() {
         probe_account(&transport, "agent-1", profile.path(), now()),
         ProbeOutcome::Failed("probe_timed_out")
     );
+}
+
+#[cfg(unix)]
+fn fake_probe(script: &str) -> (tempfile::TempDir, Command) {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("fake-probe");
+    std::fs::write(&path, format!("{script}\n")).unwrap();
+    let mut command = Command::new("/bin/sh");
+    command.arg(path);
+    (dir, command)
+}
+
+#[test]
+fn a_missing_probe_binary_is_unavailable_not_a_failed_probe() {
+    let dir = tempfile::tempdir().unwrap();
+    let output =
+        run_bounded_within(Command::new(dir.path().join("no-such-probe")), PROBE_TIMEOUT).unwrap();
+    assert_eq!(
+        output,
+        ExecOutput {
+            success: false,
+            unavailable: true,
+            timed_out: false,
+            exit_code: None,
+            output: String::new(),
+        }
+    );
+}
+
+#[test]
+#[cfg(unix)]
+fn a_probe_that_never_answers_times_out() {
+    let started = Instant::now();
+    let (_dir, command) = fake_probe("printf 'partial reply\\n'; /bin/sleep 30");
+    let output = run_bounded_within(command, Duration::from_millis(300)).unwrap();
+    assert!(output.timed_out, "{output:?}");
+    assert!(!output.success && !output.unavailable);
+    assert_eq!(output.exit_code, None);
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "a timed-out probe must return at its deadline, took {:?}",
+        started.elapsed()
+    );
+}
+
+#[test]
+#[cfg(unix)]
+fn a_timed_out_probe_does_not_wait_for_a_grandchild_holding_the_pipe() {
+    let started = Instant::now();
+    let (_dir, command) = fake_probe("/bin/sleep 30 & printf 'partial reply\\n'; wait");
+    let output = run_bounded_within(command, Duration::from_millis(300)).unwrap();
+    assert!(output.timed_out, "{output:?}");
+    assert!(
+        started.elapsed() < Duration::from_secs(10),
+        "the probe waited on a descendant that outlived its deadline, took {:?}",
+        started.elapsed()
+    );
+}
+
+#[test]
+#[cfg(unix)]
+fn probe_stdout_is_cut_at_max_output_bytes() {
+    const BLOCK: usize = 4096;
+    let cap = MAX_OUTPUT_BYTES as usize;
+    let block = "x".repeat(BLOCK);
+    for (blocks, tail) in [(cap / BLOCK, ""), (cap / BLOCK + 1, "END")] {
+        let (_dir, command) = fake_probe(&format!(
+            "i=0; while [ $i -lt {blocks} ]; do printf '%s' '{block}'; i=$((i+1)); done; \
+             printf '{tail}'"
+        ));
+        let output = run_bounded_within(command, PROBE_TIMEOUT).unwrap();
+        assert_eq!(output.exit_code, Some(0), "{output:?}");
+        assert!(output.success && !output.timed_out && !output.unavailable);
+        assert_eq!(output.output.len(), cap);
+        assert!(output.output.bytes().all(|byte| byte == b'x'));
+    }
+}
+
+#[test]
+#[cfg(unix)]
+fn probe_output_decodes_non_utf8_bytes_lossily() {
+    let (_dir, command) = fake_probe(r"printf 'a\377b'");
+    let output = run_bounded_within(command, PROBE_TIMEOUT).unwrap();
+    assert_eq!(output.output, "a\u{FFFD}b");
 }
 
 #[test]

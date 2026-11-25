@@ -339,7 +339,8 @@ fn claude(root: &Path) -> Availability {
 /// availability mapping" direction on #8436.
 ///
 /// **Known blind spot (#8443).** Role ticks do not record `TOKEN_EXHAUSTED`
-/// health holds — only the sweep reaper calls `record_terminal_for_model` —
+/// health holds — only the sweep reaper calls
+/// `record_terminal_for_model_with_reset` —
 /// so an account whose *usage* is capped can still read as spawnable here.
 /// That is a defect in the health feed this function consumes, not in the
 /// mapping; it makes the Codex tier read as available more often than it is,
@@ -373,36 +374,17 @@ fn codex(root: &Path, admitted: &ResolvedRuntime, now: u64) -> Availability {
     if !crate::role_runner::runtime_preflight::codex_pool_is_the_wall(root, admitted) {
         return ungated(CredentialSource::Unobservable);
     }
-    let state = crate::role_runner::runtime_preflight::codex_pool_state(root, now);
+    let state = crate::role_runner::runtime_preflight::codex_pool_state(
+        root,
+        now,
+        admitted.execution.is_none() && super::codex_guard::guarded(&admitted.role),
+    );
     if let Some((file, error)) = &state.read_error {
         return Availability::Exhausted {
             source,
             hold: PoolHold::Unreadable(*file),
             detail: format!("{} could not be read: {error}", file.as_str()),
         };
-    }
-    // A merging role may draw a Codex seat only when every seat it could draw
-    // runs Loom's guard hook (#9390 follow-up; see `codex_guard`). Otherwise
-    // the walk falls through to the next tap instead of selecting Codex and
-    // failing the tick in spawn-codex.sh's own fail-closed check.
-    if state.spawnable > 0 && super::codex_guard::guarded(&admitted.role) {
-        let unready = super::codex_guard::unready_profiles(root);
-        if unready.as_ref().map_or(true, |names| !names.is_empty()) {
-            return Availability::Exhausted {
-                source,
-                hold: PoolHold::Unprovisioned,
-                detail: match unready {
-                    Ok(names) => format!(
-                        "Loom's guard hook is not ready on Codex profile(s) {} for this \
-                         merging role ({}) — provision-codex-hooks.sh verify --all-profiles \
-                         --workspace <repo>; #9390",
-                        names.join(", "),
-                        admitted.role
-                    ),
-                    Err(reason) => format!("{reason} ({}) — #9390", admitted.role),
-                },
-            };
-        }
     }
     if state.spawnable > 0 {
         return Availability::Spawnable {
@@ -411,7 +393,7 @@ fn codex(root: &Path, admitted: &ResolvedRuntime, now: u64) -> Availability {
             total: Some(state.enabled),
         };
     }
-    let hold = if state.enabled == 0 {
+    let hold = if state.untrusted.len() == state.enabled {
         PoolHold::Unprovisioned
     } else {
         PoolHold::SelfHealing
@@ -447,6 +429,12 @@ fn codex(root: &Path, admitted: &ResolvedRuntime, now: u64) -> Availability {
 ///
 /// An unreadable pool directory is fail-closed too, matching the ladder's
 /// step 3 refusal.
+///
+/// A pooled provider counts only accounts **under their concurrency cap**
+/// (#14944): one that is selectable but already holds `maxConcurrent` live
+/// spawns would be refused by the ladder's tier 0, so a pool with nothing else
+/// is [`PoolHold::SelfHealing`] and the walk moves on. So is one whose free
+/// slots are all held by other draws' reservations (#14983).
 fn native(root: &Path, tap: &Tap, runtime: &str) -> Availability {
     let config = crate::config_resolver::resolve_effective_config(root);
     // An unresolvable profile is not this function's error to report: the
@@ -519,7 +507,14 @@ fn native(root: &Path, tap: &Tap, runtime: &str) -> Availability {
             }
         }
     }
-    let health = match crate::api_keys_pool::select::health(root, Some(&provider)) {
+    let health = match crate::api_keys_pool::select::health_in(
+        &crate::api_keys_pool::paths::pool_roots(root),
+        Some(&provider),
+        // #14932: a cap the workspace's `runtimes.apiKeyLimits` block declares
+        // counts here exactly as a file-declared one. The config is already
+        // resolved above; handing it over reads the tiers once per pass.
+        &crate::api_keys_pool::limits::ConfiguredLimits::from_config(&config),
+    ) {
         Ok(health) => health,
         Err(error) => {
             return Availability::Exhausted {
@@ -543,11 +538,38 @@ fn native(root: &Path, tap: &Tap, runtime: &str) -> Availability {
             ),
         };
     }
-    if entry.selectable > 0 {
+    // #14944: count what the selection ladder would offer, i.e. accounts under
+    // their declared `maxConcurrent`. `selectable` ignores the cap, so a pool
+    // whose every account was at it read as spawnable here, the draw picked
+    // it, and the launch was refused at 78 (`stage=credential`) with the tick
+    // lost. #14983: slots other draws have reserved count as taken too. This
+    // read holds nothing; a dispatching role tick takes its slot in
+    // `gate_admitted_candidate` (`api_keys_pool::reservation`), and the ladder
+    // stays the enforcement point.
+    let reserved_out = entry.unreserved_slots == Some(0);
+    if entry.selectable_under_cap > 0 && !reserved_out {
         return Availability::Spawnable {
             source,
-            spawnable: Some(entry.selectable),
+            spawnable: Some(entry.selectable_under_cap),
             total: Some(entry.total),
+        };
+    }
+    if entry.selectable_under_cap > 0 {
+        return Availability::Exhausted {
+            source,
+            hold: PoolHold::SelfHealing,
+            detail: reserved_detail(&provider),
+        };
+    }
+    if entry.selectable > 0 {
+        return Availability::Exhausted {
+            source,
+            hold: PoolHold::SelfHealing,
+            detail: format!(
+                "pool {provider} at cap: 0/{} selectable account(s) under maxConcurrent ({} at \
+                 capacity); clears when a spawn exits — #14944",
+                entry.selectable, entry.at_capacity
+            ),
         };
     }
     Availability::Exhausted {
@@ -563,6 +585,16 @@ fn native(root: &Path, tap: &Tap, runtime: &str) -> Availability {
             entry.total, entry.exhausted, entry.disabled, entry.at_capacity
         ),
     }
+}
+
+/// The skip detail for a pool whose last free slot another draw holds
+/// (#14983). Shares its `pool <provider> at cap` prefix with the #14944 skip,
+/// so one grep finds both.
+pub(crate) fn reserved_detail(provider: &str) -> String {
+    format!(
+        "pool {provider} at cap: every free slot under maxConcurrent is reserved by a concurrent \
+         draw; clears when that launch acquires or its reservation expires — #14983"
+    )
 }
 
 /// Whether an external native auth snapshot is configured — the one way a

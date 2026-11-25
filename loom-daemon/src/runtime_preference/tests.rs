@@ -52,6 +52,10 @@ pub(super) struct ClearedRuntimeEnv {
     _profile_root: tempfile::TempDir,
     /// Crate-wide `LOOM_CODEX_PROFILE_ROOT` lock (#9964); released after `Drop`.
     _profile_root_lock: crate::tokens_pool::profile_root_env::ProfileRootLock,
+    /// Crate-wide `LOOM_CODEX_HOME` lock (#15174); released after `Drop` and
+    /// after the profile-root lock above (acquired before it — see
+    /// `codex_home_env`'s documented lock order).
+    _codex_home_lock: crate::tokens_pool::codex_home_env::CodexHomeLock,
 }
 
 const ISOLATED_VARS: [&str; 17] = [
@@ -82,6 +86,7 @@ const ISOLATED_VARS: [&str; 17] = [
 
 impl ClearedRuntimeEnv {
     pub(super) fn new() -> Self {
+        let codex_home_lock = crate::tokens_pool::codex_home_env::lock();
         let profile_root_lock = crate::tokens_pool::profile_root_env::lock();
         let prior = ISOLATED_VARS
             .iter()
@@ -97,6 +102,7 @@ impl ClearedRuntimeEnv {
             prior,
             _profile_root: profile_root,
             _profile_root_lock: profile_root_lock,
+            _codex_home_lock: codex_home_lock,
         }
     }
 }
@@ -489,6 +495,29 @@ fn malformed_preference_config_fails_closed() {
     assert!(preference_for(&sibling, "builder")
         .unwrap_err()
         .contains("more than once"));
+}
+
+/// #14932: a `runtimes.apiKeyLimits` block that cannot be understood withholds
+/// accounts at selection time, so `validate` names it beside the other
+/// `runtimes.*` failings — before any launch meets it.
+#[test]
+fn a_malformed_api_key_limits_block_is_a_validate_finding() {
+    let config = serde_json::json!({
+        "runtimes": { "apiKeyLimits": { "zai": { "alice": { "maxConcurrent": 0 } } } }
+    });
+    let findings = check_runtimes_preference_config(&config);
+    assert_eq!(findings.len(), 1, "{findings:?}");
+    assert!(findings[0].starts_with("runtimes api-key limits: "), "{}", findings[0]);
+    assert!(
+        findings[0].contains("runtimes.apiKeyLimits.zai.alice.maxConcurrent must be > 0"),
+        "{}",
+        findings[0]
+    );
+    // A well-formed block, and an absent one, add nothing.
+    let sound = serde_json::json!({
+        "runtimes": { "apiKeyLimits": { "zai": { "alice": { "maxConcurrent": 1 } } } }
+    });
+    assert!(check_runtimes_preference_config(&sound).is_empty(), "{sound}");
 }
 
 // ---------------------------------------------------------------------------

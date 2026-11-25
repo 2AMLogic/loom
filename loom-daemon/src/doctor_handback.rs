@@ -40,6 +40,11 @@ pub const CLAIM: &str = "loom:treating";
 pub const QUEUE: &str = "loom:review-requested";
 /// The label the hand-back clears.
 pub const CHANGES: &str = "loom:changes-requested";
+/// The CI-failing-verdict companion of [`CHANGES`] (`.loom/roles/judge-ci-red.md`
+/// step 5). The hand-back clears it with `CHANGES` (#15020): left on after a
+/// hand-back, `verdict_gate` refuses every approval and `ci_gate_recovery`
+/// skips the pair, so the PR stalls with no automated exit.
+pub const CI_FAILURE: &str = "loom:ci-failure";
 /// Any of these present means a reviewer already has (or resolved) the PR.
 pub const ADVANCED: &[&str] = &[QUEUE, "loom:reviewing", "loom:pr"];
 /// Labels whose appearance during the write means a review raced the add.
@@ -89,8 +94,8 @@ pub fn snapshot_from_pull(doc: &Value) -> Option<Snapshot> {
 /// What the pre-write read says to do.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Plan {
-    /// Add `loom:review-requested`, then remove `loom:changes-requested` and
-    /// `loom:treating`.
+    /// Add `loom:review-requested`, then remove `loom:changes-requested`,
+    /// `loom:ci-failure` and `loom:treating`.
     HandBack,
     /// Remove only `loom:treating`; these advanced labels are already on.
     AlreadyAdvanced(Vec<String>),
@@ -214,7 +219,8 @@ pub fn rejection_precedes_claim(
 /// The result of one hand-back.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Outcome {
-    /// `loom:review-requested` on; `loom:changes-requested`/`loom:treating` off.
+    /// `loom:review-requested` on; `loom:changes-requested`/`loom:ci-failure`/
+    /// `loom:treating` off.
     HandedBack,
     /// The held stale approval was replaced by a fresh review request.
     HeldReview,
@@ -238,7 +244,10 @@ impl Outcome {
     pub fn render(&self) -> (String, i32) {
         match self {
             Self::HandedBack => (
-                format!("{SENTINEL} HANDED-BACK {QUEUE} added; {CHANGES} and {CLAIM} removed"),
+                format!(
+                    "{SENTINEL} HANDED-BACK {QUEUE} added; {CHANGES}, {CI_FAILURE} and {CLAIM} \
+                     removed"
+                ),
                 0,
             ),
             Self::HeldReview => (
@@ -297,6 +306,19 @@ pub fn lock_held_outcome(
         "lock held: another verdict on PR #{pr} has held the per-PR verdict lock for {age} \
          (waited {:.0}s); wrote nothing, retry",
         waited.as_secs_f32()
+    ))
+}
+
+/// The lock-unavailable outcome (#14617): the per-PR lock directory could not
+/// be created at all (read-only filesystem, permission denied), so no verdict
+/// holds it and waiting cannot help. Names the path and the OS error instead of
+/// reporting contention.
+#[must_use]
+pub fn lock_unavailable_outcome(pr: u64, lock: &std::path::Path, err: &std::io::Error) -> Outcome {
+    Outcome::Failed(format!(
+        "lock unavailable: cannot create the per-PR verdict lock {} for PR #{pr}: {err}; no \
+         other verdict holds it; wrote nothing (set LOOM_VERDICT_LOCK_DIR to a writable directory)",
+        lock.display()
     ))
 }
 
@@ -395,15 +417,18 @@ fn unverified_removal(forge: &mut impl Forge) -> Outcome {
 /// newer head. Undo our writes (the claim is already released) and stand down.
 /// The old rejection is restored only when nothing newer holds the PR: a
 /// verdict or review claim that landed on the newer head is not ours to
-/// contradict.
+/// contradict. Its CI companion (`restore_ci_failure`) is restored under the
+/// same terms, never beside a newer verdict.
 fn stand_down_head_moved(
     forge: &mut impl Forge,
     post: &Snapshot,
     restore_changes: bool,
+    restore_ci_failure: bool,
 ) -> Outcome {
     let newer_verdict = post.has(CHANGES) || post.has("loom:pr");
     let newer_state = newer_verdict || post.has("loom:reviewing");
-    let restored = !restore_changes || newer_state || forge.add(CHANGES);
+    let restored = (!restore_changes || newer_state || forge.add(CHANGES))
+        && (!restore_ci_failure || newer_state || forge.add(CI_FAILURE));
     // A review claim is an overlay on the queue label: without a verdict the
     // claim alone cannot bring the PR back if that review stands down.
     let keep_queue = !newer_verdict && post.has("loom:reviewing");
@@ -490,6 +515,14 @@ fn hand_back(forge: &mut impl Forge, pre: &Snapshot, expected_head: &str) -> Out
             fresh_rejection = true;
         }
     }
+    // A CI-failing verdict's companion label rides with the rejection being
+    // answered: cleared in the same write (#15020), or the re-queued PR is
+    // left `loom:review-requested` + `loom:ci-failure` — a pair `verdict_gate`
+    // refuses to approve and `ci_gate_recovery` skips. Kept when a fresh
+    // rejection landed: there the label may be the new verdict's own
+    // companion. Absent means no call at all, not an error.
+    let clear_ci_failure = pre.has(CI_FAILURE) && !fresh_rejection;
+    let ci_failure_removed = clear_ci_failure && forge.remove(CI_FAILURE);
     forge.remove(CLAIM);
     let Some(post) = forge.read() else {
         return Outcome::Failed("the labels could not be re-read to verify the hand-back".into());
@@ -499,13 +532,13 @@ fn hand_back(forge: &mut impl Forge, pre: &Snapshot, expected_head: &str) -> Out
     if !same_sha(&post.head_sha, expected_head) {
         if post.has(CLAIM) {
             // Same undo as a clean stand-down; the stuck claim makes it a failure.
-            stand_down_head_moved(forge, &post, changes_removed);
+            stand_down_head_moved(forge, &post, changes_removed, ci_failure_removed);
             return Outcome::Failed(format!(
                 "head moved to {} during the hand-back and {CLAIM} could not be removed",
                 post.head_sha
             ));
         }
-        return stand_down_head_moved(forge, &post, changes_removed);
+        return stand_down_head_moved(forge, &post, changes_removed, ci_failure_removed);
     }
     // A CHANGES that survives our own successful remove, or that we kept
     // because it is a new rejection, is a raced verdict, not a stuck label.
@@ -545,6 +578,11 @@ fn hand_back(forge: &mut impl Forge, pre: &Snapshot, expected_head: &str) -> Out
         if post.has(l) && !rivals.iter().any(|r| r == l) {
             problems.push(format!("still carries {l}"));
         }
+    }
+    // A rival verdict that landed owns the PR: its own CI companion (or the
+    // raced old one) is not ours to flag.
+    if clear_ci_failure && rivals.is_empty() && post.has(CI_FAILURE) {
+        problems.push(format!("still carries {CI_FAILURE}"));
     }
     if !problems.is_empty() {
         return Outcome::Failed(format!("the hand-back did not hold: {}", problems.join("; ")));

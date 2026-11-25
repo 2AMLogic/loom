@@ -105,6 +105,25 @@ impl Pool {
         )
     }
 
+    fn read_checksum(&self, repo: &str) -> GhInvocation {
+        let slug = format!("acme/{repo}");
+        GhInvocation::new(
+            Operation::new("release.checksum"),
+            AccessIntent::Read,
+            GhTarget::repo(&slug).unwrap(),
+            Duration::from_secs(10),
+        )
+        .program(&self.gh)
+        .current_dir(self._tmp.path())
+        .args([
+            "api",
+            &format!("repos/{slug}/releases/assets/773"),
+            "--include",
+            "-H",
+            "Accept: application/octet-stream",
+        ])
+    }
+
     /// Run `inv` against a two-reader router (`reader-2` home, `reader-1`
     /// next) that honours this run's withdrawals; `pre` readers start
     /// withdrawn. With every reader withdrawn the router answers a
@@ -136,7 +155,7 @@ impl Pool {
             asked.borrow_mut().push(req.owner_repo.to_string());
             let w = withdrawn.borrow();
             for (app, dir) in [("app-2", &r2), ("app-1", &r1)] {
-                if !w.contains(app) {
+                if !w.contains(app) && req.cooldown(app, now).is_none() {
                     return RouteDecision::Reader {
                         dir: dir.clone(),
                         app_id: app.to_string(),
@@ -145,7 +164,12 @@ impl Pool {
                 }
             }
             RouteDecision::Exhausted {
-                until: now + Duration::from_secs(900),
+                until: req
+                    .reader_cooldowns
+                    .iter()
+                    .map(|(_, until)| *until)
+                    .min()
+                    .unwrap_or(now + Duration::from_secs(900)),
                 cause,
             }
         };
@@ -214,6 +238,353 @@ fn a_gate_read_is_shed_like_any_other_and_an_unclassified_read_is_gate() {
         Duration::from_secs(1),
     );
     assert_eq!(unclassified.class(), ReadClass::Gate);
+}
+
+#[test]
+fn only_primary_graphql_gate_exhaustion_is_preserved_for_a_rest_fallback() {
+    const PRIMARY: &str = "echo 'GraphQL: API rate limit already exceeded' >&2; exit 1";
+    const SECONDARY: &str = "echo 'GraphQL: You have exceeded a secondary rate limit' >&2; exit 1";
+    const GENERIC_429: &str = "echo 'gh: HTTP 429' >&2; exit 1";
+    for (label, reader, class, cause, pre, expected) in [
+        (
+            "unqualified budget",
+            PRIMARY,
+            ReadClass::Gate,
+            ExhaustCause::Budget,
+            &["app-1", "app-2"][..],
+            false,
+        ),
+        (
+            "established primary",
+            PRIMARY,
+            ReadClass::Gate,
+            ExhaustCause::GraphqlPrimaryBudget,
+            &["app-1", "app-2"][..],
+            true,
+        ),
+        (
+            "observed primary",
+            PRIMARY,
+            ReadClass::Gate,
+            ExhaustCause::GraphqlPrimaryBudget,
+            &[][..],
+            true,
+        ),
+        (
+            "permission",
+            NOT_FOUND,
+            ReadClass::Gate,
+            ExhaustCause::GraphqlPrimaryBudget,
+            &[][..],
+            false,
+        ),
+        (
+            "secondary",
+            SECONDARY,
+            ReadClass::Gate,
+            ExhaustCause::GraphqlPrimaryBudget,
+            &[][..],
+            false,
+        ),
+        (
+            "unqualified 429",
+            GENERIC_429,
+            ReadClass::Gate,
+            ExhaustCause::GraphqlPrimaryBudget,
+            &[][..],
+            false,
+        ),
+        ("withdrawn", PRIMARY, ReadClass::Gate, ExhaustCause::Withdrawn, &[][..], false),
+        (
+            "headroom reserve",
+            PRIMARY,
+            ReadClass::Hygiene,
+            ExhaustCause::GraphqlPrimaryBudget,
+            &[][..],
+            false,
+        ),
+    ] {
+        let p = pool(PRIMARY, reader, OK);
+        let read = GhInvocation::new(
+            Operation::new("parent_link.marker_children"),
+            AccessIntent::Read,
+            GhTarget::None,
+            Duration::from_secs(10),
+        )
+        .program(&p.gh)
+        .reader_only()
+        .reader_repo("acme/admission")
+        .args(["issue", "list", "--repo", "acme/admission"])
+        .read_class(class);
+        let (out, _, _) = p.run_as(read, pre, SystemTime::now(), cause);
+        assert_eq!(
+            p.who(),
+            if pre.is_empty() {
+                vec![Who::R2, Who::R1]
+            } else {
+                Vec::new()
+            },
+            "{label}: never uses the writer",
+        );
+        let outcome = super::super::outcome::classify(Ok(out), Duration::from_secs(10));
+        let CmdOutcome::Unavailable(Unavailable::Shed {
+            graphql_budget_exhausted,
+            ..
+        }) = outcome
+        else {
+            panic!("{label}: expected a shed, got {outcome:?}");
+        };
+        assert_eq!(graphql_budget_exhausted, expected, "{label}");
+    }
+}
+
+#[test]
+fn real_scoped_withdrawals_require_primary_only_graphql_evidence() {
+    use crate::forge_bucket_book::{self, BucketKey, Reading, Source};
+    use crate::forge_identity::{self, route, Identity, Roster, RoutingMode};
+    use crate::forge_read_pool::{self, ResourceScope};
+
+    enum Prior {
+        None,
+        LongerGeneric,
+        Coverage,
+        PositiveReading(i64),
+    }
+
+    let pool = pool("exit 76", "exit 76", "exit 76");
+    let start = SystemTime::now();
+    let primary_for = |seconds| Failure::RateLimited {
+        resource: Resource::Graphql,
+        reset: Some(start + Duration::from_secs(seconds)),
+        secondary: false,
+        retry_after: None,
+        remaining: Some(0),
+        graphql_primary_message: false,
+    };
+    let primary = primary_for(120);
+    let secondary = Failure::RateLimited {
+        resource: Resource::Graphql,
+        reset: None,
+        secondary: true,
+        retry_after: Some(Duration::from_secs(10)),
+        remaining: None,
+        graphql_primary_message: false,
+    };
+    let headroom = Failure::RateLimited {
+        resource: Resource::Graphql,
+        reset: None,
+        secondary: false,
+        retry_after: None,
+        remaining: Some(12),
+        graphql_primary_message: false,
+    };
+    let classify = |stderr, status| {
+        forge_identity::classify_failure_in(
+            RoutingMode::Scoped,
+            stderr,
+            status,
+            None,
+            Resource::Graphql,
+        )
+        .unwrap()
+    };
+    let unqualified_429 = classify("gh: HTTP 429", Some(429));
+    let explicit_primary = classify("GraphQL: API rate limit already exceeded", None);
+    let primary_long = primary_for(300);
+    for (label, first, second, prior, at, expected) in [
+        ("primary", vec![primary], primary, Prior::None, 0, true),
+        ("explicit primary", vec![explicit_primary], primary, Prior::None, 0, true),
+        ("unqualified 429", vec![unqualified_429], primary, Prior::None, 0, false),
+        ("secondary", vec![secondary], secondary, Prior::None, 0, false),
+        ("headroom", vec![headroom], primary, Prior::None, 0, false),
+        ("same reader headroom", vec![primary, headroom], primary, Prior::None, 0, false),
+        (
+            "same reader secondary",
+            vec![primary, secondary],
+            primary,
+            Prior::None,
+            0,
+            false,
+        ),
+        (
+            "same reader credential",
+            vec![primary, Failure::Credential],
+            primary,
+            Prior::None,
+            0,
+            false,
+        ),
+        ("secondary expired", vec![primary, secondary], primary, Prior::None, 11, true),
+        (
+            "older positive reading",
+            vec![primary],
+            primary,
+            Prior::PositiveReading(-1),
+            0,
+            true,
+        ),
+        (
+            "newer positive reading",
+            vec![primary],
+            primary,
+            Prior::PositiveReading(1),
+            1,
+            false,
+        ),
+        (
+            "generic hold outlives proof",
+            vec![primary],
+            primary_long,
+            Prior::LongerGeneric,
+            150,
+            false,
+        ),
+        ("coverage is not proof", vec![primary], primary, Prior::Coverage, 0, false),
+    ] {
+        let slug = format!("proof-{at}-{label}/admission").replace(' ', "-");
+        let owner = slug.split_once('/').unwrap().0;
+        let readers: Vec<_> = ["90147", "90148"]
+            .into_iter()
+            .map(|app_id| Identity {
+                app_id: app_id.to_owned(),
+                slug: None,
+                private_key_path: pool._tmp.path().join("unused.pem"),
+                owners: None,
+            })
+            .collect();
+        let first_app = &readers[0].app_id;
+        match prior {
+            Prior::None => {}
+            Prior::LongerGeneric => {
+                forge_read_pool::withdraw_scoped_budget_until(
+                    first_app,
+                    owner,
+                    ResourceScope::Graphql,
+                    start + Duration::from_secs(300),
+                );
+            }
+            Prior::Coverage => {
+                forge_identity::withdraw_reader_for_repo_until(
+                    first_app,
+                    &slug,
+                    start + Duration::from_secs(300),
+                );
+            }
+            Prior::PositiveReading(offset) => {
+                let seen = i64::try_from(
+                    start
+                        .duration_since(SystemTime::UNIX_EPOCH)
+                        .unwrap()
+                        .as_secs(),
+                )
+                .unwrap()
+                    + offset;
+                forge_bucket_book::insert(
+                    BucketKey::new(&format!("app-{first_app}"), owner, Resource::Graphql),
+                    Reading {
+                        limit: Some(5000),
+                        remaining: Some(12),
+                        used: None,
+                        reset_epoch: seen + 300,
+                        observed_at: seen,
+                        source: Source::Header,
+                    },
+                );
+            }
+        }
+        let expires = (chrono::Utc::now() + chrono::Duration::minutes(50)).to_rfc3339();
+        for (reader, failures) in readers.iter().zip([first, vec![second]]) {
+            let dir = forge_identity::reader_dir(pool._tmp.path(), owner, reader);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("hosts.yml"), "{}\n").unwrap();
+            forge_identity::sidecar::write_sidecar(
+                &dir,
+                &forge_identity::Sidecar {
+                    app_id: reader.app_id.clone(),
+                    expires_at: expires.clone(),
+                    installation_id: "1".to_owned(),
+                    owner: Some(owner.to_owned()),
+                    ..forge_identity::Sidecar::default()
+                },
+            )
+            .unwrap();
+            for failure in failures {
+                forge_identity::withdraw_after_in(
+                    RoutingMode::Scoped,
+                    &reader.app_id,
+                    &slug,
+                    failure,
+                    "fixture",
+                    start,
+                    &|_, _, _| None,
+                );
+            }
+        }
+        let roster = Roster {
+            readers,
+            ..Roster::default()
+        };
+        let cfg = route::RoutingConfig::default();
+        let env = route::RouteEnv {
+            mode: RoutingMode::Scoped,
+            cfg: &cfg,
+        };
+        let now = start + Duration::from_secs(at);
+        let output = GhInvocation::new(
+            Operation::new("parent_link.marker_children"),
+            AccessIntent::Read,
+            GhTarget::None,
+            Duration::from_secs(10),
+        )
+        .program(&pool.gh)
+        .reader_only()
+        .reader_repo(&slug)
+        .args(["issue", "list", "--repo", &slug])
+        .execute_routed_v2_at(
+            &|req| route::route_read_in(pool._tmp.path(), &roster, req, &env, now),
+            &|_, _, _, _| panic!("fixture should never execute gh"),
+            now,
+        )
+        .unwrap();
+        assert!(pool.who().is_empty(), "{label}");
+        let GhCompletion::Shed {
+            graphql_budget_exhausted,
+            ..
+        } = output
+        else {
+            panic!("{label}: expected a shed, got {output:?}");
+        };
+        assert_eq!(graphql_budget_exhausted, expected, "{label}");
+    }
+}
+
+#[test]
+fn repo_scoped_rest_search_uses_the_intended_reader() {
+    let p = pool(OK, OK, "exit 76");
+    let request = GhInvocation::new(
+        Operation::new("parent_link.marker_children_rest"),
+        AccessIntent::Read,
+        GhTarget::None,
+        Duration::from_secs(10),
+    )
+    .program(&p.gh)
+    .reader_only()
+    .reader_repo("acme/admission-search")
+    .args([
+        "api",
+        "search/issues",
+        "--method",
+        "GET",
+        "-f",
+        "q=marker repo:acme/admission-search is:issue",
+    ]);
+    let (out, _, asked) = p.run(request, &[], SystemTime::now());
+    assert!(matches!(
+        out,
+        GhCompletion::Captured(Completion::Exited(out)) if out.status.success()
+    ));
+    assert_eq!(asked, ["acme/admission-search"]);
+    assert_eq!(p.calls(), vec![(Who::R2, "acme/admission-search".into())]);
 }
 
 #[test]
@@ -424,6 +795,100 @@ fn a_non_credential_failure_is_returned_without_spill_or_writer() {
 }
 
 #[test]
+fn a_checksum_delivery_refusal_spills_without_withdrawing_the_readers_credential() {
+    // Only the numeric checksum asset is unavailable; the same profile
+    // answers ordinary reads of the same repo immediately.
+    const DELIVERY_401: &str = r#"
+case "$2" in
+    */releases/assets/*)
+        printf 'HTTP/2 401 Unauthorized\r\n\r\n'
+        echo 'gh: Delivery refused (HTTP 401)' >&2
+        exit 1 ;;
+    *) echo '{}'; exit 0 ;;
+esac"#;
+    let now = SystemTime::now();
+    let expiry = now + super::v2::checksum_retry::DELAY;
+    let p = pool(OK, DELIVERY_401, "exit 90");
+    let (out, withdrawn, _) = p.run(p.read_checksum("checksum-delivery"), &[], now);
+    assert!(
+        matches!(out, GhCompletion::Captured(Completion::Exited(ref done)) if done.status.success()),
+        "{out:?}"
+    );
+    assert_eq!(p.who(), vec![Who::R2, Who::R1]);
+    assert!(
+        withdrawn.is_empty(),
+        "asset refusal changed credential withdrawal: {withdrawn:?}"
+    );
+    let (out, withdrawn, _) = p.run(p.read("checksum-delivery", ReadClass::Gate), &[], now);
+    assert!(
+        matches!(out, GhCompletion::Captured(Completion::Exited(ref done)) if done.status.success()),
+        "{out:?}"
+    );
+    assert!(withdrawn.is_empty());
+    let _ = p.run(p.read_checksum("checksum-delivery"), &[], now);
+    assert_eq!(p.who(), vec![Who::R2, Who::R1, Who::R2, Who::R1]);
+
+    let p = pool(DELIVERY_401, DELIVERY_401, "exit 90");
+    let (out, withdrawn, _) = p.run(p.read_checksum("checksum-exhausted"), &[], now);
+    assert!(matches!(out, GhCompletion::Shed { until, .. } if until == expiry), "{out:?}");
+    assert!(withdrawn.is_empty());
+    let (out, _, _) = p.run(p.read_checksum("checksum-exhausted"), &[], now);
+    assert!(matches!(out, GhCompletion::Shed { until, .. } if until == expiry), "{out:?}");
+    assert_eq!(p.who(), vec![Who::R2, Who::R1], "no more calls before expiry");
+    let (out, _, _) = p.run(p.read_checksum("checksum-exhausted"), &[], expiry);
+    assert!(matches!(out, GhCompletion::Shed { until, .. } if until > expiry), "{out:?}");
+    assert_eq!(p.who(), vec![Who::R2, Who::R1, Who::R2, Who::R1], "retry at expiry");
+}
+
+#[test]
+fn checksum_preserves_marked_api_refusals_and_rate_limits() {
+    for (status, message, failure) in [
+        (401, "Bad credentials", Failure::Credential),
+        (403, "Resource not accessible by integration", Failure::Coverage),
+        (404, "Not Found", Failure::CoverageUnproven),
+    ] {
+        for (marker, name) in [
+            ("proxy", "X-GitHub-Proxy-Version"),
+            ("github", "X-GitHub-Request-Id"),
+        ] {
+            let denied = format!(
+                "printf 'HTTP/2 {status} {message}\r\n{name}: fixture\r\n\r\n'; echo 'gh: {message} (HTTP {status})' >&2; exit 1"
+            );
+            let p = pool(OK, &denied, "exit 90");
+            let repo = format!("checksum-api-{marker}-{status}");
+            let (_, withdrawn, _) = p.run(p.read_checksum(&repo), &[], SystemTime::now());
+            assert_eq!(
+                withdrawn.first().map(|entry| entry.2),
+                Some(failure),
+                "{repo}: {withdrawn:?}"
+            );
+            assert_eq!(p.who(), vec![Who::R2, Who::R1]);
+        }
+    }
+    let p = pool(OK, LIMITED, "exit 90");
+    let (_, withdrawn, _) = p.run(p.read_checksum("checksum-limit"), &[], SystemTime::now());
+    assert!(is_rate_limited(&withdrawn[0].2), "{withdrawn:?}");
+}
+
+#[test]
+fn checksum_keeps_unmarked_delivery_coverage_refusals_local() {
+    for (status, message) in [(403, "Forbidden"), (404, "Not Found")] {
+        let denied = format!(
+            "printf 'HTTP/2 {status} {message}\r\n\r\n'; echo 'gh: {message} (HTTP {status})' >&2; exit 1"
+        );
+        let p = pool(OK, &denied, "exit 90");
+        let repo = format!("checksum-delivery-{status}");
+        let (out, withdrawn, _) = p.run(p.read_checksum(&repo), &[], SystemTime::now());
+        assert!(
+            matches!(out, GhCompletion::Captured(Completion::Exited(ref done)) if done.status.success()),
+            "{out:?}"
+        );
+        assert!(withdrawn.is_empty(), "{repo}: {withdrawn:?}");
+        assert_eq!(p.who(), vec![Who::R2, Who::R1]);
+    }
+}
+
+#[test]
 fn no_pool_is_one_plain_writer_call() {
     let p = pool(OK, OK, OK);
     let inv = p.read("nopool", ReadClass::Hygiene);
@@ -568,6 +1033,7 @@ fn every_reader_refusing_the_repo_sheds_never_absent_and_never_the_writer() {
 fn a_shed_never_reads_as_a_rate_limit() {
     let shed = Unavailable::Shed {
         until: SystemTime::UNIX_EPOCH + Duration::from_secs(1_900_000_000),
+        graphql_budget_exhausted: false,
     };
     let text = shed.to_string();
     assert!(text.starts_with("deferred: reader budget low until 2030-"), "{text}");

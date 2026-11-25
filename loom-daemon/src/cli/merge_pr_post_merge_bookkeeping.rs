@@ -72,6 +72,8 @@ impl PostMergeBookkeepingArgs {
             pr_body,
             conflicted: self.conflicted,
             open_before_merge: self.open_before_merge,
+            // The synchronous shell caller never gates on a reopen (#15145).
+            merged_at: None,
         };
         let facts = Facts {
             close_targets: self.close_targets,
@@ -85,6 +87,12 @@ impl PostMergeBookkeepingArgs {
                 std::process::exit(NEED_EXIT);
             }
             Outcome::Done(records) => {
+                print_records(&records);
+                Ok(())
+            }
+            // Unreachable today: only the observation replay (which sets
+            // `merged_at`) can defer, and it does not go through this CLI.
+            Outcome::Defer(records) => {
                 print_records(&records);
                 Ok(())
             }

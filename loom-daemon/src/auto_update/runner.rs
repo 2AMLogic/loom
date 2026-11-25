@@ -1,9 +1,9 @@
 //! The self-update loop's runtime wiring: one tick ([`run_tick`]) and the
 //! spawned loop around it ([`spawn_auto_update_task`]).
 //!
-//! Moved out of `auto_update.rs` (over the file-size ratchet threshold) by
-//! Issue #10414, which also hardened the loop. On 2026-10-05 both AWS workers
-//! stopped rolling at ~01:30Z with the daemon still up, and nothing said why:
+//! Moved out of `auto_update.rs` by Issue #10414, which also hardened the
+//! loop. On 2026-10-05 both AWS workers stopped rolling at ~01:30Z with the
+//! daemon still up, and nothing said why:
 //!
 //! - **A panicking tick no longer ends the loop.** Before #10414 a panic inside
 //!   `run_tick` reached the loop as a `JoinError`. The loop logged one `error!`

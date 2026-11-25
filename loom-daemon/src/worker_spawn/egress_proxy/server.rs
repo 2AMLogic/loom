@@ -758,7 +758,11 @@ async fn bad_mark_at_proxy(record: Record, classification: Classification, reset
     let outcome = tokio::task::spawn_blocking(move || {
         let provider_root = crate::api_keys_pool::paths::resolve_provider_root(&root, &provider)
             .map_err(|e| e.to_string())?;
-        let window = reset::configured_window(&provider_root, &provider, &account);
+        // The window is read from the host's limits file merged with the
+        // launch's workspace config (#14932). Resolved here on the blocking
+        // thread, since reading every config tier can shell out to git.
+        let configured = crate::api_keys_pool::limits::ConfiguredLimits::from_workspace(&root);
+        let window = reset::configured_window(&provider_root, &provider, &account, &configured);
         let now = crate::api_keys_pool::bad_marks::epoch_now();
         let Some((cooldown, source)) =
             reset::resolve_cooldown(classification, &reset_text, now, window)

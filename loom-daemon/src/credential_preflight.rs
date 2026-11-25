@@ -1071,8 +1071,9 @@ fn set_private_mode(path: &Path, mode: u32) -> std::io::Result<()> {
 
 /// Atomically publish `token` into `config_dir/hosts.yml` (write-then-rename,
 /// same filesystem — no partial-file window), creating `config_dir` and its
-/// static `config.yml` companion on first use. This is a **pure file
-/// operation**: it never touches `std::env`, so it cannot race the
+/// static `config.yml` companion on first use. Both files are created `0600`
+/// at open, so no token byte is ever briefly world-readable. This is a **pure
+/// file operation**: it never touches `std::env`, so it cannot race the
 /// `environ` reads of any concurrently spawned `gh`/`git` child (#4458) —
 /// the refresh tick in `main.rs` calls this in place of the old
 /// `std::env::set_var("GH_TOKEN", …)`.
@@ -1082,16 +1083,23 @@ pub fn publish_github_app_token(config_dir: &Path, token: &str) -> std::io::Resu
 
     let config_path = config_dir.join("config.yml");
     if !config_path.exists() {
-        std::fs::write(&config_path, GH_CONFIG_YAML)?;
-        set_private_mode(&config_path, 0o600)?;
+        crate::fs_util::write_atomic(
+            &config_path,
+            GH_CONFIG_YAML.as_bytes(),
+            crate::fs_util::AtomicOpts {
+                private: true,
+                sync_dir: false,
+            },
+        )?;
     }
-
-    let hosts_path = config_dir.join("hosts.yml");
-    let tmp_path = config_dir.join("hosts.yml.tmp");
-    std::fs::write(&tmp_path, gh_hosts_yaml(token, None))?;
-    set_private_mode(&tmp_path, 0o600)?;
-    std::fs::rename(&tmp_path, &hosts_path)?;
-    Ok(())
+    crate::fs_util::write_atomic(
+        &config_dir.join("hosts.yml"),
+        gh_hosts_yaml(token, None).as_bytes(),
+        crate::fs_util::AtomicOpts {
+            private: true,
+            sync_dir: false,
+        },
+    )
 }
 
 // ============================================================================
@@ -1359,6 +1367,28 @@ pub fn register_owner_gh_config_dir(owner: &str, config_dir: &Path) {
     if let Ok(mut map) = owner_slug_config_registry().lock() {
         map.insert(owner.to_string(), config_dir.to_path_buf());
     }
+}
+
+/// Drop every owner registration — the slug-keyed map (#5431) and the
+/// refresh-source map (#6171) — whose `GH_CONFIG_DIR` is exactly `config_dir`,
+/// and return how many owners were dropped. Matching on the directory rather
+/// than the owner key means a registration pointing anywhere else (another
+/// root's live credential) is never touched. The reap of a stale by-owner
+/// directory calls this so the registry and the disk never disagree: without
+/// it every [`gh_config_dir_for_owner_slug`] caller keeps being pointed at a
+/// directory with no `hosts.yml`, and the "already established" short-circuits
+/// (`write_scope`, `cross_owner`) never re-mint (#14548).
+pub fn unregister_owner_gh_config_dir(config_dir: &Path) -> usize {
+    let mut dropped = 0;
+    if let Ok(mut map) = owner_slug_config_registry().lock() {
+        let before = map.len();
+        map.retain(|_, dir| dir.as_path() != config_dir);
+        dropped += before - map.len();
+    }
+    if let Ok(mut map) = owner_refresh_registry().lock() {
+        map.retain(|_, (_, dir)| dir.as_path() != config_dir);
+    }
+    dropped
 }
 
 /// The `GH_CONFIG_DIR` registered for the owner segment of `owner_repo`, or
@@ -1709,7 +1739,7 @@ pub mod owner_drift;
 pub mod pool;
 pub use pool::attach as attach_pool;
 mod minted;
-pub use minted::{publish_minted, publish_outcome, Minted};
+pub use minted::{publish_minted, publish_outcome, Minted, ScopedIssuance};
 
 #[cfg(test)]
 mod tests {
@@ -2525,9 +2555,6 @@ mod tests {
         assert!(hosts.contains("oauth_token: ghs_first"));
         let config = std::fs::read_to_string(config_dir.join("config.yml")).unwrap();
         assert!(config.contains("version: 1"));
-
-        // No leftover temp file after a successful publish (rename consumed it).
-        assert!(!config_dir.join("hosts.yml.tmp").exists());
     }
 
     #[test]
@@ -2569,8 +2596,34 @@ mod tests {
             & 0o777;
         assert_eq!(hosts_mode, 0o600);
 
+        let config_mode = std::fs::metadata(config_dir.join("config.yml"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(config_mode, 0o600);
+
         let dir_mode = std::fs::metadata(&config_dir).unwrap().permissions().mode() & 0o777;
         assert_eq!(dir_mode, 0o700);
+    }
+
+    #[test]
+    fn a_failed_publish_leaves_no_temp_file_behind() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_dir = dir.path().join("gh-config");
+        publish_github_app_token(&config_dir, "ghs_first").unwrap();
+        let hosts_path = config_dir.join("hosts.yml");
+        std::fs::remove_file(&hosts_path).unwrap();
+        std::fs::create_dir(&hosts_path).unwrap();
+
+        assert!(publish_github_app_token(&config_dir, "ghs_second").is_err());
+
+        let mut names: Vec<String> = std::fs::read_dir(&config_dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        assert_eq!(names, ["config.yml", "hosts.yml"]);
     }
 
     // ========================================================================

@@ -121,7 +121,7 @@ impl PostMergeCleanupArgs {
                 evidence: self.landed_evidence,
             }),
         };
-        match run(&inputs, &facts, &SystemHost) {
+        match run(&inputs, &facts, &SystemHost::MERGE_PR) {
             Outcome::Need(need) => {
                 println!("LOOM-NEED {}", need.token());
                 std::process::exit(NEED_EXIT);

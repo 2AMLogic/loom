@@ -237,6 +237,8 @@ mod tests {
             deep_clean: None,
             docker: None,
             scratch: None,
+            seats: None,
+            seats_pending: false,
             target_orphans: None,
             at: Utc::now(),
             git_tmp: None,
@@ -265,6 +267,63 @@ mod tests {
             assert_eq!(phases.reclaim_ran, ran);
             assert!(phases.reclaim >= wait);
         }
+    }
+
+    /// #14777 AC: a tick reaches its next dispatch phase while an injected
+    /// seat walk is still blocked. The reclaim phase the tick awaits is the
+    /// real scheduling seam (`schedule_with_for_test` is
+    /// `schedule_from_tick`'s body with an injectable clock and walk): the
+    /// pre-span completes with the walk still in flight, and only the test's
+    /// release lets the worker exit.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn the_tick_advances_while_an_injected_seat_walk_is_still_blocked() {
+        use crate::tokens_pool::private_workspace::seat_reclaim::{
+            reset_state_for_test, schedule_with_for_test, walk_in_flight_for_test,
+            SeatReclaimReport, SeatScheduling,
+        };
+        reset_state_for_test();
+        let tmp = tempfile::tempdir().unwrap();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let release = std::sync::Mutex::new(release_rx);
+        let body = std::sync::Arc::new(move |_: std::path::PathBuf| {
+            let _ = release.lock().unwrap().recv();
+            SeatReclaimReport {
+                skipped: None,
+                seats: Vec::new(),
+            }
+        });
+
+        let (_, phases) = sample_pre_span(
+            async {
+                assert_eq!(
+                    schedule_with_for_test(tmp.path(), Utc::now(), body),
+                    SeatScheduling::Pending
+                );
+                None
+            },
+            || Some(0.5),
+            async { panic!("filtered idle was available") },
+        )
+        .await;
+        assert!(!phases.reclaim_ran);
+        assert!(
+            walk_in_flight_for_test(),
+            "the walk must still be blocked after the tick's pre-span completed"
+        );
+
+        // Failure guard, not the property under test: release the worker and
+        // bound the wait for its exit.
+        drop(release_tx);
+        let mut exited = false;
+        for _ in 0..2_000 {
+            if !walk_in_flight_for_test() {
+                exited = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(exited, "the released walk must exit");
     }
 
     #[tokio::test]

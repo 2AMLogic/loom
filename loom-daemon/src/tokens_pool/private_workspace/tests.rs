@@ -100,6 +100,13 @@ fn forge_credential_username_preserves_basic_auth_and_rejects_protocol_injection
 
 use crate::test_git_helpers::{configure, run as git};
 
+/// The writable temp base every [`repository::prepare_with_pr_lookup`] test
+/// passes explicitly — never the ambient `TMPDIR`, which a parallel test's
+/// fixture may be mutating.
+fn temp_base() -> std::path::PathBuf {
+    std::env::temp_dir()
+}
+
 struct RepoFixture {
     _temp: tempfile::TempDir,
     remote: PathBuf,
@@ -126,6 +133,7 @@ impl RepoFixture {
             container_id: "test-container".into(),
             branch: None,
             slug: None,
+            mirror_objects: None,
         };
         Self {
             _temp: temp,
@@ -137,6 +145,8 @@ impl RepoFixture {
 
     fn prepare(&self) -> Result<String> {
         repository::prepare(&self.root, &self.args)
+            .map(|outcome| outcome.revision)
+            .map_err(Into::into)
     }
 }
 
@@ -233,6 +243,66 @@ fn lease_renew_residue_does_not_refuse_reuse_but_other_dirt_does() {
     assert!(error.contains("stray-09"), "{error}");
     assert!(!error.contains("stray-10"), "{error}");
     assert!(error.contains("and 2 more"), "{error}");
+}
+
+/// #14929 AC: an unwritable seat temp dir refuses preparation naming the
+/// cause (`seat_temp_unwritable`) instead of surfacing later as a misleading
+/// fetch or dirty-clone refusal, and no Loom state directory appears in the
+/// private clone — the refusal happens before any clone work, and the state
+/// dirs never fall back to the job's working directory.
+#[test]
+fn an_unwritable_temp_dir_refuses_preparation_naming_the_cause_without_touching_the_clone() {
+    let _fork = fork_guard();
+    let f = RepoFixture::new();
+    // A temp base under a FILE cannot be created or written by any uid
+    // (ENOTDIR), so the refusal is deterministic even under root.
+    let blocker = f._temp.path().join("blocker");
+    std::fs::write(&blocker, b"not a directory").unwrap();
+    let blocked = blocker.join("tmp");
+    let lookup =
+        |_: &Path, _: &str, _: &str, _: &str| panic!("no clone work runs past the preflight");
+    let error = repository::prepare_with_pr_lookup(&f.root, &f.args, &lookup, &blocked)
+        .unwrap_err()
+        .to_string();
+    assert!(
+        error.contains(SEAT_TEMP_UNWRITABLE_REASON),
+        "the refusal names its cause: {error}"
+    );
+    assert!(error.contains("not writable"), "{error}");
+    // The clone was never created and the volume untouched.
+    assert!(!f.root.join("repo").exists());
+    assert!(std::fs::read_dir(&f.root).unwrap().next().is_none());
+
+    // A prepared clone stays clean of Loom state dirs across the refusal:
+    // prepare once, then refuse on the blocked base and re-check the tree.
+    std::fs::remove_file(&blocker).unwrap();
+    f.prepare().unwrap();
+    let repo = f.root.join("repo");
+    std::fs::write(&blocker, b"not a directory").unwrap();
+    let error = repository::prepare_with_pr_lookup(&f.root, &f.args, &lookup, &blocked)
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains(SEAT_TEMP_UNWRITABLE_REASON), "{error}");
+    for entry in std::fs::read_dir(&repo).unwrap().flatten() {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        assert!(
+            !name.starts_with("loom-forge-")
+                && !name.starts_with("loom-write-scope")
+                && !name.starts_with("tmp"),
+            "no Loom state or temp directory may appear in the clone: {name}"
+        );
+    }
+    // No probe residue is left behind in a writable base either.
+    let writable = f._temp.path().join("tmp");
+    std::fs::create_dir(&writable).unwrap();
+    repository::prepare_with_pr_lookup(&f.root, &f.args, &lookup, &writable).unwrap();
+    let residue: Vec<String> = std::fs::read_dir(&writable)
+        .unwrap()
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(residue, Vec::<String>::new(), "the preflight cleans up after itself");
 }
 
 #[test]
@@ -390,8 +460,9 @@ fn unpublished_commits_in_one_clone_do_not_block_another_clone_or_branch() {
         container_id: "test-container".into(),
         branch: Some("feature/issue-9".into()),
         slug: Some("owner-repo-12345678".into()),
+        mirror_objects: None,
     };
-    let add = repository::prepare(&f.root, &additional).unwrap();
+    let add = repository::prepare(&f.root, &additional).unwrap().revision;
     assert!(!add.is_empty());
     // Unpublished commits on one branch of the additional clone do not
     // block re-preparing it for its own branch, nor the primary at all.
@@ -429,6 +500,15 @@ fn recover_args(remote: &Path) -> repository::RecoverArgs {
         validate_worktrees: false,
         slug: None,
     }
+}
+
+/// PR-fetch residue (`refs/<name>`, `refs/remotes/<name>`) at `tip`: the
+/// shape that makes Git shorten every abbreviated lookup of
+/// `refs/heads/<name>` to `heads/<name>` (#15027). Neither ref lives under
+/// `refs/heads`, so no branch is created.
+fn add_residue(repo: &Path, name: &str, tip: &str) {
+    git(repo, &["update-ref", &format!("refs/{name}"), tip]);
+    git(repo, &["update-ref", &format!("refs/remotes/{name}"), tip]);
 }
 
 /// Two unpublished branches (one ahead each) with the root checkout
@@ -673,6 +753,223 @@ fn recover_discard_resolves_the_base_before_mutating_any_holder() {
     assert_eq!(git(&repo, &["rev-parse", "--abbrev-ref", "HEAD"]), "issue-3");
 }
 
+/// PR-fetch residue at an unpublished branch's tip must not break the
+/// recover listing: the shadowed branch keeps its true name and ahead
+/// count, and the residue refs are left exactly where they were (#15027).
+#[test]
+#[serial_test::serial(private_workspace_fork)]
+#[serial_test::serial]
+fn recover_lists_residue_shadowed_branches_by_their_true_names() {
+    let _fork = fork_guard();
+    let (f, repo, issue3, issue4) = two_unpublished_branches();
+    add_residue(&repo, "issue-3", &issue3);
+    let list = repository::recover(&f.root, &recover_args(&f.remote)).unwrap();
+    assert_eq!(
+        list.branches
+            .iter()
+            .map(|b| (b.branch.as_str(), b.ahead))
+            .collect::<Vec<_>>(),
+        vec![("issue-3", 1), ("issue-4", 1)]
+    );
+    assert!(list.ignored.is_empty());
+    assert_eq!(git(&repo, &["rev-parse", "refs/issue-3"]), issue3);
+    assert_eq!(git(&repo, &["rev-parse", "refs/remotes/issue-3"]), issue3);
+    assert_eq!(git(&repo, &["rev-parse", "issue-4"]), issue4);
+}
+
+/// A branch literally named `heads/topic` is reported (and scoped) as
+/// `heads/topic` under `refs/topic` residue, never shortened further (#15027).
+#[test]
+#[serial_test::serial(private_workspace_fork)]
+#[serial_test::serial]
+fn a_literal_heads_prefixed_branch_keeps_its_name_under_residue() {
+    let _fork = fork_guard();
+    let f = RepoFixture::new();
+    f.prepare().unwrap();
+    let repo = f.root.join("repo");
+    let base = git(&repo, &["rev-parse", "origin/main"]);
+    git(&repo, &["switch", "-c", "heads/topic"]);
+    std::fs::write(repo.join("fixture"), "literal").unwrap();
+    git(&repo, &["commit", "-am", "literal"]);
+    let tip = git(&repo, &["rev-parse", "refs/heads/heads/topic"]);
+    git(&repo, &["switch", "--detach", &base]);
+    add_residue(&repo, "topic", &tip);
+    let list = repository::recover(&f.root, &recover_args(&f.remote)).unwrap();
+    assert_eq!(
+        list.branches
+            .iter()
+            .map(|b| (b.branch.as_str(), b.ahead))
+            .collect::<Vec<_>>(),
+        vec![("heads/topic", 1)]
+    );
+    let mut scoped = recover_args(&f.remote);
+    scoped.branch = vec!["heads/topic".into()];
+    let out = repository::recover(&f.root, &scoped).unwrap();
+    assert!(out.ignored.is_empty());
+    assert_eq!(git(&repo, &["rev-parse", "refs/topic"]), tip);
+}
+
+/// A scoped `--publish` must reach the shadowed branch instead of ignoring
+/// it, and never disturb the residue refs (#15027).
+#[test]
+#[serial_test::serial(private_workspace_fork)]
+#[serial_test::serial]
+fn recover_publishes_a_residue_shadowed_scoped_branch() {
+    let _fork = fork_guard();
+    let (f, repo, issue3, _issue4) = two_unpublished_branches();
+    add_residue(&repo, "issue-3", &issue3);
+    let mut args = recover_args(&f.remote);
+    args.publish = true;
+    args.branch = vec!["issue-3".into()];
+    let out = repository::recover(&f.root, &args).unwrap();
+    assert_eq!(out.published, vec!["issue-3".to_owned()]);
+    assert!(out.ignored.is_empty());
+    assert_eq!(git(&f.remote, &["rev-parse", "refs/heads/issue-3"]), issue3);
+    assert_eq!(git(&repo, &["rev-parse", "refs/issue-3"]), issue3);
+    assert_eq!(git(&repo, &["rev-parse", "refs/remotes/issue-3"]), issue3);
+}
+
+/// `recover --discard` on a residue-shadowed branch held by the main
+/// checkout: the holder is found by the branch's true name, moved to the
+/// base, and the branch deleted — while the residue refs survive (#15027).
+#[test]
+#[serial_test::serial(private_workspace_fork)]
+#[serial_test::serial]
+fn recover_discards_a_residue_shadowed_branch_held_by_the_main_checkout() {
+    let _fork = fork_guard();
+    let f = RepoFixture::new();
+    f.prepare().unwrap();
+    let repo = f.root.join("repo");
+    git(&repo, &["switch", "-c", "pr344"]);
+    std::fs::write(repo.join("fixture"), "unpublished").unwrap();
+    git(&repo, &["commit", "-am", "unpublished"]);
+    let tip = git(&repo, &["rev-parse", "refs/heads/pr344"]);
+    add_residue(&repo, "pr344", &tip);
+    let mut args = recover_args(&f.remote);
+    args.discard = true;
+    args.branch = vec!["pr344".into()];
+    let out = repository::recover(&f.root, &args).unwrap();
+    assert_eq!(out.discarded, vec!["pr344".to_owned()]);
+    assert!(!git_ok(&repo, &["show-ref", "--verify", "refs/heads/pr344"]));
+    assert_eq!(git(&repo, &["rev-parse", "HEAD"]), git(&repo, &["rev-parse", "origin/main"]));
+    assert_eq!(git(&repo, &["rev-parse", "refs/pr344"]), tip);
+    assert_eq!(git(&repo, &["rev-parse", "refs/remotes/pr344"]), tip);
+}
+
+/// Residue-shadowed holders keep working both ways: a clean linked worktree
+/// is removed by its branch's true name, and a dirty one is reported under
+/// that name and still refuses the discard before any mutation (#15027).
+#[test]
+#[serial_test::serial(private_workspace_fork)]
+#[serial_test::serial]
+fn recover_discards_a_residue_shadowed_holder_and_reports_dirty_ones_by_true_name() {
+    let _fork = fork_guard();
+    let f = RepoFixture::new();
+    f.prepare().unwrap();
+    let repo = f.root.join("repo");
+    let holder = f.root.join("issue-344");
+    git(&repo, &["worktree", "add", "-b", "pr344", holder.to_str().unwrap()]);
+    std::fs::write(holder.join("fixture"), "held").unwrap();
+    git(&holder, &["add", "."]);
+    git(&holder, &["commit", "-am", "held"]);
+    let tip = git(&repo, &["rev-parse", "refs/heads/pr344"]);
+    let dirty = f.root.join("issue-345");
+    git(&repo, &["worktree", "add", "-b", "pr345", dirty.to_str().unwrap()]);
+    std::fs::write(dirty.join("fixture"), "committed").unwrap();
+    git(&dirty, &["add", "."]);
+    git(&dirty, &["commit", "-am", "committed"]);
+    let dirty_tip = git(&repo, &["rev-parse", "refs/heads/pr345"]);
+    std::fs::write(dirty.join("untracked"), "keep").unwrap();
+    add_residue(&repo, "pr344", &tip);
+    add_residue(&repo, "pr345", &dirty_tip);
+    let list = repository::recover(&f.root, &recover_args(&f.remote)).unwrap();
+    assert_eq!(list.dirty_worktrees.len(), 1);
+    assert_eq!(list.dirty_worktrees[0].branch.as_deref(), Some("pr345"));
+    let mut args = recover_args(&f.remote);
+    args.discard = true;
+    args.branch = vec!["pr344".into()];
+    let out = repository::recover(&f.root, &args).unwrap();
+    assert_eq!(out.discarded, vec!["pr344".to_owned()]);
+    assert!(!holder.exists(), "the clean shadowed holder was removed");
+    assert!(!git_ok(&repo, &["show-ref", "--verify", "refs/heads/pr344"]));
+    args.branch = vec!["pr345".into()];
+    let error = repository::recover(&f.root, &args).unwrap_err().to_string();
+    assert!(error.contains("uncommitted"), "{error}");
+    assert!(git_ok(&repo, &["show-ref", "--verify", "refs/heads/pr345"]));
+    assert!(dirty.join("untracked").exists());
+    assert_eq!(git(&repo, &["rev-parse", "refs/pr344"]), tip);
+    assert_eq!(git(&repo, &["rev-parse", "refs/remotes/pr345"]), dirty_tip);
+}
+
+/// `prepare` must find — and reap — a finished-PR worktree whose branch is
+/// residue-shadowed, passing the true branch name to the PR lookup (#15027).
+#[test]
+#[serial_test::serial(private_workspace_fork)]
+#[serial_test::serial]
+fn prepare_reaps_a_finished_pr_worktree_on_a_residue_shadowed_branch() {
+    let _fork = fork_guard();
+    let f = RepoFixture::new();
+    f.prepare().unwrap();
+    let repo = f.root.join("repo");
+    let holder = f.root.join("issue-344");
+    git(&repo, &["worktree", "add", "-b", "pr344", holder.to_str().unwrap()]);
+    let tip = git(&repo, &["rev-parse", "refs/heads/pr344"]);
+    add_residue(&repo, "pr344", &tip);
+    let outcome = repository::prepare_with_pr_lookup(
+        &f.root,
+        &f.args,
+        &|_, _, branch, _| branch == "pr344",
+        &temp_base(),
+    )
+    .unwrap();
+    assert_eq!(outcome.reaped, vec![holder.to_string_lossy().to_string()]);
+    assert!(!holder.exists(), "the shadowed finished-PR worktree was reaped");
+    assert!(git_ok(&repo, &["show-ref", "--verify", "refs/heads/pr344"]));
+    assert_eq!(git(&repo, &["rev-parse", "refs/pr344"]), tip);
+    assert_eq!(git(&repo, &["rev-parse", "refs/remotes/pr344"]), tip);
+}
+
+/// `holding_worktree` resolves a residue-shadowed holder by the branch's
+/// true name, so a preparation refusing on it names the cure (#15027).
+#[test]
+#[serial_test::serial(private_workspace_fork)]
+#[serial_test::serial]
+fn holding_worktree_finds_a_residue_shadowed_holder() {
+    let _fork = fork_guard();
+    let f = RepoFixture::new();
+    f.prepare().unwrap();
+    let repo = f.root.join("repo");
+    let holder = f.root.join("issue-344");
+    git(&repo, &["worktree", "add", "-b", "pr344", holder.to_str().unwrap()]);
+    let tip = git(&repo, &["rev-parse", "refs/heads/pr344"]);
+    add_residue(&repo, "pr344", &tip);
+    assert_eq!(repository::holding_worktree(&repo, "pr344").unwrap(), Some(holder));
+}
+
+/// `current_branch` reads the true name of a residue-shadowed checkout and
+/// answers `None` exactly when detached (#15027).
+#[test]
+#[serial_test::serial(private_workspace_fork)]
+#[serial_test::serial]
+fn current_branch_reads_true_names_under_residue() {
+    let _fork = fork_guard();
+    let f = RepoFixture::new();
+    f.prepare().unwrap();
+    let repo = f.root.join("repo");
+    // `prepare` without a branch leaves the main checkout detached at the base.
+    assert_eq!(repository::current_branch(&repo).unwrap(), None);
+    let holder = f.root.join("issue-344");
+    git(&repo, &["worktree", "add", "-b", "pr344", holder.to_str().unwrap()]);
+    let tip = git(&repo, &["rev-parse", "refs/heads/pr344"]);
+    add_residue(&repo, "pr344", &tip);
+    assert_eq!(repository::current_branch(&holder).unwrap().as_deref(), Some("pr344"));
+    // A literal heads-prefixed branch keeps that name under `refs/topic`
+    // residue.
+    git(&repo, &["switch", "-c", "heads/topic"]);
+    add_residue(&repo, "topic", &git(&repo, &["rev-parse", "refs/heads/heads/topic"]));
+    assert_eq!(repository::current_branch(&repo).unwrap().as_deref(), Some("heads/topic"));
+}
+
 #[test]
 #[serial_test::serial(private_workspace_fork)]
 #[serial_test::serial]
@@ -728,6 +1025,148 @@ fn https_remote_rejects_credentials_and_unsupported_transports() {
     }
 }
 
+#[test]
+fn daemon_owned_gh_config_dir_under_a_checkout_is_not_recorded() {
+    let ws = tempfile::tempdir().expect("tempdir");
+    let dir = crate::credential_preflight::github_app_gh_config_dir(ws.path());
+    std::fs::create_dir_all(&dir).expect("app dir");
+    std::fs::create_dir_all(ws.path().join(".git")).expect("daemon checkout");
+    assert!(matches!(
+        lifecycle::resolve_gh_config_with(ws.path(), Some(dir.into_os_string()), None, None),
+        Ok(None)
+    ));
+}
+
+#[test]
+fn a_per_owner_daemon_gh_config_dir_under_a_checkout_is_not_recorded() {
+    let ws = tempfile::tempdir().expect("tempdir");
+    let dir = crate::credential_preflight::github_app_gh_config_dir_for_owner(ws.path(), "org");
+    std::fs::create_dir_all(&dir).expect("owner dir");
+    std::fs::create_dir_all(ws.path().join(".git")).expect("daemon checkout");
+    assert!(matches!(
+        lifecycle::resolve_gh_config_with(ws.path(), Some(dir.into_os_string()), None, None),
+        Ok(None)
+    ));
+}
+
+#[test]
+fn a_symlinked_spelling_of_the_daemon_owned_gh_config_dir_is_not_recorded() {
+    use std::os::unix::fs::symlink;
+    let ws = tempfile::tempdir().expect("tempdir");
+    let dir = crate::credential_preflight::github_app_gh_config_dir(ws.path());
+    std::fs::create_dir_all(&dir).expect("app dir");
+    symlink(&dir, ws.path().join("linked-gh-config")).expect("symlink");
+    let linked = ws.path().join("linked-gh-config");
+    assert!(matches!(
+        lifecycle::resolve_gh_config_with(ws.path(), Some(linked.into_os_string()), None, None),
+        Ok(None)
+    ));
+}
+
+#[test]
+fn a_gh_config_dir_under_a_checkout_the_daemon_does_not_own_is_refused() {
+    let ws = tempfile::tempdir().expect("tempdir");
+    std::fs::create_dir_all(ws.path().join(".git")).expect("checkout");
+    let dir = ws.path().join("credentials/gh");
+    std::fs::create_dir_all(&dir).expect("gh dir");
+    let error =
+        lifecycle::resolve_gh_config_with(ws.path(), Some(dir.into_os_string()), None, None)
+            .expect_err("a foreign dir under a checkout must be refused");
+    assert!(error
+        .to_string()
+        .contains("forge credentials must be outside every repository/worktree"));
+}
+
+#[test]
+fn a_home_default_gh_dir_under_a_checkout_is_refused() {
+    let ws = tempfile::tempdir().expect("tempdir");
+    std::fs::create_dir_all(ws.path().join(".git")).expect("checkout");
+    let home_default = ws.path().join(".config/gh");
+    std::fs::create_dir_all(&home_default).expect("gh dir");
+    let error = lifecycle::resolve_gh_config_with(ws.path(), None, Some(home_default), None)
+        .expect_err("the home-default dir under a checkout must be refused");
+    assert!(error
+        .to_string()
+        .contains("forge credentials must be outside every repository/worktree"));
+}
+
+#[test]
+fn a_gh_config_dir_outside_every_checkout_is_recorded() {
+    let ws = tempfile::tempdir().expect("tempdir");
+    let elsewhere = tempfile::tempdir().expect("tempdir");
+    let dir = elsewhere.path().join("gh");
+    std::fs::create_dir_all(&dir).expect("gh dir");
+    assert_eq!(
+        lifecycle::resolve_gh_config_with(
+            ws.path(),
+            Some(dir.clone().into_os_string()),
+            None,
+            None
+        )
+        .expect("an ordinary dir is recorded"),
+        Some(dir.canonicalize().expect("canonical"))
+    );
+}
+
+#[test]
+fn the_primary_workspace_app_dir_is_not_recorded_for_a_distinct_acting_checkout() {
+    let primary = tempfile::tempdir().expect("tempdir");
+    let acting = tempfile::tempdir().expect("tempdir");
+    let dir = crate::credential_preflight::github_app_gh_config_dir(primary.path());
+    std::fs::create_dir_all(&dir).expect("app dir");
+    std::fs::create_dir_all(primary.path().join(".git")).expect("daemon checkout");
+    std::fs::create_dir_all(acting.path().join(".git")).expect("acting checkout");
+    let primary_root = Some(primary.path().to_path_buf());
+    assert!(matches!(
+        lifecycle::resolve_gh_config_with(
+            acting.path(),
+            Some(dir.clone().into_os_string()),
+            None,
+            primary_root
+        ),
+        Ok(None)
+    ));
+    // Without the primary root the acting checkout does not own it: refused.
+    assert!(lifecycle::resolve_gh_config_with(
+        acting.path(),
+        Some(dir.into_os_string()),
+        None,
+        None
+    )
+    .is_err());
+}
+
+#[test]
+fn an_aliased_app_dir_location_is_not_recorded() {
+    use std::os::unix::fs::symlink;
+    let ws = tempfile::tempdir().expect("tempdir");
+    let real = ws.path().join("real-gh-config");
+    std::fs::create_dir_all(&real).expect("real dir");
+    std::fs::create_dir_all(ws.path().join(".loom")).expect(".loom");
+    symlink(&real, ws.path().join(".loom/gh-config")).expect("symlink");
+    std::fs::create_dir_all(ws.path().join(".git")).expect("checkout");
+    let dir = crate::credential_preflight::github_app_gh_config_dir(ws.path());
+    assert!(matches!(
+        lifecycle::resolve_gh_config_with(ws.path(), Some(dir.into_os_string()), None, None),
+        Ok(None)
+    ));
+}
+
+#[test]
+fn an_unrelated_dir_under_the_primary_checkout_is_still_refused() {
+    let primary = tempfile::tempdir().expect("tempdir");
+    std::fs::create_dir_all(primary.path().join(".git")).expect("checkout");
+    let dir = primary.path().join("credentials/gh");
+    std::fs::create_dir_all(&dir).expect("gh dir");
+    assert!(lifecycle::resolve_gh_config_with(
+        primary.path(),
+        Some(dir.into_os_string()),
+        None,
+        Some(primary.path().to_path_buf())
+    )
+    .is_err());
+}
+
 fn config() -> Config {
     Config {
         schema_version: 1,
@@ -743,6 +1182,7 @@ fn config() -> Config {
         gh_config: None,
         session_image: None,
         extra_mounts: Vec::new(),
+        mirror_binds: Vec::new(),
     }
 }
 
@@ -923,6 +1363,7 @@ fn ambiguous_lease_is_durable_and_stopped_container_recovery_retains_last_owner(
         gh_config: None,
         session_image: None,
         extra_mounts: Vec::new(),
+        mirror_binds: Vec::new(),
     };
     assert!(lease
         .recover(&config, Some(&serde_json::json!({"Id":"new", "State":{"Running":false}})))
@@ -1019,6 +1460,7 @@ impl repository::PrepareArgs {
             container_id: self.container_id.clone(),
             branch: self.branch.clone(),
             slug: self.slug.clone(),
+            mirror_objects: self.mirror_objects.clone(),
         }
     }
 }
@@ -1033,12 +1475,12 @@ fn two_repositories_share_one_volume_with_independent_roots_and_untouched_first_
         f.additional_args(&r1.to_string_lossy(), "o-one-11111111"),
         f.additional_args(&r2.to_string_lossy(), "o-two-22222222"),
     );
-    let rev_a = repository::prepare(&f.root, &a).unwrap();
+    let rev_a = repository::prepare(&f.root, &a).unwrap().revision;
     // Unfinished work in the first additional clone survives preparing the second.
     let first = f.root.join("work/o-one-11111111");
     std::fs::write(first.join("scratch"), "unfinished").unwrap();
     std::fs::write(first.join("fixture"), "edited").unwrap();
-    let rev_b = repository::prepare(&f.root, &b).unwrap();
+    let rev_b = repository::prepare(&f.root, &b).unwrap().revision;
     assert_ne!(rev_a, rev_b);
     assert_eq!(std::fs::read_to_string(first.join("scratch")).unwrap(), "unfinished");
     assert_eq!(std::fs::read_to_string(first.join("fixture")).unwrap(), "edited");
@@ -1112,7 +1554,7 @@ fn interrupted_clone_is_recoverable_and_never_ready() {
         .to_string()
         .contains("mismatch"));
     std::fs::remove_file(f.root.join("work/.identity").join(format!("{slug}.json"))).unwrap();
-    let revision = repository::prepare(&f.root, &good).unwrap();
+    let revision = repository::prepare(&f.root, &good).unwrap().revision;
     assert!(!staging.exists());
     assert_eq!(git(&f.root.join("work").join(slug), &["rev-parse", "HEAD"]), revision);
 }
@@ -1220,6 +1662,280 @@ fn repository_bound_job_keeps_the_account_wide_exclusive_lease() {
     value.as_object_mut().unwrap().remove("repository");
     std::fs::write(root.path().join("job.json"), serde_json::to_vec(&value).unwrap()).unwrap();
     assert_eq!(lease::read(root.path()).unwrap().unwrap().repository, "");
+}
+
+/// #14678: the seat-reclaim exec drives the in-volume verb directly — same
+/// protocol envelope as `recover`, the account's resolved auth forwarded by
+/// name on the child, and **no `prepare` step anywhere in argv**: the pass
+/// must reach a dirty seat, which preparation would refuse.
+#[test]
+fn seat_reclaim_exec_drives_the_verb_without_any_preparation() {
+    const SECRET: &str = "ghs_seatTESTONLY14678";
+    let mut config = config();
+    config.repository = "https://github.com/acme/widget".into();
+    let argv = std::rc::Rc::new(std::cell::RefCell::new(Vec::<String>::new()));
+    let seen = argv.clone();
+    let _fake = docker::fake::install(Box::new(move |args| {
+        *seen.borrow_mut() = args.iter().map(|a| (*a).to_owned()).collect();
+        Ok(serde_json::json!({
+            "protocol": PROTOCOL,
+            "outcome": {
+                "worktrees_scanned": 1,
+                "worktrees_removed": 0,
+                "worktrees_failed": 0,
+                "preserved": ["PR still open"],
+                "bytes": 0,
+                "scratch_removed": 0,
+                "scratch_scanned": 0,
+                "scratch_bytes": 0,
+            }
+        })
+        .to_string())
+    }));
+    let ws = forge_auth::published_owner_workspace("acme");
+    let resolved =
+        forge_auth::ExecAuth::resolve_with(ws.path(), &config.repository, &|_| None, &|_| {
+            Some(SECRET.into())
+        });
+    let outcome = docker::seat_reclaim(&config, 86_400, 3_600, &resolved).unwrap();
+    assert_eq!(outcome.worktrees_scanned, 1);
+    assert_eq!(outcome.preserved, vec!["PR still open".to_string()]);
+
+    let args = argv.borrow().clone();
+    let joined = args.join(" ");
+    assert!(joined.contains("private-workspace seat-reclaim"), "{args:?}");
+    assert!(joined.contains("--account account"), "{args:?}");
+    assert!(joined.contains("--max-age-secs 86400"), "{args:?}");
+    assert!(joined.contains("--grace-secs 3600"), "{args:?}");
+    assert!(
+        !joined.contains("prepare"),
+        "the seat pass must not prepare the target ({args:?})"
+    );
+    assert!(
+        args.windows(2)
+            .any(|w| w[0] == "--env" && w[1] == "GH_TOKEN"),
+        "{args:?}"
+    );
+    assert!(!args.iter().any(|a| a.contains(SECRET)), "token leaked into argv");
+}
+
+/// #14889: the seat outcome carries one record per removed item with serde
+/// defaults, so an older counts-only seat image still parses and yields the
+/// two summary spans, and a current image's records reach the host intact.
+#[test]
+fn seat_reclaim_outcome_carries_removal_records_and_tolerates_counts_only_images() {
+    let mut config = config();
+    config.repository = "https://github.com/acme/widget".into();
+    let ws = forge_auth::published_owner_workspace("acme");
+    let resolved =
+        forge_auth::ExecAuth::resolve_with(ws.path(), &config.repository, &|_| None, &|_| None);
+
+    // An older seat image: counts only, no `removed`, no failure field.
+    let older = serde_json::json!({
+        "protocol": PROTOCOL,
+        "outcome": {
+            "worktrees_scanned": 2, "worktrees_removed": 1, "worktrees_failed": 0,
+            "preserved": ["PR still open"], "bytes": 4096,
+            "scratch_removed": 1, "scratch_scanned": 1, "scratch_bytes": 512,
+        }
+    })
+    .to_string();
+    let outcome = {
+        let response = older.clone();
+        let _older = docker::fake::install(Box::new(move |_| Ok(response.clone())));
+        docker::seat_reclaim(&config, 86_400, 3_600, &resolved).unwrap()
+    };
+    assert_eq!(outcome.worktrees_removed, 1);
+    assert_eq!(outcome.scratch_removed, 1);
+    assert!(outcome.removed.is_empty(), "older images carry no records");
+    assert_eq!(outcome.inspection_error, None);
+    let ((), captured) = crate::observability::ops::capture::capture(|| {
+        seat_reclaim::report_seat("agent-7", &outcome, std::time::Duration::from_secs(1));
+    });
+    // A counts-only response still yields the two per-seat summaries with
+    // their phases, counts and byte totals.
+    let summaries: Vec<(&str, &str, &str)> = captured
+        .spans
+        .iter()
+        .map(|span| {
+            (
+                span.name.as_str(),
+                span.attributes["loom.reaper.phase"].as_str(),
+                span.attributes["loom.reaper.removed"].as_str(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        summaries,
+        [
+            ("reaper.pass", "reap", "1"),
+            ("reaper.pass", "reclaim", "1")
+        ]
+    );
+    assert!(captured
+        .spans
+        .iter()
+        .all(|span| span.name.as_str() != "reaper.removal"));
+
+    // A current image: the records cross the JSON boundary field-for-field.
+    let current = serde_json::json!({
+        "protocol": PROTOCOL,
+        "outcome": {
+            "worktrees_scanned": 1, "worktrees_removed": 1, "worktrees_failed": 0,
+            "preserved": [], "bytes": 8192,
+            "scratch_removed": 1, "scratch_scanned": 1, "scratch_bytes": 512,
+            "removed": [
+                {"kind": "worktree", "path": "repo/.loom/worktrees/issue-9",
+                 "branch": "feature/issue-9", "tip": "a".repeat(40), "bytes": 7680},
+                {"kind": "scratch", "path": "cache/sta-6421", "bytes": 512},
+            ],
+            "inspection_error": "workspace Git worktree failed (exit status: 128)",
+        }
+    })
+    .to_string();
+    let outcome = {
+        let response = current.clone();
+        let _newer = docker::fake::install(Box::new(move |_| Ok(response.clone())));
+        docker::seat_reclaim(&config, 86_400, 3_600, &resolved).unwrap()
+    };
+    assert_eq!(
+        outcome.removed,
+        vec![
+            seat_reclaim::RemovedItem {
+                kind: "worktree".into(),
+                path: "repo/.loom/worktrees/issue-9".into(),
+                branch: Some("feature/issue-9".into()),
+                tip: Some("a".repeat(40)),
+                bytes: Some(7680),
+            },
+            seat_reclaim::RemovedItem {
+                kind: "scratch".into(),
+                path: "cache/sta-6421".into(),
+                branch: None,
+                tip: None,
+                bytes: Some(512),
+            },
+        ]
+    );
+    assert_eq!(
+        outcome.inspection_error.as_deref(),
+        Some("workspace Git worktree failed (exit status: 128)")
+    );
+}
+
+/// #14889: one removal span per item keeps every field after export
+/// bounding — 33 removals in one phase sit past `SpanRecord::bounded`'s
+/// 32-event cap, which a per-item span must never be subject to — and a
+/// path longer than the 256-byte attribute bound stays correlatable to the
+/// full, escaped local log entry through its bounded base name.
+#[test]
+fn removal_spans_survive_export_bounding_for_every_item() {
+    let mut config = config();
+    config.repository = "https://github.com/acme/widget".into();
+    let ws = forge_auth::published_owner_workspace("acme");
+    let resolved =
+        forge_auth::ExecAuth::resolve_with(ws.path(), &config.repository, &|_| None, &|_| None);
+
+    // A worktree path 292 bytes long in 10-byte segments: over the
+    // 256-byte attribute-value bound, with a short final component.
+    let deep = vec!["branch-xyz"; 24].join("/");
+    let long_path = format!("repo/.loom/worktrees/issue-9/{deep}");
+    assert!(long_path.len() > 256, "{}", long_path.len());
+    // A crafted scratch name that must not forge or split the log line.
+    let forged = "evil-42\nFAKE: seat agent-7 removed /etc";
+
+    let mut removed: Vec<serde_json::Value> = (0..33)
+        .map(|n| serde_json::json!({"kind": "scratch", "path": format!("cache/sta-{n}"), "bytes": 10}))
+        .collect();
+    removed.push(serde_json::json!({"kind": "scratch", "path": forged, "bytes": 7}));
+    removed.push(serde_json::json!({
+        "kind": "worktree", "path": long_path, "branch": "feature/issue-9",
+        "tip": "b".repeat(40), "bytes": 4864,
+    }));
+    let response = serde_json::json!({
+        "protocol": PROTOCOL,
+        "outcome": {
+            "worktrees_scanned": 1, "worktrees_removed": 1, "worktrees_failed": 0,
+            "preserved": [], "bytes": 8201,
+            "scratch_removed": 34, "scratch_scanned": 34, "scratch_bytes": 337,
+            "removed": removed,
+        }
+    })
+    .to_string();
+    let outcome = {
+        let _fake = docker::fake::install(Box::new(move |_| Ok(response.clone())));
+        docker::seat_reclaim(&config, 86_400, 3_600, &resolved).unwrap()
+    };
+    assert_eq!(outcome.removed.len(), 35);
+
+    let logs = crate::test_log_capture::capture_logs(|| {
+        let ((), captured) = crate::observability::ops::capture::capture(|| {
+            seat_reclaim::report_seat("agent-7", &outcome, std::time::Duration::from_secs(1));
+        });
+        let summaries: Vec<(&str, &str)> = captured
+            .spans
+            .iter()
+            .filter(|span| span.name.as_str() == "reaper.pass")
+            .map(|span| {
+                (
+                    span.attributes["loom.reaper.phase"].as_str(),
+                    span.attributes["loom.reaper.removed"].as_str(),
+                )
+            })
+            .collect();
+        assert_eq!(summaries, [("reap", "1"), ("reclaim", "34")]);
+        let removals: Vec<_> = captured
+            .spans
+            .iter()
+            .filter(|span| span.name.as_str() == "reaper.removal")
+            .map(|span| span.clone().bounded())
+            .collect();
+        assert_eq!(removals.len(), 35, "one span per item, no per-span event cap");
+        // All 33 same-phase items keep every field after bounding.
+        for n in 0..33 {
+            let span = removals
+                .iter()
+                .find(|span| {
+                    span.attributes
+                        .get("loom.reaper.removal.path")
+                        .is_some_and(|p| p == &format!("cache/sta-{n}"))
+                })
+                .unwrap_or_else(|| panic!("span for cache/sta-{n} kept its path"));
+            assert_eq!(span.attributes["loom.reaper.removal.kind"], "scratch");
+            assert_eq!(span.attributes["loom.reaper.removal.bytes"], "10");
+            assert_eq!(span.attributes["loom.reaper.removal.name"], format!("sta-{n}"));
+            assert_eq!(span.attributes["loom.repo"], "agent-7");
+        }
+        // The over-long path is dropped by the bound, but the base name
+        // keeps the span correlatable; the crafted name never enters it.
+        let long = removals
+            .iter()
+            .find(|span| {
+                span.attributes
+                    .get("loom.reaper.removal.tip")
+                    .is_some_and(|t| t.starts_with('b'))
+            })
+            .expect("the long-path worktree span");
+        assert!(!long.attributes.contains_key("loom.reaper.removal.path"));
+        assert_eq!(long.attributes["loom.reaper.removal.name"], "branch-xyz");
+        assert_eq!(long.attributes["loom.reaper.removal.tip"], "b".repeat(40));
+    });
+    // The long identity remains correlatable: the local log carries the
+    // full, escaped path AND the bounded base name the span kept.
+    let item_line = logs
+        .iter()
+        .map(|(_, line)| line.as_str())
+        .find(|line| line.contains("branch-xyz"))
+        .expect("the long-path item's log line");
+    assert!(item_line.contains(&long_path), "full path: {item_line}");
+    // The crafted name cannot forge or split a line: it appears escaped,
+    // and no captured message contains a raw newline.
+    let escaped = logs
+        .iter()
+        .map(|(_, line)| line.as_str())
+        .find(|line| line.contains("evil-42"))
+        .expect("the crafted item's log line");
+    assert!(escaped.contains("\\nFAKE:") && !escaped.contains('\n'), "{escaped:?}");
 }
 
 /// #13916: on an App-only host the prepare exec names `GH_TOKEN` as a bare
@@ -1620,7 +2336,7 @@ fn preparation_keeps_a_fast_forwarded_draft_without_finished_pr_evidence() {
         assert_eq!(revision, tip);
         false
     };
-    let error = repository::prepare_with_pr_lookup(&f.root, &f.args, &lookup)
+    let error = repository::prepare_with_pr_lookup(&f.root, &f.args, &lookup, &temp_base())
         .unwrap_err()
         .to_string();
 
@@ -1633,8 +2349,10 @@ fn preparation_reaps_published_finished_prs_independent_of_merge_method() {
     let _fork = fork_guard();
     for state in ["fast-forward", "squash", "closed"] {
         let f = RepoFixture::new();
-        f.prepare().unwrap();
+        let fresh = repository::prepare(&f.root, &f.args).unwrap();
+        assert!(fresh.reaped.is_empty(), "a no-reap preparation reports none");
         let worktree = linked_worktree(&f, "finished");
+        let expected_path = worktree.canonicalize().unwrap().display().to_string();
         for text in ["first", "second"] {
             std::fs::write(worktree.join("fixture"), text).unwrap();
             git(&worktree, &["commit", "-am", text]);
@@ -1666,11 +2384,49 @@ fn preparation_reaps_published_finished_prs_independent_of_merge_method() {
             assert_eq!(revision, tip);
             true
         };
-        repository::prepare_with_pr_lookup(&f.root, &f.args, &evidence).unwrap();
+        let outcome =
+            repository::prepare_with_pr_lookup(&f.root, &f.args, &evidence, &temp_base()).unwrap();
         assert!(!worktree.exists(), "{state} leftover removed");
+        assert_eq!(outcome.reaped, vec![expected_path], "{state} reaped worktree is reported");
         assert_eq!(git(&repo, &["rev-parse", "refs/heads/finished"]), tip);
         assert_eq!(git(&f.remote, &["rev-parse", "refs/heads/finished"]), tip);
     }
+}
+
+#[test]
+fn preparation_reports_a_reaped_worktree_when_another_refuses_reuse() {
+    let _fork = fork_guard();
+    let f = RepoFixture::new();
+    f.prepare().unwrap();
+    let finished = linked_worktree(&f, "finished");
+    git(&finished, &["push", "origin", "finished"]);
+    let tip = git(&finished, &["rev-parse", "HEAD"]);
+    let expected = finished.canonicalize().unwrap().display().to_string();
+    std::fs::write(finished.join("leftover"), "abandoned").unwrap();
+
+    let dirty = linked_worktree(&f, "still-active");
+    std::fs::write(dirty.join("retained.txt"), "keep me").unwrap();
+    let evidence =
+        |_: &Path, _: &str, branch: &str, revision: &str| branch == "finished" && revision == tip;
+    let refusal = repository::prepare_response(repository::prepare_with_pr_lookup(
+        &f.root,
+        &f.args,
+        &evidence,
+        &temp_base(),
+    ));
+    assert!(refusal["error"].as_str().unwrap().contains("seat_dirty"), "{refusal}");
+    assert!(!finished.exists());
+    assert_eq!(std::fs::read_to_string(dirty.join("retained.txt")).unwrap(), "keep me");
+    assert_eq!(refusal["reaped_worktrees"], serde_json::json!([expected]));
+
+    let refused_again = repository::prepare_response(repository::prepare_with_pr_lookup(
+        &f.root,
+        &f.args,
+        &evidence,
+        &temp_base(),
+    ));
+    assert_eq!(refused_again["error"], refusal["error"]);
+    assert_eq!(refused_again["reaped_worktrees"], serde_json::json!([]));
 }
 
 #[test]
@@ -1685,7 +2441,7 @@ fn preparation_preserves_commits_missing_from_origin_even_with_finished_pr_evide
     std::fs::write(worktree.join("leftover"), "keep").unwrap();
     let lookup =
         |_: &Path, _: &str, _: &str, _: &str| panic!("unpublished tips must skip the PR read");
-    let error = repository::prepare_with_pr_lookup(&f.root, &f.args, &lookup)
+    let error = repository::prepare_with_pr_lookup(&f.root, &f.args, &lookup, &temp_base())
         .unwrap_err()
         .to_string();
     assert!(error.contains("seat_dirty"), "{error}");
@@ -1795,6 +2551,7 @@ fn a_dirty_worktree_in_one_clone_does_not_refuse_the_seats_other_clone() {
         container_id: "test-container".into(),
         branch: None,
         slug: Some("owner-repo-12345678".into()),
+        mirror_objects: None,
     };
     repository::prepare(&f.root, &additional).unwrap();
     let wedged = linked_worktree(&f, "issue-5084");
@@ -1802,4 +2559,254 @@ fn a_dirty_worktree_in_one_clone_does_not_refuse_the_seats_other_clone() {
     assert!(f.prepare().unwrap_err().to_string().contains("seat_dirty"));
     // The other repository's clone prepares regardless (#14458).
     repository::prepare(&f.root, &additional).unwrap();
+}
+
+// ---------------------------------------------------------------------------
+// Origin object mirrors (#14680): seat-side borrowing and migration.
+// ---------------------------------------------------------------------------
+
+/// A bare clone of `remote`, standing in for the host daemon's mirror store.
+fn bare_mirror(temp: &Path, remote: &Path) -> PathBuf {
+    let mirror = temp.join("mirror.git");
+    git(
+        temp,
+        &[
+            "clone",
+            "--bare",
+            "--",
+            &remote.to_string_lossy(),
+            &mirror.to_string_lossy(),
+        ],
+    );
+    mirror
+}
+
+/// Local (non-borrowed) object count, as `git count-objects -v` reports it.
+fn local_objects(repo: &Path) -> usize {
+    let out = git(repo, &["count-objects", "-v"]);
+    let number = |prefix: &str| {
+        out.lines()
+            .find(|line| line.starts_with(prefix))
+            .and_then(|line| line.split_whitespace().last())
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or_default()
+    };
+    number("count:") + number("in-pack:")
+}
+
+/// The core #14680 migration: an existing private clone with unpublished
+/// work and a dirty linked worktree borrows its mirror's published objects
+/// in place — refs, index, worktree contents and unpublished commits all
+/// survive, local object bytes shrink, and an interrupted migration is
+/// safely retried.
+#[test]
+#[serial_test::serial(private_workspace_fork)]
+fn a_clone_migrates_onto_its_mirror_keeping_every_local_artifact() {
+    let _fork = fork_guard();
+    let f = RepoFixture::new();
+    f.prepare().unwrap();
+    let repo = f.root.join("repo");
+    git(&repo, &["switch", "-c", "unpublished"]);
+    std::fs::write(repo.join("local"), "unpushed").unwrap();
+    git(&repo, &["add", "local"]);
+    git(&repo, &["commit", "-m", "unpublished"]);
+    let unpublished = git(&repo, &["rev-parse", "unpublished"]);
+    let worktree = f.root.join("issue-7");
+    git(
+        &repo,
+        &[
+            "worktree",
+            "add",
+            "-b",
+            "issue-7",
+            worktree.to_str().unwrap(),
+        ],
+    );
+    std::fs::write(worktree.join("fixture"), "edited").unwrap();
+    let published = git(&f.remote, &["rev-parse", "main"]);
+    let mirror = bare_mirror(f._temp.path(), &f.remote);
+    let objects = mirror.join("objects").to_string_lossy().into_owned();
+    let before = local_objects(&repo);
+
+    repository::borrow_published(&repo, &objects, false).unwrap();
+
+    // The alternate names exactly the mirror's objects directory.
+    assert_eq!(
+        std::fs::read_to_string(repo.join(".git/objects/info/alternates"))
+            .unwrap()
+            .trim(),
+        objects
+    );
+    // Published objects are borrowed, not stored; unpublished work stays local.
+    assert!(local_objects(&repo) < before, "the clone must shed published objects");
+    assert_eq!(git(&repo, &["cat-file", "-e", &published]), "");
+    assert_eq!(git(&repo, &["rev-parse", "unpublished"]), unpublished);
+    // The dirty linked worktree keeps its edit; the index is untouched.
+    assert_eq!(std::fs::read_to_string(worktree.join("fixture")).unwrap(), "edited");
+    // A settled migration is a no-op, and an interrupted one (marker gone)
+    // reruns to the same end state.
+    repository::borrow_published(&repo, &objects, false).unwrap();
+    std::fs::remove_file(repo.join(".git/objects/info/loom-migrated")).unwrap();
+    repository::borrow_published(&repo, &objects, false).unwrap();
+    assert_eq!(git(&repo, &["rev-parse", "unpublished"]), unpublished);
+    assert_eq!(git(&repo, &["cat-file", "-e", &published]), "");
+}
+
+/// Nothing but the clone's own authorized mirror is ever accepted: a foreign
+/// alternate is refused (never overwritten), and a missing, symlinked or
+/// indirect mirror refuses the migration before any object moves.
+#[test]
+#[serial_test::serial(private_workspace_fork)]
+fn borrowing_refuses_foreign_missing_or_indirect_mirrors() {
+    let _fork = fork_guard();
+    let f = RepoFixture::new();
+    f.prepare().unwrap();
+    let repo = f.root.join("repo");
+    let alternates = repo.join(".git/objects/info/alternates");
+
+    std::fs::write(&alternates, "/host/objects").unwrap();
+    let error = repository::borrow_published(&repo, "/mirrors/a-b-00000000/objects", false)
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("foreign"), "{error}");
+    assert_eq!(std::fs::read_to_string(&alternates).unwrap(), "/host/objects");
+    std::fs::remove_file(&alternates).unwrap();
+
+    let error = repository::borrow_published(&repo, "/nonexistent/objects", false)
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("not mounted"), "{error}");
+
+    let real = bare_mirror(f._temp.path(), &f.remote);
+    let linked = f._temp.path().join("linked.git");
+    std::os::unix::fs::symlink(&real, &linked).unwrap();
+    let error =
+        repository::borrow_published(&repo, &linked.join("objects").to_string_lossy(), false)
+            .unwrap_err()
+            .to_string();
+    assert!(error.contains("real directory"), "{error}");
+
+    let indirect = f._temp.path().join("indirect.git");
+    std::fs::create_dir_all(indirect.join("objects/info")).unwrap();
+    std::fs::write(indirect.join("objects/info/alternates"), "/elsewhere/objects").unwrap();
+    let error =
+        repository::borrow_published(&repo, &indirect.join("objects").to_string_lossy(), false)
+            .unwrap_err()
+            .to_string();
+    assert!(error.contains("indirect"), "{error}");
+    assert!(!alternates.exists(), "no refused migration may write an alternate");
+}
+
+/// The only allowed alternate is the repository's own canonical mirror path:
+/// `identify`-derived for HTTPS repositories, none at all for anything else.
+#[test]
+fn the_only_allowed_alternate_is_the_repositorys_own_mirror() {
+    let repository = "https://forge.example/owner/repo";
+    let id = identify(repository).unwrap();
+    assert_eq!(
+        mirror_alternate(repository).as_deref(),
+        Some(format!("{MIRRORS}/{}/objects", id.slug).as_str())
+    );
+    assert_eq!(mirror_alternate("/tmp/remote"), None);
+
+    let dir = tempfile::tempdir().unwrap();
+    let repo = dir.path().join("repo");
+    let info = repo.join(".git/objects/info");
+    std::fs::create_dir_all(&info).unwrap();
+    // No alternate: a private clone, always supported.
+    assert!(repository::verify_alternates(&repo, None).is_ok());
+    // Exactly the repository's own mirror path.
+    let expected = mirror_alternate(repository).unwrap();
+    std::fs::write(info.join("alternates"), format!("{expected}\n")).unwrap();
+    assert!(repository::verify_alternates(&repo, Some(&expected)).is_ok());
+    // Another repository's mirror, an arbitrary path, or a second entry.
+    for body in [
+        "/mirrors/other-repo-00000000/objects\n",
+        "/host/objects\n",
+        &format!("{expected}\n/mirrors/a-b-11111111/objects\n"),
+    ] {
+        std::fs::write(info.join("alternates"), body).unwrap();
+        assert!(
+            repository::verify_alternates(&repo, Some(&expected)).is_err(),
+            "{body:?} must be refused"
+        );
+    }
+    // An alternate with no authorized mirror at all: preparation passes
+    // `None` whenever the host bound no mirror, and must refuse every
+    // alternate then — even one that happens to name the canonical path.
+    std::fs::write(info.join("alternates"), format!("{expected}\n")).unwrap();
+    let error = repository::verify_alternates(&repo, None)
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("private Git objects"), "{error}");
+    std::fs::write(info.join("alternates"), "/tmp/objects\n").unwrap();
+    let error = repository::verify_alternates(&repo, None)
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("private Git objects"), "{error}");
+}
+
+/// Preparation refuses a mirror path that is not the repository's own:
+/// wrong-repository and arbitrary paths never reach a clone.
+#[test]
+#[serial_test::serial(private_workspace_fork)]
+fn prepare_refuses_a_mirror_path_that_is_not_the_repositorys_own() {
+    let _fork = fork_guard();
+    let mut f = RepoFixture::new();
+    f.args.mirror_objects = Some("/mirrors/owner-other-00000000/objects".into());
+    let error = f.prepare().unwrap_err().to_string();
+    assert!(error.contains("own read-only origin mirror"), "{error}");
+    assert!(!f.root.join("repo").exists(), "nothing was cloned");
+}
+
+/// Only a target whose bind the container actually carries borrows; a
+/// registration without a bind (added after creation) stays fully private.
+#[test]
+fn a_target_without_a_recorded_bind_stays_private() {
+    let repository = "https://forge.example/owner/repo";
+    let id = identify(repository).unwrap();
+    let mut config = Config {
+        schema_version: 2,
+        account: "seat".into(),
+        container: "c".into(),
+        engine: "e".into(),
+        docker_desktop: false,
+        repository: repository.into(),
+        base: "main".into(),
+        repositories: vec![Registered {
+            repository: "https://forge.example/owner/other".into(),
+            base: "main".into(),
+            slug: "owner-other-11111111".into(),
+        }],
+        volume: "v".into(),
+        profile: PathBuf::from("/nonexistent"),
+        gh_config: None,
+        session_image: None,
+        extra_mounts: Vec::new(),
+        mirror_binds: vec![id.slug.clone()],
+    };
+    assert_eq!(
+        mirror::bound_objects(&config, &config.primary()).as_deref(),
+        Some(mirror::in_container_objects(&id.slug).as_str())
+    );
+    let additional = config
+        .target(Some("https://forge.example/owner/other"))
+        .unwrap();
+    assert_eq!(mirror::bound_objects(&config, &additional), None);
+    config.mirror_binds.clear();
+    assert_eq!(mirror::bound_objects(&config, &config.primary()), None);
+}
+
+#[test]
+fn status_running_is_false_while_the_seat_is_restarting() {
+    let state = |running, restarting| serde_json::json!({"State": {"Running": running, "Restarting": restarting}});
+    // Docker reports Running=true during a crash-loop back-off (#15015).
+    assert!(!lifecycle::reports_running(Some(&state(true, true))));
+    assert!(lifecycle::reports_running(Some(&state(true, false))));
+    assert!(!lifecycle::reports_running(Some(&state(false, false))));
+    // A missing `Restarting` key is not restarting; no container is not running.
+    assert!(lifecycle::reports_running(Some(
+        &serde_json::json!({"State": {"Running": true}})
+    )));
+    assert!(!lifecycle::reports_running(None));
 }
