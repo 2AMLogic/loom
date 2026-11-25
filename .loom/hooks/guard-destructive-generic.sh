@@ -7816,16 +7816,22 @@ _extract_rm_targets_scan() {
             # never remove one: it deletes shell structure preceding the
             # command word only, and a segment whose first word already is `rm`
             # matches none of these shapes.
-            rawseg = seg   # pre-strip snapshot: `lead` below must still see a leading `(`
+            subopen = 0   # did the strip loop consume a SUBSHELL-opening paren?
             while (1) {
-                if (seg ~ /^[A-Za-z0-9_./+@%,:?~-]+[ \t]*\(\)[ \t]*[\{(]/)
+                if (seg ~ /^[A-Za-z0-9_./+@%,:?~-]+[ \t]*\(\)[ \t]*[\{(]/) {
+                    if (seg ~ /^[A-Za-z0-9_./+@%,:?~-]+[ \t]*\(\)[ \t]*\(/) subopen = 1
                     sub(/^[A-Za-z0-9_./+@%,:?~-]+[ \t]*\(\)[ \t]*[\{(][ \t]*/, "", seg)
-                else if (seg ~ /^function[ \t]+[A-Za-z0-9_./+@%,:?~-]+([ \t]*\(\))?[ \t]*[\{(]/)
+                }
+                else if (seg ~ /^function[ \t]+[A-Za-z0-9_./+@%,:?~-]+([ \t]*\(\))?[ \t]*[\{(]/) {
+                    if (seg ~ /^function[ \t]+[A-Za-z0-9_./+@%,:?~-]+([ \t]*\(\))?[ \t]*\(/) subopen = 1
                     sub(/^function[ \t]+[A-Za-z0-9_./+@%,:?~-]+([ \t]*\(\))?[ \t]*[\{(][ \t]*/, "", seg)
+                }
                 else if (seg ~ /^\{[ \t]/)
                     sub(/^\{[ \t]+/, "", seg)
-                else if (seg ~ /^\(/ && seg !~ /^\(\(/)
+                else if (seg ~ /^\(/ && seg !~ /^\(\(/) {
+                    subopen = 1
                     sub(/^\([ \t]*/, "", seg)
+                }
                 else break
             }
             sub(/^[ \t]+/, "", seg)
@@ -7844,7 +7850,7 @@ _extract_rm_targets_scan() {
             # A leading `(` encloses this segment, so the state is saved before
             # it; a `$(` later in the segment opens AFTER the segment own
             # command ran in the outer shell, so that save happens after it.
-            lead = (rawseg ~ /^\(/ && rawseg !~ /^\(\(/) ? 1 : 0
+            lead = subopen ? 1 : 0
             npush = (popen - pclose > lead) ? popen - pclose : lead
             if (npush > popen) npush = popen
             npop = pclose - (popen - npush)
