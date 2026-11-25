@@ -1673,7 +1673,8 @@ Unanswered: skip the premise gate. Claim it (`loom:curating`), read that trusted
   `loom-daemon park-record apply --issue <N> --blocked-by <children> --by
   curator --remove-label loom:triage --remove-label loom:curating`. If the
   parent body carries `<!-- loom:split-rescoped -->` alone on a line, remove
-  that line in the same edit that parks it (#15256): the marker describes a
+  that line in the same edit that parks it (#15256; removing it is not the
+  content edit a `champion:revision-disposition` round forbids): the marker describes a
   revision the new children supersede, and a stale one makes `forge parent
   split-state` print `NOT_SPLIT` once the new children close, so the Builder
   is re-dispatched onto an empty parent (the #13635 loop).
