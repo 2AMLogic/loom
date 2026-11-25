@@ -174,19 +174,22 @@ fn volume_root_of(path: &Path) -> Option<PathBuf> {
 /// out silently.
 #[must_use]
 pub fn candidate_roots(repo_root: &Path) -> Vec<PathBuf> {
+    let home = std::env::var("HOME").unwrap_or_default();
+    let tmp = std::env::var("TMPDIR").unwrap_or_else(|_| "/tmp".to_string());
+    candidate_roots_with_dirs(repo_root, Path::new(&home), Path::new(&tmp))
+}
+
+fn candidate_roots_with_dirs(repo_root: &Path, home: &Path, tmp: &Path) -> Vec<PathBuf> {
     let mut roots: Vec<PathBuf> = Vec::new();
-    if let Some(top) = volume_root_of(&repo_root.join(".loom").join("worktrees")) {
+    if let Some(top) = volume_root_of(&crate::worktree_root::worktree_root(repo_root)) {
         roots.push(top);
     }
-    if let Ok(home) = std::env::var("HOME") {
-        if !home.is_empty() {
-            roots.push(PathBuf::from(&home));
-            roots.push(Path::new(&home).join(".cache"));
-        }
+    if !home.as_os_str().is_empty() {
+        roots.push(home.to_path_buf());
+        roots.push(home.join(".cache"));
     }
-    let tmp = std::env::var("TMPDIR").unwrap_or_else(|_| "/tmp".to_string());
-    if !tmp.is_empty() {
-        roots.push(PathBuf::from(tmp));
+    if !tmp.as_os_str().is_empty() {
+        roots.push(tmp.to_path_buf());
     }
     let mut seen = BTreeSet::new();
     roots
@@ -955,8 +958,8 @@ fn sweep(
     report
 }
 
-/// Log one pass's outcome. A pass that removed (or planned) something logs
-/// at `info`; a no-op logs at `debug`.
+/// Log completed passes with candidates at `info`, including the reason for
+/// each preserved root. Empty, disabled and deferred passes log at `debug`.
 pub fn log_report(report: &ScratchRootReport) {
     if !report.enabled {
         log::debug!(
@@ -969,7 +972,7 @@ pub fn log_report(report: &ScratchRootReport) {
         log::debug!("scratch_root_reaper: {} skipped: {reason}", report.repo_root.display());
         return;
     }
-    if report.removed.is_empty() && report.planned.is_empty() {
+    if report.candidates == 0 {
         log::debug!(
             "scratch_root_reaper: {} {} — nothing eligible",
             report.repo_root.display(),
@@ -1475,6 +1478,34 @@ mod tests {
     // ===================================================================
     // discover_candidates / evaluate_root gates
     // ===================================================================
+
+    #[cfg(unix)]
+    #[test]
+    #[serial]
+    fn candidate_roots_includes_configured_worktree_volume() {
+        use crate::env_test_support::EnvGuard;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        let worktrees = tmp.path().join("worktrees");
+        let configured = worktrees.join("repo");
+        std::fs::create_dir_all(repo.join(".loom")).unwrap();
+        std::fs::create_dir_all(&configured).unwrap();
+        // Only the override exists. Keep HOME and TMPDIR below the mount point
+        // so neither can put the expected volume in the list by coincidence.
+        let _env = EnvGuard::set("LOOM_WORKTREE_ROOT", &worktrees);
+        let roots = || candidate_roots_with_dirs(&repo, tmp.path(), tmp.path());
+        let volume = volume_root_of(&configured).unwrap();
+        assert!(roots().contains(&volume), "LOOM_WORKTREE_ROOT");
+
+        std::fs::write(
+            repo.join(".loom/config.json"),
+            serde_json::json!({ "worktree": { "root": worktrees } }).to_string(),
+        )
+        .unwrap();
+        std::env::remove_var("LOOM_WORKTREE_ROOT");
+        assert!(roots().contains(&volume), "worktree.root");
+    }
 
     #[test]
     fn test_discover_candidates_direct_children_only() {
@@ -2065,6 +2096,29 @@ mod tests {
     // ===================================================================
     // run_for — cooldown and config
     // ===================================================================
+
+    #[test]
+    fn preview_logs_path_and_reason_when_every_candidate_is_preserved() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("loom-9-builder.aa11");
+        std::fs::create_dir(&root).unwrap();
+        let (probes, _) = probes_now(IDLE_WINDOW_SECS, 24 * 3600);
+        let report =
+            sweep(tmp.path(), &[tmp.path().to_owned()], &probes, true, &Mutex::new(Vec::new()));
+        let logs = crate::test_log_capture::capture_logs(|| log_report(&report));
+
+        assert!(
+            logs.iter().any(|(level, message)| {
+                *level == log::Level::Info
+                    && message.contains("0 root(s) (nothing) [dry-run], 1 preserved")
+                    && message.contains(&format!(
+                        "{} (root younger than scratchReclaim.maxAgeHours)",
+                        root.display()
+                    ))
+            }),
+            "preview summary: {logs:?}"
+        );
+    }
 
     #[test]
     #[serial]
