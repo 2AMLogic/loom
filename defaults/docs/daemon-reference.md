@@ -2624,6 +2624,40 @@ blocker is Loom-owned:
   a log line naming the repo path. Carrying
   these to SigNoz is #11386.
 
+## Changing a bundled model profile's model (`runtimes.modelProfileOverrides`, #15252)
+
+A config tier (fleet defaults, `fleet/hosts/<host>/`, or `.loom-local/local.json`)
+can change the model a **bundled** profile runs without a Loom release:
+
+```jsonc
+"runtimes": { "modelProfileOverrides": { "zai-full": { "model": "glm-5.4" } } }
+```
+
+The override is overlaid on the bundled profile inside `profiles::lookup` — it never
+replaces it — so `excludedRoles` (`judge`, `curator` on the GLM profiles), providers,
+credentials, `credentialProxy` and billing are inherited unchanged.
+
+| Key | Effect |
+|-----|--------|
+| `model`, `effort` | replaces the bundled value |
+| `allowedEfforts` | replaces the bundled list |
+| `excludedRolesAdd` | known role names **added** to the bundled `excludedRoles` (never removes) |
+
+Anything else is an error: `loom-daemon validate` reports it, and a launch refuses
+at exit 78 with the same text. That covers an unknown key (`excludedRoles`
+included), a name that is not in `defaults/model-profiles.json`, the same name under
+both `runtimes.modelProfiles` and `runtimes.modelProfileOverrides`, a blank
+`model`/`effort`/`allowedEfforts` entry, and an unknown `excludedRolesAdd` role.
+An explicit `null` clears a lower tier's entry or field. Tier precedence is the
+ordinary `deep_merge` order (local > fleet-repo > project > committed > machine
+defaults), and `fleet-config render` applies a host overlay over the fleet default
+the same way, so a per-host override is a canary.
+
+`loom-daemon worker profile-check <name>` prints `model: <id> (source: <tier>)`,
+where `<tier>` is `local`, `fleet-repo`, `project`, `committed`, `defaults` or
+`bundled`. Full semantics: [`runtime-adapters.md`](runtime-adapters.md)
+§ "Changing a bundled profile's model without a release".
+
 ## Fleet model A/B — `sweep-experiment plan` (#8055 phase 1)
 
 `loom-daemon sweep-experiment` already randomizes **per issue**, by parity
