@@ -7,7 +7,7 @@
 //! "codex"`) never fed anything back into `.loom/account-health.json`: the
 //! adapter (`spawn-codex.sh`) prints the record on every exit, but
 //! `sweep_registry::provider_health_feedback`'s doc comment names itself
-//! "the only production caller of `tokens_pool::record_terminal_for_model`"
+//! "the only production caller of `tokens_pool::record_terminal_for_model_with_reset`"
 //! — and it is keyed on a `sweep_id=` anchor that only exists in a sweep's
 //! own log. A role tick's own child never had anything reading its
 //! terminal line back into health, so #8408's pre-spawn codex gate

@@ -8,8 +8,7 @@
 //! from any single `status --json`, and [`roll_line`] says the same thing in
 //! the human renderer.
 //!
-//! Rendering lives here rather than in `status_render.rs` (over
-//! `.loom/docs/file-size-policy.md`'s threshold, and frozen) and returns its
+//! Rendering lives here rather than in `status_render.rs` and returns its
 //! line instead of printing it, so tests assert on the text directly —
 //! the same shape as the [`super::holds`] sibling.
 
@@ -37,6 +36,7 @@ pub fn drain_json(report: &DaemonStatusReport) -> serde_json::Value {
             "origin": r.origin,
             "timed_out": r.timed_out,
             "startup_hold": r.startup_hold,
+            "fleet_hold": r.fleet_hold,
             // #10831: the H4 pause's step, budgets, per-reason requeue counts
             // and observed durations. `null` unless this is a pause roll.
             "pause": r.pause,
@@ -92,7 +92,9 @@ fn roll_line_at(report: &DaemonStatusReport, now: chrono::DateTime<chrono::Utc>)
     }
     let roll = report.drain_roll.as_ref()?;
     // #9588: say WHY dispatch is paused before anything else.
-    let state = if roll.startup_hold {
+    let state = if roll.fleet_hold {
+        "HELD by the fleet store (paused) — set it running in the store to resume"
+    } else if roll.startup_hold {
         "HELD at startup (operator stop on record — `restart --abort-drain` releases it)"
     } else if roll.timed_out {
         "TIMED OUT, dispatch held PAUSED until the stragglers finish (operator drain — \
@@ -264,6 +266,7 @@ mod tests {
             origin: "auto-update".to_string(),
             timed_out: false,
             startup_hold: false,
+            fleet_hold: false,
             pause: None,
         }
     }
@@ -440,6 +443,22 @@ mod tests {
         roll.origin = "operator".to_string();
         let line = roll_line(&report_with(Some(roll))).unwrap();
         assert!(line.contains("HELD at startup"), "{line}");
+    }
+
+    /// #15300: a fleet hold is not an operator stop and `--abort-drain` is not
+    /// its release path.
+    #[test]
+    fn a_fleet_hold_says_the_fleet_store_paused_the_host() {
+        let mut roll = pending_roll();
+        roll.startup_hold = true;
+        roll.fleet_hold = true;
+        roll.origin = "operator".to_string();
+        let report = report_with(Some(roll));
+        let line = roll_line(&report).unwrap();
+        assert!(line.contains("HELD by the fleet store"), "{line}");
+        assert!(!line.contains("--abort-drain"), "{line}");
+        assert!(!line.contains("operator stop"), "{line}");
+        assert_eq!(drain_json(&report)["roll"]["fleet_hold"], serde_json::json!(true));
     }
 
     #[test]

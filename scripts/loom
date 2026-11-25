@@ -653,6 +653,18 @@ loom_cmd_status() {
         echo "  loom-daemon:   not on PATH"
     fi
 
+    # Session gateway profiles (#14884): `loom-tools gateway status` decides
+    # whether there is anything to report (it prints nothing when no
+    # publication exists and this is not a session-mode host), so this stays
+    # a plain delegation — the binary owns the logic, not the shell.
+    if command -v loom-tools >/dev/null 2>&1; then
+        local gw_out gw_line
+        gw_out="$(loom-tools gateway status 2>/dev/null || true)"
+        if [[ -n "$gw_out" ]]; then
+            while IFS= read -r gw_line; do echo "  $gw_line"; done <<<"$gw_out"
+        fi
+    fi
+
     local hp line
     hp="$(loom_health_problems "$checkout" 2>/dev/null || true)"
     if [[ -n "$hp" ]]; then

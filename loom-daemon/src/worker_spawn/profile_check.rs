@@ -70,7 +70,12 @@ fn report(name: Option<&str>, runtime: Option<&str>) -> Result<(String, bool), L
     let (name, profile) = profiles::lookup(name, &config)?;
     let mut out = String::new();
     let _ = writeln!(out, "profile: {name}");
-    let _ = writeln!(out, "model: {}", profile.model);
+    let _ = writeln!(
+        out,
+        "model: {} (source: {})",
+        profile.model,
+        model_source(&root, &name, &config)
+    );
     if let Some(effort) = &profile.effort {
         let _ = writeln!(out, "effort: {effort}");
     }
@@ -149,6 +154,34 @@ fn report(name: Option<&str>, runtime: Option<&str>) -> Result<(String, bool), L
         }
     }
     Ok((out, resolvable))
+}
+
+/// Which layer decided the profile's model (#15252): the highest-precedence
+/// config tier setting `runtimes.modelProfileOverrides.<name>.model`, else the
+/// tier whose `runtimes.modelProfiles.<name>` replaced the bundled profile,
+/// else `bundled`. Keys are looked up by exact segment (a profile name is never
+/// dot-split) and an explicit `null` counts as unset, matching `deep_merge`.
+fn model_source(root: &Path, name: &str, config: &serde_json::Value) -> &'static str {
+    use crate::config_resolver::{source_of_segments, tier_name};
+    let tier = |group: &str| {
+        source_of_segments(root, &["runtimes", group, name, "model"])
+            .map(|path| tier_name(root, &path))
+    };
+    let set = |group: &str| {
+        config
+            .pointer("/runtimes")
+            .and_then(|r| r.get(group))
+            .and_then(|g| g.get(name))
+            .and_then(|p| p.get("model"))
+            .is_some_and(|m| !m.is_null())
+    };
+    if set("modelProfileOverrides") {
+        tier("modelProfileOverrides").unwrap_or("defaults")
+    } else if set("modelProfiles") {
+        tier("modelProfiles").unwrap_or("defaults")
+    } else {
+        "bundled"
+    }
 }
 
 /// Whether an unset `source` credential variable would be supplied by this

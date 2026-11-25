@@ -172,7 +172,7 @@ git branch feature/issue-N origin/feature/issue-N && ./.loom/scripts/worktree.sh
 ```
 
 This arm has no shell implementation of its own — `lib/worktree-forge-pr-check.sh`
-is `contract`-category (see [`shell-language-policy.md`](https://github.com/rjwalters/loom/blob/main/.loom/docs/shell-language-policy.md)),
+is `contract`-category (see [`shell-language-policy.md`](https://github.com/2AMLogic/loom/blob/main/.loom/docs/shell-language-policy.md)),
 so the decision lives once, in `loom-daemon worktree-closed-pr-branch`. A
 daemon predating the subcommand degrades to the pre-#9083 reuse behavior
 rather than surfacing a clap usage error.
@@ -513,14 +513,22 @@ config hierarchy) and reclaims it afterwards — but only when the redirect is
 attributable to that one worktree, which means a `.cargo/config.toml` inside it
 (see the never-delete list and the limitation below):
 
-- `worktree.sh remove <N>` — bash side, via
-  `defaults/scripts/lib/cargo-target-dir.sh`.
-- `merge-pr.sh`'s post-merge worktree cleanup — same bash library. This is the
-  removal path most worktrees actually take, so it is where the leak was
-  largest.
-- `loom-daemon clean` and the daemon's periodic worktree reaper — Rust side,
-  via `loom-daemon/src/worktree_ops/cargo_target.rs` (both `issue-<N>` and
-  `pr-<N>` worktrees).
+- `worktree.sh remove <N>` — via `loom-daemon worktree-remove`.
+- `merge-pr.sh`'s post-merge worktree cleanup — via `loom-daemon merge-pr
+  post-merge-cleanup`. This is the removal path most worktrees actually take,
+  so it is where the leak was largest.
+- the daemon's merge-observation pass (#14904) — directly: when the
+  reconciliation tick observes a merge made on the forge side (GitHub's own
+  merge button, a queue-merged PR), it replays `merge-pr.sh`'s whole
+  post-merge worktree-cleanup block in-process, so those worktrees are
+  reclaimed without waiting for the periodic reaper.
+- `loom-daemon clean` and the daemon's periodic worktree reaper — directly.
+
+All of them run the same Rust reclaim in
+`loom-daemon/src/worktree_ops/cargo_target.rs` (both `issue-<N>` and `pr-<N>`
+worktrees); the parallel bash reclaim stack that once lived in
+`defaults/scripts/lib/cargo-target-dir.sh` was deleted (#15075) once every
+removal surface had migrated.
 
 Preview what a removal would reclaim, with sizes, without touching anything:
 
@@ -792,9 +800,12 @@ or `LOOM_PER_WORKTREE_TARGET_DIR=1` in the daemon's environment. Then:
   every rule in the scheme is stated once, in the daemon; the shell scripts hold
   only the call sites.
 - Every removal path reclaims it: `worktree.sh remove`, `merge-pr.sh`'s
-  post-merge cleanup, `loom-daemon clean`, and the daemon's periodic reaper (so a
-  worktree whose PR merged on another host is cleaned up here too). All four now
-  run the **same** Rust decision (`worktree_ops::cargo_target::plan_reclaim`):
+  post-merge cleanup, `loom-daemon clean`, the daemon's periodic reaper (so a
+  worktree whose PR merged on another host is cleaned up here too), and the
+  daemon's merge-observation pass (#14904), which replays the script's whole
+  post-merge worktree cleanup once it observes a forge-side merge. All five
+  now run the **same** Rust decision
+  (`worktree_ops::cargo_target::plan_reclaim`):
   `merge-pr.sh` removes worktrees with its own `git worktree remove --force`
   rather than through `worktree.sh remove`, so it could not inherit that reclaim
   by delegation and carried the last bash copy of the resolve/reclaim call
@@ -941,9 +952,15 @@ jq -r 'select(.ts > "2026-08-10T20:00:00") | "\(.ts) \(.mechanism) \(.reason) \(
 ```
 
 `mechanism` is one of `clean`, `clean --aggressive`, `worktree_reaper`,
-`terminal_destroy`, `loom-recover-orphans`, `merge-pr.sh`, `worktree.sh remove`,
-`agent-destroy.sh` — all eight of Loom's removal paths; `reason` is the exact
-decision that authorized it (e.g. `force_override_unreachable`, `pr_merged`).
+`loom-recover-orphans`, `merge-pr.sh`, `worktree.sh remove`,
+`agent-destroy.sh`, `merge_observation` — all eight of Loom's removal paths
+(`merge_observation`, #14904, is the daemon's merge-observation pass: the same
+post-merge cleanup `merge-pr.sh` runs, triggered from the reconciliation tick
+when a forge-side merge is observed — a removal by it is the daemon's, not the
+script's); `reason` is the exact decision that authorized it (e.g.
+`force_override_unreachable`, `pr_merged`; `agent-destroy.sh` writes
+`terminal_destroy` here, and ledger lines older than #13867 may carry it as a
+`mechanism`).
 **An absent entry is evidence too**: no Loom code path removed it, so look at
 host-level/manual action — a bare `rm -rf`, a hand-run `git worktree remove`, a
 `git worktree prune` against a directory that was moved, or another checkout of
@@ -2315,7 +2332,7 @@ exec-latency artifacts rather than contention. The narrative and its consequence
 for gate niceness live in [`build-gate.md`](build-gate.md) (the #4044 / #4046
 falsification passage). ADR-0011 also records this as a macOS-specific defect that
 is invisible to Linux CI by construction — see
-[`docs/adr/0011-ci-runner-platform.md`](https://github.com/rjwalters/loom/blob/main/docs/adr/0011-ci-runner-platform.md)
+[`docs/adr/0011-ci-runner-platform.md`](https://github.com/2AMLogic/loom/blob/main/docs/adr/0011-ci-runner-platform.md)
 (upstream Loom repo — not shipped to consumer installs).
 
 > **Historical note on timeouts.** Contemporaneous incident writeups mention a
@@ -2353,7 +2370,7 @@ loom-daemon status --json  # machine-readable
 | `dead_pid` | (instant) | PID in the daemon sweep registry is no longer alive |
 | `error_spike` | 5 errors | Multiple errors in `.loom/logs/sweep-issue-N.log` |
 
-The pre-v0.10.0 indicators `missing_milestone:worktree_created` and `extended_work` were retired when the Python daemon brain (`daemon_v2/`) was removed — see [the migration guide § Per-CLI breaking changes](https://github.com/rjwalters/loom/blob/main/docs/migration/v0.10.0-shepherd-deprecation.md#per-cli-breaking-changes) (upstream Loom repo — not shipped to consumer installs) for the field-level diff. The shell-level `./.loom/scripts/daemon.sh` launcher was removed in #3432, and the Rust daemon does not write progress files, so milestone-based heuristics no longer apply.
+The pre-v0.10.0 indicators `missing_milestone:worktree_created` and `extended_work` were retired when the Python daemon brain (`daemon_v2/`) was removed — see [the migration guide § Per-CLI breaking changes](https://github.com/2AMLogic/loom/blob/main/docs/migration/v0.10.0-shepherd-deprecation.md#per-cli-breaking-changes) (upstream Loom repo — not shipped to consumer installs) for the field-level diff. The shell-level `./.loom/scripts/daemon.sh` launcher was removed in #3432, and the Rust daemon does not write progress files, so milestone-based heuristics no longer apply.
 
 ### A killed Task/Agent-tool subagent leaves no teardown signal for external resources it held
 
@@ -2601,7 +2618,7 @@ cd mcp-loom && npm install && npm run build
 grep -c dispatch_sweep dist/index.js   # should now be > 0
 ```
 
-`scripts/setup-mcp.sh` now auto-rebuilds when `dist/index.js` is missing **or** older than any file under `mcp-loom/src/` (#3803), so `./scripts/setup-mcp.sh` is the safe one-shot path. Rebuilding the bundle does **not** refresh an already-running session — an MCP client caches its tool list at connect time, so you must **restart the Claude Code session** (or respawn the `loom` MCP subprocess) for the new tools to appear. See [`mcp-loom/README.md`](https://github.com/rjwalters/loom/blob/main/mcp-loom/README.md#rebuilding-after-source-changes-reconnect-required) (upstream Loom repo — not shipped to consumer installs) for the full rebuild + reconnect procedure and a raw `tools/list` verification snippet.
+`scripts/setup-mcp.sh` now auto-rebuilds when `dist/index.js` is missing **or** older than any file under `mcp-loom/src/` (#3803), so `./scripts/setup-mcp.sh` is the safe one-shot path. Rebuilding the bundle does **not** refresh an already-running session — an MCP client caches its tool list at connect time, so you must **restart the Claude Code session** (or respawn the `loom` MCP subprocess) for the new tools to appear. See [`mcp-loom/README.md`](https://github.com/2AMLogic/loom/blob/main/mcp-loom/README.md#rebuilding-after-source-changes-reconnect-required) (upstream Loom repo — not shipped to consumer installs) for the full rebuild + reconnect procedure and a raw `tools/list` verification snippet.
 
 ### MCP tools hang with no response (~1800s), then abort
 
@@ -3236,7 +3253,7 @@ output. A refusal prints its reason and exits `1`. Only with no source tree
 AND no `loom-daemon` that has that subcommand does the script fail with
 `Could not locate a defaults/ source tree to sync from`
 (`check-main-freshness.sh` says which path is next). Fix for that case: install
-or update `loom-daemon`, or clone <https://github.com/rjwalters/loom> and run
+or update `loom-daemon`, or clone <https://github.com/2AMLogic/loom> and run
 `echo /path/to/local/loom-clone > .loom/loom-source-path` — or name the clone
 for one invocation only with `--source /path/to/local/loom-clone`, which never
 reads or writes the sidecar and combines with `--output` staging (#14677).

@@ -38,6 +38,38 @@ fn has_red_main(body: &str) -> bool {
         .any(|l| l.trim_start().starts_with(RED_MAIN_MARKER))
 }
 
+/// Written alone on a line in a split parent's body by the reviser (Curator
+/// answering a Champion send-back) when the revision adds work the closed
+/// children do not cover. [`split_state`] then treats the parent as buildable
+/// rather than a finished tracker (#15242).
+pub const SPLIT_RESCOPED_MARKER: &str = "<!-- loom:split-rescoped -->";
+
+/// Does `body` carry [`SPLIT_RESCOPED_MARKER`] alone on a line, outside a
+/// fenced code block? An inline mention or a fenced example does not count.
+fn has_split_rescoped(body: &str) -> bool {
+    // `(fence char, opening length)` while inside a fenced block.
+    let mut fence: Option<(char, usize)> = None;
+    for line in body.lines() {
+        let t = line.trim();
+        let lead = t.chars().next();
+        let run = lead.map_or(0, |c| t.chars().take_while(|&x| x == c).count());
+        if matches!(lead, Some('`' | '~')) && run >= 3 {
+            let c = lead.unwrap_or('`');
+            match fence {
+                None => fence = Some((c, run)),
+                // A closing fence: same char, at least as long, nothing after.
+                Some((fc, n)) if fc == c && run >= n && t.chars().all(|x| x == c) => fence = None,
+                Some(_) => {}
+            }
+            continue;
+        }
+        if fence.is_none() && t == SPLIT_RESCOPED_MARKER {
+            return true;
+        }
+    }
+    false
+}
+
 /// `body` with the parent marker (and the parent's red-main marker, when
 /// `parent_body` carries one) appended. A marker already present is not
 /// repeated, so re-running a filing is harmless.
@@ -79,8 +111,12 @@ pub fn sub_issue_link_args(slug: &str, parent: u32, child_db_id: u64) -> Vec<Str
 /// skipped).
 #[must_use]
 pub fn fetch_parent_body(root: &Path, slug: &str, parent: u32) -> Option<String> {
+    fetch_parent_body_with_gh(&gh_program(), root, slug, parent)
+}
+
+fn fetch_parent_body_with_gh(gh: &Path, root: &Path, slug: &str, parent: u32) -> Option<String> {
     let path = format!("repos/{slug}/issues/{parent}");
-    let inv = gh_call::read("parent_link.parent_body", &gh_program(), root).args([
+    let inv = gh_call::read("parent_link.parent_body", gh, root).args([
         "api",
         &path,
         "--jq",
@@ -202,9 +238,14 @@ fn parse_marker_output(text: &str, parent: u32) -> Result<Vec<(u32, bool)>> {
 /// Enumerate `parent`'s children from the native sub-issue list and from
 /// `<!-- loom:parent #N -->` markers, and classify them.
 ///
+/// A parent whose body carries [`SPLIT_RESCOPED_MARKER`] is not a finished
+/// tracker even when every child is closed: it was revised after the split to
+/// carry work the children do not (#15242).
+///
 /// # Errors
-/// Either read failed, was malformed, or filled a whole page. An unreadable
-/// list is never evidence that the parent is split and finished.
+/// Either read failed, was malformed, or filled a whole page, or the children
+/// are all closed and the parent body could not be read. An unreadable list or
+/// body is never evidence that the parent is split and finished.
 pub fn split_state(root: &Path, slug: &str, parent: u32) -> Result<SplitState> {
     split_state_with_gh(&gh_program(), root, slug, parent)
 }
@@ -262,7 +303,17 @@ fn split_state_with_gh(gh: &Path, root: &Path, slug: &str, parent: u32) -> Resul
         Some(_) => anyhow::bail!("could not search marker children of #{parent}"),
     };
     all.extend(rows.into_iter().filter(|&(n, _)| n != parent));
-    Ok(classify_children(&all))
+    let state = classify_children(&all);
+    // Only an all-closed verdict can be flipped by the marker, so only then
+    // is the body read (and its failure fatal).
+    if matches!(state, SplitState::AllClosed(_)) {
+        let body = fetch_parent_body_with_gh(gh, root, slug, parent)
+            .ok_or_else(|| anyhow::anyhow!("could not read the body of #{parent}"))?;
+        if has_split_rescoped(&body) {
+            return Ok(SplitState::NoChildren);
+        }
+    }
+    Ok(state)
 }
 
 #[derive(serde::Deserialize)]
@@ -428,12 +479,25 @@ mod tests {
         graphql_diagnostic: &str,
         pages: &[serde_json::Value],
     ) -> Result<SplitState> {
+        mocked_split_body(native, graphql_diagnostic, pages, Some("A plain tracker body.\n"))
+    }
+
+    /// `parent_body` is what `gh api repos/o/r/issues/12 --jq ...` prints;
+    /// `None` makes that read fail.
+    #[cfg(unix)]
+    fn mocked_split_body(
+        native: &str,
+        graphql_diagnostic: &str,
+        pages: &[serde_json::Value],
+        parent_body: Option<&str>,
+    ) -> Result<SplitState> {
         use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir()?;
         let gh = dir.path().join("gh-marker-fixture.sh");
         let script = r#"#!/bin/sh
 case "$1 $2" in
   "api repos/o/r/issues/12/sub_issues?per_page=100&state=all") cat native ;;
+  "api repos/o/r/issues/12") if test -f parent_body; then cat parent_body; else exit 1; fi ;;
   "issue list") cat diagnostic >&2; exit 1 ;;
   "api search/issues")
     test "$3" = "--method" && test "$4" = "GET" &&
@@ -447,6 +511,9 @@ esac"#;
         std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o700))?;
         std::fs::write(dir.path().join("native"), native)?;
         std::fs::write(dir.path().join("diagnostic"), graphql_diagnostic)?;
+        if let Some(body) = parent_body {
+            std::fs::write(dir.path().join("parent_body"), body)?;
+        }
         for (index, page) in pages.iter().enumerate() {
             std::fs::write(dir.path().join(format!("page={}", index + 1)), page.to_string())?;
         }
@@ -547,6 +614,58 @@ esac"#;
             &[marker_page(0, Vec::new())],
         )
         .is_err());
+    }
+
+    #[test]
+    fn split_rescoped_marker_must_be_alone_on_a_line_outside_a_fence() {
+        let m = SPLIT_RESCOPED_MARKER;
+        assert!(has_split_rescoped(m));
+        assert!(has_split_rescoped(&format!("Revised.\n\n  {m}  \r\nMore.\n")));
+        assert!(!has_split_rescoped("plain tracker"));
+        assert!(!has_split_rescoped(&format!("see {m} for the idea")));
+        assert!(!has_split_rescoped(&format!("{m} trailing")));
+        assert!(!has_split_rescoped(&format!("```\n{m}\n```\n")));
+        assert!(!has_split_rescoped(&format!("~~~md\n{m}\n~~~\n")));
+        // A longer fence is not closed by a shorter one, nor by another char.
+        assert!(!has_split_rescoped(&format!("````\n```\n{m}\n~~~\n````\n")));
+        // After the fence closes, the marker counts again.
+        assert!(has_split_rescoped(&format!("```\nx\n```\n{m}\n")));
+        // An unterminated fence swallows the rest.
+        assert!(!has_split_rescoped(&format!("```\n{m}\n")));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rescoped_marker_makes_an_all_closed_parent_not_split() {
+        let pages = [marker_page(0, Vec::new())];
+        let split = |body: Option<&str>| {
+            mocked_split_body("7 CLOSED\n9 CLOSED\n", GRAPHQL_EXHAUSTED, &pages, body)
+        };
+        let marked = format!("Residue work.\n{SPLIT_RESCOPED_MARKER}\n");
+        assert_eq!(split(Some(&marked)).unwrap(), SplitState::NoChildren);
+        // Regression guard (#13635): no marker => still a finished tracker.
+        assert_eq!(split(Some("Tracker.\n")).unwrap(), SplitState::AllClosed(vec![7, 9]));
+        // Fenced or inline mentions do not count.
+        for body in [
+            format!("```\n{SPLIT_RESCOPED_MARKER}\n```\n"),
+            format!("write {SPLIT_RESCOPED_MARKER} to rescope"),
+        ] {
+            assert_eq!(split(Some(&body)).unwrap(), SplitState::AllClosed(vec![7, 9]));
+        }
+        // Fail closed: an unreadable body is never an all-clear.
+        assert!(split(None).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rescoped_marker_changes_nothing_when_a_child_is_open() {
+        let none = marker_page(0, Vec::new());
+        let marked = format!("{SPLIT_RESCOPED_MARKER}\n");
+        assert_eq!(
+            mocked_split_body("7 CLOSED\n9 OPEN\n", GRAPHQL_EXHAUSTED, &[none], Some(&marked))
+                .unwrap(),
+            SplitState::OpenChildren(1)
+        );
     }
 
     #[test]

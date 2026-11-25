@@ -13,7 +13,7 @@ use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use super::{is_under_build_tree, worktree_build_tree_dirs};
+use super::is_under_build_tree;
 
 /// The top level of the worktree containing `path`, or `None` when `path` is
 /// not inside a git worktree. Build-tree directories are reported relative to
@@ -33,14 +33,6 @@ pub fn worktree_top(path: &Path) -> Option<PathBuf> {
         .trim_end_matches('\n')
         .to_string();
     (!top.is_empty()).then(|| PathBuf::from(top))
-}
-
-/// Build-tree directories of the worktree containing `path`, relative to its
-/// top level. `None` when `path` is not inside a git worktree — a caller must
-/// treat that as "could not check", never as "no build trees".
-#[must_use]
-pub fn build_tree_dirs(path: &Path) -> Option<BTreeSet<String>> {
-    worktree_top(path).map(|top| worktree_build_tree_dirs(&top))
 }
 
 /// `status` (`git status --porcelain` v1 text for the worktree at `top`)
@@ -193,6 +185,7 @@ fn git_unquote(raw: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::generated_artifact::worktree_build_tree_dirs;
 
     const SIG: &str = "Signature: 8a477f597d28d172789f06886806bc55\n# cargo\n";
 
@@ -228,10 +221,11 @@ mod tests {
         write(root, "sub/target-x/CACHEDIR.TAG", SIG);
         write(root, "sub/target-x/a.o", "bin");
         let want: BTreeSet<String> = ["sub/target-x".to_string()].into();
-        assert_eq!(build_tree_dirs(root), Some(want.clone()));
-        assert_eq!(build_tree_dirs(&root.join("sub")), Some(want));
+        let top = worktree_top(root).unwrap();
+        assert_eq!(worktree_build_tree_dirs(&top), want);
+        assert_eq!(worktree_top(&root.join("sub")), Some(top));
         let outside = tempfile::tempdir().unwrap();
-        assert_eq!(build_tree_dirs(outside.path()), None, "not a worktree is not 'no trees'");
+        assert_eq!(worktree_top(outside.path()), None, "not a worktree is not 'no trees'");
     }
 
     #[test]
@@ -243,7 +237,7 @@ mod tests {
         write(root, "target-x/CACHEDIR.TAG", SIG);
         write(root, "mixed/target-y/CACHEDIR.TAG", SIG);
         write(root, "mixed/real.txt", "keep");
-        let dirs = build_tree_dirs(root).unwrap();
+        let dirs = worktree_build_tree_dirs(&worktree_top(root).unwrap());
         let status = "?? .loom/\n?? target-x/\n?? mixed/\n A target-x/a.o\nR  old.txt -> target-x/b.o\n M src/lib.rs\n?? \"caf\\303\\251.txt\"\n?? target/\n";
         assert_eq!(
             filter_status(root, &dirs, status),
@@ -259,7 +253,7 @@ mod tests {
         let root = r.path();
         write(root, "target-x/CACHEDIR.TAG", SIG);
         write(root, "target-y/CACHEDIR.TAG", SIG);
-        let dirs = build_tree_dirs(root).unwrap();
+        let dirs = worktree_build_tree_dirs(&worktree_top(root).unwrap());
         // #11149: a rename into a tree leaves the source's deletion as dirt.
         assert_eq!(filter_status(root, &dirs, "R  old.txt -> target-x/b.o\n"), "D  old.txt");
         // Both sides in build trees: nothing left to rescue.

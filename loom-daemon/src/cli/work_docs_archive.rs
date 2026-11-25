@@ -133,13 +133,48 @@ fn date_heading(line: &str) -> Option<NaiveDate> {
     NaiveDate::parse_from_str(rest, "%Y-%m-%d").ok()
 }
 
+/// Index (into `lines`) of the first line of the file's trailing region of
+/// HTML comments (e.g. Guide's `<!-- Maintained automatically … -->`
+/// footer), or `None` when the file does not end in one (#15271).
+///
+/// Only a region that runs to the end of the file qualifies, so a comment
+/// with further content after it stays part of the section it sits in.
+fn trailing_comment_start(lines: &[&str]) -> Option<usize> {
+    let mut start = None;
+    let mut i = lines.len();
+    while i > 0 {
+        let line = lines[i - 1].trim();
+        if line.is_empty() {
+            i -= 1;
+        } else if line.ends_with("-->") {
+            // Walk back to the line that opens this comment.
+            let Some(open) = (0..i)
+                .rev()
+                .find(|&j| lines[j].trim_start().starts_with("<!--"))
+            else {
+                return start;
+            };
+            if lines[open..i].iter().any(|l| l.starts_with('#')) {
+                return start;
+            }
+            start = Some(open);
+            i = open;
+        } else {
+            break;
+        }
+    }
+    start
+}
+
 /// Split `text` into blocks whose concatenation is exactly `text`.
 fn parse(text: &str) -> Vec<Block> {
     let mut blocks = vec![Block {
         kind: Kind::Preamble,
         text: String::new(),
     }];
-    for line in text.split_inclusive('\n') {
+    let lines: Vec<&str> = text.split_inclusive('\n').collect();
+    let trailer = trailing_comment_start(&lines);
+    for (idx, line) in lines.iter().copied().enumerate() {
         let current = blocks
             .last()
             .map(|b| b.kind.clone())
@@ -151,6 +186,9 @@ fn parse(text: &str) -> Vec<Block> {
         } else if (matches!(current, Kind::Index) && line.starts_with('#'))
             || (matches!(current, Kind::Dated(_))
                 && (line.starts_with("### ") || line.starts_with("## ") || line.starts_with("# ")))
+            // The trailing maintenance comment is not part of the last dated
+            // section it follows by position (#15271): never moved.
+            || (matches!(current, Kind::Dated(_)) && trailer == Some(idx))
         {
             Some(Kind::Other)
         } else {

@@ -228,13 +228,8 @@ fn read_state(path: &Path) -> LedgerFile {
 }
 
 fn write_state(path: &Path, state: &LedgerFile) -> std::io::Result<()> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
     let serialized = serde_json::to_string_pretty(state).map_err(std::io::Error::other)?;
-    let tmp = path.with_extension("json.tmp");
-    std::fs::write(&tmp, serialized)?;
-    std::fs::rename(&tmp, path)
+    crate::fs_util::write_atomic(path, serialized.as_bytes(), crate::fs_util::AtomicOpts::default())
 }
 
 #[cfg(test)]

@@ -22,6 +22,53 @@
 
 use crate::activity::{PromptForgeEvent, PromptForgeEventType};
 use regex::Regex;
+use std::sync::LazyLock;
+
+/// Compile a compile-time-constant pattern. A bad pattern is a programming error
+/// and fails loudly (the unit tests exercise every static) instead of silently
+/// dropping events.
+fn static_regex(pattern: &str) -> Regex {
+    Regex::new(pattern).expect("static forge_parser regex must compile")
+}
+
+// Pattern: PR merged
+// Matches: "Merged pull request #123" or "Pull request #123 has been merged"
+// Also matches: "merged" in gh pr merge output
+static MERGE_RE: LazyLock<Regex> =
+    LazyLock::new(|| static_regex(r"(?i)(?:merged|merging)\s+(?:pull\s+request\s+)?#?(\d+)"));
+
+// Pattern: Issue closed
+// Matches: "Closed issue #123" or "Issue #123 closed"
+static CLOSE_ISSUE_RE: LazyLock<Regex> =
+    LazyLock::new(|| static_regex(r"(?i)(?:closed?\s+issue\s+#?(\d+)|issue\s+#?(\d+)\s+closed)"));
+
+// Pattern: PR closed (without merge)
+// Matches: "Closed pull request #123"
+static CLOSE_PR_RE: LazyLock<Regex> =
+    LazyLock::new(|| static_regex(r"(?i)closed?\s+pull\s+request\s+#?(\d+)"));
+
+// Pattern: Label added via gh issue/pr edit --add-label
+// Output typically shows: "Updated issue #123" or similar after label changes
+// We also look for the command pattern in case it's echoed
+// Matches: --add-label value OR --add-label "value" OR --add-label 'value'
+static LABEL_ADD_RE: LazyLock<Regex> =
+    LazyLock::new(|| static_regex(r#"--add-label[=\s]+["']?([^"'\s,]+(?:,[^"'\s,]+)*)["']?"#));
+
+// Pattern: Label removed via gh issue/pr edit --remove-label
+static LABEL_REMOVE_RE: LazyLock<Regex> =
+    LazyLock::new(|| static_regex(r#"--remove-label[=\s]+["']?([^"'\s,]+(?:,[^"'\s,]+)*)["']?"#));
+
+// Pattern: Review submitted
+// gh pr review output: "Approved pull request #123"
+static REVIEW_RE: LazyLock<Regex> = LazyLock::new(|| {
+    static_regex(r"(?i)(approved|requested\s+changes\s+(?:on|for))\s+(?:pull\s+request\s+)?#?(\d+)")
+});
+
+// Context patterns used to find the issue/PR a label edit applies to.
+static CONTEXT_ISSUE_RE: LazyLock<Regex> =
+    LazyLock::new(|| static_regex(r"(?i)gh\s+issue\s+(?:edit\s+)?#?(\d+)"));
+static CONTEXT_PR_RE: LazyLock<Regex> =
+    LazyLock::new(|| static_regex(r"(?i)gh\s+pr\s+(?:edit\s+)?#?(\d+)"));
 
 /// A parsed forge event from terminal output
 #[derive(Debug, Clone)]
@@ -34,6 +81,21 @@ pub struct ParsedForgeEvent {
 }
 
 impl ParsedForgeEvent {
+    /// A label-free event for the given issue and/or PR.
+    fn new(
+        event_type: PromptForgeEventType,
+        issue_number: Option<i32>,
+        pr_number: Option<i32>,
+    ) -> Self {
+        Self {
+            event_type,
+            issue_number,
+            pr_number,
+            labels_added: Vec::new(),
+            labels_removed: Vec::new(),
+        }
+    }
+
     /// Convert to a `PromptForgeEvent` for database storage
     pub fn to_prompt_forge_event(&self, input_id: Option<i64>) -> PromptForgeEvent {
         let (label_before, label_after) =
@@ -67,6 +129,79 @@ impl ParsedForgeEvent {
     }
 }
 
+/// Whether a numbered match refers to an issue or a pull request.
+#[derive(Clone, Copy)]
+enum Target {
+    Issue,
+    Pr,
+}
+
+/// Push one event per `re` match, numbered by the last participating capture group.
+///
+/// That is group 1 for `MERGE_RE`/`CLOSE_PR_RE`, whichever alternative matched for
+/// `CLOSE_ISSUE_RE`, and the trailing number (after the verb) for `REVIEW_RE`.
+fn push_numbered_events(
+    events: &mut Vec<ParsedForgeEvent>,
+    output: &str,
+    re: &Regex,
+    event_type: &PromptForgeEventType,
+    target: Target,
+) {
+    for cap in re.captures_iter(output) {
+        let Some(number) = cap
+            .iter()
+            .skip(1)
+            .flatten()
+            .last()
+            .and_then(|m| m.as_str().parse::<i32>().ok())
+        else {
+            continue;
+        };
+        let (issue_number, pr_number) = match target {
+            Target::Issue => (Some(number), None),
+            Target::Pr => (None, Some(number)),
+        };
+        events.push(ParsedForgeEvent::new(event_type.clone(), issue_number, pr_number));
+    }
+}
+
+/// Split a comma-separated label list, trimming and dropping empty entries.
+fn parse_label_list(raw: &str) -> Vec<String> {
+    raw.split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+/// Push one label event per `--add-label`/`--remove-label` match of `re`.
+fn push_label_events(events: &mut Vec<ParsedForgeEvent>, output: &str, re: &Regex, added: bool) {
+    for cap in re.captures_iter(output) {
+        let Some(labels_match) = cap.get(1) else {
+            continue;
+        };
+        let labels = parse_label_list(labels_match.as_str());
+        if labels.is_empty() {
+            continue;
+        }
+
+        // Try to find associated issue/PR number
+        let (issue_number, pr_number) = extract_issue_pr_from_context(output);
+        let event_type = if added {
+            PromptForgeEventType::LabelAdded
+        } else {
+            PromptForgeEventType::LabelRemoved
+        };
+        let mut event = ParsedForgeEvent::new(event_type, issue_number, pr_number);
+        if added {
+            event.labels_added = labels;
+        } else {
+            event.labels_removed = labels;
+        }
+        events.push(event);
+    }
+}
+
 /// Parse terminal output for forge CLI events
 ///
 /// Detects patterns from CLI output such as:
@@ -79,7 +214,6 @@ impl ParsedForgeEvent {
 ///
 /// The `forge_host` parameter specifies which hostname to match in URLs
 /// (e.g., `"github.com"`, `"gitea.example.com"`).
-#[allow(clippy::too_many_lines)]
 pub fn parse_forge_events(output: &str, forge_host: &str) -> Vec<ParsedForgeEvent> {
     let mut events = Vec::new();
 
@@ -87,199 +221,75 @@ pub fn parse_forge_events(output: &str, forge_host: &str) -> Vec<ParsedForgeEven
     // Matches: https://{forge_host}/owner/repo/issues/123
     // Matches: https://{forge_host}/owner/repo/pull/456  (GitHub)
     // Matches: https://{forge_host}/owner/repo/pulls/456 (Gitea)
+    // The host is escaped, so this only fails on a pathological host length.
     let escaped_host = regex::escape(forge_host);
     let url_pattern = format!(r"https://{escaped_host}/[^/]+/[^/]+/(issues|pulls?)/(\d+)");
     if let Ok(url_re) = Regex::new(&url_pattern) {
         for cap in url_re.captures_iter(output) {
-            if let (Some(type_match), Some(number_match)) = (cap.get(1), cap.get(2)) {
-                if let Ok(number) = number_match.as_str().parse::<i32>() {
-                    let event = match type_match.as_str() {
-                        "issues" => ParsedForgeEvent {
-                            event_type: PromptForgeEventType::IssueCreated,
-                            issue_number: Some(number),
-                            pr_number: None,
-                            labels_added: Vec::new(),
-                            labels_removed: Vec::new(),
-                        },
-                        "pull" | "pulls" => ParsedForgeEvent {
-                            event_type: PromptForgeEventType::PrCreated,
-                            issue_number: None,
-                            pr_number: Some(number),
-                            labels_added: Vec::new(),
-                            labels_removed: Vec::new(),
-                        },
-                        _ => continue,
-                    };
-                    events.push(event);
-                }
-            }
+            let (Some(type_match), Some(number_match)) = (cap.get(1), cap.get(2)) else {
+                continue;
+            };
+            let Ok(number) = number_match.as_str().parse::<i32>() else {
+                continue;
+            };
+            events.push(if type_match.as_str() == "issues" {
+                ParsedForgeEvent::new(PromptForgeEventType::IssueCreated, Some(number), None)
+            } else {
+                ParsedForgeEvent::new(PromptForgeEventType::PrCreated, None, Some(number))
+            });
         }
     }
 
-    // Pattern: PR merged
-    // Matches: "Merged pull request #123" or "Pull request #123 has been merged"
-    // Also matches: "merged" in gh pr merge output
-    if let Ok(merge_re) = Regex::new(r"(?i)(?:merged|merging)\s+(?:pull\s+request\s+)?#?(\d+)") {
-        for cap in merge_re.captures_iter(output) {
-            if let Some(number_match) = cap.get(1) {
-                if let Ok(number) = number_match.as_str().parse::<i32>() {
-                    events.push(ParsedForgeEvent {
-                        event_type: PromptForgeEventType::PrMerged,
-                        issue_number: None,
-                        pr_number: Some(number),
-                        labels_added: Vec::new(),
-                        labels_removed: Vec::new(),
-                    });
-                }
-            }
-        }
-    }
-
-    // Pattern: Issue closed
-    // Matches: "Closed issue #123" or "Issue #123 closed"
-    if let Ok(close_issue_re) =
-        Regex::new(r"(?i)(?:closed?\s+issue\s+#?(\d+)|issue\s+#?(\d+)\s+closed)")
-    {
-        for cap in close_issue_re.captures_iter(output) {
-            let number = cap.get(1).or_else(|| cap.get(2));
-            if let Some(number_match) = number {
-                if let Ok(number) = number_match.as_str().parse::<i32>() {
-                    events.push(ParsedForgeEvent {
-                        event_type: PromptForgeEventType::IssueClosed,
-                        issue_number: Some(number),
-                        pr_number: None,
-                        labels_added: Vec::new(),
-                        labels_removed: Vec::new(),
-                    });
-                }
-            }
-        }
-    }
-
-    // Pattern: PR closed (without merge)
-    // Matches: "Closed pull request #123"
-    if let Ok(close_pr_re) = Regex::new(r"(?i)closed?\s+pull\s+request\s+#?(\d+)") {
-        for cap in close_pr_re.captures_iter(output) {
-            if let Some(number_match) = cap.get(1) {
-                if let Ok(number) = number_match.as_str().parse::<i32>() {
-                    events.push(ParsedForgeEvent {
-                        event_type: PromptForgeEventType::PrClosed,
-                        issue_number: None,
-                        pr_number: Some(number),
-                        labels_added: Vec::new(),
-                        labels_removed: Vec::new(),
-                    });
-                }
-            }
-        }
-    }
-
-    // Pattern: Label added via gh issue/pr edit --add-label
-    // Output typically shows: "Updated issue #123" or similar after label changes
-    // We also look for the command pattern in case it's echoed
-    // Regex matches: --add-label value OR --add-label "value" OR --add-label 'value'
-    if let Ok(label_add_re) = Regex::new(r#"--add-label[=\s]+["']?([^"'\s,]+(?:,[^"'\s,]+)*)["']?"#)
-    {
-        for cap in label_add_re.captures_iter(output) {
-            if let Some(labels_match) = cap.get(1) {
-                let labels: Vec<String> = labels_match
-                    .as_str()
-                    .split(',')
-                    .map(|s| s.trim().to_string())
-                    .filter(|s| !s.is_empty())
-                    .collect();
-
-                if !labels.is_empty() {
-                    // Try to find associated issue/PR number
-                    let (issue_number, pr_number) = extract_issue_pr_from_context(output);
-
-                    events.push(ParsedForgeEvent {
-                        event_type: PromptForgeEventType::LabelAdded,
-                        issue_number,
-                        pr_number,
-                        labels_added: labels,
-                        labels_removed: Vec::new(),
-                    });
-                }
-            }
-        }
-    }
-
-    // Pattern: Label removed via gh issue/pr edit --remove-label
-    if let Ok(label_remove_re) =
-        Regex::new(r#"--remove-label[=\s]+["']?([^"'\s,]+(?:,[^"'\s,]+)*)["']?"#)
-    {
-        for cap in label_remove_re.captures_iter(output) {
-            if let Some(labels_match) = cap.get(1) {
-                let labels: Vec<String> = labels_match
-                    .as_str()
-                    .split(',')
-                    .map(|s| s.trim().to_string())
-                    .filter(|s| !s.is_empty())
-                    .collect();
-
-                if !labels.is_empty() {
-                    let (issue_number, pr_number) = extract_issue_pr_from_context(output);
-
-                    events.push(ParsedForgeEvent {
-                        event_type: PromptForgeEventType::LabelRemoved,
-                        issue_number,
-                        pr_number,
-                        labels_added: Vec::new(),
-                        labels_removed: labels,
-                    });
-                }
-            }
-        }
-    }
-
-    // Pattern: Review submitted
-    // gh pr review output: "Approved pull request #123"
-    if let Ok(review_re) = Regex::new(
-        r"(?i)(approved|requested\s+changes\s+(?:on|for))\s+(?:pull\s+request\s+)?#?(\d+)",
-    ) {
-        for cap in review_re.captures_iter(output) {
-            if let Some(number_match) = cap.get(2) {
-                if let Ok(number) = number_match.as_str().parse::<i32>() {
-                    events.push(ParsedForgeEvent {
-                        event_type: PromptForgeEventType::ReviewSubmitted,
-                        issue_number: None,
-                        pr_number: Some(number),
-                        labels_added: Vec::new(),
-                        labels_removed: Vec::new(),
-                    });
-                }
-            }
-        }
-    }
+    push_numbered_events(
+        &mut events,
+        output,
+        &MERGE_RE,
+        &PromptForgeEventType::PrMerged,
+        Target::Pr,
+    );
+    push_numbered_events(
+        &mut events,
+        output,
+        &CLOSE_ISSUE_RE,
+        &PromptForgeEventType::IssueClosed,
+        Target::Issue,
+    );
+    push_numbered_events(
+        &mut events,
+        output,
+        &CLOSE_PR_RE,
+        &PromptForgeEventType::PrClosed,
+        Target::Pr,
+    );
+    push_label_events(&mut events, output, &LABEL_ADD_RE, true);
+    push_label_events(&mut events, output, &LABEL_REMOVE_RE, false);
+    push_numbered_events(
+        &mut events,
+        output,
+        &REVIEW_RE,
+        &PromptForgeEventType::ReviewSubmitted,
+        Target::Pr,
+    );
 
     events
 }
 
 /// Extract issue or PR number from command context
 fn extract_issue_pr_from_context(output: &str) -> (Option<i32>, Option<i32>) {
+    let first_number = |re: &Regex| {
+        re.captures(output)
+            .and_then(|cap| cap.get(1))
+            .and_then(|m| m.as_str().parse::<i32>().ok())
+    };
+
     // Try to find "issue edit N" or "issue N" patterns
-    if let Ok(issue_re) = Regex::new(r"(?i)gh\s+issue\s+(?:edit\s+)?#?(\d+)") {
-        if let Some(cap) = issue_re.captures(output) {
-            if let Some(m) = cap.get(1) {
-                if let Ok(n) = m.as_str().parse::<i32>() {
-                    return (Some(n), None);
-                }
-            }
-        }
+    if let Some(n) = first_number(&CONTEXT_ISSUE_RE) {
+        return (Some(n), None);
     }
-
     // Try to find "pr edit N" patterns
-    if let Ok(pr_re) = Regex::new(r"(?i)gh\s+pr\s+(?:edit\s+)?#?(\d+)") {
-        if let Some(cap) = pr_re.captures(output) {
-            if let Some(m) = cap.get(1) {
-                if let Ok(n) = m.as_str().parse::<i32>() {
-                    return (None, Some(n));
-                }
-            }
-        }
+    if let Some(n) = first_number(&CONTEXT_PR_RE) {
+        return (None, Some(n));
     }
-
     (None, None)
 }
 
@@ -404,6 +414,51 @@ mod tests {
         assert_eq!(event.issue_number, Some(42));
         assert_eq!(event.label_after, Some(vec!["loom:building".to_string()]));
         assert!(event.label_before.is_none());
+    }
+
+    #[test]
+    fn test_static_regexes_compile() {
+        // Force every LazyLock so a bad static pattern fails here, not in production.
+        for re in [
+            &*MERGE_RE,
+            &*CLOSE_ISSUE_RE,
+            &*CLOSE_PR_RE,
+            &*LABEL_ADD_RE,
+            &*LABEL_REMOVE_RE,
+            &*REVIEW_RE,
+            &*CONTEXT_ISSUE_RE,
+            &*CONTEXT_PR_RE,
+        ] {
+            assert!(!re.as_str().is_empty());
+        }
+    }
+
+    #[test]
+    fn test_parse_pr_label_context_and_comma_list() {
+        let output = "gh pr edit 7 --add-label \"a, b\" --remove-label x,y";
+        let events = parse_forge_events(output, GITHUB_HOST);
+        // `[^"'\s,]+` stops at the space inside the quotes, so only "a," is captured.
+        let added = events
+            .iter()
+            .find(|e| e.event_type == PromptForgeEventType::LabelAdded)
+            .expect("label added");
+        assert_eq!(added.pr_number, Some(7));
+        assert_eq!(added.issue_number, None);
+        let removed = events
+            .iter()
+            .find(|e| e.event_type == PromptForgeEventType::LabelRemoved)
+            .expect("label removed");
+        assert_eq!(removed.labels_removed, vec!["x", "y"]);
+    }
+
+    #[test]
+    fn test_parse_issue_closed_trailing_form_and_pr_closed() {
+        let events = parse_forge_events("Issue #5 closed\nClosed pull request #6", GITHUB_HOST);
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].event_type, PromptForgeEventType::IssueClosed);
+        assert_eq!(events[0].issue_number, Some(5));
+        assert_eq!(events[1].event_type, PromptForgeEventType::PrClosed);
+        assert_eq!(events[1].pr_number, Some(6));
     }
 
     // --- Gitea-specific tests ---

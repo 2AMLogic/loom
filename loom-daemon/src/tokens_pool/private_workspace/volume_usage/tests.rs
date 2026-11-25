@@ -202,8 +202,8 @@ fn reader_image_is_refused_before_any_workspace_is_mounted() {
 fn stock_reader_candidates_include_versioned_tags_newest_first() {
     let _fake = docker::fake::install(Box::new(|args| {
         match args {
-        ["image", "ls", "--format", "{{.Repository}}:{{.Tag}}", "ghcr.io/rjwalters/loom-worker-session"] => Ok(
-            "ghcr.io/rjwalters/loom-worker-session:0.19.1100\nghcr.io/rjwalters/loom-worker-session:<none>\nghcr.io/rjwalters/loom-worker-session:0.19.1209\nghcr.io/rjwalters/loom-worker-session:latest\nghcr.io/rjwalters/loom-worker-session:foo\n".into(),
+        ["image", "ls", "--format", "{{.Repository}}:{{.Tag}}", "ghcr.io/2amlogic/loom-worker-session"] => Ok(
+            "ghcr.io/2amlogic/loom-worker-session:0.19.1100\nghcr.io/2amlogic/loom-worker-session:<none>\nghcr.io/2amlogic/loom-worker-session:0.19.1209\nghcr.io/2amlogic/loom-worker-session:latest\nghcr.io/2amlogic/loom-worker-session:foo\n".into(),
         ),
         unexpected => panic!("unexpected Docker request: {unexpected:?}"),
     }
@@ -211,9 +211,9 @@ fn stock_reader_candidates_include_versioned_tags_newest_first() {
     assert_eq!(
         local_stock_images(Instant::now() + SEAT_VOLUME_SAMPLE_INTERVAL, &Instant::now),
         [
-            "ghcr.io/rjwalters/loom-worker-session:latest",
-            "ghcr.io/rjwalters/loom-worker-session:0.19.1209",
-            "ghcr.io/rjwalters/loom-worker-session:0.19.1100",
+            "ghcr.io/2amlogic/loom-worker-session:latest",
+            "ghcr.io/2amlogic/loom-worker-session:0.19.1209",
+            "ghcr.io/2amlogic/loom-worker-session:0.19.1100",
         ]
     );
 }
@@ -497,6 +497,11 @@ fn incomplete_batch_withholds_total_even_if_the_selected_seat_is_reconfirmed() {
 #[test]
 fn reader_selection_shares_one_deadline_across_local_probes_and_bundle_checks() {
     let seconds = Duration::from_secs;
+    let (repository, _) = DEFAULT_SESSION_IMAGE
+        .rsplit_once(':')
+        .expect("tagged session image");
+    let newer_image = format!("{repository}:0.19.2");
+    let older_image = format!("{repository}:0.19.1");
     let start = Instant::now();
     let deadline = start + seconds(8);
     let clock = Rc::new(Cell::new(start));
@@ -509,12 +514,10 @@ fn reader_selection_shares_one_deadline_across_local_probes_and_bundle_checks() 
             ["image", "ls", ..] => {
                 assert_eq!(timeout, seconds(3));
                 elapsed.set(elapsed.get() + seconds(2));
-                format!(
-                    "{DEFAULT_SESSION_IMAGE}\nghcr.io/rjwalters/loom-worker-session:0.19.2\nghcr.io/rjwalters/loom-worker-session:0.19.1\n"
-                )
+                format!("{DEFAULT_SESSION_IMAGE}\n{newer_image}\n{older_image}\n")
             }
             ["image", "inspect", "--format", "{{.Id}}", image] => {
-                assert_ne!(*image, "ghcr.io/rjwalters/loom-worker-session:0.19.1");
+                assert_ne!(*image, older_image);
                 assert_eq!(timeout, seconds(3));
                 elapsed.set(elapsed.get() + seconds(1));
                 "sha256:0\n".into()
@@ -526,7 +529,7 @@ fn reader_selection_shares_one_deadline_across_local_probes_and_bundle_checks() 
                     elapsed.set(elapsed.get() + seconds(2));
                     "__LOOM_BUNDLE_NO_MANIFEST__\n".into()
                 } else {
-                    assert_eq!(*image, "ghcr.io/rjwalters/loom-worker-session:0.19.2");
+                    assert_eq!(*image, newer_image);
                     assert_eq!(timeout, seconds(2));
                     elapsed.set(elapsed.get() + timeout);
                     anyhow::bail!("modeled bundle timeout");

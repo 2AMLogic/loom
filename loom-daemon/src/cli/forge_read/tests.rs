@@ -183,6 +183,7 @@ fn only_verbs_without_a_forge_call_skip_the_mode_gate() {
             "rebase-guard",
             "verdict-body-check",
             "verdict-lock",
+            "workflow-secrets-check",
             "workflow-write-all-check"
         ]
     );

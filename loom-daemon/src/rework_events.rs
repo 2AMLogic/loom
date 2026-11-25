@@ -29,9 +29,8 @@
 //!
 //! `loom-daemon record-rework` (`cli::record_rework`) is the entry point, and
 //! `merge-pr.sh` is its first caller — the shell-language policy points new
-//! executable logic at a subcommand rather than at a script already frozen by
-//! the file-size ratchet, and a subcommand is also what makes the marker
-//! writable from a doctor/CI path later without a third copy of this format.
+//! executable logic at a subcommand rather than at a script, and a subcommand
+//! is also what makes the marker writable from a doctor/CI path later without a third copy of this format.
 //!
 //! # Two sources, one vocabulary — and what a writer must NOT mark
 //!
@@ -44,9 +43,8 @@
 //! by a fuzzy de-duplication after the fact:
 //!
 //! - a marker records only rework the worktree reflog *cannot* show — a
-//!   forge-side branch update (`merge-pr.sh`'s `forge_update_branch`, which
-//!   never touches the local worktree), a merge refusal, a CI rerun, a
-//!   rejudge;
+//!   forge-side branch update (which never touches the local worktree), a
+//!   merge refusal, a CI rerun, a rejudge;
 //! - a rebase or merge performed with local git in the sweep's worktree is
 //!   **never** marked: the reflog already reports it, and a marker would
 //!   count it twice.

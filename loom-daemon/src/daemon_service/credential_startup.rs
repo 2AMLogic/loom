@@ -149,7 +149,18 @@ pub(super) fn run_startup(sweep_workspace: &Path) -> CredentialStartup {
     // script + owner resolve, even when the startup mint itself failed and
     // the retry below establishes later).
     let startup_roots = match (&github_app_owner_repo, &github_app_script) {
-        (Some(_), Some(_)) => credential_preflight::cross_owner::managed_roots(sweep_workspace),
+        (Some(_), Some(_)) => {
+            // #14450: a failed registry read gives a non-authoritative
+            // fallback list; use an empty baseline so the drift watch adopts
+            // the first authoritative snapshot rather than a wrong one.
+            let (roots, registry_loaded) =
+                credential_preflight::cross_owner::managed_roots(sweep_workspace);
+            if registry_loaded {
+                roots
+            } else {
+                Vec::new()
+            }
+        }
         _ => Vec::new(),
     };
     if let (Some(root_owner_repo), Some(script_path), true) = (

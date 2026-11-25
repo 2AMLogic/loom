@@ -121,6 +121,28 @@ fn two_placeholders_are_never_the_same() {
     assert!(a.as_str().len() > 60, "placeholder must not be guessable");
 }
 
+/// #14933: the Google header style renders `x-goog-api-key`, mirroring the
+/// `x-api-key` shape — the header name Google's Gemini API expects — and a
+/// profile declares it by the same kebab-case name.
+#[test]
+fn the_google_header_style_renders_and_parses() {
+    assert_eq!(
+        HeaderStyle::XGoogApiKey.render("AIza-fake"),
+        ("x-goog-api-key", "AIza-fake".to_string())
+    );
+    assert_eq!(HeaderStyle::XApiKey.render("k"), ("x-api-key", "k".to_string()));
+    assert_eq!(
+        HeaderStyle::AuthorizationBearer.render("k"),
+        ("authorization", "Bearer k".to_string())
+    );
+    let proxy: ProfileProxy = serde_json::from_str(
+        r#"{"upstream":"https://generativelanguage.googleapis.com","header":"x-goog-api-key"}"#,
+    )
+    .unwrap();
+    assert_eq!(proxy.header, HeaderStyle::XGoogApiKey);
+    assert!(proxy.validate().is_ok());
+}
+
 // ---------------------------------------------------------- registry refusal
 
 fn registry_with(upstream: &str) -> (Registry, Placeholder) {

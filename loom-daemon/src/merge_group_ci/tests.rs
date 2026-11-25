@@ -508,6 +508,9 @@ fn prereqs(facts: &RepoFacts, w: &[Workflow]) -> Vec<Prereq> {
     e.failures.iter().map(|f| f.prereq).collect()
 }
 
+#[path = "authorization_status_tests.rs"]
+mod authorization_status;
+
 #[test]
 fn eligible_when_every_prerequisite_holds() {
     let facts = org_facts(vec![mq_rule(), required_rule(&["Gate", "Tests (1/2)"])]);

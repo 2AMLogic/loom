@@ -138,7 +138,7 @@ simulate_loom_install() {
     # wrapped by wrap_loom_content() in scaffolding.rs).
     cat > "$target/CLAUDE.md" << 'ROOT_CLAUDE_EOF'
 <!-- BEGIN LOOM ORCHESTRATION -->
-This repository uses [Loom](https://github.com/rjwalters/loom) for AI-powered development orchestration — see the Loom repository for the full guide (roles, labels, worktrees, configuration). When installed, Loom also writes a locally-substituted copy of that guide to `.loom/CLAUDE.md`.
+This repository uses [Loom](https://github.com/2AMLogic/loom) for AI-powered development orchestration — see the Loom repository for the full guide (roles, labels, worktrees, configuration). When installed, Loom also writes a locally-substituted copy of that guide to `.loom/CLAUDE.md`.
 <!-- END LOOM ORCHESTRATION -->
 ROOT_CLAUDE_EOF
   fi
@@ -1455,77 +1455,42 @@ echo ""
 
 
 # ==========================================================================
-# Section 5b: Retired-File Cleanup (#3572)
+# Section 5b: Retired-File Cleanup (#3572, #14846)
 # ==========================================================================
-# Exercises the content-gated retired-file cleanup block in install-loom.sh
-# (the "Retired-file cleanup (content-gated)" block after the stale-file
-# sweep). A file on the frozen retired-file allowlist is git-rm'd ONLY when its
-# on-disk content hashes to a shipped digest (unmodified); a consumer-modified
-# copy is preserved; an absent file is a no-op. The gate logic is mirrored
-# inline here (like find_stale_files above) so it can be verified without
-# invoking the full installer, plus a drift guard that asserts the real
-# allowlist in install-loom.sh still carries the digests this mirror expects.
+# Calls the production loom_remove_retired_files routine (the one install-loom.sh
+# runs, sourced from scripts/install/retired-files.sh) against throwaway git
+# repos. No mirrored decision logic or digest table lives here: a file on the
+# frozen retired-file allowlist is git-rm'd ONLY when its on-disk content hashes
+# to a shipped digest; a consumer-modified copy is preserved; an absent file is
+# a no-op. Breaking the production removal makes the shipped-blob assertions
+# below fail. The Rust/shell digest parity guard is in
+# loom-daemon/src/init/retired.rs (test_rust_and_shell_allowlists_in_sync).
 
-# Mirror of install-loom.sh's LOOM_RETIRED_FILES allowlist (#3572). Keep in
-# sync with install-loom.sh — assert_retired_allowlist_in_sync guards drift.
-RETIRED_ALLOWLIST_MIRROR=$(cat <<'RETIRED'
-.claude/commands/loom/release.md 11aef217942f45bd03d90a24e5efae9209041cb59f09c888df4dc7e8208910dd
-.claude/commands/loom/release.md 0df6c20846c98850413243362c80dea2fd01330c8d97033ef5f7c3989578fe8c
-.claude/commands/loom/release.md c45841f8da42d1bda20bc180c8a93d14242238d9a2c1d9f5a1bdac32b5e9e556
-.claude/commands/loom/release.md d91e198e977ad7799f44fa1a6827c9836bca6d31c9357ed92fc400a3c88381de
-.claude/commands/loom/release.md 0d7030dd14f32f6f382a6430cd04e5f0475825d567aaed7570b73a4c43128ad1
-.claude/commands/loom/release.md 4a077ed25cb44add0afbc4d6bda23cb372f5f3c4c2ef23b7a24b586e66e4f3e7
-.claude/commands/loom/release.md 5f9930dc72a263866122b18018a64b8fed4bd53ef623d0eef27ed1e31fa0502f
-.claude/commands/loom/release.md b7fae9d13d2bfaee3bde514cabe44ac70b6551351a9e49357ede00f82c17cf35
-.claude/commands/loom/release.md f6523d9be058e40397f0ce30c08a8f2b60e9b38adae04bd7c919e0cc840acfec
-.claude/commands/loom/release.md 29a845f7f8912545d23832551753304df6e72dd4a9c8082c2d8ada1f09f449e1
-.claude/commands/loom/release.md 795c1df1d3f3706ba448482b037a0c9e4eb6272a719adb2688b9ddfc91ab4de6
-RETIRED
-)
+RETIRED_HELPER="$LOOM_ROOT/scripts/install/retired-files.sh"
+
+# The helper expects install-loom.sh's logging functions.
+info() { echo "ℹ $*"; }
+success() { echo "✓ $*"; }
+warning() { echo "⚠ Warning: $*"; }
+# shellcheck source=scripts/install/retired-files.sh
+source "$RETIRED_HELPER"
 
 # The git blob sha of the last release.md version Loom shipped (parent of the
-# #3571 deletion). Immutable + content-addressed; its sha256 is the first row
-# of the mirror above. Used to reconstruct real shipped bytes at test time.
+# #3571 deletion). Immutable + content-addressed. Used to reconstruct real
+# shipped bytes at test time.
 RETIRED_LAST_SHIPPED_BLOB="b1dac86f43dbe159b1a617b31010cdaab7b88bc5"
 RETIRED_RELEASE_PATH=".claude/commands/loom/release.md"
 
-_test_sha256() { shasum -a 256 "$1" 2>/dev/null | awk '{print $1}'; }
-
-# Mirror of the install-loom.sh gate: prints REMOVE / PRESERVE / NONE for the
-# retired path under repo $1.
-retired_decision() {
-  local repo="$1" rp="$RETIRED_RELEASE_PATH"
-  [[ -f "$repo/$rp" ]] || { echo "NONE"; return 0; }
-  local fh; fh="$(_test_sha256 "$repo/$rp")"
-  local matched=false ap ah
-  if [[ -n "$fh" ]]; then
-    while read -r ap ah; do
-      [[ -n "$ap" && "${ap:0:1}" != "#" ]] || continue
-      if [[ "$ap" == "$rp" && "$ah" == "$fh" ]]; then matched=true; break; fi
-    done <<< "$RETIRED_ALLOWLIST_MIRROR"
-  fi
-  if [[ "$matched" == "true" ]]; then echo "REMOVE"; else echo "PRESERVE"; fi
+# Run the production cleanup non-interactively with read_root=$1 and
+# git_root=${2:-$1} (default: the same repo) from a cwd that is NOT the repo
+# (the routine must not depend on the caller's cwd). Pass a distinct $2 to
+# exercise the read_root/git_root split (Test 44e). Sets RETIRED_OUT / RETIRED_RC.
+run_retired_cleanup() {
+  RETIRED_RC=0
+  RETIRED_OUT="$(cd "$TEST_DIR" && loom_remove_retired_files "$1" "${2:-$1}" yes 2>&1)" || RETIRED_RC=$?
 }
 
-# Drift guard: every digest in the test mirror must be present in the real
-# install-loom.sh allowlist (and vice-versa for the release.md rows).
-assert_retired_allowlist_in_sync() {
-  local ok=true ap ah
-  while read -r ap ah; do
-    [[ -n "$ap" && "${ap:0:1}" != "#" ]] || continue
-    if ! grep -qF "$ap $ah" "$SCRIPT_DIR/install-loom.sh"; then
-      ok=false
-      warn "mirror digest missing from install-loom.sh: $ap $ah"
-    fi
-  done <<< "$RETIRED_ALLOWLIST_MIRROR"
-  if [[ "$ok" == "true" ]]; then
-    pass "Retired-file allowlist in test mirror matches install-loom.sh"
-  else
-    fail "Retired-file allowlist drifted between test mirror and install-loom.sh"
-  fi
-}
-
-echo "--- Section 5b: Retired-File Cleanup (#3572) ---"
+echo "--- Section 5b: Retired-File Cleanup (#3572, #14846) ---"
 echo ""
 
 # Test 44a: an unmodified (hash-matching) retired file is removed on update.
@@ -1539,35 +1504,44 @@ if git -C "$LOOM_ROOT" cat-file -e "$RETIRED_LAST_SHIPPED_BLOB" 2>/dev/null; the
   git -C "$RETIRED_REMOVE_REPO" add "$RETIRED_RELEASE_PATH"
   git -C "$RETIRED_REMOVE_REPO" commit -m "Add shipped release.md" --quiet
 
-  # The reconstructed bytes must hash to the head of the allowlist — this is
+  # The reconstructed bytes must hash to a row of the production allowlist --
   # the real linkage between "what Loom shipped" and "what the gate removes".
-  SHIPPED_HASH="$(_test_sha256 "$RETIRED_REMOVE_REPO/$RETIRED_RELEASE_PATH")"
-  if grep -qF "$RETIRED_RELEASE_PATH $SHIPPED_HASH" "$SCRIPT_DIR/install-loom.sh"; then
-    pass "Reconstructed shipped release.md hash is in install-loom.sh allowlist"
+  SHIPPED_HASH="$(_loom_sha256 "$RETIRED_REMOVE_REPO/$RETIRED_RELEASE_PATH")"
+  if grep -qF "$RETIRED_RELEASE_PATH $SHIPPED_HASH" <<< "$LOOM_RETIRED_FILES"; then
+    pass "Reconstructed shipped release.md hash is in the production allowlist"
   else
-    fail "Shipped release.md hash ($SHIPPED_HASH) absent from install-loom.sh allowlist"
+    fail "Shipped release.md hash ($SHIPPED_HASH) absent from the production allowlist"
   fi
 
-  if [[ "$(retired_decision "$RETIRED_REMOVE_REPO")" == "REMOVE" ]]; then
-    pass "Unmodified release.md gated for removal"
+  run_retired_cleanup "$RETIRED_REMOVE_REPO"
+  if [[ "$RETIRED_RC" -eq 0 ]]; then
+    pass "Production cleanup returned 0"
   else
-    fail "Unmodified release.md not gated for removal"
+    fail "Production cleanup returned $RETIRED_RC: $RETIRED_OUT"
   fi
-  # Apply the sweep (mirrors install-loom.sh git-rm step) and verify removal.
-  git -C "$RETIRED_REMOVE_REPO" rm --quiet --force "$RETIRED_RELEASE_PATH" 2>/dev/null || true
   if [[ ! -f "$RETIRED_REMOVE_REPO/$RETIRED_RELEASE_PATH" ]]; then
     pass "Unmodified release.md removed from working tree"
   else
     fail "Unmodified release.md still present after cleanup"
   fi
+  if ! git -C "$RETIRED_REMOVE_REPO" ls-files --error-unmatch "$RETIRED_RELEASE_PATH" >/dev/null 2>&1 \
+    && [[ "$(git -C "$RETIRED_REMOVE_REPO" status --porcelain)" == "D  $RETIRED_RELEASE_PATH" ]]; then
+    pass "Unmodified release.md removal is staged in the index"
+  else
+    fail "Unmodified release.md still in index or deletion not staged"
+  fi
 
   # Test 44d: idempotency — a second run with the file already gone is a no-op.
   echo ""
   echo "Test 44d: Cleanup is idempotent (second run is a no-op)"
-  if [[ "$(retired_decision "$RETIRED_REMOVE_REPO")" == "NONE" ]]; then
-    pass "Second cleanup run is a no-op (file already absent)"
+  RETIRED_STATUS_BEFORE="$(git -C "$RETIRED_REMOVE_REPO" status --porcelain)"
+  run_retired_cleanup "$RETIRED_REMOVE_REPO"
+  if [[ "$RETIRED_RC" -eq 0 && -z "$RETIRED_OUT" ]] \
+    && [[ "$(git -C "$RETIRED_REMOVE_REPO" status --porcelain)" == "$RETIRED_STATUS_BEFORE" ]] \
+    && [[ ! -f "$RETIRED_REMOVE_REPO/$RETIRED_RELEASE_PATH" ]]; then
+    pass "Second cleanup run is a no-op (exit 0, no output, tree and index unchanged)"
   else
-    fail "Second cleanup run did not treat absent file as no-op"
+    fail "Second cleanup run was not a clean no-op (rc=$RETIRED_RC out=$RETIRED_OUT)"
   fi
 else
   warn "Skipping Test 44a/44d: shipped release.md blob $RETIRED_LAST_SHIPPED_BLOB unreachable (shallow clone?)"
@@ -1581,17 +1555,25 @@ create_temp_repo "$RETIRED_KEEP_REPO"
 mkdir -p "$RETIRED_KEEP_REPO/$(dirname "$RETIRED_RELEASE_PATH")"
 printf '# my customized release skill\nlocal edits here\n' \
   > "$RETIRED_KEEP_REPO/$RETIRED_RELEASE_PATH"
+printf '# my customized release skill\nlocal edits here\n' > "$TEST_DIR/retired-keep-expected"
 git -C "$RETIRED_KEEP_REPO" add "$RETIRED_RELEASE_PATH"
 git -C "$RETIRED_KEEP_REPO" commit -m "Add customized release.md" --quiet
-if [[ "$(retired_decision "$RETIRED_KEEP_REPO")" == "PRESERVE" ]]; then
-  pass "Consumer-modified release.md gated for preservation"
+run_retired_cleanup "$RETIRED_KEEP_REPO"
+if [[ "$RETIRED_RC" -eq 0 ]] && cmp -s "$TEST_DIR/retired-keep-expected" "$RETIRED_KEEP_REPO/$RETIRED_RELEASE_PATH"; then
+  pass "Consumer-modified release.md left on disk, bytes unchanged"
 else
-  fail "Consumer-modified release.md not preserved (hash matched allowlist unexpectedly)"
+  fail "Consumer-modified release.md was removed or altered (rc=$RETIRED_RC)"
 fi
-if [[ -f "$RETIRED_KEEP_REPO/$RETIRED_RELEASE_PATH" ]]; then
-  pass "Consumer-modified release.md left on disk"
+if git -C "$RETIRED_KEEP_REPO" ls-files --error-unmatch "$RETIRED_RELEASE_PATH" >/dev/null 2>&1 \
+  && [[ -z "$(git -C "$RETIRED_KEEP_REPO" status --porcelain)" ]]; then
+  pass "Consumer-modified release.md still tracked, index untouched"
 else
-  fail "Consumer-modified release.md was removed (should be preserved)"
+  fail "Consumer-modified release.md dropped from the index or status dirty"
+fi
+if [[ "$RETIRED_OUT" == *"preserving $RETIRED_RELEASE_PATH"* ]]; then
+  pass "Preserve decision reported for consumer-modified release.md"
+else
+  fail "No preserve message for consumer-modified release.md (out=$RETIRED_OUT)"
 fi
 echo ""
 
@@ -1599,16 +1581,64 @@ echo ""
 echo "Test 44c: Absent release.md is a no-op"
 RETIRED_ABSENT_REPO="$TEST_DIR/retired-absent-test"
 create_temp_repo "$RETIRED_ABSENT_REPO"
-if [[ "$(retired_decision "$RETIRED_ABSENT_REPO")" == "NONE" ]]; then
+run_retired_cleanup "$RETIRED_ABSENT_REPO"
+if [[ "$RETIRED_RC" -eq 0 && -z "$RETIRED_OUT" ]] \
+  && [[ -z "$(git -C "$RETIRED_ABSENT_REPO" status --porcelain)" ]]; then
   pass "Absent release.md yields no cleanup action"
 else
-  fail "Absent release.md did not yield a no-op"
+  fail "Absent release.md did not yield a clean no-op (rc=$RETIRED_RC out=$RETIRED_OUT)"
 fi
 echo ""
 
-# Drift guard: the test mirror's digests must match install-loom.sh.
-assert_retired_allowlist_in_sync
+# Test 44e: read_root and git_root are distinct (as in production, where the
+# installer hashes under $TARGET_PATH but runs git in the install worktree).
+# read_root (a plain directory, not a repo) holds the shipped blob, so the hash
+# gate passes only if it reads there. git_root tracks the same relative path with
+# DIFFERENT content, so hashing under git_root would preserve instead of remove,
+# and running `git rm` against read_root would fail. Swapping either use of the
+# two roots in retired-files.sh therefore fails this fixture.
+echo "Test 44e: Distinct read_root/git_root -- hash read_root, git rm in git_root"
+if git -C "$LOOM_ROOT" cat-file -e "$RETIRED_LAST_SHIPPED_BLOB" 2>/dev/null; then
+  RETIRED_SPLIT_READ="$TEST_DIR/retired-split-read"
+  RETIRED_SPLIT_GIT="$TEST_DIR/retired-split-git"
+  mkdir -p "$RETIRED_SPLIT_READ/$(dirname "$RETIRED_RELEASE_PATH")"
+  git -C "$LOOM_ROOT" cat-file blob "$RETIRED_LAST_SHIPPED_BLOB" \
+    > "$RETIRED_SPLIT_READ/$RETIRED_RELEASE_PATH"
+  git -C "$LOOM_ROOT" cat-file blob "$RETIRED_LAST_SHIPPED_BLOB" \
+    > "$TEST_DIR/retired-split-expected"
+  create_temp_repo "$RETIRED_SPLIT_GIT"
+  mkdir -p "$RETIRED_SPLIT_GIT/$(dirname "$RETIRED_RELEASE_PATH")"
+  printf '# tracked copy, content differs from the shipped blob\n' \
+    > "$RETIRED_SPLIT_GIT/$RETIRED_RELEASE_PATH"
+  git -C "$RETIRED_SPLIT_GIT" add "$RETIRED_RELEASE_PATH"
+  git -C "$RETIRED_SPLIT_GIT" commit -m "Track release.md" --quiet
+
+  run_retired_cleanup "$RETIRED_SPLIT_READ" "$RETIRED_SPLIT_GIT"
+  if [[ "$RETIRED_RC" -eq 0 ]]; then
+    pass "Split-root cleanup returned 0"
+  else
+    fail "Split-root cleanup returned $RETIRED_RC: $RETIRED_OUT"
+  fi
+  if ! git -C "$RETIRED_SPLIT_GIT" ls-files --error-unmatch "$RETIRED_RELEASE_PATH" >/dev/null 2>&1 \
+    && [[ ! -f "$RETIRED_SPLIT_GIT/$RETIRED_RELEASE_PATH" ]] \
+    && [[ "$(git -C "$RETIRED_SPLIT_GIT" status --porcelain)" == "D  $RETIRED_RELEASE_PATH" ]]; then
+    pass "Deletion staged in git_root (hash gated on read_root content)"
+  else
+    fail "Deletion not staged in git_root (out=$RETIRED_OUT status=$(git -C "$RETIRED_SPLIT_GIT" status --porcelain))"
+  fi
+  if cmp -s "$TEST_DIR/retired-split-expected" "$RETIRED_SPLIT_READ/$RETIRED_RELEASE_PATH"; then
+    pass "read_root copy of release.md untouched"
+  else
+    fail "read_root copy of release.md was removed or altered"
+  fi
+else
+  warn "Skipping Test 44e: shipped release.md blob $RETIRED_LAST_SHIPPED_BLOB unreachable (shallow clone?)"
+fi
 echo ""
+
+# Drop the logging shims: later sections source helpers that probe for a
+# caller-defined warning() and must not see this one.
+unset -f info success warning
 
 
 # ==========================================================================
@@ -4004,6 +4034,95 @@ if grep -q 'loom_source_remote' "$INSTALL_SCRIPT"; then
   pass "scripts/install-loom.sh's install-metadata.json write includes loom_source_remote (#6780)"
 else
   fail "scripts/install-loom.sh's install-metadata.json write is missing loom_source_remote (#6780)"
+fi
+echo ""
+
+# Run the installers' actual metadata writers on fresh targets without running
+# dependency builds, host provisioning, or Full Install's forge workflow.
+echo "Test: Quick Install, Full Install and resync record the source compatibility floor (#14740)"
+if command -v jq >/dev/null 2>&1; then
+  stamp_source="$TEST_DIR/stamp-source"
+  create_temp_repo "$stamp_source"
+  mkdir -p "$stamp_source/loom-daemon/src" "$stamp_source/scripts/install" "$stamp_source/defaults/hooks"
+  cp "$LOOM_ROOT/loom-daemon/src/install_compat.rs" "$stamp_source/loom-daemon/src/"
+  cp "$LOOM_ROOT/scripts/install/loom-source-path.sh" "$stamp_source/scripts/install/"
+  jq '{version}' "$LOOM_ROOT/package.json" > "$stamp_source/package.json"
+  printf '#!/bin/sh\nexit 0\n' > "$stamp_source/defaults/hooks/guard-stamp-test.sh"
+  git -C "$stamp_source" add .
+  git -C "$stamp_source" commit -qm "Add the install source fixture"
+  stamp_floor=$(sed -n 's/^pub const REQUIRES_DAEMON: &str = "\([0-9.]*\)";$/\1/p' "$LOOM_ROOT/loom-daemon/src/install_compat.rs")
+  stamp_version=$(jq -r '.version' "$stamp_source/package.json")
+  stamp_commit=$(git -C "$stamp_source" rev-parse HEAD)
+
+  quick_target="$TEST_DIR/stamp-quick"
+  full_target="$TEST_DIR/stamp-full"
+  resync_target="$TEST_DIR/stamp-resync"
+  for target in "$quick_target" "$full_target" "$resync_target"; do
+    create_temp_repo "$target"
+    mkdir -p "$target/.loom"
+  done
+
+  # Stock Bash 3.2 cannot reliably source these process-substituted slices.
+  quick_writer="$TEST_DIR/stamp-quick-writer.sh"
+  full_writer="$TEST_DIR/stamp-full-writer.sh"
+  sed -n '/^finalize_quick_install() {/,/^# Verify critical installation files/p' "$WRAPPER_SCRIPT" > "$quick_writer"
+  sed -n '/^LOOM_SOURCE_REMOTE=""$/,/^METADATA$/p' "$INSTALL_SCRIPT" > "$full_writer"
+
+  # The Quick metadata write must also work without jq on PATH.
+  stamp_tools="$TEST_DIR/stamp-tools"
+  mkdir "$stamp_tools"
+  for tool in cat date git sed; do
+    ln -s "$(command -v "$tool")" "$stamp_tools/$tool"
+  done
+  write_quick_metadata() (
+    export PATH="$stamp_tools"
+    info() { :; }
+    success() { :; }
+    warning() { :; }
+    source "$quick_writer"
+    LOOM_VERSION="$stamp_version" LOOM_COMMIT="$stamp_commit" finalize_quick_install "$stamp_source" "$1"
+  )
+  write_quick_metadata "$quick_target"
+  (
+    cd "$full_target"
+    # The sourced Full Install writer consumes these fixture inputs.
+    export LOOM_ROOT="$stamp_source" LOOM_VERSION="$stamp_version" LOOM_COMMIT="$stamp_commit" INSTALLED_FILES_JSON='[]'
+    source "$full_writer"
+  )
+
+  jq 'del(.requires_daemon)' "$full_target/.loom/install-metadata.json" > "$resync_target/.loom/install-metadata.json"
+  printf '%s\n' "$stamp_source" > "$resync_target/.loom/loom-source-path"
+  git -C "$resync_target" add -f .loom/install-metadata.json
+  git -C "$resync_target" commit -qm "Install before resync"
+  (cd "$resync_target" && bash "$DEFAULTS_DIR/scripts/resync-installed.sh" > "$TEST_DIR/stamp-resync.log" 2>&1)
+
+  for target in "$quick_target" "$full_target" "$resync_target"; do
+    if jq -e --arg floor "$stamp_floor" '$floor != "" and .requires_daemon == $floor' \
+      "$target/.loom/install-metadata.json" >/dev/null; then
+      pass "${target##*/} records the current source floor (#14740)"
+    else
+      fail "${target##*/} did not record the current source floor (#14740)"
+    fi
+  done
+  if jq -ne --slurpfile quick "$quick_target/.loom/install-metadata.json" \
+    --slurpfile full "$full_target/.loom/install-metadata.json" \
+    --slurpfile resync "$resync_target/.loom/install-metadata.json" \
+    '($quick[0] | keys) == ($full[0] | keys) and
+     ($quick[0] | keys) == ($resync[0] | del(.last_resync) | keys)' >/dev/null; then
+    pass "fresh install and resync have the same install metadata keys (#14740)"
+  else
+    fail "install metadata keys differ across install and resync (#14740)"
+  fi
+
+  legacy_target="$TEST_DIR/stamp-legacy"
+  mkdir -p "$legacy_target/.loom"
+  mv "$stamp_source/loom-daemon/src/install_compat.rs" "$TEST_DIR/pre-contract-floor.rs"
+  write_quick_metadata "$legacy_target"
+  if jq -e 'has("requires_daemon") | not' "$legacy_target/.loom/install-metadata.json" >/dev/null; then
+    pass "Quick Install omits an unknown compatibility floor (#14740)"
+  else
+    fail "Quick Install stamped a floor for a pre-contract source (#14740)"
+  fi
 fi
 echo ""
 

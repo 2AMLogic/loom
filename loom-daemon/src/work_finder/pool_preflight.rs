@@ -727,18 +727,6 @@ pub fn preflight_held_causes_per_root(
     (held, causes, probe_roots)
 }
 
-/// The pre-#9017 projection of [`preflight_held_causes_per_root`]: the same
-/// fold, minus the cause slice. Kept byte-for-byte for its existing bool-only
-/// consumers and tests.
-pub fn preflight_held_per_root(
-    workspaces: &WorkspacePool,
-    roots: &[PathBuf],
-    now: DateTime<Utc>,
-) -> (Vec<bool>, Vec<PathBuf>) {
-    let (held, _causes, probe_roots) = preflight_held_causes_per_root(workspaces, roots, now);
-    (held, probe_roots)
-}
-
 /// Single-workspace convenience over [`PoolHoldState::observe_root`] against
 /// this host's global hold set.
 ///
