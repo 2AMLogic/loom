@@ -103,6 +103,9 @@ DIR="$(new_store)"
 (
     export LOOM_FILING_LOCK_DIR="$DIR"
     export LOOM_FILING_LOCK_WAIT_SECS=30
+    # #15265: record the mkdir rc + holder stat of every attempt (and any reap)
+    # in the filer logs, so a hosted-runner failure names its branch.
+    export LOOM_FILING_LOCK_DIAG=1
     SCRATCH="$DIR/scratch-body.md"
     FILED="$DIR/filed.txt"
     TAB=$'\t'

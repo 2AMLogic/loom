@@ -101,6 +101,11 @@
 #   LOOM_FILING_LOCK_STALE_SECS     default 300  age at which a holder is reaped
 #   LOOM_FILING_LOCK_DIR            default ~/.loom/locks/issue-filing
 #   LOOM_FILING_LOCK_HELD           re-entrancy sentinel (set by the holder)
+#   LOOM_FILING_LOCK_DIAG           default off  log mkdir rc + stat of the holder
+#                                   after every acquire attempt, and every reap
+#                                   decision's inputs (#15265). Opt-in, stderr only;
+#                                   production filers never set it. Semantics are
+#                                   unchanged either way.
 
 # Resolved lock dir currently held by this shell (empty = none).
 LOOM_FILING_LOCK_PATH="${LOOM_FILING_LOCK_PATH:-}"
@@ -207,6 +212,31 @@ _loom_filing_lock_abandoned() {
     (( age >= 0 && age >= stale ))
 }
 
+# Opt-in measurement (#15265): two filers on a GitHub-hosted runner both logged
+# "acquired ... after 0s wait" on the SAME holder path, which POSIX mkdir should
+# not allow. LOOM_FILING_LOCK_DIAG=1 makes the acquire/reap paths say what they
+# saw, so a failing hosted run names the branch. Never changes control flow.
+_loom_filing_lock_diag_on() {
+    case "$(printf '%s' "${LOOM_FILING_LOCK_DIAG:-}" | tr '[:upper:]' '[:lower:]')" in
+        1 | true | yes | on) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+# One line: "[filing-lock-diag] <what> pid=<$$> bashpid=<BASHPID> <detail>".
+# $$ is the top shell for every subshell filer, so BASHPID is what tells two
+# racers apart. stat is `inode mtime(ns) ctime(ns) nlink`, GNU first then BSD.
+_loom_filing_lock_diag() {
+    _loom_filing_lock_diag_on || return 0
+    local what="$1" path="${2:-}" st=""
+    if [[ -n "$path" ]]; then
+        st="$(stat -c 'ino=%i mtime=%.9Y ctime=%.9Z nlink=%h' "$path" 2>/dev/null \
+            || stat -f 'ino=%i mtime=%m ctime=%c nlink=%l' "$path" 2>/dev/null \
+            || echo 'stat=FAILED')"
+    fi
+    echo "[filing-lock-diag] ${what} pid=$$ bashpid=${BASHPID:-?} t=$(date +%s.%N 2>/dev/null || date +%s) ${path:+path=$path }${st}" >&2
+}
+
 # Describe the current blocker for the log line.
 _loom_filing_lock_blocker() {
     local owner="$1/holder/owner.json" o_host o_pid o_label
@@ -287,7 +317,10 @@ loom_filing_lock_acquire() {
     local start now blocker logged_wait=0 vanished=0
     start="$(date +%s)"
     while :; do
-        if mkdir "$holder" 2>/dev/null; then
+        local mkdir_rc=0
+        mkdir "$holder" 2>/dev/null || mkdir_rc=$?
+        _loom_filing_lock_diag "mkdir rc=${mkdir_rc}" "$holder"
+        if [[ "$mkdir_rc" -eq 0 ]]; then
             printf '{"host":"%s","pid":%s,"label":"%s","acquired_at":%s}\n' \
                 "$self_host" "$$" "$label" "$(date +%s)" > "$holder/owner.json" 2>/dev/null || true
             now="$(date +%s)"
@@ -330,9 +363,11 @@ loom_filing_lock_acquire() {
         fi
         vanished=0
         if _loom_filing_lock_abandoned "$store" "$self_host" "$stale"; then
+            _loom_filing_lock_diag "reap decision (age=$(_loom_filing_lock_age_secs "$holder") stale=${stale} self_host=${self_host} owner=$(tr -d '\n' < "$holder/owner.json" 2>/dev/null || echo none))" "$holder"
             echo "[filing-lock] reaping abandoned hold at ${holder} ($(_loom_filing_lock_blocker "$store"))" >&2
             rm -f "$holder/owner.json" 2>/dev/null || true
             rmdir "$holder" 2>/dev/null || true
+            _loom_filing_lock_diag "reap done" "$holder"
             continue
         fi
         blocker="$(_loom_filing_lock_blocker "$store")"
