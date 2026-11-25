@@ -589,26 +589,311 @@ fn parse_review_ends_at_the_wrapper_tail_not_end_of_output() {
 
 #[test]
 fn parse_review_rejects_missing_heading_or_verdict_line() {
-    let e = parse_review(Key::Ee, "stopped without a verdict").unwrap_err();
+    let e = parse_review(Key::Ee, "stopped without a verdict")
+        .unwrap_err()
+        .to_string();
     assert!(e.contains("## EE-key review:"), "{e}");
     // The other key's heading is not this key's.
-    let e = parse_review(Key::Ee, &valid_review(Key::Market)).unwrap_err();
+    let e = parse_review(Key::Ee, &valid_review(Key::Market))
+        .unwrap_err()
+        .to_string();
     assert!(e.contains("## EE-key review:"), "{e}");
-    let e = parse_review(Key::Market, "## Market-key review: b\nno verdict line\n").unwrap_err();
+    let e = parse_review(Key::Market, "## Market-key review: b\nno verdict line\n")
+        .unwrap_err()
+        .to_string();
     assert!(e.contains("**Overall verdict:**"), "{e}");
 }
 
 #[test]
 fn parse_review_rejects_unknown_or_conflicting_tokens() {
     let review = |t: &str| format!("## EE-key review: b\n**Overall verdict:** {t}, why\n");
-    let e = parse_review(Key::Ee, &review("thumbs-up")).unwrap_err();
+    let e = parse_review(Key::Ee, &review("thumbs-up"))
+        .unwrap_err()
+        .to_string();
     assert!(e.contains("thumbs-up"), "{e}");
     // A market token on an ee review is unknown, and vice versa.
     assert!(parse_review(Key::Ee, &review("competitive")).is_err());
     assert!(parse_review(Key::Market, &valid_review(Key::Ee)).is_err());
     let both = "## EE-key review: b\n**Overall verdict:** approve, a\n**Overall verdict:** request-changes, b\n";
-    let e = parse_review(Key::Ee, both).unwrap_err();
+    let e = parse_review(Key::Ee, both).unwrap_err().to_string();
     assert!(e.contains("conflicting"), "{e}");
+}
+
+// ---- #15315: harmless verdict formatting and the echoed template -----------
+
+use crate::role_runner::ratification_lane::ReviewError;
+
+/// The pinned EE instructions' output template (2am
+/// `ratification/ee-key/SKILL.md@fed7a23` ~:249-255, as quoted in #15315):
+/// the intro line names the heading mid-line, then the fenced block.
+pub(super) const EE_TEMPLATE: &str = "Write only the human text, starting at the \
+`## EE-key review:` heading, with this structure:\n\n```\n\
+## EE-key review: <block name / class>\n\n\
+**Overall verdict:** <approve|request-changes>, one sentence why.\n```\n";
+
+/// The pinned market instructions' output template (product
+/// `ratification/market-key/SKILL.md@d4a4862` ~:266-272, as quoted in #15315).
+pub(super) const MARKET_TEMPLATE: &str = "Write only the human text, starting at the \
+`## Market-key review:` heading, with this structure:\n\n```\n\
+## Market-key review: <block name / class>\n\n\
+**Overall verdict:** <competitive|adequate-for-catalog|uncompetitive|escalate>, one sentence why.\n```\n";
+
+/// A one-line review for `key` whose verdict line reads `verdict`.
+fn review_with(key: Key, verdict: &str) -> String {
+    format!("{} b\n**Overall verdict:** {verdict}\n", key.review_heading())
+}
+
+fn token_of(key: Key, verdict: &str) -> String {
+    match parse_review(key, &review_with(key, verdict)) {
+        Ok(r) => r.token,
+        Err(e) => panic!("{verdict:?} on {key:?}: {e}"),
+    }
+}
+
+#[test]
+fn parse_review_accepts_trailing_sentence_punctuation() {
+    for key in [Key::Ee, Key::Market] {
+        for token in key.allowed_tokens() {
+            for suffix in [".", "!", ";", ":", ".."] {
+                assert_eq!(token_of(key, &format!("{token}{suffix}")), *token, "{suffix}");
+                assert_eq!(token_of(key, &format!("{token}{suffix} why")), *token, "{suffix}");
+            }
+        }
+    }
+    assert_eq!(token_of(Key::Ee, "approve. Small and sane."), "approve");
+}
+
+#[test]
+fn parse_review_unwraps_balanced_emphasis() {
+    for (key, verdict, token) in [
+        (Key::Market, "**escalate**.", "escalate"),
+        (Key::Market, "`escalate`.", "escalate"),
+        (Key::Market, "**escalate.**", "escalate"),
+        (Key::Ee, "*approve*", "approve"),
+        (Key::Ee, "__approve__", "approve"),
+        (Key::Ee, "_approve_.", "approve"),
+        (Key::Ee, "**request-changes**, why", "request-changes"),
+    ] {
+        assert_eq!(token_of(key, verdict), token, "{verdict}");
+    }
+}
+
+#[test]
+fn parse_review_folds_ascii_case() {
+    assert_eq!(token_of(Key::Ee, "Approve."), "approve");
+    assert_eq!(token_of(Key::Market, "ESCALATE"), "escalate");
+    // A non-ASCII lookalike (Cyrillic а) is not folded into a token.
+    let e = parse_review(Key::Ee, &review_with(Key::Ee, "\u{430}pprove, why"))
+        .unwrap_err()
+        .to_string();
+    assert!(e.contains("unknown verdict token"), "{e}");
+}
+
+#[test]
+fn parse_review_still_rejects_non_tokens() {
+    for (key, verdict) in [
+        (Key::Ee, "none"),
+        (Key::Ee, "approved"),
+        (Key::Ee, "approves"),
+        (Key::Ee, "approve?"),
+        (Key::Ee, "approve-ish"),
+        (Key::Ee, "**approve"),
+        (Key::Ee, "approve**"),
+        (Key::Ee, "."),
+        (Key::Ee, "**"),
+        (Key::Ee, "*"),
+        (Key::Ee, "__"),
+        (Key::Ee, "`"),
+        (Key::Ee, "competitive."),
+        (Key::Market, "approve."),
+        (Key::Market, "adequate for catalog"),
+    ] {
+        assert!(
+            matches!(parse_review(key, &review_with(key, verdict)), Err(ReviewError::Invalid(_))),
+            "{verdict:?} on {key:?} must be withheld as invalid"
+        );
+    }
+}
+
+#[test]
+fn parse_review_conflict_uses_normalized_tokens() {
+    let same = "## EE-key review: b\n**Overall verdict:** approve.\n**Overall verdict:** approve\n";
+    assert_eq!(parse_review(Key::Ee, same).unwrap().token, "approve");
+    let differ = "## EE-key review: b\n**Overall verdict:** approve.\n**Overall verdict:** **request-changes**\n";
+    let e = parse_review(Key::Ee, differ).unwrap_err().to_string();
+    assert!(e.contains("conflicting"), "{e}");
+    // The reason keeps both raw strings for diagnosis.
+    assert!(e.contains("\"approve.\"") && e.contains("\"**request-changes**\""), "{e}");
+}
+
+#[test]
+fn measured_14956_tokens_now_parse() {
+    for (key, verdict, token) in [
+        (Key::Ee, "request-changes.", "request-changes"),
+        (Key::Market, "adequate-for-catalog.", "adequate-for-catalog"),
+        (Key::Market, "escalate.", "escalate"),
+        (Key::Ee, "approve.", "approve"),
+        (Key::Market, "`escalate`.", "escalate"),
+        (Key::Market, "**escalate**.", "escalate"),
+    ] {
+        assert_eq!(token_of(key, &format!("{verdict} One sentence why.")), token);
+    }
+}
+
+#[test]
+fn parse_review_accepts_harmless_verdict_label_variants() {
+    for label in [
+        "**Overall verdict**:",
+        "**Overall Verdict:**",
+        "**OVERALL VERDICT:**",
+        "Overall verdict:",
+        "  **overall verdict:**",
+    ] {
+        let out = format!("## EE-key review: b\n{label} approve, why\n");
+        assert_eq!(parse_review(Key::Ee, &out).unwrap().token, "approve", "{label}");
+    }
+    for not_a_label in [
+        "*Overall verdict:*",
+        "Overall verdict",
+        "**Overall verdict**",
+        "- **Overall verdict:**",
+    ] {
+        let out = format!("## EE-key review: b\n{not_a_label} approve, why\n");
+        let e = parse_review(Key::Ee, &out).unwrap_err().to_string();
+        assert!(e.contains("no **Overall verdict:** line"), "{not_a_label}: {e}");
+    }
+}
+
+#[test]
+fn parse_review_withholds_an_ambiguous_first_clause() {
+    for verdict in [
+        "approve or request-changes, depending on CI",
+        "approve / request-changes.",
+        "Approve OR Request-Changes",
+        "**approve** or **request-changes**",
+    ] {
+        let e = parse_review(Key::Ee, &review_with(Key::Ee, verdict)).unwrap_err();
+        assert!(
+            matches!(e, ReviewError::Invalid(ref r) if r.contains("ambiguous")),
+            "{verdict}: {e}"
+        );
+    }
+    assert!(matches!(
+        parse_review(Key::Ee, &review_with(Key::Ee, "approve | request-changes, why")),
+        Err(ReviewError::Placeholder(_))
+    ));
+    // The sentence of reasoning after the first clause is not part of it.
+    for (key, verdict, token) in [
+        (Key::Ee, "approve, though request-changes was considered", "approve"),
+        (Key::Ee, "approve — no request-changes needed", "approve"),
+        (Key::Ee, "approve — the margin is > 3 dB and < 5 dB", "approve"),
+        (Key::Ee, "approve. Delay < 5 ns.", "approve"),
+        (Key::Market, "competitive. Not uncompetitive at all.", "competitive"),
+        (Key::Market, "uncompetitive (competitive parts exist)", "uncompetitive"),
+    ] {
+        assert_eq!(token_of(key, verdict), token, "{verdict}");
+    }
+}
+
+#[test]
+fn parse_review_classifies_template_echo_as_placeholder() {
+    for (key, template) in [(Key::Ee, EE_TEMPLATE), (Key::Market, MARKET_TEMPLATE)] {
+        assert!(
+            matches!(parse_review(key, template), Err(ReviewError::Placeholder(_))),
+            "{key:?}: {:?}",
+            parse_review(key, template)
+        );
+    }
+}
+
+#[test]
+fn placeholder_survives_formatting() {
+    for verdict in [
+        "`<approve|request-changes>`",
+        "**<approve|request-changes>**",
+        "<approve|request-changes>.",
+        "approve|request-changes",
+        "<approve>",
+    ] {
+        let got = parse_review(Key::Ee, &review_with(Key::Ee, &format!("{verdict}, why")));
+        assert!(matches!(got, Err(ReviewError::Placeholder(_))), "{verdict}: {got:?}");
+    }
+}
+
+#[test]
+fn placeholder_heading_with_filled_verdict_is_placeholder() {
+    let out = "## EE-key review: <block name / class>\n**Overall verdict:** approve, fine\n";
+    let got = parse_review(Key::Ee, out);
+    assert!(
+        matches!(got, Err(ReviewError::Placeholder(ref r)) if r.contains("heading")),
+        "{got:?}"
+    );
+}
+
+#[test]
+fn placeholder_takes_precedence_over_a_valid_line() {
+    let out = "## EE-key review: b\n**Overall verdict:** approve, x\n\
+               **Overall verdict:** <approve|request-changes>, one sentence why.\n";
+    assert!(matches!(parse_review(Key::Ee, out), Err(ReviewError::Placeholder(_))));
+}
+
+#[test]
+fn a_template_before_the_real_review_does_not_make_it_a_placeholder() {
+    // Only the review block (from the last heading) is read.
+    for key in [Key::Ee, Key::Market] {
+        let template = if key == Key::Ee {
+            EE_TEMPLATE
+        } else {
+            MARKET_TEMPLATE
+        };
+        let out = format!("{template}\n{}", valid_review(key));
+        assert!(parse_review(key, &out).is_ok(), "{key:?}");
+    }
+}
+
+#[test]
+fn placeholder_withheld_counts_in_its_own_bucket() {
+    let (prs, sink) = (
+        Prs {
+            author: "alice",
+            listed: 0.into(),
+        },
+        Sink::default(),
+    );
+    let mut r = KeyedRunner {
+        ee: EE_TEMPLATE.into(),
+        market: valid_review(Key::Market),
+        calls: Vec::new(),
+    };
+    let results = run_lane(&cfg(), None, "o/r", &prs, &Instr { fail_market: false }, &sink, &mut r);
+    let o = TickOutcome::from_run(&results, 0);
+    assert_buckets(&o, &[("ee", "verdict_placeholder"), ("market", "posted")]);
+    assert_eq!((o.posted, o.withheld), (1, 1));
+    assert_eq!(keys_marked(&comments(&sink), HEAD), vec![Key::Market]);
+}
+
+#[test]
+fn trailing_stop_review_posts_marker_with_raw_text() {
+    let (prs, sink) = (
+        Prs {
+            author: "alice",
+            listed: 0.into(),
+        },
+        Sink::default(),
+    );
+    let mut r = KeyedRunner {
+        ee: "## EE-key review: x\n**Overall verdict:** request-changes.\n".into(),
+        market: valid_review(Key::Market),
+        calls: Vec::new(),
+    };
+    run_lane(&cfg(), None, "o/r", &prs, &Instr { fail_market: false }, &sink, &mut r);
+    let posted = sink.posted.borrow();
+    let ee: Vec<_> = posted
+        .iter()
+        .filter(|(_, b)| b.starts_with("<!-- ratify:key=ee "))
+        .collect();
+    assert_eq!(ee.len(), 1, "{posted:?}");
+    assert!(ee[0].1.contains("**Overall verdict:** request-changes."), "{}", ee[0].1);
 }
 
 fn page(range: std::ops::Range<u32>) -> String {
@@ -1147,6 +1432,7 @@ fn assert_buckets(o: &TickOutcome, expected: &[(&str, &str)]) {
             "invocation_failed",
             "output_missing",
             "verdict_invalid",
+            "verdict_placeholder",
             "post_failed",
         ] {
             let name = format!("loom.ratification.{key}.{class}");

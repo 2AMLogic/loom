@@ -409,7 +409,9 @@ impl Key {
 /// A key review parsed from a reviewer session's output (#13762).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ParsedReview {
-    /// The verdict token from the `**Overall verdict:**` line.
+    /// The verdict token from the `**Overall verdict:**` line, normalized
+    /// ([`normalize_verdict_token`]). Gate only: the posted comment carries
+    /// the review text verbatim.
     pub token: String,
     /// The review text: from the key's heading (its last occurrence in the
     /// session output) to the first launcher/wrapper line after it — the
@@ -418,20 +420,72 @@ pub struct ParsedReview {
     pub text: String,
 }
 
+/// Why a session's output did not parse as this key's review (#13762,
+/// #15315). Both variants withhold the marker; they differ only in the fixed
+/// class the tick counts them under.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReviewError {
+    /// The review block is the instruction template echoed back: its heading
+    /// still reads `<block name / class>`, or a verdict line still carries
+    /// the `<…>` placeholder or a `|` list of alternatives
+    /// ([`WithheldClass::VerdictPlaceholder`]).
+    Placeholder(String),
+    /// Anything else: no heading, no verdict line, or an empty, unknown,
+    /// ambiguous or conflicting token ([`WithheldClass::VerdictInvalid`]).
+    Invalid(String),
+}
+
+impl ReviewError {
+    /// The reason the lane logs as withheld.
+    #[must_use]
+    pub fn reason(&self) -> &str {
+        match self {
+            Self::Placeholder(r) | Self::Invalid(r) => r,
+        }
+    }
+}
+
+impl std::fmt::Display for ReviewError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.reason())
+    }
+}
+
+/// The pinned verdict label, as it appears in error reasons.
+const VERDICT_LINE: &str = "**Overall verdict:**";
+
 /// Extract this key's review from a reviewer session's output. The heading
 /// ([`Key::review_heading`]) is the start delimiter: the review runs from its
 /// **last** occurrence in `output` to the first launcher/wrapper line after
 /// it ([`is_wrapper_line`]), so launcher or wrapper noise on either side of
 /// the review is never read as a verdict or posted — no auth-mode line, no
-/// wrapper tail. A verdict is the first
-/// word after the colon on an `**Overall verdict:**` line (terminated by a
-/// comma or whitespace) and must be one of [`Key::allowed_tokens`]. Anything
-/// else — no heading, no verdict line, an empty, unknown or conflicting
-/// token — is an `Err` whose reason the lane logs as withheld.
-pub fn parse_review(key: Key, output: &str) -> Result<ParsedReview, String> {
+/// wrapper tail.
+///
+/// A verdict line starts with the `**Overall verdict:**` label or one of its
+/// harmless variants ([`verdict_label_rest`]). Its verdict is the **first
+/// word** after the label (terminated by a comma or whitespace, so
+/// `approve. Actually request-changes` reads as `approve` exactly as
+/// `approve, actually request-changes` always has), normalized by
+/// [`normalize_verdict_token`] — a trailing `.` `;` `:` `!`, a balanced
+/// `**` `__` `` ` `` `*` `_` wrapping and ASCII case are harmless (#15315) —
+/// and must then **exactly** equal one of [`Key::allowed_tokens`].
+///
+/// Only the review block is read, and the template is checked first: a
+/// heading whose title starts with `<`, or a verdict line that still carries
+/// the `<…>` placeholder or a `|` list, is [`ReviewError::Placeholder`]
+/// whatever else the block says. Anything else that is not a verdict — no
+/// heading, no verdict line, an empty or unknown token, a first clause that
+/// names a second allowed token (`approve or request-changes`), or two lines
+/// whose normalized tokens differ — is [`ReviewError::Invalid`].
+///
+/// # Errors
+///
+/// The output is not a review for `key`; the reason is logged as withheld.
+pub fn parse_review(key: Key, output: &str) -> Result<ParsedReview, ReviewError> {
+    use ReviewError::{Invalid, Placeholder};
     let heading = key.review_heading();
     let Some(at) = output.rfind(heading) else {
-        return Err(format!("no {heading} heading in session output"));
+        return Err(Invalid(format!("no {heading} heading in session output")));
     };
     let start = output[..at].rfind('\n').map_or(0, |i| i + 1);
     let lines: Vec<&str> = output[start..].lines().collect();
@@ -441,35 +495,151 @@ pub fn parse_review(key: Key, output: &str) -> Result<ParsedReview, String> {
         .unwrap_or(lines.len());
     let joined = lines[..end].join("\n");
     let review = joined.trim_end();
-    const VERDICT_LINE: &str = "**Overall verdict:**";
-    let mut token: Option<String> = None;
-    for line in review.lines() {
-        let Some(rest) = line.trim_start().strip_prefix(VERDICT_LINE) else {
-            continue;
-        };
-        let t: String = rest
+    // The template's own heading (`<block name / class>`) is never a review,
+    // even when a filled-looking verdict follows it.
+    let title = output[at + heading.len()..].lines().next().unwrap_or("");
+    if title.trim().starts_with('<') {
+        return Err(Placeholder("review heading is the template placeholder".into()));
+    }
+    let verdicts: Vec<&str> = review.lines().filter_map(verdict_label_rest).collect();
+    // Placeholder outranks every other check: a block that holds both a
+    // template line and a valid token is still the template.
+    if verdicts.iter().any(|rest| is_placeholder_verdict(rest)) {
+        return Err(Placeholder("verdict line is the template placeholder".into()));
+    }
+    let mut token: Option<(String, String)> = None;
+    for rest in verdicts {
+        let raw: String = rest
             .trim_start()
             .chars()
             .take_while(|c| *c != ',' && !c.is_whitespace())
             .collect();
-        if t.is_empty() {
-            return Err(format!("empty verdict token on an {VERDICT_LINE} line"));
+        let normalized = normalize_verdict_token(&raw);
+        if normalized.is_empty() {
+            return Err(Invalid(format!("empty verdict token on an {VERDICT_LINE} line")));
+        }
+        if let Some(other) = second_allowed_token(key, rest, &normalized) {
+            return Err(Invalid(format!(
+                "ambiguous verdict clause names both {normalized:?} and {other:?}"
+            )));
         }
         match &token {
-            Some(prev) if *prev != t => {
-                return Err(format!("conflicting verdict tokens {prev:?} and {t:?}"));
+            Some((prev, prev_raw)) if *prev != normalized => {
+                return Err(Invalid(format!(
+                    "conflicting verdict tokens {prev_raw:?} and {raw:?}"
+                )));
             }
-            _ => token = Some(t),
+            Some(_) => {}
+            None => token = Some((normalized, raw)),
         }
     }
-    let token = token.ok_or_else(|| format!("no {VERDICT_LINE} line after {heading}"))?;
+    let (token, raw) =
+        token.ok_or_else(|| Invalid(format!("no {VERDICT_LINE} line after {heading}")))?;
     if !key.allowed_tokens().contains(&token.as_str()) {
-        return Err(format!("unknown verdict token {token:?}"));
+        return Err(Invalid(format!("unknown verdict token {raw:?}")));
     }
     Ok(ParsedReview {
         token,
         text: review.to_string(),
     })
+}
+
+/// The text after a verdict label at the start of `line` (leading
+/// whitespace allowed): the pinned `**Overall verdict:**`, the harmless
+/// variants `**Overall verdict**:` and the unbolded `Overall verdict:`, the
+/// words in any ASCII case (#15315). `None` for any other line.
+fn verdict_label_rest(line: &str) -> Option<&str> {
+    const WORDS: &str = "overall verdict";
+    let line = line.trim_start();
+    let (bold, after) = match line.strip_prefix("**") {
+        Some(rest) => (true, rest),
+        None => (false, line),
+    };
+    if !after.get(..WORDS.len())?.eq_ignore_ascii_case(WORDS) {
+        return None;
+    }
+    let tail = &after[WORDS.len()..];
+    if bold {
+        tail.strip_prefix(":**")
+            .or_else(|| tail.strip_prefix("**:"))
+    } else {
+        tail.strip_prefix(':')
+    }
+}
+
+/// Whether a verdict line (the text after its label) is the template's
+/// placeholder: after any leading `` ` `` / `*` it starts with `<`, its
+/// first word carries `|`, `<` or `>`, or its first clause
+/// ([`verdict_clause`]) carries one — so `<approve|request-changes>`, its
+/// bold, backticked or full-stopped forms and a spaced
+/// `approve | request-changes` can never be normalized into a token.
+fn is_placeholder_verdict(rest: &str) -> bool {
+    const MARKS: [char; 3] = ['|', '<', '>'];
+    let rest = rest.trim_start();
+    let first_word: String = rest
+        .chars()
+        .take_while(|c| *c != ',' && !c.is_whitespace())
+        .collect();
+    rest.trim_start_matches(['`', '*']).starts_with('<')
+        || first_word.contains(MARKS)
+        || verdict_clause(rest).contains(MARKS)
+}
+
+/// The first clause of a verdict line: up to the first comma, sentence
+/// punctuation, dash or parenthesis. Wide enough to catch alternatives
+/// written as one clause (`approve | request-changes`,
+/// `approve or request-changes`), narrow enough that the sentence of
+/// reasoning after the verdict (`approve — the margin is > 3 dB`) is not
+/// read as part of it.
+fn verdict_clause(rest: &str) -> &str {
+    let rest = rest.trim_start();
+    let end = rest
+        .find([',', '.', ';', ':', '!', '?', '(', '\u{2014}', '\u{2013}'])
+        .unwrap_or(rest.len());
+    &rest[..end]
+}
+
+/// Another of `key`'s allowed tokens named, as a whole word in any ASCII
+/// case, in the first clause of a verdict line whose first word normalized
+/// to `token` — an ambiguous verdict, withheld.
+fn second_allowed_token(key: Key, rest: &str, token: &str) -> Option<&'static str> {
+    if !key.allowed_tokens().contains(&token) {
+        return None;
+    }
+    let clause = verdict_clause(rest).to_ascii_lowercase();
+    clause
+        .split(|c: char| !(c.is_ascii_alphanumeric() || c == '-'))
+        .find_map(|word| {
+            key.allowed_tokens()
+                .iter()
+                .copied()
+                .find(|t| *t == word && *t != token)
+        })
+}
+
+/// Normalize a raw verdict token's harmless formatting (#15315): repeat,
+/// until nothing changes, (a) strip a trailing run of `.` `;` `:` `!` and
+/// (b) remove one balanced emphasis pair (`**` `__` `` ` `` `*` `_` on both
+/// ends, only when something is left between them); then fold ASCII case.
+/// Never strips `?`, `)`, `|`, `<` or `>`, and never removes a one-sided
+/// marker, so `approve?`, `**approve` and `<approve>` stay non-tokens.
+#[must_use]
+pub fn normalize_verdict_token(raw: &str) -> String {
+    let mut t = raw;
+    loop {
+        let before = t.len();
+        t = t.trim_end_matches(['.', ';', ':', '!']);
+        for pair in ["**", "__", "`", "*", "_"] {
+            if t.len() > 2 * pair.len() && t.starts_with(pair) && t.ends_with(pair) {
+                t = &t[pair.len()..t.len() - pair.len()];
+                break;
+            }
+        }
+        if t.len() == before {
+            break;
+        }
+    }
+    t.to_ascii_lowercase()
 }
 
 /// A launcher or `claude-wrapper.sh` line rather than review prose: a
@@ -556,7 +726,24 @@ pub enum WithheldClass {
     InvocationFailed,
     OutputMissing,
     VerdictInvalid,
+    /// The output was the instruction template echoed back (#15315).
+    VerdictPlaceholder,
     PostFailed,
+}
+
+impl WithheldClass {
+    /// The class's span-key suffix (`loom.ratification.<key>.<wire>`).
+    #[must_use]
+    pub fn wire(self) -> &'static str {
+        match self {
+            Self::PreLaunchFailed => "pre_launch_failed",
+            Self::InvocationFailed => "invocation_failed",
+            Self::OutputMissing => "output_missing",
+            Self::VerdictInvalid => "verdict_invalid",
+            Self::VerdictPlaceholder => "verdict_placeholder",
+            Self::PostFailed => "post_failed",
+        }
+    }
 }
 
 /// Post a marker for each **attempted** key whose session ended in
@@ -577,6 +764,7 @@ pub fn post_markers(
     use super::RoleTickOutcome;
     use WithheldClass::{
         InvocationFailed, OutputMissing, PostFailed, PreLaunchFailed, VerdictInvalid,
+        VerdictPlaceholder,
     };
     [Key::Ee, Key::Market]
         .into_iter()
@@ -593,7 +781,12 @@ pub fn post_markers(
                             .unwrap_or_else(|e| {
                                 KeyPost::Withheld(PostFailed, format!("marker post failed: {e}"))
                             }),
-                        Some(Err(reason)) => KeyPost::Withheld(VerdictInvalid, reason),
+                        Some(Err(ReviewError::Placeholder(reason))) => {
+                            KeyPost::Withheld(VerdictPlaceholder, reason)
+                        }
+                        Some(Err(ReviewError::Invalid(reason))) => {
+                            KeyPost::Withheld(VerdictInvalid, reason)
+                        }
                         None => {
                             KeyPost::Withheld(OutputMissing, "no session output captured".into())
                         }
@@ -830,12 +1023,14 @@ pub const KEYS: [&str; KEY_COUNT_START + 2 * CLASSES_PER_KEY] = [
     "loom.ratification.ee.invocation_failed",
     "loom.ratification.ee.output_missing",
     "loom.ratification.ee.verdict_invalid",
+    "loom.ratification.ee.verdict_placeholder",
     "loom.ratification.ee.post_failed",
     "loom.ratification.market.posted",
     "loom.ratification.market.pre_launch_failed",
     "loom.ratification.market.invocation_failed",
     "loom.ratification.market.output_missing",
     "loom.ratification.market.verdict_invalid",
+    "loom.ratification.market.verdict_placeholder",
     "loom.ratification.market.post_failed",
 ];
 

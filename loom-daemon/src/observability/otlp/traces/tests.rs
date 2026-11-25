@@ -173,6 +173,7 @@ fn ratification_counts_reconcile_on_the_otlp_wire_without_exporting_detail() {
                 "invocation_failed",
                 "output_missing",
                 "verdict_invalid",
+                "verdict_placeholder",
                 "post_failed",
             ] {
                 let count = count(&format!("loom.ratification.{key}.{class}"));
