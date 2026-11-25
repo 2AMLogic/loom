@@ -170,6 +170,24 @@ pub fn latest_start(profiles: &[PathBuf]) -> Option<LastStart> {
         .max_by_key(|s| s.started_at_unix_ms)
 }
 
+/// The hold recorded in `profile`, when its sidecar exists and decodes.
+/// Details only: whether the account is held is [`held_across`], which a
+/// malformed sidecar still satisfies (#15292).
+#[must_use]
+pub fn read_hold(profile: &Path) -> Option<Hold> {
+    let bytes = std::fs::read(profile.join(HOLD_FILE)).ok()?;
+    serde_json::from_slice(&bytes).ok()
+}
+
+/// The newest decodable hold in any of `profiles`, by `held_at_unix_ms`.
+#[must_use]
+pub fn newest_hold(profiles: &[PathBuf]) -> Option<Hold> {
+    profiles
+        .iter()
+        .filter_map(|p| read_hold(p))
+        .max_by_key(|h| h.held_at_unix_ms)
+}
+
 /// Whether the account whose profile directories are `profiles` is held: a
 /// hold file (readable or not) exists in any of them.
 #[must_use]
