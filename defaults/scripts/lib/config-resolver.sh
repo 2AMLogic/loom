@@ -146,6 +146,11 @@ loom_resolve_config() {
 # Resolve a single value from the effective merged config by dotted key
 # path (e.g. "autonomous.workFinder.enabled"). Echoes `default` (empty
 # string if omitted) when the path is absent, non-scalar, or jq is missing.
+#
+# Failure contract (#15321): when `loom_resolve_config` itself fails (nonzero),
+# the getter returns that same status with empty stdout and lets the resolver's
+# diagnostic reach stderr -- it does NOT fall back to `default`. The fallback
+# applies only to a successful resolution that lacks the key.
 loom_config_get() {
     local repo_root="$1"
     local dotted="$2"
@@ -156,8 +161,16 @@ loom_config_get() {
         return 0
     fi
 
-    local effective
-    effective=$(loom_resolve_config "$repo_root")
+    # Fail closed (#15321): a resolver failure is not "key absent". Return the
+    # resolver's status with nothing on stdout (its diagnostic already went to
+    # stderr) instead of falling through to `default_val` with status 0. The
+    # explicit `|| rc=$?` keeps this correct under `set -e` and when the caller
+    # tests the getter in an `if` condition (where `set -e` is suspended).
+    local effective resolve_rc=0
+    effective=$(loom_resolve_config "$repo_root") || resolve_rc=$?
+    if [[ $resolve_rc -ne 0 ]]; then
+        return "$resolve_rc"
+    fi
 
     # `try ... catch empty` guards against `dotted` indexing through a
     # non-object at some segment (e.g. "a.b" where "a" is a scalar) --
