@@ -81,6 +81,9 @@ pub enum AttemptFailure {
     /// A planned version roll stopped the launched session
     /// ([`crate::observability::lifecycle::ROLL_INTERRUPTED`]).
     Rolled,
+    /// The role timeout fired while the host was saturated
+    /// ([`RoleTickOutcome::LoadSkipped`]): the host's load, not the PR.
+    HostLoad,
     /// The session ran and did not succeed; its `loom.failure_class` when the
     /// runner recorded one.
     Launched(Option<String>),
@@ -379,6 +382,7 @@ fn launched_failure(
                 .map(|f| f.class().to_string());
             Some(AttemptFailure::Launched(class))
         }
+        RoleTickOutcome::LoadSkipped { .. } => Some(AttemptFailure::HostLoad),
         _ => Some(AttemptFailure::Launched(None)),
     }
 }

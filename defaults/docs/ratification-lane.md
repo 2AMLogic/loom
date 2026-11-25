@@ -76,8 +76,11 @@ every host. Selection does not change; the bound sits between selection and
 dispatch, and posts nothing to the PR.
 
 - **Counted attempts.** A session that ran and left no usable review —
-  `output_missing`, `verdict_invalid` or `verdict_placeholder` — is one
-  counted attempt for its `(repo, PR, head, key)`. At most **3** are
+  `output_missing`, `verdict_invalid` or `verdict_placeholder`, or an
+  `invocation_failed` session that launched and failed with a class the PR
+  may have caused (`timeout-ceiling`, an `exit-<n>`, `runtime-fatal`,
+  `model-refusal`, `killed-by-signal`, unclassified) — is one counted attempt
+  for its `(repo, PR, head, key)`. At most **3** are
   dispatched in any trailing **24 h**. At the cap the key is **capped**: not
   dispatched until the oldest of its last three attempts is 24 h old, or at
   once when the PR gets a new head (attempts are recorded per head).
@@ -97,14 +100,16 @@ dispatch, and posts nothing to the PR.
   delays the next try by **15 minutes** in daemon memory (reset on restart):
   - a pinned-instruction read that failed (for example `deferred: reader
     budget low`): that pin, for every workspace on the host;
-  - a launch refused before its CLI ran (`pre_launch_failed`), or a launched
+  - a launch refused before its CLI ran (`pre_launch_failed`), a launched
     session that failed with an account, pool, credential or host class
     (`account-pool-exhausted`, `account-exhausted:*`, `no-usable-account`,
     `session-limit`, `credential-expired`, `runtime-timeout`,
-    `sandbox-unavailable`, `cwd-deleted`, or a launch-refusal class such as
-    `preflight-no-cli-start`): that key, for the repo;
-  - a marker post the forge refused (`post_failed`), or a launched session
-    that failed any other way: that PR, head and key only.
+    `sandbox-unavailable`, `cwd-deleted`, the daemon's own `launch-failed`
+    and `wait-failed`, or a launch-refusal class such as
+    `preflight-no-cli-start`), or one the role timeout stopped on a saturated
+    host: that key, for the repo;
+  - a marker post the forge refused (`post_failed`): that PR, head and key
+    only.
 
   A version roll stopping a session is neither counted nor backed off.
 - `ratification-lane status` prints each key's counted attempts and, when

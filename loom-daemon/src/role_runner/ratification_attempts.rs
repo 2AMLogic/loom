@@ -13,7 +13,9 @@
 //! # Counted attempts: the host-local ledger
 //!
 //! A session that ran and left no usable review — [`WithheldClass::OutputMissing`],
-//! [`WithheldClass::VerdictInvalid`], [`WithheldClass::VerdictPlaceholder`] —
+//! [`WithheldClass::VerdictInvalid`], [`WithheldClass::VerdictPlaceholder`],
+//! or a launched [`WithheldClass::InvocationFailed`] whose class the PR may
+//! have caused (a timeout, an exit code, a refusal; [`counts_toward_cap`]) —
 //! is one **counted attempt** for its `(repo, pr, head, key)`. At most
 //! [`MAX_COUNTED_ATTEMPTS_PER_WINDOW`] counted attempts are dispatched per
 //! `(repo, pr, head, key)` in any trailing [`ATTEMPT_WINDOW_HOURS`]: once that
@@ -36,11 +38,13 @@
 //! - a pinned-instruction read that failed (the `reader budget low` shed,
 //!   say): that pin, process-wide — every root on the host shares the reader
 //!   budget and the pin (critique A9);
-//! - a launch refused before its CLI ran ([`WithheldClass::PreLaunchFailed`])
-//!   or a launched session that failed with an account, pool, credential or
-//!   host class ([`is_host_failure_class`]): the key, for that repo;
-//! - a forge post that failed, or a launched session that failed for any
-//!   other reason: that `(repo, pr, head, key)` only.
+//! - a launch refused before its CLI ran ([`WithheldClass::PreLaunchFailed`]),
+//!   a launched session that failed with an account, pool, credential or
+//!   host class ([`is_host_failure_class`]), or one the role timeout stopped
+//!   on a saturated host ([`AttemptFailure::HostLoad`]): the key, for that
+//!   repo;
+//! - a forge post that failed ([`WithheldClass::PostFailed`]): that
+//!   `(repo, pr, head, key)` only.
 //!
 //! A version roll stopping a session is neither counted nor backed off.
 //! Backoffs reset with the daemon.
@@ -93,17 +97,29 @@ pub fn ledger_path(root: &Path) -> PathBuf {
         .join("attempts.json")
 }
 
-/// Whether a withheld class is a counted attempt: the session ran and left
-/// no usable review. Launch refusals, pre-launch and launched host failures,
-/// roll stops and post failures are never counted.
+/// Whether a withheld key is a counted attempt: the session ran and left no
+/// usable review. That is every [`WithheldClass::OutputMissing`],
+/// [`WithheldClass::VerdictInvalid`] and [`WithheldClass::VerdictPlaceholder`],
+/// and an [`WithheldClass::InvocationFailed`] session that launched and failed
+/// with a class the PR may have caused — `timeout-ceiling`, an `exit-<n>`,
+/// `runtime-fatal`, `model-refusal`, `killed-by-signal`, an unclassified
+/// failure — so a head whose session always fails that way is still bounded
+/// (#15315 scope 4). Never counted: launch refusals and pre-launch failures,
+/// a launched host failure ([`is_host_failure_class`]), a timeout on a
+/// saturated host ([`AttemptFailure::HostLoad`]), a version-roll stop, and a
+/// post failure (amendment D1).
 #[must_use]
-pub fn counts_toward_cap(class: WithheldClass) -> bool {
-    matches!(
-        class,
+pub fn counts_toward_cap(class: WithheldClass, failure: Option<&AttemptFailure>) -> bool {
+    match class {
         WithheldClass::OutputMissing
-            | WithheldClass::VerdictInvalid
-            | WithheldClass::VerdictPlaceholder
-    )
+        | WithheldClass::VerdictInvalid
+        | WithheldClass::VerdictPlaceholder => true,
+        WithheldClass::InvocationFailed => matches!(
+            failure,
+            Some(AttemptFailure::Launched(c)) if !c.as_deref().is_some_and(is_host_failure_class)
+        ),
+        WithheldClass::PreLaunchFailed | WithheldClass::PostFailed => false,
+    }
 }
 
 /// Whether a launched session's `loom.failure_class` names an account, pool,
@@ -111,7 +127,9 @@ pub fn counts_toward_cap(class: WithheldClass) -> bool {
 /// `account-pool-exhausted` (claude-wrapper exits 78 after its CLI started),
 /// `account-exhausted:*`, `no-usable-account`, `session-limit`,
 /// `credential-expired`, `runtime-timeout`, `sandbox-unavailable`,
-/// `cwd-deleted`, and every launch-refusal class.
+/// `cwd-deleted`, every launch-refusal class, and the daemon's own
+/// `launch-failed` (no child was spawned) and `wait-failed` (its exit was
+/// never observed).
 #[must_use]
 pub fn is_host_failure_class(class: &str) -> bool {
     class.starts_with("account-exhausted:")
@@ -124,6 +142,8 @@ pub fn is_host_failure_class(class: &str) -> bool {
                 | "runtime-timeout"
                 | "sandbox-unavailable"
                 | "cwd-deleted"
+                | "launch-failed"
+                | "wait-failed"
         )
         || super::ratification_dispatch::LAUNCH_REFUSAL_CLASSES.contains(&class)
 }
@@ -141,9 +161,13 @@ pub enum Backoff {
     Pr,
 }
 
-/// The backoff a withheld `class` earns, given why the attempt failed.
+/// The backoff a withheld `class` earns, given why the attempt failed: none
+/// for a counted attempt ([`counts_toward_cap`]) or a version roll.
 #[must_use]
 pub fn backoff_for(class: WithheldClass, failure: Option<&AttemptFailure>) -> Backoff {
+    if counts_toward_cap(class, failure) {
+        return Backoff::None;
+    }
     match class {
         WithheldClass::PreLaunchFailed => match failure {
             Some(AttemptFailure::Pin) => Backoff::Pin,
@@ -151,7 +175,7 @@ pub fn backoff_for(class: WithheldClass, failure: Option<&AttemptFailure>) -> Ba
         },
         WithheldClass::InvocationFailed => match failure {
             Some(AttemptFailure::Rolled) => Backoff::None,
-            Some(AttemptFailure::Launched(Some(c))) if is_host_failure_class(c) => Backoff::Key,
+            Some(AttemptFailure::HostLoad | AttemptFailure::Launched(Some(_))) => Backoff::Key,
             _ => Backoff::Pr,
         },
         WithheldClass::PostFailed => Backoff::Pr,

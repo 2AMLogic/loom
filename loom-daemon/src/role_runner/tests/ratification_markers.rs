@@ -2486,15 +2486,36 @@ mod launch_refusal {
         assert_eq!(ee_runs(&bench, &mut r, 1), 0);
         assert_eq!(ee_runs(&bench, &mut r, 16), 1, "tried again after the backoff");
         assert!(bench.records().is_empty(), "never counted");
+    }
 
-        // Any other launched failure is not counted either, but backs off
-        // only its own PR: PR #8 still runs in the same pass.
-        let bench = super::bound::Bench::new();
-        let mut r = LaunchedEe::new(1, "# LOOM_CLI_START runtime=codex\nError: boom");
-        assert_eq!(r.failure.class(), "exit-1");
-        assert_eq!(ee_runs(&bench, &mut r, 0), 2);
-        assert_eq!(ee_runs(&bench, &mut r, 1), 0, "each PR backed off");
-        assert!(bench.records().is_empty());
+    #[test]
+    fn a_launched_failure_the_pr_may_cause_is_counted_and_capped() {
+        // Review finding: a session that launched and failed with a class
+        // the PR may cause (here the role timeout, and the real classifier's
+        // bare exit code) must count, or the same head is re-dispatched
+        // after every backoff without end (#15315 scope 4).
+        let timeout = || LaunchedEe {
+            log: tick("# LOOM_CLI_START runtime=codex\nstill reviewing"),
+            failure: RoleFailure::new(
+                "timeout-ceiling",
+                None,
+                "role child ran past the 1800 s role timeout and was terminated",
+            ),
+            last_ee: false,
+        };
+        let exit_1 = || LaunchedEe::new(1, "# LOOM_CLI_START runtime=codex\nError: boom");
+        for (name, mut r) in [("timeout-ceiling", timeout()), ("exit-1", exit_1())] {
+            assert_eq!(r.failure.class(), name);
+            let bench = super::bound::Bench::new();
+            for (i, at) in [0, 16, 32].into_iter().enumerate() {
+                assert_eq!(ee_runs(&bench, &mut r, at), 2, "{name} pass {i}: both PRs run");
+            }
+            let records = bench.records();
+            assert_eq!(records.len(), 6, "{name}: one counted attempt per PR per pass");
+            assert!(records.iter().all(|a| a.class == "invocation_failed"), "{records:?}");
+            assert_eq!(ee_runs(&bench, &mut r, 48), 0, "{name}: capped at both heads");
+            assert_eq!(ee_runs(&bench, &mut r, 64), 0, "{name}: and stays capped");
+        }
     }
 }
 
@@ -2640,6 +2661,8 @@ mod bound {
         PreLaunch,
         /// Stopped by a version roll.
         Rolled,
+        /// Stopped by the role timeout on a saturated host.
+        LoadSkipped,
     }
 
     struct Scripted {
@@ -2681,6 +2704,10 @@ mod bound {
                 Ends::Review | Ends::NoVerdict => RoleTickOutcome::Success,
                 Ends::PreLaunch => RoleTickOutcome::NoTokenPool,
                 Ends::Rolled => RoleTickOutcome::Failure("stopped for the version roll".into()),
+                Ends::LoadSkipped => RoleTickOutcome::LoadSkipped {
+                    load_per_core: 2.5,
+                    detail: "still reviewing".into(),
+                },
             }
         }
         fn last_output(&self) -> Option<String> {
@@ -2903,6 +2930,27 @@ mod bound {
         }
         assert_eq!(r.ran(EE), 4, "a roll stop is neither counted nor backed off");
         assert!(bench.records().is_empty());
+    }
+
+    #[test]
+    fn a_timeout_on_a_saturated_host_is_not_counted_and_backs_off_the_key() {
+        // The role timeout under host load is the host's, not the PR's: no
+        // counted attempt, and the key backs off for the repo.
+        let bench = Bench::new();
+        let prs = Heads::one();
+        let mut r = Scripted::new(Ends::LoadSkipped, Ends::Review);
+        let pass = bench.pass(&prs, &mut r, mins(0));
+        assert_eq!(r.take(), [EE, MARKET]);
+        assert_buckets(
+            &TickOutcome::from_pass(&pass),
+            &[("ee", "invocation_failed"), ("market", "posted")],
+        );
+        let pass = bench.pass(&prs, &mut r, mins(1));
+        assert_eq!(r.take(), [MARKET], "EE backed off");
+        assert_eq!(pass.deferred, 1);
+        bench.pass(&prs, &mut r, mins(16));
+        assert_eq!(r.take(), [EE, MARKET], "tried again after the backoff");
+        assert!(bench.records().is_empty(), "never counted");
     }
 
     struct FailingSink;

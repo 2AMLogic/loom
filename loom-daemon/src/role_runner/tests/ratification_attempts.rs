@@ -166,14 +166,24 @@ fn counts_toward_cap_table() {
         (InvocationFailed, launched("sandbox-unavailable"), false, Backoff::Key),
         (InvocationFailed, launched("cwd-deleted"), false, Backoff::Key),
         (InvocationFailed, launched("preflight-no-cli-start"), false, Backoff::Key),
-        (InvocationFailed, launched("exit-1"), false, Backoff::Pr),
-        (InvocationFailed, launched("exit-78"), false, Backoff::Pr),
-        (InvocationFailed, launched("timeout-ceiling"), false, Backoff::Pr),
-        (InvocationFailed, Some(AttemptFailure::Launched(None)), false, Backoff::Pr),
+        (InvocationFailed, launched("launch-failed"), false, Backoff::Key),
+        (InvocationFailed, launched("wait-failed"), false, Backoff::Key),
+        (InvocationFailed, Some(AttemptFailure::HostLoad), false, Backoff::Key),
+        // A launched failure the PR may cause counts, so it is bounded.
+        (InvocationFailed, launched("exit-1"), true, Backoff::None),
+        (InvocationFailed, launched("exit-78"), true, Backoff::None),
+        (InvocationFailed, launched("timeout-ceiling"), true, Backoff::None),
+        (InvocationFailed, launched("runtime-fatal"), true, Backoff::None),
+        (InvocationFailed, launched("model-refusal"), true, Backoff::None),
+        (InvocationFailed, launched("killed-by-signal"), true, Backoff::None),
+        (InvocationFailed, launched("unclassified:after-launch"), true, Backoff::None),
+        (InvocationFailed, Some(AttemptFailure::Launched(None)), true, Backoff::None),
+        // No evidence of how it failed: not counted (fail open).
+        (InvocationFailed, None, false, Backoff::Pr),
         (PostFailed, None, false, Backoff::Pr),
     ];
     for (class, failure, counted, backoff) in cases {
-        assert_eq!(counts_toward_cap(class), counted, "{class:?}");
+        assert_eq!(counts_toward_cap(class, failure.as_ref()), counted, "{class:?} {failure:?}");
         assert_eq!(backoff_for(class, failure.as_ref()), backoff, "{class:?} {failure:?}");
     }
     for class in [

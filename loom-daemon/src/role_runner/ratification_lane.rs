@@ -1064,7 +1064,7 @@ pub fn run_lane_stats_with(
                     let KeyPost::Withheld(class, _) = post else {
                         continue;
                     };
-                    if counts_toward_cap(*class) {
+                    if counts_toward_cap(*class, dispatched.failure(*key)) {
                         ledger.record(AttemptRecord {
                             repo: target_repo.to_string(),
                             pr,
