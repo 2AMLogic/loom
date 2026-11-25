@@ -272,3 +272,21 @@ fn local_override_conflicting_with_fleet_config_refuses_workflow_writes() {
         assert!(!f.root().join("calls").exists());
     }
 }
+
+/// #15260: the workflow gate resolves the route once per invocation, so the
+/// `LOOM_MODE`-vs-config disagreement note is printed once, not once per call.
+#[test]
+fn notify_cleared_blockers_reports_mode_disagreement_once() {
+    for dry_run in [false, true] {
+        let f = Forge::new();
+        fs::create_dir(f.root().join(".loom-local")).unwrap();
+        f.set(".loom-local/local.json", r#"{"mode":"local-daemon"}"#);
+        let mut argv = NOTIFY.to_vec();
+        if dry_run {
+            argv.push("--dry-run");
+        }
+        let out = f.call(TOOLS, &argv, &[]);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(stderr.matches("LOOM_MODE wins").count(), 1, "dry_run={dry_run}: {out:?}");
+    }
+}

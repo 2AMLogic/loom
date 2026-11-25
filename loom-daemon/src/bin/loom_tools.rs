@@ -479,10 +479,12 @@ fn run() -> Result<()> {
         }
         ToolsCommands::NotifyClearedBlockers(args) => {
             let root = args.repo_root.clone().unwrap_or_else(|| cwd.clone());
-            if !args.dry_run && workflow_gate(&root, true)? {
+            // One gate call: its notes and env side effects happen once. A
+            // dry run evaluates it with `writes = false`, so a preview is
+            // never refused, and never takes the broker route (#15260).
+            if workflow_gate(&root, !args.dry_run)? && !args.dry_run {
                 args.run_fleet(&curation_broker()?)
             } else {
-                workflow_gate(&root, false)?;
                 args.run()
             }
         }
