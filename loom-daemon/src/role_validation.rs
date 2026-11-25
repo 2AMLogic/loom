@@ -315,6 +315,15 @@ pub fn validate_from_config(config: &serde_json::Value, mode: ValidationMode) ->
         result.errors.extend(excluded_errors);
     }
 
+    // #15252: `runtimes.modelProfileOverrides` may only overlay bundled
+    // profiles with model/effort/allowedEfforts/excludedRolesAdd.
+    let override_errors =
+        crate::worker_spawn::profiles::check_model_profile_overrides_config(config);
+    if !override_errors.is_empty() {
+        result.valid = false;
+        result.errors.extend(override_errors);
+    }
+
     let escalation_errors = crate::doctor_escalation::check_config(config);
     if !escalation_errors.is_empty() {
         result.valid = false;
@@ -686,5 +695,32 @@ mod tests {
         assert!(output.contains("ROLE CONFIGURATION WARNINGS"));
         assert!(output.contains("CHAMPION"));
         assert!(output.contains("DOCTOR"));
+    }
+
+    /// #15252: `loom-daemon validate` surfaces every bad modelProfileOverrides entry.
+    #[test]
+    fn validate_flags_bad_model_profile_overrides() {
+        let bad = serde_json::json!({"terminals": [], "runtimes": {"modelProfileOverrides": {
+            "zai-full": {"model": "glm-5.4", "excludedRoles": [], "billing": "api"},
+            "nope": {"model": "x"}
+        }}});
+        let result = validate_from_config(&bad, ValidationMode::Warn);
+        assert!(!result.valid);
+        let text = result.errors.join("\n");
+        assert!(text.contains("zai-full.excludedRoles cannot be set"), "{text}");
+        assert!(text.contains("zai-full.billing: unknown override key"), "{text}");
+        assert!(text.contains("nope: `nope` is not a bundled model profile"), "{text}");
+
+        let good = serde_json::json!({"terminals": [], "runtimes": {"modelProfileOverrides": {
+            "zai-full": {"model": "glm-5.4", "excludedRolesAdd": ["doctor"]}
+        }}});
+        let ok = validate_from_config(&good, ValidationMode::Warn);
+        assert!(
+            !ok.errors
+                .iter()
+                .any(|e| e.contains("modelProfileOverrides")),
+            "{:?}",
+            ok.errors
+        );
     }
 }
