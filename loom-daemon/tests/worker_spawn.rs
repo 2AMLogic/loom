@@ -1224,8 +1224,101 @@ mod cargo_debuginfo;
 mod excluded_roles;
 #[path = "worker_spawn/native_sweep.rs"]
 mod native_sweep;
+#[path = "worker_spawn/prompt_modifier.rs"]
+mod prompt_modifier;
 
 // Fail this test binary on any spawn of the real `gh` (#10225, extends #10138).
 #[allow(dead_code)]
 #[path = "../src/live_gh_guard.rs"]
 mod live_gh_guard;
+
+/// #15252: a `runtimes.modelProfileOverrides` entry changes the launched model
+/// of a bundled profile with no release, while the bundled `excludedRoles`
+/// still refuses Judge and Curator.
+#[test]
+fn a_model_profile_override_changes_the_launched_model_and_keeps_excluded_roles() {
+    let d = tempfile::tempdir().unwrap();
+    config(
+        d.path(),
+        serde_json::json!({"runtimes": {"modelProfileOverrides": {"zai-full": {"model": "glm-5.4"}}}}),
+    );
+    let out = worker(d.path(), "opencode")
+        .args(["--profile", "zai-full", "-p", "hello"])
+        .env("ZAI_API_KEY", "test-not-a-secret")
+        .env("ZHIPU_API_KEY", "test-not-a-secret")
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{stderr}");
+    assert!(stderr.contains("\"model\":\"glm-5.4\""), "{stderr}");
+    assert!(!stderr.contains("glm-5.3"), "{stderr}");
+
+    // (Judge/Curator refusal under an override: `worker_spawn/excluded_roles.rs`.)
+    let check = profile_check(d.path(), &["zai-full"]);
+    assert!(check.status.success(), "{}", String::from_utf8_lossy(&check.stdout));
+    let text = String::from_utf8_lossy(&check.stdout);
+    assert!(text.contains("model: glm-5.4 (source: committed)"), "{text}");
+}
+
+#[test]
+fn an_invalid_model_profile_override_fails_closed_at_78() {
+    let d = tempfile::tempdir().unwrap();
+    for (bad, expect) in [
+        (
+            serde_json::json!({"zai-full": {"excludedRoles": []}}),
+            "never replaced or reduced",
+        ),
+        (serde_json::json!({"zai-full": {"providers": {}}}), "unknown override key"),
+        (serde_json::json!({"made-up": {"model": "m"}}), "not a bundled model profile"),
+    ] {
+        config(d.path(), serde_json::json!({"runtimes": {"modelProfileOverrides": bad}}));
+        let out = worker(d.path(), "opencode")
+            .args(["--profile", "zai-full", "-p", "hello"])
+            .output()
+            .unwrap();
+        assert_eq!(out.status.code(), Some(78), "{}", String::from_utf8_lossy(&out.stderr));
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(stderr.contains(expect), "{expect}: {stderr}");
+        let check = profile_check(d.path(), &["zai-full"]);
+        assert_eq!(check.status.code(), Some(78));
+    }
+}
+
+/// #15252: `worker profile-check` names the effective model and the tier that
+/// decided it, and a higher tier's override beats a lower one.
+#[test]
+fn profile_check_reports_the_effective_model_and_its_source_tier() {
+    let d = tempfile::tempdir().unwrap();
+    let source_line = |root: &std::path::Path| {
+        let out = profile_check(root, &["zai-full"]);
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stdout));
+        String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .find(|l| l.starts_with("model: "))
+            .unwrap()
+            .to_string()
+    };
+    assert_eq!(source_line(d.path()), "model: glm-5.3 (source: bundled)");
+
+    config(
+        d.path(),
+        serde_json::json!({"runtimes": {"modelProfileOverrides": {"zai-full": {"model": "glm-5.4"}}}}),
+    );
+    assert_eq!(source_line(d.path()), "model: glm-5.4 (source: committed)");
+
+    std::fs::create_dir_all(d.path().join(".loom-local")).unwrap();
+    std::fs::write(
+        d.path().join(".loom-local/local.json"),
+        r#"{"runtimes":{"modelProfileOverrides":{"zai-full":{"model":"glm-5.5"}}}}"#,
+    )
+    .unwrap();
+    assert_eq!(source_line(d.path()), "model: glm-5.5 (source: local)");
+
+    // A higher tier's explicit null clears the field; the lower tier shows through.
+    std::fs::write(
+        d.path().join(".loom-local/local.json"),
+        r#"{"runtimes":{"modelProfileOverrides":{"zai-full":{"model":null}}}}"#,
+    )
+    .unwrap();
+    assert_eq!(source_line(d.path()), "model: glm-5.3 (source: bundled)");
+}

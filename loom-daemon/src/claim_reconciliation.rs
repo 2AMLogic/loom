@@ -2062,15 +2062,24 @@ pub mod review_conflict;
 pub mod orphan_stack;
 pub(crate) mod orphan_stack_git;
 
+/// Retarget the stacked children of a parent that merged outside
+/// `merge-pr.sh` — including the ones GitHub already retargeted (#14903) —
+/// a sibling of [`orphan_stack`] reusing its git mechanics.
+pub mod merged_stack;
+
 /// The per-repo loop of one reconciliation pass, plus the #8953 mid-pass
 /// rate-limit-breaker re-check that stops it early — a sibling file rather
-/// than more inline logic here.
-mod pass_loop;
+/// than more inline logic here. `pub(crate)` for `merge_observation`'s
+/// predicates, which the merge-pr bookkeeping shares (#15145).
+pub(crate) mod pass_loop;
 
 /// The ETag-cached `loom:building` listing [`forge`] reconciles against — a
 /// sibling file, attributed to `claim_reconciliation` in the #9251 forge-call
 /// accounting.
 mod building_listing;
+/// Issue-side `loom:curating` claims left stale by the #14811 roll-requeue
+/// bug — lease-evidenced release with a re-curation record (#14816).
+mod curating_reclaim;
 /// Keep `loom:building` on an issue whose PR is open (#11852).
 pub(crate) mod open_pr_hold;
 /// The ETag-cached REST open-PR listing the PR-side passes share (#10349).
@@ -2181,8 +2190,9 @@ pub mod forge {
     }
 
     /// Fetch `issue`'s current label names (best-effort). Mirrors
-    /// `pr_label_names` below, for the issue side.
-    fn issue_label_names(gh_bin: &Path, root: &Path, issue: u32) -> Result<Vec<String>> {
+    /// `pr_label_names` below, for the issue side. Shared with the
+    /// `loom:curating` pass (#14816) for its pre-write fresh-label read.
+    pub(crate) fn issue_label_names(gh_bin: &Path, root: &Path, issue: u32) -> Result<Vec<String>> {
         #[derive(Debug, Deserialize)]
         struct GhLabel {
             name: String,

@@ -20,25 +20,7 @@
 
 use std::path::{Path, PathBuf};
 
-fn executable(p: &Path) -> bool {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::metadata(p).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
-    }
-    #[cfg(not(unix))]
-    {
-        p.is_file()
-    }
-}
-
-fn on_path(name: &str) -> Option<PathBuf> {
-    std::env::var_os("PATH").and_then(|paths| {
-        std::env::split_paths(&paths)
-            .map(|d| d.join(name))
-            .find(|c| executable(c))
-    })
-}
+use crate::fs_util::{find_executable_on_path, is_executable};
 
 /// In-repo build candidates, in the shell's order.
 fn repo_candidates(root: Option<&Path>) -> Vec<PathBuf> {
@@ -65,30 +47,30 @@ fn repo_candidates(root: Option<&Path>) -> Vec<PathBuf> {
 #[must_use]
 pub fn daemon_bin(repo_root: Option<&Path>) -> Option<PathBuf> {
     if let Some(explicit) = super::env::var("LOOM_DAEMON_BIN").map(PathBuf::from) {
-        if executable(&explicit) {
+        if is_executable(&explicit) {
             return Some(explicit);
         }
     }
     if super::env::var("LOOM_PREFER_REPO_BUILD").as_deref() == Some("1") {
         if let Some(c) = repo_candidates(repo_root)
             .into_iter()
-            .find(|c| executable(c))
+            .find(|c| is_executable(c))
         {
             return Some(c);
         }
     }
-    if let Some(p) = on_path("loom-daemon") {
+    if let Some(p) = find_executable_on_path("loom-daemon") {
         return Some(p);
     }
     let machine_dir = super::env::var("LOOM_DAEMON_BIN_DIR")
         .map_or_else(|| dirs::home_dir().unwrap_or_default().join(".local/bin"), PathBuf::from);
     let machine_bin = machine_dir.join("loom-daemon");
-    if executable(&machine_bin) {
+    if is_executable(&machine_bin) {
         return Some(machine_bin);
     }
     repo_candidates(repo_root)
         .into_iter()
-        .find(|c| executable(c))
+        .find(|c| is_executable(c))
 }
 
 #[cfg(test)]
@@ -102,7 +84,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let f = dir.path().join("loom-daemon");
         std::fs::write(&f, b"not executable").expect("write");
-        assert!(!executable(&f));
+        assert!(!is_executable(&f));
     }
 
     #[test]

@@ -318,3 +318,31 @@ fn only_the_spend_cap_shape_gets_the_month_start_horizon() {
         Some((60, CooldownSource::Default))
     );
 }
+
+/// #14932: the plan window a workspace's config declares is the one an
+/// exhaustion is held for — when the host's file has none, and over the
+/// file's when both declare one.
+#[test]
+fn the_config_declared_window_is_the_one_an_exhaustion_is_held_for() {
+    use crate::api_keys_pool::limits::{self, ConfiguredLimits};
+    let tmp = tempfile::tempdir().unwrap();
+    let file = ConfiguredLimits::EMPTY;
+    let config = ConfiguredLimits::from_config(&serde_json::json!({
+        "runtimes": { "apiKeyLimits": { "zai": { "alpha": { "exhaustionWindowSecs": 604_800 } } } }
+    }));
+    assert_eq!(configured_window(tmp.path(), "zai", "alpha", &file), None);
+    assert_eq!(configured_window(tmp.path(), "zai", "alpha", &config), Some(604_800));
+
+    limits::set_exhaustion_window(tmp.path(), "zai", "alpha", Some(3_600)).unwrap();
+    assert_eq!(configured_window(tmp.path(), "zai", "alpha", &file), Some(3_600));
+    let both = configured_window(tmp.path(), "zai", "alpha", &config);
+    assert_eq!(both, Some(604_800));
+    assert_eq!(
+        resolve_cooldown(Classification::Exhausted, "Error: insufficient balance", NOW, both),
+        Some((604_800, CooldownSource::ConfiguredWindow))
+    );
+    // Unreadable degrades to the default horizon, as an unreadable file does.
+    let malformed =
+        ConfiguredLimits::from_config(&serde_json::json!({ "runtimes": { "apiKeyLimits": 7 } }));
+    assert_eq!(configured_window(tmp.path(), "zai", "alpha", &malformed), None);
+}

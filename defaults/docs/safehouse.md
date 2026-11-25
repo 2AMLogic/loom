@@ -941,7 +941,7 @@ what feeds the public fleet feed. Loom is the producer:
     > **`tokens` and `tokens_by_model` are deduped on `message.id` as of
     > 2026-09-28 (#9303).** A streamed assistant message is written once per
     > chunk, each chunk repeating the same `message.id` with **cumulative**
-    > usage; `sum_transcript_usage`/`sum_transcript_usage_by_model` now keep
+    > usage; `sum_transcript_usage` and the per-model `UsageFold` rows now keep
     > the max of each counter per id instead of summing every block. Before
     > that date both figures were raw block-sums, roughly 2x high (51% of
     > usage blocks were repeats, measured 2026-09-18; #8186) — so a series

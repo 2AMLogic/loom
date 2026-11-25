@@ -582,6 +582,7 @@ fn count_exclusions(report: &mut TickReport, w: &Weighing) {
             E::CoolingDown
             | E::Pass(
                 PassReason::CiPending
+                | PassReason::BackstopHeld
                 | PassReason::HeldAtHead
                 | PassReason::AuthorGateHeld
                 | PassReason::Conflicting

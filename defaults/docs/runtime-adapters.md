@@ -1417,6 +1417,110 @@ Only native runtimes (`pi`, `opencode`, `kimi`) are checked, and only when the
 profile declares a provider for that harness. `loom-daemon validate` rejects an
 `excludedRoles` entry that is not a known role name.
 
+**Changing a bundled profile's model without a release (`runtimes.modelProfileOverrides`, #15252).**
+`runtimes.modelProfiles.<name>` *replaces* a bundled profile wholesale, so a copy
+that omits `excludedRoles` silently admits GLM to Judge and Curator (#11450).
+To change only what a bundled profile runs, overlay it instead:
+
+```jsonc
+"runtimes": { "modelProfileOverrides": { "zai-full": { "model": "glm-5.4" } } }
+```
+
+- The override is merged **onto** the bundled profile inside `profiles::lookup`,
+  so every launch, admission, billing and inspection path sees it. Providers,
+  credentials, `credentialProxy`, `providerOptions`/`providerDefinition`,
+  `billing` and `excludedRoles` always come from the bundled definition.
+- Allowed keys: `model`, `effort`, `allowedEfforts` (each replaces the bundled
+  value) and `excludedRolesAdd` (a list of known role names, **unioned** onto the
+  bundled `excludedRoles`, deduplicated by canonical role). `excludedRoles` itself
+  can never be replaced or reduced. `{}` is a valid no-op.
+- Rejected by `loom-daemon validate` **and** at launch (exit 78, so a bad store
+  config cannot half-apply): an unknown key (including `excludedRoles`), a name
+  that is not bundled, a name also defined under `runtimes.modelProfiles`, a
+  blank/non-string `model`/`effort`/`allowedEfforts` entry, and an unknown or
+  non-array `excludedRolesAdd`. Explicit `null` (a profile or a field) is "absent".
+- Works at every config tier and layers by `deep_merge`, so a host-tier override
+  (`fleet/hosts/<host>/defaults.json`, `.loom-local/local.json`) beats the fleet
+  default key by key, and a higher tier's `null` clears a lower tier's value. A
+  per-host override is therefore a canary: put the new model on one host, compare,
+  then promote it to the fleet defaults.
+- `loom-daemon worker profile-check <name>` prints the effective model and the
+  tier that decided it: `model: glm-5.4 (source: defaults)`. The source is
+  `local`, `fleet-repo`, `project`, `committed`, `defaults` (the rendered machine
+  tier) or `bundled` (no override). A `runtimes.modelProfiles` replacement reports
+  the tier it came from the same way.
+
+This is the sanctioned way to change a fleet-wide model: the fleet store must not
+define its own GLM profile under `runtimes.modelProfiles` (that is the #11450
+loophole), and uses this overlay instead.
+
+**Prompt modifier for a single-step run (`LOOM_PROMPT_MODIFIER`, #15017).** A caller
+that runs exactly one step can name a registered modifier, next to the
+`LOOM_RUNTIME` / `LOOM_MODEL_PROFILE` / `LOOM_EFFORT` pins above, so the run is
+distinguishable afterwards from a plain one. Off by default: unset (or blank) changes
+nothing, and nothing about the role draw or fleet dispatch changes.
+
+```json
+{ "runtimes": { "promptModifiers": {
+    "deep": { "claude": { "append": "ultrathink" }, "pi": { "append": "think hard" } }
+} } }
+```
+
+- **Registry.** `runtimes.promptModifiers.<name>.<runtime>.append` is the text added
+  after the prompt (after a blank line). Loom hard-codes no names: the caller owns
+  what each name means per harness. Only `append` exists: text *before* the prompt
+  would stop a `/loom:<role>` invocation from expanding. A name is 1-64 bytes of
+  `[A-Za-z0-9._:-]`.
+- **One application site per runtime kind**, both in `spawn-worker`
+  (`loom-daemon/src/worker_spawn/mod.rs`), never a role file: a legacy adapter
+  (`claude`, `codex`, ...) gets the modified `-p` / `--prompt` value in the argv it is
+  exec'd with; a native harness (`pi`, `opencode`, `kimi`) gets it after the expanded
+  role prompt, on its stdin.
+- **Fails closed at preflight.** A name that is malformed, not registered, or
+  registered but with no entry for the launch's runtime is refused with exit 78 and
+  `stage=prompt_modifier` (`loom.admission.stage` on the preflight span, ledger
+  reason `preflight_prompt_modifier`). So is a legacy adapter (`claude`, `codex`,
+  ...) paired with an argv that has no `-p` / `--prompt` to modify. A native
+  harness (`pi`, `opencode`, `kimi`) refuses a missing `--prompt` earlier still,
+  at `stage=worker_options` (ledger reason `preflight_worker_options`). Either way
+  it never runs plain under the modifier's name.
+- **Recorded.** `loom.prompt_modifier` is stamped like the other provenance keys,
+  so it is on `loom.dispatch.step`, `loom.role_attempt` and `loom.runtime.usage`
+  (and the other spans of that process), and is absent when no modifier is set. It is
+  also folded into `loom.hyperparams.digest`: two runs that differ only in the
+  modifier have different digests, and an unmodified run's digest is unchanged.
+
+Observed (`loom-daemon hyperparams`, same workspace, default vector; the second and
+third lines differ only in the modifier):
+
+```text
+$ loom-daemon hyperparams .
+digest: sha256:b5d41c0d0b7846806d6e697571e03b0c30376406b632dbcd437a8119f413656c
+$ LOOM_PROMPT_MODIFIER=deep loom-daemon hyperparams .
+digest: sha256:d06bfbfcc70c46ec3eacbd3286d2810dfacaca3f668a1e463c763ba23c854e87
+promptModifier                 = deep  [env]
+$ LOOM_PROMPT_MODIFIER=wide loom-daemon hyperparams .
+digest: sha256:832a0bf534ba97d5eb05d8efbdd5725809de4ba542c8e4db62bbc212dca8dc8b
+promptModifier                 = wide  [env]
+```
+
+and an unsupported (runtime, modifier) pair, with the registry above and
+`LOOM_RUNTIME=codex`:
+
+```text
+$ LOOM_RUNTIME=codex LOOM_PROMPT_MODIFIER=deep loom-daemon spawn-worker -- -p hello
+spawn-worker: runtime=codex (from global-environment)
+# LOOM_RUNTIME_RESOLVED runtime=codex
+prompt modifier "deep" has no entry for runtime "codex" under runtimes.promptModifiers.deep; refusing to run without it (#15017)
+# LOOM_LAUNCH_REJECTED code=78 stage=prompt_modifier
+$ echo $?
+78
+```
+
+Not covered here: which modifier names exist and what each does per harness (the
+caller's registry), and multi-agent usage accounting beyond what the runtime already
+reports.
+
 **GLM-first Builder and Doctor (fleet policy, tier 1).** The routing comes
 from the fleet state store `config.defaults`, rendered into each host's machine tier
 (`~/.local/share/loom/config/defaults.json`), not from this repo's

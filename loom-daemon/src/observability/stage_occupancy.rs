@@ -213,6 +213,15 @@ async fn list_all(root: PathBuf, target: Target, label: &'static str) -> Option<
     let result = run_owned_blocking(move || {
         let _discovery = crate::gh_invocation::purpose::discovery();
         let gh = PathBuf::from(crate::gh_invocation::gh_bin());
+        // Gateway-first, not exempt (#15103): each conditional page read offers
+        // the gateway profile ahead of any reader App, so a `route=direct_read`
+        // row here is a fallback. Either the gateway was withdrawn when the page
+        // was routed, by any caller's refused or faulted request (#15134), or
+        // its own attempt faulted and the read was rerun on a reader; with no
+        // live profile for the owner, a reader App or the writer serves it. The
+        // daemon log's `gateway withdrawn` and `gateway did not answer` lines
+        // mark the first case. `defaults/docs/github-authentication.md`, "Reads
+        // through a read gateway".
         crate::forge_listing::list_issues_cached_all_for_target_as(
             CALLER, &gh, &root, &target, label, "open",
         )

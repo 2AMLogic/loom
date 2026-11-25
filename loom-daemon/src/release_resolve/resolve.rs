@@ -909,6 +909,45 @@ fn fetch_published_at(tag: &str, repo: &str, root: &Path) -> Result<String, Read
     .map(|p| p.published_at)
 }
 
+/// The `gh release download` of the checksum asset (`release.checksum`).
+///
+/// Gateway-exempt (#15134): releases never use the forge gateway, so this read
+/// goes straight to the reader pool. Offered to the gateway, the relay refuses
+/// it, the refusal classifies as `Failure::Credential`, and that withdraws the
+/// gateway for the whole owner for `CREDENTIAL_WITHDRAWAL` — every
+/// gateway-eligible read of the owner then falls back to a reader App for about
+/// five minutes of each 15-minute auto-update cycle.
+fn checksum_invocation(
+    tag: &str,
+    repo: &str,
+    sha_name: &str,
+    root: &Path,
+    dir: &str,
+) -> GhInvocation {
+    GhInvocation::new(
+        Operation::new("release.checksum"),
+        AccessIntent::Read,
+        GhTarget::repo(repo).unwrap_or(GhTarget::None),
+        GH_TIMEOUT,
+    )
+    .program(crate::gh_invocation::gh_bin())
+    .current_dir(root)
+    .args([
+        "release",
+        "download",
+        tag,
+        "-R",
+        repo,
+        "-p",
+        sha_name,
+        "-D",
+        dir,
+        "--clobber",
+    ])
+    .reader_only()
+    .gateway_exempt()
+}
+
 /// The published sha256 for this platform's binary, read from the release's own
 /// `.sha256` asset.
 ///
@@ -931,28 +970,7 @@ fn fetch_asset_sha256(tag: &str, repo: &str, sha_name: &str, root: &Path) -> Opt
     std::fs::create_dir_all(&dir).ok()?;
     let digest = (|| {
         let dir_str = dir.to_str()?;
-        let out = GhInvocation::new(
-            Operation::new("release.checksum"),
-            AccessIntent::Read,
-            GhTarget::repo(repo).unwrap_or(GhTarget::None),
-            GH_TIMEOUT,
-        )
-        .program(crate::gh_invocation::gh_bin())
-        .current_dir(root)
-        .args([
-            "release",
-            "download",
-            tag,
-            "-R",
-            repo,
-            "-p",
-            sha_name,
-            "-D",
-            dir_str,
-            "--clobber",
-        ])
-        .reader_only()
-        .run();
+        let out = checksum_invocation(tag, repo, sha_name, root, dir_str).run();
         if !out.succeeded() {
             return None;
         }

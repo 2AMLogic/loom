@@ -578,6 +578,10 @@ fn capabilities_list_the_served_forge_verbs() {
 #[path = "loom_tools_slice/workflow.rs"]
 mod workflow;
 
+#[cfg(unix)]
+#[path = "loom_tools_slice/fleet_route.rs"]
+mod fleet_route;
+
 // ---- #14519: the shared non-queue writes ----------------------------------
 
 /// A served verb that can reach the forge is gated exactly like a read: with
@@ -907,6 +911,65 @@ fn operator_decision_offline_forms_match_loom_daemon_with_no_credential() {
         out.contains("ACTION=create") && out.contains("LABELS_ADD=loom:operator"),
         "{out}"
     );
+}
+
+/// #15108: a batch `resolve` refuses under a dispatched sweep before it reads
+/// the slate, in both roots, exactly as the single-issue form does.
+#[test]
+fn operator_decision_resolve_batch_refuses_a_dispatched_run_before_reading() {
+    let tmp = tempfile::tempdir().unwrap();
+    // A slate that does not exist: exit 5 (not a usage error) proves the
+    // dispatch check runs before anything is read.
+    let args = [
+        "operator-decision",
+        "resolve",
+        "--from",
+        "/nonexistent/slate.txt",
+    ];
+    let mut outputs = Vec::new();
+    for bin in [TOOLS, DAEMON] {
+        let mut c = base(bin, tmp.path(), tmp.path());
+        c.args(args).env("LOOM_SWEEP_ID", "sweep-x");
+        outputs.push(run(c, None));
+    }
+    for o in &outputs {
+        assert_eq!(o.status.code(), Some(5));
+        let e = String::from_utf8_lossy(&o.stderr);
+        assert!(e.contains("LOOM_SWEEP_ID is set"), "{e}");
+    }
+}
+
+/// #15108: batch `resolve` usage errors — a malformed slate under
+/// `--dry-run`, and mixing `--from` with a positional issue — are exit 2 in
+/// both roots, before any forge call.
+#[test]
+fn operator_decision_resolve_batch_usage_errors_match() {
+    let tmp = tempfile::tempdir().unwrap();
+    let bad = tmp.path().join("bad.txt");
+    std::fs::write(&bad, "not a slate line\n").unwrap();
+    let bad_arg = bad.to_str().unwrap();
+    let o = parity(
+        &[
+            "operator-decision",
+            "resolve",
+            "--from",
+            bad_arg,
+            "--dry-run",
+        ],
+        None,
+        tmp.path(),
+        tmp.path(),
+    );
+    assert_eq!(o.status.code(), Some(2));
+    let e = String::from_utf8_lossy(&o.stderr);
+    assert!(e.contains("not owner/repo#issue=option"), "{e}");
+    let o = parity(
+        &["operator-decision", "resolve", "--from", bad_arg, "7"],
+        None,
+        tmp.path(),
+        tmp.path(),
+    );
+    assert_eq!(o.status.code(), Some(2));
 }
 
 /// The online forms need a forge. With none, both roots fail on the first read

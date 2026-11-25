@@ -177,6 +177,116 @@ fn session_start_and_shell_parse_mount_workspace_without_panicking() {
     }
 }
 
+/// Issue #14885: the daemon resolves the docker CLI through
+/// `LOOM_DOCKER_BIN` → `$PATH` → absolute fallback directories, so a caller
+/// started with a launchd-style minimal `PATH` (llm-monitor's menubar app,
+/// any launchd/systemd login item) still reaches a Docker installed in a
+/// fallback directory. Before the shared lookup every bare
+/// `Command::new("docker")` failed with not-found and each session-managed
+/// account read `unknown` / `session_probe_error` within milliseconds.
+///
+/// Determinism on hosts with Docker installed (the issue's test plan): the
+/// child gets a `$PATH` naming one empty directory and a `$HOME` of the
+/// fixture's own, whose `~/.docker/bin` the fallback order searches before
+/// `/usr/bin`. A docker in `/usr/local/bin` or `/opt/homebrew/bin` (a Docker
+/// Desktop mac) would precede the fake in the order, so those hosts skip
+/// rather than probe their real engine.
+#[cfg(unix)]
+#[test]
+fn accounts_check_live_measures_sessions_through_a_fallback_docker() {
+    use std::os::unix::fs::PermissionsExt;
+    use std::process::Command;
+
+    for precedes in ["/usr/local/bin/docker", "/opt/homebrew/bin/docker"] {
+        if std::path::Path::new(precedes).exists() {
+            eprintln!(
+                "skipping: host docker at {precedes} precedes the fake in the fallback order"
+            );
+            return;
+        }
+    }
+
+    let fixture = tempfile::tempdir().unwrap();
+    let home = fixture.path().join("home");
+    let empty_path = fixture.path().join("empty-path");
+    let workspace = fixture.path().join("workspace");
+    let profiles = fixture.path().join("profiles");
+    for dir in [
+        home.join(".docker/bin"),
+        empty_path.clone(),
+        workspace.join(".loom"),
+        profiles.join("alice"),
+    ] {
+        std::fs::create_dir_all(dir).unwrap();
+    }
+
+    std::fs::write(
+        workspace.join(".loom/accounts.json"),
+        r#"{"version":1,"accounts":[{"provider":"codex","name":"alice","credential_kind":"codex_home","credential_reference":"alice","enabled":true}]}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        profiles.join("alice/.session-managed.json"),
+        r#"{"schema_version":1,"container_name":"loom-codex-session-alice","adopted_at_unix":0}"#,
+    )
+    .unwrap();
+
+    // The fake docker records each subcommand, then answers `inspect` with a
+    // running container (the tab-separated `--format` line
+    // parse_inspect_line reads) and `exec` with the app-server replies
+    // codex_probe parses: account known, 23% of a 300-minute (5h) window.
+    let calls = fixture.path().join("docker-calls");
+    let docker = home.join(".docker/bin/docker");
+    let script = format!(
+        "#!/bin/sh\necho \"$1\" >> '{calls}'\ncase \"$1\" in\n  \
+         inspect) printf 'abc123\\ttrue\\tfalse\\t2026-11-21T00:00:00Z\\tsession-image:1\\t\\t\\n' ;;\n  \
+         exec) printf '{{\"id\":2,\"result\":{{\"account\":{{\"id\":\"alice\"}}}}}}\\n{{\"id\":3,\"result\":{{\"rateLimits\":{{\"primary\":{{\"usedPercent\":23.0,\"windowDurationMins\":300,\"resetsAt\":4851000000}},\"secondary\":null}}}}}}\\n' ;;\n  \
+         *) exit 0 ;;\nesac\n",
+        calls = calls.display()
+    );
+    std::fs::write(&docker, script).unwrap();
+    std::fs::set_permissions(&docker, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_loom-daemon"))
+        .args([
+            "accounts",
+            "--workspace",
+            workspace.to_str().unwrap(),
+            "check",
+            "--provider",
+            "codex",
+            "--live",
+            "--json",
+        ])
+        .env("LOOM_CODEX_PROFILE_ROOT", &profiles)
+        .env_remove("LOOM_DOCKER_BIN")
+        .env("HOME", &home)
+        .env("PATH", &empty_path)
+        .output()
+        .unwrap();
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert_eq!(output.status.code(), Some(0), "stdout: {stdout}");
+    // In --json mode the command's stdout is the JSON document alone (probe
+    // progress, if any, goes to stderr).
+    let report: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    let account = &report["report"]["accounts"][0];
+    assert_eq!(account["name"], "alice", "{account}");
+    assert_eq!(account["status"], "available", "{account}");
+    let utilization = account["5h_utilization"]
+        .as_f64()
+        .expect("measured utilization");
+    assert!(
+        (utilization - 0.23).abs() < 1e-9,
+        "the fixture's 23% window reads as 0.23, got {utilization}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&calls).unwrap(),
+        "--version\ninspect\nexec\n",
+        "the runtime check, inspect and exec all used the fallback binary"
+    );
+}
+
 // =========================================================================
 // Which registry a verb acts on (issue #8540)
 // =========================================================================
@@ -214,6 +324,11 @@ fn live_check_reports_one_missing_runtime_and_preserves_host_probes() {
     };
     write_registry(&entries);
     let calls = fixture.path().join("calls");
+    // A usable home fallback must never hide a broken explicit override.
+    let fallback = fixture.path().join(".docker/bin/docker");
+    std::fs::create_dir_all(fallback.parent().unwrap()).unwrap();
+    std::fs::write(&fallback, "#!/bin/sh\necho fallback >> \"$CALLS\"\n").unwrap();
+    std::fs::set_permissions(&fallback, std::fs::Permissions::from_mode(0o755)).unwrap();
     let check = |live: bool| {
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_loom-daemon"));
         cmd.args(["accounts", "--workspace"])
@@ -223,6 +338,7 @@ fn live_check_reports_one_missing_runtime_and_preserves_host_probes() {
             cmd.arg("--live");
         }
         let out = cmd
+            .env("HOME", fixture.path())
             .env("PATH", &bin)
             .env("LOOM_CODEX_PROFILE_ROOT", &profiles)
             .env("LOOM_SHARED_ACCOUNTS_ROOT", fixture.path().join("shared"))
@@ -258,6 +374,7 @@ fn live_check_reports_one_missing_runtime_and_preserves_host_probes() {
         "{stderr}"
     );
     assert!(!check(false).1.contains("container_runtime_unavailable"));
+    assert!(!calls.exists(), "the fallback ran despite the explicit override");
 
     let docker = bin.join("docker");
     std::fs::write(
@@ -273,6 +390,18 @@ exit 1
 "#,
     )
     .unwrap();
+    std::fs::set_permissions(&docker, std::fs::Permissions::from_mode(0o644)).unwrap();
+    let (rows, stderr) = check(true);
+    assert!(rows
+        .iter()
+        .filter(|r| r["name"] != "host")
+        .all(|r| r["error"] == "container_runtime_unavailable"));
+    assert!(
+        stderr.contains("PermissionDenied") && stderr.contains("LOOM_DOCKER_BIN"),
+        "{stderr}"
+    );
+    assert!(!calls.exists());
+
     std::fs::set_permissions(&docker, std::fs::Permissions::from_mode(0o755)).unwrap();
     let (rows, stderr) = check(true);
     let detail = |name: &str| {
@@ -442,6 +571,115 @@ fn accounts_disable_from_a_repo_cwd_is_repo_scoped_and_says_so() {
         "the shared entry must be untouched: {}",
         fixture.shared_registry()
     );
+}
+
+/// A caller must select one scope before either registry can be written.
+#[test]
+fn shared_toggle_and_explicit_workspace_are_mutually_exclusive() {
+    let fixture = RegistryFixture::new();
+    let repo = tempfile::tempdir().unwrap();
+    std::fs::create_dir(repo.path().join(".loom")).unwrap();
+    let shared_before = fixture.shared_registry();
+    for verb in ["disable", "enable"] {
+        let output = fixture.command(
+            repo.path(),
+            &[
+                verb,
+                "codex",
+                "alpha",
+                "--shared",
+                "--workspace",
+                repo.path().to_str().unwrap(),
+            ],
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(output.status.code(), Some(2), "{verb}: {stderr}");
+        assert!(stderr.contains("--shared") && stderr.contains("--workspace"), "{stderr}");
+        assert_eq!(fixture.shared_registry(), shared_before);
+        assert!(!repo.path().join(".loom/accounts.json").exists());
+    }
+}
+
+/// A shared disable works from a checkout and vetoes both discovered and
+/// locally enabled seats. Re-enabling the shared seat lifts that veto.
+#[test]
+fn shared_disable_is_honored_from_both_kinds_of_workspace() {
+    let fixture = RegistryFixture::new();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let profile = fixture.profiles.join("alpha");
+        std::fs::set_permissions(&profile, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::set_permissions(profile.join("auth.json"), std::fs::Permissions::from_mode(0o600))
+            .unwrap();
+    }
+    let repo = tempfile::tempdir().unwrap();
+    let other = tempfile::tempdir().unwrap();
+    for root in [repo.path(), other.path()] {
+        std::fs::create_dir(root.join(".loom")).unwrap();
+    }
+    let local = other.path().join(".loom/accounts.json");
+    let original =
+        registry_json("alpha", true).replace(r#""name":"alpha""#, r#""name":"local-alias""#);
+    std::fs::write(&local, &original).unwrap();
+    for (verb, selectable) in [("disable", false), ("enable", true)] {
+        let output = fixture.command(repo.path(), &[verb, "codex", "alpha", "--shared"]);
+        assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+        assert!(!repo.path().join(".loom/accounts.json").exists());
+        assert_eq!(std::fs::read_to_string(&local).unwrap(), original);
+        for root in [repo.path(), other.path()] {
+            let draw = std::process::Command::new(env!("CARGO_BIN_EXE_loom-daemon"))
+                .args(["tokens", "select", "--provider", "codex", "--workspace"])
+                .arg(root)
+                .env("LOOM_ROLE", "curator")
+                .env("LOOM_CODEX_PROFILE_ROOT", &fixture.profiles)
+                .env("LOOM_SHARED_ACCOUNTS_ROOT", &fixture.shared_root)
+                .output()
+                .unwrap();
+            assert_eq!(
+                draw.status.success(),
+                selectable,
+                "{}",
+                String::from_utf8_lossy(&draw.stderr)
+            );
+            if selectable {
+                let account: serde_json::Value = serde_json::from_slice(&draw.stdout).unwrap();
+                assert_eq!(
+                    account["name"],
+                    if root == other.path() {
+                        "local-alias"
+                    } else {
+                        "alpha"
+                    }
+                );
+            }
+        }
+    }
+}
+
+/// The launch script supplies LOOM_ROLE to the ordinary tokens selector.
+#[test]
+fn tokens_select_names_the_skipped_seat_for_guarded_roles() {
+    let fixture = RegistryFixture::new();
+    let repo = tempfile::tempdir().unwrap();
+    for role in ["builder", "doctor", "champion", "judge", "curator"] {
+        let draw = std::process::Command::new(env!("CARGO_BIN_EXE_loom-daemon"))
+            .args(["tokens", "select", "--provider", "codex", "--workspace"])
+            .arg(repo.path())
+            .env("LOOM_ROLE", role)
+            .env("LOOM_CODEX_PROFILE_ROOT", &fixture.profiles)
+            .env("LOOM_SHARED_ACCOUNTS_ROOT", &fixture.shared_root)
+            .output()
+            .unwrap();
+        assert_eq!(draw.status.success(), role == "curator");
+        if role != "curator" {
+            let stderr = String::from_utf8_lossy(&draw.stderr);
+            assert!(
+                stderr.contains(&format!("Skipping Codex account alpha for {role}")),
+                "{stderr}"
+            );
+        }
+    }
 }
 
 // =========================================================================

@@ -111,9 +111,15 @@ impl From<&TokenAccountState> for PoolAccount {
 
 /// Every enabled API-key-pool account (Z.ai, Kimi, …) under `roots`, or
 /// `None` when the pool cannot be read: unknown, not empty.
-fn api_key_accounts_in(roots: &[PathBuf]) -> Option<Vec<PoolAccount>> {
+///
+/// `configured` is the workspace's `runtimes.apiKeyLimits` block (#14932), so
+/// the plan window a config declares is the one utilization is computed over.
+fn api_key_accounts_in(
+    roots: &[PathBuf],
+    configured: &crate::api_keys_pool::limits::ConfiguredLimits,
+) -> Option<Vec<PoolAccount>> {
     use crate::api_keys_pool::Ineligible;
-    let accounts = crate::api_keys_pool::select::list_accounts_in(roots, None).ok()?;
+    let accounts = crate::api_keys_pool::select::list_accounts_in(roots, None, configured).ok()?;
     Some(
         accounts
             .into_iter()
@@ -299,7 +305,10 @@ fn merge_pool(accounts: &mut Vec<PoolAccount>, pool: Vec<PoolAccount>) {
 }
 
 fn sample(workspace_root: &Path, mut accounts: Vec<PoolAccount>, now: DateTime<Utc>) -> Sample {
-    let api_keys = api_key_accounts_in(&crate::api_keys_pool::paths::pool_roots(workspace_root));
+    let api_keys = api_key_accounts_in(
+        &crate::api_keys_pool::paths::pool_roots(workspace_root),
+        &crate::api_keys_pool::limits::ConfiguredLimits::from_workspace(workspace_root),
+    );
     let (pool, pool_start) = {
         let mut guard = STATE.lock().unwrap_or_else(PoisonError::into_inner);
         let state = guard.get_or_insert_with(QuotaState::default);

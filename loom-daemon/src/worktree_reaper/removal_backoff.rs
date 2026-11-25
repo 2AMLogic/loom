@@ -3,9 +3,8 @@
 //! resolves the condition by hand (#7709).
 //!
 //! Extracted from [`super`] rather than living inline in `worktree_reaper.rs`.
-//! The public
-//! surface is unchanged — [`super`] re-exports everything callers already name
-//! as `crate::worktree_reaper::…`.
+//! The public surface is unchanged — [`super`] re-exports everything callers
+//! already name as `crate::worktree_reaper::…`.
 //!
 //! # The state machine, in one paragraph
 //!

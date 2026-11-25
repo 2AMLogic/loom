@@ -11,9 +11,11 @@ struct Env(
     Vec<(&'static str, Option<String>)>,
     #[allow(dead_code)] tempfile::TempDir,
     #[allow(dead_code)] crate::tokens_pool::profile_root_env::ProfileRootLock,
+    #[allow(dead_code)] crate::tokens_pool::codex_home_env::CodexHomeLock,
 );
 impl Env {
     fn new() -> Self {
+        let codex_home_lock = crate::tokens_pool::codex_home_env::lock();
         let lock = crate::tokens_pool::profile_root_env::lock();
         let keys = [
             "LOOM_RUNTIME",
@@ -35,7 +37,7 @@ impl Env {
         fs::create_dir_all(profiles.path().join("seat")).unwrap();
         std::env::set_var("LOOM_CODEX_PROFILE_ROOT", profiles.path());
         sandbox_hold::clear("codex");
-        Self(prior, profiles, lock)
+        Self(prior, profiles, lock, codex_home_lock)
     }
 }
 impl Drop for Env {

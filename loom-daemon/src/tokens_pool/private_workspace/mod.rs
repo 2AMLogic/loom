@@ -61,6 +61,12 @@ pub const REPO: &str = "/workspace/repo";
 /// Parent of every additional repository clone an account holds beyond the
 /// legacy primary at [`REPO`] (#10795). Lives on the account's own volume.
 pub const WORK_ROOT: &str = "/workspace/work";
+/// Root of the read-only origin object mirrors a seat container borrows
+/// published objects through (#14680): one bind per authorized repository,
+/// at `MIRRORS/<slug>/objects`, referenced by that clone's sole object
+/// alternate. Lives on the container's read-only rootfs, so a worker cannot
+/// create or alter a mount point there.
+pub const MIRRORS: &str = "/mirrors";
 pub const MODE: &str = "private-clone";
 const VOLUME_PREFIX: &str = "loom-codex-workspace-";
 
@@ -112,6 +118,16 @@ pub struct Config {
     /// Absent in state written before it, which reads as none.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub extra_mounts: Vec<ExtraMount>,
+    /// Repository slugs whose origin object mirror (#14680) the container was
+    /// **last created** with, each bound read-only at `MIRRORS/<slug>/objects`.
+    /// Docker binds are fixed at container creation, so this snapshot — not
+    /// the current registrations — is what `validate_settings` expects and
+    /// what preparation hands down. A repository registered after creation
+    /// keeps its fully private clone until the next recreation installs and
+    /// verifies the new bind. Empty when the container predates #14680 or
+    /// `accounts.session.objectMirrors` is off.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub mirror_binds: Vec<String>,
 }
 
 /// One additional repository of an account (registered, not necessarily cloned).
@@ -163,6 +179,17 @@ impl Config {
             slug: Some(registered.slug.clone()),
         })
     }
+}
+
+/// The in-container objects path that is the ONLY object alternate a clone of
+/// `repository` may carry (#14680): `MIRRORS/<slug>/objects`, with the slug
+/// derived from the repository's own canonical identity. `None` for a
+/// repository [`identify`] cannot parse (a legacy or test-only local path):
+/// those clones stay fully private, and any alternate on them is refused.
+pub(super) fn mirror_alternate(repository: &str) -> Option<String> {
+    identify(repository)
+        .ok()
+        .map(|id| format!("{MIRRORS}/{}/objects", id.slug))
 }
 
 /// Canonical identity of a forge repository: the key two spellings of one
@@ -326,6 +353,13 @@ pub struct DetachedWork {
 /// refused (#14458). The refusal message carries it verbatim so the step's
 /// end can classify the failure by it instead of `unclassified`.
 pub const SEAT_DIRTY_REASON: &str = "seat_dirty";
+
+/// The step-outcome reason of a preparation refused because the seat's
+/// resolved temp directory is unwritable (#14929): a full 512 MB `/tmp`
+/// previously surfaced downstream as a misleading `workspace Git fetch
+/// failed` and dirty-clone refusals. The refusal message carries it verbatim
+/// so the failure names its cause.
+pub const SEAT_TEMP_UNWRITABLE_REASON: &str = "seat_temp_unwritable";
 
 /// One worktree of a clone (the main checkout included) with uncommitted or
 /// untracked files, as the recover listing reports it (#14458). Counted over

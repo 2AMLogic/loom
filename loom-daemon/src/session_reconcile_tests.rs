@@ -89,6 +89,7 @@ fn a_binding_needs_a_current_running_observation_of_the_recorded_private_seat() 
         gh_config: None,
         session_image: None,
         extra_mounts: Vec::new(),
+        mirror_binds: Vec::new(),
     };
     let state = dir.path().join(".private-sessions/alice");
     std::fs::create_dir_all(&state).unwrap();
@@ -965,6 +966,7 @@ fn a_missing_container_is_recreated_on_the_configured_image_not_the_recorded_pin
     let config = SessionImageConfig {
         image: Some("ghcr.io/example/session-mine@sha256:aa55".into()),
         extra_mounts: Vec::new(),
+        object_mirrors: false,
     };
     let mut state = ReconcileState::default();
     let pass_cfg = |lifecycle: &mut SessionLifecycle<Fake>, state: &mut ReconcileState, now| {

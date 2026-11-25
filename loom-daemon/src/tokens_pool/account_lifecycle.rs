@@ -2044,23 +2044,8 @@ mod tests {
     }
 
     #[cfg(unix)]
-    fn fixture_is_busy(error: &anyhow::Error) -> bool {
-        error
-            .downcast_ref::<std::io::Error>()
-            .is_some_and(|e| e.kind() == std::io::ErrorKind::ExecutableFileBusy)
-    }
-
-    #[cfg(unix)]
     fn bounded_status_of(profile: &Path) -> RunnerOutput {
-        let mut attempts = 0..1000;
-        loop {
-            match ProcessCodexRunner::bounded_status(profile) {
-                Err(error) if fixture_is_busy(&error) && attempts.next().is_some() => {
-                    std::thread::sleep(Duration::from_millis(2));
-                }
-                output => return output.unwrap(),
-            }
-        }
+        ProcessCodexRunner::bounded_status(profile).unwrap()
     }
 
     #[test]
@@ -2299,6 +2284,7 @@ mod tests {
                 gh_config: None,
                 session_image: None,
                 extra_mounts: Vec::new(),
+                mirror_binds: Vec::new(),
             })
             .unwrap(),
         )

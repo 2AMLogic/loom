@@ -865,6 +865,17 @@ fn judge_ctx(now: DateTime<Utc>) -> Context<'static> {
     }
 }
 
+/// [`one`] with the Judge's context.
+fn one_judge(
+    source: &Source,
+    journal: Option<&Journal>,
+    store: &mut RefusalStore,
+) -> PassVerdictRecord {
+    let mut records = records_for(&judge_ctx(t(5)), source, journal, store);
+    assert_eq!(records.len(), 1, "{records:?}");
+    records.remove(0)
+}
+
 fn judge_step(item: u32, outcome_line: Option<&str>) -> Source {
     let id = format!("step-judge-{item}-1");
     let mut text = format!("==== loom-daemon dispatch: t sweep_id={id} item={item} ====\n");
@@ -889,6 +900,15 @@ fn verdict_write(minute: u32, number: u32, action: &str, sha: &str) -> JournalEn
         action: action.to_string(),
         by: "verdict-labels".to_string(),
         head_sha: Some(sha.to_string()),
+    }
+}
+
+/// The head `forge verdict-gate --sha` journals at the evaluation (#14898).
+fn reviewed(minute: u32, number: u32, sha: &str) -> JournalEntry {
+    JournalEntry::Reviewed {
+        at: t(minute),
+        number,
+        head_sha: sha.to_string(),
     }
 }
 
@@ -939,6 +959,244 @@ fn a_judge_step_with_a_noop_line_and_no_write_is_that_noop() {
         &mut store,
     );
     assert_eq!(class_reason(&records.remove(0)), ("failed", "failed"));
+}
+
+/// #14898: the line-only `reviewed` fallback carries the head the evaluation
+/// named (`forge verdict-gate --sha`, journaled as `Reviewed`) — captured at
+/// the evaluation, so a PR that advanced afterwards cannot misattribute the
+/// reviewed commit. The projection takes no PR-tip input at all: the
+/// journaled head is the only one it can name.
+#[test]
+fn a_line_only_verdict_carries_the_head_it_was_evaluated_at() {
+    let mut store = RefusalStore::default();
+    let j = journal(vec![reviewed(1, 31, "aaa111")]);
+    let r = one_judge(
+        &judge_step(31, Some("LOOM_STEP_OUTCOME role=judge target=31 class=verdict reason=x")),
+        Some(&j),
+        &mut store,
+    );
+    assert_eq!(class_reason(&r), ("verdict", "reviewed"));
+    assert_eq!(r.step.reason_set.as_deref(), Some(judge::REASON_SET));
+    assert_eq!(r.step.head_sha.as_deref(), Some("aaa111"));
+    assert!(!r.applied, "no write was confirmed");
+    // The newest evaluation names the head; a stale one never overwrites it.
+    let j = journal(vec![reviewed(1, 31, "aaa111"), reviewed(2, 31, "ccc333")]);
+    let r = one_judge(
+        &judge_step(31, Some("LOOM_STEP_OUTCOME role=judge target=31 class=verdict reason=x")),
+        Some(&j),
+        &mut store,
+    );
+    assert_eq!(r.step.head_sha.as_deref(), Some("ccc333"));
+    // Another PR's evaluation is not this one's.
+    let j = journal(vec![reviewed(1, 32, "bbb222")]);
+    let r = one_judge(
+        &judge_step(31, Some("LOOM_STEP_OUTCOME role=judge target=31 class=verdict reason=x")),
+        Some(&j),
+        &mut store,
+    );
+    assert_eq!(r.step.head_sha, None, "no evaluated head of this PR");
+}
+
+/// #14898: a confirmed write keeps its verdict — and its evaluated head —
+/// when the later read fails: the post-state probe observes nothing
+/// (`probe_failed` on the ledger's own view) and the log carries no line,
+/// and the projection still stands on the write alone.
+#[test]
+fn a_confirmed_write_keeps_its_verdict_when_the_later_read_fails() {
+    let mut store = RefusalStore::default();
+    let j = Journal {
+        front_expected: false,
+        ..journal(vec![verdict_write(1, 31, "approved", "aaa111")])
+    };
+    let line = "LOOM_STEP_OUTCOME role=judge target=31 class=verdict reason=x";
+    let r = one_judge(&judge_step(31, Some(line)), Some(&j), &mut store);
+    assert_eq!(class_reason(&r), ("verdict", "approved"));
+    assert_eq!(r.step.reason_set.as_deref(), Some(judge::VERDICT_REASON_SET));
+    assert_eq!(r.step.head_sha.as_deref(), Some("aaa111"));
+    assert!(r.applied);
+    assert_eq!(r.step.ledger_reason.as_deref(), Some("probe_failed"));
+    // The same write with the step's line missing entirely: the posted
+    // verdict survives the missing line.
+    let r = one_judge(&judge_step(31, None), Some(&j), &mut store);
+    assert_eq!(class_reason(&r), ("verdict", "approved"));
+    assert_eq!(r.step.head_sha.as_deref(), Some("aaa111"));
+}
+
+/// #14898: a write whose own `--sha` was absent (a script roll against an
+/// older daemon) takes the head its evaluation named.
+#[test]
+fn a_write_that_named_no_head_takes_the_evaluated_one() {
+    let mut store = RefusalStore::default();
+    let j = journal(vec![
+        reviewed(1, 31, "aaa111"),
+        JournalEntry::Applied {
+            at: t(2),
+            number: 31,
+            is_pr: true,
+            action: "changes_requested".to_string(),
+            by: "verdict-labels".to_string(),
+            head_sha: None,
+        },
+    ]);
+    let r = one_judge(
+        &judge_step(31, Some("LOOM_STEP_OUTCOME role=judge target=31 class=verdict reason=x")),
+        Some(&j),
+        &mut store,
+    );
+    assert_eq!(class_reason(&r), ("verdict", "changes_requested"));
+    assert_eq!(r.step.reason_set.as_deref(), Some(judge::VERDICT_REASON_SET));
+    assert_eq!(r.step.head_sha.as_deref(), Some("aaa111"));
+    assert!(r.applied);
+}
+
+/// #14898: both outputs of one judge step — the root close's verdict of
+/// record ([`judge_verdict_of_record`]) and the drain's `pass.verdict`
+/// record — carry the same verdict, reason set and evaluated head, including
+/// when no verified write exists. The log carries an earlier dispatch of the
+/// same PR too: only this step's own section contributes.
+#[test]
+fn the_root_close_and_the_record_carry_the_same_verdict() {
+    let dir = tempfile::tempdir().unwrap();
+    let item = 31;
+    let id = "step-judge-31-1";
+    let headless_write = || JournalEntry::Applied {
+        at: t(2),
+        number: item,
+        is_pr: true,
+        action: "approved".to_string(),
+        by: judge::VERDICT_BY.to_string(),
+        head_sha: None,
+    };
+    for (name, entries, with_write, expected_head) in [
+        (
+            "approval",
+            vec![verdict_write(1, item, "approved", "aaa111")],
+            true,
+            Some("aaa111"),
+        ),
+        (
+            "changes",
+            vec![verdict_write(1, item, "changes_requested", "bbb222")],
+            true,
+            Some("bbb222"),
+        ),
+        ("line-only", vec![reviewed(1, item, "ccc333")], false, Some("ccc333")),
+        ("no verified write", vec![], false, None),
+        (
+            "another evaluation after a headless write",
+            vec![
+                reviewed(1, item, "aaa111"),
+                headless_write(),
+                reviewed(3, item, "bbb222"),
+            ],
+            true,
+            Some("aaa111"),
+        ),
+        (
+            "only another PR or later evaluations",
+            vec![
+                reviewed(1, 32, "aaa111"),
+                headless_write(),
+                reviewed(2, item, "bbb222"),
+            ],
+            true,
+            None,
+        ),
+        (
+            "an evaluation stamped after the write",
+            vec![reviewed(3, item, "bbb222"), headless_write()],
+            true,
+            None,
+        ),
+    ] {
+        let j = journal(entries);
+        let line = "LOOM_STEP_OUTCOME role=judge target=31 class=verdict reason=x";
+        // The file carries an earlier dispatch of the same PR too — only
+        // this step's own section is its evidence, as `StagedStep::read`
+        // cuts it; the record's source gets that same section.
+        let own_section = format!("{line}\n");
+        let log_text = format!(
+            "==== loom-daemon dispatch: t sweep_id=step-judge-31-0 item=31 ====\n\
+             LOOM_STEP_OUTCOME role=judge target=31 class=noop reason=already_judged\n\
+             ==== loom-daemon dispatch: t sweep_id={id} item=31 ====\n{own_section}"
+        );
+        let log = dir.path().join(format!("{name}.log"));
+        std::fs::write(&log, &log_text).unwrap();
+        let staged = StagedStep {
+            sweep_id: id.to_string(),
+            step: StepRole::Judge,
+            item,
+            log,
+            hold_auth_before: None,
+        };
+        let source = Source::Step(StepSource {
+            sweep_id: id.to_string(),
+            step: StepRole::Judge,
+            item,
+            log_text: Some(own_section),
+            hold_auth_before: None,
+        });
+        let mut records =
+            records_for(&judge_ctx(t(5)), &source, Some(&j), &mut RefusalStore::default());
+        assert_eq!(records.len(), 1, "{name}");
+        let record = records.remove(0);
+        let root = judge_verdict_of_record(staged, Some(&j)).expect(name);
+        assert_eq!(root.class, "verdict", "{name}");
+        assert_eq!(Some(root.reason.as_str()), record.reason.as_deref(), "{name}");
+        assert_eq!(root.reason_set, record.step.reason_set.as_deref().unwrap(), "{name}");
+        assert_eq!(root.head_sha.as_deref(), expected_head, "{name}");
+        assert_eq!(root.head_sha, record.step.head_sha, "{name}");
+        assert_eq!(record.applied, with_write, "{name}");
+    }
+}
+
+/// #14898: the close peeks the step's journal without consuming it, and the
+/// detached drain still emits its record from the same evidence — verdict,
+/// reason set, evaluated head and sweep id all present.
+#[test]
+fn the_drain_still_emits_the_judge_record_the_close_projected_from() {
+    let dir = tempfile::tempdir().unwrap();
+    let id = "step-judge-41-1";
+    let log = dir.path().join("judge.log");
+    std::fs::write(
+        &log,
+        format!(
+            "==== loom-daemon dispatch: t sweep_id={id} item=41 ====\n\
+             LOOM_STEP_OUTCOME role=judge target=41 class=verdict reason=x\n"
+        ),
+    )
+    .unwrap();
+    let j = journal(vec![verdict_write(1, 41, "approved", "aaa111")]);
+    let ((), captured) = crate::observability::ops::capture::capture(|| {
+        emit_drain(
+            dir.path(),
+            "judge",
+            REPO,
+            t(0),
+            Some(StagedStep {
+                sweep_id: id.into(),
+                step: StepRole::Judge,
+                item: 41,
+                log,
+                hold_auth_before: None,
+            }),
+            Some(&j),
+        );
+    });
+    let verdicts: Vec<&PassVerdictRecord> = captured
+        .records
+        .iter()
+        .filter_map(|r| match r {
+            crate::telemetry::TelemetryRecord::PassVerdict(v) => Some(v),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(verdicts.len(), 1, "{:?}", captured.records);
+    let r = verdicts[0];
+    assert_eq!(class_reason(r), ("verdict", "approved"));
+    assert_eq!(r.step.reason_set.as_deref(), Some(judge::VERDICT_REASON_SET));
+    assert_eq!(r.step.head_sha.as_deref(), Some("aaa111"));
+    assert_eq!(r.step.sweep_id.as_deref(), Some(id));
 }
 
 #[test]
