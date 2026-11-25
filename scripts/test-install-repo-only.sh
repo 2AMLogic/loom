@@ -57,7 +57,7 @@ gate_report="$(awk '
   /^if \[\[ "\$REPO_ONLY" == "true" \]\]; then/ { guard=1; arm="then"; next }
   guard && /^(else|elif)/ { arm="else"; next }
   guard && /^fi/ { guard=0; arm=""; next }
-  /^[[:space:]]*(provision_machine_daemon|provision_loom_dispatcher|provision_loom_skills|provision_loom_hooks) / {
+  /^[[:space:]]*(LOOM_PROVISION_REFUSE_DOWNGRADE=1 )?(provision_machine_daemon|provision_loom_dispatcher|provision_loom_skills|provision_loom_hooks) / {
     n++
     if (!(guard && arm == "else")) { print "UNGATED line " NR ": " $0 }
   }
@@ -125,12 +125,50 @@ else
   fail "install.sh default behaviour changed: $out"
 fi
 
+# Issue #15261: the machine-change notice sits in the same gated arm as the
+# daemon call (so it is absent under --repo-only), is printed without a prompt,
+# and names both versions plus the opt-out.
+for f in "$QUICK" "$FULL"; do
+  notice_report="$(awk '
+    /if \[\[ "\$REPO_ONLY" == "true" \]\]; then/ { guard=1; arm="then"; next }
+    guard && /^[[:space:]]*else/ { arm="else"; next }
+    guard && /^[[:space:]]*fi/ { guard=0; arm=""; next }
+    /^[[:space:]]*provision_machine_change_notice / {
+      n++; if (!(guard && arm == "else")) print "UNGATED line " NR
+    }
+    END { print "COUNT " n+0 }
+  ' "$f")"
+  if grep -q '^UNGATED' <<<"$notice_report"; then
+    fail "$(basename "$f") prints the machine-change notice outside the non-repo-only arm"
+  elif grep -qE '^COUNT [12]$' <<<"$notice_report"; then
+    pass "$(basename "$f") prints the machine-change notice only when the machine steps run"
+  else
+    fail "$(basename "$f") machine-change notice scan unexpected: $notice_report"
+  fi
+done
+if grep -q -- '--allow-downgrade' <<<"$full_help" && grep -q -- '--allow-downgrade' <<<"$quick_help"; then
+  pass "both installers document --allow-downgrade"
+else
+  fail "--allow-downgrade missing from an installer --help"
+fi
+notice_out="$(
+  # shellcheck source=scripts/install/provision-daemon.sh
+  source "$LOOM_ROOT/scripts/install/provision-daemon.sh" 2>/dev/null || exit 1
+  fake="$TEST_DIR/notice-src"; printf '#!/usr/bin/env bash\necho "loom-daemon 0.20.30"\n' >"$fake"; chmod +x "$fake"
+  LOOM_DAEMON_BIN_DIR="$TEST_DIR/notice-dest" provision_machine_change_notice "$fake" 2>&1
+)"
+if grep -q 'Machine change: loom-daemon none -> 0.20.30;.*Pass --repo-only to skip' <<<"$notice_out"; then
+  pass "machine-change notice names old -> new version and the --repo-only opt-out"
+else
+  fail "machine-change notice text unexpected: $notice_out"
+fi
+
 # The quick-install daemon provisioning call sites must be gated too.
 ungated_daemon="$(awk '
   /if \[\[ "\$REPO_ONLY" == "true" \]\]; then/ { guard=1; arm="then"; next }
   guard && /^[[:space:]]*else/ { arm="else"; next }
   guard && /^[[:space:]]*fi/ { guard=0; arm=""; next }
-  /^[[:space:]]*provision_machine_daemon "\$LOOM_CARGO_TARGET_DIR/ {
+  /^[[:space:]]*(LOOM_PROVISION_REFUSE_DOWNGRADE=1 )?provision_machine_daemon "\$LOOM_CARGO_TARGET_DIR/ {
     n++; if (!(guard && arm == "else")) print "UNGATED line " NR
   }
   END { print "COUNT " n }
