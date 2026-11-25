@@ -1907,7 +1907,7 @@ This is a pointer only — no contract-point changes ship with it.
 
 #### Claude per-seat session containers (issue #14371)
 
-The operator ruled (2AMLogic/2am#7380) that every runtime's steps may run in one
+The operator ruled that every runtime's steps may run in one
 operator-built session image with **one login per container**. For Claude that
 is a *seat*: a Claude token-pool account whose persistent container
 `loom-claude-session-<name>` is managed like Codex's `loom-codex-session-<name>`

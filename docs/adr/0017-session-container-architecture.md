@@ -456,7 +456,7 @@ See the [mount contract](../../docker/worker/MOUNT-CONTRACT.md) and
 
 ## Addendum: Claude per-seat session containers (#14371)
 
-The operator's 2026-11-18 ruling (2AMLogic/2am#7380) is that every runtime's
+The operator's 2026-11-18 ruling is that every runtime's
 steps may run in one operator-built session image with one login per container.
 Decision 1 above chose ephemeral for Claude because its token is a stateless
 bearer credential; that reasoning about *auth* still holds, but the operator
