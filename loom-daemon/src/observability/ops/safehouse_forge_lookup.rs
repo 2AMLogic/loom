@@ -6,7 +6,7 @@
 //! quiet one. This span is exported on **every** failure, so an alert can key
 //! on sustained failures per workspace. The one-shot `warn` is unchanged.
 //!
-//! Only the failure arm of `merge_source::run_gh` emits it: a `gh` that ran and exited
+//! Only the failure arm of `merge_source::run_json` emits it: a `gh` that ran and exited
 //! nonzero is an answer, not an `Unavailable`. An instant span, its own root
 //! trace, with IDs derived from the call, repo and instant
 //! (`trace-identity.md`). No stderr, path or free text. Never emitted when no

@@ -22,6 +22,8 @@ use chrono::{DateTime, SecondsFormat, Utc};
 use serde_json::Value;
 
 use super::{forge_gate, GH_BIN_ENV};
+use crate::cmd_out::{CmdOutcome, Unavailable};
+use crate::script_helpers::gh_route::gh_read_async;
 
 /// Bound on one `gh` lookup.
 const LOOKUP_TIMEOUT: Duration = Duration::from_secs(10);
@@ -179,36 +181,8 @@ async fn run_json(
         return None;
     }
     let gh_bin = super::env_nonempty(GH_BIN_ENV).unwrap_or_else(|| "gh".to_owned());
-    let output = run_gh(call, op, &gh_bin, args, workspace_root, LOOKUP_TIMEOUT).await?;
-    if !output.status.success() {
-        forge_gate::failed(call, workspace_root, &gh_bin, &output.stderr);
-        return None;
-    }
-    log_gh_recovery_once(call, workspace_root);
-    serde_json::from_slice(&output.stdout).ok()
-}
-
-/// One `gh` read through the facade (#10089: counted in `forge_call_stats` as
-/// `op`). The facade runs it in `workspace_root` under that root's owner
-/// credential (#6596). `None` when the process never started or never finished;
-/// which one is logged once per workspace. A non-zero exit is returned so the
-/// caller can inspect `stderr`.
-async fn run_gh(
-    call: &str,
-    op: &'static str,
-    gh_bin: &str,
-    args: &[&str],
-    workspace_root: &Path,
-    timeout: Duration,
-) -> Option<std::process::Output> {
-    use crate::cmd_out::{CmdOutcome, Unavailable};
-    use crate::gh_invocation::{AccessIntent, GhInvocation, GhTarget, Operation};
-    let inv = GhInvocation::new(Operation::new(op), AccessIntent::Read, GhTarget::None, timeout)
-        .program(gh_bin)
-        .current_dir(workspace_root)
-        .args(args);
-    let why = match inv.run_async().await {
-        CmdOutcome::Ran(output) => return Some(output),
+    let output = match gh_read_async(op, args, workspace_root, &gh_bin, LOOKUP_TIMEOUT).await {
+        CmdOutcome::Ran(output) => output,
         CmdOutcome::Unavailable(u) => {
             // Every failure is counted (#13156); the log below stays one-shot.
             crate::observability::ops::safehouse_forge_lookup::record_failed(
@@ -216,14 +190,22 @@ async fn run_gh(
                 &crate::host_identity::repo_slug(workspace_root),
                 &u,
             );
-            match u {
-                Unavailable::TimedOut { .. } => format!("timed out after {}s", timeout.as_secs()),
+            let why = match u {
+                Unavailable::TimedOut { after, .. } => {
+                    format!("timed out after {}s", after.as_secs())
+                }
                 u => format!("could not run gh: {u}"),
-            }
+            };
+            log_gh_failure_once(call, workspace_root, &why);
+            return None;
         }
     };
-    log_gh_failure_once(call, workspace_root, &why);
-    None
+    if !output.status.success() {
+        forge_gate::failed(call, workspace_root, &gh_bin, &output.stderr);
+        return None;
+    }
+    log_gh_recovery_once(call, workspace_root);
+    serde_json::from_slice(&output.stdout).ok()
 }
 
 /// One-per-`(call, workspace)` record of an already-warned forge failure. Every

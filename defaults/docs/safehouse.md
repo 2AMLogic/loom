@@ -462,7 +462,7 @@ queued) produces no line.
   inside the catch-up window) and then sends. It sends directly, without a
   read first. A sweep exit and a merge-step end for one PR post once per process.
 - **The fleet captain, for merges no host reported.** Where
-  `fleet.captain` arms this host ([`fleet_captain.rs`](../../loom-daemon/src/fleet_captain.rs)),
+  the [fleet captain setting](daemon-reference.md#fleet-captain-8848) selects this host,
   a timer scans each workspace for PRs merged inside a **bounded catch-up
   window**, reads the room once, and posts exactly the merges whose line is
   absent. It leaves a merge younger than the grace period to the host that made
