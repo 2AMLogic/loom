@@ -2576,9 +2576,13 @@ blocker is Loom-owned:
   back on the default branch (`checkout`, with a `refs/loom/rescue/<ts>` ref at
   the old HEAD, kind `rehomed`); the ordinary rules then fast-forward it. It
   qualifies only when every commit on HEAD is on `origin/<default>`, or HEAD
-  is the head of a pull request the forge reports as merged. The lookup is
-  `gh api repos/{owner}/{repo}/commits/<sha>/pulls`; no network, an open
-  breaker or any failure means "not merged" and the hold stays (fail closed).
+  is the head of a pull request the forge reports — **open or merged**
+  (#14973: the checkout a reviewer leaves behind is parked on an OPEN PR's
+  head, and `refs/pull/N/head` keeps the commits on the forge either way; a
+  rescue ref is written first regardless). The lookup is
+  `gh api repos/{owner}/{repo}/commits/<sha>/pulls --jq 'any(.[]; .head.sha == "<sha>")'`;
+  no network, an open breaker or any failure means "not known" and the hold
+  stays (fail closed).
   It is the **last** question the rule asks (#13835), after the clean-tree,
   `detached=keep`, six-hour and live-`git` checks, so a checkout any of those
   refuses costs no forge read at all; only one they all pass pays for it.
@@ -2599,7 +2603,9 @@ blocker is Loom-owned:
   A stranded checkout that is not repaired stays `wrong-branch`, and is said
   again as a `still-held` transition (log line plus an event on the checkout
   topic) every hour (`LOOM_CHECKOUT_REREPORT_AFTER_MINUTES`) so it can be
-  counted, instead of once.
+  counted, instead of once. Since #14973 that line names why this pass's
+  self-heal declined the rehome (`not repaired: … (self-heal: stays off
+  \`main\`: HEAD moved recently)`), where the reason used to be `debug`-only.
 - **Repair, in order.** `refs/loom/rescue/<UTC ts>` at HEAD (and `<ts>-branch`
   at the branch tip when an operation moved HEAD); the lock; `stash push` of
   the dirty paths as `loom-rescue-<ts>` (not during an operation, whose abort

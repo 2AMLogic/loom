@@ -1,6 +1,5 @@
 # Loom
 
-[![codecov](https://codecov.io/gh/2AMLogic/loom/branch/main/graph/badge.svg)](https://codecov.io/gh/2AMLogic/loom)
 [![GitHub Release](https://img.shields.io/github/v/release/2AMLogic/loom?include_prereleases)](https://github.com/2AMLogic/loom/releases)
 
 **AI-powered development orchestration using your forge as the coordination layer.**
