@@ -5107,11 +5107,13 @@ resolve_stash_cwd() {
 }
 
 # List every `git checkout|switch|commit` segment of a command with the cwd it
-# would run in (#13589). One line per segment: "<cwd>\x1f<subcmd>\x1f<args>".
-# Threads `cd <dir>` across segments (same as resolve_stash_cwd) and a
-# `git -C <dir>` global option (relative -C joins the running cwd). Leading
-# `(`/`{`, `sudo`, and `VAR=val` env prefixes are stripped; only a segment that
-# STARTS with `git` counts, so quoted text mentioning `git commit` is inert.
+# would run in (#13589), plus `gh pr checkout` segments (#14973). One line per
+# segment: "<cwd>\x1f<subcmd>\x1f<args>" (gh segments carry the subcmd marker
+# "gh-pr-checkout"). Threads `cd <dir>` across segments (same as
+# resolve_stash_cwd) and a `git -C <dir>` global option (relative -C joins the
+# running cwd). Leading `(`/`{`, `sudo`, and `VAR=val` env prefixes are
+# stripped; only a segment that STARTS with `git` or `gh pr checkout` counts,
+# so quoted text mentioning `git commit` is inert.
 resolve_primary_mutations() {
     printf '%s' "$1" | awk -v startcwd="$2" -v home="$HOME" "$_QSPLIT_AWK""$_CDEXPAND_AWK""$_CDQUOTE_AWK""$_MASKWS_AWK"'
     BEGIN { curcwd = startcwd }
@@ -5135,6 +5137,17 @@ resolve_primary_mutations() {
                     if (cdclass ~ /^\//) curcwd = cdarg
                     else if (curcwd != "") curcwd = curcwd "/" cdarg
                 }
+                continue
+            }
+            # `gh pr checkout <N>` (#14973): gh fetches the PR head into the
+            # checkout and moves it there. Resolved from the segment cwd (a
+            # `cd` prefix threads through above; gh has no -C option). Emitted
+            # with a marker subcmd the caller denies outright: gh has no
+            # path-restore or main/master-exception shape.
+            if (toks[1] == "gh" && m >= 3 && toks[2] == "pr" && toks[3] == "checkout") {
+                args = ""
+                for (j = 4; j <= m; j++) args = args (j > 4 ? " " : "") toks[j]
+                printf "%s\037gh-pr-checkout\037%s\n", curcwd, args
                 continue
             }
             if (toks[1] != "git") continue
@@ -12398,6 +12411,18 @@ index_mutation_unisolated() {
     return 1
 }
 
+# Is `$2` a target a `git checkout <path>` could restore — a path present in
+# the working tree, or a tracked one (the classic restore of a file deleted
+# from the worktree)? Resolved relative to `$1`, the cwd the git invocation
+# resolves to. Used by the primary-checkout mutation guard to keep file
+# restores allowed while denying checkout targets that are no ref and no path
+# (#14973).
+primary_checkout_target_is_path() {
+    local cwd="$1" pos="$2"
+    [[ -e "$cwd/$pos" ]] && return 0
+    (cd "$cwd" 2>/dev/null && git ls-files --error-unmatch -- "$pos" >/dev/null 2>&1)
+}
+
 # =============================================================================
 # PRIMARY-CHECKOUT MUTATION (#13589) — deny `git commit`, `git switch`,
 # `git checkout -b/-B/--detach`, and `git checkout <branch|sha>` when the
@@ -12413,15 +12438,24 @@ index_mutation_unisolated() {
 # Allowed shapes (legitimate primary-clone callers):
 #   - checkout/switch whose target is main or master (Auditor's
 #     `git checkout -B main origin/main`, `git checkout main`)
-#   - `git checkout -- <path>` / `git checkout <path>` (file restore) and -h
+#   - `git checkout -- <path>` / `git checkout <path>` (file restore: a path
+#     present in the working tree, or tracked — incl. one deleted from the
+#     worktree) and -h
 #   - anything inside a linked worktree, and all of worktree.sh,
 #     check-main-clean.sh, resync-installed.sh, merge-pr.sh, version.sh (their
 #     internal git calls are invisible to this hook; only the top-level command
 #     text is scanned).
+# Also denied (#14973): `git checkout <target>` whose target is no ref git can
+# name and no path — the shape of `git fetch origin pull/N/head:prN && git
+# checkout prN` and `git checkout FETCH_HEAD` after a fetch, which park the
+# primary checkout on a PR head — and `gh pr checkout <N>`, which does the
+# same via gh. A target like that has no successful git meaning (a pathspec
+# matching no tracked file is an error), so denying it costs no working
+# invocation.
 # Gated by primary_checkout_mutation_guard_enabled(), evaluated lazily.
 # =============================================================================
 if [[ -n "${LOOM_SWEEP_ID:-}${LOOM_WORKTREE_PATH:-}" ]] \
-   && echo "$COMMAND_NO_COMMENT" | grep -qE '(^|[;&|(`{]|[[:space:]])git[[:space:]].*(checkout|switch|commit)' \
+   && echo "$COMMAND_NO_COMMENT" | grep -qE '(^|[;&|(`{]|[[:space:]])((git[[:space:]].*(checkout|switch|commit))|(gh[[:space:]]+pr[[:space:]]+checkout))' \
    && primary_checkout_mutation_guard_enabled; then
     while IFS=$'\037' read -r _pcm_cwd _pcm_sub _pcm_args; do
         [[ -z "$_pcm_sub" ]] && continue
@@ -12458,8 +12492,12 @@ if [[ -n "${LOOM_SWEEP_ID:-}${LOOM_WORKTREE_PATH:-}" ]] \
         done
         [[ "$_pcm_help" == true ]] && continue
         _pcm_target="${_pcm_new:-$_pcm_pos}"
+        _pcm_cmd="git $_pcm_sub"
         case "$_pcm_sub" in
             commit) _pcm_deny=true ;;
+            gh-pr-checkout)
+                _pcm_deny=true
+                _pcm_cmd="gh pr checkout" ;;
             switch)
                 if [[ "$_pcm_target" == "main" || "$_pcm_target" == "master" ]]; then
                     [[ "$_pcm_makes" == true && -z "$_pcm_new" ]] && _pcm_deny=true
@@ -12475,10 +12513,20 @@ if [[ -n "${LOOM_SWEEP_ID:-}${LOOM_WORKTREE_PATH:-}" ]] \
                 elif [[ -n "$_pcm_pos" ]] \
                      && (cd "$_pcm_cwd" 2>/dev/null && git rev-parse --verify --quiet "${_pcm_pos}^{commit}" >/dev/null 2>&1); then
                     _pcm_deny=true   # a branch / sha, not a path
+                elif [[ -n "$_pcm_pos" ]] && primary_checkout_target_is_path "$_pcm_cwd" "$_pcm_pos"; then
+                    :   # a working-tree or tracked path: a file restore
+                elif [[ -n "$_pcm_pos" ]]; then
+                    # Not main/master, not a commit git can name, not a path:
+                    # a ref this same command is about to create (`git fetch
+                    # origin pull/N/head:prN && git checkout prN`), a
+                    # FETCH_HEAD after a fetch, or nothing git can act on at
+                    # all (#14973). git errors on a pathspec that matches no
+                    # tracked file, so denying costs no working invocation.
+                    _pcm_deny=true
                 fi ;;
         esac
         if [[ "$_pcm_deny" == true ]]; then
-            deny "Blocked: $COMMAND (git $_pcm_sub in the PRIMARY checkout $_pcm_top during an agent step — this moves the workspace off the default branch or commits onto it, which holds fleet sync (wrong-branch). Builder/Doctor work happens in a worktree: run './.loom/scripts/worktree.sh <issue-number>' and work in .loom/worktrees/issue-<N>. Switching back to main/master and file restores ('git checkout -- <path>') remain allowed. To opt out repo-wide set guards.primaryCheckoutMutation:false in .loom/config.json, or export LOOM_GUARD_PRIMARY_CHECKOUT_MUTATION=0 in the agent's OWN environment before the session — an inline prefix does not reach this hook, which runs as a separate process)" "primary-checkout-mutation:$_pcm_sub"  # scan-reads: COMMAND_NO_COMMENT
+            deny "Blocked: $COMMAND ($_pcm_cmd in the PRIMARY checkout $_pcm_top during an agent step — this moves the workspace off the default branch or commits onto it, which holds fleet sync (wrong-branch). Builder/Doctor work happens in a worktree: run './.loom/scripts/worktree.sh <issue-number>' and work in .loom/worktrees/issue-<N>. Switching back to main/master and file restores ('git checkout -- <path>') remain allowed. To opt out repo-wide set guards.primaryCheckoutMutation:false in .loom/config.json, or export LOOM_GUARD_PRIMARY_CHECKOUT_MUTATION=0 in the agent's OWN environment before the session — an inline prefix does not reach this hook, which runs as a separate process)" "primary-checkout-mutation:$_pcm_sub"  # scan-reads: COMMAND_NO_COMMENT
         fi
     done < <(resolve_primary_mutations "$COMMAND_NO_COMMENT" "$CWD")
 fi
