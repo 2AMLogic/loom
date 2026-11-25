@@ -722,13 +722,15 @@ pub fn run(env: &Env<'_>, roots: &[PathBuf], memory: &mut Memory) -> CheckoutPas
             let low_disk = net.low_disk > low_before;
             freshness::publish(freshness::reached(
                 env,
-                root,
-                &report,
-                branch,
-                head.as_deref(),
-                low_disk,
                 &net,
                 now,
+                &freshness::Reached {
+                    root,
+                    report: &report,
+                    branch,
+                    head: head.as_deref(),
+                    low_disk,
+                },
             ));
         }
         reached += 1;

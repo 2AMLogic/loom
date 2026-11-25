@@ -43,19 +43,32 @@ fn cached_head(root: &Path, branch: Option<&str>) -> Option<(String, String, u64
     super::heard_within_aged(root, remote::HEARD_MAX_AGE).filter(|(b, _, _)| b == branch)
 }
 
-/// The record for one checkout this pass reached. `head` is the remote head the
-/// pass learned for it, `branch` the default branch it resolved, and `report`
-/// the state the pass left it in (exported as `loom.checkout.state`, #15301).
+/// The per-checkout facts the pass holds for one checkout it reached. `head` is
+/// the remote head the pass learned for it, `branch` the default branch it
+/// resolved, and `report` the state the pass left it in (exported as
+/// `loom.checkout.state`, #15301).
+pub(super) struct Reached<'a> {
+    pub(super) root: &'a Path,
+    pub(super) report: &'a CheckoutReport,
+    pub(super) branch: Option<&'a str>,
+    pub(super) head: Option<&'a str>,
+    pub(super) low_disk: bool,
+}
+
+/// The record for one checkout this pass reached.
 pub(super) fn reached(
     env: &Env<'_>,
-    root: &Path,
-    report: &CheckoutReport,
-    branch: Option<&str>,
-    head: Option<&str>,
-    low_disk: bool,
     net: &Net,
     now: DateTime<Utc>,
+    checkout: &Reached<'_>,
 ) -> CheckoutFreshnessRecord {
+    let Reached {
+        root,
+        report,
+        branch,
+        head,
+        low_disk,
+    } = *checkout;
     let mut prompt = prompt_tree::read(root);
     let mut repo = None;
     let mut tip_age_s = None;
