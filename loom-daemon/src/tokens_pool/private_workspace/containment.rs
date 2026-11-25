@@ -346,6 +346,13 @@ pub fn trust_state(profile: &Path) -> &'static str {
     super::super::codex_hooks::trust_state(profile, &bundle::registration())
 }
 
+/// [`trust_state`] for the telemetry sampler (#15292): `None` when the profile
+/// could not be assessed, so a read failure never reports as `missing`.
+#[must_use]
+pub fn assessed_trust_state(profile: &Path) -> Option<&'static str> {
+    super::super::codex_hooks::assessed_trust_state(profile, &bundle::registration())
+}
+
 // ---------------------------------------------------------------------------
 // Host side.
 // ---------------------------------------------------------------------------
