@@ -384,7 +384,16 @@ fn reap(root: &Path) -> worktree_reaper::ReapReport {
         &probes,
         &|_, _| None,
         &|_, _| Err("no backup route in this test".to_string()),
-        &|path, issue| clean::cleanup_worktree(root, path, issue, false, "worktree_reaper").is_ok(),
+        &|path, issue| {
+            clean::cleanup_worktree(
+                root,
+                path,
+                issue,
+                &clean::CleanOptions::default(),
+                "worktree_reaper",
+            )
+            .is_ok()
+        },
     )
 }
 

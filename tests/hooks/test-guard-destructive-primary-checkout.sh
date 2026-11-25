@@ -24,6 +24,16 @@ if [[ "$DEFAULT_BR" != "main" && "$DEFAULT_BR" != "master" ]]; then
     git -C "$PC_REPO" branch -m main >/dev/null 2>&1
     DEFAULT_BR=main
 fi
+# A tracked, present file (a `git checkout <path>` restore target) and a
+# tracked file deleted from the worktree (the classic restore shape): both
+# must stay allowed when a checkout target is not a ref (#14973).
+echo present > "$PC_REPO/somefile"
+git -C "$PC_REPO" add somefile
+echo gone > "$PC_REPO/gonefile"
+git -C "$PC_REPO" add gonefile
+git -C "$PC_REPO" -c user.email=loom@test -c user.name=loom \
+    commit -q -m files >/dev/null 2>&1
+rm "$PC_REPO/gonefile"
 
 # --- DENY in the primary checkout during an agent step ---
 assert_deny_env "git commit in primary is denied" "$AGENT" "git commit -m x" "$PC_REPO"
@@ -41,6 +51,24 @@ assert_deny_env "cd <primary> && git commit from a worktree cwd is denied" "$AGE
     "cd $PC_REPO && git commit -m x" "$PC_WT"
 assert_deny_env "LOOM_WORKTREE_PATH also marks an agent step" "LOOM_WORKTREE_PATH=$PC_WT" \
     "git commit -m x" "$PC_REPO"
+
+# --- #14973: a ref the same command creates (fetch :<ref> chains), and gh pr checkout ---
+assert_deny_env "git fetch :prN && git checkout prN in primary is denied" "$AGENT" \
+    "git fetch origin pull/7/head:pr7 && git checkout pr7" "$PC_REPO"
+assert_deny_env "git fetch :refs/review/prN && git checkout refs/review/prN in primary is denied" "$AGENT" \
+    "git fetch origin pull/7/head:refs/review/pr7 && git checkout refs/review/pr7" "$PC_REPO"
+assert_deny_env "git checkout FETCH_HEAD chained after a fetch in primary is denied" "$AGENT" \
+    "git fetch origin main && git checkout FETCH_HEAD" "$PC_REPO"
+assert_deny_env "git checkout of a target that is no ref and no path in primary is denied" "$AGENT" \
+    "git checkout nosuchref" "$PC_REPO"
+assert_deny_env "git -C <primary> fetch-chain from a worktree cwd is denied" "$AGENT" \
+    "git -C $PC_REPO fetch origin pull/7/head:pr7 && git -C $PC_REPO checkout pr7" "$PC_WT"
+assert_deny_env "gh pr checkout in primary is denied" "$AGENT" "gh pr checkout 7" "$PC_REPO"
+assert_deny_env "cd <primary> && gh pr checkout from a worktree cwd is denied" "$AGENT" \
+    "cd $PC_REPO && gh pr checkout 7" "$PC_WT"
+assert_allow_env "gh pr checkout inside a worktree is allowed" "$AGENT" "gh pr checkout 7" "$PC_WT"
+assert_allow_env "quoted text mentioning gh pr checkout is inert" "$AGENT" "echo 'gh pr checkout 7'" "$PC_REPO"
+assert_allow_env "operator session gh pr checkout (no agent env) is untouched" "" "gh pr checkout 7" "$PC_REPO"
 PC_OUT=$(run_guard_env "$AGENT" "git commit -m x" "$PC_REPO") || true
 TOTAL=$((TOTAL + 1))
 if echo "$PC_OUT" | jq -r '.hookSpecificOutput.permissionDecisionReason' | grep -q 'worktree.sh <issue-number>' \
@@ -63,6 +91,8 @@ assert_allow_env "git checkout -B main origin/main (Auditor) is allowed" "$AGENT
 assert_allow_env "git switch main in primary is allowed" "$AGENT" "git switch main" "$PC_REPO"
 assert_allow_env "git checkout -- <file> restore is allowed" "$AGENT" "git checkout -- somefile" "$PC_REPO"
 assert_allow_env "git checkout <path> (not a ref) is allowed" "$AGENT" "git checkout somefile" "$PC_REPO"
+assert_allow_env "git checkout of a tracked file deleted from the worktree is allowed" "$AGENT" \
+    "git checkout gonefile" "$PC_REPO"
 assert_allow_env "git switch --help is allowed" "$AGENT" "git switch --help" "$PC_REPO"
 assert_allow_env "read-only git status is allowed" "$AGENT" "git status" "$PC_REPO"
 assert_allow_env "read-only git log is allowed" "$AGENT" "git log --oneline" "$PC_REPO"
