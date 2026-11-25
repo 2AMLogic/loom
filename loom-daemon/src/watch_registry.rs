@@ -321,30 +321,15 @@ pub fn load(path: &Path) -> WatchRegistry {
     }
 }
 
-/// Persist the registry to `path` atomically (temp file + rename), creating the
-/// parent directory as needed. Mirrors [`crate::sweep_journal::save`].
+/// Persist the registry to `path` atomically ([`crate::fs_util::write_atomic`]:
+/// uniquely named temp file per writer, so intra-daemon concurrent writers never
+/// collide), creating the parent directory as needed. Mirrors
+/// [`crate::sweep_journal::save`].
 pub fn save(path: &Path, registry: &WatchRegistry) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("creating watches dir {}", parent.display()))?;
-    }
     let mut json = serde_json::to_string_pretty(registry)?;
     json.push('\n');
-    // Unique-per-writer temp name: all in-process writers (the monitor task and
-    // every IPC handler task) share `std::process::id()`, so a PID-only suffix
-    // would collide under intra-daemon concurrency and defeat the atomic-rename
-    // guarantee. Appending a fresh uuid makes each writer's temp path unique
-    // (belt-and-suspenders alongside the watches-file lock below).
-    let tmp = path.with_extension(format!(
-        "json.tmp.{}.{}",
-        std::process::id(),
-        uuid::Uuid::new_v4().simple()
-    ));
-    std::fs::write(&tmp, json.as_bytes())
-        .with_context(|| format!("writing temp watches file {}", tmp.display()))?;
-    std::fs::rename(&tmp, path)
-        .with_context(|| format!("renaming {} -> {}", tmp.display(), path.display()))?;
-    Ok(())
+    crate::fs_util::write_atomic(path, json.as_bytes(), crate::fs_util::AtomicOpts::default())
+        .with_context(|| format!("writing watches file {}", path.display()))
 }
 
 /// Append one [`WatchResult`] as a JSON line to the durable results log at
