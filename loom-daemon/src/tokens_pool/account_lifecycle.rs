@@ -2284,6 +2284,7 @@ mod tests {
                 gh_config: None,
                 session_image: None,
                 extra_mounts: Vec::new(),
+                mirror_binds: Vec::new(),
             })
             .unwrap(),
         )

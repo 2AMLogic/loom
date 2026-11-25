@@ -80,8 +80,9 @@ fn is_healthy_status(status: &str) -> bool {
 /// retry.
 ///
 /// `exhausted` (a hit weekly/monthly ceiling) is unconditional — it comes
-/// straight from a probe's own 7d-utilization reading, not from
-/// `.bad_tokens`, so there is nothing further to check: handing it out
+/// from a probe's 7d-utilization reading or a carried prior row, not from
+/// `.bad_tokens`. The writer bounds header-less 2xx / `unknown` carry-forward;
+/// this selector does not check its reset. Handing an exhausted account out
 /// "because the pool would otherwise be empty" does not produce a working
 /// spawn, it produces a spawn that burns its retry budget and dies.
 ///
@@ -605,7 +606,7 @@ fn shadowed_shared_pool_hint(tokens_dir: &Path) -> String {
     )
 }
 
-fn read_token_file(path: &Path) -> std::io::Result<String> {
+pub(crate) fn read_token_file(path: &Path) -> std::io::Result<String> {
     let raw = std::fs::read_to_string(path)?;
     Ok(raw.split_whitespace().collect::<Vec<_>>().join(""))
 }

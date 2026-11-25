@@ -310,6 +310,21 @@ pub fn pinned_tmp_base() -> PathBuf {
         .unwrap_or_else(|| platform_tmp_root().join(PINNED_TMPDIR_LEAF))
 }
 
+/// Leaf name, under [`pinned_tmp_base`], of the host-level temp root the shared
+/// `sccache` server runs with (#15139). Deliberately **not** hex-shaped: the
+/// sweep above reclaims only [`is_pinned_tmp_entry_id`] (16 hex) and
+/// [`is_launch_id`] (full uuid) names, so this entry is never an orphan
+/// candidate and outlives every per-run `TMPDIR`. Keep it neither 16 nor 36
+/// characters of hex; a test pins that.
+pub const SHARED_SCCACHE_LEAF: &str = "sccache";
+
+/// The stable temp root for the host's shared `sccache` server:
+/// `<pinned_tmp_base>/sccache`. See [`SHARED_SCCACHE_LEAF`].
+#[must_use]
+pub fn shared_sccache_tmp() -> PathBuf {
+    pinned_tmp_base().join(SHARED_SCCACHE_LEAF)
+}
+
 /// Bytes held by everything under `path`. Best effort — an unreadable entry
 /// contributes zero rather than aborting a pass whose purpose is to free
 /// space.
@@ -761,6 +776,33 @@ mod tests {
         assert_eq!(removed, 0, "neither a foreign name nor a plain file is a candidate");
         assert!(pinned_base.join("not-a-uuid").exists());
         assert!(pinned_base.join(LAUNCH).exists());
+    }
+
+    #[test]
+    fn shared_sccache_leaf_is_not_a_reclaimable_entry_name() {
+        assert!(!is_pinned_tmp_entry_id(SHARED_SCCACHE_LEAF));
+        assert!(!is_launch_id(SHARED_SCCACHE_LEAF));
+        assert_eq!(shared_sccache_tmp(), pinned_tmp_base().join(SHARED_SCCACHE_LEAF));
+    }
+
+    #[test]
+    fn sweep_pinned_tmp_keeps_the_shared_sccache_root_but_reclaims_orphans() {
+        let temp = tempfile::tempdir().unwrap();
+        let session_base = temp.path().join("native-tools");
+        let pinned_base = temp.path().join("pinned-tmp");
+        std::fs::create_dir_all(&session_base).unwrap();
+        let stable = pinned_base.join(SHARED_SCCACHE_LEAF);
+        std::fs::create_dir_all(&stable).unwrap();
+        std::fs::write(stable.join("sccache-scratch"), b"in use").unwrap();
+        let orphan_hex = pinned_base.join(pinned_tmp_entry_id(LAUNCH));
+        std::fs::create_dir_all(&orphan_hex).unwrap();
+        std::fs::create_dir_all(pinned_base.join(LAUNCH)).unwrap();
+
+        let (removed, _bytes) = sweep_pinned_tmp(&pinned_base, &[session_base]);
+
+        assert_eq!(removed, 2, "both orphaned shapes are still reclaimed");
+        assert!(!orphan_hex.exists());
+        assert!(stable.join("sccache-scratch").is_file(), "the stable root is never reaped");
     }
 
     #[test]

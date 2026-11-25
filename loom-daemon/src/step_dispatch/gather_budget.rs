@@ -298,6 +298,15 @@ impl GatherWalk {
         self.skipped.first().copied().unwrap_or(self.start)
     }
 
+    /// The repos the deadline skipped this tick, in walk order (#15182):
+    /// their listings were never attempted, so the tick reports them as
+    /// incomplete rather than letting a missing listing read as an emptied
+    /// queue.
+    #[must_use]
+    pub fn skipped_indices(&self) -> &[usize] {
+        &self.skipped
+    }
+
     /// This walk's figures, measured at `now`.
     #[must_use]
     pub fn stats(&self, now: Instant) -> GatherStats {

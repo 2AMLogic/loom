@@ -133,6 +133,7 @@ impl RepoFixture {
             container_id: "test-container".into(),
             branch: None,
             slug: None,
+            mirror_objects: None,
         };
         Self {
             _temp: temp,
@@ -459,6 +460,7 @@ fn unpublished_commits_in_one_clone_do_not_block_another_clone_or_branch() {
         container_id: "test-container".into(),
         branch: Some("feature/issue-9".into()),
         slug: Some("owner-repo-12345678".into()),
+        mirror_objects: None,
     };
     let add = repository::prepare(&f.root, &additional).unwrap().revision;
     assert!(!add.is_empty());
@@ -498,6 +500,15 @@ fn recover_args(remote: &Path) -> repository::RecoverArgs {
         validate_worktrees: false,
         slug: None,
     }
+}
+
+/// PR-fetch residue (`refs/<name>`, `refs/remotes/<name>`) at `tip`: the
+/// shape that makes Git shorten every abbreviated lookup of
+/// `refs/heads/<name>` to `heads/<name>` (#15027). Neither ref lives under
+/// `refs/heads`, so no branch is created.
+fn add_residue(repo: &Path, name: &str, tip: &str) {
+    git(repo, &["update-ref", &format!("refs/{name}"), tip]);
+    git(repo, &["update-ref", &format!("refs/remotes/{name}"), tip]);
 }
 
 /// Two unpublished branches (one ahead each) with the root checkout
@@ -742,6 +753,223 @@ fn recover_discard_resolves_the_base_before_mutating_any_holder() {
     assert_eq!(git(&repo, &["rev-parse", "--abbrev-ref", "HEAD"]), "issue-3");
 }
 
+/// PR-fetch residue at an unpublished branch's tip must not break the
+/// recover listing: the shadowed branch keeps its true name and ahead
+/// count, and the residue refs are left exactly where they were (#15027).
+#[test]
+#[serial_test::serial(private_workspace_fork)]
+#[serial_test::serial]
+fn recover_lists_residue_shadowed_branches_by_their_true_names() {
+    let _fork = fork_guard();
+    let (f, repo, issue3, issue4) = two_unpublished_branches();
+    add_residue(&repo, "issue-3", &issue3);
+    let list = repository::recover(&f.root, &recover_args(&f.remote)).unwrap();
+    assert_eq!(
+        list.branches
+            .iter()
+            .map(|b| (b.branch.as_str(), b.ahead))
+            .collect::<Vec<_>>(),
+        vec![("issue-3", 1), ("issue-4", 1)]
+    );
+    assert!(list.ignored.is_empty());
+    assert_eq!(git(&repo, &["rev-parse", "refs/issue-3"]), issue3);
+    assert_eq!(git(&repo, &["rev-parse", "refs/remotes/issue-3"]), issue3);
+    assert_eq!(git(&repo, &["rev-parse", "issue-4"]), issue4);
+}
+
+/// A branch literally named `heads/topic` is reported (and scoped) as
+/// `heads/topic` under `refs/topic` residue, never shortened further (#15027).
+#[test]
+#[serial_test::serial(private_workspace_fork)]
+#[serial_test::serial]
+fn a_literal_heads_prefixed_branch_keeps_its_name_under_residue() {
+    let _fork = fork_guard();
+    let f = RepoFixture::new();
+    f.prepare().unwrap();
+    let repo = f.root.join("repo");
+    let base = git(&repo, &["rev-parse", "origin/main"]);
+    git(&repo, &["switch", "-c", "heads/topic"]);
+    std::fs::write(repo.join("fixture"), "literal").unwrap();
+    git(&repo, &["commit", "-am", "literal"]);
+    let tip = git(&repo, &["rev-parse", "refs/heads/heads/topic"]);
+    git(&repo, &["switch", "--detach", &base]);
+    add_residue(&repo, "topic", &tip);
+    let list = repository::recover(&f.root, &recover_args(&f.remote)).unwrap();
+    assert_eq!(
+        list.branches
+            .iter()
+            .map(|b| (b.branch.as_str(), b.ahead))
+            .collect::<Vec<_>>(),
+        vec![("heads/topic", 1)]
+    );
+    let mut scoped = recover_args(&f.remote);
+    scoped.branch = vec!["heads/topic".into()];
+    let out = repository::recover(&f.root, &scoped).unwrap();
+    assert!(out.ignored.is_empty());
+    assert_eq!(git(&repo, &["rev-parse", "refs/topic"]), tip);
+}
+
+/// A scoped `--publish` must reach the shadowed branch instead of ignoring
+/// it, and never disturb the residue refs (#15027).
+#[test]
+#[serial_test::serial(private_workspace_fork)]
+#[serial_test::serial]
+fn recover_publishes_a_residue_shadowed_scoped_branch() {
+    let _fork = fork_guard();
+    let (f, repo, issue3, _issue4) = two_unpublished_branches();
+    add_residue(&repo, "issue-3", &issue3);
+    let mut args = recover_args(&f.remote);
+    args.publish = true;
+    args.branch = vec!["issue-3".into()];
+    let out = repository::recover(&f.root, &args).unwrap();
+    assert_eq!(out.published, vec!["issue-3".to_owned()]);
+    assert!(out.ignored.is_empty());
+    assert_eq!(git(&f.remote, &["rev-parse", "refs/heads/issue-3"]), issue3);
+    assert_eq!(git(&repo, &["rev-parse", "refs/issue-3"]), issue3);
+    assert_eq!(git(&repo, &["rev-parse", "refs/remotes/issue-3"]), issue3);
+}
+
+/// `recover --discard` on a residue-shadowed branch held by the main
+/// checkout: the holder is found by the branch's true name, moved to the
+/// base, and the branch deleted — while the residue refs survive (#15027).
+#[test]
+#[serial_test::serial(private_workspace_fork)]
+#[serial_test::serial]
+fn recover_discards_a_residue_shadowed_branch_held_by_the_main_checkout() {
+    let _fork = fork_guard();
+    let f = RepoFixture::new();
+    f.prepare().unwrap();
+    let repo = f.root.join("repo");
+    git(&repo, &["switch", "-c", "pr344"]);
+    std::fs::write(repo.join("fixture"), "unpublished").unwrap();
+    git(&repo, &["commit", "-am", "unpublished"]);
+    let tip = git(&repo, &["rev-parse", "refs/heads/pr344"]);
+    add_residue(&repo, "pr344", &tip);
+    let mut args = recover_args(&f.remote);
+    args.discard = true;
+    args.branch = vec!["pr344".into()];
+    let out = repository::recover(&f.root, &args).unwrap();
+    assert_eq!(out.discarded, vec!["pr344".to_owned()]);
+    assert!(!git_ok(&repo, &["show-ref", "--verify", "refs/heads/pr344"]));
+    assert_eq!(git(&repo, &["rev-parse", "HEAD"]), git(&repo, &["rev-parse", "origin/main"]));
+    assert_eq!(git(&repo, &["rev-parse", "refs/pr344"]), tip);
+    assert_eq!(git(&repo, &["rev-parse", "refs/remotes/pr344"]), tip);
+}
+
+/// Residue-shadowed holders keep working both ways: a clean linked worktree
+/// is removed by its branch's true name, and a dirty one is reported under
+/// that name and still refuses the discard before any mutation (#15027).
+#[test]
+#[serial_test::serial(private_workspace_fork)]
+#[serial_test::serial]
+fn recover_discards_a_residue_shadowed_holder_and_reports_dirty_ones_by_true_name() {
+    let _fork = fork_guard();
+    let f = RepoFixture::new();
+    f.prepare().unwrap();
+    let repo = f.root.join("repo");
+    let holder = f.root.join("issue-344");
+    git(&repo, &["worktree", "add", "-b", "pr344", holder.to_str().unwrap()]);
+    std::fs::write(holder.join("fixture"), "held").unwrap();
+    git(&holder, &["add", "."]);
+    git(&holder, &["commit", "-am", "held"]);
+    let tip = git(&repo, &["rev-parse", "refs/heads/pr344"]);
+    let dirty = f.root.join("issue-345");
+    git(&repo, &["worktree", "add", "-b", "pr345", dirty.to_str().unwrap()]);
+    std::fs::write(dirty.join("fixture"), "committed").unwrap();
+    git(&dirty, &["add", "."]);
+    git(&dirty, &["commit", "-am", "committed"]);
+    let dirty_tip = git(&repo, &["rev-parse", "refs/heads/pr345"]);
+    std::fs::write(dirty.join("untracked"), "keep").unwrap();
+    add_residue(&repo, "pr344", &tip);
+    add_residue(&repo, "pr345", &dirty_tip);
+    let list = repository::recover(&f.root, &recover_args(&f.remote)).unwrap();
+    assert_eq!(list.dirty_worktrees.len(), 1);
+    assert_eq!(list.dirty_worktrees[0].branch.as_deref(), Some("pr345"));
+    let mut args = recover_args(&f.remote);
+    args.discard = true;
+    args.branch = vec!["pr344".into()];
+    let out = repository::recover(&f.root, &args).unwrap();
+    assert_eq!(out.discarded, vec!["pr344".to_owned()]);
+    assert!(!holder.exists(), "the clean shadowed holder was removed");
+    assert!(!git_ok(&repo, &["show-ref", "--verify", "refs/heads/pr344"]));
+    args.branch = vec!["pr345".into()];
+    let error = repository::recover(&f.root, &args).unwrap_err().to_string();
+    assert!(error.contains("uncommitted"), "{error}");
+    assert!(git_ok(&repo, &["show-ref", "--verify", "refs/heads/pr345"]));
+    assert!(dirty.join("untracked").exists());
+    assert_eq!(git(&repo, &["rev-parse", "refs/pr344"]), tip);
+    assert_eq!(git(&repo, &["rev-parse", "refs/remotes/pr345"]), dirty_tip);
+}
+
+/// `prepare` must find — and reap — a finished-PR worktree whose branch is
+/// residue-shadowed, passing the true branch name to the PR lookup (#15027).
+#[test]
+#[serial_test::serial(private_workspace_fork)]
+#[serial_test::serial]
+fn prepare_reaps_a_finished_pr_worktree_on_a_residue_shadowed_branch() {
+    let _fork = fork_guard();
+    let f = RepoFixture::new();
+    f.prepare().unwrap();
+    let repo = f.root.join("repo");
+    let holder = f.root.join("issue-344");
+    git(&repo, &["worktree", "add", "-b", "pr344", holder.to_str().unwrap()]);
+    let tip = git(&repo, &["rev-parse", "refs/heads/pr344"]);
+    add_residue(&repo, "pr344", &tip);
+    let outcome = repository::prepare_with_pr_lookup(
+        &f.root,
+        &f.args,
+        &|_, _, branch, _| branch == "pr344",
+        &temp_base(),
+    )
+    .unwrap();
+    assert_eq!(outcome.reaped, vec![holder.to_string_lossy().to_string()]);
+    assert!(!holder.exists(), "the shadowed finished-PR worktree was reaped");
+    assert!(git_ok(&repo, &["show-ref", "--verify", "refs/heads/pr344"]));
+    assert_eq!(git(&repo, &["rev-parse", "refs/pr344"]), tip);
+    assert_eq!(git(&repo, &["rev-parse", "refs/remotes/pr344"]), tip);
+}
+
+/// `holding_worktree` resolves a residue-shadowed holder by the branch's
+/// true name, so a preparation refusing on it names the cure (#15027).
+#[test]
+#[serial_test::serial(private_workspace_fork)]
+#[serial_test::serial]
+fn holding_worktree_finds_a_residue_shadowed_holder() {
+    let _fork = fork_guard();
+    let f = RepoFixture::new();
+    f.prepare().unwrap();
+    let repo = f.root.join("repo");
+    let holder = f.root.join("issue-344");
+    git(&repo, &["worktree", "add", "-b", "pr344", holder.to_str().unwrap()]);
+    let tip = git(&repo, &["rev-parse", "refs/heads/pr344"]);
+    add_residue(&repo, "pr344", &tip);
+    assert_eq!(repository::holding_worktree(&repo, "pr344").unwrap(), Some(holder));
+}
+
+/// `current_branch` reads the true name of a residue-shadowed checkout and
+/// answers `None` exactly when detached (#15027).
+#[test]
+#[serial_test::serial(private_workspace_fork)]
+#[serial_test::serial]
+fn current_branch_reads_true_names_under_residue() {
+    let _fork = fork_guard();
+    let f = RepoFixture::new();
+    f.prepare().unwrap();
+    let repo = f.root.join("repo");
+    // `prepare` without a branch leaves the main checkout detached at the base.
+    assert_eq!(repository::current_branch(&repo).unwrap(), None);
+    let holder = f.root.join("issue-344");
+    git(&repo, &["worktree", "add", "-b", "pr344", holder.to_str().unwrap()]);
+    let tip = git(&repo, &["rev-parse", "refs/heads/pr344"]);
+    add_residue(&repo, "pr344", &tip);
+    assert_eq!(repository::current_branch(&holder).unwrap().as_deref(), Some("pr344"));
+    // A literal heads-prefixed branch keeps that name under `refs/topic`
+    // residue.
+    git(&repo, &["switch", "-c", "heads/topic"]);
+    add_residue(&repo, "topic", &git(&repo, &["rev-parse", "refs/heads/heads/topic"]));
+    assert_eq!(repository::current_branch(&repo).unwrap().as_deref(), Some("heads/topic"));
+}
+
 #[test]
 #[serial_test::serial(private_workspace_fork)]
 #[serial_test::serial]
@@ -954,6 +1182,7 @@ fn config() -> Config {
         gh_config: None,
         session_image: None,
         extra_mounts: Vec::new(),
+        mirror_binds: Vec::new(),
     }
 }
 
@@ -1134,6 +1363,7 @@ fn ambiguous_lease_is_durable_and_stopped_container_recovery_retains_last_owner(
         gh_config: None,
         session_image: None,
         extra_mounts: Vec::new(),
+        mirror_binds: Vec::new(),
     };
     assert!(lease
         .recover(&config, Some(&serde_json::json!({"Id":"new", "State":{"Running":false}})))
@@ -1230,6 +1460,7 @@ impl repository::PrepareArgs {
             container_id: self.container_id.clone(),
             branch: self.branch.clone(),
             slug: self.slug.clone(),
+            mirror_objects: self.mirror_objects.clone(),
         }
     }
 }
@@ -2320,6 +2551,7 @@ fn a_dirty_worktree_in_one_clone_does_not_refuse_the_seats_other_clone() {
         container_id: "test-container".into(),
         branch: None,
         slug: Some("owner-repo-12345678".into()),
+        mirror_objects: None,
     };
     repository::prepare(&f.root, &additional).unwrap();
     let wedged = linked_worktree(&f, "issue-5084");
@@ -2327,6 +2559,242 @@ fn a_dirty_worktree_in_one_clone_does_not_refuse_the_seats_other_clone() {
     assert!(f.prepare().unwrap_err().to_string().contains("seat_dirty"));
     // The other repository's clone prepares regardless (#14458).
     repository::prepare(&f.root, &additional).unwrap();
+}
+
+// ---------------------------------------------------------------------------
+// Origin object mirrors (#14680): seat-side borrowing and migration.
+// ---------------------------------------------------------------------------
+
+/// A bare clone of `remote`, standing in for the host daemon's mirror store.
+fn bare_mirror(temp: &Path, remote: &Path) -> PathBuf {
+    let mirror = temp.join("mirror.git");
+    git(
+        temp,
+        &[
+            "clone",
+            "--bare",
+            "--",
+            &remote.to_string_lossy(),
+            &mirror.to_string_lossy(),
+        ],
+    );
+    mirror
+}
+
+/// Local (non-borrowed) object count, as `git count-objects -v` reports it.
+fn local_objects(repo: &Path) -> usize {
+    let out = git(repo, &["count-objects", "-v"]);
+    let number = |prefix: &str| {
+        out.lines()
+            .find(|line| line.starts_with(prefix))
+            .and_then(|line| line.split_whitespace().last())
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or_default()
+    };
+    number("count:") + number("in-pack:")
+}
+
+/// The core #14680 migration: an existing private clone with unpublished
+/// work and a dirty linked worktree borrows its mirror's published objects
+/// in place — refs, index, worktree contents and unpublished commits all
+/// survive, local object bytes shrink, and an interrupted migration is
+/// safely retried.
+#[test]
+#[serial_test::serial(private_workspace_fork)]
+fn a_clone_migrates_onto_its_mirror_keeping_every_local_artifact() {
+    let _fork = fork_guard();
+    let f = RepoFixture::new();
+    f.prepare().unwrap();
+    let repo = f.root.join("repo");
+    git(&repo, &["switch", "-c", "unpublished"]);
+    std::fs::write(repo.join("local"), "unpushed").unwrap();
+    git(&repo, &["add", "local"]);
+    git(&repo, &["commit", "-m", "unpublished"]);
+    let unpublished = git(&repo, &["rev-parse", "unpublished"]);
+    let worktree = f.root.join("issue-7");
+    git(
+        &repo,
+        &[
+            "worktree",
+            "add",
+            "-b",
+            "issue-7",
+            worktree.to_str().unwrap(),
+        ],
+    );
+    std::fs::write(worktree.join("fixture"), "edited").unwrap();
+    let published = git(&f.remote, &["rev-parse", "main"]);
+    let mirror = bare_mirror(f._temp.path(), &f.remote);
+    let objects = mirror.join("objects").to_string_lossy().into_owned();
+    let before = local_objects(&repo);
+
+    repository::borrow_published(&repo, &objects, false).unwrap();
+
+    // The alternate names exactly the mirror's objects directory.
+    assert_eq!(
+        std::fs::read_to_string(repo.join(".git/objects/info/alternates"))
+            .unwrap()
+            .trim(),
+        objects
+    );
+    // Published objects are borrowed, not stored; unpublished work stays local.
+    assert!(local_objects(&repo) < before, "the clone must shed published objects");
+    assert_eq!(git(&repo, &["cat-file", "-e", &published]), "");
+    assert_eq!(git(&repo, &["rev-parse", "unpublished"]), unpublished);
+    // The dirty linked worktree keeps its edit; the index is untouched.
+    assert_eq!(std::fs::read_to_string(worktree.join("fixture")).unwrap(), "edited");
+    // A settled migration is a no-op, and an interrupted one (marker gone)
+    // reruns to the same end state.
+    repository::borrow_published(&repo, &objects, false).unwrap();
+    std::fs::remove_file(repo.join(".git/objects/info/loom-migrated")).unwrap();
+    repository::borrow_published(&repo, &objects, false).unwrap();
+    assert_eq!(git(&repo, &["rev-parse", "unpublished"]), unpublished);
+    assert_eq!(git(&repo, &["cat-file", "-e", &published]), "");
+}
+
+/// Nothing but the clone's own authorized mirror is ever accepted: a foreign
+/// alternate is refused (never overwritten), and a missing, symlinked or
+/// indirect mirror refuses the migration before any object moves.
+#[test]
+#[serial_test::serial(private_workspace_fork)]
+fn borrowing_refuses_foreign_missing_or_indirect_mirrors() {
+    let _fork = fork_guard();
+    let f = RepoFixture::new();
+    f.prepare().unwrap();
+    let repo = f.root.join("repo");
+    let alternates = repo.join(".git/objects/info/alternates");
+
+    std::fs::write(&alternates, "/host/objects").unwrap();
+    let error = repository::borrow_published(&repo, "/mirrors/a-b-00000000/objects", false)
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("foreign"), "{error}");
+    assert_eq!(std::fs::read_to_string(&alternates).unwrap(), "/host/objects");
+    std::fs::remove_file(&alternates).unwrap();
+
+    let error = repository::borrow_published(&repo, "/nonexistent/objects", false)
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("not mounted"), "{error}");
+
+    let real = bare_mirror(f._temp.path(), &f.remote);
+    let linked = f._temp.path().join("linked.git");
+    std::os::unix::fs::symlink(&real, &linked).unwrap();
+    let error =
+        repository::borrow_published(&repo, &linked.join("objects").to_string_lossy(), false)
+            .unwrap_err()
+            .to_string();
+    assert!(error.contains("real directory"), "{error}");
+
+    let indirect = f._temp.path().join("indirect.git");
+    std::fs::create_dir_all(indirect.join("objects/info")).unwrap();
+    std::fs::write(indirect.join("objects/info/alternates"), "/elsewhere/objects").unwrap();
+    let error =
+        repository::borrow_published(&repo, &indirect.join("objects").to_string_lossy(), false)
+            .unwrap_err()
+            .to_string();
+    assert!(error.contains("indirect"), "{error}");
+    assert!(!alternates.exists(), "no refused migration may write an alternate");
+}
+
+/// The only allowed alternate is the repository's own canonical mirror path:
+/// `identify`-derived for HTTPS repositories, none at all for anything else.
+#[test]
+fn the_only_allowed_alternate_is_the_repositorys_own_mirror() {
+    let repository = "https://forge.example/owner/repo";
+    let id = identify(repository).unwrap();
+    assert_eq!(
+        mirror_alternate(repository).as_deref(),
+        Some(format!("{MIRRORS}/{}/objects", id.slug).as_str())
+    );
+    assert_eq!(mirror_alternate("/tmp/remote"), None);
+
+    let dir = tempfile::tempdir().unwrap();
+    let repo = dir.path().join("repo");
+    let info = repo.join(".git/objects/info");
+    std::fs::create_dir_all(&info).unwrap();
+    // No alternate: a private clone, always supported.
+    assert!(repository::verify_alternates(&repo, None).is_ok());
+    // Exactly the repository's own mirror path.
+    let expected = mirror_alternate(repository).unwrap();
+    std::fs::write(info.join("alternates"), format!("{expected}\n")).unwrap();
+    assert!(repository::verify_alternates(&repo, Some(&expected)).is_ok());
+    // Another repository's mirror, an arbitrary path, or a second entry.
+    for body in [
+        "/mirrors/other-repo-00000000/objects\n",
+        "/host/objects\n",
+        &format!("{expected}\n/mirrors/a-b-11111111/objects\n"),
+    ] {
+        std::fs::write(info.join("alternates"), body).unwrap();
+        assert!(
+            repository::verify_alternates(&repo, Some(&expected)).is_err(),
+            "{body:?} must be refused"
+        );
+    }
+    // An alternate with no authorized mirror at all: preparation passes
+    // `None` whenever the host bound no mirror, and must refuse every
+    // alternate then — even one that happens to name the canonical path.
+    std::fs::write(info.join("alternates"), format!("{expected}\n")).unwrap();
+    let error = repository::verify_alternates(&repo, None)
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("private Git objects"), "{error}");
+    std::fs::write(info.join("alternates"), "/tmp/objects\n").unwrap();
+    let error = repository::verify_alternates(&repo, None)
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("private Git objects"), "{error}");
+}
+
+/// Preparation refuses a mirror path that is not the repository's own:
+/// wrong-repository and arbitrary paths never reach a clone.
+#[test]
+#[serial_test::serial(private_workspace_fork)]
+fn prepare_refuses_a_mirror_path_that_is_not_the_repositorys_own() {
+    let _fork = fork_guard();
+    let mut f = RepoFixture::new();
+    f.args.mirror_objects = Some("/mirrors/owner-other-00000000/objects".into());
+    let error = f.prepare().unwrap_err().to_string();
+    assert!(error.contains("own read-only origin mirror"), "{error}");
+    assert!(!f.root.join("repo").exists(), "nothing was cloned");
+}
+
+/// Only a target whose bind the container actually carries borrows; a
+/// registration without a bind (added after creation) stays fully private.
+#[test]
+fn a_target_without_a_recorded_bind_stays_private() {
+    let repository = "https://forge.example/owner/repo";
+    let id = identify(repository).unwrap();
+    let mut config = Config {
+        schema_version: 2,
+        account: "seat".into(),
+        container: "c".into(),
+        engine: "e".into(),
+        docker_desktop: false,
+        repository: repository.into(),
+        base: "main".into(),
+        repositories: vec![Registered {
+            repository: "https://forge.example/owner/other".into(),
+            base: "main".into(),
+            slug: "owner-other-11111111".into(),
+        }],
+        volume: "v".into(),
+        profile: PathBuf::from("/nonexistent"),
+        gh_config: None,
+        session_image: None,
+        extra_mounts: Vec::new(),
+        mirror_binds: vec![id.slug.clone()],
+    };
+    assert_eq!(
+        mirror::bound_objects(&config, &config.primary()).as_deref(),
+        Some(mirror::in_container_objects(&id.slug).as_str())
+    );
+    let additional = config
+        .target(Some("https://forge.example/owner/other"))
+        .unwrap();
+    assert_eq!(mirror::bound_objects(&config, &additional), None);
+    config.mirror_binds.clear();
+    assert_eq!(mirror::bound_objects(&config, &config.primary()), None);
 }
 
 #[test]

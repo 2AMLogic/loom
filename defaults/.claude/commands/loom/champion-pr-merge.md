@@ -369,7 +369,13 @@ never a substring or nested path, so `docs/README.md` and
 reference** (#14182: `docs_only_fast_path_closing_check` in the code block
 below must return `ELIGIBLE` — it fails closed on any closing reference and
 on a failed read, because a docs-only diff that auto-closes an issue on
-merge is not a docs-only change), the `merge-risk` criterion is satisfied without
+merge is not a docs-only change) **and any change to WORK_PLAN.md's
+`guide:plan-body` region carries the machine-rendered `written` receipt**
+(#15220: `docs_only_fast_path_plan_check` in the code block below must
+return `ELIGIBLE` — it fails closed on a stamp-only region edit, free prose
+in place of the `WORK_PLAN check:` receipt line, a wrong or missing
+render-hash, and any failed read, because nothing mechanical stands behind
+a hand-written region), the `merge-risk` criterion is satisfied without
 judging the axes at all: there is no "load-bearing hunk" to name, blast
 radius is provably confined to non-executing docs, and `git revert -m 1
 <merge-sha>` undoes it. This is a shortcut on **this criterion
@@ -459,6 +465,144 @@ if [ "$FAST_PATH_RESULT" = "ELIGIBLE" ]; then
   FAST_PATH_RESULT=$(docs_only_fast_path_closing_check "$PR_NUMBER")
 fi
 
+# WORK_PLAN plan-body region gate (#15220), mirrored from judge.md Step 5
+# (mirrored, not shared; test-docs-only-fast-path.sh pins both copies). A
+# Guide tick once hand-wrote the `guide:plan-body` region and put free prose
+# where the `WORK_PLAN check:` receipt line belongs; this gate re-derives the
+# receipt on the reviewing side. A diff that changes the region must carry
+# exactly one `- **WORK_PLAN check**: written (render-hash <12hex>, <UTC>)`
+# line whose hash matches the head region's stamp-stripped sha256; a
+# stamp-only edit, free prose, a wrong/absent hash, a WORK_PLAN.md created or
+# deleted by the PR, malformed markers, or a failed read is NOT ELIGIBLE.
+# `ENVIRONMENT:`-prefixed refusals are tooling failures, never content
+# verdicts.
+docs_only_fast_path_plan_region() {
+  awk '/^<!-- guide:plan-body:start -->$/ { if (s) exit 1; s = NR; next }
+       /^<!-- guide:plan-body:end -->$/   { if (!s || e) exit 1; e = NR; next }
+       s && !e { print }
+       END { if (!s || !e) exit 1 }'
+}
+
+docs_only_fast_path_plan_check() {
+  # $1 = PR number.
+  local pr="$1" out repo raw l in_plan=0 touched=0 created=0 deleted=0
+  local shas base_sha head_sha base_file head_file body
+  local base_region head_region base_body head_body head_hash hash
+  local -a receipt_lines=()
+  local receipt_re='^- \*\*WORK_PLAN check\*\*: written \(render-hash ([0-9a-f]{12}), [0-9TZ:-]+\)$'
+  if ! out=$(gh pr view "$pr" --json url --jq '.url | capture("^https://[^/]+/(?<r>[^/]+/[^/]+)/pull/[0-9]+/?$").r' 2>/dev/null) || [ -z "$out" ]; then
+    echo "NOT ELIGIBLE: ENVIRONMENT: base repository read failed (gh error, not a PR-content verdict) — take the normal review flow; do NOT treat this as a passed or waived #15220 content check"
+    return 0
+  fi
+  repo="$out"
+  if ! raw=$(gh pr diff --repo "$repo" "$pr" 2>/dev/null); then
+    echo "NOT ELIGIBLE: ENVIRONMENT: PR diff read failed (gh error, not a PR-content verdict) — take the normal review flow; do NOT treat this as a passed or waived #15220 content check"
+    return 0
+  fi
+  # Exact root-file scoping, same header discipline as the worklog check: the
+  # monthly work_plan/WORK_PLAN_YYYY-MM.md archives are not the live file, and
+  # a non-WORK_PLAN hunk can neither trigger this gate nor produce a refusal.
+  while IFS= read -r l; do
+    case "$l" in
+      'diff --git '*)
+        case "$l" in
+          *' b/WORK_PLAN.md') in_plan=1; touched=1 ;;
+          *) in_plan=0 ;;
+        esac
+        continue ;;
+    esac
+    [ "$in_plan" = 1 ] || continue
+    case "$l" in
+      'new file mode'*) created=1 ;;
+      'deleted file mode'*) deleted=1 ;;
+    esac
+  done < <(printf '%s\n' "$raw")
+  if [ "$touched" -eq 0 ]; then
+    echo "ELIGIBLE"
+    return 0
+  fi
+  if [ "$created" -eq 1 ]; then
+    echo "NOT ELIGIBLE: WORK_PLAN.md newly created by this PR — the plan-body region cannot be verified (#15220)"
+    return 0
+  fi
+  if [ "$deleted" -eq 1 ]; then
+    echo "NOT ELIGIBLE: WORK_PLAN.md deleted by this PR — the plan-body region cannot be verified (#15220)"
+    return 0
+  fi
+  if ! shas=$(gh pr view "$pr" --json baseRefOid,headRefOid --jq '"\(.baseRefOid)\t\(.headRefOid)"' 2>/dev/null) || [ -z "$shas" ]; then
+    echo "NOT ELIGIBLE: ENVIRONMENT: PR ref-SHA read failed (gh error, not a PR-content verdict) — take the normal review flow; do NOT treat this as a passed or waived #15220 content check"
+    return 0
+  fi
+  base_sha="${shas%%$'\t'*}"
+  head_sha="${shas##*$'\t'}"
+  if [ -z "$base_sha" ] || [ -z "$head_sha" ]; then
+    echo "NOT ELIGIBLE: ENVIRONMENT: PR ref-SHA read failed (gh error, not a PR-content verdict) — take the normal review flow; do NOT treat this as a passed or waived #15220 content check"
+    return 0
+  fi
+  if ! body=$(gh pr view "$pr" --json body --jq '.body' 2>/dev/null); then
+    echo "NOT ELIGIBLE: ENVIRONMENT: PR body read failed (gh error, not a PR-content verdict) — take the normal review flow; do NOT treat this as a passed or waived #15220 content check"
+    return 0
+  fi
+  if ! base_file=$(gh api -H "Accept: application/vnd.github.raw" "repos/$repo/contents/WORK_PLAN.md?ref=$base_sha" 2>/dev/null); then
+    echo "NOT ELIGIBLE: ENVIRONMENT: WORK_PLAN.md base contents read failed (gh error, not a PR-content verdict) — take the normal review flow; do NOT treat this as a passed or waived #15220 content check"
+    return 0
+  fi
+  if ! head_file=$(gh api -H "Accept: application/vnd.github.raw" "repos/$repo/contents/WORK_PLAN.md?ref=$head_sha" 2>/dev/null); then
+    echo "NOT ELIGIBLE: ENVIRONMENT: WORK_PLAN.md head contents read failed (gh error, not a PR-content verdict) — take the normal review flow; do NOT treat this as a passed or waived #15220 content check"
+    return 0
+  fi
+  if ! base_region=$(printf '%s\n' "$base_file" | docs_only_fast_path_plan_region); then
+    echo "NOT ELIGIBLE: WORK_PLAN.md base has missing, duplicated or unordered guide:plan-body markers (#15220)"
+    return 0
+  fi
+  if ! head_region=$(printf '%s\n' "$head_file" | docs_only_fast_path_plan_region); then
+    echo "NOT ELIGIBLE: WORK_PLAN.md head has missing, duplicated or unordered guide:plan-body markers (#15220)"
+    return 0
+  fi
+  # Raw regions equal → the diff did not change the region (an edit outside
+  # the markers); pass without touching the receipt.
+  if [ "$base_region" = "$head_region" ]; then
+    echo "ELIGIBLE"
+    return 0
+  fi
+  # strip_plan_stamp's exact shape (guide.md #13909): drop line 1 when it is
+  # the generated-at stamp. The $() captures above already normalized trailing
+  # newlines on both sides, the same normalization WORK_PLAN_RENDER_HASH's
+  # input gets.
+  base_body="$(printf '%s\n' "$base_region" | sed -e '1{/^_Generated: .* (snapshot; compare against live labels)_$/d;}')"
+  head_body="$(printf '%s\n' "$head_region" | sed -e '1{/^_Generated: .* (snapshot; compare against live labels)_$/d;}')"
+  if [ "$base_body" = "$head_body" ]; then
+    echo "NOT ELIGIBLE: stamp-only edit to the WORK_PLAN guide:plan-body region — update_work_plan() records 'current' and never writes one (#15220)"
+    return 0
+  fi
+  # The hash the receipt must carry: sha256 of the head region's
+  # stamp-stripped body plus one trailing newline, first 12 hex — the same
+  # computation as guide.md's WORK_PLAN_RENDER_HASH (sha256sum on Linux,
+  # shasum on macOS).
+  head_hash="$(printf '%s\n' "$head_body" | { sha256sum 2>/dev/null || shasum -a 256; } 2>/dev/null | cut -c1-12)"
+  while IFS= read -r l; do
+    receipt_lines+=("$l")
+  done < <(printf '%s\n' "$body" | grep -E '^- \*\*WORK_PLAN check\*\*: ' || true)
+  if [ "${#receipt_lines[@]}" -ne 1 ]; then
+    echo "NOT ELIGIBLE: PR body carries ${#receipt_lines[@]} 'WORK_PLAN check:' lines where exactly one is required (#15220)"
+    return 0
+  fi
+  if ! [[ "${receipt_lines[0]}" =~ $receipt_re ]]; then
+    echo "NOT ELIGIBLE: the PR body's 'WORK_PLAN check:' line is not a machine-rendered 'written' receipt (render-hash <12hex>, <UTC>) — free prose, 'NOT RUN' or 'render-hash none' cannot verify a changed region (#15220)"
+    return 0
+  fi
+  hash="${BASH_REMATCH[1]}"
+  if [ "$hash" != "$head_hash" ]; then
+    echo "NOT ELIGIBLE: WORK_PLAN render-hash mismatch — PR body claims '$hash', the head region recomputes '$head_hash' (#15220)"
+    return 0
+  fi
+  echo "ELIGIBLE"
+}
+
+if [ "$FAST_PATH_RESULT" = "ELIGIBLE" ]; then
+  FAST_PATH_RESULT=$(docs_only_fast_path_plan_check "$PR_NUMBER")
+fi
+
 if [ "$FAST_PATH_RESULT" = "ELIGIBLE" ]; then
   echo "PASS (docs-only fast path, #6134): merge risk covered without axis judgment — changed files: $FAST_PATH_FILES"
   # Use this as the ONE_LINE_RATIONALE in Step 2's pre-merge comment, e.g.
@@ -470,7 +614,10 @@ fi
 
 If `$FAST_PATH_RESULT` is anything other than `ELIGIBLE` (a non-allowlisted
 file, or a closing reference such as `Closes #N`, or a failed closing-reference
-read), this PR is not fast-path eligible — fall through to the standing-authorization check below.
+read, or a WORK_PLAN plan-body region change without the matching
+machine-rendered `written` receipt (#15220 — a stamp-only edit, free prose in
+place of the receipt line, a wrong hash, or a failed read)), this PR is not
+fast-path eligible — fall through to the standing-authorization check below.
 
 **Standing operator authorization (#6850)** — run this check immediately
 after the docs-only fast path above (and, transitively, after the
@@ -634,6 +781,21 @@ behavior is byte-for-byte unchanged from before #6850.
   only after explicit opt-in. Other patterns retain their regex semantics.
   An unsupported checker, unreadable workflow or missing fallback entry
   disqualifies the class.
+- `checkWorkflowSecrets` (#14915, optional boolean) — same shape, for secret
+  use: `true` classifies the workflow structurally at the PR head instead of
+  matching the legacy secrets regexes line by line. A `secrets` context inside
+  an evaluated `${{ … }}` expression (embedded in longer scalar text included)
+  other than the built-in `secrets.GITHUB_TOKEN`, or a `secrets: inherit` key,
+  holds; literal text — an existing `deploy_secrets.py` path filter, a
+  `secrets.sh tests` step name, a YAML comment naming either — clears. Keep
+  the legacy `secrets\.(?!GITHUB_TOKEN\b)` and/or `secrets:\s*inherit` entries
+  in `privilegedContentPatterns` as the fallback for older Champions; an
+  upgraded Champion substitutes the structural check for exactly those two
+  entries (exact-string match, so a repository-supplied regex that merely
+  resembles them keeps its meaning). An unsupported checker, unreadable or
+  indeterminate workflow, or a missing fallback entry disqualifies the class.
+  The vetted CI-workflow check (`ci_workflow_blast_eval`) always uses the
+  structural classifier for its own list.
   **Fail closed**: unreadable or empty content, a file the contents API cannot
   serve (too large), a `removed` file, an invalid regex, a head SHA that moved
   while the files were read, or a value that is not an array of non-empty
@@ -762,13 +924,23 @@ standing_auth_fetch_diff() {
   DIFF_JSON=$(printf '%s' "$raw" | jq -s -c 'add // []' 2>/dev/null) || return 1
 }
 
-# standing_auth_content_clear <files-json> <regexes> [<check-write-all>]  (#12954, #14648)
+# standing_auth_content_clear <files-json> <regexes> [<check-write-all>] [<check-secrets>]  (#12954, #14648, #14915)
 # 0 = every file in <files-json> was read at the PR head SHA and no line of it
 # matches any privilegedContentPatterns regex. Anything else (a removed or
 # unreadable or empty file, an invalid regex, a head SHA that moved) = 1.
+# check-secrets substitutes the structural secrets classifier (#14915) for
+# the two legacy secrets regexes, so literal text (a deploy_secrets.py path
+# filter, a secrets.sh tests step name, a YAML comment naming either) clears
+# while an evaluated ${{ secrets.NAME }} reference or `secrets: inherit`
+# still holds. Repository-supplied regexes keep their meaning otherwise.
 standing_auth_content_clear() {
-  local files_json="$1" regexes="$2" check_write_all="${3:-false}" sha1 sha2 path enc body rx rc
-  [ -n "$regexes" ] || [ "$check_write_all" = true ] || return 0
+  local files_json="$1" regexes="$2" check_write_all="${3:-false}" check_secrets="${4:-false}" sha1 sha2 path enc body rx rc
+  if [ "$check_secrets" = true ]; then
+    # Exact-string (grep -F) so the substitution never touches a
+    # repository-supplied regex that merely resembles the legacy entries.
+    regexes=$(printf '%s\n' "$regexes" | grep -Fvx -e 'secrets\.(?!GITHUB_TOKEN\b)' -e 'secrets:\s*inherit' || true)
+  fi
+  [ -n "$regexes" ] || [ "$check_write_all" = true ] || [ "$check_secrets" = true ] || return 0
   printf '%s' "$files_json" | jq -e 'length > 0 and all(.[]; (.status // "") != "removed")' >/dev/null 2>&1 || return 1
   while IFS= read -r rx; do
     [ -z "$rx" ] && continue
@@ -786,6 +958,12 @@ standing_auth_content_clear() {
     if [ "$check_write_all" = true ]; then
       case "$path" in .github/workflows/*.yml|.github/workflows/*.yaml) ;; *) return 1 ;; esac
       printf '%s' "$body" | "${LOOM_DAEMON_BIN:-loom-daemon}" forge workflow-write-all-check >/dev/null 2>&1 || return 1
+    fi
+    # Structural secret classification (#14915): an unsupported checker or
+    # an unreadable workflow fails closed with the same return 1.
+    if [ "$check_secrets" = true ]; then
+      case "$path" in .github/workflows/*.yml|.github/workflows/*.yaml) ;; *) return 1 ;; esac
+      printf '%s' "$body" | "${LOOM_DAEMON_BIN:-loom-daemon}" forge workflow-secrets-check >/dev/null 2>&1 || return 1
     fi
     while IFS= read -r rx; do
       [ -z "$rx" ] && continue
@@ -861,7 +1039,7 @@ standing_auth_class_hits() {
 # read_ci_checks (greenCi) and, in "any" mode, FAST_PATH_FILES. In critical
 # mode $2 is the critical-files criterion's own $FILES and CRITICAL_PATTERNS its pattern list.
 standing_auth_eval() {
-  local mode="$1" crit_files="${2:-}" i NUM_CLASSES CLASS_ID PATTERNS CONDITIONS EXCLUDES FORBIDDEN PRIVILEGED CHECK_WORKFLOW_WRITE_ALL
+  local mode="$1" crit_files="${2:-}" i NUM_CLASSES CLASS_ID PATTERNS CONDITIONS EXCLUDES FORBIDDEN PRIVILEGED CHECK_WORKFLOW_WRITE_ALL CHECK_WORKFLOW_SECRETS
   local MATCH_FILES CHANGED_COUNT CRIT_DIFF="" CRIT_PATS_JSON CRIT_MATCH_FILES="" CFO ONLY_CRIT CLASS_FILES CLASS_DIFF
   local CLASS_HITS UNION_HITS="[]" USED_IDS="" CRIT_NAMES UNCOVERED
   local ADD_MIG ADD_MIG_STATE="" ADD_MIG_LIFTED=0 LOCKED_DEPS LOCKED_STATE="" LOCKED_USED=0
@@ -923,11 +1101,24 @@ standing_auth_eval() {
       | if has("checkWorkflowWriteAll") then
           .checkWorkflowWriteAll | if type == "boolean" then . else error("invalid workflow check") end
         else false end' "$CONFIG_FILE" 2>/dev/null) || continue
+    CHECK_WORKFLOW_SECRETS=$(jq -r --argjson i "$i" '
+      .champion.standingAuthorizations[$i]
+      | if has("checkWorkflowSecrets") then
+          .checkWorkflowSecrets | if type == "boolean" then . else error("invalid workflow check") end
+        else false end' "$CONFIG_FILE" 2>/dev/null) || continue
     PRIVILEGED=$(jq -r --argjson i "$i" --arg typed "$CHECK_WORKFLOW_WRITE_ALL" '
       .champion.standingAuthorizations[$i].privilegedContentPatterns // []
       | if $typed != "true" then .[]
         elif ([.[] | select(. == "write-all")] | length) == 1 then .[] | select(. != "write-all")
         else error("workflow check needs one legacy write-all guard") end' "$CONFIG_FILE" 2>/dev/null) || continue
+    if [ "$CHECK_WORKFLOW_SECRETS" = true ]; then
+      # #14915: the structural secrets classifier substitutes the two legacy
+      # secrets regexes (exact-string, like the write-all guard above); the
+      # opting-in class keeps them as the fallback for older Champions.
+      printf '%s' "$PRIVILEGED" | grep -Fxq -e 'secrets\.(?!GITHUB_TOKEN\b)' -e 'secrets:\s*inherit' \
+        || { STANDING_AUTH_WHY+="class '$CLASS_ID': checkWorkflowSecrets needs a legacy secrets guard"$'\n'; continue; }
+      PRIVILEGED=$(printf '%s' "$PRIVILEGED" | grep -Fvx -e 'secrets\.(?!GITHUB_TOKEN\b)' -e 'secrets:\s*inherit' || true)
+    fi
 
     # criticalFilesOnly (#12648): `null` (absent) or `false` is today's class.
     # `true` makes a class that waives the critical-files criterion for the critical-file hits
@@ -1105,10 +1296,10 @@ standing_auth_eval() {
     # privilegedContentPatterns (#12954): capability, read from each covered
     # file's full contents at the PR head SHA rather than from its name or its
     # changed lines. Any privileged line, or any unreadable file, disqualifies.
-    if [ -n "$PRIVILEGED" ] || [ "$CHECK_WORKFLOW_WRITE_ALL" = true ]; then
+    if [ -n "$PRIVILEGED" ] || [ "$CHECK_WORKFLOW_WRITE_ALL" = true ] || [ "$CHECK_WORKFLOW_SECRETS" = true ]; then
       [ -n "$DIFF_JSON" ] || standing_auth_fetch_diff || continue
       [ "$ONLY_CRIT" -eq 1 ] || CLASS_DIFF="$DIFF_JSON"
-      standing_auth_content_clear "$CLASS_DIFF" "$PRIVILEGED" "$CHECK_WORKFLOW_WRITE_ALL" || { STANDING_AUTH_WHY+="class '$CLASS_ID': privilegedContentPatterns hit or unreadable content in a covered file"$'\n'; continue; }
+      standing_auth_content_clear "$CLASS_DIFF" "$PRIVILEGED" "$CHECK_WORKFLOW_WRITE_ALL" "$CHECK_WORKFLOW_SECRETS" || { STANDING_AUTH_WHY+="class '$CLASS_ID': privilegedContentPatterns hit or unreadable content in a covered file"$'\n'; continue; }
     fi
 
     # File list matches this class and every condition is recognized --
@@ -1319,7 +1510,12 @@ to a CI workflow is not red on blast radius *because it is a workflow* when
   classification is by capability, never by file name, so `ci.yml` with a
   `secrets.CLOUDFLARE_API_TOKEN` deploy step is red for any edit and an offline
   `claude-bot-deploy-plan.yml` is not. The list is the one #12954's
-  `privilegedContentPatterns` classes use; both tests read it from this block;
+  `privilegedContentPatterns` classes use; both tests read it from this block.
+  Secret use is classified structurally (#14915), not by line regex: a
+  `secrets` context inside an evaluated `${{ … }}` expression other than
+  `secrets.GITHUB_TOKEN`, or a `secrets: inherit` key, holds — while an
+  existing `deploy_secrets.py` path filter, a `secrets.sh tests` step name or
+  a comment naming either is literal text and clears;
 - every workflow file has a non-empty patch, and no added or removed workflow
   line matches, case-insensitively, the words `secrets`, `id-token`,
   `pull_request_target`, `workflow_run`, `github.token`, `GITHUB_TOKEN`; and
@@ -1345,6 +1541,9 @@ is red.
 # Both Champion workflow suites extract this list. For a standing class,
 # keep the legacy `write-all` regex alongside this list and set
 # `checkWorkflowWriteAll: true` to use the same structural permission check.
+# The two `secrets` entries are likewise substituted, entry for entry, by
+# `forge workflow-secrets-check` (#14915) — always here, and for a class
+# after `checkWorkflowSecrets: true`.
 PRIVILEGED_CONTENT_PATTERNS=(
   'secrets\.(?!GITHUB_TOKEN\b)' 'secrets:\s*inherit' '^\s*environment:'
   ':\s*write\b' 'id-token' 'pull_request_target' 'workflow_run'
@@ -1397,7 +1596,7 @@ ci_workflow_blast_eval() {
     [.[] | select(((.filename | ascii_downcase) | startswith(".github/workflows/")) and ((.status // "") != "removed"))]' 2>/dev/null) \
     || { WF_BLAST_REASON="workflow files unparseable"; return 0; }
   if [ "$CONTENT_FILES" != "[]" ]; then
-    standing_auth_content_clear "$CONTENT_FILES" "$(printf '%s\n' "${PRIVILEGED_CONTENT_PATTERNS[@]}")" true \
+    standing_auth_content_clear "$CONTENT_FILES" "$(printf '%s\n' "${PRIVILEGED_CONTENT_PATTERNS[@]}")" true true \
       || { WF_BLAST_REASON="a workflow's head contents are privileged or unreadable"; return 0; }
   fi
   # permissions (#13291): direction-aware. A removed line naming it is red (it

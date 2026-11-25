@@ -64,7 +64,188 @@ fn clean_prints_the_kept_line_and_counts_held_branches_as_in_use() {
     assert!(wt.join("dirty.txt").exists());
 }
 
+/// A historical squash merge proves the PR head shipped. It says nothing about
+/// a later local commit, whether or not origin still has the old topic ref.
+#[test]
+fn safe_clean_preserves_local_work_after_an_issue_pr_merged() {
+    use std::os::unix::fs::PermissionsExt;
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().canonicalize().unwrap();
+    let repo = root.join("repo");
+    let branch = "feature/issue-42";
+    let wt = repo.join(".loom/worktrees/issue-42");
+    std::fs::create_dir_all(wt.parent().unwrap()).unwrap();
+    git(&repo, &["init", "-q", "-b", "main"]);
+    git(&repo, &["commit", "-q", "--allow-empty", "-m", "base"]);
+    git(
+        &repo,
+        &[
+            "remote",
+            "add",
+            "origin",
+            "https://github.com/example/project.git",
+        ],
+    );
+    git(&repo, &["update-ref", "refs/remotes/origin/main", "HEAD"]);
+    git(&repo, &["worktree", "add", "-qb", branch, wt.to_str().unwrap()]);
+    git(&wt, &["commit", "-q", "--allow-empty", "-m", "merged PR head"]);
+    let tip = || {
+        let out = Command::new("git")
+            .current_dir(&repo)
+            .args(["rev-parse", "--verify", branch])
+            .output()
+            .unwrap();
+        out.status
+            .success()
+            .then(|| String::from_utf8(out.stdout).unwrap().trim().to_owned())
+    };
+    let merged = tip().unwrap();
+    let topic = "refs/remotes/origin/feature/issue-42";
+    let rows = root.join("pulls.json");
+    let payload = serde_json::json!([{
+        "number": 43, "state": "closed", "merged_at": "2020-01-01T00:00:00Z",
+        "base": {"repo":{"full_name":"example/project"}},
+        "head":{"ref":branch, "sha":merged, "repo":{"full_name":"example/project","owner":{"login":"example"}}}
+    }]);
+    std::fs::write(&rows, payload.to_string()).unwrap();
+    let stub = root.join("gh");
+    std::fs::write(
+        &stub,
+        r#"#!/bin/sh
+case "$*" in
+  *"issue view"*) echo CLOSED ;;
+  *"pr list"*) echo '[{"number":43,"state":"MERGED","mergedAt":"2020-01-01T00:00:00Z"}]' ;;
+  *"/pulls?"*) cat "$PULL_ROWS" ;;
+  *) exit 1 ;;
+esac
+"#,
+    )
+    .unwrap();
+    std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let clean = |args: &[&str]| {
+        let mut cmd = Command::new(common::daemon_bin());
+        common::isolate_daemon_state(&mut cmd, &root);
+        let out = cmd
+            .current_dir(&repo)
+            .args(["clean", "--safe", "--force", "--workspace"])
+            .arg(&repo)
+            .args(args)
+            .env("LOOM_GH_BIN", &stub)
+            .env("PULL_ROWS", &rows)
+            .env("LOOM_HYGIENE_MEMO", "0")
+            .env("LOOM_CONFIG_DEFAULTS_FILE", "")
+            .stdin(Stdio::null())
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8(out.stdout).unwrap();
+        assert!(out.status.success(), "{stdout}\n{}", String::from_utf8_lossy(&out.stderr));
+        stdout
+    };
+    git(&wt, &["commit", "-q", "--allow-empty", "-m", "unpushed work"]);
+    let unpushed = tip().unwrap();
+    let dry = clean(&["--worktrees-only", "--dry-run"]);
+    assert!(
+        dry.contains(&format!("No remote or merged PR covers tip {unpushed} - keeping {branch}")),
+        "{dry}"
+    );
+    assert!(wt.exists());
+    assert_eq!(tip().as_deref(), Some(unpushed.as_str()));
+
+    let actual = clean(&["--worktrees-only"]);
+    assert!(actual.contains(&format!("keeping {branch}")), "{actual}");
+    assert!(!wt.exists(), "{actual}");
+    assert_eq!(tip().as_deref(), Some(unpushed.as_str()), "{actual}");
+    for has_remote_topic in [true, false] {
+        if has_remote_topic {
+            git(&repo, &["update-ref", topic, &merged]);
+        } else {
+            git(&repo, &["update-ref", "-d", topic]);
+        }
+        let out = clean(&["--branches-only"]);
+        assert!(out.contains("keeping feature/issue-42"), "{out}");
+        assert_eq!(tip().as_deref(), Some(unpushed.as_str()), "{out}");
+    }
+    // If the forge is unavailable, even an exact historical head stays.
+    git(&repo, &["branch", "-f", branch, &merged]);
+    std::fs::write(&rows, "unreadable").unwrap();
+    clean(&["--branches-only"]);
+    assert_eq!(tip().as_deref(), Some(merged.as_str()));
+    std::fs::write(&rows, payload.to_string()).unwrap();
+    clean(&["--branches-only"]);
+    assert!(tip().is_none(), "the squash-merged PR head can be deleted");
+
+    git(&repo, &["branch", branch, &unpushed]);
+    git(&repo, &["update-ref", topic, &unpushed]);
+    clean(&["--branches-only"]);
+    assert!(tip().is_none(), "a remote contains the exact tip");
+}
+
 // Fail this test binary on any spawn of the real `gh` (#10225, extends #10138).
 #[allow(dead_code)]
 #[path = "../src/live_gh_guard.rs"]
 mod live_gh_guard;
+
+/// A linked worktree paused mid-rebase reports `detached`; its rebase state
+/// lives under the common git dir. If the checkout is offline (locked or its
+/// volume gone) the branch must still be held, even though a remote-tracking
+/// ref makes the tip look safe to delete.
+#[test]
+fn safe_clean_keeps_branch_of_offline_worktree_paused_in_rebase() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().canonicalize().unwrap();
+    let repo = root.join("repo");
+    let branch = "feature/issue-42";
+    let wt = root.join("wt-issue-42");
+    let away = root.join("wt-issue-42-offline");
+    std::fs::create_dir_all(&repo).unwrap();
+    git(&repo, &["init", "-q", "-b", "main"]);
+    std::fs::write(repo.join("a.txt"), "base\n").unwrap();
+    git(&repo, &["add", "a.txt"]);
+    git(&repo, &["commit", "-q", "-m", "base"]);
+    git(&repo, &["worktree", "add", "-qb", branch, wt.to_str().unwrap()]);
+    std::fs::write(wt.join("a.txt"), "topic\n").unwrap();
+    git(&wt, &["commit", "-qam", "topic"]);
+    std::fs::write(repo.join("a.txt"), "main\n").unwrap();
+    git(&repo, &["commit", "-qam", "main change"]);
+    // Conflicting rebase: stops mid-way, leaving the worktree detached.
+    let mut rebase = Command::new("git");
+    rebase.current_dir(&wt).args(["rebase", "main"]);
+    assert!(!rebase.output().unwrap().status.success(), "rebase must conflict");
+    // The remote-reachability condition is true for the branch tip.
+    git(&repo, &["update-ref", "refs/remotes/origin/topic", branch]);
+    git(&repo, &["worktree", "lock", wt.to_str().unwrap()]);
+    std::fs::rename(&wt, &away).unwrap();
+
+    let mut cmd = Command::new(common::daemon_bin());
+    common::isolate_daemon_state(&mut cmd, &root);
+    let out = cmd
+        .current_dir(&repo)
+        .args([
+            "clean",
+            "--safe",
+            "--force",
+            "--branches-only",
+            "--workspace",
+        ])
+        .arg(&repo)
+        .env("LOOM_HYGIENE_MEMO", "0")
+        .env("LOOM_CONFIG_DEFAULTS_FILE", "")
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let exists = Command::new("git")
+        .current_dir(&repo)
+        .args([
+            "rev-parse",
+            "--verify",
+            "-q",
+            &format!("refs/heads/{branch}"),
+        ])
+        .output()
+        .unwrap()
+        .status
+        .success();
+    assert!(exists, "branch held by an offline paused rebase was deleted:\n{stdout}");
+    assert!(!stdout.contains("Deleted branch: feature/issue-42"), "{stdout}");
+}

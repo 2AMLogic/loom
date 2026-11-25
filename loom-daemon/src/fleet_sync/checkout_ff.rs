@@ -602,10 +602,12 @@ pub struct Env<'a> {
     pub elapsed: &'a dyn Fn() -> Duration,
     /// The clock.
     pub clock: &'a dyn Fn() -> DateTime<Utc>,
-    /// Is `sha` the head of a pull request the forge reports as merged
-    /// (#13588)? `None`: it could not be answered (no network, breaker open, a
-    /// failed lookup): the caller treats that as "not merged".
-    pub pr_merged: &'a dyn Fn(&Path, &str) -> Option<bool>,
+    /// Does the forge report `sha` as the head of any pull request, open or
+    /// merged (#13588, #14973: `refs/pull/N/head` keeps the commits on the
+    /// forge, and a rescue ref is written before any rehome)? `None`: it could
+    /// not be answered (no network, breaker open, a failed lookup): the caller
+    /// treats that as "not known".
+    pub pr_head: &'a dyn Fn(&Path, &str) -> Option<bool>,
 }
 
 impl Env<'_> {

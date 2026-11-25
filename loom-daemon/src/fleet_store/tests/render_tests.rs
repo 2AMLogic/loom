@@ -48,6 +48,34 @@ fn machine_tier_is_deep_merge_of_fleet_defaults_and_host_overlay() {
     assert_eq!(targets[1].value, json!({"observability": {"enabled": true}}));
 }
 
+/// #15252: a host's `modelProfileOverrides` beats the fleet default's, key by
+/// key — a canary host overrides `model` while inheriting the fleet's other
+/// override keys, and other hosts keep the fleet value.
+#[test]
+fn host_tier_model_profile_override_beats_fleet_tier_and_keeps_siblings() {
+    let p = paths();
+    let mut files = sample_files();
+    files.insert(
+        "fleet/defaults.json".to_string(),
+        r#"{"runtimes":{"modelProfileOverrides":{"zai-full":{"model":"glm-5.3","effort":"high"}}}}"#
+            .to_string(),
+    );
+    files.insert(
+        "fleet/hosts/build-1/defaults.json".to_string(),
+        r#"{"runtimes":{"modelProfileOverrides":{"zai-full":{"model":"glm-5.4"}}}}"#.to_string(),
+    );
+    let canary = render(&snapshot_of(&files), "build-1", &p.machine, &p.local).unwrap();
+    assert_eq!(
+        canary[0].value["runtimes"]["modelProfileOverrides"]["zai-full"],
+        json!({"model": "glm-5.4", "effort": "high"})
+    );
+    let other = render(&snapshot_of(&files), "build-2", &p.machine, &p.local).unwrap();
+    assert_eq!(
+        other[0].value["runtimes"]["modelProfileOverrides"]["zai-full"],
+        json!({"model": "glm-5.3", "effort": "high"})
+    );
+}
+
 #[test]
 fn render_write_then_check_roundtrips_to_in_sync() {
     let p = paths();

@@ -691,15 +691,14 @@ fn load_role_cursor(path: &Path) -> Option<PathBuf> {
     (!root.is_empty()).then(|| PathBuf::from(root))
 }
 
-/// Write the cursor atomically (temp file, then rename).
+/// Write the cursor atomically ([`crate::fs_util::write_atomic`]).
 fn write_role_cursor(path: &Path, root: &Path) -> std::io::Result<()> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    let tmp = path.with_extension("json.tmp");
     let body = serde_json::json!({ "root": root.to_string_lossy() });
-    std::fs::write(&tmp, body.to_string())?;
-    std::fs::rename(&tmp, path)
+    crate::fs_util::write_atomic(
+        path,
+        body.to_string().as_bytes(),
+        crate::fs_util::AtomicOpts::default(),
+    )
 }
 
 impl RoleDispatcher {

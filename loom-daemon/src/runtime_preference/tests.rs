@@ -52,6 +52,10 @@ pub(super) struct ClearedRuntimeEnv {
     _profile_root: tempfile::TempDir,
     /// Crate-wide `LOOM_CODEX_PROFILE_ROOT` lock (#9964); released after `Drop`.
     _profile_root_lock: crate::tokens_pool::profile_root_env::ProfileRootLock,
+    /// Crate-wide `LOOM_CODEX_HOME` lock (#15174); released after `Drop` and
+    /// after the profile-root lock above (acquired before it — see
+    /// `codex_home_env`'s documented lock order).
+    _codex_home_lock: crate::tokens_pool::codex_home_env::CodexHomeLock,
 }
 
 const ISOLATED_VARS: [&str; 17] = [
@@ -82,6 +86,7 @@ const ISOLATED_VARS: [&str; 17] = [
 
 impl ClearedRuntimeEnv {
     pub(super) fn new() -> Self {
+        let codex_home_lock = crate::tokens_pool::codex_home_env::lock();
         let profile_root_lock = crate::tokens_pool::profile_root_env::lock();
         let prior = ISOLATED_VARS
             .iter()
@@ -97,6 +102,7 @@ impl ClearedRuntimeEnv {
             prior,
             _profile_root: profile_root,
             _profile_root_lock: profile_root_lock,
+            _codex_home_lock: codex_home_lock,
         }
     }
 }

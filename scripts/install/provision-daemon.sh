@@ -686,6 +686,63 @@ _pmd_provision_defaults_payload() {
   return 0
 }
 
+# _pmd_version_core <version-string>
+#
+# Echo the leading `X.Y.Z` of a `loom-daemon --version` string (e.g.
+# "loom-daemon 0.19.1316" -> "0.19.1316", "v0.20.30-11-g8d328cd81" ->
+# "0.20.30"), or nothing when none is present. Pure bash: no sort(1) needed.
+_pmd_version_core() {
+  if [[ "${1:-}" =~ ([0-9]+)\.([0-9]+)\.([0-9]+) ]]; then
+    echo "${BASH_REMATCH[1]}.${BASH_REMATCH[2]}.${BASH_REMATCH[3]}"
+  fi
+}
+
+# _pmd_version_lt <X.Y.Z> <X.Y.Z> -- true when the first is strictly older.
+_pmd_version_lt() {
+  local -a a b
+  IFS=. read -r -a a <<<"$1"
+  IFS=. read -r -a b <<<"$2"
+  local i
+  for i in 0 1 2; do
+    (( 10#${a[i]:-0} < 10#${b[i]:-0} )) && return 0
+    (( 10#${a[i]:-0} > 10#${b[i]:-0} )) && return 1
+  done
+  return 1
+}
+
+# _pmd_downgrade_refused <src_ver> <dest_ver>   (issue #15261)
+#
+# Return 0 (= refuse the install) when the installer-only guard is on
+# (LOOM_PROVISION_REFUSE_DOWNGRADE=1, set by install.sh / install-loom.sh on
+# the call, never by `loom update`) and the source build is OLDER than the
+# installed daemon. Fail closed on an unparseable source version when the
+# installed one parses; an unparseable INSTALLED version (a broken binary)
+# is replaced as before. LOOM_INSTALL_ALLOW_DOWNGRADE=1 (--allow-downgrade)
+# disables the guard.
+_pmd_downgrade_refused() {
+  [[ -n "${LOOM_PROVISION_REFUSE_DOWNGRADE:-}" ]] || return 1
+  case "${LOOM_INSTALL_ALLOW_DOWNGRADE:-}" in 1|true|yes) return 1 ;; esac
+  local src_core dest_core
+  src_core="$(_pmd_version_core "$1")"
+  dest_core="$(_pmd_version_core "$2")"
+  [[ -n "$dest_core" ]] || return 1
+  [[ -n "$src_core" ]] && ! _pmd_version_lt "$src_core" "$dest_core" && return 1
+  return 0
+}
+
+# provision_machine_change_notice <src_bin> [dest_dir]   (issue #15261)
+#
+# One line, printed by the repo installers before the machine-level steps
+# run (never under --repo-only), even with --yes. Print-only: no prompt.
+provision_machine_change_notice() {
+  local src_bin="${1:-}"
+  local dest_bin="${2:-${LOOM_DAEMON_BIN_DIR:-$HOME/.local/bin}}/loom-daemon"
+  local src_ver="unknown" dest_ver="none"
+  [[ -x "$src_bin" ]] && src_ver="$("$src_bin" --version 2>/dev/null || echo unknown)"
+  [[ -x "$dest_bin" ]] && dest_ver="$("$dest_bin" --version 2>/dev/null || echo unknown)"
+  _pmd_info "Machine change: loom-daemon ${dest_ver#loom-daemon } -> ${src_ver#loom-daemon }; user-scope hooks in ~/.claude/settings.json will be re-wired. Pass --repo-only to skip."
+}
+
 # provision_machine_daemon <src_bin> [dest_dir] [defaults_src_dir]
 #
 # Installs <src_bin> to <dest_dir>/loom-daemon (default: LOOM_DAEMON_BIN_DIR,
@@ -770,6 +827,11 @@ provision_machine_daemon() {
   # holds the same version (compare `--version` strings).
   if [[ -x "$dest_bin" ]]; then
     dest_ver=$("$dest_bin" --version 2>/dev/null || echo "unknown")
+    if [[ "$src_ver" != "$dest_ver" ]] && _pmd_downgrade_refused "$src_ver" "$dest_ver"; then
+      _pmd_warn "refusing to replace the installed loom-daemon ($dest_ver) with an older/unverifiable build ($src_ver); $dest_bin was left untouched"
+      _pmd_warn "pass --allow-downgrade (or LOOM_INSTALL_ALLOW_DOWNGRADE=1) to install it anyway"
+      return 1
+    fi
     if [[ "$src_ver" == "$dest_ver" && "$src_ver" != "unknown" ]]; then
       _pmd_ok "already current at $dest_bin ($dest_ver)"
       _pmd_install_shim "loom-clean" "clean" "$dest_dir"

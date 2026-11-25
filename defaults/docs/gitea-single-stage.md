@@ -185,7 +185,7 @@ What the rest of the Builder chain does on Gitea when driven by hand
 
 | Step | Result |
 |---|---|
-| `worktree.sh 1` | **Works** — branch `feature/issue-1` + worktree created; **lease publish fails** (`publish gh call failed`, exit 2) so the lease is local-only — #14941 |
+| `worktree.sh 1` | **Works** — branch `feature/issue-1` + worktree created; **lease publish fails** (`publish gh call failed`, exit 2) so the lease is local-only — #14941 *(fixed since: publish and renewal use the Gitea API, see `lease-record.md` § "Builder leases on a Gitea checkout")* |
 | commit + `git push -u origin feature/issue-1` | **Works** with the out-of-repo credential store |
 | `create-pr.sh` | **Exits 2 by design** ("GitHub App permission-window fallback is GitHub-specific; on gitea open the PR with your forge's own CLI") — raw API below |
 | label swap `loom:issue → loom:building` | No script surface on Gitea (`forge_gh_swap_label_rl_safe` is gh-backed) — raw API |

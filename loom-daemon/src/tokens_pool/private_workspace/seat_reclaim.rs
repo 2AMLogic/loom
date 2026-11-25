@@ -437,15 +437,12 @@ fn inspect_entry(
             .push("worktree outside the private volume".into());
         return Ok(());
     }
-    let branch = repository::git(path, &["rev-parse", "--abbrev-ref", "HEAD"])?
-        .trim()
-        .to_owned();
-    if branch == "HEAD" {
+    let Some(branch) = repository::current_branch(path)? else {
         outcome
             .preserved
             .push("detached HEAD (unnamed work)".into());
         return Ok(());
-    }
+    };
     if repository::ahead_of_origin(path, "HEAD")? > 0 {
         outcome.preserved.push("unpushed commits on HEAD".into());
         return Ok(());
@@ -996,6 +993,7 @@ mod tests {
                 container_id: "test-container".into(),
                 branch: None,
                 slug: None,
+                mirror_objects: None,
             };
             repository::prepare(&root, &args).unwrap();
             Self {
@@ -1142,6 +1140,50 @@ mod tests {
                 .len()
                 == 40
         );
+    }
+
+    /// PR-fetch residue shadowing a merged branch: the pass must hand the
+    /// branch's true name to the PR lookup (so the checkout is reclaimed),
+    /// skip a detached sibling, and leave every ref it does not own — the
+    /// branch ref and the residue — exactly where it was (#15027).
+    #[test]
+    fn residue_shadowed_worktrees_pass_their_true_branch_to_the_pr_lookup() {
+        let _fork = super::super::tests::fork_guard();
+        let volume = Volume::new();
+        let shadowed = volume.worktree("issue-344", true);
+        let detached = volume.repo().join(".loom/worktrees").join("detached");
+        raw_git(
+            &volume.repo(),
+            &[
+                "worktree",
+                "add",
+                "--detach",
+                detached.to_string_lossy().as_ref(),
+            ],
+        );
+        let repo = volume.repo();
+        let tip = raw_git(&repo, &["rev-parse", "refs/heads/feature/issue-344"]);
+        raw_git(&repo, &["update-ref", "refs/feature/issue-344", &tip]);
+        raw_git(&repo, &["update-ref", "refs/remotes/feature/issue-344", &tip]);
+        let lookup = |_: &Path, _: &str, branch: &str, _: &str| -> PrAtHead {
+            if branch == "feature/issue-344" {
+                PrAtHead::Merged(merged_days_ago(30))
+            } else {
+                PrAtHead::NoPr
+            }
+        };
+        let outcome = seat_reclaim(&volume.root, &args(0, 0), &lookup, Utc::now()).unwrap();
+        assert!(!shadowed.exists(), "the shadowed checkout is reclaimed by its true name");
+        assert!(detached.exists(), "a detached worktree is never a candidate");
+        assert_eq!(outcome.worktrees_removed, 1);
+        let reasons = outcome.preserved.join("\n");
+        assert!(reasons.contains("detached HEAD (unnamed work)"), "{reasons}");
+        assert!(
+            raw_git(&repo, &["rev-parse", "--verify", "refs/heads/feature/issue-344"]).len() == 40,
+            "the branch ref survives the checkout's removal"
+        );
+        assert_eq!(raw_git(&repo, &["rev-parse", "refs/feature/issue-344"]), tip);
+        assert_eq!(raw_git(&repo, &["rev-parse", "refs/remotes/feature/issue-344"]), tip);
     }
 
     #[test]

@@ -204,7 +204,7 @@ fn only_open_pr_rows_are_counted() {
     let mut closed = row(4, true);
     closed.state = "closed".to_string();
     let rows = vec![row(1, true), row(2, false), row(3, true), closed];
-    assert_eq!(count_pr_rows(&rows), 2);
+    assert_eq!(count_axis_rows(DebtAxis::Review, &rows), 2);
     let ledger = DemandLedger::default();
     let ws = workspace("{}");
     record_listing(&ledger, ws.path(), "loom:review-requested", &rows);

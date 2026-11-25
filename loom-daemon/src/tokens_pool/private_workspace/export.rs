@@ -505,6 +505,7 @@ mod tests {
             gh_config: None,
             session_image: None,
             extra_mounts: Vec::new(),
+            mirror_binds: Vec::new(),
         };
         let second = identify("https://example.invalid/o/second").unwrap();
         config.repositories.push(Registered {
@@ -756,6 +757,7 @@ mod tests {
             gh_config: None,
             session_image: None,
             extra_mounts: Vec::new(),
+            mirror_binds: Vec::new(),
         };
         let job = lease::Job {
             owner: "fixture".into(),

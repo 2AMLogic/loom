@@ -167,6 +167,7 @@ fn absent_account_wait_transitions_to_the_recorded_seat_and_retains_a_raced_dead
         gh_config: None,
         session_image: None,
         extra_mounts: Vec::new(),
+        mirror_binds: Vec::new(),
     };
     let missing = ConfiguredSeatMissing::of(&private);
     let expected = missing.clone();

@@ -70,6 +70,70 @@
       "name": "agent-7",
       "credential_kind": "codex_home",
       "credential_reference": "agent-7",
+      "enabled": false,
+      "email": null
+    },
+    {
+      "provider": "codex",
+      "name": "agent-8",
+      "credential_kind": "codex_home",
+      "credential_reference": "agent-8",
+      "enabled": true,
+      "email": null
+    },
+    {
+      "provider": "codex",
+      "name": "agent-9",
+      "credential_kind": "codex_home",
+      "credential_reference": "agent-9",
+      "enabled": true,
+      "email": null
+    },
+    {
+      "provider": "codex",
+      "name": "agent-10",
+      "credential_kind": "codex_home",
+      "credential_reference": "agent-10",
+      "enabled": true,
+      "email": null
+    },
+    {
+      "provider": "codex",
+      "name": "agent-11",
+      "credential_kind": "codex_home",
+      "credential_reference": "agent-11",
+      "enabled": true,
+      "email": null
+    },
+    {
+      "provider": "codex",
+      "name": "agent-12",
+      "credential_kind": "codex_home",
+      "credential_reference": "agent-12",
+      "enabled": true,
+      "email": null
+    },
+    {
+      "provider": "codex",
+      "name": "agent-14",
+      "credential_kind": "codex_home",
+      "credential_reference": "agent-14",
+      "enabled": true,
+      "email": null
+    },
+    {
+      "provider": "codex",
+      "name": "agent-15",
+      "credential_kind": "codex_home",
+      "credential_reference": "agent-15",
+      "enabled": true,
+      "email": null
+    },
+    {
+      "provider": "codex",
+      "name": "agent-16",
+      "credential_kind": "codex_home",
+      "credential_reference": "agent-16",
       "enabled": true,
       "email": null
     }

@@ -1369,6 +1369,28 @@ pub fn register_owner_gh_config_dir(owner: &str, config_dir: &Path) {
     }
 }
 
+/// Drop every owner registration — the slug-keyed map (#5431) and the
+/// refresh-source map (#6171) — whose `GH_CONFIG_DIR` is exactly `config_dir`,
+/// and return how many owners were dropped. Matching on the directory rather
+/// than the owner key means a registration pointing anywhere else (another
+/// root's live credential) is never touched. The reap of a stale by-owner
+/// directory calls this so the registry and the disk never disagree: without
+/// it every [`gh_config_dir_for_owner_slug`] caller keeps being pointed at a
+/// directory with no `hosts.yml`, and the "already established" short-circuits
+/// (`write_scope`, `cross_owner`) never re-mint (#14548).
+pub fn unregister_owner_gh_config_dir(config_dir: &Path) -> usize {
+    let mut dropped = 0;
+    if let Ok(mut map) = owner_slug_config_registry().lock() {
+        let before = map.len();
+        map.retain(|_, dir| dir.as_path() != config_dir);
+        dropped += before - map.len();
+    }
+    if let Ok(mut map) = owner_refresh_registry().lock() {
+        map.retain(|_, (_, dir)| dir.as_path() != config_dir);
+    }
+    dropped
+}
+
 /// The `GH_CONFIG_DIR` registered for the owner segment of `owner_repo`, or
 /// `None` when that owner is not a registered cross-owner managed owner (the
 /// common single-owner case, or the root owner's own repos) — the slug-keyed

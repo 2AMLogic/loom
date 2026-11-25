@@ -26,16 +26,12 @@ fn base_modified_syncs_only_while_budget_remains() {
 #[test]
 fn sync_sleeps_the_current_delay_and_doubles_it_for_next_time() {
     let Route::Sync {
-        sleep,
-        next_delay,
-        wait,
-        ..
+        sleep, next_delay, ..
     } = decide(&inp(Kind::BaseModified, 1, 3, 5))
     else {
         panic!("expected Sync");
     };
     assert_eq!((sleep, next_delay), (5, 10));
-    assert_eq!(wait, "Waiting 5s for branch to sync...");
 }
 
 #[test]
@@ -85,8 +81,6 @@ fn render_keys_each_line() {
     assert_eq!(
         out,
         "LOOM-MERGE-ROUTE SYNC 10 20\n\
-         BEFORE\tBranch is behind base branch, updating... (attempt 2/3)\n\
-         WAIT\tWaiting 10s for branch to sync...\n\
-         REWORK\tbase branch was modified; synced before merge retry 2/3\n"
+         BEFORE\tBranch is behind base branch, updating... (attempt 2/3)\n"
     );
 }

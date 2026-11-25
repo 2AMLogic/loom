@@ -27,11 +27,12 @@
 //! fresh verification against the forge.
 //!
 //! Seat-side borrowing — the read-only objects bind, the single verified
-//! alternate in seat clones, and idle in-place migration — is the next
-//! slice of #14680 and consumes [`MirrorStore::attach`],
-//! [`MirrorStore::detach`] and [`MirrorStore::objects_dir`] for that.
-//! Until it lands, seats keep fully private clones with no alternate,
-//! exactly as before.
+//! alternate in seat clones, and idle in-place migration — landed with
+//! #14680's seat-side slice: [`MirrorStore::attach`] records the
+//! borrowing seat, [`MirrorStore::objects_dir`] names the bind source,
+//! and [`MirrorStore::detach`] retires a borrower record (still unwired;
+//! see #15168). A clone with no alternate — the shape every seat had
+//! before #14680 — stays supported and admitted.
 use super::forge_auth::ProvedReader;
 use super::read_authority::{
     self, Admission, BorrowerAuthority, Credential, LiveProviderHttp, Provider, Publication,
@@ -161,9 +162,8 @@ impl MirrorStore {
         self.dir.join(GIT_DIR)
     }
 
-    /// The objects directory a seat-side read-only bind mounts (the next
-    /// slice of #14680). Nothing in this module ever exposes it writable.
-    #[allow(dead_code)] // seat binds land with #14680's seat-side slice
+    /// The objects directory a seat-side read-only bind mounts. Nothing
+    /// in this module ever exposes it writable.
     pub(super) fn objects_dir(&self) -> PathBuf {
         self.git_dir().join("objects")
     }
@@ -264,13 +264,12 @@ impl MirrorStore {
         Ok(created)
     }
 
-    /// Admit one seat as a borrower of this store under `proof` (the
-    /// seat-side slice of #14680 calls this at bind time). A refused
+    /// Admit one seat as a borrower of this store under `proof`
+    /// (`plan_one` calls this at bind time). A refused
     /// admission writes nothing and the seat stays on its private clone.
     ///
     /// # Errors
     /// [`read_authority::admit_borrower`]'s refusal, or a write failure.
-    #[allow(dead_code)] // seat binds land with #14680's seat-side slice
     pub(super) fn attach(
         &self,
         account: &str,
@@ -299,7 +298,7 @@ impl MirrorStore {
 
     /// Retire one borrower's record (a seat that stopped borrowing). Absent
     /// is success: there is nothing to retire.
-    #[allow(dead_code)] // seat binds land with #14680's seat-side slice
+    #[allow(dead_code)] // no non-test caller yet; seat-side lifecycle follow-up #15168
     pub(super) fn detach(&self, account: &str) -> Result<()> {
         let path = self
             .dir
@@ -790,5 +789,187 @@ pub(super) fn refresh_session_mirrors(workspace: &Path, config: &Config) {
                 id.key
             ),
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Seat-side borrowing (#14680): the binds a container is created with.
+// ---------------------------------------------------------------------------
+
+/// The host objects directory one bind exposes: `<root>/<slug>/objects.git/objects`,
+/// the same layout [`MirrorStore`] owns.
+pub(super) fn objects_dir(root: &Path, slug: &str) -> PathBuf {
+    root.join(slug).join(GIT_DIR).join("objects")
+}
+
+/// The in-container destination of that bind: `MIRRORS/<slug>/objects`,
+/// which is also the only alternate a clone of that repository may name.
+pub(super) fn in_container_objects(slug: &str) -> String {
+    format!("{MIRRORS}/{slug}/objects")
+}
+
+/// Prove, refresh and attach one repository's mirror store: everything a
+/// container creation needs before Docker can expose `objects_dir()`. The
+/// store lock serializes concurrent seats; the FIRST proved grant is pinned
+/// by the store, and this seat is recorded as a borrower while its container
+/// can read the bind (#14680).
+fn plan_one(workspace: &Path, root: &Path, id: &RepoId, account: &str) -> Result<()> {
+    // A fake installed on this thread (`fake`, tests only) stands in for the
+    // whole prove+refresh+attach leg.
+    #[cfg(test)]
+    if let Some(scripted) = fake::dispatch(id) {
+        return scripted;
+    }
+    let store = MirrorStore::open(root, id)?;
+    let proof = prove_for_mirror(workspace, id).context("read authority could not be proved")?;
+    store.refresh(&proof, SystemTime::now())?;
+    store.attach(account, &proof, SystemTime::now())?;
+    Ok(())
+}
+
+/// The mirror binds a NEW container of this account is created with (#14680):
+/// the slugs of every registered repository whose store could be proved,
+/// refreshed and attached. Any failure skips that repository — its clone
+/// stays fully private — and is never fatal to the session.
+pub(super) fn plan_binds(workspace: &Path, config: &Config) -> Vec<String> {
+    let root = match mirror_root() {
+        Ok(root) => root,
+        Err(error) => {
+            log::debug!(
+                "private session {}: no mirror root configured; every clone stays private \
+                 ({error})",
+                config.account
+            );
+            return Vec::new();
+        }
+    };
+    let mut targets = vec![config.primary()];
+    for registered in &config.repositories {
+        if let Ok(target) = config.target(Some(&registered.repository)) {
+            targets.push(target);
+        }
+    }
+    let mut binds = Vec::new();
+    for target in targets {
+        let Ok(id) = identify(&target.repository) else {
+            continue;
+        };
+        if binds.iter().any(|slug| slug == &id.slug) {
+            continue;
+        }
+        if let Err(error) = super::lifecycle::check_firewall(workspace, &id) {
+            log::debug!(
+                "private session {}: mirror bind for {} skipped ({error})",
+                config.account,
+                id.key
+            );
+            continue;
+        }
+        match plan_one(workspace, &root, &id, &config.account) {
+            Ok(()) => binds.push(id.slug.clone()),
+            Err(error) => log::warn!(
+                "private session {}: mirror bind for {} not established; that clone stays \
+                 fully private ({error})",
+                config.account,
+                id.key
+            ),
+        }
+    }
+    binds
+}
+
+/// The in-container objects path preparation of `target` borrows through:
+/// the mirror path of exactly that repository, and only when the container
+/// was created with that bind recorded (#14680). A repository registered
+/// after creation — or an unidentifiable one — prepares fully private.
+pub(super) fn bound_objects(config: &Config, target: &Target) -> Option<String> {
+    let alternate = mirror_alternate(&target.repository)?;
+    let slug = alternate
+        .strip_prefix(MIRRORS)?
+        .strip_prefix('/')?
+        .strip_suffix("/objects")?;
+    config
+        .mirror_binds
+        .iter()
+        .any(|bound| bound == slug)
+        .then_some(alternate)
+}
+
+/// Every recorded bind's store must be usable before a container is
+/// recreated with that bind (#14680): a clone that shed published objects
+/// into its mirror dangles without them, so a missing store is re-fetched
+/// from origin here and a store that cannot be re-established refuses the
+/// recreation — the volume and its work are preserved untouched.
+///
+/// # Errors
+/// A recorded slug belongs to no repository of this account, or its store
+/// is absent and cannot be re-created and fetched from origin.
+pub(super) fn ensure_bound(workspace: &Path, config: &Config) -> Result<()> {
+    if config.mirror_binds.is_empty() {
+        return Ok(());
+    }
+    let root = mirror_root().context(
+        "no mirror root configured for a session whose clones borrow mirrors; refusing to \
+         recreate it without them",
+    )?;
+    let mut targets = vec![config.primary()];
+    for registered in &config.repositories {
+        if let Ok(target) = config.target(Some(&registered.repository)) {
+            targets.push(target);
+        }
+    }
+    for slug in &config.mirror_binds {
+        let target = targets
+            .iter()
+            .find(|target| identify(&target.repository).is_ok_and(|id| &id.slug == slug))
+            .with_context(|| {
+                format!("origin object mirror bind {slug} is not a repository of this account")
+            })?;
+        let id = identify(&target.repository).expect("identify checked while resolving the target");
+        if objects_dir(&root, slug).is_dir() {
+            continue;
+        }
+        plan_one(workspace, &root, &id, &config.account).with_context(|| {
+            format!(
+                "origin object mirror {slug} is not usable; refusing to recreate the session \
+                 without the objects its clones borrow — restore {MIRROR_ROOT_ENV} or the \
+                 origin, or clear the bind record"
+            )
+        })?;
+    }
+    Ok(())
+}
+
+/// The plan-one-bind seam: production verifies against the live forge,
+/// lifecycle tests script it so a planned bind never touches a network or a
+/// credential in a test. Mirrors [`super::docker::fake`].
+#[cfg(test)]
+pub(super) mod fake {
+    use super::super::RepoId;
+    use anyhow::Result;
+    use std::cell::RefCell;
+
+    pub(in super::super) type Handler = Box<dyn Fn(&RepoId) -> Result<()>>;
+
+    thread_local! {
+        static HANDLER: RefCell<Option<Handler>> = const { RefCell::new(None) };
+    }
+
+    /// Route this thread's bind planning to `handler` until the guard drops.
+    pub(in super::super) fn install(handler: Handler) -> Guard {
+        HANDLER.with(|h| *h.borrow_mut() = Some(handler));
+        Guard
+    }
+
+    pub(in super::super) struct Guard;
+
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            HANDLER.with(|h| *h.borrow_mut() = None);
+        }
+    }
+
+    pub(super) fn dispatch(id: &RepoId) -> Option<Result<()>> {
+        HANDLER.with(|h| h.borrow_mut().as_mut().map(|handler| handler(id)))
     }
 }

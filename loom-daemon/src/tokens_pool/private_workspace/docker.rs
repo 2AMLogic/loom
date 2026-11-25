@@ -191,7 +191,12 @@ pub(super) fn validate_settings(config: &Config, state: &Value) -> Result<()> {
     let expected = 2
         + bundle::PROFILE_CONTROLS.len()
         + usize::from(config.gh_config.is_some())
-        + config.extra_mounts.len();
+        + config.extra_mounts.len()
+        // One read-only bind per origin object mirror the container was
+        // created with (#14680): each is verified below against its exact
+        // host source and in-container destination, so an extra, writable,
+        // or wrong-repository mirror bind cannot pass.
+        + authorized_mirror_binds(config)?.len();
     if mounts.len() != expected {
         bail!("private session has unexpected mounts; no host workspace, peer volume or runtime socket may be mounted, and every account profile control file must be bound read-only");
     }
@@ -238,6 +243,11 @@ pub(super) fn validate_settings(config: &Config, state: &Value) -> Result<()> {
                         && bind_source_matches(config, mount, &extra.host)
                         && mount["RW"] == false
                 })
+                // A read-only origin object mirror bind (#14680): only this
+                // repository's own mirror, only at its own `MIRRORS/<slug>`
+                // destination, only from the host mirror root — anything else
+                // under `/mirrors` fails here and breaks the count above.
+                || mirror_bind_valid(config, mount, other)
             }
         };
         if !valid {
@@ -246,6 +256,43 @@ pub(super) fn validate_settings(config: &Config, state: &Value) -> Result<()> {
     }
 
     Ok(())
+}
+
+/// The recorded mirror binds, after proving each names a repository of THIS
+/// account: a bind for another repository's objects is exactly the
+/// unauthorized read the mirror rule exists to prevent.
+fn authorized_mirror_binds(config: &Config) -> Result<&[String]> {
+    let slugs: Vec<String> = std::iter::once(&config.repository)
+        .chain(config.repositories.iter().map(|r| &r.repository))
+        .filter_map(|url| identify(url).ok().map(|id| id.slug))
+        .collect();
+    for bound in &config.mirror_binds {
+        if !slugs.contains(bound) {
+            bail!("origin object mirror bind {bound} is not a repository of this account");
+        }
+    }
+    Ok(&config.mirror_binds)
+}
+
+/// Whether `mount` is exactly the read-only bind of `bound`'s mirror: a bind
+/// from the host mirror root, at `MIRRORS/<slug>/objects`, read-only.
+fn mirror_bind_valid(config: &Config, mount: &Value, destination: &str) -> bool {
+    let Some(slug) = destination
+        .strip_prefix(MIRRORS)
+        .and_then(|rest| rest.strip_prefix('/'))
+        .and_then(|rest| rest.strip_suffix("/objects"))
+    else {
+        return false;
+    };
+    if !config.mirror_binds.iter().any(|bound| bound == slug) {
+        return false;
+    }
+    let Ok(root) = mirror::mirror_root() else {
+        return false;
+    };
+    mount["Type"] == "bind"
+        && bind_source_matches(config, mount, &mirror::objects_dir(&root, slug))
+        && mount["RW"] == false
 }
 
 /// The read-only control-file binds a private session is created with. One
@@ -815,6 +862,32 @@ pub(super) fn create(config: &Config, image: &str) -> Result<()> {
             ),
         ]);
     }
+    // One read-only bind per origin object mirror the container is created
+    // with (#14680). The host objects directory must already be populated:
+    // Docker would silently create a missing bind source as an empty
+    // root-owned directory, and a clone borrowing through an empty store
+    // would lose every published object it shed to it.
+    if !config.mirror_binds.is_empty() {
+        let root = mirror::mirror_root()?;
+        for slug in authorized_mirror_binds(config)? {
+            let objects = mirror::objects_dir(&root, slug);
+            if !objects.is_dir() {
+                bail!(
+                    "origin object mirror {slug} has no objects directory at {}; refusing to \
+                     bind an empty one",
+                    objects.display()
+                );
+            }
+            args.extend([
+                "--mount".into(),
+                format!(
+                    "type=bind,src={},dst={},readonly",
+                    objects.display(),
+                    mirror::in_container_objects(slug)
+                ),
+            ]);
+        }
+    }
     args.extend([
         "--entrypoint".into(),
         "/usr/bin/tini".into(),
@@ -1185,6 +1258,13 @@ pub(super) fn prepare_with(
     }
     if let Some(slug) = &target.slug {
         args.extend(["--slug", slug]);
+    }
+    // The read-only origin mirror bind this clone borrows published objects
+    // through (#14680): handed down from the container's recorded binds, so
+    // the in-container verb never guesses a path.
+    let bound_mirror = mirror::bound_objects(config, target);
+    if let Some(objects) = bound_mirror.as_deref() {
+        args.extend(["--mirror-objects", objects]);
     }
     let output = command_env(&args, &auth.child_env(), EXEC_TIMEOUT).context("private workspace endpoint failed; use a current session image supporting private-workspace protocol")?;
     prepare_result(&output, |path| {

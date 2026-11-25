@@ -1,6 +1,5 @@
 # Loom
 
-[![codecov](https://codecov.io/gh/2AMLogic/loom/branch/main/graph/badge.svg)](https://codecov.io/gh/2AMLogic/loom)
 [![GitHub Release](https://img.shields.io/github/v/release/2AMLogic/loom?include_prereleases)](https://github.com/2AMLogic/loom/releases)
 
 **AI-powered development orchestration using your forge as the coordination layer.**
@@ -237,6 +236,8 @@ loom-daemon init /path/to/your/repo
 ```
 your-repo/
 ├── .loom/
+│   ├── CLAUDE.md        # Installed Claude guide (root CLAUDE.md points here)
+│   ├── AGENTS.md        # Installed AGENTS guide (root AGENTS.md points here)
 │   ├── config.json      # Terminal configuration
 │   ├── config/          # Additional config data (e.g. skill-routes.json)
 │   ├── roles/           # Agent role definitions
@@ -245,9 +246,16 @@ your-repo/
 │   ├── hooks/           # Guard hooks (PreToolUse)
 │   ├── docs/            # Reference documentation
 │   └── bin/             # CLI entry point (loom)
-├── .claude/commands/loom/  # Slash commands
-├── .github/labels.yml   # Workflow labels
-└── CLAUDE.md            # AI context document
+├── .claude/
+│   ├── agents/          # Role subagent definitions
+│   ├── commands/loom/   # Slash commands
+│   └── settings.json    # Project-level Claude Code settings (merged on reinstall)
+├── .agents/skills/      # Agent skills (e.g. loom-curator/SKILL.md)
+├── .github/
+│   ├── labels.yml       # Workflow labels
+│   └── ISSUE_TEMPLATE/  # Issue templates (config.yml, task.yml)
+├── CLAUDE.md            # Root pointer to .loom/CLAUDE.md
+└── AGENTS.md            # Root pointer to .loom/AGENTS.md
 ```
 
 The installer also makes user-level changes outside your repo (`--dry-run` lists them):
@@ -374,14 +382,14 @@ gh pr create --label "loom:review-requested"
 | `/loom:sweep` | Single-issue lifecycle orchestration (Curator → Merge) | Per-issue |
 | `loom-daemon` + `mcp__loom__dispatch_sweep` | Multi-issue detached dispatch (Tier 2) | Continuous, opt-in |
 | `/loom:builder` | Implement features and fixes | Manual |
-| `/loom:judge` | Review pull requests | Cron via GH Actions |
-| `/loom:curator` | Enhance and organize issues | Cron via GH Actions |
+| `/loom:judge` | Review pull requests | Daemon role runner (preferred, opt-in) or GH Actions cron |
+| `/loom:curator` | Enhance and organize issues | Daemon role runner (preferred, opt-in) or GH Actions cron |
 | `/loom:architect` | Create architectural proposals | Manual (cadence #3381) |
 | `/loom:hermit` | Identify simplification opportunities | Manual (cadence #3381) |
 | `/loom:doctor` | Fix PR feedback and conflicts | Manual |
-| `/loom:champion` | Evaluate proposals, auto-merge PRs | Cron via GH Actions |
-| `/loom:guide` | Triage the issue queue (tier labels, unblocking, WORK_PLAN) | Cron via GH Actions |
-| `/loom:auditor` | Validate main branch builds | Cron via GH Actions |
+| `/loom:champion` | Evaluate proposals, auto-merge PRs | Daemon role runner (preferred, opt-in) or GH Actions cron |
+| `/loom:guide` | Triage the issue queue (tier labels, unblocking, WORK_PLAN) | Daemon role runner (preferred, opt-in) or GH Actions cron |
+| `/loom:auditor` | Validate main branch builds | Daemon role runner (preferred, opt-in) or GH Actions cron |
 | `/loom:driver` | Plain shell environment — no autonomous role behavior | Manual |
 
 ## Development

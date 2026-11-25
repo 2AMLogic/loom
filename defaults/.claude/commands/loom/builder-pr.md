@@ -725,8 +725,9 @@ GitHub's auto-close feature only works with specific keywords **immediately foll
 > (`close issue #X`, `Fixes issue #X`), not its position in the body. This cuts both ways: it
 > is why `Fixes issue #123` silently fails to close, and why a stray `then close #123` buried
 > in prose silently *does* close — see "Multi-PR landings" below (#4569). An example you are
-> only quoting gets no exemption, on a final `Closes #N` PR either: it can close whichever
-> issue it names — see the quoted-example rule under "Multi-PR landings" (#15046).
+> only quoting gets no exemption, on a final `Closes #N` PR either: on the surfaces GitHub
+> reads it can close whichever issue it names — see the quoted-example rule under
+> "Multi-PR landings" (#15046, per-surface measurements in #15058).
 
 ### Multi-PR landings: every PR declares its issue (#9465)
 
@@ -793,8 +794,10 @@ close #2" closed #2 on merge, and it had to be reopened by hand).
   section); a partial PR's must print nothing at all:
 
   ```bash
-  # Lists every closing reference to any issue: #N or owner/repo#N, any keyword case, optional colon.
-  pattern='\b(closes?|closed|fix|fixes|fixed|resolves?|resolved):?[[:blank:]]+([[:alnum:]_.-]+/[[:alnum:]_.-]+)?#[0-9]+'
+  # Lists every closing reference to any issue: #N, owner/repo#N, or a full issue URL
+  # (Closes https://github.com/OWNER/REPO/issues/N closes on merge — measured, #15058),
+  # any keyword case, optional colon.
+  pattern='\b(closes?|closed|fix|fixes|fixed|resolves?|resolved):?[[:blank:]]+(([[:alnum:]_.-]+/[[:alnum:]_.-]+)?#[0-9]+|https://(www\.)?github\.com/[[:alnum:]_.-]+/[[:alnum:]_.-]+/issues/[0-9]+)'
   printf '%s\n' "$PR_BODY" | grep -inoE "$pattern"
   git log --format=%B origin/main..HEAD | grep -inoE "$pattern"
   ```
@@ -810,18 +813,32 @@ incidents, and the trailer's parser contract: `.loom/docs/issue-pr-linking.md`.
 The rule above is not only for `Part of #N`. A PR that delivers its issue carries exactly the
 closing references it means — `Closes #N` written as plain text, repeated in the commit
 messages — and nothing else may pair a closing keyword with a real issue number. Treat an
-*example* that does as a live closing reference, whatever formatting it sits in: inline code,
-a fenced block, a checklist item, a test plan, or a commit subject or body. GitHub read such
-prose in #4569 and #14176; an inline code span is reported to behave the same way in #15046.
+*example* that does as a live closing reference and break its adjacency on every surface —
+inline code, a fenced block, a checklist item, a test plan, a commit subject or body — but
+know which surfaces are **measured** to close and which are precaution only (#15058; evidence
+in `.loom/docs/issue-pr-linking.md` → "Measured GitHub closing-parser behavior"):
+
+- **Measured to close**: plain prose wherever it sits — mid-sentence, checklists, test plans
+  (#4569, #14176) — a **blockquoted** line, and a **full issue URL**
+  (`Closes https://github.com/OWNER/REPO/issues/N`); commit messages close from the merge.
+- **Measured NOT to close — precaution only**: an **inline code span** and a **fenced code
+  block**. GitHub's `closingIssuesReferences` ignored both in every measured case (#15058),
+  which refutes #15046's reported code-span incident. Rewrite examples there anyway: it costs
+  one word, keeps the scan quiet, and does not depend on GitHub's parser staying put.
+
 Loom's own trailer parser blanks code spans before it reads a body (#5234), so no Loom-side
-result tells you what GitHub will do with a quoted one.
+result tells you what GitHub will do with a quoted one — and once a PR is open, GitHub's own
+answer is `closingIssuesReferences`, not this scan or any local approximation of it.
 
 - **Quoting another issue? Break the adjacency.** Put a word between the keyword and the
   number (`Closes issue #123`), or use a nonnumeric placeholder (`Closes #N`) — `#123` is a
   real issue in a repo with that many. Rewrite only the example; the delivery line stays
   plain text, exactly as written.
 - **Run the scan above on a final PR too.** Every line it prints must name an issue this PR
-  delivers; any other number is a quoted example — rewrite it and scan again.
+  delivers; any other number is a quoted example — rewrite it and scan again. The scan flags
+  inline-code and fenced examples that GitHub (measured) ignores: that over-strictness is
+  deliberate — a precautionary match is rewritten, never assumed safe, and the scan cannot
+  know which prose GitHub will feel like reading.
 
 ### PR Creation Checklist
 
