@@ -64,6 +64,7 @@ impl ForgeReadCli {
                 // Classify stdin locally.
                 | ForgeAction::VerdictBodyCheck
                 | ForgeAction::WorkflowWriteAllCheck
+                | ForgeAction::WorkflowSecretsCheck
                 // Pure formatting of the dashboard footer.
                 | ForgeAction::DashboardLink { .. }
                 // This host's forge-call sink: local files only.
@@ -156,6 +157,7 @@ impl ForgeAction {
             | Self::VerdictStaleNotice { .. }
             | Self::VerdictBodyCheck
             | Self::WorkflowWriteAllCheck
+            | Self::WorkflowSecretsCheck
             | Self::VerdictGate { .. }
             | Self::MayWrite { .. }
             | Self::Calls(_)
@@ -231,6 +233,7 @@ impl ForgeAction {
             Self::VerdictStaleNotice { .. } => "verdict-stale-notice",
             Self::VerdictBodyCheck => "verdict-body-check",
             Self::WorkflowWriteAllCheck => "workflow-write-all-check",
+            Self::WorkflowSecretsCheck => "workflow-secrets-check",
             Self::VerdictGate { .. } => "verdict-gate",
             Self::VerdictLabels { .. } => "verdict-labels",
             Self::DoctorHandback { .. } => "doctor-handback",

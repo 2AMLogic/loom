@@ -22,8 +22,8 @@
 //! `<!-- guide:plan-body:start -->` / `<!-- guide:plan-body:end -->` markers
 //! of `<docs-worktree>/WORK_PLAN.md` with the body read on stdin (markers
 //! kept, everything outside untouched). Fails non-zero with the file
-//! untouched when either marker is missing; leaves no scratch file behind on
-//! success or failure.
+//! untouched when either marker is missing or duplicated; leaves no
+//! scratch file behind on success or failure.
 
 use std::fs;
 use std::io::Read;
@@ -50,7 +50,8 @@ pub(crate) enum GuideCommand {
     /// Replace the `guide:plan-body` marker region of
     /// `<docs-worktree>/WORK_PLAN.md` with the body read on stdin (#13923).
     /// The verb owns the scratch file and the atomic replace; fails
-    /// non-zero with the file untouched when either marker is missing.
+    /// non-zero with the file untouched when either marker is missing or
+    /// duplicated.
     WorkPlanSplice(WorkPlanSpliceArgs),
 }
 
@@ -182,19 +183,34 @@ pub(crate) fn read_field(docs_worktree: &Path, field: &str) -> Result<Option<Str
 }
 
 /// The new plan text with `body` spliced between the markers, or an error
-/// naming the missing marker. Pure: reads nothing, writes nothing.
+/// naming the offending marker. Pure: reads nothing, writes nothing.
 ///
-/// Mirrors the awk the role file shipped (issue #13923): the start-marker
-/// line is kept and the body inserted after it, lines up to (and including)
-/// the end-marker line are dropped, everything else passes through. Every
-/// emitted line is newline-terminated, so a plan missing its final newline
-/// is normalized exactly as the awk's `print` normalized it.
+/// The plan must carry exactly one `guide:plan-body` marker pair. On a
+/// well-formed plan the output is byte-identical to the awk this verb
+/// retired (issue #13923): the start-marker line is kept and the body
+/// inserted after it, lines up to (and including) the end-marker line are
+/// dropped, everything else passes through. Every emitted line is
+/// newline-terminated, so a plan missing its final newline is normalized
+/// exactly as the awk's `print` normalized it. A duplicated marker is a
+/// deliberate divergence: the retired awk silently emptied the second
+/// region (it never re-read the body file after the first drain), and
+/// neither that nor re-inserting the body repairs a corrupt plan, so the
+/// splice refuses and the caller's file stays untouched.
 pub(crate) fn splice_text(plan: &str, body: &str) -> Result<String> {
     if !plan.contains(BODY_START) {
         bail!("WORK_PLAN.md has no {BODY_START} marker; refusing to write");
     }
     if !plan.contains(BODY_END) {
         bail!("WORK_PLAN.md has no {BODY_END} marker; refusing to write");
+    }
+    // Count with the same predicate the loop below uses (`contains`, so a
+    // mid-line marker counts too): a second marker of either kind means a
+    // corrupt plan, and bailing here keeps the whole file untouched.
+    if plan.lines().filter(|l| l.contains(BODY_START)).count() > 1 {
+        bail!("WORK_PLAN.md has more than one {BODY_START} marker; refusing to write");
+    }
+    if plan.lines().filter(|l| l.contains(BODY_END)).count() > 1 {
+        bail!("WORK_PLAN.md has more than one {BODY_END} marker; refusing to write");
     }
     // The role file piped the body through `printf '%s\n'`, and awk's
     // `getline`+`print` newline-terminates every line: strip one trailing

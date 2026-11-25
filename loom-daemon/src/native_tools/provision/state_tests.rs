@@ -519,6 +519,28 @@ mod private_directory_policy {
         );
     }
 
+    /// Every ancestor the call creates is `0700`, not just the leaf, and a
+    /// pre-existing loose ancestor is left untouched. The guarantee is
+    /// carried implicitly by `DirBuilder::recursive(true).mode(0o700)` since
+    /// #15234 folded the copies together; this pins it so a
+    /// `create_dir_all` + leaf-only chmod refactor cannot silently leave a
+    /// umask-default, group-writable ancestor (#15240). The loose ancestor
+    /// is set explicitly, so the test does not depend on the process umask.
+    #[test]
+    fn missing_ancestors_are_created_private_and_loose_ones_are_left_alone() {
+        let temp = tempfile::tempdir().unwrap();
+        let loose = temp.path().join("loose");
+        fs::create_dir_all(&loose).unwrap();
+        fs::set_permissions(&loose, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let leaf = loose.join("a").join("b");
+        private_directory_with(&leaf, OnLoose::Refuse).unwrap();
+
+        assert_eq!(mode_of(&loose), 0o755, "pre-existing ancestor was chmod-ed");
+        assert_eq!(mode_of(&loose.join("a")), 0o700, "created ancestor is not 0700");
+        assert_eq!(mode_of(&leaf), 0o700, "created leaf is not 0700");
+    }
+
     /// `Tighten` repairs a `0755` directory, and the odd modes the
     /// `& 0o077`-style threshold would have left neither tightened nor
     /// accepted (`0600`, `0500`): the condition is `!= 0o700`.

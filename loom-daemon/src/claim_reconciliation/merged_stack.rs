@@ -34,12 +34,15 @@
 //!   leaves alone. The merged PR record supplies the pre-merge tip.
 //! - **Already retargeted by GitHub** (auto-delete). The base is now the
 //!   default branch, so the forge no longer records the relationship. It is
-//!   recovered from git: a child is matched to the NEWEST recorded merged
-//!   parent whose landed head is an ancestor of the child's head while the
-//!   merge commit is not — exactly the state "was stacked on that parent,
-//!   has not been replayed onto the merged default branch". A child that
-//!   already contains the merge commit has been reconciled (by the shell, by
-//!   hand, or by an earlier tick) and is left alone.
+//!   recovered from git, in a bounded number of local calls per child
+//!   (#15209): a child is matched to the NEWEST recorded merged parent whose
+//!   landed head it positively carries — the head is one of the child's own
+//!   commits or one of the best common ancestors with the default branch —
+//!   while the merge commit is not an ancestor of it: exactly the state "was
+//!   stacked on that parent, has not been replayed onto the merged default
+//!   branch". A child that already contains the merge commit has been
+//!   reconciled (by the shell, by hand, or by an earlier tick) and is left
+//!   alone.
 //!
 //! # Parent-tip evidence: preserve or positively recover
 //!
@@ -697,20 +700,36 @@ pub fn reconcile_with(
         let Some(onto) = fetched_target(&mut target, repo, default_branch) else {
             continue;
         };
-        // Two local rev-lists per child bound the records worth a closer look:
-        // a merged parent's merge commit is on the default branch but not in
-        // the child (`child..onto`). Everything else was reconciled or is
-        // unrelated, and costs no further subprocess.
+        // Three local git calls per child bound the records worth a closer
+        // look, with zero per-record spawns (#15209). A merged parent's merge
+        // commit is on the default branch but not in the child (`behind`);
+        // and the parent's landed head the child carries is either one of
+        // the child's own commits (`ahead` — a squash-merged parent, whose
+        // head never reached the default branch) or one of the best common
+        // ancestors (`bases` — a `--no-ff`-merged parent, whose head the
+        // merge commit put ON the default branch). Membership positively
+        // proves ancestry, so the match stays evidenced; absence of any
+        // answer — a git error — leaves no record matched, per the pass's
+        // fail direction.
         let Ok(behind) = git::rev_list(repo, &format!("{head}..{onto}")) else {
+            continue;
+        };
+        let Ok(ahead) = git::rev_list(repo, &format!("{onto}..{head}")) else {
+            continue;
+        };
+        let Ok(bases) = git::merge_bases(repo, head, &onto) else {
             continue;
         };
         for rec in records {
             if !behind.contains(&rec.merge_commit) {
                 continue;
             }
-            // A child that carries the parent's landed head has its objects
-            // locally, so no fetch is needed to ask.
-            if !git::is_ancestor(repo, &rec.head, head).unwrap_or(false) {
+            // `--all` best common ancestors, never the single answer: a
+            // child that merged an older default branch into itself (the
+            // #13593 Doctor shape) has several, and git's single answer
+            // picks among them by commit date — it can name the
+            // default-branch side and miss the parent.
+            if !(ahead.contains(&rec.head) || bases.contains(&rec.head)) {
                 continue;
             }
             process_child(

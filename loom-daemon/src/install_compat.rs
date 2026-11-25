@@ -434,6 +434,7 @@ pub const TOOLS_COMMANDS: &[&str] = &[
     "forge verdict-stale-notice",
     "forge verdict-body-check",
     "forge workflow-write-all-check",
+    "forge workflow-secrets-check",
     "forge verdict-gate",
     "forge may-write",
     "forge calls",

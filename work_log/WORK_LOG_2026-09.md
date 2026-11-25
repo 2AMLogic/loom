@@ -2,6 +2,107 @@
 
 Sections moved byte-for-byte from [WORK_LOG.md](../WORK_LOG.md) by `loom-daemon work-docs archive`.
 
+### 2026-09-25
+
+- **Issue #8851** (closed): docs: autonomous.ciTelemetry.* is missing from daemon-reference.md's canonical autonomous knob table
+- **PR #8979**: docs(daemon-reference): add autonomous.ciTelemetry.* to the canonical knob table
+- **Issue #8652** (closed): Record cumulative dispatch-paused time attributable to drain-and-restart rolls, per host per day
+- **PR #8980**: feat(observability): record cumulative dispatch-paused time per host per day (#8652)
+- **Issue #8969** (closed): docs(guides): remote-build guide — heavy cargo off-laptop + subagent fan-out conventions
+- **PR #8970**: docs(guides): remote-build guide — heavy cargo off-laptop + subagent fan-out conventions
+- **PR #8955**: feat(worktree): port the crash-debris cleanup / orphan guard to `loom-daemon worktree-cleanup` (#8195 slice 5)
+- **Issue #8941** (closed): Observability: harden #8857 quota metrics (pool read failures, burn interval overlap, re-read cost)
+- **Issue #8930** (closed): Observability: real-time token burn for Codex, OpenCode (GLM) and Kimi stores (#8857 phase 2)
+- **PR #8956**: feat(observability): real-time token burn for Codex, OpenCode (GLM) and Kimi (#8930)
+- **Issue #8427** (closed): Retire the now-callerless auto-merge arming surfaces (forge_auto_merge, forge_check_auto_merge_allowed, loom-daemon forge auto-merge)
+- **PR #8945**: refactor(forge): retire callerless shell auto-merge arm helpers; keep forge auto-merge operator-only (#8427)
+- **Issue #8711** (closed): Ship 'quick tap' model profiles (Cerebras, Gemini Flash) as bundled presets so metered backstops are zero-config
+- **PR #8948**: feat(model-profiles): bundle quick-tap presets for Cerebras and Gemini Flash
+- **Issue #8856** (closed): Observability: Pipeline stage dwell time, queue turnaround latency, and dispatch starvation metrics
+- **PR #8935**: feat(observability): ready-queue dwell, dispatch wait and starvation metrics (#8856)
+- **Issue #8857** (closed): Observability & Tuning: Fleet-wide token burn rate (TPM/RPM), account exhaustion downtime, and worker concurrency scaling
+- **PR #8938**: feat(observability): real-time token burn and pool exhaustion metrics over OTLP (#8857)
+- **Issue #8839** (closed): Protect private Codex guard code and effective policy before mutable admission
+- **PR #8937**: private sessions: prove the engine dispatches to the guard hook (#8839)
+- **PR #8936**: feat(observability): export the ready queue as SigNoz gauges and a queue.snapshot record (#8852 phase 2)
+- **PR #8933**: feat(worktree): port shared-artifact symlink provisioning to `loom-daemon worktree-link` (#8195 slice 4)
+- **PR #8926**: feat(merge-pr): port the loom:pr review-signal guard to Rust (#8191 slice)
+- **Issue #8602** (closed): Pin the chosen preference tap's modelProfile at launch (it gates but does not pin)
+- **PR #8932**: fix(runtime-preference): pin the chosen tap's modelProfile at launch (#8602)
+- **Issue #8623** (closed): bug: native_readiness package-cache key test fails on macOS hosts (platform mutation is a no-op)
+- **Issue #8914** (closed): merge: re-run stale required checks in place (grant fleet App Actions: write) so approved PRs stop losing loom:pr to re-date commits
+- **PR #8924**: feat(merge-pr): re-run stale required checks in place before the #8508 re-date push (#8914)
+- **Issue #8860** (closed): Observability: Universal OTLP export to SigNoz across all daemon loops, LLM token metrics, and host resources
+- **PR #8909**: feat(observability): shared OTLP ops-signal path, work-finder tick traces, host resource gauges (#8860)
+- **Issue #8829** (closed): fix #8692 (issue #8665 cycle-time analytics): live-proof test red on all 4 runs — telemetry-export transport never acknowledged (retry_scheduled:7)
+- **Issue #8665** (closed): observability: cycle-time analytics — standing answer to "what took long to ship and where did it go slow" in SigNoz + ClickHouse
+- **PR #8692**: observability: cycle-time analytics artifacts for ClickHouse + SigNoz
+- **PR #8641**: feat(usage): read per-model token usage from Codex's rollout session store
+- **Issue #8608** (closed): Extend sweep-outcomes summary --group-by complexity with a Curator-vs-Jev agreement column (step 3 of #8543)
+- **PR #8916**: feat(telemetry): Curator-vs-Jev agreement column on --group-by complexity (#8608)
+- **Issue #8825** (closed): observability: capture full GitHub Actions job logs into SigNoz with collector-side secret redaction (build/CI visibility, phase 2 of 3; blocked by #8824)
+- **PR #8915**: feat(observability): capture completed GitHub Actions job logs into chunked ci.job.log records, redacted at the gateway (#8825)
+- **Issue #8457** (closed): role prompts: state that shared-cargo-target-dir integration results are not verdict-bearing evidence (#8453 item 4, urgent stopgap)
+- **PR #8469**: role prompts: shared-cargo-target-dir integration results are not verdict-bearing evidence (#8457)
+- **Issue #8816** (closed): Credential discovery convention for task agents: reference-by-name from the owner environment + explicit provisioning flow
+- **PR #8819**: docs: add task-credential reference-by-name convention
+- **Issue #8514** (closed): A pending drain-and-restart roll pauses the host's dispatch for an hour or more behind long-running native sweeps, then is refused at the deadline and re-arms
+- **PR #8660**: feat(auto-update): supersede an overtaken pending roll and expose live roll state (#8514)
+- **Issue #8599** (closed): Surface the chosen runtime-preference tier in the launch record and role_tick.outcome
+- **PR #8640**: feat(runtime-preference): report the chosen tier in the launch record and role_tick.outcome
+- **PR #8906**: feat(daemon): show the work finder's ready queue in dispatch order (#8852 phase 1)
+- **Issue #8689** (closed): daemon: reaper resumes a sweep once more after a cap-exhausted PR block — one guaranteed no-op dispatch per blocked PR
+- **PR #8703**: fix(reaper): skip resume when the linked PR is parked (loom:blocked) (#8689)
+- **Issue #8410** (closed): merge-pr.sh --auto: a server-side armed auto-merge ignores later loom:pr revocation and non-required test suites
+- **PR #8426**: fix(merge-pr): --auto settles checks and re-validates in-process instead of arming a server-side merge (#8410)
+- **PR #8471**: feat(worktree): port the `remove` verb to `loom-daemon worktree-remove` (#8195 slice 3)
+- **Issue #8848** (closed): Fleet singleton jobs: first-class captain placement so fleet hosts can be identical
+- **PR #8910**: feat(daemon): fleet.captain gate so singleton jobs run on exactly one host
+- **Issue #8564** (closed): Kimi usage attribution: read per-session token usage from Kimi's session store / stream-json so completions carry runtime, provider and model (extends #8507)
+- **PR #8678**: feat(usage-attribution): read per-session Kimi token usage behind the UsageSource seam
+- **PR #8905**: docs(observability): answer the SigNoz UI view matrix via authenticated API probes
+- **Issue #8663** (closed): Native-runtime launches provision a fresh ~126 MB / 7,300-file tool-binding tree per session under ~/.local/state/loom/native-tools and never remove it (31–37 GB per host, ENOSPC on loom-worker-2 twice today)
+- **PR #8705**: Share OpenCode binding trees per workspace and reap stale native launch state
+- **Issue #8515** (closed): A release is visible before its assets are uploaded: updaters report 'no artifact for target' and an explicit --fetch hard-fails on a transient state
+- **PR #8662**: fix(release): defer the Latest pointer until every platform's assets upload
+- **Issue #8542** (closed): Journal the Curator complexity tier and fix judge_verdicts coverage in sweep.outcome (routing-evaluation prerequisite)
+- **PR #8582**: feat(telemetry): journal Curator complexity tier and add --group-by complexity (#8542)
+- **PR #8864**: private sessions: freeze the hook registration by mount, not by recheck (#8839)
+- **Issue #8796** (closed): merge-pr.sh: warn when a partial-increment trailer is backticked (the #3667 reset silently no-ops)
+- **PR #8808**: chore(defaults): warn on backticked partial-increment trailers (#8796)
+- **Issue #8672** (closed): Provision pooled CODEX_HOME / KIMI_CODE_HOME profiles from the default account (symlink dirs, copy files, key-merge settings, ledger) so a rotated account is not a blank install
+- **PR #8694**: feat(accounts): provision pooled CODEX_HOME profiles from the default account (symlink dirs, copy files, key-merge settings, ledger)
+- **PR #8696**: docs(observability): verify the SigNoz trial on Linux/amd64 and gate ingestion on org registration
+- **Issue #8824** (closed): observability: capture all GitHub Actions runs/jobs of the 2amlogic org as OTLP telemetry via a loom-daemon ci-telemetry poller (SigNoz build/CI visibility, phase 1 of 3)
+- **PR #8847**: feat(observability): loom-daemon ci-telemetry poller — GitHub Actions runs/jobs as OTLP telemetry (#8824)
+- **Issue #8837** (closed): incident: fleet resync installed a cross-host loom-daemon prebuilt that cannot load on the glibc 2.35 worker (repo-remote-gf180-surge) - CLI + self-repair bricked at 2026-09-24 19:24Z; add a loadability gate to the install surface
+- **PR #8843**: fix: add GLIBC compatibility gate to the daemon install surface
+- **Issue #8846** (closed): Managed CLAUDE.md block: describe the session-mode PR workflow (Doctor → Judge → merge-pr.sh)
+- **PR #8892**: docs(scaffolding): describe the label/PR workflow in the managed pointer block
+- **Issue #8886** (closed): peer_coordination DEGRADED can now be a genuine one-way mesh break, not just remaining false-positive noise (robb-studio #8509, ip-198-51-100-42 #8779 — both flapped after #8026 + #8736 fixes)
+- **PR #8891**: docs(safehouse): record #8886 genuine-mesh-break finding, file capability + operator-mechanical follow-ups
+- **Issue #8878** (closed): merge-pr.sh's --merge-method probe ignores LOOM_DAEMON_BIN, so the documented remediation cannot restore validation
+- **PR #8890**: fix(merge-pr): honor LOOM_DAEMON_BIN in the --merge-method probe (#8878)
+- **Issue #8870** (closed): loom-daemon: two dispatch tests fail on every macOS host (TMPDIR symlink vs. #8830's private-export hardening), stalling the build gate
+- **PR #8885**: fix(daemon): scope private-export symlink hardening to the workspace root (#8870)
+- **Issue #8872** (closed): forge-helpers: forge_get_required_status_check_contexts still fails closed on the plan-gated 403 (follow-up to #8844)
+- **PR #8883**: forge-helpers: plan-gated 403 no longer fails required-checks lookup closed
+- **Issue #8874** (closed): install: reinstall deletes .claude/settings.json before init, bypassing the #5396 co-owned merge and destroying other tools' hooks
+- **Issue #8873** (closed): merge-pr.sh discards the daemon's fail-closed reason on exit 2, so the #8844 troubleshooting entry's symptom text never appears
+- **PR #8882**: fix(merge-pr): keep the daemon's fail-closed reason in the exit-2 refusal
+- **Issue #8504** (closed): Machine-readable logs use host-local time without a zone designator — write UTC with an explicit Z everywhere (daemon.log, role logs, events, status)
+- **PR #8538**: fix(daemon): write UTC timestamps with a trailing Z everywhere
+- **Issue #8845** (closed): merge-pr.sh: no way to choose the merge method (always squashes when squash is allowed)
+- **PR #8877**: feat(merge-pr,forge): --merge-method flag to request a non-squash merge
+- **Issue #8835** (closed): dashboard: show a sweep's live Spot compute jobs as nested subprocesses
+- **PR #8869**: dashboard: nest a sweep's live Spot compute jobs under the sweep
+- **Issue #8844** (closed): merge-pr.sh: #8248 freshness guard hard-blocks every merge when the rulesets API returns 403 (private free-plan repos)
+- **PR #8871**: fix(merge-pr): a plan-gated rulesets 403 is "no required checks", not an unknown (#8844)
+- **Issue #8859** (closed): test-loom-dispatcher.sh: LOOM_RUNTIME=codex sweep subtests fail locally (worktreeIsolation capability admission / missing role manifest fixture)
+- **PR #8866**: test: make dispatcher Test 20/21 hermetic against an ambient LOOM_ROLE
+- **Issue #8855** (closed): resync-installed.sh lands new defaults/docs entries as real files in Loom's own tree, breaking the docs/defaults parity gate
+- **PR #8854**: private sessions: image-owned, digest-sealed control boundary (#8839)
+
 ### 2026-09-24
 
 - **Issue #8831** (closed): rework #8808 (issue #8796): port the backticked-trailer warning logic into loom-daemon (script_ports pattern) so the portable shell delta is <= 0

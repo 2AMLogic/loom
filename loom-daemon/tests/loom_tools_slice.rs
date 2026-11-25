@@ -578,6 +578,10 @@ fn capabilities_list_the_served_forge_verbs() {
 #[path = "loom_tools_slice/workflow.rs"]
 mod workflow;
 
+#[cfg(unix)]
+#[path = "loom_tools_slice/fleet_route.rs"]
+mod fleet_route;
+
 // ---- #14519: the shared non-queue writes ----------------------------------
 
 /// A served verb that can reach the forge is gated exactly like a read: with

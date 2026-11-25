@@ -166,12 +166,43 @@ fn splice_body_without_trailing_newline_is_terminated() {
 }
 
 #[test]
-fn splice_keeps_content_between_duplicate_end_markers_faithfully() {
-    // Degenerate shapes follow the awk rules literally: a second start
-    // marker re-inserts the body; content outside skip windows survives.
+fn splice_replaces_the_whole_single_marker_region() {
+    // Multi-line old content between the single marker pair is replaced
+    // wholesale, not concatenated with the new body.
     let plan = "a\n<!-- guide:plan-body:start -->\nOLD\nmiddle\n<!-- guide:plan-body:end -->\nb\n";
     let out = splice_text(plan, "NEW").unwrap();
     assert_eq!(out, "a\n<!-- guide:plan-body:start -->\nNEW\n<!-- guide:plan-body:end -->\nb\n");
+}
+
+#[test]
+fn splice_refuses_a_duplicate_start_marker() {
+    // A second start marker means a corrupt plan: refuse rather than
+    // splice into either region. Mid-line markers count too.
+    for plan in [
+        "a\n<!-- guide:plan-body:start -->\nX\n<!-- guide:plan-body:start -->\nY\n<!-- guide:plan-body:end -->\nb\n",
+        "a <!-- guide:plan-body:start -->\n<!-- guide:plan-body:start -->\n<!-- guide:plan-body:end -->\nb\n",
+    ] {
+        let err = splice_text(plan, "NEW").unwrap_err().to_string();
+        assert!(err.contains(BODY_START), "names the start marker: {err}");
+        assert!(err.contains("refusing to write"), "{err}");
+    }
+}
+
+#[test]
+fn splice_refuses_a_duplicate_end_marker() {
+    let plan = "a\n<!-- guide:plan-body:start -->\nOLD\n<!-- guide:plan-body:end -->\nb\n<!-- guide:plan-body:end -->\nc\n";
+    let err = splice_text(plan, "NEW").unwrap_err().to_string();
+    assert!(err.contains(BODY_END), "names the end marker: {err}");
+    assert!(err.contains("refusing to write"), "{err}");
+}
+
+#[test]
+fn splice_file_leaves_a_duplicate_marker_plan_untouched() {
+    let dir = wt();
+    let plan = "a\n<!-- guide:plan-body:start -->\nX\n<!-- guide:plan-body:start -->\nY\n<!-- guide:plan-body:end -->\nb\n";
+    fs::write(dir.path().join(PLAN_FILE), plan).unwrap();
+    assert!(splice_file(dir.path(), "NEW").is_err());
+    assert_eq!(read(dir.path(), PLAN_FILE), plan, "file untouched");
 }
 
 #[test]

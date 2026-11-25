@@ -140,7 +140,8 @@ fn an_opencode_launch_sources_tokens_by_model_from_the_session_db() {
         )
         .unwrap();
     }
-    std::env::set_var(crate::opencode_usage::OPENCODE_DB_ENV, &db_path);
+    // Crate-wide `LOOM_OPENCODE_DB` lock (#15204), held to the end of the test.
+    let _db_env = crate::tokens_pool::opencode_db_env::OpencodeDbEnv::set(&db_path);
 
     insert_dead_running_with_log(
         &mut registry,
@@ -151,8 +152,6 @@ fn an_opencode_launch_sources_tokens_by_model_from_the_session_db() {
     );
     registry.entries.get_mut(&sweep_id).unwrap().started_at = Utc::now() - Duration::from_secs(60);
     registry.reap_once();
-
-    std::env::remove_var(crate::opencode_usage::OPENCODE_DB_ENV);
 
     let path = registry.config().resolve_outcome_telemetry_path();
     let records = sweep_outcomes::read_all_sweep_outcomes(&path);
@@ -182,7 +181,7 @@ fn an_opencode_launch_with_no_matching_session_omits_tokens_by_model() {
     let issue = 8510;
     let sweep_id = format!("sweep-issue-{issue}-0");
 
-    std::env::remove_var(crate::opencode_usage::OPENCODE_DB_ENV);
+    let _db_env = crate::tokens_pool::opencode_db_env::OpencodeDbEnv::unset();
     insert_dead_running_with_log(
         &mut registry,
         issue,

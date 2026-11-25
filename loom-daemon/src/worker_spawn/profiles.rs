@@ -84,12 +84,61 @@ pub struct ModelProfile {
     pub excluded_roles: Vec<String>,
 }
 
+/// A narrow overlay on a *bundled* profile (`runtimes.modelProfileOverrides`,
+/// #15252). Unlike `runtimes.modelProfiles` — whose entry replaces the bundled
+/// profile wholesale, so a copy that drops `excludedRoles` silently admits GLM
+/// to Judge/Curator (#11450) — an override changes only the fields below.
+/// Credentials, providers, `credentialProxy`, billing and `excludedRoles` always
+/// come from the bundled definition; `excludedRolesAdd` can only extend the
+/// exclusion list. An explicit `null` field is "absent" (it clears a lower
+/// tier's value under `deep_merge`).
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ModelProfileOverride {
+    model: Option<String>,
+    effort: Option<String>,
+    allowed_efforts: Option<Vec<String>>,
+    excluded_roles_add: Option<Vec<String>>,
+}
+
+impl ModelProfileOverride {
+    fn apply(&self, profile: &mut ModelProfile) {
+        if let Some(model) = &self.model {
+            profile.model.clone_from(model);
+        }
+        if let Some(effort) = &self.effort {
+            profile.effort = Some(effort.clone());
+        }
+        if let Some(allowed) = &self.allowed_efforts {
+            profile.allowed_efforts.clone_from(allowed);
+        }
+        for role in self.excluded_roles_add.iter().flatten() {
+            // Validated beforehand (`check_model_profile_overrides_config`), so
+            // the canonical name exists; dedupe against the bundled entries.
+            let canonical = crate::runtime_admission::canonical_role(role);
+            let listed = profile
+                .excluded_roles
+                .iter()
+                .any(|existing| crate::runtime_admission::canonical_role(existing) == canonical);
+            if !listed {
+                profile
+                    .excluded_roles
+                    .push(canonical.map_or_else(|| role.clone(), str::to_string));
+            }
+        }
+    }
+}
+
 #[derive(Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct ProfileConfig {
     default_model_profile: Option<String>,
     #[serde(default)]
     model_profiles: BTreeMap<String, ModelProfile>,
+    /// `None` is an explicit `null` — a higher tier clearing a lower tier's
+    /// override of that profile.
+    /// The whole key may itself be `null` (a tier clearing every override).
+    model_profile_overrides: Option<BTreeMap<String, Option<ModelProfileOverride>>>,
 }
 
 #[derive(Debug)]
@@ -134,8 +183,18 @@ pub fn bundled() -> BTreeMap<String, ModelProfile> {
 }
 
 /// Resolve a profile by name, falling back to configuration's default and then
-/// the bundled set. Configuration profiles shadow bundled ones of the same name.
+/// the bundled set. Configuration profiles shadow bundled ones of the same name;
+/// `runtimes.modelProfileOverrides` (#15252) overlays a bundled one instead.
 pub fn lookup(name: Option<&str>, config: &Value) -> Result<(String, ModelProfile), LaunchError> {
+    // Fail closed on a malformed override for ANY profile: the same findings
+    // `loom-daemon validate` reports, so a bad store config cannot half-apply.
+    let override_findings = check_model_profile_overrides_config(config);
+    if !override_findings.is_empty() {
+        return Err(LaunchError::config(format!(
+            "invalid runtimes.modelProfileOverrides: {}",
+            override_findings.join("; ")
+        )));
+    }
     let configured: ProfileConfig = serde_json::from_value(
         config
             .get("runtimes")
@@ -160,16 +219,26 @@ pub fn lookup(name: Option<&str>, config: &Value) -> Result<(String, ModelProfil
     };
     let profile = match configured.model_profiles.get(&name).cloned() {
         Some(profile) => profile,
-        None => bundled().remove(&name).ok_or_else(|| {
-            let mut known: Vec<String> = configured.model_profiles.keys().cloned().collect();
-            known.extend(bundled().into_keys());
-            known.sort();
-            known.dedup();
-            LaunchError::config(format!(
-                "unknown model profile `{name}` (from {source}); known profiles: {}",
-                known.join(", ")
-            ))
-        })?,
+        None => {
+            let mut profile = bundled().remove(&name).ok_or_else(|| {
+                let mut known: Vec<String> = configured.model_profiles.keys().cloned().collect();
+                known.extend(bundled().into_keys());
+                known.sort();
+                known.dedup();
+                LaunchError::config(format!(
+                    "unknown model profile `{name}` (from {source}); known profiles: {}",
+                    known.join(", ")
+                ))
+            })?;
+            if let Some(Some(overlay)) = configured
+                .model_profile_overrides
+                .as_ref()
+                .and_then(|o| o.get(&name))
+            {
+                overlay.apply(&mut profile);
+            }
+            profile
+        }
     };
     if profile.model.trim().is_empty()
         || profile.effort.as_ref().is_some_and(|s| s.trim().is_empty())
@@ -281,8 +350,16 @@ pub fn profile_rejects_effort(
     if !resolved.providers.contains_key(runtime) {
         return None;
     }
-    (!resolved.allowed_efforts.is_empty() && !resolved.allowed_efforts.iter().any(|a| a == effort))
-        .then_some(name)
+    effort_outside_allowed(effort, &resolved.allowed_efforts).then_some(name)
+}
+
+/// The predicate [`select`] refuses a launch on (`reasoning effort is
+/// unsupported by the selected model profile`): a non-empty `allowedEfforts`
+/// that does not list `effort`. One definition shared by `select`,
+/// [`profile_rejects_effort`] and [`check_model_profile_overrides_config`]
+/// (#15268), so `validate` and the launch refusal cannot drift.
+fn effort_outside_allowed(effort: &str, allowed: &[String]) -> bool {
+    !allowed.is_empty() && !allowed.iter().any(|a| a == effort)
 }
 
 /// Issue #14962: the model profile a native launch of `runtime` would
@@ -371,6 +448,143 @@ pub fn check_excluded_roles_config(config: &Value) -> Vec<String> {
     }
     for (name, profile) in bundled() {
         findings.extend(unknown_roles("model-profiles.json", &name, &profile.excluded_roles));
+    }
+    findings
+}
+
+/// `loom-daemon validate` findings for `runtimes.modelProfileOverrides`
+/// (#15252). Also run by [`lookup`], so a launch refuses (exit 78) on exactly
+/// what validate reports. Explicit `null` (a profile or a field) is absent, not
+/// an error. Rejected: a non-bundled name, a name also defined under
+/// `runtimes.modelProfiles`, any key outside `model` / `effort` /
+/// `allowedEfforts` / `excludedRolesAdd` (`excludedRoles` itself gets its own
+/// message — the bundled list can be extended, never replaced or reduced), a
+/// blank `model` / `effort` / `allowedEfforts` entry, and an unknown role in
+/// `excludedRolesAdd`.
+#[must_use]
+pub fn check_model_profile_overrides_config(config: &Value) -> Vec<String> {
+    const PATH: &str = "runtimes.modelProfileOverrides";
+    let overrides = match config.pointer("/runtimes/modelProfileOverrides") {
+        None | Some(Value::Null) => return Vec::new(),
+        Some(Value::Object(map)) => map,
+        Some(_) => {
+            return vec![format!(
+                "{PATH} must be an object keyed by bundled profile name"
+            )];
+        }
+    };
+    fn blank(value: &Value) -> bool {
+        value.as_str().is_none_or(|s| s.trim().is_empty())
+    }
+    let bundled = bundled();
+    let configured = config
+        .pointer("/runtimes/modelProfiles")
+        .and_then(Value::as_object);
+    let mut findings = Vec::new();
+    for (name, overlay) in overrides {
+        let at = format!("{PATH}.{name}");
+        let fields = match overlay {
+            Value::Null => continue,
+            Value::Object(fields) => fields,
+            _ => {
+                findings.push(format!("{at} must be an object"));
+                continue;
+            }
+        };
+        if !bundled.contains_key(name) {
+            findings.push(format!(
+                "{at}: `{name}` is not a bundled model profile (bundled: {}); \
+                 define a new profile under runtimes.modelProfiles instead",
+                bundled.keys().cloned().collect::<Vec<_>>().join(", ")
+            ));
+        }
+        if configured.is_some_and(|m| m.get(name).is_some_and(|p| !p.is_null())) {
+            findings.push(format!(
+                "{at}: `{name}` is also defined under runtimes.modelProfiles; use exactly one \
+                 (modelProfileOverrides changes a bundled profile, modelProfiles replaces it)"
+            ));
+        }
+        for (key, value) in fields {
+            if value.is_null() {
+                continue;
+            }
+            match key.as_str() {
+                "model" | "effort" if blank(value) => {
+                    findings.push(format!("{at}.{key} must be a non-blank string"));
+                }
+                "model" | "effort" => {}
+                "allowedEfforts" => match value.as_array() {
+                    Some(items) if !items.iter().any(blank) => {}
+                    _ => findings
+                        .push(format!("{at}.allowedEfforts must be an array of non-blank strings")),
+                },
+                "excludedRolesAdd" => match value.as_array() {
+                    Some(items) => {
+                        let unknown: Vec<String> = items
+                            .iter()
+                            .filter(|item| {
+                                item.as_str()
+                                    .and_then(crate::runtime_admission::canonical_role)
+                                    .is_none()
+                            })
+                            .map(|item| {
+                                item.as_str()
+                                    .map_or_else(|| item.to_string(), str::to_string)
+                            })
+                            .collect();
+                        if !unknown.is_empty() {
+                            findings.push(format!(
+                                "{at}.excludedRolesAdd: unknown role name(s): {}",
+                                unknown.join(", ")
+                            ));
+                        }
+                    }
+                    None => findings
+                        .push(format!("{at}.excludedRolesAdd must be an array of role names")),
+                },
+                "excludedRoles" => findings.push(format!(
+                    "{at}.excludedRoles cannot be set in an override: the bundled excludedRoles \
+                     can be extended with excludedRolesAdd but never replaced or reduced"
+                )),
+                other => findings.push(format!(
+                    "{at}.{other}: unknown override key (allowed: model, effort, allowedEfforts, \
+                     excludedRolesAdd)"
+                )),
+            }
+        }
+        // #15268: each field is valid alone, but the effective pair (override,
+        // else the bundled sibling) must satisfy the predicate `select` refuses
+        // a launch on. A non-bundled name is left to the finding above.
+        if let Some(base) = bundled.get(name) {
+            let effort = match fields.get("effort") {
+                None | Some(Value::Null) => base.effort.as_deref(),
+                Some(value) => value.as_str().filter(|s| !s.trim().is_empty()),
+            };
+            let allowed: Option<Vec<String>> = match fields.get("allowedEfforts") {
+                None | Some(Value::Null) => Some(base.allowed_efforts.clone()),
+                Some(value) => value.as_array().and_then(|items| {
+                    items
+                        .iter()
+                        .map(|i| {
+                            i.as_str()
+                                .filter(|s| !s.trim().is_empty())
+                                .map(str::to_string)
+                        })
+                        .collect()
+                }),
+            };
+            // A malformed field was already reported above; don't double-report.
+            if let (Some(effort), Some(allowed)) = (effort, allowed) {
+                if effort_outside_allowed(effort, &allowed) {
+                    findings.push(format!(
+                        "{at}: effective effort `{effort}` is not in the effective allowedEfforts \
+                         [{}]; every launch of `{name}` would be refused (exit 78) — set effort \
+                         and allowedEfforts consistently",
+                        allowed.join(", ")
+                    ));
+                }
+            }
+        }
     }
     findings
 }
@@ -648,7 +862,7 @@ pub fn select(runtime: &str, options: &Options, config: &Value) -> Result<Select
         selection.effort = Some(effort);
     }
     if let Some(e) = &selection.effort {
-        if !profile.allowed_efforts.is_empty() && !profile.allowed_efforts.contains(e) {
+        if effort_outside_allowed(e, &profile.allowed_efforts) {
             return Err(LaunchError::config(
                 "reasoning effort is unsupported by the selected model profile",
             ));
@@ -1206,5 +1420,249 @@ mod tests {
         if let Some(v) = saved {
             std::env::set_var("LOOM_MODEL_PROFILE", v);
         }
+    }
+
+    // ===== runtimes.modelProfileOverrides (#15252) =====
+
+    fn with_no_profile_env<T>(f: impl FnOnce() -> T) -> T {
+        let _g = env_lock();
+        let saved = std::env::var_os("LOOM_MODEL_PROFILE");
+        std::env::remove_var("LOOM_MODEL_PROFILE");
+        let out = f();
+        if let Some(v) = saved {
+            std::env::set_var("LOOM_MODEL_PROFILE", v);
+        }
+        out
+    }
+
+    fn overrides(value: Value) -> Value {
+        serde_json::json!({"runtimes": {"modelProfileOverrides": value}})
+    }
+
+    #[test]
+    fn an_override_changes_the_model_and_keeps_every_other_bundled_field() {
+        with_no_profile_env(|| {
+            let config = overrides(serde_json::json!({"zai-full": {
+                "model": "glm-5.4", "effort": "high", "allowedEfforts": ["high", "max"]
+            }}));
+            let (name, got) = lookup(Some("zai-full"), &config).unwrap();
+            let bundled = bundled().remove("zai-full").unwrap();
+            assert_eq!(name, "zai-full");
+            assert_eq!(got.model, "glm-5.4");
+            assert_eq!(got.effort.as_deref(), Some("high"));
+            assert_eq!(got.allowed_efforts, ["high", "max"]);
+            // Everything not overridable is inherited verbatim.
+            assert_eq!(got.excluded_roles, ["judge", "curator"]);
+            assert_eq!(got.providers, bundled.providers);
+            assert_eq!(got.billing, bundled.billing);
+            assert_eq!(got.credential_pool, bundled.credential_pool);
+            assert_eq!(got.credential_targets.len(), bundled.credential_targets.len());
+            assert_eq!(
+                got.credential_proxy.as_ref().map(|p| format!("{p:?}")),
+                bundled.credential_proxy.as_ref().map(|p| format!("{p:?}"))
+            );
+            // select() launches the overridden model.
+            let options = Options {
+                profile: Some("zai-full".into()),
+                ..Options::default()
+            };
+            let selection = select("opencode", &options, &config).unwrap();
+            assert_eq!(selection.model, "glm-5.4");
+        });
+    }
+
+    #[test]
+    fn an_override_never_lifts_the_bundled_excluded_roles() {
+        with_no_profile_env(|| {
+            let config = overrides(serde_json::json!({"zai-full": {"model": "glm-5.4"}}));
+            for role in ["judge", "curator"] {
+                assert_eq!(
+                    excluded_role("opencode", Some("zai-full"), role, &config).as_deref(),
+                    Some("zai-full"),
+                    "{role} must stay excluded"
+                );
+            }
+            assert_eq!(excluded_role("opencode", Some("zai-full"), "builder", &config), None);
+        });
+    }
+
+    #[test]
+    fn excluded_roles_add_extends_and_dedupes_by_canonical_role() {
+        with_no_profile_env(|| {
+            let config = overrides(serde_json::json!({"zai-full": {
+                "excludedRolesAdd": ["doctor", "judge", "Issue_Curator", "doctor"]
+            }}));
+            let (_, got) = lookup(Some("zai-full"), &config).unwrap();
+            assert_eq!(got.excluded_roles, ["judge", "curator", "doctor"]);
+            assert_eq!(
+                excluded_role("opencode", Some("zai-full"), "doctor", &config).as_deref(),
+                Some("zai-full")
+            );
+        });
+    }
+
+    #[test]
+    fn an_empty_override_and_explicit_nulls_are_no_ops() {
+        with_no_profile_env(|| {
+            for value in [
+                serde_json::json!({"zai-full": {}}),
+                serde_json::json!({"zai-full": null}),
+                serde_json::json!({"zai-full": {"model": null, "effort": null,
+                    "allowedEfforts": null, "excludedRolesAdd": null}}),
+                serde_json::json!(null),
+            ] {
+                let config = overrides(value.clone());
+                assert!(check_model_profile_overrides_config(&config).is_empty(), "{value}");
+                let (_, got) = lookup(Some("zai-full"), &config).unwrap();
+                assert_eq!(got.model, "glm-5.3", "{value}");
+                assert_eq!(got.excluded_roles, ["judge", "curator"], "{value}");
+            }
+        });
+    }
+
+    /// #15268: the effective (override, else bundled) `effort` must be in the
+    /// effective `allowedEfforts`, the predicate `select` refuses a launch on.
+    #[test]
+    fn an_override_leaving_effort_outside_allowed_efforts_is_rejected_by_validate_and_launch() {
+        with_no_profile_env(|| {
+            // Bundled `zai-full`: effort "max", allowedEfforts [low, high, max].
+            let bad = [
+                (serde_json::json!({"effort": "medium"}), "`medium`", "[low, high, max]"),
+                (serde_json::json!({"allowedEfforts": ["low", "high"]}), "`max`", "[low, high]"),
+                (
+                    serde_json::json!({"effort": "high", "allowedEfforts": ["low", "max"]}),
+                    "`high`",
+                    "[low, max]",
+                ),
+            ];
+            for (fields, effort, allowed) in bad {
+                let config = overrides(serde_json::json!({"zai-full": fields.clone()}));
+                let findings = check_model_profile_overrides_config(&config);
+                assert_eq!(findings.len(), 1, "{fields}: {findings:?}");
+                for part in ["zai-full", effort, allowed] {
+                    assert!(findings[0].contains(part), "{fields}: {findings:?}");
+                }
+                // The same config makes `select` refuse an unqualified launch
+                // (via `lookup`, which re-runs the check, for any profile).
+                assert!(lookup(Some("zai-full"), &config).is_err(), "{fields}");
+            }
+        });
+    }
+
+    #[test]
+    fn consistent_noop_and_empty_allowed_efforts_overrides_report_no_effort_finding() {
+        with_no_profile_env(|| {
+            for value in [
+                // Both fields set, consistently.
+                serde_json::json!({"zai-full": {"effort": "medium",
+                    "allowedEfforts": ["low", "medium"]}}),
+                // Only a field that stays consistent with the bundled sibling.
+                serde_json::json!({"zai-full": {"allowedEfforts": ["max"]}}),
+                serde_json::json!({"zai-full": {"effort": "low"}}),
+                // Neither, or only `model`.
+                serde_json::json!({"zai-full": {}}),
+                serde_json::json!({"zai-full": {"model": "glm-5.4"}}),
+                // An empty effective allowedEfforts never rejects an effort.
+                serde_json::json!({"zai-full": {"allowedEfforts": []}}),
+                serde_json::json!({"zai-full": {"effort": "medium", "allowedEfforts": []}}),
+                // `null` falls back to the bundled value.
+                serde_json::json!({"zai-full": {"effort": null, "allowedEfforts": null}}),
+            ] {
+                let config = overrides(value.clone());
+                assert!(check_model_profile_overrides_config(&config).is_empty(), "{value}");
+                assert!(lookup(Some("zai-full"), &config).is_ok(), "{value}");
+            }
+        });
+    }
+
+    #[test]
+    fn a_non_bundled_override_gets_no_extra_effort_finding() {
+        with_no_profile_env(|| {
+            let config = overrides(serde_json::json!({
+                "not-bundled": {"effort": "medium", "allowedEfforts": ["low"]}
+            }));
+            let findings = check_model_profile_overrides_config(&config);
+            assert_eq!(findings.len(), 1, "{findings:?}");
+            assert!(findings[0].contains("not a bundled model profile"), "{findings:?}");
+        });
+    }
+
+    #[test]
+    fn an_override_applies_to_the_default_profile_too() {
+        with_no_profile_env(|| {
+            let config = serde_json::json!({"runtimes": {
+                "defaultModelProfile": "zai-full",
+                "modelProfileOverrides": {"zai-full": {"model": "glm-5.4"}}
+            }});
+            assert_eq!(lookup(None, &config).unwrap().1.model, "glm-5.4");
+            // A profile with no override is untouched.
+            assert_eq!(lookup(Some("zai-flash"), &config).unwrap().1.model, "glm-5.3-flash");
+        });
+    }
+
+    #[test]
+    fn invalid_overrides_are_rejected_by_validate_and_by_lookup() {
+        with_no_profile_env(|| {
+            let cases = [
+                (serde_json::json!({"zai-full": {"providers": {}}}), "unknown override key"),
+                (serde_json::json!({"zai-full": {"billing": "api"}}), "unknown override key"),
+                (
+                    serde_json::json!({"zai-full": {"excludedRoles": []}}),
+                    "never replaced or reduced",
+                ),
+                (
+                    serde_json::json!({"zai-full": {"excludedRolesAdd": ["wizard"]}}),
+                    "unknown role name(s): wizard",
+                ),
+                (
+                    serde_json::json!({"zai-full": {"excludedRolesAdd": "judge"}}),
+                    "excludedRolesAdd must be an array",
+                ),
+                (serde_json::json!({"zai-full": {"model": "  "}}), "model must be a non-blank"),
+                (serde_json::json!({"zai-full": {"model": 5}}), "model must be a non-blank"),
+                (serde_json::json!({"zai-full": {"effort": ""}}), "effort must be a non-blank"),
+                (
+                    serde_json::json!({"zai-full": {"allowedEfforts": ["high", " "]}}),
+                    "allowedEfforts must be an array of non-blank",
+                ),
+                (serde_json::json!({"zai-full": "glm-5.4"}), "must be an object"),
+                (
+                    serde_json::json!({"not-bundled": {"model": "m"}}),
+                    "not a bundled model profile",
+                ),
+            ];
+            for (value, expect) in cases {
+                let config = overrides(value.clone());
+                let findings = check_model_profile_overrides_config(&config);
+                assert!(findings.iter().any(|f| f.contains(expect)), "{value}: {findings:?}");
+                // Launch refuses too (for any profile, so a bad config cannot half-apply).
+                let message = lookup(Some("zai-flash"), &config)
+                    .expect_err("a malformed override must fail closed")
+                    .message;
+                assert!(message.contains(expect), "{value}: {message}");
+            }
+            let not_object = overrides(serde_json::json!(["zai-full"]));
+            assert_eq!(check_model_profile_overrides_config(&not_object).len(), 1);
+        });
+    }
+
+    #[test]
+    fn a_name_in_both_model_profiles_and_overrides_is_rejected() {
+        with_no_profile_env(|| {
+            let both = serde_json::json!({"runtimes": {
+                "modelProfiles": {"zai-full": {"model": "mine", "providers": {}}},
+                "modelProfileOverrides": {"zai-full": {"model": "glm-5.4"}}
+            }});
+            let findings = check_model_profile_overrides_config(&both);
+            assert!(findings.iter().any(|f| f.contains("also defined under")), "{findings:?}");
+            assert!(lookup(Some("zai-full"), &both).is_err());
+            // A null override (a higher tier clearing it) is not a collision.
+            let cleared = serde_json::json!({"runtimes": {
+                "modelProfiles": {"zai-full": {"model": "mine", "providers": {}}},
+                "modelProfileOverrides": {"zai-full": null}
+            }});
+            assert!(check_model_profile_overrides_config(&cleared).is_empty());
+            assert_eq!(lookup(Some("zai-full"), &cleared).unwrap().1.model, "mine");
+        });
     }
 }
