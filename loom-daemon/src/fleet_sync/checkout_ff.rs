@@ -723,6 +723,7 @@ pub fn run(env: &Env<'_>, roots: &[PathBuf], memory: &mut Memory) -> CheckoutPas
             freshness::publish(freshness::reached(
                 env,
                 root,
+                &report,
                 branch,
                 head.as_deref(),
                 low_disk,
@@ -748,9 +749,23 @@ pub fn run(env: &Env<'_>, roots: &[PathBuf], memory: &mut Memory) -> CheckoutPas
     memory.cursor = if pass.deferred == 0 {
         0
     } else {
-        log::info!(
-            "checkout_ff: the pass's budget is spent; {} workspace(s) keep their last report and \
-             the next pass starts with them",
+        // Reaching none of them is a starved pass, not a partial one: nothing
+        // was checked or fast-forwarded, so it must not hide at `info` (#15301).
+        let starved = reached == 0;
+        let level = if starved {
+            log::Level::Warn
+        } else {
+            log::Level::Info
+        };
+        log::log!(
+            level,
+            "checkout_ff: the pass's budget is spent{}; {} workspace(s) keep their last report \
+             and the next pass starts with them",
+            if starved {
+                " before any workspace was visited"
+            } else {
+                ""
+            },
             pass.deferred
         );
         start + reached

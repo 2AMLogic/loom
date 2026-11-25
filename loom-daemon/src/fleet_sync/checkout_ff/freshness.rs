@@ -12,7 +12,7 @@ use std::path::Path;
 
 use chrono::{DateTime, Utc};
 
-use super::{Env, Net, UNREACHABLE_STOP};
+use super::{CheckoutReport, Env, Net, UNREACHABLE_STOP};
 use crate::role_tick_telemetry::prompt_tree::{self, remote};
 use crate::telemetry::kinds::checkout_freshness::CheckoutFreshnessRecord;
 use crate::telemetry::TelemetryRecord;
@@ -44,10 +44,12 @@ fn cached_head(root: &Path, branch: Option<&str>) -> Option<(String, String, u64
 }
 
 /// The record for one checkout this pass reached. `head` is the remote head the
-/// pass learned for it, `branch` the default branch it resolved.
+/// pass learned for it, `branch` the default branch it resolved, and `report`
+/// the state the pass left it in (exported as `loom.checkout.state`, #15301).
 pub(super) fn reached(
     env: &Env<'_>,
     root: &Path,
+    report: &CheckoutReport,
     branch: Option<&str>,
     head: Option<&str>,
     low_disk: bool,
@@ -89,6 +91,7 @@ pub(super) fn reached(
         checkout_role: None,
         dirty_tracked_files: None,
         dirty_identical_to_remote: None,
+        checkout_state: Some(report.state.as_str().to_string()),
         prompt,
     }
 }
@@ -107,6 +110,7 @@ pub(super) fn deferred(root: &Path, now: DateTime<Utc>) -> CheckoutFreshnessReco
         checkout_role: None,
         dirty_tracked_files: None,
         dirty_identical_to_remote: None,
+        checkout_state: None,
         prompt: None,
     }
 }
