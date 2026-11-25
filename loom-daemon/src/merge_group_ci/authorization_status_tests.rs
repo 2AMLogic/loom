@@ -56,7 +56,7 @@ fn a_job_name_or_an_unusable_status_publisher_does_not_satisfy_the_rule() {
         ("--repo \"$GH_REPO\"", "--repo owner/repo"),
         ("  merge_group:", "  pull_request:"),
         ("      - name: Check merge-group authorization", "      - name: Check merge-group authorization\n        if: false"),
-        ("        uses: actions/checkout@", "        if: false\n        uses: actions/checkout@"),
+        ("      - name: Check out .loom", "      - name: Check out .loom\n        if: false"),
         ("--commit \"${{ github.event.merge_group.head_sha || github.event.workflow_run.head_sha }}\"", "--commit deadbeef"),
     ] {
         let invalid = TEMPLATE.replace(original, replacement);
