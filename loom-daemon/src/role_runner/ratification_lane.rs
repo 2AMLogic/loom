@@ -1012,8 +1012,9 @@ impl PrSource for Listed<'_> {
 /// candidate's sessions ended: a counted attempt
 /// ([`ratification_attempts::counts_toward_cap`]) is recorded in the ledger,
 /// anything else starts its backoff
-/// ([`ratification_attempts::backoff_for`]). The ledger is pruned and saved
-/// at the end; a ledger that cannot be read is treated as empty and one that
+/// ([`ratification_attempts::backoff_for`]). The ledger is saved after each
+/// candidate that recorded an attempt, and pruned and saved again at the
+/// end; a ledger that cannot be read is treated as empty and one that
 /// cannot be saved is kept in `state.memory`, so the bound fails open and
 /// still holds on this host.
 #[allow(clippy::too_many_arguments)]
@@ -1117,6 +1118,13 @@ pub fn run_lane_stats_with(
                         let kind = backoff_for(*class, dispatched.failure(*key));
                         lock(state.memory).back_off(kind, &slot(*key), ended);
                     }
+                }
+                // Saved now, not at the end of the pass: a pass can run for
+                // hours, and a daemon that exits mid-pass (a roll restart)
+                // must not lose the attempts it already counted.
+                if dirty {
+                    save_ledger(state, &ledger);
+                    dirty = false;
                 }
                 pass.results.push((pr, posts));
             }

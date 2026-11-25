@@ -86,8 +86,9 @@ dispatch, and posts nothing to the PR.
   once when the PR gets a new head (attempts are recorded per head).
 - **The ledger.** Counted attempts are recorded per host and workspace in
   `.loom/state/ratification-lane/attempts.json` (`{repo, pr, head_sha, key,
-  class, at}` per attempt, written atomically; `.loom/state/` is never
-  tracked). Each pass drops attempts older than the window and attempts for
+  class, at}` per attempt, `at` being when its session ended; written
+  atomically as soon as a PR's sessions have recorded an attempt, so a
+  daemon that exits mid-pass keeps them; `.loom/state/` is never tracked). Each pass drops attempts older than the window and attempts for
   a PR the forge's open-PR listing no longer shows at that head (closed, or
   pushed). A PR whose files or comments could not be read this pass is still
   listed, so it keeps its attempts, and an empty listing (which may be a

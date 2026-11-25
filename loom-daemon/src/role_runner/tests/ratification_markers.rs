@@ -3058,6 +3058,38 @@ mod bound {
     }
 
     #[test]
+    fn counted_attempts_are_saved_before_the_next_candidate_runs() {
+        // Review finding: a pass can run for hours (two sessions per
+        // candidate, each up to the role timeout). Saving only at its end
+        // loses every counted attempt when the daemon exits mid-pass (a
+        // roll restart, say), so the cap may never build on such a host.
+        struct Reads<'a> {
+            inner: Scripted,
+            ledger: &'a std::path::Path,
+            seen: Vec<usize>,
+        }
+        impl RoleInvocationRunner for Reads<'_> {
+            fn invoke(&mut self, role: &str, prompt: &str) -> RoleTickOutcome {
+                self.seen.push(load(self.ledger).unwrap().attempts.len());
+                self.inner.invoke(role, prompt)
+            }
+            fn last_output(&self) -> Option<String> {
+                self.inner.last_output()
+            }
+        }
+        let bench = Bench::new();
+        let prs = Heads(RefCell::new(vec![(7, HEAD.into()), (8, "d".repeat(40))]));
+        let mut r = Reads {
+            inner: Scripted::new(Ends::NoVerdict, Ends::NoVerdict),
+            ledger: &bench.ledger,
+            seen: Vec::new(),
+        };
+        bench.pass(&prs, &mut r, mins(0));
+        assert_eq!(r.seen, [0, 0, 2, 2], "PR #7's attempts are on disk before PR #8 runs");
+        assert_eq!(bench.records().len(), 4);
+    }
+
+    #[test]
     fn a_corrupt_ledger_fails_open_and_is_rewritten() {
         let bench = Bench::new();
         std::fs::create_dir_all(bench.ledger.parent().unwrap()).unwrap();
