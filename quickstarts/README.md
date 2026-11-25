@@ -81,7 +81,6 @@ template/
 │   ├── roles/          # Loom role definitions
 │   │   ├── builder.md  # Customized for this stack
 │   │   └── judge.md    # Review guidelines
-│   └── scripts/        # Helper scripts
 ├── README.md           # Template documentation
 └── ...                 # Stack-specific files
 ```
