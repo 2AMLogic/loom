@@ -4516,6 +4516,7 @@ mod invoke;
 mod llm_gateway;
 mod model_resolution;
 mod prompt_cache_prefix;
+mod ratification_attempts;
 mod ratification_dispatch;
 mod ratification_markers;
 mod residue_teardown;

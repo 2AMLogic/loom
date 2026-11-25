@@ -28,6 +28,7 @@
 //! ([`parse_review`], #13762): a session that stops without a verdict posts
 //! nothing, so its head stays marker-less for that key and it is retried.
 
+use super::ratification_attempts::{self, LaneMemory};
 use crate::champion_hold::ratification::{self, ChangedFile, Comment, Verdict};
 use crate::park_record::blank_block_code;
 use regex::Regex;
@@ -166,7 +167,7 @@ fn warn_once(pr: u64, head_sha: &str, kind: &'static str, reason: &str) -> bool 
 }
 
 /// The two review keys.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Key {
     Ee,
     Market,
@@ -848,7 +849,9 @@ pub fn run_lane_counted(
 }
 
 /// [`run_lane_counted`] plus the number of PRs left unselected because a
-/// candidate file or comment history was unreadable.
+/// candidate file or comment history was unreadable. One pass with a fresh
+/// [`LaneMemory`] and no ledger file: the attempt bound holds within the
+/// pass only ([`run_lane_stats_with`] is the bounded lane).
 pub fn run_lane_stats(
     cfg: &Config,
     lane_session: Option<&str>,
@@ -858,16 +861,95 @@ pub fn run_lane_stats(
     sink: &dyn CommentSink,
     runner: &mut dyn super::RoleInvocationRunner,
 ) -> (LaneResults, usize, usize) {
-    let (true, Some(ee), Some(market)) = (cfg.enabled, cfg.ee.as_ref(), cfg.market.as_ref()) else {
-        return (Vec::new(), 0, 0);
+    let memory = std::sync::Mutex::new(LaneMemory::default());
+    let state = LaneState {
+        memory: &memory,
+        ledger: None,
+        now: chrono::Utc::now(),
     };
-    let mut out = Vec::new();
-    let mut refused = 0;
+    let pass = run_lane_stats_with(
+        cfg,
+        lane_session,
+        target_repo,
+        prs,
+        instructions,
+        sink,
+        runner,
+        &state,
+    );
+    (pass.results, pass.refused, pass.unreadable)
+}
+
+/// What the attempt bound (#15315) reads and writes during one pass.
+pub struct LaneState<'a> {
+    /// The backoffs, the pin cache and unsaved ledger records; locked only
+    /// briefly, never across a session.
+    pub memory: &'a std::sync::Mutex<LaneMemory>,
+    /// The host-local attempt ledger ([`ratification_attempts::ledger_path`]);
+    /// `None` keeps the ledger in memory for this pass only.
+    pub ledger: Option<&'a std::path::Path>,
+    pub now: chrono::DateTime<chrono::Utc>,
+}
+
+/// What one bounded lane pass did.
+#[derive(Debug, Default)]
+pub struct LanePass {
+    /// Per-PR key results of the candidates that dispatched a key.
+    pub results: LaneResults,
+    /// PRs selection refused.
+    pub refused: usize,
+    /// PRs not selected because a candidate file or comment history was
+    /// unreadable.
+    pub unreadable: usize,
+    /// Candidates with no key dispatched: every missing key capped or
+    /// deferred.
+    pub held: usize,
+    /// Missing keys not dispatched because they reached the attempt cap.
+    pub capped: usize,
+    /// Missing keys not dispatched because of a backoff.
+    pub deferred: usize,
+}
+
+/// The bounded lane pass (#15315): selection exactly as
+/// [`find_candidates_counted`] makes it, then, per candidate, only the
+/// missing keys that are neither **capped** (at
+/// [`ratification_attempts::MAX_COUNTED_ATTEMPTS_PER_WINDOW`] counted attempts
+/// at this head in the window, read from the ledger) nor **deferred** (a
+/// backoff in [`LaneMemory`]) are dispatched. After the markers are posted
+/// each withheld key is accounted: a counted class is recorded in the
+/// ledger, any other class starts its backoff
+/// ([`ratification_attempts::backoff_for`]). The ledger is pruned and saved
+/// at the end; a ledger that cannot be read is treated as empty and one that
+/// cannot be saved is kept in `state.memory`, so the bound fails open and
+/// still holds on this host.
+#[allow(clippy::too_many_arguments)]
+pub fn run_lane_stats_with(
+    cfg: &Config,
+    lane_session: Option<&str>,
+    target_repo: &str,
+    prs: &dyn PrSource,
+    instructions: &dyn super::ratification_dispatch::InstructionSource,
+    sink: &dyn CommentSink,
+    runner: &mut dyn super::RoleInvocationRunner,
+    state: &LaneState<'_>,
+) -> LanePass {
+    use ratification_attempts::{backoff_for, counts_toward_cap, lock, AttemptRecord, KeySlot};
+    let (true, Some(ee), Some(market)) = (cfg.enabled, cfg.ee.as_ref(), cfg.market.as_ref()) else {
+        return LanePass::default();
+    };
+    let now = state.now;
+    let (mut ledger, mut dirty) = load_ledger(state);
+    let instructions = ratification_attempts::CachedInstructions::new(instructions, state.memory);
     let (selections, unreadable) = find_candidates_counted(cfg, lane_session, prs);
+    let mut pass = LanePass {
+        unreadable,
+        ..LanePass::default()
+    };
+    let mut current = std::collections::HashSet::new();
     for sel in selections {
         match sel {
             Selection::Refused { pr, reason } => {
-                refused += 1;
+                pass.refused += 1;
                 log::info!("ratification_lane: PR #{pr} refused: {reason}");
             }
             Selection::Candidate {
@@ -875,34 +957,138 @@ pub fn run_lane_stats(
                 head_sha,
                 missing,
             } => {
+                current.insert((pr, head_sha.to_ascii_lowercase()));
+                let slot = |key: Key| KeySlot {
+                    repo: target_repo,
+                    pr,
+                    head_sha: &head_sha,
+                    key,
+                    pin: match key {
+                        Key::Ee => ee,
+                        Key::Market => market,
+                    },
+                };
+                let mut run = Vec::new();
+                for key in missing {
+                    if ledger
+                        .capped_until(target_repo, pr, &head_sha, key, now)
+                        .is_some()
+                    {
+                        pass.capped += 1;
+                    } else if lock(state.memory).deferred(&slot(key), now) {
+                        pass.deferred += 1;
+                    } else {
+                        run.push(key);
+                    }
+                }
+                if run.is_empty() {
+                    pass.held += 1;
+                    continue;
+                }
                 let pr_ref = format!("{target_repo}#{pr}@{head_sha}");
-                // Only the keys still missing a marker are dispatched and
-                // posted (#14797); a complete key consumes no instruction
-                // read, visibility read, session or post.
+                // Only the keys still missing a marker, and neither capped
+                // nor deferred, are dispatched and posted (#14797, #15315);
+                // any other key consumes no instruction read, visibility
+                // read, session or post.
                 let dispatched = super::ratification_dispatch::dispatch(
-                    missing.contains(&Key::Ee).then_some(ee),
-                    missing.contains(&Key::Market).then_some(market),
+                    run.contains(&Key::Ee).then_some(ee),
+                    run.contains(&Key::Market).then_some(market),
                     target_repo,
                     &pr_ref,
-                    instructions,
+                    &instructions,
                     runner,
                 );
-                out.push((pr, post_markers(pr, &head_sha, &dispatched, sink)));
+                let posts = post_markers(pr, &head_sha, &dispatched, sink);
+                for (key, post) in &posts {
+                    let KeyPost::Withheld(class, _) = post else {
+                        continue;
+                    };
+                    if counts_toward_cap(*class) {
+                        ledger.record(AttemptRecord {
+                            repo: target_repo.to_string(),
+                            pr,
+                            head_sha: head_sha.clone(),
+                            key: key.wire().to_string(),
+                            class: class.wire().to_string(),
+                            at: now,
+                        });
+                        dirty = true;
+                    } else {
+                        let kind = backoff_for(*class, dispatched.failure(*key));
+                        lock(state.memory).back_off(kind, &slot(*key), now);
+                    }
+                }
+                pass.results.push((pr, posts));
             }
         }
     }
-    (out, refused, unreadable)
+    // Forget closed PRs and moved heads only when this pass read the whole
+    // open-PR set: an unreadable PR (or an empty listing, which may be a
+    // failed read) must not release a cap (critique A10).
+    let complete = unreadable == 0 && !current.is_empty();
+    let current = complete.then_some(&current);
+    dirty |= ledger.prune(now, current);
+    lock(state.memory).prune(target_repo, now, current);
+    if dirty {
+        save_ledger(state, &ledger);
+    }
+    pass
+}
+
+/// The pass's working ledger: the file (an unreadable one is empty, logged
+/// once) plus any records an earlier failed save left in memory. The flag
+/// says whether it must be saved even if nothing is recorded (it was
+/// unreadable, or memory held records the file lacks).
+fn load_ledger(state: &LaneState<'_>) -> (ratification_attempts::Ledger, bool) {
+    use ratification_attempts::{lock, Ledger};
+    let Some(path) = state.ledger else {
+        return (Ledger::default(), false);
+    };
+    let (mut ledger, mut dirty) = match ratification_attempts::load(path) {
+        Ok(l) => (l, false),
+        Err(reason) => {
+            if warn_once(0, &path.display().to_string(), "ledger-unreadable", &reason) {
+                log::warn!("ratification_lane: attempt ledger treated as empty: {reason}");
+            }
+            (Ledger::default(), true)
+        }
+    };
+    let before = ledger.attempts.len();
+    ledger.merge(lock(state.memory).unsaved(path));
+    dirty |= ledger.attempts.len() != before;
+    (ledger, dirty)
+}
+
+/// Save the pass's ledger; on failure keep its records in memory so this
+/// host still stops at the cap, and log once.
+fn save_ledger(state: &LaneState<'_>, ledger: &ratification_attempts::Ledger) {
+    use ratification_attempts::lock;
+    let Some(path) = state.ledger else {
+        return;
+    };
+    match ratification_attempts::save(path, ledger) {
+        Ok(()) => lock(state.memory).set_unsaved(path, Vec::new()),
+        Err(reason) => {
+            if warn_once(0, &path.display().to_string(), "ledger-unsaved", &reason) {
+                log::warn!("ratification_lane: attempt ledger kept in memory only: {reason}");
+            }
+            lock(state.memory).set_unsaved(path, ledger.attempts.clone());
+        }
+    }
 }
 
 /// What one lane tick did: a distinct `reason` for every way a tick can end,
 /// so "never ran" and "nothing to do" are different records (#13707).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TickOutcome {
-    /// `disabled` | `repo_unresolved` | `in_flight` | `nothing_to_do` | `degraded`
-    /// | `ran`. `degraded`: nothing was selected but some PRs were unreadable
-    /// or had keys withheld, so "no ratification PRs here" would be false.
+    /// `disabled` | `repo_unresolved` | `in_flight` | `nothing_to_do` | `held`
+    /// | `degraded` | `ran`, in increasing precedence among the last four.
+    /// `degraded`: nothing was dispatched but some PRs were unreadable, so
+    /// "no ratification PRs here" would be false. `held`: candidates were
+    /// selected, all readable, but every missing key was capped or deferred
+    /// (#15315), so nothing was dispatched.
     pub reason: &'static str,
-    /// Candidates selected for key review.
+    /// Candidates selected for key review, dispatched or held.
     pub selected: usize,
     /// PRs selection refused.
     pub skipped: usize,
@@ -914,6 +1100,10 @@ pub struct TickOutcome {
     pub unreadable: usize,
     /// Keys not posted.
     pub withheld: usize,
+    /// Missing keys not dispatched because they reached the attempt cap.
+    pub capped: usize,
+    /// Missing keys not dispatched because of a backoff.
+    pub deferred: usize,
     /// One count per fixed class, first for EE and then for market.
     key_counts: [[usize; CLASSES_PER_KEY]; 2],
 }
@@ -930,8 +1120,23 @@ impl TickOutcome {
             posted: 0,
             unreadable: 0,
             withheld: 0,
+            capped: 0,
+            deferred: 0,
             key_counts: Default::default(),
         }
+    }
+
+    /// Summarize a [`run_lane_stats_with`] pass, holds included.
+    #[must_use]
+    pub fn from_pass(pass: &LanePass) -> Self {
+        let mut o = Self::from_run_stats(&pass.results, pass.refused, pass.unreadable);
+        o.selected += pass.held;
+        o.capped = pass.capped;
+        o.deferred = pass.deferred;
+        if o.reason == "nothing_to_do" && pass.held > 0 {
+            o.reason = "held";
+        }
+        o
     }
 
     /// Summarize a [`run_lane_counted`] result.
@@ -975,6 +1180,8 @@ impl TickOutcome {
             posted,
             unreadable,
             withheld,
+            capped: 0,
+            deferred: 0,
             key_counts,
         }
     }
@@ -983,7 +1190,7 @@ impl TickOutcome {
 /// Log the tick and emit its span (when spans are exported on this host).
 fn record_tick(root: &std::path::Path, source: &str, o: &TickOutcome) {
     log::info!(
-        "ratification_lane: tick root={} source={source} reason={} selected={} skipped={} ran={} posted={} unreadable={} withheld={}",
+        "ratification_lane: tick root={} source={source} reason={} selected={} skipped={} ran={} posted={} unreadable={} withheld={} capped={} deferred={}",
         root.display(),
         o.reason,
         o.selected,
@@ -991,7 +1198,9 @@ fn record_tick(root: &std::path::Path, source: &str, o: &TickOutcome) {
         o.ran,
         o.posted,
         o.unreadable,
-        o.withheld
+        o.withheld,
+        o.capped,
+        o.deferred
     );
     if crate::observability::ops::spans_exported() {
         crate::observability::ops::emit_span(tick_span(root, source, o, chrono::Utc::now()));
@@ -1008,7 +1217,11 @@ pub const KEY_RAN: &str = "loom.ratification.ran";
 pub const KEY_POSTED: &str = "loom.ratification.posted";
 pub const KEY_UNREADABLE: &str = "loom.ratification.unreadable";
 pub const KEY_WITHHELD: &str = "loom.ratification.withheld";
-const KEY_COUNT_START: usize = 8;
+/// Missing keys the attempt cap kept from dispatch this tick (#15315).
+pub const KEY_CAPPED: &str = "loom.ratification.capped";
+/// Missing keys a backoff kept from dispatch this tick (#15315).
+pub const KEY_DEFERRED: &str = "loom.ratification.deferred";
+const KEY_COUNT_START: usize = 10;
 pub const KEYS: [&str; KEY_COUNT_START + 2 * CLASSES_PER_KEY] = [
     KEY_REASON,
     KEY_SOURCE,
@@ -1018,6 +1231,8 @@ pub const KEYS: [&str; KEY_COUNT_START + 2 * CLASSES_PER_KEY] = [
     KEY_POSTED,
     KEY_UNREADABLE,
     KEY_WITHHELD,
+    KEY_CAPPED,
+    KEY_DEFERRED,
     "loom.ratification.ee.posted",
     "loom.ratification.ee.pre_launch_failed",
     "loom.ratification.ee.invocation_failed",
@@ -1060,6 +1275,8 @@ pub fn tick_span(
     put(KEY_POSTED, o.posted.to_string());
     put(KEY_UNREADABLE, o.unreadable.to_string());
     put(KEY_WITHHELD, o.withheld.to_string());
+    put(KEY_CAPPED, o.capped.to_string());
+    put(KEY_DEFERRED, o.deferred.to_string());
     for (key, count) in KEYS[KEY_COUNT_START..]
         .iter()
         .zip(o.key_counts.iter().flatten())
@@ -1645,7 +1862,13 @@ fn tick_inner<R: super::RoleInvocationRunner + ?Sized>(
     let prs = GhPrSource::new(root, &nwo, &policy);
     let instructions = super::ratification_dispatch::GhInstructionSource { root };
     let sink = GhCommentSink { root, nwo: &nwo };
-    let (results, skipped, unreadable) = run_lane_stats(
+    let ledger = ratification_attempts::ledger_path(root);
+    let state = LaneState {
+        memory: ratification_attempts::process_memory(),
+        ledger: Some(&ledger),
+        now: chrono::Utc::now(),
+    };
+    let pass = run_lane_stats_with(
         &cfg,
         lane_session.as_deref(),
         &nwo,
@@ -1653,8 +1876,9 @@ fn tick_inner<R: super::RoleInvocationRunner + ?Sized>(
         &instructions,
         &sink,
         &mut RunnerRef(runner),
+        &state,
     );
-    TickOutcome::from_run_stats(&results, skipped, unreadable)
+    TickOutcome::from_pass(&pass)
 }
 
 /// How often the step-dispatch driver ticks the lane for a root.

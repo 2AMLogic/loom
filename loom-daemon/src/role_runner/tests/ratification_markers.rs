@@ -434,11 +434,22 @@ fn a_withheld_key_does_not_suppress_a_later_rerun_at_the_same_head() {
         last_key: std::cell::Cell::new(None),
     };
     let instr = Instr { fail_market: false };
-    run_lane(&cfg(), None, "o/r", &live, &instr, &sink, &mut r);
+    // The bounded lane, as the tick runs it: a withheld key is a counted
+    // attempt, and below the cap the same head is dispatched again (#15315).
+    let bench = bound::Bench::new();
+    let t0 = bound::t0();
+    let state = |now| LaneState {
+        memory: &bench.memory,
+        ledger: Some(bench.ledger.as_path()),
+        now,
+    };
+    run_lane_stats_with(&cfg(), None, "o/r", &live, &instr, &sink, &mut r, &state(t0));
     assert_eq!((r.calls, sink.posted.borrow().len()), (2, 0));
-    run_lane(&cfg(), None, "o/r", &live, &instr, &sink, &mut r);
+    let later = t0 + chrono::TimeDelta::minutes(5);
+    run_lane_stats_with(&cfg(), None, "o/r", &live, &instr, &sink, &mut r, &state(later));
     assert_eq!(r.calls, 4, "no marker exists, so the same head is selected again");
     assert!(sink.posted.borrow().is_empty());
+    assert_eq!(bench.records().len(), 4, "each withheld key is one counted attempt");
 }
 
 #[test]
@@ -1416,8 +1427,8 @@ fn a_failed_post_for_the_missing_key_leaves_the_completed_key_alone() {
 // ---- tick outcome + shared entry points (#13707) ----
 
 use crate::role_runner::ratification_lane::{
-    run_lane_counted, run_lane_stats, tick_span, KeyPost, TickOutcome, WithheldClass,
-    STEP_TICK_INTERVAL,
+    run_lane_counted, run_lane_stats, run_lane_stats_with, tick_span, KeyPost, LaneState,
+    TickOutcome, WithheldClass, STEP_TICK_INTERVAL,
 };
 
 fn assert_buckets(o: &TickOutcome, expected: &[(&str, &str)]) {
@@ -2345,5 +2356,589 @@ mod launch_refusal {
             assert_buckets(&o, &[("ee", "invocation_failed"), ("market", "posted")]);
             assert_eq!(ee_posts, 0);
         }
+    }
+
+    /// The EE session's runs in a bounded pass at minute `at`.
+    fn ee_runs(bench: &super::bound::Bench, r: &mut LaunchedEe, at: i64) -> usize {
+        let prs = super::bound::Heads(RefCell::new(vec![(7, HEAD.into()), (8, "d".repeat(40))]));
+        let mut runs = 0;
+        struct Counting<'a>(&'a mut LaunchedEe, &'a mut usize);
+        impl RoleInvocationRunner for Counting<'_> {
+            fn invoke(&mut self, role: &str, prompt: &str) -> RoleTickOutcome {
+                *self.1 += usize::from(role == "ratification-ee");
+                self.0.invoke(role, prompt)
+            }
+            fn trace_context(&self) -> Option<RoleTrace> {
+                self.0.trace_context()
+            }
+            fn last_output(&self) -> Option<String> {
+                self.0.last_output()
+            }
+        }
+        let now = super::bound::t0() + chrono::TimeDelta::minutes(at);
+        bench.pass(&prs, &mut Counting(r, &mut runs), now);
+        runs
+    }
+
+    #[test]
+    fn host_class_failure_is_not_counted_and_backs_off_the_key() {
+        // A launched session the account pool ran dry under (the real
+        // classifier's `account-pool-exhausted`): not the PR's fault, so no
+        // counted attempt, and the EE key backs off for the whole repo.
+        let bench = super::bound::Bench::new();
+        let mut r = LaunchedEe::new(78, "# CLAUDE_CLI_START\n# ACCOUNT_POOL_EXHAUSTED");
+        assert_eq!(r.failure.class(), "account-pool-exhausted", "the real classifier");
+        assert_eq!(ee_runs(&bench, &mut r, 0), 1, "PR #8's EE run is deferred");
+        assert_eq!(ee_runs(&bench, &mut r, 1), 0);
+        assert_eq!(ee_runs(&bench, &mut r, 16), 1, "tried again after the backoff");
+        assert!(bench.records().is_empty(), "never counted");
+
+        // Any other launched failure is not counted either, but backs off
+        // only its own PR: PR #8 still runs in the same pass.
+        let bench = super::bound::Bench::new();
+        let mut r = LaunchedEe::new(1, "# LOOM_CLI_START runtime=codex\nError: boom");
+        assert_eq!(r.failure.class(), "exit-1");
+        assert_eq!(ee_runs(&bench, &mut r, 0), 2);
+        assert_eq!(ee_runs(&bench, &mut r, 1), 0, "each PR backed off");
+        assert!(bench.records().is_empty());
+    }
+}
+
+// ---- the attempt bound (#15315) ----
+
+mod bound {
+    use super::*;
+    use crate::observability::lifecycle::{RoleFailure, ROLL_INTERRUPTED};
+    use crate::role_runner::ratification_attempts::{
+        ledger_path, load, save, AttemptRecord, LaneMemory, Ledger, LEDGER_RULES,
+        MAX_COUNTED_ATTEMPTS_PER_WINDOW,
+    };
+    use crate::role_runner::ratification_lane::LanePass;
+    use chrono::{DateTime, TimeDelta, Utc};
+
+    pub(super) fn t0() -> DateTime<Utc> {
+        DateTime::parse_from_rfc3339("2026-11-22T10:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc)
+    }
+
+    fn mins(n: i64) -> DateTime<Utc> {
+        t0() + TimeDelta::minutes(n)
+    }
+
+    /// One workspace's bound: a ledger file in a temp root and a fresh
+    /// process memory, as `tick_inner` wires them.
+    pub(super) struct Bench {
+        _dir: tempfile::TempDir,
+        pub(super) ledger: std::path::PathBuf,
+        pub(super) memory: std::sync::Mutex<LaneMemory>,
+        pub(super) sink: Sink,
+        pub(super) instr: CountingInstr,
+    }
+
+    impl Bench {
+        pub(super) fn new() -> Self {
+            let dir = tempfile::tempdir().unwrap();
+            Self {
+                ledger: ledger_path(dir.path()),
+                _dir: dir,
+                memory: std::sync::Mutex::default(),
+                sink: Sink::default(),
+                instr: CountingInstr::default(),
+            }
+        }
+
+        pub(super) fn pass(
+            &self,
+            prs: &dyn PrSource,
+            runner: &mut dyn RoleInvocationRunner,
+            now: DateTime<Utc>,
+        ) -> LanePass {
+            run_lane_stats_with(
+                &cfg(),
+                None,
+                "o/r",
+                prs,
+                &self.instr,
+                &self.sink,
+                runner,
+                &LaneState {
+                    memory: &self.memory,
+                    ledger: Some(&self.ledger),
+                    now,
+                },
+            )
+        }
+
+        pub(super) fn records(&self) -> Vec<AttemptRecord> {
+            load(&self.ledger).unwrap().attempts
+        }
+
+        fn seed(&self, attempts: Vec<AttemptRecord>) {
+            save(
+                &self.ledger,
+                &Ledger {
+                    rules: LEDGER_RULES,
+                    attempts,
+                },
+            )
+            .unwrap();
+        }
+    }
+
+    fn rec(pr: u64, head: &str, key: Key, at: DateTime<Utc>) -> AttemptRecord {
+        AttemptRecord {
+            repo: "o/r".into(),
+            pr,
+            head_sha: head.into(),
+            key: key.wire().into(),
+            class: "verdict_invalid".into(),
+            at,
+        }
+    }
+
+    /// Open PRs whose heads a test can move; no marker is ever read back, so
+    /// every key stays missing.
+    pub(super) struct Heads(pub(super) RefCell<Vec<(u64, String)>>);
+
+    impl Heads {
+        pub(super) fn one() -> Self {
+            Self(RefCell::new(vec![(7, HEAD.into())]))
+        }
+    }
+
+    impl PrSource for Heads {
+        fn open_prs(&self) -> Vec<OpenPr> {
+            self.0
+                .borrow()
+                .iter()
+                .map(|(number, head)| OpenPr {
+                    number: *number,
+                    author: "alice".into(),
+                    head_sha: head.clone(),
+                })
+                .collect()
+        }
+        fn files(
+            &self,
+            pr: u64,
+            hold: &crate::champion_hold::ratification::Config,
+        ) -> Vec<ChangedFile> {
+            Prs {
+                author: "alice",
+                listed: 0.into(),
+            }
+            .files(pr, hold)
+        }
+        fn trusted_comments(&self, _pr: u64) -> Result<Vec<Comment>, String> {
+            Ok(Vec::new())
+        }
+    }
+
+    /// How a scripted key session ends.
+    #[derive(Clone, Copy, Debug)]
+    enum Ends {
+        /// A valid review: the marker is posted.
+        Review,
+        /// The session ran and wrote no verdict: a counted attempt.
+        NoVerdict,
+        /// Refused before launch (no token pool).
+        PreLaunch,
+        /// Stopped by a version roll.
+        Rolled,
+    }
+
+    struct Scripted {
+        ee: Ends,
+        market: Ends,
+        calls: Vec<String>,
+    }
+
+    impl Scripted {
+        fn new(ee: Ends, market: Ends) -> Self {
+            Self {
+                ee,
+                market,
+                calls: Vec::new(),
+            }
+        }
+
+        fn last(&self) -> (Key, Ends) {
+            match self.calls.last() {
+                Some(r) if r == "ratification-market" => (Key::Market, self.market),
+                _ => (Key::Ee, self.ee),
+            }
+        }
+
+        fn ran(&self, role: &str) -> usize {
+            self.calls.iter().filter(|r| *r == role).count()
+        }
+
+        /// Sessions run since the last call.
+        fn take(&mut self) -> Vec<String> {
+            std::mem::take(&mut self.calls)
+        }
+    }
+
+    impl RoleInvocationRunner for Scripted {
+        fn invoke(&mut self, role: &str, _prompt: &str) -> RoleTickOutcome {
+            self.calls.push(role.to_string());
+            match self.last().1 {
+                Ends::Review | Ends::NoVerdict => RoleTickOutcome::Success,
+                Ends::PreLaunch => RoleTickOutcome::NoTokenPool,
+                Ends::Rolled => RoleTickOutcome::Failure("stopped for the version roll".into()),
+            }
+        }
+        fn last_output(&self) -> Option<String> {
+            match self.last() {
+                (key, Ends::Review) => Some(valid_review(key)),
+                (_, Ends::NoVerdict) => Some("I stopped without writing a verdict.".into()),
+                _ => None,
+            }
+        }
+        fn unlaunched_failure(&self) -> Option<RoleFailure> {
+            matches!(self.last().1, Ends::Rolled)
+                .then(|| RoleFailure::new(ROLL_INTERRUPTED, None, "fixture roll"))
+        }
+    }
+
+    const EE: &str = "ratification-ee";
+    const MARKET: &str = "ratification-market";
+
+    #[test]
+    fn cap_stops_redispatch_at_the_same_head() {
+        let bench = Bench::new();
+        let prs = Heads::one();
+        let mut r = Scripted::new(Ends::NoVerdict, Ends::NoVerdict);
+        for i in 0..MAX_COUNTED_ATTEMPTS_PER_WINDOW {
+            let pass = bench.pass(&prs, &mut r, mins(i as i64 * 5));
+            assert_eq!((pass.capped, pass.held, pass.results.len()), (0, 0, 1), "pass {i}");
+        }
+        assert_eq!(r.take().len(), 2 * MAX_COUNTED_ATTEMPTS_PER_WINDOW);
+        assert_eq!(bench.records().len(), 2 * MAX_COUNTED_ATTEMPTS_PER_WINDOW);
+
+        let pass = bench.pass(&prs, &mut r, mins(20));
+        assert!(r.take().is_empty(), "a capped head runs no session");
+        assert!(bench.sink.posted.borrow().is_empty(), "and posts nothing");
+        assert_eq!((pass.capped, pass.deferred, pass.held), (2, 0, 1));
+        let o = TickOutcome::from_pass(&pass);
+        assert_eq!(
+            (o.reason, o.selected, o.ran, o.posted, o.withheld, o.capped),
+            ("held", 1, 0, 0, 0, 2)
+        );
+        assert_eq!(bench.records().len(), 6, "a capped pass records nothing");
+    }
+
+    #[test]
+    fn cap_is_per_key() {
+        let bench = Bench::new();
+        bench.seed((0..3).map(|i| rec(7, HEAD, Key::Ee, mins(i))).collect());
+        let mut r = Scripted::new(Ends::NoVerdict, Ends::NoVerdict);
+        let pass = bench.pass(&Heads::one(), &mut r, mins(10));
+        assert_eq!(r.take(), [MARKET], "only the capped key is held back");
+        assert_eq!((pass.capped, pass.held, pass.results.len()), (1, 0, 1));
+        assert_buckets(&TickOutcome::from_pass(&pass), &[("market", "verdict_invalid")]);
+    }
+
+    #[test]
+    fn cap_resets_on_a_new_head() {
+        let bench = Bench::new();
+        let mut seeded: Vec<_> = (0..3).map(|i| rec(7, HEAD, Key::Ee, mins(i))).collect();
+        seeded.extend((0..3).map(|i| rec(7, HEAD, Key::Market, mins(i))));
+        bench.seed(seeded);
+        let moved = "c".repeat(40);
+        let prs = Heads(RefCell::new(vec![(7, moved.clone())]));
+        let mut r = Scripted::new(Ends::NoVerdict, Ends::NoVerdict);
+        let pass = bench.pass(&prs, &mut r, mins(10));
+        assert_eq!(r.take(), [EE, MARKET], "a new head is dispatched at once");
+        assert_eq!(pass.capped, 0);
+        // The old head is no longer a candidate, so its records are pruned.
+        let records = bench.records();
+        assert_eq!(records.len(), 2);
+        assert!(records.iter().all(|r| r.head_sha == moved), "{records:?}");
+    }
+
+    #[test]
+    fn cap_releases_when_the_oldest_ages_out() {
+        let bench = Bench::new();
+        let hours = |h: i64| t0() + TimeDelta::hours(h);
+        bench.seed(vec![
+            rec(7, HEAD, Key::Ee, hours(0)),
+            rec(7, HEAD, Key::Ee, hours(1)),
+            rec(7, HEAD, Key::Ee, hours(2)),
+        ]);
+        let prs = Heads::one();
+        let mut r = Scripted::new(Ends::NoVerdict, Ends::Review);
+
+        let pass = bench.pass(&prs, &mut r, hours(23));
+        assert_eq!(r.take(), [MARKET], "still capped inside the window");
+        assert_eq!(pass.capped, 1);
+
+        let pass = bench.pass(&prs, &mut r, hours(24));
+        assert_eq!(r.take(), [EE, MARKET], "the oldest aged out: one more attempt");
+        assert_eq!(pass.capped, 0);
+        let ledger = load(&bench.ledger).unwrap();
+        assert_eq!(ledger.attempts.len(), 3, "the aged record is pruned");
+        assert_eq!(
+            ledger.capped_until("o/r", 7, HEAD, Key::Ee, hours(24)),
+            Some(hours(25)),
+            "capped again until the next oldest ages out"
+        );
+    }
+
+    #[test]
+    fn cap_does_not_change_selection() {
+        let bench = Bench::new();
+        let mut seeded: Vec<_> = (0..3).map(|i| rec(7, HEAD, Key::Ee, mins(i))).collect();
+        seeded.extend((0..3).map(|i| rec(7, HEAD, Key::Market, mins(i))));
+        bench.seed(seeded);
+        let prs = Heads::one();
+        let (selections, unreadable) =
+            crate::role_runner::ratification_lane::find_candidates_counted(&cfg(), None, &prs);
+        let pass = bench.pass(&prs, &mut Scripted::new(Ends::Review, Ends::Review), mins(10));
+        // Selection still names the PR with both keys missing; the pass
+        // holds it rather than refusing or dropping it.
+        assert_eq!((selections.len(), unreadable), (1, 0));
+        assert!(matches!(
+            &selections[0],
+            crate::role_runner::ratification_lane::Selection::Candidate { missing, .. }
+                if missing.len() == 2
+        ));
+        assert_eq!((pass.refused, pass.unreadable, pass.held, pass.capped), (0, 0, 1, 2));
+        let o = TickOutcome::from_pass(&pass);
+        assert_eq!((o.selected, o.skipped), (1, 0));
+    }
+
+    #[test]
+    fn prelaunch_failure_posts_no_record_and_defers_the_key() {
+        let bench = Bench::new();
+        let prs = Heads(RefCell::new(vec![(7, HEAD.into()), (8, "d".repeat(40))]));
+        let mut r = Scripted::new(Ends::PreLaunch, Ends::Review);
+
+        let pass = bench.pass(&prs, &mut r, mins(0));
+        // PR #7's EE refusal backs the EE key off for the repo, so PR #8's
+        // EE session is not even launched in the same pass.
+        assert_eq!(r.take(), [EE, MARKET, MARKET]);
+        assert_eq!((pass.deferred, pass.capped, pass.held), (1, 0, 0));
+        assert!(bench.records().is_empty(), "a launch refusal is never counted");
+
+        let pass = bench.pass(&prs, &mut r, mins(1));
+        assert_eq!(r.take(), [MARKET, MARKET], "EE still backed off");
+        assert_eq!(pass.deferred, 2);
+
+        bench.pass(&prs, &mut r, mins(16));
+        assert_eq!(r.ran(EE), 1, "after the backoff the key is tried again");
+        assert!(bench.records().is_empty());
+    }
+
+    /// An instruction source whose market pin read fails (the `reader
+    /// budget low` shed), counting reads by pin path.
+    #[derive(Default)]
+    struct ShedMarket {
+        fetches: RefCell<Vec<String>>,
+    }
+
+    impl InstructionSource for ShedMarket {
+        fn fetch(
+            &self,
+            pin: &crate::role_runner::ratification_lane::Pin,
+        ) -> Result<String, String> {
+            self.fetches.borrow_mut().push(pin.path.clone());
+            if pin.path == "market.md" {
+                Err("deferred: reader budget low".into())
+            } else {
+                Ok("INSTR".into())
+            }
+        }
+        fn repo_is_private(&self, _repo: &str) -> Option<bool> {
+            Some(false)
+        }
+    }
+
+    #[test]
+    fn a_pin_read_failure_defers_that_pin_without_counting() {
+        let bench = Bench::new();
+        let mut r = Scripted::new(Ends::Review, Ends::Review);
+        let shed = ShedMarket::default();
+        let state = |now| LaneState {
+            memory: &bench.memory,
+            ledger: Some(&bench.ledger),
+            now,
+        };
+        let prs = Heads(RefCell::new(vec![(7, HEAD.into()), (8, "d".repeat(40))]));
+        let run = |r: &mut Scripted, now| {
+            run_lane_stats_with(&cfg(), None, "o/r", &prs, &shed, &bench.sink, r, &state(now))
+        };
+        let market_reads = || {
+            shed.fetches
+                .borrow()
+                .iter()
+                .filter(|p| *p == "market.md")
+                .count()
+        };
+
+        // Pass 1: one market read fails; PR #8's market key is deferred
+        // without a second read.
+        let pass = run(&mut r, mins(0));
+        assert_eq!(market_reads(), 1);
+        assert_eq!(pass.deferred, 1);
+        assert_eq!(r.take(), [EE, EE], "market never launched; EE unaffected");
+        // A minute later: no market read at all, both deferred, EE runs.
+        let pass = run(&mut r, mins(1));
+        assert_eq!(market_reads(), 1);
+        assert_eq!(pass.deferred, 2, "the market pin is backed off");
+        assert_eq!(r.take(), [EE, EE]);
+        // After the backoff the pin is read again.
+        run(&mut r, mins(16));
+        assert_eq!(market_reads(), 2);
+        assert!(bench.records().is_empty(), "a pin failure is never counted");
+    }
+
+    #[test]
+    fn roll_interrupted_attempt_is_not_counted() {
+        let bench = Bench::new();
+        let prs = Heads::one();
+        let mut r = Scripted::new(Ends::Rolled, Ends::Review);
+        for i in 0..4 {
+            let pass = bench.pass(&prs, &mut r, mins(i));
+            assert_eq!((pass.capped, pass.deferred), (0, 0), "pass {i}");
+            assert_buckets(
+                &TickOutcome::from_pass(&pass),
+                &[("ee", "invocation_failed"), ("market", "posted")],
+            );
+        }
+        assert_eq!(r.ran(EE), 4, "a roll stop is neither counted nor backed off");
+        assert!(bench.records().is_empty());
+    }
+
+    struct FailingSink;
+
+    impl CommentSink for FailingSink {
+        fn post(&self, _pr: u64, _body: &str) -> Result<(), String> {
+            Err("HTTP 502".into())
+        }
+    }
+
+    #[test]
+    fn post_failed_backs_off_without_counting() {
+        let bench = Bench::new();
+        let prs = Heads(RefCell::new(vec![(7, HEAD.into()), (8, "d".repeat(40))]));
+        let mut r = Scripted::new(Ends::Review, Ends::Review);
+        let pass = |r: &mut Scripted, now| {
+            run_lane_stats_with(
+                &cfg(),
+                None,
+                "o/r",
+                &prs,
+                &bench.instr,
+                &FailingSink,
+                r,
+                &LaneState {
+                    memory: &bench.memory,
+                    ledger: Some(&bench.ledger),
+                    now,
+                },
+            )
+        };
+        let first = pass(&mut r, mins(0));
+        assert_eq!(r.take().len(), 4, "a post failure backs off only its own PR");
+        assert_eq!(first.deferred, 0);
+        let second = pass(&mut r, mins(1));
+        assert!(r.take().is_empty());
+        assert_eq!((second.deferred, second.held), (4, 2));
+        assert_eq!(TickOutcome::from_pass(&second).reason, "held");
+        pass(&mut r, mins(16));
+        assert_eq!(r.take().len(), 4);
+        assert!(bench.records().is_empty(), "a post failure is never counted");
+    }
+
+    #[test]
+    fn failed_ledger_save_still_caps_in_this_process() {
+        let dir = tempfile::tempdir().unwrap();
+        // The ledger's parent is a regular file: every read and save fails.
+        let blocker = dir.path().join("not-a-dir");
+        std::fs::write(&blocker, "x").unwrap();
+        let ledger = blocker.join("attempts.json");
+        let memory = std::sync::Mutex::new(LaneMemory::default());
+        let (prs, sink, instr) = (Heads::one(), Sink::default(), CountingInstr::default());
+        let mut r = Scripted::new(Ends::NoVerdict, Ends::Review);
+        for i in 0..=MAX_COUNTED_ATTEMPTS_PER_WINDOW {
+            let state = LaneState {
+                memory: &memory,
+                ledger: Some(&ledger),
+                now: mins(i as i64),
+            };
+            run_lane_stats_with(&cfg(), None, "o/r", &prs, &instr, &sink, &mut r, &state);
+        }
+        assert_eq!(r.ran(EE), MAX_COUNTED_ATTEMPTS_PER_WINDOW, "the fourth EE run is capped");
+        assert_eq!(r.ran(MARKET), MAX_COUNTED_ATTEMPTS_PER_WINDOW + 1);
+    }
+
+    #[test]
+    fn a_corrupt_ledger_fails_open_and_is_rewritten() {
+        let bench = Bench::new();
+        std::fs::create_dir_all(bench.ledger.parent().unwrap()).unwrap();
+        std::fs::write(&bench.ledger, "{\"rules\": 1, \"attempts\": [oops").unwrap();
+        let mut r = Scripted::new(Ends::NoVerdict, Ends::NoVerdict);
+        let pass = bench.pass(&Heads::one(), &mut r, mins(0));
+        assert_eq!(r.take(), [EE, MARKET], "an unreadable ledger never blocks dispatch");
+        assert_eq!(pass.capped, 0);
+        assert_eq!(bench.records().len(), 2, "the file is valid again");
+    }
+
+    #[test]
+    fn prune_needs_a_complete_read_of_the_open_prs() {
+        let bench = Bench::new();
+        let gone = rec(99, HEAD, Key::Ee, mins(0));
+        bench.seed(vec![gone.clone()]);
+        let mut r = Scripted::new(Ends::Review, Ends::Review);
+        // An empty listing may be a failed read: nothing is forgotten.
+        bench.pass(&Heads(RefCell::new(Vec::new())), &mut r, mins(1));
+        assert_eq!(bench.records(), std::slice::from_ref(&gone));
+        // An unreadable candidate makes the read incomplete too.
+        let unreadable = Feed {
+            fail_comments: Some("HTTP 502".into()),
+            ..Feed::new()
+        };
+        let pass = bench.pass(&unreadable, &mut r, mins(2));
+        assert_eq!(pass.unreadable, 1);
+        assert_eq!(bench.records(), [gone]);
+        // A complete read that no longer sees PR #99 forgets it.
+        bench.pass(&Heads::one(), &mut r, mins(3));
+        assert!(bench.records().is_empty());
+    }
+
+    #[test]
+    fn pinned_instructions_are_fetched_once_per_memory() {
+        let bench = Bench::new();
+        let prs = Heads(RefCell::new(vec![(7, HEAD.into()), (8, "d".repeat(40))]));
+        let mut r = Scripted::new(Ends::NoVerdict, Ends::NoVerdict);
+        bench.pass(&prs, &mut r, mins(0));
+        bench.pass(&prs, &mut r, mins(1));
+        assert_eq!(r.take().len(), 8, "2 PRs x 2 keys x 2 passes");
+        assert_eq!(*bench.instr.fetches.borrow(), ["ee.md", "market.md"]);
+        assert_eq!(*bench.instr.visibility.borrow(), 2, "visibility: once per pass");
+    }
+
+    #[test]
+    fn tick_span_carries_capped_and_deferred() {
+        let pass = LanePass {
+            held: 2,
+            capped: 3,
+            deferred: 1,
+            ..LanePass::default()
+        };
+        let o = TickOutcome::from_pass(&pass);
+        assert_eq!((o.reason, o.selected), ("held", 2));
+        let span = tick_span(std::path::Path::new("/r"), "step_dispatch", &o, Utc::now()).bounded();
+        assert_eq!(span.attributes["loom.ratification.capped"], "3");
+        assert_eq!(span.attributes["loom.ratification.deferred"], "1");
+        assert_eq!(span.attributes["loom.ratification.reason"], "held");
+        // An unreadable PR still outranks a hold.
+        let o = TickOutcome::from_pass(&LanePass {
+            unreadable: 1,
+            ..pass
+        });
+        assert_eq!(o.reason, "degraded");
     }
 }
