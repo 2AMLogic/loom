@@ -197,7 +197,9 @@ fn safe_clean_keeps_branch_of_offline_worktree_paused_in_rebase() {
     let branch = "feature/issue-42";
     let wt = root.join("wt-issue-42");
     let away = root.join("wt-issue-42-offline");
-    std::fs::create_dir_all(&repo).unwrap();
+    // `clean` refuses a workspace without `.loom/`; without it the run exits
+    // non-zero before reaching the branch decision.
+    std::fs::create_dir_all(repo.join(".loom")).unwrap();
     git(&repo, &["init", "-q", "-b", "main"]);
     std::fs::write(repo.join("a.txt"), "base\n").unwrap();
     git(&repo, &["add", "a.txt"]);
@@ -234,6 +236,10 @@ fn safe_clean_keeps_branch_of_offline_worktree_paused_in_rebase() {
         .output()
         .unwrap();
     let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    // An early non-zero exit would leave the branch in place and stdout free of
+    // `Deleted branch:`, passing the asserts below without testing anything.
+    assert!(out.status.success(), "clean failed\nstdout:\n{stdout}\nstderr:\n{stderr}");
     let exists = Command::new("git")
         .current_dir(&repo)
         .args([
@@ -248,4 +254,7 @@ fn safe_clean_keeps_branch_of_offline_worktree_paused_in_rebase() {
         .success();
     assert!(exists, "branch held by an offline paused rebase was deleted:\n{stdout}");
     assert!(!stdout.contains("Deleted branch: feature/issue-42"), "{stdout}");
+    // Pin *why* the branch survived: the offline worktree still holds it.
+    let kept = format!("kept: worktree {} holds {branch}", wt.display());
+    assert!(stdout.contains(&kept), "missing `{kept}` in:\n{stdout}\nstderr:\n{stderr}");
 }
