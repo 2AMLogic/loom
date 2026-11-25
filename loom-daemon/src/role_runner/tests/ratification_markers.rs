@@ -438,15 +438,10 @@ fn a_withheld_key_does_not_suppress_a_later_rerun_at_the_same_head() {
     // attempt, and below the cap the same head is dispatched again (#15315).
     let bench = bound::Bench::new();
     let t0 = bound::t0();
-    let state = |now| LaneState {
-        memory: &bench.memory,
-        ledger: Some(bench.ledger.as_path()),
-        now,
-    };
-    run_lane_stats_with(&cfg(), None, "o/r", &live, &instr, &sink, &mut r, &state(t0));
+    bench.run(&live, &instr, &sink, &mut r, &move || t0);
     assert_eq!((r.calls, sink.posted.borrow().len()), (2, 0));
     let later = t0 + chrono::TimeDelta::minutes(5);
-    run_lane_stats_with(&cfg(), None, "o/r", &live, &instr, &sink, &mut r, &state(later));
+    bench.run(&live, &instr, &sink, &mut r, &move || later);
     assert_eq!(r.calls, 4, "no marker exists, so the same head is selected again");
     assert!(sink.posted.borrow().is_empty());
     assert_eq!(bench.records().len(), 4, "each withheld key is one counted attempt");
@@ -2569,18 +2564,31 @@ mod bound {
             runner: &mut dyn RoleInvocationRunner,
             now: DateTime<Utc>,
         ) -> LanePass {
+            self.run(prs, &self.instr, &self.sink, runner, &move || now)
+        }
+
+        /// One bounded pass with this bench's ledger and memory, the given
+        /// sources and `clock`.
+        pub(super) fn run(
+            &self,
+            prs: &dyn PrSource,
+            instr: &dyn InstructionSource,
+            sink: &dyn CommentSink,
+            runner: &mut dyn RoleInvocationRunner,
+            clock: &dyn Fn() -> DateTime<Utc>,
+        ) -> LanePass {
             run_lane_stats_with(
                 &cfg(),
                 None,
                 "o/r",
                 prs,
-                &self.instr,
-                &self.sink,
+                instr,
+                sink,
                 runner,
                 &LaneState {
                     memory: &self.memory,
                     ledger: Some(&self.ledger),
-                    now,
+                    clock,
                 },
             )
         }
@@ -2881,14 +2889,9 @@ mod bound {
         let bench = Bench::new();
         let mut r = Scripted::new(Ends::Review, Ends::Review);
         let shed = ShedMarket::default();
-        let state = |now| LaneState {
-            memory: &bench.memory,
-            ledger: Some(&bench.ledger),
-            now,
-        };
         let prs = Heads(RefCell::new(vec![(7, HEAD.into()), (8, "d".repeat(40))]));
-        let run = |r: &mut Scripted, now| {
-            run_lane_stats_with(&cfg(), None, "o/r", &prs, &shed, &bench.sink, r, &state(now))
+        let run = |r: &mut Scripted, now: DateTime<Utc>| {
+            bench.run(&prs, &shed, &bench.sink, r, &move || now)
         };
         let market_reads = || {
             shed.fetches
@@ -2932,6 +2935,56 @@ mod bound {
         assert!(bench.records().is_empty());
     }
 
+    /// A runner whose every session takes `minutes` on `clock`.
+    struct Slow<'a> {
+        inner: Scripted,
+        clock: &'a std::cell::Cell<DateTime<Utc>>,
+        minutes: i64,
+    }
+
+    impl RoleInvocationRunner for Slow<'_> {
+        fn invoke(&mut self, role: &str, prompt: &str) -> RoleTickOutcome {
+            self.clock
+                .set(self.clock.get() + TimeDelta::minutes(self.minutes));
+            self.inner.invoke(role, prompt)
+        }
+        fn last_output(&self) -> Option<String> {
+            self.inner.last_output()
+        }
+        fn unlaunched_failure(&self) -> Option<RoleFailure> {
+            self.inner.unlaunched_failure()
+        }
+    }
+
+    #[test]
+    fn records_and_backoffs_are_stamped_when_the_sessions_end() {
+        // Review finding: a pass runs its sessions one after another, each up
+        // to the role timeout, so a backoff stamped with the pass's start
+        // time can be over before it is set, and a record's window ends
+        // early by the length of the pass.
+        let bench = Bench::new();
+        let clock = std::cell::Cell::new(t0());
+        let prs = Heads::one();
+        // EE writes a review whose post fails (a PR backoff); market writes
+        // no verdict (a counted attempt). Each session takes 30 minutes.
+        let mut r = Slow {
+            inner: Scripted::new(Ends::Review, Ends::NoVerdict),
+            clock: &clock,
+            minutes: 30,
+        };
+        bench.run(&prs, &bench.instr, &FailingSink, &mut r, &|| clock.get());
+        assert_eq!(r.inner.take(), [EE, MARKET]);
+        let records = bench.records();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].at, mins(60), "stamped when its session ended");
+        // One minute after the pass ended, the EE backoff (15 minutes from
+        // the failed post) still holds; market is below the cap and runs.
+        clock.set(mins(61));
+        let pass = bench.run(&prs, &bench.instr, &FailingSink, &mut r, &|| clock.get());
+        assert_eq!(r.inner.take(), [MARKET], "EE is still backed off");
+        assert_eq!(pass.deferred, 1);
+    }
+
     #[test]
     fn a_timeout_on_a_saturated_host_is_not_counted_and_backs_off_the_key() {
         // The role timeout under host load is the host's, not the PR's: no
@@ -2966,21 +3019,8 @@ mod bound {
         let bench = Bench::new();
         let prs = Heads(RefCell::new(vec![(7, HEAD.into()), (8, "d".repeat(40))]));
         let mut r = Scripted::new(Ends::Review, Ends::Review);
-        let pass = |r: &mut Scripted, now| {
-            run_lane_stats_with(
-                &cfg(),
-                None,
-                "o/r",
-                &prs,
-                &bench.instr,
-                &FailingSink,
-                r,
-                &LaneState {
-                    memory: &bench.memory,
-                    ledger: Some(&bench.ledger),
-                    now,
-                },
-            )
+        let pass = |r: &mut Scripted, now: DateTime<Utc>| {
+            bench.run(&prs, &bench.instr, &FailingSink, r, &move || now)
         };
         let first = pass(&mut r, mins(0));
         assert_eq!(r.take().len(), 4, "a post failure backs off only its own PR");
@@ -3005,10 +3045,11 @@ mod bound {
         let (prs, sink, instr) = (Heads::one(), Sink::default(), CountingInstr::default());
         let mut r = Scripted::new(Ends::NoVerdict, Ends::Review);
         for i in 0..=MAX_COUNTED_ATTEMPTS_PER_WINDOW {
+            let now = mins(i as i64);
             let state = LaneState {
                 memory: &memory,
                 ledger: Some(&ledger),
-                now: mins(i as i64),
+                clock: &move || now,
             };
             run_lane_stats_with(&cfg(), None, "o/r", &prs, &instr, &sink, &mut r, &state);
         }

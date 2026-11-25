@@ -926,7 +926,7 @@ pub fn run_lane_stats(
     let state = LaneState {
         memory: &memory,
         ledger: None,
-        now: chrono::Utc::now(),
+        clock: &chrono::Utc::now,
     };
     let pass = run_lane_stats_with(
         cfg,
@@ -949,7 +949,10 @@ pub struct LaneState<'a> {
     /// The host-local attempt ledger ([`ratification_attempts::ledger_path`]);
     /// `None` keeps the ledger in memory for this pass only.
     pub ledger: Option<&'a std::path::Path>,
-    pub now: chrono::DateTime<chrono::Utc>,
+    /// The clock ([`chrono::Utc::now`] in the daemon), read per candidate
+    /// and again when its sessions end — never once per pass, since a pass
+    /// runs its sessions one after another, each up to the role timeout.
+    pub clock: &'a dyn Fn() -> chrono::DateTime<chrono::Utc>,
 }
 
 /// What one bounded lane pass did.
@@ -977,8 +980,10 @@ pub struct LanePass {
 /// [`ratification_attempts::MAX_COUNTED_ATTEMPTS_PER_WINDOW`] counted attempts
 /// at this head in the window, read from the ledger) nor **deferred** (a
 /// backoff in [`LaneMemory`]) are dispatched. After the markers are posted
-/// each withheld key is accounted: a counted class is recorded in the
-/// ledger, any other class starts its backoff
+/// each withheld key is accounted, stamped with `state.clock` read when the
+/// candidate's sessions ended: a counted attempt
+/// ([`ratification_attempts::counts_toward_cap`]) is recorded in the ledger,
+/// anything else starts its backoff
 /// ([`ratification_attempts::backoff_for`]). The ledger is pruned and saved
 /// at the end; a ledger that cannot be read is treated as empty and one that
 /// cannot be saved is kept in `state.memory`, so the bound fails open and
@@ -998,7 +1003,6 @@ pub fn run_lane_stats_with(
     let (true, Some(ee), Some(market)) = (cfg.enabled, cfg.ee.as_ref(), cfg.market.as_ref()) else {
         return LanePass::default();
     };
-    let now = state.now;
     let (mut ledger, mut dirty) = load_ledger(state);
     let instructions = ratification_attempts::CachedInstructions::new(instructions, state.memory);
     let (selections, unreadable) = find_candidates_counted(cfg, lane_session, prs);
@@ -1029,6 +1033,10 @@ pub fn run_lane_stats_with(
                         Key::Market => market,
                     },
                 };
+                // The clock is read per candidate and again once its
+                // sessions end, never once per pass: the sessions run one
+                // after another, each up to the role timeout.
+                let now = (state.clock)();
                 let mut run = Vec::new();
                 for key in missing {
                     if ledger
@@ -1060,6 +1068,7 @@ pub fn run_lane_stats_with(
                     runner,
                 );
                 let posts = post_markers(pr, &head_sha, &dispatched, sink);
+                let ended = (state.clock)();
                 for (key, post) in &posts {
                     let KeyPost::Withheld(class, _) = post else {
                         continue;
@@ -1071,12 +1080,12 @@ pub fn run_lane_stats_with(
                             head_sha: head_sha.clone(),
                             key: key.wire().to_string(),
                             class: class.wire().to_string(),
-                            at: now,
+                            at: ended,
                         });
                         dirty = true;
                     } else {
                         let kind = backoff_for(*class, dispatched.failure(*key));
-                        lock(state.memory).back_off(kind, &slot(*key), now);
+                        lock(state.memory).back_off(kind, &slot(*key), ended);
                     }
                 }
                 pass.results.push((pr, posts));
@@ -1088,6 +1097,7 @@ pub fn run_lane_stats_with(
     // failed read) must not release a cap (critique A10).
     let complete = unreadable == 0 && !current.is_empty();
     let current = complete.then_some(&current);
+    let now = (state.clock)();
     dirty |= ledger.prune(now, current);
     lock(state.memory).prune(target_repo, now, current);
     if dirty {
@@ -1927,7 +1937,7 @@ fn tick_inner<R: super::RoleInvocationRunner + ?Sized>(
     let state = LaneState {
         memory: ratification_attempts::process_memory(),
         ledger: Some(&ledger),
-        now: chrono::Utc::now(),
+        clock: &chrono::Utc::now,
     };
     let pass = run_lane_stats_with(
         &cfg,
