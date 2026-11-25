@@ -6742,6 +6742,51 @@ path for (provider console/CLI restart, tailnet-identity survival,
 re-registration), documented in full at that step, along with the #4697
 `fleet status` "expected power-off" classification.
 
+### Docker CLI lookup and the `LOOM_DOCKER_BIN` override (#14885)
+
+Every daemon path that launches `docker` — session-container startup and
+teardown, the accounts `check --live` probes, private-workspace exports,
+image cleanup, native containment — resolves the CLI through one shared
+lookup (`loom-daemon/src/docker_bin.rs`), never a bare
+`Command::new("docker")`. Before #14885, a daemon started by launchd (or a
+minimal systemd unit) inherited `PATH=/usr/bin:/bin:/usr/sbin:/sbin`, which
+names none of the directories Docker Desktop installs its CLI into, and
+every docker launch failed at spawn with not-found.
+
+Resolution order:
+
+1. `LOOM_DOCKER_BIN` when set (trimmed; empty/whitespace counts as unset).
+2. Each `$PATH` entry, in order.
+3. Absolute fallback directories, in order: `/usr/local/bin`,
+   `/opt/homebrew/bin`, `~/.docker/bin` (expanded from the process's home),
+   `/Applications/Docker.app/Contents/Resources/bin`, `/usr/bin`.
+
+A candidate qualifies only if it is an existing regular file (symlinks
+followed — how Docker Desktop links its CLI) with an execute bit. The
+caller's `$PATH` is never modified: the child gets the resolved absolute
+path.
+
+**`LOOM_DOCKER_BIN` is fail-closed, fleet-wide.** An override that does not
+name an executable file is a hard error at the call site — it never falls
+through to a working `docker` elsewhere — so a broken explicit override
+fails even when another docker exists. That is deliberate (#14885): an
+operator who points the daemon at a moved CLI wants the misconfiguration to
+surface, not be masked by an incidental fallback. Practically, a stale
+`LOOM_DOCKER_BIN` left on one host disables every daemon Docker launch on
+that host (sessions read `unknown`/`session_probe_error`, containment
+refuses to start), which is the blast radius to check when clearing one.
+
+**The one exception: the sweep reaper's `container_stop::docker_program()`.**
+It takes `LOOM_DOCKER_BIN` verbatim (trimmed, non-empty) with no
+executability check, and only falls back to the shared lookup when the
+override is unset. There the spawn failure itself is the fail-safe: a
+container stop that cannot spawn its docker logs and skips (the teardown
+must never block a cancel), exactly as it did before #14885.
+
+A scoped `--docker` CLI argument (or `LOOM_CODEX_SESSION_DOCKER`) still wins
+verbatim over all of the above at its call sites; the literal `docker`
+default value means "resolve through this shared lookup".
+
 ### Daemon log path override (`LOOM_DAEMON_LOG`, #4010)
 
 `setup_logging()` writes every daemon log line to `$HOME/.loom/daemon.log` by

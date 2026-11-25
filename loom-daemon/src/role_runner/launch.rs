@@ -71,6 +71,20 @@ pub(super) fn apply_role_observability(
 
 // #10640: why a launched tick failed, for its `loom.role_attempt` span.
 mod failure_class;
+
+/// The failure a launched role child that exited with `code` reports, read
+/// by the real classifier against its tick region (#10640) — so the
+/// ratification lane's tests drive what production produces rather than
+/// injecting a class by hand (#15315).
+#[cfg(all(test, unix))]
+pub(super) fn exited_failure_for_test(
+    code: i32,
+    full_log: &str,
+    tick_anchor: &str,
+) -> crate::observability::lifecycle::RoleFailure {
+    use std::os::unix::process::ExitStatusExt;
+    failure_class::exited(std::process::ExitStatus::from_raw(code << 8), full_log, tick_anchor)
+}
 // #11453: each launched tick's failure class (or success) is also counted
 // against its (workspace, role, tap) launch-failure hold.
 mod hold_feed;
