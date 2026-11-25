@@ -32,7 +32,8 @@ use super::{
     gh_config_dir_for_owner_slug, gh_config_dir_for_root, github_app_gh_config_dir_for_owner,
     nwo_from_git_remote, owner_of_nwo, plan_cross_owner_credentials, publish_outcome,
     register_owner_gh_config_dir, register_owner_refresh_source, register_root_gh_config_dir,
-    CrossOwnerCredentialPlan, GithubAppMinter, GithubAppOutcome, RealGithubAppMinter,
+    unregister_owner_gh_config_dir, CrossOwnerCredentialPlan, GithubAppMinter, GithubAppOutcome,
+    RealGithubAppMinter,
 };
 
 /// What one establishment pass did.
@@ -217,7 +218,9 @@ fn recently_published(dir: &Path) -> bool {
 ///   and `managed` is non-empty: a failed read must not wipe live credentials.
 ///
 /// Only the writer files are removed, then the directory itself if that left
-/// it empty: a reader App's `<owner>/<app id>/` subdirectories, the live
+/// it empty, and the registry entries naming it are evicted (#14548, so the
+/// next pass re-mints rather than short-circuiting on a registration whose
+/// credential is gone): a reader App's `<owner>/<app id>/` subdirectories, the live
 /// root-owner credential (`.loom/gh-config`) and every other cross-owner's
 /// directory are never touched. A directory published within [`REAP_GRACE`]
 /// is skipped (a live caller may hold it) and reaped on a later pass.
@@ -282,6 +285,12 @@ fn remove_owner_writer_credential(dir: &Path, owner: &str) {
     }
     // Non-recursive: fails (and is ignored) while reader subdirectories remain.
     let emptied = std::fs::remove_dir(dir).is_ok();
+    // #14548: the registry must not keep naming a directory whose writer
+    // credential is gone. Only evict once `hosts.yml` is verifiably absent (a
+    // failed removal above leaves the credential, so keep the registration).
+    if !dir.join("hosts.yml").exists() {
+        unregister_owner_gh_config_dir(dir);
+    }
     if removed || emptied {
         log::info!(
             "credential_preflight: removed the stale per-owner credential for {owner} at {} — \
