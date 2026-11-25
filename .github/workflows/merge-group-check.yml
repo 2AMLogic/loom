@@ -70,7 +70,7 @@ jobs:
       # that has `.loom/` and whose origin is this repository (write_scope, #9548).
       # Sparse + depth 1 keeps it cheap; the default ref is the merge-group commit.
       - name: Check out .loom
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           sparse-checkout: .loom
           fetch-depth: 1
