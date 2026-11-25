@@ -28,12 +28,44 @@ into consumer repos.
 2026-10-10). Paths without a prefix are under `loom-daemon/src/`. Paths under
 `defaults/`, `mcp-loom/`, `loom-api/` and `docs/` are written in full.
 
-**Writer recount (2026-11-25, `main` at `dd56506cc`).** Citations in E1, E9
-and T11 use this revision. All 11 JSON writers migrated in #15336 call
-`fs_util::write_atomic`. The three rows grouped together in §13 now use two
-write implementations. E1 and both E9 sidecars share the helper. T11 writes
-and renames its own PID-suffixed temporary file. The broader estimate in §13
-dates to the original inventory.
+**Writer recount (2026-11-25, `main` at `dd56506cc`).** The stores in §13’s
+“Before” column have **22 distinct write/recovery implementations**. Each table
+row below counts once. Stores that delegate persistence to the same writer share
+a row. Independently maintained writers count separately, even when they perform
+the same filesystem operations. A writer’s rotation, replay or cleanup is part
+of that implementation. Of the 11 JSON writers migrated by #15336, the sweep
+journal and the PR-less sidecar writer appear in this recount. The citations
+below and in E1, E9 and T11 use this revision.
+
+| Inventory rows | What the writer does | Source at `dd56506cc` |
+| --- | --- | --- |
+| E1, E9 (both sidecars), C6, C7, H1 | All use `fs_util::write_atomic`. C6 and C7 go through the fleet-store wrapper. H1 performs its own best-effort directory sync after the shared write. | `sweep_journal.rs:156`, `sweep_registry/prless_retry/durable.rs:142`, `fleet_store/pending_restart.rs:83`, `fleet_sync.rs:926`, `fleet_store/fetch.rs:441`, `auto_update/persisted_state.rs:216-225` |
+| E2 | Acquires the lock directory and writes the owner JSON directly. | `sweep_registry/locks.rs:337-351` |
+| E3 | Stages the checkpoint in a named temporary file, syncs it, replaces the target and syncs the directory. | `cli/sweep_checkpoint.rs:278-291` |
+| E4, E5, E10 | The worktree checkpoint, claim record and recovery-event array all use `script_helpers::write_json_file`. | `script_helpers/checkpoints.rs:230`, `script_helpers/claim.rs:185`, `script_helpers/validate_phase.rs:369`, `script_helpers/mod.rs:178-197` |
+| E6 | The claim IPC handler still inserts into SQLite’s `issue_claims` table. | `ipc.rs:2717`, `activity/claims.rs:45` |
+| E7 (registry) | Replaces each run’s JSON entry on registration and heartbeat. | `defaults/scripts/sweep-run-registry.sh:445`, `defaults/scripts/sweep-run-registry.sh:480` |
+| E7 (main-clean baseline) | A separate script snapshots working-tree status to the run’s text file. | `defaults/scripts/check-main-clean.sh:612` |
+| E8 | Rotates the outcome log to a single backup, then appends the record. | `sweep_outcomes.rs:327-335`, `sweep_outcomes.rs:357` |
+| E11 | The wrapper overwrites retry JSON and removes it on exit. | `defaults/scripts/claude-wrapper.sh:317-333` |
+| E12 | The wrapper writes the numeric exit code to its own sidecar. | `defaults/scripts/claude-wrapper.sh:203` |
+| T1, T2 | Both call `append_telemetry_envelope`, which checks age and size before appending. Each caller supplies its size limit. | `sweep_outcomes.rs:435`, `sweep_outcomes.rs:455-462`, `sweep_outcomes.rs:476-490`, `sweep_outcomes.rs:625` |
+| T3 | Appends a rework event and prunes oversized logs by rewriting the newest lines. | `rework_events.rs:206-215`, `rework_events.rs:226-245` |
+| T4 (log and seen set) | One operation creates the event’s deduplication marker, appends the log and removes the marker if the append fails. | `forge_merge_queue/events.rs:162-184` |
+| T5 (guide) | The guide script appends its telemetry line. | `defaults/scripts/guide-docs-telemetry.sh:209` |
+| T5 (merge admission) | The merge-admission script has its own append. | `defaults/scripts/merge-admission-telemetry.sh:231` |
+| T6 | Appends one model-statistics record to the experiment log. | `script_helpers/sweep_experiment.rs:320-341` |
+| T7 | Repairs the CI journal’s torn tail on open and rotates according to the export cursor. | `ci_telemetry/journal.rs:47-49`, `ci_telemetry/export.rs:515-546` |
+| T8 | Commits units to the durable ledger, replays missing envelopes and compacts the ledger. | `ci_telemetry/ledger.rs:720`, `ci_telemetry/poll.rs:628-636`, `ci_telemetry/ledger.rs:965` |
+| T9 (export cursor only) | Stages the cursor, syncs the file, renames it and syncs the directory. | `ci_telemetry/export.rs:124-140` |
+| T10 | The queue appends on enqueue and rewrites the live entries on acknowledgement or compaction. | `observability/queue.rs:295-320`, `observability/queue.rs:472-488` |
+| T11 | Replaces the backfill cursor using a PID-suffixed temporary file. | `observability/backfill.rs:155-163` |
+| H2 | Writes the artifact-roll record directly and falls back to its in-memory guard on write failure. | `auto_update.rs:703-720` |
+
+Two execution stores in §13 have retired writers and contribute zero. E13’s
+spawn-loop writer was removed in v0.11.0 (`worktree_ops/liveness.rs:62-63`).
+E14’s daemon-state file retired with the daemon-brain state (`init/post_init.rs:92-95`).
+C8 was a proposed snapshot and had no store in the “Before” column.
 
 **Contents**
 
