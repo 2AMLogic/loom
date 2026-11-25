@@ -1,0 +1,1 @@
+../.claude/commands/loom/judge-docs-only-fast-path.md
