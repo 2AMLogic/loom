@@ -1584,10 +1584,10 @@ pub enum CleanupOutcome {
     AlreadyGone,
 }
 
-/// Remove a worktree and delete its feature branch.
+/// Remove an issue worktree and clean up its feature branch.
 ///
 /// Exposed (issue #4876) so the daemon-side reaper performs the *same*
-/// removal the CLI does, including the `git branch -d` → `-D` fallback.
+/// removal the CLI does, with the same safe branch-retention policy.
 ///
 /// `Err` carries the underlying cause (git's stderr) so the caller can name it
 /// in a diagnostic (issue #4877).
@@ -1599,7 +1599,7 @@ pub fn cleanup_worktree(
     repo_root: &Path,
     worktree_path: &Path,
     issue_num: u32,
-    dry_run: bool,
+    opts: &CleanOptions,
     mechanism: &str,
 ) -> Result<CleanupOutcome, String> {
     let branch_name = naming::branch_name(issue_num);
@@ -1609,9 +1609,13 @@ pub fn cleanup_worktree(
     // default in-worktree path unless a redirect is actually possible, so an
     // ordinary host pays no cargo invocation per removal.
     let resolved_target_dir = super::cargo_target::resolve_for_worktree(worktree_path);
-    if dry_run {
+    if opts.dry_run {
         println!("Would remove: {}", worktree_path.display());
-        println!("Would delete branch: {branch_name}");
+        if opts.safe {
+            let _ = clean_safe_issue_branch(repo_root, &branch_name, true);
+        } else {
+            println!("Would delete branch: {branch_name}");
+        }
         if let Some(line) =
             super::cargo_target::reclaim(repo_root, worktree_path, &resolved_target_dir, true)
                 .report_line()
@@ -1661,17 +1665,22 @@ pub fn cleanup_worktree(
         "classify_worktree=Remove",
     );
 
-    let deleted = skip_if_held(repo_root, &branch_name)
-        || Command::new("git")
+    if opts.safe {
+        if let Err(cause) = clean_safe_issue_branch(repo_root, &branch_name, false) {
+            eprintln!("  Could not delete {branch_name}: {cause}");
+        }
+    } else if !skip_if_held(repo_root, &branch_name) {
+        let deleted = Command::new("git")
             .args(["branch", "-d", &branch_name])
             .current_dir(repo_root)
             .status()
             .is_ok_and(|s| s.success());
-    if !deleted {
-        let _ = Command::new("git")
-            .args(["branch", "-D", &branch_name])
-            .current_dir(repo_root)
-            .status();
+        if !deleted {
+            let _ = Command::new("git")
+                .args(["branch", "-D", &branch_name])
+                .current_dir(repo_root)
+                .status();
+        }
     }
 
     // #7239: now that the worktree is actually off disk (so it cannot count as
@@ -2182,8 +2191,7 @@ pub fn clean_worktrees(repo_root: &Path, stats: &mut CleanupStats, opts: &CleanO
                 );
             }
             WorktreeDecision::Remove => {
-                let result =
-                    cleanup_worktree(repo_root, &worktree_path, issue_num, opts.dry_run, "clean");
+                let result = cleanup_worktree(repo_root, &worktree_path, issue_num, opts, "clean");
                 record_cleanup_result(stats, &worktree_path, result);
             }
             WorktreeDecision::RemoveWithBackup => {
@@ -2217,7 +2225,7 @@ pub fn clean_worktrees(repo_root: &Path, stats: &mut CleanupStats, opts: &CleanO
                                 repo_root,
                                 &worktree_path,
                                 issue_num,
-                                opts.dry_run,
+                                opts,
                                 "clean",
                             );
                             record_cleanup_result(stats, &worktree_path, result);
@@ -2239,22 +2247,12 @@ pub fn clean_worktrees(repo_root: &Path, stats: &mut CleanupStats, opts: &CleanO
                     stats.cleaned_worktrees += 1;
                 } else if opts.force {
                     println!("  Auto-removing: {}", entry.path().display());
-                    let result = cleanup_worktree(
-                        repo_root,
-                        &worktree_path,
-                        issue_num,
-                        opts.dry_run,
-                        "clean",
-                    );
+                    let result =
+                        cleanup_worktree(repo_root, &worktree_path, issue_num, opts, "clean");
                     record_cleanup_result(stats, &worktree_path, result);
                 } else if confirm("  Force remove this worktree? [y/N] ") {
-                    let result = cleanup_worktree(
-                        repo_root,
-                        &worktree_path,
-                        issue_num,
-                        opts.dry_run,
-                        "clean",
-                    );
+                    let result =
+                        cleanup_worktree(repo_root, &worktree_path, issue_num, opts, "clean");
                     record_cleanup_result(stats, &worktree_path, result);
                 } else {
                     println!("  Skipping: {}", entry.path().display());
@@ -2490,6 +2488,76 @@ pub fn branch_reachable_from_remotes(repo_root: &Path, branch: &str) -> bool {
         .is_ok_and(|n| n == 0)
 }
 
+/// Clean an issue branch only when a remote contains its current tip or a
+/// same-repository merged PR identifies that exact tip (including squash merges).
+/// The expected old object ID keeps a concurrent commit on the branch intact.
+fn clean_safe_issue_branch(repo_root: &Path, branch: &str, dry_run: bool) -> Result<bool, String> {
+    let Some(tip) = local_branch_tip(repo_root, branch) else {
+        println!("  Cannot resolve local tip - keeping {branch}");
+        return Ok(false);
+    };
+    let reason = if branch_reachable_from_remotes(repo_root, &tip) {
+        "tip reachable from a remote"
+    } else if crate::forge_repo_facts::origin_identity(repo_root).is_some_and(|(host, slug)| {
+        matches!(
+            super::clean_owner::pr_at_head(repo_root, &host, &slug, branch, &tip),
+            super::clean_owner::PrAtHead::Merged(_)
+        )
+    }) {
+        "tip matches merged PR head"
+    } else {
+        println!("  No remote or merged PR covers tip {tip} - keeping {branch}");
+        return Ok(false);
+    };
+    if dry_run {
+        println!("  Would delete branch: {branch} ({tip}, {reason})");
+    } else {
+        let Some(holders) = super::branch_holders::branch_holders_checked(repo_root) else {
+            println!("  Cannot establish worktree holders - keeping {branch}");
+            return Ok(false);
+        };
+        if super::branch_holders::skip_if_held_in(&holders, branch) {
+            return Ok(false);
+        }
+        let mut delete = Command::new("git");
+        delete.current_dir(repo_root).args([
+            "update-ref",
+            "--no-deref",
+            "-d",
+            &format!("refs/heads/{branch}"),
+            &tip,
+        ]);
+        run_checked(delete)?;
+        // update-ref deletes the ref and reflog. Remove the tracking settings
+        // that git branch -D normally removes as well.
+        let _ = Command::new("git")
+            .current_dir(repo_root)
+            .args([
+                "config",
+                "--local",
+                "--remove-section",
+                &format!("branch.{branch}"),
+            ])
+            .output();
+        println!("  Deleted branch: {branch} ({tip}, {reason})");
+    }
+    Ok(true)
+}
+
+/// Record the branch-only pass independently of worktree removal accounting.
+fn count_safe_issue_branch(
+    repo_root: &Path,
+    branch: &str,
+    stats: &mut CleanupStats,
+    dry_run: bool,
+) {
+    match clean_safe_issue_branch(repo_root, branch, dry_run) {
+        Ok(true) => stats.cleaned_branches += 1,
+        Ok(false) => stats.kept_branches += 1,
+        Err(cause) => stats.record_error(branch, "git update-ref -d", &cause),
+    }
+}
+
 /// Whether `branch`'s PR is merged (including squash-merged, whose original
 /// commits are never reachable from a remote ref). REST first (the daemon's
 /// separate, less-contended pool — see
@@ -2551,6 +2619,11 @@ fn handle_stale_branch(
             stats.kept_branches += 1;
             return;
         }
+    }
+
+    if naming::issue_from_branch(branch).is_some() {
+        count_safe_issue_branch(repo_root, branch, stats, opts.dry_run);
+        return;
     }
 
     let reachable = branch_reachable_from_remotes(repo_root, branch);
@@ -2636,6 +2709,9 @@ pub fn clean_branches(repo_root: &Path, stats: &mut CleanupStats, opts: &CleanOp
         // `CLOSED` deletes the branch: confirmed by a fresh read (W6 PR2).
         let status = super::hygiene_pass::branch_issue_state(repo_root, issue_num, opts.dry_run);
         match status.as_str() {
+            "CLOSED" if opts.safe => {
+                count_safe_issue_branch(repo_root, branch, stats, opts.dry_run)
+            }
             "CLOSED" => {
                 let hint = sha_hint(repo_root, branch);
                 println!("  Issue #{issue_num} CLOSED - deleting {branch}{hint}");
