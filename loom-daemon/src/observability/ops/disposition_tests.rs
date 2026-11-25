@@ -861,6 +861,86 @@ fn delayed_new_source_stays_old_and_both_paths_share_one_watermark() {
     assert!(envelope.emitted_at - span.started_at > Duration::seconds(300));
 }
 
+/// #15182: a repo the gather deadline skipped reaches the summary with its
+/// root in `listing_incomplete` (the driver records the skip) and no rows:
+/// its tracked rows are preserved — unread is not empty — while a separately
+/// scanned, genuinely empty repo still departs exactly once. A later whole
+/// gather updates the preserved row, or reports its genuine departure.
+#[test]
+fn a_deadline_skipped_repo_preserves_rows_while_a_scanned_empty_repo_departs_once() {
+    let known = HashMap::from([
+        ("/skipped".to_string(), repo_ref("acme/skipped")),
+        ("/scanned".to_string(), repo_ref("acme/scanned")),
+    ]);
+    let cache = |root: &str| known.get(root).cloned();
+    let refresh = Duration::seconds(refresh_secs(None));
+    let skipped_row = summary_row("/skipped", 7, 1, Qd::DeferredCapacity, None);
+    let scanned_row = summary_row("/scanned", 9, 2, Qd::DeferredCapacity, None);
+    let mut sampler = Sampler::default();
+    let sample = |sampler: &mut Sampler, summary: WorkFinderTickSummary| {
+        let roots = summary_roots(&summary);
+        let repos = sampler.cached_repos(&roots, cache);
+        let failed = failed_slugs(&summary, &roots, &repos, cache);
+        let (rows, _) = build_rows(&summary, &repos);
+        sampler
+            .consume(summary.at, &rows, &failed, refresh)
+            .unwrap()
+            .emissions
+    };
+
+    let before = WorkFinderTickSummary {
+        at: at(0),
+        queue: vec![skipped_row.clone(), scanned_row],
+        ..Default::default()
+    };
+    assert_eq!(sample(&mut sampler, before).len(), 2, "first sight of both rows");
+
+    let truncated = |seconds| WorkFinderTickSummary {
+        at: at(seconds),
+        listing_incomplete: vec!["/skipped".into()],
+        ..Default::default()
+    };
+    let departed = sample(&mut sampler, truncated(60));
+    assert_eq!(departed.len(), 1, "only the scanned repo's real departure emits");
+    assert_eq!(departed[0].slug, "acme/scanned");
+    assert_eq!(departed[0].transition, Transition::LeftQueue);
+    // The same truncated tick observed again still has nothing to say.
+    assert!(sample(&mut sampler, truncated(120)).is_empty());
+
+    // A later complete gather updates the preserved row: past the refresh
+    // window since its last whole observation, it re-emits as a refresh.
+    let updated = WorkFinderTickSummary {
+        at: at(180),
+        queue: vec![skipped_row.clone()],
+        ..Default::default()
+    };
+    let emissions = sample(&mut sampler, updated);
+    assert_eq!(emissions.len(), 1);
+    assert_eq!(emissions[0].slug, "acme/skipped");
+    assert_eq!(emissions[0].transition, Transition::Refresh);
+
+    // Once a whole gather no longer holds it, the departure is real.
+    let gone = sample(
+        &mut sampler,
+        WorkFinderTickSummary {
+            at: at(240),
+            ..Default::default()
+        },
+    );
+    assert_eq!(gone.len(), 1);
+    assert_eq!(gone[0].slug, "acme/skipped");
+    assert_eq!(gone[0].transition, Transition::LeftQueue);
+    // ... and it is reported once, not re-emitted.
+    let again = sample(
+        &mut sampler,
+        WorkFinderTickSummary {
+            at: at(300),
+            ..Default::default()
+        },
+    );
+    assert!(again.is_empty(), "{again:?}");
+}
+
 #[test]
 fn missing_identity_partial_and_failed_keep_rows_until_a_whole_departure() {
     let known = repos_with_repo();

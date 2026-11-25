@@ -338,6 +338,129 @@ pub fn current(repo: &str, issue: u64, title: &str, body: &str) -> Result<Curren
     })
 }
 
+/// How many edit-history entries the fallback walks: the newest
+/// [`BODY_HISTORY_LIMIT`] versions of the body. The last published block sits
+/// within these for every ruling flow (the ruling edit is the newest
+/// block-destroying edit); a block older than the cap is not recovered and
+/// the refusal names it (#15108).
+pub const BODY_HISTORY_LIMIT: usize = 100;
+
+/// The GraphQL query behind the history fallback (#15108): an issue body's
+/// edit history. GraphQL-only data — REST exposes no body versions — read
+/// like the comments fallback (#10025). For issue bodies each entry's `diff`
+/// is the COMPLETE body as it stood after that edit (verified against live
+/// `userContentEdits` responses, small edits included), so no diff replay is
+/// involved; `last=LIMIT` is the newest-entries window.
+pub const BODY_HISTORY_QUERY: &str = "query($owner:String!,$name:String!,$number:Int!){\
+repository(owner:$owner,name:$name){issue(number:$number){userContentEdits(last:LIMIT){\
+nodes{editedAt diff editor{login __typename}}}}}}";
+
+/// [`BODY_HISTORY_QUERY`] with the limit spelled in.
+#[must_use]
+pub fn body_history_query() -> String {
+    BODY_HISTORY_QUERY.replace("last:LIMIT", &format!("last:{BODY_HISTORY_LIMIT}"))
+}
+
+/// One prior version of an issue body, as the forge's edit history reports
+/// it (#15108): the body as it stood after one edit, and who made that edit.
+#[derive(Debug, Clone)]
+pub struct BodyEdit {
+    /// The body text as it stood after the edit (the entry's `diff` field,
+    /// which for issue bodies is that snapshot, not a patch).
+    pub body: String,
+    /// When the edit was made (`editedAt`, ISO-8601 UTC); orders the history.
+    pub edited_at: String,
+    /// Who made the edit, in a shape
+    /// [`crate::comment_trust::Author::from_json`] reads: `{"author": …}`
+    /// (GraphQL `editor`) or `{"user": …}` (REST).
+    pub editor: serde_json::Value,
+}
+
+/// Parse one `gh api graphql` response of [`body_history_query`] into the
+/// body's prior versions, newest first. `None` when the response carries
+/// GraphQL `errors` or does not parse — the caller fails closed rather than
+/// treat an unreadable history as an empty one.
+#[must_use]
+pub fn parse_body_history(stdout: &[u8]) -> Option<Vec<BodyEdit>> {
+    let v: serde_json::Value = serde_json::from_slice(stdout).ok()?;
+    if v.get("errors").is_some_and(|e| !e.is_null()) {
+        return None;
+    }
+    let nodes = v
+        .pointer("/data/repository/issue/userContentEdits/nodes")?
+        .as_array()?;
+    let mut edits: Vec<BodyEdit> = nodes
+        .iter()
+        .filter_map(|n| {
+            Some(BodyEdit {
+                body: n.get("diff")?.as_str()?.to_string(),
+                edited_at: n.get("editedAt")?.as_str()?.to_string(),
+                editor: serde_json::json!({
+                    "author": n.get("editor").cloned().unwrap_or(serde_json::Value::Null)
+                }),
+            })
+        })
+        .collect();
+    edits.sort_by(|a, b| b.edited_at.cmp(&a.edited_at));
+    Some(edits)
+}
+
+/// [`current`] with the #15108 history fallback: when the body carries no
+/// ```` ```decision ```` block at all — an attended ruling replaces the block
+/// with an "Operator ruling" section — read the decision from the newest
+/// prior body version that carries a parseable one, so the binding is to the
+/// exact decision text the operator reviewed. A body that still HAS a block,
+/// however it fails to parse, stays authoritative: no fallback. The recovered
+/// version's editor must be one the [`crate::comment_trust::TrustPolicy`]
+/// believes (the daemon identity, a trusted commenter or the operator — the
+/// rule that guards recommendations); a recoverable block whose editor is not
+/// believed is refused, naming the editor.
+///
+/// Both digests are computed over the recovered version's text exactly as
+/// [`current`] would have computed them had that version still stood in the
+/// body, so `resolve` and `premise-check` cannot disagree.
+///
+/// # Errors
+///
+/// Why the decision cannot be read: the body's own reason when it carries a
+/// block, otherwise why no recoverable version could be used.
+pub fn current_with_history(
+    repo: &str,
+    issue: u64,
+    title: &str,
+    body: &str,
+    history: &[BodyEdit],
+    policy: &crate::comment_trust::TrustPolicy,
+) -> Result<Current, String> {
+    if super::render::extract_block(body).is_some() {
+        return current(repo, issue, title, body);
+    }
+    let mut newest_first: Vec<&BodyEdit> = history.iter().collect();
+    newest_first.sort_by(|a, b| b.edited_at.cmp(&a.edited_at));
+    newest_first.truncate(BODY_HISTORY_LIMIT);
+    for e in newest_first {
+        let Ok(c) = current(repo, issue, title, &e.body) else {
+            continue;
+        };
+        if policy.trusts_json(&e.editor) {
+            return Ok(c);
+        }
+        let who = crate::comment_trust::Author::from_json(&e.editor)
+            .login
+            .unwrap_or_else(|| "an unreadable account".to_string());
+        return Err(format!(
+            "the issue body carries no ```decision block and the newest one recoverable from the \
+             edit history was written by `{who}`, whom the trust policy does not believe; \
+             re-publish the decision with `loom-daemon operator-decision apply`"
+        ));
+    }
+    Err(format!(
+        "the issue body carries no ```decision block and no version in its edit history (newest \
+         {BODY_HISTORY_LIMIT}) carries a parseable one; re-publish the decision with \
+         `loom-daemon operator-decision apply`"
+    ))
+}
+
 /// One issue comment, with the forge's verdict on its author already applied.
 #[derive(Debug, Clone)]
 pub struct Candidate {

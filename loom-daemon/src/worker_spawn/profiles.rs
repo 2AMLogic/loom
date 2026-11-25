@@ -84,12 +84,61 @@ pub struct ModelProfile {
     pub excluded_roles: Vec<String>,
 }
 
+/// A narrow overlay on a *bundled* profile (`runtimes.modelProfileOverrides`,
+/// #15252). Unlike `runtimes.modelProfiles` — whose entry replaces the bundled
+/// profile wholesale, so a copy that drops `excludedRoles` silently admits GLM
+/// to Judge/Curator (#11450) — an override changes only the fields below.
+/// Credentials, providers, `credentialProxy`, billing and `excludedRoles` always
+/// come from the bundled definition; `excludedRolesAdd` can only extend the
+/// exclusion list. An explicit `null` field is "absent" (it clears a lower
+/// tier's value under `deep_merge`).
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ModelProfileOverride {
+    model: Option<String>,
+    effort: Option<String>,
+    allowed_efforts: Option<Vec<String>>,
+    excluded_roles_add: Option<Vec<String>>,
+}
+
+impl ModelProfileOverride {
+    fn apply(&self, profile: &mut ModelProfile) {
+        if let Some(model) = &self.model {
+            profile.model.clone_from(model);
+        }
+        if let Some(effort) = &self.effort {
+            profile.effort = Some(effort.clone());
+        }
+        if let Some(allowed) = &self.allowed_efforts {
+            profile.allowed_efforts.clone_from(allowed);
+        }
+        for role in self.excluded_roles_add.iter().flatten() {
+            // Validated beforehand (`check_model_profile_overrides_config`), so
+            // the canonical name exists; dedupe against the bundled entries.
+            let canonical = crate::runtime_admission::canonical_role(role);
+            let listed = profile
+                .excluded_roles
+                .iter()
+                .any(|existing| crate::runtime_admission::canonical_role(existing) == canonical);
+            if !listed {
+                profile
+                    .excluded_roles
+                    .push(canonical.map_or_else(|| role.clone(), str::to_string));
+            }
+        }
+    }
+}
+
 #[derive(Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct ProfileConfig {
     default_model_profile: Option<String>,
     #[serde(default)]
     model_profiles: BTreeMap<String, ModelProfile>,
+    /// `None` is an explicit `null` — a higher tier clearing a lower tier's
+    /// override of that profile.
+    /// The whole key may itself be `null` (a tier clearing every override).
+    model_profile_overrides: Option<BTreeMap<String, Option<ModelProfileOverride>>>,
 }
 
 #[derive(Debug)]
@@ -134,8 +183,18 @@ pub fn bundled() -> BTreeMap<String, ModelProfile> {
 }
 
 /// Resolve a profile by name, falling back to configuration's default and then
-/// the bundled set. Configuration profiles shadow bundled ones of the same name.
+/// the bundled set. Configuration profiles shadow bundled ones of the same name;
+/// `runtimes.modelProfileOverrides` (#15252) overlays a bundled one instead.
 pub fn lookup(name: Option<&str>, config: &Value) -> Result<(String, ModelProfile), LaunchError> {
+    // Fail closed on a malformed override for ANY profile: the same findings
+    // `loom-daemon validate` reports, so a bad store config cannot half-apply.
+    let override_findings = check_model_profile_overrides_config(config);
+    if !override_findings.is_empty() {
+        return Err(LaunchError::config(format!(
+            "invalid runtimes.modelProfileOverrides: {}",
+            override_findings.join("; ")
+        )));
+    }
     let configured: ProfileConfig = serde_json::from_value(
         config
             .get("runtimes")
@@ -160,16 +219,26 @@ pub fn lookup(name: Option<&str>, config: &Value) -> Result<(String, ModelProfil
     };
     let profile = match configured.model_profiles.get(&name).cloned() {
         Some(profile) => profile,
-        None => bundled().remove(&name).ok_or_else(|| {
-            let mut known: Vec<String> = configured.model_profiles.keys().cloned().collect();
-            known.extend(bundled().into_keys());
-            known.sort();
-            known.dedup();
-            LaunchError::config(format!(
-                "unknown model profile `{name}` (from {source}); known profiles: {}",
-                known.join(", ")
-            ))
-        })?,
+        None => {
+            let mut profile = bundled().remove(&name).ok_or_else(|| {
+                let mut known: Vec<String> = configured.model_profiles.keys().cloned().collect();
+                known.extend(bundled().into_keys());
+                known.sort();
+                known.dedup();
+                LaunchError::config(format!(
+                    "unknown model profile `{name}` (from {source}); known profiles: {}",
+                    known.join(", ")
+                ))
+            })?;
+            if let Some(Some(overlay)) = configured
+                .model_profile_overrides
+                .as_ref()
+                .and_then(|o| o.get(&name))
+            {
+                overlay.apply(&mut profile);
+            }
+            profile
+        }
     };
     if profile.model.trim().is_empty()
         || profile.effort.as_ref().is_some_and(|s| s.trim().is_empty())
@@ -220,6 +289,17 @@ pub fn excluded_role(
         .then_some(name)
 }
 
+/// Issues #14962 / #15205: whether `model` is a qualified `provider/model`
+/// pin (two non-empty halves) — the shape [`select`] honours verbatim, before
+/// any profile lookup, when no profile was explicitly requested. Shared by
+/// [`profile_rejects_model`] and [`profile_rejects_effort`] so both mirror
+/// `select`'s early return on one condition.
+fn is_qualified_model(model: &str) -> bool {
+    model
+        .split_once('/')
+        .is_some_and(|(provider, rest)| !provider.is_empty() && !rest.is_empty())
+}
+
 /// Issue #14963: the model profile a native launch of `runtime` would resolve,
 /// when that profile declares a non-empty `allowedEfforts` that does not
 /// include `effort` — the exact predicate [`select`] refuses the launch on
@@ -236,10 +316,21 @@ pub fn excluded_role(
 /// or a profile with no provider for this harness (it cannot be the model that
 /// harness runs); `Some(profile_name)` when the profile's `allowedEfforts`
 /// lists at least one level and does not include `effort`.
+///
+/// Issue #15205: `model` is the final model the launch will carry (`None` /
+/// empty when it launches with the profile's own). With **no** explicitly
+/// requested profile (tap `modelProfile` or `LOOM_MODEL_PROFILE`), a qualified
+/// `provider/model` (two non-empty halves) returns `None`: [`select`] honours
+/// that pin verbatim — effort included — before any profile lookup, so
+/// `allowedEfforts` is never consulted and the effort is not a refusal. This
+/// is the same carve-out, on the same condition, as [`profile_rejects_model`].
+/// With an explicit profile, or a bare / malformed model, the effort is still
+/// judged against the resolved profile.
 #[must_use]
 pub fn profile_rejects_effort(
     runtime: &str,
     profile: Option<&str>,
+    model: Option<&str>,
     effort: &str,
     config: &Value,
 ) -> Option<String> {
@@ -251,12 +342,75 @@ pub fn profile_rejects_effort(
         .map(str::trim)
         .filter(|p| !p.is_empty())
         .or(env_profile.as_deref());
+    // Mirror `select`'s early return (see `profile_rejects_model`).
+    if requested.is_none() && model.is_some_and(is_qualified_model) {
+        return None;
+    }
     let (name, resolved) = lookup(requested, config).ok()?;
     if !resolved.providers.contains_key(runtime) {
         return None;
     }
-    (!resolved.allowed_efforts.is_empty() && !resolved.allowed_efforts.iter().any(|a| a == effort))
-        .then_some(name)
+    effort_outside_allowed(effort, &resolved.allowed_efforts).then_some(name)
+}
+
+/// The predicate [`select`] refuses a launch on (`reasoning effort is
+/// unsupported by the selected model profile`): a non-empty `allowedEfforts`
+/// that does not list `effort`. One definition shared by `select`,
+/// [`profile_rejects_effort`] and [`check_model_profile_overrides_config`]
+/// (#15268), so `validate` and the launch refusal cannot drift.
+fn effort_outside_allowed(effort: &str, allowed: &[String]) -> bool {
+    !allowed.is_empty() && !allowed.iter().any(|a| a == effort)
+}
+
+/// Issue #14962: the model profile a native launch of `runtime` would
+/// resolve, when that profile's model differs from `model` — the
+/// predicate [`select`] refuses the launch on (see the qualified-pin carve-out below) (`stage=profile_selection`,
+/// exit 78), factored out so the daemon's launch sites can drop a
+/// *configured-tier* model override instead of losing the step.
+///
+/// Shares [`excluded_role`]'s lookup path verbatim — `profile` is the
+/// explicitly chosen profile (a preference tap's `modelProfile`); `None`
+/// falls back exactly as [`lookup`] does for a launch: `LOOM_MODEL_PROFILE`,
+/// then `runtimes.defaultModelProfile`, then the bundled `zai-flash` default
+/// — so the daemon's reconciliation judges the profile the child would
+/// actually select. Returns `None` (no objection) for a non-native runtime,
+/// an unknown profile (the launch itself fails closed on that, with its own
+/// diagnostic), or a profile with no provider for this harness (it cannot be
+/// the model that harness runs); `Some(profile_name)` when the resolved
+/// profile's `model` differs from `model`. The comparison is the full
+/// configured string against the profile's model, exactly as [`select`]
+/// compares them — including a *qualified* `provider/model` value when a
+/// profile was explicitly requested (tap `modelProfile` or
+/// `LOOM_MODEL_PROFILE`), which is refused unless it literally equals the
+/// profile's model. With **no** explicitly requested profile, a qualified
+/// `provider/model` (two non-empty halves) returns `None`: [`select`] honours
+/// it verbatim before any profile lookup, so it is not a refusal.
+#[must_use]
+pub fn profile_rejects_model(
+    runtime: &str,
+    profile: Option<&str>,
+    model: &str,
+    config: &Value,
+) -> Option<String> {
+    if !super::is_native(runtime) {
+        return None;
+    }
+    let env_profile = super::nonempty_env("LOOM_MODEL_PROFILE");
+    let requested = profile
+        .map(str::trim)
+        .filter(|p| !p.is_empty())
+        .or(env_profile.as_deref());
+    // Mirror `select`'s early return: with no explicitly requested profile, a
+    // qualified `provider/model` is honoured verbatim and never compared
+    // against a profile (documented `roleModels` shape, configuring-resources.md).
+    if requested.is_none() && is_qualified_model(model) {
+        return None;
+    }
+    let (name, resolved) = lookup(requested, config).ok()?;
+    if !resolved.providers.contains_key(runtime) {
+        return None;
+    }
+    (resolved.model != model).then_some(name)
 }
 
 /// `loom-daemon validate` findings for `excludedRoles` (#11400): every entry,
@@ -294,6 +448,143 @@ pub fn check_excluded_roles_config(config: &Value) -> Vec<String> {
     }
     for (name, profile) in bundled() {
         findings.extend(unknown_roles("model-profiles.json", &name, &profile.excluded_roles));
+    }
+    findings
+}
+
+/// `loom-daemon validate` findings for `runtimes.modelProfileOverrides`
+/// (#15252). Also run by [`lookup`], so a launch refuses (exit 78) on exactly
+/// what validate reports. Explicit `null` (a profile or a field) is absent, not
+/// an error. Rejected: a non-bundled name, a name also defined under
+/// `runtimes.modelProfiles`, any key outside `model` / `effort` /
+/// `allowedEfforts` / `excludedRolesAdd` (`excludedRoles` itself gets its own
+/// message — the bundled list can be extended, never replaced or reduced), a
+/// blank `model` / `effort` / `allowedEfforts` entry, and an unknown role in
+/// `excludedRolesAdd`.
+#[must_use]
+pub fn check_model_profile_overrides_config(config: &Value) -> Vec<String> {
+    const PATH: &str = "runtimes.modelProfileOverrides";
+    let overrides = match config.pointer("/runtimes/modelProfileOverrides") {
+        None | Some(Value::Null) => return Vec::new(),
+        Some(Value::Object(map)) => map,
+        Some(_) => {
+            return vec![format!(
+                "{PATH} must be an object keyed by bundled profile name"
+            )];
+        }
+    };
+    fn blank(value: &Value) -> bool {
+        value.as_str().is_none_or(|s| s.trim().is_empty())
+    }
+    let bundled = bundled();
+    let configured = config
+        .pointer("/runtimes/modelProfiles")
+        .and_then(Value::as_object);
+    let mut findings = Vec::new();
+    for (name, overlay) in overrides {
+        let at = format!("{PATH}.{name}");
+        let fields = match overlay {
+            Value::Null => continue,
+            Value::Object(fields) => fields,
+            _ => {
+                findings.push(format!("{at} must be an object"));
+                continue;
+            }
+        };
+        if !bundled.contains_key(name) {
+            findings.push(format!(
+                "{at}: `{name}` is not a bundled model profile (bundled: {}); \
+                 define a new profile under runtimes.modelProfiles instead",
+                bundled.keys().cloned().collect::<Vec<_>>().join(", ")
+            ));
+        }
+        if configured.is_some_and(|m| m.get(name).is_some_and(|p| !p.is_null())) {
+            findings.push(format!(
+                "{at}: `{name}` is also defined under runtimes.modelProfiles; use exactly one \
+                 (modelProfileOverrides changes a bundled profile, modelProfiles replaces it)"
+            ));
+        }
+        for (key, value) in fields {
+            if value.is_null() {
+                continue;
+            }
+            match key.as_str() {
+                "model" | "effort" if blank(value) => {
+                    findings.push(format!("{at}.{key} must be a non-blank string"));
+                }
+                "model" | "effort" => {}
+                "allowedEfforts" => match value.as_array() {
+                    Some(items) if !items.iter().any(blank) => {}
+                    _ => findings
+                        .push(format!("{at}.allowedEfforts must be an array of non-blank strings")),
+                },
+                "excludedRolesAdd" => match value.as_array() {
+                    Some(items) => {
+                        let unknown: Vec<String> = items
+                            .iter()
+                            .filter(|item| {
+                                item.as_str()
+                                    .and_then(crate::runtime_admission::canonical_role)
+                                    .is_none()
+                            })
+                            .map(|item| {
+                                item.as_str()
+                                    .map_or_else(|| item.to_string(), str::to_string)
+                            })
+                            .collect();
+                        if !unknown.is_empty() {
+                            findings.push(format!(
+                                "{at}.excludedRolesAdd: unknown role name(s): {}",
+                                unknown.join(", ")
+                            ));
+                        }
+                    }
+                    None => findings
+                        .push(format!("{at}.excludedRolesAdd must be an array of role names")),
+                },
+                "excludedRoles" => findings.push(format!(
+                    "{at}.excludedRoles cannot be set in an override: the bundled excludedRoles \
+                     can be extended with excludedRolesAdd but never replaced or reduced"
+                )),
+                other => findings.push(format!(
+                    "{at}.{other}: unknown override key (allowed: model, effort, allowedEfforts, \
+                     excludedRolesAdd)"
+                )),
+            }
+        }
+        // #15268: each field is valid alone, but the effective pair (override,
+        // else the bundled sibling) must satisfy the predicate `select` refuses
+        // a launch on. A non-bundled name is left to the finding above.
+        if let Some(base) = bundled.get(name) {
+            let effort = match fields.get("effort") {
+                None | Some(Value::Null) => base.effort.as_deref(),
+                Some(value) => value.as_str().filter(|s| !s.trim().is_empty()),
+            };
+            let allowed: Option<Vec<String>> = match fields.get("allowedEfforts") {
+                None | Some(Value::Null) => Some(base.allowed_efforts.clone()),
+                Some(value) => value.as_array().and_then(|items| {
+                    items
+                        .iter()
+                        .map(|i| {
+                            i.as_str()
+                                .filter(|s| !s.trim().is_empty())
+                                .map(str::to_string)
+                        })
+                        .collect()
+                }),
+            };
+            // A malformed field was already reported above; don't double-report.
+            if let (Some(effort), Some(allowed)) = (effort, allowed) {
+                if effort_outside_allowed(effort, &allowed) {
+                    findings.push(format!(
+                        "{at}: effective effort `{effort}` is not in the effective allowedEfforts \
+                         [{}]; every launch of `{name}` would be refused (exit 78) — set effort \
+                         and allowedEfforts consistently",
+                        allowed.join(", ")
+                    ));
+                }
+            }
+        }
     }
     findings
 }
@@ -571,7 +862,7 @@ pub fn select(runtime: &str, options: &Options, config: &Value) -> Result<Select
         selection.effort = Some(effort);
     }
     if let Some(e) = &selection.effort {
-        if !profile.allowed_efforts.is_empty() && !profile.allowed_efforts.contains(e) {
+        if effort_outside_allowed(e, &profile.allowed_efforts) {
             return Err(LaunchError::config(
                 "reasoning effort is unsupported by the selected model profile",
             ));
@@ -875,25 +1166,25 @@ mod tests {
         // The reported incident's exact shape: a `medium` effort meeting a
         // profile that allows only low/high/max.
         assert_eq!(
-            profile_rejects_effort("opencode", Some("strict"), "medium", &config),
+            profile_rejects_effort("opencode", Some("strict"), None, "medium", &config),
             Some("strict".to_string())
         );
         // An effort the profile allows is no objection.
-        assert_eq!(profile_rejects_effort("opencode", Some("strict"), "high", &config), None);
+        assert_eq!(profile_rejects_effort("opencode", Some("strict"), None, "high", &config), None);
         // An empty `allowedEfforts` (here: absent) never rejects.
-        assert_eq!(profile_rejects_effort("opencode", Some("open"), "medium", &config), None);
+        assert_eq!(profile_rejects_effort("opencode", Some("open"), None, "medium", &config), None);
         // A non-native runtime is never judged (Claude/Codex forward the flag
         // to their own CLIs, which own their level vocabularies).
-        assert_eq!(profile_rejects_effort("claude", Some("strict"), "medium", &config), None);
+        assert_eq!(profile_rejects_effort("claude", Some("strict"), None, "medium", &config), None);
         // A profile with no provider entry for this harness cannot be the
         // model that harness runs.
         assert_eq!(
-            profile_rejects_effort("opencode", Some("other-harness"), "medium", &config),
+            profile_rejects_effort("opencode", Some("other-harness"), None, "medium", &config),
             None
         );
         // An unknown profile is left to the launch's own fail-closed
         // diagnostic, never judged here.
-        assert_eq!(profile_rejects_effort("opencode", Some("nope"), "medium", &config), None);
+        assert_eq!(profile_rejects_effort("opencode", Some("nope"), None, "medium", &config), None);
 
         if let Some(v) = saved {
             std::env::set_var("LOOM_MODEL_PROFILE", v);
@@ -913,15 +1204,18 @@ mod tests {
 
         std::env::remove_var("LOOM_MODEL_PROFILE");
         assert_eq!(
-            profile_rejects_effort("opencode", None, "medium", &serde_json::json!({})),
+            profile_rejects_effort("opencode", None, None, "medium", &serde_json::json!({})),
             Some("zai-flash".to_string()),
             "the bundled zai-flash fallback rejects the incident's medium"
         );
-        assert_eq!(profile_rejects_effort("opencode", None, "high", &serde_json::json!({})), None);
+        assert_eq!(
+            profile_rejects_effort("opencode", None, None, "high", &serde_json::json!({})),
+            None
+        );
 
         std::env::set_var("LOOM_MODEL_PROFILE", "zai-full");
         assert_eq!(
-            profile_rejects_effort("opencode", None, "medium", &serde_json::json!({})),
+            profile_rejects_effort("opencode", None, None, "medium", &serde_json::json!({})),
             Some("zai-full".to_string()),
             "LOOM_MODEL_PROFILE names the profile a bare tap is judged against"
         );
@@ -932,7 +1226,7 @@ mod tests {
                           "allowedEfforts": ["low", "high", "max"]}
         }}});
         assert_eq!(
-            profile_rejects_effort("opencode", None, "medium", &config),
+            profile_rejects_effort("opencode", None, None, "medium", &config),
             Some("zai-full".to_string()),
             "runtimes.defaultModelProfile names the profile a bare tap is judged against"
         );
@@ -940,5 +1234,435 @@ mod tests {
         if let Some(v) = saved {
             std::env::set_var("LOOM_MODEL_PROFILE", v);
         }
+    }
+
+    /// Issue #15205: with no explicitly requested profile, a qualified
+    /// `provider/model` pin is honoured by `select` verbatim — effort
+    /// included, `allowedEfforts` never consulted — so `profile_rejects_effort`
+    /// must not call it a refusal. An explicit profile (tap or
+    /// `LOOM_MODEL_PROFILE`), a bare model and a malformed qualified model all
+    /// keep today's judgment against the resolved profile.
+    #[test]
+    fn profile_rejects_effort_honours_a_qualified_model_pin_like_select() {
+        let _g = env_lock();
+        let saved = std::env::var_os("LOOM_MODEL_PROFILE");
+        std::env::remove_var("LOOM_MODEL_PROFILE");
+        let none = serde_json::json!({});
+        let pin = Some("google/gemini-2.5-pro");
+
+        // The gap: the bundled zai-flash rejects `medium`, but `select`
+        // returns the pin's selection before ever reading its allowedEfforts.
+        assert_eq!(profile_rejects_effort("opencode", None, pin, "medium", &none), None);
+        // ... which the real `select` confirms, so the carve-out cannot drift.
+        let selected = select(
+            "opencode",
+            &Options {
+                model: pin.map(str::to_string),
+                effort: Some("medium".to_string()),
+                ..Options::default()
+            },
+            &none,
+        )
+        .expect("select honours a qualified pin without consulting allowedEfforts");
+        assert_eq!(selected.effort.as_deref(), Some("medium"));
+
+        // An explicit profile (tap) keeps judging the effort against it.
+        assert_eq!(
+            profile_rejects_effort("opencode", Some("zai-flash"), pin, "medium", &none),
+            Some("zai-flash".to_string())
+        );
+        // So does LOOM_MODEL_PROFILE.
+        std::env::set_var("LOOM_MODEL_PROFILE", "zai-full");
+        assert_eq!(
+            profile_rejects_effort("opencode", None, pin, "medium", &none),
+            Some("zai-full".to_string())
+        );
+        std::env::remove_var("LOOM_MODEL_PROFILE");
+
+        // Bare, empty-half and absent models fall through to today's behaviour.
+        for model in [
+            Some("glm-5.3-flash"),
+            Some("google/"),
+            Some("/gemini"),
+            Some(""),
+            None,
+        ] {
+            assert_eq!(
+                profile_rejects_effort("opencode", None, model, "medium", &none),
+                Some("zai-flash".to_string()),
+                "model {model:?} is not a qualified pin"
+            );
+        }
+
+        if let Some(v) = saved {
+            std::env::set_var("LOOM_MODEL_PROFILE", v);
+        }
+    }
+
+    /// Issue #14962: `profile_rejects_model` mirrors `select`'s
+    /// model-mismatch refusal predicate on `excluded_role`'s exact lookup
+    /// path, so the daemon's launch sites can drop a *configured-tier* model
+    /// instead of losing the step to a `profile_selection` refusal. The full
+    /// drop-vs-keep precedence lives with the resolver
+    /// (`role_runner/tests/model_resolution.rs`); these tests pin the
+    /// predicate itself.
+    #[test]
+    fn profile_rejects_model_matches_selects_model_predicate() {
+        let _g = env_lock();
+        let saved = std::env::var_os("LOOM_MODEL_PROFILE");
+        std::env::remove_var("LOOM_MODEL_PROFILE");
+        let config = serde_json::json!({"runtimes":{"modelProfiles":{
+            "strict": {"model": "glm-5.3", "providers": {"opencode": "zai-coding-plan"}},
+            "other-harness": {"model": "glm-5.3", "providers": {"pi": "zai"}}
+        }}});
+
+        // The reported incident's exact shape: a Claude-shaped model meeting
+        // the native profile the draw pinned.
+        assert_eq!(
+            profile_rejects_model("opencode", Some("strict"), "claude-opus-5", &config),
+            Some("strict".to_string())
+        );
+        // The profile's own model is no objection.
+        assert_eq!(profile_rejects_model("opencode", Some("strict"), "glm-5.3", &config), None);
+        // A qualified provider/model that does not literally equal the
+        // profile's model is the same objection (`select` compares the full
+        // string once a profile is selected).
+        assert_eq!(
+            profile_rejects_model("opencode", Some("strict"), "zai-coding-plan/glm-5.3", &config),
+            Some("strict".to_string())
+        );
+        // A non-native runtime is never judged (Claude/Codex forward `--model`
+        // to their own CLIs, which own their vocabularies).
+        assert_eq!(profile_rejects_model("claude", Some("strict"), "claude-opus-5", &config), None);
+        // A profile with no provider entry for this harness cannot be the
+        // model that harness runs.
+        assert_eq!(
+            profile_rejects_model("opencode", Some("other-harness"), "claude-opus-5", &config),
+            None
+        );
+        // An unknown profile is left to the launch's own fail-closed
+        // diagnostic, never judged here.
+        assert_eq!(profile_rejects_model("opencode", Some("nope"), "claude-opus-5", &config), None);
+
+        if let Some(v) = saved {
+            std::env::set_var("LOOM_MODEL_PROFILE", v);
+        }
+    }
+
+    /// Issue #14962: a bare native runtime (a preference tap with no
+    /// `modelProfile`) is judged against the profile the launch would
+    /// actually select — the `LOOM_MODEL_PROFILE` / `defaultModelProfile` /
+    /// bundled `zai-flash` fallback chain, exactly as `excluded_role` and
+    /// `profile_rejects_effort` judge it. The bundled `zai-flash` runs
+    /// `glm-5.3-flash`, so the incident's `claude-opus-5` meets it too.
+    #[test]
+    fn profile_rejects_model_falls_back_to_the_launchs_own_profile() {
+        let _g = env_lock();
+        let saved = std::env::var_os("LOOM_MODEL_PROFILE");
+
+        std::env::remove_var("LOOM_MODEL_PROFILE");
+        assert_eq!(
+            profile_rejects_model("opencode", None, "claude-opus-5", &serde_json::json!({})),
+            Some("zai-flash".to_string()),
+            "the bundled zai-flash fallback rejects the incident's model"
+        );
+        assert_eq!(
+            profile_rejects_model("opencode", None, "glm-5.3-flash", &serde_json::json!({})),
+            None,
+            "the bundled zai-flash's own model (glm-5.3-flash) is no objection"
+        );
+        // `select` honours a qualified `provider/model` verbatim when no
+        // profile was requested (it never consults a profile), so it is no
+        // objection — the documented `roleModels` shape.
+        assert_eq!(
+            profile_rejects_model(
+                "opencode",
+                None,
+                "google/gemini-2.5-pro",
+                &serde_json::json!({})
+            ),
+            None,
+            "a qualified pin on a bare pick is honoured by select"
+        );
+        // Malformed halves are not the early-return shape; they fall through.
+        assert_eq!(
+            profile_rejects_model("opencode", None, "google/", &serde_json::json!({})),
+            Some("zai-flash".to_string())
+        );
+        // An explicitly requested profile still refuses a differing qualified pin.
+        assert_eq!(
+            profile_rejects_model(
+                "opencode",
+                Some("zai-flash"),
+                "google/gemini-2.5-pro",
+                &serde_json::json!({})
+            ),
+            Some("zai-flash".to_string())
+        );
+
+        std::env::set_var("LOOM_MODEL_PROFILE", "zai-full");
+        assert_eq!(
+            profile_rejects_model("opencode", None, "claude-opus-5", &serde_json::json!({})),
+            Some("zai-full".to_string()),
+            "LOOM_MODEL_PROFILE names the profile a bare tap is judged against"
+        );
+
+        std::env::remove_var("LOOM_MODEL_PROFILE");
+        let config = serde_json::json!({"runtimes":{"defaultModelProfile":"zai-full", "modelProfiles":{
+            "zai-full": {"model": "glm-5.3", "providers": {"opencode": "zai-coding-plan"}}
+        }}});
+        assert_eq!(
+            profile_rejects_model("opencode", None, "claude-opus-5", &config),
+            Some("zai-full".to_string()),
+            "runtimes.defaultModelProfile names the profile a bare tap is judged against"
+        );
+
+        if let Some(v) = saved {
+            std::env::set_var("LOOM_MODEL_PROFILE", v);
+        }
+    }
+
+    // ===== runtimes.modelProfileOverrides (#15252) =====
+
+    fn with_no_profile_env<T>(f: impl FnOnce() -> T) -> T {
+        let _g = env_lock();
+        let saved = std::env::var_os("LOOM_MODEL_PROFILE");
+        std::env::remove_var("LOOM_MODEL_PROFILE");
+        let out = f();
+        if let Some(v) = saved {
+            std::env::set_var("LOOM_MODEL_PROFILE", v);
+        }
+        out
+    }
+
+    fn overrides(value: Value) -> Value {
+        serde_json::json!({"runtimes": {"modelProfileOverrides": value}})
+    }
+
+    #[test]
+    fn an_override_changes_the_model_and_keeps_every_other_bundled_field() {
+        with_no_profile_env(|| {
+            let config = overrides(serde_json::json!({"zai-full": {
+                "model": "glm-5.4", "effort": "high", "allowedEfforts": ["high", "max"]
+            }}));
+            let (name, got) = lookup(Some("zai-full"), &config).unwrap();
+            let bundled = bundled().remove("zai-full").unwrap();
+            assert_eq!(name, "zai-full");
+            assert_eq!(got.model, "glm-5.4");
+            assert_eq!(got.effort.as_deref(), Some("high"));
+            assert_eq!(got.allowed_efforts, ["high", "max"]);
+            // Everything not overridable is inherited verbatim.
+            assert_eq!(got.excluded_roles, ["judge", "curator"]);
+            assert_eq!(got.providers, bundled.providers);
+            assert_eq!(got.billing, bundled.billing);
+            assert_eq!(got.credential_pool, bundled.credential_pool);
+            assert_eq!(got.credential_targets.len(), bundled.credential_targets.len());
+            assert_eq!(
+                got.credential_proxy.as_ref().map(|p| format!("{p:?}")),
+                bundled.credential_proxy.as_ref().map(|p| format!("{p:?}"))
+            );
+            // select() launches the overridden model.
+            let options = Options {
+                profile: Some("zai-full".into()),
+                ..Options::default()
+            };
+            let selection = select("opencode", &options, &config).unwrap();
+            assert_eq!(selection.model, "glm-5.4");
+        });
+    }
+
+    #[test]
+    fn an_override_never_lifts_the_bundled_excluded_roles() {
+        with_no_profile_env(|| {
+            let config = overrides(serde_json::json!({"zai-full": {"model": "glm-5.4"}}));
+            for role in ["judge", "curator"] {
+                assert_eq!(
+                    excluded_role("opencode", Some("zai-full"), role, &config).as_deref(),
+                    Some("zai-full"),
+                    "{role} must stay excluded"
+                );
+            }
+            assert_eq!(excluded_role("opencode", Some("zai-full"), "builder", &config), None);
+        });
+    }
+
+    #[test]
+    fn excluded_roles_add_extends_and_dedupes_by_canonical_role() {
+        with_no_profile_env(|| {
+            let config = overrides(serde_json::json!({"zai-full": {
+                "excludedRolesAdd": ["doctor", "judge", "Issue_Curator", "doctor"]
+            }}));
+            let (_, got) = lookup(Some("zai-full"), &config).unwrap();
+            assert_eq!(got.excluded_roles, ["judge", "curator", "doctor"]);
+            assert_eq!(
+                excluded_role("opencode", Some("zai-full"), "doctor", &config).as_deref(),
+                Some("zai-full")
+            );
+        });
+    }
+
+    #[test]
+    fn an_empty_override_and_explicit_nulls_are_no_ops() {
+        with_no_profile_env(|| {
+            for value in [
+                serde_json::json!({"zai-full": {}}),
+                serde_json::json!({"zai-full": null}),
+                serde_json::json!({"zai-full": {"model": null, "effort": null,
+                    "allowedEfforts": null, "excludedRolesAdd": null}}),
+                serde_json::json!(null),
+            ] {
+                let config = overrides(value.clone());
+                assert!(check_model_profile_overrides_config(&config).is_empty(), "{value}");
+                let (_, got) = lookup(Some("zai-full"), &config).unwrap();
+                assert_eq!(got.model, "glm-5.3", "{value}");
+                assert_eq!(got.excluded_roles, ["judge", "curator"], "{value}");
+            }
+        });
+    }
+
+    /// #15268: the effective (override, else bundled) `effort` must be in the
+    /// effective `allowedEfforts`, the predicate `select` refuses a launch on.
+    #[test]
+    fn an_override_leaving_effort_outside_allowed_efforts_is_rejected_by_validate_and_launch() {
+        with_no_profile_env(|| {
+            // Bundled `zai-full`: effort "max", allowedEfforts [low, high, max].
+            let bad = [
+                (serde_json::json!({"effort": "medium"}), "`medium`", "[low, high, max]"),
+                (serde_json::json!({"allowedEfforts": ["low", "high"]}), "`max`", "[low, high]"),
+                (
+                    serde_json::json!({"effort": "high", "allowedEfforts": ["low", "max"]}),
+                    "`high`",
+                    "[low, max]",
+                ),
+            ];
+            for (fields, effort, allowed) in bad {
+                let config = overrides(serde_json::json!({"zai-full": fields.clone()}));
+                let findings = check_model_profile_overrides_config(&config);
+                assert_eq!(findings.len(), 1, "{fields}: {findings:?}");
+                for part in ["zai-full", effort, allowed] {
+                    assert!(findings[0].contains(part), "{fields}: {findings:?}");
+                }
+                // The same config makes `select` refuse an unqualified launch
+                // (via `lookup`, which re-runs the check, for any profile).
+                assert!(lookup(Some("zai-full"), &config).is_err(), "{fields}");
+            }
+        });
+    }
+
+    #[test]
+    fn consistent_noop_and_empty_allowed_efforts_overrides_report_no_effort_finding() {
+        with_no_profile_env(|| {
+            for value in [
+                // Both fields set, consistently.
+                serde_json::json!({"zai-full": {"effort": "medium",
+                    "allowedEfforts": ["low", "medium"]}}),
+                // Only a field that stays consistent with the bundled sibling.
+                serde_json::json!({"zai-full": {"allowedEfforts": ["max"]}}),
+                serde_json::json!({"zai-full": {"effort": "low"}}),
+                // Neither, or only `model`.
+                serde_json::json!({"zai-full": {}}),
+                serde_json::json!({"zai-full": {"model": "glm-5.4"}}),
+                // An empty effective allowedEfforts never rejects an effort.
+                serde_json::json!({"zai-full": {"allowedEfforts": []}}),
+                serde_json::json!({"zai-full": {"effort": "medium", "allowedEfforts": []}}),
+                // `null` falls back to the bundled value.
+                serde_json::json!({"zai-full": {"effort": null, "allowedEfforts": null}}),
+            ] {
+                let config = overrides(value.clone());
+                assert!(check_model_profile_overrides_config(&config).is_empty(), "{value}");
+                assert!(lookup(Some("zai-full"), &config).is_ok(), "{value}");
+            }
+        });
+    }
+
+    #[test]
+    fn a_non_bundled_override_gets_no_extra_effort_finding() {
+        with_no_profile_env(|| {
+            let config = overrides(serde_json::json!({
+                "not-bundled": {"effort": "medium", "allowedEfforts": ["low"]}
+            }));
+            let findings = check_model_profile_overrides_config(&config);
+            assert_eq!(findings.len(), 1, "{findings:?}");
+            assert!(findings[0].contains("not a bundled model profile"), "{findings:?}");
+        });
+    }
+
+    #[test]
+    fn an_override_applies_to_the_default_profile_too() {
+        with_no_profile_env(|| {
+            let config = serde_json::json!({"runtimes": {
+                "defaultModelProfile": "zai-full",
+                "modelProfileOverrides": {"zai-full": {"model": "glm-5.4"}}
+            }});
+            assert_eq!(lookup(None, &config).unwrap().1.model, "glm-5.4");
+            // A profile with no override is untouched.
+            assert_eq!(lookup(Some("zai-flash"), &config).unwrap().1.model, "glm-5.3-flash");
+        });
+    }
+
+    #[test]
+    fn invalid_overrides_are_rejected_by_validate_and_by_lookup() {
+        with_no_profile_env(|| {
+            let cases = [
+                (serde_json::json!({"zai-full": {"providers": {}}}), "unknown override key"),
+                (serde_json::json!({"zai-full": {"billing": "api"}}), "unknown override key"),
+                (
+                    serde_json::json!({"zai-full": {"excludedRoles": []}}),
+                    "never replaced or reduced",
+                ),
+                (
+                    serde_json::json!({"zai-full": {"excludedRolesAdd": ["wizard"]}}),
+                    "unknown role name(s): wizard",
+                ),
+                (
+                    serde_json::json!({"zai-full": {"excludedRolesAdd": "judge"}}),
+                    "excludedRolesAdd must be an array",
+                ),
+                (serde_json::json!({"zai-full": {"model": "  "}}), "model must be a non-blank"),
+                (serde_json::json!({"zai-full": {"model": 5}}), "model must be a non-blank"),
+                (serde_json::json!({"zai-full": {"effort": ""}}), "effort must be a non-blank"),
+                (
+                    serde_json::json!({"zai-full": {"allowedEfforts": ["high", " "]}}),
+                    "allowedEfforts must be an array of non-blank",
+                ),
+                (serde_json::json!({"zai-full": "glm-5.4"}), "must be an object"),
+                (
+                    serde_json::json!({"not-bundled": {"model": "m"}}),
+                    "not a bundled model profile",
+                ),
+            ];
+            for (value, expect) in cases {
+                let config = overrides(value.clone());
+                let findings = check_model_profile_overrides_config(&config);
+                assert!(findings.iter().any(|f| f.contains(expect)), "{value}: {findings:?}");
+                // Launch refuses too (for any profile, so a bad config cannot half-apply).
+                let message = lookup(Some("zai-flash"), &config)
+                    .expect_err("a malformed override must fail closed")
+                    .message;
+                assert!(message.contains(expect), "{value}: {message}");
+            }
+            let not_object = overrides(serde_json::json!(["zai-full"]));
+            assert_eq!(check_model_profile_overrides_config(&not_object).len(), 1);
+        });
+    }
+
+    #[test]
+    fn a_name_in_both_model_profiles_and_overrides_is_rejected() {
+        with_no_profile_env(|| {
+            let both = serde_json::json!({"runtimes": {
+                "modelProfiles": {"zai-full": {"model": "mine", "providers": {}}},
+                "modelProfileOverrides": {"zai-full": {"model": "glm-5.4"}}
+            }});
+            let findings = check_model_profile_overrides_config(&both);
+            assert!(findings.iter().any(|f| f.contains("also defined under")), "{findings:?}");
+            assert!(lookup(Some("zai-full"), &both).is_err());
+            // A null override (a higher tier clearing it) is not a collision.
+            let cleared = serde_json::json!({"runtimes": {
+                "modelProfiles": {"zai-full": {"model": "mine", "providers": {}}},
+                "modelProfileOverrides": {"zai-full": null}
+            }});
+            assert!(check_model_profile_overrides_config(&cleared).is_empty());
+            assert_eq!(lookup(Some("zai-full"), &cleared).unwrap().1.model, "mine");
+        });
     }
 }

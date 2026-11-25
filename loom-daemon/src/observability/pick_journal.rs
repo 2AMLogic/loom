@@ -119,6 +119,17 @@ pub enum JournalEntry {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         head_sha: Option<String>,
     },
+    /// The head a run evaluated a verdict against (`forge verdict-gate
+    /// --sha`, #14898), journaled at the evaluation, before any write: the
+    /// step's evidence then names the evaluated head even when the
+    /// verdict-labels write is unconfirmed or absent, and a later PR tip can
+    /// never stand in for it. Not a write: nothing moved.
+    Reviewed {
+        at: DateTime<Utc>,
+        number: u32,
+        /// The reviewed head SHA.
+        head_sha: String,
+    },
     /// A PR lease release a daemon subcommand made (`lease pr release`,
     /// #14639): the typed outcome Champion's release records on its marker.
     /// Written only after the release's own PATCH landed and never for a
@@ -315,6 +326,15 @@ pub fn peek(root: &Path) -> Option<Journal> {
             .map(|(_, path)| path.clone())
     })?;
     Some(journal_of(std::fs::read_to_string(path)))
+}
+
+/// Read a step's journal file without consuming it (#14898): the step's
+/// `loom.sweep` close projects the Judge verdict of record from the same
+/// evidence the detached drain will take. A missing or unreadable file
+/// reads empty with `read=false`, exactly as a drained one.
+#[must_use]
+pub fn peek_step(root: &Path, sweep_id: &str) -> Journal {
+    journal_of(std::fs::read_to_string(step_path(root, sweep_id)))
 }
 
 fn journal_of(raw: std::io::Result<String>) -> Journal {
@@ -720,6 +740,23 @@ pub const VERDICT_LABELS_BY: &str = "verdict-labels";
 /// run; makes no forge call.
 pub fn record_verdict(pr: u64, action: &str, head_sha: Option<&str>) {
     record_applied_at(pr, true, action, VERDICT_LABELS_BY, head_sha);
+}
+
+/// Journal the head a verdict is being evaluated against (`forge
+/// verdict-gate --sha`, #14898), before any write — the reviewed head is then
+/// on the step's evidence even when the verdict-labels write is unconfirmed
+/// or absent. A no-op outside a journaled run; no forge call.
+pub fn record_review(pr: u64, head_sha: &str) {
+    if journal_path().is_none() {
+        return;
+    }
+    if let Ok(number) = u32::try_from(pr) {
+        append(&JournalEntry::Reviewed {
+            at: Utc::now(),
+            number,
+            head_sha: head_sha.to_string(),
+        });
+    }
 }
 
 /// [`record_applied`] with the head the write was made against (#12362).

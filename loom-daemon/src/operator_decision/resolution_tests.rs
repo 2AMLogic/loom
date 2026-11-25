@@ -256,3 +256,126 @@ fn option_ids_the_marker_cannot_carry_are_flagged() {
         assert!(!id_is_markable(bad), "{bad:?}");
     }
 }
+
+// --- #15108: the edit-history fallback ---
+
+fn edit(at: &str, login: &str, assoc: &str, body: String) -> BodyEdit {
+    BodyEdit {
+        body,
+        edited_at: at.into(),
+        editor: serde_json::json!({
+            "user": {"login": login, "type": "User"},
+            "author_association": assoc
+        }),
+    }
+}
+
+fn test_policy() -> crate::comment_trust::TrustPolicy {
+    crate::comment_trust::TrustPolicy::new(
+        crate::forge_identity::FleetLogins::of(&crate::forge_identity::Roster::default()),
+        None,
+        Vec::new(),
+    )
+}
+
+/// The issue body after an attended ruling replaced the decision block.
+fn ruled_body() -> String {
+    "## Operator ruling\n\nkeep: the design stands.\n".into()
+}
+
+#[test]
+fn a_recovered_block_binds_to_the_text_the_operator_reviewed() {
+    let policy = test_policy();
+    let published = body("w");
+    let history = vec![
+        edit("2026-11-23T20:09:12Z", "rjwalters", "OWNER", ruled_body()),
+        edit("2026-11-23T17:44:00Z", "rjwalters", "OWNER", published.clone()),
+    ];
+    let recovered =
+        current_with_history("Acme/Widgets", 7, TITLE, &ruled_body(), &history, &policy).unwrap();
+    let standing = current("Acme/Widgets", 7, TITLE, &published).unwrap();
+    assert_eq!(recovered.decision_digest, standing.decision_digest);
+    assert_eq!(recovered.scope_digest, standing.scope_digest);
+    assert_eq!(recovered.decision, standing.decision);
+}
+
+#[test]
+fn the_newest_parseable_version_wins_whatever_the_order() {
+    let policy = test_policy();
+    let older = edit("2026-11-01T00:00:00Z", "rjwalters", "OWNER", body("first why"));
+    let newer = edit("2026-11-02T00:00:00Z", "rjwalters", "OWNER", body("second why"));
+    for history in [vec![older.clone(), newer.clone()], vec![newer, older]] {
+        let c = current_with_history("acme/widgets", 7, TITLE, &ruled_body(), &history, &policy)
+            .unwrap();
+        let standing = current("acme/widgets", 7, TITLE, &body("second why")).unwrap();
+        assert_eq!(c.decision_digest, standing.decision_digest);
+    }
+}
+
+#[test]
+fn a_recovered_block_from_an_untrusted_editor_is_ignored_and_named() {
+    let policy = test_policy();
+    let history = vec![edit("2026-11-02T00:00:00Z", "rando", "NONE", body("w"))];
+    let err = current_with_history("acme/widgets", 7, TITLE, &ruled_body(), &history, &policy)
+        .unwrap_err();
+    assert!(err.contains("`rando`"), "{err}");
+}
+
+#[test]
+fn a_block_that_fails_to_parse_in_the_body_stays_authoritative() {
+    let policy = test_policy();
+    let malformed = "```decision\nnot json\n```\n";
+    let history = vec![edit(
+        "2026-11-02T00:00:00Z",
+        "rjwalters",
+        "OWNER",
+        body("w"),
+    )];
+    let err =
+        current_with_history("acme/widgets", 7, TITLE, malformed, &history, &policy).unwrap_err();
+    assert!(!err.contains("edit history"), "no fallback for a present block: {err}");
+}
+
+#[test]
+fn an_empty_or_blockless_history_refuses_naming_the_fix() {
+    let policy = test_policy();
+    for history in [
+        Vec::new(),
+        vec![edit(
+            "2026-11-02T00:00:00Z",
+            "rjwalters",
+            "OWNER",
+            ruled_body(),
+        )],
+    ] {
+        let err = current_with_history("acme/widgets", 7, TITLE, &ruled_body(), &history, &policy)
+            .unwrap_err();
+        assert!(
+            err.contains("no version in its edit history")
+                && err.contains("operator-decision apply"),
+            "{err}"
+        );
+    }
+}
+
+#[test]
+fn parse_body_history_reads_graphql_nodes_newest_first() {
+    let page = serde_json::json!({
+        "data": {"repository": {"issue": {"userContentEdits": {"nodes": [
+            {"editedAt": "2026-11-23T17:44:00Z", "diff": "older body",
+             "editor": {"login": "rjwalters", "__typename": "User"}},
+            {"editedAt": "2026-11-23T20:09:12Z", "diff": "newer body",
+             "editor": {"login": "loom-fleet-dispatch", "__typename": "Bot"}}
+        ]}}}}
+    });
+    let edits = parse_body_history(page.to_string().as_bytes()).unwrap();
+    assert_eq!(edits.len(), 2);
+    assert_eq!(edits[0].body, "newer body");
+    assert_eq!(edits[0].edited_at, "2026-11-23T20:09:12Z");
+    assert!(crate::comment_trust::Author::from_json(&edits[0].editor).app);
+    assert!(!crate::comment_trust::Author::from_json(&edits[1].editor).app);
+    // GraphQL errors and garbage fail closed.
+    let errors = serde_json::json!({"errors": [{"message": "bad"}]});
+    assert!(parse_body_history(errors.to_string().as_bytes()).is_none());
+    assert!(parse_body_history(b"not json").is_none());
+}

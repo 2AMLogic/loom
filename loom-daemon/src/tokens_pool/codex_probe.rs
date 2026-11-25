@@ -120,21 +120,7 @@ impl ProbeOutcome {
     pub(super) fn diagnostic(&self) -> Option<String> {
         match self {
             Self::RuntimeUnavailable(kind) => {
-                let search = match std::env::var_os("PATH") {
-                    Some(path) => {
-                        let dirs: Vec<_> = std::env::split_paths(&path)
-                            .map(|dir| {
-                                if dir.as_os_str().is_empty() {
-                                    ".".into()
-                                } else {
-                                    dir
-                                }
-                            })
-                            .collect();
-                        format!("searched PATH directories {dirs:?}")
-                    }
-                    None => "PATH is unset (system default search)".into(),
-                };
+                let search = crate::docker_bin::search_description();
                 Some(format!(
                     "container_runtime_unavailable: docker could not start ({kind:?}), {search}"
                 ))

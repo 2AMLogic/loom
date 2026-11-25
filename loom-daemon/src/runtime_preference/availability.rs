@@ -446,36 +446,17 @@ fn codex(root: &Path, admitted: &ResolvedRuntime, now: u64) -> Availability {
     if !crate::role_runner::runtime_preflight::codex_pool_is_the_wall(root, admitted) {
         return ungated(CredentialSource::Unobservable);
     }
-    let state = crate::role_runner::runtime_preflight::codex_pool_state(root, now);
+    let state = crate::role_runner::runtime_preflight::codex_pool_state(
+        root,
+        now,
+        admitted.execution.is_none() && super::codex_guard::guarded(&admitted.role),
+    );
     if let Some((file, error)) = &state.read_error {
         return Availability::Exhausted {
             source,
             hold: PoolHold::Unreadable(*file),
             detail: format!("{} could not be read: {error}", file.as_str()),
         };
-    }
-    // A merging role may draw a Codex seat only when every seat it could draw
-    // runs Loom's guard hook (#9390 follow-up; see `codex_guard`). Otherwise
-    // the walk falls through to the next tap instead of selecting Codex and
-    // failing the tick in spawn-codex.sh's own fail-closed check.
-    if state.spawnable > 0 && super::codex_guard::guarded(&admitted.role) {
-        let unready = super::codex_guard::unready_profiles(root);
-        if unready.as_ref().map_or(true, |names| !names.is_empty()) {
-            return Availability::Exhausted {
-                source,
-                hold: PoolHold::Unprovisioned,
-                detail: match unready {
-                    Ok(names) => format!(
-                        "Loom's guard hook is not ready on Codex profile(s) {} for this \
-                         merging role ({}) — provision-codex-hooks.sh verify --all-profiles \
-                         --workspace <repo>; #9390",
-                        names.join(", "),
-                        admitted.role
-                    ),
-                    Err(reason) => format!("{reason} ({}) — #9390", admitted.role),
-                },
-            };
-        }
     }
     if state.spawnable > 0 {
         return Availability::Spawnable {
@@ -484,7 +465,7 @@ fn codex(root: &Path, admitted: &ResolvedRuntime, now: u64) -> Availability {
             total: Some(state.enabled),
         };
     }
-    let hold = if state.enabled == 0 {
+    let hold = if state.untrusted.len() == state.enabled {
         PoolHold::Unprovisioned
     } else {
         PoolHold::SelfHealing
@@ -598,7 +579,14 @@ fn native(root: &Path, tap: &Tap, runtime: &str) -> Availability {
             }
         }
     }
-    let health = match crate::api_keys_pool::select::health(root, Some(&provider)) {
+    let health = match crate::api_keys_pool::select::health_in(
+        &crate::api_keys_pool::paths::pool_roots(root),
+        Some(&provider),
+        // #14932: a cap the workspace's `runtimes.apiKeyLimits` block declares
+        // counts here exactly as a file-declared one. The config is already
+        // resolved above; handing it over reads the tiers once per pass.
+        &crate::api_keys_pool::limits::ConfiguredLimits::from_config(&config),
+    ) {
         Ok(health) => health,
         Err(error) => {
             return Availability::Exhausted {

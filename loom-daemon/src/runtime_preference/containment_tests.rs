@@ -7,14 +7,18 @@ use super::*;
 use crate::runtime_admission::{AdmissionContext, ContainmentProof};
 use std::fs;
 
-/// The third field holds the crate-wide `LOOM_CODEX_PROFILE_ROOT` lock (#9964).
+/// The third field holds the crate-wide `LOOM_CODEX_PROFILE_ROOT` lock (#9964);
+/// the fourth the crate-wide `LOOM_CODEX_HOME` lock (#15174), acquired before
+/// it and released after (see `codex_home_env`'s documented lock order).
 struct Env(
     Vec<(&'static str, Option<String>)>,
     tempfile::TempDir,
     crate::tokens_pool::profile_root_env::ProfileRootLock,
+    crate::tokens_pool::codex_home_env::CodexHomeLock,
 );
 impl Env {
     fn new() -> Self {
+        let codex_home_lock = crate::tokens_pool::codex_home_env::lock();
         let lock = crate::tokens_pool::profile_root_env::lock();
         let keys = [
             "LOOM_RUNTIME",
@@ -40,7 +44,7 @@ impl Env {
         }
         let profiles = tempfile::tempdir().unwrap();
         std::env::set_var("LOOM_CODEX_PROFILE_ROOT", profiles.path());
-        Self(prior, profiles, lock)
+        Self(prior, profiles, lock, codex_home_lock)
     }
     fn provision_codex_seat(&self) {
         fs::create_dir_all(self.1.path().join("seat")).unwrap();

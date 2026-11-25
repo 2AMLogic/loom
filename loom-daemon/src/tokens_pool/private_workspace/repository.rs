@@ -1,6 +1,7 @@
 use super::*;
 use serde_json::json;
 use std::io::Read;
+use std::os::unix::fs::DirBuilderExt;
 use std::process::{Command, Stdio};
 
 #[derive(clap::Subcommand)]
@@ -70,6 +71,12 @@ pub struct PrepareArgs {
     /// cloned at `<volume>/work/<slug>`. Absent: the legacy `<volume>/repo`.
     #[arg(long)]
     pub slug: Option<String>,
+    /// The read-only origin object mirror this clone borrows published
+    /// objects through (#14680): `MIRRORS/<slug>/objects`, bound by the host
+    /// and recorded in the container's mount inventory. Absent: the clone
+    /// keeps fully private Git objects.
+    #[arg(long)]
+    pub mirror_objects: Option<String>,
 }
 
 #[derive(clap::Args)]
@@ -306,7 +313,7 @@ pub(super) fn prepare_response(
 }
 
 pub(super) fn prepare(root: &Path, args: &PrepareArgs) -> Result<PrepareOutcome, PrepareFailure> {
-    prepare_with_pr_lookup(root, args, &finished_pr)
+    prepare_with_pr_lookup(root, args, &finished_pr, &crate::forge_etag_store::host_tmp_base())
 }
 
 /// The real lookup uses the credentials that the host already scopes to this
@@ -315,11 +322,37 @@ pub(super) fn prepare_with_pr_lookup(
     root: &Path,
     args: &PrepareArgs,
     has_finished_pr: &dyn Fn(&Path, &str, &str, &str) -> bool,
+    temp_base: &Path,
 ) -> Result<PrepareOutcome, PrepareFailure> {
     let mut reaped = Vec::new();
-    match prepare_revision(root, args, has_finished_pr, &mut reaped) {
+    match prepare_revision(root, args, has_finished_pr, temp_base, &mut reaped) {
         Ok(revision) => Ok(PrepareOutcome { revision, reaped }),
         Err(error) => Err(PrepareFailure { error, reaped }),
+    }
+}
+
+/// Probe that [`temp_base`] can hold a private directory and a file in it
+/// (#14929). A full or read-only seat temp dir previously surfaced as a
+/// misleading `workspace Git fetch failed (…128)` or dirty-clone refusal;
+/// refusing here names the actual cause before any clone work is touched,
+/// and no Loom state directory is ever created in the job's working
+/// directory as a fallback (the resolved base stays absolute — see
+/// [`crate::forge_etag_store::host_tmp_base`]).
+fn require_writable_temp(temp_base: &Path) -> Result<()> {
+    let probe = temp_base.join(format!("loom-temp-probe-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&probe);
+    let probed = std::fs::DirBuilder::new()
+        .mode(0o700)
+        .create(&probe)
+        .and_then(|()| std::fs::write(probe.join("writable"), b""));
+    let _ = std::fs::remove_dir_all(&probe);
+    match probed {
+        Ok(()) => Ok(()),
+        Err(error) => bail!(
+            "{SEAT_TEMP_UNWRITABLE_REASON}: resolved temp directory {} is not writable ({error}); \
+             reclaim the seat's temp space (caches belong on its cache volume) before retrying",
+            temp_base.display()
+        ),
     }
 }
 
@@ -327,11 +360,24 @@ fn prepare_revision(
     root: &Path,
     args: &PrepareArgs,
     has_finished_pr: &dyn Fn(&Path, &str, &str, &str) -> bool,
+    temp_base: &Path,
     reaped: &mut Vec<String>,
 ) -> Result<String> {
     valid_base(&args.base)?;
+    require_writable_temp(temp_base)?;
     if args.account.is_empty() || args.container_id.is_empty() {
         bail!("workspace account and container identity are required");
+    }
+    // Before any mutation: a mirror path may only ever be this repository's
+    // own canonical mirror location, never another repository's or an
+    // arbitrary objects directory (#14680).
+    if let Some(objects) = &args.mirror_objects {
+        if mirror_alternate(&args.repository).as_deref() != Some(objects.as_str()) {
+            bail!(
+                "object mirror {objects} is not this repository's own read-only origin mirror; \
+                 refusing to borrow another repository's objects"
+            );
+        }
     }
     let root = root.canonicalize()?;
     let (repo, record, staging) = match &args.slug {
@@ -368,6 +414,13 @@ fn prepare_revision(
         save(&record, &identity)?;
         identity
     };
+    // Whether THIS call performed the clone: a clone we just made carries no
+    // work yet, so its alternates file is ours to normalize rather than a
+    // foreign one to refuse (#14680).
+    let fresh_clone = match &staging {
+        Some(_) => repo.symlink_metadata().is_err(),
+        None => !repo.exists(),
+    };
     if let Some(staging) = &staging {
         if repo.symlink_metadata().is_err() {
             // A staging directory is only ever a clone that never completed:
@@ -375,46 +428,34 @@ fn prepare_revision(
             // no work and is safe to discard (a ready clone is never staged).
             discard_staging(staging)?;
             let relative = staging.strip_prefix(&root)?.to_string_lossy().into_owned();
-            git(
-                &root,
-                &[
-                    "clone",
-                    "--no-local",
-                    "--no-hardlinks",
-                    "--",
-                    &args.repository,
-                    &relative,
-                ],
-            )?;
+            git(&root, &clone_args(&args.repository, &relative, args.mirror_objects.as_deref())?)?;
             // The ready path appears only once the clone is complete.
             std::fs::rename(staging, &repo)?;
         }
     } else if !repo.exists() {
-        git(
-            &root,
-            &[
-                "clone",
-                "--no-local",
-                "--no-hardlinks",
-                "--",
-                &args.repository,
-                "repo",
-            ],
-        )?;
+        git(&root, &clone_args(&args.repository, "repo", args.mirror_objects.as_deref())?)?;
     }
+    let borrow = args.mirror_objects.clone();
     if !repo.join(".git").is_dir()
         || repo.canonicalize()? != repo
         || repo.join(".git").canonicalize()? != repo.join(".git")
-        || repo.join(".git/objects/info/alternates").exists()
     {
-        bail!("workspace must own a real clone and private Git objects, without symlinks or alternates");
+        bail!("workspace must own a real clone and private Git objects, without symlinks");
     }
+    verify_alternates(&repo, args.mirror_objects.as_deref())?;
     private_metadata(&repo.join(".git"))?;
     if Path::new(git(&repo, &["rev-parse", "--show-toplevel"])?.trim()).canonicalize()? != repo {
         bail!("workspace clone is not its own independent Git root");
     }
     if git(&repo, &["remote", "get-url", "origin"])?.trim() != args.repository {
         bail!("private clone origin changed; preserve work and restore its verified identity");
+    }
+    // A fresh clone borrows from its mirror: normalize the alternate git
+    // wrote (or establish it), then shed the local copies. An existing clone
+    // migrates in place through the same idempotent step, keeping every ref,
+    // the index, linked worktrees and unpublished commits (#14680).
+    if let Some(objects) = borrow {
+        borrow_published(&repo, &objects, fresh_clone)?;
     }
     git(&repo, &["fetch", "--prune", "origin"])?;
     reap_finished_worktrees(&root, &repo, &args.repository, has_finished_pr, reaped)?;
@@ -511,6 +552,132 @@ fn prepare_revision(
     identity.revision.clone_from(&revision);
     save(&record, &identity)?;
     Ok(revision)
+}
+
+/// The `git clone` argument list, borrowing from the origin object mirror
+/// when one is bound (#14680): `--reference-if-able` names the mirror's own
+/// directory so a fresh clone announces the mirror's objects as haves and
+/// starts life with the alternate already in place. A reference git cannot
+/// use is skipped with a warning, and [`borrow_published`] below establishes
+/// or refuses the alternate regardless of what git wrote.
+fn clone_args<'a>(
+    repository: &'a str,
+    dest: &'a str,
+    mirror: Option<&'a str>,
+) -> Result<Vec<&'a str>> {
+    let mut args = vec!["clone", "--no-local", "--no-hardlinks"];
+    if let Some(objects) = mirror {
+        let reference = Path::new(objects)
+            .parent()
+            .context("object mirror path has no repository directory")?;
+        args.push("--reference-if-able");
+        args.push(
+            reference
+                .to_str()
+                .context("object mirror path is not valid UTF-8")?,
+        );
+    }
+    args.extend(["--", repository, dest]);
+    Ok(args)
+}
+
+/// The one alternate shape a clone may carry (#14680): no
+/// alternate at all (a private clone, always supported), or exactly the
+/// mirror objects path the caller authorized for THIS repository. Anything
+/// else — a second entry, a wrong path, an alternate with no authorized
+/// mirror — is refused, preserving the work in place. The caller decides
+/// what is authorized: preparation passes the mirror the host bound (or
+/// `None`, refusing every alternate), admission passes the repository's
+/// canonical mirror path.
+pub(super) fn verify_alternates(repo: &Path, mirror: Option<&str>) -> Result<()> {
+    let file = repo.join(".git/objects/info/alternates");
+    let content = match std::fs::read_to_string(&file) {
+        Ok(content) => content,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.into()),
+    };
+    let Some(expected) = mirror else {
+        bail!(
+            "workspace must own a real clone and private Git objects; its object alternate is \
+             not authorized for this session (a clone that already borrows needs its mirror \
+             bind back: restore the mirror, or re-enable accounts.session.objectMirrors)"
+        );
+    };
+    if content.lines().count() > 1 || content.trim() != expected {
+        bail!(
+            "workspace must own a real clone and private Git objects; its object alternate must \
+             name exactly this repository's read-only origin mirror"
+        );
+    }
+    Ok(())
+}
+
+/// Marker recording that a clone finished borrowing from its mirror: present
+/// together with a matching alternates file, it makes re-preparation skip
+/// straight past the migration; absent (an interrupted migration), the whole
+/// idempotent step simply runs again.
+const MIRROR_MIGRATED: &str = ".git/objects/info/loom-migrated";
+
+/// Make `repo` borrow its repository's published objects from the mirror at
+/// `objects`, shedding the local copies (#14680). Every step is idempotent
+/// and ordered so an interruption is retried safely: the alternate is
+/// verified and written first, `repack -a -d -l` then rewrites only the
+/// local store (`-l` never pulls borrowed objects back in) and drops the
+/// local duplicates, and `fsck --full` proves object connectivity through
+/// the borrowed store before the completion marker is written.
+///
+/// `fresh`: the caller performed the clone in this same call, so git's own
+/// `--reference-if-able` output is normalized rather than treated as
+/// foreign. Any other pre-existing alternate content is refused, never
+/// overwritten.
+pub(super) fn borrow_published(repo: &Path, objects: &str, fresh: bool) -> Result<()> {
+    let alternates = repo.join(".git/objects/info/alternates");
+    let current = std::fs::read_to_string(&alternates).ok();
+    let settled = current.as_deref().is_some_and(|c| c.trim() == objects)
+        && std::fs::read_to_string(repo.join(MIRROR_MIGRATED))
+            .map(|m| m.trim() == objects)
+            .unwrap_or(false);
+    if settled {
+        return Ok(());
+    }
+    if let Some(current) = &current {
+        if !(fresh || current.trim() == objects) {
+            bail!(
+                "private clone carries a foreign object alternate; retain it for recovery \
+                 instead of re-pointing it"
+            );
+        }
+    }
+    // Verify the alternate BEFORE repacking against it: a missing, symlinked
+    // or indirect mirror must refuse the migration, not strand the clone.
+    let mirror = Path::new(objects);
+    let metadata = std::fs::symlink_metadata(mirror)
+        .with_context(|| format!("origin object mirror {objects} is not mounted"))?;
+    if !metadata.is_dir()
+        || mirror
+            .canonicalize()
+            .with_context(|| format!("origin object mirror {objects} is not a real directory"))?
+            != mirror
+    {
+        bail!("origin object mirror {objects} must be a real directory, not a link");
+    }
+    if mirror.join("info/alternates").exists() {
+        bail!("origin object mirror {objects} carries its own alternates; indirect mirrors are refused");
+    }
+    std::fs::create_dir_all(
+        alternates
+            .parent()
+            .context("alternates file has no parent directory")?,
+    )?;
+    std::fs::write(&alternates, format!("{objects}\n"))?;
+    // Local-only repack: borrowed objects stay borrowed, local duplicates of
+    // published objects are dropped, and unpublished work stays local.
+    git(repo, &["repack", "-a", "-d", "-l"])?;
+    // Connectivity through the borrowed store is the migration's proof:
+    // every ref of this clone must resolve through mirror + local objects.
+    git(repo, &["fsck", "--full"])?;
+    std::fs::write(repo.join(MIRROR_MIGRATED), format!("{objects}\n"))?;
+    Ok(())
 }
 
 /// Worktree HEADs (the main checkout included) whose detached HEAD carries

@@ -434,9 +434,11 @@ struct ProbeEnv(
     Vec<(&'static str, Option<String>)>,
     tempfile::TempDir,
     crate::tokens_pool::profile_root_env::ProfileRootLock,
+    crate::tokens_pool::codex_home_env::CodexHomeLock,
 );
 impl ProbeEnv {
     fn new() -> Self {
+        let codex_home_lock = crate::tokens_pool::codex_home_env::lock();
         let lock = crate::tokens_pool::profile_root_env::lock();
         let keys = [
             "LOOM_RUNTIME",
@@ -459,7 +461,7 @@ impl ProbeEnv {
         }
         let profiles = tempfile::tempdir().unwrap();
         std::env::set_var("LOOM_CODEX_PROFILE_ROOT", profiles.path());
-        Self(prior, profiles, lock)
+        Self(prior, profiles, lock, codex_home_lock)
     }
 
     fn provision_codex_seat(&self) {

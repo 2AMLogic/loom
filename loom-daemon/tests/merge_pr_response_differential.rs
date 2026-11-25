@@ -22,7 +22,7 @@
 //! Not "the Rust looks right" — the unit tests beside the module do that. This
 //! proves the port did not change **which route a failed merge takes**. The two
 //! middle routes are opposites: `base-modified` answers the failure with
-//! `forge_update_branch` and another merge attempt, `head-mismatch` refuses to
+//! a sleep and another merge attempt, `head-mismatch` refuses to
 //! retry-and-merge at all (#5579). Swapping them on a body that names both is a
 //! one-word diff that no verdict-level assertion elsewhere would see.
 //!

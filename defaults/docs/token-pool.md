@@ -284,11 +284,15 @@ mark, so its row is `blocked`, not a frozen `exhausted` one (#14317).
 #14265, #14317).** `tokens check --ranking` (the probe path) does not blindly
 overwrite the file. When an account's previous row was `exhausted` and this
 round's row carries no probe evidence — `error` (timeout, connection, 5xx) or
-`blocked` (empty token, credential-shape mismatch, `401`), or a codex `unknown`
-while the held reset is still in the future — the previous `exhausted` row is
-written back unchanged, so one failed probe cannot shorten an active weekly
-hold to the 6h fixed cooldown. Positive evidence (`available`, `rate_limited`,
-a fresh `exhausted`) overwrites as before. Two consequences for an operator
+`blocked` (empty token, credential-shape mismatch, `401`), or an `available`
+with no 5h-utilization header (#14195), or a codex `unknown` — the last two only
+while the held reset is still in the future and within the eight-day credibility
+horizon (`MAX_WEEKLY_RESET_HORIZON_SECS`) — the previous `exhausted` row is
+written back unchanged, so one failed or header-less probe cannot shorten an
+active weekly hold to the 6h fixed cooldown. Once that reset has passed (or is
+missing, unparseable or beyond the horizon) the fresh row overwrites. Measured
+evidence (`available` with a 5h utilization, `rate_limited`, a fresh
+`exhausted`) overwrites as before. Two consequences for an operator
 reading `.ranking` directly:
 
 - **A row may be a previous round's record, and nothing on disk marks it as

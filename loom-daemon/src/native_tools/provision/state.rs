@@ -123,6 +123,18 @@ pub fn outside_every_repository(path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// What [`private_directory_with`] does with an existing directory whose
+/// mode is anything other than `0700`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OnLoose {
+    /// Refuse it: per-launch native state must never have been loose.
+    Refuse,
+    /// Tighten it to `0700` once the symlink and ownership checks have
+    /// passed, for host-level roots that must survive one bad `umask`
+    /// (`sccache_server`, `hooks_home`; #15187).
+    Tighten,
+}
+
 /// Create `path` (and any missing parent) as a 0700 directory owned by the
 /// current user, then validate that it really is one.
 ///
@@ -130,11 +142,27 @@ pub fn outside_every_repository(path: &Path) -> Result<()> {
 /// per-attempt state with the same check the production launch path applies,
 /// rather than a second, weaker copy of it.
 ///
+/// Equivalent to [`private_directory_with`] with [`OnLoose::Refuse`].
+///
 /// # Errors
 ///
 /// Propagates a creation failure, or a validation failure when the path is a
 /// symlink, is not owned by the current user, or is not mode 0700.
 pub fn private_directory(path: &Path) -> Result<()> {
+    private_directory_with(path, OnLoose::Refuse)
+}
+
+/// [`private_directory`] with an explicit policy for an existing directory
+/// whose mode is looser than `0700`: [`OnLoose::Refuse`] fails, while
+/// [`OnLoose::Tighten`] chmods it to `0700` — only after the symlink and
+/// ownership checks, never before.
+///
+/// # Errors
+///
+/// Propagates a creation failure, or a validation failure when the path is a
+/// symlink or is not owned by the current user; with [`OnLoose::Refuse`],
+/// also when it is not mode 0700.
+pub fn private_directory_with(path: &Path, on_loose: OnLoose) -> Result<()> {
     let mut builder = fs::DirBuilder::new();
     builder.recursive(true);
     #[cfg(unix)]
@@ -145,10 +173,10 @@ pub fn private_directory(path: &Path) -> Result<()> {
     builder
         .create(path)
         .context("cannot create private native state directory")?;
-    validate_private_directory(path)
+    validate_private_directory(path, on_loose)
 }
 
-fn validate_private_directory(path: &Path) -> Result<()> {
+fn validate_private_directory(path: &Path, on_loose: OnLoose) -> Result<()> {
     let metadata = fs::symlink_metadata(path)?;
     ensure!(
         metadata.is_dir() && !metadata.file_type().is_symlink(),
@@ -162,11 +190,26 @@ fn validate_private_directory(path: &Path) -> Result<()> {
             metadata.uid() == unsafe { libc::geteuid() },
             "native state directory must belong to the current user"
         );
-        ensure!(
-            metadata.permissions().mode() & 0o777 == 0o700,
-            "native state directory must have permissions 0700"
-        );
+        if metadata.permissions().mode() & 0o777 != 0o700 {
+            match on_loose {
+                OnLoose::Refuse => {
+                    bail!("native state directory must have permissions 0700");
+                }
+                // Strictly after the symlink and ownership checks above: a
+                // symlink or another user's directory is never chmod-ed.
+                OnLoose::Tighten => {
+                    fs::set_permissions(path, fs::Permissions::from_mode(0o700))
+                        .with_context(|| format!("cannot tighten {} to 0700", path.display()))?;
+                    // Re-validate the tightened directory with the refusing
+                    // policy, so the accepted end state is the same one
+                    // `private_directory` would accept.
+                    return validate_private_directory(path, OnLoose::Refuse);
+                }
+            }
+        }
     }
+    #[cfg(not(unix))]
+    let _ = on_loose;
     Ok(())
 }
 
@@ -177,6 +220,7 @@ fn auth_snapshot(root: &Path, path: &Path) -> Result<Vec<u8>> {
     validate_private_directory(
         path.parent()
             .context("native auth file requires a private parent directory")?,
+        OnLoose::Refuse,
     )?;
     let file = fs::File::open(path).context("cannot open external native auth file")?;
     let metadata = file.metadata()?;
