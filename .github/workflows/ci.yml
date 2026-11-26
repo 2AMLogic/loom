@@ -609,14 +609,22 @@ jobs:
       # `live_gh_guard::install` creates pre-`main`: present with a `gh` stub
       # means install got past `write_stub` — the dir CONTENTS (not just the
       # listing) settle whether the stub was written (#14229, #14691). The
-      # per-pid /proc capture names WHICH fd a hung child is blocked on:
-      # occurrence 3 (#14691) caught the lib binary in anon_pipe_write but
-      # could not say which pipe fd it was blocked on. The fdinfo capture
-      # answers that; it does NOT carry the pipe's buffer fill level --
+      # per-pid /proc capture names WHICH fd a hung child is blocked on.
+      # Occurrences 3 and 5 (#14691, #15378) both caught the lib binary in
+      # anon_pipe_write with stdout AND stderr piped to nextest, so wchan plus
+      # fdinfo (which names every pipe fd and its inode) still could not say
+      # which descriptor the write was stuck on. `/proc/<pid>/syscall`
+      # answers that directly: arg0 of the blocked write-class syscall IS the
+      # fd, decoded below against /proc/<pid>/fd so stdout vs stderr stops
+      # being a guess. It does NOT carry the pipe's buffer fill level --
       # /proc/<pid>/fdinfo/<n> for a pipe reports only pos/flags/mnt_id/ino,
       # and occupancy needs an ioctl(FIONREAD) on the read end -- so no
-      # fill-level number will appear in this log (#14708). Guard dir
-      # resolves via
+      # fill-level number will appear in this log (#14708). The per-THREAD
+      # capture below is the other half of #15378's open question: /proc/<pid>
+      # reads see the MAIN thread only, while nextest's pipe-draining threads
+      # are not the main thread (occurrence 5's nextest main thread sat in
+      # futex_do_wait), so each /proc/<pid>/task/<tid> gets comm/wchan/
+      # syscall/stack too. Guard dir resolves via
       # `${TMPDIR:-/tmp}` because `live_gh_guard` uses `std::env::temp_dir()`,
       # which honors TMPDIR. Every command is failure-tolerant: this step is
       # continue-on-error evidence gathering, never a verdict.
@@ -637,6 +645,36 @@ jobs:
             cat /proc/${pid}/stack 2>/dev/null \
               || sudo -n cat /proc/${pid}/stack 2>/dev/null \
               || echo "(unreadable)"
+            # #15378: the descriptor argument of a blocked write. Raw line
+            # first (it is `NR arg0 arg1 ... sp pc`, or `running`); then, for
+            # write-class NRs (write=1, writev=20 on x86_64), arg0 decoded as
+            # the fd with its /proc/<pid>/fd target so the blocked stream is
+            # named, not inferred. Neither read touches the pipe itself, so
+            # the sample cannot consume the very evidence it samples.
+            syscall_line="$(cat /proc/${pid}/syscall 2>/dev/null \
+              || sudo -n cat /proc/${pid}/syscall 2>/dev/null \
+              || true)"
+            if [ -n "$syscall_line" ]; then
+              echo "/proc/${pid}/syscall: ${syscall_line}"
+              set -- ${syscall_line}
+              syscall_nr="${1:-}"
+              syscall_fd_hex="${2:-}"
+              case ":${syscall_nr}:${syscall_fd_hex}:" in
+                ":1:0x"*|":20:0x"*)
+                  syscall_fd="$((syscall_fd_hex))"
+                  syscall_target="$(readlink /proc/${pid}/fd/${syscall_fd} 2>/dev/null || true)"
+                  if [ "${syscall_fd}" = "1" ]; then
+                    echo "blocked write-class syscall on fd 1 (stdout) -> ${syscall_target:-unknown}"
+                  elif [ "${syscall_fd}" = "2" ]; then
+                    echo "blocked write-class syscall on fd 2 (stderr) -> ${syscall_target:-unknown}"
+                  else
+                    echo "blocked write-class syscall on fd ${syscall_fd} -> ${syscall_target:-unknown}"
+                  fi
+                  ;;
+              esac
+            else
+              echo "/proc/${pid}/syscall: (unreadable)"
+            fi
             echo "/proc/${pid}/fd:"
             ls -l /proc/${pid}/fd 2>/dev/null || echo "(unreadable)"
             echo "fdinfo for pipe fds of ${pid}:"
@@ -653,6 +691,27 @@ jobs:
               esac
             done
             [ "$found_pipe_fd" -eq 1 ] || echo "(no pipe fds)"
+            # #15378: the reader side. Everything above reads the MAIN thread
+            # only (/proc/<pid> is /proc/<pid>/task/<pid>); nextest's
+            # pipe-draining threads are other tasks, so capture comm, wchan,
+            # syscall and stack for each one. A thread can exit between the
+            # listing and the read, so every read stays failure-tolerant.
+            echo "threads of ${pid} (main thread ${pid} covered above):"
+            tids="$(ls /proc/${pid}/task 2>/dev/null || true)"
+            if [ -z "$tids" ]; then
+              echo "(no readable task directory)"
+            fi
+            for tid in $tids; do
+              if [ "$tid" = "$pid" ]; then continue; fi
+              echo "--- tid ${pid}/${tid} ($(cat /proc/${pid}/task/${tid}/comm 2>/dev/null || true)):"
+              echo "wchan: $(cat /proc/${pid}/task/${tid}/wchan 2>/dev/null || true)"
+              echo "syscall: $(cat /proc/${pid}/task/${tid}/syscall 2>/dev/null \
+                || sudo -n cat /proc/${pid}/task/${tid}/syscall 2>/dev/null \
+                || echo '(unreadable)')"
+              cat /proc/${pid}/task/${tid}/stack 2>/dev/null \
+                || sudo -n cat /proc/${pid}/task/${tid}/stack 2>/dev/null \
+                || echo "(unreadable)"
+            done
           done
           echo "::endgroup::"
           echo "::group::df -h \${TMPDIR:-/tmp}"
