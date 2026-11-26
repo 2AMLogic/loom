@@ -455,12 +455,11 @@ queued) produces no line.
 
 **Who posts.**
 
-- **The host that ran the merge.** The daemon's event-bus subscriber treats a
-  sweep exit (`sweep.issue.{N}.exited`) or a Champion merge step that ended with
-  a verdict (`step.item.{N}.ended`) as a *hint* only. It confirms the merge
-  from the forge (`gh pr list --head` / `gh pr view`; `mergedAt` must be set and
-  inside the catch-up window) and then sends. It sends directly, without a
-  read first. A sweep exit and a merge-step end for one PR post once per process.
+- **The host that ran the merge.** A completed sweep merge phase or a Champion
+  `merged` verdict identifies the PR by number. The host confirms that PR's
+  `mergedAt` with `gh pr view` and sends if it falls inside the catch-up
+  window. An issue-only exit, including cancellation on a reused branch,
+  leaves reporting to the captain.
 - **The fleet captain, for merges no host reported.** Where
   the [fleet captain setting](daemon-reference.md#fleet-captain-8848) selects this host,
   a timer scans each workspace for PRs merged inside a **bounded catch-up
@@ -473,7 +472,9 @@ queued) produces no line.
 **Delivery rule** (`safehouse/merge_report.rs`). Post with the `send` op. If
 the reply is **lost or times out**, the outcome is unknown: **read the recent
 room messages with the `read` op and re-send only if that PR's line is
-absent.** If the read-back itself fails, nothing is re-sent. A protocol refusal
+absent.** A visible match settles the report. If the room read fails or has
+unreadable events, an absent match is inconclusive. Later host events must
+read again before sending, including after a lost reply to the second send. A protocol refusal
 (`ok:false`, e.g. `'room' required`) or an unreachable socket means the line was
 certainly not sent and is not retried by the reporter; the captain's next scan
 will try again while the merge is inside the window. At most two `send`s are
@@ -484,9 +485,10 @@ are tolerated by design.
 
 **The captain's scan is retryable.** Each workspace keeps an in-memory
 watermark that advances only after a *complete* pass: the forge answered, every
-page was read, the room was read, and every post that was due succeeded. A
-failed forge read, an unreadable room, a refused post, a full page the scan could
-not walk back past, or a cooling rate-limit breaker leaves the window as it was.
+interval was fully searched, the room was readable, and every due post succeeded.
+A full result splits the merge-time interval in half. Both halves must complete
+within the query budget. A saturated single second, an exhausted query budget,
+a failed read or send, or a cooling rate-limit breaker keeps the window open.
 The room read-back is what stops a retried scan from posting a line twice.
 
 | Env var | Default | Meaning |
@@ -506,7 +508,7 @@ sink held open; each report now connects on demand). An operator escalation
 still reaches the human as its forge comment and the pinned hold digest.
 
 **Telemetry.** `loom.feed.completions{kind,outcome}` still counts reports, by
-trigger (`sweep_exit`, `champion_merge_step`, `reconcile`). The `completion.narrated`
+trigger (`sweep_exit` for the sweep merge phase, `step`, `reconcile`). The `completion.narrated`
 log record described in `telemetry-schema.md` is **no longer emitted**: it
 described the retired completion envelope's token payload.
 
@@ -524,8 +526,8 @@ described the retired completion envelope's token payload.
 - `read` carries an optional `room` and a `limit` (default 20, at most 100) and
   replies `{"ok":true,"messages":[{"event_id","sender","own","ts",
   "envelope":{"body",…}}],"undecryptable":N}`, oldest first. Loom reads each
-  row's `envelope.body`; a row without one (an attachment, an unsupported
-  version) is skipped. This is the read-back described above.
+  row’s `envelope.body`. A positive `undecryptable` count or an unreadable
+  envelope prevents the reporter from concluding that a line is absent.
 - Replies echo the request `id`. **Async push lines are interleaved on the same
   connection, carry an `event` key, and have no `id`** — the client
   demultiplexes by skipping any line with an `event` key.
@@ -539,7 +541,7 @@ described the retired completion envelope's token payload.
 - `loom-daemon/src/safehouse/merge_report.rs` — the line, its `owner/repo#N`
   identity and matcher, and the post / read-back / retry rule.
 - `loom-daemon/src/safehouse/merge_source.rs` — the read-only forge lookups
-  (merged PR for an issue branch, by number, and the captain's windowed scan).
+  (the event's PR by number and the captain's merge-time intervals).
 - `loom-daemon/src/safehouse/reporter.rs` — the reporter task: the host path
   (bus events) and the captain-gated catch-up scan.
 - `loom-daemon/src/safehouse/forge_gate.rs` — the rate-limit breaker gate for

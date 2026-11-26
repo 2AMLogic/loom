@@ -44,6 +44,9 @@ struct Room {
     hang_after_store: AtomicUsize,
     /// Every `send` is refused at the protocol layer.
     refuse_sends: AtomicBool,
+    /// Optional raw read reply for partial or malformed responses.
+    read_reply: Mutex<Option<Value>>,
+    reads: AtomicUsize,
     /// Every `read` is refused.
     fail_reads: AtomicBool,
 }
@@ -95,7 +98,11 @@ async fn serve(stream: tokio::net::UnixStream, room: Arc<Room>) {
                 }
             }
             "read" => {
-                if room.fail_reads.load(Ordering::SeqCst) {
+                room.reads.fetch_add(1, Ordering::SeqCst);
+                if let Some(mut reply) = room.read_reply.lock().unwrap().clone() {
+                    reply["id"] = id;
+                    reply
+                } else if room.fail_reads.load(Ordering::SeqCst) {
                     json!({"ok": false, "error": "read refused", "id": id})
                 } else {
                     let limit = req["limit"].as_u64().unwrap_or(20) as usize;
@@ -454,10 +461,10 @@ async fn the_client_sends_and_reads_back_through_the_room() {
     assert_eq!(event_id.as_deref(), Some("$evt"));
     client.send_to(&chat("second"), Some("!r:x")).await.unwrap();
     assert_eq!(
-        client.read_recent(Some("!r:x"), 10).await.unwrap(),
+        client.read_recent(Some("!r:x"), 10).await.unwrap().bodies,
         vec!["first".to_owned(), "second".to_owned()]
     );
-    assert_eq!(client.read_recent(None, 1).await.unwrap(), vec!["second".to_owned()]);
+    assert_eq!(client.read_recent(None, 1).await.unwrap().bodies, vec!["second".to_owned()]);
     assert_eq!(room.sends.load(Ordering::SeqCst), 2);
 }
 
@@ -510,7 +517,9 @@ async fn read_recent_skips_rows_without_a_body_and_push_lines() {
     let mut client = SafehouseClient::connect(&socket, "loom_daemon")
         .await
         .unwrap();
-    assert_eq!(client.read_recent(None, 20).await.unwrap(), vec!["kept".to_owned()]);
+    let recent = client.read_recent(None, 20).await.unwrap();
+    assert_eq!(recent.bodies, vec!["kept".to_owned()]);
+    assert!(!recent.complete);
 }
 
 // ---- the delivery rule ------------------------------------------------------
@@ -573,7 +582,7 @@ async fn an_unreadable_room_after_a_lost_reply_never_retries() {
     let r = report_for(&merged(5, "a/b", minutes(1)));
     let outcome = merge_report::post(&target(&socket), &r).await;
     assert!(
-        matches!(&outcome, Outcome::Failed(why) if why.contains("read-back failed")),
+        matches!(&outcome, Outcome::Uncertain(why) if why.contains("read-back failed")),
         "{outcome:?}"
     );
     assert_eq!(room.sends.load(Ordering::SeqCst), 1, "unknown stays unknown: no blind retry");
@@ -586,7 +595,7 @@ async fn a_second_lost_reply_gives_up_instead_of_looping() {
     let (socket, room) = start_room(dir.path());
     room.close_before_store.store(2, Ordering::SeqCst);
     let r = report_for(&merged(5, "a/b", minutes(1)));
-    assert!(matches!(merge_report::post(&target(&socket), &r).await, Outcome::Failed(_)));
+    assert!(matches!(merge_report::post(&target(&socket), &r).await, Outcome::Uncertain(_)));
     assert_eq!(room.sends.load(Ordering::SeqCst), 2, "at most two sends");
 }
 
@@ -604,6 +613,12 @@ async fn a_refused_send_is_not_retried_and_sets_send_rejected() {
     );
     assert_eq!(room.sends.load(Ordering::SeqCst), 1);
     assert!(matches!(snapshot_state(&t.state), SafehouseState::SendRejected { .. }));
+    assert!(merge_report::read_room(&t).await.unwrap().complete);
+    assert!(matches!(snapshot_state(&t.state), SafehouseState::SendRejected { .. }));
+    assert!(room.lines().is_empty());
+    room.refuse_sends.store(false, Ordering::SeqCst);
+    assert_eq!(merge_report::post(&t, &r).await, Outcome::Posted);
+    assert!(matches!(snapshot_state(&t.state), SafehouseState::Connected { .. }));
 }
 
 #[tokio::test]
@@ -644,9 +659,13 @@ async fn the_host_posts_a_merge_once_however_many_events_see_it() {
     let (socket, room) = start_room(dir.path());
     let host = reporter(&socket, dir.path());
     let pr = merged(9, "a/b", minutes(1));
-    host.report_host_merge(&pr, Trigger::SweepExit).await;
+    host.report_host_merge(&pr, Trigger::SweepMerge).await;
     host.report_host_merge(&pr, Trigger::Step).await;
-    assert_eq!(room.count_containing("a/b#9"), 1, "sweep exit and merge step share one report");
+    assert_eq!(
+        room.count_containing("a/b#9"),
+        1,
+        "sweep merge phase and merge step share one report"
+    );
 }
 
 #[tokio::test]
@@ -654,7 +673,7 @@ async fn the_host_ignores_a_merge_too_old_to_be_the_one_it_just_made() {
     let dir = tempfile::tempdir().unwrap();
     let (socket, room) = start_room(dir.path());
     let host = reporter(&socket, dir.path());
-    host.report_host_merge(&merged(9, "a/b", hours(7)), Trigger::SweepExit)
+    host.report_host_merge(&merged(9, "a/b", hours(7)), Trigger::SweepMerge)
         .await;
     assert!(room.lines().is_empty(), "a stale merge on a reused branch is not reported");
 }
@@ -666,11 +685,76 @@ async fn a_failed_host_post_is_retried_by_a_later_event() {
     let host = reporter(&socket, dir.path());
     let pr = merged(9, "a/b", minutes(1));
     room.refuse_sends.store(true, Ordering::SeqCst);
-    host.report_host_merge(&pr, Trigger::SweepExit).await;
+    host.report_host_merge(&pr, Trigger::SweepMerge).await;
     assert!(room.lines().is_empty());
     room.refuse_sends.store(false, Ordering::SeqCst);
     host.report_host_merge(&pr, Trigger::Step).await;
     assert_eq!(room.count_containing("a/b#9"), 1);
+}
+
+#[tokio::test]
+async fn partial_and_malformed_reads_never_authorize_a_retry() {
+    let dir = tempfile::tempdir().unwrap();
+    let (socket, room) = start_room(dir.path());
+    let host = reporter(&socket, dir.path());
+    let pr = merged(9, "a/b", minutes(1));
+    room.close_after_store.store(1, Ordering::SeqCst);
+    for reply in [
+        json!({"ok": true, "messages": [], "undecryptable": 1}),
+        json!({"ok": true, "undecryptable": 0}),
+        json!({"ok": true, "messages": {}, "undecryptable": 0}),
+        json!({"ok": true, "messages": []}),
+    ] {
+        *room.read_reply.lock().unwrap() = Some(reply);
+        host.report_host_merge(&pr, Trigger::Step).await;
+        assert_eq!(room.sends.load(Ordering::SeqCst), 1);
+    }
+    // A visible match settles the report even while another event is unreadable.
+    *room.read_reply.lock().unwrap() = Some(json!({
+        "ok": true, "messages": [{"envelope": {"body": room.lines()[0]}}], "undecryptable": 1
+    }));
+    host.report_host_merge(&pr, Trigger::Step).await;
+    host.report_host_merge(&pr, Trigger::Step).await;
+    assert_eq!(room.reads.load(Ordering::SeqCst), 5);
+    assert_eq!(room.lines().len(), 1);
+}
+
+#[tokio::test]
+async fn a_later_host_event_reads_before_resending_an_uncertain_report() {
+    for landed in [true, false] {
+        let dir = tempfile::tempdir().unwrap();
+        let (socket, room) = start_room(dir.path());
+        let host = reporter(&socket, dir.path());
+        let pr = merged(9, "a/b", minutes(1));
+        if landed {
+            room.close_after_store.store(1, Ordering::SeqCst);
+        } else {
+            room.close_before_store.store(1, Ordering::SeqCst);
+        }
+        room.fail_reads.store(true, Ordering::SeqCst);
+        host.report_host_merge(&pr, Trigger::SweepMerge).await;
+        assert_eq!(room.sends.load(Ordering::SeqCst), 1);
+        room.fail_reads.store(false, Ordering::SeqCst);
+        host.report_host_merge(&pr, Trigger::Step).await;
+        assert_eq!(room.reads.load(Ordering::SeqCst), 2);
+        assert_eq!(room.sends.load(Ordering::SeqCst), if landed { 1 } else { 2 });
+        assert_eq!(room.lines().len(), 1);
+    }
+}
+
+#[tokio::test]
+async fn a_lost_acknowledgement_on_the_second_send_still_requires_a_fresh_read() {
+    let dir = tempfile::tempdir().unwrap();
+    let (socket, room) = start_room(dir.path());
+    let host = reporter(&socket, dir.path());
+    let pr = merged(9, "a/b", minutes(1));
+    room.close_before_store.store(1, Ordering::SeqCst);
+    room.close_after_store.store(1, Ordering::SeqCst);
+    host.report_host_merge(&pr, Trigger::SweepMerge).await;
+    host.report_host_merge(&pr, Trigger::Step).await;
+    assert_eq!(room.reads.load(Ordering::SeqCst), 2);
+    assert_eq!(room.sends.load(Ordering::SeqCst), 2);
+    assert_eq!(room.lines().len(), 1);
 }
 
 // ---- captain path -----------------------------------------------------------
@@ -705,11 +789,29 @@ impl FakeGh {
         let dir = dir.join("gh");
         std::fs::create_dir_all(&dir).unwrap();
         let script = dir.join("gh.sh");
-        let body = format!(
-            "#!/usr/bin/env bash\nprintf '%s\\n' \"$*\" >> \"{d}/calls.log\"\n\
-             if [ -f \"{d}/fail\" ]; then echo 'boom' >&2; exit 1; fi\ncat \"{d}/rows.json\"\n",
-            d = dir.display()
-        );
+        // Search in fixture (creation) order, with the forge's inclusive
+        // second-resolution merge filter and row limit.
+        let body = r#"#!/usr/bin/env bash
+set -eu
+dir=$(dirname "$0")
+echo "$*" >> "$dir/calls.log"
+if [[ -f "$dir/fail" ]]; then exit 1; fi
+if [[ -f "$dir/fail-call" && $(wc -l < "$dir/calls.log") -eq $(cat "$dir/fail-call") ]]; then
+    exit 1
+fi
+if [[ "$1 $2" == "pr view" ]]; then
+    exec jq --argjson number "$3" 'first(.[] | select(.number == $number))' "$dir/rows.json"
+fi
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --search) window=${2#merged:}; shift ;;
+        --limit) limit=$2; shift ;;
+    esac
+    shift
+done
+exec jq --arg lo "${window%..*}" --arg hi "${window#*..}" --argjson limit "$limit" \
+    '[.[] | select(.mergedAt >= $lo and .mergedAt <= $hi)][: $limit]' "$dir/rows.json"
+"#;
         std::fs::write(&script, body).unwrap();
         let mut perms = std::fs::metadata(&script).unwrap().permissions();
         perms.set_mode(0o755);
@@ -788,6 +890,62 @@ fn this_host() -> String {
 
 #[tokio::test]
 #[serial]
+async fn host_looks_up_the_numbered_merge_on_a_reused_branch() {
+    use crate::types::Event;
+    let _socket_env =
+        crate::env_test_support::EnvGuard::clear(&[SOCKET_ENV, SAFEHOUSED_SOCKET_ENV]);
+    let dir = tempfile::tempdir().unwrap();
+    let c = captain_fixture(dir.path(), "another-host");
+    c.gh.rows(&[row(36, "a/b", minutes(50)), row(50, "a/b", minutes(1))]);
+    let bus = crate::event_bus::EventBus::new();
+    let handle = spawn_merge_reporter(
+        &SafehouseConfig {
+            enabled: true,
+            socket: Some(c.socket.clone()),
+            ..Default::default()
+        },
+        &bus,
+        &tokio::runtime::Handle::current(),
+        new_shared_state(),
+        c.root.clone(),
+    )
+    .unwrap();
+    let repo = Some(c.root.to_str().unwrap().to_owned());
+    bus.publish(Event::SweepExited {
+        issue: 9,
+        exit_code: None,
+        duration_sec: 20,
+        no_progress: false,
+        death_class: None,
+        repo: repo.clone(),
+    })
+    .unwrap();
+    bus.publish(Event::SweepPhase {
+        issue: 9,
+        phase: "merge".into(),
+        pr_number: Some(50),
+        repo,
+    })
+    .unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while c.room.lines().is_empty() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    handle.abort();
+    let calls = std::fs::read_to_string(c.gh.dir.join("calls.log")).unwrap();
+    assert_eq!(
+        calls.lines().collect::<Vec<_>>(),
+        ["pr view 50 --json number,url,mergedAt,title"]
+    );
+    assert_eq!(c.room.count_containing("a/b#50 ·"), 1);
+    assert_eq!(c.room.count_containing("a/b#36 ·"), 0);
+}
+
+#[tokio::test]
+#[serial]
 async fn the_captain_posts_a_merge_no_host_reported() {
     let dir = tempfile::tempdir().unwrap();
     let c = captain_fixture(dir.path(), &this_host());
@@ -808,7 +966,7 @@ async fn the_captain_stays_quiet_for_a_merge_a_host_reported() {
     c.gh.rows(&[row(5, "a/b", minutes(60))]);
     // The merging host (another reporter, another process) posts first.
     let host = reporter(&c.socket, &c.root);
-    host.report_host_merge(&merged(5, "a/b", minutes(60)), Trigger::SweepExit)
+    host.report_host_merge(&merged(5, "a/b", minutes(60)), Trigger::SweepMerge)
         .await;
     assert_eq!(c.room.count_containing("a/b#5"), 1);
     // The captain's own reporter has no memory of it: the room read-back decides.
@@ -891,6 +1049,46 @@ async fn an_unreadable_room_stops_the_pass_before_any_post() {
     assert!(captain.watermark(&c.root).is_none());
     c.room.fail_reads.store(false, Ordering::SeqCst);
     assert_eq!(captain.captain_pass().await, 1);
+}
+
+#[tokio::test]
+#[serial]
+async fn an_incomplete_room_read_preserves_the_captain_window() {
+    let dir = tempfile::tempdir().unwrap();
+    let c = captain_fixture(dir.path(), &this_host());
+    c.gh.rows(&[row(5, "a/b", minutes(60))]);
+    *c.room.read_reply.lock().unwrap() = Some(json!({"ok":true,"messages":[],"undecryptable":1}));
+    let captain = reporter(&c.socket, &c.root);
+    assert_eq!(captain.captain_pass().await, 0);
+    assert!(captain.watermark(&c.root).is_none());
+    assert_eq!(c.room.sends.load(Ordering::SeqCst), 0);
+    *c.room.read_reply.lock().unwrap() = None;
+    assert_eq!(captain.captain_pass().await, 1);
+}
+
+#[tokio::test]
+#[serial]
+async fn a_saturated_creation_order_page_does_not_hide_a_late_merge() {
+    let dir = tempfile::tempdir().unwrap();
+    let c = captain_fixture(dir.path(), &this_host());
+    // PR #1 was opened first, returned last, and merged after all the others.
+    let mut rows: Vec<_> = (2..=101)
+        .rev()
+        .map(|n| row(n, "a/b", if n % 2 == 0 { hours(5) } else { hours(2) }))
+        .collect();
+    rows.push(row(1, "a/b", minutes(15)));
+    c.gh.rows(&rows);
+    let captain = reporter(&c.socket, &c.root);
+    std::fs::write(c.gh.dir.join("fail-call"), "3").unwrap();
+    assert_eq!(captain.captain_pass().await, rows.len() - 1);
+    assert!(captain.watermark(&c.root).is_none(), "the second half failed");
+    assert_eq!(c.room.count_containing("a/b#1 ·"), 0);
+
+    assert_eq!(captain.captain_pass().await, 1);
+    assert_eq!(c.room.count_containing("a/b#1 ·"), 1);
+    assert_eq!(c.room.lines().len(), rows.len());
+    assert_eq!(c.gh.calls(), 6, "each attempt searched the parent and both halves");
+    assert!(captain.watermark(&c.root).is_some());
 }
 
 #[tokio::test]

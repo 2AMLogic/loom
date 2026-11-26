@@ -3,7 +3,7 @@
 //! Two producers feed the one report in [`super::merge_report`]:
 //!
 //! - **The host that ran the merge posts.** This daemon subscribes to the event
-//!   bus; a sweep that exits ([`Event::SweepExited`]) or a Champion merge step
+//!   bus; a sweep merge phase naming a PR ([`Event::SweepPhase`]) or a Champion merge step
 //!   that ends with a verdict ([`Event::StepEnded`]) is only a *hint*. The merge
 //!   itself is confirmed from the forge ([`super::merge_source`]), and only then
 //!   is the line posted. An open PR, or a PR that merged long ago, posts
@@ -23,13 +23,13 @@
 //! tick (and is bounded below by the catch-up window). The room read-back is what
 //! keeps a retried scan from posting a line twice.
 
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, SubsecRound, Utc};
 
 use super::merge_report::{self, Outcome, PrReport, ReportTarget};
 use super::merge_source::{self, MergedPr};
@@ -58,12 +58,11 @@ const DEFAULT_GRACE: Duration = Duration::from_secs(10 * 60);
 /// trails a merge by seconds to minutes.
 const WATERMARK_SLACK: chrono::Duration = chrono::Duration::minutes(30);
 
-/// Most pages one workspace scan will walk back through when the forge keeps
+/// Most queries one workspace scan will make when the forge keeps
 /// returning full pages.
 const MAX_PAGES: u32 = 5;
 
-/// Cap on the in-process set of reported keys; cleared when exceeded (a
-/// duplicate after that is tolerated).
+/// Maximum local report keys. Confirmed keys may be evicted at capacity.
 const REPORTED_CAP: usize = 10_000;
 
 fn env_secs(name: &str, default: Duration) -> Duration {
@@ -79,21 +78,12 @@ fn scan_interval() -> Duration {
         .map_or(DEFAULT_SCAN_INTERVAL, Duration::from_millis)
 }
 
-/// Whether a step that ended with this ledger classification may have merged its
-/// PR, so the reporter should look. Only a Champion merge step merges: a Builder
-/// opens a PR (an open PR is unfinished work, never a report), and Judge,
-/// Doctor, Curator and promotion move labels. Of the merge step's outcomes only
-/// a `verdict` can be a merge, and its non-merge verdicts are ruled out without
-/// a forge call; the forge's `mergedAt`, not the reason, decides the rest. Pure.
-#[must_use]
-pub(crate) fn step_may_have_merged(
-    role: crate::step_role::StepRole,
-    class: &str,
-    reason: &str,
-) -> bool {
-    role == crate::step_role::StepRole::ChampionMerge
-        && class == "verdict"
-        && !matches!(reason, "rejected" | "triaged" | "triage_blocked" | "triage_operator")
+/// The previous local outcome decides whether a new send needs a fresh read.
+#[derive(Clone, Copy)]
+enum ReportState {
+    InFlight,
+    Uncertain(DateTime<Utc>),
+    Reported,
 }
 
 /// Start the merged-PR reporter on `runtime` when enabled. Returns the task
@@ -149,10 +139,8 @@ pub(super) struct Reporter {
     target: ReportTarget,
     /// The daemon's default workspace (captain gate root + a scan target).
     default_root: PathBuf,
-    /// `owner/repo#N` keys already handled by this process (posted, found in the
-    /// room, or in flight), so a sweep exit and a merge-step end for one PR post
-    /// once.
-    reported: Mutex<HashSet<String>>,
+    /// Delivery state shared by sweep, step and captain reports for each `owner/repo#N`.
+    reported: Mutex<HashMap<String, ReportState>>,
     /// Workspaces seen on live events, scanned in addition to the registry.
     known_workspaces: Mutex<BTreeSet<String>>,
     /// Per-workspace scan watermarks (see the module docs).
@@ -170,7 +158,7 @@ impl Reporter {
         Self {
             target,
             default_root,
-            reported: Mutex::new(HashSet::new()),
+            reported: Mutex::new(HashMap::new()),
             known_workspaces: Mutex::new(BTreeSet::new()),
             watermarks: Mutex::new(HashMap::new()),
             scan_in_flight: AtomicBool::new(false),
@@ -201,21 +189,50 @@ impl Reporter {
             .copied()
     }
 
-    /// Mark `key` handled by this process; `false` when it already was.
-    fn claim(&self, key: &str) -> bool {
-        let mut reported = self.reported.lock().unwrap_or_else(PoisonError::into_inner);
-        if reported.len() >= REPORTED_CAP {
-            reported.clear();
+    /// Reserve the key across awaits. A second worker cannot send while the
+    /// first worker is deciding whether an earlier send landed.
+    async fn deliver(&self, report: &PrReport, visible_in_room: bool) -> Outcome {
+        let key = report.key();
+        let previous = {
+            let mut states = self.reported.lock().unwrap_or_else(PoisonError::into_inner);
+            match states.get(&key) {
+                Some(ReportState::Reported) => return Outcome::AlreadyReported,
+                Some(ReportState::InFlight) => return Outcome::Failed("report in flight".into()),
+                _ => {}
+            }
+            if states.len() >= REPORTED_CAP {
+                let cutoff = Utc::now() - self.catchup;
+                states.retain(|_, state| match state {
+                    ReportState::InFlight => true,
+                    ReportState::Uncertain(at) => *at >= cutoff,
+                    ReportState::Reported => false,
+                });
+                if states.len() >= REPORTED_CAP && !states.contains_key(&key) {
+                    return Outcome::Failed("local report cache full of pending sends".into());
+                }
+            }
+            states.insert(key.clone(), ReportState::InFlight)
+        };
+        let outcome = if visible_in_room {
+            Outcome::AlreadyReported
+        } else if matches!(previous, Some(ReportState::Uncertain(_))) {
+            merge_report::post_after_read(&self.target, report).await
+        } else {
+            merge_report::post(&self.target, report).await
+        };
+        let mut states = self.reported.lock().unwrap_or_else(PoisonError::into_inner);
+        match &outcome {
+            Outcome::Posted | Outcome::AlreadyReported => {
+                states.insert(key, ReportState::Reported);
+            }
+            Outcome::Uncertain(_) => {
+                states.insert(key, ReportState::Uncertain(Utc::now()));
+            }
+            Outcome::Failed(_) => {
+                states.remove(&key);
+            }
         }
-        reported.insert(key.to_owned())
-    }
-
-    /// Hand `key` back so a later pass may try it again.
-    fn release(&self, key: &str) {
-        self.reported
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .remove(key);
+        outcome
     }
 
     fn remember_workspace(&self, root: &str) {
@@ -244,12 +261,11 @@ impl Reporter {
     }
 
     /// The host path: post the line for a merge this host just saw confirmed.
-    /// Sends directly (no read first): the merging host is the normal poster.
-    /// Only the post's own retry reads the room.
+    /// An earlier ambiguous attempt requires a room read before sending again.
     pub(super) async fn report_host_merge(&self, pr: &MergedPr, trigger: Trigger) {
         if pr.merged_at < Utc::now() - self.catchup {
             log::debug!(
-                "safehouse: PR #{} merged at {} is outside the report window; not the merge this exit just made",
+                "safehouse: PR #{} merged at {} is outside the report window; skipping stale merge",
                 pr.number,
                 pr.merged_at
             );
@@ -260,10 +276,7 @@ impl Reporter {
             return;
         };
         let key = report.key();
-        if !self.claim(&key) {
-            return;
-        }
-        match merge_report::post(&self.target, &report).await {
+        match self.deliver(&report, false).await {
             Outcome::Posted => {
                 feed::record_completions(trigger, false, 1);
                 log::info!("safehouse: reported merged PR {key}");
@@ -271,10 +284,7 @@ impl Reporter {
             Outcome::AlreadyReported => {
                 log::debug!("safehouse: {key} was already in the room; not re-sent");
             }
-            Outcome::Failed(why) => {
-                // Hand the key back: the captain's catch-up scan (or a later
-                // event for the same PR) may still deliver it.
-                self.release(&key);
+            Outcome::Failed(why) | Outcome::Uncertain(why) => {
                 log::warn!("safehouse: could not report merged PR {key}: {why}; continuing");
             }
         }
@@ -290,7 +300,12 @@ impl Reporter {
             return 0;
         }
         let mut bodies = match merge_report::read_room(&self.target).await {
-            Ok(bodies) => bodies,
+            Ok(recent) if recent.complete => recent.bodies,
+            Ok(_) => {
+                log::warn!("safehouse: incomplete fleet room read; deferring captain catch-up");
+                feed::record_reconcile_pass(PassOutcome::Failed);
+                return 0;
+            }
             Err(why) => {
                 log::warn!(
                     "safehouse: captain catch-up could not read the fleet room ({why}); \
@@ -328,40 +343,8 @@ impl Reporter {
                 .map_or(now - self.catchup, |mark| mark.max(now - self.catchup))
         };
 
-        let mut rows: Vec<MergedPr> = Vec::new();
-        let mut complete = true;
-        let mut until: Option<DateTime<Utc>> = None;
-        for page_no in 1..=MAX_PAGES {
-            let Some(page) = merge_source::merged_prs_between(root, since, until).await else {
-                complete = false;
-                break;
-            };
-            let oldest = page.rows.iter().map(|pr| pr.merged_at).min();
-            rows.extend(page.rows);
-            if !page.saturated {
-                break;
-            }
-            // A full page: older merges in the window may be hidden. Walk the
-            // window back to the oldest row seen. Out of pages, or no progress
-            // possible, means the scan is incomplete and must be retried.
-            match oldest {
-                Some(oldest) if oldest > since && Some(oldest) != until && page_no < MAX_PAGES => {
-                    until = Some(oldest);
-                }
-                _ => {
-                    complete = false;
-                    log::warn!(
-                        "safehouse: catch-up scan of {} filled its pages; merges older than \
-                         the oldest row read are not reported until the next pass",
-                        root.display()
-                    );
-                    break;
-                }
-            }
-        }
-        // Oldest first, one row per PR (overlapping pages repeat a boundary row),
-        // and only merges old enough that the merging host has had its chance.
-        // The URL carries `owner/repo/pull/N`, i.e. the report's whole identity.
+        let (mut rows, complete) = scan_window(root, since, horizon).await;
+        // A saturated parent can repeat rows returned by its children.
         rows.sort_by(|a, b| (a.merged_at, a.number, &a.url).cmp(&(b.merged_at, b.number, &b.url)));
         rows.dedup_by(|a, b| a.url == b.url);
         let mut posted = 0;
@@ -371,24 +354,19 @@ impl Reporter {
                 continue;
             };
             let key = report.key();
-            if report.is_reported_in(bodies) {
-                self.claim(&key);
-                continue;
-            }
-            // The room read above is the authority; the in-process set also
-            // skips a PR whose host-path post settled after that read.
-            if !self.claim(&key) {
-                continue;
-            }
-            match merge_report::post(&self.target, &report).await {
+            let visible = report.is_reported_in(bodies);
+            match self.deliver(&report, visible).await {
                 Outcome::Posted => {
                     bodies.push(report.body());
                     posted += 1;
                     log::info!("safehouse: captain reported merged PR {key} that no host reported");
                 }
-                Outcome::AlreadyReported => bodies.push(report.body()),
-                Outcome::Failed(why) => {
-                    self.release(&key);
+                Outcome::AlreadyReported => {
+                    if !visible {
+                        bodies.push(report.body());
+                    }
+                }
+                Outcome::Failed(why) | Outcome::Uncertain(why) => {
                     failures.push(format!("{key}: {why}"));
                 }
             }
@@ -418,44 +396,87 @@ impl Reporter {
     }
 }
 
-/// Act on one bus event. Never blocks the bus loop: the forge lookup and the
-/// post run on their own task.
-fn on_event(reporter: &Arc<Reporter>, event: Event, runtime: &tokio::runtime::Handle) {
-    match event {
-        Event::SweepExited {
-            issue,
-            repo: Some(root),
-            ..
-        } => {
-            reporter.remember_workspace(&root);
-            let reporter = Arc::clone(reporter);
-            runtime.spawn(async move {
-                if let Some(pr) = merge_source::merged_pr_for_issue(Path::new(&root), issue).await {
-                    reporter.report_host_merge(&pr, Trigger::SweepExit).await;
-                }
-            });
+/// Search both halves of a saturated interval. The forge can return rows in
+/// creation order, so the oldest visible merge says nothing about unseen rows.
+async fn scan_window(
+    root: &Path,
+    since: DateTime<Utc>,
+    until: DateTime<Utc>,
+) -> (Vec<MergedPr>, bool) {
+    let mut intervals = VecDeque::new();
+    if since <= until {
+        intervals.push_back((since.trunc_subsecs(0), until.trunc_subsecs(0)));
+    }
+    let mut rows = Vec::new();
+    let mut complete = true;
+    for _ in 0..MAX_PAGES {
+        let Some((start, end)) = intervals.pop_front() else {
+            break;
+        };
+        let Some(page) = merge_source::merged_prs_between(root, start, end).await else {
+            complete = false;
+            break;
+        };
+        rows.extend(page.rows);
+        if page.saturated {
+            if start == end {
+                complete = false;
+                continue;
+            }
+            let midpoint = start + chrono::Duration::seconds((end - start).num_seconds() / 2);
+            intervals.push_back((start, midpoint));
+            intervals.push_back((midpoint + chrono::Duration::seconds(1), end));
         }
+    }
+    (rows, complete && intervals.is_empty())
+}
+
+/// Only a completed merge naming a PR authorizes the host lookup. An issue
+/// branch can be reused, and a sweep exit (including a cancellation) has no PR.
+fn host_merge_hint(event: &Event) -> Option<(u32, Trigger)> {
+    match event {
+        Event::SweepPhase {
+            phase,
+            pr_number: Some(pr),
+            ..
+        } if phase == "merge" => u32::try_from(*pr)
+            .ok()
+            .filter(|n| *n > 0)
+            .map(|n| (n, Trigger::SweepMerge)),
         Event::StepEnded {
             item,
-            role,
+            role: crate::step_role::StepRole::ChampionMerge,
             class,
             reason,
-            repo: Some(root),
             ..
-        } => {
-            reporter.remember_workspace(&root);
-            if step_may_have_merged(role, &class, &reason) {
-                let reporter = Arc::clone(reporter);
-                runtime.spawn(async move {
-                    if let Some(pr) =
-                        merge_source::merged_pr_by_number(Path::new(&root), item).await
-                    {
-                        reporter.report_host_merge(&pr, Trigger::Step).await;
-                    }
-                });
-            }
+        } if class == "verdict" && reason == "merged" => Some((*item, Trigger::Step)),
+        _ => None,
+    }
+}
+
+/// Act on a bus event without blocking the bus loop on a forge or room read.
+fn on_event(reporter: &Arc<Reporter>, event: Event, runtime: &tokio::runtime::Handle) {
+    let root = match &event {
+        Event::SweepPhase {
+            repo: Some(root), ..
         }
-        _ => {}
+        | Event::SweepExited {
+            repo: Some(root), ..
+        }
+        | Event::StepEnded {
+            repo: Some(root), ..
+        } => root,
+        _ => return,
+    };
+    reporter.remember_workspace(root);
+    if let Some((number, trigger)) = host_merge_hint(&event) {
+        let root = PathBuf::from(root);
+        let reporter = Arc::clone(reporter);
+        runtime.spawn(async move {
+            if let Some(pr) = merge_source::merged_pr_by_number(&root, number).await {
+                reporter.report_host_merge(&pr, trigger).await;
+            }
+        });
     }
 }
 
@@ -513,16 +534,42 @@ mod tests {
     use crate::step_role::StepRole;
 
     #[test]
-    fn only_a_champion_merge_verdict_may_have_merged() {
-        assert!(step_may_have_merged(StepRole::ChampionMerge, "verdict", "merged"));
-        assert!(step_may_have_merged(StepRole::ChampionMerge, "verdict", "closed"));
-        assert!(step_may_have_merged(StepRole::ChampionMerge, "verdict", "unclassified"));
-        for reason in ["rejected", "triaged", "triage_blocked", "triage_operator"] {
-            assert!(!step_may_have_merged(StepRole::ChampionMerge, "verdict", reason));
-        }
-        for class in ["noop", "refused", "failed"] {
-            assert!(!step_may_have_merged(StepRole::ChampionMerge, class, "merged"));
-        }
-        assert!(!step_may_have_merged(StepRole::Builder, "verdict", "merged"));
+    fn host_reports_only_a_merge_that_names_its_pr() {
+        let sweep = |phase: &str, pr_number| Event::SweepPhase {
+            issue: 9,
+            phase: phase.into(),
+            pr_number,
+            repo: Some("root".into()),
+        };
+        assert_eq!(host_merge_hint(&sweep("merge", Some(50))), Some((50, Trigger::SweepMerge)));
+        assert_eq!(host_merge_hint(&sweep("merge", None)), None);
+        assert_eq!(host_merge_hint(&sweep("judge", Some(36))), None);
+        // A cancellation on this issue's reused branch cannot report its earlier PR.
+        assert_eq!(
+            host_merge_hint(&Event::SweepExited {
+                issue: 9,
+                exit_code: None,
+                duration_sec: 20,
+                no_progress: false,
+                death_class: None,
+                repo: Some("root".into())
+            }),
+            None
+        );
+        let step = |role, class: &str, reason: &str| Event::StepEnded {
+            item: 50,
+            role,
+            class: class.into(),
+            reason: reason.into(),
+            ran_for_sec: 1,
+            repo: Some("root".into()),
+        };
+        assert_eq!(
+            host_merge_hint(&step(StepRole::ChampionMerge, "verdict", "merged")),
+            Some((50, Trigger::Step))
+        );
+        assert_eq!(host_merge_hint(&step(StepRole::ChampionMerge, "verdict", "closed")), None);
+        assert_eq!(host_merge_hint(&step(StepRole::ChampionMerge, "noop", "merged")), None);
+        assert_eq!(host_merge_hint(&step(StepRole::Builder, "verdict", "merged")), None);
     }
 }

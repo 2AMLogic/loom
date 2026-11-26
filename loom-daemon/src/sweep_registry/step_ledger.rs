@@ -275,7 +275,7 @@ impl SweepRegistry {
     /// step's terminal event on the bus, carrying the ledger's
     /// classification. A step emits no `sweep.issue.{N}.exited`, so this is
     /// what the safehouse merged-PR reporter reads to report a merged PR
-    /// (`safehouse::reporter::step_may_have_merged` decides which ends
+    /// (`safehouse::reporter::host_merge_hint` decides which ends
     /// qualify). Called once per ended step by the settle pass, never for a
     /// spawn-time refusal (`record_refusal`: no session ran). A no-op without
     /// a bus.

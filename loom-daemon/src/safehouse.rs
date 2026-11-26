@@ -440,6 +440,15 @@ pub fn snapshot_state(cell: &SharedSafehouseState) -> SafehouseState {
     }
 }
 
+/// Visible room lines and whether the read can establish that a report is absent.
+#[derive(Debug, PartialEq, Eq)]
+pub struct RecentMessages {
+    /// Message bodies returned by safehoused, oldest first.
+    pub bodies: Vec<String>,
+    /// Every possible report in the returned window was readable.
+    pub complete: bool,
+}
+
 /// Set `cell` to [`SafehouseState::NotConfigured`] (#4345).
 #[cfg(test)]
 pub fn set_not_configured(cell: &SharedSafehouseState) {
@@ -624,13 +633,12 @@ impl SafehouseClient {
     /// The text bodies of the most recent `limit` (at most 100) messages in
     /// `room`, oldest first, via the socket `read` op — the room read-back the
     /// merged-PR report runs before any retry. A row with no readable envelope
-    /// body (an attachment, an unsupported version) is skipped; the caller only
-    /// ever looks for its own line.
+    /// body contributes no visible line. Unreadable events make absence inconclusive.
     pub async fn read_recent(
         &mut self,
         room: Option<&str>,
         limit: u32,
-    ) -> std::result::Result<Vec<String>, SendError> {
+    ) -> std::result::Result<RecentMessages, SendError> {
         let id = self.next_id;
         self.next_id = self.next_id.wrapping_add(1);
         let mut req = json!({"id": id, "op": "read", "limit": limit.min(100)});
@@ -640,21 +648,22 @@ impl SafehouseClient {
         self.write_line(&req).await.map_err(SendError::Transport)?;
         let reply = self.read_reply().await.map_err(SendError::Transport)?;
         Self::check_reply(&reply, id)?;
-        let messages = reply
-            .get("messages")
-            .and_then(Value::as_array)
-            .map(|rows| {
-                rows.iter()
-                    .filter_map(|row| {
-                        row.get("envelope")?
-                            .get("body")?
-                            .as_str()
-                            .map(ToOwned::to_owned)
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
-        Ok(messages)
+        let rows = reply["messages"]
+            .as_array()
+            .context("read reply has no messages array")
+            .map_err(SendError::Transport)?;
+        let mut complete = reply["undecryptable"].as_u64() == Some(0);
+        let mut bodies = Vec::new();
+        for row in rows {
+            if let Some(body) = row["envelope"]["body"].as_str() {
+                bodies.push(body.to_owned());
+            } else {
+                // A decryption gap, unknown envelope version or malformed row
+                // can hide the text even when attachment metadata is present.
+                complete = false;
+            }
+        }
+        Ok(RecentMessages { bodies, complete })
     }
 
     /// Shared reply gate: `ok:false` is a [`SendError::Rejected`]; a reply `id`

@@ -1,11 +1,10 @@
 //! Forge lookups behind the merged-PR report (#13946).
 //!
-//! Three read-only `gh` questions, each answered from forge truth and each
+//! Two read-only `gh` questions, each answered from forge truth and each
 //! `None` when the forge did not answer (so a caller can tell "nothing merged"
 //! from "could not look"):
 //!
-//! - [`merged_pr_for_issue`] — did the PR on an issue's branch merge?
-//! - [`merged_pr_by_number`] — did this PR merge? (a Champion merge step ran on it)
+//! - [`merged_pr_by_number`] — did this PR merge? (a local merge event named it)
 //! - [`merged_prs_between`] — every PR merged in a time window (the captain's
 //!   catch-up scan).
 //!
@@ -97,42 +96,28 @@ pub(super) fn parse_row(row: &Value) -> Option<MergedPr> {
     })
 }
 
-/// The merged PR on `issue`'s branch, if there is one — a sweep that exits
-/// cleanly with its PR still open (awaiting a Judge) returns `None`.
-pub(super) async fn merged_pr_for_issue(workspace_root: &Path, issue: u32) -> Option<MergedPr> {
-    let branch = crate::worktree_ops::naming::branch_name(issue);
-    let args = [
-        "pr", "list", "--head", &branch, "--state", "merged", "--json", PR_FIELDS, "--limit", "1",
-    ];
-    let rows = run_json("pr list", "safehouse.merged_pr", workspace_root, &args).await?;
-    parse_row(rows.as_array()?.first()?)
-}
-
 /// The PR `pr`, if it is merged.
 pub(super) async fn merged_pr_by_number(workspace_root: &Path, pr: u32) -> Option<MergedPr> {
     let number = pr.to_string();
     let args = ["pr", "view", &number, "--json", PR_FIELDS];
     let row = run_json("pr view", "safehouse.step_merged_pr", workspace_root, &args).await?;
-    parse_row(&row)
+    parse_row(&row).filter(|merged| merged.number == pr)
 }
 
 /// One windowed scan's answer.
 #[derive(Debug)]
 pub(super) struct Page {
-    /// Merged PRs in the window, newest first (the forge's order).
+    /// Merged PRs in the window. Search order need not follow merge time.
     pub(super) rows: Vec<MergedPr>,
-    /// The forge returned a full page: older merges in the window may be hidden.
+    /// The forge returned a full page: other merges in the window may be hidden.
     pub(super) saturated: bool,
 }
 
 /// The `gh pr list` arguments for a scan of PRs merged in `[since, until]`
-/// (`until: None` is open-ended). Pure.
-pub(super) fn scan_args(since: DateTime<Utc>, until: Option<DateTime<Utc>>) -> Vec<String> {
+/// (inclusive, with second precision). Pure.
+pub(super) fn scan_args(since: DateTime<Utc>, until: DateTime<Utc>) -> Vec<String> {
     let stamp = |t: DateTime<Utc>| t.to_rfc3339_opts(SecondsFormat::Secs, true);
-    let search = match until {
-        Some(until) => format!("merged:{}..{}", stamp(since), stamp(until)),
-        None => format!("merged:>={}", stamp(since)),
-    };
+    let search = format!("merged:{}..{}", stamp(since), stamp(until));
     [
         "pr",
         "list",
@@ -156,7 +141,7 @@ pub(super) fn scan_args(since: DateTime<Utc>, until: Option<DateTime<Utc>>) -> V
 pub(super) async fn merged_prs_between(
     workspace_root: &Path,
     since: DateTime<Utc>,
-    until: Option<DateTime<Utc>>,
+    until: DateTime<Utc>,
 ) -> Option<Page> {
     let owned = scan_args(since, until);
     let args: Vec<&str> = owned.iter().map(String::as_str).collect();
@@ -164,7 +149,11 @@ pub(super) async fn merged_prs_between(
     let array = rows.as_array()?;
     let saturated = u32::try_from(array.len()).is_ok_and(|n| n >= SCAN_LIMIT);
     Some(Page {
-        rows: array.iter().filter_map(parse_row).collect(),
+        rows: array
+            .iter()
+            .filter(|row| row.get("mergedAt") != Some(&Value::Null))
+            .map(parse_row)
+            .collect::<Option<Vec<_>>>()?,
         saturated,
     })
 }
@@ -357,11 +346,9 @@ mod tests {
     #[test]
     fn scan_args_bound_the_window() {
         let since = ts("2026-11-25T04:00:00Z");
-        let open = scan_args(since, None);
-        assert!(open.contains(&"merged:>=2026-11-25T04:00:00Z".to_owned()));
-        assert!(open.contains(&SCAN_LIMIT.to_string()));
         let until = ts("2026-11-25T09:30:00Z");
-        let ranged = scan_args(since, Some(until));
+        let ranged = scan_args(since, until);
+        assert!(ranged.contains(&SCAN_LIMIT.to_string()));
         assert!(ranged.contains(&"merged:2026-11-25T04:00:00Z..2026-11-25T09:30:00Z".to_owned()));
         assert_eq!(&ranged[..4], ["pr", "list", "--state", "merged"]);
     }

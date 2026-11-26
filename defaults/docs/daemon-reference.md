@@ -8597,8 +8597,8 @@ should fall back to the static env pair while it is investigated.
 
 Safehouse carries exactly one thing from the daemon: a slim
 `merged ✓ owner/repo#N · <title> · <url>` line per merged PR. The host that ran
-the merge posts it (a sweep exit or a Champion merge step is a hint; the merge is
-confirmed from the forge first), and on the fleet captain a bounded catch-up scan
+the merge posts it after confirming the PR named by the sweep merge phase or
+Champion merge verdict, and on the fleet captain a bounded catch-up scan
 posts the merges no host reported. Delivery is best effort: a lost reply is
 followed by a room read-back and a re-send only when the PR's line is absent.
 The `completion-v1` envelope, its token/title/diffstat payload and the

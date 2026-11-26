@@ -26,8 +26,8 @@ use anyhow::Result;
 
 use super::merge_source::MergedPr;
 use super::{
-    set_state, Envelope, SafehouseClient, SafehouseConfig, SafehouseState, SendError,
-    SharedSafehouseState,
+    set_state, Envelope, RecentMessages, SafehouseClient, SafehouseConfig, SafehouseState,
+    SendError, SharedSafehouseState,
 };
 
 /// How many recent room messages the read-back inspects (safehoused caps
@@ -75,26 +75,28 @@ impl ReportTarget {
         )
         .await
         .unwrap_or_else(|_| Err(anyhow::anyhow!("timed out connecting to safehoused")));
-        match attempt {
-            Ok(client) => {
-                set_state(
-                    &self.state,
-                    SafehouseState::Connected {
-                        socket: self.socket.clone(),
-                        room: self.room.clone(),
-                    },
-                );
-                Ok(client)
-            }
-            Err(err) => {
-                set_state(
-                    &self.state,
-                    SafehouseState::Unreachable {
-                        socket: self.socket.clone(),
-                    },
-                );
-                Err(err)
-            }
+        // A handshake (or a failed reconnect) does not establish that the room
+        // will accept a send. Keep the last rejection until an acknowledgement.
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !matches!(*state, SafehouseState::SendRejected { .. }) {
+            *state = if attempt.is_ok() {
+                self.connected()
+            } else {
+                SafehouseState::Unreachable {
+                    socket: self.socket.clone(),
+                }
+            };
+        }
+        attempt
+    }
+
+    fn connected(&self) -> SafehouseState {
+        SafehouseState::Connected {
+            socket: self.socket.clone(),
+            room: self.room.clone(),
         }
     }
 }
@@ -137,6 +139,15 @@ impl PrReport {
         }
     }
 
+    fn envelope(&self) -> Envelope {
+        Envelope {
+            to: "*".to_owned(),
+            kind: "chat".to_owned(),
+            task_id: None,
+            body: self.body(),
+        }
+    }
+
     /// What every line for this PR starts with.
     fn prefix(&self) -> String {
         format!("merged ✓ {}", self.key())
@@ -174,32 +185,25 @@ pub(super) enum Outcome {
     /// The room already holds this PR's line (found by the read-back), so
     /// nothing was sent.
     AlreadyReported,
-    /// Not delivered, with the reason. Either the line was certainly not sent
-    /// (unreachable, refused) or its fate is unknown and was not retried.
+    /// This attempt definitely did not deliver a line.
     Failed(String),
+    /// A send may have landed. Any later attempt must read before sending.
+    Uncertain(String),
 }
 
-/// What one `send` attempt established.
-enum Attempt {
-    /// Acknowledged.
-    Sent,
-    /// Certainly not delivered: could not connect, or safehoused refused it.
-    NotSent(String),
-    /// The request may have been written but no reply arrived (closed
-    /// connection, timeout, desync): the line may or may not be in the room.
-    Unknown(String),
-}
-
-async fn attempt_send(target: &ReportTarget, envelope: &Envelope) -> Attempt {
+async fn attempt_send(target: &ReportTarget, envelope: &Envelope) -> Outcome {
     let mut client = match target.connect().await {
         Ok(client) => client,
-        Err(err) => return Attempt::NotSent(format!("{err:#}")),
+        Err(err) => return Outcome::Failed(format!("{err:#}")),
     };
     let sent =
         tokio::time::timeout(target.rpc_timeout, client.send_to(envelope, target.room.as_deref()))
             .await;
     match sent {
-        Ok(Ok(_event_id)) => Attempt::Sent,
+        Ok(Ok(_event_id)) => {
+            set_state(&target.state, target.connected());
+            Outcome::Posted
+        }
         Ok(Err(SendError::Rejected { reason })) => {
             set_state(
                 &target.state,
@@ -208,16 +212,18 @@ async fn attempt_send(target: &ReportTarget, envelope: &Envelope) -> Attempt {
                     reason: reason.clone(),
                 },
             );
-            Attempt::NotSent(format!("safehoused rejected the send: {reason}"))
+            Outcome::Failed(format!("safehoused rejected the send: {reason}"))
         }
-        Ok(Err(SendError::Transport(err))) => Attempt::Unknown(format!("{err:#}")),
-        Err(_elapsed) => Attempt::Unknown("no reply before the timeout".to_owned()),
+        Ok(Err(SendError::Transport(err))) => Outcome::Uncertain(format!("{err:#}")),
+        Err(_elapsed) => Outcome::Uncertain("no reply before the timeout".to_owned()),
     }
 }
 
 /// The recent messages of the fleet room, oldest first (the read-back). `Err`
 /// carries a reason when the room could not be read.
-pub(super) async fn read_room(target: &ReportTarget) -> std::result::Result<Vec<String>, String> {
+pub(super) async fn read_room(
+    target: &ReportTarget,
+) -> std::result::Result<RecentMessages, String> {
     let mut client = target.connect().await.map_err(|err| format!("{err:#}"))?;
     let read = tokio::time::timeout(
         target.rpc_timeout,
@@ -234,27 +240,21 @@ pub(super) async fn read_room(target: &ReportTarget) -> std::result::Result<Vec<
 /// Post `report` to the fleet room, reading the room back before any retry.
 /// See the module docs for the rule. At most two `send`s are made.
 pub(super) async fn post(target: &ReportTarget, report: &PrReport) -> Outcome {
-    let envelope = Envelope {
-        to: "*".to_owned(),
-        kind: "chat".to_owned(),
-        task_id: None,
-        body: report.body(),
-    };
+    let envelope = report.envelope();
     match attempt_send(target, &envelope).await {
-        Attempt::Sent => Outcome::Posted,
-        Attempt::NotSent(reason) => Outcome::Failed(reason),
-        Attempt::Unknown(reason) => match read_room(target).await {
-            Err(read_err) => Outcome::Failed(format!(
-                "send outcome unknown ({reason}) and the read-back failed ({read_err}); not retrying"
-            )),
-            Ok(bodies) if report.is_reported_in(&bodies) => Outcome::AlreadyReported,
-            Ok(_) => match attempt_send(target, &envelope).await {
-                Attempt::Sent => Outcome::Posted,
-                Attempt::NotSent(reason) | Attempt::Unknown(reason) => {
-                    Outcome::Failed(format!("retry after a lost reply failed: {reason}"))
-                }
-            },
-        },
+        Outcome::Uncertain(_) => post_after_read(target, report).await,
+        outcome => outcome,
+    }
+}
+
+/// Resolve a previous ambiguous send. One fresh, complete negative read
+/// authorizes exactly one send, even if this attempt also loses its reply.
+pub(super) async fn post_after_read(target: &ReportTarget, report: &PrReport) -> Outcome {
+    match read_room(target).await {
+        Ok(recent) if report.is_reported_in(&recent.bodies) => Outcome::AlreadyReported,
+        Ok(recent) if recent.complete => attempt_send(target, &report.envelope()).await,
+        Ok(_) => Outcome::Uncertain("read-back incomplete".to_owned()),
+        Err(why) => Outcome::Uncertain(format!("read-back failed: {why}")),
     }
 }
 
