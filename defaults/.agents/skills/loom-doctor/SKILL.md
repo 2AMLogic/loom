@@ -771,7 +771,7 @@ to PR 588. Address the feedback only after it selects an editable worktree.
 
 # Complete normally (hand-back: see "Verdict-Time CAS Recheck")
 git push
-loom-daemon forge doctor-handback 588 --expected-head-sha "$(git rev-parse HEAD)" --watch-pid "${LOOM_AGENT_SESSION_PID:-${CLAUDE_PID:-$PPID}}"
+LOOM_AGENT_SESSION_PID="${LOOM_AGENT_SESSION_PID:-${CLAUDE_PID:-$PPID}}" loom-daemon forge doctor-handback 588 --expected-head-sha "$(git rev-parse HEAD)"
 ./.loom/scripts/post-comment.sh 588 --pr --body "Per-finding handoff (see Communicate Clearly): <fixed at file:line / still open / disputed + reason, per finding>. Ready for re-review"
 ```
 
@@ -1124,10 +1124,11 @@ Your own push moves the head, so the stale-verdict guard may re-queue the PR
 and a Judge resolve it seconds later — before you write labels you read
 before pushing (#9388; Judge analog: `judge.md`'s "Verdict-Time CAS
 Recheck"). A prose re-read plus a separate `gh pr edit` did not hold, so the
-read-decide-write is one verb. **Never hand-write the completion labels:**
+read-decide-write is one verb. Pass the claim PID in the environment so daemons
+with the older handback CLI can still queue ordinary repairs. **Never hand-write the completion labels:**
 
 ```bash
-loom-daemon forge doctor-handback $N --expected-head-sha "$(git rev-parse HEAD)" --watch-pid "${LOOM_AGENT_SESSION_PID:-${CLAUDE_PID:-$PPID}}"  # the SHA you pushed
+LOOM_AGENT_SESSION_PID="${LOOM_AGENT_SESSION_PID:-${CLAUDE_PID:-$PPID}}" loom-daemon forge doctor-handback $N --expected-head-sha "$(git rev-parse HEAD)"  # the SHA you pushed
 ```
 
 It re-reads labels and head, adds `loom:review-requested` *before* removing
@@ -1508,7 +1509,7 @@ git push
 
 # Signal completion and unclaim — one verified write; act on its exit code
 # (see "Verdict-Time CAS Recheck" above): 0/10 comment, 13 done, 11/12 stand down
-loom-daemon forge doctor-handback 42 --expected-head-sha "$(git rev-parse HEAD)" --watch-pid "${LOOM_AGENT_SESSION_PID:-${CLAUDE_PID:-$PPID}}"
+LOOM_AGENT_SESSION_PID="${LOOM_AGENT_SESSION_PID:-${CLAUDE_PID:-$PPID}}" loom-daemon forge doctor-handback 42 --expected-head-sha "$(git rev-parse HEAD)"
 ./.loom/scripts/post-comment.sh 42 --pr --body "🩺 Doctor handoff — per-finding status at $(git rev-parse --short HEAD):
 - Reviewer A, null handling: **fixed** at foo.ts:15
 - Reviewer A, missing error-case test: **fixed** at foo.test.ts:40
