@@ -1909,7 +1909,8 @@ mod tests {
                 "https://github.com/acme/widgets.git",
             ],
         );
-        let worker = root.join("worker");
+        // Multicall coreutils selects the applet by the executable's basename.
+        let worker = root.join("cat");
         std::fs::copy("/bin/cat", &worker).unwrap();
 
         // Limit the scan to real procfs entries we can inspect on any CI host.
@@ -1939,16 +1940,22 @@ mod tests {
 
         // cat waits for EOF on its input pipe. Its executable is the only
         // reference to the candidate while it runs.
-        let mut child = Command::new(&worker)
+        let child = Command::new(&worker)
             .current_dir(tmp.path())
             .stdin(Stdio::piped())
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
+            .stderr(Stdio::piped())
             .spawn()
             .unwrap();
         symlink(format!("/proc/{}", child.id()), procfs.join(child.id().to_string())).unwrap();
         let active = preview();
-        assert!(child.wait().unwrap().success());
+        let output = child.wait_with_output().unwrap();
+        assert!(
+            output.status.success(),
+            "scratch cat exited with {}: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        );
         assert!(active.planned.is_empty());
         assert_eq!(
             active.preserved[0].reason,
