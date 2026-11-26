@@ -18,6 +18,12 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 ### 2026-11-26
 
+- **Issue #15496** (closed): tests/hooks: harness does not unset ambient LOOM_SWEEP_ID — six guard suites fail inside a dispatched agent session
+- **PR #15507**: fix(tests): unset ambient agent-step markers in the guard harness
+- **Issue #15508** (closed): config-resolver.sh: whole config tiers passed as jq --argjson argv fail with E2BIG (exit 126) once a tier exceeds 128 KiB
+- **Issue #15479** (closed): install/hygiene: .loom/account-ranking.codex is in neither LOOM_OWNED_PREFIXES list — a consumer whose managed ignore block predates #14594 still exits 3 from check-main-clean.sh, and --quarantine stashes the daemon's file
+- **PR #15498**: fix: add daemon-written account-* files to both owned-path lists
+- **PR #15476**: docs(runtime-adapters): record verified agy pin, updater control, flags
 - **Issue #15337** (closed): test flake: orphan_process_reaper::tests::live::test_production_pass_reaps_a_genuinely_orphaned_tree fails on Rust Unit Tests (4/5) — leftovers after the pass
 - **PR #15351**: fix(test): poll for survivors in orphan reaper production-pass test (#15337)
 - **Issue #15466** (closed): verify-output-decl rejects a Make target line as a generated-output producer citation
