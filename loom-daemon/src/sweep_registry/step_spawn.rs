@@ -1075,9 +1075,9 @@ impl SweepRegistry {
             && crate::role_runner::runtime_preflight::codex_pool_is_the_wall(root, &admitted)
         {
             Some(
-                crate::tokens_pool::private_workspace::dispatch::Selection::guarded_shared_step(
+                crate::tokens_pool::private_workspace::dispatch::Selection::shared(
                     root,
-                    name,
+                    Some(name),
                     model.as_deref(),
                 )
                 .map_err(|error| {

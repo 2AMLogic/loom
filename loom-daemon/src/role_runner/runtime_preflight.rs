@@ -500,7 +500,7 @@ fn codex_health_exhausted_reason(state: &CodexPoolState) -> String {
     )
 }
 
-/// The account provider `spawn-codex.sh` will select from for `admitted`'s
+/// The account provider `spawn-codex.sh` will select from for the
 /// runtime — the same manifest lookup, in the same order, as that script's
 /// `_loom_account_provider_for_runtime`: the workspace's installed manifest,
 /// else the one beside the adapter, else (missing file or key) `claude`.
@@ -514,10 +514,9 @@ fn codex_health_exhausted_reason(state: &CodexPoolState) -> String {
 /// test of it — depend on a tool that is a de-facto prerequisite of the whole
 /// `.loom/scripts/` surface anyway: a host missing `jq` cannot run a Loom
 /// spawn adapter at all, so the divergence is unreachable in practice.
-fn adapter_account_provider(root: &Path, admitted: &ResolvedRuntime) -> String {
-    let file = format!("{}.json", admitted.runtime);
-    let beside_adapter = admitted
-        .adapter
+fn adapter_account_provider(root: &Path, runtime: &str, adapter: &Path) -> String {
+    let file = format!("{runtime}.json");
+    let beside_adapter = adapter
         .parent()
         .and_then(Path::parent)
         .map(|dir| dir.join("runtimes").join(&file));
@@ -545,7 +544,11 @@ fn adapter_account_provider(root: &Path, admitted: &ResolvedRuntime) -> String {
 /// that [`codex_gate`] asks, rather than re-deriving a second answer that
 /// could drift from this one.
 pub(crate) fn codex_pool_is_the_wall(root: &Path, admitted: &ResolvedRuntime) -> bool {
-    if adapter_account_provider(root, admitted) != "codex" {
+    adapter_uses_codex_pool(root, &admitted.runtime, &admitted.adapter)
+}
+
+pub(crate) fn adapter_uses_codex_pool(root: &Path, runtime: &str, adapter: &Path) -> bool {
+    if adapter_account_provider(root, runtime, adapter) != "codex" {
         return false;
     }
     let pinned = CODEX_EXPLICIT_CREDENTIAL_ENV

@@ -513,15 +513,11 @@ impl Selection {
         Ok(selection)
     }
 
-    /// Pin a ready shared seat before the step's forge claim. The dispatch
-    /// preflight has already handled any needed private reservation.
-    pub(crate) fn guarded_shared_step(
-        root: &Path,
-        role: &str,
-        model: Option<&str>,
-    ) -> Result<Self> {
+    /// Bind a shared Codex profile after private reservation has been handled.
+    /// Guarded roles draw only from profiles ready for that role.
+    pub(crate) fn shared(root: &Path, role: Option<&str>, model: Option<&str>) -> Result<Self> {
         let selected =
-            crate::runtime_preference::codex_guard::select(root, model, Some(role), |account| {
+            crate::runtime_preference::codex_guard::select(root, model, role, |account| {
                 !crate::tokens_pool::codex_hooks::is_private_clone(&account.credential_reference)
             })?;
         let crate::tokens_pool::AccountBinding::CodexHome { directory } = selected.binding else {

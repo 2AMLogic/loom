@@ -35,16 +35,6 @@ pub fn stamp(attributes: &mut TraceAttributes, runtime: &str, account: Option<&s
     }
 }
 
-/// [`stamp`] from the launch's own environment: `LOOM_ACCOUNT_NAME` names the
-/// seat, and `LOOM_ACCOUNT_PROVIDER` (when set) must say `codex`.
-pub fn stamp_from_env(attributes: &mut TraceAttributes, runtime: &str) {
-    let var = |name: &str| std::env::var(name).ok().filter(|v| !v.is_empty());
-    if var("LOOM_ACCOUNT_PROVIDER").is_some_and(|provider| provider != "codex") {
-        return;
-    }
-    stamp(attributes, runtime, var("LOOM_ACCOUNT_NAME").as_deref());
-}
-
 /// The seat every one of `launches` agrees on, for usage that cannot be split
 /// between them. No launch carrying a seat, or two seats, is `None` — never one
 /// launch's seat for all of them.

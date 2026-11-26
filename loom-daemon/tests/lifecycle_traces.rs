@@ -470,8 +470,7 @@ mod live_gh_guard;
 /// adapter its documented precedence (the handed-over `--model`/`--effort`
 /// argv, then the `LOOM_MODEL` / `LOOM_CODEX_MODEL` / `LOOM_EFFORT` env
 /// tier). A runtime that reports no launched model leaves `loom.model`
-/// ABSENT rather than filling it with a configured value, and no account
-/// name ever reaches a span.
+/// ABSENT. Only the Codex seat attribute may name an account (#15291).
 #[test]
 fn runtime_run_spans_carry_identity_and_only_reported_launch_facts() {
     // Native (opencode): identity plus the selection it launched with.
@@ -675,10 +674,11 @@ fn runtime_run_spans_carry_identity_and_only_reported_launch_facts() {
         cmd.env("LOOM_RUNTIME", runtime)
             .env("LOOM_ROLE", "builder")
             .env("LOOM_SWEEP_ID", "legacy-sweep")
-            // The account the launch would run on is an env fact. A span
+            // The explicitly pinned fixture names its seat. A span
             // carries the pool KIND, never this name -- with one sanctioned
             // exception (#15291): a Codex launch stamps it as the value of
             // `loom.codex.account` and nowhere else.
+            .env("LOOM_ACCOUNT_PROVIDER", "codex")
             .env("LOOM_ACCOUNT_NAME", "SECRET-ACCOUNT-NAME")
             .env_remove("LOOM_MODEL")
             .env_remove("LOOM_EFFORT");
@@ -688,7 +688,11 @@ fn runtime_run_spans_carry_identity_and_only_reported_launch_facts() {
         if runtime == "codex" {
             // #8787's private-clone containment is pool machinery no fixture
             // has; the adapter's explicit-credential env bypasses it.
-            cmd.env("LOOM_CODEX_NO_EXEC", "1");
+            cmd.env("LOOM_CODEX_NO_EXEC", "1")
+                .env_remove("CODEX_HOME")
+                .env_remove("LOOM_CODEX_HOME")
+                .env_remove("LOOM_SPAWN_NO_EXPORT")
+                .env("LOOM_CODEX_PROFILE", "SECRET-ACCOUNT-NAME");
         }
         if env_tier == "LOOM_CODEX_MODEL" {
             cmd.env("LOOM_CODEX_MODEL", "seat-model");
@@ -741,5 +745,133 @@ fn runtime_run_spans_carry_identity_and_only_reported_launch_facts() {
             !value.to_string().contains("SECRET-ACCOUNT-NAME"),
             "{runtime} leaks an account name outside loom.codex.account"
         );
+    }
+}
+
+/// Compare the account seen by the CLI behind the shipped adapter to all
+/// three exported span types, on both sides of the private-inventory branch.
+#[test]
+fn runtime_spans_follow_the_account_launched_by_the_codex_adapter() {
+    use loom_daemon::observability::runtime_usage::journal_usage;
+    use loom_daemon::script_helpers::sweep_experiment::ModelUsageTotals;
+    use std::os::unix::fs::symlink;
+
+    for binding in ["pool", "mixed", "profile", "home"] {
+        for parent in [None, Some("agent-9")] {
+            let repo = root();
+            let root = repo.path();
+            let home = tempfile::tempdir().unwrap();
+            let profiles = home.path().join("profiles");
+            let profile = profiles.join("credential-dir");
+            fs::create_dir_all(&profile).unwrap();
+            fs::write(profile.join("auth.json"), r#"{"synthetic":true}"#).unwrap();
+            let mut accounts = vec![
+                json!({"provider":"codex","name":"agent-2","credential_kind":"codex_home","credential_reference":"credential-dir","enabled":true}),
+            ];
+            if binding == "mixed" {
+                accounts.push(json!({"provider":"codex","name":"private","credential_kind":"codex_home","credential_reference":"private","enabled":true}));
+                // A private sibling makes Selection::prepare resolve the
+                // named shared seat; the private seat itself is never used.
+                fs::create_dir(profiles.join("private")).unwrap();
+                fs::write(profiles.join("private/auth.json"), r#"{"synthetic":true}"#).unwrap();
+                let state = profiles.join(".private-sessions/private");
+                fs::create_dir_all(&state).unwrap();
+                fs::write(state.join("workspace.json"), "{}").unwrap();
+            }
+            fs::write(
+                root.join(".loom/accounts.json"),
+                json!({"version":1,"accounts":accounts}).to_string(),
+            )
+            .unwrap();
+            symlink(fixture(), home.path().join("codex")).unwrap();
+            let scripts = Path::new(env!("CARGO_MANIFEST_DIR")).join("../defaults/scripts");
+            let execution = "codex-seat-test";
+            let sweep =
+                lifecycle::begin(root, execution, SpanName::Sweep, Default::default()).unwrap();
+            let mut cmd = Command::new(env!("CARGO_BIN_EXE_loom-daemon"));
+            cmd.current_dir(root)
+                .env_clear()
+                .args(["spawn-worker", "--scripts-dir"])
+                .arg(&scripts)
+                .args(["--", "-p", "hello"])
+                .env("HOME", home.path())
+                .env(
+                    "PATH",
+                    std::env::join_paths(
+                        std::iter::once(home.path().to_owned())
+                            .chain(std::env::split_paths(&std::env::var_os("PATH").unwrap())),
+                    )
+                    .unwrap(),
+                )
+                .env("LOOM_WORKSPACE", root)
+                .env("LOOM_CONFIG_DEFAULTS_FILE", "")
+                .env("LOOM_RUNTIME", "codex")
+                .env("LOOM_CODEX_PROFILE_ROOT", &profiles)
+                .env("LOOM_DAEMON_BIN", env!("CARGO_BIN_EXE_loom-daemon"))
+                .env("LOOM_DAEMON_SELF_BIN", env!("CARGO_BIN_EXE_loom-daemon"))
+                .env("LOOM_SWEEP_NICE", "0")
+                .env("LOOM_CODEX_NO_CAPTURE", "1")
+                .env("FIXTURE_PRINT_ENV", "CODEX_HOME,LOOM_ACCOUNT_NAME,LOOM_ACCOUNT_PROVIDER");
+            match binding {
+                "mixed" => {
+                    cmd.env("LOOM_CODEX_PROFILE", "agent-2");
+                }
+                "profile" => {
+                    cmd.env("LOOM_CODEX_PROFILE", "credential-dir");
+                }
+                "home" => {
+                    cmd.env("CODEX_HOME", &profile);
+                }
+                _ => {}
+            }
+            if let Some(name) = parent {
+                cmd.env("LOOM_ACCOUNT_NAME", name)
+                    .env("LOOM_ACCOUNT_PROVIDER", "codex");
+            }
+            sweep.command(&mut cmd);
+            let out = cmd.output().unwrap();
+            assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+            let stdout = String::from_utf8(out.stdout).unwrap();
+            let child = stdout
+                .lines()
+                .find_map(|line| line.strip_prefix("child_env LOOM_ACCOUNT_NAME="))
+                .unwrap();
+            assert_eq!(child, "agent-2", "binding {binding}, parent {parent:?}");
+            assert!(stdout
+                .lines()
+                .any(|line| line == format!("child_env CODEX_HOME={}", profile.display())));
+            assert!(stdout
+                .lines()
+                .any(|line| line == "child_env LOOM_ACCOUNT_PROVIDER=codex"));
+
+            lifecycle::finish_execution(root, execution, "success", Default::default()).unwrap();
+            let now = chrono::Utc::now();
+            let totals = ModelUsageTotals {
+                model: "gpt-test".into(),
+                input: 1,
+                ..Default::default()
+            };
+            journal_usage(root, execution, (now, now), Some(&[totals]), Some("codex")).unwrap();
+            let records = spans(root);
+            for name in [
+                SpanName::RuntimePreflight,
+                SpanName::RuntimeRun,
+                SpanName::RuntimeUsage,
+            ] {
+                let matching: Vec<_> = records.iter().filter(|s| s.name == name).collect();
+                assert_eq!(matching.len(), 1, "{name:?}");
+                let span = matching[0];
+                if name == SpanName::RuntimePreflight {
+                    assert_eq!(span.attributes["loom.result"], "accepted");
+                }
+                assert_eq!(
+                    span.attributes
+                        .get("loom.codex.account")
+                        .map(String::as_str),
+                    Some(child),
+                    "{name:?}, binding {binding}, parent {parent:?}"
+                );
+            }
+        }
     }
 }

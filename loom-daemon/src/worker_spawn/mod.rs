@@ -313,30 +313,73 @@ fn nonempty_env(key: &str) -> Option<String> {
     std::env::var(key).ok().filter(|v| !v.trim().is_empty())
 }
 
-/// Mirror only spawn-codex's model precedence. In particular, a prompt or
-/// config value that looks like `--model` is data, and `--` ends adapter flags.
-fn codex_adapter_model(args: &[std::ffi::OsString]) -> Option<String> {
-    let mut model = nonempty_env("LOOM_MODEL").or_else(|| nonempty_env("LOOM_CODEX_MODEL"));
+/// Account selection needs only these two facts from the Codex adapter argv.
+/// Values that look like flags are data, and `--` ends the adapter flags.
+fn codex_adapter_args(args: &[std::ffi::OsString]) -> (Option<&str>, bool) {
+    let mut model = None;
+    let mut headless = nonempty_env("LOOM_RESUME_SESSION_ID").is_some();
     let mut args = args.iter();
     while let Some(arg) = args.next() {
         let Some(arg) = arg.to_str() else { continue };
         match arg {
             "--" => break,
-            "-m" | "--model" => model = args.next().and_then(|s| s.to_str()).map(str::to_owned),
-            "-p" | "--prompt" | "--effort" | "-s" | "--sandbox" | "-c" | "--config" => {
+            "--help" | "-h" => return (model, false),
+            "-m" | "--model" => model = args.next().and_then(|s| s.to_str()),
+            "-p" | "--prompt" => headless = args.next().is_some(),
+            "--effort" | "-s" | "--sandbox" | "-c" | "--config" => {
                 args.next();
             }
+            _ if arg.starts_with("--prompt=") || arg.starts_with("-p=") => headless = true,
             _ => {
                 if let Some(value) = arg
                     .strip_prefix("--model=")
                     .or_else(|| arg.strip_prefix("-m="))
                 {
-                    model = Some(value.to_owned());
+                    model = Some(value);
                 }
             }
         }
     }
-    model
+    (model, headless)
+}
+
+/// Identify a binding the caller already pinned. An inherited name by itself
+/// cannot identify a seat: a nested launch may still select a different one.
+fn inherited_codex_account(root: &Path) -> Option<String> {
+    use crate::tokens_pool::{account_inventory_quiet, AccountProvider};
+    if std::env::var_os("LOOM_SPAWN_NO_EXPORT").is_some_and(|v| !v.is_empty())
+        || std::env::var_os("LOOM_ACCOUNT_PROVIDER").is_some_and(|p| !p.is_empty() && p != "codex")
+    {
+        return None;
+    }
+    let home = ["LOOM_CODEX_HOME", "CODEX_HOME"]
+        .into_iter()
+        .find_map(|key| {
+            std::env::var_os(key)
+                .filter(|v| !v.is_empty())
+                .map(PathBuf::from)
+        });
+    // An account's credential directory can have a different registry name.
+    // An arbitrary home outside the inventory supplies no public identity.
+    let registered = |home: PathBuf| {
+        let path = home.canonicalize().ok()?;
+        account_inventory_quiet(root, AccountProvider::Codex)
+            .ok()?
+            .into_iter()
+            .find(|account| account.credential_reference == path)
+            .map(|account| account.id.name)
+    };
+    if let Some(home) = home {
+        if nonempty_env("LOOM_PRIVATE_LEASE_FD").is_some() {
+            // A prepared private dispatch supplied the name, home and lease together.
+            return nonempty_env("LOOM_ACCOUNT_NAME");
+        }
+        return registered(home);
+    }
+    let profile = nonempty_env("LOOM_CODEX_PROFILE")?;
+    crate::tokens_pool::paths::codex_profile_root()
+        .and_then(|dir| registered(dir.join(&profile)))
+        .or(Some(profile))
 }
 
 /// The `--model`/`--effort` a legacy adapter launch resolves, read off the
@@ -346,7 +389,7 @@ fn codex_adapter_model(args: &[std::ffi::OsString]) -> Option<String> {
 /// Beyond that tier the adapter picks its own, so an absent value stays
 /// absent rather than being filled with a configured guess. `--` ends
 /// adapter flags, and a prompt or config value that looks like a flag is
-/// data, mirroring `codex_adapter_model`'s scan. For codex an explicit
+/// data, mirroring `codex_adapter_args`' scan. For codex an explicit
 /// `-c model_reasoning_effort=` is the highest-precedence effort (#14414).
 fn adapter_launch_facts(
     runtime: &str,
@@ -393,8 +436,7 @@ fn codex_effort(
 /// split on its first `@`; an empty base falls through to the next source
 /// (its suffix is discarded), an empty suffix means no effort. Deliberately
 /// not `model_tiers::base_of`, which lower-cases and would change the
-/// recorded model. `codex_adapter_model` stays raw on purpose: containment
-/// admission wants the value as configured.
+/// recorded model. Private workspace admission takes the raw configured model.
 fn codex_env_model_split(sources: [Option<&str>; 2]) -> (Option<String>, Option<String>) {
     for value in sources.into_iter().flatten() {
         let (base, suffix) = value.split_once('@').unwrap_or((value, ""));
@@ -1147,18 +1189,20 @@ fn run_preflight(
     // and not a native harness either, which holds a routed key only under
     // its own provider-key variable (`llm_gateway::Route::credential`).
     llm_gateway::scrub(&mut command);
-    let private_selection = if runtime == "codex"
-        && std::env::var_os("LOOM_PRIVATE_LEASE_FD").is_none()
+    let codex_selection = if runtime == "codex"
+        && std::env::var_os("LOOM_PRIVATE_LEASE_FD").is_none_or(|fd| fd.is_empty())
         && nonempty_env("LOOM_CODEX_NO_EXEC").is_none()
     {
         // Legacy adapters own their argv contract, including interactive and
         // Codex-specific options. Read selection metadata without imposing the
         // native harness parser's mandatory prompt or restricted flag list.
-        let model = codex_adapter_model(&args.args);
+        let (explicit_model, headless) = codex_adapter_args(&args.args);
+        let env_models = [nonempty_env("LOOM_MODEL"), nonempty_env("LOOM_CODEX_MODEL")];
+        let model = explicit_model.or_else(|| env_models.iter().find_map(Option::as_deref));
         let owner = format!("worker-{}", uuid::Uuid::new_v4());
         let admission = nonempty_env("LOOM_ROLE")
             .map(|role| crate::runtime_admission::resolve_and_admit(root, &role, Some("codex")));
-        match admission {
+        let prepared = match admission {
             // #8787: a role refused ONLY for native repository isolation may
             // run on verified private-clone containment, through the one
             // selection that proved it. Every other rejection still fails
@@ -1171,7 +1215,7 @@ fn run_preflight(
                         &role,
                         Some("codex"),
                         rejection,
-                        model.as_deref(),
+                        model,
                         crate::tokens_pool::private_workspace::JobKind::Role,
                         None,
                         &owner,
@@ -1189,7 +1233,7 @@ fn run_preflight(
             _ => crate::tokens_pool::private_workspace::dispatch::Selection::prepare(
                 root,
                 &runtime,
-                model.as_deref(),
+                model,
                 crate::tokens_pool::private_workspace::JobKind::Role,
                 None,
                 &owner,
@@ -1197,12 +1241,55 @@ fn run_preflight(
             .map_err(|e| {
                 LaunchError::config(e.to_string()).with_stage(LaunchStage::WorkspaceAdmission)
             })?,
+        };
+        if prepared.is_none()
+            && headless
+            && crate::role_runner::runtime_preflight::adapter_uses_codex_pool(
+                root,
+                &runtime,
+                Path::new(command.get_program()),
+            )
+            && crate::fs_util::find_executable_on_path("jq").is_some()
+        {
+            // The same guarded, model-aware draw as `tokens select`. Pin its
+            // binding on the child so spawn-codex.sh cannot draw a second seat
+            // after the accepted preflight and run have been recorded.
+            let (env_model, _) = codex_env_model_split(env_models.each_ref().map(Option::as_deref));
+            Some(
+                crate::tokens_pool::private_workspace::dispatch::Selection::shared(
+                    root,
+                    nonempty_env("LOOM_ROLE").as_deref(),
+                    explicit_model.or(env_model.as_deref()),
+                )
+                .map_err(|error| {
+                    LaunchError::config(format!("Codex account selection failed: {error}"))
+                        .with_stage(LaunchStage::Credential)
+                })?,
+            )
+        } else {
+            prepared
         }
     } else {
         None
     };
-    if let Some(selection) = &private_selection {
+    if let Some(selection) = &codex_selection {
         selection.apply(&mut command);
+        crate::observability::codex_seat::stamp(
+            &mut trace_identity,
+            &runtime,
+            Some(&selection.name),
+        );
+    } else if runtime == "codex" {
+        if let Some(name) = inherited_codex_account(root)
+            .filter(|name| egress_proxy::rotation::is_account_name(name))
+        {
+            // Explicit profiles use the same identity in the adapter and in
+            // telemetry, including when the caller inherited a stale name.
+            command
+                .env("LOOM_ACCOUNT_NAME", &name)
+                .env("LOOM_ACCOUNT_PROVIDER", "codex");
+            crate::observability::codex_seat::stamp(&mut trace_identity, &runtime, Some(&name));
+        }
     }
     command.env("LOOM_RUNTIME", &runtime);
     // #10607: the same sink variables every tmux session gets (W5,
@@ -1355,8 +1442,6 @@ fn run_preflight(
         )
         .stamp(&mut trace_identity);
     }
-    // #15291: a Codex launch names its seat (valid account names only).
-    crate::observability::codex_seat::stamp_from_env(&mut trace_identity, &runtime);
     // Host memory state at the runtime's launch (this span's begin boundary;
     // the daemon stamps the end boundary when the child exits or is observed
     // gone). Clones of this identity carry the snapshot onto the RuntimeRun
@@ -1525,7 +1610,7 @@ mod codex_adapter_tests {
                 .into_iter()
                 .map(std::ffi::OsString::from)
                 .collect::<Vec<_>>();
-            assert_eq!(super::codex_adapter_model(&args).as_deref(), Some("gpt-5"));
+            assert_eq!(super::codex_adapter_args(&args).0, Some("gpt-5"));
         }
     }
 }
