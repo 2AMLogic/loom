@@ -2139,13 +2139,26 @@ land".
 Long-running task liveness (Issue #10414, `observability/ops/liveness.rs`).
 `task_alive` is sampled every 60 s on its own ticker, not on the collector's
 pass. `task_faults` is emitted when a fault happens. The `task` label is a
-fixed daemon loop name: `auto_update`, `ci_telemetry` or
-`role_runner.<role>`. It is never a repo, issue or path.
+fixed daemon loop name: `auto_update`, `ci_telemetry`,
+`github_app_refresh` (#15327) or `role_runner.<role>`. It is never a repo, issue or path.
 
 | Metric | Unit | Labels | Meaning |
 |---|---|---|---|
 | `loom.daemon.task_alive` | `1` | `task` | `1` while the loop has beaten within its staleness window (two intervals plus 60 s, plus the loop's own iteration bound where it has one), `0` once it has gone silent past the window or marked itself dead |
 | `loom.daemon.task_faults` | `{fault}` | `task`, `reason` ∈ `panic`, `overrun`, `exit` | a delta counter: an iteration panicked and was caught, an iteration ran past the loop's bound, or the loop stopped for good |
+
+Primary writer-token freshness (Issue #15327, `credential_preflight/primary_token.rs`).
+Sampled every 60 s on its own ticker, so a wedged refresh tick cannot silence
+it. The `owner` label is the installation owner of the token. The series are
+absent until the daemon has published a primary token. While the token is
+within 60 s of (or past) its `expires_at`, `forge_credential_stale()` is true
+for the stale-grace window and loom-ui carries `forge.credential-expired`.
+
+| Metric | Unit | Labels | Meaning |
+|---|---|---|---|
+| `loom.daemon.forge_token_age` | `s` | `owner` | seconds since the primary writer token was last published; healthy values stay under ~600 s, a value that keeps growing means rotation stopped |
+| `loom.daemon.forge_token_remaining` | `s` | `owner` | seconds until the published token's `expires_at`, negative once past; absent when the minter gave no parseable expiry |
+| `loom.daemon.forge_token_last_rotation` | `s` | `owner` | unix time of the last publication |
 
 CI telemetry poller cycles (Issue #12793, `ci_telemetry/metrics.rs`). Both
 daemon loops (periodic and feed-driven) call one helper after every
@@ -3607,6 +3620,7 @@ scope by operator ruling: no hook and no CLI command emits this.
 | `checkout_role` | string? | `daemon-root` (`loom.checkout.role`) on the sample of the daemon's own root checkout (#12727); absent on a registered workspace |
 | `dirty_tracked_files` | int? | `loom.checkout.dirty_tracked_files`: tracked files with a staged or unstaged change; daemon-root samples only |
 | `dirty_identical_to_remote` | bool? | `loom.checkout.dirty_identical_to_remote`: every dirty tracked file is byte-identical to `remote_tip`, so a fast-forward could pass through it; absent when nothing is dirty or the tip is not in the object store |
+| `checkout_state` | string? | `loom.checkout.state` (#15301): the state the fast-forward pass left the checkout in (`current`, `fast-forwarded`, `behind`, `dirty`, `diverged`, `fetch-failed`, `low-disk`, `wrong-branch`, `would-overwrite`, …), so a declined checkout is queryable the pass it stalls. Absent on a `budget`-deferred checkout and on the daemon-root sample |
 
 The remote fields (all optional, additive, no `schema_version` bump) also ride
 on `role_tick.outcome`'s `prompt`:

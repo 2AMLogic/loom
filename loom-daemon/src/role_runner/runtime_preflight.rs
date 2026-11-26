@@ -374,6 +374,17 @@ pub(crate) struct CodexPoolState {
 /// account and left a window in which an account observed early and one
 /// observed late could disagree about the same tick's state.
 pub(crate) fn codex_pool_state(root: &Path, now: u64, require_hook: bool) -> CodexPoolState {
+    codex_pool_state_for(root, now, require_hook, |_| true)
+}
+
+/// Restrict the pool read to profiles that can serve this launch. A role
+/// needing private-clone containment cannot recover on a shared profile.
+pub(crate) fn codex_pool_state_for(
+    root: &Path,
+    now: u64,
+    require_hook: bool,
+    include: impl Fn(&Path) -> bool,
+) -> CodexPoolState {
     let mut state = CodexPoolState {
         enabled: 0,
         spawnable: 0,
@@ -394,12 +405,15 @@ pub(crate) fn codex_pool_state(root: &Path, now: u64, require_hook: bool) -> Cod
             return state;
         }
     };
+    let enabled = inventory
+        .iter()
+        .filter(|account| account.enabled && include(&account.credential_reference));
     let health_state = match health_snapshot(root) {
         Ok(health) => health,
         Err(e) => {
             // Count the pool first: `enabled` is what the skip reports as
             // `0/N`, and the inventory read that produced it did succeed.
-            state.enabled = inventory.iter().filter(|account| account.enabled).count();
+            state.enabled = enabled.count();
             state.read_error = Some((PoolStateFile::HealthState, format!("{e:#}")));
             return state;
         }
@@ -407,7 +421,7 @@ pub(crate) fn codex_pool_state(root: &Path, now: u64, require_hook: bool) -> Cod
     // #10454/#10660: the session watch's published snapshot — a mutex read,
     // never a `docker` process on this per-tick path. Fail open on `None`.
     let liveness = crate::tokens_pool::session_lifecycle::liveness::published();
-    for account in inventory.iter().filter(|account| account.enabled) {
+    for account in enabled {
         state.enabled += 1;
         // Before the no-health-entry `continue` below: an account the health
         // file has never heard of is still unspawnable if its container is down.

@@ -827,6 +827,30 @@ fn unverified_out_of_band_ac_holds_the_issue_open() {
     ));
 }
 
+/// #13900, carried over from `test-classify-ac-verification.sh` Test 23 when
+/// #14905 retired Champion's own `hold_issue_on_unverified_ac` block: the hold
+/// notice shows the evidence-marker SHAPE with a `<head>` placeholder and names
+/// the real head only in prose. A rendered `sha=<head literal>` marker would be
+/// read by the classifier (issue comments are its evidence corpus) as proof the
+/// out-of-band step ran, and the hold would satisfy itself.
+#[test]
+fn the_hold_notice_never_embeds_a_live_ac_verified_marker() {
+    let (mut f, dir) = close_target_fixture();
+    f.classify
+        .insert("h1".into(), (12, "next run\tConfirm on the next real run".into()));
+    let store = RecordStore::for_root(dir.path());
+    run(&f, &store, true);
+    let notice = f.issue("3").comments[0].clone();
+    // The marker shape is shown to the human ...
+    assert!(notice.contains("<!-- loom:ac-verified sha=<head> -->"), "{notice}");
+    // ... every occurrence of the marker prefix is the placeholder, never the head ...
+    for part in notice.split("loom:ac-verified sha=").skip(1) {
+        assert!(part.starts_with("<head>"), "live-looking marker in hold notice: {notice}");
+    }
+    // ... and the real head is still named, in prose.
+    assert!(notice.contains("merged head `h1`"), "{notice}");
+}
+
 #[test]
 fn a_marker_for_a_different_head_holds_like_a_missing_one() {
     let (mut f, dir) = close_target_fixture();
