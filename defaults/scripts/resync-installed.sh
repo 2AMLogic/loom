@@ -1320,6 +1320,11 @@ N_SKIPPED=0
 # (#14012, prune_stale_manifest_entries()) -- both count as changes for
 # restamp_metadata()'s #11680 no-op logic.
 N_REMOVED=0
+# #15519: the repo-relative paths remove_retired_files() actually deleted
+# this run. A tracked file the run retires has no defaults/ counterpart, so
+# collect_resync_dirt() cannot tell its deletion from a stray it must never
+# commit (#6613) by looking at defaults/ alone -- it asks this list instead.
+RESYNC_REMOVED_PATHS=()
 # #4669: files that could not be staged/renamed into place. A non-empty list
 # means the refresh is PARTIAL and must be reported as such (exit 1), never
 # swallowed into a "success" summary.
@@ -2295,6 +2300,10 @@ remove_retired_files() {
         if rm -f "$dst" 2>/dev/null; then
             printf '%b\n' "  ${GREEN}removed${NC}   $rel ${YELLOW}(retired from defaults/, #5981)${NC}"
             N_REMOVED=$((N_REMOVED + 1))
+            # #15519: remember the deletion in the form `git status` reports
+            # it, so collect_resync_dirt() can stage it. A pinned or
+            # symlink-skipped entry never gets here, so it has nothing to stage.
+            RESYNC_REMOVED_PATHS+=("${dst#"$WRITE_ROOT"/}")
         else
             err "failed to remove retired file $rel"
             record_failure "$rel"
@@ -4093,7 +4102,11 @@ fi
 #                        cover (plus the re-stamped install-metadata.json).
 #                        The ONLY thing any printed `git add` may name.
 #   RESYNC_RETIRED_PATHS pure-copy-surface-shaped paths with no defaults/
-#                        counterpart today (#6613): never committed.
+#                        counterpart today (#6613) that this run did not
+#                        delete itself: never committed. A tracked file the
+#                        retirement pass removed this run has no counterpart
+#                        either, but its deletion IS this run's output, so it
+#                        goes to RESYNC_DIRT_PATHS instead (#15519).
 #   RESYNC_FOREIGN_DIRT  1 when anything else is dirty — a genuine operator
 #                        edit, or (the case this exists for) a credential
 #                        path such as a token-pool copy at
@@ -4118,6 +4131,18 @@ RESYNC_DIRT_PATHS=()
 RESYNC_RETIRED_PATHS=()
 RESYNC_FOREIGN_DIRT=0
 RESYNC_DIRT_COLLECTED=0
+
+# _resync_removed_this_run <repo-relative-path> -> succeeds when the
+# retirement pass deleted that path in THIS run (#15519). Indexed array +
+# linear membership test rather than `declare -A`, for bash 3.2 (#7749), and
+# the empty array is expanded the `set -u`-safe way (see _pin_was_hit()).
+_resync_removed_this_run() {
+    local needle="$1" e
+    for e in ${RESYNC_REMOVED_PATHS[@]+"${RESYNC_REMOVED_PATHS[@]}"}; do
+        [[ "$e" == "$needle" ]] && return 0
+    done
+    return 1
+}
 
 collect_resync_dirt() {
     [[ "$RESYNC_DIRT_COLLECTED" -eq 1 ]] && return 0
@@ -4145,6 +4170,14 @@ collect_resync_dirt() {
             src="$(_loom_pure_copy_surface_source_path "$path" 2>/dev/null)"
             if [[ -n "$src" && -e "$src" ]]; then
                 RESYNC_DIRT_PATHS+=("$path")
+            elif _resync_removed_this_run "$path"; then
+                # #15519: no counterpart because THIS run just retired it.
+                # The line is the deletion of a tracked file the run itself
+                # deleted, i.e. this run's output: a recipe that leaves it out
+                # commits the resync with the retired file still in it. A
+                # stray, or a deletion older than this run, is not in the
+                # list and stays excluded exactly as before.
+                RESYNC_DIRT_PATHS+=("$path")
             else
                 RESYNC_RETIRED_PATHS+=("$path")
             fi
@@ -4159,8 +4192,11 @@ collect_resync_dirt() {
             # touched either surface its own output was classified as foreign
             # dirt: the hint below went silent and `land-resync-commit.sh`
             # refused to land the run it was printed for. `.github/labels.yml`
-            # is refresh_labels_block()'s output (#11033).
-            .claude/commands/loom/*|.claude/agents/*|.claude/README.md|.github/CONFIGURATION.md|.github/labels.yml|.loom/install-metadata.json|.loom/CLAUDE.md|.gitattributes|.gitignore|.agents/skills/*)
+            # is refresh_labels_block()'s output (#11033). `.loom/pricing.json`
+            # is the single-file rate card (#8177): it was on no list here,
+            # so a run that changed it reported its own output as foreign
+            # dirt (#15519).
+            .claude/commands/loom/*|.claude/agents/*|.claude/README.md|.github/CONFIGURATION.md|.github/labels.yml|.loom/install-metadata.json|.loom/CLAUDE.md|.gitattributes|.gitignore|.agents/skills/*|.loom/pricing.json)
                 RESYNC_DIRT_PATHS+=("$path")
                 ;;
             *)
