@@ -352,14 +352,7 @@ pub(crate) fn handle_agent_metrics_command(
 
     let is_json = format == "json";
 
-    let db_path = std::env::var_os("LOOM_ACTIVITY_DB")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|| {
-            dirs::home_dir()
-                .unwrap_or_else(|| std::path::PathBuf::from("."))
-                .join(".loom")
-                .join("activity.db")
-        });
+    let db_path = activity::default_activity_db_path();
 
     if !db_path.is_file() {
         if is_json {
