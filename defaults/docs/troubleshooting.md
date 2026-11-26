@@ -3093,6 +3093,19 @@ the primary. Because nothing is written to the primary checkout either way, the
 be run from anywhere (the main checkout or any linked worktree) at any time,
 including mid-sweep, with zero risk to the live checkout.
 
+**Staging mode never touches user-scope paths either (#15518).** The two
+host-level steps a **real** non-staging run ends with — the #10238
+(re)provisioning of `~/.local/bin/loom` and of the `~/.claude/commands/loom` +
+`~/.claude/agents/loom-*.md` links from the source checkout, and the #12121
+strip of the retired `presence-beat.sh` wiring from `~/.claude/settings.json` —
+are both skipped under `--output`: a staged resync has no user-scope surface to
+refresh, and those paths serve every session on the host. Before #15518 a real
+`--output --source <checkout>` run still ran the first of them, so it
+re-installed `~/.local/bin/loom` from whatever checkout `--source` named while
+`--dry-run` (which skips the step) showed nothing. A bare run (or
+`--allow-worktree`) still does both; `LOOM_RESYNC_SKIP_USER_SCOPE=1` opts a bare
+run out of the first.
+
 **`<base>` is the HEAD of the checkout you invoked it from (#9550)** — not the
 primary checkout's — so a commit you make in the staging worktree fast-forwards
 onto the branch you were standing on. That matters because the documented place
