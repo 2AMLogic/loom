@@ -36,12 +36,14 @@
 //!
 //! A context's evidence is every check run AND every commit status bearing its
 //! name (a required context may be either). Check runs of one name: any run
-//! not yet `completed` makes the context pending (a re-run in flight supersedes
-//! the run it replaces); otherwise the latest run by `started_at` decides, with
-//! `success`/`neutral`/`skipped` green — the conclusions GitHub's branch
-//! protection accepts — and every other conclusion red (an unrecognised one is
-//! not evidence of success). Statuses: `success` green, `pending` pending,
-//! anything else red. Across sources the worst state wins.
+//! not yet settled per [`crate::merge_pr::check_runs_rollup::is_settled`]
+//! (#13758 / #15371: `status == "completed"`, or a string `conclusion` plus a
+//! non-null `completed_at`) makes the context pending (a re-run in flight
+//! supersedes the run it replaces); otherwise the latest run by `started_at`
+//! decides, with `success`/`neutral`/`skipped` green — the conclusions GitHub's
+//! branch protection accepts — and every other conclusion red (an unrecognised
+//! one is not evidence of success). Statuses: `success` green, `pending`
+//! pending, anything else red. Across sources the worst state wins.
 
 use std::collections::BTreeSet;
 
@@ -105,7 +107,7 @@ fn from_check_runs(runs: &[&CheckRun]) -> Option<State> {
     if runs.is_empty() {
         return None;
     }
-    if let Some(r) = runs.iter().find(|r| r.status != "completed") {
+    if let Some(r) = runs.iter().find(|r| !r.settled) {
         return Some(State::Pending(r.status.clone()));
     }
     let latest = runs.iter().max_by_key(|r| r.started_at)?;
@@ -209,6 +211,34 @@ Unknown is not success: nothing was merged; re-attempt once they report.",
     )
 }
 
+/// Stderr diagnostics for required check-run rows that settled via a string
+/// `conclusion` and `completed_at` while GitHub left `status` at something
+/// other than `"completed"` (#15371).
+#[must_use]
+pub fn status_disagreements(
+    pr: &str,
+    sha: &str,
+    required: &[String],
+    runs: &[CheckRun],
+) -> Vec<String> {
+    let required: BTreeSet<&str> = required.iter().map(String::as_str).collect();
+    runs.iter()
+        .filter(|r| required.contains(r.name.as_str()) && r.settled && r.status != "completed")
+        .map(|r| {
+            let status = if r.status.is_empty() {
+                "<missing>"
+            } else {
+                r.status.as_str()
+            };
+            let conclusion = r.conclusion.as_deref().unwrap_or("<none>");
+            format!(
+                "required-checks: PR #{pr} head {sha}: required check `{}` reported status `{status}` with conclusion `{conclusion}` and completed_at set; treating as settled (#15371).",
+                r.name
+            )
+        })
+        .collect()
+}
+
 /// The audit comment a real merge posts for an `--allow-red-required` override.
 #[must_use]
 pub fn bypass_comment(pr: &str, sha: &str, bypassed: &Named) -> String {
@@ -244,8 +274,9 @@ pub fn parse_statuses(combined: &Value) -> Result<Vec<Status>, String> {
         .collect()
 }
 
-/// `[{name, status, conclusion, started_at}]` rows (the `--from-stdin` shape)
-/// as [`CheckRun`]s.
+/// `[{name, status, conclusion, started_at, completed_at?}]` rows (the
+/// `--from-stdin` shape) as [`CheckRun`]s, evaluating settlement via
+/// [`crate::merge_pr::check_runs_rollup::is_settled`] (#15371).
 pub fn parse_check_runs(rows: &Value) -> Result<Vec<CheckRun>, String> {
     rows.as_array()
         .ok_or("`check_runs` is not an array")?
@@ -263,6 +294,7 @@ pub fn parse_check_runs(rows: &Value) -> Result<Vec<CheckRun>, String> {
             Ok(CheckRun {
                 name: s("name").ok_or("a check run has no string `name`")?.into(),
                 status: s("status").unwrap_or_default().into(),
+                settled: crate::merge_pr::check_runs_rollup::is_settled(v),
                 conclusion: s("conclusion").map(String::from),
                 started_at,
             })
