@@ -283,6 +283,17 @@ fn verdict_sha_readers_go_through_the_trust_filter() {
         ("doctor_handback.rs", "parses already-filtered records"),
         // In-memory records for the pure predicate and the `Fake` forge; no forge read.
         ("doctor_handback/tests.rs", "test fixture"),
+        // #15068: the daemon port of the shell guard's operator send-back rule.
+        // Its marker lookup feeds the comment listing through
+        // `TrustPolicy::for_root(root)` before `body_carries_verdict_marker`
+        // sees a body, and the label actor's collaborator permission goes
+        // through the same predicate.
+        (
+            "claim_reconciliation/verdict_send_back.rs",
+            "reads comments through TrustPolicy",
+        ),
+        // Fixture only: a fake `gh` serving a canned comment listing.
+        ("claim_reconciliation/verdict_send_back_tests.rs", "test fixture"),
         ("comment_trust.rs", "module docs"),
         ("comment_trust/tests.rs", "this test"),
     ];
