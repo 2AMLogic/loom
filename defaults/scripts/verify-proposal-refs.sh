@@ -130,9 +130,10 @@ CHECKED_CLAIMS=0
 # string plus a bash `case` glob is an exact substitute -- and it spawns no
 # subprocess per lookup, unlike a `grep -qxF` over the same data.
 TOP_LEVEL_NL=$'\n'
-while IFS= read -r entry; do
-    [[ -n "$entry" ]] && TOP_LEVEL_NL="${TOP_LEVEL_NL}${entry}"$'\n'
-done < <(git -C "$WORKSPACE" ls-tree --name-only origin/main)
+# -z keeps quoted characters literal. A citation can only span one line.
+while IFS= read -r -d '' entry; do
+    [[ "$entry" != *$'\n'* ]] && TOP_LEVEL_NL="${TOP_LEVEL_NL}${entry}"$'\n'
+done < <(git -C "$WORKSPACE" ls-tree -z --name-only origin/main)
 
 for generic in \
     src lib libs source sources vendor third_party \
