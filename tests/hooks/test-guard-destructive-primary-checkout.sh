@@ -187,6 +187,56 @@ assert_deny_env "gh pr checkout --help=false is not help" "$AGENT" \
     'gh pr checkout 7 --help=false' "$PC_REPO"
 assert_deny_env "gh pr checkout -bh (h is the branch value) is not help" "$AGENT" \
     'gh pr checkout 7 -bh' "$PC_REPO"
+# Last explicit boolean wins on gh's help flag (both orderings, leading and
+# trailing positions).
+assert_deny_env "gh --help --help=false pr checkout: last value wins (not help)" "$AGENT" \
+    'gh --help --help=false pr checkout 7' "$PC_REPO"
+assert_allow_env "gh --help=false --help pr checkout: last value wins (help)" "$AGENT" \
+    'gh --help=false --help pr checkout 7' "$PC_REPO"
+assert_deny_env "gh --help pr checkout --help=false: trailing false overrides leading" "$AGENT" \
+    'gh --help pr checkout 7 --help=false' "$PC_REPO"
+assert_allow_env "gh --help=false pr checkout --help: trailing true overrides leading" "$AGENT" \
+    'gh --help=false pr checkout 7 --help' "$PC_REPO"
+assert_deny_env "gh pr checkout --help --help=false is not help" "$AGENT" \
+    'gh pr checkout 7 --help --help=false' "$PC_REPO"
+assert_allow_env "gh pr checkout --help=false --help is help" "$AGENT" \
+    'gh pr checkout 7 --help=false --help' "$PC_REPO"
+
+# Option names survive shell quoting / attachment with an unknown operand, so
+# a later help flag still classifies (CLI: usage, no checkout).
+assert_allow_env "gh -R\"\$VAR\" --help is help" "$AGENT" \
+    'gh pr checkout -R"$REVIEW_REPO" --help' "$PC_REPO"
+assert_allow_env "gh -b\"\$VAR\" --help is help" "$AGENT" \
+    'gh pr checkout -b"$TOPIC" --help' "$PC_REPO"
+assert_allow_env "gh quoted \"--repo=\$VAR\" --help is help" "$AGENT" \
+    'gh pr checkout "--repo=$REVIEW_REPO" --help' "$PC_REPO"
+assert_allow_env "git commit -m\"\$VAR\" -h is help" "$AGENT" \
+    'git commit -m"$MSG" -h' "$PC_REPO"
+assert_allow_env "git commit quoted \"--message=\$VAR\" -h is help" "$AGENT" \
+    'git commit "--message=$MSG" -h' "$PC_REPO"
+assert_allow_env "git checkout -b\"\$VAR\" -h is help" "$AGENT" \
+    'git checkout -b"$TOPIC" -h' "$PC_REPO"
+assert_allow_env "git switch -c\"\$VAR\" -h is help" "$AGENT" \
+    'git switch -c"$TOPIC" -h' "$PC_REPO"
+assert_deny_env "gh -R\"\$VAR\" without help stays denied" "$AGENT" \
+    'gh pr checkout -R"$REVIEW_REPO" 7' "$PC_REPO"
+assert_deny_env "git commit -m\"\$VAR\" without help stays denied" "$AGENT" \
+    'git commit -m"$MSG"' "$PC_REPO"
+
+# Optional attached operands (git commit -S[<key-id>] / -u[<mode>]): letters in
+# the attached text are not short flags, and the next word is not consumed.
+assert_deny_env "git commit -Sabch: h in the key id is not help" "$AGENT" \
+    'git commit -Sabch -m x' "$PC_REPO"
+assert_deny_env "git commit -uhello: h in the mode is not help" "$AGENT" \
+    'git commit -uhello -m x' "$PC_REPO"
+assert_deny_env "git commit -S\"\$KEY\" without help is denied" "$AGENT" \
+    'git commit -S"$KEY" -m x' "$PC_REPO"
+assert_allow_env "git commit -S -h (bare -S takes no next word) is help" "$AGENT" \
+    'git commit -S -h' "$PC_REPO"
+assert_allow_env "git commit -Sabc -h is help" "$AGENT" \
+    'git commit -Sabc -h' "$PC_REPO"
+assert_allow_env "git commit -vh bundle (booleans) is help" "$AGENT" \
+    'git commit -vh' "$PC_REPO"
 
 # --- #15003 gap 3: bare `git checkout -` is a branch switch, not a flag ---
 assert_deny_env "git checkout - (previous-branch switch) is denied" "$AGENT" "git checkout -" "$PC_REPO"

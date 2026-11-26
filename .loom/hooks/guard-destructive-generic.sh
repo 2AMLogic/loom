@@ -5183,10 +5183,23 @@ resolve_primary_mutations() {
     # name is literal even when its attached value is not, so option
     # position and help flags still classify. A bare unknown word stays
     # UNKNOWN (conservative).
-    function pcm_arg(raw,   v) {
+    #
+    # The name survives shell quoting and attachment too: a quoted long
+    # option (`"--repo=$X"`) and a short option with an attached operand
+    # (`-R"$X"`, `-b$X`) keep their literal option text, with the unknown
+    # operand collapsed to one UNKNOWN field so the operand boundary holds.
+    function pcm_arg(raw,   v, lit) {
         v = pcm_word(raw)
-        if (v == UNKNOWN && match(raw, /^--?[A-Za-z][A-Za-z0-9-]*=/))
-            return substr(raw, 1, RLENGTH) UNKNOWN
+        if (v != UNKNOWN) return v
+        lit = raw
+        if ((substr(lit, 1, 1) == DQ || substr(lit, 1, 1) == SQ) &&
+            match(lit, /^.--[A-Za-z][A-Za-z0-9-]*=/)) lit = substr(lit, 2)
+        if (match(lit, /^--?[A-Za-z][A-Za-z0-9-]*=/))
+            return substr(lit, 1, RLENGTH) UNKNOWN
+        if (match(lit, /^-[A-Za-z]+/)) {
+            # Only the literal letters before the first quote or expansion.
+            return substr(lit, 1, RLENGTH) UNKNOWN
+        }
         return v
     }
     # Recognize assignment-only segments, including literal export writes.
@@ -5272,7 +5285,9 @@ resolve_primary_mutations() {
                 k = 2; global_help = 0
                 while (k <= m && (opt = pcm_arg(toks[k])) ~ /^-/) {
                     if (opt == "-R" || opt == "--repo") k++
-                    else if (opt ~ /^(-h|--help)(=(1|t|T|true|TRUE|True))?$/) global_help = 1
+                    else if (opt ~ /^(-h|--help)$/ ||
+                             opt ~ /^(-h|--help)=(1|t|T|true|TRUE|True)$/) global_help = 1
+                    else if (opt ~ /^(-h|--help)=(0|f|F|false|FALSE|False)$/) global_help = 0
                     k++
                 }
                 if (k + 1 <= m && toks[k] == "pr" && toks[k+1] == "checkout") {
@@ -12510,12 +12525,18 @@ index_mutation_unisolated() {
 # Git permits abbreviated long options and both CLIs accept short-option
 # bundles. Only a value-taking short option at the end needs the next word.
 primary_checkout_has_help() {
-    local sub="$1" arg opt short_value short_chars take_next=false
+    local sub="$1" arg opt short_value short_chars opt_chars='' all_chars take_next=false
+    local help=false
     local -a long_values
     shift
+    # short_chars take a REQUIRED operand (attached, or the next word when
+    # last in the bundle). opt_chars take an OPTIONAL attached operand only
+    # (`git commit -S[<key-id>]`, `-u[<mode>]`): the rest of the bundle is
+    # that operand, but the next word is never consumed.
     case "$sub" in
         commit)
             short_chars='mFcCt'
+            opt_chars='Su'
             long_values=(--message --file --reedit-message --reuse-message --template
                 --author --date --fixup --squash --trailer --cleanup --pathspec-from-file) ;;
         gh-pr-checkout)
@@ -12529,28 +12550,36 @@ primary_checkout_has_help() {
             long_values=(--orphan --conflict --create --force-create) ;;
         *) return 1 ;;
     esac
-    short_value="^-[^-$short_chars]*[$short_chars]\$"
+    all_chars="$short_chars$opt_chars"
+    short_value="^-[^-$all_chars]*[$short_chars]\$"
     for arg in "$@"; do
         if [[ "$take_next" == true ]]; then take_next=false; continue; fi
         case "$arg" in
-            -h|--help) return 0 ;;
-            # gh (pflag) accepts an affirmative boolean value on its help flag.
+            -h|--help) help=true; [[ "$sub" == gh-pr-checkout ]] || return 0 ;;
+            # gh (pflag) takes an explicit boolean on its help flag and the
+            # LAST value wins (`--help --help=false` is not help).
             -h=1|--help=1|-h=t|--help=t|-h=T|--help=T|-h=true|--help=true|-h=TRUE|--help=TRUE|-h=True|--help=True)
-                [[ "$sub" == gh-pr-checkout ]] && return 0 ;;
-            --|$'\001') return 1 ;;  # end of options or unknown argument arity
+                [[ "$sub" == gh-pr-checkout ]] && help=true ;;
+            -h=0|--help=0|-h=f|--help=f|-h=F|--help=F|-h=false|--help=false|-h=FALSE|--help=FALSE|-h=False|--help=False)
+                [[ "$sub" == gh-pr-checkout ]] && help=false ;;
+            --) [[ "$sub" == gh-pr-checkout && "$help" == true ]] && return 0
+                return 1 ;;  # end of options
+            $'\001') return 1 ;;  # unknown argument arity
             --*=*) ;;
             --*)
                 for opt in "${long_values[@]}"; do
                     if [[ "$opt" == "$arg"* ]]; then take_next=true; break; fi
                 done ;;
             -?*)
-                # A bundle reaches `h` only through boolean short flags: a
-                # value-taking flag earlier in the bundle consumes the rest.
-                [[ "$arg" =~ ^-[^-$short_chars]*h ]] && return 0
+                # A bundle reaches `h` only through boolean short flags: an
+                # operand-taking flag earlier in the bundle consumes the rest.
+                if [[ "$arg" =~ ^-[^-$all_chars]*h ]]; then
+                    help=true; [[ "$sub" == gh-pr-checkout ]] || return 0
+                fi
                 [[ "$arg" =~ $short_value ]] && take_next=true ;;
         esac
     done
-    return 1
+    [[ "$help" == true ]]
 }
 
 # Is `$2` a target a `git checkout <path>` could restore — a path present in
