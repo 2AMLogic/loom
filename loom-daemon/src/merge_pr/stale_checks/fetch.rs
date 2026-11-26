@@ -488,6 +488,7 @@ failing closed rather than evaluating the freshness guard on a subset (#8987)",
             Ok(CheckRun {
                 name: str_of("name").unwrap_or_default().to_string(),
                 status: str_of("status").unwrap_or_default().to_string(),
+                settled: crate::merge_pr::check_runs_rollup::is_settled(v),
                 conclusion: str_of("conclusion").map(String::from),
                 started_at,
             })
