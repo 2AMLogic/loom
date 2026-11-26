@@ -602,10 +602,12 @@ pub struct Env<'a> {
     pub elapsed: &'a dyn Fn() -> Duration,
     /// The clock.
     pub clock: &'a dyn Fn() -> DateTime<Utc>,
-    /// Is `sha` the head of a pull request the forge reports as merged
-    /// (#13588)? `None`: it could not be answered (no network, breaker open, a
-    /// failed lookup): the caller treats that as "not merged".
-    pub pr_merged: &'a dyn Fn(&Path, &str) -> Option<bool>,
+    /// Does the forge report `sha` as the head of any pull request, open or
+    /// merged (#13588, #14973: `refs/pull/N/head` keeps the commits on the
+    /// forge, and a rescue ref is written before any rehome)? `None`: it could
+    /// not be answered (no network, breaker open, a failed lookup): the caller
+    /// treats that as "not known".
+    pub pr_head: &'a dyn Fn(&Path, &str) -> Option<bool>,
 }
 
 impl Env<'_> {
@@ -720,12 +722,15 @@ pub fn run(env: &Env<'_>, roots: &[PathBuf], memory: &mut Memory) -> CheckoutPas
             let low_disk = net.low_disk > low_before;
             freshness::publish(freshness::reached(
                 env,
-                root,
-                branch,
-                head.as_deref(),
-                low_disk,
                 &net,
                 now,
+                &freshness::Reached {
+                    root,
+                    report: &report,
+                    branch,
+                    head: head.as_deref(),
+                    low_disk,
+                },
             ));
         }
         reached += 1;
@@ -746,9 +751,23 @@ pub fn run(env: &Env<'_>, roots: &[PathBuf], memory: &mut Memory) -> CheckoutPas
     memory.cursor = if pass.deferred == 0 {
         0
     } else {
-        log::info!(
-            "checkout_ff: the pass's budget is spent; {} workspace(s) keep their last report and \
-             the next pass starts with them",
+        // Reaching none of them is a starved pass, not a partial one: nothing
+        // was checked or fast-forwarded, so it must not hide at `info` (#15301).
+        let starved = reached == 0;
+        let level = if starved {
+            log::Level::Warn
+        } else {
+            log::Level::Info
+        };
+        log::log!(
+            level,
+            "checkout_ff: the pass's budget is spent{}; {} workspace(s) keep their last report \
+             and the next pass starts with them",
+            if starved {
+                " before any workspace was visited"
+            } else {
+                ""
+            },
             pass.deferred
         );
         start + reached

@@ -10,6 +10,8 @@ pub(super) const NO_IDLE_SEAT: &str = "no idle seat";
 /// The resolved repository is served by no inventoried account: a routing
 /// misconfiguration, not contention (#14512).
 pub(super) const NO_SEAT_SERVES_REPOSITORY: &str = "no seat serves this repository";
+pub(super) const WRONG_ACCOUNT: &str =
+    "private dispatch account or profile does not match the named account";
 
 /// The one descriptor a private dispatch hands its account lease down on.
 /// Also the only value `roll_pause::resume::release_inherited_lease` accepts.
@@ -72,18 +74,26 @@ pub fn uses_private(root: &Path) -> Result<bool> {
     Ok(false)
 }
 
-enum SeatPolicy {
+enum SeatPolicy<'a> {
     /// Containment admission (#8787): every eligible seat is tried at most
     /// once, and a candidate only wins when a containment proof can be taken
     /// for it — the winning lease, proof and launch stay bound to one seat.
-    Contained,
+    Contained {
+        role: &'a str,
+    },
     /// Launch through the admitted runtime's own preparation: a busy seat is
     /// passed over for the next eligible one, with no containment requirement
     /// of its own.
-    Existing,
-    Idle {
-        guarded: bool,
+    Existing {
+        role: Option<&'a str>,
     },
+    Idle {
+        role: &'a str,
+    },
+    /// The one account a caller resolved by name and must launch on: never
+    /// walks, so a busy named seat refuses with its own reason instead of
+    /// handing back a different seat (#14627).
+    Named(&'a Config),
 }
 
 /// Why the bounded seat walk passed one candidate over.
@@ -178,6 +188,7 @@ impl Selection {
             gh_config: None,
             session_image: None,
             extra_mounts: Vec::new(),
+            mirror_binds: Vec::new(),
         };
         Selection {
             name: "fixture".into(),
@@ -202,7 +213,20 @@ impl Selection {
         issue: Option<u64>,
         owner: &str,
     ) -> Result<Option<Self>> {
-        Self::prepare_with(root, runtime, model, kind, issue, owner, SeatPolicy::Existing)
+        let role = std::env::var("LOOM_ROLE").ok();
+        Self::prepare_for_role(root, runtime, model, kind, issue, owner, role.as_deref())
+    }
+
+    pub(crate) fn prepare_for_role(
+        root: &Path,
+        runtime: &str,
+        model: Option<&str>,
+        kind: JobKind,
+        issue: Option<u64>,
+        owner: &str,
+        role: Option<&str>,
+    ) -> Result<Option<Self>> {
+        Self::prepare_with(root, runtime, model, kind, issue, owner, SeatPolicy::Existing { role })
     }
 
     /// Reserve a seat for a host-admitted read-only launch. Try each eligible
@@ -213,9 +237,9 @@ impl Selection {
         kind: JobKind,
         issue: Option<u64>,
         owner: &str,
-        guarded: bool,
+        role: &str,
     ) -> Result<Option<Self>> {
-        Self::prepare_with(root, "codex", model, kind, issue, owner, SeatPolicy::Idle { guarded })
+        Self::prepare_with(root, "codex", model, kind, issue, owner, SeatPolicy::Idle { role })
     }
 
     /// Prepare a selection for containment admission (#8787, #14578): the
@@ -231,8 +255,22 @@ impl Selection {
         kind: JobKind,
         issue: Option<u64>,
         owner: &str,
+        role: &str,
     ) -> Result<Option<Self>> {
-        Self::prepare_with(root, "codex", model, kind, issue, owner, SeatPolicy::Contained)
+        Self::prepare_with(root, "codex", model, kind, issue, owner, SeatPolicy::Contained { role })
+    }
+
+    /// Prepare only the account already resolved by transport (#14627).
+    /// A busy named seat must retain its own refusal even when other seats
+    /// are available.
+    pub(super) fn prepare_named(
+        root: &Path,
+        config: &Config,
+        kind: JobKind,
+        issue: Option<u64>,
+        owner: &str,
+    ) -> Result<Option<Self>> {
+        Self::prepare_with(root, "codex", None, kind, issue, owner, SeatPolicy::Named(config))
     }
 
     fn prepare_with(
@@ -242,7 +280,7 @@ impl Selection {
         kind: JobKind,
         issue: Option<u64>,
         owner: &str,
-        policy: SeatPolicy,
+        policy: SeatPolicy<'_>,
     ) -> Result<Option<Self>> {
         export::check_runtime(root, issue, runtime)?;
         if runtime == "codex" {
@@ -272,19 +310,26 @@ impl Selection {
             export::check_failover(root, issue, "unavailable")?;
             return Ok(None);
         }
-        use super::super::account_registry::{
-            account_inventory, select_codex_account_where, AccountBinding, AccountProvider,
-        };
+        use super::super::account_registry::{account_inventory, AccountBinding, AccountProvider};
+        use crate::runtime_preference::codex_guard;
+
         let try_idle_seats = matches!(policy, SeatPolicy::Idle { .. });
-        let prepare = |name, profile| -> Result<Self> {
+        let prepare = |name, profile: PathBuf| -> Result<Self> {
+            // Explicit pins may confirm a named launch. A conflicting pin
+            // cannot substitute a different account before we take a lease.
+            if let SeatPolicy::Named(config) = policy {
+                if config.account != name || config.profile != profile.canonicalize()? {
+                    bail!("{WRONG_ACCOUNT}");
+                }
+            }
             let mut selection = Self::prepare_profile(root, name, profile, kind, issue, owner)?;
             match policy {
                 // A guarded read-only reservation must already prove
                 // containment for its own seat (#14481).
-                SeatPolicy::Idle { guarded: true } => {
-                    if selection.lease().is_some() {
-                        selection.contain(root)?;
-                    }
+                SeatPolicy::Idle { role }
+                    if codex_guard::guarded(role) && selection.lease().is_some() =>
+                {
+                    selection.contain(root)?;
                 }
                 // Containment admission: an account with no private clone,
                 // and a clone whose boundary cannot be re-proven, cannot win.
@@ -292,7 +337,7 @@ impl Selection {
                 // the next eligible seat (#14578). The proof captured here is
                 // carried on the selection so the admission that consumes it
                 // need not take the same proof twice (#14626).
-                SeatPolicy::Contained => {
+                SeatPolicy::Contained { .. } => {
                     if selection.lease().is_none() {
                         bail!("selected Codex account holds no private-clone workspace");
                     }
@@ -331,6 +376,16 @@ impl Selection {
             export::check_failover(root, issue, "other-provider")?;
             return Ok(None);
         }
+        // The caller resolved one account by name and must launch on it
+        // (#14627): prepare that seat and nothing else, so its own refusal
+        // (a busy session) reaches the caller instead of another seat.
+        let role = match policy {
+            SeatPolicy::Named(config) => {
+                return prepare(config.account.clone(), config.profile.clone()).map(Some);
+            }
+            SeatPolicy::Existing { role } => role,
+            SeatPolicy::Idle { role } | SeatPolicy::Contained { role } => Some(role),
+        };
 
         let logical = logical_repository(root);
         let mut tried = std::collections::BTreeSet::new();
@@ -340,7 +395,7 @@ impl Selection {
             // account disappears from a later selection snapshot. Unknown
             // routes also prevent a definite routing-miss diagnosis.
             let routing_miss = Cell::new(logical.is_some() && tried.is_empty());
-            let account = select_codex_account_where(root, model, |account| {
+            let account = codex_guard::select(root, model, role, |account| {
                 if tried.contains(&account.id.name) {
                     return false;
                 }
@@ -411,7 +466,10 @@ impl Selection {
             return Ok(selection);
         }
         adapter::check(Some(&selection.profile))?;
-        let (config, dir) = lifecycle::resolve(root, &selection.name)?;
+        let (config, resolved_dir) = lifecycle::resolve(root, &selection.name)?;
+        if resolved_dir != dir {
+            bail!("private dispatch account profile changed during preparation");
+        }
         export::check_failover(root, issue, &selection.name)?;
         let target = select_target(root, &config)?;
         // Refuse BEFORE the lease, the container exec and the claim when the
@@ -495,6 +553,28 @@ impl Selection {
             Some(proof) => Ok(proof),
             None => self.contain(root),
         }
+    }
+
+    /// Pin a ready shared seat before the step's forge claim. The dispatch
+    /// preflight has already handled any needed private reservation.
+    pub(crate) fn guarded_shared_step(
+        root: &Path,
+        role: &str,
+        model: Option<&str>,
+    ) -> Result<Self> {
+        let selected =
+            crate::runtime_preference::codex_guard::select(root, model, Some(role), |account| {
+                !crate::tokens_pool::codex_hooks::is_private_clone(&account.credential_reference)
+            })?;
+        let crate::tokens_pool::AccountBinding::CodexHome { directory } = selected.binding else {
+            unreachable!()
+        };
+        Ok(Self {
+            name: selected.id.name,
+            profile: directory,
+            prepared: None,
+            proven: None,
+        })
     }
 
     pub fn rebind(&self, _root: &Path, owner: &str) -> Result<()> {
@@ -713,11 +793,12 @@ mod tests {
             repository: repository.into(),
             base: "main".into(),
             repositories: vec![],
-            volume: format!("loom-codex-workspace-{name}"),
+            volume: workspace_volume_name(name),
             profile: profile.canonicalize().unwrap(),
             gh_config: None,
             session_image: None,
             extra_mounts: Vec::new(),
+            mirror_binds: Vec::new(),
         };
         save(&dir.join("workspace.json"), &config).unwrap();
         profile
@@ -868,6 +949,68 @@ mod tests {
         );
         assert!(none.is_err());
     }
+    /// #14585: among equally healthy seats that serve this repository, the one
+    /// with the most weekly headroom is drawn first and exclusions reveal the
+    /// next-best seat. An account bound to another repository stays excluded.
+    #[test]
+    #[serial_test::serial]
+    fn pool_selection_orders_weekly_headroom_within_repository() {
+        use super::super::super::account_registry::select_codex_account_where;
+        use super::super::super::paths::SHARED_ACCOUNTS_ROOT_ENV;
+        let _fork = super::super::tests::fork_guard();
+        let ws = workspace_with_origin("https://github.com/2AMLogic/gf180-parasynth.git");
+        let shared_root = tempfile::tempdir().unwrap();
+        let profiles = tempfile::tempdir().unwrap();
+        let usage = [("agent-3", 10.0), ("agent-4", 30.0), ("agent-5", 49.0)];
+        for (name, weekly) in usage {
+            let sessions = profiles.path().join(name).join("sessions");
+            std::fs::create_dir_all(&sessions).unwrap();
+            let line = serde_json::json!({"rate_limits": {"secondary": {
+                "used_percent": weekly, "window_minutes": 10_080, "resets_in_seconds": 400_000,
+            }}});
+            std::fs::write(sessions.join("rollout-fixture.jsonl"), format!("{line}\n")).unwrap();
+        }
+        // The emptiest seat of all, but a private clone of another repository.
+        private_profile(profiles.path(), "agent-1", "https://github.com/2AMLogic/vibesql");
+        let sessions = profiles.path().join("agent-1").join("sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+        std::fs::write(
+            sessions.join("rollout-fixture.jsonl"),
+            r#"{"rate_limits":{"secondary":{"used_percent":0,"window_minutes":10080,"resets_in_seconds":400000}}}
+"#,
+        )
+        .unwrap();
+        let accounts = ["agent-1", "agent-3", "agent-4", "agent-5"]
+            .iter()
+            .map(|name| {
+                format!(
+                    r#"{{"provider":"codex","name":"{name}","credential_kind":"codex_home","credential_reference":"{name}","enabled":true}}"#
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        std::fs::create_dir_all(ws.path().join(".loom")).unwrap();
+        std::fs::write(
+            ws.path().join(".loom/accounts.json"),
+            format!(r#"{{"version":1,"accounts":[{accounts}]}}"#),
+        )
+        .unwrap();
+        std::env::set_var(SHARED_ACCOUNTS_ROOT_ENV, shared_root.path());
+        let _profile_root =
+            crate::tokens_pool::profile_root_env::ProfileRootEnv::set(profiles.path());
+        let logical = logical_repository(ws.path());
+        let mut tried = std::collections::BTreeSet::new();
+        let mut order = Vec::new();
+        while let Ok(account) = select_codex_account_where(ws.path(), None, |account| {
+            !tried.contains(&account.id.name)
+                && repository_route(&account.credential_reference, logical.as_deref()) == Some(true)
+        }) {
+            tried.insert(account.id.name.clone());
+            order.push(account.id.name);
+        }
+        std::env::remove_var(SHARED_ACCOUNTS_ROOT_ENV);
+        assert_eq!(order, ["agent-3", "agent-4", "agent-5"]);
+    }
     fn fixture_config() -> Config {
         Config {
             schema_version: 1,
@@ -883,6 +1026,7 @@ mod tests {
             gh_config: None,
             session_image: None,
             extra_mounts: Vec::new(),
+            mirror_binds: Vec::new(),
         }
     }
     fn reservation(dir: &Path) -> Selection {

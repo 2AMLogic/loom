@@ -14,13 +14,17 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-/// The second field holds the crate-wide `LOOM_CODEX_PROFILE_ROOT` lock (#9964).
+/// The second field holds the crate-wide `LOOM_CODEX_PROFILE_ROOT` lock (#9964);
+/// the third the crate-wide `LOOM_CODEX_HOME` lock (#15174), acquired before it
+/// and released after (see `codex_home_env`'s documented lock order).
 struct Environment(
     Vec<(&'static str, Option<std::ffi::OsString>)>,
     #[allow(dead_code)] crate::tokens_pool::profile_root_env::ProfileRootLock,
+    #[allow(dead_code)] crate::tokens_pool::codex_home_env::CodexHomeLock,
 );
 impl Environment {
     fn isolated(root: &Path) -> Self {
+        let codex_home_lock = crate::tokens_pool::codex_home_env::lock();
         let lock = crate::tokens_pool::profile_root_env::lock();
         let keys = [
             "LOOM_RUNTIME",
@@ -59,7 +63,7 @@ impl Environment {
         }
         std::env::set_var("LOOM_CODEX_PROFILE_ROOT", root.join("codex-profiles"));
         std::env::set_var("LOOM_BACKSTOP_LEASE_DIR", root.join("backstop"));
-        Self(prior, lock)
+        Self(prior, lock, codex_home_lock)
     }
 }
 impl Drop for Environment {
@@ -126,7 +130,7 @@ fn fixture(
     fs::write(
         root.join(".loom/scripts/spawn-claude.sh"),
         format!(
-            "#!/bin/sh\nprintf '%s\\n' \"$LOOM_RUNTIME\" \"$@\" > '{}'\nexit 0\n",
+            "#!/bin/sh\nprintf '%s\\n' \"$LOOM_RUNTIME\" \"$@\" \"profile=$LOOM_MODEL_PROFILE\" > '{}'\nexit 0\n",
             record.display()
         ),
     )
@@ -539,4 +543,357 @@ fn a_step_resolves_its_effort_against_the_admitted_runtime() {
     bare["autonomous"]["roleRunner"]["roleEfforts"] = json!({"curator@codex": "low"});
     let launch = step_launch(dir.path(), &bare, crate::step_role::StepRole::Curator).unwrap();
     assert_eq!(launch.effort, None);
+}
+
+// ---- #14963: an unqualified roleEfforts entry vs a native profile pick ----
+
+/// `#14963` fixture: the preference walk admits `opencode` pinned to the
+/// `strict-zai` model profile, whose `allowedEfforts` is low/high/max (the
+/// bundled zai vocabulary), with the role-effort config `efforts`.
+fn native_profile_effort_config(efforts: Value) -> Value {
+    let mut config = fallback_config();
+    config["runtimes"]["default"] = json!("opencode");
+    config["runtimes"]["preference"] =
+        json!([{"runtime": "opencode", "modelProfile": "strict-zai"}]);
+    config["runtimes"]["modelProfiles"]["strict-zai"] = json!({
+        "model": "glm-5.3",
+        "providers": {"opencode": "zai-coding-plan"},
+        "allowedEfforts": ["low", "high", "max"]
+    });
+    config["autonomous"]["roleRunner"]["roleEfforts"] = efforts;
+    config
+}
+
+/// The reported incident, at the step-launch site: a bare
+/// `roleEfforts.builder` meant for the Claude and Codex picks meets the
+/// native profile the walk drew, whose `allowedEfforts` excludes the value —
+/// the launch keeps its step (effort dropped to the profile's own) instead of
+/// being refused at `profile_selection`.
+#[test]
+#[serial_test::serial(loom_shared_tokens_dir_env)]
+fn a_bare_role_effort_a_native_profile_disallows_is_dropped_not_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let _env = Environment::isolated(dir.path());
+    let config = native_profile_effort_config(json!({"builder": "medium"}));
+    let launch = builder_launch(dir.path(), &config).unwrap();
+    let admitted = launch.admission.admitted.unwrap();
+    assert_eq!(admitted.runtime, "opencode", "the test must exercise a native pick");
+    assert_eq!(admitted.preference.unwrap().model_profile.as_deref(), Some("strict-zai"));
+    assert_eq!(
+        launch.effort, None,
+        "the profile's own effort launches instead of a profile_selection refusal"
+    );
+}
+
+/// The bounds of the same reconciliation: an unqualified effort the profile
+/// DOES allow is forwarded verbatim, and a runtime-qualified pin is forwarded
+/// verbatim even when the profile disallows it (select refuses it loudly —
+/// the fail-closed behaviour an explicit pin keeps).
+#[test]
+#[serial_test::serial(loom_shared_tokens_dir_env)]
+fn an_allowed_bare_effort_and_a_qualified_pin_are_forwarded_verbatim() {
+    let allowed = tempfile::tempdir().unwrap();
+    let _env1 = Environment::isolated(allowed.path());
+    let config = native_profile_effort_config(json!({"builder": "high"}));
+    let launch = builder_launch(allowed.path(), &config).unwrap();
+    assert_eq!(
+        launch.effort.as_deref(),
+        Some("high"),
+        "an unqualified effort inside allowedEfforts keeps its override"
+    );
+
+    let pinned = tempfile::tempdir().unwrap();
+    let _env2 = Environment::isolated(pinned.path());
+    let config = native_profile_effort_config(json!({"builder@opencode": "medium"}));
+    let launch = builder_launch(pinned.path(), &config).unwrap();
+    assert_eq!(
+        launch.effort.as_deref(),
+        Some("medium"),
+        "a runtime-qualified pin is never silently dropped"
+    );
+}
+
+// ---- #14962: a configured role-tier model vs a native profile pick ----
+
+/// `#14962` fixture: a non-Builder stage draws with certainty onto a native
+/// pick pinned to the `strict-zai` model profile (model `glm-5.3`, no
+/// `allowedEfforts` vocabulary — the model, not the effort, is what this
+/// exercises), with the role-model config `models`.
+fn native_profile_model_config(models: Value) -> Value {
+    let mut config = fallback_config();
+    config["runtimes"]["default"] = json!("opencode");
+    config["runtimes"]["preference"] =
+        json!([{"runtime": "opencode", "modelProfile": "strict-zai"}]);
+    config["runtimes"]["modelProfiles"]["strict-zai"] = json!({
+        "model": "glm-5.3",
+        "providers": {"opencode": "zai-coding-plan"}
+    });
+    config["autonomous"]["roleRunner"]["roleModels"] = models;
+    config
+}
+
+/// The reported incident, at the step-launch site: a bare
+/// `roleModels.curator` meant for the Claude and Codex picks meets the
+/// native profile the walk drew, whose model differs from the resolved pin —
+/// the launch keeps its step (the configured model dropped to the profile's
+/// own) instead of being refused at `profile_selection`.
+#[test]
+#[serial_test::serial(loom_shared_tokens_dir_env)]
+fn a_configured_role_model_a_native_profile_pick_would_refuse_is_dropped_not_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let _env = Environment::isolated(dir.path());
+    let config = native_profile_model_config(json!({"curator": "opus"}));
+    let launch = step_launch(dir.path(), &config, crate::step_role::StepRole::Curator).unwrap();
+    let admitted = launch.admission.admitted.unwrap();
+    assert_eq!(admitted.runtime, "opencode", "the test must exercise a native pick");
+    let profile = admitted.preference.unwrap().model_profile;
+    assert_eq!(profile.as_deref(), Some("strict-zai"));
+    assert_eq!(
+        launch.model, None,
+        "the profile's own model launches instead of a profile_selection refusal"
+    );
+    // And the launched shape is one `profiles::select` accepts: no `--model`
+    // for the profile's own to supply.
+    let options = Options {
+        model: launch.model,
+        profile,
+        ..Options::default()
+    };
+    let selection = profiles::select("opencode", &options, &config).unwrap();
+    assert_eq!(selection.model, "glm-5.3");
+    assert_eq!(selection.profile.as_deref(), Some("strict-zai"));
+}
+
+/// The bounds of the same reconciliation at the step-launch site: the same
+/// config drawing Claude still launches `--model` (alias-resolved), and a
+/// drawn model pin on the native pick — an explicit statement of intent — is
+/// forwarded verbatim even when it differs from the selected profile, so
+/// `profiles::select` keeps its loud refusal.
+#[test]
+#[serial_test::serial(loom_shared_tokens_dir_env)]
+fn a_configured_role_model_on_claude_and_a_drawn_native_pin_are_forwarded_verbatim() {
+    // The Claude draw: the configured pin still launches.
+    let claude = tempfile::tempdir().unwrap();
+    let _env1 = Environment::isolated(claude.path());
+    let mut config = native_profile_model_config(json!({"curator": "opus"}));
+    config["runtimes"]["preference"] = json!(["claude", "opencode"]);
+    let launch = step_launch(claude.path(), &config, crate::step_role::StepRole::Curator).unwrap();
+    assert_eq!(
+        launch.admission.admitted.unwrap().runtime,
+        "claude",
+        "control: this arm must draw the Claude pick"
+    );
+    assert_eq!(
+        launch.model.as_deref(),
+        Some("claude-opus-5"),
+        "a Claude launch keeps the configured model (alias-resolved)"
+    );
+
+    // The drawn pin: `opencode:<profile>/<model>` names BOTH, and the model
+    // half is the pick's own statement — never dropped, refused by select.
+    let pinned = tempfile::tempdir().unwrap();
+    let _env2 = Environment::isolated(pinned.path());
+    let mut config = native_profile_model_config(json!({"curator": "opus"}));
+    config["runtimes"]["roleDraw"] =
+        json!({"curator": [{"attempt": 1, "draw": {"opencode:strict-zai/glm-5.4": 100}}]});
+    let launch = step_launch(pinned.path(), &config, crate::step_role::StepRole::Curator).unwrap();
+    let admitted = launch.admission.admitted.unwrap();
+    assert_eq!(admitted.runtime, "opencode");
+    assert_eq!(
+        launch.model.as_deref(),
+        Some("glm-5.4"),
+        "a drawn model pin is never silently dropped"
+    );
+    let options = Options {
+        model: launch.model,
+        profile: admitted.preference.and_then(|p| p.model_profile),
+        ..Options::default()
+    };
+    let error = profiles::select("opencode", &options, &config).unwrap_err();
+    assert_eq!(error.code, 78);
+    assert!(error
+        .message
+        .contains("bare model differs from the selected profile"));
+}
+
+#[test]
+#[serial_test::serial(loom_shared_tokens_dir_env)]
+#[serial_test::serial]
+fn judge_recovers_from_claude_exhaustion_on_codex() {
+    judge_pool_recovery("codex");
+}
+
+#[test]
+#[serial_test::serial(loom_shared_tokens_dir_env)]
+#[serial_test::serial]
+fn judge_recovers_from_claude_exhaustion_on_gemini() {
+    judge_pool_recovery("opencode");
+}
+
+/// Weigh the same review-requested PR on both ticks, with both registry gates.
+fn judge_draw(root: &Path, registry: &Mutex<SweepRegistry>, pr: u32) -> Option<u32> {
+    use crate::step_dispatch::{
+        driver::probe_exhausted_roles,
+        gather::draw_inputs,
+        item_draw::{weigh, ItemWeights, WeighContext},
+    };
+    use crate::work_finder::step_item::{classify, Inputs, PullInput, Step};
+
+    let inputs = Inputs {
+        pulls: vec![PullInput {
+            number: pr,
+            labels: vec!["loom:review-requested".into()],
+            same_repo: true,
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    let items = draw_inputs(classify(&inputs), &[], |_, _| None);
+    let now = chrono::Utc::now();
+    let ctx = WeighContext {
+        now,
+        build_backoff_engaged: false,
+        pool_exhausted_roles: probe_exhausted_roles(root, registry, now).0,
+        workspace_idx: 0,
+        cooldowns: registry.lock().unwrap().step_cooldowns(now),
+    };
+    weigh(&items, &ctx, &ItemWeights::default())
+        .pool
+        .into_iter()
+        .find(|candidate| candidate.step == Step::Judge)
+        .map(|candidate| candidate.target())
+}
+
+fn judge_pool_recovery(runtime: &str) {
+    use crate::env_test_support::EnvGuard;
+    use crate::step_role::StepRole;
+    use crate::sweep_registry::step_spawn::{StepRefusal, StepSpawnRequest};
+
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let credentials = tempfile::tempdir().unwrap();
+    let _env = Environment::isolated(credentials.path());
+    let _credentials = EnvGuard::clear(&[
+        "GEMINI_API_KEY",
+        "LOOM_NATIVE_AUTH_FILE",
+        "LOOM_CODEX_NO_EXEC",
+        "LOOM_SPAWN_NO_EXPORT",
+    ])
+    .and_set("LOOM_SHARED_ACCOUNTS_ROOT", Some(std::ffi::OsStr::new("")));
+    let mut config = draw_config_for(
+        "judge",
+        "sonnet",
+        json!({"claude": 1, "codex/gpt-6.2-astra": 899, "opencode:quick-flash": 50}),
+    );
+    // The reported Judge configuration falls back to Claude alone on attempt two.
+    config["runtimes"]["roleDraw"]["judge"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!({"attempt": 2, "draw": {"claude": 100}}));
+    let (registry, record, _, _ws) = fixture(root, &config);
+    assert!(!registry.config.skip_label_flip);
+    let pool = crate::write_scope_test_support::SharedTokenPool::one_account();
+    crate::tokens_pool::bad_tokens::mark_bad_in_dir(pool.path(), "fake", "exhausted: rate limit")
+        .unwrap();
+    let registry = Arc::new(Mutex::new(registry));
+    let pr = 8715;
+    let request = StepSpawnRequest::new(judge_draw(root, &registry, pr).unwrap(), StepRole::Judge);
+    let assert_refused = || {
+        let err = SweepRegistry::spawn_step_unlocked(&registry, &request).unwrap_err();
+        let refusal = err.downcast_ref::<StepRefusal>().unwrap();
+        assert_eq!(refusal.reason, "pool_exhausted", "{refusal}");
+        assert!(refusal.detail.contains("ClaudeTokens"), "{refusal}");
+        assert!(!record.exists());
+        crate::step_dispatch::step_end::record_refusal(
+            root,
+            &registry,
+            &request,
+            Some(refusal),
+            false,
+        );
+    };
+    assert_refused();
+    assert_eq!(judge_draw(root, &registry, pr), None);
+    if runtime == "codex" {
+        crate::tokens_pool::codex_hooks::test_support::guard_ready_in_workspace(
+            root,
+            &credentials.path().join("codex-profiles/fixture-seat"),
+        );
+    } else {
+        std::env::set_var("GEMINI_API_KEY", "fixture-only");
+    }
+
+    {
+        let _pin = EnvGuard::set("LOOM_RUNTIME_JUDGE", "claude");
+        assert_refused();
+        assert_eq!(judge_draw(root, &registry, pr), None);
+    }
+
+    use crate::runtime_preference::role_draw::attempts;
+    attempts::record_failure(root, "judge");
+    assert_eq!(judge_draw(root, &registry, pr), None, "attempt two allows only Claude");
+    attempts::record_success(root, "judge");
+    assert!(
+        registry
+            .lock()
+            .unwrap()
+            .pool_exhausted_roles(chrono::Utc::now())
+            .contains("judge"),
+        "the refusal has not aged out"
+    );
+    assert_eq!(
+        judge_draw(root, &registry, pr),
+        Some(pr),
+        "tick two must draw the Judge step with {runtime} eligible"
+    );
+
+    let kind = SweepKind::Step {
+        item: request.item,
+        role: request.role,
+    };
+    let reg = registry.lock().unwrap();
+    let launch = SweepRegistry::resolve_step_launch(&reg.config, request.role, &kind).unwrap();
+    let admitted = launch.admission.admitted.as_ref().unwrap();
+    assert_eq!(admitted.runtime, runtime);
+    let stamp = admitted.preference.as_ref().unwrap();
+    assert_eq!(stamp.draw.as_ref().unwrap().attempt, 1);
+    let mut child = reg
+        .spawn_child_process_for(
+            &kind,
+            &root.join("step.log"),
+            "step-judge-fixture",
+            launch.model.as_deref(),
+            launch.effort.as_deref(),
+            None,
+            Some(admitted),
+            launch.selection.as_ref(),
+            None,
+        )
+        .unwrap()
+        .child;
+    assert!(child.wait().unwrap().success());
+    let args = fs::read_to_string(record).unwrap();
+    assert_eq!(args.lines().next(), Some(runtime));
+    assert!(args.lines().any(|arg| arg == "/loom:judge 8715"), "{args}");
+    let args: Vec<_> = args.lines().collect();
+    let model = args
+        .windows(2)
+        .find(|pair| pair[0] == "--model")
+        .map(|pair| pair[1]);
+    if runtime == "codex" {
+        assert_eq!(model, Some("gpt-6.2-astra"));
+    } else {
+        let profile = args.last().unwrap().strip_prefix("profile=").unwrap();
+        assert_eq!(profile, "quick-flash");
+        let options = Options {
+            model: model.map(str::to_owned),
+            profile: Some(profile.into()),
+            ..Options::default()
+        };
+        let selected = profiles::select(runtime, &options, &config).unwrap();
+        assert_eq!(
+            (selected.provider.as_str(), selected.model.as_str()),
+            ("google", "gemini-3.5-flash")
+        );
+    }
 }

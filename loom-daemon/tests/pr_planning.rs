@@ -409,6 +409,165 @@ case "$*" in *comments*) cat comments.json;; *) cat pulls.json;; esac
     assert_eq!(queue("1").0, 1, "an outsider's records are prose");
 }
 
+#[allow(dead_code)]
+#[path = "support/gitea_stub.rs"]
+mod gitea_stub;
+
+fn gitea_queue(
+    root: &std::path::Path,
+    stub: &gitea_stub::Stub,
+) -> (std::process::Output, std::path::PathBuf) {
+    let (_gh, gh_log) = gitea_stub::failing_gh(root);
+    let out = gitea_stub::daemon(root, stub, "synthetic-token")
+        .env("LOOM_GH_BIN", root.join("gh"))
+        .args(["pr-queue", "--role", "judge"])
+        .output()
+        .unwrap();
+    (out, gh_log)
+}
+
+/// No `gh` invocation happens at all: the stub host runs with no fleet
+/// store, so a call is a read of this checkout on the Gitea path.
+fn assert_no_gitea_read_reached_gh(gh_log: &std::path::Path) {
+    assert!(
+        !gh_log.exists(),
+        "the queue's forge read reached gh: {}",
+        std::fs::read_to_string(gh_log).unwrap_or_default()
+    );
+}
+
+/// #14939: on a Gitea origin with an explicit port the queue is read from the
+/// Gitea API with the session's token, in Gitea's own page dialect, and the
+/// seeded PR reaches the planner as a workflow row. `gh` is never reached.
+#[cfg(unix)]
+#[test]
+fn gitea_queue_serves_the_seeded_pr_as_a_workflow_row() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let stub = gitea_stub::Stub::start();
+    gitea_stub::checkout(root, &stub, "qual/consumer");
+    let head = "c".repeat(40);
+    stub.route(
+        "/pulls",
+        gitea_stub::Reply::json(
+            "200 OK",
+            serde_json::json!([gitea_stub::pull(
+                7,
+                "open",
+                &["loom:review-requested"],
+                &head
+            )]),
+        ),
+    );
+    stub.route("/issues/7/comments", gitea_stub::Reply::json("200 OK", serde_json::json!([])));
+    let (out, gh_log) = gitea_queue(root, &stub);
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let rows: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(rows.as_array().unwrap().len(), 1);
+    assert_eq!(rows[0]["number"], 7);
+    assert_eq!(rows[0]["mode"], "workflow");
+    let requests = stub.requests();
+    assert!(
+        requests.iter().any(|r| r.target()
+            == "/api/v1/repos/qual/consumer/pulls?state=open&sort=recentupdate&limit=50&page=1"),
+        "the origin's repository, in Gitea's page dialect: {:?}",
+        requests
+    );
+    assert!(
+        requests
+            .iter()
+            .all(|r| r.authorization.as_deref() == Some("token synthetic-token")),
+        "every read carries the session's token"
+    );
+    assert_no_gitea_read_reached_gh(&gh_log);
+}
+
+/// A Gitea page holds 50 rows and the planner's walk asks for GitHub's 100:
+/// the transport joins two Gitea pages per page asked, so no listing is cut
+/// short at the first one.
+#[cfg(unix)]
+#[test]
+fn gitea_queue_walks_giteas_fifty_row_pages() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let stub = gitea_stub::Stub::start();
+    gitea_stub::checkout(root, &stub, "qual/consumer");
+    let pull = |n: u64| gitea_stub::pull(n, "open", &["loom:review-requested"], &"d".repeat(40));
+    stub.route("/comments", gitea_stub::Reply::json("200 OK", serde_json::json!([])));
+    for (page, rows) in [(1u64, 50u64), (2, 50), (3, 20)] {
+        stub.route(
+            &format!("&page={page}"),
+            gitea_stub::Reply::json(
+                "200 OK",
+                serde_json::Value::Array((0..rows).map(|i| pull(page * 100 + i)).collect()),
+            ),
+        );
+    }
+    let (out, gh_log) = gitea_queue(root, &stub);
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let rows: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(rows.as_array().unwrap().len(), 120, "all three Gitea pages are served");
+    let mut pages: Vec<_> = stub
+        .requests()
+        .iter()
+        .filter(|r| r.target().contains("/pulls?"))
+        .map(|r| r.target().rsplit("page=").next().unwrap().to_string())
+        .collect();
+    pages.sort();
+    assert_eq!(pages, ["1", "2", "3"], "two Gitea pages per page asked, and none past the last");
+    assert_no_gitea_read_reached_gh(&gh_log);
+}
+
+/// A listing that fails, is refused, is unreadable or has no credential is an
+/// error, never a successful empty queue, and `gh` is not tried as a fallback.
+#[cfg(unix)]
+#[test]
+fn gitea_queue_fails_nonzero_on_a_failed_listing() {
+    use gitea_stub::Reply;
+    for reply in [
+        Reply::text("500 Internal Server Error", r#"{"message":"boom"}"#),
+        Reply::text("401 Unauthorized", r#"{"message":"token is required"}"#),
+        Reply::text("200 OK", "<html>not json</html>"),
+        Reply::json("200 OK", serde_json::json!({"message": "not a listing"})),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let stub = gitea_stub::Stub::start();
+        gitea_stub::checkout(root, &stub, "qual/consumer");
+        stub.route("/pulls", reply.clone());
+        let (out, gh_log) = gitea_queue(root, &stub);
+        assert_eq!(
+            out.status.code(),
+            Some(1),
+            "{}: {}",
+            reply.status,
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(out.stdout.is_empty(), "{}", reply.status);
+        assert_no_gitea_read_reached_gh(&gh_log);
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let stub = gitea_stub::Stub::start();
+    gitea_stub::checkout(root, &stub, "qual/consumer");
+    let (_gh, gh_log) = gitea_stub::failing_gh(root);
+    let out = gitea_stub::daemon(root, &stub, "synthetic-token")
+        .env_remove("GITEA_TOKEN")
+        .env("LOOM_GH_BIN", root.join("gh"))
+        .args(["pr-queue", "--role", "judge"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(1), "no credential, no queue");
+    assert!(out.stdout.is_empty());
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("GITEA_TOKEN"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(stub.requests().is_empty(), "no credential, no request");
+    assert_no_gitea_read_reached_gh(&gh_log);
+}
+
 // Fail this test binary on any spawn of the real `gh` (#10225, extends #10138).
 #[allow(dead_code)]
 #[path = "../src/live_gh_guard.rs"]

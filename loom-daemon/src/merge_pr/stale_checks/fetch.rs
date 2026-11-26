@@ -8,8 +8,7 @@
 //! `forge wait-checks` still read (the other `merge-pr` verbs that shared
 //! these reads went in slice 2).
 //!
-//! 1. **required contexts** — the TWO-source union
-//!    `forge_get_required_status_check_contexts` builds (#8103): rulesets
+//! 1. **required contexts** — the TWO-source union of #8103: rulesets
 //!    (`GET /repos/{nwo}/rules/branches/{branch}`) and classic branch
 //!    protection (GraphQL `branchProtectionRule.requiredStatusCheckContexts`,
 //!    or the REST branch summary when GraphQL is refused, #11855). A failure
@@ -337,8 +336,8 @@ pub(crate) fn branch_protection_contexts(body: &str) -> Result<Vec<String>, Stri
 }
 
 /// Required status check contexts, unioned across rulesets and classic branch
-/// protection (mirroring `forge_get_required_status_check_contexts`, #8103),
-/// plus any [`plan_gated_notice`] the lookup had to record.
+/// protection (#8103), plus any [`plan_gated_notice`] the lookup had to
+/// record.
 ///
 /// The rulesets read is retried in-process for transport/timeout failures
 /// ([`ruleset_read_retryable`]; at most
@@ -489,6 +488,7 @@ failing closed rather than evaluating the freshness guard on a subset (#8987)",
             Ok(CheckRun {
                 name: str_of("name").unwrap_or_default().to_string(),
                 status: str_of("status").unwrap_or_default().to_string(),
+                settled: crate::merge_pr::check_runs_rollup::is_settled(v),
                 conclusion: str_of("conclusion").map(String::from),
                 started_at,
             })

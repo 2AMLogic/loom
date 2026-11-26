@@ -332,6 +332,137 @@ fn classify_roundtrip_error(e: anyhow::Error) -> StatusAttemptError {
     }
 }
 
+/// Exit code when the daemon answered a `Ping` but the status request itself
+/// failed (#15316). This generic failure code is shared with the "daemon too
+/// old" and `daemon_install_state::EXIT_NOT_EXPECTED` paths.
+const EXIT_RESPONDING_STATUS_FAILED: i32 = 1;
+
+/// Budget for the second, light liveness request (#15316). Independent of the
+/// (possibly 30s load-scaled) status budget: a daemon that cannot answer a
+/// `Ping` in this long is genuinely unresponsive.
+const PING_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Everything known about one failed status query (#15316): which socket and
+/// request were used, the budget, the error, and whether a second, much
+/// lighter request (`Ping`) was answered. Lets the banner state exactly what
+/// failed instead of concluding "not responding over IPC" from one request.
+pub(crate) struct StatusFailure {
+    /// Wire name of the request that failed (`DaemonStatus`, …).
+    request: &'static str,
+    /// [`describe_status_timeout`] of the budget the request ran under.
+    timeout: String,
+    /// `None` = the `Ping` was answered; `Some(why)` = it failed too.
+    ping_error: Option<String>,
+}
+
+impl StatusFailure {
+    /// Probe the daemon with a `Ping` after a status query for `request` failed.
+    async fn observe(
+        socket_path: &Path,
+        request: &Request,
+        timeout_info: &StatusTimeoutInfo,
+    ) -> Self {
+        Self::observe_with(socket_path, request, timeout_info, PING_PROBE_TIMEOUT).await
+    }
+
+    /// [`Self::observe`] with an explicit `Ping` budget (unit-testable).
+    async fn observe_with(
+        socket_path: &Path,
+        request: &Request,
+        timeout_info: &StatusTimeoutInfo,
+        ping_timeout: Duration,
+    ) -> Self {
+        let ping_error =
+            match super::common::query_daemon_bounded(socket_path, &Request::Ping, ping_timeout)
+                .await
+            {
+                Ok(Response::Pong) => None,
+                Ok(other) => Some(format!("unexpected response to Ping: {other:?}")),
+                Err(e) => Some(e.to_string()),
+            };
+        Self {
+            request: status_request_name(request),
+            timeout: describe_status_timeout(timeout_info),
+            ping_error,
+        }
+    }
+
+    /// The daemon answered the light request: it is up and serving IPC, and
+    /// only the (heavier) status request failed.
+    fn daemon_responding(&self) -> bool {
+        self.ping_error.is_none()
+    }
+
+    /// One-line summary of the second request, for either banner.
+    fn ping_summary(&self) -> String {
+        match &self.ping_error {
+            None => "answered (daemon is responding)".to_string(),
+            Some(why) => format!("failed too: {why}"),
+        }
+    }
+}
+
+/// Wire name of a status-family request, for the failure banner.
+fn status_request_name(request: &Request) -> &'static str {
+    match request {
+        Request::DaemonStatusSections { .. } => "DaemonStatusSections",
+        _ => "DaemonStatus",
+    }
+}
+
+/// Banner for a daemon that answered `Ping` but whose status request failed
+/// (#15316). Never recommends a restart: the daemon is demonstrably serving.
+fn print_status_responding_human(socket_path: &Path, err: &anyhow::Error, failure: &StatusFailure) {
+    eprint!("{}", render_status_responding_human(socket_path, err, failure));
+}
+
+/// Text of [`print_status_responding_human`], split out so tests can assert on
+/// it (it must never carry restart advice).
+fn render_status_responding_human(
+    socket_path: &Path,
+    err: &anyhow::Error,
+    failure: &StatusFailure,
+) -> String {
+    format!(
+        "loom-daemon IS responding at {sock} (Ping answered), but the {req} request failed.\n\
+         \x20 socket:  {sock}\n\
+         \x20 request: {req}\n\
+         \x20 timeout: {timeout}\n\
+         \x20 error:   {err}\n\
+         \n\
+         This is not an IPC outage — the full status report is the heaviest request the \
+         daemon serves and can run past its budget while the daemon is busy. Retry with \
+         more headroom or a narrower report:\n\
+         \x20 loom-daemon status --timeout-secs 60\n\
+         \x20 loom-daemon status --json --section daemon_build\n",
+        sock = socket_path.display(),
+        req = failure.request,
+        timeout = failure.timeout,
+    )
+}
+
+/// `--json` counterpart of [`print_status_responding_human`].
+fn print_status_responding_json(
+    socket_path: &Path,
+    err: &anyhow::Error,
+    failure: &StatusFailure,
+) -> Result<()> {
+    let payload = serde_json::json!({
+        "error": format!(
+            "loom-daemon at {} is responding (Ping answered) but {} failed: {err}",
+            socket_path.display(),
+            failure.request
+        ),
+        "daemon_responding": true,
+        "socket": socket_path.display().to_string(),
+        "request": failure.request,
+        "timeout": failure.timeout,
+        "observed_at": watchdog_utc_stamp(chrono::Utc::now()),
+    });
+    println!("{}", serde_json::to_string_pretty(&payload)?);
+    Ok(())
+}
+
 /// Collect per-token usage via an in-process call to
 /// [`crate::tokens_pool::check::run_check`] — the same native probe
 /// `loom-daemon tokens check --json` (`TokensAction::Check`) runs, called
@@ -406,6 +537,20 @@ pub async fn handle_status_command(args: sections::StatusArgs) -> Result<()> {
         Err(e) if sections::is_daemon_too_old(&e) => sections::exit_daemon_too_old(&e),
         Err(_) if crate::cli::host::report_disabled(json) => return Ok(()),
         Err(e) => {
+            // #15316: a failed status query does not mean the daemon is
+            // down — the full `DaemonStatus` report is the heaviest request
+            // the daemon serves, while `dispatch_sweep` answers from a cheap
+            // early return. Send the lightest request (`Ping`) before
+            // concluding anything, and keep every detail of the failure.
+            let failure = StatusFailure::observe(&socket_path, &request, &timeout_info).await;
+            if failure.daemon_responding() {
+                if json {
+                    print_status_responding_json(&socket_path, &e, &failure)?;
+                } else {
+                    print_status_responding_human(&socket_path, &e, &failure);
+                }
+                std::process::exit(EXIT_RESPONDING_STATUS_FAILED);
+            }
             // Issue #4069 (AC3 of #4011): classify WHY the daemon is
             // unreachable using the same autonomy-desired marker + heartbeat
             // `loom-daemon-watchdog.sh` reads, so `status` and the watchdog
@@ -418,9 +563,9 @@ pub async fn handle_status_command(args: sections::StatusArgs) -> Result<()> {
                 .as_ref()
                 .map_or(daemon_install_state::EXIT_NOT_EXPECTED, |r| r.state.exit_code());
             if json {
-                print_status_unreachable_json(&socket_path, &e, install_state.as_ref())?;
+                print_status_unreachable_json(&socket_path, &e, &failure, install_state.as_ref())?;
             } else {
-                print_status_unreachable_human(&socket_path, &e, install_state.as_ref());
+                print_status_unreachable_human(&socket_path, &e, &failure, install_state.as_ref());
             }
             std::process::exit(exit_code);
         }
@@ -635,12 +780,18 @@ fn resolve_reported_started_at(
 fn print_status_unreachable_json(
     socket_path: &Path,
     err: &anyhow::Error,
+    failure: &StatusFailure,
     install_state: Option<&InstallStateReport>,
 ) -> Result<()> {
     let now = chrono::Utc::now();
     let mut payload = serde_json::json!({
         "error": format!("could not reach loom-daemon at {}: {err}", socket_path.display()),
         "observed_at": watchdog_utc_stamp(now),
+        "daemon_responding": false,
+        "socket": socket_path.display().to_string(),
+        "request": failure.request,
+        "timeout": failure.timeout,
+        "ping": failure.ping_summary(),
     });
     if let Some(r) = install_state {
         let started_at =
@@ -695,10 +846,16 @@ fn print_status_unreachable_json(
 fn print_status_unreachable_human(
     socket_path: &Path,
     err: &anyhow::Error,
+    failure: &StatusFailure,
     install_state: Option<&InstallStateReport>,
 ) {
     let now = chrono::Utc::now();
     eprintln!("Could not reach loom-daemon at {}: {err}", socket_path.display());
+    // #15316: name exactly what failed, so the "not responding" conclusion
+    // below is checkable rather than asserted.
+    eprintln!("  socket:  {}", socket_path.display());
+    eprintln!("  request: {} (timeout {})", failure.request, failure.timeout);
+    eprintln!("  second request (Ping): {}", failure.ping_summary());
     eprintln!(
         "Observed at {} (UTC — the same clock and format the watchdog log stamps \
          every line with; use it to line this report up against that log).",
@@ -1681,8 +1838,101 @@ mod degraded_journal_tests {
     }
 }
 
+#[cfg(test)]
+mod ping_probe_tests {
+    //! #15316: a failed status query must not be reported as "not responding"
+    //! when a lighter request still gets answered.
+    use super::{
+        query_daemon_status, render_status_responding_human, resolve_status_timeout, StatusFailure,
+    };
+    use crate::types::{Request, Response};
+    use std::time::Duration;
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    use tokio::net::UnixListener;
+
+    /// Stub daemon: answers `Ping` with `Pong`, accepts anything else and then
+    /// never replies (the "slow `DaemonStatus` build" shape).
+    fn spawn_ping_only_daemon(listener: UnixListener) -> tokio::task::JoinHandle<()> {
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((stream, _)) = listener.accept().await {
+                let (reader, mut writer) = stream.into_split();
+                let mut lines = BufReader::new(reader).lines();
+                let Ok(Some(line)) = lines.next_line().await else {
+                    continue;
+                };
+                if let Ok(Request::Ping) = serde_json::from_str::<Request>(&line) {
+                    let json = serde_json::to_string(&Response::Pong).expect("serialize");
+                    writer.write_all(json.as_bytes()).await.expect("write");
+                    writer.write_all(b"\n").await.expect("newline");
+                    writer.flush().await.expect("flush");
+                }
+                held.push((lines, writer));
+            }
+        })
+    }
+
+    #[tokio::test]
+    async fn responsive_daemon_with_slow_status_is_classified_responding() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let socket_path = dir.path().join("daemon.sock");
+        let server = spawn_ping_only_daemon(UnixListener::bind(&socket_path).expect("bind"));
+
+        let timeout_info = resolve_status_timeout(Some(1));
+        let err = query_daemon_status(&socket_path, &timeout_info)
+            .await
+            .expect_err("stub never answers DaemonStatus");
+        assert!(err.to_string().contains("timed out"), "got: {err}");
+
+        let failure = StatusFailure::observe_with(
+            &socket_path,
+            &Request::DaemonStatus,
+            &timeout_info,
+            Duration::from_secs(2),
+        )
+        .await;
+        assert!(failure.daemon_responding(), "Ping was answered");
+
+        let banner = render_status_responding_human(&socket_path, &err, &failure);
+        assert!(banner.contains("IS responding"), "got: {banner}");
+        assert!(banner.contains(&socket_path.display().to_string()), "names socket: {banner}");
+        assert!(banner.contains("DaemonStatus"), "names request: {banner}");
+        assert!(banner.contains("timeout: 1s"), "names timeout: {banner}");
+        assert!(banner.contains("timed out"), "names error: {banner}");
+        assert!(
+            banner
+                .lines()
+                .any(|line| line.trim() == "loom-daemon status --json --section daemon_build"),
+            "missing section command: {banner}"
+        );
+        assert!(!banner.contains("restart"), "must not advise a restart: {banner}");
+        assert!(!banner.contains("not responding"), "got: {banner}");
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn absent_socket_keeps_unresponsive_classification() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let socket_path = dir.path().join("missing.sock");
+        let timeout_info = resolve_status_timeout(Some(1));
+        let failure = StatusFailure::observe_with(
+            &socket_path,
+            &Request::DaemonStatus,
+            &timeout_info,
+            Duration::from_millis(300),
+        )
+        .await;
+        assert!(!failure.daemon_responding());
+        assert!(
+            failure.ping_summary().contains("connect failed"),
+            "got: {}",
+            failure.ping_summary()
+        );
+    }
+}
+
 /// Issue #8224: the root-scaled floor `resolve_status_timeout` applies, in a
-/// sibling file so the over-threshold parent (`scripts/check-file-size-budget.sh`)
-/// does not grow — see `.loom/docs/file-size-policy.md`.
+/// sibling file.
 #[cfg(test)]
 mod root_scaled_timeout_tests;

@@ -1,6 +1,7 @@
 use super::*;
 use serde_json::json;
 use std::io::Read;
+use std::os::unix::fs::DirBuilderExt;
 use std::process::{Command, Stdio};
 
 #[derive(clap::Subcommand)]
@@ -44,6 +45,10 @@ pub enum WorkerCommand {
     /// location, preserving every branch and file (`accounts session
     /// rebind`, issue #14357).
     Rebind(RebindArgs),
+    /// The periodic seat reclaim (#14678): remove ended step scratch and
+    /// clean, published, merged-past-grace linked worktrees inside this
+    /// volume. Host-driven, under the seat lease, while the seat is idle.
+    SeatReclaim(super::seat_reclaim::SeatReclaimArgs),
     /// Git credential-helper protocol; output goes only to Git's private pipe.
     Credential {
         operation: String,
@@ -66,6 +71,12 @@ pub struct PrepareArgs {
     /// cloned at `<volume>/work/<slug>`. Absent: the legacy `<volume>/repo`.
     #[arg(long)]
     pub slug: Option<String>,
+    /// The read-only origin object mirror this clone borrows published
+    /// objects through (#14680): `MIRRORS/<slug>/objects`, bound by the host
+    /// and recorded in the container's mount inventory. Absent: the clone
+    /// keeps fully private Git objects.
+    #[arg(long)]
+    pub mirror_objects: Option<String>,
 }
 
 #[derive(clap::Args)]
@@ -90,6 +101,15 @@ pub struct RecoverArgs {
     /// Scope the action to a named branch (repeatable).
     #[arg(long, value_name = "BRANCH")]
     pub branch: Vec<String>,
+    /// With `--discard`: remove this linked worktree (repeatable) and whatever
+    /// uncommitted or untracked files it holds, when nothing at its HEAD is
+    /// unpublished (#14458). Never deletes a branch; never touches a worktree
+    /// it was not named for.
+    #[arg(long, value_name = "PATH", requires = "discard", conflicts_with_all = ["branch", "issue"])]
+    pub worktree: Vec<PathBuf>,
+    /// Validate which paths this clone owns before a cross-clone discard.
+    #[arg(long, requires = "worktree", hide = true)]
+    pub validate_worktrees: bool,
     /// Collision-safe directory name of an additional repository (#10795).
     /// Absent: the legacy `<volume>/repo`.
     #[arg(long)]
@@ -155,14 +175,7 @@ impl WorkerCommand {
             Self::Execute { command } => worker_setup::execute(command)?,
             Self::Prepare(args) => {
                 repository_url(&args.repository)?;
-                match prepare(Path::new(ROOT), &args) {
-                    Ok(revision) => {
-                        println!("{}", json!({"protocol": PROTOCOL, "revision": revision}))
-                    }
-                    Err(error) => {
-                        println!("{}", json!({"protocol": PROTOCOL, "error": error.to_string()}))
-                    }
-                }
+                println!("{}", prepare_response(prepare(Path::new(ROOT), &args)));
             }
             Self::Recover(args) => {
                 repository_url(&args.repository)?;
@@ -189,6 +202,22 @@ impl WorkerCommand {
                     }
                 }
             }
+            Self::SeatReclaim(args) => {
+                let lookup = seat_reclaim::github_pr_at_head;
+                match seat_reclaim::seat_reclaim(
+                    Path::new(ROOT),
+                    &args,
+                    &lookup,
+                    chrono::Utc::now(),
+                ) {
+                    Ok(outcome) => {
+                        println!("{}", json!({"protocol": PROTOCOL, "outcome": outcome}))
+                    }
+                    Err(error) => {
+                        println!("{}", json!({"protocol": PROTOCOL, "error": error.to_string()}))
+                    }
+                }
+            }
             Self::Credential { operation } => credential(&operation)?,
         }
         Ok(())
@@ -207,7 +236,7 @@ fn helper_cause(stderr: &[u8]) -> Option<&'static str> {
     HELPER_CAUSES.into_iter().find(|cause| text.contains(cause))
 }
 
-fn git(root: &Path, args: &[&str]) -> Result<String> {
+pub(super) fn git(root: &Path, args: &[&str]) -> Result<String> {
     let result = Command::new("git")
         .arg("-C")
         .arg(root)
@@ -239,10 +268,116 @@ fn git(root: &Path, args: &[&str]) -> Result<String> {
     String::from_utf8(result.stdout).context("workspace Git returned invalid text")
 }
 
-pub(super) fn prepare(root: &Path, args: &PrepareArgs) -> Result<String> {
+/// What one `prepare` resolved, plus the finished-PR linked worktrees its
+/// automatic reap removed (display paths, same form as
+/// `RecoverOutcome::removed_worktrees`).
+#[derive(Clone, Debug, PartialEq)]
+pub(super) struct PrepareOutcome {
+    pub(super) revision: String,
+    pub(super) reaped: Vec<String>,
+}
+
+#[derive(Debug)]
+pub(super) struct PrepareFailure {
+    error: anyhow::Error,
+    reaped: Vec<String>,
+}
+
+impl std::fmt::Display for PrepareFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(&self.error, f)
+    }
+}
+
+impl std::error::Error for PrepareFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.error.as_ref())
+    }
+}
+
+pub(super) fn prepare_response(
+    outcome: Result<PrepareOutcome, PrepareFailure>,
+) -> serde_json::Value {
+    match outcome {
+        Ok(outcome) => json!({
+            "protocol": PROTOCOL,
+            "revision": outcome.revision,
+            "reaped_worktrees": outcome.reaped,
+        }),
+        Err(failure) => json!({
+            "protocol": PROTOCOL,
+            "error": failure.to_string(),
+            "reaped_worktrees": failure.reaped,
+        }),
+    }
+}
+
+pub(super) fn prepare(root: &Path, args: &PrepareArgs) -> Result<PrepareOutcome, PrepareFailure> {
+    prepare_with_pr_lookup(root, args, &finished_pr, &crate::forge_etag_store::host_tmp_base())
+}
+
+/// The real lookup uses the credentials that the host already scopes to this
+/// clone's exec. Local tests supply a lookup and never contact a forge.
+pub(super) fn prepare_with_pr_lookup(
+    root: &Path,
+    args: &PrepareArgs,
+    has_finished_pr: &dyn Fn(&Path, &str, &str, &str) -> bool,
+    temp_base: &Path,
+) -> Result<PrepareOutcome, PrepareFailure> {
+    let mut reaped = Vec::new();
+    match prepare_revision(root, args, has_finished_pr, temp_base, &mut reaped) {
+        Ok(revision) => Ok(PrepareOutcome { revision, reaped }),
+        Err(error) => Err(PrepareFailure { error, reaped }),
+    }
+}
+
+/// Probe that [`temp_base`] can hold a private directory and a file in it
+/// (#14929). A full or read-only seat temp dir previously surfaced as a
+/// misleading `workspace Git fetch failed (…128)` or dirty-clone refusal;
+/// refusing here names the actual cause before any clone work is touched,
+/// and no Loom state directory is ever created in the job's working
+/// directory as a fallback (the resolved base stays absolute — see
+/// [`crate::forge_etag_store::host_tmp_base`]).
+fn require_writable_temp(temp_base: &Path) -> Result<()> {
+    let probe = temp_base.join(format!("loom-temp-probe-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&probe);
+    let probed = std::fs::DirBuilder::new()
+        .mode(0o700)
+        .create(&probe)
+        .and_then(|()| std::fs::write(probe.join("writable"), b""));
+    let _ = std::fs::remove_dir_all(&probe);
+    match probed {
+        Ok(()) => Ok(()),
+        Err(error) => bail!(
+            "{SEAT_TEMP_UNWRITABLE_REASON}: resolved temp directory {} is not writable ({error}); \
+             reclaim the seat's temp space (caches belong on its cache volume) before retrying",
+            temp_base.display()
+        ),
+    }
+}
+
+fn prepare_revision(
+    root: &Path,
+    args: &PrepareArgs,
+    has_finished_pr: &dyn Fn(&Path, &str, &str, &str) -> bool,
+    temp_base: &Path,
+    reaped: &mut Vec<String>,
+) -> Result<String> {
     valid_base(&args.base)?;
+    require_writable_temp(temp_base)?;
     if args.account.is_empty() || args.container_id.is_empty() {
         bail!("workspace account and container identity are required");
+    }
+    // Before any mutation: a mirror path may only ever be this repository's
+    // own canonical mirror location, never another repository's or an
+    // arbitrary objects directory (#14680).
+    if let Some(objects) = &args.mirror_objects {
+        if mirror_alternate(&args.repository).as_deref() != Some(objects.as_str()) {
+            bail!(
+                "object mirror {objects} is not this repository's own read-only origin mirror; \
+                 refusing to borrow another repository's objects"
+            );
+        }
     }
     let root = root.canonicalize()?;
     let (repo, record, staging) = match &args.slug {
@@ -279,6 +414,13 @@ pub(super) fn prepare(root: &Path, args: &PrepareArgs) -> Result<String> {
         save(&record, &identity)?;
         identity
     };
+    // Whether THIS call performed the clone: a clone we just made carries no
+    // work yet, so its alternates file is ours to normalize rather than a
+    // foreign one to refuse (#14680).
+    let fresh_clone = match &staging {
+        Some(_) => repo.symlink_metadata().is_err(),
+        None => !repo.exists(),
+    };
     if let Some(staging) = &staging {
         if repo.symlink_metadata().is_err() {
             // A staging directory is only ever a clone that never completed:
@@ -286,40 +428,21 @@ pub(super) fn prepare(root: &Path, args: &PrepareArgs) -> Result<String> {
             // no work and is safe to discard (a ready clone is never staged).
             discard_staging(staging)?;
             let relative = staging.strip_prefix(&root)?.to_string_lossy().into_owned();
-            git(
-                &root,
-                &[
-                    "clone",
-                    "--no-local",
-                    "--no-hardlinks",
-                    "--",
-                    &args.repository,
-                    &relative,
-                ],
-            )?;
+            git(&root, &clone_args(&args.repository, &relative, args.mirror_objects.as_deref())?)?;
             // The ready path appears only once the clone is complete.
             std::fs::rename(staging, &repo)?;
         }
     } else if !repo.exists() {
-        git(
-            &root,
-            &[
-                "clone",
-                "--no-local",
-                "--no-hardlinks",
-                "--",
-                &args.repository,
-                "repo",
-            ],
-        )?;
+        git(&root, &clone_args(&args.repository, "repo", args.mirror_objects.as_deref())?)?;
     }
+    let borrow = args.mirror_objects.clone();
     if !repo.join(".git").is_dir()
         || repo.canonicalize()? != repo
         || repo.join(".git").canonicalize()? != repo.join(".git")
-        || repo.join(".git/objects/info/alternates").exists()
     {
-        bail!("workspace must own a real clone and private Git objects, without symlinks or alternates");
+        bail!("workspace must own a real clone and private Git objects, without symlinks");
     }
+    verify_alternates(&repo, args.mirror_objects.as_deref())?;
     private_metadata(&repo.join(".git"))?;
     if Path::new(git(&repo, &["rev-parse", "--show-toplevel"])?.trim()).canonicalize()? != repo {
         bail!("workspace clone is not its own independent Git root");
@@ -327,8 +450,16 @@ pub(super) fn prepare(root: &Path, args: &PrepareArgs) -> Result<String> {
     if git(&repo, &["remote", "get-url", "origin"])?.trim() != args.repository {
         bail!("private clone origin changed; preserve work and restore its verified identity");
     }
-    clean_worktrees(&root, &repo)?;
+    // A fresh clone borrows from its mirror: normalize the alternate git
+    // wrote (or establish it), then shed the local copies. An existing clone
+    // migrates in place through the same idempotent step, keeping every ref,
+    // the index, linked worktrees and unpublished commits (#14680).
+    if let Some(objects) = borrow {
+        borrow_published(&repo, &objects, fresh_clone)?;
+    }
     git(&repo, &["fetch", "--prune", "origin"])?;
+    reap_finished_worktrees(&root, &repo, &args.repository, has_finished_pr, reaped)?;
+    clean_worktrees(&root, &repo, &args.account)?;
     // Unpublished commits are only stranded when no branch names them:
     // preparation never moves a branch (a resumed one keeps its local tip)
     // and never touches another one, so work carried by a branch ref
@@ -423,13 +554,139 @@ pub(super) fn prepare(root: &Path, args: &PrepareArgs) -> Result<String> {
     Ok(revision)
 }
 
+/// The `git clone` argument list, borrowing from the origin object mirror
+/// when one is bound (#14680): `--reference-if-able` names the mirror's own
+/// directory so a fresh clone announces the mirror's objects as haves and
+/// starts life with the alternate already in place. A reference git cannot
+/// use is skipped with a warning, and [`borrow_published`] below establishes
+/// or refuses the alternate regardless of what git wrote.
+fn clone_args<'a>(
+    repository: &'a str,
+    dest: &'a str,
+    mirror: Option<&'a str>,
+) -> Result<Vec<&'a str>> {
+    let mut args = vec!["clone", "--no-local", "--no-hardlinks"];
+    if let Some(objects) = mirror {
+        let reference = Path::new(objects)
+            .parent()
+            .context("object mirror path has no repository directory")?;
+        args.push("--reference-if-able");
+        args.push(
+            reference
+                .to_str()
+                .context("object mirror path is not valid UTF-8")?,
+        );
+    }
+    args.extend(["--", repository, dest]);
+    Ok(args)
+}
+
+/// The one alternate shape a clone may carry (#14680): no
+/// alternate at all (a private clone, always supported), or exactly the
+/// mirror objects path the caller authorized for THIS repository. Anything
+/// else — a second entry, a wrong path, an alternate with no authorized
+/// mirror — is refused, preserving the work in place. The caller decides
+/// what is authorized: preparation passes the mirror the host bound (or
+/// `None`, refusing every alternate), admission passes the repository's
+/// canonical mirror path.
+pub(super) fn verify_alternates(repo: &Path, mirror: Option<&str>) -> Result<()> {
+    let file = repo.join(".git/objects/info/alternates");
+    let content = match std::fs::read_to_string(&file) {
+        Ok(content) => content,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.into()),
+    };
+    let Some(expected) = mirror else {
+        bail!(
+            "workspace must own a real clone and private Git objects; its object alternate is \
+             not authorized for this session (a clone that already borrows needs its mirror \
+             bind back: restore the mirror, or re-enable accounts.session.objectMirrors)"
+        );
+    };
+    if content.lines().count() > 1 || content.trim() != expected {
+        bail!(
+            "workspace must own a real clone and private Git objects; its object alternate must \
+             name exactly this repository's read-only origin mirror"
+        );
+    }
+    Ok(())
+}
+
+/// Marker recording that a clone finished borrowing from its mirror: present
+/// together with a matching alternates file, it makes re-preparation skip
+/// straight past the migration; absent (an interrupted migration), the whole
+/// idempotent step simply runs again.
+const MIRROR_MIGRATED: &str = ".git/objects/info/loom-migrated";
+
+/// Make `repo` borrow its repository's published objects from the mirror at
+/// `objects`, shedding the local copies (#14680). Every step is idempotent
+/// and ordered so an interruption is retried safely: the alternate is
+/// verified and written first, `repack -a -d -l` then rewrites only the
+/// local store (`-l` never pulls borrowed objects back in) and drops the
+/// local duplicates, and `fsck --full` proves object connectivity through
+/// the borrowed store before the completion marker is written.
+///
+/// `fresh`: the caller performed the clone in this same call, so git's own
+/// `--reference-if-able` output is normalized rather than treated as
+/// foreign. Any other pre-existing alternate content is refused, never
+/// overwritten.
+pub(super) fn borrow_published(repo: &Path, objects: &str, fresh: bool) -> Result<()> {
+    let alternates = repo.join(".git/objects/info/alternates");
+    let current = std::fs::read_to_string(&alternates).ok();
+    let settled = current.as_deref().is_some_and(|c| c.trim() == objects)
+        && std::fs::read_to_string(repo.join(MIRROR_MIGRATED))
+            .map(|m| m.trim() == objects)
+            .unwrap_or(false);
+    if settled {
+        return Ok(());
+    }
+    if let Some(current) = &current {
+        if !(fresh || current.trim() == objects) {
+            bail!(
+                "private clone carries a foreign object alternate; retain it for recovery \
+                 instead of re-pointing it"
+            );
+        }
+    }
+    // Verify the alternate BEFORE repacking against it: a missing, symlinked
+    // or indirect mirror must refuse the migration, not strand the clone.
+    let mirror = Path::new(objects);
+    let metadata = std::fs::symlink_metadata(mirror)
+        .with_context(|| format!("origin object mirror {objects} is not mounted"))?;
+    if !metadata.is_dir()
+        || mirror
+            .canonicalize()
+            .with_context(|| format!("origin object mirror {objects} is not a real directory"))?
+            != mirror
+    {
+        bail!("origin object mirror {objects} must be a real directory, not a link");
+    }
+    if mirror.join("info/alternates").exists() {
+        bail!("origin object mirror {objects} carries its own alternates; indirect mirrors are refused");
+    }
+    std::fs::create_dir_all(
+        alternates
+            .parent()
+            .context("alternates file has no parent directory")?,
+    )?;
+    std::fs::write(&alternates, format!("{objects}\n"))?;
+    // Local-only repack: borrowed objects stay borrowed, local duplicates of
+    // published objects are dropped, and unpublished work stays local.
+    git(repo, &["repack", "-a", "-d", "-l"])?;
+    // Connectivity through the borrowed store is the migration's proof:
+    // every ref of this clone must resolve through mirror + local objects.
+    git(repo, &["fsck", "--full"])?;
+    std::fs::write(repo.join(MIRROR_MIGRATED), format!("{objects}\n"))?;
+    Ok(())
+}
+
 /// Worktree HEADs (the main checkout included) whose detached HEAD carries
 /// commits no ref of `origin` reaches: preparation could leave them unnamed.
 pub(super) fn stranded_heads(repo: &Path) -> Result<Vec<DetachedWork>> {
     let mut stranded = Vec::new();
     for worktree in worktrees(repo)? {
-        // `rev-parse --abbrev-ref HEAD` answers `HEAD` only when detached.
-        if git(&worktree, &["rev-parse", "--abbrev-ref", "HEAD"])?.trim() != "HEAD" {
+        // `current_branch` answers `None` only when detached.
+        if current_branch(&worktree)?.is_some() {
             continue;
         }
         let ahead = ahead_of_origin(&worktree, "HEAD")?;
@@ -454,7 +711,7 @@ pub(super) fn holding_worktree(repo: &Path, branch: &str) -> Result<Option<PathB
         if worktree.canonicalize()? == main {
             continue;
         }
-        if git(&worktree, &["rev-parse", "--abbrev-ref", "HEAD"])?.trim() == branch {
+        if current_branch(&worktree)?.as_deref() == Some(branch) {
             return Ok(Some(worktree));
         }
     }
@@ -502,16 +759,41 @@ pub(super) fn held_branch_refusal(
     Ok(message)
 }
 
+/// Every local branch of `repo` as `(full ref, branch name)`, enumerated by
+/// full refname with the single `refs/heads/` prefix stripped once: PR-fetch
+/// residue (`refs/<name>`, `refs/remotes/<name>`) cannot shorten
+/// `refs/heads/<name>` into the non-name `heads/<name>` the way
+/// `%(refname:short)` does (#15027).
+fn local_branch_refs(repo: &Path) -> Result<Vec<(String, String)>> {
+    let refs = git(repo, &["for-each-ref", "--format=%(refname)", "refs/heads/"])?;
+    Ok(refs
+        .lines()
+        .map(str::trim)
+        .filter(|r| !r.is_empty())
+        .filter_map(|r| {
+            r.strip_prefix("refs/heads/")
+                .map(|name| (r.to_owned(), name.to_owned()))
+        })
+        .collect())
+}
+
+/// The branch checked out at `path`, or `None` when detached. `git branch
+/// --show-current` prints the true name where `rev-parse --abbrev-ref HEAD`
+/// shortens a residue-shadowed branch to `heads/<name>` (#15027).
+pub(super) fn current_branch(path: &Path) -> Result<Option<String>> {
+    let name = git(path, &["branch", "--show-current"])?.trim().to_owned();
+    Ok((!name.is_empty()).then_some(name))
+}
+
 /// Every local branch with commits no remote-tracking ref of `origin`
 /// reaches, with its ahead count.
 pub(super) fn unpublished_branches(repo: &Path) -> Result<Vec<UnpublishedBranch>> {
-    let names = git(repo, &["for-each-ref", "--format=%(refname:short)", "refs/heads"])?;
     let mut unpublished = Vec::new();
-    for name in names.lines().map(str::trim).filter(|name| !name.is_empty()) {
-        let ahead = ahead_of_origin(repo, &format!("refs/heads/{name}"))?;
+    for (full_ref, name) in local_branch_refs(repo)? {
+        let ahead = ahead_of_origin(repo, &full_ref)?;
         if ahead > 0 {
             unpublished.push(UnpublishedBranch {
-                branch: name.to_owned(),
+                branch: name,
                 ahead,
             });
         }
@@ -519,13 +801,12 @@ pub(super) fn unpublished_branches(repo: &Path) -> Result<Vec<UnpublishedBranch>
     Ok(unpublished)
 }
 
-fn ahead_of_origin(repo: &Path, revision: &str) -> Result<u64> {
+pub(super) fn ahead_of_origin(repo: &Path, revision: &str) -> Result<u64> {
     git(repo, &["rev-list", "--count", revision, "--not", "--remotes=origin"])?
         .trim()
         .parse::<u64>()
         .context("workspace Git returned a non-numeric ahead count")
 }
-
 /// The clone paths a `recover` call acts on. Unlike `additional_paths` this
 /// never creates anything: a clone that was never materialized has nothing
 /// to recover.
@@ -563,6 +844,8 @@ fn empty_outcome(repository: &str) -> RecoverOutcome {
         discarded: Vec::new(),
         ignored: Vec::new(),
         detached: Vec::new(),
+        dirty_worktrees: Vec::new(),
+        removed_worktrees: Vec::new(),
     }
 }
 
@@ -571,9 +854,22 @@ fn empty_outcome(repository: &str) -> RecoverOutcome {
 /// branch scope, deletes only branches it was named for, and never removes
 /// the volume or moves a branch ref other than the ones being discarded.
 pub(super) fn recover(root: &Path, args: &RecoverArgs) -> Result<RecoverOutcome> {
+    if !args.worktree.is_empty() && (!args.branch.is_empty() || args.issue.is_some()) {
+        bail!("discard accepts a worktree scope or a branch/issue scope, separately");
+    }
     let (repo, record) = recover_paths(root, args)?;
     if !repo.join(".git").is_dir() {
-        return Ok(empty_outcome(&args.repository));
+        let mut outcome = empty_outcome(&args.repository);
+        if args.validate_worktrees {
+            outcome.ignored = args
+                .worktree
+                .iter()
+                .map(|path| path.display().to_string())
+                .collect();
+        } else if !args.worktree.is_empty() {
+            bail!("named worktree is unavailable in this clone");
+        }
+        return Ok(outcome);
     }
     let identity: Identity = serde_json::from_slice(&std::fs::read(&record)?)?;
     if identity.protocol != PROTOCOL
@@ -590,7 +886,25 @@ pub(super) fn recover(root: &Path, args: &RecoverArgs) -> Result<RecoverOutcome>
         discarded: Vec::new(),
         ignored: Vec::new(),
         detached: stranded_heads(&repo)?,
+        dirty_worktrees: Vec::new(),
+        removed_worktrees: Vec::new(),
     };
+    if !args.worktree.is_empty() {
+        let targets = named_worktrees(root, &repo, &args.worktree, &mut outcome.ignored)?;
+        if args.validate_worktrees {
+            return Ok(outcome);
+        }
+        if !args.discard || !outcome.ignored.is_empty() {
+            bail!(
+                "discard requires paths in this clone; unavailable: {}",
+                outcome.ignored.join(", ")
+            );
+        }
+        for path in targets {
+            git(&repo, &["worktree", "remove", "--force", &path.display().to_string()])?;
+            outcome.removed_worktrees.push(path.display().to_string());
+        }
+    }
     let mut scope = args.branch.clone();
     if let Some(issue) = args.issue {
         let name = format!("feature/issue-{issue}");
@@ -599,13 +913,13 @@ pub(super) fn recover(root: &Path, args: &RecoverArgs) -> Result<RecoverOutcome>
     }
     scope.sort();
     scope.dedup();
-    if args.discard && scope.is_empty() {
-        bail!("discard requires an explicit branch scope (--branch BRANCH or --issue N)");
+    if args.discard && scope.is_empty() && args.worktree.is_empty() {
+        bail!("discard requires an explicit scope (--branch BRANCH, --issue N or --worktree PATH)");
     }
     if !scope.is_empty() {
-        let local = git(&repo, &["for-each-ref", "--format=%(refname:short)", "refs/heads"])?;
+        let local = local_branch_refs(&repo)?;
         for name in &scope {
-            if !local.lines().any(|line| line.trim() == name) {
+            if !local.iter().any(|(_, local)| local == name) {
                 outcome.ignored.push(name.clone());
             }
         }
@@ -628,7 +942,7 @@ pub(super) fn recover(root: &Path, args: &RecoverArgs) -> Result<RecoverOutcome>
             publish(&repo, name)?;
             outcome.published.push(name.clone());
         }
-    } else if args.discard {
+    } else if args.discard && !scope.is_empty() {
         // A scoped branch with nothing unpublished is left alone: deleting a
         // published (or absent) branch is never part of a discard.
         let targets: Vec<String> = scope
@@ -657,6 +971,7 @@ pub(super) fn recover(root: &Path, args: &RecoverArgs) -> Result<RecoverOutcome>
     }
     outcome.branches = unpublished_branches(&repo)?;
     outcome.detached = stranded_heads(&repo)?;
+    outcome.dirty_worktrees = dirty_worktrees(root, &repo)?;
     Ok(outcome)
 }
 
@@ -900,7 +1215,7 @@ fn holds_of(repo: &Path, branches: &[String]) -> Result<Holds> {
     };
     for name in branches {
         for worktree in worktrees(repo)? {
-            if git(&worktree, &["rev-parse", "--abbrev-ref", "HEAD"])?.trim() != name {
+            if current_branch(&worktree)?.as_deref() != Some(name.as_str()) {
                 continue;
             }
             let is_main = worktree.canonicalize()? == main;
@@ -1044,59 +1359,234 @@ pub(super) fn firewalled(id: &RepoId, records: &[(String, Option<String>)]) -> b
 }
 
 fn worktrees(repo: &Path) -> Result<Vec<PathBuf>> {
-    Ok(git(repo, &["worktree", "list", "--porcelain", "-z"])?
-        .split('\0')
-        .filter_map(|field| field.strip_prefix("worktree "))
-        .map(PathBuf::from)
+    Ok(worktree_entries(repo)?
+        .into_iter()
+        .map(|entry| entry.path)
         .collect())
 }
 
-/// An untracked `.loom/lease-renew/.lock` has been observed in seat clones
-/// (#14160): runtime residue, not stranded work, so it must never refuse
-/// preparation. The writer is not traced (#14226): the store
-/// (`Store::from_env`) defaults to `$HOME/.loom/lease-renew`, and the seat
-/// container's `$HOME` is `/home/loom`, not the clone root. The seat env sets
-/// `LOOM_LEASE_RENEW_STATE_DIR` so store writes land on the cache volume; the
-/// exclude forgives residue whatever wrote it, including from an older
-/// container.
-const LEASE_RENEW_EXCLUDE: &str = ":(exclude).loom/lease-renew";
+pub(super) struct WorktreeEntry {
+    pub(super) path: PathBuf,
+    pub(super) locked: bool,
+}
+
+pub(super) fn worktree_entries(repo: &Path) -> Result<Vec<WorktreeEntry>> {
+    Ok(git(repo, &["worktree", "list", "--porcelain", "-z"])?
+        .split("\0\0")
+        .filter_map(|record| {
+            let mut fields = record.split('\0');
+            let path = PathBuf::from(fields.next()?.strip_prefix("worktree ")?);
+            let locked = fields.any(|field| field == "locked" || field.starts_with("locked "));
+            Some(WorktreeEntry { path, locked })
+        })
+        .collect())
+}
 
 /// The dirty refusal names at most this many paths, so an operator can tell
 /// stranded work from residue without exhausting the message (#14160).
 const DIRTY_PATH_LIMIT: usize = 10;
 
-fn clean_worktrees(root: &Path, repo: &Path) -> Result<()> {
-    for path in worktrees(repo)? {
-        if !path.canonicalize()?.starts_with(root) {
+/// Ignore only untracked Loom runtime residue (#14160) and tool caches
+/// (#14458). Porcelain v1 C-quotes special path bytes, including newlines,
+/// keeping each changed path on a single line. Both prefixes are literal in
+/// a quoted path, so status of any tracked edit is preserved verbatim.
+pub(super) fn worktree_status(path: &Path) -> Result<Vec<String>> {
+    let status = git(
+        path,
+        &[
+            "-c",
+            "core.quotePath=true",
+            "status",
+            "--porcelain=v1",
+            "--untracked-files=all",
+        ],
+    )?;
+    Ok(status
+        .lines()
+        .filter(|line| {
+            !line.strip_prefix("?? ").is_some_and(|path| {
+                let path = path.strip_prefix('"').unwrap_or(path);
+                path.starts_with(".loom/lease-renew/") || path.starts_with(".cache/")
+            })
+        })
+        .map(str::to_owned)
+        .collect())
+}
+
+fn clean_worktrees(root: &Path, repo: &Path, account: &str) -> Result<()> {
+    for WorktreeEntry { path, locked } in worktree_entries(repo)? {
+        let canonical = path.canonicalize()?;
+        if !canonical.starts_with(root) {
             bail!("worktree points outside the private volume; refuse reuse");
         }
-        let status = git(
-            &path,
-            &[
-                "status",
-                "--porcelain=v1",
-                "--untracked-files=all",
-                "--",
-                ".",
-                LEASE_RENEW_EXCLUDE,
-            ],
-        )?;
+        let status = worktree_status(&path)?;
         if status.is_empty() {
             continue;
         }
-        let total = status.lines().count();
         let mut detail = status
-            .lines()
+            .iter()
             .take(DIRTY_PATH_LIMIT)
+            .cloned()
             .collect::<Vec<_>>()
             .join("\n  ");
-        if total > DIRTY_PATH_LIMIT {
-            detail.push_str(&format!("\n  … and {} more", total - DIRTY_PATH_LIMIT));
+        if status.len() > DIRTY_PATH_LIMIT {
+            detail.push_str(&format!("\n  … and {} more", status.len() - DIRTY_PATH_LIMIT));
         }
+        let guidance = recovery_guidance(
+            account,
+            &path.display().to_string(),
+            canonical != repo && !locked && ahead_of_origin(&path, "HEAD")? == 0,
+        );
+        let account = crate::shell_quote::shell_quote(account);
         bail!(
-            "private clone/worktree is dirty; retain and recover its work before reuse ({}):\n  {detail}",
+            "{SEAT_DIRTY_REASON}: private clone/worktree is dirty; retain and recover its work before reuse ({}):\n  {detail}\n\
+             list every dirty worktree with `loom-daemon accounts session recover {account}`; {guidance}",
             path.display()
         );
+    }
+    Ok(())
+}
+
+/// Every worktree of the clone (the main checkout included) that
+/// [`worktree_status`] calls dirty, with its counts (#14458).
+fn dirty_worktrees(root: &Path, repo: &Path) -> Result<Vec<DirtyWorktree>> {
+    let root = root.canonicalize()?;
+    let main = repo.canonicalize()?;
+    let mut dirty = Vec::new();
+    for WorktreeEntry { path, locked } in worktree_entries(repo)? {
+        let status = worktree_status(&path)?;
+        if status.is_empty() {
+            continue;
+        }
+        let untracked = status.iter().filter(|line| line.starts_with("?? ")).count();
+        let branch = current_branch(&path)?;
+        let canonical = path.canonicalize()?;
+        let unpublished = ahead_of_origin(&path, "HEAD")?;
+        dirty.push(DirtyWorktree {
+            path: path.display().to_string(),
+            branch,
+            tracked: status.len() - untracked,
+            untracked,
+            unpublished,
+            discardable: canonical != main
+                && canonical.starts_with(&root)
+                && !locked
+                && unpublished == 0,
+        });
+    }
+    Ok(dirty)
+}
+
+/// Resolve the entire requested scope before removal. Unknown paths may be
+/// owned by a sibling clone; the host must account for every one before it
+/// asks any clone to remove its own. Aliases target one canonical worktree.
+fn named_worktrees(
+    root: &Path,
+    repo: &Path,
+    named: &[PathBuf],
+    ignored: &mut Vec<String>,
+) -> Result<Vec<PathBuf>> {
+    let root = root.canonicalize()?;
+    let main = repo.canonicalize()?;
+    let listed: Vec<_> = worktree_entries(repo)?
+        .into_iter()
+        .filter_map(|entry| Some((entry.path.canonicalize().ok()?, entry)))
+        .collect();
+    let mut seen = std::collections::HashSet::new();
+    let mut targets = Vec::new();
+    for want in named {
+        let wanted = want.canonicalize().ok();
+        let Some((canonical, entry)) = listed
+            .iter()
+            .find(|(path, _)| Some(path) == wanted.as_ref())
+        else {
+            ignored.push(want.display().to_string());
+            continue;
+        };
+        if !seen.insert(canonical) {
+            continue;
+        }
+        let path = &entry.path;
+        if *canonical == main {
+            bail!(
+                "{} is the clone's main checkout; save or resolve its changes in place",
+                path.display()
+            );
+        }
+        if entry.locked {
+            bail!("worktree {} is locked; save or resolve its changes in place", path.display());
+        }
+        if !canonical.starts_with(&root) {
+            bail!("worktree points outside the private volume; refuse removal");
+        }
+        let unpublished = ahead_of_origin(path, "HEAD")?;
+        if unpublished > 0 {
+            bail!(
+                "worktree {} carries {unpublished} unpublished commit(s); save or publish them before removing the worktree",
+                path.display()
+            );
+        }
+        targets.push(path.clone());
+    }
+    Ok(targets)
+}
+
+fn finished_pr(repo: &Path, repository: &str, branch: &str, tip: &str) -> bool {
+    let host = std::env::var("GH_HOST").unwrap_or_else(|_| "github.com".into());
+    let Some(slug) = super::forge_auth::github_slug(repository, &host) else {
+        return false;
+    };
+    crate::worktree_ops::clean_owner::finished_pr_at_head(repo, &host, &slug, branch, tip)
+}
+
+/// `(repository, account)` recorded for one clone by its identity record
+/// (the legacy primary's at the volume root, an additional clone's under
+/// `work/.identity/`), or `None` when no record exists. A record that exists
+/// but is invalid or foreign is an error — the caller preserves the clone.
+pub(super) fn recorded_identity(record: &Path) -> Result<Option<(String, String)>> {
+    match std::fs::read(record) {
+        Ok(bytes) => {
+            let identity: Identity = serde_json::from_slice(&bytes)
+                .context("invalid private clone identity; preserve state for operator recovery")?;
+            if identity.protocol != PROTOCOL {
+                bail!("private clone identity protocol mismatch; preserve state for operator recovery");
+            }
+            Ok(Some((identity.repository, identity.account)))
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error.into()),
+    }
+}
+
+/// Reclaim only an in-volume linked checkout whose tip is published and
+/// whose own repository and branch have a finished PR at that exact tip.
+/// Keep the branch ref and every commit. A missing, open or unreadable PR
+/// leaves the checkout for the usual recovery flow, even if Git ancestry
+/// alone would make its tip look merged.
+fn reap_finished_worktrees(
+    root: &Path,
+    repo: &Path,
+    repository: &str,
+    has_finished_pr: &dyn Fn(&Path, &str, &str, &str) -> bool,
+    reaped: &mut Vec<String>,
+) -> Result<()> {
+    for WorktreeEntry { path, locked } in worktree_entries(repo)? {
+        let canonical = path.canonicalize()?;
+        if locked || canonical == repo || !canonical.starts_with(root) {
+            continue;
+        }
+        let Some(branch) = current_branch(&path)? else {
+            continue;
+        };
+        if ahead_of_origin(&path, "HEAD")? > 0 {
+            continue;
+        }
+        let tip = git(&path, &["rev-parse", "HEAD"])?;
+        if has_finished_pr(repo, repository, &branch, tip.trim()) {
+            let display_path = path.display().to_string();
+            git(repo, &["worktree", "remove", "--force", &display_path])?;
+            reaped.push(display_path);
+        }
     }
     Ok(())
 }

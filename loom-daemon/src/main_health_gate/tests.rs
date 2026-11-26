@@ -3024,3 +3024,145 @@ fn test_global_credential_tracker_holds_a_real_tick_and_releases_it() {
 
     crate::credential_preflight::reset_forge_credential_streaks();
 }
+
+// ===================================================================
+// run_capture_with_timeout on proc_exec::run_bounded (#15006, #15001
+// slice B)
+//
+// The helper's contract is pinned end-to-end through real children: the
+// returned stdout string, the byte-identical historical error strings, the
+// process-group kill on timeout, and pipe draining for large outputs — the
+// properties the temp-file + `child.kill()` implementation used to provide
+// (plus the descendants fix it did not).
+// ===================================================================
+
+/// Pin the stdout contract: a real child that prints known bytes comes back
+/// byte-identical. The old implementation returned `fs::read_to_string` of a
+/// temp file; the new one decodes piped bytes with `String::from_utf8` — the
+/// two must agree for every caller of the helper.
+#[test]
+fn run_capture_with_timeout_returns_child_stdout_byte_identical() {
+    let dir = tempfile::tempdir().unwrap();
+    let out = run_capture_with_timeout(
+        "/bin/sh",
+        &["-c", "printf 'line-one\\nline-two\\n'"],
+        dir.path(),
+        Duration::from_secs(10),
+    )
+    .expect("sh must run and print");
+    assert_eq!(out, "line-one\nline-two\n", "stdout must be byte-identical, no more, no less");
+}
+
+/// A nonzero exit keeps the historical error-string shape (`` `{program}`
+/// exited with {status} ``), so callers matching on it keep working.
+#[test]
+fn run_capture_with_timeout_reports_nonzero_exit_with_historical_string() {
+    let dir = tempfile::tempdir().unwrap();
+    let err =
+        run_capture_with_timeout("/bin/sh", &["-c", "exit 3"], dir.path(), Duration::from_secs(10))
+            .unwrap_err();
+    assert!(
+        err.starts_with("`/bin/sh` exited with"),
+        "nonzero-exit error must keep the historical prefix, got: {err}"
+    );
+    assert!(
+        err.contains("exit status: 3"),
+        "the child's own exit status must be reported, got: {err}"
+    );
+}
+
+/// Spawn failure keeps the historical error-string shape
+/// (`could not spawn \`{program}\`: {e}`).
+#[test]
+fn run_capture_with_timeout_reports_spawn_failure_with_historical_string() {
+    let dir = tempfile::tempdir().unwrap();
+    let err = run_capture_with_timeout(
+        "loom-no-such-binary-15006",
+        &["--version"],
+        dir.path(),
+        Duration::from_secs(10),
+    )
+    .unwrap_err();
+    assert!(
+        err.starts_with("could not spawn `loom-no-such-binary-15006`:"),
+        "spawn-failure error must keep the historical prefix, got: {err}"
+    );
+}
+
+/// Non-UTF-8 stdout keeps the historical "could not read probe output"
+/// error-string shape (the old `fs::read_to_string` io::Error and the new
+/// `String::from_utf8` error differ in detail but not in prefix).
+#[test]
+fn run_capture_with_timeout_maps_non_utf8_stdout_onto_the_read_error_string() {
+    let dir = tempfile::tempdir().unwrap();
+    let err = run_capture_with_timeout(
+        "/bin/sh",
+        &["-c", r"printf 'a\377b'"],
+        dir.path(),
+        Duration::from_secs(10),
+    )
+    .unwrap_err();
+    assert!(
+        err.starts_with("could not read probe output:"),
+        "non-UTF-8 stdout must surface as the read-failure string, got: {err}"
+    );
+}
+
+/// A child that sleeps past the deadline returns the historical timeout
+/// string, and — the fix this slice exists for — a grandchild it spawned is
+/// gone: `run_bounded` terminates the child's whole process group, where the
+/// old `child.kill()` reached only the immediate child.
+#[test]
+#[cfg(unix)]
+fn run_capture_with_timeout_timeout_kills_the_process_group_including_grandchildren() {
+    let dir = tempfile::tempdir().unwrap();
+    let pidfile = dir.path().join("grandchild.pid");
+    let script = format!("/bin/sleep 120 & echo $! > {}; exec /bin/sleep 120", pidfile.display());
+    let err =
+        run_capture_with_timeout("/bin/sh", &["-c", &script], dir.path(), Duration::from_secs(1))
+            .unwrap_err();
+    assert_eq!(
+        err, "`/bin/sh` timed out after 1s",
+        "timeout error must stay byte-identical to the historical string"
+    );
+
+    // Give the group kill a moment to be reaped before asking.
+    std::thread::sleep(Duration::from_millis(300));
+
+    let pid: i32 = std::fs::read_to_string(&pidfile)
+        .expect("grandchild must have recorded its pid")
+        .trim()
+        .parse()
+        .expect("pid must parse");
+    assert!(pid > 0, "fixture must capture a real pid");
+
+    // SAFETY: signal 0 performs error checking only; it never delivers a signal.
+    let alive = unsafe { libc::kill(pid as libc::pid_t, 0) } == 0;
+    if alive {
+        // Do not leak the process if the assertion is about to fail.
+        unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) };
+    }
+    assert!(
+        !alive,
+        "grandchild pid {pid} outlived the deadline — the timeout killed only the immediate child"
+    );
+}
+
+/// A child writing more than the pipe buffer (>64 KiB) to stdout completes
+/// without deadlock. The old implementation avoided the deadlock with a temp
+/// file; the new one drains the pipe concurrently — output volume must stay
+/// indistinguishable from a fast exit.
+#[test]
+fn run_capture_with_timeout_completes_large_stdout_without_deadlock() {
+    const SIZE: usize = 256 * 1024;
+    let dir = tempfile::tempdir().unwrap();
+    let out = run_capture_with_timeout(
+        "/bin/sh",
+        &["-c", &format!("head -c {SIZE} /dev/zero | tr '\\0' 'x'")],
+        dir.path(),
+        Duration::from_secs(30),
+    )
+    .expect("a large payload must complete, not hang and time out");
+    assert_eq!(out.len(), SIZE, "every byte must be captured, not just the first pipe-full");
+    assert!(out.chars().all(|c| c == 'x'), "payload must survive intact");
+}

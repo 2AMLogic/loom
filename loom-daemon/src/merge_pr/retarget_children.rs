@@ -331,14 +331,11 @@ impl Forge for GhForge {
     }
 
     fn rebase_child(&self, repo: &str, number: i64, parent_branch: &str) -> Result<(), String> {
-        use std::os::unix::fs::PermissionsExt;
         if self.script_dir.is_empty() {
             return Err("no --script-dir given".to_string());
         }
         let script = std::path::Path::new(&self.script_dir).join("reconcile-stack.sh");
-        if !std::fs::metadata(&script)
-            .is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
-        {
+        if !crate::fs_util::is_executable(&script) {
             return Err(format!("{} is not executable", script.display()));
         }
         let out = std::process::Command::new(&script)

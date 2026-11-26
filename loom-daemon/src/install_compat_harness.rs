@@ -35,6 +35,17 @@
 //! definition of "this script calls the daemon". A pair the file marks
 //! `optional` is skipped: the script probes for it and degrades.
 //!
+//! A pair may carry a verb path, not just the subcommand (#14985): for a
+//! call whose subcommand the file hard-floors (`# requires-daemon: <sub> >=
+//! <version>`) the detector emits `<sub> <verb>…` (`session-exec
+//! claude-seat`) and the probe runs `<daemon> <sub> <verb> --help`. A floor
+//! naming a release that lacks the verb — the number a PR must guess before
+//! its merge, and which goes stale every time `main` releases first — then
+//! fails direction B as soon as a release at or above the floor publishes,
+//! instead of surviving to a review finding. Unfloored calls keep the single
+//! token, and the `optional` skip matches a path's first token, the level
+//! the marker grammar floors.
+//!
 //! A violated claim is a [`Report::violations`] entry, and the CLI exits 1.
 //!
 //! A sibling of [`crate::install_compat`], not a child of it, on purpose:
@@ -308,7 +319,7 @@ fn direction_a(
     let scripts = installed_shell_files(&prev_tree)?;
     let label = format!("A ({prev_ref} installed files vs new daemon)");
     let gaps = probe.missing_subcommands(&opts.repo_root, &opts.new_daemon, &scripts)?;
-    record_gaps(&label, &gaps, &prev_tree, report);
+    record_gaps(&label, &opts.new_daemon, &gaps, &prev_tree, report);
     record_absent_files(&label, &opts.invoked_files, &prev_tree, report);
     report.notes.push(gaps.summary(&label, scripts.len()));
     Ok(())
@@ -393,7 +404,7 @@ fn direction_b(
         (label, opts.new_daemon.clone(), opts.invoked_files.clone())
     };
     let gaps = probe.missing_subcommands(&opts.repo_root, &daemon, scripts)?;
-    record_gaps(&label, &gaps, new_tree, report);
+    record_gaps(&label, &daemon, &gaps, new_tree, report);
     record_absent_files(&label, &invoked, new_tree, report);
     report.notes.push(gaps.summary(&label, scripts.len()));
     Ok(())
@@ -518,11 +529,12 @@ fn old_invoked_files(
     }
 }
 
-fn record_gaps(label: &str, gaps: &Gaps, tree: &Path, report: &mut Report) {
+fn record_gaps(label: &str, daemon: &Path, gaps: &Gaps, tree: &Path, report: &mut Report) {
     for (sub, files) in &gaps.missing {
         let users: Vec<String> = files.iter().map(|f| display(f, tree)).collect();
         report.violations.push(format!(
-            "{label}: daemon has no `{sub}` subcommand, called by {}",
+            "{label}: daemon {} has no `{sub}` subcommand, called by {}",
+            daemon.display(),
             users.join(", ")
         ));
     }
@@ -544,7 +556,8 @@ fn record_absent_files(label: &str, invoked: &[String], tree: &Path, report: &mu
     }
 }
 
-/// What `<daemon> <sub> --help` says about one subcommand (#10868).
+/// What `<daemon> <sub> [<verb> …] --help` says about one subcommand or verb
+/// path (#10868; verb paths: #14985).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Probed {
     /// The daemon has it.
@@ -610,7 +623,9 @@ impl Gaps {
     }
 }
 
-/// `<daemon> <sub> --help` results, cached per binary and subcommand.
+/// `<daemon> <sub> [<verb> …] --help` results, cached per binary and
+/// subcommand-or-verb-path (`sub` is the detector's path string; its tokens
+/// become separate argv entries, #14985).
 #[derive(Default)]
 struct Probe {
     seen: HashMap<(PathBuf, String), Probed>,
@@ -631,7 +646,8 @@ impl Probe {
             return known.clone();
         }
         let outcome = Command::new(daemon)
-            .args([sub, "--help"])
+            .args(sub.split_whitespace())
+            .arg("--help")
             .stdin(Stdio::null())
             .output();
         let result = classify_probe(&outcome);
@@ -694,7 +710,9 @@ pub fn subcommand_unrecognized(stderr: &str) -> bool {
 }
 
 /// Every `(file, subcommand)` the detector finds in `scripts`, minus the
-/// subcommands a file marks `optional`.
+/// subcommands a file marks `optional`. A pair's subcommand may be a verb
+/// path (`session-exec claude-seat`, #14985); the marker grammar floors the
+/// SUBCOMMAND, so the skip matches the path's first token.
 fn hard_pairs(repo_root: &Path, scripts: &[PathBuf]) -> Result<BTreeSet<(PathBuf, String)>> {
     if scripts.is_empty() {
         return Ok(BTreeSet::new());
@@ -719,7 +737,8 @@ fn hard_pairs(repo_root: &Path, scripts: &[PathBuf]) -> Result<BTreeSet<(PathBuf
                 .map(|t| optional_subs(&t))
                 .unwrap_or_default()
         });
-        if !skip.contains(&sub) {
+        let root = sub.split_whitespace().next().unwrap_or_default();
+        if !root.is_empty() && !skip.contains(root) {
             pairs.insert((file, sub));
         }
     }

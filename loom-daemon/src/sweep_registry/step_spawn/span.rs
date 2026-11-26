@@ -43,6 +43,7 @@ use std::path::Path;
 
 use super::capture::{StepEnd, StepOutcomeClass, StepOutcomeLine};
 use crate::observability::lifecycle::{self, roll_interruption, RoleFailure};
+use crate::observability::step_verdict::Projection;
 use crate::role_runner::RoleTickOutcome;
 use crate::step_dispatch::outcome_ledger::{self, OutcomeClass, PostState, StepOutcome};
 use crate::step_role::StepRole;
@@ -132,7 +133,15 @@ pub(crate) fn step_failure(
 /// close, absent when none was (#14234): with a line and a post-state the
 /// close adds `loom.step.outcome.agrees`, whether the ledger's class for the
 /// two ([`crate::step_dispatch::outcome_ledger::classify`]) is the class the
-/// step claimed. Pure.
+/// step claimed. `verdict` (#14898) is the Judge verdict of record — the
+/// same projection the step's `pass.verdict` record carries, built by
+/// [`crate::observability::step_verdict::judge_verdict_of_record`] from the
+/// same step-scoped evidence — stamped on the close as
+/// `loom.step.outcome.verdict` (with `.reason_set` and `.head_sha`) so a
+/// trace-only reader recovers it; the raw line class below is unchanged, so
+/// a posted verdict that survived a missing line reads `class=none` with its
+/// verdict beside it. `None` for any other role, or a Judge step whose
+/// projection is not a verdict. Pure.
 #[must_use]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn sweep_close(
@@ -147,6 +156,7 @@ pub(crate) fn sweep_close(
     pr_number: Option<u32>,
     provider_exhausted: bool,
     post: Option<PostState>,
+    verdict: Option<&Projection>,
 ) -> (String, TraceAttributes) {
     let (result, _) = crate::role_tick_telemetry::classify(outcome);
     let result = crate::role_tick_telemetry::result_label(result);
@@ -165,6 +175,17 @@ pub(crate) fn sweep_close(
     }
     if let (Some(l), Some(post)) = (line, post.filter(|_| !provider_exhausted)) {
         close.insert("loom.step.outcome.agrees".into(), outcome_agrees(l, post).to_string());
+    }
+    // #14898: the verdict of record beside the raw line class, so a
+    // trace-only reader recovers both what the session claimed and what the
+    // Judge actually recorded. `pass.verdict` stays the record of record;
+    // the two join by repository and `loom.sweep_id`.
+    if let Some(v) = verdict {
+        close.insert("loom.step.outcome.verdict".into(), v.reason.clone());
+        close.insert("loom.step.outcome.reason_set".into(), v.reason_set.to_owned());
+        if let Some(sha) = &v.head_sha {
+            close.insert("loom.step.outcome.head_sha".into(), (*sha).clone());
+        }
     }
     for (key, value) in [("loom.configured_model", model), ("loom.effort", effort)] {
         if let Some(value) = value.filter(|v| !v.is_empty()) {

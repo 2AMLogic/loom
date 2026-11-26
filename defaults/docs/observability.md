@@ -1,6 +1,6 @@
 # Fleet Observability: end-to-end reference
 
-> Epic [#4702](https://github.com/rjwalters/loom/issues/4702), Phase 4
+> Epic [#4702](https://github.com/2AMLogic/loom/issues/4702), Phase 4
 > (#4860). This is the single entry point tying the whole pipeline together —
 > **daemon config → wire schema → exporter → Cloudflare backend → dashboard
 > views** — matching the map-plus-links pattern `daemon-reference.md` and
@@ -83,11 +83,30 @@ Precedence is **env > config > default**, the same rule every other
 | `endpoint` | `LOOM_OBSERVABILITY_ENDPOINT` | unset (disables export) |
 | `ingestKeyFile` | `LOOM_OBSERVABILITY_INGEST_KEY_FILE` | `$HOME/.loom/observability/ingest.key` |
 | `batchSize` | `LOOM_OBSERVABILITY_BATCH_SIZE` | 50 |
+| `maxBatchBytes` | `LOOM_OBSERVABILITY_MAX_BATCH_BYTES` | 4,194,304 bytes (4 MiB) |
 | `flushIntervalSecs` | `LOOM_OBSERVABILITY_FLUSH_INTERVAL_SECS` | 30 |
 | `queueCapacity` | `LOOM_OBSERVABILITY_QUEUE_CAPACITY` | 2000 |
 | `exporter` | `LOOM_OBSERVABILITY_EXPORTER` | unset ⇒ no exporter; `"otlp"` (§3). The retired `"https"` is skipped with a warning (#12813) |
 | `exporters` | — (config only) | unset ⇒ `exporter` (§3); an `otlp` entry may carry `headers_file` (§3) |
 | `claudeCodeTelemetry` | `LOOM_CLAUDE_CODE_TELEMETRY_*` | off — a nested, separately-resolved block (#9215) |
+
+`batchSize` limits the number of queued envelopes considered per flush.
+`maxBatchBytes` limits the **encoded OTLP JSON body** of each HTTP request,
+including its resource and scope wrappers. The first valid positive integer
+wins in this order: `LOOM_OBSERVABILITY_MAX_BATCH_BYTES`, the selected
+`observability.exporters[].maxBatchBytes` object field, the shared
+`observability.maxBatchBytes` field, then 4 MiB. A singular exporter or a
+string entry uses the shared field. For a receiver that caps requests at
+one MiB, set `"maxBatchBytes": 1048576` next to `batchSize` or on its exporter
+object.
+
+The queued exporter splits requests over the configured limit and requests
+explicitly refused for size (HTTP 413 or an explicit HTTP 400 size message).
+It processes the resulting groups in order. An irreducible oversized
+envelope records `request_too_large` in the durable loss ledger. Ordinary
+HTTP 400 responses keep their existing `status_400` behavior. This byte
+setting applies to the queued exporter. Raw worker relay forwarding keeps
+its own request policy.
 
 `claudeCodeTelemetry` is the one sub-block that configures **someone else's**
 exporter: the OTel environment a spawned worker's own Claude Code session needs
@@ -163,7 +182,7 @@ exporter is configured**):
 
 OTLP is the only exporter (#12813 removed the native JSON-over-HTTPS `POST
 /ingest` one). `OtlpExporter` (epic Phase 4, issue
-[#4858](https://github.com/rjwalters/loom/issues/4858)) translates
+[#4858](https://github.com/2AMLogic/loom/issues/4858)) translates
 `TelemetryEnvelope` batches into OTLP logs (`/v1/logs`) and metrics
 (`/v1/metrics`) requests, batched (`batchSize`), retried with jitter, and
 backed by the durable disk queue so a sink outage or a sleeping host never
@@ -952,7 +971,17 @@ cadence. Two more per-account gauges ride the same pass:
 `loom.codex_session.record{account,kind,container}` (`hold`, `drift_removal`:
 1 while that on-disk record stands) and
 `loom.codex_session.mount_drift{account,kind,container}` (`missing`, `extra`,
-`denied`: path counts). `loom-daemon status` shows the same per-account view
+`denied`: path counts). Seat signals (#15292) ride the same pass:
+`loom.codex_session.login` (1 signed in, 0 signed out), `hold_age` (seconds,
+`reason` ∈ `operator_stop`, `other`), `hook_trust` (`state` ∈ `recorded`,
+`sealed`, `missing`), and the latest rate limits (`quota_used` as a 0-1
+fraction and `quota_resets_at` by `kind` ∈ `5h`, `7d`, `quota_observed_at`,
+`reset_credits`). Login and live limits come from one bounded in-container
+`codex app-server` round trip per running seat; hold, hook trust and the local
+rollout snapshot are files and still export while docker is down. A source that
+cannot be read emits nothing for its field, never a false value, so a held or
+signed-out seat with weekly quota left is a join of `record{kind=hold}` or
+`login=0` with `quota_used{kind=7d}`. `loom-daemon status` shows the same per-account view
 (state, mounts, posture, hold, removal record, the reconciler's last action)
 under `Session containers:`. If docker cannot be queried at all
 (CLI missing, Docker daemon unreachable, timeout), nothing about any container

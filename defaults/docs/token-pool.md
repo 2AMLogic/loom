@@ -275,7 +275,54 @@ an operator runs to ask "is this mark still true?". A host that sets
 `max_tokens: 1` request per marked account per cycle. This is **reporting
 only**: a healthy answer never edits `.bad_tokens`, and the account stays
 excluded from selection — and `<name>|blocked` in `.ranking` — until
-`loom-daemon tokens unblock <name>`.
+`loom-daemon tokens unblock <name>`. That holds even if the account was
+`exhausted` in an earlier round: the previous-round carry-forward (below) is
+never applied to an account with a standing `auth` / `malformed-timestamp`
+mark, so its row is `blocked`, not a frozen `exhausted` one (#14317).
+
+**`.ranking` rows can be carried over from the previous round (#14145,
+#14265, #14317).** `tokens check --ranking` (the probe path) does not blindly
+overwrite the file. When an account's previous row was `exhausted` and this
+round's row carries no probe evidence — `error` (timeout, connection, 5xx) or
+`blocked` (empty token, credential-shape mismatch, `401`), or an `available`
+with no 5h-utilization header (#14195), or a codex `unknown` — the last two only
+while the held reset is still in the future and within the eight-day credibility
+horizon (`MAX_WEEKLY_RESET_HORIZON_SECS`) — the previous `exhausted` row is
+written back unchanged, so one failed or header-less probe cannot shorten an
+active weekly hold to the 6h fixed cooldown. Once that reset has passed (or is
+missing, unparseable or beyond the horizon) the fresh row overwrites. Measured
+evidence (`available` with a 5h utilization, `rate_limited`, a fresh
+`exhausted`) overwrites as before. Two consequences for an operator
+reading `.ranking` directly:
+
+- **A row may be a previous round's record, and nothing on disk marks it as
+  carried.** The line format has no "carried" field, and the file's mtime is
+  the write time of the round, not the age of the row. `--json` is the
+  measurement view: its `probed` field says whether a request was sent in *this*
+  run, and a failed round's `status`/`error` show what this round saw even when
+  `.ranking` kept the older `exhausted` row.
+- **What releases a carried row depends on why it was carried.** For `error` /
+  `blocked`, the row stays until a round gets evidence for that account, so
+  while a probe keeps failing the `exhausted` row (with its recorded reset)
+  persists. For a codex `unknown` or a header-less `available`, a later probe
+  that answers the same way does **not** release it — a header-less 2xx is a
+  real answer but carries no 5h-utilization evidence — so the release is the
+  carried reset elapsing (or being missing, unparseable or beyond the eight-day
+  horizon), not the next answered probe. A round that measures (`available`
+  with a 5h utilization, `rate_limited`, a fresh `exhausted`) overwrites at
+  any time.
+  Throughout, the selector's `exhausted` hard exclusion keeps applying to the
+  carried row. Carrying never widens the selectable set, for all four carried
+  statuses: `error` and `blocked` are excluded or ranked after every selectable
+  status anyway, and for `unknown` / header-less `available` the fresh row
+  would have been selectable, so carrying the `exhausted` row can only narrow
+  the set.
+
+The carry-forward does **not** apply to an account with a standing `auth` or
+`malformed-timestamp` mark: that account's `blocked` row comes from the mark,
+not from a failed probe, and it is written as `<name>|blocked` even when the
+previous row was `exhausted`. A self-clearing `exhaustion` mark is probed live
+and keeps the carry-forward.
 
 Every row says whether it is a measurement or a stored record:
 
@@ -880,6 +927,14 @@ closed set (`haiku`/`sonnet`/`opus`/`fable`), so the un-marked ones can be
 named and shown to be fine, while a provider whose class vocabulary is
 open-ended model IDs has no list to enumerate and must not invent one.
 
+The `N exhausted/near-ceiling` figure is `total − healthy`, not a count of
+`exhausted` rows: a `blocked` (e.g. auth-dead), `error`, `rate_limited` or
+`unknown` account is in it too. With a `.ranking` source it can also include an
+account whose row is a previous round's `exhausted` record carried forward
+(see "`.ranking` rows can be carried over from the previous round"); an
+account with a standing `auth` / `malformed-timestamp` mark is never one of
+those (#14317).
+
 Three properties are worth relying on:
 
 - **Degradation is the contract.** The breakdown appears only when
@@ -1109,7 +1164,7 @@ is visible on `kicad-tools#5333` — 287 recorded label events (142 `loom:issue`
 140 `loom:building`), 105 lease acquisitions and 12 yields across three hosts
 over ~16 h, every one of them authored by `loom-fleet-dispatch[bot]`. The same
 pattern ran **89** `loom:issue` ↔ `loom:building` label events deep on
-`rjwalters/loom#7815`.
+`2AMLogic/loom#7815`.
 
 **Which executable this was, and why that matters.** Every token-selection
 death in the 2026-09-16 window logs its own deciding binary (#4643), so the
@@ -1507,7 +1562,7 @@ first-class in *generated* systemd units; this section is for bare/unmanaged
 daemon startups and ad hoc CLI invocations from arbitrary cwds — the generated
 units already cover the managed case).
 
-Implementation: [`resolve_tokens_dir_anchored()`](https://github.com/rjwalters/loom/blob/main/loom-daemon/src/tokens_pool/paths.rs)
+Implementation: [`resolve_tokens_dir_anchored()`](https://github.com/2AMLogic/loom/blob/main/loom-daemon/src/tokens_pool/paths.rs)
 delegates step 2/3's "is this candidate a recognized Loom workspace" question
 to the same registry-membership check `#4299` established for CLI
 `--workspace` defaulting (`workspace_registry::resolve_client_workspace_default`)
@@ -1570,7 +1625,7 @@ rotation has not been configured at all.
 
 The `loom-daemon` role runner (`autonomous.roleRunner`, see
 [daemon-reference.md](daemon-reference.md)) pre-checks
-[`tokens::token_pool_size`](https://github.com/rjwalters/loom/blob/main/loom-daemon/src/tokens.rs) for exactly this
+[`tokens::token_pool_size`](https://github.com/2AMLogic/loom/blob/main/loom-daemon/src/tokens.rs) for exactly this
 condition **before** it ever spawns `spawn-claude.sh` (issue #4642): a repo
 with neither pool provisioned skips the doomed spawn entirely instead of
 hitting this hard-fail on every single tick forever. The skip is logged once
@@ -1994,9 +2049,18 @@ under a sibling `mkdir` lock.
 For managed headless runs, `spawn-codex.sh` asks the native selector for an
 eligible profile and exports that profile as `CODEX_HOME`. Selection excludes
 disabled profiles, persistent `reauth_required` holds, and unexpired cooldowns;
-then prefers fewer recent transient failures and round-robins equal candidates.
-If none are healthy, selection exits closed rather than using ambient
-`~/.codex`.
+then prefers fewer recent transient failures. Within that group it prefers the
+seat(s) with the **lowest weekly (7d) utilization** (#14585) and round-robins
+among seats tied for the lowest. Ranking reads the provider's weekly window
+from the seat's own rollout logs because provisioned profiles can share session
+history. A reading expires at its reported reset or after one known window
+from the observation when a reset is unavailable.
+If **any** candidate in the group lacks a live weekly reading, the whole group
+falls back to plain round-robin. A measured `0%` is a reading. Live-session
+preference, repository and model eligibility, and explicit profile pins apply
+first. A seat that turns out busy at lease time is skipped and the next-best
+eligible seat is tried. If none are healthy, selection exits closed rather than using
+ambient `~/.codex`.
 
 Terminal policy is intentionally conservative:
 
@@ -2014,8 +2078,8 @@ Terminal policy is intentionally conservative:
   the tick's working directory) do not poison account health. Those three also
   record no freshness, because nothing ran.
 
-Codex exposes no trustworthy quota-headroom percentage here. Status/capacity
-therefore reports raw, enabled, healthy, cooldown, and reauth-required counts;
+Capacity reporting makes no use of utilization: Status/capacity
+reports raw, enabled, healthy, cooldown, and reauth-required counts;
 transcript token totals remain observability and are never presented as
 remaining quota. Claude's existing global daemon concurrency cap is unchanged.
 
@@ -2330,7 +2394,7 @@ Four properties keep a parser reading an agent's own transcript honest:
 
 The parse happens in `loom-daemon`, not in `spawn-codex.sh`, for two reasons:
 date parsing is new executable logic and belongs in the daemon
-([shell-language-policy.md](https://github.com/rjwalters/loom/blob/main/.loom/docs/shell-language-policy.md)),
+([shell-language-policy.md](https://github.com/2AMLogic/loom/blob/main/.loom/docs/shell-language-policy.md)),
 and a new `LOOM_TERMINAL_RESULT` field
 would be dropped wholesale by an older daemon on a mixed-version host, losing
 the bad-mark along with the horizon. Parsing text the adapter already writes

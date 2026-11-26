@@ -1,7 +1,6 @@
 # Loom
 
-[![codecov](https://codecov.io/gh/rjwalters/loom/branch/main/graph/badge.svg)](https://codecov.io/gh/rjwalters/loom)
-[![GitHub Release](https://img.shields.io/github/v/release/rjwalters/loom?include_prereleases)](https://github.com/rjwalters/loom/releases)
+[![GitHub Release](https://img.shields.io/github/v/release/2AMLogic/loom?include_prereleases)](https://github.com/2AMLogic/loom/releases)
 
 **AI-powered development orchestration using your forge as the coordination layer.**
 
@@ -29,7 +28,7 @@ installed, and the planned separation of CLI tools from the work engine.
 
 ```bash
 # Clone and install to your repository
-git clone https://github.com/rjwalters/loom
+git clone https://github.com/2AMLogic/loom
 cd loom
 ./install.sh /path/to/your/repo
 
@@ -211,7 +210,7 @@ See [Forge Authentication](.loom/docs/forge-authentication.md) for setup details
 - macOS or Linux. Every release publishes `loom-daemon` binaries for
   `aarch64-apple-darwin`, `x86_64-unknown-linux-gnu`, and
   `aarch64-unknown-linux-gnu`, plus a multi-arch
-  `ghcr.io/rjwalters/loom-worker` image — macOS is the primary development
+  `ghcr.io/2amlogic/loom-worker` image — macOS is the primary development
   platform, Linux is the primary fleet-worker platform.
 - Git repository
 - tmux (`brew install tmux`)
@@ -237,6 +236,8 @@ loom-daemon init /path/to/your/repo
 ```
 your-repo/
 ├── .loom/
+│   ├── CLAUDE.md        # Installed Claude guide (root CLAUDE.md points here)
+│   ├── AGENTS.md        # Installed AGENTS guide (root AGENTS.md points here)
 │   ├── config.json      # Terminal configuration
 │   ├── config/          # Additional config data (e.g. skill-routes.json)
 │   ├── roles/           # Agent role definitions
@@ -245,9 +246,16 @@ your-repo/
 │   ├── hooks/           # Guard hooks (PreToolUse)
 │   ├── docs/            # Reference documentation
 │   └── bin/             # CLI entry point (loom)
-├── .claude/commands/loom/  # Slash commands
-├── .github/labels.yml   # Workflow labels
-└── CLAUDE.md            # AI context document
+├── .claude/
+│   ├── agents/          # Role subagent definitions
+│   ├── commands/loom/   # Slash commands
+│   └── settings.json    # Project-level Claude Code settings (merged on reinstall)
+├── .agents/skills/      # Agent skills (e.g. loom-curator/SKILL.md)
+├── .github/
+│   ├── labels.yml       # Workflow labels
+│   └── ISSUE_TEMPLATE/  # Issue templates (config.yml, task.yml)
+├── CLAUDE.md            # Root pointer to .loom/CLAUDE.md
+└── AGENTS.md            # Root pointer to .loom/AGENTS.md
 ```
 
 The installer also makes user-level changes outside your repo (`--dry-run` lists them):
@@ -295,7 +303,7 @@ The read-only posture cannot claim issues, edit labels, build in worktrees,
 create PRs, or merge; restart Codex with the full-lifecycle posture before
 performing those operations. These flags configure only the interactive parent
 session. They do not configure Codex workers dispatched by `loom-daemon`; that
-policy is tracked in [#4478](https://github.com/rjwalters/loom/issues/4478).
+policy is tracked in [#4478](https://github.com/2AMLogic/loom/issues/4478).
 See the [Codex guardrail-parity document](defaults/docs/guardrail-parity-codex.md)
 for the runtime trust-boundary comparison.
 
@@ -374,21 +382,21 @@ gh pr create --label "loom:review-requested"
 | `/loom:sweep` | Single-issue lifecycle orchestration (Curator → Merge) | Per-issue |
 | `loom-daemon` + `mcp__loom__dispatch_sweep` | Multi-issue detached dispatch (Tier 2) | Continuous, opt-in |
 | `/loom:builder` | Implement features and fixes | Manual |
-| `/loom:judge` | Review pull requests | Cron via GH Actions |
-| `/loom:curator` | Enhance and organize issues | Cron via GH Actions |
+| `/loom:judge` | Review pull requests | Daemon role runner (preferred, opt-in) or GH Actions cron |
+| `/loom:curator` | Enhance and organize issues | Daemon role runner (preferred, opt-in) or GH Actions cron |
 | `/loom:architect` | Create architectural proposals | Manual (cadence #3381) |
 | `/loom:hermit` | Identify simplification opportunities | Manual (cadence #3381) |
 | `/loom:doctor` | Fix PR feedback and conflicts | Manual |
-| `/loom:champion` | Evaluate proposals, auto-merge PRs | Cron via GH Actions |
-| `/loom:guide` | Triage the issue queue (tier labels, unblocking, WORK_PLAN) | Cron via GH Actions |
-| `/loom:auditor` | Validate main branch builds | Cron via GH Actions |
+| `/loom:champion` | Evaluate proposals, auto-merge PRs | Daemon role runner (preferred, opt-in) or GH Actions cron |
+| `/loom:guide` | Triage the issue queue (tier labels, unblocking, WORK_PLAN) | Daemon role runner (preferred, opt-in) or GH Actions cron |
+| `/loom:auditor` | Validate main branch builds | Daemon role runner (preferred, opt-in) or GH Actions cron |
 | `/loom:driver` | Plain shell environment — no autonomous role behavior | Manual |
 
 ## Development
 
 ```bash
 # Clone and setup
-git clone https://github.com/rjwalters/loom
+git clone https://github.com/2AMLogic/loom
 cd loom
 
 # Run the daemon in dev mode
@@ -447,10 +455,10 @@ Creates a new GitHub repo with Loom pre-installed and initial roadmap.
 
 If your project was built with Loom, you can add a badge to your README:
 
-[![Built with Loom](https://img.shields.io/badge/Built_with-Loom-blue?logo=github)](https://github.com/rjwalters/loom)
+[![Built with Loom](https://img.shields.io/badge/Built_with-Loom-blue?logo=github)](https://github.com/2AMLogic/loom)
 
 ```markdown
-[![Built with Loom](https://img.shields.io/badge/Built_with-Loom-blue?logo=github)](https://github.com/rjwalters/loom)
+[![Built with Loom](https://img.shields.io/badge/Built_with-Loom-blue?logo=github)](https://github.com/2AMLogic/loom)
 ```
 
 ## License

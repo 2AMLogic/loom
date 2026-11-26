@@ -2221,8 +2221,7 @@ pub fn assess_throughput(inputs: &HealthInputs) -> HealthSection {
 // ============================================================================
 //
 // `assess_operator_attention` lives in the `operator_attention` sibling
-// module and is re-exported here, mirroring `holds` (#7990) just above: this
-// file sits at its `.loom/docs/file-size-policy.md` ratchet, so new
+// module and is re-exported here, mirroring `holds` (#7990) just above: new
 // assessment logic goes in a sibling module and this file only carries the
 // dispatch line.
 
@@ -2284,8 +2283,8 @@ pub fn assess_stale_sweeps(inputs: &HealthInputs) -> HealthSection {
 // ============================================================================
 
 /// The wrong-repo-resolution escalation (Issue #8513) this section applies
-/// on top of the staleness rules below — a sibling module so this file, over
-/// `.loom/docs/file-size-policy.md`'s threshold, does not grow to hold it.
+/// on top of the staleness rules below — a sibling module so this file does
+/// not grow to hold it.
 mod auto_update_stale_repo;
 
 /// Assess the auto_update section: the autonomous self-update loop's own
@@ -2462,9 +2461,9 @@ pub use holds::{assess_pool_hold, assess_worktree_reaper};
 
 /// The conditional `observability` section (#4830/#5083/#5337): exporter
 /// anomalies only — host-identity mismatch, never-exported, failing and
-/// misconfigured. Lives in its own file (#8572) for the same file-size-ratchet
-/// reason as [`calibration_section`] and [`transcript_ingest_section`]; the
-/// move was pure, with no behavior change.
+/// misconfigured. Lives in its own file (#8572), like [`calibration_section`]
+/// and [`transcript_ingest_section`]; the move was pure, with no behavior
+/// change.
 mod observability_section;
 
 pub use observability_section::assess_observability;
@@ -2561,13 +2560,16 @@ mod busy;
 /// round-trip that could not happen), and the overall verdict is `Dead` so the
 /// exit code is `2` rather than a misleading `1`.
 ///
-/// Every section is unconditional except `observability` (#4830),
-/// `codesign_identity` (#7605), `limit_calibration` (#8063/#8349), `codex`
-/// (#8407), `tmpfs_visibility` (#8572), `review_role_pins` (#11970) and
-/// `owner_drift` (#14223), each of which is appended only when there is
+/// Every section is unconditional except seven, in two shapes.
+/// `observability` (#4830), `codesign_identity` (#7605), `tmpfs_visibility`
+/// (#8572) and `review_role_pins` (#11970) are appended only when there is
 /// something to report — see [`assess_observability`],
-/// [`assess_codesign_identity`], [`assess_limit_calibration`],
-/// [`codex_accounts::assess`] and [`assess_tmpfs_visibility`].
+/// [`assess_codesign_identity`], [`assess_tmpfs_visibility`] and
+/// [`assess_review_role_pins`]. `limit_calibration` (#8063/#8349), `codex`
+/// (#8407) and `owner_drift` (#14223) are appended whenever their collection
+/// ran or the signal applies on this host, Green when clean — see
+/// [`assess_limit_calibration`], [`codex_accounts::assess`] and
+/// [`assess_owner_drift`].
 ///
 /// # `IndeterminateBusy` (#6191, #8163)
 ///
@@ -2867,8 +2869,7 @@ pub fn format_age(secs: i64) -> String {
 #[allow(clippy::unwrap_used)]
 mod tests;
 
-// Issue #8504's UTC-`Z` regression coverage: kept out of `tests.rs` itself
-// (already over `.loom/docs/file-size-policy.md`'s threshold and frozen) by
+// Issue #8504's UTC-`Z` regression coverage: kept out of `tests.rs` itself by
 // declaring it here instead, at its existing file path under `health/tests/`.
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]

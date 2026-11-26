@@ -280,40 +280,15 @@ fn euid() -> u32 {
 /// Group and other write.
 const SHARED_WRITE: u32 = 0o022;
 
-/// Create `base` (mode `0700`) if it is missing, and require it to be a real
-/// directory owned by this user; tighten it to `0700` if it is looser.
+/// Create `base` (mode `0700`, missing ancestors `0700` too) if it is
+/// missing, and require it to be a real directory owned by this user; a
+/// loose existing directory is tightened to `0700` (the shared
+/// [`private_directory_with`] sequence, #15187).
 fn ensure_private_dir(base: &Path) -> Result<()> {
-    use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
-    if let Some(parent) = base.parent() {
-        // Missing ancestors are created 0700 too (an existing one is left
-        // alone): a umask-default parent would be group-writable.
-        std::fs::DirBuilder::new()
-            .recursive(true)
-            .mode(0o700)
-            .create(parent)
-            .with_context(|| format!("create {}", parent.display()))?;
-    }
-    if base.symlink_metadata().is_err() {
-        let made = std::fs::DirBuilder::new().mode(0o700).create(base);
-        if let Err(e) = made {
-            if e.kind() != std::io::ErrorKind::AlreadyExists {
-                return Err(e).with_context(|| format!("create {}", base.display()));
-            }
-        }
-    }
-    let meta = base
-        .symlink_metadata()
-        .with_context(|| format!("stat {}", base.display()))?;
-    anyhow::ensure!(
-        meta.is_dir() && !meta.file_type().is_symlink() && meta.uid() == euid(),
-        "{} is not a directory owned by this user",
-        base.display()
-    );
-    if meta.permissions().mode() & 0o077 != 0 {
-        std::fs::set_permissions(base, std::fs::Permissions::from_mode(0o700))
-            .with_context(|| format!("chmod 700 {}", base.display()))?;
-    }
-    Ok(())
+    crate::native_tools::provision::private_directory_with(
+        base,
+        crate::native_tools::provision::OnLoose::Tighten,
+    )
 }
 
 /// Visit `root` and everything under it without following symlinks. Stops

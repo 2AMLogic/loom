@@ -175,7 +175,7 @@ fn git_stdout(root: &Path, args: &[&str]) -> Option<String> {
 /// contributing). Any other case — non-git root, no `origin/HEAD`, diverged
 /// or detached-ahead `HEAD`, local edit — returns `None` and the caller reads
 /// the working copy exactly as before.
-fn default_branch_tier_text(repo_root: &Path, rel: &str) -> Option<String> {
+fn default_branch_tier_ref(repo_root: &Path, rel: &str) -> Option<String> {
     let top = git_stdout(repo_root, &["rev-parse", "--show-toplevel"])?;
     if std::fs::canonicalize(top.trim()).ok()? != std::fs::canonicalize(repo_root).ok()? {
         return None;
@@ -194,7 +194,12 @@ fn default_branch_tier_text(repo_root: &Path, rel: &str) -> Option<String> {
     {
         return None;
     }
-    Some(git_stdout(repo_root, &["show", &format!("origin/HEAD:{rel}")]).unwrap_or_default())
+    Some(format!("origin/HEAD:{rel}"))
+}
+
+fn default_branch_tier_text(repo_root: &Path, rel: &str) -> Option<String> {
+    let object = default_branch_tier_ref(repo_root, rel)?;
+    Some(git_stdout(repo_root, &["show", &object]).unwrap_or_default())
 }
 
 /// [`soft_read_json_object`] for a tracked tier, preferring the default
@@ -328,6 +333,53 @@ pub fn resolve_effective_config(repo_root: &Path) -> Value {
     effective
 }
 
+/// Resolve the same tiers for decisions that must preserve a hold when policy
+/// cannot be read. Absent files contribute nothing. A selected but unreadable
+/// or malformed file is an error, including a tracked tier on origin/HEAD.
+pub(crate) fn resolve_effective_config_checked(repo_root: &Path) -> anyhow::Result<Value> {
+    use anyhow::{bail, Context as _};
+
+    let mut effective = Value::Object(Map::new());
+    for path in tier_paths_by_precedence(repo_root).into_iter().rev() {
+        let selected = [LEGACY_CONFIG_REL, PROJECT_CONFIG_REL]
+            .into_iter()
+            .find(|rel| path == repo_root.join(rel))
+            .and_then(|rel| default_branch_tier_ref(repo_root, rel).map(|object| (rel, object)));
+        let text = if let Some((rel, object)) = selected {
+            if let Some(text) = git_stdout(repo_root, &["show", &object]) {
+                text
+            } else if git_stdout(repo_root, &["ls-tree", "origin/HEAD", "--", rel])
+                .is_some_and(|line| line.is_empty())
+            {
+                continue;
+            } else {
+                bail!("could not read config tier {object}");
+            }
+        } else {
+            match std::fs::read_to_string(&path) {
+                Ok(text) => text,
+                Err(error)
+                    if error.kind() == std::io::ErrorKind::NotFound
+                        && std::fs::symlink_metadata(&path)
+                            .is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound) =>
+                {
+                    continue;
+                }
+                Err(error) => {
+                    return Err(error).with_context(|| format!("reading {}", path.display()))
+                }
+            }
+        };
+        let value: Value =
+            serde_json::from_str(&text).with_context(|| format!("parsing {}", path.display()))?;
+        if !value.is_object() {
+            bail!("config tier {} is not a JSON object", path.display());
+        }
+        effective = deep_merge(&effective, &value);
+    }
+    Ok(effective)
+}
+
 /// Tier files that exist but could not contribute (#11029): unreadable,
 /// malformed JSON, or not a JSON object. [`resolve_effective_config`]
 /// soft-fails each of these to `{}`, which is right for most keys but wrong
@@ -392,6 +444,48 @@ pub fn source_of(repo_root: &Path, dotted: &str) -> Option<PathBuf> {
     tier_paths_by_precedence(repo_root)
         .into_iter()
         .find(|path| get_path(&soft_read_json_object(path), dotted).is_some_and(|v| !v.is_null()))
+}
+
+/// The highest-precedence tier file in which the exact key path `segments`
+/// (each one object key, so a profile name containing `.` is not split) is
+/// present and non-null — [`source_of`] without dot-splitting (#15252).
+#[must_use]
+pub fn source_of_segments(repo_root: &Path, segments: &[&str]) -> Option<PathBuf> {
+    tier_paths_by_precedence(repo_root)
+        .into_iter()
+        .find(|path| {
+            let mut cur = soft_read_json_object(path);
+            segments
+                .iter()
+                .all(|segment| match cur.get_mut(*segment).map(Value::take) {
+                    Some(next) => {
+                        cur = next;
+                        true
+                    }
+                    None => false,
+                })
+                && !cur.is_null()
+        })
+}
+
+/// Name the tier a config source file (from [`tier_paths_by_precedence`] /
+/// [`source_of`]) belongs to: `local`, `fleet-repo`, `project`, `committed`, or
+/// `defaults` (the rendered machine tier). Shared by `loom-daemon config get`
+/// and `worker profile-check`.
+#[must_use]
+pub fn tier_name(repo_root: &Path, source: &Path) -> &'static str {
+    let is = |rel: &str| source == repo_root.join(rel);
+    if is(LOCAL_CONFIG_REL) {
+        "local"
+    } else if is(FLEET_REPO_CONFIG_REL) {
+        "fleet-repo"
+    } else if is(PROJECT_CONFIG_REL) {
+        "project"
+    } else if is(LEGACY_CONFIG_REL) {
+        "committed"
+    } else {
+        "defaults"
+    }
 }
 
 /// One leaf config key that two or more tiers set to different values, where at
@@ -1452,6 +1546,77 @@ mod tests {
         let conflicts = tier_conflicts(root.path());
         std::env::remove_var(PRIVATE_DEFAULTS_ENV);
         assert!(conflicts.is_empty());
+    }
+
+    // ===== modelProfileOverrides tiering (#15252) =====
+
+    /// A host-local override beats the machine-defaults and fleet-repo tiers,
+    /// sibling override keys survive the merge, and `null` clears a lower tier.
+    #[test]
+    #[serial(loom_config_env)]
+    fn test_model_profile_overrides_layer_local_over_fleet_over_defaults() {
+        let root = tempdir().unwrap();
+        let defaults = root.path().join("machine-defaults.json");
+        write(
+            &defaults,
+            r#"{"runtimes":{"modelProfileOverrides":{"zai-full":{"model":"glm-5.3","effort":"high"}}}}"#,
+        );
+        write(
+            &root.path().join(FLEET_REPO_CONFIG_REL),
+            r#"{"runtimes":{"modelProfileOverrides":{"zai-full":{"model":"glm-5.4"}}}}"#,
+        );
+        std::env::set_var(PRIVATE_DEFAULTS_ENV, &defaults);
+        let fleet_wins = resolve_effective_config(root.path());
+        write(
+            &root.path().join(LOCAL_CONFIG_REL),
+            r#"{"runtimes":{"modelProfileOverrides":{"zai-full":{"model":"glm-5.5"}}}}"#,
+        );
+        let local_wins = resolve_effective_config(root.path());
+        let source = source_of_segments(
+            root.path(),
+            &["runtimes", "modelProfileOverrides", "zai-full", "model"],
+        );
+        write(
+            &root.path().join(LOCAL_CONFIG_REL),
+            r#"{"runtimes":{"modelProfileOverrides":{"zai-full":{"model":null}}}}"#,
+        );
+        let null_source = source_of_segments(
+            root.path(),
+            &["runtimes", "modelProfileOverrides", "zai-full", "model"],
+        );
+        let cleared = resolve_effective_config(root.path());
+        std::env::remove_var(PRIVATE_DEFAULTS_ENV);
+
+        let at = |v: &Value| v["runtimes"]["modelProfileOverrides"]["zai-full"].clone();
+        assert_eq!(at(&fleet_wins), serde_json::json!({"model": "glm-5.4", "effort": "high"}));
+        assert_eq!(at(&local_wins), serde_json::json!({"model": "glm-5.5", "effort": "high"}));
+        assert_eq!(source, Some(root.path().join(LOCAL_CONFIG_REL)));
+        assert_eq!(tier_name(root.path(), source.as_deref().unwrap()), "local");
+        assert_eq!(at(&cleared), serde_json::json!({"model": null, "effort": "high"}));
+        // An explicit null is not a source; the fleet-repo tier still "sets" it.
+        assert_eq!(null_source, Some(root.path().join(FLEET_REPO_CONFIG_REL)));
+        assert_eq!(tier_name(root.path(), null_source.as_deref().unwrap()), "fleet-repo");
+        assert_eq!(tier_name(root.path(), &defaults), "defaults");
+    }
+
+    #[test]
+    #[serial(loom_config_env)]
+    fn test_source_of_segments_does_not_split_dots_in_a_name() {
+        std::env::set_var(PRIVATE_DEFAULTS_ENV, "");
+        let root = tempdir().unwrap();
+        write(
+            &root.path().join(LEGACY_CONFIG_REL),
+            r#"{"runtimes":{"modelProfileOverrides":{"a.b":{"model":"m"}}}}"#,
+        );
+        let hit =
+            source_of_segments(root.path(), &["runtimes", "modelProfileOverrides", "a.b", "model"]);
+        let miss = source_of_segments(
+            root.path(),
+            &["runtimes", "modelProfileOverrides", "a", "b", "model"],
+        );
+        std::env::remove_var(PRIVATE_DEFAULTS_ENV);
+        assert_eq!(hit, Some(root.path().join(LEGACY_CONFIG_REL)));
+        assert_eq!(miss, None);
     }
 
     // ===== source_of / tier_paths_by_precedence (#4512) =====

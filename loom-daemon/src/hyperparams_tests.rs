@@ -1,13 +1,21 @@
 //! Coverage for the unified hyperparameters module (Issue #9683): schema
-//! defaults, tier precedence (`env-vector > config > legacy > default`),
-//! strict layer validation, digest stability, and the startup capture that
-//! feeds the provenance stamper and the lease-TTL resolver.
+//! defaults, tier precedence (single-knob env > config block > legacy >
+//! default), strict layer validation, digest stability, consumer overlays
+//! through each module's own reader, and the *fail-fast* `startup_init`
+//! error path.
+//!
+//! The startup SUCCESS path is not here: only
+//! `startup_init_fails_fast_naming_the_offending_path` calls `startup_init`,
+//! and it expects an error, so the process globals (`RESOLVED`/`DIGEST`/
+//! `ROOT`) are never set by this suite. The successful capture, the
+//! provenance stamp, and the lease-TTL hot-apply assertions live in the
+//! integration suite `loom-daemon/tests/hyperparams_startup.rs`
+//! (`startup_capture_and_lease_ttl_hot_apply_without_a_restart`), which
+//! runs as its own process precisely so it can populate the globals
+//! without poisoning them for other tests.
 //!
 //! Env-var-touching tests are `#[serial]` (`serial_test`) so concurrent
-//! tests cannot observe each other's `LOOM_HYPERPARAMS`. The startup-success
-//! test deliberately populates the process-global vector (`OnceLock`): no
-//! other test here asserts the globals are unset, so capture order across
-//! the suite is harmless.
+//! tests cannot observe each other's env.
 
 use super::*;
 use serial_test::serial;
@@ -93,48 +101,30 @@ fn config_block_beats_legacy_keys() {
 
 #[test]
 #[serial]
-fn env_vector_beats_config_block_and_normalizes_dotted_keys() {
+fn retired_env_vector_is_ignored_and_never_fails() {
     let tmp = empty_workspace();
     write_config(tmp.path(), r#"{"hyperparameters": {"dispatch": {"tickIntervalSecs": 30}}}"#);
-    std::env::set_var(HYPERPARAMS_ENV, r#"{"dispatch.tickIntervalSecs": 45}"#);
-    let resolved = resolve_effective(tmp.path());
-    std::env::remove_var(HYPERPARAMS_ENV);
-    assert_eq!(resolved.params.dispatch.tick_interval_secs, 45);
-    assert_eq!(resolved.sources["dispatch.tickIntervalSecs"], Source::EnvVector);
+    for raw in [r#"{"dispatch.tickIntervalSecs": 45}"#, "not json", "[1,2]"] {
+        std::env::set_var(HYPERPARAMS_ENV, raw);
+        let resolved = resolve_effective(tmp.path());
+        let layer = overlay_from_effective(&serde_json::json!({
+            "hyperparameters": {"dispatch": {"maxConcurrent": 2}}
+        }));
+        std::env::remove_var(HYPERPARAMS_ENV);
+        assert_eq!(resolved.params.dispatch.tick_interval_secs, 30, "{raw}");
+        assert_eq!(resolved.sources["dispatch.tickIntervalSecs"], Source::Config);
+        assert_eq!(layer["dispatch"]["maxConcurrent"], 2);
+    }
 }
 
 #[test]
-fn dotted_keys_normalize_to_nested_groups() {
-    let normalized = normalize_dotted(&serde_json::json!({
-        "dispatch.maxConcurrent": 4,
-        "lifecycle.leaseTtlMinutes": 20,
-    }));
-    assert_eq!(normalized["dispatch"]["maxConcurrent"], 4);
-    assert_eq!(normalized["lifecycle"]["leaseTtlMinutes"], 20);
-}
-
-#[test]
-fn env_vector_must_be_a_json_object() {
-    assert!(parse_env_vector("[1,2]").is_err());
-    assert!(parse_env_vector("42").is_err());
-    assert!(parse_env_vector("{}").is_ok());
-}
-
-#[test]
-#[serial]
-fn invalid_env_vector_is_soft_ignored_by_per_tick_readers_but_fatal_at_startup() {
-    let tmp = empty_workspace();
-    std::env::set_var(HYPERPARAMS_ENV, "not json");
-    // Per-tick readers soft-ignore: the committed block still applies.
+fn dotted_config_keys_remain_invalid() {
     let layer = overlay_from_effective(&serde_json::json!({
-        "hyperparameters": {"dispatch": {"maxConcurrent": 2}}
+        "hyperparameters": {"dispatch.maxConcurrent": 4}
     }));
-    assert_eq!(layer["dispatch"]["maxConcurrent"], 2);
-    // ...but the startup gate names the garbage and refuses to boot.
-    let result = startup_init(tmp.path());
-    std::env::remove_var(HYPERPARAMS_ENV);
-    let problem = result.unwrap_err().to_string();
-    assert!(problem.contains(HYPERPARAMS_ENV), "{problem}");
+    let violations = validate_layer(&layer);
+    assert_eq!(violations.len(), 1);
+    assert_eq!(violations[0].path, "hyperparameters.dispatch.maxConcurrent");
 }
 
 // ---------------------------------------------------------------------------
@@ -209,6 +199,42 @@ fn digest_is_stable_and_distinct() {
     let mut tweaked = Hyperparameters::default();
     tweaked.dispatch.max_concurrent += 1;
     assert_ne!(a, digest_of(&tweaked));
+}
+
+/// #15017: the prompt modifier is part of the digest, but an unset one leaves
+/// the canonical serialization — and so every existing digest — untouched.
+#[test]
+fn the_prompt_modifier_enters_the_digest_only_when_set() {
+    let params = Hyperparameters::default();
+    // Unset: byte-identical to the bare vector's serialization, computed here
+    // independently of `digest_with` so the pin does not follow a refactor.
+    let canonical = serde_json::to_string(&params).unwrap();
+    let bare = format!("sha256:{}", hex::encode(Sha256::digest(canonical.as_bytes())));
+    assert_eq!(digest_of(&params), bare);
+    assert_eq!(digest_with(&params, None), bare);
+
+    // Set: differs from unset, and from a different modifier; stable per name.
+    let deep = digest_with(&params, Some("deep"));
+    assert_ne!(deep, bare);
+    assert_ne!(deep, digest_with(&params, Some("wide")));
+    assert_eq!(deep, digest_with(&params, Some("deep")));
+    // Same modifier, different vector: still distinct (it is folded in, not
+    // substituted for the vector).
+    let mut tweaked = params;
+    tweaked.dispatch.max_concurrent += 1;
+    assert_ne!(deep, digest_with(&tweaked, Some("deep")));
+}
+
+#[test]
+#[serial]
+fn a_resolved_vector_digests_through_its_modifier() {
+    let tmp = empty_workspace();
+    let mut resolved = resolve_effective(tmp.path());
+    // The process env carries no modifier in the unit-test binary.
+    assert_eq!(resolved.prompt_modifier, None);
+    assert_eq!(resolved.digest(), digest_of(&resolved.params));
+    resolved.prompt_modifier = Some("deep".into());
+    assert_eq!(resolved.digest(), digest_with(&resolved.params, Some("deep")));
 }
 
 #[test]
@@ -315,23 +341,21 @@ fn champion_defaults_match_the_documented_slice_values() {
 
 #[test]
 #[serial]
-fn champion_block_and_env_vector_resolve_with_provenance() {
+fn champion_block_resolves_with_provenance() {
     clear_champion_envs();
     let tmp = empty_workspace();
     write_config(
         tmp.path(),
         r#"{"hyperparameters": {"champion": {"prSlice": 20, "tier3BacklogCap": 8}}}"#,
     );
-    std::env::set_var(HYPERPARAMS_ENV, r#"{"champion.prSlice": 15, "champion.tier2Cap": 4}"#);
     let resolved = resolve_effective(tmp.path());
-    std::env::remove_var(HYPERPARAMS_ENV);
     let c = resolved.params.champion;
-    assert_eq!(c.pr_slice, 15);
-    assert_eq!(c.tier2_cap, 4);
+    assert_eq!(c.pr_slice, 20);
+    assert_eq!(c.tier2_cap, 2);
     assert_eq!(c.tier3_backlog_cap, 8);
     assert_eq!(c.promotion_slice, 3);
-    assert_eq!(resolved.sources["champion.prSlice"], Source::EnvVector);
-    assert_eq!(resolved.sources["champion.tier2Cap"], Source::EnvVector);
+    assert_eq!(resolved.sources["champion.prSlice"], Source::Config);
+    assert_eq!(resolved.sources["champion.tier2Cap"], Source::Default);
     assert_eq!(resolved.sources["champion.tier3BacklogCap"], Source::Config);
     assert_eq!(resolved.sources["champion.tier3Cap"], Source::Default);
 }
@@ -363,14 +387,13 @@ fn clear_champion_envs() {
 
 #[test]
 #[serial]
-fn champion_single_knob_env_beats_vector_and_config_with_provenance() {
+fn champion_single_knob_env_beats_config_with_provenance() {
     clear_champion_envs();
     let tmp = empty_workspace();
     write_config(
         tmp.path(),
         r#"{"hyperparameters": {"champion": {"prSlice": 20, "tier3Cap": 2, "tier3BacklogCap": 8}}}"#,
     );
-    std::env::set_var(HYPERPARAMS_ENV, r#"{"champion.prSlice": 15, "champion.tier2Cap": 4}"#);
     std::env::set_var("LOOM_CHAMPION_PR_SLICE", "7");
     std::env::set_var("LOOM_CHAMPION_TIER2_CAP", "9");
     std::env::set_var("LOOM_CHAMPION_TIER3_CAP", "0");
@@ -378,11 +401,10 @@ fn champion_single_knob_env_beats_vector_and_config_with_provenance() {
     std::env::set_var("LOOM_CHAMPION_TIER3_BACKLOG_CAP", "2.5");
     std::env::set_var("LOOM_CHAMPION_PROMOTION_SLICE", "");
     let resolved = resolve_effective(tmp.path());
-    std::env::remove_var(HYPERPARAMS_ENV);
     clear_champion_envs();
     let c = resolved.params.champion;
-    assert_eq!(c.pr_slice, 7, "env beats vector (15) and config (20)");
-    assert_eq!(c.tier2_cap, 9, "env beats vector (4)");
+    assert_eq!(c.pr_slice, 7, "env beats config (20)");
+    assert_eq!(c.tier2_cap, 9, "env beats default (2)");
     assert_eq!(c.tier3_cap, 0, "env 0 is honoured over config (2)");
     assert_eq!(c.tier3_backlog_cap, 8, "non-integer env falls through to config");
     assert_eq!(c.promotion_slice, 3, "empty env falls through to default");
@@ -432,7 +454,7 @@ fn champion_values_enter_the_digest() {
 }
 
 // ---------------------------------------------------------------------------
-// dispatch.drawTemperature (#11684)
+// Dispatch weight bonuses (#11742)
 // ---------------------------------------------------------------------------
 
 /// #12185: the retired `weightBonus*` points are still accepted (and ignored,
@@ -476,7 +498,7 @@ fn retired_weight_bonuses_are_accepted_ignored_and_reported() {
 }
 
 /// #12185: α and β default to 0 (the two-stage draw, no busy-ness), read the
-/// block and the env vector, enter the digest, and are validated by name.
+/// config block, enter the digest, and are validated by name.
 #[test]
 #[serial]
 fn pool_exponents_default_read_every_tier_and_validate_by_name() {

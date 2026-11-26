@@ -1101,10 +1101,9 @@ LOOM_CODEX_MUTABLE_ROLES="builder doctor"
 # GUARDED roles (#9390) do not write the repository, so they keep the read-only
 # sandbox, but they act with merge (champion) or verdict (judge) authority on
 # the forge, which is what Loom's guards police. They need the same proven hook
-# and fail closed the same way. loom-daemon's runtime preference already passes
-# Codex over for them while any shared profile is unready
-# (runtime_preference::codex_guard, which mirrors this list); this is the
-# backstop, not the router.
+# and fail closed the same way. The runtime preference and account selection
+# skip unready shared seats for these and the mutable roles
+# (runtime_preference::codex_guard). This verifies the seat at launch.
 LOOM_CODEX_GUARDED_ROLES="champion judge"
 _hook_role="$(printf '%s' "${LOOM_ROLE:-}" | tr '[:upper:]_' '[:lower:]-')"
 case "$_hook_role" in
@@ -1155,7 +1154,11 @@ if [[ -n "${LOOM_PRIVATE_LEASE_FD:-}" && "$CODEX_SESSION_EXEC" == "true" ]]; the
     #     has established Codex hook trust. That is a strictly stronger form of
     #     exactly the obligation checked below.
     #
-    # The trust waiver (#10102) is never used for a private-clone session.
+    # This script never passes the trust waiver (#10102) for a private-clone
+    # session: the clone's project layers are only visible inside the
+    # container, so `private-workspace execute` vets them there and adds
+    # `--dangerously-bypass-hook-trust` itself, for a sealed registration only
+    # (#14105). Recorded trust works as before.
     _hook_status="verified-in-private-session"; _hook_reason="proven inside the account's private session, against the image-owned bridge for /workspace/repo (#8787)"
 elif [[ ! -x "$_hook_provisioner" && ! -r "$_hook_provisioner" ]]; then
     _hook_status="unavailable"
@@ -1383,9 +1386,13 @@ set -e
 # resolve the concrete path when the session dir is reachable, and fall back to
 # reporting just the id when it is not (e.g. `--ephemeral`, or ambient auth
 # whose CODEX_HOME this script never set).
+# The read is line-anchored: only a line that IS the banner (after leading
+# whitespace) is a launch, the same rule as the daemon's
+# `usage_source::codex_session_banner`. A banner quoted mid-line in a message
+# block is data about a launch, not evidence of one.
 _session_id="$(
-    grep -aoE 'session id:[[:space:]]*[0-9a-fA-F-]{8,}' "$_stderr_file" 2>/dev/null \
-    | head -1 | sed -E 's/.*session id:[[:space:]]*//' || true
+    grep -aoE '^[[:space:]]*session id:[[:space:]]*[0-9a-fA-F-]{8,}' "$_stderr_file" 2>/dev/null \
+    | head -1 | sed -E 's/^[[:space:]]*session id:[[:space:]]*//' || true
 )"
 if [[ -n "$_session_id" ]]; then
     log_info "spawn-codex: session=$_session_id"

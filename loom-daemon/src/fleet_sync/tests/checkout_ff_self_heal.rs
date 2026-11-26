@@ -40,7 +40,7 @@ fn pass_at(fx: &Fixture, knobs: &Knobs, memory: &mut Memory, now: DateTime<Utc>)
         budget: None,
         elapsed: &|| Duration::ZERO,
         clock: &clock,
-        pr_merged: &|_, _| knobs.merged,
+        pr_head: &|_, _| knobs.pr_head,
     };
     run(&env, std::slice::from_ref(&fx.host), memory)
 }
@@ -862,9 +862,9 @@ fn a_detached_head_pinned_to_keep_is_not_put_back() {
 // A checkout stranded off the default branch (#13588)
 // ----------------------------------------------------------------------------
 
-fn knobs_merged(merged: Option<bool>) -> Knobs {
+fn knobs_pr_head(pr_head: Option<bool>) -> Knobs {
     Knobs {
-        merged,
+        pr_head,
         ..Knobs::default()
     }
 }
@@ -896,7 +896,7 @@ fn a_branch_whose_commits_are_a_merged_prs_is_put_back() {
     let tip = fx.push("README.md", "two\n");
     git(&fx.host, &["fetch", "--quiet", "origin"]);
 
-    let found = pass_at(&fx, &knobs_merged(Some(true)), &mut Memory::default(), much_later());
+    let found = pass_at(&fx, &knobs_pr_head(Some(true)), &mut Memory::default(), much_later());
 
     assert!(healed(only(&found).state), "{found:?}");
     assert_eq!(fx.head(), tip);
@@ -906,14 +906,14 @@ fn a_branch_whose_commits_are_a_merged_prs_is_put_back() {
 }
 
 #[test]
-fn a_failed_or_negative_merged_pr_lookup_keeps_the_hold() {
+fn a_failed_or_negative_pr_lookup_keeps_the_hold() {
     for answer in [None, Some(false)] {
         let fx = loom_fixture();
         git(&fx.host, &["checkout", "--quiet", "-b", "feature/issue-756"]);
         fx.commit_locally("src/feature.rs");
         fx.push("README.md", "two\n");
         git(&fx.host, &["fetch", "--quiet", "origin"]);
-        let knobs = knobs_merged(answer);
+        let knobs = knobs_pr_head(answer);
         assert_eq!(
             assert_untouched_with(&fx, &knobs, much_later()),
             CheckoutState::WrongBranch,
@@ -980,16 +980,147 @@ fn a_standing_wrong_branch_hold_is_said_again_each_interval() {
     assert_eq!(still(&pass_at(&fx, &knobs, &mut memory, at(125))), 1);
 }
 
+#[test]
+fn a_still_held_line_names_why_the_rehome_was_refused() {
+    // A tracked change refuses the rehome; the standing hold's line must
+    // carry that reason, not only which branch the checkout is on (#14973).
+    let dirty = loom_fixture();
+    git(&dirty.host, &["checkout", "--quiet", "-b", "feature/issue-756"]);
+    write(&dirty.host.join("README.md"), "edited\n");
+    let mut memory = Memory::default();
+    let knobs = Knobs::default();
+    let t0 = Utc::now();
+    pass_at(&dirty, &knobs, &mut memory, t0);
+    let said = pass_at(&dirty, &knobs, &mut memory, t0 + chrono::Duration::minutes(61));
+    let line = &said
+        .transitions
+        .iter()
+        .find(|t| t.kind == "still-held")
+        .expect("a still-held line")
+        .line;
+    assert!(
+        line.contains("the working tree has a tracked change"),
+        "the still-held line names the refusal reason: {line}"
+    );
+
+    // A recent move refuses it too, and is named the same way.
+    let moved = loom_fixture();
+    git(&moved.host, &["checkout", "--quiet", "-b", "feature/issue-756"]);
+    let mut memory = Memory::default();
+    let knobs = Knobs::default();
+    let t0 = Utc::now();
+    pass_at(&moved, &knobs, &mut memory, t0);
+    let said = pass_at(&moved, &knobs, &mut memory, t0 + chrono::Duration::minutes(61));
+    let line = &said
+        .transitions
+        .iter()
+        .find(|t| t.kind == "still-held")
+        .expect("a still-held line")
+        .line;
+    assert!(
+        line.contains("HEAD moved recently"),
+        "the still-held line names the refusal reason: {line}"
+    );
+}
+
+// ----------------------------------------------------------------------------
+// #15301: every standing declined hold is said again, not only wrong-branch
+// ----------------------------------------------------------------------------
+
+/// The `still-held` transitions of a pass.
+fn still_held(pass: &CheckoutPass) -> Vec<&Transition> {
+    pass.transitions
+        .iter()
+        .filter(|t| t.kind == "still-held")
+        .collect()
+}
+
+#[test]
+fn a_standing_dirty_hold_is_said_again_with_its_lag_and_paths() {
+    let fx = Fixture::new();
+    fx.push("src/a.rs", "fn a() {}\n");
+    write(&fx.host.join("README.md"), "edited here\n");
+    let mut memory = Memory::default();
+    let knobs = Knobs::default();
+    let t0 = Utc::now();
+    let at = |mins: i64| t0 + chrono::Duration::minutes(mins);
+
+    let first = pass_at(&fx, &knobs, &mut memory, at(0));
+    assert!(still_held(&first).is_empty(), "the first sight is the transition");
+    assert!(still_held(&pass_at(&fx, &knobs, &mut memory, at(30))).is_empty());
+    let hourly = pass_at(&fx, &knobs, &mut memory, at(61));
+    let said = still_held(&hourly);
+    assert_eq!(said.len(), 1, "{:?}", kinds(&hourly));
+    assert_eq!(said[0].level, Level::Warn);
+    let line = &said[0].line;
+    assert!(line.contains("still `dirty` after 61 min"), "{line}");
+    assert!(line.contains(", 1 behind"), "{line}");
+    assert!(line.contains("README.md"), "{line}");
+    assert!(still_held(&pass_at(&fx, &knobs, &mut memory, at(90))).is_empty());
+    assert_eq!(still_held(&pass_at(&fx, &knobs, &mut memory, at(125))).len(), 1);
+}
+
+#[test]
+fn a_standing_hold_on_installed_files_is_said_again_as_an_error() {
+    let fx = Fixture::new();
+    fx.push(".loom/scripts/spawn.sh", "#!/bin/sh\necho new\n");
+    write(&fx.host.join("README.md"), "edited here\n");
+    let mut memory = Memory::default();
+    let knobs = Knobs::default();
+    let t0 = Utc::now();
+    pass_at(&fx, &knobs, &mut memory, t0);
+    let hourly = pass_at(&fx, &knobs, &mut memory, t0 + chrono::Duration::minutes(61));
+    let said = still_held(&hourly);
+    assert_eq!(said.len(), 1, "{:?}", kinds(&hourly));
+    assert_eq!(said[0].level, Level::Error);
+    assert!(said[0].line.contains("installed Loom files are behind"), "{}", said[0].line);
+}
+
+#[test]
+fn a_standing_diverged_hold_is_said_again_with_both_counts() {
+    let fx = Fixture::new();
+    fx.commit_locally("local.rs");
+    fx.push("src/a.rs", "fn a() {}\n");
+    let mut memory = Memory::default();
+    let knobs = Knobs::default();
+    let t0 = Utc::now();
+    let at = |mins: i64| t0 + chrono::Duration::minutes(mins);
+
+    pass_at(&fx, &knobs, &mut memory, at(0));
+    let hourly = pass_at(&fx, &knobs, &mut memory, at(61));
+    let said = still_held(&hourly);
+    assert_eq!(said.len(), 1, "{:?}", kinds(&hourly));
+    assert!(said[0].line.contains("still `diverged`"), "{}", said[0].line);
+    assert!(said[0].line.contains(", 1 behind, 1 ahead"), "{}", said[0].line);
+}
+
+#[test]
+fn a_standing_fetch_failure_is_said_again() {
+    let fx = Fixture::new();
+    let gone = fx.base().join("nowhere.git");
+    git(&fx.host, &["remote", "set-url", "origin", gone.to_str().unwrap()]);
+    let mut memory = Memory::default();
+    let knobs = Knobs::default();
+    let t0 = Utc::now();
+    for n in 0..3 {
+        pass_at(&fx, &knobs, &mut memory, t0 + chrono::Duration::minutes(n));
+    }
+    let hourly = pass_at(&fx, &knobs, &mut memory, t0 + chrono::Duration::minutes(61));
+    let said = still_held(&hourly);
+    assert_eq!(said.len(), 1, "{:?}", kinds(&hourly));
+    assert!(said[0].line.contains("still `fetch-failed`"), "{}", said[0].line);
+}
+
 // ----------------------------------------------------------------------------
 // #13835: the forge lookup runs last, and a rescue ref is reused
 // ----------------------------------------------------------------------------
 
-/// A pass whose `pr_merged` stub counts its calls. Returns the count and the
+/// A pass whose `pr_head` stub counts its calls. Returns the count and the
 /// pass, so a test can assert both the lookup's cost and the outcome.
 fn lookups_in_a_pass(fx: &Fixture, knobs: &Knobs, now: DateTime<Utc>) -> (usize, CheckoutPass) {
     let calls = Rc::new(Cell::new(0_usize));
     let seen = Rc::clone(&calls);
-    let answer = knobs.merged;
+    let answer = knobs.pr_head;
     let count = move |_: &Path, _: &str| {
         seen.set(seen.get() + 1);
         answer
@@ -1007,14 +1138,14 @@ fn lookups_in_a_pass(fx: &Fixture, knobs: &Knobs, now: DateTime<Utc>) -> (usize,
         budget: None,
         elapsed: &|| Duration::ZERO,
         clock: &clock,
-        pr_merged: &count,
+        pr_head: &count,
     };
     let pass = run(&env, std::slice::from_ref(&fx.host), &mut Memory::default());
     (calls.get(), pass)
 }
 
 /// A checkout off `main` carrying one commit of its own, with origin moved on:
-/// the only shape in which the `pr_merged` lookup is reached at all.
+/// the only shape in which the `pr_head` lookup is reached at all.
 fn stranded_with_its_own_commit(fx: &Fixture) {
     git(&fx.host, &["checkout", "--quiet", "-b", "feature/issue-756"]);
     fx.commit_locally("src/feature.rs");
@@ -1027,7 +1158,7 @@ fn the_merged_pr_lookup_is_the_last_question_asked() {
     // The one case that must still pay for it: everything local agrees.
     let fx = loom_fixture();
     stranded_with_its_own_commit(&fx);
-    let (asked, found) = lookups_in_a_pass(&fx, &knobs_merged(Some(true)), much_later());
+    let (asked, found) = lookups_in_a_pass(&fx, &knobs_pr_head(Some(true)), much_later());
     assert_eq!(
         asked,
         1,
@@ -1039,11 +1170,36 @@ fn the_merged_pr_lookup_is_the_last_question_asked() {
 }
 
 #[test]
+fn an_open_prs_head_is_put_back() {
+    // #14973: the checkout a reviewer leaves behind is parked on an OPEN PR's
+    // head. The lookup that vouches for its commits is `pr_head` — open or
+    // merged (see host.rs, which drops the `merged_at` filter) — so a clean
+    // checkout old enough to move goes back on the default branch with the PR
+    // commits recoverable from the rescue ref.
+    let fx = loom_fixture();
+    stranded_with_its_own_commit(&fx);
+    let stranded = fx.head();
+
+    let (asked, found) = lookups_in_a_pass(&fx, &knobs_pr_head(Some(true)), much_later());
+
+    assert_eq!(asked, 1, "the lookup settles it: {:?}", kinds(&found));
+    assert!(kinds(&found).contains(&"rehomed"), "{:?}", kinds(&found));
+    assert_eq!(git(&fx.host, &["symbolic-ref", "--short", "HEAD"]), "main");
+    let refs = rescue_refs(&fx);
+    assert_eq!(refs.len(), 1, "{refs:?}");
+    let rescue = refs[0].split(' ').next().unwrap().to_string();
+    assert!(rescue.ends_with(&stranded) || refs[0].ends_with(&stranded), "{refs:?}");
+    // The PR's commits are still reachable from the rescue ref.
+    let only_rescue = git(&fx.host, &["rev-list", "--count", &rescue, "--not", "origin/main"]);
+    assert!(only_rescue.trim().parse::<usize>().unwrap() >= 1, "{refs:?}");
+}
+
+#[test]
 fn a_local_refusal_costs_no_forge_lookup() {
     // "HEAD moved recently": `late()` is two hours on, inside the six-hour wait.
     let recent = loom_fixture();
     stranded_with_its_own_commit(&recent);
-    let (asked, found) = lookups_in_a_pass(&recent, &knobs_merged(Some(true)), late());
+    let (asked, found) = lookups_in_a_pass(&recent, &knobs_pr_head(Some(true)), late());
     assert_eq!(asked, 0, "HEAD moved recently: {:?}", kinds(&found));
     assert_eq!(only(&found).state, CheckoutState::WrongBranch);
 
@@ -1054,7 +1210,7 @@ fn a_local_refusal_costs_no_forge_lookup() {
     pinned.push("README.md", "two\n");
     git(&pinned.host, &["fetch", "--quiet", "origin"]);
     git(&pinned.host, &["config", "--local", "loom.checkoutFf.detached", "keep"]);
-    let (asked, found) = lookups_in_a_pass(&pinned, &knobs_merged(Some(true)), much_later());
+    let (asked, found) = lookups_in_a_pass(&pinned, &knobs_pr_head(Some(true)), much_later());
     assert_eq!(asked, 0, "detached on purpose: {:?}", kinds(&found));
     assert_eq!(only(&found).state, CheckoutState::WrongBranch);
 
@@ -1068,7 +1224,7 @@ fn a_local_refusal_costs_no_forge_lookup() {
         .stdout(Stdio::null())
         .spawn()
         .unwrap();
-    let (asked, found) = lookups_in_a_pass(&busy, &knobs_merged(Some(true)), much_later());
+    let (asked, found) = lookups_in_a_pass(&busy, &knobs_pr_head(Some(true)), much_later());
     child.kill().unwrap();
     child.wait().unwrap();
     assert_eq!(asked, 0, "a git process is running: {:?}", kinds(&found));
@@ -1154,7 +1310,7 @@ fn a_rescue_ref_at_another_sha_is_not_reused() {
     fx.push("README.md", "two\n");
     git(&fx.host, &["fetch", "--quiet", "origin"]);
 
-    let found = pass_at(&fx, &knobs_merged(Some(true)), &mut Memory::default(), much_later());
+    let found = pass_at(&fx, &knobs_pr_head(Some(true)), &mut Memory::default(), much_later());
 
     assert!(kinds(&found).contains(&"repair-failed"), "{:?}", kinds(&found));
     let refs = rescue_refs(&fx);
@@ -1178,9 +1334,9 @@ fn a_rehome_that_carried_nothing_does_not_say_it_carried_zero_commits() {
     let carried_one = loom_fixture();
     stranded_with_its_own_commit(&carried_one);
     let found =
-        pass_at(&carried_one, &knobs_merged(Some(true)), &mut Memory::default(), much_later());
+        pass_at(&carried_one, &knobs_pr_head(Some(true)), &mut Memory::default(), much_later());
     let line = &only_repair(&found, "rehomed").line;
-    assert!(line.contains("(1 commit(s) only on a merged PR)"), "{line}");
+    assert!(line.contains("(1 commit(s) only on a PR)"), "{line}");
 }
 
 /// The pass's single transition of `kind`.

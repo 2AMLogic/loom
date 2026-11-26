@@ -16,20 +16,39 @@ pub mod export;
 mod forge_auth;
 mod lease;
 mod lifecycle;
+mod mirror;
+#[cfg(test)]
+mod mirror_tests;
+pub mod read_authority;
+#[cfg(test)]
+mod read_authority_tests;
 #[cfg(test)]
 mod recover_tests;
 mod repository;
+pub(crate) mod seat_reclaim;
 #[cfg(test)]
 mod tests;
 pub mod transport;
+mod volume_usage;
 mod worker_setup;
 
 pub use lease::AccountBusy;
+pub(crate) use lifecycle::ConfiguredSeatMissing;
 pub use lifecycle::{
     check_binding, configured, converge, rebind, recover, registered_repositories, registrations,
     run_job, session_recover, start, status, stop, Converged,
 };
+/// The read-authority proof contract for host mirror admission (#14716):
+/// the stable grant a store pins, the verified credential a proof carries,
+/// and the separate attach/publication decisions over them.
+pub use read_authority::{
+    Admission, AdmissionRefusal, AuthorityGap, BorrowerAuthority, Publication, PublicationRefusal,
+    ReadGrant, ReadProof, Verification,
+};
 pub use repository::WorkerCommand;
+pub(crate) use volume_usage::{
+    reader_image, SeatVolumeSamples, SeatVolumeUsage, SEAT_VOLUME_SAMPLE_INTERVAL,
+};
 
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
@@ -42,7 +61,18 @@ pub const REPO: &str = "/workspace/repo";
 /// Parent of every additional repository clone an account holds beyond the
 /// legacy primary at [`REPO`] (#10795). Lives on the account's own volume.
 pub const WORK_ROOT: &str = "/workspace/work";
+/// Root of the read-only origin object mirrors a seat container borrows
+/// published objects through (#14680): one bind per authorized repository,
+/// at `MIRRORS/<slug>/objects`, referenced by that clone's sole object
+/// alternate. Lives on the container's read-only rootfs, so a worker cannot
+/// create or alter a mount point there.
+pub const MIRRORS: &str = "/mirrors";
 pub const MODE: &str = "private-clone";
+const VOLUME_PREFIX: &str = "loom-codex-workspace-";
+
+fn workspace_volume_name(account: &str) -> String {
+    format!("{VOLUME_PREFIX}{account}")
+}
 pub const PROTOCOL: &str = "loom-private-workspace-v1";
 const PROFILE: &str = "/home/loom/.codex-profile";
 const GH_CONFIG: &str = "/run/loom-gh";
@@ -88,6 +118,16 @@ pub struct Config {
     /// Absent in state written before it, which reads as none.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub extra_mounts: Vec<ExtraMount>,
+    /// Repository slugs whose origin object mirror (#14680) the container was
+    /// **last created** with, each bound read-only at `MIRRORS/<slug>/objects`.
+    /// Docker binds are fixed at container creation, so this snapshot — not
+    /// the current registrations — is what `validate_settings` expects and
+    /// what preparation hands down. A repository registered after creation
+    /// keeps its fully private clone until the next recreation installs and
+    /// verifies the new bind. Empty when the container predates #14680 or
+    /// `accounts.session.objectMirrors` is off.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub mirror_binds: Vec<String>,
 }
 
 /// One additional repository of an account (registered, not necessarily cloned).
@@ -139,6 +179,17 @@ impl Config {
             slug: Some(registered.slug.clone()),
         })
     }
+}
+
+/// The in-container objects path that is the ONLY object alternate a clone of
+/// `repository` may carry (#14680): `MIRRORS/<slug>/objects`, with the slug
+/// derived from the repository's own canonical identity. `None` for a
+/// repository [`identify`] cannot parse (a legacy or test-only local path):
+/// those clones stay fully private, and any alternate on them is refused.
+pub(super) fn mirror_alternate(repository: &str) -> Option<String> {
+    identify(repository)
+        .ok()
+        .map(|id| format!("{MIRRORS}/{}/objects", id.slug))
 }
 
 /// Canonical identity of a forge repository: the key two spellings of one
@@ -218,12 +269,26 @@ pub struct Status {
     /// Also under `config.extra_mounts`; empty without the setting.
     pub extra_mounts: Vec<ExtraMount>,
     pub running: bool,
+    /// An operator hold on this seat's private profile, even if still running.
+    pub held: bool,
     pub lease: Option<lease::Job>,
     /// Secret-free containment-admission provenance for the CURRENT job
     /// (#8787), so `session status` reports what an execution-specific
     /// admission actually relied on. Absent on every ordinary session.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub admission: Option<serde_json::Value>,
+}
+
+impl Status {
+    pub(crate) fn state_label(&self) -> &'static str {
+        if self.running {
+            "running"
+        } else if self.held {
+            "stopped, held (operator stop)"
+        } else {
+            "stopped"
+        }
+    }
 }
 
 #[derive(Clone, Debug, clap::Args)]
@@ -262,6 +327,8 @@ pub enum RecoverAction {
     List,
     Publish,
     Discard,
+    #[doc(hidden)]
+    ValidateWorktrees,
 }
 
 /// One branch whose tip is not reachable from `origin`.
@@ -282,6 +349,54 @@ pub struct DetachedWork {
     pub ahead: u64,
 }
 
+/// The step-outcome reason of a preparation the seat's own dirty worktree
+/// refused (#14458). The refusal message carries it verbatim so the step's
+/// end can classify the failure by it instead of `unclassified`.
+pub const SEAT_DIRTY_REASON: &str = "seat_dirty";
+
+/// The step-outcome reason of a preparation refused because the seat's
+/// resolved temp directory is unwritable (#14929): a full 512 MB `/tmp`
+/// previously surfaced downstream as a misleading `workspace Git fetch
+/// failed` and dirty-clone refusals. The refusal message carries it verbatim
+/// so the failure names its cause.
+pub const SEAT_TEMP_UNWRITABLE_REASON: &str = "seat_temp_unwritable";
+
+/// One worktree of a clone (the main checkout included) with uncommitted or
+/// untracked files, as the recover listing reports it (#14458). Counted over
+/// the same `git status` preparation refuses on, so the two cannot disagree.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct DirtyWorktree {
+    pub path: String,
+    /// The checked-out branch; `None` on a detached HEAD.
+    pub branch: Option<String>,
+    /// Paths with tracked changes (modified, staged, merge state).
+    pub tracked: usize,
+    /// Untracked paths.
+    pub untracked: usize,
+    /// Commits at this worktree's HEAD that no ref of `origin` reaches.
+    pub unpublished: u64,
+    /// An in-volume linked worktree with no unpublished commits. Older
+    /// workers may omit this proof, so default to in-place advice.
+    #[serde(default)]
+    pub discardable: bool,
+}
+
+impl DirtyWorktree {
+    pub(crate) fn recovery_guidance(&self, account: &str) -> String {
+        recovery_guidance(account, &self.path, self.discardable)
+    }
+}
+
+fn recovery_guidance(account: &str, path: &str, discardable: bool) -> String {
+    if discardable {
+        let account = crate::shell_quote::shell_quote(account);
+        let path = crate::shell_quote::shell_quote(path);
+        format!("if the local changes can be discarded, run `loom-daemon accounts session recover {account} --discard --worktree {path}`")
+    } else {
+        "save or resolve its changes in place".into()
+    }
+}
+
 /// One clone's recover outcome, as the in-container
 /// `private-workspace recover` verb reports it (#14030).
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -300,6 +415,13 @@ pub struct RecoverOutcome {
     /// Detached HEADs still holding unreferenced unpublished work
     /// (report-only: recover never touches them).
     pub detached: Vec<DetachedWork>,
+    /// Worktrees still dirty after the action, whether or not anything is
+    /// unpublished (#14458).
+    #[serde(default)]
+    pub dirty_worktrees: Vec<DirtyWorktree>,
+    /// Worktrees this call removed (`--discard --worktree`, #14458).
+    #[serde(default)]
+    pub removed_worktrees: Vec<String>,
 }
 
 /// What one `accounts session recover` call did across the account's clones.
@@ -362,12 +484,38 @@ pub struct RebindReport {
     pub after: CloneState,
 }
 
+/// A Codex account not found in the inventories used for convergence.
+#[derive(Debug)]
+pub(crate) enum AccountAbsent {
+    ActingRoots,
+    SelectedRoot,
+}
+
+impl std::fmt::Display for AccountAbsent {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::ActingRoots => "Codex account not found in any registered root",
+            Self::SelectedRoot => "Codex account not found",
+        })
+    }
+}
+
+impl std::error::Error for AccountAbsent {}
+
+/// Current evidence about the account or configured seat a binding is waiting for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BindingReadiness {
+    Ready,
+    Missing,
+    Unverified,
+}
+
 fn account(workspace: &Path, name: &str) -> Result<super::account_registry::AccountDescriptor> {
     use super::account_registry::{account_inventory, account_matches_reference, AccountProvider};
     account_inventory(workspace, AccountProvider::Codex)?
         .into_iter()
         .find(|a| account_matches_reference(a, name))
-        .context("Codex account not found")
+        .ok_or_else(|| AccountAbsent::SelectedRoot.into())
 }
 
 fn state_dir(profile: &Path) -> Result<PathBuf> {

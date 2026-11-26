@@ -228,7 +228,20 @@ pub(super) fn execute(command: Vec<String>) -> Result<()> {
     let (bin, args) = command.split_first().context("private command missing")?;
     let mut child = Command::new(bin);
     let clone = selected_clone()?;
-    child.args(args).current_dir(&clone);
+    // A guarded role on a profile with no recorded hook trust runs on the
+    // sealed registration (#14105). Vetted against the argv as given, then
+    // the waiver is added: the audit above never sees Loom's own flags.
+    let waiver = if Path::new(bin)
+        .file_name()
+        .is_some_and(|name| name == "codex")
+    {
+        containment::waiver_args(&role, args, &clone)?
+    } else {
+        Vec::new()
+    };
+    child
+        .args(containment::with_waiver(args, waiver))
+        .current_dir(&clone);
     // The last check before the model runs, on the boundary the host bound at
     // admission. Nothing has started yet — the session was proven idle — so a
     // boundary that is Ready here is the boundary Codex will read its hook
@@ -266,7 +279,7 @@ fn admit_role(role: &str) -> Result<()> {
             containment::in_container(&account, &bound, &revision, &repository, &clone_text)
                 .map_err(|error| {
                     anyhow::anyhow!(
-                        "role {role} merges or issues verdicts, and Loom's guard hook is not \
+                        "role {role} requires Loom's guard hook, but it is not \
                          proven for this private session: {error}"
                     )
                 })?;

@@ -1288,7 +1288,7 @@ pub const VERDICT_ANCHOR_ENABLED_ENV: &str = "LOOM_VERDICT_ANCHOR";
 
 // The #9124 tree-identical carve-out's own kill switch
 // (`LOOM_VERDICT_TREE_CARVEOUT`) lives beside the logic it gates, in
-// `verdict_invalidation` — this module has no file-size ratchet headroom.
+// `verdict_invalidation`.
 
 /// The marker Judge stamps into every verdict comment
 /// (`defaults/.claude/commands/loom/judge.md` -> "Verdict SHA Marker"),
@@ -1412,6 +1412,44 @@ pub struct VerdictPr {
     /// Suppresses only the duplicate *comment*; the label swap is unaffected,
     /// which is what makes the retry after a failed label write still work.
     pub invalidation_recorded: bool,
+    /// #15068 (porting the shell guard's #13586/#14516 step 4b to this pass):
+    /// a trusted actor **other than the marker's author** applied this
+    /// `loom:changes-requested` label at a time newer than the newest marker
+    /// comment, and no `committed` / `head_ref_force_pushed` event follows
+    /// that label. Every condition is verified by
+    /// [`super::verdict_send_back::fetch_operator_send_back`] BEFORE this
+    /// field is set — [`decide_verdict`] only checks `is_some()`, never
+    /// re-derives the evidence. `None` means "no such evidence" **or**
+    /// "evidence unavailable" (an unreadable timeline, an untrusted or
+    /// unverifiable actor, a missing field): both fail closed to the ordinary
+    /// marker-vs-head result, exactly as before this field existed.
+    ///
+    /// A hand-posted operator ruling writes no marker, so the newest marker
+    /// names an OLDER verdict's tree and the marker comparison alone would
+    /// clear the operator's rejection and re-queue the very head they
+    /// rejected — the #14470 incident. Clearing a *rejection* is the unsafe
+    /// direction, so this evidence pins the label to the current head until
+    /// the head actually moves. `changes-requested` only: an approval keeps
+    /// the strict marker rule (a missing marker fails safe by re-queueing,
+    /// never by anchoring, #9258).
+    pub operator_send_back: Option<OperatorSendBack>,
+}
+
+/// Positively verified evidence that the standing `loom:changes-requested`
+/// label was applied by a trusted human at the current head (#15068,
+/// porting `verdict-staleness-guard.sh` step 4b — #13586, hardened by
+/// #14516). Carried on [`VerdictPr`] like `on_hold` and `marker_scan_ok` so
+/// [`decide_verdict`] stays a pure function of its input.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OperatorSendBack {
+    /// The `labeled loom:changes-requested` event's actor, verified trusted
+    /// (write-or-higher collaborator permission, or the comment-trust
+    /// predicate's other rules) and a DIFFERENT login from the newest
+    /// marker's author.
+    pub actor: String,
+    /// When that label event landed — always newer than the newest marker
+    /// comment, with no head-moving timeline event after it.
+    pub labeled_at: chrono::DateTime<chrono::Utc>,
 }
 
 /// Why [`decide_verdict`] left a verdict in place.
@@ -1420,6 +1458,11 @@ pub enum VerdictKeepReason {
     /// The recorded SHA matches the current head — the verdict still
     /// describes the tree in front of it.
     Fresh,
+    /// A trusted human's `loom:changes-requested` label, applied after the
+    /// newest marker at an unmoved head ([`OperatorSendBack`], #15068) — the
+    /// marker names a superseded tree, but the label itself describes the
+    /// head in front of it, so it stays until the head moves.
+    OperatorSendBack,
     /// No marker for this verdict kind. Fail safe: never force-clear a
     /// verdict on missing evidence (this is every pre-#5686 verdict).
     Unverifiable,
@@ -1595,6 +1638,19 @@ impl VerdictReconcileStats {
 /// for a superseded verdict vouch for (or wrongly invalidate) the live one.
 #[must_use]
 pub fn extract_latest_verdict_sha(bodies: &[String], kind: VerdictKind) -> Option<String> {
+    let re = verdict_marker_regex(kind)?;
+    bodies
+        .iter()
+        .rev()
+        .find_map(|body| re.captures_iter(body).last().map(|c| c[1].to_string()))
+}
+
+/// The `verdict-sha` marker pattern for `kind` — canonical spelling plus the
+/// tolerated aliases ([`VerdictKind::marker_tokens`]). One implementation so
+/// [`extract_latest_verdict_sha`] and the marker-comment lookup in
+/// `verdict_send_back` (#15068) can never drift apart.
+#[must_use]
+pub(crate) fn verdict_marker_regex(kind: VerdictKind) -> Option<regex::Regex> {
     let tokens = kind
         .marker_tokens()
         .iter()
@@ -1602,11 +1658,14 @@ pub fn extract_latest_verdict_sha(bodies: &[String], kind: VerdictKind) -> Optio
         .collect::<Vec<_>>()
         .join("|");
     let pattern = format!(r"<!-- loom:verdict-sha sha=([0-9a-f]{{7,40}}) verdict=(?:{tokens}) -->");
-    let re = regex::Regex::new(&pattern).ok()?;
-    bodies
-        .iter()
-        .rev()
-        .find_map(|body| re.captures_iter(body).last().map(|c| c[1].to_string()))
+    regex::Regex::new(&pattern).ok()
+}
+
+/// Whether `body` carries any `verdict-sha` marker of `kind` — the same
+/// pattern [`extract_latest_verdict_sha`] scans with.
+#[must_use]
+pub(crate) fn body_carries_verdict_marker(body: &str, kind: VerdictKind) -> bool {
+    verdict_marker_regex(kind).is_some_and(|re| re.is_match(body))
 }
 
 /// Pure decision function for one verdict-labelled PR — no I/O, fully
@@ -1644,6 +1703,20 @@ pub fn decide_verdict(pr: &VerdictPr) -> VerdictAction {
     }
     if pr.on_hold {
         return VerdictAction::Keep(VerdictKeepReason::Held);
+    }
+    // #15068: the daemon-side port of the shell guard's step 4b
+    // (#13586/#14516). A human applying `loom:changes-requested` by hand
+    // writes no marker, so the newest marker names an older verdict's SHA and
+    // the marker comparison above reads their send-back as stale. The
+    // evidence that the label describes THIS head was verified before it
+    // reached this struct ([`VerdictPr::operator_send_back`]): trusted actor,
+    // different login from the marker's author, label newer than the marker,
+    // and no commit / force-push after it. `changes-requested` only — an
+    // approval keeps the strict marker rule above, because a missing approval
+    // marker must keep failing safe by re-queueing (#9258), and an operator
+    // never *approves* by hand-labeling around the pipeline.
+    if pr.kind == VerdictKind::ChangesRequested && pr.operator_send_back.is_some() {
+        return VerdictAction::Keep(VerdictKeepReason::OperatorSendBack);
     }
     VerdictAction::Invalidate {
         marker_sha: marker_sha.to_string(),
@@ -1935,8 +2008,7 @@ pub fn spawn_periodic_reconciliation_task(
 
 /// The `gh pr view --json labels,isDraft` lookup [`forge::reclaim_pr`] uses to
 /// decide whether its `loom:review-requested` safety net may fire — split
-/// into its own file per the file-size ratchet (`.loom/docs/file-size-policy.md`)
-/// rather than growing `forge` inline.
+/// into its own file rather than growing `forge` inline.
 mod liveness;
 pub use liveness::{
     claim_activity_marker, extra_liveness_at, live_pr_lease_at, most_recent_claim_activity_at,
@@ -1949,51 +2021,65 @@ mod pr_label_info;
 
 /// The #8900 auto-merge disarm hook
 /// [`verdict_invalidation::invalidate_verdict`] calls before posting its
-/// stale-verdict comment — a sibling file per the file-size ratchet
-/// (`.loom/docs/file-size-policy.md`) rather than more inline logic here.
+/// stale-verdict comment — a sibling file rather than more inline logic here.
 mod auto_merge_disarm;
 
 /// The stale-verdict audit comment's body and its #9124 idempotence test —
-/// a sibling file per the file-size ratchet. The measurement behind it (25% of
+/// a sibling file. The measurement behind it (25% of
 /// this repo's invalidation comments were duplicates) is in that module's own
 /// header.
 mod verdict_stale_comment;
 
 /// Everything [`forge::reconcile_pr_verdicts`] does once [`decide_verdict`]
 /// answers `Invalidate`: the #9124 tree-identical re-anchor carve-out and the
-/// #5686 clear it falls through to — a sibling file per the file-size ratchet,
-/// leaving a single dispatch call in the match arm here.
+/// #5686 clear it falls through to — a sibling file, leaving a single
+/// dispatch call in the match arm here.
 mod verdict_invalidation;
 
 /// Return a PR held only by a machine CI gate to review once its exact head is
-/// green (#10178) — a sibling file per the file-size ratchet.
+/// green (#10178) — a sibling file.
 pub(crate) mod ci_gate_recovery;
 
 /// The `Keep(Unverifiable)` arm of [`forge::reconcile_pr_verdicts`]: anchor an
 /// unmarked rejection (#6319), re-queue an unmarked approval (#9258) — a
-/// sibling file per the file-size ratchet.
+/// sibling file.
 mod unanchored_verdict;
+
+/// The timeline walk behind [`VerdictPr::operator_send_back`] (#15068): the
+/// daemon-side port of `verdict-staleness-guard.sh` step 4b (#13586,
+/// hardened by #14516) — a trusted human's `loom:changes-requested` label at
+/// an unmoved head pins the verdict to that head — a sibling file, so the
+/// I/O stays out of [`decide_verdict`].
+mod verdict_send_back;
 
 pub mod merge_sequence;
 /// The #8922 base-conflict pass for `loom:review-requested` PRs — a sibling
-/// file per the file-size ratchet, run on the same tick right after
-/// [`forge::reconcile_pr_verdicts`].
+/// file, run on the same tick right after [`forge::reconcile_pr_verdicts`].
 pub mod review_conflict;
 
 /// Retarget open PRs stacked on a parent closed unmerged (#12760) — and its
-/// scratch-worktree git mechanics — sibling files per the file-size ratchet.
+/// scratch-worktree git mechanics — sibling files.
 pub mod orphan_stack;
 pub(crate) mod orphan_stack_git;
 
+/// Retarget the stacked children of a parent that merged outside
+/// `merge-pr.sh` — including the ones GitHub already retargeted (#14903) —
+/// a sibling of [`orphan_stack`] reusing its git mechanics.
+pub mod merged_stack;
+
 /// The per-repo loop of one reconciliation pass, plus the #8953 mid-pass
-/// rate-limit-breaker re-check that stops it early — a sibling file per the
-/// file-size ratchet rather than more inline logic here.
-mod pass_loop;
+/// rate-limit-breaker re-check that stops it early — a sibling file rather
+/// than more inline logic here. `pub(crate)` for `merge_observation`'s
+/// predicates, which the merge-pr bookkeeping shares (#15145).
+pub(crate) mod pass_loop;
 
 /// The ETag-cached `loom:building` listing [`forge`] reconciles against — a
-/// sibling file per the file-size ratchet, attributed to `claim_reconciliation`
-/// in the #9251 forge-call accounting.
+/// sibling file, attributed to `claim_reconciliation` in the #9251 forge-call
+/// accounting.
 mod building_listing;
+/// Issue-side `loom:curating` claims left stale by the #14811 roll-requeue
+/// bug — lease-evidenced release with a re-curation record (#14816).
+mod curating_reclaim;
 /// Keep `loom:building` on an issue whose PR is open (#11852).
 pub(crate) mod open_pr_hold;
 /// The ETag-cached REST open-PR listing the PR-side passes share (#10349).
@@ -2002,7 +2088,7 @@ pub(crate) mod open_pr_listing;
 mod startup_cutoff;
 
 /// The facade glue every `gh` call below goes through (#10089), and the
-/// version-keyed reuse of its per-PR reads — sibling files per the ratchet.
+/// version-keyed reuse of its per-PR reads — sibling files.
 pub(crate) mod gh_call;
 pub(crate) mod read_cache;
 
@@ -2104,8 +2190,9 @@ pub mod forge {
     }
 
     /// Fetch `issue`'s current label names (best-effort). Mirrors
-    /// `pr_label_names` below, for the issue side.
-    fn issue_label_names(gh_bin: &Path, root: &Path, issue: u32) -> Result<Vec<String>> {
+    /// `pr_label_names` below, for the issue side. Shared with the
+    /// `loom:curating` pass (#14816) for its pre-write fresh-label read.
+    pub(crate) fn issue_label_names(gh_bin: &Path, root: &Path, issue: u32) -> Result<Vec<String>> {
         #[derive(Debug, Deserialize)]
         struct GhLabel {
             name: String,
@@ -3009,6 +3096,39 @@ pub mod forge {
                     });
                     scan.map_or((None, false, false), |(sha, recorded)| (sha, true, recorded))
                 };
+                // #15068: only the one shape that is about to be invalidated —
+                // a `changes-requested` verdict whose marker names a different
+                // tree than the head — pays for the timeline walk that checks
+                // for a human send-back at the current head. Everything else
+                // (approvals, fresh verdicts, held PRs, unreadable comment
+                // listings) answers exactly as before, and an unavailable or
+                // negative answer here fails closed to that same
+                // marker-vs-head result inside [`decide_verdict`].
+                let operator_send_back = if kind == VerdictKind::ChangesRequested
+                    && marker_scan_ok
+                    && !on_hold
+                    && matches!(
+                        (marker_sha.as_deref(), r.head_sha.as_deref()),
+                        (Some(m), Some(h)) if !m.is_empty() && !h.is_empty() && !h.starts_with(m)
+                    ) {
+                    let head = r.head_sha.as_deref().unwrap_or_default();
+                    let what = format!("sendback:{label}@{head}");
+                    let key =
+                        super::read_cache::key(root, r.number, &what, r.updated_at.as_deref());
+                    super::read_cache::VERDICT_SEND_BACK
+                        .get_or(key, || {
+                            // `get_or` only stores a `Some`; `None` (a failed walk
+                            // OR no send-back, indistinguishable here) is
+                            // re-walked next tick — fail closed is never cached.
+                            super::verdict_send_back::fetch_operator_send_back(
+                                gh_bin, root, r.number, kind,
+                            )
+                            .map(Some)
+                        })
+                        .flatten()
+                } else {
+                    None
+                };
                 VerdictPr {
                     number: r.number,
                     kind,
@@ -3017,6 +3137,7 @@ pub mod forge {
                     marker_scan_ok,
                     on_hold,
                     invalidation_recorded,
+                    operator_send_back,
                 }
             })
             .collect())
@@ -3119,6 +3240,13 @@ pub mod forge {
                             gh_bin, root, &pr, anchoring, &mut stats,
                         );
                     }
+                    VerdictAction::Keep(VerdictKeepReason::OperatorSendBack) => {
+                        log::info!(
+                            "verdict reconcile: PR #{} keeps its hand-applied changes-requested \
+                             (trusted operator send-back at an unmoved head, #15068)",
+                            pr.number
+                        );
+                    }
                     VerdictAction::Keep(_) => {}
                 }
             }
@@ -3132,13 +3260,11 @@ pub mod forge {
 #[allow(clippy::unwrap_used)]
 mod tests;
 
-// Issue #8263's `gh api` GH_REPO regression coverage, in its own sibling file
-// so this over-threshold module does not grow (scripts/file-size-baseline.txt).
+// Issue #8263's `gh api` GH_REPO regression coverage, in its own sibling file.
 #[cfg(test)]
 mod repo_env_tests;
 
-// Issue #9124's verdict-dedup coverage, in its own sibling file for the same
-// reason: neither this module nor `tests.rs` has ratchet headroom.
+// Issue #9124's verdict-dedup coverage, in its own sibling file.
 #[cfg(test)]
 mod verdict_dedup_tests;
 
@@ -3156,6 +3282,11 @@ mod rest_only_tests;
 // #9258: an unmarked approval is re-queued, never anchored.
 #[cfg(test)]
 mod unanchored_verdict_tests;
+
+// #15068: the operator send-back walk (`verdict_send_back`), pure and
+// end-to-end.
+#[cfg(test)]
+mod verdict_send_back_tests;
 
 // #12230: a slow startup pass beside work-finder ticks dispatches once.
 #[cfg(test)]

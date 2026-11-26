@@ -1,9 +1,8 @@
 //! `loom-daemon tokens select` — the pool's token-selection entry point.
 //!
 //! Extracted from `cli/tokens.rs`'s inline `TokensAction::Select` match arm
-//! (issue #8146) so the parent file stays under the
-//! `check-file-size-budget.sh` ratchet while this handler grows the `--role`
-//! argument that feeds the prompt-cache affinity preference
+//! (issue #8146) so the parent file does not grow while this handler gains the
+//! `--role` argument that feeds the prompt-cache affinity preference
 //! (`tokens_pool::affinity`). Behavior is otherwise unchanged.
 
 use anyhow::{anyhow, Result};
@@ -25,7 +24,7 @@ pub(crate) struct SelectArgs {
     /// or a value the classifier does not recognize, selects account-wide.
     pub model: Option<String>,
     /// The spawning role's name (`LOOM_ROLE`), when the caller knows it.
-    /// Used only as the prompt-cache affinity key (issue #8146); `None` —
+    /// Used for Codex guard readiness and Claude prompt-cache affinity; `None` —
     /// the default, and every pre-#8146 caller — selects exactly as before.
     pub role: Option<String>,
 }
@@ -65,8 +64,12 @@ pub(crate) fn handle_select(args: SelectArgs) -> Result<()> {
         // accepts (see `select_token_for_model_and_role` below) now also
         // narrows Codex selection past a class-scoped
         // `MODEL_CREDITS_EXHAUSTED` hold (#8058 Phase 2).
-        let selected = crate::tokens_pool::select_account(&ws, provider, model.as_deref())
-            .map_err(|error| anyhow!(error))?;
+        let selected = crate::runtime_preference::codex_guard::select(
+            &ws,
+            model.as_deref(),
+            role.as_deref(),
+            |_| true,
+        )?;
         let directory = match &selected.binding {
             crate::tokens_pool::AccountBinding::CodexHome { directory } => directory,
             _ => unreachable!("Codex selection returned a non-Codex binding"),

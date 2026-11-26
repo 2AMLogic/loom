@@ -41,6 +41,10 @@
 //!   reap records the no-verdict pass for the backstop whatever the CI state.
 //! - **check** reports [`ClaimState`] (`free`, `held-self`, `held-peer`,
 //!   `unknown`) — the PR-phase shape of #11118's proposed `claim_state(item)`.
+//! - **backstop-clear** (operator, #15096) releases Judge no-verdict
+//!   backstop holds without a push or a label change, by rewriting each
+//!   trusted in-window record to `verdict=cleared` — a token no hold reader
+//!   counts (`cli/pr_lease/backstop.rs`).
 //!
 //! The label stays the caller's to write, **after** a won claim: the label is
 //! a projection of the lease, not the evidence (#11118).
@@ -85,6 +89,20 @@ pub(crate) mod renew;
 pub(crate) const LEASE_PREFIX: &str = "<!-- loom:pr-lease role=";
 /// First-line prefix of a tie-break loser's standdown record.
 pub(crate) const YIELD_PREFIX: &str = "<!-- loom:pr-lease-yield role=";
+/// The one-line `release`/`reap` summary. A release that patched nothing
+/// because this identity's own rows already carry the released marker (the
+/// verdict step released first) says so, rather than "released 0" (#14392);
+/// no own row at all keeps the plain zero count.
+fn release_summary(verb: &str, released: usize, already_released: usize, stopped: usize) -> String {
+    if released == 0 && already_released > 0 {
+        format!(
+            "already released ({already_released} lease comment(s)); stopped {stopped} renewer(s)"
+        )
+    } else {
+        format!("{verb} {released} lease comment(s); stopped {stopped} renewer(s)")
+    }
+}
+
 /// First-line prefix a released lease's marker is rewritten to.
 pub(crate) const RELEASED_PREFIX: &str = "<!-- loom:pr-lease-released role=";
 /// The common prefix all three share — the read's `--jq` pre-filter.
@@ -649,6 +667,15 @@ fn unreadable_claim_line(why: Option<&str>) -> String {
     }
 }
 
+/// The stderr line of `lease pr check` when it reports `unknown` (#15105): the
+/// bounded cause of the exhausted read, so the first run is diagnosable.
+fn unreadable_check_line(why: Option<&str>) -> String {
+    match why {
+        Some(why) => format!("could not read this PR's lease records (state unknown): {why}"),
+        None => "could not read this PR's lease records (state unknown)".to_string(),
+    }
+}
+
 /// The writer credential directory this process inherited
 /// (`GH_CONFIG_DIR`): the daemon resolved it for this claim
 /// (`lease_command` sets it from its own per-root registry, or the child
@@ -945,6 +972,23 @@ pub(crate) fn lease_body(me: &Identity, pr: u64, renewed: Option<DateTime<Utc>>)
     body
 }
 
+/// The visible prose `release_with` leaves on a row it releases (#14807):
+/// the live record's text says the claim "is held", and a human reading the
+/// PR must not keep seeing that behind a released marker. `reaped` words it
+/// as the role runner's reap of a claimant that ended without releasing.
+pub(crate) fn released_body(holder: &Identity, pr: u64, reaped: bool) -> String {
+    format!(
+        "PR #{pr}'s `{label}` lease for the {role} of sweep `{sweep}` on host `{host}` was {verb}. \
+         This **PR lease record** (#9401) is no longer live. \
+         See `defaults/docs/lease-record.md` § \"PR-phase leases\".",
+        verb = if reaped { "reaped" } else { "released" },
+        label = holder.claim_label_text(),
+        role = holder.role.as_str(),
+        sweep = holder.sweep,
+        host = holder.host,
+    )
+}
+
 // ---------------------------------------------------------------------------
 // CLI
 // ---------------------------------------------------------------------------
@@ -1002,8 +1046,10 @@ pub(crate) enum PrLeaseAction {
     /// sweep id (the claim's `--watch-pid`/`--sweep-id` was omitted; the
     /// output names it), nothing released (#13132).
     Release(ReleaseArgs),
-    /// Print `PR_LEASE_STATE=free|held-self|held-peer|unknown` (+ holder).
-    /// Exit 0 free/held-self, 4 held-peer, 5 unknown.
+    /// Print `PR_LEASE_STATE=free|held-self|held-peer|held-backstop|unknown`.
+    /// Exit 0 free/held-self, 4 held-peer (+ holder), 5 unknown, 6 held-backstop.
+    /// A Judge backstop hold includes `PR_LEASE_BACKSTOP_UNTIL=<RFC3339>` and,
+    /// for a gate-refusal cooldown, `PR_LEASE_BACKSTOP_REFUSED=<token>`.
     Check(Common),
     /// Internal: renew-only (#11906). Re-attach to this claimant's own live
     /// lease and start its renewer; never posts a lease. Exit 0 = attached;
@@ -1019,6 +1065,14 @@ pub(crate) enum PrLeaseAction {
     /// Always 0.
     #[command(hide = true)]
     Reap(ReapArgs),
+    /// Operator (#15096): release Judge no-verdict backstop holds without a
+    /// push or a label change, by rewriting each trusted in-window record on
+    /// the PR from `verdict=none` to `verdict=cleared` (which no hold reader
+    /// counts). `--pr N` clears one PR; `--all` clears every open
+    /// `loom:review-requested` PR `lease pr check --role judge` reports
+    /// `held-backstop`. Exit 0 = done (a `BACKSTOP_CLEAR pr=<n> cleared=<k>`
+    /// line per PR); 1 = a read, the write target or a rewrite failed.
+    BackstopClear(BackstopClearArgs),
 }
 
 /// `release`'s arguments: the shared flags plus the pass's own skip reason.
@@ -1064,6 +1118,21 @@ pub(crate) struct ReapArgs {
     pub(crate) workspace: PathBuf,
 }
 
+/// `backstop-clear`'s arguments (#15096): one PR, or every held one.
+#[derive(clap::Args, Debug, Clone)]
+pub(crate) struct BackstopClearArgs {
+    /// The PR whose Judge no-verdict records to clear.
+    #[arg(long, value_name = "PR", required_unless_present = "all")]
+    pub(crate) pr: Option<u64>,
+    /// Clear every open `loom:review-requested` PR the backstop holds
+    /// (`lease pr check --role judge` answers `held-backstop`).
+    #[arg(long, conflicts_with = "pr")]
+    pub(crate) all: bool,
+    /// Repo checkout to operate in.
+    #[arg(long, default_value = ".")]
+    pub(crate) workspace: PathBuf,
+}
+
 impl PrLeaseAction {
     /// Tools-only dispatch. The daemon runs the same actions without consulting
     /// tools mode, and retains its scheduled attach/reap entry points.
@@ -1079,6 +1148,12 @@ impl PrLeaseAction {
             Self::RenewLoop(args) => &mut args.workspace,
             Self::Attach(_) | Self::Reap(_) => {
                 eprintln!("loom-tools lease pr: attach and reap are daemon service operations; use loom-daemon");
+                std::process::exit(super::forge_read::EX_WRITE_VERB_NOT_MIGRATED);
+            }
+            Self::BackstopClear(_) => {
+                eprintln!(
+                    "loom-tools lease pr: backstop-clear is an operator verb of loom-daemon; use loom-daemon lease pr backstop-clear"
+                );
                 std::process::exit(super::forge_read::EX_WRITE_VERB_NOT_MIGRATED);
             }
         };
@@ -1131,6 +1206,9 @@ impl PrLeaseAction {
                 };
                 with_context_as(&common, Some(&r.host), EXIT_HELD, true, |ctx| ctx.reap(&r.reason))
             }
+            // An operator verb, not a claimant's: it has no lease identity,
+            // so it resolves its own context (cli/pr_lease/backstop.rs).
+            Self::BackstopClear(a) => backstop::backstop_clear(&a),
         };
         std::process::exit(code)
     }
@@ -1632,12 +1710,19 @@ impl Ctx {
             }
         };
         let mut released = 0;
+        // #14392: own rows already carrying the released marker (the verdict
+        // step released first); counted only to word the summary line.
+        let mut already_released = 0;
         // #11855: a Judge leaving the PR still waiting for review records it.
         let mut extra = None;
         for row in rows {
             // Our own lease, whatever step it named (ownership ignores it).
             let holder = match parse_record(&row.body) {
                 Some(Record::Lease(holder)) if holder == self.me => holder,
+                Some(Record::Released(holder)) if holder == self.me => {
+                    already_released += 1;
+                    continue;
+                }
                 _ => continue,
             };
             let extra = extra.get_or_insert_with(|| {
@@ -1660,9 +1745,6 @@ impl Ctx {
                     Some(reason) => backstop::reaped_release_fields(self.me.role, head, reason),
                 }
             });
-            let mut lines = row.body.lines();
-            lines.next();
-            let rest: Vec<&str> = lines.collect();
             // The released marker keeps the lease's own step.
             // A Champion merge step's release records its outcome (#12616);
             // a reaped one died without releasing, so it has none.
@@ -1676,10 +1758,14 @@ impl Ctx {
                 Some((word, reason)) => backstop::format_champion_outcome(word, reason.as_deref()),
                 None => String::new(),
             };
+            // #14807: the prose is rewritten too — the live record's text
+            // says the claim "is held", and no reader of the PR should keep
+            // seeing that behind a released marker. The renewal line, if
+            // any, goes with it: no reader parses it on a released row.
             let body = format!(
                 "{}\n{}",
                 holder.released_marker_with(&format!("{extra}{champion}")),
-                rest.join("\n")
+                released_body(&holder, self.pr(), reaped.is_some())
             );
             if self.gh.patch(row.id, &body).is_ok() {
                 released += 1;
@@ -1708,14 +1794,35 @@ impl Ctx {
         } else {
             "released"
         };
-        self.say(&format!("{verb} {released} lease comment(s); stopped {stopped} renewer(s)"));
+        self.say(&release_summary(verb, released, already_released, stopped));
         (EXIT_HELD, released)
     }
 
     /// `check`.
     pub(crate) fn check(&self) -> i32 {
-        let rows = self.gh.read_rows_retrying(self.pr(), &self.policy);
+        // #15105: keep the final read failure's reason — a probe whose whole
+        // contract is "report the state" must not fail silently.
+        let (rows, why) = match self.gh.read_rows_retrying_why(self.pr(), &self.policy) {
+            Ok(rows) => (Some(rows), None),
+            Err(why) => (None, Some(why)),
+        };
         let state = self.state_of(rows.as_deref());
+        if state == ClaimState::Unknown {
+            // stderr only: stdout stays exactly `PR_LEASE_STATE=unknown`.
+            self.say(&unreadable_check_line(why.as_deref()));
+        }
+        if let Some((until, refused)) = rows
+            .as_deref()
+            .filter(|_| state == ClaimState::Free)
+            .and_then(|rows| self.backstop_hold(rows))
+        {
+            println!("PR_LEASE_STATE=held-backstop");
+            println!("PR_LEASE_BACKSTOP_UNTIL={}", until.to_rfc3339());
+            if let Some(token) = refused {
+                println!("PR_LEASE_BACKSTOP_REFUSED={token}");
+            }
+            return backstop::EXIT_BACKSTOP;
+        }
         println!("PR_LEASE_STATE={}", state.as_str());
         match state {
             ClaimState::HeldByPeer { holder, .. } => {

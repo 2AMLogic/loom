@@ -51,8 +51,9 @@
 #   * OUT OF SCOPE: everything with an effect — the `gh pr list` discovery, the
 #     `gh api` label fetch, the `reconcile-stack.sh` invocation, the comment
 #     POST, and all `info`/`warning`/`success` narration. Those stayed in
-#     `merge-pr.sh` and are covered by `test-merge-pr-auto-reconcile.sh`'s
-#     T1-T9, which drive the live script.
+#     `merge-pr.sh` (until #14905 retired them) and were covered by the since-
+#     deleted `test-merge-pr-auto-reconcile.sh` T1-T9; the daemon tick's copies
+#     are covered by `claim_reconciliation/merged_stack_tests.rs`.
 #
 # `LC_ALL=C` is pinned by the harness, not here, so a caller cannot forget it.
 

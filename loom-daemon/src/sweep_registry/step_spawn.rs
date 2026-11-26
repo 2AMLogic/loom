@@ -162,7 +162,9 @@ pub struct StepRefusal {
     /// facts the spawn records as a route hold. `None` for every other
     /// refusal.
     pub writer_limit: Option<Box<crate::writer_limit::WriterLimited>>,
-    seat_unavailable: bool,
+    /// The runtime reported no usable seat. The captain and the local draw
+    /// both use this signal to back off after a launch refusal.
+    pub(crate) seat_unavailable: bool,
 }
 
 impl StepRefusal {
@@ -1037,7 +1039,20 @@ impl SweepRegistry {
                 let drawn = admitted.preference.as_ref().and_then(|p| p.model.clone());
                 let (model, source) = match drawn {
                     Some(drawn) => (drawn, "role-draw".to_string()),
-                    None => models::resolve_role_runner_model(root, name),
+                    // #14962: through the launch form, which drops a
+                    // *configured-tier* model the admitted native profile's
+                    // own model differs from (the profile's model launches
+                    // instead of a `profile_selection` refusal); a drawn pin
+                    // is forwarded verbatim and keeps its refusal.
+                    None => models::resolve_role_runner_model_for_launch(
+                        root,
+                        name,
+                        Some(&admitted.runtime),
+                        admitted
+                            .preference
+                            .as_ref()
+                            .and_then(|p| p.model_profile.as_deref()),
+                    ),
                 };
                 let (model, _) =
                     models::reconcile_unpinned_model_with_runtime(&admitted.runtime, model, source);
@@ -1056,10 +1071,47 @@ impl SweepRegistry {
         // runtime the configured Claude-shaped model fit.
         let (model, model_configured, model_fallback) =
             with_model_fallback(root, kind, role, model);
+        let selection = if selection.is_none()
+            && admitted.runtime == "codex"
+            && crate::runtime_preference::codex_guard::guarded(name)
+            && crate::role_runner::runtime_preflight::codex_pool_is_the_wall(root, &admitted)
+        {
+            Some(
+                crate::tokens_pool::private_workspace::dispatch::Selection::guarded_shared_step(
+                    root,
+                    name,
+                    model.as_deref(),
+                )
+                .map_err(|error| {
+                    let seat_unavailable =
+                        error.is::<crate::tokens_pool::health::NoHealthyAccountError>();
+                    StepRefusal::new("pool_exhausted", error)
+                        .with_seat_unavailable(seat_unavailable)
+                })?,
+            )
+        } else {
+            selection
+        };
         // #14017: effort is resolved once the runtime is admitted, so a
         // `roleEfforts.<role>@<runtime>` entry and the Codex default can apply.
+        // #14963: resolved through the launch form, which drops an
+        // *unqualified* effort the admitted native profile's `allowedEfforts`
+        // does not include (the profile's own effort launches instead of a
+        // `profile_selection` refusal); a runtime-qualified pin is forwarded
+        // verbatim and keeps its refusal.
         let effort = non_empty(
-            models::resolve_role_runner_effort_for_runtime(root, name, Some(&admitted.runtime)).0,
+            models::resolve_role_runner_effort_for_launch(
+                root,
+                name,
+                Some(&admitted.runtime),
+                admitted
+                    .preference
+                    .as_ref()
+                    .and_then(|p| p.model_profile.as_deref()),
+                // #15205: the post-fallback model `select` will see.
+                model.as_deref(),
+            )
+            .0,
         );
         Ok(StepLaunch {
             admission: crate::runtime_preference::DispatchAdmission {
