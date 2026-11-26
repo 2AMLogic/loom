@@ -56,7 +56,9 @@
 //!
 //! Each removal (and, under `dryRun`, each *planned* removal) is logged and
 //! published on the event bus as `daemon.scratch_root.reaped` with
-//! `{path, bytes, ticket, repo, dry_run}` — the record shape #14889 asks the
+//! `{path, bytes, ticket, repo, dry_run}` (`bytes` is apparent size, the sum of
+//! file lengths — sparse files and hard links make it differ from freed space)
+//! — the record shape #14889 asks the
 //! seat pass for, which had not merged when this was written. The pass
 //! summary logs removed count/bytes and every preserved root with its reason.
 //!
@@ -141,30 +143,23 @@ pub fn parse_root_name(name: &str) -> Option<ScratchRootName> {
 // ============================================================================
 
 /// The topmost directory of the mount volume holding `path`: walk up while
-/// the device id is unchanged. On the reporting host this turns
+/// the mount identity is unchanged. On the reporting host this turns
 /// `/Volumes/Stripe/agents/loom/.loom/worktrees` into `/Volumes/Stripe`,
-/// which is where the leaked roots sit. `None` when the path does not exist
-/// or its device cannot be read (non-Unix: no volume root is derived).
+/// which is where the leaked roots sit. The identity is the Linux mount id,
+/// because a bind mount shares its parent's device number. `None` when the
+/// path does not exist or its mount identity cannot be read.
 fn volume_root_of(path: &Path) -> Option<PathBuf> {
+    volume_root_with(path, &mount_boundary::mount_id)
+}
+
+fn volume_root_with(path: &Path, mount_id_of: &dyn Fn(&Path) -> Option<u64>) -> Option<PathBuf> {
     let mut cur = path.canonicalize().ok()?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-        let mut dev = std::fs::metadata(&cur).ok()?.dev();
-        while let Some(parent) = cur.parent() {
-            let Ok(pmeta) = std::fs::metadata(parent) else {
-                break;
-            };
-            if pmeta.dev() != dev {
-                break;
-            }
-            dev = pmeta.dev();
-            cur = parent.to_path_buf();
+    let mount = mount_id_of(&cur)?;
+    while let Some(parent) = cur.parent() {
+        if mount_id_of(parent) != Some(mount) {
+            break;
         }
-    }
-    #[cfg(not(unix))]
-    {
-        return None;
+        cur = parent.to_path_buf();
     }
     Some(cur)
 }
@@ -829,6 +824,8 @@ pub struct RemovalRecord {
     pub path: PathBuf,
     pub ticket: u32,
     pub repo: String,
+    /// Apparent size: the sum of file lengths under the root. Sparse files
+    /// and hard links make this differ from the space actually freed.
     pub bytes: u64,
     pub dry_run: bool,
 }
@@ -916,7 +913,8 @@ pub struct ScratchRootReport {
 }
 
 impl ScratchRootReport {
-    /// Total bytes removed or (dry-run) that would be freed.
+    /// Total apparent bytes (sum of file lengths) removed or, in dry-run,
+    /// planned for removal. Not an estimate of freed disk space.
     #[must_use]
     pub fn reclaimed_bytes(&self) -> u64 {
         self.removed
@@ -926,7 +924,7 @@ impl ScratchRootReport {
             .sum()
     }
 
-    /// Human-readable freed size, e.g. `"41.2G"` or `"nothing"`.
+    /// Human-readable apparent size, e.g. `"41.2G"` or `"nothing"`.
     #[must_use]
     pub fn reclaimed_human(&self) -> String {
         if self.removed.is_empty() && self.planned.is_empty() {
@@ -1669,6 +1667,22 @@ mod tests {
         .unwrap();
         std::env::remove_var("LOOM_WORKTREE_ROOT");
         assert!(roots().contains(&volume), "worktree.root");
+    }
+
+    #[test]
+    fn test_volume_root_stops_at_bind_mount_with_equal_device() {
+        let tmp = tempfile::tempdir().unwrap();
+        let top = tmp.path().canonicalize().unwrap();
+        let bind = top.join("bind");
+        let child = bind.join("worktrees");
+        std::fs::create_dir_all(&child).unwrap();
+        // Parent and child share a device number; only the mount id differs.
+        let probe = |p: &Path| -> Option<u64> { Some(if p.starts_with(&bind) { 2 } else { 1 }) };
+        assert_eq!(volume_root_with(&child, &probe), Some(bind));
+        let same = |_: &Path| -> Option<u64> { Some(1) };
+        assert_ne!(volume_root_with(&child, &same), Some(child));
+        let unreadable = |_: &Path| -> Option<u64> { None };
+        assert_eq!(volume_root_with(&top, &unreadable), None);
     }
 
     #[test]

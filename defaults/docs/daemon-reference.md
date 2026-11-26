@@ -10061,8 +10061,10 @@ It unlinks entries relative to the open directory and runs `git worktree prune`
 on each surviving parent repository.
 By default, the pass evaluates the gates and keeps eligible roots on disk.
 For each eligible root it publishes `daemon.scratch_root.reaped` with
-`path`, `bytes`, `ticket`, `repo` and `dry_run: true`. The summary
-includes the planned count and bytes, and the reason for each preserved
+`path`, `bytes`, `ticket`, `repo` and `dry_run: true`. `bytes` is the
+apparent size, the sum of file lengths; sparse files and hard links make it
+differ from the space removal frees. The summary
+includes the planned count and apparent bytes, and the reason for each preserved
 root. A preview that frees no space still counts as an empty eager pass
 when the other reclaim tiers also finish empty.
 
