@@ -1333,16 +1333,37 @@ assert_deny_reason_matches "#15218: bare cd names the non-literal argument" \
     'cd && rm -rf y' "$_NONLIT_PHRASE" "$REPO_ROOT"
 assert_deny_reason_matches "#15218: a non-literal cd followed by a literal relative cd keeps the non-literal reason" \
     'cd $D && cd sub && rm -rf x' "$_NONLIT_PHRASE" "$REPO_ROOT"
+assert_deny_reason_matches "#15218: a quoted cd path with whitespace keeps the non-literal reason" \
+    'cd "/opt/my dir" && rm -f missing-file' "$_NONLIT_PHRASE" "$REPO_ROOT"
+_SYNTAX_PHRASE='could not determine the directory from this cd syntax'
+assert_deny_reason_matches "#15218: redirection after a literal path names unsupported cd syntax" \
+    'cd /opt/vendor > /dev/null && rm -f missing-file' "$_SYNTAX_PHRASE" "$REPO_ROOT"
+assert_deny_reason_matches "#15218: redirection before a literal path names unsupported cd syntax" \
+    'cd > /dev/null /opt/vendor && rm -f missing-file' "$_SYNTAX_PHRASE" "$REPO_ROOT"
+assert_deny_reason_matches "#15218: a variable in a leading redirection is not the cd path" \
+    'cd >"$log" /opt/vendor && rm -f missing-file' "$_SYNTAX_PHRASE" "$REPO_ROOT"
+assert_deny_reason_matches "#15218: an unsupported cd option names unsupported syntax" \
+    'cd -Z /opt/vendor && rm -f missing-file' "$_SYNTAX_PHRASE" "$REPO_ROOT"
+_BASE_PHRASE='needs a plain absolute session working directory to resolve the relative cd path'
 assert_deny_reason_matches "#15218: literal relative cd + whitespace session cwd names the session cwd" \
-    'cd sub && rm -rf x' 'session working directory it would be joined to is not a plain absolute literal path' "/tmp/loom 15218 cwd"
+    'cd sub && rm -rf x' "$_BASE_PHRASE" "/tmp/loom 15218 cwd"
+assert_deny_reason_matches "#15218: a relative session cwd also lacks an absolute base" \
+    'cd sub && rm -f missing-file' "$_BASE_PHRASE" relative
 _assert_reason_lacks "#15218: whitespace session cwd does not blame a non-literal cd argument" \
     'cd sub && rm -rf x' "$_NONLIT_PHRASE" "/tmp/loom 15218 cwd"
+_HEREDOC_PHRASE="command text contains the word 'cd', so the guard cannot establish the working directory of this heredoc command substitution"
 assert_deny_reason_matches "#15218: heredoc substitution after a literal cd names the heredoc" \
-    $'cd /opt/vendor && cat <<EOF\n$(rm -rf important)\nEOF' 'heredoc command substitution that follows a cd' "$REPO_ROOT"
+    $'cd /opt/vendor && cat <<EOF\n$(rm -rf important)\nEOF' "$_HEREDOC_PHRASE" "$REPO_ROOT"
 _assert_reason_lacks "#15218: heredoc substitution after a literal cd does not blame a non-literal cd argument" \
     $'cd /opt/vendor && cat <<EOF\n$(rm -rf important)\nEOF' "$_NONLIT_PHRASE" "$REPO_ROOT"
 assert_deny_reason_matches "#15218: heredoc substitution (relative ../../etc) after a literal cd names the heredoc" \
-    $'cd /opt/vendor && cat <<EOF\n$(rm -rf ../../etc)\nEOF' 'heredoc command substitution that follows a cd' "$REPO_ROOT"
+    $'cd /opt/vendor && cat <<EOF\n$(rm -rf ../../etc)\nEOF' "$_HEREDOC_PHRASE" "$REPO_ROOT"
+assert_deny_reason_matches "#15218: cd after the heredoc is still a word in the command text" \
+    $'cat <<EOF\n$(rm -f missing-file)\nEOF\ncd /opt/vendor' "$_HEREDOC_PHRASE" "$REPO_ROOT"
+assert_deny_reason_matches "#15218: the word cd as data also makes the heredoc directory unknown" \
+    $'echo cd && cat <<EOF\n$(rm -f missing-file)\nEOF' "$_HEREDOC_PHRASE" "$REPO_ROOT"
+assert_deny_reason_matches "#15218: a mark byte in a target with no cd gets the generic advice" \
+    $'rm -f missing\035file' 'could not resolve \(guards\.rmScope=repo\)\. Use an absolute rm target\.$' "$REPO_ROOT"
 echo ""
 
 # =========================================================================

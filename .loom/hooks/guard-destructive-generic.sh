@@ -7677,8 +7677,8 @@ fi
 _RM_SPAN_MARK=$'\036'
 # `cd` provenance marks (#15112), emitted by _extract_rm_targets_scan() AFTER
 # the span mark: `$_RM_CD_MARK<dir>$_RM_CD_MARK<target>` carries the directory a
-# preceding `cd` put in effect; `$_RM_CDUNRES_MARK<target>` says a preceding
-# `cd` could not be resolved (followed by a one-letter reason, #15218). Neither is IFS whitespace, so the caller's
+# preceding `cd` put in effect; `$_RM_CDUNRES_MARK<why><target>` marks an
+# unresolved directory with a one-letter reason (#15218). Neither mark is IFS whitespace, so the caller's
 # `for target in $RM_TARGETS` word split is unaffected.
 _RM_CD_MARK=$'\037'
 _RM_CDUNRES_MARK=$'\035'
@@ -7719,8 +7719,8 @@ _extract_rm_targets_scan() {
     #   `cd` could not be resolved       -> `$_RM_CDUNRES_MARK<why><target>`
     # where <why> is ONE non-whitespace letter naming the reason (#15218), so the
     # deny can say what actually went wrong: a non-literal cd argument, a
-    # session cwd that is not a plain absolute path, a heredoc/substitution
-    # span that cannot see the outer cd, a cd whose separators did not parse,
+    # session cwd that is not a plain absolute path, an unknown directory for
+    # a heredoc substitution, unsupported cd syntax or unparsed separators,
     # or (c) anything else, e.g. a target carrying an internal mark byte.
     # The caller strips the prefix (after the #8217 span mark) and uses the
     # directory in place of $CWD. A `cd` argument is resolvable only when it is
@@ -7751,8 +7751,8 @@ _extract_rm_targets_scan() {
         # newline, `|`, `||` or `&` followed it) makes a relative base unknowable.
         wasbroken = (cdseen && !cdlink)
         cdseen = 1
-        # argbad: this cd has a non-literal argument (the deny message is then
-        # accurate). brokebase: every argument is literal but the base is
+        # argbad: keep the unresolved-directory deny for this cd. cdwhy
+        # carries its diagnostic. brokebase: the base of the literal path is
         # untrusted (a `;`/newline/`|`/`||`/`&` broke the link), so the target
         # falls back to the session-cwd verdict like main, not a false deny.
         argbad = 0; brokebase = 0
@@ -7762,17 +7762,21 @@ _extract_rm_targets_scan() {
         # option, and any other `-x` word is not a plain `cd <dir>`.
         while (k <= m && toks[k] ~ /^-[LPe@]+$/) k++
         if (k <= m && toks[k] == "--") k++
-        else if (k <= m && toks[k] ~ /^-./) { cdunres = 1; argbad = 1; cdwhy = "a"; return }
+        else if (k <= m && toks[k] ~ /^-./) { cdunres = 1; argbad = 1; cdwhy = "x"; return }
         if (k > m || toks[k] == "-" || toks[k] == "") { cdunres = 1; argbad = 1; cdwhy = "a"; return }
         arg = expand_cd_arg(toks[k], home)
-        # Anything after the directory other than a redirection is not a plain
-        # `cd <dir>` (e.g. an unquoted space in the path): unresolved.
-        for (bad = k + 1; bad <= m; bad++)
-            if (toks[bad] != "" && toks[bad] !~ /^[0-9]*[<>&]/) { cdunres = 1; argbad = 1; cdwhy = "a"; return }
         cls = strip_cd_quoting(arg)
         # Literal paths only: no expansion/quote/escape/glob/tilde-user/space,
         # and no control bytes that collide with the output marks.
-        if (cls == "" || nonliteral(cls) || cls ~ /^~/) { cdunres = 1; argbad = 1; cdwhy = "a"; return }
+        if (cls == "" || nonliteral(cls) || cls ~ /^~/) {
+            cdunres = 1; argbad = 1
+            cdwhy = (toks[k] ~ /^[0-9]*[<>]/ ? "x" : "a")
+            return
+        }
+        # Extra words (including a separate redirection operand) can make
+        # even a literal directory ambiguous to this scanner.
+        for (bad = k + 1; bad <= m; bad++)
+            if (toks[bad] != "" && toks[bad] !~ /^[0-9]*[<>&]/) { cdunres = 1; argbad = 1; cdwhy = "x"; return }
         if (cls ~ /^\//) { curcwd = cls; cdunres = 0; return }
         # A relative join needs a literal base: a session cwd with whitespace or
         # quote/glob bytes would corrupt the word split in the caller.
@@ -10011,8 +10015,8 @@ if echo "$COMMAND_RM_SCAN" | grep -qE 'rm[[:space:]]+-[a-zA-Z]*[rf]'; then
             # the session cwd (#15112).
             ABS_PATH="$_rm_cd_dir/$_rmclassify"
         elif [[ "$_rm_cd_unres" == 1 ]] && rm_scope_repo_enabled; then
-            # A preceding `cd` could not be resolved, so "$CWD/<target>" would
-            # be a path computed from the wrong base. Fail closed and say so,
+            # The scanner could not establish a base for this relative target.
+            # Joining it to $CWD could produce a misleading path. Fail closed,
             # unless the target is `$`-rooted: those take the variable
             # fast-path/deny flow below, which never prints a cwd-joined path.
             mark_expandable_dollars "$target"
@@ -10021,10 +10025,11 @@ if echo "$COMMAND_RM_SCAN" | grep -qE 'rm[[:space:]]+-[a-zA-Z]*[rf]'; then
                 # and the tag are the same for every reason.
                 case "$_rm_cd_why" in
                     a) _rm_cd_unres_why="An earlier cd in the same command has an argument that is not a plain literal path (a variable, command substitution, glob, 'cd -', a bare 'cd', or a path with whitespace), so where '${target}' lands is unknown. Use a literal cd path, or an absolute rm target." ;;
-                    b) _rm_cd_unres_why="The cd path is literal but relative, and the session working directory it would be joined to is not a plain absolute literal path (it is empty, or contains whitespace, quotes or glob characters), so where '${target}' lands is unknown. Use an absolute cd path, or an absolute rm target." ;;
-                    h) _rm_cd_unres_why="This rm runs inside a heredoc command substitution that follows a cd in the same command, and this guard cannot see which directory that outer cd set, so where '${target}' lands is unknown. Move the rm out of the heredoc, or use an absolute rm target." ;;
-                    s) _rm_cd_unres_why="An earlier cd in the same command is followed by shell operators this guard could not parse, so it cannot tell whether that cd moved the shell and where '${target}' lands is unknown. Use an absolute rm target." ;;
-                    *) _rm_cd_unres_why="The directory an earlier cd in the same command put in effect could not be determined, so where '${target}' lands is unknown. Use an absolute rm target." ;;
+                    b) _rm_cd_unres_why="The guard needs a plain absolute session working directory to resolve the relative cd path. Use an absolute cd path or an absolute rm target." ;;
+                    h) _rm_cd_unres_why="The command text contains the word 'cd', so the guard cannot establish the working directory of this heredoc command substitution. Use an absolute rm target." ;;
+                    x) _rm_cd_unres_why="The guard could not determine the directory from this cd syntax. Use an absolute rm target." ;;
+                    s) _rm_cd_unres_why="The guard could not parse the shell operators around cd to establish the working directory. Use an absolute rm target." ;;
+                    *) _rm_cd_unres_why="Use an absolute rm target." ;;
                 esac
                 deny "BLOCKED: rm target '${target}' is relative to a directory this guard could not resolve (guards.rmScope=repo). ${_rm_cd_unres_why}" "rm-scope-unresolved-var"  # scan-reads: COMMAND_ASK_SCAN
             fi
