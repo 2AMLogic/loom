@@ -2144,7 +2144,7 @@ LOOM_FORCE_SCOPE=all git reset --hard HEAD~1   # ASK
 
 ### Primary-Checkout Mutation Guard (`guards.primaryCheckoutMutation` / `LOOM_GUARD_PRIMARY_CHECKOUT_MUTATION`)
 
-**An agent step never commits or switches branches in a workspace's primary
+**An agent step never commits or switches branches in its workspace's primary
 checkout (#13589).** A stray `git commit` / `git checkout <branch>` there parks
 the primary clone off the default branch (observed on loom-worker-4,
 2026-11-04) and holds fleet sync with a `wrong-branch` hold (self-heal: #13588).
@@ -2152,8 +2152,23 @@ Builder and Doctor work in `.loom/worktrees/issue-<N>`.
 
 - **Agent step** = `LOOM_SWEEP_ID` or `LOOM_WORKTREE_PATH` is exported (set by
   the dispatcher). An operator's interactive session has neither and is untouched.
+- **The workspace's primary checkout** (#15483) is the primary checkout of the
+  repository `LOOM_WORKSPACE` names — the repository the dispatcher dispatched
+  the step against; the dispatcher exports the variable into the step's
+  session. The value may itself be a linked worktree of that repository
+  (`loom-daemon spawn --worktree` exports the worktree), so the hook resolves
+  the parent of the repository's common git dir instead of comparing paths.
+  **Only that checkout is in scope.** Every standalone repository is
+  structurally a primary checkout (its toplevel is the parent of its common
+  git dir), so a repository other than the workspace's — a throwaway fixture
+  created for a disposable reproduction, a second clone — is unaffected, with
+  or without a `.loom/` directory: it has no fleet sync to hold.
+- **Fail closed when `LOOM_WORKSPACE` is unusable** — unset, empty, relative,
+  not an existing directory, or not inside a working tree (a bare repository) —
+  *any* primary checkout is denied, as before #15483. No `.loom/` marker is
+  consulted: a scaffold reproduction legitimately copies files under `.loom/`.
 - **Denied** (tier: deny, since headless runs cannot answer an ask) when the
-  resolved cwd — honouring `cd X &&` and `git -C X` — is a primary checkout:
+  resolved cwd — honouring `cd X &&` and `git -C X` — is that primary checkout:
   `git commit`, `git switch <x>`/`-c`, `git checkout -b|-B <x>`, `--detach`,
   and `git checkout <branch|sha>`. The message names
   `./.loom/scripts/worktree.sh <issue-number>` and this toggle.
@@ -2165,7 +2180,8 @@ Builder and Doctor work in `.loom/worktrees/issue-<N>`.
   after a fetch) — and `gh pr checkout <N>`, which fetches the PR head and
   moves the checkout onto it. git errors on a pathspec matching no tracked
   file, so denying these costs no working invocation.
-- **Allowed**: everything inside a linked worktree; checkout/switch whose target
+- **Allowed**: everything inside a linked worktree; anything in a repository
+  other than the workspace's; checkout/switch whose target
   is `main`/`master` (the Auditor's `git checkout -B main origin/main`);
   `git checkout -- <path>` and `git checkout <path>` file restores (a path
   present in the working tree, or tracked — including one deleted from the
@@ -2173,6 +2189,12 @@ Builder and Doctor work in `.loom/worktrees/issue-<N>`.
   read-only git. `worktree.sh`, `check-main-clean.sh --quarantine`,
   `resync-installed.sh`, `merge-pr.sh` and `scripts/version.sh` are unaffected:
   the hook only sees the top-level command text, not their internal git calls.
+- **Not scanned**: a directory the same command creates. The hook runs before
+  the command, so `mkdir -p x && cd x && git init && git commit` is judged on
+  the pre-command filesystem and `x` does not exist yet. A real workspace's
+  directory always exists, so this is not a gap in its protection; it only
+  means the first commit of a fixture created in one command is never denied,
+  and a later commit in that fixture is judged by the rules above.
 - **Decision-log tag**:
   `primary-checkout-mutation:<commit|switch|checkout|gh-pr-checkout>`.
 - **Toggle**: `LOOM_GUARD_PRIMARY_CHECKOUT_MUTATION=0` (env, agent's own
@@ -2673,7 +2695,15 @@ env -u LOOM_FORCE_SCOPE -u LOOM_GUARD_DECISION_LOG <test-suite-command>
 
 This is also called out directly in the dispatched agent's own brief — see `defaults/roles/builder.md` → "Build Verification During Implementation" — rather than left as a fact an agent has to already know to look up here.
 
-**Other dispatcher-exported `LOOM_*` vars (#5388 survey)**: `loom-daemon-start.sh` / `sweep_registry/dispatch.rs` also export `LOOM_WORKSPACE`, `LOOM_WORK_FINDER`, `LOOM_MAIN_HEALTH_GATE`, `LOOM_PID_FILE`, `LOOM_TERMINAL_ID`, `LOOM_SWEEP_CLAIM_OWNED`, `LOOM_RUNTIME`, `LOOM_ROLE`, `BG_WAIT_CEILING_ENV`, and the experiment allowlist (`LOOM_MODEL_EXPERIMENT`, `LOOM_MODEL_EXPERIMENT_CANARY`, `LOOM_TRANSCRIPT_ARCHIVE`) into every dispatched child. None of these are read by a *managed repo's own* tooling — they are Loom-internal dispatch/orchestration knobs a repo's test suite has no reason to assert against, unlike `LOOM_FORCE_SCOPE`/`LOOM_GUARD_DECISION_LOG` which name-collide with values a repo's **own installed guard hook** (shipped by Loom into every managed repo) reads and whose factory defaults a repo's own suite plausibly tests. If a future dispatcher-exported var is likewise consumed by shipped repo tooling with an assertable default, treat it the same way — surface it in this doc's "Known consequence" and in the Builder brief, not just as an env-var reference table entry.
+**`LOOM_WORKSPACE` joins that class (#15483).** The dispatcher exports it into every dispatched child, and the primary-checkout mutation guard reads it to decide which checkout is the workspace's (see "Primary-Checkout Mutation Guard" above). A suite that asserts a commit in a primary checkout is denied during an agent step gets the opposite verdict for a fixture outside the ambient workspace, because only the workspace's own checkout is in scope. Loom's own `tests/hooks` harness unsets it for that reason; run another repo's guard suite with it stripped before trusting a failure:
+
+```bash
+env -u LOOM_WORKSPACE <test-suite-command>
+```
+
+The agent-step markers that guard reads (`LOOM_SWEEP_ID`, `LOOM_WORKTREE_PATH`) are the same kind of leak and are not yet covered by this consequence or by the Builder brief: #15496.
+
+**Other dispatcher-exported `LOOM_*` vars (#5388 survey)**: `loom-daemon-start.sh` / `sweep_registry/dispatch.rs` also export `LOOM_WORK_FINDER`, `LOOM_MAIN_HEALTH_GATE`, `LOOM_PID_FILE`, `LOOM_TERMINAL_ID`, `LOOM_SWEEP_CLAIM_OWNED`, `LOOM_RUNTIME`, `LOOM_ROLE`, `BG_WAIT_CEILING_ENV`, and the experiment allowlist (`LOOM_MODEL_EXPERIMENT`, `LOOM_MODEL_EXPERIMENT_CANARY`, `LOOM_TRANSCRIPT_ARCHIVE`) into every dispatched child. None of these are read by a *managed repo's own* tooling — they are Loom-internal dispatch/orchestration knobs a repo's test suite has no reason to assert against, unlike `LOOM_FORCE_SCOPE`/`LOOM_GUARD_DECISION_LOG` which name-collide with values a repo's **own installed guard hook** (shipped by Loom into every managed repo) reads and whose factory defaults a repo's own suite plausibly tests. (`LOOM_WORKSPACE` was on this list until #15483, when the shipped primary-checkout mutation guard began to read it — see the note above.) If a future dispatcher-exported var is likewise consumed by shipped repo tooling with an assertable default, treat it the same way — surface it in this doc's "Known consequence" and in the Builder brief, not just as an env-var reference table entry.
 
 **Standing per-trigger review policy** — a periodic support role (the **Auditor**, see `.loom/roles/auditor.md`) tails `.loom/logs/guard-decisions.log`, dedups by `pattern`, and files **one issue per distinct trigger** observed in autonomous runs, proposing to either (a) **allowlist / refine** the guard for the in-scope op or (b) **confirm it stays flagged**. Over time this converges the guard to dangerous-only. The dedup + summarize one-liner:
 

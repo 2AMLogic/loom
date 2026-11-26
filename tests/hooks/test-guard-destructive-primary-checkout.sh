@@ -2,6 +2,9 @@
 # Test suite for defaults/hooks/guard-destructive-generic.sh — primary-checkout
 # mutation guard (#13589): git commit / switch / checkout <branch> in a
 # workspace's PRIMARY checkout during an agent step is denied.
+# #15483: with LOOM_WORKSPACE exported the workspace's own primary checkout is
+# the only one in scope (an independent repository is allowed); without a
+# usable value the guard fails closed and denies any primary checkout.
 #
 # Usage: ./tests/hooks/test-guard-destructive-primary-checkout.sh
 
@@ -101,6 +104,91 @@ assert_allow_env "quoted text mentioning git commit is inert" "$AGENT" "echo 'gi
 assert_allow_env "worktree.sh invocation is allowed" "$AGENT" "./.loom/scripts/worktree.sh 5" "$PC_REPO"
 assert_allow_env "merge-pr.sh invocation is allowed" "$AGENT" "./.loom/scripts/merge-pr.sh 5" "$PC_REPO"
 assert_allow_env "resync-installed.sh invocation is allowed" "$AGENT" "./.loom/scripts/resync-installed.sh" "$PC_REPO"
+
+# --- #15483: LOOM_WORKSPACE narrows the guard to the workspace's own clone ---
+# The dispatcher exports LOOM_SWEEP_ID and LOOM_WORKSPACE together. run_guard_env
+# takes one assignment, so this block exports the sweep id for its duration and
+# passes the workspace per invocation. Every case above ran with LOOM_WORKSPACE
+# unset — the fail-closed half of the rule — so the two halves together cover
+# each shape with and without the signal.
+export LOOM_SWEEP_ID=step-builder-1-1
+PC_WS="LOOM_WORKSPACE=$PC_REPO"
+PC_FIXTURE=$(make_standalone_repo)
+PC_OUTSIDE=$(mktemp -d 2>/dev/null)   # a cwd inside no repository at all
+PC_NESTED="$PC_REPO/throwaway-clone"  # a second repository INSIDE the workspace dir
+mkdir -p "$PC_NESTED"
+git -C "$PC_NESTED" init -q >/dev/null 2>&1
+
+# ALLOW: a repository other than the workspace's is out of scope
+assert_allow_env "A: git commit in an independent repository (tool-call cwd) is allowed" "$PC_WS" \
+    "git commit -q -m second" "$PC_FIXTURE"
+assert_allow_env "cd <independent> && git commit from the workspace cwd is allowed" "$PC_WS" \
+    "cd $PC_FIXTURE && git commit -q -m second" "$PC_REPO"
+assert_allow_env "cd <independent> && git commit from a worktree cwd is allowed" "$PC_WS" \
+    "cd $PC_FIXTURE && git commit -q -m second" "$PC_WT"
+assert_allow_env "B: git -C <independent> commit from a cwd outside any repository is allowed" "$PC_WS" \
+    "git -C $PC_FIXTURE commit -q -m second" "$PC_OUTSIDE"
+assert_allow_env "git -C <independent> commit from the workspace cwd is allowed" "$PC_WS" \
+    "git -C $PC_FIXTURE commit -q -m second" "$PC_REPO"
+assert_allow_env "D: mkdir + init + commit of a directory that already exists is allowed" "$PC_WS" \
+    "mkdir -p $PC_FIXTURE && cd $PC_FIXTURE && git init -q -b main && git commit --allow-empty -q -m first" "$PC_OUTSIDE"
+assert_allow_env "git checkout -b in an independent repository is allowed" "$PC_WS" "git checkout -b x" "$PC_FIXTURE"
+assert_allow_env "git switch -c in an independent repository is allowed" "$PC_WS" "git switch -c x" "$PC_FIXTURE"
+assert_allow_env "a second repository nested inside the workspace directory is allowed" "$PC_WS" \
+    "git commit -q -m second" "$PC_NESTED"
+
+# DENY: the workspace's own primary checkout stays protected
+assert_deny_env "F: git commit in the workspace primary is still denied" "$PC_WS" "git commit -m x" "$PC_REPO"
+assert_deny_env "git checkout -b in the workspace primary is still denied" "$PC_WS" "git checkout -b x" "$PC_REPO"
+assert_deny_env "git switch <branch> in the workspace primary is still denied" "$PC_WS" "git switch other" "$PC_REPO"
+assert_deny_env "fetch-chain checkout in the workspace primary is still denied" "$PC_WS" \
+    "git fetch origin pull/7/head:pr7 && git checkout pr7" "$PC_REPO"
+assert_deny_env "gh pr checkout in the workspace primary is still denied" "$PC_WS" "gh pr checkout 7" "$PC_REPO"
+assert_deny_env "git -C <workspace primary> commit from a worktree cwd is still denied" "$PC_WS" \
+    "git -C $PC_REPO commit -m x" "$PC_WT"
+assert_deny_env "git -C <workspace primary> commit from an independent repository is still denied" "$PC_WS" \
+    "git -C $PC_REPO commit -m x" "$PC_FIXTURE"
+assert_deny_env "cd <workspace primary> && git commit from a worktree cwd is still denied" "$PC_WS" \
+    "cd $PC_REPO && git commit -m x" "$PC_WT"
+
+# The workspace value may itself be a linked worktree (`loom-daemon spawn
+# --worktree` exports the worktree): the clone behind it stays protected.
+PC_WSWT="LOOM_WORKSPACE=$PC_WT"
+assert_deny_env "LOOM_WORKSPACE naming a linked worktree still denies a commit in its clone" "$PC_WSWT" \
+    "git commit -m x" "$PC_REPO"
+assert_deny_env "LOOM_WORKSPACE naming a linked worktree still denies git -C <clone> commit" "$PC_WSWT" \
+    "git -C $PC_REPO commit -m x" "$PC_WT"
+assert_allow_env "LOOM_WORKSPACE naming a linked worktree allows a commit in that worktree" "$PC_WSWT" \
+    "git commit -m x" "$PC_WT"
+assert_allow_env "LOOM_WORKSPACE naming a linked worktree allows an independent repository" "$PC_WSWT" \
+    "git commit -q -m second" "$PC_FIXTURE"
+assert_deny_env "LOOM_WORKSPACE naming a repository makes THAT repository the protected one" \
+    "LOOM_WORKSPACE=$PC_FIXTURE" "git commit -q -m second" "$PC_FIXTURE"
+
+# FAIL CLOSED: an unusable LOOM_WORKSPACE keeps the wider rule (any primary checkout)
+assert_deny_env "LOOM_WORKSPACE unset: a commit in an independent repository is still denied" "" \
+    "git commit -q -m second" "$PC_FIXTURE"
+assert_deny_env "LOOM_WORKSPACE unset: git -C <independent> commit is still denied" "" \
+    "git -C $PC_FIXTURE commit -q -m second" "$PC_OUTSIDE"
+assert_deny_env "LOOM_WORKSPACE empty: a commit in an independent repository is still denied" "LOOM_WORKSPACE=" \
+    "git commit -q -m second" "$PC_FIXTURE"
+assert_deny_env "LOOM_WORKSPACE naming a missing directory: an independent repository is still denied" \
+    "LOOM_WORKSPACE=$PC_OUTSIDE/no-such-dir" "git commit -q -m second" "$PC_FIXTURE"
+assert_deny_env "LOOM_WORKSPACE relative: an independent repository is still denied" "LOOM_WORKSPACE=." \
+    "git commit -q -m second" "$PC_FIXTURE"
+assert_deny_env "LOOM_WORKSPACE naming a directory outside any repository: an independent repository is still denied" \
+    "LOOM_WORKSPACE=$PC_OUTSIDE" "git commit -q -m second" "$PC_FIXTURE"
+PC_BARE="$PC_OUTSIDE/bare.git"   # a repository with no working tree at all
+git init -q --bare "$PC_BARE" >/dev/null 2>&1
+assert_deny_env "LOOM_WORKSPACE naming a bare repository: an independent repository is still denied" \
+    "LOOM_WORKSPACE=$PC_BARE" "git commit -q -m second" "$PC_FIXTURE"
+assert_deny_env "LOOM_WORKSPACE naming a bare repository: a workspace's primary checkout is still denied" \
+    "LOOM_WORKSPACE=$PC_BARE" "git commit -m x" "$PC_REPO"
+assert_allow_env "a directory the same command creates does not exist at scan time: not scanned" "" \
+    "mkdir -p $PC_OUTSIDE/fresh && cd $PC_OUTSIDE/fresh && git init -q -b main && git commit --allow-empty -q -m first" "$PC_OUTSIDE"
+
+unset LOOM_SWEEP_ID
+rm -rf "$PC_OUTSIDE" "$PC_FIXTURE" "$PC_NESTED"
 
 # --- not an agent step / toggle off ---
 assert_allow_env "operator session (no agent env) is untouched" "" "git commit -m x" "$PC_REPO"

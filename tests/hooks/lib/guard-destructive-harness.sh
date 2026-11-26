@@ -36,9 +36,13 @@ set -euo pipefail
 # (#4325). Tests that exercise env-driven behavior deliberately inject their
 # vars explicitly per invocation (run_guard_env / assert_ask_env / assert_allow_env),
 # or via run_guard_in_worktree, so they are unaffected by this unset.
+# LOOM_WORKSPACE (#15483): a dispatched agent's session exports it, and the
+# primary-checkout mutation guard scopes itself to the repository it names —
+# left ambient, it would silently narrow that guard for every suite.
 unset LOOM_FORCE_SCOPE LOOM_DEFAULT_BRANCH LOOM_GUARD_SQL LOOM_GUARD_CLOUD \
       LOOM_GUARD_REVERSIBLE_GH LOOM_RM_SCOPE LOOM_GUARD_READONLY_FASTPATH \
       LOOM_GUARD_WORKTREE_ISOLATION LOOM_WORKTREE_PATH LOOM_WORKTREE_ROOT \
+      LOOM_WORKSPACE \
       LOOM_GUARD_DECISION_LOG LOOM_GUARD_DECISION_LOG_FILE LOOM_GUARD_STASH_SCOPE \
       LOOM_ROLE LOOM_GUARD_CARGO_CLEAN CARGO_TARGET_DIR LOOM_GUARD_SCRATCH_ROOT
 
@@ -553,6 +557,18 @@ make_wt_repo_linked() {
         -b feature/issue-1 >/dev/null 2>&1
     mkdir -p "$dir/.loom/worktrees/issue-1/src"
     : > "$dir/.loom/worktrees/issue-1/.loom-managed"
+    echo "$dir"
+}
+
+# An INDEPENDENT repository (#15483): no .loom/, a worktree of nothing, and
+# created under the temp dir rather than beside any workspace fixture. Its
+# toplevel is the parent of its git common dir, so structurally it is a
+# primary checkout exactly like a workspace's own clone.
+make_standalone_repo() {
+    local dir
+    dir=$(mktemp -d 2>/dev/null)
+    dir=$(cd "$dir" && pwd -P)
+    git -C "$dir" init -q >/dev/null 2>&1
     echo "$dir"
 }
 
