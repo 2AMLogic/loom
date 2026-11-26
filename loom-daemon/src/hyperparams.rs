@@ -3,10 +3,13 @@
 //! Loom's operational tunables — tick intervals, concurrency ceilings,
 //! admission caps, lease TTLs, backoff thresholds — were scattered across
 //! per-module built-in constants, one-off `LOOM_*` env vars, and
-//! module-specific `autonomous.*` config blocks. That dispersion made two
-//! things impossible: recording *which* hyperparameter vector a given run
-//! executed under (run provenance), and having an external optimizer (CMA-ES,
-//! Bayesian search) sample the vector programmatically.
+//! module-specific `autonomous.*` config blocks. That dispersion made it
+//! impossible to record *which* hyperparameter vector a given run
+//! executed under (run provenance). (The original motivation also cited
+//! letting an external optimizer (CMA-ES, Bayesian search) sample the
+//! vector programmatically; both that optimizer (#9766/#9767) and the
+//! `$LOOM_HYPERPARAMS` vector tier it would have sampled (#11107) are
+//! retired — only the provenance motivation is live.)
 //!
 //! This module is the consolidation seam. It defines one typed, validated
 //! vector over a first tranche of those tunables, addresses it at a single
@@ -269,6 +272,8 @@ impl Default for Hyperparameters {
 /// committed `"hyperparameters"` block.
 #[must_use]
 pub fn overlay_from_effective(effective: &Value) -> Value {
+    // Called on every config read so a stale $LOOM_HYPERPARAMS export warns
+    // at most once per process, whichever reader gets there first.
     warn_if_retired_env_set();
     effective
         .get("hyperparameters")
