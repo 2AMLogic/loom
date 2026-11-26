@@ -1124,33 +1124,7 @@ pub fn tick_with_lanes(
 /// concurrency budget is filled in that order, so a higher-priority tool repo
 /// is usually served first without a permanently-full tier starving the rest.
 /// The cap/budget mechanics are unchanged — this only orders the queue.
-/// Compute, per root (parallel to `roots`), whether the work-finder should hold
-/// new dispatch off that root this tick — the `halted` slice `tick_multi`
-/// consumes.
 ///
-/// A root is held when its `main` is verified-red (`is_halted`, #3930) **or**
-/// (#4084) a build-gate run against it is currently in flight and the
-/// `suppress_dispatch_during_gate` knob is on — the latter keeps a fresh sweep
-/// build from racing the gate's own build for cores. The suppression is strictly
-/// **per root**: a sibling root with no gate in flight is never held on account
-/// of another root's gate run, preserving the #3930 per-repo isolation contract.
-/// With `suppress_dispatch_during_gate = false` the in-flight term drops out
-/// entirely, so the result is byte-for-byte the pre-#4084 `is_halted`-only vector.
-#[must_use]
-pub fn dispatch_held_per_root(
-    health_states: &WorkspaceHealthStates,
-    roots: &[std::path::PathBuf],
-    suppress_dispatch_during_gate: bool,
-) -> Vec<bool> {
-    roots
-        .iter()
-        .map(|r| {
-            health_states.is_halted(r)
-                || (suppress_dispatch_during_gate && health_states.is_gate_in_flight(r))
-        })
-        .collect()
-}
-
 /// The plain multi-workspace tick: no halt causes, lanes or build back-off.
 /// See [`tick_multi_with_build_backoff`].
 pub fn tick_multi<S: WorkSource, D: WorkDispatcher>(
@@ -2062,12 +2036,7 @@ pub fn spawn_multi_work_finder_task(
             let now_tick = chrono::Utc::now();
             let (preflight_held, preflight_causes, preflight_probe_roots) =
                 pool_preflight::preflight_held_causes_per_root(&pool, &roots, now_tick);
-            // #9017: compute the per-root CAUSE, then project the `halted`
-            // bool from it, so the slice the tick routes on and the causes
-            // its rows record are one fold and can never disagree — the same
-            // terms, same inputs, same instant as the pre-#9017 inline bool
-            // fold (a bool fold of `dispatch_held_per_root`, pre-flight and drain,
-            // which `causes_per_root` mirrors cause-for-cause).
+            // Derive dispatch holds from the same causes recorded in the tick's rows.
             let halt_causes = halt_cause::causes_per_root(
                 &health_states,
                 &roots,
