@@ -2252,6 +2252,14 @@ jobs:
       - name: tier-3 manifest launch shape (#8671)
         if: ${{ !cancelled() && steps.daemon-bin.outcome == 'success' }}
         run: bash defaults/scripts/tests/test-spawn-generic-launch.sh
+      # #15109: spawn-agy.sh gives each launch an isolated HOME and reclaims
+      # abandoned ones at the next launch. The chain it execs into resolves the
+      # launch shape via `loom-daemon runtime-launch-env`, so this suite needs
+      # the binary this job downloads. It pins it via
+      # loom_test_require_daemon_bin and FAILS rather than skips without one.
+      - name: agy adapter per-launch HOME lifecycle (#15109)
+        if: ${{ !cancelled() && steps.daemon-bin.outcome == 'success' }}
+        run: bash defaults/scripts/tests/test-spawn-agy.sh
       - name: Syntax-check the Codex adapter and its test
         if: ${{ !cancelled() && steps.daemon-bin.outcome == 'success' }}
         run: |

@@ -79,6 +79,7 @@ them but does not decide them.
 | Pi, OpenCode, Kimi Code CLI | native Rust, `loom-daemon/src/worker_spawn/harness.rs` | **2** | [`guardrail-parity-native.md`](guardrail-parity-native.md) (Pi/OpenCode only — Kimi is not covered) | none dedicated (`worker_spawn.rs`/`worker_spawn_kimi.rs` integration tests) | Setup, model profiles and live-canary evidence live in [`runtime-model-trials.md`](runtime-model-trials.md), not here. Kimi (#8561) declares every `defaults/runtimes/kimi.json` capability `"no"` — no guarded `loom_*` tool binding exists yet (#8562) — so it is admitted only for roles with no `runtimeRequirements` (Curator, Guide, Auditor); Pi/OpenCode's `worktreeIsolation`/`loomControl` are `"yes"`. |
 | Aider ([aider.chat](https://aider.chat)) | `defaults/scripts/spawn-aider.sh` (exec stub → `spawn-generic-launch.sh` → `spawn-generic.sh`) | **3** (generic passthrough, unverified) | n/a — tier-3 does not require one | none (no CI leg is required for tier-3; the checker assertion below is a plain `test-*.sh`, not an adapter-admission gate) | **Worked example** for issues #4780 / #8671 — proves the tier-3 mechanism end-to-end, not a vetted integration. Capability manifest `defaults/runtimes/aider.json` declares every capability `"no"`, including `worktreeIsolation: "no"` EXPLICITLY (not `"partial"`), and now carries aider's whole launch shape in its `launch` object. |
 | Gemini CLI ([gemini-cli](https://github.com/google-gemini/gemini-cli)) | `defaults/scripts/spawn-gemini.sh` (exec stub → `spawn-generic-launch.sh` → `spawn-generic.sh`) | **3** (generic passthrough, unverified) | n/a — tier-3 does not require one | none (as Aider — tier-3 requires no CI leg) | Same instantiation shape as the Aider worked example; intended as a [`runtimes.preference`](#ordered-runtime-preference-with-fall-through-issue-8436) fall-through tap (e.g. `["claude", "gemini"]`) for roles with no `runtimeRequirements`, so an exhausted Claude pool does not strand them. Manifest `defaults/runtimes/gemini.json` declares every capability `"no"`, including `worktreeIsolation: "no"` EXPLICITLY — Builder, Doctor and Judge stay refused by construction. |
+| Google Antigravity CLI (`agy`) | `defaults/scripts/spawn-agy.sh` (exec stub → `spawn-generic-launch.sh` → `spawn-generic.sh`) | **3** (generic passthrough, unverified) | n/a — tier-3 does not require one | none (as Aider — tier-3 requires no CI leg); the adapter's own HOME-lifecycle suite is `test-spawn-agy.sh` | Second route of the [Gemini pilot](#the-pooled-tier-3-pilot-google-antigravity-agy-14945) (#14945) and the one tier-3 runtime that declares a credential pool (`credentialPool: gemini`), which every launch **must** draw from. Unlike the other stubs, `spawn-agy.sh` also builds each launch a fresh isolated `HOME`; see the pilot section for the pool obligation, the `HOME` lifecycle and the unverified flag surface. |
 
 ### Tier 3: generic passthrough
 
@@ -270,6 +271,15 @@ the one cap.
   issue text, not from a verified doc pass; the live run (#15059) must
   re-confirm them. An on-disk `.loom/runtimes/agy.json` or an operator-pinned
   `LOOM_GENERIC_EXTRA_ARGS` overrides either without recompiling.
+- **The per-launch `HOME` is reclaimed by the next launch, not by its own** —
+  `spawn-agy.sh` `exec`s down the adapter chain, so it cannot clean up after
+  itself. It writes its pid to `<HOME>/.loom-pid`, and before every launch it
+  removes a same-owner `loom-agy-*` directory under `TMPDIR` only when that
+  directory is older than 24 hours **and** its marker names a process
+  confirmed gone. A live launch is kept, and so is anything whose liveness is
+  unknown: no marker, or an unreadable or malformed one. A `HOME` written
+  before the marker existed is therefore never reclaimed by the sweep and
+  stays with the host's own temp-dir policy.
 - **Effort is not mapped** — `agy models` lists `-low/medium/high/xhigh`
   model variants an operator can pass through explicitly.
 
@@ -1643,12 +1653,16 @@ appending to it would report a runtime called `"opencode tier=2"`. "How much wor
 is going to the backstop" reduces to counting markers whose `tier` is not `0`.
 
 **An uninstalled tier-3 tap is skipped, not launched (#9368).** A tier-3
-generic runtime (`gemini`, `aider`, operator-defined) has no credential pool, so
-the one thing the walk can observe about it is its CLI binary: when the name is
+generic runtime with no credential pool (`gemini`, `aider`, operator-defined)
+is observable by the walk only through its CLI binary: when the name is
 known (`LOOM_GENERIC_CLI_BIN`, else the manifest's `launch.cliBin`) and it is
 not an executable file on the daemon's `PATH`, the tap is passed over as
 `unavailable(binary: 'gemini' not found in PATH …)` and the walk continues, or
-holds if nothing below qualifies. Without a known name (no `launch.cliBin`) the
+holds if nothing below qualifies. `agy` is the exception: it is the one tier-3
+runtime that declares a pool, so [its tap](#the-pooled-tier-3-pilot-google-antigravity-agy-14945)
+composes the binary gate with the `api_keys:gemini` pool check
+(`pooled_tier3`), and an unprovisioned, unreadable, exhausted or at-cap pool
+skips it the same way. Without a known name (no `launch.cliBin`) the
 tap stays ungated and `spawn-generic.sh`'s own exit-127 check remains the
 backstop, so declare `cliBin` in any tier-3 manifest you list in a preference.
 `claude`, `codex` and the native harnesses are never `PATH`-checked.

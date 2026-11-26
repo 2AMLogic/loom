@@ -40,13 +40,62 @@ set -euo pipefail
 
 _SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-# Per-launch isolated HOME: outside every checkout, owner-only, never reused.
-# `agy` state (settings, any cache) lives and dies with the launch; nothing
-# accumulates on the host and no cached login can be picked up.
+# Minutes a per-launch HOME must have been abandoned before the launch-time
+# sweep below will reclaim it.
+AGY_HOME_MAX_AGE_MIN=1440
+
+# _agy_pid_confirmed_gone <pid> -- exit 0 only when `kill -0` fails with ESRCH.
+# A signalable pid is live, and EPERM (the pid was reused by another user's
+# process) is NOT "gone", so the two have to be told apart; the C-locale text
+# of the builtin's own error is the only way bash exposes errno.
+_agy_pid_confirmed_gone() {
+    local msg
+    msg="$(LC_ALL=C kill -0 "$1" 2>&1 >/dev/null)" && return 1
+    [[ "$msg" == *"No such process"* ]]
+}
+
+# _agy_sweep_stale_homes -- best-effort reclamation of per-launch HOMEs whose
+# launch is over. It can never fail the launch, prints nothing, and costs one
+# pass over the top level of TMPDIR. Every step is guarded by hand, because the
+# caller invokes it inside `|| true`, which suspends `set -e` for the whole
+# function.
+_agy_sweep_stale_homes() {
+    local root="${TMPDIR:-/tmp}" dir marker pid
+    [[ -d "$root" ]] || return 0
+    while IFS= read -r -d '' dir; do
+        marker="$dir/.loom-pid"
+        [[ -f "$marker" && -r "$marker" ]] || continue
+        pid="$(head -c 32 "$marker" 2>/dev/null)" || continue
+        [[ "$pid" =~ ^[1-9][0-9]*$ ]] || continue
+        _agy_pid_confirmed_gone "$pid" || continue
+        rm -rf -- "$dir" 2>/dev/null || true
+    done < <(find "$root" -mindepth 1 -maxdepth 1 -name 'loom-agy-*' -type d \
+        -uid "$EUID" -mmin +"$AGY_HOME_MAX_AGE_MIN" -print0 2>/dev/null)
+    return 0
+}
+
+# Per-launch isolated HOME: outside every checkout, owner-only, never reused,
+# and holding the settings file that selects the gemini provider -- so no
+# cached login under the operator's real HOME can be picked up. It does NOT
+# die with the launch: this script `exec`s down the adapter chain, so nothing
+# set here can run afterwards to remove it. What keeps it from accumulating is
+# the sweep, run at the NEXT launch: it reclaims a same-owner `loom-agy-*`
+# directory only once that directory is older than AGY_HOME_MAX_AGE_MIN and
+# its `.loom-pid` marker names a process confirmed gone. Anything whose
+# liveness is unknown is kept: a live launch, a missing/unreadable/malformed
+# marker, and every HOME written before the marker existed (those stay with
+# the host's own temp-dir policy, as before). Pid reuse only delays removal.
+_agy_sweep_stale_homes >/dev/null 2>&1 || true
 AGY_HOME="$(mktemp -d "${TMPDIR:-/tmp}/loom-agy-XXXXXX")"
 chmod 700 "$AGY_HOME"
 printf '{"modelProvider": "gemini"}\n' >"$AGY_HOME/settings.json"
 chmod 600 "$AGY_HOME/settings.json"
+# The liveness marker the sweep reads. `$$` is the pid that exec's `agy`
+# (interactive) or waits on it (headless): spawn-generic-launch.sh and
+# spawn-generic.sh both `exec`, the `nice` re-exec included, so this pid lives
+# exactly as long as the launch.
+printf '%s\n' "$$" >"$AGY_HOME/.loom-pid"
+chmod 600 "$AGY_HOME/.loom-pid"
 
 # Guarded launch argv: the settings argument selecting the gemini provider,
 # and the sandbox policy (never agy's auto-approve flag). Set as DEFAULTS
