@@ -89,6 +89,12 @@ ALLOWED_HOST_SUFFIXES=(
   github.com githubusercontent.com
   anthropic.com claude.com
   aistudio.google.com
+  # `storage.googleapis.com` is Google's public object-storage host, which
+  # serves the Antigravity CLI (`agy`) release archive and manifest that
+  # `defaults/docs/runtime-adapters.md` records as the version pin (#15059).
+  # Same category as aistudio.google.com — a public vendor distribution host,
+  # not an operator-owned deployment.
+  storage.googleapis.com
   # `kimi.com` / `moonshot.ai` are Moonshot AI's public endpoints, added with
   # the Kimi Code CLI native harness (#8561): the former hosts the CLI docs
   # `defaults/docs/runtime-model-trials.md` cites, the latter the platform API
