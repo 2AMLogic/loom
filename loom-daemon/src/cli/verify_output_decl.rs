@@ -47,7 +47,7 @@ use std::path::PathBuf;
 
 use anyhow::{Context, Result};
 
-use super::git_blob_lines::{resolved_blob, ResolvedBlob};
+use super::git_blob_lines::{citable_lines, resolved_blob, ResolvedBlob};
 
 /// Disproof: the declaration failed — a miss. Mirrors
 /// [`super::git_blob_lines`]'s `EX_OUT_OF_RANGE`.
@@ -206,27 +206,16 @@ pub(crate) fn line_contains_complete_arg(line: &str, needle: &str) -> bool {
 }
 
 /// 1-based line `line_no` of the content, or `None` when it does not exist.
-/// A trailing `\n` produces a final empty segment that is not a line.
+/// A trailing `\n` produces a final empty segment that is not a line; the
+/// addressable range is [`citable_lines`], the same count the diagnostic reports.
 pub(crate) fn line_at(content: &[u8], line_no: u64) -> Option<String> {
     if line_no == 0 {
         return None;
     }
     let text = String::from_utf8_lossy(content);
     let segments: Vec<&str> = text.split('\n').collect();
-    let real = if content.last() == Some(&b'\n') {
-        segments.len().saturating_sub(1)
-    } else {
-        segments.len()
-    };
     let idx = line_no as usize - 1;
-    (idx < real).then(|| segments[idx].to_string())
-}
-
-/// `wc -l` line count of the content, matching [`resolved_blob`]'s line
-/// counting so the diagnostic agrees with `git-blob-lines`' "has only N
-/// lines".
-fn line_count(content: &[u8]) -> u64 {
-    content.iter().filter(|&&b| b == b'\n').count() as u64
+    (line_no <= citable_lines(content)).then(|| segments[idx].to_string())
 }
 
 /// Handle `loom-daemon verify-output-decl …`. Never returns (exits the
@@ -298,7 +287,7 @@ fn handle(
                 println!(
                     "BAD OUTPUT DECL: `{cite}` — {rev}:{resolved_path} has only {} lines, no \
                      line {line_no}",
-                    line_count(&bytes)
+                    citable_lines(&bytes)
                 );
                 std::process::exit(EX_DECL_FAILED);
             };
@@ -420,6 +409,24 @@ mod tests {
         assert_eq!(parse_producer_spec("Makefile:"), None);
         assert_eq!(parse_producer_spec("Makefile:x"), None);
         assert_eq!(parse_producer_spec(":5"), None);
+    }
+
+    #[test]
+    fn the_diagnostic_count_agrees_with_the_lines_line_at_can_address() {
+        // `has only N lines` reports `citable_lines`, so for every blob the
+        // last line `line_at` returns is line N and line N + 1 is absent.
+        for (blob, want) in [
+            (&b""[..], 0),
+            (b"last", 1),
+            (b"first\nlast", 2),
+            (b"first\nlast\n", 2),
+        ] {
+            assert_eq!(citable_lines(blob), want, "{blob:?}");
+            assert_eq!(line_at(blob, want + 1), None, "{blob:?}");
+            if want > 0 {
+                assert!(line_at(blob, want).is_some(), "{blob:?}");
+            }
+        }
     }
 
     #[test]
