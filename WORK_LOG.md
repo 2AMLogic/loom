@@ -18,6 +18,17 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 ### 2026-11-26
 
+- **Issue #15372** (closed): Consolidate duplicated expand_tilde, default_activity_db_path, and git-origin resolve_repo helpers in loom-daemon
+- **PR #15389**: refactor: consolidate duplicated tilde, activity-db, and git-origin resolver helpers in loom-daemon
+- **Issue #14110** (closed): Contained roles: select only private-clone accounts registering the repository; clear refusal, status and docs
+- **PR #14260**: fix(daemon): contained launches draw only private-clone accounts registering the workspace repository
+- **PR #15339**: chore(deps): Bump the github-actions group across 1 directory with 4 updates
+- **Issue #15159** (closed): Cross-owner reap and plan disagree on owner-name case, costing a re-mint per pass
+- **PR #15349**: fix(credential_preflight): compare the root owner case-insensitively in the plan (#15159)
+- **Issue #15387** (closed): verify-proposal-refs reports generated outputs named in acceptance tests as missing source files
+- **PR #15393**: feat(daemon): verify generated-output declarations in proposal refs
+- **Issue #15452** (closed): Ignore config tiers containing multiple top-level JSON values
+- **PR #15462**: fix(config-resolver): ignore config tiers holding several JSON values
 - **Issue #15414** (closed): Remove the second config-tier scan from configure_terminal
 - **PR #15425**: Remove the second config-tier scan from configure_terminal (#15414)
 - **Issue #15435** (closed): daemon tests: LOOM_GH_BIN is mutated under #[serial(loom_config_env)] in forge_verdict_cmd vs bare #[serial] in two claim_reconciliation test files
