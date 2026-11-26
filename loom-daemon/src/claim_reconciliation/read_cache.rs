@@ -68,6 +68,13 @@ pub(super) static HEAD_PUSH: ReadCache<DateTime<Utc>> = ReadCache::new(CLAIM_MAX
 pub(super) static VERDICT_SCAN: ReadCache<(Option<String>, bool)> = ReadCache::new(MAX_AGE);
 /// A held approval whose trusted comments contain no repair intent for the listed head.
 pub(super) static NO_HELD_INTENT: ReadCache<()> = ReadCache::new(CLAIM_MAX_AGE);
+/// A would-invalidate `changes-requested` PR's operator send-back scan
+/// (#15068): `Some(evidence)` = a trusted human's label pins the verdict to
+/// the current head. Only a positive answer is cached: the fetch returns
+/// `None` both for a failed walk and for "no send-back", so neither is stored
+/// and both are re-walked next tick — fail closed is never cached.
+pub(super) static VERDICT_SEND_BACK: ReadCache<Option<super::OperatorSendBack>> =
+    ReadCache::new(MAX_AGE);
 /// An open PR's changed paths. Keyed on the base branch NAME, not its SHA —
 /// an approximation: a base that advances without the head moving keeps the
 /// cached set until [`MAX_AGE`] (the PR's own diff rarely changes from that).

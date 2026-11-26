@@ -233,3 +233,9 @@ scripts/tests/test-generate-agents-md-layouts.sh
 # (T38e) at the daemon boundary; the prompt boundary is pinned by
 # test-guide-unblock-open-crossrepo.sh.
 scripts/tests/test-guide-unblock-merged-blocker.sh
+
+# #14905 — merge observation took over stacked-child reconciliation, closed-issue
+# label cleanup and branch-derived issue closure.
+scripts/tests/test-merge-pr-auto-reconcile.sh
+scripts/tests/test-merge-pr-closed-issue-cleanup.sh
+scripts/tests/test-merge-pr-feature-branch-close.sh

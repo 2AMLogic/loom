@@ -89,6 +89,7 @@ fn pr(head: Option<&str>, marker: Option<&str>, invalidation_recorded: bool) -> 
         marker_scan_ok: true,
         on_hold: false,
         invalidation_recorded,
+        operator_send_back: None,
     }
 }
 

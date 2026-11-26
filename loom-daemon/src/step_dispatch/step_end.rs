@@ -42,6 +42,7 @@ use super::session_ledger;
 use crate::step_role::StepRole;
 use crate::sweep_registry::step_ledger::StepRun;
 use crate::sweep_registry::step_spawn::ended::{self, EndedStep};
+use crate::sweep_registry::step_spawn::{StepRefusal, StepSpawnRequest};
 use crate::sweep_registry::SweepRegistry;
 
 /// The role's post-state from one read of the item: the claim release's own
@@ -185,7 +186,7 @@ pub fn run_of(
 }
 
 /// The ledger's refusal reason for a spawn-time refusal
-/// (`sweep_registry::step_spawn::StepRefusal::reason`): the pool gate and a
+/// (`sweep_registry::step_spawn::StepRefusal::reason`): a child failing token selection and a
 /// claim held elsewhere cool the `(item, step)` down; a lost claim is a
 /// counted redraw. A standing admission refusal (#14032: the runtime will
 /// not take the launch — a rejected runtime, a model/runtime mismatch, or
@@ -197,7 +198,10 @@ pub fn run_of(
 #[must_use]
 pub fn ledger_reason(spawn_reason: &str) -> Option<&'static str> {
     match spawn_reason {
-        "pool_exhausted" | "no_token_pool" | "token_selection_failed" => Some("pool_gate"),
+        // The role mark normally suffices. record_refusal also cools the
+        // item when the probe let a marked role retry or a seat was unavailable.
+        "pool_exhausted" | "no_token_pool" => None,
+        "token_selection_failed" => Some("pool_gate"),
         "claimed" | "claim_unverified" | "backstop_hold" | "peer_active" => Some("claimed"),
         // A failed spawn cools down like a gate, so it is not respawned on
         // every tick. A missing `/loom:<role>` command is refused before the
@@ -215,19 +219,30 @@ pub fn ledger_reason(spawn_reason: &str) -> Option<&'static str> {
     }
 }
 
-fn refusal_ledger_reason(spawn_reason: &str, detail: Option<&str>) -> Option<&'static str> {
+fn refusal_ledger_reason(
+    refusal: Option<&StepRefusal>,
+    retried_pool: bool,
+) -> Option<&'static str> {
+    let Some(refusal) = refusal else {
+        return ledger_reason("spawn_failed");
+    };
+    let spawn_reason = refusal.reason;
+    if matches!(spawn_reason, "pool_exhausted" | "no_token_pool")
+        && (retried_pool || refusal.seat_unavailable)
+    {
+        return Some("pool_gate");
+    }
     // Match the start of the static Codex containment rejection and its
     // preparation cause. A path, diagnostic excerpt or preference summary
     // that mentions the marker is still an ordinary admission refusal.
     if spawn_reason == "runtime_rejected"
-        && detail
-            .and_then(|detail| {
-                detail.strip_prefix(concat!(
-                    "unmet capabilities: worktreeIsolation; ",
-                    "verified private-clone containment could not satisfy it: ",
-                    "private workspace preparation refused: ",
-                ))
-            })
+        && refusal
+            .detail
+            .strip_prefix(concat!(
+                "unmet capabilities: worktreeIsolation; ",
+                "verified private-clone containment could not satisfy it: ",
+                "private workspace preparation refused: ",
+            ))
             .and_then(|cause| cause.strip_prefix(outcome_ledger::SEAT_DIRTY))
             .is_some_and(|detail| detail.starts_with(": private clone/worktree is dirty;"))
     {
@@ -242,17 +257,16 @@ fn refusal_ledger_reason(spawn_reason: &str, detail: Option<&str>) -> Option<&'s
 pub fn record_refusal(
     root: &Path,
     registry: &Arc<Mutex<SweepRegistry>>,
-    item: u32,
-    role: StepRole,
-    spawn_reason: &str,
-    detail: Option<&str>,
+    request: &StepSpawnRequest,
+    refusal: Option<&StepRefusal>,
+    retried_pool: bool,
 ) {
-    let Some(reason) = refusal_ledger_reason(spawn_reason, detail) else {
+    let Some(reason) = refusal_ledger_reason(refusal, retried_pool) else {
         return;
     };
     let run = StepRun {
-        item,
-        step: role,
+        item: request.item,
+        step: request.role,
         sweep_id: String::new(),
         outcome: outcome_ledger::StepOutcome::new(outcome_ledger::OutcomeClass::Refused, reason),
         ran_for: std::time::Duration::ZERO,
@@ -401,7 +415,8 @@ mod tests {
 
     #[test]
     fn spawn_refusals_map_onto_the_ledgers_reasons() {
-        assert_eq!(ledger_reason("pool_exhausted"), Some("pool_gate"));
+        assert_eq!(ledger_reason("pool_exhausted"), None);
+        assert_eq!(ledger_reason("no_token_pool"), None);
         assert_eq!(ledger_reason("token_selection_failed"), Some("pool_gate"));
         assert_eq!(ledger_reason("backstop_hold"), Some("claimed"));
         // #12105: another actor working the PR cools the Doctor down.
@@ -420,12 +435,23 @@ mod tests {
     }
 
     #[test]
+    fn pool_refusal_after_an_optimistic_probe_cools_the_item() {
+        for reason in ["pool_exhausted", "no_token_pool"] {
+            let refusal = StepRefusal::new(reason, "launch refused");
+            assert_eq!(refusal_ledger_reason(Some(&refusal), false), None);
+            assert_eq!(refusal_ledger_reason(Some(&refusal), true), Some("pool_gate"));
+        }
+    }
+
+    #[test]
     fn only_the_dirty_private_preparation_refusal_gets_the_specific_ledger_reason() {
         let isolation = "unmet capabilities: worktreeIsolation; verified private-clone \
                          containment could not satisfy it: ";
         let dirty = "private workspace preparation refused: seat_dirty: private \
                      clone/worktree is dirty; retain and recover its work before reuse\n  M file";
-        let refusal = |reason, detail: String| refusal_ledger_reason(reason, Some(&detail));
+        let refusal = |reason, detail: String| {
+            refusal_ledger_reason(Some(&StepRefusal::new(reason, detail)), false)
+        };
         assert_eq!(
             refusal("runtime_rejected", format!("{isolation}{dirty}")),
             Some(outcome_ledger::SEAT_DIRTY)
@@ -439,7 +465,7 @@ mod tests {
             Some("admission")
         );
         assert_eq!(refusal("roll_paused", format!("{isolation}{dirty}")), None);
-        assert_eq!(refusal_ledger_reason("spawn_failed", None), Some("pool_gate"));
+        assert_eq!(refusal_ledger_reason(None, false), Some("pool_gate"));
     }
 
     /// #14458: a step that died on its seat's dirty leftover worktree wrote no

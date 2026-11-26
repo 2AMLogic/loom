@@ -68,7 +68,7 @@ npx wrangler d1 create loom-api-db
 # Copy the database_id to wrangler.toml
 
 # Create KV namespace
-npx wrangler kv:namespace create "sessions"
+npx wrangler kv namespace create "sessions"
 # Copy the id to wrangler.toml
 
 # Set JWT secret

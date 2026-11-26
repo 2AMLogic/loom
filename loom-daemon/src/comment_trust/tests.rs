@@ -287,6 +287,17 @@ fn verdict_sha_readers_go_through_the_trust_filter() {
         // held handback and reconciliation; neither reads live forge comments.
         ("doctor_handback/held_review/tests.rs", "test fixture"),
         ("claim_reconciliation/verdict_dedup_tests/held_recovery_e2e.rs", "test fixture"),
+        // #15068: the daemon port of the shell guard's operator send-back rule.
+        // Its marker lookup feeds the comment listing through
+        // `TrustPolicy::for_root(root)` before `body_carries_verdict_marker`
+        // sees a body, and the label actor's collaborator permission goes
+        // through the same predicate.
+        (
+            "claim_reconciliation/verdict_send_back.rs",
+            "reads comments through TrustPolicy",
+        ),
+        // Fixture only: a fake `gh` serving a canned comment listing.
+        ("claim_reconciliation/verdict_send_back_tests.rs", "test fixture"),
         ("comment_trust.rs", "module docs"),
         ("comment_trust/tests.rs", "this test"),
     ];
