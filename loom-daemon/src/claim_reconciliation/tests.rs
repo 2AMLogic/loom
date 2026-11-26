@@ -3164,6 +3164,9 @@ fn verdict_pr(kind: VerdictKind, head: Option<&str>, marker_sha: Option<&str>) -
         // yet", so the audit comment goes out. `decide_verdict` does not read
         // this field at all -- it only gates the duplicate comment.
         invalidation_recorded: false,
+        // #15068: the ordinary case is no verified operator send-back
+        // evidence — the marker comparison decides.
+        operator_send_back: None,
     }
 }
 
@@ -3305,6 +3308,61 @@ fn decide_verdict_respects_an_explicit_hold() {
     let mut pr = verdict_pr(VerdictKind::ChangesRequested, Some(SHA_B), Some(SHA_A));
     pr.on_hold = true;
     assert_eq!(decide_verdict(&pr), VerdictAction::Keep(VerdictKeepReason::Held));
+}
+
+// --- #15068: an operator's hand-applied send-back pins the label ----------
+
+/// The #14470 incident's SHAs, verbatim: the bot verdict's marker vs the
+/// unmoved head an operator rejected by hand.
+const MARKER_14470: &str = "3efb454aff553b10483684e2bf4ffdf5a8628a02";
+const HEAD_14470: &str = "bcf2c895d92b25e1a286ae31b98542f5835a0bba";
+
+fn send_back(actor: &str) -> OperatorSendBack {
+    OperatorSendBack {
+        actor: actor.to_string(),
+        labeled_at: "2026-11-21T00:43:32Z".parse().unwrap(),
+    }
+}
+
+#[test]
+fn decide_verdict_keeps_a_trusted_send_back_at_an_unmoved_head() {
+    // The #14470 shape: marker names 3efb454a (an older bot verdict), the head
+    // is bcf2c895, and a trusted human applied `loom:changes-requested` at
+    // that head after the marker, with no push since. The marker comparison
+    // alone would clear the operator's rejection and re-queue the head they
+    // refused.
+    let mut pr = verdict_pr(VerdictKind::ChangesRequested, Some(HEAD_14470), Some(MARKER_14470));
+    pr.operator_send_back = Some(send_back("rjwalters"));
+    assert_eq!(decide_verdict(&pr), VerdictAction::Keep(VerdictKeepReason::OperatorSendBack));
+}
+
+#[test]
+fn decide_verdict_send_back_never_applies_to_an_approval() {
+    // An approval keeps the strict marker rule: a missing/unmatched approval
+    // marker must fail safe by re-queueing (#9258), never by pinning.
+    let mut pr = verdict_pr(VerdictKind::Approved, Some(SHA_B), Some(SHA_A));
+    pr.operator_send_back = Some(send_back("rjwalters"));
+    assert_eq!(
+        decide_verdict(&pr),
+        VerdictAction::Invalidate {
+            marker_sha: SHA_A.to_string(),
+            head_sha: SHA_B.to_string(),
+        }
+    );
+}
+
+#[test]
+fn decide_verdict_send_back_loses_to_a_fresh_marker_and_a_hold() {
+    // Evidence only exists for the would-invalidate shape, but the pure
+    // function must stay well-ordered if a caller ever hands it in anyway:
+    // a matching marker is Fresh, and a hold still names the hold.
+    let mut fresh = verdict_pr(VerdictKind::ChangesRequested, Some(SHA_A), Some(SHA_A));
+    fresh.operator_send_back = Some(send_back("rjwalters"));
+    assert_eq!(decide_verdict(&fresh), VerdictAction::Keep(VerdictKeepReason::Fresh));
+    let mut held = verdict_pr(VerdictKind::ChangesRequested, Some(SHA_B), Some(SHA_A));
+    held.on_hold = true;
+    held.operator_send_back = Some(send_back("rjwalters"));
+    assert_eq!(decide_verdict(&held), VerdictAction::Keep(VerdictKeepReason::Held));
 }
 
 #[test]

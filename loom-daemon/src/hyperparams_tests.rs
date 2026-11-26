@@ -1,13 +1,21 @@
 //! Coverage for the unified hyperparameters module (Issue #9683): schema
-//! defaults, tier precedence (`env > config > legacy > default`),
-//! strict layer validation, digest stability, and the startup capture that
-//! feeds the provenance stamper and the lease-TTL resolver.
+//! defaults, tier precedence (single-knob env > config block > legacy >
+//! default), strict layer validation, digest stability, consumer overlays
+//! through each module's own reader, and the *fail-fast* `startup_init`
+//! error path.
+//!
+//! The startup SUCCESS path is not here: only
+//! `startup_init_fails_fast_naming_the_offending_path` calls `startup_init`,
+//! and it expects an error, so the process globals (`RESOLVED`/`DIGEST`/
+//! `ROOT`) are never set by this suite. The successful capture, the
+//! provenance stamp, and the lease-TTL hot-apply assertions live in the
+//! integration suite `loom-daemon/tests/hyperparams_startup.rs`
+//! (`startup_capture_and_lease_ttl_hot_apply_without_a_restart`), which
+//! runs as its own process precisely so it can populate the globals
+//! without poisoning them for other tests.
 //!
 //! Env-var-touching tests are `#[serial]` (`serial_test`) so concurrent
-//! tests cannot observe each other's env. The startup-success
-//! test deliberately populates the process-global vector (`OnceLock`): no
-//! other test here asserts the globals are unset, so capture order across
-//! the suite is harmless.
+//! tests cannot observe each other's env.
 
 use super::*;
 use serial_test::serial;

@@ -1,9 +1,10 @@
 //! Tests for the closed-issue `loom:building` cleanup decision (#6199).
 //!
-//! The T-numbered cases mirror `test-merge-pr-closed-issue-cleanup.sh`'s own
-//! per-issue assertions (T1-T5), which still run against this code through the
-//! shell wrapper. They are duplicated here so a Rust-only change that breaks
-//! them fails without a shell suite in the loop.
+//! The T-numbered cases mirror the per-issue assertions (T1-T5) of
+//! `test-merge-pr-closed-issue-cleanup.sh`, which #14905 deleted together with
+//! the shell wrapper it drove. They are now the only per-issue coverage of this
+//! decision (plus `tests/merge_pr_closed_building_differential.rs` against the
+//! frozen shell, and the strip pass inside `merge_observation_tests.rs`).
 
 use super::*;
 

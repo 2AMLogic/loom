@@ -704,6 +704,21 @@ pub enum MetricName {
     /// point, labelled `task` and `reason` = `panic` / `overrun` / `exit`.
     #[serde(rename = "loom.daemon.task_faults")]
     DaemonTaskFaults,
+    // ---- Primary writer token freshness (Issue #15327) -------------------
+    /// Seconds since the daemon last published its primary writer token,
+    /// labelled `owner` (the installation owner). Climbs past ~600 s only
+    /// when rotation has stopped.
+    #[serde(rename = "loom.daemon.forge_token_age")]
+    DaemonForgeTokenAge,
+    /// Seconds until the published primary writer token's `expires_at`
+    /// (negative once past), labelled `owner`. Absent when the minter gave
+    /// no parseable expiry.
+    #[serde(rename = "loom.daemon.forge_token_remaining")]
+    DaemonForgeTokenRemaining,
+    /// Unix time of the last primary writer token publication, labelled
+    /// `owner`.
+    #[serde(rename = "loom.daemon.forge_token_last_rotation")]
+    DaemonForgeTokenLastRotation,
     // ---- IPC request latency (Issue #10765) -------------------------------
     /// Slowest IPC request answered in the interval, seconds from the request
     /// line being read to the response written, labelled `kind` (the
@@ -965,6 +980,9 @@ impl MetricName {
             Self::EgressTtft => "loom.egress.ttft",
             Self::DaemonTaskAlive => "loom.daemon.task_alive",
             Self::DaemonTaskFaults => "loom.daemon.task_faults",
+            Self::DaemonForgeTokenAge => "loom.daemon.forge_token_age",
+            Self::DaemonForgeTokenRemaining => "loom.daemon.forge_token_remaining",
+            Self::DaemonForgeTokenLastRotation => "loom.daemon.forge_token_last_rotation",
             Self::DaemonIpcLatencyMax => "loom.daemon.ipc.latency_max",
             Self::DaemonIpcLatency => "loom.daemon.ipc.latency",
             Self::DaemonIpcRequests => "loom.daemon.ipc.requests",
@@ -1113,6 +1131,9 @@ impl MetricName {
             Self::EgressLatency | Self::EgressTtft => "s",
             Self::DaemonTaskAlive => "1",
             Self::DaemonTaskFaults => "{fault}",
+            Self::DaemonForgeTokenAge
+            | Self::DaemonForgeTokenRemaining
+            | Self::DaemonForgeTokenLastRotation => "s",
             Self::DaemonIpcLatencyMax | Self::DaemonIpcLatency => "s",
             Self::DaemonIpcRequests => "{request}",
             Self::DaemonIpcStatusBuilds => "{build}",
@@ -1254,6 +1275,15 @@ impl MetricName {
             Self::EgressLatency => "Summed egress-proxy request latency, by seat.",
             Self::EgressTtft => "Summed egress-proxy time to first response byte, by seat.",
             Self::DaemonTaskFaults => "Faults of a long-running daemon loop, by task and reason.",
+            Self::DaemonForgeTokenAge => {
+                "Seconds since the primary writer token was last published, by owner."
+            }
+            Self::DaemonForgeTokenRemaining => {
+                "Seconds until the published primary writer token expires, by owner."
+            }
+            Self::DaemonForgeTokenLastRotation => {
+                "Unix time the primary writer token was last published, by owner."
+            }
             Self::DaemonIpcLatencyMax => "Slowest IPC request answered in the interval, by kind.",
             Self::DaemonIpcLatency => "Summed IPC request latency, by request kind.",
             Self::DaemonIpcRequests => "IPC requests answered, by request kind.",

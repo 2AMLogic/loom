@@ -1371,9 +1371,9 @@ fn close_check(
 
 /// The out-of-band AC hold (#6883): reopen if the merge already closed the
 /// issue, post the marker-idempotent notice, and add `loom:operator`. The
-/// marker is byte-identical to Champion's own
-/// (`champion-pr-merge.md` → `hold_issue_on_unverified_ac`), so a hold
-/// posted by either side is recognized by both.
+/// marker is byte-identical to the one
+/// (Champion's former `hold_issue_on_unverified_ac`, retired by #14905), so a
+/// hold posted before the cutover is still recognized and never re-posted.
 fn hold_for_unverified_ac(
     f: &impl Forge,
     rec: &MergeRecord,
