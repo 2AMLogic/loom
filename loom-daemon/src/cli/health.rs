@@ -371,7 +371,7 @@ async fn collect(window: Duration) -> HealthReport {
         chrono::Utc::now() - chrono::Duration::days(limit_calibration::DEFAULT_LOOKBACK_DAYS);
     let limit_calibration = match limit_calibration::compute_with_fallback(
         &limit_calibration::default_monitor_db_path(),
-        &limit_calibration::default_activity_db_path(),
+        &crate::activity::default_activity_db_path(),
         since,
     ) {
         CalibrationStatus::Unavailable(_) => None,
@@ -402,7 +402,7 @@ async fn collect(window: Duration) -> HealthReport {
     let transcript_ingest_status =
         crate::transcript_tokens::claude_projects_dir().map(|projects_dir| {
             transcript_ingest::collect_health_status(
-                &limit_calibration::default_activity_db_path(),
+                &crate::activity::default_activity_db_path(),
                 &projects_dir,
                 &transcript_ingest_config,
             )

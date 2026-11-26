@@ -218,6 +218,61 @@ capabilities honestly (`"partial"` where a real, if incomplete, mechanism
 exists; `"yes"` only where it is fully proven). Promotion is a manifest edit
 plus the missing artifacts, not a rewrite of the adapter shape.
 
+#### The pooled tier-3 pilot: Google Antigravity (`agy`, #14945)
+
+`agy` is a tier-3 adapter with one extra manifest-declared obligation: its
+launch **must** draw its credential from the API-key account pool. It is the
+second route of the Gemini pilot (2AMLogic/2am `docs/llm-policy.md` rule 6;
+OpenCode's `quick-flash` profile is the first), and the account's
+`maxConcurrent` cap — shared with OpenCode through the same `gemini`
+namespace — is the pilot's spend control.
+
+Top-level manifest keys (validated by `loom-daemon`, fail-closed at exit 78
+on a malformed declaration):
+
+| Key | Meaning |
+|---|---|
+| `credentialPool` | API-key pool namespace (`gemini`); shared with every tap that names it. |
+| `credentialEnv` | The child variable a pooled account supplies (`GEMINI_API_KEY`). |
+| `model` | Default model (`gemini-4-neon`, the 2026-11-22 canary's); `LOOM_MODEL` overrides it and is passed to the CLI exactly once via `launch.modelFlag`. |
+
+The launch semantics differ from every other tier-3 runtime in exactly one
+way: **the pool is mandatory**. `loom-daemon spawn-worker` selects the
+account in the worker process (so the in-flight lease is counted against the
+PID that becomes the CLI run) and injects the key into the child environment
+only. A missing, unreadable, disabled, exhausted or at-cap pool refuses the
+launch at 78 **before the CLI runs — including when an ambient
+`GEMINI_API_KEY` or a cached Google login exists**: an ambient key never
+reaches the child (the pool's selection replaces it), and the adapter's
+per-launch isolated `HOME` (a fresh `mktemp -d` holding the
+`{"modelProvider": "gemini"}` settings file) keeps the CLI away from any
+stored session. The `# LOOM_LAUNCH` record names the account, never the key.
+At draw time the availability walk composes the binary gate with the shared
+pool check and reports `api_keys:gemini` — the same source a native tap on
+the namespace reports — so `hold_pool_slot` reserves either route against
+the one cap.
+
+- **Supported roles**: read-only roles with no `runtimeRequirements`
+  (Curator, Guide, Auditor). Builder and Doctor (worktreeIsolation +
+  loomControl) and Judge (loomControl) are refused by the manifest's
+  all-`"no"` capabilities, by the same mechanism as every other tier-3
+  runtime.
+- **Pilot invocation**: `LOOM_RUNTIME=agy .loom/scripts/spawn-worker.sh -p
+  "<prompt>"`, or a `runtimes.preference` / role-draw entry naming `agy`.
+- **Version pin**: `1.5.14` (the canary's binary, 273 MB). Pin the install
+  on fleet hosts; the adapter never updates or re-downloads the CLI itself.
+- **Background self-update must be disabled on fleet hosts** — the exact
+  verified mechanism (setting and effect, checked against the pinned binary)
+  is pending the live verification run tracked in #15059; treat an
+  unverified updater as enabled.
+- **Unverified flag surface**: `--settings <file>` and `--sandbox` (the
+  guarded choice over the auto-approve flag) come from the canary and the
+  issue text, not from a verified doc pass; the live run (#15059) must
+  re-confirm them. An on-disk `.loom/runtimes/agy.json` or an operator-pinned
+  `LOOM_GENERIC_EXTRA_ARGS` overrides either without recompiling.
+- **Effort is not mapped** — `agy models` lists `-low/medium/high/xhigh`
+  model variants an operator can pass through explicitly.
+
 ## The seven contract points
 
 Every runtime adapter implements the same seven-point contract. Each point below

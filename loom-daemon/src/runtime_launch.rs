@@ -73,9 +73,20 @@ struct LaunchSpec {
 /// deliberately no `deny_unknown_fields` here, so this module never has an
 /// opinion about fields that belong to `runtime_admission::RuntimeManifest`.
 #[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct RuntimeManifestDoc {
     #[serde(default)]
     launch: Option<LaunchSpec>,
+    /// #14945: a tier-3 runtime whose launch MUST draw its credential from
+    /// the API-key account pool (`agy`, the Antigravity pilot). Validated by
+    /// [`pooled_tier3`], not by serde.
+    #[serde(default)]
+    credential_pool: Option<String>,
+    #[serde(default)]
+    credential_env: Option<String>,
+    /// The pooled launch's default model; `LOOM_MODEL` overrides it.
+    #[serde(default)]
+    model: Option<String>,
 }
 
 /// Outcome of [`resolve_launch_env`], mapped to `runtime-launch-env`'s three
@@ -134,12 +145,13 @@ fn push_default(lines: &mut Vec<String>, var: &str, value: &str) {
     ));
 }
 
-/// Read `runtime`'s manifest and return its `launch` object — the one
-/// manifest read behind both [`resolve_launch_env`] and [`cli_bin_with`], so
-/// the launch path and the availability gate cannot disagree about which file
-/// (or bundled fallback) describes a runtime. `Ok(None)` is a manifest with no
-/// `launch` object; `Err` carries the non-`Resolved` outcome to report.
-fn read_launch(root: &Path, runtime: &str) -> Result<Option<LaunchSpec>, LaunchEnvOutcome> {
+/// Read `runtime`'s manifest and return the subset of it this module owns —
+/// the one manifest read behind [`resolve_launch_env`], [`cli_bin_with`] and
+/// [`pooled_tier3`], so the launch path, the availability gate and the pooled
+/// tier-3 pilot cannot disagree about which file (or bundled fallback)
+/// describes a runtime. `Ok(None)`-shaped docs are the caller's to interpret;
+/// `Err` carries the non-`Resolved` outcome to report.
+fn read_doc(root: &Path, runtime: &str) -> Result<RuntimeManifestDoc, LaunchEnvOutcome> {
     let (_roles, runtimes_dir, _scripts) = roots(root);
     let manifest_path = runtimes_dir.join(format!("{runtime}.json"));
 
@@ -175,7 +187,13 @@ fn read_launch(root: &Path, runtime: &str) -> Result<Option<LaunchSpec>, LaunchE
             return Err(LaunchEnvOutcome::Fatal(format!("{}: {e}", manifest_path.display())));
         }
     };
-    Ok(doc.launch)
+    Ok(doc)
+}
+
+/// [`read_doc`] narrowed to the `launch` object — the shape
+/// [`resolve_launch_env`] renders.
+fn read_launch(root: &Path, runtime: &str) -> Result<Option<LaunchSpec>, LaunchEnvOutcome> {
+    read_doc(root, runtime).map(|doc| doc.launch)
 }
 
 /// The environment variable that pins a tier-3 runtime's CLI binary,
@@ -249,6 +267,80 @@ pub fn resolve_launch_env(root: &Path, runtime: &str) -> LaunchEnvOutcome {
         push_default(&mut lines, "LOOM_GENERIC_EXTRA_ARGS", &launch.extra_args.join(" "));
     }
     LaunchEnvOutcome::Resolved(lines)
+}
+
+/// A tier-3 manifest's credential-pool declaration (#14945, the Antigravity
+/// pilot): this runtime's launch MUST draw `env_var` from `provider`'s
+/// API-key accounts, with no environment escape — unlike a native profile's
+/// ladder, an ambient variable neither wins nor bypasses the pool, because
+/// the account's `maxConcurrent` cap is the pilot's spend control.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PooledTier3 {
+    /// API-key pool namespace (`gemini`), shared with every other tap that
+    /// declares the same namespace (OpenCode's `quick-flash` profile).
+    pub provider: String,
+    /// The child variable an account supplies (`GEMINI_API_KEY`). Also the
+    /// `expected_env` the selection ladder checks an account's own
+    /// assignment against.
+    pub env_var: String,
+    /// The pooled launch's default model; `LOOM_MODEL` overrides it
+    /// (env > manifest, the tier-3 precedence).
+    pub model: Option<String>,
+}
+
+/// Read `runtime`'s pooled-tier-3 declaration, when its manifest carries one.
+///
+/// * `Ok(None)` — no declaration (every tier-3 runtime except the pilot):
+///   the launch and availability paths behave exactly as before #14945.
+/// * `Ok(Some)` — a validated declaration.
+/// * `Err` — a malformed declaration (one key without the other, an invalid
+///   pool namespace or variable name, an unparseable manifest). The launch
+///   path refuses at 78 with this detail; the availability walk, which
+///   cannot render it with full context, stays ungated and lets the launch
+///   be the loud surface — the same split `native()` already gives an
+///   unresolvable profile.
+///
+/// NoManifest is `Ok(None)`, not an error: a runtime with no manifest
+/// anywhere fails earlier and louder on its missing runner.
+pub fn pooled_tier3(root: &Path, runtime: &str) -> Result<Option<PooledTier3>, String> {
+    let doc = match read_doc(root, runtime) {
+        Ok(doc) => doc,
+        Err(LaunchEnvOutcome::Fatal(detail)) => return Err(detail),
+        Err(_) => return Ok(None),
+    };
+    let (Some(pool), Some(env_var)) = (&doc.credential_pool, &doc.credential_env) else {
+        if doc.credential_pool.is_some() || doc.credential_env.is_some() {
+            return Err(format!(
+                "runtime {runtime:?} declares credentialPool or credentialEnv without the other; \
+                 a pooled tier-3 launch needs both"
+            ));
+        }
+        return Ok(None);
+    };
+    // An invalid namespace must not be silently ignored (it would point the
+    // pool nowhere the operator named) and must not fall back to a
+    // derivation — the same refusal `credential::pool_provider` gives a
+    // malformed explicit override.
+    crate::api_keys_pool::paths::validate_provider(pool)
+        .map_err(|_| format!("runtime {runtime:?} declares an invalid credentialPool namespace"))?;
+    // A variable name check, never echoing the value: a mistaken string must
+    // not be reflected into a log (the same caution `profiles::check_name`
+    // takes). `UPPER_SNAKE_CASE`, matching the registry's own check so an
+    // account registered for this variable can never mismatch on casing.
+    if env_var.is_empty()
+        || !env_var
+            .bytes()
+            .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || b == b'_')
+        || env_var.starts_with(|b: char| b.is_ascii_digit())
+    {
+        return Err(format!("runtime {runtime:?} declares an invalid credentialEnv variable name"));
+    }
+    let model = doc.model.filter(|m| !m.trim().is_empty());
+    Ok(Some(PooledTier3 {
+        provider: pool.clone(),
+        env_var: env_var.clone(),
+        model,
+    }))
 }
 
 #[cfg(test)]
@@ -433,5 +525,109 @@ mod tests {
         assert_eq!(cli_bin_with(root, "bare", None), None);
         assert_eq!(cli_bin_with(root, "totally-unknown-runtime", None), None);
         assert_eq!(cli_bin_with(root, "broken", None), None);
+    }
+
+    // ---- pooled_tier3 declaration parsing (#14945) ----
+
+    #[test]
+    fn pooled_tier3_reads_a_full_declaration() {
+        let dir = tempdir().unwrap();
+        write_manifest(
+            dir.path(),
+            "widget",
+            r#"{
+                "runtime": "widget",
+                "capabilities": {},
+                "credentialPool": "gemini",
+                "credentialEnv": "GEMINI_API_KEY",
+                "model": "gemini-4-neon",
+                "launch": {"cliBin": "widget-cli"}
+            }"#,
+        );
+        assert_eq!(
+            pooled_tier3(dir.path(), "widget").unwrap(),
+            Some(PooledTier3 {
+                provider: "gemini".into(),
+                env_var: "GEMINI_API_KEY".into(),
+                model: Some("gemini-4-neon".into()),
+            })
+        );
+        // A whitespace-only model is no model at all.
+        write_manifest(
+            dir.path(),
+            "widget",
+            r#"{"runtime": "widget", "capabilities": {}, "credentialPool": "p", "credentialEnv": "K", "model": "  "}"#,
+        );
+        assert_eq!(
+            pooled_tier3(dir.path(), "widget").unwrap(),
+            Some(PooledTier3 {
+                provider: "p".into(),
+                env_var: "K".into(),
+                model: None
+            })
+        );
+    }
+
+    #[test]
+    fn pooled_tier3_is_none_without_a_declaration() {
+        let dir = tempdir().unwrap();
+        write_manifest(
+            dir.path(),
+            "widget",
+            r#"{"runtime": "widget", "capabilities": {}, "launch": {"cliBin": "widget-cli"}}"#,
+        );
+        assert_eq!(pooled_tier3(dir.path(), "widget").unwrap(), None);
+        // No manifest at all (and no bundled fallback for this name).
+        assert_eq!(pooled_tier3(dir.path(), "totally-unknown-runtime").unwrap(), None);
+    }
+
+    #[test]
+    fn pooled_tier3_rejects_half_a_declaration() {
+        let dir = tempdir().unwrap();
+        write_manifest(
+            dir.path(),
+            "widget",
+            r#"{"runtime": "widget", "capabilities": {}, "credentialPool": "gemini"}"#,
+        );
+        let error = pooled_tier3(dir.path(), "widget").unwrap_err();
+        assert!(error.contains("without the other"), "{error}");
+    }
+
+    #[test]
+    fn pooled_tier3_rejects_invalid_names_without_echoing_them() {
+        let dir = tempdir().unwrap();
+        write_manifest(
+            dir.path(),
+            "widget",
+            r#"{"runtime": "widget", "capabilities": {}, "credentialPool": "../etc", "credentialEnv": "GEMINI_API_KEY"}"#,
+        );
+        let error = pooled_tier3(dir.path(), "widget").unwrap_err();
+        assert!(error.contains("invalid credentialPool"), "{error}");
+        assert!(!error.contains("../etc"), "{error}");
+        write_manifest(
+            dir.path(),
+            "widget",
+            r#"{"runtime": "widget", "capabilities": {}, "credentialPool": "gemini", "credentialEnv": "gemini-4-neon"}"#,
+        );
+        let error = pooled_tier3(dir.path(), "widget").unwrap_err();
+        assert!(error.contains("invalid credentialEnv"), "{error}");
+        // A value-shaped string must not be reflected into the error.
+        assert!(!error.contains("gemini-4-neon"), "{error}");
+    }
+
+    /// The daemon binary carries the pilot's declaration in its bundled
+    /// fallback, so a consumer install with no on-disk manifest still gets
+    /// the mandatory pool (the same path the launch-time reader takes).
+    #[test]
+    fn bundled_agy_manifest_carries_the_pilot_declaration() {
+        let dir = tempdir().unwrap();
+        assert_eq!(
+            pooled_tier3(dir.path(), "agy").unwrap(),
+            Some(PooledTier3 {
+                provider: "gemini".into(),
+                env_var: "GEMINI_API_KEY".into(),
+                model: Some("gemini-4-neon".into()),
+            })
+        );
     }
 }

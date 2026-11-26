@@ -88,7 +88,14 @@ impl Harness {
         let mut command = Command::new(&bin);
         let cwd = std::env::current_dir().map_err(|e| LaunchError::config(e.to_string()))?;
         command.env("PWD", &cwd);
-        command.env("LOOM_NATIVE_WORKER_PID", std::process::id().to_string());
+        // #15455: this pid owns the session for as long as the launch lasts —
+        // the Unix path `exec`s the harness into it, and the egress-proxy
+        // launcher stays alive as the harness's parent — so it is what a
+        // tool shell's `${LOOM_AGENT_SESSION_PID:-${CLAUDE_PID:-$PPID}}` must
+        // resolve to, never the tool's own short-lived parent.
+        let launch_pid = std::process::id().to_string();
+        command.env("LOOM_NATIVE_WORKER_PID", &launch_pid);
+        command.env("LOOM_AGENT_SESSION_PID", &launch_pid);
         // Explicit env > API-key pool > nothing; resolved upstream so the
         // secret has exactly one consumer (#8401).
         credential.apply(&mut command);
