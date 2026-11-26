@@ -102,23 +102,55 @@ mod e2e {
     use std::os::unix::fs::PermissionsExt;
     use tempfile::tempdir;
 
+    /// Guard for the tests in this module: each holds BOTH the crate-default
+    /// `#[serial]` lock and `loom_config_env`. `serial_test` only mutually
+    /// excludes tests that share the *same* key, and its macro cannot name
+    /// the default key next to a named one, so a test nests: the
+    /// `#[serial(loom_config_env)]` test calls a `#[serial] fn *_body()`.
+    /// `loom_config_env` is the crate's one writer group for `LOOM_GH_BIN`
+    /// (#8480) and must be the OUTER lock — the order
+    /// `lock_order_tests::loom_config_env_is_only_ever_the_outer_lock`
+    /// enforces. The default lock stays inner: it is what these tests
+    /// already held, and `VERDICT_TREE_CARVEOUT_ENABLED_ENV` is written under
+    /// it too. On the bare `#[serial]` alone they ran concurrently with
+    /// `labels_verify_tests` and swapped `LOOM_GH_BIN` under it (#15435);
+    /// nesting fixes that, and this fails loudly if either lock is ever
+    /// dropped from a caller.
+    fn assert_holds_default_and_config_env_locks() {
+        assert!(
+            serial_test::is_locked_serially(Some("loom_config_env")),
+            "caller must hold the loom_config_env lock: writes LOOM_GH_BIN (#8480)"
+        );
+        assert!(
+            serial_test::is_locked_serially(None),
+            "caller must hold the bare #[serial] lock: writes {VERDICT_TREE_CARVEOUT_ENABLED_ENV}"
+        );
+    }
+
     /// One pass over PR #400. `timeline` is the PR's timeline JSON, `perm`
     /// the collaborator-permission answer for `rjwalters` (`write` trusts,
     /// anything else does not). Returns the stats and every write the pass
     /// attempted. The tree carve-out is switched OFF so a would-be clear
     /// takes the ordinary path without the equivalence machinery (its
     /// evidence gate has its own coverage in `verdict_dedup_tests.rs`).
+    ///
+    /// Callers MUST hold both locks — see [`reconcile_with`].
     fn reconcile(timeline: &str, perm: &str) -> (VerdictReconcileStats, String) {
         reconcile_with(timeline, perm, None)
     }
 
     /// As [`reconcile`], with an optional `forge.trustedCommenters` login
     /// and `perm == "fail"` making the permission probe exit non-zero.
+    ///
+    /// Writes the process-global `LOOM_GH_BIN` and
+    /// `VERDICT_TREE_CARVEOUT_ENABLED_ENV`: a caller MUST hold both locks —
+    /// see [`assert_holds_default_and_config_env_locks`].
     fn reconcile_with(
         timeline: &str,
         perm: &str,
         allowlisted: Option<&str>,
     ) -> (VerdictReconcileStats, String) {
+        assert_holds_default_and_config_env_locks();
         let dir = tempdir().unwrap();
         let root = dir.path().join("repo");
         std::fs::create_dir_all(root.join(".loom")).unwrap();
@@ -195,8 +227,13 @@ esac
     }
 
     #[test]
-    #[serial]
+    #[serial(loom_config_env)]
     fn a_trusted_send_back_keeps_the_verdict_and_writes_nothing() {
+        a_trusted_send_back_keeps_the_verdict_and_writes_nothing_body();
+    }
+
+    #[serial]
+    fn a_trusted_send_back_keeps_the_verdict_and_writes_nothing_body() {
         let (stats, writes) = reconcile(&incident_timeline(), "write");
         assert_eq!(stats.checked, 1, "{stats:?}");
         assert_eq!(stats.invalidated, 0, "the operator's rejection stands: {stats:?}");
@@ -209,16 +246,26 @@ esac
     }
 
     #[test]
-    #[serial]
+    #[serial(loom_config_env)]
     fn a_labeler_without_write_access_fails_closed_to_the_clear() {
+        a_labeler_without_write_access_fails_closed_to_the_clear_body();
+    }
+
+    #[serial]
+    fn a_labeler_without_write_access_fails_closed_to_the_clear_body() {
         let (stats, writes) = reconcile(&incident_timeline(), "none");
         assert_eq!(stats.invalidated, 1, "untrusted actor -> ordinary clear: {stats:?}");
         assert!(writes.contains("--add-label loom:review-requested"), "{writes}");
     }
 
     #[test]
-    #[serial]
+    #[serial(loom_config_env)]
     fn an_unreadable_probe_still_trusts_an_allowlisted_login() {
+        an_unreadable_probe_still_trusts_an_allowlisted_login_body();
+    }
+
+    #[serial]
+    fn an_unreadable_probe_still_trusts_an_allowlisted_login_body() {
         // The probe 404s (not a collaborator) but the login is on
         // `forge.trustedCommenters`: the shell guard keeps the verdict.
         let (stats, writes) = reconcile_with(&incident_timeline(), "fail", Some("rjwalters"));
@@ -227,15 +274,25 @@ esac
     }
 
     #[test]
-    #[serial]
+    #[serial(loom_config_env)]
     fn an_unreadable_probe_for_an_unlisted_login_fails_closed() {
+        an_unreadable_probe_for_an_unlisted_login_fails_closed_body();
+    }
+
+    #[serial]
+    fn an_unreadable_probe_for_an_unlisted_login_fails_closed_body() {
         let (stats, _) = reconcile_with(&incident_timeline(), "fail", None);
         assert_eq!(stats.invalidated, 1, "{stats:?}");
     }
 
     #[test]
-    #[serial]
+    #[serial(loom_config_env)]
     fn a_commit_after_the_label_fails_closed_to_the_clear() {
+        a_commit_after_the_label_fails_closed_to_the_clear_body();
+    }
+
+    #[serial]
+    fn a_commit_after_the_label_fails_closed_to_the_clear_body() {
         let tl = format!(
             r#"[{{"event":"labeled","label":{{"name":"loom:changes-requested"}},"actor":{{"login":"rjwalters"}},"created_at":"{}"}},{{"event":"committed","sha":"{SHA_B}","committed_date":"{}"}}]"#,
             ts("2026-11-21T00:43:32Z"),
@@ -247,8 +304,13 @@ esac
     }
 
     #[test]
-    #[serial]
+    #[serial(loom_config_env)]
     fn an_unreadable_timeline_fails_closed_to_the_clear() {
+        an_unreadable_timeline_fails_closed_to_the_clear_body();
+    }
+
+    #[serial]
+    fn an_unreadable_timeline_fails_closed_to_the_clear_body() {
         // `{}` parses as no events listing at all — the fetch "succeeded" but
         // the answer is unusable, which must read as no evidence.
         let (stats, writes) = reconcile("{}", "write");
