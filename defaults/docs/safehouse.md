@@ -462,9 +462,11 @@ queued) produces no line.
   leaves reporting to the captain.
 - **The fleet captain, for merges no host reported.** Where
   the [fleet captain setting](daemon-reference.md#fleet-captain-8848) selects this host,
-  a timer queries each workspace's origin for PRs merged inside a **bounded catch-up
-  window**, reads the room once, and posts exactly the merges whose line is
-  absent. It leaves a merge younger than the grace period to the host that made
+  each pass reads the current workspace registry. An empty registry selects the
+  daemon's startup checkout. A registry read error defers the pass. The captain
+  queries each selected origin for PRs merged inside a **bounded catch-up window**,
+  reads the room once, and posts missing reports when room history covers the
+  merge. It leaves a merge younger than the grace period to the host that made
   it, so the two normally never race. This is what covers a hosted/manual merge,
   or a host that died before posting. A host that is not the captain, or a fleet
   with no captain declared, never scans.

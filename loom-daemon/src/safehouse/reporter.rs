@@ -37,6 +37,7 @@ use super::{
 use crate::event_bus::{EventBus, RecvError, Subscription};
 use crate::observability::ops::feed::{self, PassOutcome, Trigger};
 use crate::types::Event;
+use crate::workspace_registry::WorkspaceRegistry;
 
 /// Captain scan cadence, in milliseconds. Test/operator override.
 const SCAN_INTERVAL_ENV: &str = "LOOM_SAFEHOUSE_RECONCILE_INTERVAL_MS";
@@ -92,8 +93,8 @@ enum ReportState {
 /// when disabled or when no socket path can be resolved. `state` is set to the
 /// resolved config-only state immediately and updated by each report's connect.
 ///
-/// `workspace_root` is the daemon's default workspace: where the captain gate
-/// reads `fleet.captain` and one of the workspaces the captain scans.
+/// The captain reads `fleet.captain` from `workspace_root` and scans that root
+/// when the workspace registry is empty.
 #[must_use]
 pub fn spawn_merge_reporter(
     config: &SafehouseConfig,
@@ -138,14 +139,12 @@ pub fn spawn_merge_reporter(
 /// report/scan task reaches it.
 pub(super) struct Reporter {
     target: ReportTarget,
-    /// The daemon's default workspace (captain gate root + a scan target).
+    /// Captain gate root and empty-registry fallback.
     default_root: PathBuf,
     /// Delivery state shared by sweep, step and captain reports for each `owner/repo#N`.
     reported: Mutex<HashMap<String, ReportState>>,
-    /// Workspaces seen on live events, scanned in addition to the registry.
-    known_workspaces: Mutex<BTreeSet<String>>,
     /// Per-workspace scan watermarks (see the module docs).
-    watermarks: Mutex<HashMap<String, DateTime<Utc>>>,
+    watermarks: Mutex<HashMap<PathBuf, DateTime<Utc>>>,
     /// Unfinished searches resume at the next tick, with their original end time.
     pending: Mutex<HashMap<PathBuf, ScanWindow>>,
     /// A scan is running; the next tick skips instead of overlapping it.
@@ -160,7 +159,6 @@ impl Reporter {
             target,
             default_root,
             reported: Mutex::new(HashMap::new()),
-            known_workspaces: Mutex::new(BTreeSet::new()),
             watermarks: Mutex::new(HashMap::new()),
             pending: Mutex::new(HashMap::new()),
             scan_in_flight: AtomicBool::new(false),
@@ -192,7 +190,7 @@ impl Reporter {
         self.watermarks
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .get(root.to_string_lossy().as_ref())
+            .get(root)
             .copied()
     }
 
@@ -251,31 +249,6 @@ impl Reporter {
         outcome
     }
 
-    fn remember_workspace(&self, root: &str) {
-        self.known_workspaces
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .insert(root.to_owned());
-    }
-
-    /// The workspaces the captain scans: the default workspace, every one seen
-    /// on a live event, and every one in the on-disk registry (which survives a
-    /// restart, unlike the live set).
-    fn scan_targets(&self) -> Vec<String> {
-        let mut targets: BTreeSet<String> = self
-            .known_workspaces
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .clone();
-        targets.insert(self.default_root.to_string_lossy().into_owned());
-        if let Ok(registry) = crate::workspace_registry::WorkspaceRegistry::load_default() {
-            for root in registry.roots() {
-                targets.insert(root.to_string_lossy().into_owned());
-            }
-        }
-        targets.into_iter().collect()
-    }
-
     /// The host path: post the line for a merge this host just saw confirmed.
     /// An earlier ambiguous attempt requires a room read before sending again.
     pub(super) async fn report_host_merge(&self, pr: &MergedPr, trigger: Trigger) {
@@ -319,6 +292,28 @@ impl Reporter {
             log::trace!("safehouse: {}", gate.message("safehouse merged-PR catch-up"));
             return 0;
         }
+        let roots: BTreeSet<_> = match WorkspaceRegistry::load_default() {
+            Ok(registry) => registry
+                .effective_roots(&self.default_root)
+                .into_iter()
+                .collect(),
+            Err(err) => {
+                log::warn!(
+                    "safehouse: could not load workspace registry ({err:#}); deferring captain catch-up"
+                );
+                feed::record_reconcile_pass(PassOutcome::Failed);
+                return 0;
+            }
+        };
+        // Deregistered checkouts may later be reused for a different repository.
+        self.watermarks
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .retain(|root, _| roots.contains(root));
+        self.pending
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .retain(|root, _| roots.contains(root));
         let mut recent = match merge_report::read_room(&self.target).await {
             Ok(recent) if recent.complete => recent,
             Ok(_) => {
@@ -336,10 +331,8 @@ impl Reporter {
             }
         };
         let mut posted = 0;
-        for root in self.scan_targets() {
-            posted += self
-                .scan_workspace(Path::new(&root), &mut recent, now)
-                .await;
+        for root in roots {
+            posted += self.scan_workspace(&root, &mut recent, now).await;
         }
         posted
     }
@@ -352,7 +345,6 @@ impl Reporter {
         recent: &mut RecentMessages,
         now: DateTime<Utc>,
     ) -> usize {
-        let root_key = root.to_string_lossy().into_owned();
         if forge_gate::suppressed("pr list (scan)", root) {
             feed::record_reconcile_pass(PassOutcome::Deferred);
             return 0;
@@ -367,7 +359,7 @@ impl Reporter {
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner);
             marks
-                .get(&root_key)
+                .get(root)
                 .copied()
                 .map_or(cutoff, |mark| mark.max(cutoff))
         };
@@ -420,7 +412,7 @@ impl Reporter {
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
                 .insert(
-                    root_key,
+                    root.to_owned(),
                     window
                         .until
                         .checked_sub_signed(WATERMARK_SLACK)
@@ -496,43 +488,32 @@ impl ScanWindow {
 
 /// Only a completed merge naming a PR authorizes the host lookup. An issue
 /// branch can be reused, and a sweep exit (including a cancellation) has no PR.
-fn host_merge_hint(event: &Event) -> Option<(u32, Trigger)> {
+fn host_merge_hint(event: &Event) -> Option<(&str, u32, Trigger)> {
     match event {
         Event::SweepPhase {
             phase,
             pr_number: Some(pr),
+            repo: Some(root),
             ..
         } if phase == "merge" => u32::try_from(*pr)
             .ok()
             .filter(|n| *n > 0)
-            .map(|n| (n, Trigger::SweepMerge)),
+            .map(|n| (root.as_str(), n, Trigger::SweepMerge)),
         Event::StepEnded {
             item,
             role: crate::step_role::StepRole::ChampionMerge,
             class,
             reason,
+            repo: Some(root),
             ..
-        } if class == "verdict" && reason == "merged" => Some((*item, Trigger::Step)),
+        } if class == "verdict" && reason == "merged" => Some((root, *item, Trigger::Step)),
         _ => None,
     }
 }
 
 /// Act on a bus event without blocking the bus loop on a forge or room read.
-fn on_event(reporter: &Arc<Reporter>, event: Event, runtime: &tokio::runtime::Handle) {
-    let root = match &event {
-        Event::SweepPhase {
-            repo: Some(root), ..
-        }
-        | Event::SweepExited {
-            repo: Some(root), ..
-        }
-        | Event::StepEnded {
-            repo: Some(root), ..
-        } => root,
-        _ => return,
-    };
-    reporter.remember_workspace(root);
-    if let Some((number, trigger)) = host_merge_hint(&event) {
+pub(super) fn on_event(reporter: &Arc<Reporter>, event: &Event, runtime: &tokio::runtime::Handle) {
+    if let Some((root, number, trigger)) = host_merge_hint(event) {
         let root = PathBuf::from(root);
         let reporter = Arc::clone(reporter);
         runtime.spawn(async move {
@@ -552,8 +533,7 @@ async fn run(
 ) {
     let mut timer = tokio::time::interval(interval);
     timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    // The first tick fires immediately; skip it so a freshly started daemon does
-    // not scan before its workspace registry and live events are known.
+    // Give the merging hosts one scan interval before starting catch-up.
     timer.tick().await;
     // One eager connect so `loom-daemon status` and new-host onboarding read the
     // real state (`connected` / `unreachable`) at startup instead of waiting for
@@ -569,7 +549,7 @@ async fn run(
         tokio::select! {
             biased;
             received = subscription.recv() => match received {
-                Ok(event) => on_event(&reporter, event, &runtime),
+                Ok(event) => on_event(&reporter, &event, &runtime),
                 Err(RecvError::Closed) => {
                     log::debug!("safehouse: event bus closed; merged-PR reporter stopping");
                     break;
@@ -604,7 +584,10 @@ mod tests {
             pr_number,
             repo: Some("root".into()),
         };
-        assert_eq!(host_merge_hint(&sweep("merge", Some(50))), Some((50, Trigger::SweepMerge)));
+        assert_eq!(
+            host_merge_hint(&sweep("merge", Some(50))),
+            Some(("root", 50, Trigger::SweepMerge))
+        );
         assert_eq!(host_merge_hint(&sweep("merge", None)), None);
         assert_eq!(host_merge_hint(&sweep("judge", Some(36))), None);
         // A cancellation on this issue's reused branch cannot report its earlier PR.
@@ -629,7 +612,7 @@ mod tests {
         };
         assert_eq!(
             host_merge_hint(&step(StepRole::ChampionMerge, "verdict", "merged")),
-            Some((50, Trigger::Step))
+            Some(("root", 50, Trigger::Step))
         );
         assert_eq!(host_merge_hint(&step(StepRole::ChampionMerge, "verdict", "closed")), None);
         assert_eq!(host_merge_hint(&step(StepRole::ChampionMerge, "noop", "merged")), None);

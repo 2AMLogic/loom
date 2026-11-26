@@ -1069,6 +1069,7 @@ async fn host_and_captain_select_each_workspaces_origin_over_the_ambient_repo() 
         .repos
         .repo("second", &[("origin", "git@github.com:a/two.git")]);
     let mut registry = crate::workspace_registry::WorkspaceRegistry::default();
+    registry.add(&c.root, None).unwrap();
     registry.add(&second, None).unwrap();
     registry.save_default().unwrap();
     let mut unmerged = row(8, "a/b", minutes(60));
@@ -1097,6 +1098,71 @@ async fn host_and_captain_select_each_workspaces_origin_over_the_ambient_repo() 
     assert!(captain.watermark(&second).is_some());
     assert_eq!(c.room.count_containing("ambient/repo"), 0);
     assert_eq!(c.room.count_containing("a/b#8"), 0);
+}
+
+#[tokio::test]
+#[serial]
+async fn the_captain_scans_only_current_registry_roots_after_workspace_events() {
+    let dir = tempfile::tempdir().unwrap();
+    let c = captain_fixture(dir.path(), &this_host());
+    let managed = c
+        .repos
+        .repo("managed", &[("origin", "https://github.com/a/managed.git")]);
+    let mut registry = crate::workspace_registry::WorkspaceRegistry::default();
+    registry.add(&managed, None).unwrap();
+    registry.save_default().unwrap();
+    c.gh.rows(&[row(1, "a/b", minutes(60)), row(1, "a/managed", minutes(60))]);
+
+    let captain = Arc::new(reporter(&c.socket, &c.root));
+    super::reporter::on_event(
+        &captain,
+        &crate::types::Event::SweepPhase {
+            issue: 1,
+            phase: "judge".into(),
+            pr_number: Some(1),
+            repo: Some(managed.to_str().unwrap().to_owned()),
+        },
+        &tokio::runtime::Handle::current(),
+    );
+    assert_eq!(captain.captain_pass().await, 1);
+    assert_eq!(c.room.count_containing("a/managed#1 ·"), 1);
+    assert_eq!(c.room.count_containing("a/b#1 ·"), 0);
+
+    // Removing the last entry restores the startup checkout as the sole target.
+    assert!(registry.remove(&managed));
+    registry.save_default().unwrap();
+    c.gh.rows(&[row(1, "a/b", minutes(60)), row(2, "a/managed", minutes(20))]);
+    assert_eq!(captain.captain_pass().await, 1);
+    assert_eq!(c.room.count_containing("a/b#1 ·"), 1);
+    assert_eq!(c.room.count_containing("a/managed#2 ·"), 0);
+    assert!(captain.watermark(&managed).is_none());
+
+    let calls = std::fs::read_to_string(c.gh.dir.join("calls.log")).unwrap();
+    let repos: Vec<_> = calls
+        .lines()
+        .map(|call| call.rsplit_once(" --repo ").unwrap().1)
+        .collect();
+    assert_eq!(repos, ["github.com/a/managed", "github.com/a/b"]);
+}
+
+#[tokio::test]
+#[serial]
+async fn an_unreadable_workspace_registry_defers_captain_catch_up() {
+    let dir = tempfile::tempdir().unwrap();
+    let c = captain_fixture(dir.path(), &this_host());
+    c.gh.rows(&[row(1, "a/b", minutes(60))]);
+    std::fs::write(dir.path().join("workspaces.json"), "{").unwrap();
+    let captain = reporter(&c.socket, &c.root);
+    assert_eq!(captain.captain_pass().await, 0);
+    assert_eq!(c.gh.calls(), 0);
+    assert_eq!(c.room.sends.load(Ordering::SeqCst), 0);
+    assert!(captain.watermark(&c.root).is_none());
+
+    crate::workspace_registry::WorkspaceRegistry::default()
+        .save_default()
+        .unwrap();
+    assert_eq!(captain.captain_pass().await, 1);
+    assert_eq!(c.room.count_containing("a/b#1 ·"), 1);
 }
 
 #[tokio::test]
