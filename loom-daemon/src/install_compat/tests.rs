@@ -145,6 +145,26 @@ fn held_back_paths_make_an_otherwise_compatible_install_owe_a_resync() {
 }
 
 #[test]
+fn held_back_is_absent_or_an_array_of_strings_and_outranks_nothing() {
+    // What `InstallMeta::parse` documents: absent or `[]` parses, and anything
+    // that is not an array of strings is not metadata.
+    assert_eq!(InstallMeta::parse(r#"{"held_back":[]}"#).unwrap(), InstallMeta::default());
+    assert!(InstallMeta::parse(r#"{"held_back":null}"#).is_err());
+    assert!(InstallMeta::parse(r#"{"held_back":"hooks/guard.sh"}"#).is_err());
+    assert!(InstallMeta::parse(r#"{"held_back":["hooks/guard.sh",5]}"#).is_err());
+
+    // The version floor and the newer-daemon check still win over it.
+    let held = |loom_version: &str, requires_daemon: &str| {
+        InstallMeta::parse(&format!(
+            r#"{{"loom_version":"{loom_version}","requires_daemon":"{requires_daemon}","held_back":["hooks/guard.sh"]}}"#
+        ))
+        .unwrap()
+    };
+    assert_eq!(classify(&held("0.19.400", "0.19.300"), &daemon()), Compat::InstalledTooOld);
+    assert_eq!(classify(&held("0.19.900", "0.19.890"), &daemon()), Compat::NeedsNewerDaemon);
+}
+
+#[test]
 fn classify_installed_too_old() {
     assert_eq!(
         classify(&meta(Some("0.19.400"), Some("0.19.300")), &daemon()),

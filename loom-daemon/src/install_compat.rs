@@ -135,8 +135,10 @@ impl fmt::Display for Version {
 }
 
 /// The contract fields of `.loom/install-metadata.json`. Every other key in
-/// the file is ignored here. Both fields default to `None`, so metadata
-/// written before #10716 (no `requires_daemon`) still parses.
+/// the file is ignored here. Both version fields are optional and default to
+/// `None`, so metadata written before #10716 (no `requires_daemon`) still
+/// parses. `held_back` is optional as well and defaults to no paths: the
+/// resync adds it only when it withholds a file (#14434).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
 pub struct InstallMeta {
     /// The release whose installed files these are: the repo's active version.
@@ -156,7 +158,11 @@ impl InstallMeta {
     /// Parse the contents of an `install-metadata.json`.
     ///
     /// # Errors
-    /// The text is not a JSON object, or a contract field is not a string.
+    /// The text is not a JSON object; a version field is neither a string nor
+    /// `null`; or `held_back` is present but is not an array of strings
+    /// (`null` included). A version that is a string but not
+    /// `MAJOR.MINOR.PATCH` is not an error: it parses, and [`classify`]
+    /// treats it as not recorded.
     pub fn parse(json: &str) -> Result<Self, serde_json::Error> {
         // Via `Value` so a top-level array is refused: serde would otherwise
         // read `[]` as a struct with every field defaulted.
@@ -208,12 +214,22 @@ impl DaemonCompat {
 pub enum Compat {
     /// Both claims are recorded and both hold.
     Compatible,
-    /// No usable claim recorded: `loom_version` or `requires_daemon` is
-    /// absent or not a version. Every install before #10716 lands here. It
-    /// keeps dispatching as today. The first resync that changes a file
-    /// writes the fields; one whose files already match the payload writes
-    /// nothing, so such an install stays `ResyncOwed` and the workspace pass
-    /// treats its empty diff as W0 (#10718).
+    /// A resync is owed, for one of two reasons:
+    ///
+    /// * No usable claim is recorded: `loom_version` or `requires_daemon` is
+    ///   absent or not a version. Every install before #10716 lands here. It
+    ///   keeps dispatching as today. The first resync that changes a file
+    ///   writes the fields; one whose files already match the payload writes
+    ///   nothing, so such an install stays `ResyncOwed` and the workspace pass
+    ///   treats its empty diff as W0 (#10718).
+    /// * `held_back` is not empty (#14434): the last resync withheld those
+    ///   paths as local fixes and still advanced `loom_version`, so the stamp
+    ///   does not describe every installed file. Only a resync that holds
+    ///   nothing back clears the field.
+    ///
+    /// [`classify`] reaches this variant only after ruling out
+    /// [`Compat::NeedsNewerDaemon`] and [`Compat::InstalledTooOld`], which win
+    /// whatever `held_back` says.
     ResyncOwed,
     /// The installed `loom_version` is below this daemon's
     /// `supports_installed`, or below the fleet floor.

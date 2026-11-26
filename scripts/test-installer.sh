@@ -4127,6 +4127,199 @@ fi
 echo ""
 
 # ==========================================================================
+# Same-version gate vs. held-back paths (#14460)
+# ==========================================================================
+# The resync lists under `held_back` the installed paths its local-divergence
+# protection withheld (#14434) and still advances `loom_version`. Run the
+# installer's own Check 1 -- the same-version gate -- against stamps that
+# differ only in that field. A held path means the stamp overstates the
+# install, so the gate must say so instead of offering a reinstall, which
+# would overwrite the local fix the resync just protected. It must still exit
+# 0 without writing anything, for both metadata readers: jq, and the grep/sed
+# fallback the installer uses when jq is absent.
+echo "Test: the same-version install gate reports held-back paths instead of reinstall options (#14460)"
+
+# The fallback run can see only the tools the gate's grep/sed reader uses.
+held_tools="$TEST_DIR/held-back-tools"
+mkdir "$held_tools"
+for tool in grep head sed; do
+  ln -s "$(command -v "$tool")" "$held_tools/$tool"
+done
+
+# Stock Bash 3.2 cannot reliably source process-substituted slices.
+held_funcs="$TEST_DIR/held-back-funcs.sh"
+held_gate="$TEST_DIR/held-back-gate.sh"
+sed -n '/^held_back_[a-z_]*() {/,/^}/p;/^same_version_noop() {/,/^}/p' "$INSTALL_SCRIPT" > "$held_funcs"
+sed -n '/^  # Check 1: Is Loom already installed with the same version?$/,/^  # Check 2: /p' "$INSTALL_SCRIPT" > "$held_gate"
+if grep -q '^same_version_noop() {' "$held_funcs" && grep -q 'same_version_noop ' "$held_gate"; then
+  pass "the same-version gate and its helpers are cut from the production installer (#14460)"
+else
+  fail "could not cut the same-version gate and its helpers out of install-loom.sh (#14460)"
+fi
+
+# $1 = target repo, $2 = PATH the gate runs with. The gate's `exit 0` ends
+# this subshell; the last line is printed only if control fell through to
+# Check 2. The output helpers are `echo -e`, as the installer's own are.
+held_gate_run() (
+  set -euo pipefail
+  # The sourced gate reads these two.
+  export TARGET_PATH="$1" LOOM_VERSION="0.19.1315"
+  PATH="$2"
+  header() { :; }
+  info() { echo -e "info:$*"; }
+  warning() { echo -e "warn:$*"; }
+  # shellcheck source=/dev/null
+  source "$held_funcs"
+  # shellcheck source=/dev/null
+  source "$held_gate"
+  echo "gate fell through"
+)
+
+held_repo="$TEST_DIR/held-back-repo"
+create_temp_repo "$held_repo"
+held_hook="$held_repo/.loom/hooks/guard.sh"
+mkdir -p "$held_repo/.loom/hooks"
+printf '%s\n' '#!/usr/bin/env bash' '# the local fix the resync withheld' 'exit 0' > "$held_hook"
+held_stamp="$held_repo/.loom/install-metadata.json"
+held_stamp_before="$TEST_DIR/held-back-stamp.before"
+held_hook_before="$TEST_DIR/held-back-hook.before"
+
+held_readers="fallback"
+command -v jq >/dev/null 2>&1 && held_readers="jq fallback"
+
+# Stamp $held_stamp with the given shape of the held_back field and set
+# held_paths to the paths a gate may list for it, one per line.
+held_stamp_write() {
+  local version="0.19.1315" field
+  held_paths=""
+  case "$1" in
+    absent)     field="" ;;
+    empty)      field=',\n  "held_back": []' ;;
+    held)       field=',\n  "held_back": [\n    "hooks/guard.sh",\n    "scripts/path with spaces.sh"\n  ]'
+                held_paths=$'hooks/guard.sh\nscripts/path with spaces.sh' ;;
+    string)     field=',\n  "held_back": "oops"' ;;
+    null)       field=',\n  "held_back": null' ;;
+    object)     field=',\n  "held_back": {}' ;;
+    non-string) field=',\n  "held_back": [\n    "hooks/guard.sh",\n    5\n  ]' ;;
+    unclosed)   field=',\n  "held_back": [\n    "hooks/guard.sh"' ;;
+    unicode)    field=',\n  "held_back": [\n    "hooks/guard.sh",\n    "docs/caf\\u00e9.md"\n  ]'
+                held_paths=$'hooks/guard.sh\ndocs/café.md' ;;
+    quote)      field=',\n  "held_back": [\n    "scripts/a\\"b.sh"\n  ]'
+                held_paths=$'scripts/a"b.sh' ;;
+    backslash)  field=',\n  "held_back": [\n    "docs/a\\\\b.sh"\n  ]'
+                held_paths=$'docs/a\\b.sh' ;;
+    linebreak)  field=',\n  "held_back": [\n    "hooks/guard.sh",\n    "a\\nb"\n  ]' ;;
+    trailing)   field=',\n  "held_back": [\n    "hooks/guard.sh",\n  ]' ;;
+    upgrade)    version="0.19.1300"
+                field=',\n  "held_back": [\n    "hooks/guard.sh"\n  ]' ;;
+  esac
+  printf '{\n  "loom_version": "%s"%b\n}\n' "$version" "$field" > "$held_stamp"
+}
+
+# shape:expected-from-jq:expected-from-the-fallback.
+#   plain      the no-op with its reinstall options, and no resync
+#   held       the paths plus the dry run, never a reinstall
+#   unverified "Could not verify" plus the dry run, no path, no reinstall
+#   upgrade    a different version: on to Check 2
+#   unparsed   jq cannot read the stamp at all, so there is no same-version
+#              install to report on and the gate stands aside, as before
+# jq decodes an escape and lists the path it names (python's json.dump writes
+# non-ASCII as \uXXXX). What the fallback cannot read exactly is unverified
+# there, never a guess -- and a path holding a line break is unverified for
+# jq too, since it reads one path per line.
+held_cases="absent:plain:plain empty:plain:plain held:held:held"
+held_cases="$held_cases string:unverified:unverified null:unverified:unverified"
+held_cases="$held_cases object:unverified:unverified non-string:unverified:unverified"
+held_cases="$held_cases unclosed:unparsed:unverified"
+held_cases="$held_cases unicode:held:unverified quote:held:unverified"
+held_cases="$held_cases backslash:held:unverified linebreak:unverified:unverified"
+held_cases="$held_cases trailing:unparsed:unverified upgrade:upgrade:upgrade"
+
+for held_case in $held_cases; do
+  held_shape="${held_case%%:*}"
+  held_rest="${held_case#*:}"
+  held_want_jq="${held_rest%%:*}"
+  held_want_fallback="${held_rest##*:}"
+  held_stamp_write "$held_shape"
+  cp "$held_stamp" "$held_stamp_before"
+  cp "$held_hook" "$held_hook_before"
+
+  for held_reader in $held_readers; do
+    held_path="$held_tools"
+    held_want="$held_want_fallback"
+    if [[ "$held_reader" == "jq" ]]; then
+      held_path="$PATH"
+      held_want="$held_want_jq"
+    fi
+    held_rc=0
+    held_out="$(held_gate_run "$held_repo" "$held_path" 2>&1)" || held_rc=$?
+
+    held_problems=""
+    [[ "$held_rc" -eq 0 ]] || held_problems+=" exit=$held_rc"
+    cmp -s "$held_stamp" "$held_stamp_before" || held_problems+=" rewrote-the-stamp"
+    cmp -s "$held_hook" "$held_hook_before" || held_problems+=" rewrote-the-local-hook"
+    if [[ "$held_want" == "upgrade" || "$held_want" == "unparsed" ]]; then
+      if ! grep -q '^gate fell through$' <<< "$held_out"; then
+        held_problems+=" stopped-the-fall-through-to-Check-2"
+      fi
+    else
+      if ! grep -q 'is already installed in this repository' <<< "$held_out"; then
+        held_problems+=" lost-the-no-op"
+      fi
+      if grep -q '^gate fell through$' <<< "$held_out"; then
+        held_problems+=" fell-through-to-Check-2"
+      fi
+    fi
+    case "$held_want" in
+      plain)
+        if ! grep -qF -- 'Use --force to reinstall in place' <<< "$held_out"; then
+          held_problems+=" dropped-the-reinstall-options"
+        fi
+        if grep -q 'resync' <<< "$held_out"; then
+          held_problems+=" mentions-a-resync"
+        fi
+        ;;
+      held|unverified)
+        if grep -Eq -- '--force|--confirm-reinstall|reinstall' <<< "$held_out"; then
+          held_problems+=" suggests-a-reinstall"
+        fi
+        if ! grep -qF -- './.loom/scripts/resync-installed.sh --dry-run' <<< "$held_out"; then
+          held_problems+=" missing-the-dry-run-command"
+        fi
+        if [[ "$held_want" == "held" ]]; then
+          while IFS= read -r held_p; do
+            if ! grep -qFx -- "info:  $held_p" <<< "$held_out"; then
+              held_problems+=" missing-path[$held_p]"
+            fi
+          done <<< "$held_paths"
+        else
+          if ! grep -q 'Could not verify' <<< "$held_out"; then
+            held_problems+=" missing-the-unverified-status"
+          fi
+          # Only a listed path is indented after the `info:` prefix.
+          if grep -q '^info:  ' <<< "$held_out"; then
+            held_problems+=" invented-a-held-path"
+          fi
+        fi
+        ;;
+    esac
+    case "$held_want" in
+      plain)     held_says="keeps the plain no-op and its reinstall options" ;;
+      held)      held_says="lists the held paths and the resync dry run, never a reinstall" ;;
+      unverified) held_says="reports the status as unverified, naming no path and no reinstall" ;;
+      upgrade)   held_says="lets the upgrade through to Check 2" ;;
+      unparsed)  held_says="stands aside for a stamp the reader cannot parse, as before" ;;
+    esac
+    if [[ -z "$held_problems" ]]; then
+      pass "$held_reader reader, held_back=$held_shape: $held_says; exit 0, stamp and local hook byte-identical (#14460)"
+    else
+      fail "$held_reader reader, held_back=$held_shape wanted [$held_says]:$held_problems -- gate said: $(tr '\n' '|' <<< "$held_out") (#14460)"
+    fi
+  done
+done
+echo ""
+
+# ==========================================================================
 # Summary
 # ==========================================================================
 echo "======================================"

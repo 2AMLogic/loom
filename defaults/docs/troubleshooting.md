@@ -3226,8 +3226,10 @@ git merge --ff-only origin/main                 # bring defaults/ current
 **held back** one or more files that look like a local fix. On exit `3` everything
 else is applied and `.loom/install-metadata.json` records the withheld paths under
 `held_back` (the version stamp still advances; the daemon's install classifier treats
-a non-empty `held_back` as a resync owed, never as current). Review each file, then
-re-run with `--force`; the next run that holds nothing back clears `held_back`.
+a non-empty `held_back` as a resync owed, never as current, and so does the
+installer's same-version check, which lists the held paths and the resync dry run
+instead of offering a reinstall). Review each file, then re-run with `--force`; the
+next run that holds nothing back clears `held_back`.
 
 The last step is what actually commits and pushes the refreshed surfaces onto
 the primary clone's default branch — see "Landing a resync commit on the

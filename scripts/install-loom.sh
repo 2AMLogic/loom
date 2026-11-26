@@ -1205,6 +1205,183 @@ if [[ ! -d "$LOOM_ROOT/scripts/install" ]]; then
   error "Installation scripts directory not found: $LOOM_ROOT/scripts/install"
 fi
 
+# Mark an install metadata `held_back` field as unreadable; $1 says what is
+# wrong with it. See held_back_load.
+held_back_refuse() {
+  HELD_BACK_STATE="invalid"
+  HELD_BACK_WHY="$1"
+  HELD_BACK_PATHS=()
+}
+
+# No-jq reader for one `held_back` value; $1 is the metadata text from that
+# key's line on. Fills HELD_BACK_PATHS and returns 0 only when the value is an
+# array of strings written without escapes -- on one line, or one per line as
+# the resync writes them. Returns 1 for anything else, so a value this cannot
+# read exactly is never reported as a list of paths.
+held_back_read_plain_array() {
+  local rest="${1#*:}" rel
+  HELD_BACK_PATHS=()
+
+  # Drop leading whitespace, line breaks included.
+  rest="${rest#"${rest%%[![:space:]]*}"}"
+  [[ "$rest" == '['* ]] || return 1
+  rest="${rest#"["}"
+  while :; do
+    rest="${rest#"${rest%%[![:space:]]*}"}"
+    if [[ "$rest" == ']'* ]]; then
+      return 0
+    fi
+    [[ "$rest" == '"'* ]] || return 1
+    rel="${rest#\"}"
+    rel="${rel%%\"*}"
+    # A backslash is an escape, an escaped quote included; decoding those is a
+    # JSON parser's job.
+    [[ "$rel" != *\\* ]] || return 1
+    HELD_BACK_PATHS+=("$rel")
+    rest="${rest#\""$rel"\"}"
+    rest="${rest#"${rest%%[![:space:]]*}"}"
+    case "$rest" in
+      ']'*) ;;
+      ','*)
+        # An entry must follow a comma.
+        rest="${rest#,}"
+        rest="${rest#"${rest%%[![:space:]]*}"}"
+        [[ "$rest" == '"'* ]] || return 1
+        ;;
+      *) return 1 ;;
+    esac
+  done
+}
+
+# Read an install-metadata.json's `held_back` field into globals (#14460).
+#
+# `resync-installed.sh` records under `held_back` the installed paths its
+# local-divergence protection withheld (#14434) and still advances
+# `loom_version`, so the stamp alone cannot say an install is current.
+# Results:
+#   HELD_BACK_STATE  absent  -- no such field, or no file to read
+#                    empty   -- `[]`
+#                    held    -- a non-empty array of strings
+#                    invalid -- the field is there but is not that array, or
+#                               is not written in a form this can read
+#   HELD_BACK_PATHS  the paths as recorded (`held` only)
+#   HELD_BACK_WHY    what is wrong with the field (`invalid` only)
+# This only feeds a message, so it never fails: what cannot be read is
+# reported as `invalid`, never guessed.
+held_back_load() {
+  local meta="${1:-}" state count rel found key_re
+  HELD_BACK_STATE="absent"
+  HELD_BACK_WHY=""
+  HELD_BACK_PATHS=()
+
+  [[ -n "$meta" && -f "$meta" ]] || return 0
+
+  if command -v jq >/dev/null 2>&1; then
+    state="$(jq -r '
+      if has("held_back") | not then "absent"
+      elif (.held_back | type) != "array" then "invalid"
+      elif (.held_back | length) == 0 then "empty"
+      elif (.held_back | map(type) | unique) == ["string"] then "held"
+      else "invalid"
+      end' "$meta" 2>/dev/null || true)"
+    HELD_BACK_STATE="$state"
+    if [[ "$state" == "held" ]]; then
+      # One path per line is the list only while no path holds a line break.
+      count="$(jq -r '.held_back | length' "$meta" 2>/dev/null || true)"
+      while IFS= read -r rel; do
+        HELD_BACK_PATHS+=("$rel")
+      done < <(jq -r '.held_back[]' "$meta" 2>/dev/null || true)
+      [[ "$count" == "${#HELD_BACK_PATHS[@]}" ]] || held_back_refuse "a held path holds a line break"
+    elif [[ -z "$state" ]]; then
+      held_back_refuse "install-metadata.json is not a JSON object"
+    elif [[ "$state" == "invalid" ]]; then
+      held_back_refuse "held_back is not an array of paths"
+    fi
+    return 0
+  fi
+
+  # No jq. Every key the resync writes starts a line, so that is where the
+  # field is looked for; anywhere else it is not a form this can read.
+  key_re='^[[:space:]]*"held_back"[[:space:]]*:'
+  found="$(grep -c "$key_re" "$meta" 2>/dev/null || true)"
+  case "$found" in
+    1) ;;
+    0)
+      if grep -q '"held_back"[[:space:]]*:' "$meta" 2>/dev/null; then
+        held_back_refuse "held_back is not written the way the resync writes it"
+      fi
+      return 0
+      ;;
+    *)
+      held_back_refuse "held_back could not be located as a single key"
+      return 0
+      ;;
+  esac
+  if ! held_back_read_plain_array "$(sed -n "/$key_re/,\$p" "$meta" 2>/dev/null)"; then
+    held_back_refuse "held_back is not an array of plain paths"
+  elif [[ "${#HELD_BACK_PATHS[@]}" -eq 0 ]]; then
+    HELD_BACK_STATE="empty"
+  else
+    HELD_BACK_STATE="held"
+  fi
+  return 0
+}
+
+# The same-version gate's one exit: nothing is written and the script exits 0.
+# What it says depends on the install metadata's `held_back` (held_back_load):
+#   absent, empty -- "already installed", with the reinstall options.
+#   held          -- the last resync withheld the listed files as local fixes,
+#                    so the install is not current whatever the stamp says.
+#                    No reinstall options here: they would overwrite the very
+#                    fix the resync protected. The resync is where that
+#                    decision is made, so the resync is what gets named.
+#   invalid       -- the status could not be verified. Said as such, again
+#                    without the reinstall options: they are no remedy for an
+#                    unreadable field.
+same_version_noop() {
+  local rel
+  held_back_load "${1:-}"
+  case "$HELD_BACK_STATE" in
+    held)
+      warning "Loom v${LOOM_VERSION} is already installed in this repository, but a resync is pending: ${#HELD_BACK_PATHS[@]} file(s) were held back."
+      info "The last resync left these installed files alone because they look like a local fix:"
+      for rel in "${HELD_BACK_PATHS[@]}"; do
+        # `info` is `echo -e`, which would read a backslash as an escape.
+        info "  ${rel//\\/\\\\}"
+      done
+      info "Preview what a resync would change: ./.loom/scripts/resync-installed.sh --dry-run"
+      info "Nothing was changed."
+      ;;
+    invalid)
+      info "Loom v${LOOM_VERSION} is already installed in this repository."
+      warning "Could not verify that the installed files are current: ${HELD_BACK_WHY}."
+      info "Preview what a resync would change: ./.loom/scripts/resync-installed.sh --dry-run"
+      info "Nothing was changed."
+      ;;
+    *)
+      info "Loom v${LOOM_VERSION} is already installed in this repository."
+      # #5559: --force/--clean are flags THIS script (scripts/install-loom.sh)
+      # accepts directly -- but most users reach this idempotency check through
+      # the top-level install.sh wrapper, whose own arg parser does NOT accept
+      # --force and hard-errors "Unknown flag: --force" if they follow a bare
+      # "Use --force" hint. Name both paths explicitly, and do not conflate
+      # --force with install.sh's --confirm-reinstall: --force overwrites this
+      # installation in place (and enables PR auto-merge on the Full Install
+      # path), while --confirm-reinstall uninstalls and then reinstalls --
+      # a heavier, destructive operation, not an equivalent shortcut.
+      info "Running this script directly? Use --force to reinstall in place, or --clean for a fresh install."
+      info "Running via the top-level install.sh instead (it does not accept --force)? Use"
+      info "'install.sh --confirm-reinstall', which uninstalls and reinstalls (not equivalent"
+      info "to --force's in-place overwrite)."
+      ;;
+  esac
+  echo ""
+
+  # Disable error trap and exit successfully
+  trap - EXIT SIGINT SIGTERM
+  exit 0
+}
+
 # ============================================================================
 # PRE-FLIGHT: Idempotency Checks
 # ============================================================================
@@ -1254,25 +1431,7 @@ if [[ "$FORCE_OVERWRITE" != "true" ]] && [[ "$CLEAN_FIRST" != "true" ]]; then
 
   if [[ -n "$INSTALLED_VERSION" ]]; then
     if [[ "$INSTALLED_VERSION" == "$LOOM_VERSION" ]]; then
-      info "Loom v${LOOM_VERSION} is already installed in this repository."
-      # #5559: --force/--clean are flags THIS script (scripts/install-loom.sh)
-      # accepts directly -- but most users reach this idempotency check through
-      # the top-level install.sh wrapper, whose own arg parser does NOT accept
-      # --force and hard-errors "Unknown flag: --force" if they follow a bare
-      # "Use --force" hint. Name both paths explicitly, and do not conflate
-      # --force with install.sh's --confirm-reinstall: --force overwrites this
-      # installation in place (and enables PR auto-merge on the Full Install
-      # path), while --confirm-reinstall uninstalls and then reinstalls --
-      # a heavier, destructive operation, not an equivalent shortcut.
-      info "Running this script directly? Use --force to reinstall in place, or --clean for a fresh install."
-      info "Running via the top-level install.sh instead (it does not accept --force)? Use"
-      info "'install.sh --confirm-reinstall', which uninstalls and reinstalls (not equivalent"
-      info "to --force's in-place overwrite)."
-      echo ""
-
-      # Disable error trap and exit successfully
-      trap - EXIT SIGINT SIGTERM
-      exit 0
+      same_version_noop "$TARGET_PATH/.loom/install-metadata.json"
     else
       info "Existing Loom installation detected: v${INSTALLED_VERSION}"
       info "Upgrading to: v${LOOM_VERSION}"
