@@ -1150,22 +1150,21 @@ info "Branch: $PR_BRANCH"
 # and GitHub-only, like every step in this section.
 _notify_cleared_blockers() { [[ "$FORGE_TYPE" == "github" ]] || return 0; "${LOOM_DAEMON_BIN:-loom-daemon}" notify-cleared-blockers --pr "$PR_NUMBER" --repo "$REPO_NWO" --repo-root "${REPO_ROOT:-.}" --quiet || warning "Close-triggered loom:blocked re-check (#9102) did not run; the next sweep's check-stale-blocked pass still covers it."; }
 
-# Overlap-release floor for the daemon's merge-observation pass (#14905). The
-# bookkeeping, stack and worktree follow-up this script used to run now lives in
-# loom-daemon v0.20.29+ (#14902/#14903/#14904). A host whose daemon predates it
-# would silently lose that follow-up, so say so loudly -- but never fail the merge
-# (it already happened) and never raise the `requires-daemon: merge-pr` floor,
-# which is about fail-closed PRE-merge verbs. This reads the binary THIS script
-# resolves; the running daemon may differ, which is why an unreadable version
-# warns too instead of passing silently.
+# After a GitHub merge, explain when the daemon handles follow-up (#14905,
+# #15259). The resolved binary's version determines the message level. The
+# daemon watching this workspace may use a different binary or run elsewhere.
+# This advisory is independent of the fail-closed pre-merge version floor.
 _warn_if_daemon_lacks_merge_observation() {
   [[ "${FORGE_TYPE:-github}" == "github" ]] || return 0
   local min="0.20.29" bin="${LOOM_DAEMON_BIN:-loom-daemon}" have=""
+  local prerequisite="Post-merge follow-up runs on a reconciliation tick of a running loom-daemon watching this workspace with reconciliation enabled. That daemon may be on another host."
   have="$("$bin" --version 2>/dev/null | sed -n 's/^[^0-9]*\([0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*\).*/\1/p;q' || true)"
   if [[ -z "$have" ]]; then
-    warning "Could not read '$bin --version', so this merge cannot confirm the daemon runs the merge-observation pass (loom-daemon >= $min). That pass now does the post-merge issue bookkeeping, stacked-child restack and worktree cleanup this script no longer runs (#14905). If follow-up looks missing, check the daemon version on this host."
+    warning "Could not read '$bin --version' to verify support for the merge-observation pass (loom-daemon >= $min). $prerequisite If bookkeeping, stacked-child restack or worktree cleanup looks missing, check the version of the daemon watching this workspace."
   elif [[ "$(printf '%s\n%s\n' "$min" "$have" | sort -V | head -n 1)" != "$min" ]]; then
-    warning "loom-daemon $have predates the merge-observation pass (>= $min). PR #$PR_NUMBER merged, but NO post-merge follow-up will run on this host: partial-increment reset, issue close check, closed-issue label strip, stacked-child restack and worktree cleanup (#14905). Do by hand what applies — partial increment still loom:building: gh issue edit <N> --repo $REPO_NWO --remove-label loom:building --add-label loom:issue; closed issue still labelled: --remove-label loom:building --remove-label loom:issue; stacked child: ./.loom/scripts/reconcile-stack.sh <child-pr> $PR_BRANCH; worktree: ${SCRIPT_DIR:-.loom/scripts}/worktree.sh remove <issue> or loom-clean. Fix: roll this host — ${SCRIPT_DIR:-.loom/scripts}/cli/loom-daemon-update.sh --fetch"
+    warning "loom-daemon $have predates the merge-observation pass (>= $min). PR #$PR_NUMBER merged. $prerequisite If follow-up is missing, do by hand what applies — partial increment still loom:building: gh issue edit <N> --repo $REPO_NWO --remove-label loom:building --add-label loom:issue; closed issue still labelled: --remove-label loom:building --remove-label loom:issue; stacked child: ./.loom/scripts/reconcile-stack.sh <child-pr> $PR_BRANCH; worktree: ${SCRIPT_DIR:-.loom/scripts}/worktree.sh remove <issue> or loom-clean. Fix: roll this host — ${SCRIPT_DIR:-.loom/scripts}/cli/loom-daemon-update.sh --fetch"
+  else
+    info "$prerequisite"
   fi
   return 0
 }
