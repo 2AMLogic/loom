@@ -385,13 +385,22 @@ describe("configure_terminal write policy", () => {
     );
   });
 
-  it("flags a nonempty private defaults tier", async () => {
-    const root = await makeRepo({ legacy: '{"a": 1}' });
+  it("flags nonempty private defaults and refuses the edit without changing legacy", async () => {
+    const legacy = '{"version":"1.0","terminals":[{"id":"terminal-1","name":"Old"}]}\n';
+    const root = await makeRepo({ legacy });
     const defaultsRoot = await makeRepo({});
     const defaultsFile = join(defaultsRoot, "defaults.json");
     await writeFile(defaultsFile, '{"d": 1}');
     process.env[PRIVATE_DEFAULTS_ENV] = defaultsFile;
+    process.env.LOOM_WORKSPACE = root;
     expect((await resolveEffectiveConfigWithTiers(root)).hasNonLegacyTier).toBe(true);
+
+    const result = await handleTerminalTool("configure_terminal", {
+      terminal_id: "terminal-1",
+      name: "New",
+    });
+    expect(result[0]?.text).toContain("Refusing to edit terminal-1: a non-legacy config tier");
+    expect(await readFile(join(root, LEGACY_CONFIG_REL))).toEqual(Buffer.from(legacy));
   });
 
   const nonLegacyTiers = [
@@ -422,15 +431,14 @@ describe("configure_terminal write policy", () => {
   }
 
   it("reads each tier at most once per configure_terminal call (#15414)", async () => {
-    // Point the private defaults tier at an absent fixture so it is probed.
-    const absentDefaults = join(tmpdir(), "loom-cfg-absent-defaults.json");
-    process.env[PRIVATE_DEFAULTS_ENV] = absentDefaults;
     const legacy = JSON.stringify(
       { version: "1.0", terminals: [{ id: "terminal-1", name: "Old" }] },
       null,
       2
     );
     const root = await makeRepo({ legacy });
+    const absentDefaults = join(root, "absent-defaults.json");
+    process.env[PRIVATE_DEFAULTS_ENV] = absentDefaults;
     process.env.LOOM_WORKSPACE = root;
     const tierPaths = [
       absentDefaults,
