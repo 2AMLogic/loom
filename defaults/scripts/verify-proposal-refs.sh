@@ -189,6 +189,12 @@ PATH_RE='[A-Za-z0-9_.-]+(/[A-Za-z0-9_.-]+)+(:[0-9]+(-[0-9]+)?)?'
 # metacharacter can reach the pattern side.
 FULL_TREE_NL=""
 full_tree_contains() {
+    # ls-tree C-quotes some names. An explicit backticked path can contain
+    # any of those characters, so look up its literal Git object directly.
+    if [[ "$1" == *[!a-zA-Z0-9_./-]* ]]; then
+        git -C "$WORKSPACE" cat-file -e "origin/main:$1" 2>/dev/null
+        return
+    fi
     if [[ -z "$FULL_TREE_NL" ]]; then
         FULL_TREE_NL=$'\n'"$(git -C "$WORKSPACE" ls-tree -r -t origin/main --name-only)"$'\n'
     fi
@@ -203,7 +209,7 @@ full_tree_contains() {
 # only to this occurrence, even if the next citation names the same output.
 # An explicit output needs neither a slash nor a recognized top-level entry.
 FILE_RE='[A-Za-z0-9_.-]+(/[A-Za-z0-9_.-]+)*'
-DECL_RE='(`[^`]+`|'"$FILE_RE"')[[:blank:]]*[(][[:blank:]]*generated[[:blank:]]+by[[:blank:]]+`('"$FILE_RE"':[0-9]+)`[[:blank:]]*[)]'
+DECL_RE='(`[^`]+`|'"$FILE_RE"')[[:blank:]]*[(][[:blank:]]*generated[[:blank:]]+by[[:blank:]]+`([^`]+:[0-9]+)`[[:blank:]]*[)]'
 
 while IFS= read -r raw_candidate; do
     if [[ "$raw_candidate" =~ ^${DECL_RE}$ ]]; then
@@ -215,11 +221,14 @@ while IFS= read -r raw_candidate; do
         if ! full_tree_contains "$path" && [[ -n "$DAEMON_BIN" ]]; then
             # Only exit 1 disproves the declaration. An unreadable producer
             # or an older daemon without this optional command is inconclusive.
-            miss=$("$DAEMON_BIN" verify-output-decl --producer "$producer" --workspace "$WORKSPACE" -- "$path")
-            (( $? == 1 )) && MISSES+=("$miss")
+            miss=$("$DAEMON_BIN" verify-output-decl --producer="$producer" --workspace "$WORKSPACE" -- "$path")
+            case $? in
+                1) MISSES+=("$miss"); continue ;;
+                0|10) continue ;;
+            esac
         fi
-        # A nested producer is itself an ordinary path:line citation. Keep
-        # its existing range check, including when the output is tracked.
+        # If the declaration check did not run, including for a tracked
+        # output, keep the ordinary range check on a nested producer.
         [[ "$producer" == */* ]] || continue
         raw_candidate="$producer"
     fi
@@ -255,7 +264,7 @@ while IFS= read -r raw_candidate; do
     # RESOLVED path). Exit 10 => unreadable, already reported on stderr and
     # deliberately NOT a miss. Anything else (0, or no binary) => nothing.
     if [[ -n "$lines" && -n "$DAEMON_BIN" ]]; then
-        miss=$("$DAEMON_BIN" git-blob-lines "$path" --rev origin/main --workspace "$WORKSPACE" --range "$lines" --cite "$candidate")
+        miss=$("$DAEMON_BIN" git-blob-lines --rev origin/main --workspace "$WORKSPACE" --range "$lines" --cite="$candidate" -- "$path")
         (( $? == 1 )) && MISSES+=("$miss")
     fi
 done < <(grep -oE "$DECL_RE|$PATH_RE" "$BODY_FILE")

@@ -101,8 +101,7 @@ impl VerifyOutputDeclArgs {
 
 /// Parse a `PATH:L` producer spec into `(path, line)`. The line number must
 /// be all digits and the path non-empty; `rsplit_once` keeps a `:` that is
-/// part of the path (none of the verifier's path shapes contain one) on the
-/// path side.
+/// part of the backticked filename on the path side.
 pub(crate) fn parse_producer_spec(spec: &str) -> Option<(&str, u64)> {
     let (path, line) = spec.rsplit_once(':')?;
     if path.is_empty() || line.is_empty() || !line.bytes().all(|b| b.is_ascii_digit()) {

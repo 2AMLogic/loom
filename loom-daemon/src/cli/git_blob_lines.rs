@@ -123,25 +123,40 @@ pub(crate) enum ResolvedBlob {
 /// When `git` cannot be run, or a `git` invocation itself fails (e.g. `rev`
 /// does not resolve).
 pub(crate) fn resolved_blob(workspace: &Path, rev: &str, path: &str) -> Result<ResolvedBlob> {
-    if tree_entry_mode(workspace, rev, path)?.is_none() {
-        return Ok(ResolvedBlob::Absent {
-            resolved_path: normalize_lexically(path),
+    let Some(mut current) = normalize_lexically("", path) else {
+        return Ok(ResolvedBlob::Unreadable {
+            resolved_path: path.to_owned(),
         });
-    }
-    let resolved = resolve_symlink_path(workspace, rev, path)?;
-    let mode = tree_entry_mode(workspace, rev, &resolved)?;
-    match mode.as_deref() {
-        Some("100644") | Some("100755") => {
-            let bytes = read_blob(workspace, rev, &resolved)?;
-            Ok(ResolvedBlob::Content {
-                resolved_path: resolved,
-                bytes,
-            })
+    };
+    for hop in 0..=MAX_HOPS {
+        match tree_entry_mode(workspace, rev, &current)?.as_deref() {
+            None if hop == 0 => {
+                return Ok(ResolvedBlob::Absent {
+                    resolved_path: current,
+                })
+            }
+            Some("100644" | "100755") => {
+                let bytes = read_blob(workspace, rev, &current)?;
+                return Ok(ResolvedBlob::Content {
+                    resolved_path: current,
+                    bytes,
+                });
+            }
+            Some("120000") if hop < MAX_HOPS => {
+                let bytes = read_blob(workspace, rev, &current)?;
+                let dir = current.rsplit_once('/').map_or("", |(dir, _)| dir);
+                let next = std::str::from_utf8(&bytes)
+                    .ok()
+                    .and_then(|target| normalize_lexically(dir, target));
+                let Some(next) = next else { break };
+                current = next;
+            }
+            _ => break,
         }
-        _ => Ok(ResolvedBlob::Unreadable {
-            resolved_path: resolved,
-        }),
     }
+    Ok(ResolvedBlob::Unreadable {
+        resolved_path: current,
+    })
 }
 
 fn git(workspace: &Path, args: &[&str]) -> Result<std::process::Output> {
@@ -156,7 +171,7 @@ fn git(workspace: &Path, args: &[&str]) -> Result<std::process::Output> {
 /// `git ls-tree <rev> -- <path>` mode column, or `None` when the path does
 /// not exist in the tree at that rev at all.
 fn tree_entry_mode(workspace: &Path, rev: &str, path: &str) -> Result<Option<String>> {
-    let out = git(workspace, &["ls-tree", rev, "--", path])?;
+    let out = git(workspace, &["--literal-pathspecs", "ls-tree", rev, "--", path])?;
     if !out.status.success() {
         anyhow::bail!(
             "git ls-tree {rev} -- {path} failed: {}",
@@ -184,56 +199,26 @@ fn read_blob(workspace: &Path, rev: &str, path: &str) -> Result<Vec<u8>> {
     Ok(out.stdout)
 }
 
-/// Collapse `.` / `..` segments **lexically**. See the module doc for why
-/// this must not touch the filesystem.
-fn normalize_lexically(path: &str) -> String {
-    let mut stack: Vec<&str> = Vec::new();
-    for seg in path.split('/') {
-        match seg {
+/// Resolve a relative path from a directory in the pinned tree. An absolute
+/// path or a parent hop above the root has no referent in this tree.
+fn normalize_lexically(dir: &str, path: &str) -> Option<String> {
+    if path.starts_with('/') {
+        return None;
+    }
+    let mut stack = Vec::new();
+    for segment in dir.split('/').chain(path.split('/')) {
+        match segment {
             "" | "." => continue,
             ".." => {
-                stack.pop();
+                stack.pop()?;
             }
             other => stack.push(other),
         }
     }
-    stack.join("/")
-}
-
-/// The directory component of a repo-relative path, or `""` for a top-level
-/// path.
-fn parent_dir(path: &str) -> String {
-    match path.rsplit_once('/') {
-        Some((dir, _)) => dir.to_string(),
-        None => String::new(),
+    if stack.is_empty() {
+        return None;
     }
-}
-
-/// Follow `path` through up to [`MAX_HOPS`] `120000` tree entries at `rev`,
-/// resolving each target relative to the **link's own directory**. Returns
-/// once the current path stops being a symlink tree entry — which may still
-/// not exist (a dangling target) or may still be `120000` if the hop bound
-/// was hit (an unresolved cycle); the caller classifies that via a final
-/// [`tree_entry_mode`] check.
-fn resolve_symlink_path(workspace: &Path, rev: &str, path: &str) -> Result<String> {
-    let mut current = normalize_lexically(path);
-    for _ in 0..MAX_HOPS {
-        let mode = tree_entry_mode(workspace, rev, &current)?;
-        if mode.as_deref() != Some("120000") {
-            break;
-        }
-        let target_bytes = read_blob(workspace, rev, &current)?;
-        let target = String::from_utf8_lossy(&target_bytes);
-        let target = target.trim_end_matches('\n');
-        let dir = parent_dir(&current);
-        let joined = if dir.is_empty() {
-            target.to_string()
-        } else {
-            format!("{dir}/{target}")
-        };
-        current = normalize_lexically(&joined);
-    }
-    Ok(current)
+    Some(stack.join("/"))
 }
 
 /// Resolve `path` against `rev` in `workspace`, then classify the result.
@@ -615,9 +600,9 @@ mod tests {
 
     #[test]
     fn lexical_normalize_collapses_dot_and_dotdot() {
-        assert_eq!(normalize_lexically("docs/../regular.md"), "regular.md");
-        assert_eq!(normalize_lexically("./docs/./link.md"), "docs/link.md");
-        assert_eq!(normalize_lexically("a/b/../../c"), "c");
+        assert_eq!(normalize_lexically("docs", "../regular.md").as_deref(), Some("regular.md"));
+        assert_eq!(normalize_lexically("", "./docs/./link.md").as_deref(), Some("docs/link.md"));
+        assert_eq!(normalize_lexically("a/b", "../../c").as_deref(), Some("c"));
     }
 
     // --- resolved_blob (#15387): absent / unreadable / content stay
