@@ -66,6 +66,7 @@ pub fn wire(category: TerminalClassification) -> Option<&'static str> {
     match category {
         TerminalClassification::SessionDown => Some("SESSION_DOWN"),
         TerminalClassification::SessionMountStale => Some("SESSION_MOUNT_STALE"),
+        TerminalClassification::HooksUntrusted => Some("HOOKS_UNTRUSTED"),
         _ => None,
     }
 }
@@ -132,8 +133,8 @@ pub fn category_of(
 mod tests {
     use super::*;
     use TerminalClassification::{
-        Fatal, Recoverable, SessionDown, SessionLimit, SessionMountStale, Success, TokenExhausted,
-        TokenExpired,
+        Fatal, HooksUntrusted, Recoverable, SessionDown, SessionLimit, SessionMountStale, Success,
+        TokenExhausted, TokenExpired,
     };
 
     #[test]
@@ -147,7 +148,8 @@ mod tests {
     /// Add each new refusal category to this list.
     #[test]
     fn every_wire_name_parses_back_to_its_category() {
-        let categories: &[TerminalClassification] = &[SessionDown, SessionMountStale];
+        let categories: &[TerminalClassification] =
+            &[SessionDown, SessionMountStale, HooksUntrusted];
         for &category in categories {
             let parsed: TerminalClassification = wire(category).unwrap().parse().unwrap();
             assert_eq!(parsed, category);
@@ -172,6 +174,20 @@ mod tests {
         assert_eq!(apply(&line, Recoverable, 1), Recoverable);
         let both = format!("{}\n{line}\n", marker_line(SessionDown).unwrap());
         assert_eq!(apply(&both, Recoverable, 78), SessionMountStale);
+    }
+
+    /// #15397: the in-container hook-trust refusal rides the same line; only
+    /// a generic `RECOVERABLE` 78 record is relabelled, never another
+    /// verdict, and the record's category parses back from the wire name.
+    #[test]
+    fn a_hooks_untrusted_refusal_is_announced_and_read_back() {
+        let line = marker_line(HooksUntrusted).unwrap();
+        assert_eq!(line, "# LOOM_SESSION_REFUSAL v=1 category=HOOKS_UNTRUSTED");
+        assert_eq!(announced(&line), Some(HooksUntrusted));
+        assert_eq!(apply(&line, Recoverable, 78), HooksUntrusted);
+        assert_eq!(apply(&line, Recoverable, 1), Recoverable);
+        assert_eq!(apply(&line, TokenExhausted, 78), TokenExhausted);
+        assert_eq!(apply("no marker", Recoverable, 78), Recoverable);
     }
 
     #[test]

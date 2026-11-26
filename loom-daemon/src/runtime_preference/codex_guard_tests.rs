@@ -32,6 +32,53 @@ struct Fixture {
     _codex_home_lock: crate::tokens_pool::codex_home_env::CodexHomeLock,
 }
 
+/// A private-clone profile holding the image-owned bridge registration
+/// exactly as a provisioned seat's controls shape it: no recorded trust, a
+/// sealable registration (#15397), so the seat is `sealed` and stays
+/// eligible for the guarded draw.
+fn private_registration(profile: &Path) {
+    let command = crate::tokens_pool::private_workspace::bundle::registration();
+    fs::create_dir_all(profile).unwrap();
+    fs::write(
+        profile.join("hooks.json"),
+        serde_json::json!({"hooks": {"PreToolUse": [{"matcher": "*", "hooks": [
+            {"type": "command", "command": command, "timeout": 30}
+        ]}]}})
+        .to_string(),
+    )
+    .unwrap();
+    fs::write(
+        profile.join("loom-codex-hooks.json"),
+        serde_json::json!({"loomManagedHook": {
+            "command": command,
+            "commandSha256": sha256_hex(command.as_bytes()),
+            "trustBaselineHashes": []
+        }})
+        .to_string(),
+    )
+    .unwrap();
+    fs::write(profile.join("config.toml"), "").unwrap();
+}
+
+/// A private-clone profile with neither recorded nor sealable trust: an
+/// extra hook event the seal refuses, so its trust state is `missing` and
+/// the guarded draw excludes it (#15397).
+fn unseal_private(profile: &Path) {
+    let path = profile.join("hooks.json");
+    let mut hooks: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+    hooks["hooks"]["PostToolUse"] = serde_json::json!([]);
+    fs::write(path, hooks.to_string()).unwrap();
+}
+
+/// The key Codex records trust for Loom's entry under in a private session.
+const SESSION_KEY: &str = "/home/loom/.codex-profile/hooks.json:pre_tool_use:0:0";
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    hex::encode(Sha256::digest(bytes))
+}
+
 impl Fixture {
     fn new() -> Self {
         let codex_home_lock = crate::tokens_pool::codex_home_env::lock();
@@ -66,6 +113,9 @@ impl Fixture {
         let private_state = profiles.path().join(".private-sessions/private");
         fs::create_dir_all(&private_state).unwrap();
         fs::write(private_state.join("workspace.json"), "{}").unwrap();
+        // #15397: a sealed private seat, eligible for the guarded draw; the
+        // deeper proof is the container's, not this module's.
+        private_registration(&profiles.path().join("private"));
         let accounts = names
             .iter()
             .map(|name| {
@@ -145,27 +195,44 @@ fn mutable_and_merging_roles_are_guarded() {
 
 #[test]
 #[serial_test::serial]
-fn shared_profiles_are_checked_individually_and_private_ones_are_left_to_the_container() {
+fn shared_profiles_are_checked_individually_and_private_ones_only_for_missing_trust() {
     let f = Fixture::new();
     let mut unready = unready_profiles(f.root.path()).unwrap();
     unready.sort();
-    assert_eq!(unready, ["missing", "untrusted"], "the private profile is not judged here");
+    assert_eq!(
+        unready,
+        ["missing", "untrusted"],
+        "a sealed private seat is proven in-container, not judged here"
+    );
+    // #15397: a private profile with `missing` trust can serve no guarded
+    // role — the draw excludes it before any Docker call, exactly as it
+    // excludes an unprovisioned shared profile.
+    unseal_private(&f.profile("private"));
+    let mut unready = unready_profiles(f.root.path()).unwrap();
+    unready.sort();
+    assert_eq!(unready, ["missing", "private", "untrusted"]);
     f.ready_everything();
+    private_registration(&f.profile("private"));
     assert_eq!(unready_profiles(f.root.path()).unwrap(), Vec::<String>::new());
     // Only the stale profile loses readiness.
     fs::write(f.profile("missing").join("hooks.json"), "{}").unwrap();
     assert_eq!(unready_profiles(f.root.path()).unwrap(), ["missing"]);
     // ...and so does a checkout with no bridge for the entry to run.
     f.ready_everything();
+    unseal_private(&f.profile("private"));
     fs::remove_file(f.root.path().join(".loom/hooks/guard-codex-bridge.sh")).unwrap();
-    assert_eq!(unready_profiles(f.root.path()).unwrap().len(), 3);
+    let mut unready = unready_profiles(f.root.path()).unwrap();
+    unready.sort();
+    // The shared profiles need the checkout's bridge; the private one does
+    // not (its bridge is the image's), but it stays `missing`.
+    assert_eq!(unready.len(), 4);
 }
 
 #[test]
 #[serial_test::serial]
 fn guarded_roles_can_use_a_mixed_pool_and_refuse_an_entirely_untrusted_pool() {
     let f = Fixture::new();
-    fs::remove_dir(f.profile("private")).unwrap();
+    fs::remove_dir_all(f.profile("private")).unwrap();
     for role in ["champion", "judge"] {
         assert!(f.codex_for(role).is_spawnable(), "{role}");
     }
@@ -202,7 +269,7 @@ fn guarded_roles_can_use_a_mixed_pool_and_refuse_an_entirely_untrusted_pool() {
 fn healthy_untrusted_profiles_cannot_substitute_for_a_held_ready_seat() {
     use crate::tokens_pool::{AccountId, AccountProvider, TerminalClassification};
     let f = Fixture::new();
-    fs::remove_dir(f.profile("private")).unwrap();
+    fs::remove_dir_all(f.profile("private")).unwrap();
     crate::tokens_pool::health::record_terminal_at(
         f.root.path(),
         &AccountId {
@@ -248,4 +315,51 @@ fn a_sealed_session_seat_is_guarded_without_recorded_trust() {
     ]}]);
     fs::write(&hooks, value.to_string()).unwrap();
     assert_eq!(unready_profiles(f.root.path()).unwrap(), ["missing"]);
+}
+
+/// #15397: a private-clone profile with `missing` trust is excluded from the
+/// guarded draw (`ready`, `unready_profiles`, `select`) before any Docker
+/// call, while `sealed` and `recorded` private seats stay eligible.
+#[test]
+#[serial_test::serial]
+fn a_missing_trust_private_clone_profile_is_excluded_from_the_guarded_draw() {
+    let f = Fixture::new();
+
+    // `sealed` stays eligible, and can even win the draw when no shared
+    // profile is ready.
+    let selected = select(f.root.path(), None, Some("judge"), |_| true).unwrap();
+    assert!(
+        selected.id.name == "ready" || selected.id.name == "private",
+        "a sealed private seat is eligible alongside a ready shared one"
+    );
+    for profile in [
+        f.profile("ready"),
+        f.profile("untrusted"),
+        f.profile("missing"),
+    ] {
+        let hooks = profile.join("hooks.json");
+        if hooks.exists() {
+            fs::remove_file(hooks).unwrap();
+        }
+    }
+    let selected = select(f.root.path(), None, Some("judge"), |_| true).unwrap();
+    assert_eq!(selected.id.name, "private", "a sealed private seat may serve a guarded role");
+
+    // `recorded` (a trusted_hash at the session key) stays eligible too.
+    fs::write(
+        f.profile("private").join("config.toml"),
+        format!("[hooks.state.\"{SESSION_KEY}\"]\ntrusted_hash = \"fresh\"\n"),
+    )
+    .unwrap();
+    let selected = select(f.root.path(), None, Some("judge"), |_| true).unwrap();
+    assert_eq!(selected.id.name, "private", "a recorded private seat may serve a guarded role");
+
+    // `missing` is excluded, and a pool with nothing else refuses the draw.
+    // (config.toml is cleared too: the recorded hash above would keep the
+    // profile `recorded` even with a spoiled registration.)
+    unseal_private(&f.profile("private"));
+    fs::write(f.profile("private").join("config.toml"), "").unwrap();
+    assert!(select(f.root.path(), None, Some("judge"), |_| true).is_err());
+    // An unguarded role never reads the trust state at all.
+    assert!(select(f.root.path(), None, Some("curator"), |_| true).is_ok());
 }

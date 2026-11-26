@@ -223,7 +223,15 @@ pub(super) fn execute(command: Vec<String>) -> Result<()> {
     control::audit_args(&command)?;
     let role = std::env::var("LOOM_ROLE").unwrap_or_default();
     if !role.is_empty() {
-        admit_role(&role)?;
+        // #15397: an admission the worker cannot prove is a seat-configuration
+        // fact, not a transient failure. Announce the category and exit with
+        // the refusal code so the tick's terminal record is relabelled
+        // HOOKS_UNTRUSTED instead of RECOVERABLE — a RECOVERABLE mark would
+        // put a bogus transient hold on the account and re-draw this same
+        // unusable seat after every backoff window.
+        if let Err(cause) = admit_role(&role) {
+            refuse_hooks_untrusted(&cause);
+        }
     }
     let (bin, args) = command.split_first().context("private command missing")?;
     let mut child = Command::new(bin);
@@ -235,7 +243,11 @@ pub(super) fn execute(command: Vec<String>) -> Result<()> {
         .file_name()
         .is_some_and(|name| name == "codex")
     {
-        containment::waiver_args(&role, args, &clone)?
+        // Same refusal semantics as admission above (#15397).
+        match containment::waiver_args(&role, args, &clone) {
+            Ok(waiver) => waiver,
+            Err(cause) => refuse_hooks_untrusted(&cause),
+        }
     } else {
         Vec::new()
     };
@@ -249,6 +261,23 @@ pub(super) fn execute(command: Vec<String>) -> Result<()> {
     control_boundary(&mut child)?;
     let error = child.exec();
     Err(error.into())
+}
+
+/// The in-container admission or hook-trust vetting refused this launch
+/// (#15397): announce the refusal category on stderr and exit with the
+/// shared refusal code. The announce line reaches the tick's log through the
+/// adapter's stderr pass-through, and the daemon's terminal-record parser
+/// relabels the generic `RECOVERABLE` the adapter's classifier writes for
+/// this exit code to [`TerminalClassification::HooksUntrusted`] — the same
+/// contract `SESSION_DOWN` and `SESSION_MOUNT_STALE` already ride. The cause
+/// text is printed first: these refusals are fixed, secret-free obligation
+/// strings by construction.
+fn refuse_hooks_untrusted(cause: &anyhow::Error) -> ! {
+    eprintln!("private-workspace execute: {cause:#}");
+    crate::session_exec::refusal::announce(
+        crate::tokens_pool::health::TerminalClassification::HooksUntrusted,
+    );
+    std::process::exit(crate::session_exec::refusal::REFUSAL_EXIT_CODE)
 }
 
 /// The worker's own, independent admission of the role it is about to exec —

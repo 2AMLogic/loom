@@ -72,6 +72,11 @@ fn untrusted(why: &str) -> String {
 const NOT_IN_CONTAINER: &str = "container identity: this process is not running inside the bound private session container, or the clone's identity record does not match the bound job; refusing to claim containment";
 const NOT_OWNED_CLONE: &str = "host, sibling and peer repository isolation: the selected clone is not an owned, independent Git root (missing, symlinked, or borrowing objects through anything other than its own read-only origin mirror)";
 const MALFORMED: &str = "container identity: the bound container, control identity or base revision is malformed, absent, or predates loom-private-control-v1";
+/// The refusal for a `sealed` profile on a session image whose own worker
+/// binary predates sealed-registration support (#15397): the host may be
+/// current, but the launch would be refused in-container seconds after it
+/// started, so it fails closed here instead — before the seat is drawn.
+const STALE_SEALED_IMAGE: &str = "sealed registration is unsupported by the running session image: the container's loom-daemon predates it, so an unattended guarded launch would be refused inside the container; recreate the session on a current image (private session containers do not roll with the daemon), or record Codex hook trust for the profile";
 /// A proof is valid for the one clone it was measured against (#10796).
 pub(super) const WRONG_CLONE: &str = "host, sibling and peer repository isolation: the containment proof or lease is bound to a different repository clone than the one this execution acts on; refusing to reuse another clone's evidence";
 
@@ -253,12 +258,30 @@ pub(super) enum Trust {
 /// control identity, so a verdict taken here is pinned by the same recheck
 /// that pins the rest of the boundary at spawn and at exec. Any vetting
 /// failure keeps the refusal: the seal only ever adds an admission path.
-pub(super) fn enforcing(report: &bundle::Report, profile: &Path) -> Result<Trust> {
+///
+/// `sealed_support` answers whether the RUNNING container's own binary can
+/// run the sealed path (#15397). It is consulted **lazily** — only after
+/// recorded trust has been ruled out — so a seat with a recorded decision
+/// spends zero extra Docker execs. The host passes the
+/// [`docker::supports_sealed_trust`] probe; the worker side passes an
+/// inherent yes, because there this code IS the image's binary.
+pub(super) fn enforcing(
+    report: &bundle::Report,
+    profile: &Path,
+    sealed_support: impl FnOnce() -> bool,
+) -> Result<Trust> {
     if !report.managed {
         bail!("{UNMANAGED}");
     }
     if hook_trust_established(profile) {
         return Ok(Trust::Recorded);
+    }
+    // #15397: a private session container does not roll with the host
+    // daemon (#14112), so the image the host would launch into may predate
+    // sealed support. Refuse here, on the host, with the image named — not
+    // seconds later inside the container after the seat was already drawn.
+    if !sealed_support() {
+        bail!("{STALE_SEALED_IMAGE}");
     }
     seal::vet_profile(profile, Path::new(PROFILE), &seal_request(Vec::new(), None))
         .map(|_| Trust::Sealed)
@@ -361,11 +384,17 @@ pub fn assessed_trust_state(profile: &Path) -> Option<&'static str> {
 /// freshly re-observed control boundary. Called only by
 /// [`dispatch::Selection::contain`], which owns the lease and has just
 /// re-inspected the container by ID.
+///
+/// `sealed_support` is the sealed-trust capability probe for the RUNNING
+/// container ([`docker::supports_sealed_trust`] in production); it runs only
+/// when the profile has no recorded trust, so a healthy `recorded` seat
+/// takes zero extra Docker execs (#15397).
 pub(super) fn host_proof(
     config: &Config,
     report: &bundle::Report,
     job: &lease::Job,
     target: &Target,
+    sealed_support: impl FnOnce() -> bool,
 ) -> Result<ContainmentProof> {
     // The durable job must name exactly the clone this selection prepared; a
     // lease left by another clone's job never certifies this one.
@@ -377,7 +406,7 @@ pub(super) fn host_proof(
     if job.repository != expected {
         bail!("{WRONG_CLONE}");
     }
-    enforcing(report, &config.profile)?;
+    enforcing(report, &config.profile, sealed_support)?;
     ContainmentProof::new(
         &config.account,
         &job.container_id,
@@ -658,7 +687,9 @@ pub(super) fn in_container(
     let profile = Path::new(PROFILE);
     let report = bundle::observe(Path::new(bundle::CONTROL_ROOT), profile);
     bundle::rebind(&report, profile, bound)?;
-    let trust = enforcing(&report, profile)?;
+    // The worker side IS the session image's binary (#15397): sealed support
+    // is inherent here, and there is no Docker inside the session to ask.
+    let trust = enforcing(&report, profile, || true)?;
     // The profile vetted; what the host could not see is the clone Codex starts in.
     if trust == Trust::Sealed {
         seal::vet_project_layers(Path::new(clone))

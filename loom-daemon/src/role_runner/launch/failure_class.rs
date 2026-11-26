@@ -19,6 +19,7 @@
 //! | `hook-denied` | exit 0, but a guard hook denied every tool call (#11727) |
 //! | `preflight-auth-failed` | the wrapper's auth pre-flight refused the session |
 //! | `session-down`, `session-mount-stale` | a `session-exec` refusal (#10455, #10364): the account's session container was down, or did not mount the workdir |
+//! | `hooks-untrusted` | a private-clone session refused the role: its guard hook could not be proven (#15397) |
 //! | `preflight-mcp-failed`, `preflight-token-selection-failed`, `preflight-no-cli-start` | the sweep's pre-flight classifier: the adapter died before its CLI started |
 //! | `account-pool-exhausted` | the wrapper's rotation ran out of accounts mid-run |
 //! | `credential-expired`, `account-exhausted:<category>`, `session-limit`, `runtime-timeout`, `runtime-fatal`, `cwd-deleted`, `model-refusal` | the runtime adapter's own terminal verdict (`# LOOM_TERMINAL_RESULT`) |
@@ -203,12 +204,14 @@ pub(super) fn classify_exit(
     sweep_registry::classify_crash(region, Some(code)).unwrap_or_else(|| format!("exit-{code}"))
 }
 
-/// The class of a `session-exec` refusal category (#10455, #10364) — the same
-/// literals as `loom.admission.reason` — or `None` for any other category.
+/// The class of a `session-exec` refusal category (#10455, #10364, #15397) —
+/// the same literals as `loom.admission.reason` — or `None` for any other
+/// category.
 fn session_refusal_class(category: TerminalClassification) -> Option<&'static str> {
     match category {
         TerminalClassification::SessionDown => Some("session-down"),
         TerminalClassification::SessionMountStale => Some("session-mount-stale"),
+        TerminalClassification::HooksUntrusted => Some("hooks-untrusted"),
         _ => None,
     }
 }
@@ -227,7 +230,9 @@ fn adapter_class(category: TerminalClassification) -> Option<&'static str> {
         C::CwdDeleted => Some("cwd-deleted"),
         C::ModelRefusal => Some("model-refusal"),
         C::SandboxUnavailable => Some("sandbox-unavailable"),
-        C::SessionDown | C::SessionMountStale => session_refusal_class(category),
+        C::SessionDown | C::SessionMountStale | C::HooksUntrusted => {
+            session_refusal_class(category)
+        }
         C::Recoverable | C::Success => None,
     }
 }
@@ -249,6 +254,7 @@ fn adapter_wire_name(category: TerminalClassification) -> &'static str {
         C::SandboxUnavailable => "SANDBOX_UNAVAILABLE",
         C::SessionDown => "SESSION_DOWN",
         C::SessionMountStale => "SESSION_MOUNT_STALE",
+        C::HooksUntrusted => "HOOKS_UNTRUSTED",
     }
 }
 

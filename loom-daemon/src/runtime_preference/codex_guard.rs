@@ -32,9 +32,13 @@
 //! argv, the container's own copies of the profile controls) and passes
 //! `--dangerously-bypass-hook-trust`, or exits 78 if the proof fails there.
 //!
-//! Private-clone profiles are not judged here. Their registration is the
-//! pinned, image-owned one, and a private launch re-proves the obligation
-//! inside the container before the model runs.
+//! Private-clone profiles are judged here for exactly one fact the draw can
+//! read without Docker: a profile whose trust state is `missing` (neither a
+//! recorded decision nor a sealable registration) can run no guarded role —
+//! in-container admission refuses it — so it is excluded from the draw
+//! before any Docker work, instead of being selected and failing the launch
+//! seconds later (#15397). `recorded` and `sealed` seats stay eligible;
+//! everything past that is proven per launch, inside the container.
 
 use std::path::Path;
 
@@ -49,23 +53,27 @@ pub fn guarded(role: &str) -> bool {
     crate::runtime_admission::canonical_role(role).is_some_and(|role| GUARDED_ROLES.contains(&role))
 }
 
-/// Private clones prove the image-owned registration inside the container.
-/// Shared profiles prove their own registration in this workspace.
+/// Private clones prove the image-owned registration inside the container —
+/// unless their profile's trust is `missing`, which no launch can prove
+/// (#15397). Shared profiles prove their own registration in this workspace.
 pub(crate) fn ready(root: &Path, profile: &Path) -> bool {
-    codex_hooks::is_private_clone(profile)
-        || Check {
-            codex_home: profile.to_owned(),
-            workspace: Some(root.to_owned()),
-            registration: Registration::WorkspaceIndependent,
-            fallback_bridge: None,
-            runtime_home: None,
-            sealed: Some(codex_hooks::seal::Request {
-                launch_dir: Some(root.to_owned()),
-                ..Default::default()
-            }),
-        }
-        .verify()
-        .ready
+    if codex_hooks::is_private_clone(profile) {
+        return crate::tokens_pool::private_workspace::containment::trust_state(profile)
+            != "missing";
+    }
+    Check {
+        codex_home: profile.to_owned(),
+        workspace: Some(root.to_owned()),
+        registration: Registration::WorkspaceIndependent,
+        fallback_bridge: None,
+        runtime_home: None,
+        sealed: Some(codex_hooks::seal::Request {
+            launch_dir: Some(root.to_owned()),
+            ..Default::default()
+        }),
+    }
+    .verify()
+    .ready
 }
 
 /// The enabled shared profiles whose guard is not ready for this workspace.

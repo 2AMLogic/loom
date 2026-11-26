@@ -5,7 +5,10 @@ use std::os::fd::AsRawFd;
 use std::os::unix::process::CommandExt;
 use std::process::Command;
 
-/// Every matching seat is busy or could not be prepared; self-heals as seats free.
+/// Every matching seat is busy, or none was offered to the walk at all;
+/// self-heals as seats free. A seat that was offered and failed its own
+/// preparation is reported by [`exhausted_error`] instead, so its refusal
+/// stays diagnosable and the draw can fall through (#15397).
 pub(super) const NO_IDLE_SEAT: &str = "no idle seat";
 /// The resolved repository is served by no inventoried account: a routing
 /// misconfiguration, not contention (#14512).
@@ -403,7 +406,23 @@ impl Selection {
                         return Err(error.context(NO_SEAT_SERVES_REPOSITORY));
                     }
                     if try_idle_seats {
-                        return Err(error.context(NO_IDLE_SEAT));
+                        // #15397: an idle walk that actually tried seats
+                        // reports each refusal with its own reason instead of
+                        // masking them behind NO_IDLE_SEAT. Only "nothing was
+                        // offered" and "every offered seat was busy"
+                        // self-heal as seats free; a seat that failed its own
+                        // containment or trust check is a configuration fact
+                        // the role draw must fall through on, so the step is
+                        // neither cooled as contention nor retried into the
+                        // same unusable seat.
+                        if passed_over.is_empty() {
+                            return Err(error.context(NO_IDLE_SEAT));
+                        }
+                        let exhausted = exhausted_error(&passed_over);
+                        if exhausted.all_busy {
+                            return Err(error.context(NO_IDLE_SEAT));
+                        }
+                        return Err(exhausted.into());
                     }
                     if passed_over.is_empty() {
                         // Nothing eligible was ever offered: keep the pool's
@@ -573,7 +592,14 @@ impl Selection {
             bail!("{}", containment::DRIFTED);
         }
         let report = docker::recheck_control(&config, &job.container_id, &job.control)?;
-        containment::host_proof(&config, &report, &job, &prepared.target)
+        // #15397: the sealed-trust capability is asked of the RUNNING
+        // container, addressed by the immutable ID this proof is bound to.
+        // The closure runs lazily, inside `enforcing`, only after recorded
+        // trust is ruled out — a healthy `recorded` seat spends zero extra
+        // Docker execs on it.
+        containment::host_proof(&config, &report, &job, &prepared.target, || {
+            docker::supports_sealed_trust(&job.container_id)
+        })
     }
 
     /// The clone this selection was prepared in, when it holds a lease.

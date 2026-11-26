@@ -185,6 +185,7 @@ fn adapter_wire_names_round_trip() {
         C::SandboxUnavailable,
         C::SessionDown,
         C::SessionMountStale,
+        C::HooksUntrusted,
     ] {
         let parsed: TerminalClassification = adapter_wire_name(category).parse().unwrap();
         assert_eq!(parsed, category);
@@ -205,6 +206,10 @@ fn a_session_refusal_outranks_the_no_cli_start_inference() {
     assert_eq!(
         classify_exit(region, Some(TerminalClassification::SessionMountStale), 78),
         "session-mount-stale"
+    );
+    assert_eq!(
+        classify_exit(region, Some(TerminalClassification::HooksUntrusted), 78),
+        "hooks-untrusted"
     );
     // Without the refusal the same region is still a pre-flight death.
     assert_eq!(classify_exit(region, None, 78), "preflight-no-cli-start");
@@ -227,6 +232,27 @@ fn an_announced_mount_stale_refusal_classifies_from_the_log() {
     assert_eq!(
         attrs[crate::telemetry::trace::STATUS_MESSAGE],
         "role child exited with code 78; runtime adapter reported SESSION_MOUNT_STALE"
+    );
+}
+
+/// #15397: the in-container hook-trust refusal is announced by
+/// `private-workspace execute` (worker side), the adapter packages only a
+/// generic `RECOVERABLE` 78, and the record parser applies the announcement —
+/// so the span names `hooks-untrusted` instead of a transient failure.
+#[cfg(unix)]
+#[test]
+fn an_announced_hooks_untrusted_refusal_classifies_from_the_log() {
+    let log = tick(&format!(
+        "# LOOM_ACCOUNT name=alice\n# LOOM_SESSION_REFUSAL v=1 category=HOOKS_UNTRUSTED\n{}",
+        terminal("RECOVERABLE", 78)
+    ));
+    let failure = exited(exit_with(78), &log, ANCHOR);
+    let attrs = failure.attributes();
+    assert_eq!(attrs["loom.failure_class"], "hooks-untrusted");
+    assert_eq!(attrs["loom.exit_code"], "78");
+    assert_eq!(
+        attrs[crate::telemetry::trace::STATUS_MESSAGE],
+        "role child exited with code 78; runtime adapter reported HOOKS_UNTRUSTED"
     );
 }
 
