@@ -18,6 +18,11 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 ### 2026-11-26
 
+- **Issue #15467** (closed): Accept source citations to an unterminated final line in verify-proposal-refs
+- **PR #15472**: fix: count an unterminated final line in git-blob-lines range checks
+- **Issue #15477** (closed): Champion promotion reconciliation reports OK when its trusted-comment input cannot be read
+- **Issue #15461** (closed): loom-start.sh malformed-tier guard accepts several top-level JSON values, so a two-object config reports "no terminals" instead of "Invalid JSON"
+- **PR #15469**: fix: fail loom start on config tiers holding several JSON values
 - **Issue #15455** (closed): Export the native session PID to OpenCode tools so self-claim leases survive tool exit
 - **PR #15465**: fix: export LOOM_AGENT_SESSION_PID from the native launcher
 - **Issue #15450** (closed): Document queue_membership_unknown under backoff in the pick-decision guide
