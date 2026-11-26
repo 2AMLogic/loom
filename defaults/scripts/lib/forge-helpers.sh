@@ -303,6 +303,45 @@ gitea_api() {
   fi
 }
 
+# --- Gitea lease-record reads (#14941) ---
+#
+# The Builder lease (`sweep-lease-publish.sh` / `sweep-lease-renew.sh`) lists
+# an issue's comments, reads its state and PATCHes its own comment. Gitea's
+# REST paths for these are GitHub-shaped (`repos/{o}/{r}/issues/{n}/comments`,
+# `repos/{o}/{r}/issues/comments/{id}`), so the lease scripts reuse their
+# GitHub request shapes through `gitea_api` on a Gitea checkout and never
+# reach for `gh`. Callers must have run `forge_detect` (FORGE_TYPE=gitea).
+
+# forge_gitea_issue_comments NWO ISSUE -> one JSON array holding EVERY comment
+# of the issue, oldest first, in Gitea's REST shape. Gitea's issue-comment list
+# takes `since`/`before` only and is not paginated, so one GET is the whole
+# listing. Returns 1 when it cannot be read or is not an array, so an error
+# document is never mistaken for "no comments".
+forge_gitea_issue_comments() {
+  local chunk
+  chunk="$(gitea_api GET "repos/$1/issues/$2/comments")" || return 1
+  jq -ec 'if type == "array" then . else empty end' <<< "$chunk"
+}
+
+# forge_gitea_issue_state NWO ISSUE -> `open` / `closed` (empty + exit 1 when
+# the state cannot be read).
+forge_gitea_issue_state() {
+  local body
+  body="$(gitea_api GET "repos/$1/issues/$2")" || return 1
+  jq -er '.state // empty' <<< "$body"
+}
+
+# forge_gitea_self_login -> the login the configured Gitea credential
+# authenticates as (`GET /user`). Gitea reports no `author_association`, so
+# this is the identity a lease record written with this host's own credential
+# is attributed to: the Gitea reading of comment-trust's "this daemon's own
+# identity" rule (`loom-daemon forge trusted-comments --self-login`).
+forge_gitea_self_login() {
+  local body
+  body="$(gitea_api GET user)" || return 1
+  jq -er '.login // empty' <<< "$body"
+}
+
 # --- Owner/Repo Helpers ---
 
 # Extract owner and repo from NWO (name-with-owner) string.
@@ -820,7 +859,7 @@ forge_get_pr_body() {
 #   Neither branch is negation-aware: "does not fix #N" reads exactly like
 #   "fixes #N" (#1057). A caller about to ACT on a candidate re-checks it with
 #   `loom-daemon merge-pr-refs has-unnegated-closing-ref --issue N` (text on
-#   stdin), as champion-pr-merge.md Step 4 does before `gh issue close`.
+#   stdin), as Champion Step 4 does before unblocking dependents.
 #
 # Gitea: The Gitea API does not expose an equivalent of closingIssuesReferences,
 #   so this falls back to a word-boundary regex over the PR body. The regex

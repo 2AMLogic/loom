@@ -580,3 +580,131 @@ fn a_hold_file_older_than_the_horizon_is_pruned_whatever_it_says() {
     budget::prune(f.store(), now);
     assert!(!file.exists());
 }
+
+#[test]
+fn paginated_check_runs_projects_settled_in_progress_and_agrees_with_stdin() {
+    use crate::merge_pr::checks_failure::required::{
+        assess, parse_check_runs, status_disagreements, Verdict,
+    };
+
+    let mut page1_rows: Vec<serde_json::Value> = (0..99)
+        .map(|i| {
+            serde_json::json!({
+                "name": format!("filler-{i}"),
+                "status": "completed",
+                "conclusion": "success",
+                "started_at": "2026-11-24T17:00:00Z",
+                "completed_at": "2026-11-24T17:00:05Z"
+            })
+        })
+        .collect();
+    // Older settled-in-progress attempt on page 1; newer running attempt lands on page 2.
+    page1_rows.push(serde_json::json!({
+        "name": "rerunning",
+        "status": "in_progress",
+        "conclusion": "success",
+        "started_at": "2026-11-24T17:28:46Z",
+        "completed_at": "2026-11-24T17:28:53Z"
+    }));
+    let page2_rows = vec![
+        serde_json::json!({
+            "name": "lint",
+            "status": "in_progress",
+            "conclusion": "success",
+            "started_at": "2026-11-24T17:28:46Z",
+            "completed_at": "2026-11-24T17:28:53Z"
+        }),
+        serde_json::json!({
+            "name": "red-gate",
+            "status": "in_progress",
+            "conclusion": "failure",
+            "started_at": "2026-11-24T17:28:46Z",
+            "completed_at": "2026-11-24T17:28:53Z"
+        }),
+        serde_json::json!({
+            "name": "null-conc",
+            "status": "in_progress",
+            "conclusion": null,
+            "started_at": "2026-11-24T17:28:46Z",
+            "completed_at": "2026-11-24T17:28:53Z"
+        }),
+        serde_json::json!({
+            "name": "no-ts",
+            "status": "in_progress",
+            "conclusion": "success",
+            "started_at": "2026-11-24T17:28:46Z",
+            "completed_at": null
+        }),
+        serde_json::json!({
+            "name": "rerunning",
+            "status": "in_progress",
+            "conclusion": null,
+            "started_at": "2026-11-24T17:35:00Z",
+            "completed_at": null
+        }),
+    ];
+    let total = page1_rows.len() + page2_rows.len();
+    let mut all_rows = page1_rows.clone();
+    all_rows.extend(page2_rows.clone());
+
+    let f = Forge::new();
+    f.serve(
+        &runs_url(SHA),
+        &serde_json::json!({"total_count": total, "check_runs": page1_rows}).to_string(),
+    );
+    f.serve(
+        &format!("{}&page=2", runs_url(SHA)),
+        &serde_json::json!({"total_count": total, "check_runs": page2_rows}).to_string(),
+    );
+
+    let live_runs = fetch_check_runs(f.gh(), "o/r", SHA).unwrap();
+    let stdin_runs = parse_check_runs(&serde_json::Value::Array(all_rows)).unwrap();
+    assert_eq!(live_runs, stdin_runs, "live projection and stdin fixture path must agree");
+
+    for runs in [&live_runs, &stdin_runs] {
+        assert_eq!(assess(&["lint".into()], runs, &[], &[]), Verdict::Clean);
+        let notes = status_disagreements("430", SHA, &["lint".into()], runs);
+        assert_eq!(notes.len(), 1, "{notes:?}");
+        assert!(notes[0].contains("in_progress"), "{}", notes[0]);
+
+        assert_eq!(
+            assess(&["red-gate".into()], runs, &[], &[]),
+            Verdict::Refuse {
+                red: vec![("red-gate".into(), "failure".into())],
+                bypassed: vec![]
+            }
+        );
+        assert_eq!(
+            assess(&["red-gate".into()], runs, &[], &["red-gate".into()]),
+            Verdict::Bypassed(vec![("red-gate".into(), "failure".into())])
+        );
+        for pending in ["null-conc", "no-ts", "rerunning"] {
+            assert_eq!(
+                assess(&[pending.into()], runs, &[], &[]),
+                Verdict::Hold {
+                    waiting: vec![(pending.into(), "in_progress".into())],
+                    bypassed: vec![]
+                },
+                "{pending} must stay on hold"
+            );
+        }
+    }
+
+    // A short read carrying a settled-in-progress row still fails closed (#8987).
+    let f_short = Forge::new();
+    f_short.serve(
+        &runs_url(SHA),
+        &serde_json::json!({
+            "total_count": 2,
+            "check_runs": [{
+                "name": "lint",
+                "status": "in_progress",
+                "conclusion": "success",
+                "started_at": "2026-11-24T17:28:46Z",
+                "completed_at": "2026-11-24T17:28:53Z"
+            }]
+        })
+        .to_string(),
+    );
+    assert!(fetch_check_runs(f_short.gh(), "o/r", SHA).is_err());
+}

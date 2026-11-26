@@ -193,7 +193,7 @@ cycle) is added only when loom-ui's error tracking shows it is needed.
 | [`checkout.external_change`](#checkoutexternal_change) | log, OTLP only | `fleet_sync/checkout_ff/external_change.rs` |
 | [`roster.change`](#rosterchange) | log, OTLP only | `fleet_sync/roster_clone.rs` |
 | [`daemon.run_state_request`](#daemonrun_state_request--who-asked-the-daemon-to-pause-drain-stop-or-restart) | log, OTLP only | `ipc.rs` (`handle_client` run-state verbs), `observability/run_state_request.rs` |
-| [`completion.narrated`](#completionnarrated--a-public-feed-completion-the-narration-sink-built) | log, OTLP only | `safehouse/completion_runtime.rs` (`emit_narration_record`, from `build_and_narrate_completion`) |
+| [`completion.narrated`](#completionnarrated--a-public-feed-completion-the-narration-sink-built) | log, OTLP only | *none: no longer emitted since #13946; the kind stays defined* |
 | [`write_scope.refused`](#write_scoperefused--a-daemon-pass-write-the-9548-gate-refused) | log, OTLP only | `write_scope.rs` (`gate()` and the per-call checks, `emit_refused`) |
 | [`merge_queue.event`](#merge_queueevent--a-merge-queue-record-exported-to-otlp) | log, OTLP only | `forge_merge_queue/events.rs` (`FileEventSink::record`, after the JSONL append) |
 | [`merge.authorization.evaluated`](#mergeauthorizationevaluated--one-merge-group-authorization-evaluation) | log, OTLP only | `forge_merge_queue/group_run.rs` (`run_group_check`) |
@@ -2139,13 +2139,26 @@ land".
 Long-running task liveness (Issue #10414, `observability/ops/liveness.rs`).
 `task_alive` is sampled every 60 s on its own ticker, not on the collector's
 pass. `task_faults` is emitted when a fault happens. The `task` label is a
-fixed daemon loop name: `auto_update`, `ci_telemetry` or
-`role_runner.<role>`. It is never a repo, issue or path.
+fixed daemon loop name: `auto_update`, `ci_telemetry`,
+`github_app_refresh` (#15327) or `role_runner.<role>`. It is never a repo, issue or path.
 
 | Metric | Unit | Labels | Meaning |
 |---|---|---|---|
 | `loom.daemon.task_alive` | `1` | `task` | `1` while the loop has beaten within its staleness window (two intervals plus 60 s, plus the loop's own iteration bound where it has one), `0` once it has gone silent past the window or marked itself dead |
 | `loom.daemon.task_faults` | `{fault}` | `task`, `reason` ∈ `panic`, `overrun`, `exit` | a delta counter: an iteration panicked and was caught, an iteration ran past the loop's bound, or the loop stopped for good |
+
+Primary writer-token freshness (Issue #15327, `credential_preflight/primary_token.rs`).
+Sampled every 60 s on its own ticker, so a wedged refresh tick cannot silence
+it. The `owner` label is the installation owner of the token. The series are
+absent until the daemon has published a primary token. While the token is
+within 60 s of (or past) its `expires_at`, `forge_credential_stale()` is true
+for the stale-grace window and loom-ui carries `forge.credential-expired`.
+
+| Metric | Unit | Labels | Meaning |
+|---|---|---|---|
+| `loom.daemon.forge_token_age` | `s` | `owner` | seconds since the primary writer token was last published; healthy values stay under ~600 s, a value that keeps growing means rotation stopped |
+| `loom.daemon.forge_token_remaining` | `s` | `owner` | seconds until the published token's `expires_at`, negative once past; absent when the minter gave no parseable expiry |
+| `loom.daemon.forge_token_last_rotation` | `s` | `owner` | unix time of the last publication |
 
 CI telemetry poller cycles (Issue #12793, `ci_telemetry/metrics.rs`). Both
 daemon loops (periodic and feed-driven) call one helper after every
@@ -2201,6 +2214,13 @@ a label.
 | `loom.codex_session.state` | `1` | `account`, `state` ∈ `running`, `stopped`, `restarting`, `missing`, `stale_mounts`, `container` | per session-managed Codex account, `1` for the container's current state and `0` for the other four (#10455). `restarting`: Docker is backing off a crash loop (`State.Restarting`; counts as down). `stale_mounts`: the container's workspace mounts differ from what its workspace label would mount today: a registered root under the label is not mounted, a mount is no longer registered, or a mount is one `session start` now refuses although still registered (home, `firewall: true`) (#10364; the reconciler's own definition since #10600). No drift verdict, so never `stale_mounts`, while the workspace registry cannot be read. Only emitted when an enabled account is session-managed, and omitted for a pass where docker could not be queried (never reported as `missing`) |
 | `loom.codex_session.record` | `1` | `account`, `kind` ∈ `hold`, `drift_removal`, `container` | per session-managed Codex account, `1` while that on-disk record stands, else `0` (#10600): `hold` is an operator `accounts session stop` (`.session-hold.json`); `drift_removal` is the reconciler's fail-closed removal for a denied mount (`.session-drift-removed.json`), which keeps the seat down. Emitted with `loom.codex_session.state`, and omitted the same way |
 | `loom.codex_session.mount_drift` | `{path}` | `account`, `kind` ∈ `missing`, `extra`, `denied`, `container` | per session-managed Codex account whose container has a drift verdict (#10600): how many workspace paths drift that way. `missing`: registered roots it does not mount; `extra`: mounts no longer registered; `denied`: mounts `session start` refuses today (not counted in `extra`). Omitted for a missing, private-clone or unlabelled container, and while the registry cannot be read |
+| `loom.codex_session.login` | `1` | `account`, `container` | per session-managed Codex account whose login was read this pass (#15292): `1` signed in, `0` signed out. Read by the bounded in-container `codex app-server` probe (never host-direct), only for a running seat; **absent** while unknown (container not running, docker down, no reply, timeout) rather than `0` |
+| `loom.codex_session.hold_age` | `s` | `account`, `container`, `reason` ∈ `operator_stop`, `other` | age of the operator hold (`.session-hold.json`, newest decodable one across the seat's profiles), never negative (#15292). `reason` is the record's reason bounded to a closed set; the free text is never exported. Absent when the seat is not held or the record cannot be decoded (`record{kind=hold}` still reads `1` for a malformed sidecar). Local files only, so it survives a docker outage |
+| `loom.codex_session.hook_trust` | `1` | `account`, `container`, `state` ∈ `recorded`, `sealed`, `missing` | the profile's hook trust as `accounts session status` shows it (#14105, #15292): `1` for the current verdict, `0` for the others. Emitted only when every profile of the seat could be read and they agree; an unreadable profile or a disagreement between roots emits nothing rather than `missing` |
+| `loom.codex_session.quota_used` | `1` | `account`, `container`, `kind` ∈ `5h`, `7d` | latest rate-limit utilisation as a 0–1 fraction (#15292): the live in-container reading when the probe measured one, else the newest local rollout snapshot across the seat's profiles. Windows are filed by duration, a window whose reset has passed is dropped, and a measured `0` is emitted as `0` |
+| `loom.codex_session.quota_resets_at` | `s` | `account`, `container`, `kind` ∈ `5h`, `7d` | Unix time at which that window resets; absent when the window reports none (an unused window has not started) |
+| `loom.codex_session.quota_observed_at` | `s` | `account`, `container` | Unix time of the reading behind the `quota_*` points: the probe time for a live reading, the rollout line's time for a local snapshot |
+| `loom.codex_session.reset_credits` | `{reset}` | `account`, `container` | unused limit resets (`rateLimitResetCredits.availableCount`) from the live reading; absent for an older Codex CLI or when no live reading was possible. Credit details are never read into a label |
 
 The dwell names (#8856) are `loom.queue.oldest_wait`, `loom.queue.starved`,
 `loom.queue.starved.by_reason` and `loom.queue.dispatch_wait[.samples]`. They
@@ -2498,7 +2518,7 @@ GitHub rate limit (Issue #10022):
 | `loom.discovery.recheck` | delta `Sum` | `{request}`; labels `reason`, `outcome` | rechecks the daemon asked the state mirror for (`POST /v1/mirror/recheck`) after a claim refusal showed a stale draw (#12318); `reason` is the refusal token (`claimed`, `label_flip_failed`), `outcome` ∈ `sent`, `error` (a failed POST, `429` or `403`; never retried), `skipped` (over the local 60/h bucket) |
 | `loom.forge.mirror.wake_latency` | delta `Sum` | `s`; label `repo` | summed seconds from a change at the mirror (its `at`) to the pull that saw it; divided by `loom.forge.mirror.changes` it is the mean wake latency |
 | `loom.stage_entry.lookups` | delta `Sum` | `{lookup}`; labels `repo`, `kind` | stage-entry times the step engine's provider (`step_dispatch::stage_entry`, #11897) looked up since the previous point, flushed on the same tick, by the source that answered in `kind`: `mirror` (the state mirror's per-item `labels_at`), `events` (the issue's `labeled` events, from the provider's persisted cache or one budgeted read), `created` (the item's creation time) or `none` (not even that). The `mirror` + `events` share is the stage-age coverage the step-dispatch design gates on (#11894). Nothing consumes the provider yet, so the series is empty until the item draw lands. Past 1024 series a new one is counted under `repo` = `overflow`. Accumulated only while an ops sink is registered |
-| `loom.feed.completions` | delta `Sum` | `{completion}`; labels `kind`, `outcome` | public-feed `completion` envelopes the safehouse narration sink built since the previous point (#12152), flushed on the same tick, by the trigger that found the merge in `kind`: `sweep_exit` (an issue sweep's `SweepExited`), `step` (a Champion merge step's `step.item.{N}.ended`) or `reconcile` (the periodic merge-reconciliation pass); `outcome` is `narrated`, or `seeded` for a fresh host's first pass, which records merges without posting them (#4649). The direct measure of merged work reaching the feed: a step emits no `sweep.completed`, so since step dispatch (#12009) that record no longer tracks it. Accumulated only while an ops sink is registered |
+| `loom.feed.completions` | delta `Sum` | `{completion}`; labels `kind`, `outcome` | Merged-PR reports acknowledged since the previous point. The `kind` is `sweep_exit` (the historical label for a sweep, now recorded at its numbered merge phase), `step` (a Champion merge verdict) or `reconcile` (captain catch-up). The reporter records `outcome=narrated`. The direct measure of merged work reaching the feed: a step emits no `sweep.completed`, so since step dispatch (#12009) that record no longer tracks it. Accumulated only while an ops sink is registered |
 | `loom.feed.reconcile_passes` | delta `Sum` | `{pass}`; label `outcome` | merge-reconciliation ticks of the narration sink that had a workspace to visit (#12152), by `outcome`: `ran` (the forge answered; the workspace's watermark advanced), `deferred` (the rate-limit breaker was cooling; the tick is not spent and the workspace catches up from its watermark later) or `failed` (the forge read failed; the watermark holds). Accumulated only while an ops sink is registered |
 | `loom.ci.queue_depth` | `Gauge` | `{run}`; label `repo` | workflow runs with `status == "queued"` in the page the CI telemetry poll fetched for the repo (#11993), one point per repo per cycle (`0` when none), counted from the run listing `poll_repo` already reads, so it adds no GitHub request. A run older than the rescan floor that is still queued is not counted. Fleet CI contention at that instant, beside the per-run `loom.ci.queued_ms` on `ci.run` / `ci.job` |
 | `loom.fleet_dispatch.fallback_ticks` | `DeltaCounter` | `{tick}`; label `reason` | step ticks a fleet-dispatch worker ran in fallback (Issue #12450), `reason` the failed call's token that entered it (`transport`, `status_5xx`, `status_4xx`, `malformed`). Fallback ticks draw one round with no free `claim_lost`. Host-level: the resource names the host |
@@ -3600,6 +3620,7 @@ scope by operator ruling: no hook and no CLI command emits this.
 | `checkout_role` | string? | `daemon-root` (`loom.checkout.role`) on the sample of the daemon's own root checkout (#12727); absent on a registered workspace |
 | `dirty_tracked_files` | int? | `loom.checkout.dirty_tracked_files`: tracked files with a staged or unstaged change; daemon-root samples only |
 | `dirty_identical_to_remote` | bool? | `loom.checkout.dirty_identical_to_remote`: every dirty tracked file is byte-identical to `remote_tip`, so a fast-forward could pass through it; absent when nothing is dirty or the tip is not in the object store |
+| `checkout_state` | string? | `loom.checkout.state` (#15301): the state the fast-forward pass left the checkout in (`current`, `fast-forwarded`, `behind`, `dirty`, `diverged`, `fetch-failed`, `low-disk`, `wrong-branch`, `would-overwrite`, …), so a declined checkout is queryable the pass it stalls. Absent on a `budget`-deferred checkout and on the daemon-root sample |
 
 The remote fields (all optional, additive, no `schema_version` bump) also ride
 on `role_tick.outcome`'s `prompt`:
@@ -4267,6 +4288,10 @@ then did: `champion.run` on `loom.champion.sweep_id` = the span's
 
 
 ### `completion.narrated` — a public-feed completion the narration sink built
+
+**No longer emitted (#13946).** The narration sink and its `completion` envelope were
+retired, so nothing builds this record any more; the kind and its OTLP mapping stay
+defined until a follow-up removes them, and historical records stay queryable.
 
 One OTLP log (INFO) per `completion` envelope the safehouse narration sink builds
 (Issue #13287), from `build_and_narrate_completion`, the core all three trigger

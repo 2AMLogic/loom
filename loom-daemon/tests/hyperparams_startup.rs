@@ -9,8 +9,7 @@
 //! `hyperparams_tests.rs`.
 
 use loom_daemon::hyperparams::{
-    digest_global, env_vector, lease_ttl_minutes_from_layer, resolved_global, startup_init, Source,
-    HYPERPARAMS_ENV,
+    digest_global, lease_ttl_minutes_from_layer, resolved_global, startup_init, Source,
 };
 use loom_daemon::telemetry::trace::{provenance, TraceAttributes};
 use serial_test::serial;
@@ -21,16 +20,25 @@ fn write_config(dir: &std::path::Path, body: &str) {
     std::fs::write(loom_dir.join("config.json"), body).unwrap();
 }
 
+// NOTE: this binary has exactly ONE startup_init success-path test. The
+// startup globals (RESOLVED / ROOT) are OnceLocks — first call
+// wins, later calls silently keep them — so every assertion that depends on
+// them must live in that one test, in a deliberate order. A second
+// "capture" test would race this one alphabetically and assert against the
+// first test's root and vector.
+//
+// Hot-apply (#9768) is asserted here for the same reason: the lease TTL
+// re-resolves from the layer anchored at the captured root, so a
+// committed-block edit lands WITHOUT a daemon restart.
 #[test]
 #[serial]
-fn startup_init_captures_vector_digest_and_provenance() {
+fn startup_capture_and_lease_ttl_hot_apply_without_a_restart() {
     let tmp = tempfile::tempdir().unwrap();
     write_config(tmp.path(), r#"{"hyperparameters": {"lifecycle": {"leaseTtlMinutes": 42}}}"#);
     startup_init(tmp.path()).unwrap();
     let resolved = resolved_global().expect("startup_init captured the vector");
     assert_eq!(resolved.params.lifecycle.lease_ttl_minutes, 42.0);
     assert_eq!(resolved.sources["lifecycle.leaseTtlMinutes"], Source::Config);
-    // And the provenance stamper records the captured digest.
     let mut attributes = TraceAttributes::new();
     provenance::stamp(&mut attributes);
     let digest = resolved.digest();
@@ -41,26 +49,6 @@ fn startup_init_captures_vector_digest_and_provenance() {
         Some(digest.as_str())
     );
     assert_eq!(digest_global(), Some(digest.as_str()));
-}
-
-// NOTE: this binary has exactly ONE startup_init success-path test. The
-// startup globals (RESOLVED / DIGEST / ROOT) are OnceLocks — first call
-// wins, later calls silently keep them — so every assertion that depends on
-// them must live in that one test, in a deliberate order. A second
-// "capture" test would race this one alphabetically and assert against the
-// first test's root and vector.
-//
-// Hot-apply (#9768) is asserted here for the same reason: the lease TTL
-// re-resolves from the layer anchored at the captured root, so a
-// committed-block edit lands WITHOUT a daemon restart — unlike the digest,
-// which intentionally stays pinned to the startup vector (a run's
-// provenance is the vector it STARTED under).
-#[test]
-#[serial]
-fn lease_ttl_hot_applies_from_a_config_edit_without_a_restart() {
-    let tmp = tempfile::tempdir().unwrap();
-    write_config(tmp.path(), r#"{"hyperparameters": {"lifecycle": {"leaseTtlMinutes": 42}}}"#);
-    startup_init(tmp.path()).unwrap();
     assert_eq!(lease_ttl_minutes_from_layer(), Some(42.0));
     assert_eq!(loom_daemon::claim_reconciliation::resolve_lease_ttl_minutes(), 42.0);
 
@@ -107,18 +95,6 @@ fn hyperparams_validate_gate_mirrors_startup() {
     let problem = args.run().unwrap_err().to_string();
     assert!(problem.contains("dispatch.maxConcurrent"), "{problem}");
     assert!(problem.contains("dispatch.bogus"), "{problem}");
-}
-
-#[test]
-#[serial]
-fn startup_init_fails_loudly_on_an_unparseable_env_vector() {
-    std::env::set_var(HYPERPARAMS_ENV, "not json");
-    let tmp = tempfile::tempdir().unwrap();
-    let result = startup_init(tmp.path());
-    let problem = env_vector().err().unwrap();
-    std::env::remove_var(HYPERPARAMS_ENV);
-    let error = result.unwrap_err().to_string();
-    assert!(error.contains(&problem), "{error}");
 }
 
 // Fail this test binary on any spawn of the real `gh` (#10225, extends #10138).

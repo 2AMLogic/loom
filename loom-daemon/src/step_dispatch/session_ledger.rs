@@ -331,18 +331,13 @@ pub fn load(root: &Path) -> Ledger {
         .unwrap_or_default()
 }
 
-/// Write the ledger atomically (temp file, then rename).
+/// Write the ledger atomically ([`crate::fs_util::write_atomic`]).
 ///
 /// # Errors
 /// The filesystem's.
 pub fn save(root: &Path, ledger: &Ledger) -> std::io::Result<()> {
-    let path = path_for(root);
-    if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir)?;
-    }
-    let tmp = path.with_extension(format!("json.tmp{}", std::process::id()));
-    std::fs::write(&tmp, serde_json::to_vec_pretty(ledger).map_err(std::io::Error::other)?)?;
-    std::fs::rename(&tmp, &path)
+    let bytes = serde_json::to_vec_pretty(ledger).map_err(std::io::Error::other)?;
+    crate::fs_util::write_atomic(&path_for(root), &bytes, crate::fs_util::AtomicOpts::default())
 }
 
 /// The Claude session a spawned step runs, noted at spawn and taken at its

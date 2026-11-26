@@ -1,13 +1,11 @@
-//! Rate-limit breaker gate for the sink's forge lookups (Issue #8997 gap c).
+//! Rate-limit breaker gate for the merged-PR report's forge lookups (Issue #8997 gap c).
 //!
-//! Every safehouse `gh` lookup — dispatch-title enrichment, merge
-//! verification, repo identity, and the periodic merge reconciliation —
-//! consults the shared breaker at the lookup boundary ([`suppressed`]) and
-//! reports a genuine rate-limit failure to it ([`failed`]). While cooling the
-//! sink makes **zero** forge calls and keeps narrating with the data it has
-//! (an un-titled dispatch line, an `ack` without its completion); a
-//! completion it could not verify is *not* recorded as narrated, so the
-//! reconciliation pass discovers it once the breaker releases.
+//! Every safehouse `gh` lookup — merge verification and the captain's
+//! catch-up scan — consults the shared breaker at the lookup boundary
+//! ([`suppressed`]) and reports a genuine rate-limit failure to it
+//! ([`failed`]). While cooling the reporter makes **zero** forge calls; a merge
+//! it could not verify is not reported then, so the captain's catch-up scan
+//! discovers it once the breaker releases (inside its bounded window).
 //!
 //! Reporting is separate from the deduplicated WARN logging: a repeat
 //! failure that only logs at debug is still classified. The report uses
@@ -67,5 +65,5 @@ pub(super) fn failed(call: &str, root: &Path, gh_bin: &str, stderr: &[u8]) {
             );
         }
     }
-    super::log_gh_failure_once(call, root, &super::stderr_head(stderr));
+    super::merge_source::log_gh_failure_once(call, root, &super::merge_source::stderr_head(stderr));
 }

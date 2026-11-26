@@ -454,6 +454,20 @@ impl<R: ContainerRunner> ClaudeSeatLifecycle<R> {
         })
     }
 
+    /// Every Claude pool account with its seat state: which are registered
+    /// seats, and the runtime and image each seat's container runs (#14371
+    /// AC8). Unregistered accounts are listed too (`seat_registered: false`),
+    /// since they dispatch on the host or per-sweep.
+    ///
+    /// # Errors
+    /// The Claude token pool cannot be read, or Docker cannot be asked.
+    pub fn list(&self) -> Result<Vec<SeatStatus>> {
+        account_inventory(&self.workspace, AccountProvider::Claude)?
+            .iter()
+            .map(|account| self.status(&account.id.name))
+            .collect()
+    }
+
     /// Tear the container down cleanly (`docker stop` then `rm`). Refuses an
     /// in-flight `docker exec` unless `force` — the restart-safety contract
     /// never SIGKILLs active work. The seat stays registered and its state
