@@ -697,12 +697,8 @@ impl StepDriver {
                 .iter()
                 .filter(|c| c.step == Step::ChampionMerge)
                 .count();
-            let queue_mode = matches!(
-                crate::forge_merge_queue::mode::resolve_merge_mode(root),
-                Ok(m) if m.mode == crate::forge_merge_queue::mode::MergeMode::Queue
-            );
             claims.merge_concurrency = effective_merge_limit(
-                queue_mode,
+                gathered.queue_mode,
                 claims.merge_concurrency,
                 eligible,
                 crate::role_runner::demand::read_demand_config(root).lane_k,

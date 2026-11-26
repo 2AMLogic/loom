@@ -533,37 +533,44 @@ work reaching the public feed", read `loom.feed.completions` (#12152), whose
 
 #### Per-model token usage (Issue #6384)
 
-`tokens_by_model` is an **additive, optional** array — omitted entirely
-(never an empty array, never a fabricated `0`) when no attributable
-transcript was found for this sweep. Each row is a
-`(model, speed, service_tier)` bucket with raw, **not cost-weighted** input
-(`input` = `input_tokens` + `cache_read_input_tokens` +
-`cache_creation_input_tokens`; `cache_read`/`cache_write_5m`/
-`cache_write_1h` further split the cache portion) and output token counts —
-the same shape and same underlying aggregation
-(`crate::transcript_tokens::sum_sweep_tokens_by_model`) the safehouse
-`completion-v1` envelope's own `tokens_by_model` field already carries, so
-the two paths report identical per-sweep token data. This closes the gap
-where a dashboard-sourced backfill (reconstructing completions from
-`sweep.completed` + GitHub when the safehouse→egress path is down) had no
-token data to fall back on.
+Query `sweep.completed` or its paired [`sweep.outcome`](#sweepoutcome) for a
+sweep's per-model token counts. Both records carry the same optional
+`tokens_by_model` array. If the runtime's usage source yields no rows
+attributable to the sweep, both records omit the field. For example, an
+OpenCode sweep reads its session database, while a Claude sweep reads its
+transcripts.
 
-Populated on the backfill/local-journal export path
-(`observability::backfill::synthesize_completed`, copied verbatim from the
-paired `sweep.outcome` record's own `tokens_by_model` — see below) **and**, since
-Issue #9440, on the live event-bus path too: `collector::terminal_records` stays
-a pure, I/O-free mapping and a post-pass (`collector::attach_outcome_usage`)
-performs one usage read per terminal event off the reactor thread, applying it to
-both records of the `sweep.completed` / `sweep.outcome` pair so the two can never
-disagree. Before #9440 that path hard-coded both this field and
-`sweep.outcome`'s `tokens_in`/`tokens_out` absent — see
-"`tokens_status`" below for the measurement hole that produced.
+Each row groups raw token counts by `(model, speed, service_tier)`. It
+records `input`, `cache_read`, `cache_write_5m`, `cache_write_1h` and
+`output` separately.
+
+On the live event bus, `collector::attach_outcome_usage` reads usage once per
+terminal event and copies the optional breakdown to both records (#9440).
+Before #9440 the live collector omitted the breakdown and the outcome's
+`tokens_in` and `tokens_out`. On journal backfill,
+`observability::backfill::synthesize_completed` copies `tokens_by_model`
+from `sweep.outcome` into `sweep.completed`, preserving its absence as well.
+Adding the field to `sweep.completed` in #6384 let dashboards recover token
+counts from telemetry when the Safehouse egress path was down.
 
 This field is purely additive — a `schema_version` bump is unnecessary (see
 "`schema_version` semantics" above). Like `pr_number`/`tokens_in`/
 `tokens_out`, it is workload detail about a private repo and is not added to
 the public (unauthenticated, private-repo) redaction allowlist
 (`loom-ui:src/redaction.ts`) by this change.
+
+**Historical Safehouse records.** Until #13946 retired the narration sink,
+a merged PR also reached the fleet feed as a `completion-v1` envelope.
+Its metadata could include `runtime`, `provider` and `profile`. Its optional
+`tokens_by_model` field used the same row format as telemetry. Safehouse ran a
+separate lookup, so an older envelope could omit the breakdown even when
+telemetry recorded usage. This happened when the lookup was disabled with
+`LOOM_SAFEHOUSE_TRANSCRIPT_TOKENS=0` or timed out. A merge now reaches the
+room only as a `chat` line,
+`merged ✓ owner/repo#N · <title> · <url>`, which names the merged PR by
+repository, number, optional title (dropped when the PR has none) and URL
+and carries no token usage
+([`safehouse.md` → What gets reported](safehouse.md#what-gets-reported)).
 
 ### `sweep.outcome`
 
@@ -674,25 +681,21 @@ are omitted when empty/unset.
 captured without a schema bump. `disposition` (Issue #9441) is the one recent
 addition that is **never** omitted — see its own section below.
 
-`tokens_by_model` (Issue #6384) is the same per-model breakdown documented
-under `sweep.completed` above — the same aggregation
-(`crate::transcript_tokens::sum_sweep_tokens_by_model`), computed here with
-the sweep's real start/completion instant
-(`sweep_registry::outcome_journal::append_outcome_telemetry_journal`), and
-the source `sweep.completed`'s own copy is taken from.
+The outcome journal computes `tokens_by_model` from the runtime's usage
+source over the sweep's start and completion times. See
+[Per-model token usage](#per-model-token-usage-issue-6384) for the row format
+and how the paired records receive the same breakdown.
 
 #### Work-output fields (Issue #5357)
 
-Four **independently optional** fields, each omitted (never coerced to `0`)
-when unavailable — a sweep with no PR carries no LOC pair; a sweep whose
-Claude Code transcripts were pruned/rotated before capture carries no token
-pair. The two pairs are unrelated to each other, so a record can carry
-either, both, or neither.
+The four fields are **independently optional**. A sweep without a PR omits
+the line counts. A Claude sweep whose transcripts were pruned before capture
+omits the token counts. A record can carry either pair, both or neither.
 
 | Field | Source | Notes |
 |---|---|---|
-| `tokens_in` | Sum of `input_tokens` + `cache_read_input_tokens` + `cache_creation_input_tokens` across the sweep's own Claude Code transcripts (parent session + every subagent). | **Raw**, not cost-weighted — this record already carries `model`, so a consumer applies whatever per-model pricing table it wants without a backfill when that table changes. |
-| `tokens_out` | Sum of `output_tokens` across the same transcripts. | Kept separate from `tokens_in` — input and output tokens price very differently per model, so a cost-weighted total needs both counts plus `model`, not one pre-mixed number. |
+| `tokens_in` | Sum of `input`, `cache_read`, `cache_write_5m` and `cache_write_1h` across the sweep's per-model usage rows. | **Raw**, not cost-weighted — this record already carries `model`, so a consumer applies whatever per-model pricing table it wants without a backfill when that table changes. |
+| `tokens_out` | Sum of `output` across the same rows. | Kept separate from `tokens_in` — input and output tokens price very differently per model, so a cost-weighted total needs both counts plus `model`, not one pre-mixed number. |
 | `lines_added` | `git diff --numstat` between the worktree's `HEAD` and its mainline merge base, summed. | **Local only — never a forge API call.** Sampled opportunistically while the worktree is still live (so a `--merge`-mode sweep's own synchronous post-merge worktree cleanup, which can complete before the daemon ever observes the sweep's process exit, does not erase it), with a live-probe fallback at outcome-write time for a sweep that died before any sampling tick. |
 | `lines_deleted` | Same `git diff --numstat`, deletions side. | Kept as a separate field from `lines_added` (not a net) — a large refactor that adds and deletes a similar line count is not "no work done". |
 
@@ -819,7 +822,7 @@ Two deliberate non-classifications:
   very often burned tokens first. Calling that a zero would re-introduce the
   undercount in the one shape where the spend is real and interesting.
 - **A read is never unbounded.** Every reader behind
-  `usage_source::sweep_tokens_by_model` is window-filtered, because a per-issue
+  `usage_source::sweep_tokens_by_window` is window-filtered, because a per-issue
   transcript directory accumulates *every* dispatch of that issue. A sweep whose
   registry entry is already gone reconstructs its window from the measured
   `total_duration_sec` (the terminal transition is happening now, so the sweep
@@ -843,7 +846,7 @@ by `sweep_id`, or could not be answered at all.
 |---|---|---|---|
 | `failure_class` | string | The paired `sweep_outcomes::OutcomeRecord`'s own classification for the same terminal transition: `death_class` when the pre-flight classifier derived one (`preflight-token-selection-failed`, `preflight-no-cli-start`, …), otherwise `crash_classification` (`account-exhausted:model-credits-exhausted`, `no-usable-account`, …). | Copied at emit time in the same function that writes the sibling record — never a post-hoc joiner. Lets a consumer separate real build failures from sub-60s spawn deaths from this journal alone. The sibling record still carries both classifier fields separately; this is the single most canonical label, not a replacement. When nothing classified the transition it is omitted on a success, and on a reported `failure` it is `unclassified:no-class` (#11854) — a `failure` never goes out without one. |
 | `no_phase_cause` | object `{ "exit": string, "last_step": string, "reason": string }` | Issue #10642. Present **only** when `failure_class` is the synthesized `unclassified:no-phase-signal`. `exit` is the orchestrator's exit code as a decimal string, or `none_observed`; `last_step` is the last checkpoint phase (`curator`…`merge`, else `other`), or — with none — `cli_started` / `pre_cli` from this dispatch's log, or `none` when the log could not be read; `reason` is one of `killed_or_exit_unobserved`, `clean_exit_without_checkpoint`, `nonzero_exit_without_checkpoint`, `died_before_cli_start`, `log_unreadable`. | Closed vocabularies, so each field can be grouped on. Also emitted as `loom.no_phase.exit` / `loom.no_phase.last_step` / `loom.no_phase.reason` on the `loom.sweep` span and the `sweep.outcome` OTLP log record. Additive; no `schema_version` bump. The same class is counted toward the PR-less retry hold from this journal (see `daemon-reference.md`, "Phaseless deaths have a durable floor"). |
-| `models_used` | string array | The distinct `model` ids in `tokens_by_model`, sorted and deduped. | The top-level "did this sweep run more than one model?" signal. Since #9465 `model` names the **dominant** model that actually ran (the largest input+output row in `tokens_by_model`, dispatched model as fallback), so a sweep that escalated to `claude-opus-5` through the Doctor ladder reports `model: "claude-opus-5"` with `config["arm"]` still carrying the dispatch-time arm — `models_used` is what shows that the *earlier* phases ran something else. Inherits `tokens_by_model`'s contract exactly: omitted (never `[]`) when no attributable transcript was found. |
+| `models_used` | string array | The distinct `model` ids in `tokens_by_model`, sorted and deduped. | The top-level "did this sweep run more than one model?" signal. Since #9465 `model` names the **dominant** model that actually ran (the largest input+output row in `tokens_by_model`, dispatched model as fallback), so a sweep that escalated to `claude-opus-5` through the Doctor ladder reports `model: "claude-opus-5"` with `config["arm"]` still carrying the dispatch-time arm — `models_used` is what shows that the *earlier* phases ran something else. Inherits `tokens_by_model`'s contract exactly: omitted when the runtime's usage source yields no attributable rows. |
 | `doctor_cycles` | integer | **The forge label timeline** of the PR named by this record's own `pr_number` (Issue #8222 — re-sourced; the #8056 shipment counted sampled checkpoint markers instead): one cycle per `loom:changes-requested` arrival that a later `loom:review-requested` arrival closed the loop on. | A rejection nobody handed back (the sweep hit the Doctor-cycle cap, or died) is **not** a cycle. Because the label events are durable forge state rather than a ~30s sample, a cycle that opens and closes between two reaper ticks is still counted: this is a certified count, **not** the lower-bound proxy it was under #8056. `0` means "the timeline was read and no Doctor cycle completed"; an **absent** key means the timeline was not read at all. |
 | `judge_verdicts` | array of `{ "attempt": int, "verdict": string }` | The same PR's label timeline: `loom:pr` ⇒ `"pass"`, `loom:changes-requested` ⇒ `"fail"`, in lifecycle order. | What makes **first-pass judge approval rate** computable from this journal alone: `judge_verdicts[0].verdict == "pass"` over the records that carry the field. `attempt` is **1-based per PR**, counting `loom:review-requested` arrivals — attempt 1 is the PR as first opened, attempt 2 the pass after the first Doctor hand-back. A repeat of the same verdict inside one attempt (a label removed and re-applied) is one entry, not two. `[]` means "the timeline was read and carried no verdict" (a sweep that died before Judge); an **absent** key means the timeline was not read. |
 
