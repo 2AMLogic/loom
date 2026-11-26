@@ -89,12 +89,6 @@ ALLOWED_HOST_SUFFIXES=(
   github.com githubusercontent.com
   anthropic.com claude.com
   aistudio.google.com
-  # `storage.googleapis.com` is Google's public object-storage host, which
-  # serves the Antigravity CLI (`agy`) release archive and manifest that
-  # `defaults/docs/runtime-adapters.md` records as the version pin (#15059).
-  # Same category as aistudio.google.com — a public vendor distribution host,
-  # not an operator-owned deployment.
-  storage.googleapis.com
   # `kimi.com` / `moonshot.ai` are Moonshot AI's public endpoints, added with
   # the Kimi Code CLI native harness (#8561): the former hosts the CLI docs
   # `defaults/docs/runtime-model-trials.md` cites, the latter the platform API
@@ -116,6 +110,16 @@ ALLOWED_HOST_SUFFIXES=(
   # Package/source origins the fleet bootstrap plan fetches from (#7814).
   tailscale.com
   sf.net
+)
+
+# Hosts allowed by EXACT match only — no subdomains. `storage.googleapis.com`
+# is Google's public object-storage host, which serves the Antigravity CLI
+# (`agy`) release archive and manifest that `defaults/docs/runtime-adapters.md`
+# records as the version pin (#15059). Bucket-style hostnames under it
+# (`<bucket>.storage.googleapis.com`) can identify an operator's deployment, so
+# it must NOT be a suffix entry.
+ALLOWED_HOSTS_EXACT=(
+  storage.googleapis.com
 )
 
 # Dotted identifiers that are NOT hostnames: config-key paths whose last
@@ -166,6 +170,9 @@ host_allowed() {
   host="$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')"
   for s in "${ALLOWED_HOST_SUFFIXES[@]}"; do
     [[ "$host" == "$s" || "$host" == *".$s" ]] && return 0
+  done
+  for s in "${ALLOWED_HOSTS_EXACT[@]}"; do
+    [[ "$host" == "$s" ]] && return 0
   done
   return 1
 }
@@ -357,6 +364,22 @@ EOF
   else
     echo "self-test: FAIL — tracked violation was not detected inside a work tree. Got:" >&2
     echo "$out" >&2
+    fails=1
+  fi
+
+  # Exact-only host (#15059): the bare Google object-storage host passes, a
+  # bucket-specific hostname under it is still rejected.
+  mkdir -p "$tmp/gcs-ok/docs" "$tmp/gcs-bad/docs"
+  printf 'Archive: https://storage.googleapis.com/vendor-public/cli.tar.gz\n' > "$tmp/gcs-ok/docs/a.md"
+  printf 'Archive: https://sample-tenant-bucket.storage.googleapis.com/cli.tar.gz\n' > "$tmp/gcs-bad/docs/a.md"
+  gcs_bad_out="$(scan_tree "$tmp/gcs-bad" || true)"
+  if scan_tree "$tmp/gcs-ok" >/dev/null \
+     && ! scan_tree "$tmp/gcs-bad" >/dev/null \
+     && grep -q 'sample-tenant-bucket.storage.googleapis.com' <<<"$gcs_bad_out"; then
+    echo "self-test: OK — storage.googleapis.com passes while a bucket-specific subdomain fails"
+  else
+    echo "self-test: FAIL — storage.googleapis.com exact-match did not discriminate. Got:" >&2
+    echo "$gcs_bad_out" >&2
     fails=1
   fi
 

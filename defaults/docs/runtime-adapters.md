@@ -287,7 +287,8 @@ the one cap.
   and the connection. With the variable the log reads `Auto-update disabled
   via environment variable AGY_CLI_DISABLE_AUTO_UPDATE` and none of them
   appears. Absent files alone prove nothing: the same control re-run on
-  that HOME inside the 15-minute debounce also leaves none, logging
+  that HOME inside the 15-minute debounce makes no new file changes (the
+  first run's files stay unchanged), logging
   `Last check was less than 15 minutes ago, skipping update (fast path)`.
   **The adapter does not set it** — the variable reaches the CLI only by
   inheritance from the worker environment, so a launch from a clean
