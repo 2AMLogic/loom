@@ -22,7 +22,7 @@ impl FakeDocker {
             .unwrap_or_default();
         let path = std::env::join_paths(std::iter::once(bin).chain(rest)).unwrap();
         Self {
-            _path: EnvGuard::set("PATH", path),
+            _path: EnvGuard::set("PATH", path).and_set(crate::docker_bin::DOCKER_BIN_ENV, None),
             _dir: dir,
         }
     }
@@ -36,7 +36,8 @@ fn capture(argv: &[&str], timeout: Duration) -> Result<ExecOutput> {
 #[serial]
 fn a_missing_docker_cli_is_unavailable_not_a_failed_exec() {
     let empty = tempfile::tempdir().unwrap();
-    let _path = EnvGuard::set("PATH", empty.path().to_str().unwrap());
+    let missing = empty.path().join("docker");
+    let _docker = EnvGuard::set(crate::docker_bin::DOCKER_BIN_ENV, &missing);
     let output = capture(&["codex", "login", "status"], PROBE_TIMEOUT).unwrap();
     assert_eq!(
         output,
@@ -45,7 +46,9 @@ fn a_missing_docker_cli_is_unavailable_not_a_failed_exec() {
             unavailable: true,
             timed_out: false,
             exit_code: None,
-            output: "docker CLI is not installed or not on PATH".into(),
+            output: format!(
+                "docker CLI could not start: LOOM_DOCKER_BIN={missing:?} does not name an executable file"
+            ),
         }
     );
 }

@@ -26,10 +26,15 @@ struct Fixture {
     prior: Vec<(&'static str, Option<std::ffi::OsString>)>,
     /// Crate-wide `LOOM_CODEX_PROFILE_ROOT` lock (#9964); released after `Drop`.
     _profile_root_lock: crate::tokens_pool::profile_root_env::ProfileRootLock,
+    /// Crate-wide `LOOM_CODEX_HOME` lock (#15174); released after `Drop` and
+    /// after the profile-root lock above (acquired before it — see
+    /// `codex_home_env`'s documented lock order).
+    _codex_home_lock: crate::tokens_pool::codex_home_env::CodexHomeLock,
 }
 
 impl Fixture {
     fn new() -> Self {
+        let codex_home_lock = crate::tokens_pool::codex_home_env::lock();
         let profile_root_lock = crate::tokens_pool::profile_root_env::lock();
         let repo = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
         let root = tempfile::tempdir().unwrap();
@@ -92,6 +97,7 @@ impl Fixture {
             _shared: shared,
             prior,
             _profile_root_lock: profile_root_lock,
+            _codex_home_lock: codex_home_lock,
         };
         guard_ready(&fixture.profile("ready"), None);
         // Installed, but its only trust was taken somewhere Codex won't look.
@@ -128,33 +134,25 @@ impl Drop for Fixture {
 }
 
 #[test]
-fn only_the_merging_roles_are_guarded() {
-    for role in ["champion", "judge"] {
+fn mutable_and_merging_roles_are_guarded() {
+    for role in ["builder", "doctor", "sweep-lifecycle", "champion", "judge"] {
         assert!(guarded(role), "{role}");
     }
-    for role in [
-        "curator",
-        "hermit",
-        "guide",
-        "auditor",
-        "architect",
-        "builder",
-        "doctor",
-    ] {
+    for role in ["curator", "hermit", "guide", "auditor", "architect"] {
         assert!(!guarded(role), "{role}");
     }
 }
 
 #[test]
 #[serial_test::serial]
-fn every_shared_profile_must_be_ready_and_private_ones_are_left_to_the_container() {
+fn shared_profiles_are_checked_individually_and_private_ones_are_left_to_the_container() {
     let f = Fixture::new();
     let mut unready = unready_profiles(f.root.path()).unwrap();
     unready.sort();
     assert_eq!(unready, ["missing", "untrusted"], "the private profile is not judged here");
     f.ready_everything();
     assert_eq!(unready_profiles(f.root.path()).unwrap(), Vec::<String>::new());
-    // A profile going stale closes the gate again.
+    // Only the stale profile loses readiness.
     fs::write(f.profile("missing").join("hooks.json"), "{}").unwrap();
     assert_eq!(unready_profiles(f.root.path()).unwrap(), ["missing"]);
     // ...and so does a checkout with no bridge for the entry to run.
@@ -163,28 +161,71 @@ fn every_shared_profile_must_be_ready_and_private_ones_are_left_to_the_container
     assert_eq!(unready_profiles(f.root.path()).unwrap().len(), 3);
 }
 
-/// The #9390 fallback: while any shared seat is unguarded, Codex is
-/// unavailable to Champion and Judge (so the preference walk moves on to the
-/// next tap) and stays available to every read-only role.
 #[test]
 #[serial_test::serial]
-fn codex_is_unavailable_to_merging_roles_until_every_seat_is_guarded() {
+fn guarded_roles_can_use_a_mixed_pool_and_refuse_an_entirely_untrusted_pool() {
     let f = Fixture::new();
+    fs::remove_dir(f.profile("private")).unwrap();
+    for role in ["champion", "judge"] {
+        assert!(f.codex_for(role).is_spawnable(), "{role}");
+    }
+    for role in ["builder", "doctor", "champion", "judge"] {
+        let selected = select(f.root.path(), None, Some(role), |_| true).unwrap();
+        assert_eq!(selected.id.name, "ready", "{role}");
+    }
+    let step = crate::tokens_pool::private_workspace::dispatch::Selection::guarded_shared_step(
+        f.root.path(),
+        "judge",
+        None,
+    )
+    .unwrap();
+    assert_eq!(step.name, "ready");
+    fs::remove_file(f.profile("ready").join("hooks.json")).unwrap();
     for role in ["champion", "judge"] {
         match f.codex_for(role) {
             Availability::Exhausted { source, detail, .. } => {
                 assert_eq!(source, CredentialSource::CodexAccounts);
-                assert!(detail.contains("missing") && detail.contains("untrusted"), "{detail}");
-                assert!(detail.contains("#9390"), "{detail}");
+                for name in ["missing", "untrusted", "ready"] {
+                    assert!(detail.contains(name), "{detail}");
+                }
             }
             other => panic!("{role}: expected Exhausted, got {other:?}"),
         }
     }
+    assert!(select(f.root.path(), None, Some("judge"), |_| true).is_err());
+    assert!(select(f.root.path(), None, Some("curator"), |_| true).is_ok());
     assert!(f.codex_for("curator").is_spawnable());
-    f.ready_everything();
-    for role in ["champion", "judge"] {
-        assert!(f.codex_for(role).is_spawnable(), "{role}");
-    }
+}
+
+#[test]
+#[serial_test::serial]
+fn healthy_untrusted_profiles_cannot_substitute_for_a_held_ready_seat() {
+    use crate::tokens_pool::{AccountId, AccountProvider, TerminalClassification};
+    let f = Fixture::new();
+    fs::remove_dir(f.profile("private")).unwrap();
+    crate::tokens_pool::health::record_terminal_at(
+        f.root.path(),
+        &AccountId {
+            provider: AccountProvider::Codex,
+            name: "ready".into(),
+        },
+        TerminalClassification::TokenExpired,
+        "test",
+        0,
+    )
+    .unwrap();
+    assert!(!f.codex_for("judge").is_spawnable());
+    assert!(select(f.root.path(), None, Some("judge"), |_| true).is_err());
+    assert!(select(f.root.path(), None, Some("curator"), |_| true).is_ok());
+}
+
+#[test]
+#[serial_test::serial]
+fn unreadable_inventory_refuses_the_guarded_tap_and_draw() {
+    let f = Fixture::new();
+    fs::write(f.root.path().join(".loom/accounts.json"), "{").unwrap();
+    assert!(!f.codex_for("judge").is_spawnable());
+    assert!(select(f.root.path(), None, Some("judge"), |_| true).is_err());
 }
 
 /// #10102: a session seat whose registration is sealed counts as guarded

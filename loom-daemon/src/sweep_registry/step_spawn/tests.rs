@@ -4,10 +4,10 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use super::capture::{
-    emit_step_capture, launch_rejection_of, parse_outcome_line, read_outcome_line,
-    release_class_fallback, release_class_of_line, sandbox_unavailable_in, step_exit_evidence,
-    step_failure, step_outcome_projection, tick_outcome, StepCapture, StepEnd, StepOutcomeClass,
-    StepOutcomeLine,
+    emit_step_capture, launch_rejection_of, never_started_reason, parse_outcome_line,
+    read_outcome_line, release_class_fallback, release_class_of_line, sandbox_unavailable_in,
+    step_exit_evidence, step_failure, step_outcome_projection, tick_outcome, StepCapture, StepEnd,
+    StepOutcomeClass, StepOutcomeLine,
 };
 use super::lease::{claim_args, claim_verdict, ClaimRun};
 use super::timeout::timed_out;
@@ -634,6 +634,73 @@ fn a_launch_rejection_is_spent_only_on_a_genuine_exit_78_without_a_line() {
         StepEnd::Exited(Some(1)),
     ] {
         assert_eq!(launch_rejection_of(other, None, reported), None);
+    }
+}
+
+/// #14951: each way a Judge step ends without ever reaching the model reaps
+/// with a reason that writes no no-verdict record; a Judge that ran and ended
+/// without a verdict still records (`exited`, `timeout`).
+#[test]
+fn a_judge_step_that_never_started_writes_no_no_verdict_record() {
+    use crate::cli::pr_lease::backstop::reaped_release_fields;
+    use crate::cli::pr_lease::Role;
+    use crate::pr_lease_reap::{REASON_LAUNCH_REJECTED, REASON_PROVIDER_EXHAUSTED, REASON_TIMEOUT};
+    use std::time::Duration;
+
+    let window = Duration::from_secs(120);
+    let fast = Duration::from_secs(1);
+    let slow = Duration::from_secs(900);
+    let exit78 = StepEnd::Exited(Some(78));
+    let line = parse_outcome_line(
+        "LOOM_STEP_OUTCOME role=judge target=7 class=noop reason=already_judged",
+    );
+
+    // The reap reason `end_step` picks, as it picks it.
+    let reason = |end, line, typed, exhausted, ran_for| {
+        never_started_reason(end, line, typed, exhausted, ran_for, window).unwrap_or(match end {
+            StepEnd::TimedOut => REASON_TIMEOUT,
+            StepEnd::Cancelled => "cancelled",
+            StepEnd::Exited(_) => "exited",
+        })
+    };
+    let state = || {
+        Some((
+            true,
+            "3".repeat(40),
+            vec![
+                "loom:review-requested".to_string(),
+                "loom:reviewing".to_string(),
+            ],
+        ))
+    };
+    let recorded = |reason: &str| !reaped_release_fields(Role::Judge, state(), reason).is_empty();
+
+    // A typed rejection (exit 78 + the launcher's report), however long it took.
+    assert_eq!(reason(exit78, None, true, false, slow), REASON_LAUNCH_REJECTED);
+    // Codex hook trust / empty Claude pool: a spawn script's own `exit 78`,
+    // untyped, inside the window (the incident's sub-second exits).
+    assert_eq!(reason(exit78, None, false, false, fast), REASON_LAUNCH_REJECTED);
+    // A provider-exhausted run, whatever its exit.
+    assert_eq!(
+        reason(StepEnd::Exited(Some(1)), None, false, true, slow),
+        REASON_PROVIDER_EXHAUSTED
+    );
+    // Typed rejection wins over exhaustion.
+    assert_eq!(reason(exit78, None, true, true, fast), REASON_LAUNCH_REJECTED);
+    for r in [REASON_LAUNCH_REJECTED, REASON_PROVIDER_EXHAUSTED] {
+        assert!(!recorded(r), "{r} must not stamp a record");
+    }
+
+    // A Judge that ran stays bounded: a late exit 78, an exit 78 that wrote a
+    // line, any other fast exit, a timeout (even a flagged one) and a cancel.
+    assert_eq!(reason(exit78, None, false, false, slow), "exited");
+    assert_eq!(reason(exit78, line.as_ref(), false, false, fast), "exited");
+    assert_eq!(reason(StepEnd::Exited(Some(1)), None, false, false, fast), "exited");
+    assert_eq!(reason(StepEnd::Exited(Some(0)), None, false, false, fast), "exited");
+    assert_eq!(reason(StepEnd::TimedOut, None, false, true, slow), REASON_TIMEOUT);
+    assert_eq!(reason(StepEnd::Cancelled, None, true, true, fast), "cancelled");
+    for r in ["exited", REASON_TIMEOUT] {
+        assert!(recorded(r), "{r} must still stamp a record");
     }
 }
 

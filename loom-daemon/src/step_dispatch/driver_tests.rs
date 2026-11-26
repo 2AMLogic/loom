@@ -640,3 +640,32 @@ fn fleet_role_capacity_uses_all_participating_pool_facts_before_listing() {
         }
     }
 }
+
+/// #15182: a repo the gather deadline skipped was never listed — the tick
+/// reports its listing incomplete, so consumers that read a missing row as
+/// a departure (the disposition tracker, dwell, dispatch eligibility)
+/// preserve its rows instead of emitting false `left_queue` spans. A whole
+/// tick records nothing.
+#[test]
+#[serial_test::serial]
+fn a_deadline_skipped_repo_reports_an_incomplete_listing() {
+    let (report, _, _) = fleet_capacity_tick(FleetCapacityCase {
+        truncate: true,
+        ..FleetCapacityCase::default()
+    });
+    assert_eq!(report.gather.unwrap().repos_skipped, 1);
+    assert_eq!(
+        report.listing_failed,
+        Vec::<usize>::new(),
+        "the skipped repo's listing did not fail; it never ran"
+    );
+    assert_eq!(
+        report.listing_incomplete,
+        vec![1],
+        "the deadline-skipped workspace's listing reads incomplete"
+    );
+    assert_eq!(report.listing_not_whole(), vec![1]);
+
+    let (whole, _, _) = fleet_capacity_tick(FleetCapacityCase::default());
+    assert!(whole.listing_not_whole().is_empty(), "a whole tick holds every backlog");
+}

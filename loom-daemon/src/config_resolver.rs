@@ -446,6 +446,48 @@ pub fn source_of(repo_root: &Path, dotted: &str) -> Option<PathBuf> {
         .find(|path| get_path(&soft_read_json_object(path), dotted).is_some_and(|v| !v.is_null()))
 }
 
+/// The highest-precedence tier file in which the exact key path `segments`
+/// (each one object key, so a profile name containing `.` is not split) is
+/// present and non-null — [`source_of`] without dot-splitting (#15252).
+#[must_use]
+pub fn source_of_segments(repo_root: &Path, segments: &[&str]) -> Option<PathBuf> {
+    tier_paths_by_precedence(repo_root)
+        .into_iter()
+        .find(|path| {
+            let mut cur = soft_read_json_object(path);
+            segments
+                .iter()
+                .all(|segment| match cur.get_mut(*segment).map(Value::take) {
+                    Some(next) => {
+                        cur = next;
+                        true
+                    }
+                    None => false,
+                })
+                && !cur.is_null()
+        })
+}
+
+/// Name the tier a config source file (from [`tier_paths_by_precedence`] /
+/// [`source_of`]) belongs to: `local`, `fleet-repo`, `project`, `committed`, or
+/// `defaults` (the rendered machine tier). Shared by `loom-daemon config get`
+/// and `worker profile-check`.
+#[must_use]
+pub fn tier_name(repo_root: &Path, source: &Path) -> &'static str {
+    let is = |rel: &str| source == repo_root.join(rel);
+    if is(LOCAL_CONFIG_REL) {
+        "local"
+    } else if is(FLEET_REPO_CONFIG_REL) {
+        "fleet-repo"
+    } else if is(PROJECT_CONFIG_REL) {
+        "project"
+    } else if is(LEGACY_CONFIG_REL) {
+        "committed"
+    } else {
+        "defaults"
+    }
+}
+
 /// One leaf config key that two or more tiers set to different values, where at
 /// least one of those tiers is a fleet tier (#11703).
 #[derive(Debug, Clone, PartialEq)]
@@ -1504,6 +1546,77 @@ mod tests {
         let conflicts = tier_conflicts(root.path());
         std::env::remove_var(PRIVATE_DEFAULTS_ENV);
         assert!(conflicts.is_empty());
+    }
+
+    // ===== modelProfileOverrides tiering (#15252) =====
+
+    /// A host-local override beats the machine-defaults and fleet-repo tiers,
+    /// sibling override keys survive the merge, and `null` clears a lower tier.
+    #[test]
+    #[serial(loom_config_env)]
+    fn test_model_profile_overrides_layer_local_over_fleet_over_defaults() {
+        let root = tempdir().unwrap();
+        let defaults = root.path().join("machine-defaults.json");
+        write(
+            &defaults,
+            r#"{"runtimes":{"modelProfileOverrides":{"zai-full":{"model":"glm-5.3","effort":"high"}}}}"#,
+        );
+        write(
+            &root.path().join(FLEET_REPO_CONFIG_REL),
+            r#"{"runtimes":{"modelProfileOverrides":{"zai-full":{"model":"glm-5.4"}}}}"#,
+        );
+        std::env::set_var(PRIVATE_DEFAULTS_ENV, &defaults);
+        let fleet_wins = resolve_effective_config(root.path());
+        write(
+            &root.path().join(LOCAL_CONFIG_REL),
+            r#"{"runtimes":{"modelProfileOverrides":{"zai-full":{"model":"glm-5.5"}}}}"#,
+        );
+        let local_wins = resolve_effective_config(root.path());
+        let source = source_of_segments(
+            root.path(),
+            &["runtimes", "modelProfileOverrides", "zai-full", "model"],
+        );
+        write(
+            &root.path().join(LOCAL_CONFIG_REL),
+            r#"{"runtimes":{"modelProfileOverrides":{"zai-full":{"model":null}}}}"#,
+        );
+        let null_source = source_of_segments(
+            root.path(),
+            &["runtimes", "modelProfileOverrides", "zai-full", "model"],
+        );
+        let cleared = resolve_effective_config(root.path());
+        std::env::remove_var(PRIVATE_DEFAULTS_ENV);
+
+        let at = |v: &Value| v["runtimes"]["modelProfileOverrides"]["zai-full"].clone();
+        assert_eq!(at(&fleet_wins), serde_json::json!({"model": "glm-5.4", "effort": "high"}));
+        assert_eq!(at(&local_wins), serde_json::json!({"model": "glm-5.5", "effort": "high"}));
+        assert_eq!(source, Some(root.path().join(LOCAL_CONFIG_REL)));
+        assert_eq!(tier_name(root.path(), source.as_deref().unwrap()), "local");
+        assert_eq!(at(&cleared), serde_json::json!({"model": null, "effort": "high"}));
+        // An explicit null is not a source; the fleet-repo tier still "sets" it.
+        assert_eq!(null_source, Some(root.path().join(FLEET_REPO_CONFIG_REL)));
+        assert_eq!(tier_name(root.path(), null_source.as_deref().unwrap()), "fleet-repo");
+        assert_eq!(tier_name(root.path(), &defaults), "defaults");
+    }
+
+    #[test]
+    #[serial(loom_config_env)]
+    fn test_source_of_segments_does_not_split_dots_in_a_name() {
+        std::env::set_var(PRIVATE_DEFAULTS_ENV, "");
+        let root = tempdir().unwrap();
+        write(
+            &root.path().join(LEGACY_CONFIG_REL),
+            r#"{"runtimes":{"modelProfileOverrides":{"a.b":{"model":"m"}}}}"#,
+        );
+        let hit =
+            source_of_segments(root.path(), &["runtimes", "modelProfileOverrides", "a.b", "model"]);
+        let miss = source_of_segments(
+            root.path(),
+            &["runtimes", "modelProfileOverrides", "a", "b", "model"],
+        );
+        std::env::remove_var(PRIVATE_DEFAULTS_ENV);
+        assert_eq!(hit, Some(root.path().join(LEGACY_CONFIG_REL)));
+        assert_eq!(miss, None);
     }
 
     // ===== source_of / tier_paths_by_precedence (#4512) =====

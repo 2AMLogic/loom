@@ -17,8 +17,8 @@ export const errorHandler: ErrorHandler = (err, c) => {
       {
         error: "Validation Error",
         message: "Invalid request data",
-        details: err.errors.map((e) => ({
-          path: e.path.join("."),
+        details: err.issues.map((e) => ({
+          path: e.path.map((p) => String(p)).join("."),
           message: e.message,
         })),
       },

@@ -16,10 +16,7 @@ use anyhow::{bail, Result};
 use clap::{Args, Subcommand};
 use serde_json::{json, Value};
 
-use crate::config_resolver::{
-    get_path, resolve_effective_config, source_of, FLEET_REPO_CONFIG_REL, LEGACY_CONFIG_REL,
-    LOCAL_CONFIG_REL, PROJECT_CONFIG_REL,
-};
+use crate::config_resolver::{get_path, resolve_effective_config, source_of};
 
 /// `loom-daemon config` arguments.
 #[derive(Args)]
@@ -75,22 +72,6 @@ pub fn dispatch(args: ConfigArgs) -> Result<()> {
     }
 }
 
-/// Name the tier a source file belongs to.
-fn tier_name(repo_root: &Path, source: &Path) -> &'static str {
-    let is = |rel: &str| source == repo_root.join(rel);
-    if is(LOCAL_CONFIG_REL) {
-        "local"
-    } else if is(FLEET_REPO_CONFIG_REL) {
-        "fleet-repo"
-    } else if is(PROJECT_CONFIG_REL) {
-        "project"
-    } else if is(LEGACY_CONFIG_REL) {
-        "committed"
-    } else {
-        "defaults"
-    }
-}
-
 fn lookup(repo_root: &Path, key: &str) -> Result<Value> {
     if key.is_empty() || key.split('.').any(str::is_empty) {
         bail!("invalid config key {key:?}");
@@ -102,7 +83,7 @@ fn lookup(repo_root: &Path, key: &str) -> Result<Value> {
         "key": key,
         "found": value.is_some(),
         "value": value,
-        "tier": source.as_deref().map(|s| tier_name(repo_root, s)),
+        "tier": source.as_deref().map(|s| crate::config_resolver::tier_name(repo_root, s)),
         "source": source.as_ref().map(|s| s.display().to_string()),
     }))
 }
@@ -110,6 +91,7 @@ fn lookup(repo_root: &Path, key: &str) -> Result<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config_resolver::{FLEET_REPO_CONFIG_REL, LEGACY_CONFIG_REL};
     use serial_test::serial;
     use std::fs;
 

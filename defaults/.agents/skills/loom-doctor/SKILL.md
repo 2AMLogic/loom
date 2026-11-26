@@ -215,6 +215,16 @@ commit object that matches both forge reads and sets tracking only after a
 successful fast-forward. The `+` refreshes only the named remote-tracking ref when its
 cache is stale. The local branch advances by fast-forward after verification.
 
+For a dirty worktree, the refusal is the disposition: the snapshot (when one was
+taken) preserved the WIP as a patch under
+`<worktree-root>/.snapshots/issue-<N>-<UTC-timestamp>.patch`. In the PR comment
+name only the relative `.snapshots/issue-<N>-<UTC-timestamp>.patch` under the
+managed worktree root; keep the absolute path (the helper's `patchPath` output
+carries the workstation username and directory layout) and the patch contents
+local, never pasted into the PR. Then stop, release the PR lease
+and `loom:treating`, and park the PR instead (same shape as the
+detached-`pr-<N>` read-only rule, #14403).
+
 For a fork or a nonstandard head, use the existing `pr-worktree.sh` route and
 check the exact head and clean state there. The named `origin` recovery
 applies only to the matching same-repository issue branch. If the dedicated
@@ -890,7 +900,8 @@ Use this reclaim comment:
 # The lease first: a live peer lease (exit 4) means stand down, label untouched.
 loom-daemon lease pr claim $N --role doctor --watch-pid "${LOOM_AGENT_SESSION_PID:-${CLAUDE_PID:-$PPID}}"; [[ $? =~ ^[02]$ ]] &&
 gh pr edit $N --remove-label "loom:treating" &&
-./.loom/scripts/post-comment.sh $N --pr --body "Reclaiming loom:treating claim: $STANDDOWN_COUNT stand-down passes, no fix progress for ${LOOM_STALE_TREATING_MINUTES:-60}m (bounded by LOOM_MAX_STANDDOWN_STREAK=${LOOM_MAX_STANDDOWN_STREAK:-3}) — breaking the livelock." &&
+./.loom/scripts/post-comment.sh $N --pr --body "Reclaiming loom:treating claim: $STANDDOWN_COUNT stand-down passes, no fix progress for ${LOOM_STALE_TREATING_MINUTES:-60}m (bounded by LOOM_MAX_STANDDOWN_STREAK=${LOOM_MAX_STANDDOWN_STREAK:-3}) — breaking the livelock.
+<!-- loom:reclaim claim=$CLAIMED_AT -->" &&
 gh pr edit $N --add-label "loom:treating"
 CLAIM_HEAD_SHA=$(gh pr view $N --json headRefOid --jq '.headRefOid')
 # Continue to step 3 (Check PR details) and fix normally
@@ -902,11 +913,19 @@ CLAIM_HEAD_SHA=$(gh pr view $N --json headRefOid --jq '.headRefOid')
 # The lease first: a live peer lease (exit 4) means stand down, label untouched.
 loom-daemon lease pr claim $N --role doctor --watch-pid "${LOOM_AGENT_SESSION_PID:-${CLAUDE_PID:-$PPID}}"; [[ $? =~ ^[02]$ ]] &&
 gh pr edit $N --remove-label "loom:treating" &&
-./.loom/scripts/post-comment.sh $N --pr --body "Reclaiming stale loom:treating claim (idle ${IDLE_MINUTES}m > ${LOOM_STALE_TREATING_MINUTES:-60}m, no claimant activity) — the prior process likely died mid-fix." &&
+./.loom/scripts/post-comment.sh $N --pr --body "Reclaiming stale loom:treating claim (idle ${IDLE_MINUTES}m > ${LOOM_STALE_TREATING_MINUTES:-60}m, no claimant activity) — the prior process likely died mid-fix.
+<!-- loom:reclaim claim=$CLAIMED_AT -->" &&
 gh pr edit $N --add-label "loom:treating"
 CLAIM_HEAD_SHA=$(gh pr view $N --json headRefOid --jq '.headRefOid')
 # Continue to step 3 (Check PR details) and fix normally
 ```
+
+**Both reclaim comments end with the `loom:reclaim` claim marker
+keyed to `$CLAIMED_AT` (#15044)**: the forge timeline can lag the label remove + re-add above,
+and `claim-staleness.sh` then matches this marker against the stale verdict it
+computed from the pre-reclaim timestamp — so your replacement claim reads
+`fresh` while you are active and is not reclaimed in turn (and `unknown`, never
+stale, once you go idle).
 
 **Env vars**: `LOOM_STALE_TREATING_MINUTES` (default **60**) — deliberately
 longer than the Judge's `LOOM_STALE_REVIEWING_MINUTES` (45): a Doctor's fix
@@ -1090,8 +1109,9 @@ loom-daemon forge doctor-handback $N --expected-head-sha "$(git rev-parse HEAD)"
 ```
 
 It re-reads labels and head, adds `loom:review-requested` *before* removing
-`loom:changes-requested`/`loom:treating` (never an unlabelled PR), re-reads,
-and withdraws its add if a verdict landed meanwhile. Act on the exit:
+`loom:changes-requested`, `loom:ci-failure` and `loom:treating` (never an
+unlabelled PR), re-reads, and withdraws its add if a verdict landed
+meanwhile. Act on the exit:
 
 | Exit | Line | Action |
 |------|------|--------|
@@ -1560,7 +1580,7 @@ states Doctor exists to clear:
 | Label | Meaning | Doctor's action |
 |-------|---------|-----------------|
 | `loom:merge-conflict` | PR has merge conflicts requiring resolution | **Remove it once you have rebased and the conflicts are resolved** (the PR is no longer conflicting). Apply it if you triage a conflicted PR you cannot immediately fix. |
-| `loom:ci-failure` | PR has failing CI checks | **Remove it once CI is green again** after your fix. Apply it if you are flagging a PR whose CI is red and leaving it for a follow-up. |
+| `loom:ci-failure` | PR has failing CI checks | **Cleared by `forge doctor-handback` on every hand-back, green or not.** Apply it by hand only when flagging a PR whose CI is red and leaving it for a follow-up. |
 
 These are informational flags, not queue gates (the queues are `loom:pr` for conflicts and
 `loom:changes-requested` for feedback). Keep them current: clear each the moment its

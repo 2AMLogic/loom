@@ -103,6 +103,7 @@ mod forge_workflow_permissions;
 mod git_blob_lines;
 mod guard_mcp_tools;
 mod guards_status;
+mod guide_work_plan;
 pub mod health;
 mod hooks_home_cmd;
 pub(crate) mod host;

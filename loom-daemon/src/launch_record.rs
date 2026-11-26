@@ -441,9 +441,10 @@ fn session_ids_in(region: &str) -> Vec<String> {
 /// banner (after leading whitespace) counts. A banner quoted inside a tool
 /// output or an agent's text — mid-line, or inside a JSON event string — is
 /// data about a launch, not evidence of one, exactly like the nested
-/// `sessionID` keys [`session_ids_in`] refuses. The token shape is
-/// [`crate::usage_source`]'s own `codex_session_token` check — the same
-/// hex/dash, ≥8-character shape `spawn-codex.sh`'s transcript join greps for.
+/// `sessionID` keys [`session_ids_in`] refuses. Both the anchoring and the
+/// token shape are [`crate::usage_source`]'s own `codex_session_banner` — the
+/// rule every Codex banner reader shares (#15023) — the same hex/dash,
+/// ≥8-character shape `spawn-codex.sh`'s transcript join greps for.
 #[must_use]
 pub fn codex_session_ids(contents: &str) -> Vec<String> {
     codex_ids_in(contents)
@@ -465,11 +466,7 @@ fn codex_ids_in(region: &str) -> Vec<String> {
     let mut seen = std::collections::HashSet::new();
     let mut ids = Vec::new();
     for line in region.lines() {
-        let Some(token) = line
-            .trim_start()
-            .strip_prefix("session id:")
-            .and_then(crate::usage_source::codex_session_token)
-        else {
+        let Some(token) = crate::usage_source::codex_session_banner(line) else {
             continue;
         };
         if seen.insert(token.clone()) {

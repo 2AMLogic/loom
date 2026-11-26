@@ -26,6 +26,7 @@
 //! Operator reference: `defaults/docs/merge-queue-ci.md`.
 
 pub mod audit;
+mod authorization_status;
 pub mod context;
 pub mod eligibility;
 pub mod expr;
@@ -211,6 +212,9 @@ pub fn render_eligibility(e: &Eligibility) -> String {
     }
     if !e.required_checks.is_empty() {
         let _ = writeln!(out, "{PREFIX} required checks: {}", e.required_checks.join(", "));
+    }
+    if let Some(wf) = &e.authorization_workflow {
+        let _ = writeln!(out, "{PREFIX} authorization status workflow: {wf}");
     }
     for f in &e.failures {
         let _ = writeln!(out, "{PREFIX} FAILED {}: {}", f.prereq.as_str(), f.detail);

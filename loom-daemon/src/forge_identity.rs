@@ -1238,6 +1238,149 @@ fn refresh_pass(ws: &Path, primary: Option<String>) {
     );
 }
 
+/// Mint-and-publish a reader installation token for `owner_repo` on a host
+/// whose daemon has never published one (#14730): the bootstrap a standalone
+/// online store read — `fleet-config render` before the first daemon start —
+/// needs, because nothing else refreshes reader tokens there. Only the
+/// readers the routing would pick for the store's owner are minted
+/// ([`route::eligible_readers`]), through the same `github-app-token.sh`
+/// seam and the same [`reader_dir`] publication [`refresh_reader_credentials`]
+/// uses, so every later process, the daemon included, reuses the token while
+/// it stays fresh.
+///
+/// `Ok(())` asks the caller to retry routing. It returns without minting
+/// when an eligible reader that is not withdrawn already holds a *fresh*
+/// credential ([`dir_is_fresh`], the test routing applies), and when every
+/// eligible reader is withdrawn: a withdrawal is kept, never worked around by
+/// a remint, so the read sheds as before. An expired or missing credential on a
+/// non-withdrawn reader is reminted. `Err` names the reader setup to fix before
+/// starting the daemon, including when the workspace has no mint helper. A mint
+/// failure never withdraws the reader (owner-level coverage, exactly as in
+/// [`refresh_reader_credentials`]) but is remembered for
+/// [`BOOTSTRAP_MINT_BACKOFF`] across callers in this process, so repeated reads
+/// do not re-run the helper each time.
+pub fn provision_bootstrap_reader(
+    workspace_root: &Path,
+    roster: &Roster,
+    owner_repo: &str,
+    make_minter: Option<&impl Fn(&Identity) -> Box<dyn GithubAppMinter>>,
+) -> std::result::Result<(), String> {
+    provision_bootstrap_reader_at(
+        workspace_root,
+        roster,
+        owner_repo,
+        make_minter,
+        SystemTime::now(),
+    )
+}
+
+/// How long a failed bootstrap mint for one workspace and store repo is not
+/// retried (#14730). Short: a fixed key or helper is picked up soon.
+pub const BOOTSTRAP_MINT_BACKOFF: Duration = Duration::from_secs(60);
+
+type BootstrapFailures = std::collections::HashMap<(PathBuf, String), (SystemTime, String)>;
+
+/// `(workspace root, owner/repo)` -> `(retry not before, last failure)`.
+fn bootstrap_failures() -> &'static Mutex<BootstrapFailures> {
+    static MAP: OnceLock<Mutex<BootstrapFailures>> = OnceLock::new();
+    MAP.get_or_init(|| Mutex::new(BootstrapFailures::new()))
+}
+
+/// [`provision_bootstrap_reader`] at an explicit `now`.
+pub(crate) fn provision_bootstrap_reader_at(
+    workspace_root: &Path,
+    roster: &Roster,
+    owner_repo: &str,
+    make_minter: Option<&impl Fn(&Identity) -> Box<dyn GithubAppMinter>>,
+    now: SystemTime,
+) -> std::result::Result<(), String> {
+    let owner = crate::credential_preflight::owner_of_nwo(owner_repo);
+    if owner.is_empty() {
+        return Err(format!("{owner_repo} is not OWNER/REPO"));
+    }
+    let eligible: Vec<&Identity> = route::eligible_readers(roster, owner);
+    if eligible.is_empty() {
+        return Err(format!(
+            "no reader in the workspace's pool serves owner {owner} — check the reader's \
+             `owners` list covers the store repository",
+        ));
+    }
+    let mode = RoutingMode::current();
+    let eligible: Vec<&Identity> = eligible
+        .into_iter()
+        .filter(|r| reader_eligible(&r.app_id, owner_repo, Resource::Core, now, mode))
+        .collect();
+    if eligible.is_empty()
+        || eligible
+            .iter()
+            .any(|r| dir_is_fresh(&reader_dir(workspace_root, owner, r), now))
+    {
+        return Ok(());
+    }
+    let key = (workspace_root.to_path_buf(), owner_repo.to_ascii_lowercase());
+    if let Ok(map) = bootstrap_failures().lock() {
+        if let Some((until, reason)) = map.get(&key).filter(|(until, _)| now < *until) {
+            let wait = until.duration_since(now).unwrap_or_default().as_secs();
+            return Err(format!(
+                "{reason} (mint not retried for another {wait}s after that failure)"
+            ));
+        }
+    }
+
+    let Some(make_minter) = make_minter else {
+        return Err(
+            "the workspace's github-app-token.sh is missing (installed and source paths). \
+             Restore the Loom helper and retry"
+                .to_string(),
+        );
+    };
+
+    let mut failures: Vec<String> = Vec::new();
+    for reader in eligible {
+        let minted = match make_minter(reader).mint(owner_repo) {
+            GithubAppOutcome::Minted {
+                token,
+                installation_id,
+                expires_at,
+                ..
+            } => {
+                let dir = reader_dir(workspace_root, owner, reader);
+                publish(&dir, &token, reader, owner, &installation_id, &expires_at)
+                    .map_err(|e| format!("could not publish to {}: {e}", dir.display()))
+            }
+            GithubAppOutcome::Error(reason) => Err(reason),
+            GithubAppOutcome::NotConfigured => {
+                Err("github-app-token.sh is not configured for this reader (no app id or private \
+                 key)"
+                    .to_string())
+            }
+        };
+        if let Err(reason) = minted {
+            log::warn!(
+                "forge_identity: bootstrap reader app {} could not mint for {owner_repo} \
+                 ({reason}) — #14730",
+                reader.app_id
+            );
+            failures.push(format!("reader app {}: {reason}", reader.app_id));
+        }
+    }
+    if read_credential_in(workspace_root, roster, owner_repo, now).is_some() {
+        if let Ok(mut map) = bootstrap_failures().lock() {
+            map.remove(&key);
+        }
+        return Ok(());
+    }
+    let reason = if failures.is_empty() {
+        format!("published bootstrap credentials still cannot route a read of {owner_repo}")
+    } else {
+        failures.join("; ")
+    };
+    if let Ok(mut map) = bootstrap_failures().lock() {
+        map.insert(key, (now + BOOTSTRAP_MINT_BACKOFF, reason.clone()));
+    }
+    Err(reason)
+}
+
 /// The production minter factory: [`IdentityMinter`] over the workspace's
 /// `github-app-token.sh`. `None` when the script is not installed.
 #[must_use]

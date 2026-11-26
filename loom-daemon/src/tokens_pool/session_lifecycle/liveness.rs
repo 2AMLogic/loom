@@ -174,12 +174,10 @@ pub fn for_selector(inventory: &[AccountDescriptor]) -> Option<SessionLiveness> 
     #[cfg(not(test))]
     let (watched, docker) = (
         WATCH_RUNS_HERE.load(Ordering::Acquire),
-        Some(
-            std::env::var("LOOM_CODEX_SESSION_DOCKER")
-                .ok()
-                .filter(|docker| !docker.is_empty())
-                .unwrap_or_else(|| "docker".to_string()),
-        ),
+        std::env::var("LOOM_CODEX_SESSION_DOCKER")
+            .ok()
+            .filter(|docker| !docker.is_empty())
+            .or_else(|| crate::docker_bin::resolve_str().ok()),
     );
     selector_read(published(), watched, docker.as_deref())
 }

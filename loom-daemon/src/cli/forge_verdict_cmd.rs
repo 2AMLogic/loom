@@ -34,6 +34,25 @@ fn read_labels(repo: &str, pr: u64, root: &Path) -> Option<Vec<String>> {
     gate::label_names(&doc)
 }
 
+/// The PR's label names for a **write-gating read-back** (#15185): the same
+/// REST read as [`read_labels`], but every call carries a unique `verify=`
+/// query component, so no URL-keyed cache layer between this process and the
+/// forge (the gateway relay's ETag cache, a coalescing front) can answer it
+/// from a body that predates the writes being verified. In the #15185
+/// incident the approving transition's `loom:review-requested` DELETE was
+/// lost in flight while the read-back was served a label set that no longer
+/// matched the forge, and the resulting exit 0 left `loom:pr` beside
+/// `loom:review-requested` for seven hours. GitHub ignores unknown query
+/// components, and a cache that has never seen the URL cannot hold a body
+/// for it. `None` when the read failed — never a pass (#10605).
+fn read_labels_uncached(repo: &str, pr: u64, root: &Path) -> Option<Vec<String>> {
+    let nonce = chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default();
+    let path = format!("repos/{repo}/issues/{pr}/labels?per_page=100&verify={nonce}-{pr}");
+    let out = crate::script_helpers::gh_read("verdict.labels", &["api", &path], root, false);
+    let doc = serde_json::from_slice::<Value>(&out.ok_output()?.stdout).ok()?;
+    gate::label_names(&doc)
+}
+
 /// `forge verdict-body-check` (#9258): classify the body on stdin. An
 /// unreadable stdin is a rejection, never a pass.
 pub(crate) fn verdict_body_check() -> Result<()> {
@@ -290,6 +309,50 @@ pub(crate) fn verdict_reconcile(
 pub(crate) fn verdict_labels(pr: u64, repo: &str, verdict: &str, sha: Option<&str>) -> Result<()> {
     let kind = verdict_or_exit("verdict-labels", verdict);
     let root = super::forge_identity_cmd::workspace();
+    match apply_labels(pr, repo, kind, &root) {
+        Ok(()) => {
+            // Telemetry only (#12362): the verdict the run observed, from this
+            // write; no forge call.
+            crate::observability::pick_journal::record_verdict(pr, journal_action(kind), sha);
+            println!("{} OK {}", gate::LABELS_SENTINEL, gate::transition(kind).0.join(","));
+            Ok(())
+        }
+        Err(problems) => {
+            eprintln!(
+                "forge verdict-labels: PR #{pr}'s {} label transition did not hold: {}.\n  Repair: {}",
+                kind.marker_token(),
+                problems.join("; "),
+                gate::repair_command(pr, repo, kind)
+            );
+            std::process::exit(1)
+        }
+    }
+}
+
+/// How many times [`apply_labels`] reads the labels back before a mismatching
+/// set is reported as a failed transition (#15185). The first read-back is
+/// the #10605 verify; the extras re-issue the removals a lost DELETE left
+/// behind, so a transiently lost write is healed inside the same verdict
+/// transaction instead of exiting 8 for a human to repair.
+const VERIFY_ATTEMPTS: usize = 3;
+/// Pause between [`VERIFY_ATTEMPTS`]' read-backs, giving the forge a moment
+/// to settle before the next read.
+const VERIFY_RETRY_PAUSE: std::time::Duration = std::time::Duration::from_millis(400);
+
+/// Apply the verdict's base label transition and verify that it held
+/// (#10605, #15185). The verdict label lands first: a failure there leaves
+/// the existing queue/claim labels in place, never a verdict with no label.
+/// Each removal is then a lone REST `DELETE` whose individual result is not
+/// consultable — a 404 is the documented no-op for a label the PR does not
+/// carry, so success and a silently lost write look alike here. What decides
+/// is the read-back loop: [`read_labels_uncached`] names every removal still
+/// present, those `DELETE`s are re-issued and the labels re-read, and only a
+/// read-back that matches [`gate::transition`] is a pass. After
+/// [`VERIFY_ATTEMPTS`] attempts the mismatching problems are returned —
+/// `post-verdict.sh` turns them into its exit 8 with the repair command, so
+/// a transition can no longer end as a silent exit 0 with a
+/// self-contradictory label set.
+fn apply_labels(pr: u64, repo: &str, kind: VerdictKind, root: &Path) -> Result<(), Vec<String>> {
     let (add, remove) = gate::transition(kind);
     let base = format!("repos/{repo}/issues/{pr}/labels");
     // Add first: a failure after this point leaves the verdict label on,
@@ -303,47 +366,52 @@ pub(crate) fn verdict_labels(pr: u64, repo: &str, verdict: &str, sha: Option<&st
     // Never delete the source/claim labels unless the add landed: a failed
     // POST followed by the DELETEs would drop the PR out of its queue with
     // no verdict label to replace it.
-    if crate::script_helpers::gh_write("verdict.add_labels", &argv, &root, false)
+    if crate::script_helpers::gh_write("verdict.add_labels", &argv, root, false)
         .ok_output()
         .is_none()
     {
-        eprintln!(
-            "forge verdict-labels: PR #{pr}'s {} label could not be added; the existing queue/claim \
-             labels were left in place.\n  Repair: {}",
-            kind.marker_token(),
-            gate::repair_command(pr, repo, kind)
-        );
-        std::process::exit(1)
+        return Err(vec![format!(
+            "the {} label could not be added; the existing queue/claim labels were left in place",
+            kind.marker_token()
+        )]);
     }
-    // A DELETE of a label the PR does not carry is a 404; the re-read below
+    // A DELETE of a label the PR does not carry is a 404; the read-back below
     // is what decides success, so the individual results are not consulted.
     for l in remove {
         let path = format!("{base}/{}", l.replace(':', "%3A"));
         let _ = crate::script_helpers::gh_write(
             "verdict.remove_label",
             &["api", "-X", "DELETE", &path],
-            &root,
+            root,
             false,
         );
     }
-    let problems = match read_labels(repo, pr, &root) {
-        Some(labels) => gate::label_problems(kind, &labels),
-        None => vec!["the labels could not be re-read to verify the transition".to_string()],
-    };
-    if problems.is_empty() {
-        // Telemetry only (#12362): the verdict the run observed, from this
-        // write; no forge call.
-        crate::observability::pick_journal::record_verdict(pr, journal_action(kind), sha);
-        println!("{} OK {}", gate::LABELS_SENTINEL, add.join(","));
-        return Ok(());
+    let mut problems = Vec::new();
+    for attempt in 0..VERIFY_ATTEMPTS {
+        problems = match read_labels_uncached(repo, pr, root) {
+            Some(labels) => gate::label_problems(kind, &labels),
+            None => vec!["the labels could not be re-read to verify the transition".to_string()],
+        };
+        if problems.is_empty() {
+            return Ok(());
+        }
+        if attempt + 1 < VERIFY_ATTEMPTS {
+            // Heal in-transaction (#15185): re-issue every removal — one the
+            // forge lost is the write the read-back just flagged, and one
+            // already gone stays a 404 no-op — then settle and read again.
+            for l in remove {
+                let path = format!("{base}/{}", l.replace(':', "%3A"));
+                let _ = crate::script_helpers::gh_write(
+                    "verdict.remove_label",
+                    &["api", "-X", "DELETE", &path],
+                    root,
+                    false,
+                );
+            }
+            std::thread::sleep(VERIFY_RETRY_PAUSE);
+        }
     }
-    eprintln!(
-        "forge verdict-labels: PR #{pr}'s {} label transition did not hold: {}.\n  Repair: {}",
-        kind.marker_token(),
-        problems.join("; "),
-        gate::repair_command(pr, repo, kind)
-    );
-    std::process::exit(1)
+    Err(problems)
 }
 
 /// Whether a `gh` failure is an authentication refusal: the session
@@ -865,5 +933,180 @@ mod lock_tests {
         let line = crate::doctor_handback::deadline_exceeded_line(300);
         assert!(line.starts_with(crate::doctor_handback::SENTINEL), "{line}");
         assert!(line.contains("deadline of 300s"), "{line}");
+    }
+}
+
+#[cfg(test)]
+mod labels_verify_tests {
+    use super::*;
+    use serial_test::serial;
+
+    /// A stateful fake forge for the label transition (#15185): one `gh`
+    /// whose `state` file holds the PR's label names, updated by the POST and
+    /// by every DELETE that is not scenario-dropped. A dropped DELETE exits
+    /// 0 with the state untouched — a write silently lost in flight, exactly
+    /// the shape the incident's timeline shows (no `unlabeled` event, the
+    /// label still on the PR, the caller none the wiser).
+    fn fake_gh(dir: &Path) -> std::path::PathBuf {
+        let bin = dir.join("fake-gh.sh");
+        std::fs::write(
+            &bin,
+            r#"#!/usr/bin/env bash
+D="${LOOM_LABELS_FAKE_DIR:?}"
+printf '%s\n' "$*" >> "$D/gh.log"
+if [[ "$*" == *" -X POST repos/o/r/issues/7/labels"* ]]; then
+  [[ -f "$D/post-fail" ]] && { echo "HTTP 502" >&2; exit 1; }
+  prev=""
+  for a in "$@"; do
+    if [[ "$prev" == "-f" && "$a" == "labels[]="* ]]; then
+      l="${a#labels[]=}"
+      grep -Fxq "$l" "$D/state" 2>/dev/null || printf '%s\n' "$l" >> "$D/state"
+    fi
+    prev="$a"
+  done
+  echo '{}'
+  exit 0
+fi
+if [[ "$*" == *" -X DELETE repos/o/r/issues/7/labels/"* ]]; then
+  label="$(printf '%s' "$*" | sed -e 's#.*/labels/##' -e 's/%3A/:/g')"
+  if [[ "$label" == "loom:review-requested" ]]; then
+    if [[ -f "$D/drop-review-requested-always" ]]; then exit 0; fi
+    if [[ -f "$D/drop-review-requested-once" && ! -f "$D/dropped" ]]; then
+      touch "$D/dropped"
+      exit 0
+    fi
+  fi
+  grep -Fxv "$label" "$D/state" > "$D/state.t" 2>/dev/null && mv "$D/state.t" "$D/state"
+  exit 0
+fi
+if [[ "$*" == *"repos/o/r/issues/7/labels?per_page=100&verify="* ]]; then
+  [[ -f "$D/labels-read-fail" ]] && { echo "HTTP 502" >&2; exit 1; }
+  printf '['
+  first=1
+  while IFS= read -r l; do
+    (( first )) || printf ','
+    first=0
+    printf '{"name":"%s"}' "$l"
+  done < "$D/state"
+  printf ']'
+  exit 0
+fi
+echo "fake-gh: no route for: $*" 1>&2
+exit 1
+"#,
+        )
+        .unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        bin
+    }
+
+    /// The incident's pre-state: queued for review, under review.
+    fn fixture(name: &str) -> (tempfile::TempDir, std::path::PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let fake = dir.path().join(name);
+        std::fs::create_dir(&fake).unwrap();
+        std::fs::write(fake.join("state"), "loom:review-requested\nloom:reviewing\n").unwrap();
+        let gh = fake_gh(&fake);
+        std::env::set_var("LOOM_GH_BIN", &gh);
+        std::env::set_var("LOOM_LABELS_FAKE_DIR", &fake);
+        (dir, fake)
+    }
+
+    fn teardown(_fake: &Path) {
+        std::env::remove_var("LOOM_GH_BIN");
+        std::env::remove_var("LOOM_LABELS_FAKE_DIR");
+    }
+
+    fn log(fake: &Path) -> String {
+        std::fs::read_to_string(fake.join("gh.log")).unwrap_or_default()
+    }
+
+    fn deletions_of(fake: &Path, label: &str) -> usize {
+        log(fake)
+            .lines()
+            .filter(|l| l.contains("-X DELETE") && l.contains(&format!("labels/{label}")))
+            .count()
+    }
+
+    #[test]
+    #[serial(loom_config_env)]
+    fn a_lost_delete_is_healed_inside_the_transaction() {
+        let (dir, fake) = fixture("heal");
+        std::fs::write(fake.join("drop-review-requested-once"), "").unwrap();
+        let out = apply_labels(7, "o/r", VerdictKind::Approved, dir.path());
+        teardown(&fake);
+        assert!(out.is_ok(), "{out:?}");
+        let state = std::fs::read_to_string(fake.join("state")).unwrap();
+        assert_eq!(state, "loom:pr\n", "the transition held on the forge");
+        assert!(
+            deletions_of(&fake, "loom%3Areview-requested") >= 2,
+            "the lost DELETE was re-issued: {}",
+            log(&fake)
+        );
+    }
+
+    #[test]
+    #[serial(loom_config_env)]
+    fn a_never_converging_transition_fails_loudly() {
+        let (dir, fake) = fixture("stuck");
+        std::fs::write(fake.join("drop-review-requested-always"), "").unwrap();
+        let out = apply_labels(7, "o/r", VerdictKind::Approved, dir.path());
+        teardown(&fake);
+        let problems = out.expect_err("the label set never matched");
+        assert!(
+            problems
+                .iter()
+                .any(|p| p == "still carries loom:review-requested"),
+            "{problems:?}"
+        );
+        let reads = log(&fake)
+            .lines()
+            .filter(|l| l.contains("labels?per_page=100&verify="))
+            .count();
+        assert_eq!(reads, VERIFY_ATTEMPTS, "every attempt read the labels back");
+    }
+
+    #[test]
+    #[serial(loom_config_env)]
+    fn every_verifying_read_carries_a_cache_defeating_component() {
+        let (dir, fake) = fixture("nonce");
+        let out = apply_labels(7, "o/r", VerdictKind::Approved, dir.path());
+        teardown(&fake);
+        assert!(out.is_ok(), "{out:?}");
+        let argv = log(&fake);
+        let reads = argv
+            .lines()
+            .filter(|l| l.contains("/labels?"))
+            .collect::<Vec<_>>();
+        assert!(!reads.is_empty(), "the labels were read back");
+        assert!(
+            reads.iter().all(|l| l.contains("&verify=")),
+            "no URL-keyed cache can answer a unique URL: {reads:?}"
+        );
+    }
+
+    #[test]
+    #[serial(loom_config_env)]
+    fn a_failed_add_never_touches_the_removals() {
+        let (dir, fake) = fixture("addfail");
+        std::fs::write(fake.join("post-fail"), "").unwrap();
+        let out = apply_labels(7, "o/r", VerdictKind::Approved, dir.path());
+        teardown(&fake);
+        let problems = out.expect_err("a failed add is a failed transition");
+        assert!(problems.iter().any(|p| p.contains("could not be added")), "{problems:?}");
+        assert_eq!(deletions_of(&fake, "loom%3A"), 0, "no removal was issued");
+    }
+
+    #[test]
+    fn the_incidents_label_set_is_self_contradictory() {
+        let after = ["loom:pr", "loom:review-requested"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            gate::label_problems(VerdictKind::Approved, &after),
+            vec!["still carries loom:review-requested"]
+        );
     }
 }
