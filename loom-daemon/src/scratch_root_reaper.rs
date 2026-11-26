@@ -660,8 +660,11 @@ pub fn evaluate_root(root: &Path, owner: &str, probes: &ScratchRootProbes<'_>) -
         return RootVerdict::Preserve("root younger than scratchReclaim.maxAgeHours");
     }
     match watch_pid_state(root, probes.pid_alive) {
-        WatchPidState::Alive | WatchPidState::Unreadable => {
+        WatchPidState::Alive => {
             return RootVerdict::Preserve("watch-pid file names a live process");
+        }
+        WatchPidState::Unreadable => {
+            return RootVerdict::Preserve("watch-pid file could not be read or parsed");
         }
         WatchPidState::Dead | WatchPidState::Absent => {}
     }
@@ -1733,7 +1736,7 @@ mod tests {
         backdate(&root, now.timestamp() - 48 * 3600);
         assert_eq!(
             evaluate_root(&root, "acme/widgets", &probing),
-            RootVerdict::Preserve("watch-pid file names a live process")
+            RootVerdict::Preserve("watch-pid file could not be read or parsed")
         );
     }
 
