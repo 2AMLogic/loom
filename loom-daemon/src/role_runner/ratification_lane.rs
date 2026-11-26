@@ -2346,6 +2346,31 @@ mod tests {
         );
     }
 
+    /// #15430: a proposed record requiring the two keys before its own PR
+    /// merges is selected, both keys missing. A bare status line and an
+    /// ordinary request for two code reviews select nothing.
+    #[test]
+    fn a_record_requiring_the_keys_before_merge_is_a_candidate() {
+        let record = "Status: proposed.\n\n## Ratification\n\nRatification of this record takes both independent reviewer keys\n(`ratification/ee-key/`, `ratification/market-key/`) on the PR that carries it,\nplus the flip of its status line to `RATIFIED` — both in that same PR, before\nmerge.";
+        let path = "spec/decision-records/DR-0009.md";
+        let src = one_pr("alice", vec![file(path, record)], vec![]);
+        assert_eq!(
+            find_candidates(&enabled(), None, &src),
+            vec![Selection::Candidate {
+                pr: 7,
+                head_sha: SHA.into(),
+                missing: vec![Key::Ee, Key::Market]
+            }]
+        );
+        for clear in [
+            "Status: Proposed",
+            "**Status:** Proposed\n\nThis change needs two code reviews before it can be merged.",
+        ] {
+            let src = one_pr("alice", vec![file(path, clear)], vec![]);
+            assert!(find_candidates(&enabled(), None, &src).is_empty(), "{clear}");
+        }
+    }
+
     #[test]
     fn selection_is_the_holds_predicate() {
         let h = ratification::Config::default();

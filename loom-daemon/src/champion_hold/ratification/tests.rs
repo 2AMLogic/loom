@@ -156,6 +156,91 @@ fn config_extends_paths_and_phrases_but_cannot_remove_built_ins() {
     );
 }
 
+/// #15430: a proposed record that makes the two reviewer keys and the flip to
+/// `Ratified` prerequisites of its own PR's merge, in no built-in phrase.
+/// Minimal reconstructions of the wording fleet decision records use; their
+/// contents live in private repos and are not copied.
+const KEYS_BEFORE_MERGE: &str = "Status: proposed.\n\n## Ratification\n\nRatification of this record takes both independent reviewer keys (`ratification/ee-key/`, `ratification/market-key/`) on the PR that carries it, plus the flip of its status line to `RATIFIED` — both in that same PR, before merge.";
+/// The same policy, stated merge first and with Markdown emphasis.
+const KEYS_UNTIL_MERGED: &str = "**Status:** Proposed\n\nThis PR must not be merged until both reviewer keys are posted and the status line above reads **Ratified**: the two independent reviews are what ratify it.";
+/// `KEYS_BEFORE_MERGE` with emphasis in place of its code ticks.
+const KEYS_BEFORE_MERGE_EMPHASIZED: &str = "**Status:** proposed.\n\n## Ratification\n\n**Ratification** of this record takes **both independent reviewer keys** (`ratification/ee-key/`, `ratification/market-key/`) on the PR that carries it, plus the flip of its status line to **RATIFIED** — both in that same PR, **before merge**.";
+
+/// Soft-wrap every paragraph of `text` to `width` columns, changing no words.
+fn soft_wrapped(text: &str, width: usize) -> String {
+    text.split("\n\n")
+        .map(|paragraph| {
+            let mut lines = vec![String::new()];
+            for word in paragraph.split(' ') {
+                let line = lines.last_mut().expect("starts with one line");
+                if !line.is_empty() && line.len() + 1 + word.len() > width {
+                    lines.push(String::new());
+                }
+                let line = lines.last_mut().expect("pushed above");
+                if !line.is_empty() {
+                    line.push(' ');
+                }
+                line.push_str(word);
+            }
+            lines.join("\n")
+        })
+        .collect::<Vec<_>>()
+        .join("\n\n")
+}
+
+#[test]
+fn a_record_requiring_the_reviewer_keys_before_its_merge_is_held() {
+    let path = "spec/decision-records/DR-0009.md";
+    let cfg = Config::default();
+    for body in [
+        KEYS_BEFORE_MERGE,
+        KEYS_BEFORE_MERGE_EMPHASIZED,
+        KEYS_UNTIL_MERGED,
+    ] {
+        let verdict = scan(&[file(path, "added", Some(body))], &cfg);
+        assert_eq!(verdict, Verdict::Hold(vec![path.to_string()]), "{body}");
+        assert_eq!(decide(&verdict, &[], HEAD), Action::Hold, "{body}");
+    }
+}
+
+/// The policy reads the same however an editor soft-wraps it. The line-bound
+/// clause check held or cleared these same words with the wrap width.
+#[test]
+fn soft_wrapping_does_not_change_the_verdict() {
+    let path = "spec/decision-records/DR-0009.md";
+    let cfg = Config::default();
+    for policy in [
+        KEYS_BEFORE_MERGE,
+        KEYS_BEFORE_MERGE_EMPHASIZED,
+        KEYS_UNTIL_MERGED,
+    ] {
+        for width in [100usize, 80, 72, 60, 40] {
+            let body = soft_wrapped(policy, width);
+            let verdict = scan(&[file(path, "added", Some(&body))], &cfg);
+            assert_eq!(verdict, Verdict::Hold(vec![path.to_string()]), "{body}");
+            assert_eq!(decide(&verdict, &[], HEAD), Action::Hold, "{body}");
+        }
+    }
+}
+
+#[test]
+fn a_bare_status_or_an_ordinary_review_request_stays_clear() {
+    let cfg = Config::default();
+    for body in [
+        "Status: Proposed",
+        // An ordinary request for two code reviews.
+        "**Status:** Proposed\n\nThis change needs two code reviews before it can be merged.",
+        // `two reviews` on its own is not the reviewer pair.
+        "Status: Proposed\n\nRatification is a separate step. This record needs two reviews before it can be merged.",
+        // The pair, with no ratification word beside it.
+        "Status: Proposed\n\nThis proposal needs two independent reviews before it is merged.",
+    ] {
+        let verdict = scan(&[file("spec/decision-records/DR-0009.md", "added", Some(body))], &cfg);
+        assert_eq!(verdict, Verdict::Clear, "{body}");
+        assert_eq!(decide(&verdict, &[], HEAD), Action::None, "{body}");
+    }
+}
+
 fn hold_note(head: &str) -> Comment {
     Comment::new(
         "fleet[bot]",

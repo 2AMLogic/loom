@@ -74,6 +74,31 @@ never names a head the hold has moved off.
 built-in. An explicit path alone does not hold; the phrase test still applies.
 Invalid phrase regexes degrade to literals.
 
+## The reviewer-pair gate (#15430)
+
+A proposed record can gate its own PR the other way round: not "merging
+ratifies", but the two reviewer keys and the flip to `Ratified` must land in
+this PR before it merges. No built-in phrase says that, and the status fallback
+linked a ratification word to a merge word only on one line, so the same policy
+held or cleared depending on where an editor wrapped it. A cleared record got
+no hold and no key reviews.
+
+With a `Status:` line in the file, one paragraph that carries all three now
+holds, whatever its wording, emphasis or line wrapping:
+
+- a ratification word (`ratif…`);
+- the reviewer pair: `both … keys` or `both … reviews`, `two independent …` or
+  `two key …` reviews or keys, `independent … reviewers`. A plain `two reviews`
+  or `two code reviews` is an ordinary review request and does not count;
+- the record's own PR: a merge word, or `this PR`, `that same PR`, `its own
+  PR`, `this record's own PR`. A "separate" or "later" PR is a deferral, not
+  this PR.
+
+The status line is still required, so a process description in a README and a
+bare `Status: Proposed` do not hold. A paragraph that names the pair, the PR
+and a ratification word without gating anything still holds: the false hold
+costs one operator comment.
+
 ## Rejected
 
 - A new `loom:ratification-hold` label: needs a fleet-wide label and a
