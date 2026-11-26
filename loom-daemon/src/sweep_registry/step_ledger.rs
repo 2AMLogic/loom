@@ -64,6 +64,9 @@ pub struct StepRun {
     /// The reaper's failure class, when it has one; the outcome's reason
     /// otherwise.
     pub failure_class: Option<String>,
+    /// How the attempt ended and where its output is (#15413); `None` for a
+    /// run the daemon has no process evidence for (a spawn-time refusal).
+    pub attempt: Option<super::step_spawn::ended::AttemptEvidence>,
 }
 
 impl SweepRegistry {
