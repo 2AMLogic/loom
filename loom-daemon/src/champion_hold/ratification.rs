@@ -176,12 +176,29 @@ pub fn declares_ratification(content: &str, cfg: &Config) -> bool {
     if phrases.map(compile).any(|re| re.is_match(&text)) {
         return true;
     }
-    if !compile(STATUS).is_match(&text) {
+    let status = compile(STATUS);
+    if !status.is_match(&text) {
         return false;
     }
     let clause = compile(CLAUSE);
-    let holds =
-        |passage: &str| clause.is_match(passage) && !EXPLICIT_DEFERRAL.is_match(passage.trim());
+    let holds = |previous: &str, passage: &str| {
+        if !clause.is_match(passage) {
+            return false;
+        }
+        if !EXPLICIT_DEFERRAL.is_match(passage.trim()) {
+            return true;
+        }
+        // A word-final dot can belong to an abbreviation ("Acme Inc. this PR ...").
+        // Only a known status or complete deferral establishes a break after a word.
+        // DR-015's issue citation and item number both end in digits.
+        let previous = previous.trim();
+        previous.ends_with(char::is_alphabetic)
+            && !status
+                .find_iter(previous)
+                .any(|m| m.end() == previous.len())
+            && !EXPLICIT_DEFERRAL.is_match(previous)
+    };
+    let mut previous = "";
     let mut start = 0;
     for (dot, _) in text.match_indices('.') {
         let before = &text[start..dot];
@@ -194,12 +211,13 @@ pub fn declares_ratification(content: &str, cfg: &Config) -> bool {
         {
             continue;
         }
-        if holds(before) {
+        if holds(previous, before) {
             return true;
         }
+        previous = before;
         start = dot + 1;
     }
-    holds(&text[start..])
+    holds(previous, &text[start..])
 }
 
 /// Scan a PR's change list. Only files the PR adds, modifies or renames count:

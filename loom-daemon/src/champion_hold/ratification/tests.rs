@@ -140,6 +140,8 @@ fn a_record_explicitly_deferring_ratification_clears() {
     let paragraph = dr_paragraph();
     for body in [
         paragraph.clone(),
+        // The original status paragraph has an issue citation before the denial.
+        paragraph.replace(". It is", ". Drafted for issue #359. It is"),
         // Markdown soft wraps in the source paragraph.
         paragraph
             .replace("is not", "is\n  not")
@@ -147,6 +149,7 @@ fn a_record_explicitly_deferring_ratification_clears() {
             .replace("that flips", "that\n  flips"),
         "Status: Proposed. not ratified by merging this PR.".into(),
         "Status: Proposed. does not ratify on merge.".into(),
+        format!("Status: Proposed. Does not ratify on merge. {DR_DEFERRAL}."),
     ] {
         assert_eq!(
             scan(&[file(DR_PATH, "modified", Some(&body))], &Config::default()),
@@ -190,6 +193,10 @@ fn ambiguous_periods_keep_conditions_attached_to_the_denial() {
         format!("{DR_DENIAL}.1 without operator approval."),
         "Only if the operator rejects it... this PR does not ratify on merge.".to_owned(),
         "This PR does not ratify on merge . . . unless the operator approves it.".to_owned(),
+        "Without sign-off from Acme Inc. this PR does not ratify on merge.".to_owned(),
+        "Without sign-off from Acme Inc this PR does not ratify on merge.".to_owned(),
+        "Without sign-off from Acme p.l.c.\n  This PR does not ratify on merge.".to_owned(),
+        "Pending approval from the legal dept. This PR does not ratify on merge".to_owned(),
     ] {
         let body = format!("Status: Proposed. {wording}");
         assert_eq!(

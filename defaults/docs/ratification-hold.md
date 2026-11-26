@@ -46,7 +46,10 @@ with wording that links ratification to merge or approval. It skips a match
 only when the entire passage explicitly denies ratification by this merge or
 defers it to a separate PR, as in DR-015 (#15377). Mixed or ambiguous wording
 still holds, even when the denial and an affirmative declaration share a
-sentence. Each changed file is evaluated independently.
+sentence. A period after a word such as `Inc.` can belong to an abbreviation.
+The scanner keeps the hold if a denial starts after such a period, unless the
+preceding passage ends with the status field or is itself a recognized denial
+or deferral. Each changed file is evaluated independently.
 
 A held PR that goes CONFLICTING is served by Doctor, hold intact (#13505): Doctor resolves and pushes, leaves `loom:blocked` and `loom:pr` on, and Judge re-reviews the new head; the operator then ratifies a clean head.
 
