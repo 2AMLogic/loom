@@ -2426,6 +2426,24 @@ mod launch_refusal {
     }
 
     #[test]
+    fn a_worker_hook_refusal_is_pre_launch_and_costs_no_ratification_attempt() {
+        let mut runner = LaunchedEe::new(
+            78,
+            "# LOOM_SESSION_REFUSAL v=1 category=HOOKS_UNTRUSTED\n\
+             # LOOM_TERMINAL_RESULT v=2 provider=codex account=fixture category=RECOVERABLE \
+             exit_code=78 model=gpt-5",
+        );
+        let bench = super::bound::Bench::new();
+        let pass = bench.pass(&super::bound::Heads::one(), &mut runner, super::bound::t0());
+        assert_eq!(runner.failure.class(), "hooks-untrusted");
+        assert_buckets(
+            &TickOutcome::from_pass(&pass),
+            &[("ee", "pre_launch_failed"), ("market", "posted")],
+        );
+        assert!(bench.records().is_empty(), "a refused worker never started the review");
+    }
+
+    #[test]
     fn launched_real_failure_stays_invocation_failed() {
         for (code, body) in [
             (1, "# LOOM_CLI_START runtime=codex\nError: something codex said".to_string()),
