@@ -2152,20 +2152,16 @@ Builder and Doctor work in `.loom/worktrees/issue-<N>`.
 
 - **Agent step** = `LOOM_SWEEP_ID` or `LOOM_WORKTREE_PATH` is exported (set by
   the dispatcher). An operator's interactive session has neither and is untouched.
-- **The workspace's primary checkout** (#15483) is the primary checkout of the
-  repository `LOOM_WORKSPACE` names — the repository the dispatcher dispatched
-  the step against; the dispatcher exports the variable into the step's
-  session. The value may itself be a linked worktree of that repository
-  (`loom-daemon spawn --worktree` exports the worktree), so the hook resolves
-  the parent of the repository's common git dir instead of comparing paths.
-  **Only that checkout is in scope.** Every standalone repository is
-  structurally a primary checkout (its toplevel is the parent of its common
-  git dir), so a repository other than the workspace's — a throwaway fixture
-  created for a disposable reproduction, a second clone — is unaffected, with
-  or without a `.loom/` directory: it has no fleet sync to hold.
+- **The workspace's primary checkout** (#15483) shares the canonical common Git
+  directory of the repository at `LOOM_WORKSPACE` and uses that directory as
+  its own Git directory. The dispatcher can set `LOOM_WORKSPACE` to any linked
+  worktree because all worktrees of the repository share its common directory.
+  Linked worktrees have distinct per-worktree Git directories. A separate
+  Git directory can live outside the primary checkout, even inside an
+  independent repository. Only the workspace's primary checkout is in scope.
 - **Fail closed when `LOOM_WORKSPACE` is unusable** — unset, empty, relative,
   not an existing directory, or not inside a working tree (a bare repository) —
-  *any* primary checkout is denied, as before #15483. No `.loom/` marker is
+  the guard applies to *every* primary checkout. No `.loom/` marker is
   consulted: a scaffold reproduction legitimately copies files under `.loom/`.
 - **Denied** (tier: deny, since headless runs cannot answer an ask) when the
   resolved cwd — honouring `cd X &&` and `git -C X` — is that primary checkout:

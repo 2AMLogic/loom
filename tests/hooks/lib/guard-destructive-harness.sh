@@ -561,9 +561,7 @@ make_wt_repo_linked() {
 }
 
 # An INDEPENDENT repository (#15483): no .loom/, a worktree of nothing, and
-# created under the temp dir rather than beside any workspace fixture. Its
-# toplevel is the parent of its git common dir, so structurally it is a
-# primary checkout exactly like a workspace's own clone.
+# created under the temp dir. It has its own common Git directory.
 make_standalone_repo() {
     local dir
     dir=$(mktemp -d 2>/dev/null)

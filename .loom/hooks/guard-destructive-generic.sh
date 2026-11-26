@@ -12418,23 +12418,16 @@ primary_checkout_target_is_path() {
     (cd "$cwd" 2>/dev/null && git ls-files --error-unmatch -- "$pos" >/dev/null 2>&1)
 }
 
-# Echo the workspace's primary checkout (#15483): the parent of the common git
-# dir of the repository LOOM_WORKSPACE names, so a value that is itself a
-# linked worktree (`loom-daemon spawn --worktree` exports the worktree)
-# resolves to the clone behind it. Prints nothing when the signal is unusable —
-# unset, empty, relative, or not an existing directory inside a working tree
-# (a bare repository has no checkout to protect, and its common dir's parent
-# is just a directory) — and the caller then keeps the wider rule and denies
-# ANY primary checkout. No `.loom/` marker test: a scaffold reproduction
-# legitimately copies files under `.loom/`.
-workspace_primary_checkout() {
-    [[ "${LOOM_WORKSPACE:-}" == /* && -d "${LOOM_WORKSPACE:-}" ]] || return 0
-    [[ "$(cd "$LOOM_WORKSPACE" 2>/dev/null && git rev-parse --is-inside-work-tree 2>/dev/null)" == true ]] || return 0
+# All worktrees of one repository share this directory, including when the
+# primary checkout stores its Git metadata outside the working tree (#15483).
+primary_checkout_common_dir() (
     local common
-    common=$(cd "$LOOM_WORKSPACE" 2>/dev/null && git rev-parse --git-common-dir 2>/dev/null) || return 0
-    [[ -n "$common" ]] || return 0
-    (cd "$LOOM_WORKSPACE" 2>/dev/null && cd "$common/.." 2>/dev/null && pwd -P)
-}
+    CDPATH=''
+    cd -- "$1" 2>/dev/null || exit 1
+    common=$(git rev-parse --git-common-dir 2>/dev/null) || exit 1
+    [[ -n "$common" ]] || exit 1
+    cd -P -- "$common" 2>/dev/null && pwd -P
+)
 
 # =============================================================================
 # PRIMARY-CHECKOUT MUTATION (#13589) — deny `git commit`, `git switch`,
@@ -12449,12 +12442,10 @@ workspace_primary_checkout() {
 # Deny, not ask: headless fleet runs have nobody to answer an ask.
 #
 # The workspace is the repository LOOM_WORKSPACE names (the dispatcher exports
-# it into the step's session); see workspace_primary_checkout(). Only its
-# primary checkout is in scope (#15483). Structurally EVERY standalone
-# repository is "a primary checkout" (toplevel == parent of its common dir),
-# so without that filter a throwaway fixture created for a disposable
-# reproduction was denied like the clone this rule protects. With no usable
-# LOOM_WORKSPACE the guard fails closed and denies any primary checkout.
+# it into the step's session). Its primary checkout uses the common Git
+# directory as its own Git directory. Linked worktrees share the common
+# directory but have their own Git directories. With no usable LOOM_WORKSPACE
+# the guard fails closed and denies any primary checkout.
 #
 # Allowed shapes (legitimate primary-clone callers):
 #   - checkout/switch whose target is main or master (Auditor's
@@ -12479,7 +12470,10 @@ workspace_primary_checkout() {
 if [[ -n "${LOOM_SWEEP_ID:-}${LOOM_WORKTREE_PATH:-}" ]] \
    && echo "$COMMAND_NO_COMMENT" | grep -qE '(^|[;&|(`{]|[[:space:]])((git[[:space:]].*(checkout|switch|commit))|(gh[[:space:]]+pr[[:space:]]+checkout))' \
    && primary_checkout_mutation_guard_enabled; then
-    _pcm_ws_primary=$(workspace_primary_checkout) || _pcm_ws_primary=""
+    _pcm_ws_common=""
+    if [[ "${LOOM_WORKSPACE:-}" == /* && "$(git -C "$LOOM_WORKSPACE" rev-parse --is-inside-work-tree 2>/dev/null)" == true ]]; then
+        _pcm_ws_common=$(primary_checkout_common_dir "$LOOM_WORKSPACE") || _pcm_ws_common=""
+    fi
     while IFS=$'\037' read -r _pcm_cwd _pcm_sub _pcm_args; do
         [[ -z "$_pcm_sub" ]] && continue
         if [[ "$_pcm_cwd" == *"'"* || "$_pcm_cwd" == *'"'* ]]; then
@@ -12488,10 +12482,10 @@ if [[ -n "${LOOM_SWEEP_ID:-}${LOOM_WORKTREE_PATH:-}" ]] \
         [[ -n "$_pcm_cwd" && -d "$_pcm_cwd" ]] || continue
         _pcm_top=$(cd "$_pcm_cwd" 2>/dev/null && git rev-parse --show-toplevel 2>/dev/null) || continue
         _pcm_top=$(cd "$_pcm_top" 2>/dev/null && pwd -P) || continue
-        _pcm_common=$(cd "$_pcm_cwd" 2>/dev/null && git rev-parse --git-common-dir 2>/dev/null) || continue
-        _pcm_parent=$(cd "$_pcm_cwd" 2>/dev/null && cd "$_pcm_common/.." 2>/dev/null && pwd -P) || continue
-        [[ "$_pcm_top" == "$_pcm_parent" ]] || continue   # linked worktree: unaffected
-        [[ -n "$_pcm_ws_primary" && "$_pcm_top" != "$_pcm_ws_primary" ]] && continue   # not the workspace's checkout: unaffected (#15483)
+        _pcm_common=$(primary_checkout_common_dir "$_pcm_cwd") || continue
+        _pcm_git_dir=$(git -C "$_pcm_cwd" rev-parse --absolute-git-dir 2>/dev/null) || continue
+        [[ "$_pcm_git_dir" -ef "$_pcm_common" ]] || continue   # linked worktree
+        [[ -n "$_pcm_ws_common" && ! "$_pcm_ws_common" -ef "$_pcm_common" ]] && continue   # independent repository
 
         read -r -a _pcm_t <<< "$_pcm_args"
         _pcm_deny=false

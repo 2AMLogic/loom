@@ -165,6 +165,22 @@ assert_allow_env "LOOM_WORKSPACE naming a linked worktree allows an independent 
 assert_deny_env "LOOM_WORKSPACE naming a repository makes THAT repository the protected one" \
     "LOOM_WORKSPACE=$PC_FIXTURE" "git commit -q -m second" "$PC_FIXTURE"
 
+# A separate Git directory can live inside another repository's working tree.
+PC_SEPARATE="$PC_OUTSIDE/workspace"
+PC_SEPARATE_WT="$PC_OUTSIDE/linked"
+git clone -q --separate-git-dir="$PC_FIXTURE/metadata" "$PC_REPO" "$PC_SEPARATE"
+git -C "$PC_SEPARATE" worktree add -q --detach "$PC_SEPARATE_WT"
+assert_deny_env "a workspace with a separate Git directory protects its primary checkout" \
+    "LOOM_WORKSPACE=$PC_SEPARATE" "git commit -m x" "$PC_SEPARATE"
+assert_allow_env "the independent repository containing workspace metadata is allowed" \
+    "LOOM_WORKSPACE=$PC_SEPARATE" "git commit -m x" "$PC_FIXTURE"
+assert_allow_env "a workspace with a separate Git directory allows its linked worktree" \
+    "LOOM_WORKSPACE=$PC_SEPARATE" "git commit -m x" "$PC_SEPARATE_WT"
+assert_deny_env "a linked workspace still protects its primary checkout with a separate Git directory" \
+    "LOOM_WORKSPACE=$PC_SEPARATE_WT" "git commit -m x" "$PC_SEPARATE"
+assert_deny_env "LOOM_WORKSPACE unset: a primary checkout with a separate Git directory is denied" \
+    "" "git commit -m x" "$PC_SEPARATE"
+
 # FAIL CLOSED: an unusable LOOM_WORKSPACE keeps the wider rule (any primary checkout)
 assert_deny_env "LOOM_WORKSPACE unset: a commit in an independent repository is still denied" "" \
     "git commit -q -m second" "$PC_FIXTURE"
