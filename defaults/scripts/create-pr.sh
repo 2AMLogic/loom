@@ -319,12 +319,29 @@ EX_REVIEW_GATE_COLLISION=6
 # Builder actually claimed, which is what the review gate and the
 # superseded-target check should consult. With no such branch, or a branch
 # number absent from the body's references, the last match applies as above.
+#
+# Quoted evidence (#15404): a body that cites another PR's closing line -- an
+# inline-code span (`` `Closes #396` ``) or a double-quoted citation
+# (`"closed #396"`) in an evidence/verification table cell -- is prose about
+# that PR's reference, never this PR's own declaration, so it supplies no
+# candidate. GitHub's own auto-close parser ignores code spans for the same
+# reason. The filter below strips both span kinds per line BEFORE the
+# extraction, so both guards (review gate and superseded-target) see the same
+# candidates and a quoted `#396` can no longer win the closing leg whenever
+# the body's real reference is partial or absent (the reported refusal on
+# `feature/issue-1378`). Line-local pairing: an unbalanced quote or backtick
+# matches no span and its text survives, so ordinary prose -- including prose
+# containing a genuine inline reference -- is never over-removed.
 _cpr_body_ref_issue() {
   # $1 = keyword alternation, e.g. 'close[sd]?|closing|fix(e[sd])?|resolve[sd]?'
-  local refs branch_n
+  local refs branch_n body
+  # #15404: strip quoted evidence (inline code + double-quoted citations)
+  # before extracting, so the selection rules below only ever see genuine
+  # references. See the comment block above for the rationale.
+  body="$(sed -e 's/`[^`]*`//g' -e 's/"[^"]*"//g' <<< "$BODY")"
   # One number per match: each match ends in `#<digits>`, so the trailing
   # digit run is the reference itself (never an earlier digit-token prefix).
-  refs="$(grep -ioE "((^[[:space:]]*)|((^|[[:space:]])[^#[:space:]]*[0-9][[:space:]]+)|([^#0-9][[:space:]]+)|([^[:alnum:]_#[:space:]]))($1)[[:space:]]+#[0-9]+" <<< "$BODY" \
+  refs="$(grep -ioE "((^[[:space:]]*)|((^|[[:space:]])[^#[:space:]]*[0-9][[:space:]]+)|([^#0-9][[:space:]]+)|([^[:alnum:]_#[:space:]]))($1)[[:space:]]+#[0-9]+" <<< "$body" \
     | grep -oE '[0-9]+$' || true)"
   [[ -n "$refs" ]] || return 0
   if [[ "$HEAD_BRANCH" =~ ^feature/issue-([0-9]+)($|[^0-9]) ]]; then
@@ -422,13 +439,21 @@ if [[ -n "$CLOSES_ISSUE" ]]; then
     # If the closing PR IS this branch (re-running after our own PR already
     # merged the issue closed), this is not a supersede -- fall through.
     if [[ -z "$SUPERSEDING_PR_NUMBER" || "$SUPERSEDING_HEAD" != "$HEAD_BRANCH" ]]; then
+      # #15404: the recovery advice must be survivable on a false positive.
+      # A body whose reference is quoted evidence (a citation of another PR's
+      # closing line) should be corrected and retried, not discarded -- and
+      # "discard this branch's work" steered a builder with a perfectly good
+      # branch toward deleting it. Keep the branch, inspect the matched
+      # reference, fix it if it cited another issue, re-run.
       echo "create-pr.sh: target issue #$CLOSES_ISSUE is already CLOSED\
 ${SUPERSEDING_PR_NUMBER:+ by #$SUPERSEDING_PR_NUMBER}\
 ${SUPERSEDING_PR_URL:+ ($SUPERSEDING_PR_URL)} -- refusing to open a \
 duplicate PR for $HEAD_BRANCH. Your commits are already pushed; do NOT push \
-further and do NOT delete the branch. Rebase onto the superseding PR, \
-retarget this PR at a different issue, or discard this branch's work as \
-redundant." >&2
+further and keep the branch (do NOT delete it). Inspect the PR body's \
+reference to #$CLOSES_ISSUE: if it merely cites another PR's closing line \
+as evidence rather than declaring this PR's own target, correct that \
+reference and re-run this script to retry; otherwise rebase onto the \
+superseding PR or retarget this PR at a different issue." >&2
       exit 1
     fi
   fi
