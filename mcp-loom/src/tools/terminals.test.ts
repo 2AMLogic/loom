@@ -102,6 +102,89 @@ describe("create_terminal", () => {
   });
 });
 
+describe("daemon error replies keep the daemon's text (#15431)", () => {
+  const REGISTRY = {
+    type: "TerminalList",
+    payload: {
+      terminals: [
+        {
+          id: "terminal-1",
+          name: "Builder",
+          role: "builder",
+          working_dir: "/repo",
+          tmux_session: "loom-terminal-1",
+          created_at: 0,
+        },
+      ],
+    },
+  };
+
+  const FRAMES = [
+    {
+      shape: "a legacy Error with its message under payload",
+      reply: { type: "Error", payload: { message: "boom" } },
+      expected: "boom",
+    },
+    {
+      shape: "a legacy Error with its message at the top level",
+      reply: { type: "Error", message: "boom" },
+      expected: "boom",
+    },
+    {
+      shape: "a legacy Error with no message at all",
+      reply: { type: "Error" },
+      expected: "Unknown error",
+    },
+    {
+      shape: "a StructuredError",
+      reply: { type: "StructuredError", payload: { message: "boom" } },
+      expected: "boom",
+    },
+  ];
+
+  const TOOLS = [
+    {
+      tool: "create_terminal",
+      heading: "Create Terminal",
+      args: { role: "builder" },
+      earlierReplies: [REGISTRY],
+    },
+    {
+      tool: "delete_terminal",
+      heading: "Delete Terminal",
+      args: { terminal_id: "terminal-1" },
+      earlierReplies: [],
+    },
+    {
+      tool: "restart_terminal",
+      heading: "Restart Terminal",
+      args: { terminal_id: "terminal-1" },
+      earlierReplies: [REGISTRY, { type: "Success" }],
+    },
+  ];
+
+  it.each(FRAMES)(
+    "list_terminals rejects with '$expected' for $shape",
+    async ({ reply, expected }) => {
+      sendDaemonRequest.mockResolvedValueOnce(reply);
+
+      await expect(handleTerminalTool("list_terminals")).rejects.toThrow(expected);
+    }
+  );
+
+  it.each(TOOLS.flatMap((tool) => FRAMES.map((frame) => ({ ...tool, ...frame }))))(
+    "$tool reports '$expected' for $shape",
+    async ({ tool, heading, args, earlierReplies, reply, expected }) => {
+      earlierReplies.forEach((frame) => sendDaemonRequest.mockResolvedValueOnce(frame));
+      sendDaemonRequest.mockResolvedValueOnce(reply);
+
+      const [{ text }] = await handleTerminalTool(tool, args);
+
+      expect(text).toBe(`=== ${heading} ===\n\nFailed\n\n${expected}`);
+    }
+  );
+});
+
 describe("removed state.json tools (#13821)", () => {
   it.each(["set_primary_terminal", "get_selected_terminal"])(
     "no longer advertises or handles %s",
