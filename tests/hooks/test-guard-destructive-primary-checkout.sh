@@ -41,6 +41,10 @@ echo present > "$PC_REPO/space file"
 git -C "$PC_REPO" add "space file"
 echo gone > "$PC_REPO/space gone"
 git -C "$PC_REPO" add "space gone"
+# Keep literal quoting and expansion distinguishable in the path probe.
+PC_NOTES="release 'v2' notes.md"
+touch "$PC_REPO/$PC_NOTES" "$PC_REPO/"'$UNBOUND'
+git -C "$PC_REPO" add -- "$PC_NOTES" '$UNBOUND'
 echo dash > "$PC_REPO/-"
 git -C "$PC_REPO" add ./-
 git -C "$PC_REPO" -c user.email=loom@test -c user.name=loom \
@@ -102,6 +106,15 @@ assert_allow_env "git switch 'main' (quoted default branch) is allowed" "$AGENT"
 assert_deny_env "git checkout 'other' (quoted non-default branch) is denied" "$AGENT" "git checkout 'other'" "$PC_REPO"
 assert_deny_env "git checkout \"nosuchref\" (quoted unknown target) is denied" "$AGENT" 'git checkout "nosuchref"' "$PC_REPO"
 
+assert_allow_env "double quotes preserve apostrophes in a tracked path" "$AGENT" \
+    "git checkout \"$PC_NOTES\"" "$PC_REPO"
+assert_allow_env "a bound path keeps apostrophes after expansion" "$AGENT" \
+    "FILE=\"$PC_NOTES\"; git checkout \"\$FILE\"" "$PC_REPO"
+assert_allow_env "single quotes preserve a literal dollar in a tracked path" "$AGENT" \
+    "git checkout '\$UNBOUND'" "$PC_REPO"
+assert_deny_env "unknown expansion cannot match a literal dollar filename" "$AGENT" \
+    'git checkout "$UNBOUND"' "$PC_REPO"
+
 # --- #15003 gap 2: gh global flags before `pr checkout` ---
 assert_deny_env "gh --repo owner/repo pr checkout in primary is denied" "$AGENT" \
     "gh --repo 2AMLogic/loom pr checkout 7" "$PC_REPO"
@@ -120,6 +133,24 @@ assert_allow_env "gh --repo owner/repo pr checkout inside a worktree is allowed"
     "gh --repo 2AMLogic/loom pr checkout 7" "$PC_WT"
 assert_allow_env "operator session gh --repo ... pr checkout (no agent env) is untouched" "" \
     "gh --repo 2AMLogic/loom pr checkout 7" "$PC_REPO"
+
+# The harness feeds these strings to the hook as JSON. It never executes them.
+assert_deny_env "flag-shaped commit message is an operand" "$AGENT" \
+    'git commit --dry-run -m "--help"' "$PC_REPO"
+assert_allow_env "a separate commit help flag after a message is recognized" "$AGENT" \
+    'git commit -m "message" -h' "$PC_REPO"
+assert_deny_env "bundled message option still takes an operand" "$AGENT" \
+    'git commit --dry-run -qm "-h"' "$PC_REPO"
+assert_allow_env "help after an attached message is recognized" "$AGENT" \
+    'git commit -mtext -h' "$PC_REPO"
+assert_allow_env "help after a flag without an operand is recognized" "$AGENT" \
+    'git commit --dry-run -h' "$PC_REPO"
+assert_deny_env "global repository operand is distinct from gh help" "$AGENT" \
+    'gh --repo "--help" pr checkout 7' "$PC_REPO"
+assert_deny_env "checkout branch operand is distinct from gh help" "$AGENT" \
+    'gh pr checkout 7 --branch "-h"' "$PC_REPO"
+assert_allow_env "gh help remains available after a branch operand" "$AGENT" \
+    'gh pr checkout 7 --branch topic --help' "$PC_REPO"
 
 # --- #15003 gap 3: bare `git checkout -` is a branch switch, not a flag ---
 assert_deny_env "git checkout - (previous-branch switch) is denied" "$AGENT" "git checkout -" "$PC_REPO"
@@ -165,6 +196,17 @@ assert_deny_env "single-quoted '\$BR' stays a literal, unresolved target" "$AGEN
     'BR=main; git checkout '"'"'$BR'"'"'' "$PC_REPO"
 assert_deny_env "env-prefix BR=main git checkout \"\$BR\" stays unresolved" "$AGENT" \
     'BR=main git checkout "$BR"' "$PC_REPO"
+
+assert_deny_env "a skipped assignment cannot establish the target" "$AGENT" \
+    'false && BR=main; git checkout "$BR"' "$PC_REPO"
+assert_deny_env "a background assignment cannot establish the target" "$AGENT" \
+    'BR=main & git checkout "$BR"' "$PC_REPO"
+assert_deny_env "a later export supersedes the initial assignment" "$AGENT" \
+    'BR=main; export BR=other; git checkout "$BR"' "$PC_REPO"
+assert_allow_env "a later literal export can establish the default target" "$AGENT" \
+    'BR=other; export BR=main; git checkout "$BR"' "$PC_REPO"
+assert_deny_env "unset invalidates a previous assignment" "$AGENT" \
+    'BR=main; unset BR; git checkout "$BR"' "$PC_REPO"
 
 # --- ALLOW: worktrees unaffected ---
 assert_allow_env "git commit inside a worktree is allowed" "$AGENT" "git commit -m x" "$PC_WT"

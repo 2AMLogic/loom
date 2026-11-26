@@ -2173,11 +2173,13 @@ Builder and Doctor work in `.loom/worktrees/issue-<N>`.
   is `main`/`master` (the Auditor's `git checkout -B main origin/main`);
   `git checkout -- <path>` and `git checkout <path>` file restores (a path
   present in the working tree, or tracked — including one deleted from the
-  worktree), quoted or unquoted — the target is unquoted (and a
-  same-command literal assignment resolved: `BR=main; git checkout "$BR"`
-  classifies like the literal `main`, #15003) before the
-  branch/ref/path classification; `-h/--help`;
-  read-only git. `worktree.sh`, `check-main-clean.sh --quarantine`,
+  worktree), quoted or unquoted. Quote removal preserves literal characters in
+  filenames. A leading sequence of literal assignments (including `export`)
+  can establish the target of the next command, as in `BR=main; git checkout "$BR"`.
+  A conditional or intervening command can leave the value unknown, in which
+  case it cannot establish a default branch or file restore. The guard allows
+  `-h` and `--help` when they occupy an option position. Also allowed are
+  read-only git commands. `worktree.sh`, `check-main-clean.sh --quarantine`,
   `resync-installed.sh`, `merge-pr.sh` and `scripts/version.sh` are unaffected:
   the hook only sees the top-level command text, not their internal git calls.
 - **Decision-log tag**:
