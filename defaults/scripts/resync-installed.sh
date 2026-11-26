@@ -2162,6 +2162,14 @@ resync_agent_skills() {
     retire_agent_skills "$src_dir" "$dst_dir"
 }
 
+# #15475: repo-relative paths of the generated skills retire_agent_skills()
+# (just below) removed this run. prune_stale_manifest_entries() reconciles
+# their manifest entries against THIS list and nothing wider: the marker that
+# proves a skill is Loom's lived in the file, so once it is unlinked a retired
+# generated skill cannot be told apart from a consumer-authored one whose entry
+# must stay.
+RETIRED_AGENT_SKILL_PATHS=()
+
 # retire_agent_skills: delete-side counterpart of resync_agent_skills() (#12507),
 # matching native stage_skills() (loom-daemon/src/init/payload/surfaces.rs).
 # The walk above only visits skills defaults/ ships today, so an installed
@@ -2174,6 +2182,8 @@ resync_agent_skills() {
 # .loom/resync-ignore pin; then `rmdir`s the dir if now empty (never rm -r).
 # Does nothing unless the source set is valid (at least one marker-carrying
 # loom-*/SKILL.md), so a missing/empty/unreadable source never wipes skills.
+# Every path it removes is recorded in RETIRED_AGENT_SKILL_PATHS (#15475) so
+# the manifest prune can drop its entry in the same run.
 retire_agent_skills() {
     local src_dir="$1" dst_dir="$2"
     [[ -d "$src_dir" && -d "$dst_dir" ]] || return 0
@@ -2208,6 +2218,10 @@ retire_agent_skills() {
             continue
         fi
         if rm -f "$dst" 2>/dev/null; then
+            # #15475: the manifest prune drops this entry on the strength of
+            # THIS removal alone -- the marker that proved ownership went with
+            # the file.
+            RETIRED_AGENT_SKILL_PATHS+=(".agents/skills/$name/SKILL.md")
             printf '%b\n' "  ${GREEN}removed${NC}   $rel ${YELLOW}(retired generated skill, #12507)${NC}"
             N_REMOVED=$((N_REMOVED + 1))
             rmdir "$d" 2>/dev/null || true
@@ -2875,6 +2889,12 @@ resync_workspace_stub_version
 # suggest_commit_if_resync_only_dirt() (which scans the whole tree) also
 # recognizes it as resync-only dirt safe to suggest committing.
 #
+# Deliberately narrower than the set of surfaces resync copies: the command,
+# agent and generated-skill surfaces outside .loom/ are reconciled by the
+# manifest prune alone, through _manifest_prune_source_path() below. Adding
+# them here would route their tracked deletions out of the commit advice
+# (#15475).
+#
 # (This section lives before restamp_metadata() rather than with its other
 # consumers further down because prune_stale_manifest_entries() runs earlier
 # in the script's straight-line flow and needs these helpers defined first,
@@ -2929,6 +2949,57 @@ _loom_pure_copy_surface_source_path() {
     esac
 }
 
+# ---------- prune-only eligibility: surfaces outside .loom/ (#15475) ----------
+#
+# The walk also copies three surfaces the shared classifier above deliberately
+# does not list -- .claude/commands/loom/ and .claude/agents/ (resync_tree)
+# and the marker-gated .agents/skills/ (resync_agent_skills) -- so a
+# retirement there removed the installed file and kept its manifest entry:
+# the #14012 over-claim, on the surfaces that classifier never reached.
+#
+# prune_stale_manifest_entries() is this wider eligibility's ONLY consumer,
+# and that is the point. collect_resync_dirt() uses the shared classifier to
+# send a path whose defaults/ counterpart is gone to RESYNC_RETIRED_PATHS
+# (never committed, #6613) -- right for an unlisted orphan under .loom/, and
+# wrong for a retired command, whose tracked deletion is exactly the resync
+# output a consumer's commit has to stage.
+#
+# _manifest_prune_source_path <repo-relative manifest entry>
+#   Echoes the defaults/ source whose absence upstream makes a stale entry
+#   prunable: the shared mapping for a pure-copy path, the same relative path
+#   under $DEFAULTS_DIR for a command or an agent. Returns 1 when the entry is
+#   not the prune's to touch -- an install-once file, or a generated skill
+#   retire_agent_skills() did not remove this run. A skill entry that was
+#   already absent before the run therefore stays: its marker went with the
+#   file, so nothing proves the entry was ever Loom's.
+_manifest_prune_source_path() {
+    local approved
+    if _is_loom_pure_copy_surface_path "$1"; then
+        _loom_pure_copy_surface_source_path "$1"
+        return
+    fi
+    case "$1" in
+        .claude/commands/loom/*)
+            printf '%s\n' "$DEFAULTS_DIR/.claude/commands/loom/${1#.claude/commands/loom/}"
+            ;;
+        .claude/agents/*)
+            printf '%s\n' "$DEFAULTS_DIR/.claude/agents/${1#.claude/agents/}"
+            ;;
+        .agents/skills/*)
+            for approved in ${RETIRED_AGENT_SKILL_PATHS[@]+"${RETIRED_AGENT_SKILL_PATHS[@]}"}; do
+                if [[ "$approved" == "$1" ]]; then
+                    printf '%s\n' "$DEFAULTS_DIR/.agents/skills/${1#.agents/skills/}"
+                    return 0
+                fi
+            done
+            return 1
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
 # ---------- prune stale install-metadata.json manifest entries (#14012) ----------
 #
 # install-metadata.json's installed_files array over-claims after an upstream
@@ -2938,9 +3009,11 @@ _loom_pure_copy_surface_source_path() {
 # skips the gap or errors on a file it was told to expect (16 stale entries
 # observed in one consumer repo, stable across two commits). This is the
 # missing reconcile: for every entry that satisfies ALL of
-#   1. it matches _is_loom_pure_copy_surface_path() -- entries outside the
-#      pure-copy surfaces (install-once files such as .github/workflows/*,
-#      .codex/config.toml, .claude/settings.json) are never touched here;
+#   1. it is on a surface resync copies -- _is_loom_pure_copy_surface_path(),
+#      or one of the three outside .loom/ that only this prune reconciles
+#      (_manifest_prune_source_path() above). Install-once files such as
+#      .github/workflows/*, .codex/config.toml and .claude/settings.json are
+#      never touched here;
 #   2. it is absent on disk under $WRITE_ROOT -- a pinned fork, or a locally
 #      deleted file this same run just restored from defaults/, still exists
 #      and is never pruned; and
@@ -2982,9 +3055,8 @@ if isinstance(arr, list):
     fi
     while IFS= read -r p; do
         [[ -z "$p" ]] && continue
-        _is_loom_pure_copy_surface_path "$p" || continue
+        src="$(_manifest_prune_source_path "$p" 2>/dev/null)" || continue
         [[ -e "$WRITE_ROOT/$p" || -L "$WRITE_ROOT/$p" ]] && continue
-        src="$(_loom_pure_copy_surface_source_path "$p" 2>/dev/null)"
         [[ -n "$src" && ! -e "$src" && ! -L "$src" ]] || continue
         prunable+=("$p")
     done <<<"$entries"
