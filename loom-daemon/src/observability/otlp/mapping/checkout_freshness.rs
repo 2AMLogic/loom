@@ -41,6 +41,9 @@ pub(super) fn log_parts(
     if let Some(same) = r.dirty_identical_to_remote {
         attributes.push(kv_bool("loom.checkout.dirty_identical_to_remote", same));
     }
+    if let Some(state) = &r.checkout_state {
+        attributes.push(kv_string("loom.checkout.state", state.clone()));
+    }
     attributes.extend(prompt_tree::attributes(r.prompt.as_ref()));
     let body = serde_json::to_string(r).unwrap_or_default();
     Some((
@@ -70,6 +73,7 @@ mod tests {
             checkout_role: Some("daemon-root".to_string()),
             dirty_tracked_files: Some(1),
             dirty_identical_to_remote: Some(true),
+            checkout_state: Some("dirty".to_string()),
             prompt: Some(PromptTree {
                 commit: "a".repeat(40),
                 loom_version: Some("0.19.1100".to_string()),
@@ -103,6 +107,7 @@ mod tests {
             "loom.checkout.role",
             "loom.checkout.dirty_tracked_files",
             "loom.checkout.dirty_identical_to_remote",
+            "loom.checkout.state",
         ] {
             assert!(has(&attributes, key), "{key}");
         }

@@ -60,7 +60,7 @@ pub struct PromptTree {
 /// One bounded local `git` read; `None` on a non-zero exit, a spawn failure
 /// or a timeout (#12111).
 fn git(root: &Path, args: &[&str]) -> Option<String> {
-    git::ok(root, args, LOCAL_TIMEOUT).ok()
+    git::ok_as("prompt_tree", root, args, LOCAL_TIMEOUT).ok()
 }
 
 /// `root`'s `origin` URL, for classification only: it must not be exported.
