@@ -61,10 +61,9 @@ use std::os::unix::net::UnixStream;
 use std::time::Duration;
 
 /// The script's closed envelope-v1 enum. Deliberately NOT
-/// [`crate::safehouse::KNOWN_TYPES`], which also carries `completion` and
-/// `digest`: the helper has rejected those locally for its whole life
-/// (completion additionally requires a meta object the CLI cannot build), and
-/// widening the script's surface is a behavior change, not a port.
+/// [`crate::safehouse::KNOWN_TYPES`], which also carries `digest`: the helper
+/// has rejected it locally for its whole life, and widening the script's
+/// surface is a behavior change, not a port.
 const SCRIPT_TYPES: [&str; 4] = ["chat", "task", "handoff", "ack"];
 
 /// How long any single socket operation may take. The shell used one
@@ -160,7 +159,6 @@ impl FleetSendArgs {
             kind: kind.to_owned(),
             task_id,
             body: body.to_owned(),
-            meta: None,
         };
         // Canonical builder: type/task_id/`to` validation, `v: 1`, no `from`,
         // omitted `task_id`/`room` when absent — the exact shape safehoused

@@ -172,7 +172,7 @@ pub(crate) fn handle_fleet_command(action: FleetAction) -> Result<()> {
             json,
         } => {
             // Resolved once, from the operator's own cwd (mirrors
-            // `WorkspacePool::start_safehouse_narration`'s
+            // `WorkspacePool::start_merge_reporter`'s
             // `safehouse::resolve_config(repo_root)` call shape) — see
             // `fleet::drain::flush_safehouse`'s doc comment for the real
             // supervised-stop flush check this now gates on (#3998).

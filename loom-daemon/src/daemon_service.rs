@@ -626,28 +626,12 @@ pub(crate) async fn run_daemon() -> Result<()> {
         }
     }
 
-    // Optional cross-host completion dedup (#6352): a dedicated safehouse
-    // connection that announces this daemon's narrated completions and consumes
-    // peers', so a merge is posted to the public feed once fleet-wide.
+    // Optional safehouse merged-PR report (#13946, part of #13920): the one line
+    // Loom still posts in the fleet room per merged PR. The host that ran a merge
+    // posts it; on the fleet captain a bounded catch-up scan posts the merges no
+    // host reported. Best effort, with a room read-back before any retry.
     // Byte-for-byte no-op when `safehouse.enabled` is false/absent.
-    //
-    // Deliberately started **before** `start_safehouse_narration` below: the
-    // narration sink reads back this call's publisher + view synchronously
-    // (`WorkspacePool::start_safehouse_narration` locks `completion_dedup`) to
-    // build its fleet-wide completion-dedup handle — reversing this order would
-    // silently leave completion dedup per-host-only even with `safehouse.enabled`
-    // true.
-    workspace_pool.start_completion_dedup(&sweep_workspace);
-
-    // Optional safehouse fleet-comms narration (#3997): subscribe the shared
-    // event bus and narrate sweep-lifecycle transitions into an E2E Matrix room.
-    // Byte-for-byte no-op when `safehouse.enabled` is false/absent. The activity
-    // DB handle (#4497) is the same `Arc` the IPC server gets, shared so the
-    // public-feed `completion` envelope can carry a best-effort per-issue token
-    // total; the sink only ever reads, on the blocking pool. Started after the
-    // completion dedup above (Issue #6352) so it can pick up the fleet-wide
-    // completion-dedup handle.
-    workspace_pool.start_safehouse_narration(&sweep_workspace, Some(activity_db.clone()));
+    workspace_pool.start_merge_reporter(&sweep_workspace);
 
     // Restart-survivorship capacity seed (Issue #6262). A daemon restart leaves
     // in-flight sweeps running but rebuilds capacity accounting from scratch, so

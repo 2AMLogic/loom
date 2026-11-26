@@ -63,7 +63,7 @@ fn legacy_labels_carry_no_level() {
 
 #[test]
 fn within_workspace_is_level_then_oldest_then_number() {
-    let items = vec![
+    let mut items = [
         key(9, Some("2026-01-01T00:00:00Z"), &[]),
         key(5, Some("2026-03-01T00:00:00Z"), &[IMPORTANT_LABEL]),
         key(4, Some("2026-02-01T00:00:00Z"), &[IMPORTANT_LABEL]),
@@ -71,13 +71,9 @@ fn within_workspace_is_level_then_oldest_then_number() {
         key(2, Some("2026-02-01T00:00:00Z"), &[IMPORTANT_LABEL]),
         key(1, None, &[]),
     ];
-    let order: Vec<u32> = order_in_workspace(items.clone())
-        .iter()
-        .map(|i| i.number)
-        .collect();
-    assert_eq!(order, vec![30, 2, 4, 5, 9, 1]);
-    assert_eq!(next_in_workspace(&items).unwrap().number, 30);
-    assert!(next_in_workspace(&[]).is_none());
+    items.sort_by(issue_cmp);
+    let order = items.map(|issue| issue.number);
+    assert_eq!(order, [30, 2, 4, 5, 9, 1]);
 }
 
 #[test]
@@ -270,18 +266,15 @@ fn very_important_holder_ties_break_by_number_and_dated_first() {
 fn red_main_fix_leads_the_workspace_order() {
     // #11547: a verified red-main fix (default level, newest) goes ahead of
     // every level and every older issue.
-    let items = vec![
+    let mut items = [
         key(9, Some("2026-01-01T00:00:00Z"), &[]),
         key(30, Some("2026-02-01T00:00:00Z"), &[VERY_IMPORTANT_LABEL]),
         fix(77, Some("2026-09-01T00:00:00Z")),
         key(2, Some("2026-02-01T00:00:00Z"), &[IMPORTANT_LABEL]),
     ];
-    let order: Vec<u32> = order_in_workspace(items.clone())
-        .iter()
-        .map(|i| i.number)
-        .collect();
-    assert_eq!(order, vec![77, 30, 2, 9]);
-    assert_eq!(next_in_workspace(&items).unwrap().number, 77);
+    items.sort_by(issue_cmp);
+    let order = items.map(|issue| issue.number);
+    assert_eq!(order, [77, 30, 2, 9]);
 }
 
 #[test]
