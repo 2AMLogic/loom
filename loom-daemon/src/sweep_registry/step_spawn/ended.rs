@@ -36,6 +36,54 @@ use std::time::Duration;
 
 use crate::step_role::StepRole;
 
+/// How the step's process ended, as the reaper observed it (#15413).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Termination {
+    /// It exited with this status. A signal death arrives here as the
+    /// reaper's `128 + signal`; no signal is inferred from an ordinary
+    /// numeric exit.
+    Status(i32),
+    /// It exited but no status was observed (for example after adoption).
+    #[default]
+    StatusUnavailable,
+    /// Killed at its role's timeout.
+    TimedOut,
+    /// Cancelled by an operator or a roll.
+    Cancelled,
+}
+
+impl From<super::capture::StepEnd> for Termination {
+    fn from(end: super::capture::StepEnd) -> Self {
+        use super::capture::StepEnd;
+        match end {
+            StepEnd::Exited(Some(code)) => Self::Status(code),
+            StepEnd::Exited(None) => Self::StatusUnavailable,
+            StepEnd::TimedOut => Self::TimedOut,
+            StepEnd::Cancelled => Self::Cancelled,
+        }
+    }
+}
+
+/// What is known about one attempt's end and where its output lives
+/// (#15413), carried with the queued step to the failed-Builder notice.
+/// Never a transcript: a raw log can hold credentials, so the notice points
+/// at it instead.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct AttemptEvidence {
+    pub termination: Termination,
+    /// The worker host the step ran on (`host_identity`).
+    pub host: String,
+    /// How long the process ran, sampled when it ended (before any forge
+    /// call), so a slow forge does not inflate the displayed runtime.
+    pub ran_for: Duration,
+    /// The step's log, relative to the workspace root when it is under it.
+    pub log: String,
+    /// An untyped fast exit 78 with no outcome line
+    /// ([`super::capture::never_started_reason`] answered `launch_rejected`):
+    /// the coarse launch rejection, when no typed reason was reported.
+    pub launch_rejected: bool,
+}
+
 /// One ended step.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EndedStep {
@@ -60,6 +108,8 @@ pub struct EndedStep {
     /// `unclassified`; ownership release, the `failed` class and the
     /// fast-fail ladder are unchanged.
     pub launch_rejection: Option<&'static str>,
+    /// The termination and log pointer the failed-Builder notice shows (#15413).
+    pub attempt: AttemptEvidence,
 }
 
 type Queue = HashMap<PathBuf, Vec<EndedStep>>;
