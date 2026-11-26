@@ -41,7 +41,8 @@ function extractDaemonErrorMessage(response: {
   message?: string;
 }): string | null {
   if (response.type === "Error") {
-    return response.message || "Unknown error";
+    const payload = response.payload as { message?: string } | undefined;
+    return payload?.message || response.message || "Unknown error";
   }
   if (response.type === "StructuredError") {
     const payload = response.payload as { message?: string } | undefined;
@@ -71,13 +72,18 @@ function extractDaemonErrorMessage(response: {
 async function listTerminals(): Promise<Terminal[]> {
   const response = (await sendDaemonRequest({
     type: "ListTerminals",
-  })) as { type: string; payload?: { terminals: Terminal[] } };
+  })) as { type: string; payload?: { terminals?: Terminal[] }; message?: string };
 
-  if (response.type === "TerminalList" && response.payload?.terminals) {
+  if (response.type === "TerminalList") {
+    if (!Array.isArray(response.payload?.terminals)) {
+      throw new Error("Invalid ListTerminals response: expected a terminals array");
+    }
     return response.payload.terminals;
   }
 
-  return [];
+  throw new Error(
+    extractDaemonErrorMessage(response) ?? `Unexpected ListTerminals response: ${response.type}`
+  );
 }
 
 /**

@@ -27,6 +27,7 @@ use super::resolution::{
 };
 use super::DECISION_LABEL;
 use crate::comment_trust::TrustPolicy;
+use std::collections::HashSet;
 use std::io::Write;
 
 /// Not run from an attended session.
@@ -99,16 +100,29 @@ pub fn require_attended() -> Result<(), String> {
     Ok(())
 }
 
+fn one_line(s: &str) -> String {
+    s.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+struct StepError {
+    code: i32,
+    reason: String,
+}
+
 fn read_current(
     forge: &mut dyn ResolveForge,
     policy: &TrustPolicy,
     repo: &str,
     issue: u64,
     err: &mut dyn Write,
-) -> Result<(IssueView, Current), i32> {
+) -> Result<(IssueView, Current), StepError> {
     let view = forge.view(issue).map_err(|e| {
-        let _ = writeln!(err, "operator-decision: could not read issue #{issue}: {e}");
-        exit::FORGE
+        let reason = format!("could not read issue #{issue}: {e}");
+        let _ = writeln!(err, "operator-decision: {reason}");
+        StepError {
+            code: exit::FORGE,
+            reason,
+        }
     })?;
     let cur = match current(repo, issue, &view.title, &view.body) {
         Ok(c) => c,
@@ -119,25 +133,31 @@ fn read_current(
             // case that may fall back — a block that fails to parse stays
             // authoritative.
             let history = forge.body_history(issue).map_err(|e| {
-                let _ = writeln!(
-                    err,
-                    "operator-decision: could not read the edit history of #{issue}: {e}"
-                );
-                exit::FORGE
+                let reason = format!("could not read the edit history of #{issue}: {e}");
+                let _ = writeln!(err, "operator-decision: {reason}");
+                StepError {
+                    code: exit::FORGE,
+                    reason,
+                }
             })?;
             current_with_history(repo, issue, &view.title, &view.body, &history, policy).map_err(
                 |why| {
-                    let _ = writeln!(
-                        err,
-                        "operator-decision: REFUSED - cannot resolve #{issue}: {why}"
-                    );
-                    exit::REFUSED
+                    let reason = format!("cannot resolve #{issue}: {why}");
+                    let _ = writeln!(err, "operator-decision: REFUSED - {reason}");
+                    StepError {
+                        code: exit::REFUSED,
+                        reason,
+                    }
                 },
             )?
         }
         Err(why) => {
-            let _ = writeln!(err, "operator-decision: REFUSED - cannot resolve #{issue}: {why}");
-            return Err(exit::REFUSED);
+            let reason = format!("cannot resolve #{issue}: {why}");
+            let _ = writeln!(err, "operator-decision: REFUSED - {reason}");
+            return Err(StepError {
+                code: exit::REFUSED,
+                reason,
+            });
         }
     };
     Ok((view, cur))
@@ -148,11 +168,14 @@ fn status_now(
     policy: &TrustPolicy,
     cur: &Current,
     err: &mut dyn Write,
-) -> Result<(Status, usize), i32> {
+) -> Result<(Status, usize), StepError> {
     let items = forge.comments(cur.issue).map_err(|e| {
-        let _ =
-            writeln!(err, "operator-decision: could not read the comments of #{}: {e}", cur.issue);
-        exit::FORGE
+        let reason = format!("could not read the comments of #{}: {e}", cur.issue);
+        let _ = writeln!(err, "operator-decision: {reason}");
+        StepError {
+            code: exit::FORGE,
+            reason,
+        }
     })?;
     let a = verify(&Evidence {
         current: Ok(cur.clone()),
@@ -171,15 +194,8 @@ pub struct Reviewed {
     pub option_label: String,
 }
 
-/// Phase 1 of the safety property: read the issue (with the #15108 history
-/// fallback), find the option, and print the review — the exact option,
-/// effect and digests being approved. Asks nothing.
-///
-/// # Errors
-///
-/// The exit code: refusal reasons on `err`, forge failures as [`exit::FORGE`].
 #[allow(clippy::too_many_arguments)]
-pub fn review(
+fn review_detailed(
     forge: &mut dyn ResolveForge,
     policy: &TrustPolicy,
     repo: &str,
@@ -188,7 +204,7 @@ pub fn review(
     effect: Effect,
     out: &mut dyn Write,
     err: &mut dyn Write,
-) -> Result<Reviewed, i32> {
+) -> Result<Reviewed, StepError> {
     let (view, cur) = read_current(forge, policy, repo, issue, err)?;
     let Some(opt) = cur
         .decision
@@ -197,22 +213,26 @@ pub fn review(
         .find(|o| o.id.trim() == option_id)
     else {
         let ids: Vec<&str> = cur.decision.options.iter().map(|o| o.id.trim()).collect();
-        let _ = writeln!(
-            err,
-            "operator-decision: REFUSED - option `{option_id}` is not in the published decision \
-             (options: {})",
+        let reason = format!(
+            "option `{option_id}` is not in the published decision (options: {})",
             ids.join(", ")
         );
-        return Err(exit::REFUSED);
+        let _ = writeln!(err, "operator-decision: REFUSED - {reason}");
+        return Err(StepError {
+            code: exit::REFUSED,
+            reason,
+        });
     };
     if !super::resolution::id_is_markable(option_id) {
-        let _ = writeln!(
-            err,
-            "operator-decision: REFUSED - option id `{option_id}` has characters a resolution \
-             record cannot carry (use letters, digits, . _ : -); re-publish the decision with a \
-             plain id"
+        let reason = format!(
+            "option id `{option_id}` has characters a resolution record cannot carry (use \
+             letters, digits, . _ : -); re-publish the decision with a plain id"
         );
-        return Err(exit::REFUSED);
+        let _ = writeln!(err, "operator-decision: REFUSED - {reason}");
+        return Err(StepError {
+            code: exit::REFUSED,
+            reason,
+        });
     }
     let resolution = Resolution {
         repo: repo.to_ascii_lowercase(),
@@ -225,7 +245,6 @@ pub fn review(
     };
 
     // The review: exactly what is being approved, before anything is asked.
-    let one_line = |s: &str| s.split_whitespace().collect::<Vec<_>>().join(" ");
     let _ = writeln!(out, "REPO={}", resolution.repo);
     let _ = writeln!(out, "ISSUE={issue}");
     let _ = writeln!(out, "TITLE={}", one_line(&view.title));
@@ -246,6 +265,200 @@ pub fn review(
     })
 }
 
+/// Phase 1 of the safety property: read the issue (with the #15108 history
+/// fallback), find the option, and print the review — the exact option,
+/// effect and digests being approved. Asks nothing.
+///
+/// # Errors
+///
+/// The exit code: refusal reasons on `err`, forge failures as [`exit::FORGE`].
+#[allow(clippy::too_many_arguments)]
+pub fn review(
+    forge: &mut dyn ResolveForge,
+    policy: &TrustPolicy,
+    repo: &str,
+    issue: u64,
+    option_id: &str,
+    effect: Effect,
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+) -> Result<Reviewed, i32> {
+    review_detailed(forge, policy, repo, issue, option_id, effect, out, err).map_err(|e| e.code)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReceiptStatus {
+    Unverified,
+    Verified { already: bool },
+}
+
+impl ReceiptStatus {
+    fn is_verified(self) -> bool {
+        matches!(self, Self::Verified { .. })
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Unverified => "unverified",
+            Self::Verified { already: false } => "verified",
+            Self::Verified { already: true } => "verified(already)",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReleaseStatus {
+    NotRequested,
+    Skipped,
+    NotHeld,
+    Released,
+    Failed,
+}
+
+impl ReleaseStatus {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::NotRequested => "-",
+            Self::Skipped => "skipped",
+            Self::NotHeld => "not-held",
+            Self::Released => "released",
+            Self::Failed => "failed",
+        }
+    }
+}
+
+struct RecordOutcome {
+    code: i32,
+    receipt: ReceiptStatus,
+    release: ReleaseStatus,
+    failure: Option<(&'static str, String)>,
+}
+
+fn record_detailed(
+    forge: &mut dyn ResolveForge,
+    policy: &TrustPolicy,
+    r: &Reviewed,
+    release: bool,
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+) -> RecordOutcome {
+    let n = r.issue;
+    let resolution = &r.resolution;
+    let skipped_release = if release {
+        ReleaseStatus::Skipped
+    } else {
+        ReleaseStatus::NotRequested
+    };
+    let fail = |phase: &'static str, code: i32, reason: String| RecordOutcome {
+        code,
+        receipt: ReceiptStatus::Unverified,
+        release: skipped_release,
+        failure: Some((phase, reason)),
+    };
+
+    // Scope may change between review and recording: re-read, compare.
+    let (view, fresh) = match read_current(forge, policy, &r.repo, n, err) {
+        Ok(x) => x,
+        Err(e) => return fail("record", e.code, e.reason),
+    };
+    if fresh.decision_digest != r.cur.decision_digest || fresh.scope_digest != r.cur.scope_digest {
+        let reason = "the decision or the proposal changed after you reviewed it; nothing was \
+                      recorded. Re-run to review the current text"
+            .to_string();
+        let _ = writeln!(err, "operator-decision: REFUSED - {reason}");
+        return fail("record", exit::REFUSED, reason);
+    }
+
+    let (prior, _) = match status_now(forge, policy, &r.cur, err) {
+        Ok(x) => x,
+        Err(e) => return fail("record", e.code, e.reason),
+    };
+    let already = match &prior {
+        Status::Resolved(p) if p.option == resolution.option && p.effect == resolution.effect => {
+            true
+        }
+        Status::Pending | Status::Stale(_) | Status::Unavailable(_) | Status::Unreadable(_) => {
+            false
+        }
+        other => {
+            let reason = format!(
+                "this decision already has a standing resolution ({}): {}",
+                other.token(),
+                other
+                    .reason()
+                    .unwrap_or_else(|| "a different choice is recorded".to_string())
+            );
+            let _ = writeln!(err, "operator-decision: REFUSED - {reason}");
+            return fail("record", exit::REFUSED, reason);
+        }
+    };
+    if !already {
+        let body = render_comment(resolution, &r.option_label);
+        if let Err(e) = forge.post_comment(n, &body) {
+            let reason = format!("recording the resolution on #{n} failed: {e}");
+            let _ = writeln!(err, "operator-decision: {reason}");
+            return fail("record", exit::FORGE, reason);
+        }
+    }
+
+    // Persist, then verify what the forge now says, before any release.
+    let (after, ignored) = match status_now(forge, policy, &r.cur, err) {
+        Ok(x) => x,
+        Err(e) => return fail("verify", e.code, e.reason),
+    };
+    match &after {
+        Status::Resolved(p) if p.option == resolution.option && p.effect == resolution.effect => {}
+        other => {
+            let reason = format!(
+                "the resolution is on #{n} but does not verify ({}): {}{}. Nothing was released",
+                other.token(),
+                other.reason().unwrap_or_default(),
+                if ignored > 0 {
+                    "; the forge does not report the posting account as an operator of this \
+                     repository (OWNER/MEMBER/COLLABORATOR or fleet admin)"
+                } else {
+                    ""
+                }
+            );
+            let _ = writeln!(err, "operator-decision: {reason}");
+            return fail("verify", UNVERIFIED, reason);
+        }
+    }
+    let receipt = ReceiptStatus::Verified { already };
+    let _ = writeln!(out, "RECORDED={}", if already { "already" } else { "true" });
+    let _ = writeln!(out, "VERIFIED=true");
+
+    let release_status = if release {
+        let held = view.labels.iter().any(|l| l == DECISION_LABEL);
+        if held {
+            if let Err(e) = forge.remove_label(n, DECISION_LABEL) {
+                let reason = format!("removing {DECISION_LABEL} from #{n} failed: {e}");
+                let _ = writeln!(err, "operator-decision: {reason}");
+                return RecordOutcome {
+                    code: exit::FORGE,
+                    receipt,
+                    release: ReleaseStatus::Failed,
+                    failure: Some(("release", reason)),
+                };
+            }
+        }
+        let _ = writeln!(out, "RELEASED={held}");
+        if held {
+            ReleaseStatus::Released
+        } else {
+            ReleaseStatus::NotHeld
+        }
+    } else {
+        ReleaseStatus::NotRequested
+    };
+    RecordOutcome {
+        code: exit::OK,
+        receipt,
+        release: release_status,
+        failure: None,
+    }
+}
+
 /// Phases 2-6 for one reviewed item: re-read and refuse if the decision or
 /// proposal changed since the review, record (a retry of the same resolution
 /// records nothing), verify with the gate's own verifier, and only with
@@ -258,96 +471,7 @@ pub fn record(
     out: &mut dyn Write,
     err: &mut dyn Write,
 ) -> i32 {
-    let n = r.issue;
-    let resolution = &r.resolution;
-    // Scope may change between review and recording: re-read, compare.
-    let (view, fresh) = match read_current(forge, policy, &r.repo, n, err) {
-        Ok(x) => x,
-        Err(code) => return code,
-    };
-    if fresh.decision_digest != r.cur.decision_digest || fresh.scope_digest != r.cur.scope_digest {
-        let _ = writeln!(
-            err,
-            "operator-decision: REFUSED - the decision or the proposal changed after you \
-             reviewed it; nothing was recorded. Re-run to review the current text"
-        );
-        return exit::REFUSED;
-    }
-
-    let (prior, _) = match status_now(forge, policy, &r.cur, err) {
-        Ok(x) => x,
-        Err(code) => return code,
-    };
-    let already = match &prior {
-        Status::Resolved(p) if p.option == resolution.option && p.effect == resolution.effect => {
-            true
-        }
-        Status::Pending | Status::Stale(_) | Status::Unavailable(_) | Status::Unreadable(_) => {
-            false
-        }
-        other => {
-            let _ = writeln!(
-                err,
-                "operator-decision: REFUSED - this decision already has a standing resolution \
-                 ({}): {}",
-                other.token(),
-                other
-                    .reason()
-                    .unwrap_or_else(|| "a different choice is recorded".to_string())
-            );
-            return exit::REFUSED;
-        }
-    };
-    if !already {
-        let body = render_comment(resolution, &r.option_label);
-        if let Err(e) = forge.post_comment(n, &body) {
-            let _ =
-                writeln!(err, "operator-decision: recording the resolution on #{n} failed: {e}");
-            return exit::FORGE;
-        }
-    }
-
-    // Persist, then verify what the forge now says, before any release.
-    let (after, ignored) = match status_now(forge, policy, &r.cur, err) {
-        Ok(x) => x,
-        Err(code) => return code,
-    };
-    match &after {
-        Status::Resolved(p) if p.option == resolution.option && p.effect == resolution.effect => {}
-        other => {
-            let _ = writeln!(
-                err,
-                "operator-decision: the resolution is on #{n} but does not verify ({}): {}{}. \
-                 Nothing was released",
-                other.token(),
-                other.reason().unwrap_or_default(),
-                if ignored > 0 {
-                    "; the forge does not report the posting account as an operator of this \
-                     repository (OWNER/MEMBER/COLLABORATOR or fleet admin)"
-                } else {
-                    ""
-                }
-            );
-            return UNVERIFIED;
-        }
-    }
-    let _ = writeln!(out, "RECORDED={}", if already { "already" } else { "true" });
-    let _ = writeln!(out, "VERIFIED=true");
-
-    if release {
-        let held = view.labels.iter().any(|l| l == DECISION_LABEL);
-        if held {
-            if let Err(e) = forge.remove_label(n, DECISION_LABEL) {
-                let _ = writeln!(
-                    err,
-                    "operator-decision: removing {DECISION_LABEL} from #{n} failed: {e}"
-                );
-                return exit::FORGE;
-            }
-        }
-        let _ = writeln!(out, "RELEASED={held}");
-    }
-    exit::OK
+    record_detailed(forge, policy, r, release, out, err).code
 }
 
 /// Record the resolution. Returns the exit code.
@@ -396,6 +520,19 @@ pub struct ResolveItem {
     pub issue: u64,
     pub option: String,
 }
+
+impl ResolveItem {
+    fn canonical_line(&self) -> String {
+        format!("{}#{}={}", self.repo.to_ascii_lowercase(), self.issue, self.option.trim())
+    }
+}
+
+/// Opening delimiter printed before the ready-to-save `--from` retry block on
+/// partial batch failure (#15385). Starts with `#` so the entire delimited
+/// block can be saved directly and parsed by [`parse_items`].
+pub const RETRY_BEGIN: &str = "# --- BEGIN RETRY --from ---";
+/// Closing delimiter printed after the ready-to-save `--from` retry block.
+pub const RETRY_END: &str = "# --- END RETRY --from ---";
 
 /// Parse `--from` content: one `owner/repo#issue=option` per line; blank
 /// lines and `#`-comment lines are ignored. Any other line is a usage error
@@ -456,15 +593,113 @@ pub struct BatchRequest {
     pub dry_run: bool,
 }
 
-/// Batch `resolve` (#15108): review EVERY item first — each prints its own
-/// `REPO=`/`ISSUE=`/…/`SCOPE_DIGEST=` block under an `ITEM=i/N` header — then
-/// take ONE typed confirmation naming how many items were reviewed
+struct BatchOutcome {
+    input_index: usize,
+    target: String,
+    code: i32,
+    receipt: ReceiptStatus,
+    release: ReleaseStatus,
+    failure: Option<(&'static str, String)>,
+}
+
+fn write_batch_summary(outcomes: &[&BatchOutcome], out: &mut dyn Write) {
+    let _ = writeln!(out, "BATCH_SUMMARY");
+    let rows: Vec<(&str, &str, &str, &str, String)> = outcomes
+        .iter()
+        .map(|o| {
+            let status = if o.code == exit::OK { "ok" } else { "failed" };
+            let reason = match &o.failure {
+                Some((phase, msg)) => format!("{phase}: {}", one_line(msg)),
+                None => "-".to_string(),
+            };
+            (o.target.as_str(), status, o.receipt.as_str(), o.release.as_str(), reason)
+        })
+        .collect();
+    let w_item = rows
+        .iter()
+        .map(|r| r.0.len())
+        .max()
+        .unwrap_or(0)
+        .max("ITEM".len());
+    let w_status = rows
+        .iter()
+        .map(|r| r.1.len())
+        .max()
+        .unwrap_or(0)
+        .max("STATUS".len());
+    let w_receipt = rows
+        .iter()
+        .map(|r| r.2.len())
+        .max()
+        .unwrap_or(0)
+        .max("RECEIPT".len());
+    let w_release = rows
+        .iter()
+        .map(|r| r.3.len())
+        .max()
+        .unwrap_or(0)
+        .max("RELEASE".len());
+    let _ = writeln!(
+        out,
+        "{:<w_item$}  {:<w_status$}  {:<w_receipt$}  {:<w_release$}  REASON",
+        "ITEM", "STATUS", "RECEIPT", "RELEASE",
+    );
+    for (item, status, receipt, release, reason) in &rows {
+        let _ = writeln!(
+            out,
+            "{item:<w_item$}  {status:<w_status$}  {receipt:<w_receipt$}  {release:<w_release$}  {reason}",
+        );
+    }
+}
+
+fn write_retry_block(
+    outcomes: &[BatchOutcome],
+    effect: Effect,
+    release: bool,
+    out: &mut dyn Write,
+) {
+    // Walk backwards through the operations as they finished. All review
+    // failures precede every record, regardless of where their inputs appeared.
+    let mut completed = HashSet::new();
+    let mut retry = Vec::new();
+    for outcome in outcomes.iter().rev() {
+        let target = outcome.target.as_str();
+        if outcome.code == exit::OK {
+            completed.insert(target);
+        } else if !completed.contains(target) {
+            retry.push(outcome);
+        }
+    }
+    if retry.is_empty() {
+        return;
+    }
+    let release_flag = if release { " --release" } else { "" };
+    let _ = writeln!(out, "{RETRY_BEGIN}");
+    let _ = writeln!(out, "# Save this block as retry.txt and rerun:");
+    let _ = writeln!(
+        out,
+        "#   loom-daemon operator-decision resolve --from retry.txt --effect {}{release_flag}",
+        effect.as_str()
+    );
+    retry.sort_unstable_by_key(|o| o.input_index);
+    for outcome in retry {
+        let _ = writeln!(out, "{}", outcome.target);
+    }
+    let _ = writeln!(out, "{RETRY_END}");
+}
+
+/// Batch `resolve` (#15108, #15385): review EVERY item first — each prints its
+/// own `REPO=`/`ISSUE=`/…/`SCOPE_DIGEST=` block under an `ITEM=i/N` header —
+/// then take ONE typed confirmation naming how many items were reviewed
 /// (`resolve <N>`), then run the same record/re-read/verify/release steps per
-/// item. A refused item (unknown option, changed scope, no recoverable block)
-/// is reported on stderr and does not stop the others; the exit code is `0`
-/// only when every item recorded (or already stood), otherwise the first
-/// non-zero item code wins — review-phase codes before record-phase ones.
-/// `forge_for` builds the forge for one item's repository.
+/// item. After a confirmed batch, prints a per-item summary table in input
+/// order (including items refused at review and separating verified receipts
+/// from failed hold releases) and, if any requests still need a retry, a
+/// ready-to-save `--from` block containing those items. A refused or failed item
+/// does not stop the others; the exit code is `0` only when every item
+/// completed, otherwise the first non-zero item code wins — review-phase codes
+/// before record-phase ones. `forge_for` builds the forge for one item's
+/// repository.
 pub fn resolve_batch(
     forge_for: &mut dyn FnMut(&str) -> Box<dyn ResolveForge>,
     policy: &TrustPolicy,
@@ -479,11 +714,17 @@ pub fn resolve_batch(
     }
     let n = req.items.len();
     let mut reviewed: Vec<(usize, Reviewed)> = Vec::new();
+    let mut outcomes = Vec::with_capacity(n);
     let mut first_bad: Option<i32> = None;
+    let skipped_release = if req.release {
+        ReleaseStatus::Skipped
+    } else {
+        ReleaseStatus::NotRequested
+    };
     for (i, item) in req.items.iter().enumerate() {
         let _ = writeln!(out, "ITEM={}/{}", i + 1, n);
         let mut forge = forge_for(&item.repo);
-        match review(
+        match review_detailed(
             &mut *forge,
             policy,
             &item.repo,
@@ -494,8 +735,16 @@ pub fn resolve_batch(
             err,
         ) {
             Ok(r) => reviewed.push((i, r)),
-            Err(code) => {
-                first_bad.get_or_insert(code);
+            Err(e) => {
+                first_bad.get_or_insert(e.code);
+                outcomes.push(BatchOutcome {
+                    input_index: i,
+                    target: item.canonical_line(),
+                    code: e.code,
+                    receipt: ReceiptStatus::Unverified,
+                    release: skipped_release,
+                    failure: Some(("review", e.reason)),
+                });
             }
         }
     }
@@ -519,19 +768,31 @@ pub fn resolve_batch(
         let _ = writeln!(err, "operator-decision: REFUSED - not confirmed; nothing was recorded");
         return exit::REFUSED;
     }
-    let mut ok = 0;
     for (i, r) in &reviewed {
         let _ = writeln!(out, "ITEM={}/{}", i + 1, n);
         let item = &req.items[*i];
         let mut forge = forge_for(&item.repo);
-        let code = record(&mut *forge, policy, r, req.release, out, err);
-        if code == exit::OK {
-            ok += 1;
-        } else {
-            first_bad.get_or_insert(code);
+        let rec = record_detailed(&mut *forge, policy, r, req.release, out, err);
+        if rec.code != exit::OK {
+            first_bad.get_or_insert(rec.code);
         }
+        outcomes.push(BatchOutcome {
+            input_index: *i,
+            target: item.canonical_line(),
+            code: rec.code,
+            receipt: rec.receipt,
+            release: rec.release,
+            failure: rec.failure,
+        });
     }
-    let _ = writeln!(out, "BATCH_RECORDED={ok}");
+    let recorded = outcomes.iter().filter(|o| o.receipt.is_verified()).count();
+    let failed = outcomes.iter().filter(|o| o.code != exit::OK).count();
+    let _ = writeln!(out, "BATCH_RECORDED={recorded}");
+    let _ = writeln!(out, "BATCH_FAILED={failed}");
+    let mut input_order: Vec<_> = outcomes.iter().collect();
+    input_order.sort_unstable_by_key(|o| o.input_index);
+    write_batch_summary(&input_order, out);
+    write_retry_block(&outcomes, req.effect, req.release, out);
     first_bad.unwrap_or(exit::OK)
 }
 

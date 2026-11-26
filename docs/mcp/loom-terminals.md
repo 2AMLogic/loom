@@ -402,7 +402,9 @@ The loom-terminals server communicates with the Loom daemon using JSON over Unix
 ```json
 {
   "type": "Error",
-  "payload": "Terminal not found: terminal-99"
+  "payload": {
+    "message": "Terminal not found: terminal-99"
+  }
 }
 ```
 

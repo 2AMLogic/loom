@@ -19,6 +19,7 @@
 //! error codes for these mutations); anything unrecognized is
 //! [`QueueError::Forge`], never a success.
 
+use std::collections::HashMap;
 use std::time::Duration;
 
 use serde::Deserialize;
@@ -201,15 +202,70 @@ impl GhQueueApi {
         inv.run()
     }
 
+    /// Read each open PR's entry in its own base branch's queue. Issue-listing
+    /// rows need only a number, even when their base is unknown. Missing or
+    /// malformed answers stay out of the map; only an explicit null entry
+    /// establishes that a PR can be handed to the queue.
+    pub(crate) fn membership(&self, prs: &[u32]) -> HashMap<u32, bool> {
+        let mut known = HashMap::new();
+        for batch in prs.chunks(100) {
+            let mut fields = String::new();
+            for pr in batch {
+                fields.push_str(&format!(
+                    " pr{pr}: pullRequest(number: {pr}) {{ number state mergeQueueEntry {{ position }} }}"
+                ));
+            }
+            let query = format!(
+                "query($owner: String!, $name: String!) {{ repository(owner: $owner, name: $name) {{{fields}}} }}"
+            );
+            let args = [
+                "-f".into(),
+                format!("query={query}"),
+                "-f".into(),
+                format!("owner={}", self.owner),
+                "-f".into(),
+                format!("name={}", self.name),
+            ];
+            let data = match self.run("merge_queue.membership", AccessIntent::Read, &args, None) {
+                Ok(data) => data,
+                Err(e) => {
+                    log::warn!(
+                        "merge-queue: {}/{}: membership read failed: {}",
+                        self.owner,
+                        self.name,
+                        safe_detail(&e)
+                    );
+                    break;
+                }
+            };
+            for &pr in batch {
+                let node = &data["repository"][format!("pr{pr}")];
+                if node["number"].as_u64() != Some(u64::from(pr)) || node["state"] != "OPEN" {
+                    continue;
+                }
+                match node.get("mergeQueueEntry") {
+                    Some(entry) if entry.is_null() => {
+                        known.insert(pr, false);
+                    }
+                    Some(entry) if entry["position"].is_u64() => {
+                        known.insert(pr, true);
+                    }
+                    _ => {}
+                }
+            }
+        }
+        known
+    }
+
     /// Run a GraphQL call to a parsed `data` value, or the failure text.
     fn run(
         &self,
         op: &'static str,
         intent: AccessIntent,
         args: &[String],
-        pr: u32,
+        pr: Option<u32>,
     ) -> Result<serde_json::Value, String> {
-        let out = self.graphql(op, intent, args, Some(pr));
+        let out = self.graphql(op, intent, args, pr);
         let combined = format!("{}\n{}", out.stderr_trimmed(), out.stdout_trimmed());
         if !out.succeeded() {
             return Err(combined);
@@ -297,7 +353,7 @@ impl GhQueueApi {
             "-F".to_string(),
             format!("number={pr}"),
         ];
-        self.run("merge_queue.status", AccessIntent::Read, &args, pr)
+        self.run("merge_queue.status", AccessIntent::Read, &args, Some(pr))
             .map_err(|text| error_for(classify_failure(&text), &text, pr, None))
     }
 
@@ -332,7 +388,7 @@ impl QueueApi for GhQueueApi {
             "-f".to_string(),
             format!("expectedHeadOid={expected_head_oid}"),
         ];
-        match self.run("merge_queue.enqueue", AccessIntent::Write, &args, pr) {
+        match self.run("merge_queue.enqueue", AccessIntent::Write, &args, Some(pr)) {
             Ok(data) => Ok(EnqueueAck::Enqueued {
                 position: data
                     .pointer("/enqueuePullRequest/mergeQueueEntry/position")
@@ -353,7 +409,7 @@ impl QueueApi for GhQueueApi {
             "-f".to_string(),
             format!("id={node_id}"),
         ];
-        match self.run("merge_queue.dequeue", AccessIntent::Write, &args, pr) {
+        match self.run("merge_queue.dequeue", AccessIntent::Write, &args, Some(pr)) {
             Ok(_) => Ok(DequeueAck::Dequeued),
             Err(text) => match classify_failure(&text) {
                 FailureClass::NotQueued => Ok(DequeueAck::NotQueued),
