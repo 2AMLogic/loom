@@ -514,41 +514,10 @@ fn strip_markers(body: &str) -> String {
 }
 
 /// `owner/repo` from the checkout's origin remote, `gh` as the fallback — the
-/// same order, for the same offline/rate-limit reason, as `dep_classify`.
+/// same resolver and the same offline/rate-limit rationale as `dep_classify`
+/// (issue #15372), under this module's `premise.repo_view` operation tag.
 pub(crate) fn resolve_repo(repo_root: &Path) -> Option<String> {
-    if let Some(nwo) = crate::script_helpers::run_git(repo_root, &["remote", "get-url", "origin"])
-        .ok_stdout_trimmed()
-        .as_deref()
-        .and_then(nwo_from_remote_url)
-    {
-        return Some(nwo);
-    }
-    #[derive(serde::Deserialize)]
-    struct NameWithOwner {
-        #[serde(rename = "nameWithOwner")]
-        name_with_owner: String,
-    }
-    let q: crate::cmd_out::Query<NameWithOwner> = crate::script_helpers::gh_read_json(
-        "premise.repo_view",
-        &["repo", "view", "--json", "nameWithOwner"],
-        repo_root,
-        false,
-        |n: &NameWithOwner| n.name_with_owner.is_empty(),
-    );
-    match q {
-        crate::cmd_out::Query::Populated(n) => Some(n.name_with_owner),
-        _ => None,
-    }
-}
-
-fn nwo_from_remote_url(url: &str) -> Option<String> {
-    let trimmed = url.strip_suffix(".git").unwrap_or(url);
-    let mut parts: Vec<&str> = trimmed.rsplit(['/', ':']).take(2).collect();
-    if parts.len() != 2 || parts.iter().any(|p| p.is_empty()) {
-        return None;
-    }
-    parts.reverse();
-    Some(parts.join("/"))
+    crate::script_helpers::resolve_repo(repo_root, "premise.repo_view")
 }
 
 #[cfg(test)]

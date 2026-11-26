@@ -138,6 +138,46 @@ pub fn run_git(dir: &Path, args: &[&str]) -> CmdOutcome {
     run_command(cmd, DEFAULT_TIMEOUT)
 }
 
+/// Resolve `owner/repo` for the checkout at `dir`, git origin first (issue
+/// #15372: the one resolver `dep_classify` and `premise_check` used to carry
+/// as character-for-character copies).
+///
+/// Order matters and is the shell's: `git remote get-url origin` is answered
+/// locally, so it keeps working offline and under GraphQL exhaustion — which
+/// is exactly when a Champion pass most needs to keep running. `gh repo view`
+/// is the fallback for a checkout with no origin; a fallback that fails,
+/// answers empty or is unavailable yields `None`, never a guess.
+///
+/// `op_tag` is the caller's `forge_call_stats` operation name
+/// (`"dep.repo_view"`, `"premise.repo_view"`), so the shared resolver books
+/// the call under the module that made it.
+pub(crate) fn resolve_repo(dir: &Path, op_tag: &'static str) -> Option<String> {
+    if let Some(nwo) = run_git(dir, &["remote", "get-url", "origin"])
+        .ok_stdout_trimmed()
+        .as_deref()
+        .and_then(crate::forge_cmd::parse_nwo_from_remote_url)
+    {
+        return Some(nwo);
+    }
+
+    #[derive(serde::Deserialize)]
+    struct NameWithOwner {
+        #[serde(rename = "nameWithOwner")]
+        name_with_owner: String,
+    }
+    let q: crate::cmd_out::Query<NameWithOwner> = gh_read_json(
+        op_tag,
+        &["repo", "view", "--json", "nameWithOwner"],
+        dir,
+        false,
+        |n: &NameWithOwner| n.name_with_owner.is_empty(),
+    );
+    match q {
+        crate::cmd_out::Query::Populated(n) => Some(n.name_with_owner),
+        _ => None,
+    }
+}
+
 // --------------------------------------------------------------------------
 // Diagnostics (port of `loom_tools.common.logging`)
 // --------------------------------------------------------------------------
@@ -345,5 +385,65 @@ mod tests {
         let empty = dir.path().join("empty.json");
         std::fs::write(&empty, "   ").unwrap();
         assert!(read_json_file(&empty).is_none());
+    }
+
+    fn init_repo_with_origin(dir: &Path, remote: &str) {
+        let git = |args: &[&str]| crate::test_git_helpers::run(dir, args);
+        git(&["init", "-q"]);
+        git(&["remote", "add", "origin", remote]);
+    }
+
+    #[test]
+    fn resolve_repo_answers_from_the_origin_remote_offline() {
+        // The reason git comes first: the answer is available offline and
+        // under API exhaustion, which is exactly when a Champion pass most
+        // needs to keep running.
+        let dir = tempdir().unwrap();
+        init_repo_with_origin(dir.path(), "git@github.com:acme/widgets.git");
+        assert_eq!(resolve_repo(dir.path(), "dep.repo_view").as_deref(), Some("acme/widgets"));
+    }
+
+    #[test]
+    #[serial_test::serial(loom_config_env)]
+    fn resolve_repo_falls_back_to_gh_when_the_origin_is_missing() {
+        let dir = tempdir().unwrap();
+        crate::test_git_helpers::run(dir.path(), &["init", "-q"]);
+        let gh = crate::gh_invocation::test_support::stub(
+            dir.path(),
+            "gh-nwo",
+            r#"printf '{"nameWithOwner":"acme/from-gh"}'"#,
+        );
+        std::env::set_var("LOOM_GH_BIN", &gh);
+        let nwo = resolve_repo(dir.path(), "premise.repo_view");
+        std::env::remove_var("LOOM_GH_BIN");
+        assert_eq!(nwo.as_deref(), Some("acme/from-gh"));
+    }
+
+    #[test]
+    #[serial_test::serial(loom_config_env)]
+    fn resolve_repo_returns_none_when_gh_fails_or_answers_empty() {
+        // A checkout with no origin and a failing (or empty-answering) `gh`
+        // yields `None` — never a guessed owner/repo.
+        let dir = tempdir().unwrap();
+        crate::test_git_helpers::run(dir.path(), &["init", "-q"]);
+        let failing = crate::gh_invocation::test_support::stub(
+            dir.path(),
+            "gh-fail",
+            "echo 'gh: rate limit exceeded' >&2; exit 1",
+        );
+        std::env::set_var("LOOM_GH_BIN", &failing);
+        let none = resolve_repo(dir.path(), "dep.repo_view");
+        std::env::remove_var("LOOM_GH_BIN");
+        assert_eq!(none, None);
+
+        let empty = crate::gh_invocation::test_support::stub(
+            dir.path(),
+            "gh-empty",
+            r#"printf '{"nameWithOwner":""}'"#,
+        );
+        std::env::set_var("LOOM_GH_BIN", &empty);
+        let none = resolve_repo(dir.path(), "dep.repo_view");
+        std::env::remove_var("LOOM_GH_BIN");
+        assert_eq!(none, None);
     }
 }

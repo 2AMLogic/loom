@@ -12,7 +12,7 @@ database_id = "YOUR_DATABASE_ID"  # Update after running: wrangler d1 create loo
 # KV Namespace for sessions/cache
 [[kv_namespaces]]
 binding = "KV"
-id = "YOUR_KV_ID"  # Update after running: wrangler kv:namespace create "sessions"
+id = "YOUR_KV_ID"  # Update after running: wrangler kv namespace create "sessions"
 
 # Environment variables (set via wrangler secret or dashboard)
 [vars]

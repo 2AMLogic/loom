@@ -55,7 +55,10 @@
 /// Keep this list short and every entry justified: it is the explicit record of
 /// a kind the daemon no longer emits. Removing the last producer of a kind is a
 /// reviewed act *because* it must land as a row here.
-pub const PRODUCER_LESS_KINDS: &[(&str, &str)] = &[];
+pub const PRODUCER_LESS_KINDS: &[(&str, &str)] = &[(
+    "completion.narrated",
+    "Safehouse stopped emitting completion envelopes when it switched to merged-PR reports (#13946).",
+)];
 
 /// Whether `kind` is on the [`PRODUCER_LESS_KINDS`] allowlist.
 #[must_use]

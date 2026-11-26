@@ -45,7 +45,13 @@ use std::path::{Path, PathBuf};
 const RETIRED: &[&str] = &["run_gh(", "gh_query(", "fn run_gh(", "fn gh_query("];
 
 /// The typed entry points whose declarations this lint checks.
-const ENTRY_POINTS: &[&str] = &["gh_read_for_repo", "gh_read_json", "gh_read", "gh_write"];
+const ENTRY_POINTS: &[&str] = &[
+    "gh_read_for_repo",
+    "gh_read_async",
+    "gh_read_json",
+    "gh_read",
+    "gh_write",
+];
 
 /// Porcelain verbs that fetch state.
 const READ_VERBS: &[&str] = &["view", "list", "diff", "checks", "status", "download"];
@@ -477,6 +483,7 @@ fn a_mutation_declared_read_fails() {
         r#"gh_read("t.probe", &["api", "-X", "DELETE", "repos/o/r"], root, false)"#,
         r#"gh_read("t.probe", &["api", "-X", "POST", "repos/o/r", "-f", "labels[]=x"], root, false)"#,
         r#"gh_read_for_repo("t.probe", &["api", "graphql", "-f", "query=mutation{updateIssue}"], root, "o/r")"#,
+        r#"gh_read_async("t.probe", &["pr", "edit", "7"], root, "gh", timeout)"#,
     ] {
         let src = format!("fn f(root: &Path) {{ {argv} }}\n");
         let problems = lint(&file("new/mislabel.rs", &src));

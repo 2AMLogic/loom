@@ -900,7 +900,7 @@ pub fn detect_cross_owner_repos(
     let root_owner = owner_of(root_owner_repo);
     managed_owner_repos
         .iter()
-        .filter(|nwo| owner_of(nwo) != root_owner)
+        .filter(|nwo| !owner_of(nwo).eq_ignore_ascii_case(root_owner))
         .cloned()
         .collect()
 }
@@ -1295,7 +1295,7 @@ pub(crate) fn apply_gh_config_for_root_with_recovery_using(
         {
             let root_owner = owner_of(root_owner_repo);
             let primary_owner = owner_of(primary_owner_repo);
-            if !root_owner.is_empty() && root_owner != primary_owner {
+            if !root_owner.is_empty() && !root_owner.eq_ignore_ascii_case(primary_owner) {
                 // Ignore the "retry me" signal deliberately: unlike
                 // `forge_listing.rs`'s caller (which retries a specific
                 // already-failed `gh` call), there is nothing to retry here
@@ -1502,7 +1502,9 @@ pub fn plan_cross_owner_credentials(
             continue;
         }
         let owner = owner_of(owner_repo);
-        if owner.is_empty() || owner == root_owner {
+        // GitHub owner names are case-insensitive: `2amlogic` is the root owner
+        // `2AMLogic`, matching `reap_stale_owner_credentials` (#15159).
+        if owner.is_empty() || owner.eq_ignore_ascii_case(root_owner) {
             continue;
         }
         match by_owner.get_mut(owner) {
@@ -2142,6 +2144,26 @@ mod tests {
         // First-seen repo of that owner is the representative mint key.
         assert_eq!(plans[0].representative_owner_repo, "2AMLogic/marketing");
         assert_eq!(plans[0].roots, vec![PathBuf::from("/ws/marketing"), PathBuf::from("/ws/2am")]);
+    }
+
+    /// #15159: owner names are case-insensitive, so a managed root whose origin
+    /// spells the root owner in a different case is not a cross-owner.
+    #[test]
+    fn plan_cross_owner_credentials_skips_root_owner_in_any_ascii_case() {
+        let managed = vec![
+            (PathBuf::from("/ws/loom"), "2AMLogic/loom".to_string()),
+            (PathBuf::from("/ws/app"), "2amlogic/app".to_string()),
+            (PathBuf::from("/ws/other"), "rjwalters/other".to_string()),
+        ];
+        let plans = plan_cross_owner_credentials("2AMLogic", &managed);
+        assert_eq!(plans.len(), 1, "{plans:?}");
+        assert_eq!(plans[0].owner, "rjwalters");
+        assert!(detect_cross_owner_repos(
+            "2AMLogic/loom",
+            &["2amlogic/app".to_string(), "rjwalters/other".to_string()]
+        )
+        .iter()
+        .all(|nwo| nwo == "rjwalters/other"));
     }
 
     #[test]

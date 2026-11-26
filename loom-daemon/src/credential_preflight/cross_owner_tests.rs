@@ -451,3 +451,29 @@ fn a_just_published_root_owner_dir_survives_until_it_ages_out() {
     establish_cross_owner_credentials(&workspace, &home, &managed, &minter);
     assert!(!dir.exists(), "aged out: reaped on the next pass");
 }
+
+/// #15159: GitHub owner names are case-insensitive. A managed root whose origin
+/// spells the root owner in another case is not a cross-owner: the plan and the
+/// reaper agree, so its by-owner directory is reaped and nothing is minted for
+/// it (before, the pass planned and re-minted what it had just reaped).
+#[test]
+#[serial_test::serial]
+fn a_case_divergent_root_owner_dir_is_reaped_without_a_mint() {
+    let env = Env::new(&[]);
+    let _cache = ScratchCache::new(env.tmp.path());
+    let home = format!("Home-{}", &unique("")[..8]);
+    let lower = home.to_ascii_lowercase();
+    assert_ne!(home, lower);
+    let (home_repo, lower_repo) = (format!("{home}/loom"), format!("{lower}/app"));
+    let workspace = env.repo("ws", &[("origin", &format!("https://github.com/{home_repo}.git"))]);
+    let root = env.repo("b", &[("origin", &format!("https://github.com/{lower_repo}.git"))]);
+    let managed = vec![(workspace.clone(), home_repo), (root, lower_repo)];
+
+    let dir = publish_owner_dir(&workspace, &lower); // older than REAP_GRACE
+    let minter = ScriptedMinter::new(vec![minted()]);
+    let pass = establish_cross_owner_credentials(&workspace, &home, &managed, &minter);
+
+    assert_eq!(minter.calls.get(), 0, "no mint for the root owner: {pass:?}");
+    assert!(pass.established.is_empty(), "{pass:?}");
+    assert!(!dir.exists(), "the root owner's dir is reaped");
+}

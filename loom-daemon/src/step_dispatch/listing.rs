@@ -16,27 +16,14 @@ use crate::forge_listing::RestIssue;
 pub const CALLER: &str = "step_engine";
 
 /// Every open issue and pull request of the repo at `cwd` (or `repo`),
-/// oldest first.
+/// oldest first. Gitea lists issues and pulls separately to produce the same
+/// set as GitHub's single walk.
 ///
 /// # Errors
 ///
 /// The REST walk's: a page failed or was shed, the walk passed its page cap,
 /// or the listing moved mid-walk. The set is all-or-nothing, so a caller must
 /// not read a missing item as absent.
-pub fn list_all_open(
-    gh_bin: &Path,
-    cwd: Option<&Path>,
-    repo: Option<&str>,
-) -> Result<Vec<RestIssue>> {
-    list_all_open_on(crate::forge_cmd::ForgeType::GitHub, gh_bin, cwd, repo)
-}
-
-/// [`list_all_open`] on `forge` (#12312): Gitea's dialect lists issues and
-/// pulls as two walks, so the rows are the same set GitHub's one walk gives.
-///
-/// # Errors
-///
-/// As [`list_all_open`].
 pub fn list_all_open_on(
     forge: crate::forge_cmd::ForgeType,
     gh_bin: &Path,

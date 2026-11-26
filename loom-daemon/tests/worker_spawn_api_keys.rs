@@ -451,3 +451,311 @@ fn a_credential_pool_on_an_array_form_credential_env_is_rejected_before_launch()
 #[allow(dead_code)]
 #[path = "../src/live_gh_guard.rs"]
 mod live_gh_guard;
+
+// ---- Tier-3 pooled pilot: `agy` (#14945) ----
+//
+// The Antigravity adapter is the one tier-3 runtime whose manifest declares
+// `credentialPool`, so its key comes from the gemini API-key pool selected
+// in the worker process itself — these drive the REAL spawn-agy.sh →
+// spawn-generic-launch.sh → spawn-generic.sh chain with a fake `agy` CLI,
+// exactly the "fake CLI through the worker entry point" the issue's test
+// plan asks for. No `.loom/runtimes/` is created, so the manifest
+// (declaration included) resolves through the daemon binary's bundled
+// fallback — the consumer-install path the bundled table exists for.
+mod agy {
+    use super::launch_field;
+    use std::os::unix::fs::PermissionsExt;
+    use std::path::{Path, PathBuf};
+    use std::process::Command;
+
+    const POOL_KEY: &str = "fake-agy-pool-key-must-never-be-logged";
+    const AMBIENT_KEY: &str = "fake-agy-ambient-key-must-never-be-logged";
+
+    struct AgyWorkspace {
+        root: tempfile::TempDir,
+        bin: tempfile::TempDir,
+        capture: PathBuf,
+    }
+
+    impl AgyWorkspace {
+        fn new() -> Self {
+            let root = tempfile::tempdir().unwrap();
+            let bin = tempfile::tempdir().unwrap();
+            let repo = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
+            let src = repo.join("defaults/scripts");
+            let scripts = root.path().join(".loom/scripts");
+            std::fs::create_dir_all(scripts.join("lib")).unwrap();
+            for name in [
+                "spawn-agy.sh",
+                "spawn-generic-launch.sh",
+                "spawn-generic.sh",
+            ] {
+                std::fs::copy(src.join(name), scripts.join(name)).unwrap();
+            }
+            std::fs::copy(
+                src.join("lib/locate-daemon-bin.sh"),
+                scripts.join("lib/locate-daemon-bin.sh"),
+            )
+            .unwrap();
+            for name in [
+                "spawn-agy.sh",
+                "spawn-generic-launch.sh",
+                "spawn-generic.sh",
+            ] {
+                std::fs::set_permissions(
+                    scripts.join(name),
+                    std::fs::Permissions::from_mode(0o755),
+                )
+                .unwrap();
+            }
+            // The fake CLI records one `ARG <token>` line per argv element
+            // plus the two environment facts under test, and prints
+            // NOTHING to stdout — a leaked key must have nowhere to hide.
+            let capture = root.path().join("agy-capture.txt");
+            std::fs::write(
+                bin.path().join("agy"),
+                format!(
+                    "#!/bin/sh\nprintf 'ARG %s\\n' \"$@\" >{c}\nprintf 'HOME=%s\\n' \"$HOME\" >>{c}\nprintf 'KEY=%s\\n' \"${{GEMINI_API_KEY:-<unset>}}\" >>{c}\nprintf 'SETTINGS=%s\\n' \"$(cat \"$HOME/settings.json\" 2>/dev/null || printf absent)\" >>{c}\n",
+                    c = capture.display()
+                ),
+            )
+            .unwrap();
+            std::fs::set_permissions(
+                bin.path().join("agy"),
+                std::fs::Permissions::from_mode(0o755),
+            )
+            .unwrap();
+            Self { root, bin, capture }
+        }
+
+        /// Register one enabled `gemini` pool account — the pilot's seat.
+        fn register_pool(&self, name: &str) {
+            let dir = self.root.path().join(".loom/api-keys/gemini");
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join(format!("{name}.env")), format!("GEMINI_API_KEY={POOL_KEY}\n"))
+                .unwrap();
+            std::fs::set_permissions(
+                dir.join(format!("{name}.env")),
+                std::fs::Permissions::from_mode(0o600),
+            )
+            .unwrap();
+        }
+
+        fn worker(&self) -> Command {
+            let mut c = Command::new(env!("CARGO_BIN_EXE_loom-daemon"));
+            c.args(["spawn-worker", "--"])
+                .current_dir(self.root.path())
+                .env("LOOM_WORKSPACE", self.root.path())
+                .env("LOOM_RUNTIME", "agy")
+                .env_remove("LOOM_ROLE")
+                .env_remove("LOOM_MODEL")
+                .env_remove("LOOM_MODEL_PROFILE")
+                .env("LOOM_CONFIG_DEFAULTS_FILE", "")
+                .env("LOOM_SHARED_API_KEYS_DIR", "")
+                .env_remove("GEMINI_API_KEY")
+                // spawn-generic-launch.sh resolves a daemon binary, and the
+                // dispatch environment this suite may run under exports its
+                // own pins (LOOM_DAEMON_SELF_BIN names the HOST daemon and
+                // outranks LOOM_DAEMON_BIN in locate-daemon-bin.sh; the
+                // preference marker rides the worker log). Neither may leak
+                // into what these tests observe.
+                .env_remove("LOOM_DAEMON_SELF_BIN")
+                .env_remove("LOOM_RUNTIME_PREFERENCE_MARKER")
+                .env("LOOM_DAEMON_BIN", env!("CARGO_BIN_EXE_loom-daemon"))
+                .env(
+                    "PATH",
+                    format!("{}:{}", self.bin.path().display(), std::env::var("PATH").unwrap()),
+                );
+            c
+        }
+
+        fn capture(&self) -> String {
+            std::fs::read_to_string(&self.capture).unwrap_or_default()
+        }
+
+        fn args(&self) -> Vec<String> {
+            self.capture()
+                .lines()
+                .filter_map(|l| l.strip_prefix("ARG ").map(str::to_string))
+                .collect()
+        }
+
+        fn fact(&self, prefix: &str) -> String {
+            self.capture()
+                .lines()
+                .find(|l| l.starts_with(prefix))
+                .unwrap_or_default()
+                .trim_start_matches(prefix)
+                .to_string()
+        }
+    }
+
+    /// Happy path: prompt once, the configured model once, the guarded
+    /// launch flags, an isolated HOME holding the gemini provider settings,
+    /// and the POOL's key in the child environment only — an ambient
+    /// GEMINI_API_KEY neither wins nor rides along (#14945 criteria 1-2).
+    #[test]
+    fn pooled_agy_launch_passes_prompt_model_and_flags_with_child_only_key() {
+        let w = AgyWorkspace::new();
+        w.register_pool("alpha");
+        let out = w
+            .worker()
+            .env("GEMINI_API_KEY", AMBIENT_KEY)
+            .args(["--dangerously-skip-permissions", "-p", "hello"])
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(out.status.success(), "{stderr}");
+        // Prompt once, model once, guarded flags from the stub, in the
+        // tier-3 template's documented order (extra args, model, prompt).
+        // The Loom-only permission flag is consumed by the template, never
+        // forwarded to the CLI.
+        let args = w.args();
+        assert_eq!(args.len(), 7, "{args:?}");
+        assert!(!args.iter().any(|a| a.contains("dangerously")), "{args:?}");
+        assert_eq!(args[0], "--settings");
+        let settings = PathBuf::from(&args[1]);
+        assert!(settings.is_file(), "settings file missing: {settings:?}");
+        assert_eq!(args[2], "--sandbox");
+        assert_eq!(args[3], "--model");
+        assert_eq!(args[4], "gemini-4-neon");
+        assert_eq!(args[5], "-p");
+        assert_eq!(args[6], "hello");
+        // The isolated settings select the gemini provider (canary shape).
+        assert_eq!(w.fact("SETTINGS="), r#"{"modelProvider": "gemini"}"#);
+        // HOME was redirected outside every checkout.
+        let home = w.fact("HOME=");
+        assert!(!home.is_empty());
+        assert!(Path::new(&home).starts_with(std::env::temp_dir()), "{home}");
+        assert!(!Path::new(&home).starts_with(w.root.path()), "{home}");
+        // Only the pool's key reached the child; the ambient one lost.
+        assert_eq!(w.fact("KEY="), POOL_KEY);
+        // The launch record names the account, never the key.
+        assert_eq!(launch_field(&stderr, "credentialSource"), "pool");
+        assert_eq!(launch_field(&stderr, "credentialProvider"), "gemini");
+        assert_eq!(launch_field(&stderr, "credentialAccount"), "alpha");
+        assert_eq!(launch_field(&stderr, "model"), "gemini-4-neon");
+        for haystack in [&stderr, &stdout] {
+            assert!(!haystack.contains(POOL_KEY), "key material leaked: {haystack}");
+            assert!(!haystack.contains(AMBIENT_KEY), "ambient key leaked: {haystack}");
+        }
+        // The adapter chain's own stdout is a bare newline at most; the
+        // point is that no key material has a stdout route.
+        assert!(stdout.trim().is_empty(), "{stdout}");
+    }
+
+    /// LOOM_MODEL overrides the manifest default once (env > manifest), and
+    /// is what the pool's model-class read sees.
+    #[test]
+    fn loom_model_overrides_the_manifest_default_once() {
+        let w = AgyWorkspace::new();
+        w.register_pool("alpha");
+        let out = w
+            .worker()
+            .env("LOOM_MODEL", "gemini-4-neon-high")
+            .args(["-p", "hello"])
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(out.status.success(), "{stderr}");
+        let args = w.args();
+        let model = args.iter().position(|a| a == "--model").unwrap();
+        assert_eq!(args[model + 1], "gemini-4-neon-high");
+        assert_eq!(args.iter().filter(|a| *a == "--model").count(), 1, "{args:?}");
+        assert_eq!(launch_field(&stderr, "model"), "gemini-4-neon-high");
+    }
+
+    /// Criterion 2's hard half: a missing pool refuses at 78 BEFORE the CLI
+    /// runs — an ambient key (or, per the adapter's isolated HOME, a cached
+    /// login) cannot substitute for the pilot's spend control.
+    #[test]
+    fn a_missing_pool_refuses_before_exec_even_with_an_ambient_key() {
+        let w = AgyWorkspace::new();
+        let out = w
+            .worker()
+            .env("GEMINI_API_KEY", AMBIENT_KEY)
+            .args(["-p", "hello"])
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(78), "{stderr}");
+        assert!(
+            stderr.contains("requires a usable account from the gemini API-key pool"),
+            "{stderr}"
+        );
+        assert!(stderr.contains("api-keys add gemini"), "{stderr}");
+        assert!(!stderr.contains(AMBIENT_KEY), "{stderr}");
+        assert!(out.stdout.is_empty());
+        // The CLI never ran.
+        assert_eq!(w.capture(), "");
+    }
+
+    /// A disabled pool is the same refusal, without key material.
+    #[test]
+    fn an_all_disabled_pool_refuses_at_78_without_key_material() {
+        let w = AgyWorkspace::new();
+        w.register_pool("alpha");
+        std::fs::write(w.root.path().join(".loom/api-keys/gemini/.disabled"), "alpha\n").unwrap();
+        let out = w.worker().args(["-p", "hello"]).output().unwrap();
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(78), "{stderr}");
+        assert!(stderr.contains("disabled by operator"), "{stderr}");
+        assert!(!stderr.contains(POOL_KEY), "{stderr}");
+        assert_eq!(w.capture(), "");
+    }
+
+    /// Criterion 3's direct-launch half: at the account's declared cap the
+    /// launch refuses before exec; the slot is the same one a live OpenCode
+    /// draw would hold (shared `gemini` namespace).
+    #[test]
+    fn a_direct_launch_at_the_account_cap_refuses_before_exec() {
+        let w = AgyWorkspace::new();
+        w.register_pool("alpha");
+        std::fs::write(
+            w.root.path().join(".loom/api-keys/gemini/.limits.json"),
+            r#"{"alpha": {"maxConcurrent": 1}}"#,
+        )
+        .unwrap();
+        // One live lease, held by this test process (a live PID): the
+        // in-flight shape `spawn-worker`'s own selection would register.
+        let inflight = w.root.path().join(".loom/api-keys/gemini/.inflight/alpha");
+        std::fs::create_dir_all(&inflight).unwrap();
+        let holder = serde_json::json!({
+            "pid": std::process::id(),
+            "startedAt": std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0),
+        })
+        .to_string();
+        std::fs::write(inflight.join(format!("{}-lease.json", std::process::id())), holder)
+            .unwrap();
+        let out = w.worker().args(["-p", "hello"]).output().unwrap();
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(78), "{stderr}");
+        assert!(stderr.contains("concurrency cap"), "{stderr}");
+        assert!(!stderr.contains(POOL_KEY), "{stderr}");
+        assert_eq!(w.capture(), "");
+    }
+
+    /// An operator's LOOM_GENERIC_EXTRA_ARGS stays authoritative over the
+    /// stub's guarded defaults (the env > manifest tier), and the manifest's
+    /// launch shape still applies around it.
+    #[test]
+    fn an_operator_pinned_extra_args_wins_over_the_stub_defaults() {
+        let w = AgyWorkspace::new();
+        w.register_pool("alpha");
+        let out = w
+            .worker()
+            .env("LOOM_GENERIC_EXTRA_ARGS", "--sandbox")
+            .args(["-p", "hello"])
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(out.status.success(), "{stderr}");
+        let args = w.args();
+        assert_eq!(args[0], "--sandbox", "{args:?}");
+        assert!(!args.iter().any(|a| a.starts_with("--settings")), "{args:?}");
+    }
+}
