@@ -6204,8 +6204,8 @@ concurrency ceiling 5" and share it with the team:
 > **Operational tunables have their own surface (#9683/#9768).** The knobs that
 > govern *how fast and how much* the engine runs — tick cadence, concurrency,
 > admission ramps, lease TTL, review-debt backoff — live in the validated
-> [`hyperparameters`](hyperparameters.md) block (with the `$LOOM_HYPERPARAMS`
-> optimizer vector and the `loom.hyperparams.digest` run-provenance stamp), not
+> [`hyperparameters`](hyperparameters.md) block (with the
+> `loom.hyperparams.digest` run-provenance stamp), not
 > in the `autonomous` feature block below. The two compose: the
 > `hyperparameters` layer wins per-field where both set the same knob.
 
