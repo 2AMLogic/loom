@@ -84,10 +84,11 @@ impl SweepRegistry {
             return;
         }
         let path = self.noop_holds_path();
-        let tmp = path.with_extension("json.tmp");
-        let written = std::fs::create_dir_all(self.config.logs_dir())
-            .and_then(|()| std::fs::write(&tmp, &json))
-            .and_then(|()| std::fs::rename(&tmp, &path));
+        let written = crate::fs_util::write_atomic(
+            &path,
+            json.as_bytes(),
+            crate::fs_util::AtomicOpts::default(),
+        );
         match written {
             Ok(()) => self.noop_cooldown.persisted = json,
             Err(e) => log::debug!("sweep_registry: could not persist no-op holds: {e}"),
