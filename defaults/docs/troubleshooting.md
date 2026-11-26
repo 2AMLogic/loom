@@ -2081,9 +2081,10 @@ The daemon automatically prunes them once they are older than the
 4. **Replay, don't pop.** To recover the work, apply the diff **inside the
    owning issue worktree** rather than `git stash pop`-ing it back into the
    primary clone — a pop in a shared stack can restore someone else's entry
-   (see "Never use bare `git stash` for ad-hoc WIP" in `builder.md`), and it
-   puts the contamination straight back where the backstop will quarantine it
-   again.
+   (see
+   [`builder-worktree.md` → "Replay quarantined edits"](https://github.com/2AMLogic/loom/blob/main/defaults/.claude/commands/loom/builder-worktree.md#replay-quarantined-edits)),
+   and it puts the contamination straight back where the backstop will
+   quarantine it again.
 
 **Empty entries**: an entry flagged `[EMPTY]` recorded nothing. These came from
 a race between the contamination snapshot and the stash push; the push is now

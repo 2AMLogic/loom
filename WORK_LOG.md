@@ -18,6 +18,24 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 ### 2026-11-26
 
+- **Issue #15258** (closed): merge-pr.sh: --no-cleanup-primary joins --no-cleanup-worktree as a silently-ignored opt-out after the #14905 cutover
+- **PR #15443**: docs: mark merge-pr --no-cleanup-* flags no-op on GitHub default path
+- **Issue #15406** (closed): Update token-attribution docs after the Safehouse completion envelope is retired
+- **PR #15447**: docs: point token-attribution guides at the sweep and role telemetry records
+- **Issue #15259** (closed): Clarify when daemon reconciliation handles post-merge follow-up in merge-pr.sh
+- **PR #15445**: fix(merge-pr): explain when post-merge reconciliation runs
+- **Issue #15416** (closed): Skip Champion merge dispatch for PRs already in GitHub’s merge queue
+- **PR #15436**: fix: check GitHub queue membership before dispatching Champion merges
+- **Issue #15052** (closed): workflow-lint: detect duplicate on keys and preserve boolean-like step IDs
+- **PR #15426**: fix(workflow-lint): detect duplicate on keys and preserve boolean-like step IDs
+- **Issue #15438** (closed): docs/mcp/loom-terminals.md shows a legacy Error frame with a bare-string payload
+- **PR #15442**: docs: correct the Error frame payload shape in loom-terminals.md
+- **Issue #15413** (closed): Builder step that exits within a minute is recorded as unclassified with no cause before quarantine
+- **PR #15427**: feat(daemon): show exit status, runtime and log pointer on failed Builder steps
+- **Issue #15431** (closed): mcp-loom terminals.ts drops the daemon's legacy Error message (reads top-level `message`, wire shape is `payload.message`)
+- **PR #15439**: fix: surface legacy daemon Error messages in mcp-loom terminal tools
+- **Issue #15415** (closed): create-pr.sh: quoted-evidence filter misses fenced code blocks and single-quoted citations
+- **PR #15424**: fix: ignore fenced examples and single-quoted citations in PR guard lookups
 - **Issue #15385** (closed): operator-decision resolve --from: batch recorded 3 of 5 items with no visible failure
 - **PR #15388**: feat: print per-item batch summary and retry block in resolve --from
 - **Issue #15423** (closed): Remove the synthetic empty registry fallback from MCP list_terminals
