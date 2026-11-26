@@ -3245,13 +3245,11 @@ pub enum Event {
     /// ask clears. (Its first publisher, the star-liveness pass, was removed
     /// by #11104.)
     ///
-    /// Consumed by the Safehouse narration sink
-    /// ([`crate::safehouse::operator_priority_envelope`] — *not*
-    /// `event_to_envelope`, which returns `None` for this variant because the
-    /// body needs `safehouse.operatorMention` from config), which renders it as a
-    /// `handoff` envelope — the `Signal` attention class, i.e. the team's
-    /// notifications-on Matrix room — so the ask reaches the human rather than
-    /// only a forge comment nobody reads in time (the #9268 failure mode).
+    /// Matrix no longer carries it: the Safehouse narration sink that rendered
+    /// it as a `handoff` line (#9321) was retired with the rest of the per-event
+    /// narration (#13946). The ask still reaches the human as the forge comment
+    /// and the pinned hold digest; this event stays on the bus for other
+    /// subscribers.
     ///
     /// Secret-free by construction: forge slug, issue number, dedupe key, ask
     /// kind/stage wire names, the operator-facing ask sentence, the issue's
@@ -3403,11 +3401,9 @@ impl Event {
     /// `sweep.issue.{N}.blocker` — are upgraded to their typed [`Event`]
     /// variants ([`Event::SweepPhase`] / [`Event::SweepBlocker`]) when the topic
     /// parses and the payload matches the documented schema
-    /// (`defaults/.claude/commands/loom/sweep.md`). This is what lets the
-    /// narration sink ([`crate::safehouse::event_to_envelope`]) emit the
-    /// documented `task` / `handoff` room lines — a raw [`Event::Generic`] is
-    /// never narrated, so before this upgrade the child's phase/blocker lines
-    /// silently never reached the room.
+    /// (`defaults/.claude/commands/loom/sweep.md`). This is what lets every
+    /// bus subscriber match on the typed phase/blocker variants rather than a
+    /// raw [`Event::Generic`].
     ///
     /// Publish is **fire-and-forget advisory**: an unknown topic, a
     /// non-integer issue segment, or a payload that does not match the

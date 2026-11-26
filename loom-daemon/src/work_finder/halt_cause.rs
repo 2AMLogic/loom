@@ -136,8 +136,8 @@ pub fn held_summary(causes: &[Option<HaltCause>]) -> String {
     parts.join(", ")
 }
 
-/// The per-root cause fold — [`super::dispatch_held_per_root`]'s holds plus the
-/// pre-flight causes and the daemon-global `draining` term (#9017).
+/// Determine why each root is held using its health, gate and pre-flight state
+/// and the daemon-wide drain flag (#9017).
 ///
 /// `preflight_causes` is parallel to `roots`, as computed by
 /// [`crate::work_finder::pool_preflight::preflight_held_causes_per_root`];

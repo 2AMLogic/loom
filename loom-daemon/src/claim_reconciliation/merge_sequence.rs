@@ -609,11 +609,6 @@ pub const REPLAN_NOTE_BODY: &str =
      ---\n\
      *Automated by loom-daemon claim reconciliation (#9686)*";
 
-/// The repair-deferral marker: written by the review-conflict pass when a
-/// base conflict is deferred behind an open predecessor instead of flagged.
-pub const DEFER_REPAIR_MARKER_FMT: &str =
-    "<!-- loom:sequence defer-repair plan=%PLAN% pred=%PRED% -->";
-
 /// The deferral comment body.
 #[must_use]
 pub fn defer_comment_body(marker: &SequenceMarker) -> String {
