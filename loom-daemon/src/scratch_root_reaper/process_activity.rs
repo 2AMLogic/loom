@@ -96,9 +96,9 @@ fn process_uses_root(process: &Path, root: &Path) -> std::io::Result<bool> {
         Err(e) => return Err(e),
     }
     // The executable image need not appear in the numbered descriptors.
-    match std::fs::read_link(process.join("exe")) {
+    let kernel_thread = match std::fs::read_link(process.join("exe")) {
         Ok(exe) if exe.starts_with(root) => return Ok(true),
-        Ok(_) => {}
+        Ok(_) => false,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             // Kernel threads have no userspace executable. Still check their
             // descriptors, and preserve on a missing image for any other task.
@@ -106,9 +106,10 @@ fn process_uses_root(process: &Path, root: &Path) -> std::io::Result<bool> {
             if !status.lines().any(|line| line == "Kthread:\t1") {
                 return Err(e);
             }
+            true
         }
         Err(e) => return Err(e),
-    }
+    };
     for fd in std::fs::read_dir(process.join("fd"))? {
         match std::fs::read_link(fd?.path()) {
             Ok(target) if target.starts_with(root) => return Ok(true),
@@ -118,7 +119,63 @@ fn process_uses_root(process: &Path, root: &Path) -> std::io::Result<bool> {
             Err(e) => return Err(e),
         }
     }
-    Ok(false)
+    if kernel_thread {
+        return Ok(false); // No userspace address space.
+    }
+    mapped_file_under_root(process, root)
+}
+
+#[cfg(target_os = "linux")]
+fn mapped_file_under_root(process: &Path, root: &Path) -> std::io::Result<bool> {
+    use std::ffi::OsStr;
+    use std::io::{BufRead, BufReader, Error, ErrorKind::InvalidData};
+    use std::os::unix::ffi::OsStrExt;
+
+    // procfs renders a newline in a pathname as a literal backslash-012.
+    // If that ambiguity occurs in the root itself we cannot prove absence.
+    if root.as_os_str().as_bytes().contains(&b'\n') {
+        return Err(Error::from(InvalidData));
+    }
+    let mut maps = BufReader::new(std::fs::File::open(process.join("maps"))?);
+    let mut line = Vec::new();
+    let mut saw_mapping = false;
+    loop {
+        line.clear();
+        if maps.read_until(b'\n', &mut line)? == 0 {
+            return if saw_mapping {
+                Ok(false)
+            } else {
+                Err(Error::from(InvalidData))
+            };
+        }
+        let mut rest = line.strip_suffix(b"\n").ok_or(InvalidData)?;
+        // Skip address, permissions, offset and device. Only the columns
+        // before the pathname are space-delimited; filenames can contain
+        // spaces, tabs and non-UTF-8 bytes.
+        for _ in 0..4 {
+            let end = rest
+                .iter()
+                .position(|&c| c == b' ')
+                .filter(|&i| i > 0)
+                .ok_or(InvalidData)?;
+            rest = rest[end..].trim_ascii_start();
+        }
+        let end = rest.iter().position(|&c| c == b' ').unwrap_or(rest.len());
+        let inode = std::str::from_utf8(&rest[..end])
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .ok_or(InvalidData)?;
+        let path = rest[end..].trim_ascii_start();
+        if path.starts_with(b"/") {
+            if Path::new(OsStr::from_bytes(path)).starts_with(root) {
+                return Ok(true);
+            }
+        } else if !(inode == 0 && path.is_empty() || path.starts_with(b"[") && path.ends_with(b"]"))
+        {
+            return Err(Error::from(InvalidData));
+        }
+        saw_mapping = true;
+    }
 }
 
 /// True when every task in the process is a zombie or dead; errors when any
@@ -285,7 +342,7 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn proc_scan_requires_cwd_exe_and_fds_to_be_inspectable() {
+    fn proc_scan_requires_cwd_exe_fds_and_file_mappings_to_be_inspectable() {
         use std::os::unix::fs::symlink;
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().join("candidate");
@@ -298,7 +355,20 @@ mod tests {
         symlink(tmp.path().join("worker"), pid.join("exe")).unwrap();
         assert_eq!(scan_proc(&procfs, &root), None);
         std::fs::create_dir(pid.join("fd")).unwrap();
+        assert_eq!(scan_proc(&procfs, &root), None, "missing maps");
+        let maps = pid.join("maps");
+        for invalid in ["", "truncated", "100-200 r--p 0 00:00 7\n"] {
+            std::fs::write(&maps, invalid).unwrap();
+            assert_eq!(scan_proc(&procfs, &root), None);
+        }
+        let outside = format!("100-200 r--p 0 00:00 7 {}-peer/data\n", root.display());
+        std::fs::write(&maps, outside).unwrap();
         assert_eq!(scan_proc(&procfs, &root), Some(false));
+        let mut mapped = format!("100-200 r--p 0 00:00 7 {}/db ", root.display()).into_bytes();
+        mapped.extend_from_slice(b"index\xff (deleted)\n");
+        std::fs::write(&maps, mapped).unwrap();
+        assert_eq!(scan_proc(&procfs, &root), Some(true));
+        std::fs::remove_file(maps).unwrap();
         std::fs::remove_file(pid.join("exe")).unwrap();
         std::fs::write(pid.join("status"), "Kthread:\t0\n").unwrap();
         assert_eq!(scan_proc(&procfs, &root), None);
@@ -320,6 +390,7 @@ mod tests {
         std::fs::create_dir_all(idle.join("fd")).unwrap();
         symlink(tmp.path(), idle.join("cwd")).unwrap();
         symlink(tmp.path().join("worker"), idle.join("exe")).unwrap();
+        std::fs::write(idle.join("maps"), "100-200 rw-p 0 00:00 0 [heap]\n").unwrap();
         // Zombie: no cwd or fd entries, every task in state Z.
         let zombie = procfs.join("41");
         let task = |tid: &str, stat: &str| {

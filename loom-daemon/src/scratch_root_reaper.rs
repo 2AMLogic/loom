@@ -14,10 +14,8 @@
 //! mount-volume top holding `<repo>/.loom/worktrees`, `$HOME`,
 //! `$HOME/.cache`, `$TMPDIR`) whose name matches
 //! [`ROOT_NAME_RE`]. The pass never recurses to *find* candidates and never
-//! follows symlinks; a candidate that is itself a symlink or sits on a
-//! different device than its parent (a volume mounted at the candidate path)
-//! is preserved — deleting through either would cross a boundary the name
-//! pattern did not describe.
+//! follows symlinks. It preserves symlink roots and any candidate whose tree
+//! cannot be verified to share its parent’s mount.
 //!
 //! # Ticket → repo, and fail-closed everywhere
 //!
@@ -34,7 +32,7 @@
 //!    failure is `UNKNOWN` → preserve);
 //! 2. a `watch-pid` file at the root's top level names a dead process (absent
 //!    passes; unparseable is treated as alive);
-//! 3. a complete process scan finds no cwd, executable or open fd under the root;
+//! 3. a complete process scan finds no cwd, executable, open fd or mapped file under the root;
 //! 4. the bounded idle walk finds no change within the idle window (24 h).
 //!    An unreadable subtree is `Unknown` and preserves the root.
 //! 5. every git worktree inside is clean **and** its `HEAD` is reachable from
@@ -48,8 +46,9 @@
 //!
 //! # Removal mechanics (the hand-cleanup gotchas, implemented as stated)
 //!
-//! Read-only trees (Go module caches, cert stores) need `chmod -R u+w`
-//! before removal; deleting a worktree directory leaves a stale entry in its
+//! Removal opens directories without following links, verifies their mount
+//! and grants owner write access to read-only directories before unlinking entries.
+//! Deleting a worktree directory leaves a stale entry in its
 //! parent repo, so the pass runs `git worktree prune` on every parent repo
 //! that still exists afterwards.
 //!
@@ -81,6 +80,7 @@ use regex::Regex;
 
 use crate::fs_util::human_size;
 
+mod mount_boundary;
 mod process_activity;
 
 /// The topic published for every (planned) root removal.
@@ -672,10 +672,8 @@ pub struct ScratchRootProbes<'a> {
     pub pid_alive: &'a dyn Fn(u32) -> Option<bool>,
     /// Whether any process holds the root. An incomplete scan returns `None`.
     pub directory_in_use: &'a dyn Fn(&Path) -> Option<bool>,
-    /// Device id of a path, for the mount-point refusal (gate on candidate
-    /// vs its parent differing). `None` = cannot determine → gate passes
-    /// (defense in depth; the canonical deployment is Linux, where it works).
-    pub device_of: &'a dyn Fn(&Path) -> Option<u64>,
+    /// Mount identity of the entry itself, including symlinks. Unknown preserves.
+    pub mount_id_of: &'a dyn Fn(&Path) -> Option<u64>,
 }
 
 /// Apply every removal gate, cheapest first, to one candidate root. Pure
@@ -694,14 +692,14 @@ pub fn evaluate_root(root: &Path, owner: &str, probes: &ScratchRootProbes<'_>) -
             return RootVerdict::Preserve("root is a symlink (never followed)");
         }
         Ok(m) if !m.is_dir() => return RootVerdict::Preserve("not a directory"),
-        _ => {}
+        Err(_) => return RootVerdict::Preserve("root metadata unreadable"),
+        Ok(_) => {}
     }
-    match ((probes.device_of)(root), root.parent().map(|p| (probes.device_of)(p))) {
-        (Some(child_dev), Some(Some(parent_dev))) if child_dev != parent_dev => {
-            return RootVerdict::Preserve("root is a mount point (device differs from parent)");
-        }
-        _ => {}
-    }
+    let mount = match ((probes.mount_id_of)(root), root.parent().and_then(probes.mount_id_of)) {
+        (Some(root_id), Some(parent_id)) if root_id == parent_id => root_id,
+        (Some(_), Some(_)) => return RootVerdict::Preserve("root is a mount point"),
+        _ => return RootVerdict::Preserve(mount_boundary::UNKNOWN),
+    };
     let Some(root_mtime) = mtime_epoch(root) else {
         return RootVerdict::Preserve("root mtime unreadable");
     };
@@ -721,6 +719,10 @@ pub fn evaluate_root(root: &Path, owner: &str, probes: &ScratchRootProbes<'_>) -
     }
     let Ok(canonical_root) = root.canonicalize() else {
         return RootVerdict::Preserve("root path could not be resolved");
+    };
+    let bytes = match mount_boundary::tree_size(&canonical_root, mount, probes.mount_id_of) {
+        Ok(bytes) => bytes,
+        Err(reason) => return RootVerdict::Preserve(reason),
     };
     let Some(worktrees) = find_git_worktrees(&canonical_root) else {
         return RootVerdict::Preserve("worktree search could not answer (unreadable subtree)");
@@ -765,7 +767,7 @@ pub fn evaluate_root(root: &Path, owner: &str, probes: &ScratchRootProbes<'_>) -
     match (probes.directory_in_use)(&canonical_root) {
         Some(true) => {
             return RootVerdict::Preserve(
-                "a process has its cwd, executable or an open file under the root",
+                "a process has its cwd, executable, open file or mapped file under the root",
             )
         }
         None => {
@@ -776,7 +778,7 @@ pub fn evaluate_root(root: &Path, owner: &str, probes: &ScratchRootProbes<'_>) -
     RootVerdict::Remove {
         ticket: name.ticket,
         repo: owner.to_owned(),
-        bytes: dir_size_bytes(root),
+        bytes,
         prune,
     }
 }
@@ -784,34 +786,6 @@ pub fn evaluate_root(root: &Path, owner: &str, probes: &ScratchRootProbes<'_>) -
 // ============================================================================
 // Removal mechanics
 // ============================================================================
-
-/// Total size in bytes of everything under `path` (symlinks not followed).
-/// Read failures contribute `0` — informational, never a removal decision.
-fn dir_size_bytes(path: &Path) -> u64 {
-    let mut total = 0u64;
-    let Ok(entries) = std::fs::read_dir(path) else {
-        return total;
-    };
-    for entry in entries.flatten() {
-        if let Ok(ft) = entry.file_type() {
-            if ft.is_dir() {
-                total += dir_size_bytes(&entry.path());
-            } else if let Ok(meta) = entry.metadata() {
-                total += meta.len();
-            }
-        }
-    }
-    total
-}
-
-/// Remove one scratch root: `chmod -R u+w` first (Go module caches and cert
-/// trust stores are read-only; a failed chmod is not fatal — removal then
-/// fails and is reported), then `remove_dir_all`, which does not follow
-/// symlinks.
-fn remove_root(path: &Path) -> std::io::Result<()> {
-    let _ = Command::new("chmod").args(["-R", "u+w"]).arg(path).status();
-    std::fs::remove_dir_all(path)
-}
 
 /// `git worktree prune` on every parent repo that still exists — deleting a
 /// worktree dir leaves a stale entry behind. Best effort: a prune failure is
@@ -1024,7 +998,7 @@ fn sweep(
                     };
                     recorder.removal(&record);
                     report.planned.push(record);
-                } else if let Err(e) = remove_root(&candidate) {
+                } else if let Err(e) = mount_boundary::remove_root(&candidate) {
                     log::warn!(
                         "scratch_root_reaper: could not remove {}: {e}",
                         candidate.display()
@@ -1138,19 +1112,6 @@ fn prod_ticket_finished(cwd: &Path, slug: &str, ticket: u32) -> Option<bool> {
     }
 }
 
-fn prod_device_of(path: &Path) -> Option<u64> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-        std::fs::metadata(path).ok().map(|m| m.dev())
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = path;
-        None
-    }
-}
-
 /// Production probes for [`evaluate_root`].
 #[must_use]
 pub fn production_probes(
@@ -1165,7 +1126,7 @@ pub fn production_probes(
         ticket_finished: &prod_ticket_finished,
         pid_alive: &process_activity::pid_alive,
         directory_in_use: &process_activity::directory_in_use,
-        device_of: &prod_device_of,
+        mount_id_of: &mount_boundary::mount_id,
     }
 }
 
@@ -1365,7 +1326,7 @@ mod tests {
                 ticket_finished: &always_finished,
                 pid_alive: &never_alive,
                 directory_in_use: &no_processes,
-                device_of: &same_device,
+                mount_id_of: &same_device,
             },
             now,
         )
@@ -1794,11 +1755,11 @@ mod tests {
             ticket_finished: probes.ticket_finished,
             pid_alive: probes.pid_alive,
             directory_in_use: probes.directory_in_use,
-            device_of: &mount_device,
+            mount_id_of: &mount_device,
         };
         assert_eq!(
             evaluate_root(&mount, "acme/widgets", &probing),
-            RootVerdict::Preserve("root is a mount point (device differs from parent)")
+            RootVerdict::Preserve("root is a mount point")
         );
     }
 
@@ -1818,7 +1779,7 @@ mod tests {
             ticket_finished: probes.ticket_finished,
             pid_alive: &process_activity::pid_alive,
             directory_in_use: probes.directory_in_use,
-            device_of: probes.device_of,
+            mount_id_of: probes.mount_id_of,
         };
         assert_eq!(
             evaluate_root(&root, "acme/widgets", &probing),
@@ -1890,12 +1851,7 @@ mod tests {
         assert!(matches!(watch_pid_state(&marker, &never_alive), WatchPidState::Unreadable));
     }
 
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn preview_skips_a_running_executable_with_cwd_and_fds_outside_the_root() {
-        use std::os::unix::fs::symlink;
-        use std::process::Stdio;
-
+    fn published_scratch_fixture() -> (tempfile::TempDir, PathBuf) {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().join("loom-203-builder.cafe");
         let source = root.join("source");
@@ -1909,6 +1865,121 @@ mod tests {
                 "https://github.com/acme/widgets.git",
             ],
         );
+        (tmp, root)
+    }
+
+    fn checked_sweep(
+        base: &Path,
+        probes: &ScratchRootProbes<'_>,
+        dry_run: bool,
+    ) -> ScratchRootReport {
+        let events = Mutex::new(Vec::new());
+        let report =
+            sweep(base, Some("acme/widgets"), &[base.to_owned()], probes, dry_run, &events);
+        assert_eq!(
+            if dry_run {
+                &report.planned
+            } else {
+                &report.removed
+            },
+            &events.into_inner().unwrap()
+        );
+        report
+    }
+
+    #[test]
+    fn nested_or_unknown_mount_preserves_every_byte_in_preview_and_live_cleanup() {
+        let (tmp, root) = published_scratch_fixture();
+        let canonical = root.canonicalize().unwrap();
+        let cache = canonical.join("build/cache");
+        let payload = cache.join("payload");
+        std::fs::create_dir_all(&cache).unwrap();
+        std::fs::write(&payload, b"mounted data").unwrap();
+        let (probes, now) = probes_now(IDLE_WINDOW_SECS, IDLE_WINDOW_SECS);
+        backdate(&root, now.timestamp() - 2 * IDLE_WINDOW_SECS);
+        assert_eq!(checked_sweep(tmp.path(), &probes, true).planned.len(), 1);
+
+        for (boundary, id) in [
+            (&cache, Some(2)),
+            (&payload, Some(2)),
+            (&payload, None),
+            (&root, None),
+        ] {
+            let probe = |p: &Path| if p == boundary { id } else { Some(1) };
+            let probes = ScratchRootProbes {
+                mount_id_of: &probe,
+                ..probes
+            };
+            for dry_run in [true, false] {
+                let report = checked_sweep(tmp.path(), &probes, dry_run);
+                assert_eq!(report.preserved.len(), 1);
+                assert_eq!(
+                    report.preserved[0].reason,
+                    if id.is_some() {
+                        "root contains a mount point"
+                    } else {
+                        mount_boundary::UNKNOWN
+                    }
+                );
+                assert!(report.planned.is_empty() && report.removed.is_empty());
+                assert_eq!(std::fs::read(&payload).unwrap(), b"mounted data");
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn closed_descriptor_keeps_root_active_until_file_is_unmapped() {
+        use std::os::fd::AsRawFd;
+        use std::os::unix::fs::symlink;
+        let (tmp, root) = published_scratch_fixture();
+        let data = root.join("mapped index");
+        std::fs::write(&data, b"x").unwrap();
+        let procfs = tmp.path().join("proc");
+        std::fs::create_dir(&procfs).unwrap();
+        symlink("/proc/self", procfs.join(std::process::id().to_string())).unwrap();
+        let (probes, now) = probes_now(IDLE_WINDOW_SECS, IDLE_WINDOW_SECS);
+        let probes = ScratchRootProbes {
+            directory_in_use: &|path| process_activity::scan_proc(&procfs, path),
+            ..probes
+        };
+        backdate(&root, now.timestamp() - 2 * IDLE_WINDOW_SECS);
+        assert_eq!(checked_sweep(tmp.path(), &probes, true).planned.len(), 1);
+
+        let file = std::fs::File::open(data).unwrap();
+        // SAFETY: a readable, nonempty file backs the one-byte read-only map.
+        let mapping = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                1,
+                libc::PROT_READ,
+                libc::MAP_PRIVATE,
+                file.as_raw_fd(),
+                0,
+            )
+        };
+        assert_ne!(mapping, libc::MAP_FAILED);
+        drop(file);
+        for dry_run in [true, false] {
+            let report = checked_sweep(tmp.path(), &probes, dry_run);
+            assert!(report.planned.is_empty() && report.removed.is_empty());
+            assert_eq!(
+                report.preserved[0].reason,
+                "a process has its cwd, executable, open file or mapped file under the root"
+            );
+        }
+        // SAFETY: release the successful mmap above with its original length.
+        assert_eq!(unsafe { libc::munmap(mapping, 1) }, 0);
+        assert_eq!(checked_sweep(tmp.path(), &probes, true).planned.len(), 1);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn preview_skips_a_running_executable_with_cwd_and_fds_outside_the_root() {
+        use std::os::unix::fs::symlink;
+        use std::process::Stdio;
+
+        let (tmp, root) = published_scratch_fixture();
         // Multicall coreutils selects the applet by the executable's basename.
         let worker = root.join("cat");
         std::fs::copy("/bin/cat", &worker).unwrap();
@@ -1923,19 +1994,7 @@ mod tests {
             ..probes
         };
         backdate(&root, now.timestamp() - 2 * IDLE_WINDOW_SECS);
-        let preview = || {
-            let events = Mutex::new(Vec::new());
-            let report = sweep(
-                tmp.path(),
-                Some("acme/widgets"),
-                &[tmp.path().to_owned()],
-                &probes,
-                true,
-                &events,
-            );
-            assert_eq!(report.planned, events.into_inner().unwrap());
-            report
-        };
+        let preview = || checked_sweep(tmp.path(), &probes, true);
         assert_eq!(preview().planned.len(), 1);
 
         // cat waits for EOF on its input pipe. Its executable is the only
@@ -1959,7 +2018,7 @@ mod tests {
         assert!(active.planned.is_empty());
         assert_eq!(
             active.preserved[0].reason,
-            "a process has its cwd, executable or an open file under the root"
+            "a process has its cwd, executable, open file or mapped file under the root"
         );
     }
 
@@ -1979,7 +2038,7 @@ mod tests {
             ticket_finished: &open_answer,
             pid_alive: probes.pid_alive,
             directory_in_use: probes.directory_in_use,
-            device_of: probes.device_of,
+            mount_id_of: probes.mount_id_of,
         };
         let unknown_probes = ScratchRootProbes {
             ticket_finished: &unknown_answer,
@@ -2034,7 +2093,7 @@ mod tests {
             ticket_finished: probes.ticket_finished,
             pid_alive: probes.pid_alive,
             directory_in_use: &holder_processes,
-            device_of: probes.device_of,
+            mount_id_of: probes.mount_id_of,
         };
         assert_eq!(
             evaluate_root(&root, "acme/widgets", &probing),
@@ -2048,7 +2107,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn test_remove_root_chmods_read_only_trees_first() {
+    fn test_remove_root_unlinks_read_only_trees() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().join("loom-15-hermit.007a");
         let ro = root.join("pkg/mod/cache/download");
@@ -2058,7 +2117,8 @@ mod tests {
         std::fs::set_permissions(&ro, std::fs::Permissions::from_mode(0o555)).unwrap();
         std::fs::set_permissions(ro.join("file"), std::fs::Permissions::from_mode(0o444)).unwrap();
         std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o555)).unwrap();
-        remove_root(&root).expect("chmod -R u+w makes the read-only tree removable");
+        mount_boundary::remove_root(&root)
+            .expect("owner-write permission on directories permits removal");
         assert!(!root.exists());
     }
 
@@ -2266,7 +2326,7 @@ mod tests {
             ticket_finished: &ticket_probe,
             pid_alive: &process_activity::pid_alive,
             directory_in_use: &process_probe,
-            device_of: &device_probe,
+            mount_id_of: &device_probe,
         };
 
         let recorder = Mutex::new(Vec::new());
@@ -2311,7 +2371,7 @@ mod tests {
         assert_eq!(reason_for("loom-102-builder.cccc"), "watch-pid file names a live process");
         assert_eq!(
             reason_for("loom-103-builder.dddd"),
-            "a process has its cwd, executable or an open file under the root"
+            "a process has its cwd, executable, open file or mapped file under the root"
         );
         assert_eq!(reason_for("loom-104-builder.eeee"), "files changed within the 24h idle window");
         assert_eq!(reason_for("loom-105-builder.ffff"), "worktree has tracked changes");
@@ -2319,10 +2379,7 @@ mod tests {
         assert_eq!(reason_for("loom-107-judge.2222"), "no resolvable GitHub origin repository");
         assert_eq!(reason_for("loom-108-judge.3333"), "no resolvable GitHub origin repository");
         assert_eq!(reason_for("loom-109-judge.4444"), "root is a symlink (never followed)");
-        assert_eq!(
-            reason_for("loom-110-judge.5555"),
-            "root is a mount point (device differs from parent)"
-        );
+        assert_eq!(reason_for("loom-110-judge.5555"), "root is a mount point");
 
         // Removal records went to the recorder with the #14889 shape.
         let records = recorder.into_inner().unwrap();
@@ -2381,12 +2438,12 @@ mod tests {
             ticket_finished: &always_finished,
             pid_alive: &never_alive,
             directory_in_use: &no_processes,
-            device_of: &same_device,
+            mount_id_of: &same_device,
         };
         let recorder = Mutex::new(Vec::new());
         let config = read_scratch_reclaim_config(base);
         assert_eq!(config.dry_run, None);
-        let bytes = dir_size_bytes(&root);
+        let bytes = mount_boundary::tree_size(&root, 1, &same_device).unwrap();
         assert!(bytes > 0);
         let report = sweep(
             base,

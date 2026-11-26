@@ -10015,8 +10015,10 @@ directories.
 **What it removes, and the gates.** Direct children of the mount-volume top
 holding the repo's worktree root, `$HOME`, `$HOME/.cache` and `$TMPDIR` whose
 name matches the pattern above — never deeper, never through symlinks, and a
-candidate that is itself a symlink or sits on a different device than its
-parent (a volume mounted at the candidate path) is preserved. A root is
+candidate that is itself a symlink is preserved. The candidate and every
+entry beneath it must share its parent’s mount. Nested mounts, including
+Linux bind mounts, and unreadable mount identities preserve the candidate
+and exclude its bytes from the preview. A root is
 removed only when **every** gate proves eligibility; any unreadable answer
 preserves (fail closed):
 
@@ -10032,9 +10034,11 @@ preserves (fail closed):
    a non-GitHub origin or a failed ticket lookup preserves the root.
 2. the `watch-pid` marker is absent or names a process confirmed dead.
    An unreadable marker, invalid PID or inconclusive probe preserves the root.
-3. the process scan confirms that no process has its cwd, executable or an open
-   file under the root. Incomplete process visibility preserves it. Linux checks procfs
-   and macOS checks the full `lsof` listing against the process table.
+3. the process scan confirms that no process has its cwd, executable, open file
+   or file-backed mapping under the root. Linux checks procfs, including each
+   userspace process’s memory maps even after it closes the file descriptor.
+   Incomplete process visibility preserves the root. macOS checks the full
+   `lsof` listing against the process table.
 4. the idle walk finds no writes in the last 24 h. An unreadable subtree
    preserves the root. The walk stops descending after 50,000 directories,
    so a recent write in an unexamined subtree can be missed.
@@ -10051,9 +10055,10 @@ preserves (fail closed):
    must have no stash.
 6. the root itself is at least `scratchReclaim.maxAgeHours` old.
 
-Removal runs `chmod -R u+w` first (Go module caches and cert stores are
-read-only), then `remove_dir_all`, then `git worktree prune` on every parent
-repo that still exists (deleting a worktree dir leaves a stale entry behind).
+During live removal the reaper opens each directory without following symlinks,
+rechecks its mount and grants owner write access to read-only directories.
+It unlinks entries relative to the open directory and runs `git worktree prune`
+on each surviving parent repository.
 By default, the pass evaluates the gates and keeps eligible roots on disk.
 For each eligible root it publishes `daemon.scratch_root.reaped` with
 `path`, `bytes`, `ticket`, `repo` and `dry_run: true`. The summary
