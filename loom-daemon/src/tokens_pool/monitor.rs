@@ -435,19 +435,8 @@ pub fn write_monitor_ranking_atomic(
 
 /// Build a [`ProbeReport`] from claude-monitor's `ranking.json`, or `None` when
 /// no fresh data is available. When `write_ranking` is set and data exists,
-/// emits `.ranking` in the selector's pipe format (raw statuses). Mirrors
-/// `check._run_monitor_check`.
-pub fn run_monitor_check(
-    tokens_dir: &Path,
-    write_ranking: bool,
-    ranked_at_fn: impl Fn() -> String,
-) -> Option<ProbeReport> {
-    run_monitor_check_with_reprobe(tokens_dir, write_ranking, ranked_at_fn, Utc::now(), None)
-}
-
-/// [`run_monitor_check`], additionally repairing rows that `ranking.json`
-/// has frozen in a never-readmitted status past their own reset instant
-/// (issue #7420).
+/// emits `.ranking` in the selector's pipe format. An optional re-probe can
+/// repair accounts whose recorded reset time has passed (#7420).
 ///
 /// `reprobe`, when supplied, is called **only** for accounts matching
 /// [`super::check::reset_is_overdue`] at `now` — every other row keeps this
@@ -1143,7 +1132,13 @@ mod tests {
         );
         // Point the default monitor dir at our fixture via env.
         let env_guard = MonitorDirEnvGuard::legacy(&monitor_dir);
-        let report = run_monitor_check(&tokens_dir, true, || "2026-01-01T00:00:00Z".to_string());
+        let report = run_monitor_check_with_reprobe(
+            &tokens_dir,
+            true,
+            || "2026-01-01T00:00:00Z".to_string(),
+            Utc::now(),
+            None,
+        );
         drop(env_guard);
 
         let report = report.unwrap();
@@ -1276,7 +1271,7 @@ mod tests {
         // End-to-end for the monitor backend (issue #4874): the CLI table
         // (`ProbeReport`) and the written `.ranking` must BOTH carry the reset,
         // and both must name the *binding* window. Before this,
-        // `run_monitor_check` hardcoded `s7d_reset: None`, so the reset column
+        // the monitor backend hardcoded `s7d_reset: None`, so the reset column
         // was empty on every monitor-sourced run even though `ranking.json` had
         // the instants all along.
         let tmp = tempfile::tempdir().unwrap();
@@ -1303,7 +1298,13 @@ mod tests {
             ]),
         );
         let env_guard = MonitorDirEnvGuard::legacy(&monitor_dir);
-        let report = run_monitor_check(&tokens_dir, true, || "2026-01-01T00:00:00Z".to_string());
+        let report = run_monitor_check_with_reprobe(
+            &tokens_dir,
+            true,
+            || "2026-01-01T00:00:00Z".to_string(),
+            Utc::now(),
+            None,
+        );
         drop(env_guard);
 
         let report = report.unwrap();
@@ -1592,7 +1593,13 @@ mod tests {
         write_overdue_fixture(&tokens_dir, &monitor_dir, -chrono::Duration::days(8));
 
         let env_guard = MonitorDirEnvGuard::legacy(&monitor_dir);
-        let report = run_monitor_check(&tokens_dir, false, || "2026-01-01T00:00:00Z".to_string());
+        let report = run_monitor_check_with_reprobe(
+            &tokens_dir,
+            false,
+            || "2026-01-01T00:00:00Z".to_string(),
+            Utc::now(),
+            None,
+        );
         drop(env_guard);
 
         let report = report.unwrap();
