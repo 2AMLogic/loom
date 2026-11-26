@@ -7,7 +7,7 @@ The body below is a snapshot of GitHub label state as of the last merged docs-ma
 <!-- Maintained automatically by the Guide triage agent. Manual edits are fine but may be overwritten. -->
 
 <!-- guide:plan-body:start -->
-_Generated: 2026-11-26T11:29:15Z (snapshot; compare against live labels)_
+_Generated: 2026-11-26T13:55:55Z (snapshot; compare against live labels)_
 ## Operator Attention: Merge-Risk-Hold Pileup
 
 Judge-approved PRs under a hold (`loom:blocked` or `loom:operator`) — a human merge decision, or the prerequisite shown, is missing.
@@ -17,12 +17,15 @@ Judge-approved PRs under a hold (`loom:blocked` or `loom:operator`) — a human 
 - **#14384**: fix: require native ownership before handing a fresh worktree to a Builder *(held: champion merge-risk hold)*
 - **#14696**: fix(dispatch): admit on the containment proof the walk already took *(held: champion merge-risk hold)*
 - **#15060**: feat: add agy tier-3 runtime keyed from the gemini API-key pool *(held: champion merge-risk hold)*
+- **#15133**: feat: read Builder claim and split-parent evidence from Gitea *(held: champion merge-risk hold)*
 - **#15307**: refactor(prompts): load-gate the docs-only fast path bodies (#15236) *(held: champion merge-risk hold)*
 - **#15320**: feat(daemon): pin the account on a seat-stored Claude session resume *(held: champion merge-risk hold)*
 - **#15334**: feat(telemetry): Codex seat on runtime spans and seat refusals (#15291) *(held: champion merge-risk hold)*
 - **#15339**: chore(deps): Bump the github-actions group across 1 directory with 4 updates *(held: champion merge-risk hold)*
 - **#15349**: fix(credential_preflight): compare the root owner case-insensitively in the plan (#15159) *(held: champion merge-risk hold)*
 - **#15389**: refactor: consolidate duplicated tilde, activity-db, and git-origin resolver helpers in loom-daemon *(held: champion merge-risk hold)*
+- **#15411**: Gate private-clone sealed admission on the session image's own capabilities *(held: champion merge-risk hold)*
+- **#15429**: fix: recognize explicit merge-ratification denials and deferrals *(held: champion merge-risk hold)*
 - **#15434**: Share the live-sweep and checkpoint checks for issue and step logs *(held: champion merge-risk hold)*
 
 ## Very Important
@@ -40,6 +43,7 @@ _None._
 - **#12993**: Shadow evaluation of the new Champion (2026-10-20): 1/95 holds cleared — ranked remaining causes + fixtures *(held)*
 - **#13865**: [ci-daily] Supply Chain *(held)*
 - **#14465**: Serve hold diagnostics, curation labels and blocker notifications from loom-tools *(held)*
+- **#14474**: Expose worktree operations through the shared Rust CLI
 - **#14566**: Telemetry: about 40% of OpenCode (GLM) runs on 0.19.1316 emit no loom.runtime.usage row *(held)*
 - **#15308**: main CI red since 11:10Z: install-compat (session-exec claude-seat vs requires_daemon 0.20.5) and E0308 in daemon tests *(held)*
 
@@ -47,7 +51,7 @@ _None._
 
 Human-approved issues (`loom:issue`) ready for implementation — excluding held (`loom:blocked`/`loom:operator`/`loom:frozen`), `loom:building`, and issues with an open linked PR (native admission `OPEN_PR`; listed under Issues with Open PRs).
 
-- **#15417**: guard: quoted $(...)-tailed /tmp redirect target is resolved as a cwd-relative token and denied
+- **#15452**: Ignore config tiers containing multiple top-level JSON values
 
 ## Issues with Open PRs (Not Dispatchable)
 
@@ -60,7 +64,7 @@ Human-approved issues (`loom:issue`) ready for implementation — excluding held
 - **#14474**: Expose worktree operations through the shared Rust CLI — open PR #14514 (approved)
 - **#14626**: Private-clone admission contains the winning seat twice per admission — open PR #14696 (held)
 - **#14712**: resync: a no-op resync warns that it stamped the canonical loom_source_remote, but leaves the stale one — open PR #14769 (approved)
-- **#14714**: Held Doctor repairs leave stale approvals outside the Judge queue — open PR #14715 (approved)
+- **#14714**: Held Doctor repairs leave stale approvals outside the Judge queue — open PR #14715 (in review)
 - **#14876**: clean: stale-branch pass deletes a mis-prefixed 'heads/<name>' branch and fails permanently on PR-fetch ref residue — open PR #14916 (unlabeled)
 
 ## In Progress
@@ -69,6 +73,7 @@ Issues currently being built (`loom:building`).
 
 - **#13933**: forge_auth forwards an expired token: a stale per-workspace gh-config-by-owner wins over the refreshed primary one
 - **#14376**: Refuse a peer-owned claim before handing a new worktree to a Builder
+- **#14460**: held_back residue: install-loom.sh's "already installed" gate still reads the stamp alone, and three install_compat doc comments are stale
 - **#14560**: Work-finder completion gaps leave the Fleet queue stale
 - **#14935**: Fetch private-seat clones through the configured fleet Git read relay
 - **#14936**: Diagnose writer renewal and refuse private-seat write jobs before leasing when credentials are missing
@@ -78,12 +83,10 @@ Issues currently being built (`loom:building`).
 - **#14981**: Pin the account on a seat-stored Claude session resume (follow-up to #14371 / PR #14596)
 - **#15003**: Primary-checkout mutation guard: quoted pathspec denied, gh global flags bypass, bare `-` unguarded
 - **#15033**: Remove 7 superseded pub functions (and GraphqlReading) in loom-daemon kept alive only by self-tests
-- **#15052**: workflow-lint: detect duplicate on keys and preserve boolean-like step IDs
 - **#15091**: Codex: an account's weekly exhaustion is learned per host, so every newly seated host burns attempts on it
 - **#15159**: Cross-owner reap and plan disagree on owner-name case, costing a re-mint per pass
 - **#15221**: rm-scope guard: an rm on an unresolved variable is admitted when it is the only statement in a function body (the same rm at top level is denied)
 - **#15236**: Load-gate the docs-only fast-path block out of judge.md and champion-pr-merge.md
-- **#15258**: merge-pr.sh: --no-cleanup-primary joins --no-cleanup-worktree as a silently-ignored opt-out after the #14905 cutover
 - **#15291**: Telemetry: Codex runs and refusals carry no seat, and seat state (held / container missing / quota) is log-only
 - **#15337**: test flake: orphan_process_reaper::tests::live::test_production_pass_reaps_a_genuinely_orphaned_tree fails on Rust Unit Tests (4/5) — leftovers after the pass
 - **#15356**: [ci-daily] Session and Private-Workspace Docker Fixtures (unfiltered)
@@ -91,13 +94,13 @@ Issues currently being built (`loom:building`).
 - **#15377**: Ratification detector holds a record that says merging does NOT ratify it (STATUS + CLAUSE ignore negation)
 - **#15387**: verify-proposal-refs reports generated outputs named in acceptance tests as missing source files
 - **#15397**: Codex private-clone steps keep drawing seats with no recorded hook trust ('sealed'); 21% of Codex runs fail in seconds
-- **#15413**: Builder step that exits within a minute is recorded as unclassified with no cause before quarantine
 - **#15414**: Remove the second config-tier scan from configure_terminal
-- **#15416**: Skip Champion merge dispatch for PRs already in GitHub’s merge queue
+- **#15417**: guard: quoted $(...)-tailed /tmp redirect target is resolved as a cwd-relative token and denied
 - **#15421**: Share the live-sweep and checkpoint checks for issue and step logs
 - **#15430**: Ratification hold and reviewer dispatch miss a proposed record requiring both keys before merge
-- **#15431**: mcp-loom terminals.ts drops the daemon's legacy Error message (reads top-level `message`, wire shape is `payload.message`)
 - **#15435**: daemon tests: LOOM_GH_BIN is mutated under #[serial(loom_config_env)] in forge_verdict_cmd vs bare #[serial] in two claim_reconciliation test files
+- **#15440**: telemetry-kind-pick-decision.md: the pick-skip wire-name mapping is 3 names behind the code (and its count says 24, not 27)
+- **#15455**: Export the native session PID to OpenCode tools so self-claim leases survive tool exit
 
 ## PRs Awaiting Review
 
@@ -105,14 +108,11 @@ PRs waiting on Judge (`loom:review-requested`).
 
 - **#12969**: feat: age-bound Codex rollout history in live profiles *(held)*
 - **#14612**: fix: launch eager reclaim detached so it cannot hold back a work-finder tick *(held)*
+- **#14715**: fix: send verified Champion-held Doctor repairs back to Judge
 - **#15047**: refactor: drop superseded zero-caller pub helpers from loom-daemon *(held)*
-- **#15133**: feat: read Builder claim and split-parent evidence from Gitea
 - **#15351**: fix(test): poll for survivors in orphan reaper production-pass test (#15337)
-- **#15411**: Gate private-clone sealed admission on the session image's own capabilities
-- **#15427**: feat(daemon): show exit status, runtime and log pointer on failed Builder steps
-- **#15429**: fix: recognize explicit merge-ratification denials and deferrals
-- **#15436**: fix: check GitHub queue membership before dispatching Champion merges
-- **#15439**: fix: surface legacy daemon Error messages in mcp-loom terminal tools
+- **#15393**: feat(daemon): verify generated-output declarations in proposal refs
+- **#15459**: fix: make the installer's same-version gate report held-back paths
 
 ## Approved (Awaiting Merge)
 
@@ -125,19 +125,24 @@ PRs that passed review (`loom:pr`); unmarked PRs are queued for Champion auto-me
 - **#14384**: fix: require native ownership before handing a fresh worktree to a Builder — closes #14376 *(held: champion merge-risk hold)*
 - **#14514**: feat(tools): share worktree CLI operations and read routing — closes #14474
 - **#14696**: fix(dispatch): admit on the containment proof the walk already took — closes #14626 *(held: champion merge-risk hold)*
-- **#14715**: fix: send verified Champion-held Doctor repairs back to Judge — closes #14714
 - **#14769**: fix: skip source-remote lookup on no-op resyncs — closes #14712
 - **#15060**: feat: add agy tier-3 runtime keyed from the gemini API-key pool — closes #14945 *(held: champion merge-risk hold)*
+- **#15066**: feat: reap agent per-ticket scratch roots on the worktree volume — closes #14952
 - **#15071**: feat: relay private-seat preparation Git reads through the fleet gateway — closes #14935
+- **#15133**: feat: read Builder claim and split-parent evidence from Gitea — closes #14938 *(held: champion merge-risk hold)*
 - **#15307**: refactor(prompts): load-gate the docs-only fast path bodies (#15236) — closes #15236 *(held: champion merge-risk hold)*
 - **#15320**: feat(daemon): pin the account on a seat-stored Claude session resume — closes #14981 *(held: champion merge-risk hold)*
 - **#15334**: feat(telemetry): Codex seat on runtime spans and seat refusals (#15291) — closes #15291 *(held: champion merge-risk hold)*
 - **#15339**: chore(deps): Bump the github-actions group across 1 directory with 4 updates *(held: champion merge-risk hold)*
 - **#15349**: fix(credential_preflight): compare the root owner case-insensitively in the plan (#15159) — closes #15159 *(held: champion merge-risk hold)*
 - **#15389**: refactor: consolidate duplicated tilde, activity-db, and git-origin resolver helpers in loom-daemon — closes #15372 *(held: champion merge-risk hold)*
+- **#15411**: Gate private-clone sealed admission on the session image's own capabilities — closes #15397 *(held: champion merge-risk hold)*
 - **#15425**: Remove the second config-tier scan from configure_terminal (#15414) — closes #15414
-- **#15426**: fix(workflow-lint): detect duplicate on keys and preserve boolean-like step IDs — closes #15052
+- **#15429**: fix: recognize explicit merge-ratification denials and deferrals — closes #15377 *(held: champion merge-risk hold)*
 - **#15434**: Share the live-sweep and checkpoint checks for issue and step logs — closes #15421 *(held: champion merge-risk hold)*
+- **#15444**: docs: add backstop_held and operator_link_unverified to the pick-skip mapping — closes #15440
+- **#15448**: test: hold loom_config_env around LOOM_GH_BIN writes in verdict tests — closes #15435
+- **#15451**: fix: hold records that require both reviewer keys before their PR merges — closes #15430
 
 ## Proposed
 
@@ -196,6 +201,7 @@ Issues carrying `loom:curated`.
 - **#14376**: Refuse a peer-owned claim before handing a new worktree to a Builder *(curated)*
 - **#14433**: accounts session recover --publish cannot authenticate: the seat's credential helper has no token outside a job *(curated)* *(held)*
 - **#14455**: Codex Curator steps are dispatched to stopped, unprovisioned seats and end SANDBOX_UNAVAILABLE every time *(curated)*
+- **#14460**: held_back residue: install-loom.sh's "already installed" gate still reads the stamp alone, and three install_compat doc comments are stale *(curated)*
 - **#14461**: Serve the remaining forge actions through the shared loom-tools dispatcher *(curated)* *(held)*
 - **#14464**: Expose park records and operator decisions through loom-tools *(curated)* *(held)*
 - **#14465**: Serve hold diagnostics, curation labels and blocker notifications from loom-tools *(curated)* *(held)*
@@ -229,7 +235,6 @@ Issues carrying `loom:curated`.
 - **#14952**: Per-ticket agent scratch roots on /Volumes/Stripe are never cleaned up (~300 new dirs/day, volume fills) *(curated)*
 - **#14981**: Pin the account on a seat-stored Claude session resume (follow-up to #14371 / PR #14596) *(curated)*
 - **#15003**: Primary-checkout mutation guard: quoted pathspec denied, gh global flags bypass, bare `-` unguarded *(curated)*
-- **#15052**: workflow-lint: detect duplicate on keys and preserve boolean-like step IDs *(curated)*
 - **#15054**: Live verification: private-seat /tmp stays flat with caches on /workspace/cache (AC from #14929) *(curated)* *(held)*
 - **#15070**: Gitea qualification: record the numbered Judge/Doctor gate outcomes (#14939 AC4) *(curated)* *(held)*
 - **#15091**: Codex: an account's weekly exhaustion is learned per host, so every newly seated host burns attempts on it *(curated)*
@@ -240,7 +245,6 @@ Issues carrying `loom:curated`.
 - **#15162**: Gitea claim probe: open-PR leg drops GitHub's feature/issue-N head widening, and walks every pull *(curated)* *(held)*
 - **#15221**: rm-scope guard: an rm on an unresolved variable is admitted when it is the only statement in a function body (the same rm at top level is denied) *(curated)*
 - **#15236**: Load-gate the docs-only fast-path block out of judge.md and champion-pr-merge.md *(curated)*
-- **#15258**: merge-pr.sh: --no-cleanup-primary joins --no-cleanup-worktree as a silently-ignored opt-out after the #14905 cutover *(curated)*
 - **#15291**: Telemetry: Codex runs and refusals carry no seat, and seat state (held / container missing / quota) is log-only *(curated)*
 - **#15308**: main CI red since 11:10Z: install-compat (session-exec claude-seat vs requires_daemon 0.20.5) and E0308 in daemon tests *(curated)* *(held)*
 - **#15337**: test flake: orphan_process_reaper::tests::live::test_production_pass_reaps_a_genuinely_orphaned_tree fails on Rust Unit Tests (4/5) — leftovers after the pass *(curated)*
@@ -250,15 +254,13 @@ Issues carrying `loom:curated`.
 - **#15377**: Ratification detector holds a record that says merging does NOT ratify it (STATUS + CLAUSE ignore negation) *(curated)*
 - **#15387**: verify-proposal-refs reports generated outputs named in acceptance tests as missing source files *(curated)*
 - **#15397**: Codex private-clone steps keep drawing seats with no recorded hook trust ('sealed'); 21% of Codex runs fail in seconds *(curated)*
-- **#15413**: Builder step that exits within a minute is recorded as unclassified with no cause before quarantine *(curated)*
-- **#15416**: Skip Champion merge dispatch for PRs already in GitHub’s merge queue *(curated)*
 - **#15417**: guard: quoted $(...)-tailed /tmp redirect target is resolved as a cwd-relative token and denied *(curated)*
 - **#15418**: Telemetry: report the seat/account for Claude and Z.ai runs too (provider-neutral, extends #15291) *(curated)* *(held)*
 - **#15430**: Ratification hold and reviewer dispatch miss a proposed record requiring both keys before merge *(curated)*
-- **#15431**: mcp-loom terminals.ts drops the daemon's legacy Error message (reads top-level `message`, wire shape is `payload.message`) *(curated)*
 - **#15435**: daemon tests: LOOM_GH_BIN is mutated under #[serial(loom_config_env)] in forge_verdict_cmd vs bare #[serial] in two claim_reconciliation test files *(curated)*
-- **#15438**: docs/mcp/loom-terminals.md shows a legacy Error frame with a bare-string payload *(curated)*
 - **#15440**: telemetry-kind-pick-decision.md: the pick-skip wire-name mapping is 3 names behind the code (and its count says 24, not 27) *(curated)*
+- **#15452**: Ignore config tiers containing multiple top-level JSON values *(curated)*
+- **#15455**: Export the native session PID to OpenCode tools so self-claim leases survive tool exit *(curated)*
 
 ## Proposed (Architect / Hermit)
 
@@ -282,15 +284,15 @@ Issues carrying `loom:curated`.
 
 | Bucket | Count |
 |------|-------|
-| Operator merge-risk holds | 12 |
+| Operator merge-risk holds | 15 |
 | Very important | 0 |
-| Important | 7 |
+| Important | 8 |
 | Ready (`loom:issue`, net of holds/building/open-linked-PRs) | 1 |
-| In Progress (`loom:building`) | 31 |
-| Held, no other bucket | 70 |
-| PRs awaiting review | 10 |
-| Approved PRs awaiting merge | 20 |
-| Curated | 116 |
+| In Progress (`loom:building`) | 30 |
+| Held, no other bucket | 74 |
+| PRs awaiting review | 7 |
+| Approved PRs awaiting merge | 25 |
+| Curated | 113 |
 | Architect / Hermit proposals | 5 |
 | Active epics | 7 |
 <!-- guide:plan-body:end -->
