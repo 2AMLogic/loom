@@ -663,6 +663,21 @@ impl SweepRegistry {
                     timed_out: end == StepEnd::TimedOut,
                     provider_exhausted,
                     launch_rejection,
+                    attempt: super::ended::AttemptEvidence {
+                        termination: end.into(),
+                        // The id the Builder lease publishes, so an operator can match
+                        // the lease and this notice (and the host's publication setting holds).
+                        host: self.published_host_id(),
+                        // Measured at process end, before the lease lookup above.
+                        ran_for,
+                        log: log_path
+                            .strip_prefix(&self.config.workspace_root)
+                            .unwrap_or(&log_path)
+                            .display()
+                            .to_string(),
+                        launch_rejected: never_started
+                            == Some(crate::pr_lease_reap::REASON_LAUNCH_REJECTED),
+                    },
                 },
             );
         }
