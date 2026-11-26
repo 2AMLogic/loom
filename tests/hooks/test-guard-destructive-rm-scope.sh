@@ -289,6 +289,21 @@ assert_allow "rmScope default (#15221): function-body rm on literal in-repo path
     "probe() { rm -rf $REPO_ROOT/.loom/tmp/x; }; probe" "$REPO_ROOT"
 assert_allow_env "rmScope repo (#15221): function-body rm on same-command mktemp -d var still allows (#6520)" \
     "LOOM_RM_SCOPE=repo" 'D=$(mktemp -d); probe() { rm -rf "$D"; }; probe' "$REPO_ROOT"
+# A subshell close is shell syntax, even when it touches the last operand.
+assert_allow "rmScope default (#15221): spaced subshell close after an ephemeral target outside the repo cwd" \
+    'cd /usr && finish() ( rm -f /tmp/x/foo ); finish' "$REPO_ROOT"
+assert_allow "rmScope default (#15221): adjacent subshell close after a proven mktemp target" \
+    'D=$(mktemp -d); finish() ( rm -rf "$D"); finish' "$REPO_ROOT"
+assert_allow "rmScope default (#15221): nested subshell closes after a proven mktemp target" \
+    'D=$(mktemp -d); function finish { ( ( rm -rf "$D") ); }; finish' "$REPO_ROOT"
+assert_allow "rmScope default (#15221): redirection on the subshell body follows the rm operands" \
+    'cd /usr && finish() ( rm -f /tmp/x/foo ) >/dev/null; finish' "$REPO_ROOT"
+assert_deny_reason_matches "rmScope default (#15221): quoted closing paren belongs to the filename" \
+    'finish() ( rm -f "/opt/loom-fixture)"); finish' '/opt/loom-fixture\)$' "$REPO_ROOT"
+assert_deny_reason_matches "rmScope default (#15221): escaped closing paren belongs to the filename" \
+    'finish() ( rm -f /opt/loom-fixture\)); finish' '/opt/loom-fixture\)$' "$REPO_ROOT"
+assert_deny_reason_matches "rmScope default (#15221): an operand following a quoted paren is still checked" \
+    "finish() ( rm -f '/tmp/loom-fixture)' /opt/loom-second ); finish" '/opt/loom-second$' "$REPO_ROOT"
 assert_allow "rmScope default (#15221): rm as a bare WORD after a non-opener command word allows" \
     'probe() { echo rm -f "$NOPE/x"; }; probe' "$REPO_ROOT"
 assert_allow "rmScope default (#15221): (( arithmetic )) is not a subshell opener" \

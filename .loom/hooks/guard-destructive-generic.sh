@@ -7907,7 +7907,36 @@ _extract_rm_targets_scan() {
             }
         }
     }
+    # The grouping openers have already been removed from s. Keep parens
+    # inside quoted/escaped filenames and balanced operand expressions.
+    function rm_command_text(s,   pos, c, quote, depth, args, tail, plain) {
+        for (pos = 1; pos <= length(s); pos++) {
+            c = substr(s, pos, 1)
+            if (c == BS && quote != SQ) { pos++; continue }
+            if (quote != "") {
+                if (c == quote) quote = ""
+            } else if (c == SQ || c == DQ || c == "`") {
+                quote = c
+            } else if (c == "(") {
+                depth++
+            } else if (c == ")") {
+                if (depth > 0) { depth--; continue }
+                args = substr(s, 1, pos - 1)
+                tail = substr(s, pos)
+                if (tail ~ /^[) \t]+$/) return args
+                # A redirection or comment can follow the subshell. Only
+                # discard that trailer when the preceding words contain no
+                # complex expansion whose own syntax might contain this paren.
+                if (tail !~ /^[) \t]+([0-9]*[<>]|#)/) continue
+                plain = args
+                gsub(/\$\{[A-Za-z_][A-Za-z0-9_]*\}/, "", plain)
+                if (plain !~ /\$[({\047]|`/) return args
+            }
+        }
+        return s
+    }
     function emit_rm(   j, has_rf) {
+        if (sdepth && index(seg, ")")) seg = rm_command_text(seg)
         m = split(seg, toks, /[ \t]+/)
         has_rf = 0
         for (j = 2; j <= m; j++)
