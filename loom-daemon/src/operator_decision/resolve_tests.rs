@@ -4,7 +4,7 @@ use crate::forge_identity::FleetLogins;
 use crate::operator_decision::resolution::tests::body;
 use serde_json::{json, Value};
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::rc::Rc;
 
 #[derive(Default)]
@@ -491,6 +491,7 @@ fn parse_items_reads_lines_comments_and_blank_lines() {
 #[derive(Default)]
 struct MultiRepoState {
     views: HashMap<(String, u64), IssueView>,
+    view_errors: VecDeque<Option<&'static str>>,
     comments: HashMap<(String, u64), Vec<Value>>,
     next_post_errors: HashMap<(String, u64), String>,
     remove_label_errors: HashMap<(String, u64), String>,
@@ -542,8 +543,11 @@ impl ResolveForge for MultiRepoFake {
 
     fn view(&mut self, issue: u64) -> Result<IssueView, String> {
         let key = (self.repo.to_ascii_lowercase(), issue);
-        self.state
-            .borrow()
+        let mut state = self.state.borrow_mut();
+        if let Some(error) = state.view_errors.pop_front().flatten() {
+            return Err(error.into());
+        }
+        state
             .views
             .get(&key)
             .cloned()
@@ -624,6 +628,9 @@ fn multi_items(specs: &[(&str, u64, &str)]) -> Vec<ResolveItem> {
         .collect()
 }
 
+// Match the operator-visible format even when testing a resolver that predates it.
+const RETRY_HEADER: &str = "# --- BEGIN RETRY --from ---";
+
 fn summary_rows(out: &str) -> Vec<&str> {
     let mut lines = out.lines();
     let Some(_) = lines.find(|l| *l == "BATCH_SUMMARY") else {
@@ -632,17 +639,17 @@ fn summary_rows(out: &str) -> Vec<&str> {
     // Skip column header line.
     let _header = lines.next();
     lines
-        .take_while(|l| !l.is_empty() && !l.starts_with(RETRY_BEGIN))
+        .take_while(|l| !l.is_empty() && *l != RETRY_HEADER)
         .collect()
 }
 
 fn retry_block(out: &str) -> Option<String> {
     let mut lines = out.lines();
-    let begin = lines.find(|l| *l == RETRY_BEGIN)?;
+    let begin = lines.find(|l| *l == RETRY_HEADER)?;
     let mut block = vec![begin];
     for line in lines {
         block.push(line);
-        if line == RETRY_END {
+        if line == "# --- END RETRY --from ---" {
             return Some(block.join("\n"));
         }
     }
@@ -809,6 +816,46 @@ fn retry_omits_a_failed_request_completed_by_a_later_duplicate() {
 }
 
 #[test]
+fn retry_uses_completion_order_when_a_duplicate_issue_read_fails() {
+    // The second review precedes the first record. The second record follows it.
+    for (read_errors, confirmation, failure_phase, needs_retry) in [
+        (vec![None, Some("read failed")], "resolve 1", "review:", false),
+        (vec![None, None, None, Some("read failed")], "resolve 2", "record:", true),
+    ] {
+        let s = MultiRepoState::with_issues(&[("acme/r", 7)], operator());
+        s.borrow_mut().view_errors = read_errors.into();
+        let req = BatchRequest {
+            items: parse_items("acme/r#7=keep\nacme/r#7=keep").unwrap(),
+            effect: Effect::Proceed,
+            release: true,
+            dry_run: false,
+        };
+        let result = run_multi_batch(&s, &req, &mut |expected| expected == confirmation);
+        assert_eq!(result.code, exit::FORGE, "{}", result.err);
+        assert_eq!(s.borrow().comment_count("acme/r", 7), 1);
+        assert!(!s.borrow().is_held("acme/r", 7));
+        let rows = summary_rows(&result.out);
+        assert_eq!(rows.len(), 2);
+        assert!(rows[0].split_whitespace().eq([
+            "acme/r#7=keep",
+            "ok",
+            "verified",
+            "released",
+            "-"
+        ]));
+        assert!(rows[1].split_whitespace().take(5).eq([
+            "acme/r#7=keep",
+            "failed",
+            "unverified",
+            "skipped",
+            failure_phase
+        ]));
+        let retry = retry_block(&result.out).map(|block| parse_items(&block).unwrap());
+        assert_eq!(retry, needs_retry.then(|| vec![req.items[1].clone()]), "{failure_phase}");
+    }
+}
+
+#[test]
 fn a_batch_reports_review_refusal_in_order_and_counts_prior_receipts_as_recorded() {
     let s = MultiRepoState::with_issues(
         &[("acme/alpha", 7), ("acme/beta", 8), ("acme/gamma", 9)],
@@ -956,8 +1003,8 @@ fn a_batch_preserves_first_nonzero_exit_code_across_review_and_record_failures()
 
     let req = BatchRequest {
         items: multi_items(&[
-            ("acme/alpha", 7, "ghost"),
             ("acme/beta", 8, "keep"),
+            ("acme/alpha", 7, "ghost"),
             ("acme/gamma", 9, "drop"),
         ]),
         effect: Effect::Proceed,
@@ -971,13 +1018,13 @@ fn a_batch_preserves_first_nonzero_exit_code_across_review_and_record_failures()
     assert!(o.out.contains("BATCH_FAILED=2"), "{}", o.out);
     let rows = summary_rows(&o.out);
     assert_eq!(rows.len(), 3, "{}", o.out);
-    assert!(rows[0].starts_with("acme/alpha#7=ghost ") && rows[0].contains("review:"));
-    assert!(rows[1].starts_with("acme/beta#8=keep ") && rows[1].contains("HTTP 502 bad gateway"));
+    assert!(rows[0].starts_with("acme/beta#8=keep ") && rows[0].contains("HTTP 502 bad gateway"));
+    assert!(rows[1].starts_with("acme/alpha#7=ghost ") && rows[1].contains("review:"));
     assert!(rows[2].starts_with("acme/gamma#9=drop ") && rows[2].contains("verified"));
 
     let block = retry_block(&o.out).expect("retry block printed");
     assert_eq!(
         parse_items(&block).unwrap(),
-        multi_items(&[("acme/alpha", 7, "ghost"), ("acme/beta", 8, "keep")])
+        multi_items(&[("acme/beta", 8, "keep"), ("acme/alpha", 7, "ghost")])
     );
 }

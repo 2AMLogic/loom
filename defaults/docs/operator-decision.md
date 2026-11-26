@@ -195,10 +195,13 @@ a verified receipt, including matching prior receipts), `BATCH_FAILED=` (items
 with an incomplete operation), and a `BATCH_SUMMARY` table in input order with
 one row per input — including any item refused at review, and separating a
 verified receipt from a failed hold release (#15385). The first failed attempt
-sets the exit code, even if an identical later input succeeds. That later success
-clears the earlier attempt from the retry file. If any inputs still need a
-retry, the command prints them in input order in a delimited block. All comment
-and delimiter lines start with `#`, so `resolve --from` reads the block verbatim.
+sets the exit code. Once an attempt verifies the receipt and completes any
+requested release, it clears earlier failures for the same repository, issue
+and option from the retry file. All reviews happen before recording, so this
+also clears a review failure for a duplicate further down the input file. The
+command prints any remaining retries in input order in a delimited block and
+omits the block when none remain. All comment and delimiter lines start with
+`#`, so `resolve --from` reads the block verbatim.
 
 ```text
 BATCH_RECORDED=4

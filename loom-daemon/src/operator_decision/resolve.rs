@@ -594,6 +594,7 @@ pub struct BatchRequest {
 }
 
 struct BatchOutcome {
+    input_index: usize,
     target: String,
     code: i32,
     receipt: ReceiptStatus,
@@ -601,7 +602,7 @@ struct BatchOutcome {
     failure: Option<(&'static str, String)>,
 }
 
-fn write_batch_summary(outcomes: &[BatchOutcome], out: &mut dyn Write) {
+fn write_batch_summary(outcomes: &[&BatchOutcome], out: &mut dyn Write) {
     let _ = writeln!(out, "BATCH_SUMMARY");
     let rows: Vec<(&str, &str, &str, &str, String)> = outcomes
         .iter()
@@ -657,7 +658,8 @@ fn write_retry_block(
     release: bool,
     out: &mut dyn Write,
 ) {
-    // A later success satisfies earlier failures of the same repo, issue and option.
+    // Walk backwards through the operations as they finished. All review
+    // failures precede every record, regardless of where their inputs appeared.
     let mut completed = HashSet::new();
     let mut retry = Vec::new();
     for outcome in outcomes.iter().rev() {
@@ -665,7 +667,7 @@ fn write_retry_block(
         if outcome.code == exit::OK {
             completed.insert(target);
         } else if !completed.contains(target) {
-            retry.push(target);
+            retry.push(outcome);
         }
     }
     if retry.is_empty() {
@@ -679,8 +681,9 @@ fn write_retry_block(
         "#   loom-daemon operator-decision resolve --from retry.txt --effect {}{release_flag}",
         effect.as_str()
     );
-    for line in retry.into_iter().rev() {
-        let _ = writeln!(out, "{line}");
+    retry.sort_unstable_by_key(|o| o.input_index);
+    for outcome in retry {
+        let _ = writeln!(out, "{}", outcome.target);
     }
     let _ = writeln!(out, "{RETRY_END}");
 }
@@ -711,7 +714,7 @@ pub fn resolve_batch(
     }
     let n = req.items.len();
     let mut reviewed: Vec<(usize, Reviewed)> = Vec::new();
-    let mut outcomes: Vec<Option<BatchOutcome>> = (0..n).map(|_| None).collect();
+    let mut outcomes = Vec::with_capacity(n);
     let mut first_bad: Option<i32> = None;
     let skipped_release = if req.release {
         ReleaseStatus::Skipped
@@ -734,7 +737,8 @@ pub fn resolve_batch(
             Ok(r) => reviewed.push((i, r)),
             Err(e) => {
                 first_bad.get_or_insert(e.code);
-                outcomes[i] = Some(BatchOutcome {
+                outcomes.push(BatchOutcome {
+                    input_index: i,
                     target: item.canonical_line(),
                     code: e.code,
                     receipt: ReceiptStatus::Unverified,
@@ -772,7 +776,8 @@ pub fn resolve_batch(
         if rec.code != exit::OK {
             first_bad.get_or_insert(rec.code);
         }
-        outcomes[*i] = Some(BatchOutcome {
+        outcomes.push(BatchOutcome {
+            input_index: *i,
             target: item.canonical_line(),
             code: rec.code,
             receipt: rec.receipt,
@@ -780,16 +785,14 @@ pub fn resolve_batch(
             failure: rec.failure,
         });
     }
-    let final_outcomes: Vec<BatchOutcome> = outcomes.into_iter().flatten().collect();
-    let recorded = final_outcomes
-        .iter()
-        .filter(|o| o.receipt.is_verified())
-        .count();
-    let failed = final_outcomes.iter().filter(|o| o.code != exit::OK).count();
+    let recorded = outcomes.iter().filter(|o| o.receipt.is_verified()).count();
+    let failed = outcomes.iter().filter(|o| o.code != exit::OK).count();
     let _ = writeln!(out, "BATCH_RECORDED={recorded}");
     let _ = writeln!(out, "BATCH_FAILED={failed}");
-    write_batch_summary(&final_outcomes, out);
-    write_retry_block(&final_outcomes, req.effect, req.release, out);
+    let mut input_order: Vec<_> = outcomes.iter().collect();
+    input_order.sort_unstable_by_key(|o| o.input_index);
+    write_batch_summary(&input_order, out);
+    write_retry_block(&outcomes, req.effect, req.release, out);
     first_bad.unwrap_or(exit::OK)
 }
 
