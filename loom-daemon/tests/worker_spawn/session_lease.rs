@@ -138,6 +138,9 @@ echo "tool_chain chain_pid=${LOOM_AGENT_SESSION_PID:-${CLAUDE_PID:-$PPID}} ppid=
 /// on its own. Then the fixture's clock moves past the publication's TTL.
 const RENEW: &str = r#"#!/usr/bin/env bash
 D="$LOOM_TEST_FORGE"
+# A zombie (state Z) is an exited renewer awaiting its parent's reap: `kill -0`
+# succeeds for it, so ask `ps` for the state, as the production check does.
+live() { st="$(ps -o state= -p "$1" 2> /dev/null | tr -d '[:space:]')"; [ -n "$st" ] && [ "${st:0:1}" != "Z" ]; }
 lease_id() { sed -n '1s/^POST \([0-9]*\) .*/\1/p' "$D/writes.log" 2> /dev/null; }
 loop_pid="$(sed -n 's/.*renewal loop \([0-9]*\) is running.*/\1/p' "$D/ensure.err")"
 n=0
@@ -147,7 +150,7 @@ until grep -q "^PATCH $(lease_id) " "$D/writes.log" 2> /dev/null; do
 done
 if grep -q "^PATCH $(lease_id) " "$D/writes.log" 2> /dev/null; then
     echo "tool_renewed_after_publish=true"
-elif kill -0 "$loop_pid" 2> /dev/null; then
+elif live "$loop_pid"; then
     echo "tool_renewed_after_publish=loop-alive-without-a-patch"
 else
     echo "tool_renewed_after_publish=renewer-dead"
@@ -160,6 +163,9 @@ echo "$LOOM_TEST_CLOCK_ADVANCE" > "$D/clock-advance"
 /// the host resolve as the publisher did.
 const FENCE: &str = r#"#!/usr/bin/env bash
 D="$LOOM_TEST_FORGE"
+# A zombie (state Z) is an exited renewer awaiting its parent's reap: `kill -0`
+# succeeds for it, so ask `ps` for the state, as the production check does.
+live() { st="$(ps -o state= -p "$1" 2> /dev/null | tr -d '[:space:]')"; [ -n "$st" ] && [ "${st:0:1}" != "Z" ]; }
 lease_id="$(sed -n '1s/^POST \([0-9]*\) .*/\1/p' "$D/writes.log" 2> /dev/null)"
 sweep="$(sed -n 's/.*lease published\/held (host=[^ ]* sweep=\([^)]*\)).*/\1/p' "$D/ensure.err")"
 loop_pid="$(sed -n 's/.*renewal loop \([0-9]*\) is running.*/\1/p' "$D/ensure.err")"
@@ -168,7 +174,7 @@ until grep -q "^PATCH $lease_id .* advanced=1" "$D/writes.log" 2> /dev/null; do
     n=$((n + 1)); [ "$n" -ge 100 ] && break
     sleep 0.2
 done
-if kill -0 "$loop_pid" 2> /dev/null; then echo "tool_renewer_alive_at_fence=true"; else echo "tool_renewer_alive_at_fence=false"; fi
+if live "$loop_pid"; then echo "tool_renewer_alive_at_fence=true"; else echo "tool_renewer_alive_at_fence=false"; fi
 now=$(( $(date -u +%s) + LOOM_TEST_CLOCK_ADVANCE ))
 echo "$now" > "$D/fence.now"
 cd "$LOOM_TEST_LEASE_ROOT" || exit 1
@@ -357,12 +363,17 @@ fn runner_of(stdout: &str, call: u32) -> String {
         .to_string()
 }
 
+/// Live means "exists and is not a zombie": `kill -0` succeeds for an exited
+/// child until its parent reaps it, which a detached renewer may wait on.
 fn alive(pid: u32) -> bool {
-    Command::new("kill")
-        .args(["-0", &pid.to_string()])
+    Command::new("ps")
+        .args(["-o", "state=", "-p", &pid.to_string()])
         .stderr(std::process::Stdio::null())
-        .status()
-        .is_ok_and(|status| status.success())
+        .output()
+        .is_ok_and(|out| {
+            let state = String::from_utf8_lossy(&out.stdout);
+            state.trim().chars().next().is_some_and(|c| c != 'Z')
+        })
 }
 
 fn wait_for(what: &str, mut predicate: impl FnMut() -> bool) {
