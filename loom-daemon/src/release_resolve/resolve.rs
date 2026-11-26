@@ -941,9 +941,14 @@ fn fetch_asset_sha256(tag: &str, repo: &str, sha_name: &str, root: &Path) -> Opt
         assets: Vec<ChecksumAsset>,
     }
 
-    // `gh release download` uses the asset's absolute URL, bypassing the
-    // reader profile's api_host. Look up its numeric ID and route both API
-    // calls by relative path so the credential is sent to its own endpoint.
+    // Look up the asset's numeric ID and fetch it with `gh api --include`
+    // rather than `gh release download`. The asset request is redirected to
+    // asset storage on another host, where `gh` drops the `Authorization`
+    // header. `--include` exposes the final response's status and headers,
+    // which `gh release download` hides. `checksum_retry::is_asset_refusal` uses
+    // them to tell a refusal from storage (no `x-github-request-id`) apart
+    // from a GitHub API refusal (which carries one). The relative path does
+    // not change which API host the reader credential reaches.
     let target = GhTarget::repo(repo).ok()?;
     let GhTarget::Repo { owner, repo: name } = &target else {
         return None;
