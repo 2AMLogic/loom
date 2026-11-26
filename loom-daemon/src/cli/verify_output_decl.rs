@@ -48,7 +48,7 @@
 //! a target with quotes in its name. Storing the path in a variable still
 //! matches as an argument (`REPORT = build/report.json`), but an assignment
 //! to a variable NAMED like the output declares nothing
-//! (`build/report.json := val`).
+//! (`build/report.json := val`, or the same with `=`, `+=`, `?=` and `!=`).
 //!
 //! # Exit-code contract
 //!
@@ -190,25 +190,39 @@ fn inline_flagged_recipe(line: &str) -> Option<&str> {
     None
 }
 
-/// What precedes the first unquoted colon of a line that is not a recipe.
+/// What precedes the first unquoted colon or equals sign of a line that is not
+/// a recipe.
 enum BeforeColon<'a> {
     /// The target list of a rule: `targets:` or `targets::`.
     Rule { targets: &'a str },
-    /// The variable name of an assignment: `name :=`, `name ::=` or `name :::=`.
+    /// The left side of an assignment: `name :=`, `name ::=`, `name :::=`,
+    /// `name =`, `name +=`, `name ?=` or `name !=`.
     Assignment { name: &'a str },
-    /// The colon belongs to an ordinary word: a comment, `=` or shell
-    /// operator precedes it, or there is no colon at all.
+    /// The colon belongs to an ordinary word: a comment or shell operator
+    /// precedes it, or there is no colon at all.
     Word,
 }
 
-/// Find the colon that ends a Make rule's target list, without interpreting
-/// Make: the first colon outside quotes, escapes and expansions. Only return
-/// the portion of the header on the cited physical line.
+/// Find the colon that ends a Make rule's target list or the operator that
+/// starts an assignment, without interpreting Make: the first unquoted `:` or
+/// `=` outside quotes, escapes and expansions. `+=`, `?=` and `!=` may space
+/// their first character from the `=`. Only return the portion of the header
+/// on the cited physical line.
 fn before_rule_colon(line: &str, cited_start: usize) -> BeforeColon<'_> {
     let mut unquoted = unquoted();
+    let mut prefix = None;
     for (index, ch) in line.char_indices().filter(|&(_, ch)| unquoted(ch)) {
         match ch {
-            '#' | '=' | ';' | '&' | '|' | '<' | '>' | '(' | ')' => break,
+            '#' | ';' | '&' | '|' | '<' | '>' | '(' | ')' => break,
+            '+' | '?' | '!' => prefix = Some(index),
+            '=' => {
+                // `X + = val` spaces the prefix from the `=`; `X ? y = val` does not.
+                let start = prefix.filter(|&start| line[start + 1..index].trim().is_empty());
+                let Some(name) = line.get(cited_start..start.unwrap_or(index)) else {
+                    return BeforeColon::Word;
+                };
+                return BeforeColon::Assignment { name };
+            }
             ':' => {
                 // `:=`, `::=` and `:::=` assign to a variable; `:` and `::` open a rule.
                 let Some(before) = line.get(cited_start..index) else {
@@ -587,6 +601,40 @@ mod tests {
             assert!(!line_contains_complete_arg(line, output), "{line}");
         }
         assert!(line_contains_complete_arg("REPORT = build/report.json", output));
+    }
+
+    #[test]
+    fn an_assignment_without_a_colon_named_like_the_output_declares_nothing() {
+        let output = "build/report.json";
+        for line in [
+            "build/report.json = val",
+            "build/report.json += val",
+            "build/report.json ?= val",
+            "build/report.json != echo val",
+            "build/report.json=val",
+            "build/report.json+=val",
+            "build/report.json ? = val",
+            "build/report.json + = val",
+            "build/report.json ! = echo val",
+            "export build/report.json = val",
+        ] {
+            assert!(!line_contains_complete_arg(line, output), "{line}");
+        }
+    }
+
+    #[test]
+    fn an_assignment_keeps_the_output_an_argument_outside_its_variable_name() {
+        let output = "build/report.json";
+        for line in [
+            "build/report.json: FOO = bar",
+            "build/report.json: FOO += bar",
+            "REPORT = build/report.json",
+            "REPORT != gen build/report.json",
+            "gen build/report.json --fmt=json",
+            "make build/report.json MODE=release",
+        ] {
+            assert!(line_contains_complete_arg(line, output), "{line}");
+        }
     }
 
     #[test]
