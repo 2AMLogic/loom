@@ -42,6 +42,13 @@ impl Fixture {
         self.route("/issues/12/comments", json!([]));
     }
 
+    fn permission(&self, login: &str, level: &str) {
+        self.route(
+            &format!("/collaborators/{login}/permission"),
+            json!({"permission": level, "user": {"login": login}}),
+        );
+    }
+
     fn merged_issue_branch(&self) {
         let mut pr = pull(8, "closed", &[], "abc");
         // Gitea substitutes a pull ref after deletion but retains the original branch label.
@@ -216,6 +223,7 @@ fn an_unlinked_open_issue_branch_blocks_only_in_its_own_repository() {
         f.route(&format!("{PULLS}1"), json!([pr]));
         f.route(&format!("{PULLS}2"), json!([]));
         f.route("/assignees", json!([{"login":"alice"}]));
+        f.permission("alice", "write");
         f.defaults();
         std::fs::write(f.dir.path().join("branch"), "abc refs/heads/feature/issue-12\n").unwrap();
         f.expect(FORCE, false, code, token);
@@ -275,6 +283,7 @@ fn only_trusted_live_unyielded_leases_block_dispatcher_owned_claims() {
         f.route("/issues/12", issue(12, "open", &["loom:building"]));
         f.route("/issues/12/comments", rows);
         f.route("/assignees", json!([{"login":"worker"}]));
+        f.permission("worker", "write");
         f.defaults();
         f.expect(CLAIM, true, code, token);
     }
@@ -348,6 +357,7 @@ fn a_link_from_a_fork_requires_a_trusted_author() {
         f.route(&format!("{PULLS}1"), json!([pr]));
         f.route(&format!("{PULLS}2"), json!([]));
         f.route("/assignees", writers);
+        f.permission("alice", "write");
         f.defaults();
         f.expect(CLAIM, false, code, token);
     }
@@ -386,4 +396,59 @@ fn the_unpaged_timeline_must_account_for_every_visible_row() {
         f.defaults();
         f.expect(FORCE, false, code, token);
     }
+}
+
+#[test]
+fn a_read_only_assignee_is_not_a_trusted_author() {
+    let now = chrono::Utc::now();
+    let marker = "<!-- loom:lease host=peer sweep=other -->";
+    // Gitea lists read-team members as assignees. Only write access is trust.
+    for (level, code, token) in [
+        ("read", 1, ""),
+        ("none", 1, ""),
+        ("write", 0, "LEASE_ALREADY_HELD peer other\n"),
+        ("admin", 0, "LEASE_ALREADY_HELD peer other\n"),
+    ] {
+        let f = Fixture::new();
+        f.route("/issues/12", issue(12, "open", &["loom:building"]));
+        f.route(
+            "/issues/12/comments",
+            json!([{"body":marker, "updated_at":now, "user":{"login":"reader"}}]),
+        );
+        f.route("/assignees", json!([{"login":"reader"}]));
+        f.permission("reader", level);
+        f.defaults();
+        f.expect(CLAIM, true, code, token);
+    }
+    for (level, code, token) in [("read", 1, ""), ("write", 0, "OPEN_PR #8\n")] {
+        let f = Fixture::new();
+        let mut pr = pull(8, "open", &[], "abc");
+        pr["head"]["repo"]["full_name"] = json!("outsider/fork");
+        pr["body"] = json!("Contributes to #12");
+        f.route(&format!("{PULLS}1"), json!([pr]));
+        f.route(&format!("{PULLS}2"), json!([]));
+        f.route("/assignees", json!([{"login":"alice"}]));
+        f.permission("alice", level);
+        f.defaults();
+        f.expect(CLAIM, false, code, token);
+    }
+}
+
+#[test]
+fn an_unreadable_permission_fails_closed() {
+    let now = chrono::Utc::now();
+    let f = Fixture::new();
+    f.route("/issues/12", issue(12, "open", &["loom:building"]));
+    f.route(
+        "/issues/12/comments",
+        json!([{"body":"<!-- loom:lease host=peer sweep=other -->", "updated_at":now,
+                "user":{"login":"worker"}}]),
+    );
+    f.route("/assignees", json!([{"login":"worker"}]));
+    f.stub.route(
+        &format!("{REPO}/collaborators/worker/permission"),
+        Reply::json("403 Forbidden", json!({"message":"admins only"})),
+    );
+    f.defaults();
+    f.expect(CLAIM, true, 5, "");
 }

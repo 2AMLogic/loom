@@ -1,6 +1,6 @@
 //! Live Gitea evidence for the Builder's claim and split-parent gates.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 use anyhow::{anyhow, ensure, Context, Result};
@@ -208,6 +208,25 @@ impl Repository {
         Ok(string(&row["head"]["repo"], "full_name")?.eq_ignore_ascii_case(&self.slug))
     }
 
+    /// Whether `login` holds write (or admin/owner) permission on this
+    /// repository. An unreadable or malformed answer is an error, never a
+    /// silent "not a writer" or "writer".
+    fn has_write_permission(&self, login: &str) -> Result<bool> {
+        ensure!(
+            !login.is_empty()
+                && login
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.')),
+            "unexpected Gitea login {login:?}"
+        );
+        let (row, _) = self.get(&format!("collaborators/{login}/permission"))?;
+        match string(&row, "permission")? {
+            "write" | "admin" | "owner" => Ok(true),
+            "read" | "none" => Ok(false),
+            other => Err(anyhow!("unrecognized Gitea permission {other:?}")),
+        }
+    }
+
     pub(crate) fn lease(
         &self,
         issue: u32,
@@ -244,10 +263,14 @@ impl Repository {
 }
 
 /// Gitea does not supply GitHub's author_association. Its unpaginated
-/// assignees endpoint lists repository writers. Fetch it once, and only when
-/// a marker or a fork PR actually needs an author decision.
+/// assignees endpoint is only a candidate list: on organization repositories
+/// it also includes members of read-only teams. A candidate is trusted only
+/// when the repository permission endpoint reports write access or better.
+/// Both reads happen lazily, only when a marker or a fork PR actually needs
+/// an author decision.
 pub(crate) struct TrustedAuthors {
     writers: Option<Vec<String>>,
+    permitted: HashMap<String, bool>,
     allowlist: Vec<String>,
 }
 
@@ -255,6 +278,7 @@ impl TrustedAuthors {
     pub(crate) fn for_root(root: &Path) -> Self {
         Self {
             writers: None,
+            permitted: HashMap::new(),
             allowlist: allowlist_from_config(&crate::config_resolver::resolve_effective_config(
                 root,
             )),
@@ -281,10 +305,20 @@ impl TrustedAuthors {
                 .collect::<Result<_>>()?;
             self.writers = Some(writers);
         }
-        Ok(self
+        let candidate = self
             .writers
             .as_ref()
-            .is_some_and(|writers| writers.iter().any(|w| w.eq_ignore_ascii_case(login))))
+            .is_some_and(|writers| writers.iter().any(|w| w.eq_ignore_ascii_case(login)));
+        if !candidate {
+            return Ok(false);
+        }
+        let key = login.to_ascii_lowercase();
+        if let Some(&writer) = self.permitted.get(&key) {
+            return Ok(writer);
+        }
+        let writer = repo.has_write_permission(login)?;
+        self.permitted.insert(key, writer);
+        Ok(writer)
     }
 }
 
