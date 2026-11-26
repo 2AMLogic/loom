@@ -9159,6 +9159,10 @@ _extract_write_targets_scan() {
     # Keep the opening quote on substitution-bearing redirect operands,
     # even if qsplit returned only the fragment before a pipe (#15417).
     function redirect_target(tok,   inner, closed) {
+        # Peel an enclosing `$(...)`/`(...)` closing paren first (#6940), as
+        # resolve_var_q() does, so the closing-quote test below sees the real
+        # operand rather than one with the outer construct `)` glued on.
+        tok = strip_subst_close_parens(tok)
         if (substr(tok, 1, 1) == DQ && tok ~ /\$\([^(]/) {
             # Prove a same-command literal directory binding, but keep the
             # quote shape so the shell-side filename check still sees one

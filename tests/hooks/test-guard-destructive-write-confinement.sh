@@ -181,6 +181,25 @@ assert_allow "write-confinement (#15417): ISO-style stamp with literal T and Z" 
 assert_deny "write-confinement (#15417): other literal letters are not admitted" \
     'echo ok > "/tmp/report-$(date +%Y/x).log"' "$WT_DIR"
 
+# The redirect operand may be the last token before an enclosing construct's
+# closing paren; that paren must not defeat the quoted-operand check.
+assert_allow "write-confinement (#15417): timestamped scratch redirect inside a capture" \
+    'out=$(printf ok > "/tmp/report-$(date +%s).log")' "$WT_REPO"
+assert_allow "write-confinement (#15417): timestamped scratch stderr redirect inside a capture" \
+    'out=$(printf ok 2>"/tmp/report-$(date +%s).log")' "$WT_REPO"
+assert_allow "write-confinement (#15417): timestamped scratch redirect nested in two captures" \
+    'a=$(b=$(printf ok > "/tmp/r-$(date +%s).log"))' "$WT_REPO"
+assert_allow "write-confinement (#15417): timestamped scratch redirect inside a plain subshell" \
+    '(printf ok > "/tmp/r-$(date +%s).log")' "$WT_REPO"
+assert_allow "write-confinement (#15417): bound scratch directory, timestamped, inside a capture" \
+    'OUT=/tmp; out=$(printf ok 2>"$OUT/report-$(date +%s).log")' "$WT_REPO"
+assert_allow "write-confinement (#15417): relative timestamped file in a managed worktree, inside a capture" \
+    'out=$(printf ok > "r-$(date +%s).log")' "$WT_DIR"
+assert_deny "write-confinement (#15417): checkout destination inside a capture still denies" \
+    "out=\$(printf ok > \"$WT_REPO/r-\$(date +%s).log\")" "$WT_DIR"
+assert_deny "write-confinement (#15417): unknown filename output inside a capture still denies" \
+    'out=$(printf ok > "/tmp/r-$(cat labels.txt).log")' "$WT_DIR"
+
 # --- #7415: a git worktree NESTED under the main checkout, created by a plain
 # `git worktree add` (so carrying no `.loom-managed` sentinel), was
 # indistinguishable from the main checkout: the sentinel walk-up found nothing
