@@ -233,10 +233,10 @@ pub(super) fn execute(command: Vec<String>) -> Result<()> {
             // Only a failed containment proof is a hook-trust refusal; a
             // static rejection (missing adapter, bad manifest, unknown role)
             // keeps its ordinary error so the clone or adapter gets repaired.
-            if is_hooks_untrusted(&cause) {
-                refuse_hooks_untrusted(&cause);
+            match admission_failure(cause) {
+                AdmissionFailure::Refuse(refusal) => refusal.emit_and_exit(),
+                AdmissionFailure::Error(cause) => return Err(cause),
             }
-            return Err(cause);
         }
     }
     let (bin, args) = command.split_first().context("private command missing")?;
@@ -252,7 +252,7 @@ pub(super) fn execute(command: Vec<String>) -> Result<()> {
         // Same refusal semantics as admission above (#15397).
         match containment::waiver_args(&role, args, &clone) {
             Ok(waiver) => waiver,
-            Err(cause) => refuse_hooks_untrusted(&cause),
+            Err(cause) => HooksRefusal::new(&cause).emit_and_exit(),
         }
     } else {
         Vec::new()
@@ -269,15 +269,6 @@ pub(super) fn execute(command: Vec<String>) -> Result<()> {
     Err(error.into())
 }
 
-/// The in-container admission or hook-trust vetting refused this launch
-/// (#15397): announce the refusal category on stderr and exit with the
-/// shared refusal code. The announce line reaches the tick's log through the
-/// adapter's stderr pass-through, and the daemon's terminal-record parser
-/// relabels the generic `RECOVERABLE` the adapter's classifier writes for
-/// this exit code to [`TerminalClassification::HooksUntrusted`] — the same
-/// contract `SESSION_DOWN` and `SESSION_MOUNT_STALE` already ride. The cause
-/// text is printed first: these refusals are fixed, secret-free obligation
-/// strings by construction.
 /// Marks an admission error as a containment-proof / hook-trust failure, as
 /// opposed to a static admission rejection.
 #[derive(Debug)]
@@ -299,12 +290,57 @@ fn is_hooks_untrusted(cause: &anyhow::Error) -> bool {
     cause.is::<HooksUntrustedCause>()
 }
 
-fn refuse_hooks_untrusted(cause: &anyhow::Error) -> ! {
-    eprintln!("private-workspace execute: {cause:#}");
-    crate::session_exec::refusal::announce(
-        crate::tokens_pool::health::TerminalClassification::HooksUntrusted,
-    );
-    std::process::exit(crate::session_exec::refusal::REFUSAL_EXIT_CODE)
+/// What the worker does with a failed role admission.
+enum AdmissionFailure {
+    /// A hook-trust / containment refusal: announce the category and exit 78.
+    Refuse(HooksRefusal),
+    /// A static rejection: an ordinary error, no marker, exit 1.
+    Error(anyhow::Error),
+}
+
+/// Decide, at the worker entry, whether an admission error is a hook-trust
+/// refusal or an ordinary static rejection.
+fn admission_failure(cause: anyhow::Error) -> AdmissionFailure {
+    if is_hooks_untrusted(&cause) {
+        AdmissionFailure::Refuse(HooksRefusal::new(&cause))
+    } else {
+        AdmissionFailure::Error(cause)
+    }
+}
+
+/// The in-container admission or hook-trust vetting refused this launch
+/// (#15397): the cause text, the refusal-category announcement for stderr,
+/// and the shared refusal exit code. The announce line reaches the tick's log
+/// through the adapter's stderr pass-through, and the daemon's terminal-record
+/// parser relabels the generic `RECOVERABLE` the adapter's classifier writes
+/// for this exit code to [`TerminalClassification::HooksUntrusted`] — the
+/// same contract `SESSION_DOWN` and `SESSION_MOUNT_STALE` already ride. The
+/// cause text is a fixed, secret-free obligation string by construction.
+#[derive(Debug)]
+struct HooksRefusal {
+    diagnostic: String,
+    marker: Option<String>,
+    exit_code: i32,
+}
+
+impl HooksRefusal {
+    fn new(cause: &anyhow::Error) -> Self {
+        Self {
+            diagnostic: format!("private-workspace execute: {cause:#}"),
+            marker: crate::session_exec::refusal::marker_line(
+                crate::tokens_pool::health::TerminalClassification::HooksUntrusted,
+            ),
+            exit_code: crate::session_exec::refusal::REFUSAL_EXIT_CODE,
+        }
+    }
+
+    fn emit_and_exit(self) -> ! {
+        eprintln!("{}", self.diagnostic);
+        if let Some(marker) = &self.marker {
+            eprintln!("{marker}");
+        }
+        std::process::exit(self.exit_code)
+    }
 }
 
 /// The worker's own, independent admission of the role it is about to exec —
@@ -413,20 +449,33 @@ pub(super) fn check_host_job() -> Result<()> {
 mod hooks_untrusted_tests {
     use super::*;
 
-    #[test]
-    fn a_containment_failure_is_marked_hooks_untrusted() {
-        assert!(is_hooks_untrusted(&hooks_untrusted("proof missing".into())));
+    const MARKER: &str = "# LOOM_SESSION_REFUSAL v=1 category=HOOKS_UNTRUSTED";
+
+    /// The worker-entry decision: status and marker for a failed admission.
+    fn entry(cause: anyhow::Error) -> Result<(i32, String), anyhow::Error> {
+        match admission_failure(cause) {
+            AdmissionFailure::Refuse(r) => Ok((r.exit_code, r.marker.unwrap_or_default())),
+            AdmissionFailure::Error(e) => Err(e),
+        }
     }
 
     #[test]
-    fn a_static_admission_rejection_is_not_marked() {
-        // Same shape `admit_role` returns for a static rejection.
-        assert!(!is_hooks_untrusted(&anyhow::anyhow!("adapter spawn-codex.sh is missing")));
+    fn a_containment_failure_exits_78_with_the_marker() {
+        let (code, marker) = entry(hooks_untrusted("proof missing".into())).expect("refusal");
+        assert_eq!(code, 78);
+        assert_eq!(marker, MARKER);
     }
 
     #[test]
-    fn an_unknown_role_at_worker_entry_is_not_hooks_untrusted() {
+    fn a_static_admission_rejection_stays_an_ordinary_error_without_the_marker() {
+        let cause = entry(anyhow::anyhow!("adapter spawn-codex.sh is missing"))
+            .expect_err("static rejection is not a refusal");
+        assert!(format!("{cause:#}").contains("is missing"));
+    }
+
+    #[test]
+    fn an_unknown_role_through_admission_is_an_ordinary_error() {
         let cause = admit_role("no-such-role-15397").expect_err("unknown role is refused");
-        assert!(!is_hooks_untrusted(&cause), "{cause:#}");
+        assert!(entry(cause).is_err(), "unknown role must not be marked");
     }
 }
