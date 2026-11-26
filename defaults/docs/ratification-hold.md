@@ -49,7 +49,9 @@ still holds, even when the denial and an affirmative declaration share a
 sentence. A period after a word such as `Inc.` can belong to an abbreviation.
 The scanner keeps the hold if a denial starts after such a period, unless the
 preceding passage ends with the status field or is itself a recognized denial
-or deferral. Each changed file is evaluated independently.
+or deferral. A denial or deferral in a numbered list also keeps the hold. The
+period in `1.` can introduce a list item governed by a condition above it.
+Each changed file is evaluated independently.
 
 A held PR that goes CONFLICTING is served by Doctor, hold intact (#13505): Doctor resolves and pushes, leaves `loom:blocked` and `loom:pr` on, and Judge re-reviews the new head; the operator then ratifies a clean head.
 

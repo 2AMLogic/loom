@@ -208,6 +208,22 @@ fn ambiguous_periods_keep_conditions_attached_to_the_denial() {
 }
 
 #[test]
+fn a_list_item_keeps_the_condition_introducing_the_list() {
+    for marker in ["1.", "-", "  12.", ">1.", "- 1.", "1. 2.", "1) 2."] {
+        for declaration in ["This PR does not ratify on merge", DR_DEFERRAL] {
+            let body = format!(
+                "Status: Proposed.\n\nIf the board withholds consent:\n\n{marker} {declaration}."
+            );
+            assert_eq!(
+                scan(&[file(DR_PATH, "modified", Some(&body))], &Config::default()),
+                Verdict::Hold(vec![DR_PATH.into()]),
+                "{body}"
+            );
+        }
+    }
+}
+
+#[test]
 fn explicit_phrases_still_hold_a_deferred_record() {
     let cfg = Config {
         phrases: vec!["sign-off is merge".into()],

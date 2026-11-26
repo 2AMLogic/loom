@@ -142,6 +142,16 @@ fn compile(pat: &str) -> Regex {
         .expect("an escaped literal is always a valid regex")
 }
 
+/// The text immediately before a period can end in a Markdown list marker.
+/// Allow indentation, block quotes and enclosing list markers on the same line.
+fn ends_in_list_ordinal(passage: &str) -> bool {
+    let line = passage.rsplit(['\r', '\n']).next().unwrap_or(passage);
+    line.ends_with(|c: char| c.is_ascii_digit())
+        && line.bytes().all(|b| {
+            b.is_ascii_digit() || matches!(b, b' ' | b'\t' | b'>' | b'-' | b'+' | b'.' | b')')
+        })
+}
+
 /// Whether the file (or the name it was renamed from) is a spec/decision path.
 #[must_use]
 pub fn is_candidate(f: &ChangedFile, cfg: &Config) -> bool {
@@ -189,10 +199,10 @@ pub fn declares_ratification(content: &str, cfg: &Config) -> bool {
             return true;
         }
         // A word-final dot can belong to an abbreviation ("Acme Inc. this PR ...").
-        // Only a known status or complete deferral establishes a break after a word.
-        // DR-015's issue citation and item number both end in digits.
+        // An ordered list marker ("1. This PR ...") can likewise separate a
+        // denial from the condition introducing the list.
         let previous = previous.trim();
-        previous.ends_with(char::is_alphabetic)
+        (previous.ends_with(char::is_alphabetic) || ends_in_list_ordinal(previous))
             && !status
                 .find_iter(previous)
                 .any(|m| m.end() == previous.len())
