@@ -93,6 +93,7 @@ pub(crate) fn forge_op_for(op: &str) -> Option<ForgeOp> {
         | "sequence.label_timeline"
         | "intake.label_events"
         | "champion.label_events"
+        | "verdict.pr_timeline"
         | "merged_obs.timeline" => ops::TIMELINE_READ,
         "guard.open_pr_graphql" => ops::PR_CLOSING_ISSUE_REFERENCES,
         "merged_obs.close_targets" => ops::PR_CLOSING_ISSUE_REFERENCES,

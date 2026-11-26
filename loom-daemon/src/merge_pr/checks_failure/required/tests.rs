@@ -7,6 +7,7 @@ fn run(name: &str, status: &str, conclusion: Option<&str>, started: Option<&str>
     CheckRun {
         name: name.into(),
         status: status.into(),
+        settled: status == "completed",
         conclusion: conclusion.map(String::from),
         started_at: started.map(|t| t.parse().unwrap()),
     }
@@ -225,4 +226,170 @@ fn parses_check_run_rows() {
     assert_eq!(runs.len(), 2);
     assert_eq!(runs[1].conclusion, None);
     assert!(parse_check_runs(&json!([{"status": "completed"}])).is_err());
+}
+
+#[test]
+fn settled_in_progress_green_is_clean_and_red_refuses() {
+    let green_rows = json!([{
+        "name": "lint",
+        "status": "in_progress",
+        "conclusion": "success",
+        "started_at": "2026-11-24T17:28:46Z",
+        "completed_at": "2026-11-24T17:28:53Z"
+    }]);
+    let green = parse_check_runs(&green_rows).unwrap();
+    assert_eq!(assess(&v(&["lint"]), &green, &[], &[]), Verdict::Clean);
+
+    let red_rows = json!([{
+        "name": "lint",
+        "status": "in_progress",
+        "conclusion": "failure",
+        "started_at": "2026-11-24T17:28:46Z",
+        "completed_at": "2026-11-24T17:28:53Z"
+    }]);
+    let red = parse_check_runs(&red_rows).unwrap();
+    assert_eq!(
+        assess(&v(&["lint"]), &red, &[], &[]),
+        Verdict::Refuse {
+            red: named(&[("lint", "failure")]),
+            bypassed: vec![]
+        }
+    );
+    assert_eq!(
+        assess(&v(&["lint"]), &red, &[], &v(&["lint"])),
+        Verdict::Bypassed(named(&[("lint", "failure")]))
+    );
+
+    let ordered_rows = json!([
+        {
+            "name": "lint",
+            "status": "in_progress",
+            "conclusion": "failure",
+            "started_at": "2026-11-24T17:00:00Z",
+            "completed_at": "2026-11-24T17:00:10Z"
+        },
+        {
+            "name": "lint",
+            "status": "in_progress",
+            "conclusion": "success",
+            "started_at": "2026-11-24T17:28:46Z",
+            "completed_at": "2026-11-24T17:28:53Z"
+        }
+    ]);
+    let ordered = parse_check_runs(&ordered_rows).unwrap();
+    assert_eq!(assess(&v(&["lint"]), &ordered, &[], &[]), Verdict::Clean);
+}
+
+#[test]
+fn partial_in_progress_rows_still_hold() {
+    for row in [
+        json!({
+            "name": "lint",
+            "status": "in_progress",
+            "conclusion": null,
+            "started_at": "2026-11-24T17:28:46Z",
+            "completed_at": "2026-11-24T17:28:53Z"
+        }),
+        json!({
+            "name": "lint",
+            "status": "in_progress",
+            "conclusion": "success",
+            "started_at": "2026-11-24T17:28:46Z",
+            "completed_at": null
+        }),
+        json!({
+            "name": "lint",
+            "status": "in_progress",
+            "conclusion": "success",
+            "started_at": "2026-11-24T17:28:46Z"
+        }),
+    ] {
+        let runs = parse_check_runs(&json!([row])).unwrap();
+        assert_eq!(
+            assess(&v(&["lint"]), &runs, &[], &[]),
+            Verdict::Hold {
+                waiting: named(&[("lint", "in_progress")]),
+                bypassed: vec![]
+            },
+            "partial row must stay on hold: {row}"
+        );
+    }
+}
+
+#[test]
+fn newer_running_attempt_holds_even_after_settled_success() {
+    let settled = json!({
+        "name": "lint",
+        "status": "in_progress",
+        "conclusion": "success",
+        "started_at": "2026-11-24T17:28:46Z",
+        "completed_at": "2026-11-24T17:28:53Z"
+    });
+    let rerunning = json!({
+        "name": "lint",
+        "status": "in_progress",
+        "conclusion": null,
+        "started_at": "2026-11-24T17:35:00Z",
+        "completed_at": null
+    });
+    for pair in [
+        json!([settled.clone(), rerunning.clone()]),
+        json!([rerunning, settled]),
+    ] {
+        let runs = parse_check_runs(&pair).unwrap();
+        assert_eq!(
+            assess(&v(&["lint"]), &runs, &[], &[]),
+            Verdict::Hold {
+                waiting: named(&[("lint", "in_progress")]),
+                bypassed: vec![]
+            }
+        );
+    }
+}
+
+#[test]
+fn status_disagreement_diagnostic_fires_only_for_settled_non_completed_required_rows() {
+    let rows = json!([
+        {
+            "name": "lint",
+            "status": "in_progress",
+            "conclusion": "success",
+            "started_at": "2026-11-24T17:28:46Z",
+            "completed_at": "2026-11-24T17:28:53Z"
+        },
+        {
+            "name": "docs",
+            "status": "completed",
+            "conclusion": "success",
+            "started_at": "2026-11-24T17:28:46Z",
+            "completed_at": "2026-11-24T17:28:53Z"
+        },
+        {
+            "name": "informational-stuck",
+            "status": "in_progress",
+            "conclusion": "success",
+            "started_at": "2026-11-24T17:28:46Z",
+            "completed_at": "2026-11-24T17:28:53Z"
+        },
+        {
+            "name": "still-running",
+            "status": "in_progress",
+            "conclusion": null,
+            "started_at": "2026-11-24T17:28:46Z",
+            "completed_at": "2026-11-24T17:28:53Z"
+        }
+    ]);
+    let runs = parse_check_runs(&rows).unwrap();
+    assert_eq!(runs[0].status, "in_progress");
+    assert!(runs[0].settled);
+    assert!(!runs[3].settled);
+
+    let notes =
+        status_disagreements("430", "1e847cee", &v(&["lint", "docs", "still-running"]), &runs);
+    assert_eq!(notes.len(), 1, "{notes:?}");
+    assert!(notes[0].contains("PR #430"), "{}", notes[0]);
+    assert!(notes[0].contains("1e847cee"), "{}", notes[0]);
+    assert!(notes[0].contains("`lint`"), "{}", notes[0]);
+    assert!(notes[0].contains("in_progress"), "{}", notes[0]);
+    assert!(notes[0].contains("success"), "{}", notes[0]);
 }
