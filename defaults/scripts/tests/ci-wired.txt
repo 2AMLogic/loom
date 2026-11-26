@@ -30,6 +30,7 @@ test-agent-destroy.sh
 test-app-permission-fallback.sh
 test-approval-history-per-issue-events.sh
 test-archive-transcripts.sh
+test-atomic-mkdir.sh
 test-blame-issue.sh
 test-branch-landed.sh
 test-body-repo-affinity.sh
