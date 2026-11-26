@@ -1320,6 +1320,10 @@ N_SKIPPED=0
 # (#14012, prune_stale_manifest_entries()) -- both count as changes for
 # restamp_metadata()'s #11680 no-op logic.
 N_REMOVED=0
+# #15478: destinations a retirement pass reported `would remove` in this run,
+# in install-metadata.json's spelling (relative to $WRITE_ROOT). Written only
+# under --dry-run; read by _removal_planned_this_run().
+PLANNED_REMOVAL_PATHS=()
 # #4669: files that could not be staged/renamed into place. A non-empty list
 # means the refresh is PARTIAL and must be reported as such (exit 1), never
 # swallowed into a "success" summary.
@@ -2260,6 +2264,12 @@ retired_target_path() {
 # deliberately kept a fork of a retired file is never touched, and a
 # dogfood-style symlinked install target is never unlinked out from under
 # its source of truth.
+#
+# Under --dry-run each approved destination is also recorded in
+# PLANNED_REMOVAL_PATHS (#15478): the removal pass only reports, so this is
+# the only way prune_stale_manifest_entries() can preview the entry the
+# removal will leave stale. A pinned or symlinked destination is not
+# recorded, because it is not removed.
 remove_retired_files() {
     local list="$DEFAULTS_DIR/.loom-retired.list"
     [[ -f "$list" ]] || return 0
@@ -2288,6 +2298,7 @@ remove_retired_files() {
 
         if [[ "$DRY_RUN" -eq 1 ]]; then
             printf '%b\n' "  ${BOLD}would remove${NC} $rel ${YELLOW}(retired from defaults/, #5981)${NC}"
+            PLANNED_REMOVAL_PATHS+=("${dst#"$WRITE_ROOT/"}")
             N_REMOVED=$((N_REMOVED + 1))
             continue
         fi
@@ -2929,6 +2940,23 @@ _loom_pure_copy_surface_source_path() {
     esac
 }
 
+# _removal_planned_this_run <repo-relative path>
+#   Returns 0 only under --dry-run, and only for a path a retirement pass
+#   reported `would remove` in the current run. This is criterion 2's
+#   --dry-run relaxation in prune_stale_manifest_entries() below: the preview
+#   removes nothing, so the file is still on disk at classify time, while the
+#   apply for the same retirement does remove it and prune the entry. An
+#   apply never passes this test -- it keeps strictly to the filesystem, so a
+#   removal that failed keeps its entry.
+_removal_planned_this_run() {
+    [[ "$DRY_RUN" -eq 1 ]] || return 1
+    local planned
+    for planned in ${PLANNED_REMOVAL_PATHS[@]+"${PLANNED_REMOVAL_PATHS[@]}"}; do
+        [[ "$planned" == "$1" ]] && return 0
+    done
+    return 1
+}
+
 # ---------- prune stale install-metadata.json manifest entries (#14012) ----------
 #
 # install-metadata.json's installed_files array over-claims after an upstream
@@ -2943,7 +2971,11 @@ _loom_pure_copy_surface_source_path() {
 #      .codex/config.toml, .claude/settings.json) are never touched here;
 #   2. it is absent on disk under $WRITE_ROOT -- a pinned fork, or a locally
 #      deleted file this same run just restored from defaults/, still exists
-#      and is never pruned; and
+#      and is never pruned. Under --dry-run a destination a retirement pass
+#      reported `would remove` this run counts as absent (#15478): the
+#      preview removes nothing, yet has to name the prune the apply performs
+#      for that same retirement. An apply keeps strictly to the filesystem,
+#      so a removal that failed keeps its entry; and
 #   3. its _loom_pure_copy_surface_source_path() counterpart is also absent
 #      under $DEFAULTS_DIR -- i.e. genuinely retired upstream. A locally
 #      deleted file that is STILL shipped is a copy gap, not a retirement,
@@ -2983,7 +3015,9 @@ if isinstance(arr, list):
     while IFS= read -r p; do
         [[ -z "$p" ]] && continue
         _is_loom_pure_copy_surface_path "$p" || continue
-        [[ -e "$WRITE_ROOT/$p" || -L "$WRITE_ROOT/$p" ]] && continue
+        if [[ -e "$WRITE_ROOT/$p" || -L "$WRITE_ROOT/$p" ]]; then
+            _removal_planned_this_run "$p" || continue
+        fi
         src="$(_loom_pure_copy_surface_source_path "$p" 2>/dev/null)"
         [[ -n "$src" && ! -e "$src" && ! -L "$src" ]] || continue
         prunable+=("$p")
