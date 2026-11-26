@@ -74,13 +74,17 @@ that hard-denies the `-f body=@path` shape) **lives in
 edit` (mandatory for every verdict) are GraphQL-backed mutations, and GitHub's
 GraphQL and REST quotas are independent: GraphQL can read 0 remaining while
 REST still has thousands left. When a write fails with a rate-limit signature
-(`api rate limit·exceeded`, `secondary rate limit`, `abuse detection
-mechanism`, `was submitted too quickly`; `·` is a space, #11411), do **not**
-give up or wait idly —
+(`api rate limit·exceeded`, `api rate limit·already exceeded` (the GraphQL
+spelling), `secondary rate limit`, `abuse detection mechanism`, `was submitted
+too quickly`; `·` is a space, #11411), do **not** give up or wait idly —
 retry the same mutation over REST. The signature table, REST command
 equivalents, the `create-issue.sh` fallback, and the `GraphQL: Body is too
 long` carve-out: **[judge-forge-api.md](judge-forge-api.md)** (load when a
-rate-limit signature appears on a `gh` write).
+rate-limit signature appears on a `gh` write, and **also** when any `gh` write
+fails with an error you cannot classify from this list). A `GraphQL: Body is too
+long` rejection on a body edit is **not** a rate limit and must not be retried
+over REST: post the update as a comment instead (rationale in
+`.loom/docs/graphql-body-size-cap.md`; detail in `judge-forge-api.md`).
 
 ## Your Role
 
@@ -403,7 +407,10 @@ and continue the batch; `stale` → reclaim; `stale-bounded-fallback` →
 force-reclaim (the livelock breaker). The eval snippet, decision table,
 claimant-activity marker rules, reclaim commands, env vars, and the
 missing-script fallback: **[judge-claims.md](judge-claims.md)** (load when the
-candidate PR already carries `loom:reviewing`).
+candidate PR already carries `loom:reviewing`, **and also** when you have just
+claimed a PR and your review is about to run long or enter a CI wait — it holds
+the claim-activity progress-marker rule that keeps your fresh claim from being
+classified idle).
 
 ### PR Lease (Step 2, #9401)
 
