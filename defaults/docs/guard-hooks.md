@@ -2180,8 +2180,10 @@ Builder and Doctor work in `.loom/worktrees/issue-<N>`.
   `pwd; BR=main; git checkout "$BR"` is allowed, including when the commands
   appear on consecutive lines. An intervening command discards earlier
   bindings. Assignments whose execution or value the guard cannot establish
-  leave the target unknown. The guard allows
-  `-h` and `--help` when they occupy an option position. Also allowed are
+  leave the target unknown. Checkout also accepts a path list on stdin through
+  either spelling of `--pathspec-from-file`. The help exception requires a
+  help flag in every possible interpretation of the arguments. For GitHub CLI,
+  the final help value must be known and true. Also allowed are
   read-only git commands. `worktree.sh`, `check-main-clean.sh --quarantine`,
   `resync-installed.sh`, `merge-pr.sh` and `scripts/version.sh` are unaffected:
   the hook only sees the top-level command text, not their internal git calls.

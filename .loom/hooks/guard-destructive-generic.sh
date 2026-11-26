@@ -5155,7 +5155,9 @@ resolve_primary_mutations() {
                     # quotes are unsupported. Else the dollar is literal.
                     after = substr(tail, 2, 1)
                     if (after != "" && (index("{([0123456789@*#?$!-", after) ||
-                        (q == "" && (after == SQ || after == DQ)))) return UNKNOWN
+                        (q == "" && (after == SQ || after == DQ)))) {
+                        return (mode == "argument" ? out UNKNOWN : UNKNOWN)
+                    }
                     out = out c
                     continue
                 }
@@ -5166,41 +5168,99 @@ resolve_primary_mutations() {
                 # shell syntax. Its value is immaterial when checking syntax.
                 if (mode == "syntax") continue
                 if (substr(name, 1, 1) == "{") name = substr(name, 2, length(name) - 2)
-                if (!(name in binding)) return UNKNOWN
-                value = binding[name]
-                if (q == "" && value !~ /^[a-zA-Z0-9_.\/-]+$/) return UNKNOWN
+                value = (name in binding ? binding[name] : UNKNOWN)
+                if (q == "" && value !~ /^[a-zA-Z0-9_.\/-]+$/ &&
+                    !(mode == "argument" && value == "" && out != "")) value = UNKNOWN
+                if (value == UNKNOWN && mode != "argument") return UNKNOWN
                 out = out value
             } else if (c == "`" ||
                        (mode == "assignment" && q == "" && c !~ /[a-zA-Z0-9_.\/-]/) ||
                        (mode == "syntax" && q == "" && c !~ /[a-zA-Z0-9_.\/:@%+=,-]/)) {
-                return UNKNOWN
+                return (mode == "argument" ? out UNKNOWN : UNKNOWN)
             } else out = out c
         }
         return (q == "" ? out : UNKNOWN)
     }
-    # An argument word whose unresolvable value hides only the part after a
-    # literal `--name=` / `-n=` prefix keeps that prefix (#15003): the option
-    # name is literal even when its attached value is not, so option
-    # position and help flags still classify. A bare unknown word stays
-    # UNKNOWN (conservative).
-    #
-    # The name survives shell quoting and attachment too: a quoted long
-    # option (`"--repo=$X"`) and a short option with an attached operand
-    # (`-R"$X"`, `-b$X`) keep their literal option text, with the unknown
-    # operand collapsed to one UNKNOWN field so the operand boundary holds.
-    function pcm_arg(raw,   v, lit) {
-        v = pcm_word(raw)
-        if (v != UNKNOWN) return v
-        lit = raw
-        if ((substr(lit, 1, 1) == DQ || substr(lit, 1, 1) == SQ) &&
-            match(lit, /^.--[A-Za-z][A-Za-z0-9-]*=/)) lit = substr(lit, 2)
-        if (match(lit, /^--?[A-Za-z][A-Za-z0-9-]*=/))
-            return substr(lit, 1, RLENGTH) UNKNOWN
-        if (match(lit, /^-[A-Za-z]+/)) {
-            # Only the literal letters before the first quote or expansion.
-            return substr(lit, 1, RLENGTH) UNKNOWN
+    # Multiple possible argv boundaries can reach the same word. Help must
+    # be established on every path there. Merging at the word index bounds
+    # the work even with many adjacent uncertain operands.
+    function pcm_reach(paths, at, help) {
+        if (!(at in paths) || !help) paths[at] = help
+    }
+    # Return true when every reachable interpretation is help (or, while
+    # scanning gh global options, does not invoke PR checkout at all).
+    # The help bit means "definitely true". A false or unknown explicit gh
+    # value clears it; a later known value can set it again.
+    function pcm_only_help(subcmd, first, last, initial,   paths, gh, leading, required, optional, longs, count, i, j, arg, flag, rest, help, width, opt) {
+        leading = (subcmd == "gh-global")
+        gh = (leading || subcmd == "gh-pr-checkout")
+        if (gh) {
+            required = "Rb"
+            count = split("--repo --branch --worktree", longs)
+        } else if (subcmd == "commit") {
+            required = "mFcCt"; optional = "Su"
+            count = split("--message --file --reedit-message --reuse-message --template --author --date --fixup --squash --trailer --cleanup --pathspec-from-file", longs)
+        } else if (subcmd == "checkout") {
+            required = "bB"
+            count = split("--orphan --conflict --pathspec-from-file", longs)
+        } else {
+            required = "cC"
+            count = split("--orphan --conflict --create --force-create", longs)
         }
-        return v
+        paths[first] = initial
+        for (i = first; i <= last; i++) {
+            if (!(i in paths)) continue
+            arg = argv[i]; help = paths[i]; width = 1
+            if (leading && arg !~ /^-/) {
+                if (arg == "pr" && i < last && argv[i+1] == "checkout" &&
+                    !pcm_only_help("gh-pr-checkout", i+2, last, help)) return 0
+                continue
+            }
+            if (arg == "--" && !leading) {
+                if (!help) return 0
+                continue
+            }
+            if (substr(arg, 1, 1) == UNKNOWN) return 0
+            if (arg == "--help") help = 1
+            else if (gh && arg ~ /^--help=/)
+                help = (substr(arg, 8) ~ /^(1|t|T|true|TRUE|True)$/)
+            else if (arg ~ /^--[^=]+$/) {
+                for (opt = 1; opt <= count; opt++)
+                    if (arg == longs[opt] || (!gh && index(longs[opt], arg) == 1)) {
+                        width = 2
+                        break
+                    }
+            } else if (arg ~ /^-[^-]/) {
+                for (j = 2; j <= length(arg); j++) {
+                    flag = substr(arg, j, 1); rest = substr(arg, j+1)
+                    if (index(required, flag)) {
+                        if (rest == "") width = 2
+                        # A wholly unknown suffix can be empty (consume the
+                        # next word) or nonempty (leave it in option position).
+                        else if (rest ~ /^\001+$/) pcm_reach(paths, i+2, help)
+                        break
+                    }
+                    if (index(optional, flag)) break  # attached operand only
+                    if (flag == UNKNOWN) {
+                        # Unknown bundle text may contain a value-taking flag.
+                        if (gh) help = 0
+                        pcm_reach(paths, i+2, help)
+                        break
+                    }
+                    if (flag == "h") {
+                        if (gh && substr(rest, 1, 1) == "=") {
+                            help = (substr(rest, 2) ~ /^(1|t|T|true|TRUE|True)$/)
+                            break
+                        }
+                        help = 1
+                    }
+                }
+            }
+            if (!gh && help) continue  # Git help cannot be turned off later.
+            pcm_reach(paths, i+width, help)
+        }
+        if (leading) return 1
+        return (!(last+1 in paths) || paths[last+1]) && (!(last+2 in paths) || paths[last+2])
     }
     # Recognize assignment-only segments, including literal export writes.
     function pcm_assignments(words, n,   first, j, at, name, raw, value) {
@@ -5272,29 +5332,10 @@ resolve_primary_mutations() {
                 }
                 continue
             }
-            # `gh [global flags] pr checkout <N>` (#14973, #15003): gh fetches
-            # the PR head into the checkout and moves it there. Global flags
-            # may precede `pr` — walk them (consuming the value of the
-            # two-token `-R` / `--repo` form; `--repo=…` / `-R…` are single
-            # tokens), then match `pr checkout`. Resolved from the segment
-            # cwd (a `cd` prefix threads through above; gh has no -C
-            # option). Emitted with a marker subcmd the caller denies
-            # outright: gh has no path-restore or main/master-exception
-            # shape. Carry only actual global help and the checkout arguments.
             if (toks[1] == "gh") {
-                k = 2; global_help = 0
-                while (k <= m && (opt = pcm_arg(toks[k])) ~ /^-/) {
-                    if (opt == "-R" || opt == "--repo") k++
-                    else if (opt ~ /^(-h|--help)$/ ||
-                             opt ~ /^(-h|--help)=(1|t|T|true|TRUE|True)$/) global_help = 1
-                    else if (opt ~ /^(-h|--help)=(0|f|F|false|FALSE|False)$/) global_help = 0
-                    k++
-                }
-                if (k + 1 <= m && toks[k] == "pr" && toks[k+1] == "checkout") {
-                    args = (global_help ? "--help" : "")
-                    for (j = k + 2; j <= m; j++) args = args (global_help || j > k + 2 ? PCMSEP : "") pcm_arg(toks[j])
-                    printf "%s\037gh-pr-checkout\037%s\n", curcwd, args
-                }
+                for (j = 2; j <= m; j++) argv[j] = pcm_word(toks[j], "argument")
+                if (!pcm_only_help("gh-global", 2, m, 0))
+                    printf "%s\037gh-pr-checkout\037\n", curcwd
                 continue
             }
             if (toks[1] != "git") continue
@@ -5315,8 +5356,10 @@ resolve_primary_mutations() {
             if (k > m) continue
             sub_ = toks[k]
             if (sub_ != "checkout" && sub_ != "switch" && sub_ != "commit") continue
+            for (j = k + 1; j <= m; j++) argv[j] = pcm_word(toks[j], "argument")
+            if (pcm_only_help(sub_, k+1, m, 0)) continue
             args = ""
-            for (j = k + 1; j <= m; j++) args = args (j > k + 1 ? PCMSEP : "") pcm_arg(toks[j])
+            for (j = k + 1; j <= m; j++) args = args (j > k + 1 ? PCMSEP : "") argv[j]
             printf "%s\037%s\037%s\n", gcwd, sub_, args
         }
     }'
@@ -12522,66 +12565,6 @@ index_mutation_unisolated() {
     return 1
 }
 
-# Git permits abbreviated long options and both CLIs accept short-option
-# bundles. Only a value-taking short option at the end needs the next word.
-primary_checkout_has_help() {
-    local sub="$1" arg opt short_value short_chars opt_chars='' all_chars take_next=false
-    local help=false
-    local -a long_values
-    shift
-    # short_chars take a REQUIRED operand (attached, or the next word when
-    # last in the bundle). opt_chars take an OPTIONAL attached operand only
-    # (`git commit -S[<key-id>]`, `-u[<mode>]`): the rest of the bundle is
-    # that operand, but the next word is never consumed.
-    case "$sub" in
-        commit)
-            short_chars='mFcCt'
-            opt_chars='Su'
-            long_values=(--message --file --reedit-message --reuse-message --template
-                --author --date --fixup --squash --trailer --cleanup --pathspec-from-file) ;;
-        gh-pr-checkout)
-            short_chars='Rb'
-            long_values=(--repo --branch --worktree) ;;
-        checkout)
-            short_chars='bB'
-            long_values=(--orphan --conflict --pathspec-from-file) ;;
-        switch)
-            short_chars='cC'
-            long_values=(--orphan --conflict --create --force-create) ;;
-        *) return 1 ;;
-    esac
-    all_chars="$short_chars$opt_chars"
-    short_value="^-[^-$all_chars]*[$short_chars]\$"
-    for arg in "$@"; do
-        if [[ "$take_next" == true ]]; then take_next=false; continue; fi
-        case "$arg" in
-            -h|--help) help=true; [[ "$sub" == gh-pr-checkout ]] || return 0 ;;
-            # gh (pflag) takes an explicit boolean on its help flag and the
-            # LAST value wins (`--help --help=false` is not help).
-            -h=1|--help=1|-h=t|--help=t|-h=T|--help=T|-h=true|--help=true|-h=TRUE|--help=TRUE|-h=True|--help=True)
-                [[ "$sub" == gh-pr-checkout ]] && help=true ;;
-            -h=0|--help=0|-h=f|--help=f|-h=F|--help=F|-h=false|--help=false|-h=FALSE|--help=FALSE|-h=False|--help=False)
-                [[ "$sub" == gh-pr-checkout ]] && help=false ;;
-            --) [[ "$sub" == gh-pr-checkout && "$help" == true ]] && return 0
-                return 1 ;;  # end of options
-            $'\001') return 1 ;;  # unknown argument arity
-            --*=*) ;;
-            --*)
-                for opt in "${long_values[@]}"; do
-                    if [[ "$opt" == "$arg"* ]]; then take_next=true; break; fi
-                done ;;
-            -?*)
-                # A bundle reaches `h` only through boolean short flags: an
-                # operand-taking flag earlier in the bundle consumes the rest.
-                if [[ "$arg" =~ ^-[^-$all_chars]*h ]]; then
-                    help=true; [[ "$sub" == gh-pr-checkout ]] || return 0
-                fi
-                [[ "$arg" =~ $short_value ]] && take_next=true ;;
-        esac
-    done
-    [[ "$help" == true ]]
-}
-
 # Is `$2` a target a `git checkout <path>` could restore — a path present in
 # the working tree, or a tracked one (the classic restore of a file deleted
 # from the worktree)? Resolved relative to `$1`, the cwd the git invocation
@@ -12655,7 +12638,6 @@ if [[ -n "${LOOM_SWEEP_ID:-}${LOOM_WORKTREE_PATH:-}" ]] \
         # stays ONE field here; IFS is a non-whitespace separator, so read
         # performs no whitespace trimming/collapsing on the tokens.
         IFS=$'\036' read -r -a _pcm_t <<< "$_pcm_args"
-        primary_checkout_has_help "$_pcm_sub" "${_pcm_t[@]}" && continue
         _pcm_deny=false
         _pcm_dashdash=false
         _pcm_new=""        # branch named by -b/-B/-c/-C
@@ -12664,14 +12646,20 @@ if [[ -n "${LOOM_SWEEP_ID:-}${LOOM_WORKTREE_PATH:-}" ]] \
         _pcm_prev=""
         for _pcm_a in "${_pcm_t[@]}"; do
             if [[ -n "$_pcm_prev" ]]; then
-                _pcm_new="$_pcm_a"; _pcm_prev=""; continue
+                if [[ "$_pcm_prev" != operand ]]; then _pcm_new="$_pcm_a"; fi
+                _pcm_prev=""; continue
             fi
             case "$_pcm_a" in
                 --) _pcm_dashdash=true; break ;;
-                -b|-B|-c|-C) _pcm_makes=true; _pcm_prev="$_pcm_a" ;;
+                --pathspec-from-file|--conflict) _pcm_prev=operand ;;
                 --orphan|--detach|-d|--create|--force-create) _pcm_makes=true ;;
                 -) [[ -z "$_pcm_pos" ]] && _pcm_pos="-" ;;
-                -*) ;;
+                -?*)
+                    if [[ "$_pcm_a" =~ ^-[^-bBcC]*[bBcC](.*)$ ]]; then
+                        _pcm_makes=true
+                        _pcm_new="${BASH_REMATCH[1]}"
+                        [[ -n "$_pcm_new" ]] || _pcm_prev=branch
+                    fi ;;
                 *) [[ -z "$_pcm_pos" ]] && _pcm_pos="$_pcm_a" ;;
             esac
         done
@@ -12694,7 +12682,7 @@ if [[ -n "${LOOM_SWEEP_ID:-}${LOOM_WORKTREE_PATH:-}" ]] \
                     :   # return to / refresh the default branch
                 elif [[ "$_pcm_makes" == true ]]; then
                     _pcm_deny=true
-                elif [[ "$_pcm_pos" == $'\001' ]]; then
+                elif [[ "$_pcm_pos" == *$'\001'* ]]; then
                     _pcm_deny=true   # unresolved shell word cannot establish a literal path
                 elif [[ "$_pcm_pos" == "-" ]]; then
                     # #15003: `git checkout -` always switches to @{-1} — git

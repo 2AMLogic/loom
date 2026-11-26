@@ -202,26 +202,71 @@ assert_deny_env "gh pr checkout --help --help=false is not help" "$AGENT" \
 assert_allow_env "gh pr checkout --help=false --help is help" "$AGENT" \
     'gh pr checkout 7 --help=false --help' "$PC_REPO"
 
-# Option names survive shell quoting / attachment with an unknown operand, so
-# a later help flag still classifies (CLI: usage, no checkout).
+# A nonempty short operand and an equals-delimited long operand both leave
+# the following word in option position.
 assert_allow_env "gh -R\"\$VAR\" --help is help" "$AGENT" \
-    'gh pr checkout -R"$REVIEW_REPO" --help' "$PC_REPO"
+    'REVIEW_REPO=owner/repo; gh pr checkout -R"$REVIEW_REPO" --help' "$PC_REPO"
 assert_allow_env "gh -b\"\$VAR\" --help is help" "$AGENT" \
-    'gh pr checkout -b"$TOPIC" --help' "$PC_REPO"
+    'TOPIC=topic; gh pr checkout -b"$TOPIC" --help' "$PC_REPO"
 assert_allow_env "gh quoted \"--repo=\$VAR\" --help is help" "$AGENT" \
     'gh pr checkout "--repo=$REVIEW_REPO" --help' "$PC_REPO"
 assert_allow_env "git commit -m\"\$VAR\" -h is help" "$AGENT" \
-    'git commit -m"$MSG" -h' "$PC_REPO"
+    'MSG=sample; git commit -m"$MSG" -h' "$PC_REPO"
 assert_allow_env "git commit quoted \"--message=\$VAR\" -h is help" "$AGENT" \
     'git commit "--message=$MSG" -h' "$PC_REPO"
 assert_allow_env "git checkout -b\"\$VAR\" -h is help" "$AGENT" \
-    'git checkout -b"$TOPIC" -h' "$PC_REPO"
+    'TOPIC=topic; git checkout -b"$TOPIC" -h' "$PC_REPO"
 assert_allow_env "git switch -c\"\$VAR\" -h is help" "$AGENT" \
-    'git switch -c"$TOPIC" -h' "$PC_REPO"
+    'TOPIC=topic; git switch -c"$TOPIC" -h' "$PC_REPO"
 assert_deny_env "gh -R\"\$VAR\" without help stays denied" "$AGENT" \
     'gh pr checkout -R"$REVIEW_REPO" 7' "$PC_REPO"
 assert_deny_env "git commit -m\"\$VAR\" without help stays denied" "$AGENT" \
     'git commit -m"$MSG"' "$PC_REPO"
+
+# Exercise raw argument words directly. Both operand boundaries must establish
+# help, including when the same option is parsed before the gh subcommand.
+PC_PARSER=$(sed -n '/^    function pcm_word(/,/^    }$/p
+    /^    function pcm_reach(/,/^    }$/p
+    /^    function pcm_only_help(/,/^    }$/p' "$GUARD")
+assert_parser_help() {
+    local expected="$1" subcommand="$2" result
+    shift 2
+    result=$(printf '%s\n' "$@" | awk -v subcmd="$subcommand" "$PC_PARSER"'
+        BEGIN {
+            UNKNOWN = sprintf("%c", 1); SQ = sprintf("%c", 39); DQ = sprintf("%c", 34)
+            binding["EMPTY"] = ""; binding["SET"] = "sample"
+        }
+        { argv[NR] = pcm_word($0, "argument") }
+        END { print pcm_only_help(subcmd, 1, NR, 0) ? "help" : "ordinary" }
+    ')
+    TOTAL=$((TOTAL + 1))
+    if [[ "$result" == "$expected" ]]; then
+        PASS=$((PASS + 1))
+    else
+        FAIL=$((FAIL + 1))
+        printf 'FAIL: %s %s expected %s, got %s\n' "$subcommand" "$*" "$expected" "$result"
+    fi
+}
+for spec in 'commit:-m' 'commit:-qF' 'switch:-c' 'checkout:-b' 'gh-pr-checkout:-b' 'gh-pr-checkout:-R'; do
+    subcmd="${spec%:*}"
+    flag="${spec#*:}"
+    assert_parser_help ordinary "$subcmd" "$flag"'$EMPTY' --help
+    assert_parser_help help "$subcmd" "$flag"'"$SET"' --help
+    assert_parser_help ordinary "$subcmd" "$flag"'"$UNKNOWN"' --help
+    assert_parser_help help "$subcmd" "$flag"'"$UNKNOWN"' sample --help
+done
+assert_parser_help ordinary gh-global '-R"$UNKNOWN"' sample pr checkout
+assert_parser_help ordinary gh-global '-R"$UNKNOWN"' --help pr checkout
+assert_parser_help help gh-global '-R"$UNKNOWN"' --help pr checkout --help
+assert_parser_help ordinary gh-global '-R"$EMPTY"' --help pr checkout
+assert_parser_help help gh-global '-R"$SET"' --help pr checkout
+for flag in -h --help; do
+    assert_parser_help ordinary gh-global --help "$flag="'$UNKNOWN' pr checkout
+    assert_parser_help ordinary gh-global --help pr checkout "$flag="'$UNKNOWN'
+    assert_parser_help help gh-global "$flag="'$UNKNOWN' --help pr checkout
+    assert_parser_help help gh-global "$flag="'$UNKNOWN' pr checkout --help
+    assert_parser_help help gh-pr-checkout "$flag="'$UNKNOWN' "$flag=true"
+done
 
 # Optional attached operands (git commit -S[<key-id>] / -u[<mode>]): letters in
 # the attached text are not short flags, and the next word is not consumed.
@@ -241,6 +286,10 @@ assert_allow_env "git commit -vh bundle (booleans) is help" "$AGENT" \
 # --- #15003 gap 3: bare `git checkout -` is a branch switch, not a flag ---
 assert_deny_env "git checkout - (previous-branch switch) is denied" "$AGENT" "git checkout -" "$PC_REPO"
 assert_deny_env "git checkout - stays denied with a tracked file named -" "$AGENT" "git checkout -" "$PC_REPO"
+assert_allow_env "checkout reads pathspecs from stdin (separate operand)" "$AGENT" \
+    'git checkout --pathspec-from-file -' "$PC_REPO"
+assert_allow_env "checkout reads pathspecs from stdin (attached operand)" "$AGENT" \
+    'git checkout --pathspec-from-file=-' "$PC_REPO"
 assert_allow_env "git checkout -- - (path restore) is allowed" "$AGENT" "git checkout -- -" "$PC_REPO"
 assert_allow_env "git checkout - inside a worktree is allowed" "$AGENT" "git checkout -" "$PC_WT"
 
