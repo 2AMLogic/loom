@@ -378,7 +378,7 @@ impl Reporter {
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
                 .insert(root.to_owned(), window);
-            feed::record_reconcile_pass(PassOutcome::Deferred);
+            feed::record_reconcile_pass(PassOutcome::Failed);
             return 0;
         }
         let mut rows = window.rows;
