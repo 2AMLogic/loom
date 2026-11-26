@@ -522,6 +522,8 @@ pub enum PassReason {
     HostSkipLabel,
     Claimed,
     Queued,
+    /// A merge candidate whose live queue membership could not be verified this tick.
+    QueueMembershipUnknown,
     SharedPr,
     Sequenced,
     Blocked,
@@ -578,6 +580,7 @@ impl PassReason {
             Self::HostSkipLabel => "host_skip_label",
             Self::Claimed => "claimed",
             Self::Queued => "queued",
+            Self::QueueMembershipUnknown => "queue_membership_unknown",
             Self::SharedPr => "shared_pr",
             Self::Sequenced => "sequenced",
             Self::Blocked => "blocked",

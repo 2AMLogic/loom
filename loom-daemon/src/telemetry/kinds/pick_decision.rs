@@ -216,7 +216,8 @@ impl PickSkipReason {
                 | P::AuthorGateHeld
                 | P::Conflicting
                 | P::Stacked
-                | P::OperatorLinkUnverified => Self::Backoff,
+                | P::OperatorLinkUnverified
+                | P::QueueMembershipUnknown => Self::Backoff,
             },
         }
     }
