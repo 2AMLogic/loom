@@ -9,7 +9,7 @@ import { writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, isAbsolute, join, resolve } from "node:path";
 import type { ConfigFile } from "../types.js";
-import { resolveEffectiveConfig } from "./config-resolver.js";
+import { resolveEffectiveConfig, resolveEffectiveConfigWithTiers } from "./config-resolver.js";
 
 /** Global Loom directory in user's home */
 export const LOOM_DIR = join(homedir(), ".loom");
@@ -146,7 +146,7 @@ export function getWorkspacePath(): string {
  * WRITE HAZARD: the result may be a merge across tiers. Callers must NOT write
  * it back to `.loom/config.json` when a non-legacy tier is present, or they
  * flatten higher-tier overrides into the legacy file. `configure_terminal`
- * guards against this with `hasNonLegacyTier` (see config-resolver.ts).
+ * guards against this by using {@link readConfigFileWithTiers} instead.
  */
 export async function readConfigFile(): Promise<ConfigFile | null> {
   const effective = await resolveEffectiveConfig(getWorkspacePath());
@@ -157,13 +157,31 @@ export async function readConfigFile(): Promise<ConfigFile | null> {
 }
 
 /**
+ * Like {@link readConfigFile}, but also reports whether a non-legacy tier
+ * contributed to the merged result, computed in the same resolution pass
+ * (#15414). Use this when the caller may write the config back: a `true`
+ * `hasNonLegacyTier` means the write must be refused.
+ */
+export async function readConfigFileWithTiers(): Promise<{
+  config: ConfigFile | null;
+  hasNonLegacyTier: boolean;
+}> {
+  const { config, hasNonLegacyTier } = await resolveEffectiveConfigWithTiers(getWorkspacePath());
+  return {
+    config: Object.keys(config).length === 0 ? null : (config as unknown as ConfigFile),
+    hasNonLegacyTier,
+  };
+}
+
+/**
  * Write the workspace config file.
  *
  * Always targets the legacy `.loom/config.json` and only that file — this
  * resolver family is read-only across all four languages, so there is no
  * tier-aware write path. Do not call this with a merged (multi-tier) config
  * when a non-legacy tier is present; see `readConfigFile`'s WRITE HAZARD note
- * and the `hasNonLegacyTier` guard in `configure_terminal`.
+ * and the `hasNonLegacyTier` guard in `configure_terminal` (see
+ * {@link readConfigFileWithTiers}).
  */
 export async function writeConfigFile(config: ConfigFile): Promise<void> {
   const workspacePath = getWorkspacePath();

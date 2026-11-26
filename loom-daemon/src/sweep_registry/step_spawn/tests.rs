@@ -2231,3 +2231,16 @@ fn a_step_without_the_fallback_block_launches_the_configured_model() {
         .contains_key("loom.step.model_fallback_from"));
     cancel_all(&mut reg);
 }
+
+/// #15413: the observed end maps onto the evidence the failed-Builder notice
+/// shows: a status (a signal death is the reaper's `128 + signal`, carried as
+/// the number), an unavailable status, a timeout, a cancel.
+#[test]
+fn a_step_end_becomes_its_termination_evidence() {
+    use super::ended::Termination;
+    assert_eq!(Termination::from(StepEnd::Exited(Some(1))), Termination::Status(1));
+    assert_eq!(Termination::from(StepEnd::Exited(Some(137))), Termination::Status(137));
+    assert_eq!(Termination::from(StepEnd::Exited(None)), Termination::StatusUnavailable);
+    assert_eq!(Termination::from(StepEnd::TimedOut), Termination::TimedOut);
+    assert_eq!(Termination::from(StepEnd::Cancelled), Termination::Cancelled);
+}

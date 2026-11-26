@@ -102,11 +102,41 @@ fn stats_count_a_requeue_as_remediated() {
     assert_eq!(stats.residual_unverifiable(), 0, "never underflows");
 }
 
+/// Guard for the end-to-end tests below: each holds BOTH the crate-default
+/// `#[serial]` lock and `loom_config_env`. `serial_test` only mutually
+/// excludes tests that share the *same* key, and its macro cannot name the
+/// default key next to a named one, so a test nests: the
+/// `#[serial(loom_config_env)]` test calls a `#[serial] fn *_body()`.
+/// `loom_config_env` is the crate's one writer group for `LOOM_GH_BIN`
+/// (#8480) and must be the OUTER lock — the order
+/// `lock_order_tests::loom_config_env_is_only_ever_the_outer_lock`
+/// enforces. The default lock stays inner and load-bearing:
+/// `VERDICT_ANCHOR_ENABLED_ENV` is also mutated under it in `tests.rs`. On
+/// the bare `#[serial]` alone these tests ran concurrently with
+/// `labels_verify_tests` and swapped `LOOM_GH_BIN` under it (#15435); nesting
+/// fixes that, and this fails loudly if either lock is ever dropped from a
+/// caller.
+fn assert_holds_default_and_config_env_locks() {
+    assert!(
+        serial_test::is_locked_serially(Some("loom_config_env")),
+        "caller must hold the loom_config_env lock: writes LOOM_GH_BIN (#8480)"
+    );
+    assert!(
+        serial_test::is_locked_serially(None),
+        "caller must hold the bare #[serial] lock: writes {VERDICT_ANCHOR_ENABLED_ENV}"
+    );
+}
+
 /// One pass over PR #300 carrying `label` at `SHA_B` with a single trusted
 /// comment whose body is the literal `@-` (the #9258 incident: no marker).
 /// Returns the stats and the fake `gh`'s write log.
+///
+/// Writes the process-global `LOOM_GH_BIN` and `VERDICT_ANCHOR_ENABLED_ENV`:
+/// a caller MUST hold both locks — see
+/// [`assert_holds_default_and_config_env_locks`].
 fn reconcile_unmarked(label: &str, anchoring: bool) -> (VerdictReconcileStats, String) {
     use super::open_pr_listing::test_support::{pulls_arm, row};
+    assert_holds_default_and_config_env_locks();
     let dir = tempdir().unwrap();
     let root = dir.path().join("repo");
     std::fs::create_dir_all(&root).unwrap();
@@ -148,8 +178,13 @@ esac
 }
 
 #[test]
-#[serial]
+#[serial(loom_config_env)]
 fn reconcile_requeues_an_unmarked_approval_and_posts_no_anchor() {
+    reconcile_requeues_an_unmarked_approval_and_posts_no_anchor_body();
+}
+
+#[serial]
+fn reconcile_requeues_an_unmarked_approval_and_posts_no_anchor_body() {
     let (stats, writes) = reconcile_unmarked("loom:pr", true);
     assert_eq!(stats.unverifiable, 1, "{stats:?}");
     assert_eq!(stats.anchored, 0, "an approval is never anchored: {stats:?}");
@@ -170,16 +205,26 @@ fn reconcile_requeues_an_unmarked_approval_and_posts_no_anchor() {
 }
 
 #[test]
-#[serial]
+#[serial(loom_config_env)]
 fn the_requeue_does_not_depend_on_the_anchor_switch() {
+    the_requeue_does_not_depend_on_the_anchor_switch_body();
+}
+
+#[serial]
+fn the_requeue_does_not_depend_on_the_anchor_switch_body() {
     let (stats, writes) = reconcile_unmarked("loom:pr", false);
     assert_eq!(stats.unanchored_approvals_requeued, 1, "{stats:?}");
     assert!(writes.contains("--add-label loom:review-requested"), "{writes}");
 }
 
 #[test]
-#[serial]
+#[serial(loom_config_env)]
 fn reconcile_still_anchors_an_unmarked_rejection() {
+    reconcile_still_anchors_an_unmarked_rejection_body();
+}
+
+#[serial]
+fn reconcile_still_anchors_an_unmarked_rejection_body() {
     let (stats, writes) = reconcile_unmarked("loom:changes-requested", true);
     assert_eq!((stats.anchored, stats.unanchored_approvals_requeued), (1, 0), "{stats:?}");
     assert!(
