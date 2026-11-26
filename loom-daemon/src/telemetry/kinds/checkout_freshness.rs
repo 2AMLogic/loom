@@ -38,6 +38,7 @@ pub const CHECKOUT_FRESHNESS_LOG_ATTRIBUTE_KEYS: &[&str] = &[
     "loom.checkout.role",
     "loom.checkout.dirty_tracked_files",
     "loom.checkout.dirty_identical_to_remote",
+    "loom.checkout.state",
 ];
 
 /// The `checkout.freshness` record.
@@ -71,6 +72,13 @@ pub struct CheckoutFreshnessRecord {
     /// the tip is not in the object store.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dirty_identical_to_remote: Option<bool>,
+    /// The checkout's fast-forward state this pass (`CheckoutState::as_str`:
+    /// `current`, `dirty`, `diverged`, `fetch-failed`, `wrong-branch`, ...), set
+    /// only for a checkout the pass reached, so fleet tooling can query a
+    /// declined checkout (#15301). Absent for a deferred checkout and for the
+    /// daemon-root sample, which never fast-forwards.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checkout_state: Option<String>,
     /// The checkout's prompt tree; absent when it could not be read.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prompt: Option<PromptTree>,
