@@ -73,6 +73,7 @@ const REFERENCE_SUBDOCS: &[&str] = &[
     "champion-reference",
     "ci-refusals-reference",
     "hermit-patterns",
+    "judge-docs-only-fast-path",
     "judge-reference",
     "sweep-reference",
     // builder sub-docs
@@ -82,6 +83,7 @@ const REFERENCE_SUBDOCS: &[&str] = &[
     // champion-* helpers (everything but `champion` itself)
     "champion-common",
     "champion-critical-file-hold",
+    "champion-docs-only-fast-path",
     "champion-epic",
     "champion-epic-guard-invariants",
     "champion-epic-standdown",

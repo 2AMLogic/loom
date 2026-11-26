@@ -1538,7 +1538,7 @@ writes) and names the offending entry on stderr — a Guide backfill once wrote
 another repository's merged history into a consumer repo's WORK_LOG.md
 (sg13g2-vco#311), and Judge's docs-only fast path approved the file-name shape
 without reading the content. Judge re-checks the same records independently
-from the PR diff (see "Docs-Only Fast Path" in judge.md, #13760); this gate
+from the PR diff (see `judge-docs-only-fast-path.md`, #13760); this gate
 stops the bad delta one step earlier, before the PR exists. Zero new entries
 skips the gate trivially (a no-op tick stays a no-op).
 

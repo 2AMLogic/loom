@@ -4,8 +4,8 @@
 # diff is confined to WORK_LOG.md/WORK_PLAN.md/README.md skip the full code
 # evaluation + merge-risk judgment cycle, while still landing safely.
 #
-# Judge's "Docs-Only Fast Path" section and Champion's merge-risk criterion "Docs-only
-# fast path" subsection are prose an LLM instance reads and executes, not a
+# Judge's judge-docs-only-fast-path.md and Champion's champion-docs-only-fast-path.md
+# (gated siblings of judge.md / champion-pr-merge.md, #15236) are prose an LLM instance reads and executes, not a
 # standalone script (same situation as test-champion-critical-file-check.sh)
 # — so this file mirrors the documented `docs_only_fast_path_check()`
 # function in a local copy and pins the shipped markdown's exact commands
@@ -45,8 +45,14 @@ if [[ -d "$SCRIPTS_DIR/../../.claude/commands/loom" ]]; then
 else
     PROMPT_DIR="$(cd "$SCRIPTS_DIR/../.claude/commands/loom" && pwd)"
 fi
-JUDGE_MD="$PROMPT_DIR/judge.md"
-CHAMPION_MD="$PROMPT_DIR/champion-pr-merge.md"
+# #15236: the check functions, their prose and the approval write live in gated
+# sibling files, one per role (two copies, not one shared file, so divergence
+# stays a visible drift). JUDGE_MD / CHAMPION_MD name those siblings; the role
+# prompts keep only the decision points (JUDGE_PROMPT_MD / CHAMPION_PROMPT_MD).
+JUDGE_MD="$PROMPT_DIR/judge-docs-only-fast-path.md"
+CHAMPION_MD="$PROMPT_DIR/champion-docs-only-fast-path.md"
+JUDGE_PROMPT_MD="$PROMPT_DIR/judge.md"
+CHAMPION_PROMPT_MD="$PROMPT_DIR/champion-pr-merge.md"
 GUIDE_MD="$PROMPT_DIR/guide.md"
 
 # shellcheck source=lib/assert.sh
@@ -246,10 +252,10 @@ assert_doc_contains "$CHAMPION_MD" "closingIssuesReferences" "champion-pr-merge.
 # block, so prose narrower than the code block's gate (file list only) would
 # grant a fast path the code refuses. Pin the closing-issue clause so adding a
 # condition to the code block without updating its prose turns this red.
-assert_doc_contains "$CHAMPION_MD" \
+assert_doc_contains "$CHAMPION_PROMPT_MD" \
     "and the PR has no closing-issue" \
     "champion-pr-merge.md fast-path lead-in states the no-closing-issue condition (#14182)"
-assert_doc_contains "$JUDGE_MD" \
+assert_doc_contains "$JUDGE_PROMPT_MD" \
     "and the PR has no closing-issue reference" \
     "judge.md Primary Queue step 4b states the no-closing-issue condition (#14182)"
 
@@ -278,9 +284,21 @@ assert_doc_contains "$JUDGE_MD" \
     'DOCS_FAST_PATH_ALLOWLIST=("WORK_LOG.md" "WORK_PLAN.md" "README.md")' \
     "judge.md defines the exact 3-file allowlist"
 
-assert_doc_contains "$JUDGE_MD" \
-    'FILES=$(gh api "repos/{owner}/{repo}/pulls/$PR_NUMBER/files" --paginate --jq '"'"'.[].filename'"'"')' \
-    "judge.md fetches the changed-file list via the paginated REST endpoint (not the truncating gh pr view --json files)"
+FILES_READ='FILES=$(gh api "repos/{owner}/{repo}/pulls/$PR_NUMBER/files" --paginate --jq '"'"'.[].filename'"'"')'
+assert_doc_contains "$JUDGE_PROMPT_MD" "$FILES_READ" \
+    "judge.md (always-loaded) reads the changed-file list via the paginated REST endpoint (not the truncating gh pr view --json files)"
+assert_doc_contains "$JUDGE_PROMPT_MD" '|| FILES=""' \
+    "judge.md: a failed file-list read leaves FILES empty (full review)"
+assert_doc_lacks "$JUDGE_MD" "$FILES_READ" \
+    "judge sibling does not fetch the file list itself; it reuses the parent's read"
+FILES_LN=$(grep -nF -- "$FILES_READ" "$JUDGE_PROMPT_MD" | head -1 | cut -d: -f1)
+GATE_LN=$(grep -nF -- '[`judge-docs-only-fast-path.md`](judge-docs-only-fast-path.md) |' "$JUDGE_PROMPT_MD" | head -1 | cut -d: -f1)
+STEP4B_LN=$(grep -n '^4b\. \*\*Check docs-only' "$JUDGE_PROMPT_MD" | head -1 | cut -d: -f1)
+if [ -n "$FILES_LN" ] && [ -n "$STEP4B_LN" ] && [ "$FILES_LN" -gt "$STEP4B_LN" ] && [ "$FILES_LN" -lt "${GATE_LN:-0}" ]; then
+    pass "judge.md: file-list read sits in step 4b, before the load gate row"
+else
+    fail "judge.md: file-list read sits in step 4b, before the load gate row (4b=$STEP4B_LN read=$FILES_LN gate=$GATE_LN)"
+fi
 
 assert_doc_contains "$JUDGE_MD" \
     'docs_only_fast_path_check() {' \
@@ -295,6 +313,27 @@ assert_doc_contains "$JUDGE_MD" \
     "judge.md documents the #6134 fast path"
 
 echo
+echo "--- Load gate (#15236): role prompts keep the decision point, the siblings hold the bodies ---"
+for fn in docs_only_fast_path_check docs_only_fast_path_closing_check docs_only_fast_path_plan_check; do
+    assert_doc_lacks "$JUDGE_PROMPT_MD" "${fn}() {" "judge.md no longer carries ${fn}() inline"
+    assert_doc_lacks "$CHAMPION_PROMPT_MD" "${fn}() {" "champion-pr-merge.md no longer carries ${fn}() inline"
+done
+assert_doc_lacks "$JUDGE_PROMPT_MD" "docs_only_fast_path_worklog_check() {" \
+    "judge.md no longer carries docs_only_fast_path_worklog_check() inline"
+assert_doc_contains "$JUDGE_PROMPT_MD" '[`judge-docs-only-fast-path.md`](judge-docs-only-fast-path.md) |' \
+    "judge.md has a load-gate row for judge-docs-only-fast-path.md"
+assert_doc_contains "$CHAMPION_PROMPT_MD" '[`champion-docs-only-fast-path.md`](champion-docs-only-fast-path.md) |' \
+    "champion-pr-merge.md has a load-gate row for champion-docs-only-fast-path.md"
+assert_doc_contains "$JUDGE_PROMPT_MD" "there is no fast path" \
+    "judge.md states an unloaded sibling means no fast path (fails closed)"
+# Champion's standing-authorization check reads FAST_PATH_FILES whether or not the
+# sibling loads, so the fresh read AND a non-eligible default stay inline.
+assert_doc_contains "$CHAMPION_PROMPT_MD" 'FAST_PATH_RESULT="NOT ELIGIBLE: docs-only fast path not run"' \
+    "champion-pr-merge.md defaults FAST_PATH_RESULT to not-eligible (fails closed when the sibling is not loaded)"
+assert_doc_lacks "$CHAMPION_MD" 'FAST_PATH_FILES=$(gh api' \
+    "champion-docs-only-fast-path.md does not re-fetch the file list (champion-pr-merge.md owns the read)"
+echo
+
 echo "--- Doc pins: champion-pr-merge.md independently re-derives eligibility, never trusts Judge's marker ---"
 
 assert_doc_contains "$CHAMPION_MD" \
@@ -305,11 +344,11 @@ assert_doc_contains "$CHAMPION_MD" \
     'docs_only_fast_path_check() {' \
     "champion-pr-merge.md defines its own docs_only_fast_path_check()"
 
-assert_doc_contains "$CHAMPION_MD" \
+assert_doc_contains "$CHAMPION_PROMPT_MD" \
     'FAST_PATH_FILES=$(gh api "repos/{owner}/{repo}/pulls/$PR_NUMBER/files" --paginate --jq '"'"'.[].filename'"'"')' \
     "champion-pr-merge.md fetches the changed-file list via the paginated REST endpoint for its own fast-path check"
 
-assert_doc_contains "$CHAMPION_MD" \
+assert_doc_contains "$CHAMPION_PROMPT_MD" \
     "Never trust a marker, label, or the PR body's stated intent" \
     "champion-pr-merge.md explicitly states it never trusts Judge's marker/label for the fast path"
 
@@ -821,7 +860,7 @@ assert_doc_contains "$JUDGE_MD" \
 assert_doc_contains "$JUDGE_MD" \
     "#13760" \
     "judge.md documents the #13760 record gate"
-assert_doc_contains "$JUDGE_MD" \
+assert_doc_contains "$JUDGE_PROMPT_MD" \
     "and every WORK_LOG record the diff adds verifies against the base repository" \
     "judge.md Primary Queue step 4b states the record-verification condition"
 assert_doc_contains "$JUDGE_MD" \
@@ -847,12 +886,12 @@ assert_doc_contains "$JUDGE_MD" \
 # edit (#15048 AC: judge.md and SKILL.md stay in lockstep). Mirror of the
 # PROMPT_DIR probe above (#6725).
 if [[ -d "$SCRIPTS_DIR/../../.claude/commands/loom" ]]; then
-    JUDGE_SKILL_MD="$SCRIPTS_DIR/../../.agents/skills/loom-judge/SKILL.md"
+    JUDGE_SKILL_MD="$SCRIPTS_DIR/../../.agents/skills/loom-judge-docs-only-fast-path/SKILL.md"
 else
-    JUDGE_SKILL_MD="$SCRIPTS_DIR/../.agents/skills/loom-judge/SKILL.md"
+    JUDGE_SKILL_MD="$SCRIPTS_DIR/../.agents/skills/loom-judge-docs-only-fast-path/SKILL.md"
 fi
 assert_eq "$(worklog_fn_block "$JUDGE_MD")" "$(worklog_fn_block "$JUDGE_SKILL_MD")" \
-    "judge.md and loom-judge SKILL.md ship a byte-identical worklog gate (#15048)"
+    "judge-docs-only-fast-path.md and its SKILL.md ship a byte-identical worklog gate (#15048)"
 
 # The Guide-side gate is the counterpart — guide.md must ship it and wire it.
 assert_doc_contains "$GUIDE_MD" \
@@ -1160,7 +1199,7 @@ assert_doc_contains "$JUDGE_MD" \
 assert_doc_contains "$JUDGE_MD" \
     "#15220" \
     "judge.md documents the #15220 plan-body gate"
-assert_doc_contains "$JUDGE_MD" \
+assert_doc_contains "$JUDGE_PROMPT_MD" \
     'guide:plan-body` region carries the machine-rendered `written` receipt' \
     "judge.md Primary Queue step 4b states the plan-body receipt condition (#15220)"
 
@@ -1173,7 +1212,7 @@ assert_doc_contains "$CHAMPION_MD" \
 assert_doc_contains "$CHAMPION_MD" \
     "#15220" \
     "champion-pr-merge.md documents the #15220 plan-body gate"
-assert_doc_contains "$CHAMPION_MD" \
+assert_doc_contains "$CHAMPION_PROMPT_MD" \
     'guide:plan-body` region carries the machine-rendered `written` receipt' \
     "champion-pr-merge.md fast-path lead-in states the plan-body receipt condition (#15220)"
 
@@ -1187,7 +1226,7 @@ assert_eq "$(plan_fn_block "$JUDGE_MD" | grep -v '^[[:space:]]*#')" \
 # edit (JUDGE_SKILL_MD is the #6725-layout probe from the worklog section
 # above).
 assert_eq "$(plan_fn_block "$JUDGE_MD")" "$(plan_fn_block "$JUDGE_SKILL_MD")" \
-    "judge.md and loom-judge SKILL.md ship a byte-identical plan-body gate (#15220)"
+    "judge-docs-only-fast-path.md and its SKILL.md ship a byte-identical plan-body gate (#15220)"
 
 echo
 echo "Results: $TESTS_PASSED/$TESTS_RUN passed, $TESTS_FAILED failed"
