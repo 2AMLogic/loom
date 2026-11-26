@@ -1102,11 +1102,13 @@ cache is stale. The local branch advances by fast-forward after verification.
 
 For a dirty worktree, the refusal is the disposition: the snapshot (when one was
 taken) preserved the WIP as a patch under
-`<worktree-root>/.snapshots/issue-<N>-<UTC-timestamp>.patch`. In the PR comment
+`<worktree-root>/.snapshots/issue-<N>-<UTC-timestamp>.patch`. Post a PR comment
+ending with `<!-- loom:judge-note -->` (#13222 — an unmarked note trips the
+Stale-Read Gate if you approve after read-only review); when a snapshot exists,
 name only the relative `.snapshots/issue-<N>-<UTC-timestamp>.patch` under the
-managed worktree root; keep the absolute path (the helper's `patchPath` output
-carries the workstation username and directory layout) and the patch contents
-local, never pasted into the PR. Then fall back to read-only
+managed worktree root, keeping the absolute path (the helper's `patchPath`
+output carries the workstation username and directory layout) and the patch
+contents local, never pasted into the PR. Then fall back to read-only
 review (`gh pr diff` / `git merge-tree`) per "PR Branch Isolation", or park the
 PR per "Environment Gap: Cannot Verify Here".
 
@@ -2881,7 +2883,7 @@ Applies only when **your environment** cannot run a command you need to reach a 
 
 Declining to approve is not enough: left alone the PR stays `loom:review-requested` and waits silently for an attended session. Route it:
 
-1. **Comment** on the PR naming the missing tool or failing command and the observed error, quoted verbatim (e.g. `tests/test_sim_batch.py`: "no Python executable"; `ruff`: "Exec format error"; `post-verdict.sh` exit 5).
+1. **Comment** on the PR naming the missing tool or failing command and the observed error, quoted verbatim (e.g. `tests/test_sim_batch.py`: "no Python executable"; `ruff`: "Exec format error"; `post-verdict.sh` exit 5), ending the note with `<!-- loom:judge-note -->` (#13222).
 2. **Park** it: `loom-daemon park-record apply --pr <N> --reason "<missing tool>" --by judge` (body park record plus `loom:blocked`; `pr-queue` drops parked PRs, so it leaves the Judge queue). Use `--dry-run` first if unsure.
 3. **Release** `loom:reviewing` and the PR lease as on any stand-down (`loom-daemon lease pr release <n> --role judge --watch-pid …`).
 
