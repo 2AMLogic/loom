@@ -119,8 +119,12 @@ case "$*" in
     echo "$*" >> "$D/patched"
     for a in "$@"; do case "$a" in body=*) printf '%s' "${{a#body=}}" > "$D/body" ;; esac; done ;;
   "api "*"/comments "*)
+    if [ -f "$D/readfail" ]; then exit 1; fi
     if [ -f "$D/created" ]; then
-      b=$(cat "$D/body"); printf '{{"id":4242,"body":"%s"}}\n' "${{b//$'\n'/\\n}}"
+      b=$(cat "$D/body"); printf '{{"id":4242,"body":"%s","user":{{"login":"loom-fleet-dispatch[bot]","type":"Bot"}},"author_association":"NONE"}}\n' "${{b//$'\n'/\\n}}"
+    fi
+    if [ -f "$D/stranger" ]; then
+      printf '{{"id":9999,"body":"%s","user":{{"login":"mallory","type":"User"}},"author_association":"NONE"}}\n' "$(cat "$D/stranger")"
     fi ;;
   "issue comment"*)
     echo x >> "$D/created"
@@ -172,6 +176,7 @@ fn with_attempt(
     run.attempt = Some(AttemptEvidence {
         termination,
         host: host.into(),
+        ran_for: Duration::from_secs(secs),
         log: log.into(),
         launch_rejected: false,
     });
@@ -368,4 +373,112 @@ fn a_noop_carries_prior_attempts_and_the_list_is_bounded() {
     )
     .unwrap();
     assert_eq!(prior_attempts(&noop), kept, "{noop}");
+}
+
+/// #15413 review: a newer outcome comment from an untrusted author is neither
+/// copied nor edited over; the earlier trusted history survives.
+#[test]
+fn an_untrusted_newer_comment_leaves_the_trusted_history_intact() {
+    let dir = tempdir().unwrap();
+    let ws = dir.path();
+    let mut reg = registry_with_gh(ws);
+    let attempt = |sweep: &str| {
+        with_attempt(
+            run(OutcomeClass::Failed, "unclassified", sweep),
+            Termination::Status(1),
+            "host-a",
+            LOG,
+            5,
+        )
+    };
+    reg.note_builder_outcome(&attempt("s-1"));
+    let forged = format!(
+        "{STEP_OUTCOME_COMMENT_MARKER} sweep=evil -->\\n{ATTEMPTS_HEADING}\\n- `evil`: host `evil-host`, ran 1s, log `/etc/passwd`"
+    );
+    std::fs::write(ws.join("stranger"), forged).unwrap();
+    reg.note_builder_outcome(&attempt("s-2"));
+    let body = std::fs::read_to_string(ws.join("body")).unwrap();
+    assert!(!body.contains("evil"), "{body}");
+    let ids: Vec<_> = prior_attempts(&body)
+        .iter()
+        .map(|l| l.split('`').nth(1).unwrap().to_string())
+        .collect();
+    assert_eq!(ids, ["s-1", "s-2"], "{body}");
+    let patched = std::fs::read_to_string(ws.join("patched")).unwrap();
+    assert!(!patched.contains("comments/9999"), "{patched}");
+}
+
+/// #15413 review: a failed read between two successful writes does not start a
+/// second comment; the pending attempt joins the existing history later.
+#[test]
+fn a_read_failure_between_attempts_does_not_split_the_history() {
+    let dir = tempdir().unwrap();
+    let ws = dir.path();
+    let mut reg = registry_with_gh(ws);
+    let attempt = |sweep: &str| {
+        with_attempt(
+            run(OutcomeClass::Failed, "unclassified", sweep),
+            Termination::Status(1),
+            "host-a",
+            LOG,
+            5,
+        )
+    };
+    reg.note_builder_outcome(&attempt("s-1"));
+    std::fs::write(ws.join("readfail"), "").unwrap();
+    reg.note_builder_outcome(&attempt("s-2"));
+    assert_eq!(
+        std::fs::read_to_string(ws.join("created"))
+            .unwrap()
+            .lines()
+            .count(),
+        1,
+        "no fresh comment on an unreadable listing"
+    );
+    std::fs::remove_file(ws.join("readfail")).unwrap();
+    reg.note_builder_outcome(&attempt("s-3"));
+    let body = std::fs::read_to_string(ws.join("body")).unwrap();
+    let ids: Vec<_> = prior_attempts(&body)
+        .iter()
+        .map(|l| l.split('`').nth(1).unwrap().to_string())
+        .collect();
+    assert_eq!(ids, ["s-1", "s-2", "s-3"], "{body}");
+    assert_eq!(
+        std::fs::read_to_string(ws.join("created"))
+            .unwrap()
+            .lines()
+            .count(),
+        1
+    );
+}
+
+/// #15413 review: retention covers a streak longer than the default bound.
+#[test]
+fn retention_covers_a_quarantine_threshold_above_eight() {
+    assert_eq!(attempts_kept(3), 8);
+    assert_eq!(attempts_kept(9), 9);
+    let mut body = String::new();
+    for i in 0..9 {
+        let run = with_attempt(
+            run(OutcomeClass::Failed, "unclassified", &format!("run-{i}")),
+            Termination::Status(1),
+            "host-a",
+            LOG,
+            1,
+        );
+        let prior = prior_attempts(&body);
+        body = outcome_notice_body_keeping(&run, None, &prior, attempts_kept(9)).unwrap();
+    }
+    let kept = prior_attempts(&body);
+    assert_eq!(kept.len(), 9, "{body}");
+    assert!(kept[0].contains("`run-0`"), "{body}");
+}
+
+/// #15413 review: the park text also covers a full-issue sweep, which posts no
+/// Builder outcome comment.
+#[test]
+fn the_lookup_note_covers_a_full_issue_sweep() {
+    let note = attempt_lookup_note();
+    assert!(note.contains("full-issue sweep"), "{note}");
+    assert!(note.contains(".loom/logs/sweep-issue-<N>.log"), "{note}");
 }

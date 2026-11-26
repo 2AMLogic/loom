@@ -826,6 +826,7 @@ mod tests {
             attempt: ended::AttemptEvidence {
                 termination,
                 host: "host-a".into(),
+                ran_for: std::time::Duration::from_secs(9),
                 log: ".loom/logs/step-builder-15413.log".into(),
                 launch_rejected,
             },

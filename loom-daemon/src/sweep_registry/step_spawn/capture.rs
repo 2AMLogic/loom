@@ -665,7 +665,11 @@ impl SweepRegistry {
                     launch_rejection,
                     attempt: super::ended::AttemptEvidence {
                         termination: end.into(),
-                        host: crate::host_identity::host_identity(),
+                        // The id the Builder lease publishes, so an operator can match
+                        // the lease and this notice (and the host's publication setting holds).
+                        host: self.published_host_id(),
+                        // Measured at process end, before the lease lookup above.
+                        ran_for,
                         log: log_path
                             .strip_prefix(&self.config.workspace_root)
                             .unwrap_or(&log_path)

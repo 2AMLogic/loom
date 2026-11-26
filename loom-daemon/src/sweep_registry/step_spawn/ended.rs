@@ -73,6 +73,9 @@ pub struct AttemptEvidence {
     pub termination: Termination,
     /// The worker host the step ran on (`host_identity`).
     pub host: String,
+    /// How long the process ran, sampled when it ended (before any forge
+    /// call), so a slow forge does not inflate the displayed runtime.
+    pub ran_for: Duration,
     /// The step's log, relative to the workspace root when it is under it.
     pub log: String,
     /// An untyped fast exit 78 with no outcome line
