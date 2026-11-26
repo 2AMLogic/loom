@@ -49,13 +49,12 @@
 //! so a disk that stays below the floor for many consecutive dispatch ticks
 //! does not re-walk `.loom/claude-config/*/tmp` every 60 seconds.
 
-use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, OnceLock};
 
 use chrono::{DateTime, Utc};
 
 use crate::fs_util::human_size;
+use crate::host_wide_cooldown::PerRepoCooldown;
 
 // ============================================================================
 // Constants
@@ -371,35 +370,13 @@ pub fn log_report(report: &ScratchReclaimReport) {
 // Process-global per-repo cooldown state
 // ============================================================================
 
-static LAST_RUN_AT: OnceLock<Mutex<BTreeMap<PathBuf, DateTime<Utc>>>> = OnceLock::new();
-
-fn last_run_slot() -> &'static Mutex<BTreeMap<PathBuf, DateTime<Utc>>> {
-    LAST_RUN_AT.get_or_init(|| Mutex::new(BTreeMap::new()))
-}
-
-fn last_run_at(repo_root: &Path) -> Option<DateTime<Utc>> {
-    last_run_slot()
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .get(repo_root)
-        .copied()
-}
-
-fn record_run(repo_root: &Path, now: DateTime<Utc>) {
-    last_run_slot()
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .insert(repo_root.to_path_buf(), now);
-}
+static COOLDOWN: PerRepoCooldown = PerRepoCooldown::new();
 
 /// Drop cooldown state. Test-only seam (the process-global would otherwise
 /// leak between `#[serial]` tests in the same binary).
 #[doc(hidden)]
 pub fn reset_state_for_test() {
-    last_run_slot()
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .clear();
+    COOLDOWN.reset();
 }
 
 /// Run one production scratch-reclaim pass for `repo_root`, honoring its own
@@ -424,28 +401,23 @@ pub fn run_for(repo_root: &Path) -> ScratchReclaimReport {
     }
 
     let min_interval_secs = resolve_min_interval_secs(&config);
-    if let Some(last) = last_run_at(repo_root) {
-        let since_secs = (now - last).num_seconds();
-        if since_secs >= 0 && since_secs < i64::try_from(min_interval_secs).unwrap_or(i64::MAX) {
-            let report = ScratchReclaimReport {
-                repo_root: repo_root.to_path_buf(),
-                enabled: true,
-                removed_count: 0,
-                removed_bytes: 0,
-                deferred: Some(format!(
-                    "a pass ran {since_secs}s ago (cooldown {min_interval_secs}s)"
-                )),
-                at: now,
-            };
-            log_report(&report);
-            return report;
-        }
+    if let Some(reason) = COOLDOWN.deferred_reason(repo_root, now, min_interval_secs) {
+        let report = ScratchReclaimReport {
+            repo_root: repo_root.to_path_buf(),
+            enabled: true,
+            removed_count: 0,
+            removed_bytes: 0,
+            deferred: Some(reason),
+            at: now,
+        };
+        log_report(&report);
+        return report;
     }
 
     let max_age_secs =
         i64::try_from(resolve_max_age_hours(&config).saturating_mul(3600)).unwrap_or(i64::MAX);
     let (removed_count, removed_bytes) = sweep_scratch(repo_root, max_age_secs, now);
-    record_run(repo_root, now);
+    COOLDOWN.record(repo_root, now);
 
     let report = ScratchReclaimReport {
         repo_root: repo_root.to_path_buf(),

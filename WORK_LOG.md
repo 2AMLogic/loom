@@ -18,6 +18,62 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 ### 2026-11-25
 
+- **Issue #14851** (closed): Investigate Codex Champion merge steps that exit before recording a verdict
+- **Issue #15348** (closed): Broken on main: authorization_status mutation test asserts on a stale actions/checkout@v4 needle after the v7.0.1 SHA pin
+- **PR #15353**: test: fix stale actions/checkout@v4 needle in authorization_status mutation test
+- **Issue #15104** (closed): Tighten safe_clean_keeps_branch_of_offline_worktree_paused_in_rebase: assert the clean actually succeeded
+- **PR #15303**: test(clean): gate offline-rebase test on exit status and keep line (#15104)
+- **Issue #15296** (closed): Consolidate 11 remaining registry/ledger atomic-write sites onto fs_util::write_atomic
+- **PR #15336**: refactor(daemon): route 11 durable JSON writers through fs_util::write_atomic
+- **Issue #15198** (closed): release_resolve: the checksum read's api_host rationale is stale — reader profiles carry no api_host
+- **PR #15333**: docs(release_resolve): correct stale api_host rationale comment (#15198)
+- **Issue #14991** (closed): token-pool.md: the "carried row is re-measured only by a round that gets evidence" bullet predates the `unknown` / header-less-`available` carry-forward arms
+- **PR #15331**: docs(token-pool): fix carried-row release bullet for unknown / header-less available (#14991)
+- **Issue #15300** (closed): dispatch_sweep refusal blames restart --drain for a fleet-store hold; name the hold's real source
+- **PR #15309**: fix(daemon): name the real source of a dispatch hold in refusals and status (#15300)
+- **Issue #15299** (closed): In-session /loom:sweep must dispatch Builder/Doctor as Claude subagents, never via worker run (session mode never hands work to OpenCode)
+- **PR #15306**: docs(sweep): attended in-session sweep never calls worker run (#15299)
+- **Issue #15292** (closed): Telemetry: Codex seat gauge lacks login state, hold reason/age, hook trust and quota snapshot
+- **PR #15319**: Telemetry: Codex seat login, hold reason/age, hook trust and quota gauges (#15292)
+- **Issue #14548** (closed): gh_config_dir_for_owner_slug callers outside config_dir_for still trust a registered path that may have been reaped
+- **PR #15324**: fix: evict owner registry entries when the reap removes a by-owner credential (#14548)
+- **Issue #15281** (closed): Section 5b does not exercise loom_remove_retired_files with read_root != git_root
+- **PR #15335**: test: split read_root/git_root fixture for retired-file cleanup (Test 44e)
+- **Issue #15321** (closed): config-resolver.sh: propagate resolver failures from loom_config_get
+- **PR #15328**: fix(config-resolver): propagate resolver failures from loom_config_get
+- **Issue #15276** (closed): No CI check covers quickstarts/desktop, so its manifest/source changes land unverified
+- **PR #15278**: ci: typecheck quickstarts/desktop in node-packages (#15276)
+- **Issue #15094** (closed): test flake: nextest discovery stalls inside the Run tests step (lib binary --list) on Rust Unit Tests (2/5) — fourth occurrence, #14066's diagnostic skipped
+- **PR #15128**: ci: run discovery-stall diagnostic after the run step, gate on either failure
+- **PR #15311**: feat: Claude seat telemetry, accounts list and docs (slice 3 of #14371)
+- **Issue #14941** (closed): Lease publish in worktree.sh is gh-backed: on Gitea the lease stays local-only and cross-host protection is lost
+- **PR #15120**: feat: publish and renew the Builder lease through the Gitea API on a Gitea checkout
+- **Issue #15086** (closed): Make #14885's fallback-docker CLI test prove it ran, and document LOOM_DOCKER_BIN as a fleet-wide fail-closed override
+- **PR #15127**: test: fail the fallback-docker CLI test on skip under a CI opt-in; document LOOM_DOCKER_BIN
+- **Issue #15095** (closed): merge-group-check.yml is the repo's only unpinned action (actions/checkout@v7), and its defaults/optional template still says @v4
+- **PR #15129**: ci: pin actions/checkout to v7.0.1 SHA in merge-group-check workflow and template
+- **Issue #15317** (closed): README drift: What Gets Installed tree omits shipped surfaces; roles table cadence predates the role runner
+- **PR #15323**: docs(readme): sync install tree and role cadence cells (#15317)
+- **Issue #15315** (closed): Ratification lane: fix the withheld-verdict loop (trailing full stop, exit 78, placeholder echo) and cap attempts per head
+- **PR #15326**: fix(ratification): stop the withheld-review loop — normalize verdicts, class launch refusals, cap attempts per head
+- **Issue #15330** (closed): create-issue.sh fails with "jq: Argument list too long" when the private fleet-defaults tier exceeds 128 KiB
+- **PR #15298**: accounts.json: register Codex seats agent-8..12 and agent-14..16, disable agent-7
+- **Issue #14946** (closed): Remove serde_yaml_ng (and unsafe-libyaml): consolidate workflow-lint onto serde-saphyr
+- **PR #14950**: refactor: parse workflow-lint YAML with serde-saphyr, drop serde_yaml_ng
+- **Issue #14647** (closed): Remove unused Radix dropdown and switch dependencies from both UI quickstarts
+- **PR #15273**: chore(quickstarts): remove unused Radix dropdown-menu and switch deps
+- **Issue #14846** (closed): Exercise the installer’s retired-file cleanup directly in Section 5b
+- **PR #15275**: refactor(installer): Section 5b tests the production retired-file cleanup (#14846)
+- **Issue #14973** (closed): Review sessions switch the primary checkout to a PR head; checkout_ff logs wrong-branch and never repairs it (30 checkouts on four hosts)
+- **PR #14996**: fix: rehome open-PR heads in checkout_ff and block PR-head checkouts in the primary-checkout guard
+- **Issue #15027** (closed): private_workspace: unpublished_branches/recover enumerate with %(refname:short) and break under PR-fetch ref residue
+- **PR #15055**: fix: read private-workspace branch names via full refs under PR-fetch residue
+- **Issue #15313** (closed): bug(config-resolver): jq --argjson hits Linux 128 KiB MAX_ARG_STRLEN when defaults.json exceeds 128 KiB, breaking create-pr.sh and forge_detect
+- **PR #15322**: fix(config-resolver): stream tiers to jq on stdin to avoid argv limit
+- **PR #15310**: fix: restore main CI after #14897 and #14596 (test call sites, claude-seat compat claim)
+- **Issue #15318** (closed): create-issue.sh fails with exit 126 when the private defaults config exceeds the 128 KiB per-argument execve limit
+- **Issue #15314** (closed): Shell config resolver fails with E2BIG when a compact JSON tier reaches 128 KiB on Linux
+- **PR #15289**: chore: repo hygiene fixes (gitignore aider rules, README trees, codecov orphan)
 - **Issue #14879** (closed): clean --safe: closed-issue branch cleanup force-deletes unpushed commits via the -d to -D fallback
 - **PR #14897**: fix: keep unpushed issue branch tips during safe cleanup
 - **PR #14596**: feat: dispatch Claude steps into persistent account seats
@@ -2111,9 +2167,7 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 - **Issue #13047** (closed): Dedupe multi-line pass()/fail() helpers in 31 test suites via lib/assert.sh
 - **Issue #13045** (closed): Remove stale references to the retired shell-budget gate (#12106 leftovers)
 - **PR #13048**: refactor: source lib/assert.sh in 31 test suites with multi-line pass()/fail()
-- **PR #13047**: Dedupe multi-line pass()/fail() helpers in 31 test suites via lib/assert.sh
 - **PR #13046**: docs: remove stale references to the retired shell-budget gate
-- **PR #13045**: Remove stale references to the retired shell-budget gate (#12106 leftovers)
 - **Issue #12862** (closed): Design review: preserve worktree confinement while supporting orchestration checkpoint writes
 - **Issue #12808** (closed): The daemon stops calling the loom-ui dashboard: remove the /ingest exporter and the native-only queue.snapshot
 

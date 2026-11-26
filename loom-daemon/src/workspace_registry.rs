@@ -223,26 +223,14 @@ impl WorkspaceRegistry {
         Self::load(&default_registry_path()?)
     }
 
-    /// Persist the registry to `path` atomically (write to a sibling temp file,
-    /// then rename) so a concurrent reader never observes a half-written file.
+    /// Persist the registry to `path` atomically ([`crate::fs_util::write_atomic`])
+    /// so a concurrent reader never observes a half-written file.
     /// Creates the parent directory if needed.
     pub fn save(&self, path: &Path) -> Result<()> {
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)
-                .with_context(|| format!("creating registry dir {}", parent.display()))?;
-        }
         let mut json = serde_json::to_string_pretty(self)?;
         json.push('\n');
-
-        // Temp file in the same directory guarantees the rename is atomic
-        // (same filesystem). Include the PID to avoid collisions between
-        // concurrent writers.
-        let tmp = path.with_extension(format!("json.tmp.{}", std::process::id()));
-        std::fs::write(&tmp, json.as_bytes())
-            .with_context(|| format!("writing temp registry {}", tmp.display()))?;
-        std::fs::rename(&tmp, path)
-            .with_context(|| format!("renaming {} -> {}", tmp.display(), path.display()))?;
-        Ok(())
+        crate::fs_util::write_atomic(path, json.as_bytes(), crate::fs_util::AtomicOpts::default())
+            .with_context(|| format!("writing registry {}", path.display()))
     }
 
     /// Persist to the default registry path.
@@ -840,7 +828,7 @@ mod tests {
         let leftovers: Vec<_> = std::fs::read_dir(path.parent().unwrap())
             .unwrap()
             .filter_map(std::result::Result::ok)
-            .filter(|e| e.file_name().to_string_lossy().contains(".tmp."))
+            .filter(|e| crate::fs_util::is_staging_name(&e.file_name().to_string_lossy()))
             .collect();
         assert!(leftovers.is_empty(), "temp file should be renamed away");
     }

@@ -623,11 +623,14 @@ pub(super) fn escalate(
     });
 }
 
-/// Say a standing `wrong-branch` hold again every `every` (#13588): the
-/// ordinary transition is logged once, and a checkout left off its default
-/// branch goes stale silently. One `still-held` transition (a log line and an
-/// event on the checkout topic) per interval, so the hold can be counted.
-/// The line also names why this pass's self-heal declined the rehome
+/// Say a standing declined hold again every `every` (#13588, #15301): the
+/// ordinary transition is logged once, and a checkout held off its tip goes
+/// stale silently. One `still-held` transition (a log line and an event on the
+/// checkout topic) per interval, so the hold can be counted. Every state that
+/// declines to fast-forward is re-reported, with the same severity
+/// [`Memory::record`] gave its entry (`Info` for a plain `behind`).
+/// The line names how far behind the checkout is and why it is held; for
+/// `wrong-branch` it also names why this pass's self-heal declined the rehome
 /// (`left`, #14973): the refusal was `debug`-only before, so `not repaired`
 /// repeated indefinitely without ever saying the reason.
 pub(super) fn rereport(
@@ -638,7 +641,7 @@ pub(super) fn rereport(
     left: &[String],
     out: &mut Vec<Transition>,
 ) {
-    if report.state != CheckoutState::WrongBranch {
+    if matches!(report.state, CheckoutState::Current | CheckoutState::FastForwarded) {
         ledger.said.remove(&report.root);
         return;
     }
@@ -658,31 +661,42 @@ pub(super) fn rereport(
     // The rehome's own refusal ("stays off `<branch>`: why") says more about a
     // wrong-branch hold than the repair-path refusal after it; either is
     // better than silence.
-    let why = left
-        .iter()
-        .rev()
-        .find(|e| e.starts_with(&format!("{prefix}stays off ")))
-        .or_else(|| left.iter().rev().find(|e| e.starts_with(&prefix)))
-        .map(|e| &e[prefix.len()..]);
-    let detail = report.detail.as_deref().unwrap_or("off the default branch");
-    let line = match why {
-        Some(why) => format!(
-            "{}: still `wrong-branch` after {} min, not repaired: {} (self-heal: {})",
-            report.root.display(),
-            stood.as_secs() / 60,
-            detail,
-            why
-        ),
-        None => format!(
-            "{}: still `wrong-branch` after {} min, not repaired: {}",
-            report.root.display(),
-            stood.as_secs() / 60,
-            detail
-        ),
+    let why = (report.state == CheckoutState::WrongBranch)
+        .then(|| {
+            left.iter()
+                .rev()
+                .find(|e| e.starts_with(&format!("{prefix}stays off ")))
+                .or_else(|| left.iter().rev().find(|e| e.starts_with(&prefix)))
+                .map(|e| &e[prefix.len()..])
+        })
+        .flatten();
+    let detail = report.detail.as_deref().unwrap_or(match report.state {
+        CheckoutState::WrongBranch => "off the default branch",
+        _ => "no detail",
+    });
+    let loom = report.installed_files_behind;
+    let line = format!(
+        "{}: still `{}` after {} min{}{}, not repaired: {}{}",
+        report.root.display(),
+        report.state.as_str(),
+        stood.as_secs() / 60,
+        super::counts(report),
+        if loom {
+            ", installed Loom files are behind"
+        } else {
+            ""
+        },
+        detail,
+        why.map_or_else(String::new, |why| format!(" (self-heal: {why})")),
+    );
+    let level = match (report.state, loom) {
+        (CheckoutState::Behind, false) => Level::Info,
+        (CheckoutState::Behind, true) | (_, false) => Level::Warn,
+        (_, true) => Level::Error,
     };
     out.push(Transition {
         kind: "still-held",
-        level: Level::Warn,
+        level,
         previous: None,
         line,
         report: report.clone(),
