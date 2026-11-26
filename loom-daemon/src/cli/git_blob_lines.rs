@@ -123,11 +123,19 @@ pub(crate) enum ResolvedBlob {
 /// When `git` cannot be run, or a `git` invocation itself fails (e.g. `rev`
 /// does not resolve).
 pub(crate) fn resolved_blob(workspace: &Path, rev: &str, path: &str) -> Result<ResolvedBlob> {
-    let Some(mut current) = normalize_lexically("", path) else {
-        return Ok(ResolvedBlob::Unreadable {
+    // ls-tree normalizes pathspecs (even "missing/../Makefile"). Only real
+    // tree-entry names may make up a citation. Resolve relative link targets
+    // after finding the link itself in the pinned tree.
+    let relative = path.trim_start_matches("./");
+    if relative
+        .split('/')
+        .any(|part| matches!(part, "" | "." | ".."))
+    {
+        return Ok(ResolvedBlob::Absent {
             resolved_path: path.to_owned(),
         });
-    };
+    }
+    let mut current = relative.to_owned();
     for hop in 0..=MAX_HOPS {
         match tree_entry_mode(workspace, rev, &current)?.as_deref() {
             None if hop == 0 => {
@@ -230,7 +238,13 @@ fn normalize_lexically(dir: &str, path: &str) -> Option<String> {
 /// When `git` cannot be run, or a `git` invocation itself fails (e.g. `rev`
 /// does not resolve).
 pub(crate) fn resolve(workspace: &Path, rev: &str, path: &str) -> Result<Resolution> {
-    match resolved_blob(workspace, rev, path)? {
+    // The line-count command historically accepts lexical paths.
+    let Some(normalized) = normalize_lexically("", path) else {
+        return Ok(Resolution::Unreadable {
+            resolved_path: path.to_owned(),
+        });
+    };
+    match resolved_blob(workspace, rev, &normalized)? {
         ResolvedBlob::Content {
             resolved_path,
             bytes,

@@ -121,24 +121,13 @@ fn unquote(word: &str) -> &str {
     word
 }
 
-/// Compare whole recipe words without interpreting Make or running the shell.
-/// Only unquoted whitespace and shell operators separate words. In particular,
-/// `+` and `$(SUFFIX)` after the path are part of the same argument.
-pub(crate) fn line_contains_complete_arg(line: &str, needle: &str) -> bool {
-    if needle.is_empty() {
-        return false;
-    }
-
-    // Make consumes recipe flags before handing a tab-prefixed line to the shell.
-    let line = match line.strip_prefix('\t') {
-        Some(recipe) => recipe.trim_start_matches([' ', '\t', '@', '-', '+']),
-        None => line,
-    };
+/// Whether each successive character is outside quotes, escapes and Make expansions.
+fn unquoted() -> impl FnMut(char) -> bool {
     let mut quote = None;
     let mut escaped = false;
     let mut dollar = false;
     let mut expansion_depth = 0;
-    let words = line.split(|ch: char| {
+    move |ch| {
         let after_dollar = std::mem::take(&mut dollar);
         if std::mem::take(&mut escaped) {
             return false;
@@ -158,14 +147,48 @@ pub(crate) fn line_contains_complete_arg(line: &str, needle: &str) -> bool {
                 '(' if after_dollar || expansion_depth > 0 => expansion_depth += 1,
                 ')' if expansion_depth > 0 => expansion_depth -= 1,
                 '$' => dollar = true,
-                _ if expansion_depth == 0 => {
-                    return ch.is_ascii_whitespace()
-                        || matches!(ch, ';' | '&' | '|' | '<' | '>' | '(' | ')');
-                }
+                _ if expansion_depth == 0 => return true,
                 _ => {}
             }
         }
         false
+    }
+}
+
+/// Find the flags on an inline Make recipe (`targets: prerequisites ; @cmd`).
+/// A semicolon in an ordinary command, assignment or comment is not a recipe start.
+fn inline_flagged_recipe(line: &str) -> Option<&str> {
+    let mut unquoted = unquoted();
+    let mut saw_rule = false;
+    for (index, ch) in line.char_indices().filter(|&(_, ch)| unquoted(ch)) {
+        match ch {
+            '#' | '=' => return None,
+            ':' if !line[..index].trim().is_empty() => saw_rule = true,
+            ';' => {
+                let recipe = line[index + 1..].trim_start_matches([' ', '\t']);
+                return (saw_rule && recipe.starts_with(['@', '-', '+'])).then_some(recipe);
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Compare whole recipe words without interpreting Make or running the shell.
+/// Only unquoted whitespace and shell operators separate words. In particular,
+/// `+` and `$(SUFFIX)` after the path are part of the same argument.
+pub(crate) fn line_contains_complete_arg(line: &str, needle: &str) -> bool {
+    if needle.is_empty() {
+        return false;
+    }
+    let recipe = line
+        .strip_prefix('\t')
+        .or_else(|| inline_flagged_recipe(line));
+    let line = recipe.map_or(line, |body| body.trim_start_matches([' ', '\t', '@', '-', '+']));
+    let mut unquoted = unquoted();
+    let words = line.split(|ch: char| {
+        unquoted(ch)
+            && (ch.is_ascii_whitespace() || matches!(ch, ';' | '&' | '|' | '<' | '>' | '(' | ')'))
     });
 
     words.take_while(|word| !word.starts_with('#')).any(|word| {
@@ -337,6 +360,21 @@ mod tests {
         let output = "build/report.json";
         assert!(!line_contains_complete_arg("\t-@+ # tool --json build/report.json", output));
         assert!(line_contains_complete_arg("\t@tool @# --json build/report.json", output));
+    }
+
+    #[test]
+    fn inline_recipe_flags_start_after_the_rule_separator() {
+        let output = "build/report.json";
+        assert!(!line_contains_complete_arg(
+            r"report: dep\;one $(call dep,a;b) ; -@+ # tool --json build/report.json",
+            output
+        ));
+        assert!(line_contains_complete_arg(
+            "report: dep; @tool @# --json build/report.json",
+            output
+        ));
+        assert!(line_contains_complete_arg("tool 'a:b' build/report.json; @helper", output));
+        assert!(line_contains_complete_arg("tool --json build/report.json; @helper", output));
     }
 
     #[test]
