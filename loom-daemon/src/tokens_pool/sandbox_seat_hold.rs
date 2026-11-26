@@ -38,6 +38,9 @@ fn read(profile: &Path) -> Result<Option<Hold>> {
 }
 
 fn profile_for(workspace: &Path, id: &AccountId) -> Result<Option<PathBuf>> {
+    if super::paths::codex_profile_root().is_none() {
+        return Ok(None);
+    }
     Ok(account_inventory_quiet(workspace, AccountProvider::Codex)?
         .into_iter()
         .find(|account| account.id == *id)

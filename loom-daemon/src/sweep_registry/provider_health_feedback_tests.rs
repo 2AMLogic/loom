@@ -72,6 +72,7 @@ fn insert_codex_entry_with_prefixed_log(
 /// A later attempt on the same item and seat can neither create nor mask
 /// sandbox feedback for the dispatch being reaped.
 #[test]
+#[serial_test::serial]
 fn a_sandbox_hold_reads_only_the_reaped_dispatch() {
     use crate::tokens_pool::{
         account_inventory, health::inventory_health_snapshot, profile_root_env::ProfileRootEnv,
