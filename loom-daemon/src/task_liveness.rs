@@ -48,6 +48,8 @@ pub const CI_TELEMETRY: &str = "ci_telemetry";
 /// Task name of the Codex session-container watch (#10600): its snapshot is
 /// what dispatch selection and `loom-daemon status` read.
 pub const CODEX_SESSION_WATCH: &str = "codex_session_watch";
+/// Task name of the primary GitHub App writer-token refresh loop (#15327).
+pub const GITHUB_APP_REFRESH: &str = "github_app_refresh";
 /// Prefix of the per-role role-runner loops: `role_runner.<role>`.
 pub const ROLE_RUNNER_PREFIX: &str = "role_runner.";
 
