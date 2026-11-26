@@ -477,12 +477,8 @@ fn read_state(workspace: &Path) -> Result<HealthFile> {
 
 fn write_state(workspace: &Path, state: &HealthFile) -> Result<()> {
     let path = state_path(workspace);
-    let parent = path.parent().expect("health path has parent");
-    fs::create_dir_all(parent)?;
-    let temporary = parent.join(format!(".account-health.{}.tmp", std::process::id()));
     let bytes = serde_json::to_vec_pretty(state)?;
-    fs::write(&temporary, bytes)?;
-    fs::rename(&temporary, &path)?;
+    crate::fs_util::write_atomic(&path, &bytes, crate::fs_util::AtomicOpts::default())?;
     Ok(())
 }
 

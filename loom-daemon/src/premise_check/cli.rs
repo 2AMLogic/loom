@@ -299,7 +299,8 @@ fn forge_inputs(opts: &Options, issue: i64, repo_root: &Path) -> Result<Inputs, 
     let labels = v.labels.into_iter().map(|l| l.name).collect();
     let inputs = match (listing, object) {
         (Some(listing), Some(object)) => {
-            let evidence = resolution_evidence(&policy, &repo, issue, &v.title, &v.body, &listing);
+            let evidence =
+                resolution_evidence(&policy, &repo, issue, repo_root, &v.title, &v.body, &listing);
             trusted_inputs(&policy, v.title, v.body, labels, &listing, &object).map(|mut i| {
                 i.resolution = evidence;
                 i
@@ -420,21 +421,86 @@ fn trusted_inputs(
 /// author. A comment counts as a resolution only from an operator, an
 /// identical decision for REST and GraphQL because both shapes go through
 /// [`crate::comment_trust::Author::from_json`].
+///
+/// #15108: when the body carries no decision block at all — an attended
+/// ruling replaces the block with an "Operator ruling" section — the newest
+/// prior body version that carries a parseable one is recovered from the
+/// edit history, through the same [`current_with_history`] `resolve` uses, so
+/// the gate and the recorder cannot disagree. A body that still HAS a block
+/// stays authoritative, however it fails to parse.
 fn resolution_evidence(
     policy: &crate::comment_trust::TrustPolicy,
     repo: &str,
     issue: i64,
+    repo_root: &Path,
     title: &str,
     raw_body: &str,
     listing: &[u8],
 ) -> Option<crate::operator_decision::resolution::Evidence> {
-    use crate::operator_decision::resolution::{candidates, current, Evidence};
+    use crate::operator_decision::resolution::{
+        candidates, current, current_with_history, Evidence,
+    };
     let items = crate::comment_trust::parse_listing(listing)?;
     let candidates = candidates(policy, &items);
+    let n = u64::try_from(issue).ok()?;
+    let current = match current(repo, n, title, raw_body) {
+        Ok(c) => Ok(c),
+        Err(why) => {
+            if crate::operator_decision::render::extract_block(raw_body).is_some() {
+                Err(why)
+            } else {
+                match graphql_body_history(repo, issue, repo_root) {
+                    Some(history) => {
+                        current_with_history(repo, n, title, raw_body, &history, policy)
+                    }
+                    None => Err(
+                        "the issue body carries no ```decision block and its edit history could \
+                         not be read; re-publish the decision with `loom-daemon \
+                         operator-decision apply`"
+                            .to_string(),
+                    ),
+                }
+            }
+        }
+    };
     Some(Evidence {
-        current: current(repo, u64::try_from(issue).ok()?, title, raw_body),
+        current,
         candidates,
     })
+}
+
+/// The issue body's edit history over GraphQL (#15108 fallback): the same
+/// repo-routed read the comments fallback uses (#10025), for data REST does
+/// not expose at all. `None` when `gh` fails or the response does not parse —
+/// the gate then reports the decision unreadable rather than empty.
+fn graphql_body_history(
+    repo: &str,
+    number: i64,
+    repo_root: &Path,
+) -> Option<Vec<crate::operator_decision::resolution::BodyEdit>> {
+    let (owner, name) = repo.split_once('/')?;
+    let query = crate::operator_decision::resolution::body_history_query();
+    let f_owner = format!("owner={owner}");
+    let f_name = format!("name={name}");
+    let f_number = format!("number={number}");
+    let out = crate::script_helpers::gh_route::gh_read_for_repo(
+        "premise.graphql_body_history",
+        &[
+            "api",
+            "graphql",
+            "-f",
+            &format!("query={query}"),
+            "-f",
+            &f_owner,
+            "-f",
+            &f_name,
+            "-F",
+            &f_number,
+        ],
+        repo_root,
+        repo,
+    );
+    crate::operator_decision::resolution::parse_body_history(&out.ok_output()?.stdout)
 }
 
 /// An untrusted body with every `loom:premise-check` marker line removed, so
@@ -448,41 +514,10 @@ fn strip_markers(body: &str) -> String {
 }
 
 /// `owner/repo` from the checkout's origin remote, `gh` as the fallback — the
-/// same order, for the same offline/rate-limit reason, as `dep_classify`.
+/// same resolver and the same offline/rate-limit rationale as `dep_classify`
+/// (issue #15372), under this module's `premise.repo_view` operation tag.
 pub(crate) fn resolve_repo(repo_root: &Path) -> Option<String> {
-    if let Some(nwo) = crate::script_helpers::run_git(repo_root, &["remote", "get-url", "origin"])
-        .ok_stdout_trimmed()
-        .as_deref()
-        .and_then(nwo_from_remote_url)
-    {
-        return Some(nwo);
-    }
-    #[derive(serde::Deserialize)]
-    struct NameWithOwner {
-        #[serde(rename = "nameWithOwner")]
-        name_with_owner: String,
-    }
-    let q: crate::cmd_out::Query<NameWithOwner> = crate::script_helpers::gh_read_json(
-        "premise.repo_view",
-        &["repo", "view", "--json", "nameWithOwner"],
-        repo_root,
-        false,
-        |n: &NameWithOwner| n.name_with_owner.is_empty(),
-    );
-    match q {
-        crate::cmd_out::Query::Populated(n) => Some(n.name_with_owner),
-        _ => None,
-    }
-}
-
-fn nwo_from_remote_url(url: &str) -> Option<String> {
-    let trimmed = url.strip_suffix(".git").unwrap_or(url);
-    let mut parts: Vec<&str> = trimmed.rsplit(['/', ':']).take(2).collect();
-    if parts.len() != 2 || parts.iter().any(|p| p.is_empty()) {
-        return None;
-    }
-    parts.reverse();
-    Some(parts.join("/"))
+    crate::script_helpers::resolve_repo(repo_root, "premise.repo_view")
 }
 
 #[cfg(test)]

@@ -408,6 +408,7 @@ fn an_override_seat_is_never_recreated_for_skew_and_never_from_the_stock_tag() {
     let config = SessionImageConfig {
         image: Some("ghcr.io/example/session-mine@sha256:aa55".into()),
         extra_mounts: Vec::new(),
+        object_mirrors: false,
     };
     let mut state = ReconcileState::default();
     // The daemon rolled; the override seat is left running — never recreated

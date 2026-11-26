@@ -63,6 +63,10 @@ pub use post_init::{update_gitignore, update_gitignore_in};
 // The credential-bearing subset of EPHEMERAL_PATTERNS (#8005): the single
 // declared class every Loom stager must refuse regardless of `.gitignore`.
 pub use post_init::{is_credential_path, CREDENTIAL_PATTERNS};
+// The daemon-written subset of EPHEMERAL_PATTERNS (#15479) that both
+// `LOOM_OWNED_PREFIXES` dirty-tree backstops must carry, re-exported for the
+// parity test in `main_health_gate/owned_paths.rs`.
+pub use post_init::{DAEMON_RUNTIME_PATTERNS, EPHEMERAL_PATTERNS};
 
 // Import the rest for internal use
 pub(crate) use git::link_dogfood_symlinks;
@@ -281,7 +285,7 @@ pub fn initialize_workspace_with_mode(
     // retired by #3563) lingers on disk for Quick-Install consumers. Remove it
     // iff its sha256 matches a frozen shipped digest (unmodified); preserve a
     // customized copy; no-op when absent. Mirrors the shell-side
-    // `LOOM_RETIRED_FILES` block in scripts/install-loom.sh (PR #3575).
+    // `LOOM_RETIRED_FILES` block in scripts/install/retired-files.sh (PR #3575).
     //
     // Placed after scaffolding (post-sync) and before generate_manifest so the
     // manifest reflects on-disk state. The self-install short-circuit above

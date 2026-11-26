@@ -241,6 +241,11 @@ pub fn decide(
     if record.context_size > cfg.context_cap {
         return fresh(FreshReason::OverContextCap, Some(record));
     }
+    // A transcript written inside a persistent seat resumes only in that seat
+    // (#14371). The launch pins the record's account and store (#14981), so a
+    // seat-stored record resumes like any other; `store_reachable` is also
+    // where a pin that cannot be honoured (account gone, bad-marked,
+    // exhausted) resolves Fresh with a handoff, instead of a failed launch.
     if !store_reachable(record) {
         return fresh(FreshReason::StoreUnreachable, Some(record));
     }
@@ -322,18 +327,13 @@ pub fn load(root: &Path) -> Ledger {
         .unwrap_or_default()
 }
 
-/// Write the ledger atomically (temp file, then rename).
+/// Write the ledger atomically ([`crate::fs_util::write_atomic`]).
 ///
 /// # Errors
 /// The filesystem's.
 pub fn save(root: &Path, ledger: &Ledger) -> std::io::Result<()> {
-    let path = path_for(root);
-    if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir)?;
-    }
-    let tmp = path.with_extension(format!("json.tmp{}", std::process::id()));
-    std::fs::write(&tmp, serde_json::to_vec_pretty(ledger).map_err(std::io::Error::other)?)?;
-    std::fs::rename(&tmp, &path)
+    let bytes = serde_json::to_vec_pretty(ledger).map_err(std::io::Error::other)?;
+    crate::fs_util::write_atomic(&path_for(root), &bytes, crate::fs_util::AtomicOpts::default())
 }
 
 /// The Claude session a spawned step runs, noted at spawn and taken at its
@@ -386,6 +386,65 @@ pub fn claude_transcript_size(config_dir: &Path, session_id: &str) -> u64 {
         .unwrap_or(0)
 }
 
+/// Where a Claude session's transcript lives (#14371): the host config dir, or
+/// the private home of the persistent seat whose Claude wrote it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct LocatedSession {
+    /// The seat home holding the transcript. `None` for the host config dir,
+    /// which is where an unrecorded store is already looked for.
+    pub store: Option<PathBuf>,
+    /// The seat's name, when `store` is a seat home.
+    pub account: Option<String>,
+    /// Bytes of the transcript, `0` when none was found.
+    pub size: u64,
+}
+
+/// Find `session_id`'s transcript under `host_dir`, else under each registered
+/// seat of `seat_root` (sorted, so the answer is deterministic). The session id
+/// is the key: a seat's Claude has its own `CLAUDE_CONFIG_DIR`, so the host's
+/// `projects/` never holds a seat step's transcript.
+#[must_use]
+pub fn locate_claude_session(
+    host_dir: Option<&Path>,
+    seat_root: Option<&Path>,
+    session_id: &str,
+) -> LocatedSession {
+    use crate::tokens_pool::claude_seat as seat;
+    if let Some(size) = host_dir
+        .map(|d| claude_transcript_size(d, session_id))
+        .filter(|s| *s > 0)
+    {
+        return LocatedSession {
+            size,
+            ..LocatedSession::default()
+        };
+    }
+    let Some(root) = seat_root else {
+        return LocatedSession::default();
+    };
+    let mut names: Vec<String> = std::fs::read_dir(root)
+        .map(|rd| {
+            rd.flatten()
+                .filter_map(|e| e.file_name().into_string().ok())
+                .filter(|n| seat::is_seat(root, n))
+                .collect()
+        })
+        .unwrap_or_default();
+    names.sort();
+    for name in names {
+        let home = seat::home_dir(root, &name);
+        let size = claude_transcript_size(&home, session_id);
+        if size > 0 {
+            return LocatedSession {
+                store: Some(home),
+                account: Some(name),
+                size,
+            };
+        }
+    }
+    LocatedSession::default()
+}
+
 /// Record the session of a step that ended (`step_end::settle`). A no-op when
 /// the feature is off or the role resumes nothing. Best effort: a failed
 /// write only costs a fresh step later.
@@ -404,10 +463,14 @@ pub fn record_ended(
     if !crate::roll_pause::resume::valid_session_id(&session_id) {
         return;
     }
-    let context_size = std::env::var_os("CLAUDE_CONFIG_DIR")
+    let host_dir = std::env::var_os("CLAUDE_CONFIG_DIR")
         .map(PathBuf::from)
-        .or_else(|| dirs::home_dir().map(|h| h.join(".claude")))
-        .map_or(0, |d| claude_transcript_size(&d, &session_id));
+        .or_else(|| dirs::home_dir().map(|h| h.join(".claude")));
+    let located = locate_claude_session(
+        host_dir.as_deref(),
+        crate::tokens_pool::claude_seat::seat_root().as_deref(),
+        &session_id,
+    );
     let mut ledger = load(root);
     ledger.prune(ended_at, cfg.ttl);
     ledger.upsert(SessionRecord {
@@ -416,14 +479,24 @@ pub fn record_ended(
         host: crate::host_identity::lease_host_identity(),
         runtime: "claude".to_string(),
         session_id,
-        account: None,
-        session_store: None,
+        account: located.account,
+        session_store: located.store.map(|p| p.display().to_string()),
         ended_at,
-        context_size,
+        context_size: located.size,
     });
     if let Err(e) = save(root, &ledger) {
         log::warn!("step_dispatch: session ledger not written: {e}");
     }
+}
+
+/// Whether the account `record` must resume in can be selected now (#14981):
+/// the same check `tokens select --pin-account` makes at launch, asked early so
+/// a pin that cannot be honoured runs Fresh with a handoff rather than failing
+/// the spawn. A record with no account (host-stored) has nothing to pin.
+fn pinned_account_usable(root: &Path, record: &SessionRecord) -> bool {
+    record.account.as_deref().is_none_or(|account| {
+        crate::tokens_pool::select::select_pinned_token(root, account, None).is_ok()
+    })
 }
 
 /// [`decide`] for the workspace at `root`, against the real ledger, host and
@@ -451,6 +524,7 @@ pub fn decide_for(root: &Path, item: u32, role: StepRole) -> Decision {
                 r.session_store.as_deref(),
             )
             .is_ok()
+                && pinned_account_usable(root, r)
         },
     )
 }

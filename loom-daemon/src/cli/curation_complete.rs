@@ -47,7 +47,39 @@ impl CurationCompleteArgs {
             crate::write_scope::Verdict::Allow(_) => Ok(()),
             crate::write_scope::Verdict::Deny(why) => Err(why),
         };
-        self.run_with(std::ffi::OsStr::new("gh"), &policy, &may_write)
+        self.run_with(std::ffi::OsStr::new("gh"), &policy, Some(&may_write), &|issue, points| {
+            self.project_labels(std::ffi::OsStr::new("gh"), issue, points)
+        })
+    }
+
+    /// The fleet route (#14465): the reads (issue body, trusted comments)
+    /// still run through the fleet reader the mode gate configured, and the
+    /// label projection goes to the broker's scoped `complete_curation`
+    /// operation instead of a local `gh` write. There is no write-scope
+    /// probe here: it would consult the reader for a credential that never
+    /// carries the write; the broker verifies the caller, repository and
+    /// target server-side before its first mutation. A broker failure fails
+    /// the command — nothing falls back to a local writer.
+    pub fn run_fleet<T: crate::fleet_curation_broker::Transport>(
+        &self,
+        broker: &crate::fleet_curation_broker::Broker<T>,
+    ) -> Result<()> {
+        self.run_fleet_with(std::ffi::OsStr::new("gh"), broker)
+    }
+
+    fn run_fleet_with<T: crate::fleet_curation_broker::Transport>(
+        &self,
+        gh: &std::ffi::OsStr,
+        broker: &crate::fleet_curation_broker::Broker<T>,
+    ) -> Result<()> {
+        crate::forge_cmd::decline_gitea(Some(&self.workspace_root));
+        let policy = TrustPolicy::for_root(&self.workspace_root);
+        self.run_with(gh, &policy, None, &|_issue, points| {
+            broker
+                .complete_curation(&self.repo, self.issue, points)
+                .map(|_| ())
+                .map_err(|e| anyhow::anyhow!("fleet curation write failed: {e}"))
+        })
     }
 
     fn gh(
@@ -142,13 +174,16 @@ impl CurationCompleteArgs {
     }
 
     fn run_with(
-        self,
+        &self,
         gh: &std::ffi::OsStr,
         policy: &TrustPolicy,
-        may_write: &dyn Fn() -> std::result::Result<(), String>,
+        may_write: Option<&dyn Fn() -> std::result::Result<(), String>>,
+        project: &dyn Fn(&serde_json::Value, u32) -> Result<()>,
     ) -> Result<()> {
         // Refuse before anything is labeled.
-        may_write().map_err(|why| anyhow::anyhow!("refusing to label {}: {why}", self.repo))?;
+        if let Some(gate) = may_write {
+            gate().map_err(|why| anyhow::anyhow!("refusing to label {}: {why}", self.repo))?;
+        }
         let issue = self.issue_json(gh)?;
         let path = format!("repos/{}/issues/{}/comments", self.repo, self.issue);
         let listing = self
@@ -166,7 +201,7 @@ impl CurationCompleteArgs {
         let body = issue.get("body").and_then(|v| v.as_str()).unwrap_or("");
         let points = resolve_points(body, policy.trusts_json(&issue), &comments)
             .map_err(|e| anyhow::anyhow!("issue {}#{}: {e}", self.repo, self.issue))?;
-        self.project_labels(gh, &issue, points)?;
+        project(&issue, points)?;
         println!(
             "{}",
             serde_json::json!({"recorded":true,"points":points,"completion_id":self.completion_id})

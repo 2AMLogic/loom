@@ -67,17 +67,7 @@ pub fn resolve_issue_script(
     cli_dir: &Path,
     fallback_override: Option<&Path>,
 ) -> Option<PathBuf> {
-    let executable = |p: &Path| -> bool {
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::metadata(p).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
-        }
-        #[cfg(not(unix))]
-        {
-            p.is_file()
-        }
-    };
+    use crate::fs_util::is_executable;
 
     if let Some(root) = repo_root {
         for rel in [
@@ -85,14 +75,14 @@ pub fn resolve_issue_script(
             "defaults/scripts/create-issue.sh",
         ] {
             let c = root.join(rel);
-            if executable(&c) {
+            if is_executable(&c) {
                 return Some(c);
             }
         }
     }
     let fallback = fallback_override.map_or_else(|| cli_dir.join(".."), Path::to_path_buf);
     let c = fallback.join("create-issue.sh");
-    executable(&c).then_some(c)
+    is_executable(&c).then_some(c)
 }
 
 /// Everything the issue body reports.

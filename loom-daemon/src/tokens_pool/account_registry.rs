@@ -19,6 +19,7 @@ use serde::{Deserialize, Serialize};
 use super::locking::MkdirLock;
 use super::paths::{
     codex_profile_root, is_shared_accounts_root, per_repo_accounts_file, resolve_tokens_dir,
+    shared_accounts_root,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -279,19 +280,13 @@ pub(crate) fn validate_name(name: &str) -> Result<()> {
 
 fn write_repo_registry(workspace: &Path, entries: Vec<RegistryEntry>) -> Result<()> {
     let path = per_repo_accounts_file(workspace);
-    let parent = path
-        .parent()
-        .ok_or_else(|| anyhow!("account registry has no parent directory"))?;
-    std::fs::create_dir_all(parent).context("failed to create account registry directory")?;
     let file = RegistryFile {
         version: registry_version(),
         accounts: entries,
     };
     let bytes = serde_json::to_vec_pretty(&file)?;
-    let temp =
-        parent.join(format!(".accounts.json.tmp-{}-{}", std::process::id(), uuid::Uuid::new_v4()));
-    std::fs::write(&temp, bytes).context("failed to stage account registry update")?;
-    std::fs::rename(&temp, &path).context("failed to commit account registry update")?;
+    crate::fs_util::write_atomic(&path, &bytes, crate::fs_util::AtomicOpts::default())
+        .context("failed to write account registry")?;
     Ok(())
 }
 
@@ -786,8 +781,40 @@ fn codex_inventory(workspace: &Path, quiet: bool) -> Result<(Vec<AccountDescript
             });
         }
     }
+    if registry_provenance == InventoryProvenance::Repo {
+        if let Some(shared) = shared_accounts_root() {
+            apply_shared_disables(&shared, &root, &mut out)?;
+        }
+    }
     out.sort_by(|a, b| a.id.name.cmp(&b.id.name));
     Ok((out, absence_verified))
+}
+
+/// Local membership and local disables still apply. A shared disable follows
+/// either the logical account name or its physical profile (including aliases).
+fn apply_shared_disables(
+    shared: &Path,
+    root: &Path,
+    accounts: &mut [AccountDescriptor],
+) -> Result<()> {
+    let mut names = HashSet::new();
+    let mut profiles = HashSet::new();
+    for entry in read_repo_registry(shared)?
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|entry| entry.provider == AccountProvider::Codex && !entry.enabled)
+    {
+        validate_name(&entry.credential_reference)?;
+        names.insert(entry.name);
+        if let Ok(directory) = root.join(entry.credential_reference).canonicalize() {
+            profiles.insert(directory);
+        }
+    }
+    for account in accounts {
+        account.enabled &=
+            !names.contains(&account.id.name) && !profiles.contains(&account.credential_reference);
+    }
+    Ok(())
 }
 
 pub fn account_inventory(

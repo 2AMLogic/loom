@@ -172,7 +172,7 @@ pub(crate) fn handle_fleet_command(action: FleetAction) -> Result<()> {
             json,
         } => {
             // Resolved once, from the operator's own cwd (mirrors
-            // `WorkspacePool::start_safehouse_narration`'s
+            // `WorkspacePool::start_merge_reporter`'s
             // `safehouse::resolve_config(repo_root)` call shape) — see
             // `fleet::drain::flush_safehouse`'s doc comment for the real
             // supervised-stop flush check this now gates on (#3998).
@@ -323,10 +323,15 @@ fn auto_init_missing_sweep_command(canonical: &std::path::Path) -> Result<()> {
 /// #10364 Part B); the report says so and keeps the manual recreate.
 fn report_session_mount_drift(registry: &crate::workspace_registry::WorkspaceRegistry) {
     let profile_root = crate::tokens_pool::paths::codex_profile_root();
-    let docker = std::env::var("LOOM_CODEX_SESSION_DOCKER")
-        .ok()
-        .filter(|d| !d.is_empty())
-        .unwrap_or_else(|| "docker".to_string());
+    // Scoped override verbatim, else the shared lookup (#14885); an
+    // unresolvable docker stays unlaunchable, so the report says "cannot
+    // observe" instead of probing (best-effort, fail open).
+    let docker = crate::docker_bin::scoped_or_fail_open(
+        std::env::var("LOOM_CODEX_SESSION_DOCKER")
+            .ok()
+            .filter(|d| !d.is_empty())
+            .as_deref(),
+    );
     for line in crate::tokens_pool::session_drift_report::report(
         profile_root.as_deref(),
         &docker,

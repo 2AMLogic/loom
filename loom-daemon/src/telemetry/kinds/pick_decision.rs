@@ -211,11 +211,13 @@ impl PickSkipReason {
                 P::CapabilityMissing | P::HostSkipLabel => Self::HostConstraint,
                 P::Epic | P::Tracker | P::Proposal | P::NoStage | P::Draft => Self::NoStep,
                 P::CiPending
+                | P::BackstopHeld
                 | P::HeldAtHead
                 | P::AuthorGateHeld
                 | P::Conflicting
                 | P::Stacked
-                | P::OperatorLinkUnverified => Self::Backoff,
+                | P::OperatorLinkUnverified
+                | P::QueueMembershipUnknown => Self::Backoff,
             },
         }
     }

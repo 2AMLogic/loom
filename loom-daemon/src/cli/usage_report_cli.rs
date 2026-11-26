@@ -53,7 +53,9 @@ impl UsageReportArgs {
     pub(crate) fn run(self) -> Result<()> {
         let group_by = UsageReportGroupBy::parse(&self.by)?;
         let since = crate::sweep_outcome_summary::parse_since(&self.since, Utc::now())?;
-        let db_path = self.db.unwrap_or_else(default_activity_db_path);
+        let db_path = self
+            .db
+            .unwrap_or_else(crate::activity::default_activity_db_path);
 
         if !db_path.is_file() {
             if self.json {
@@ -84,19 +86,6 @@ impl UsageReportArgs {
         }
         Ok(())
     }
-}
-
-/// `~/.loom/activity.db`, or `LOOM_ACTIVITY_DB` if set — matches
-/// [`crate::cli::stats::handle_agent_metrics_command`]'s resolution.
-fn default_activity_db_path() -> PathBuf {
-    std::env::var_os("LOOM_ACTIVITY_DB")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| {
-            dirs::home_dir()
-                .unwrap_or_else(|| PathBuf::from("."))
-                .join(".loom")
-                .join("activity.db")
-        })
 }
 
 fn print_report(
@@ -243,7 +232,16 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let want = dir.path().join("custom-activity.db");
         std::env::set_var("LOOM_ACTIVITY_DB", &want);
-        assert_eq!(default_activity_db_path(), want);
+        assert_eq!(crate::activity::default_activity_db_path(), want);
         std::env::remove_var("LOOM_ACTIVITY_DB");
+        // Without the override the shared resolution (#15372) falls back to
+        // `.loom/activity.db` under the discovered home (or `.` without one)
+        // — the same default `stats agent-metrics` and the weekly-point
+        // sampler use, so all three land in one database.
+        let home_default = dirs::home_dir()
+            .unwrap_or_else(|| PathBuf::from("."))
+            .join(".loom")
+            .join("activity.db");
+        assert_eq!(crate::activity::default_activity_db_path(), home_default);
     }
 }

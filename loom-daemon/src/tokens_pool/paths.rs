@@ -47,7 +47,7 @@ pub fn per_repo_accounts_file(workspace: &Path) -> PathBuf {
 pub fn shared_accounts_root() -> Option<PathBuf> {
     match std::env::var(SHARED_ACCOUNTS_ROOT_ENV) {
         Ok(value) if value.trim().is_empty() => None,
-        Ok(value) => Some(expand_tilde(value.trim())),
+        Ok(value) => Some(crate::fs_util::expand_tilde(value.trim())),
         #[cfg(test)]
         Err(_) => None,
         #[cfg(not(test))]
@@ -81,7 +81,7 @@ pub fn is_shared_accounts_root(workspace: &Path) -> bool {
 pub fn codex_profile_root() -> Option<PathBuf> {
     match std::env::var(CODEX_PROFILE_ROOT_ENV) {
         Ok(value) if value.trim().is_empty() => None,
-        Ok(value) => Some(expand_tilde(value.trim())),
+        Ok(value) => Some(crate::fs_util::expand_tilde(value.trim())),
         #[cfg(test)]
         Err(_) => panic!(
             "{CODEX_PROFILE_ROOT_ENV} unset in a test; refusing to resolve the real ~/.loom (issue #9964)"
@@ -207,7 +207,7 @@ pub fn shared_tokens_dir() -> Option<PathBuf> {
             if trimmed.is_empty() {
                 None
             } else {
-                Some(expand_tilde(trimmed))
+                Some(crate::fs_util::expand_tilde(trimmed))
             }
         }
         #[cfg(test)]
@@ -215,21 +215,6 @@ pub fn shared_tokens_dir() -> Option<PathBuf> {
         #[cfg(not(test))]
         Err(_) => dirs::home_dir().map(|h| h.join(".loom").join("tokens")),
     }
-}
-
-/// Minimal `~`/`~/` expansion (Python's `Path.expanduser()` equivalent for
-/// the cases this env var realistically carries).
-pub(super) fn expand_tilde(raw: &str) -> PathBuf {
-    if let Some(rest) = raw.strip_prefix("~/") {
-        if let Some(home) = dirs::home_dir() {
-            return home.join(rest);
-        }
-    } else if raw == "~" {
-        if let Some(home) = dirs::home_dir() {
-            return home;
-        }
-    }
-    PathBuf::from(raw)
 }
 
 /// Return `true` iff `tokens_dir` exists and holds at least one `*.token` file.

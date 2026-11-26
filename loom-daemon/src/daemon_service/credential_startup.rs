@@ -107,6 +107,13 @@ pub(super) fn run_startup(sweep_workspace: &Path) -> CredentialStartup {
     if let Some(minted) = &github_app_preflight.minted {
         match credential_preflight::publish_minted(&github_app_config_dir, minted) {
             Ok(()) => {
+                // #15327: the expiry watch starts from the startup publish.
+                if let Some(owner_repo) = &github_app_owner_repo {
+                    credential_preflight::primary_token::record_published(
+                        owner_repo,
+                        &minted.expires_at,
+                    );
+                }
                 std::env::remove_var("GH_TOKEN");
                 std::env::remove_var("GITHUB_TOKEN");
                 std::env::set_var("GH_CONFIG_DIR", &github_app_config_dir);
@@ -149,7 +156,18 @@ pub(super) fn run_startup(sweep_workspace: &Path) -> CredentialStartup {
     // script + owner resolve, even when the startup mint itself failed and
     // the retry below establishes later).
     let startup_roots = match (&github_app_owner_repo, &github_app_script) {
-        (Some(_), Some(_)) => credential_preflight::cross_owner::managed_roots(sweep_workspace),
+        (Some(_), Some(_)) => {
+            // #14450: a failed registry read gives a non-authoritative
+            // fallback list; use an empty baseline so the drift watch adopts
+            // the first authoritative snapshot rather than a wrong one.
+            let (roots, registry_loaded) =
+                credential_preflight::cross_owner::managed_roots(sweep_workspace);
+            if registry_loaded {
+                roots
+            } else {
+                Vec::new()
+            }
+        }
         _ => Vec::new(),
     };
     if let (Some(root_owner_repo), Some(script_path), true) = (

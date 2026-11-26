@@ -21,6 +21,7 @@ mod profile_check;
 pub(crate) mod profiles;
 mod prompt;
 pub(crate) mod rejection;
+pub mod sccache_server;
 
 pub use profile_check::{cli as profile_cli, WorkerArgs as WorkerCommand};
 // #11360: the mixed-sweep accounting fixture builds its escalated-Doctor log
@@ -212,6 +213,11 @@ pub enum LaunchStage {
     /// (the OpenCode major guard, #8438/#11283): the probe answered with an
     /// unsupported or canary-unverified version.
     CliQualification,
+    /// The caller's `LOOM_PROMPT_MODIFIER` cannot be applied to this launch:
+    /// malformed, not registered, no entry for the runtime, or no prompt
+    /// argument to modify (#15017). The run never proceeds plain under the
+    /// modifier's name.
+    PromptModifier,
 }
 
 impl LaunchStage {
@@ -233,6 +239,7 @@ impl LaunchStage {
             Self::LogWrite => "log_write",
             Self::LaunchPrep => "launch_prep",
             Self::CliQualification => "cli_qualification",
+            Self::PromptModifier => "prompt_modifier",
         }
     }
 
@@ -257,6 +264,7 @@ impl LaunchStage {
             "log_write" => Self::LogWrite,
             "launch_prep" => Self::LaunchPrep,
             "cli_qualification" => Self::CliQualification,
+            "prompt_modifier" => Self::PromptModifier,
             _ => return None,
         })
     }
@@ -297,6 +305,7 @@ fn stage_reason(stage: LaunchStage) -> &'static str {
         LaunchStage::LogWrite => "preflight_log_write",
         LaunchStage::LaunchPrep => "preflight_launch_prep",
         LaunchStage::CliQualification => "preflight_cli_qualification",
+        LaunchStage::PromptModifier => "preflight_prompt_modifier",
     }
 }
 
@@ -631,6 +640,7 @@ fn rejection_attributes(
     if let Some(resolution) = resolution {
         let runtime = match resolution.runtime.as_str() {
             "aider" => "aider",
+            "agy" => "agy",
             "claude" => "claude",
             "codex" => "codex",
             "gemini" => "gemini",
@@ -740,6 +750,26 @@ fn record_resolved_runtime(
         .map_err(|e| LaunchError::config(e.to_string()).with_stage(LaunchStage::LogWrite))
 }
 
+/// The single-step caller's prompt modifier as a transform for `runtime`
+/// (#15017), `None` when the caller named none.
+///
+/// A name the launch cannot honor is a `prompt_modifier` preflight rejection:
+/// the run must never proceed plain under the modifier's name.
+fn resolve_prompt_modifier(
+    config: &serde_json::Value,
+    runtime: &str,
+) -> Result<Option<crate::prompt_modifier::Transform>, LaunchError> {
+    let Some(name) = crate::prompt_modifier::current() else {
+        return Ok(None);
+    };
+    crate::prompt_modifier::resolve(config, runtime, name)
+        .map(Some)
+        .map_err(|rejection| {
+            LaunchError::config(rejection.describe(name, runtime))
+                .with_stage(LaunchStage::PromptModifier)
+        })
+}
+
 fn run_preflight(
     args: WorkerArgs,
     root: &Path,
@@ -805,6 +835,9 @@ fn run_preflight(
             &runtime,
             source,
         )?;
+        // #15017: checked here, on the host, before admission, containment and
+        // credentials — a contained launch's re-exec'd copy re-resolves it.
+        let prompt_modifier = resolve_prompt_modifier(&config, &runtime)?;
         // A role-tagged invocation must meet the same capabilities as daemon dispatch.
         // Free-form prompts remain available for controlled, isolated experiments.
         let role = nonempty_env("LOOM_ROLE");
@@ -978,7 +1011,24 @@ fn run_preflight(
             .as_deref()
             .map(|p| prompt::expand(root, p))
             .transpose()
-            .map_err(|e| e.or_stage(LaunchStage::PromptExpansion))?;
+            .map_err(|e| e.or_stage(LaunchStage::PromptExpansion))?
+            // #15017: the one application site for a native harness — after
+            // role expansion, so the text follows the whole role prompt.
+            .map(|text| match &prompt_modifier {
+                Some(transform) => transform.apply(&text),
+                None => text,
+            });
+        // A resolved modifier with no prompt to modify must not launch plain
+        // under the modifier's name (provenance and the digest would record a
+        // modified run). Same refusal as the legacy arm (#15017).
+        if prompt_modifier.is_some() && expanded.is_none() {
+            return Err(LaunchError::config(format!(
+                "prompt modifier {:?} needs a prompt to modify; refusing to run without it \
+                 (#15017)",
+                crate::prompt_modifier::current().unwrap_or_default()
+            ))
+            .with_stage(LaunchStage::PromptModifier));
+        }
         let mut command = harness
             .command(
                 &options,
@@ -1043,6 +1093,20 @@ fn run_preflight(
         command
     } else {
         record_resolved_runtime(log.as_mut(), &runtime, source)?;
+        // #15017: the one application site for a legacy adapter — its `-p` /
+        // `--prompt` value, so `spawn-<runtime>.sh` and the CLI behind it see
+        // the modified prompt and nothing else about the argv changes.
+        let mut adapter_args = args.args.clone();
+        if let Some(transform) = resolve_prompt_modifier(&config, &runtime)? {
+            if !crate::prompt_modifier::apply_to_args(&mut adapter_args, &transform) {
+                return Err(LaunchError::config(format!(
+                    "prompt modifier {:?} needs a -p/--prompt argument to modify; refusing to run \
+                     without it (#15017)",
+                    crate::prompt_modifier::current().unwrap_or_default()
+                ))
+                .with_stage(LaunchStage::PromptModifier));
+            }
+        }
         let runner = scripts.join(format!("spawn-{runtime}.sh"));
         if !runner.is_file() {
             let available = fs::read_dir(&scripts)
@@ -1061,7 +1125,63 @@ fn run_preflight(
                 .with_stage(LaunchStage::RunnerMissing));
         }
         let mut command = Command::new(runner);
-        command.args(&args.args);
+        command.args(&adapter_args);
+        // #14945: a tier-3 runtime whose manifest declares `credentialPool`
+        // (the Antigravity `agy` pilot) draws its key from the API-key pool
+        // HERE, in the worker process that exec's the runner — the process
+        // the in-flight lease names, so the account's shared concurrency cap
+        // frees exactly when the CLI run ends. A short-lived helper would
+        // count the lease against the wrong PID. See
+        // `credential::resolve_tier3` for why the pool is mandatory (no
+        // ambient-key escape) and what refuses.
+        match crate::runtime_launch::pooled_tier3(root, &runtime) {
+            Err(detail) => {
+                return Err(LaunchError::config(format!(
+                    "runtime {runtime} has a malformed credential-pool declaration: {detail}"
+                ))
+                .with_stage(LaunchStage::Credential));
+            }
+            Ok(None) => {}
+            Ok(Some(declaration)) => {
+                // env > manifest, the tier-3 precedence: an operator's
+                // LOOM_MODEL wins and is forwarded once (spawn-generic.sh's
+                // modelFlag); the manifest default is set only when the
+                // environment did not supply one, so the CLI sees exactly
+                // one --model.
+                let env_model = nonempty_env("LOOM_MODEL");
+                let model = env_model.clone().or_else(|| declaration.model.clone());
+                let selected =
+                    credential::resolve_tier3(root, &runtime, &declaration, model.as_deref())
+                        .map_err(|e| e.or_stage(LaunchStage::Credential))?;
+                // The pool's selection is the ONLY value that reaches the
+                // child: `Command::env` overrides the inherited one, so an
+                // ambient GEMINI_API_KEY neither wins nor rides along. The
+                // value never touches argv, and the record below names the
+                // account, never the key.
+                command.env(&declaration.env_var, &selected.credential.value);
+                if env_model.is_none() {
+                    if let Some(model) = &model {
+                        command.env("LOOM_MODEL", model);
+                    }
+                }
+                let tap = crate::runtime_preference::Tap::runtime(&runtime).to_string();
+                let launch = serde_json::json!({
+                    "schema": 1,
+                    "runtime": runtime,
+                    "tap": tap,
+                    "model": model,
+                    "credentialSource": "pool",
+                    "credentialProvider": selected.provider,
+                    "credentialAccount": selected.name,
+                    "usage": "none",
+                    "billing": "not-measured",
+                })
+                .to_string();
+                writeln!(log, "# LOOM_LAUNCH {launch}").map_err(|e| {
+                    LaunchError::config(e.to_string()).with_stage(LaunchStage::LogWrite)
+                })?;
+            }
+        }
         // #14167: a legacy adapter's launch facts are the `--model`/`--effort`
         // its documented precedence resolves — exactly what the dispatch step
         // handed this child over and what `loom.step.model_launched` records
@@ -1201,6 +1321,11 @@ fn run_preflight(
     // the build on an empty value instead of reading it as unset.
     cargo_debuginfo::apply(&mut command, &debuginfo, |k| std::env::var_os(k));
     let _ = writeln!(log, "{}", debuginfo.marker);
+    // #15139: a shared `sccache` server started lazily by this worker's own
+    // `cargo` would inherit the per-run TMPDIR the reaper later removes, then
+    // fail every compile on the host. Start (or probe) it now under a stable
+    // root instead; a failure is one log line, never a failed launch.
+    let _ = sccache_server::ensure(&mut log);
     // The other half of #8453, on the same seam and for the same reason
     // (#8458): when the repo opts in (`cargo.perWorktreeTargetDir`), a spawn
     // that OWNS a sweep's claim runs under that issue worktree's own
@@ -1420,6 +1545,7 @@ mod launch_rejection_tests {
             LaunchStage::LogWrite,
             LaunchStage::LaunchPrep,
             LaunchStage::CliQualification,
+            LaunchStage::PromptModifier,
         ];
         for stage in all {
             assert_eq!(LaunchStage::parse(stage.as_str()), Some(stage));

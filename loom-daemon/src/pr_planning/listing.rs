@@ -28,6 +28,15 @@ fn read(root: &Path, gh: &Path, op: ForgeOp, suffix: &str) -> Result<Value> {
     let key = store::cache_key(Some(root), &target, &url);
     let path = store::disk_cache_path(&key);
     let sent = store::read_disk_entry(&path);
+    // Gateway-first, not exempt (#15103): `fetch_conditional` offers the gateway
+    // profile ahead of any reader App, so a `route=direct_read` row here is a
+    // fallback. Either the gateway was withdrawn when the read was routed, by
+    // any caller's refused or faulted request (#15134), or its own attempt
+    // faulted and the read was rerun on a reader; with no live profile in this
+    // process (a CLI that adopted no `LOOM_GH_GATEWAY_DIR`) or an unresolved
+    // repo, a reader App or the writer serves it. The daemon log's `gateway
+    // withdrawn` and `gateway did not answer` lines mark the first case.
+    // `defaults/docs/github-authentication.md`, "Reads through a read gateway".
     let (status, response, stderr) = store::fetch_conditional(
         store::ConditionalRead::new("pr_planning", op),
         gh,

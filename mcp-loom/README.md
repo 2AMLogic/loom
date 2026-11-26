@@ -237,21 +237,30 @@ mcp-loom/
 ├── src/
 │   ├── index.ts           # Main server entry point
 │   ├── types.ts           # Shared TypeScript types
+│   ├── no-shell-string-construction.test.ts
 │   ├── shared/
 │   │   ├── config.ts      # Workspace resolution + config file utilities
 │   │   ├── config.test.ts
 │   │   ├── config-resolver.ts       # Tiered config merge (TS port of config_resolver.rs)
 │   │   ├── config-resolver.test.ts
-│   │   ├── ipc.ts         # File-based IPC with retry
 │   │   ├── daemon.ts      # Socket-based daemon communication
 │   │   └── formatting.ts  # Log/output formatting
 │   └── tools/
+│       ├── agent-metrics.ts         # Agent metrics tools
+│       ├── agent-metrics.test.ts
+│       ├── status.ts                # Daemon status tools
+│       ├── status.test.ts
 │       ├── ui.ts          # UI/Engine tools
 │       ├── ui.test.ts
 │       ├── terminals.ts   # Terminal management tools
 │       ├── terminals.test.ts
 │       ├── sweeps.ts      # Sweep-dispatch tools (loom-daemon IPC)
-│       └── sweeps.test.ts
+│       ├── sweeps.test.ts
+│       ├── sweep-dispatch-options.ts
+│       └── sweep-dispatch-payload.ts
+├── scripts/
+│   └── verify-daemon-timeout.mjs
+├── esbuild.config.js
 ├── package.json
 └── tsconfig.json
 ```

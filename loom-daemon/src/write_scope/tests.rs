@@ -586,8 +586,8 @@ enum Scope {
     /// the repo with `loom_write_repo` and passes it as `--repo`.
     ShellVetted(&'static str),
     /// A CLI verb whose target is `git remote get-url origin` or an explicit
-    /// `--repo` from its caller, never gh's base-repo resolution; the file
-    /// named must keep resolving origin first.
+    /// `--repo` from its caller. The named CLI must delegate to the shared
+    /// resolver, which checks origin before falling back to `gh repo view`.
     OriginResolved(&'static str),
     /// An operator-run verb with an explicit, configured target, never run by
     /// an autonomous path. Not write-scoped yet; listed so the gap is visible.
@@ -609,6 +609,10 @@ fn daemon_write_paths_are_scoped() {
     let reviewed: &[(&str, Scope)] = &[
         (PASS, Gated),
         ("claim_reconciliation.rs", Via(PASS, "reclaim + anchor passes")),
+        (
+            "claim_reconciliation/curating_reclaim.rs",
+            Via(PASS, "Curator claim recovery: label release and re-curation comment (#14816)"),
+        ),
         ("claim_reconciliation/verdict_invalidation.rs", Via(PASS, "verdict pass")),
         (
             "claim_reconciliation/unanchored_verdict.rs",
@@ -627,6 +631,10 @@ fn daemon_write_paths_are_scoped() {
         ),
         ("claim_reconciliation/pass_loop/building_heal.rs", Via(PASS, "heal pass")),
         (
+            "claim_reconciliation/pass_loop/merge_observation.rs",
+            Via(PASS, "merge-observation pass: issue close, label strip and audit comments (#14902)"),
+        ),
+        (
             "claim_reconciliation/ci_gate_recovery.rs",
             Via(PASS, "CI-gate recovery pass: audit comment + label swap"),
         ),
@@ -636,6 +644,14 @@ fn daemon_write_paths_are_scoped() {
                 PASS,
                 "orphan-stack pass (#12760): base retarget PATCH, conflict label, flag \
                  comment; its scratch-worktree push (orphan_stack_git.rs) rides the same gate",
+            ),
+        ),
+        (
+            "claim_reconciliation/merged_stack.rs",
+            Via(
+                PASS,
+                "merged-stack pass (#14903): base retarget PATCH and reconcile comments; its \
+                 scratch-worktree push (orphan_stack_git.rs) rides the same gate",
             ),
         ),
         (
@@ -1058,13 +1074,32 @@ fn daemon_write_paths_are_scoped() {
                     "{file} relies on {script} vetting its --repo with loom_write_repo"
                 );
             }
-            OriginResolved(resolver) => {
-                let text = std::fs::read_to_string(src.join(resolver)).unwrap_or_default();
-                let origin = text.find(r#"["remote", "get-url", "origin"]"#);
-                let gh = text.find(r#"["repo", "view""#);
+            OriginResolved(caller) => {
+                // Limit each check to the resolver itself, excluding docs, other
+                // functions and test fixtures that can mention the same commands.
+                fn resolve_repo_body(source: &str) -> &str {
+                    let (_, definition) =
+                        source.split_once("fn resolve_repo(").expect("resolve_repo");
+                    let (_, body) = definition.split_once('{').expect("start of resolve_repo");
+                    let (body, _) = body.split_once("\n}").expect("end of resolve_repo");
+                    body.trim()
+                }
+
+                assert!(matches(file), "stale entry: {file} no longer writes");
+                let cli = std::fs::read_to_string(src.join(caller)).unwrap();
+                assert_eq!(
+                    resolve_repo_body(&cli),
+                    r#"crate::script_helpers::resolve_repo(cwd, "dep.repo_view")"#,
+                    "{file} relies on {caller} delegating to the shared resolver"
+                );
+
+                let shared = std::fs::read_to_string(src.join("script_helpers/mod.rs")).unwrap();
+                let body = resolve_repo_body(&shared);
+                let origin = body.find(r#"["remote", "get-url", "origin"]"#);
+                let fallback = body.find(r#"["repo", "view""#);
                 assert!(
-                    matches(file) && origin.is_some() && gh.is_none_or(|g| origin < Some(g)),
-                    "{file} relies on {resolver} resolving origin before any gh repo view"
+                    matches!((origin, fallback), (Some(origin), Some(fallback)) if origin < fallback),
+                    "{file} relies on the shared resolver checking origin before gh repo view"
                 );
             }
             OperatorOnly(why) | NotAWrite(why) => {

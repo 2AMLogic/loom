@@ -257,8 +257,8 @@ pub use drain_status::{DrainRollStatus, PauseRollStatus, MAX_DRAIN_PENDING_BUDGE
 /// The drain state machine (#4090 … #10831) — see the module doc.
 pub mod drain_state;
 pub use drain_state::{
-    evaluate_drain_tick, AbortOutcome, DrainBegin, DrainDescriptor, DrainOrigin, DrainState,
-    DrainTick, MaintenanceBegin, PauseOwnership, ResumeHold, TookOver,
+    evaluate_drain_tick, AbortOutcome, DispatchHold, DrainBegin, DrainDescriptor, DrainOrigin,
+    DrainState, DrainTick, MaintenanceBegin, PauseOwnership, ResumeHold, TookOver,
 };
 /// `DrainAndRestartDaemon` handling and the drain supervisor — see the module doc.
 pub mod drain_supervisor;
@@ -801,7 +801,9 @@ async fn handle_client(
         // before `handle_request` runs, so the request never reaches the
         // registry/headroom/model-resolution machinery at all.
         if let Request::DispatchSweep { kind, force, .. } = &request {
-            if let Some(refusal) = drain_dispatch_refusal(kind, drain_state.is_draining(), *force) {
+            if let Some(refusal) =
+                drain_dispatch_refusal(kind, &drain_state.dispatch_hold(), *force)
+            {
                 let response_json = serde_json::to_string(&refusal)?;
                 writer.write_all(response_json.as_bytes()).await?;
                 writer.write_all(b"\n").await?;
@@ -1843,8 +1845,7 @@ pub fn build_daemon_status_for(
         // no pool is held, which is the steady state.
         pool_exhaustion_holds: crate::work_finder::pool_preflight::active_hold_statuses(),
         // Live safehouse connection state (#4345) — the pool's shared cell is
-        // updated by the narration sink / completion-dedup tasks
-        // `start_safehouse_narration`/`start_completion_dedup` spawn, and
+        // updated by the merged-PR reporter `start_merge_reporter` spawns, and
         // read back here on every status call (no second connection).
         safehouse: Some(workspace_pool.safehouse_status()),
         // Whether the work-finder loop is enabled for THIS running daemon
@@ -2035,26 +2036,45 @@ fn rate_limit_dispatch_refusal(
 /// through during a drain (e.g. an urgent hotfix) can.
 fn drain_dispatch_refusal(
     kind: &crate::types::SweepKind,
-    is_draining: bool,
+    hold: &DispatchHold,
     force: bool,
 ) -> Option<Response> {
-    if !is_draining || force {
+    if force {
         return None;
     }
-    log::warn!(
-        "dispatch_sweep: refused {kind:?} — an active drain (`restart --drain`) is pausing new \
-         dispatch pending a supervised restart (#4090/#5340). Wait for the drain to finish, \
-         check progress with `loom-daemon status`, cancel it with `loom-daemon restart \
-         --abort-drain` to resume normal dispatch immediately, or re-run with force to \
-         override."
-    );
-    Some(Response::Error {
-        message: "dispatch_sweep refused: an active drain (`restart --drain`) is pausing new \
-             dispatch pending a supervised restart (#4090/#5340). Check progress with \
-             `loom-daemon status`, cancel the drain with `loom-daemon restart --abort-drain` \
-             to resume normal dispatch immediately, or re-run with force to override."
+    // #15300: name the hold's real source. Only a genuine drain mentions
+    // `restart --drain`/`--abort-drain`; a fleet or operator-stop hold must not
+    // advertise remedies that would override (or misdiagnose) it.
+    let message = match hold {
+        DispatchHold::None => return None,
+        DispatchHold::Drain => "dispatch_sweep refused: an active drain (`restart --drain`) is \
+             pausing new dispatch pending a supervised restart (#4090/#5340). Check progress \
+             with `loom-daemon status`, cancel the drain with `loom-daemon restart \
+             --abort-drain` to resume normal dispatch immediately, or re-run with force to \
+             override."
             .to_string(),
-    })
+        DispatchHold::FleetHold(note) => {
+            format!("dispatch_sweep refused: host is paused in the fleet store: {note}")
+        }
+        DispatchHold::OperatorStop(note) => {
+            format!("dispatch_sweep refused: an operator stop is on record: {note}")
+        }
+        DispatchHold::RollResume(note) => {
+            format!("dispatch_sweep refused: dispatch is held while a roll resumes: {note}")
+        }
+    };
+    if matches!(hold, DispatchHold::Drain) {
+        log::warn!(
+            "dispatch_sweep: refused {kind:?} — an active drain (`restart --drain`) is pausing \
+             new dispatch pending a supervised restart (#4090/#5340). Wait for the drain to \
+             finish, check progress with `loom-daemon status`, cancel it with `loom-daemon \
+             restart --abort-drain` to resume normal dispatch immediately, or re-run with force \
+             to override."
+        );
+    } else {
+        log::warn!("dispatch_sweep: refused {kind:?} — {message}");
+    }
+    Some(Response::Error { message })
 }
 
 /// Resolve which per-repo [`SweepRegistry`] a sweep request targets (Issue
@@ -3270,8 +3290,8 @@ fn handle_request(
             //
             // Issue #4466: the two documented child-published topics
             // (`sweep.issue.{N}.phase` / `.blocker`) are upgraded to their
-            // typed variants here so the narration sink can emit the documented
-            // room lines — an `Event::Generic` is never narrated. Unknown
+            // typed variants here so subscribers match the documented
+            // phase/blocker payloads instead of a raw `Event::Generic`. Unknown
             // topics and malformed payloads fall through to `Event::Generic`
             // unchanged (publish is fire-and-forget advisory).
             let topic_ack = topic.clone();

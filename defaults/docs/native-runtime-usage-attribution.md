@@ -13,15 +13,32 @@ and nothing else writes that file, so work dispatched on OpenCode produced **no*
 2026-09-21 GLM-5.3 trial merged 46 PRs whose completions carried nothing
 identifying the model, the provider, or even the runtime.
 
-Two independent fixes, because they fail independently:
+Two independent fixes, because they fail independently. Both ride the run's
+telemetry record: `sweep.outcome` for a sweep, and `role_tick.outcome` for a
+role tick or a step (the same record, with `source = "step"`). The field
+reference for both is [`telemetry-schema.md`](telemetry-schema.md).
 
 1. **Labels.** `runtime` / `provider` / `profile` are now first-class fields on
-   `sweep.outcome`, `role_tick.outcome` and the `completion-v1` meta, read off
-   the launch's own `# LOOM_LAUNCH` record. They carry no token counts, so a
-   completion is identifiable **even when no usage numbers exist anywhere**.
-2. **Numbers.** The per-model token lookup is dispatched on that `runtime`
-   through `loom-daemon/src/usage_source.rs`, so an OpenCode launch reads
-   OpenCode's own session store instead of transcripts it never wrote.
+   `sweep.outcome` and `role_tick.outcome`, read off the launch's own
+   `# LOOM_LAUNCH` record. They are launch facts, not token counts, so an
+   outcome is identifiable **even when no usage numbers exist anywhere**.
+2. **Numbers.** `tokens_by_model` is a separate, **optional** field on the
+   same two records. The per-model token lookup is dispatched on that
+   `runtime` through `loom-daemon/src/usage_source.rs`, so an OpenCode launch
+   reads OpenCode's own session store instead of transcripts it never wrote.
+   When nothing attributable is found the field is omitted — never `[]`, never
+   a fabricated `0` — and the three labels, which do not depend on it, are
+   unaffected.
+
+**The Safehouse room is not a source for either.** The `completion-v1`
+envelope is **historical**: until #13946 retired the narration sink, that
+envelope's `meta` repeated the same three launch labels and its own optional
+`tokens_by_model`, so an older fleet-feed record may still carry them.
+Nothing writes it now. A merge reaches the room only as a `chat` line,
+`merged ✓ owner/repo#N · <title> · <url>`, which names the merged PR by
+repository, number, optional title (dropped when the PR has none) and URL
+and carries no runtime, provider, profile or token usage — see
+[`safehouse.md` → What gets reported](safehouse.md#what-gets-reported).
 
 ## Where each value comes from
 
@@ -67,8 +84,11 @@ caller-supplied set) plus the caller's wall-clock window:
   names any — OpenCode's event stream carries `sessionID` on every event and
   Codex prints a `session id: <uuid>` banner, both captured in the step's
   per-item log. For OpenCode the id is the whole key (no directory, no window:
-  it cannot name another launch's session); the Codex arm still ANDs the
-  workspace directory and window on top of the ids. This is what separates two concurrent
+  it cannot name another launch's session); the Codex arm
+  (`codex_usage::lookup_ids`) keys on id + window with no directory (#14540 —
+  deliberately no directory retry, which could fold a sibling launch's spend
+  into this one). The merged-PR join below is a different key: id alone, no
+  window (#14883). This is what separates two concurrent
   same-role steps dispatched in one workspace. No ids in the log (a Claude
   step, an unreadable log, a Kimi launch) falls back to directory+window on
   the workspace root, the role-tick key.
@@ -81,9 +101,17 @@ zero-token badge for a model that was never called.
 workspace root, so directory+window would fold in whichever neighbouring session
 overlapped. A step's log (`.loom/logs/step-<role>-<item>.log`) captures the
 launch's native JSON event stream, whose events carry a top-level
-`"sessionID":"ses_…"`; a step-dispatched completion reads exactly those sessions
-(`opencode_usage::tokens_by_session_ids`) and sums them with the Claude
-transcripts of the same PR's Judge/Doctor/`champion --pr` steps. **Builder
+`"sessionID":"ses_…"`, and a Codex launch prints a `session id: <uuid>` banner
+in the same log. A step-dispatched completion sums **three** sources (#14883),
+because the steps of one PR can run on different runtimes (an OpenCode Builder,
+a Claude Judge, a Codex Doctor): the Claude transcripts of the same PR's
+Judge/Doctor/`champion --pr` steps; the OpenCode sessions named by the log's
+`sessionID`s (`opencode_usage::tokens_by_session_ids`); and the Codex rollouts
+named by the banners (`codex_usage::tokens_by_session_ids`). The OpenCode and
+Codex reads are by exact id — no directory, no window: the OpenCode store's
+`directory` is shared repo-wide, a Codex rollout's `cwd` is container-local on
+a private-clone seat (#14540), and a Builder rollout can start before the PR's
+`createdAt`, so the merge window must not bound it. **Builder
 retries vs. PR rounds (#14210).** Step logs are append-mode, with one
 `==== loom-daemon dispatch:` region per dispatch, and the two keyings mean
 different things. The Builder log is keyed by *issue*: an earlier region is an
@@ -93,8 +121,10 @@ Claude side drops it too), so only the **last** region
 `champion_merge` logs are keyed by *PR*: an earlier region is a completed round on
 this PR (e.g. a Doctor run after a changes-requested verdict), inside the Claude
 side's `(PR createdAt, mergedAt)` window, so **every** region counts
-(`launch_record::opencode_session_ids`) — the same stance as the Claude side. A
-Builder log with no dispatch header is read whole. The published
+(`launch_record::opencode_session_ids`) — the same stance as the Claude side.
+Codex banners take the same split (`launch_record::codex_session_ids_last_dispatch`
+vs `launch_record::codex_session_ids`, #14883); a Builder log with no dispatch
+header is read whole. The published
 `runtime`/`provider`/`profile` come from the first step log present on the
 narrating host (Builder, else Doctor, Judge, `champion_merge`). Steps that ran
 on another host left nothing here, so the total stays partial until the

@@ -42,7 +42,10 @@
 //! An unchanged PR therefore gets at most [`MAX_PER_WINDOW`] Judge runs per
 //! window. A push (new head), or a change to the PR's `loom:*` label *set*
 //! (new digest), releases the hold at once, because the old records no longer
-//! match. Removing and re-adding the same label leaves the set — and the hold —
+//! match; so does the operator verb `lease pr backstop-clear` (#15096), which
+//! rewrites the records themselves to `verdict=cleared` — the release for a
+//! hold whose cause (a runtime fault, say) is fixed without touching the PR.
+//! Removing and re-adding the same label leaves the set — and the hold —
 //! unchanged: to force a re-review of an unchanged PR, push, or run the Judge
 //! with [`DISABLE_ENV`]`=0`. A pass whose head still has a check run in
 //! progress that started within [`PENDING_EXEMPT_HOURS`], or a legacy commit
@@ -421,6 +424,45 @@ pub fn parse(body: &str) -> Option<NoVerdict> {
         labels: field("labels")?.to_string(),
         refused: field("refused").map(str::to_string),
     })
+}
+
+/// The rewrite `lease pr backstop-clear` makes to a no-verdict record
+/// (#15096): the first line's `verdict=none` token becomes `verdict=cleared`
+/// and nothing else changes — the whole first line and the body below it are
+/// kept byte-for-byte, so the audit trail (`head=`, `labels=`, `reaped=`,
+/// `refused=`) survives. [`parse`] answers `None` for the rewrite, which is
+/// the point: every hold reader stops seeing the record. `None` unless
+/// [`parse`] saw one (a plain release, an already-cleared record and a
+/// non-Judge marker are all left alone).
+#[must_use]
+pub fn clear_record(body: &str) -> Option<String> {
+    parse(body)?;
+    let mut lines = body.lines();
+    let first = lines.next()?;
+    let mut cleared = String::with_capacity(body.len() + 4);
+    let mut swapped = false;
+    for (i, token) in first.split(' ').enumerate() {
+        if i > 0 {
+            cleared.push(' ');
+        }
+        if token == "verdict=none" {
+            cleared.push_str("verdict=cleared");
+            swapped = true;
+        } else {
+            cleared.push_str(token);
+        }
+    }
+    if !swapped {
+        return None;
+    }
+    for line in lines {
+        cleared.push('\n');
+        cleared.push_str(line);
+    }
+    if body.ends_with('\n') {
+        cleared.push('\n');
+    }
+    Some(cleared)
 }
 
 /// When the hold on a PR at `head` with label digest `digest` ends, given its

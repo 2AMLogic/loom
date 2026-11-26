@@ -1,9 +1,7 @@
 //! `message.id` dedupe regression tests (issue #8186, fixed by #9303).
 
 use super::*;
-use crate::script_helpers::sweep_experiment::{
-    sum_transcript_usage, sum_transcript_usage_by_model,
-};
+use crate::script_helpers::sweep_experiment::sum_transcript_usage;
 
 /// One streamed assistant message written as three chunks that share
 /// `msg_A` (identical cumulative usage, as measured on real transcripts), a
@@ -55,7 +53,9 @@ fn both_shared_readers_dedupe_and_still_reconcile() {
     let path = dir.path().join("agent-x.jsonl");
     std::fs::write(&path, streamed_transcript()).unwrap();
 
-    let rows = sum_transcript_usage_by_model(&path);
+    let mut fold = UsageFold::default();
+    fold.add_text(&std::fs::read_to_string(&path).unwrap());
+    let rows = fold.rows();
     let grouped: i64 = rows
         .iter()
         .map(|r| r.input + r.output + r.cache_read + r.cache_write_5m + r.cache_write_1h)

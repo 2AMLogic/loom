@@ -1,10 +1,13 @@
-//! Small filesystem/formatting helpers shared by the reclaim and GC modules
-//! (`target_dir_gc`, `tmpfs_reclaim`, `scratch_reclaim`, `git_tmp_reclaim`,
-//! `docker_image_clean`, `target_orphan_reclaim`).
+//! Small filesystem/formatting helpers shared across the crate: the reclaim
+//! and GC modules (`target_dir_gc`, `tmpfs_reclaim`, `scratch_reclaim`,
+//! `git_tmp_reclaim`, `docker_image_clean`, `target_orphan_reclaim`) and, since
+//! issue #15372, the one `~`-expansion convention every pool and forge path
+//! resolver delegates to ([`expand_tilde_with_home`]).
 
+use std::ffi::OsStr;
 use std::fs;
 use std::io::{self, Write as _};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, Utc};
 
@@ -131,18 +134,50 @@ fn mtime_of(meta: &fs::Metadata) -> DateTime<Utc> {
 /// bit set? On non-unix targets, any regular file qualifies.
 #[must_use]
 pub fn is_executable(path: &Path) -> bool {
-    let Ok(meta) = fs::metadata(path) else {
-        return false;
-    };
+    check_executable(path).is_ok()
+}
+
+/// Like `is_executable`, retaining the failure kind for startup diagnostics.
+pub(crate) fn check_executable(path: &Path) -> io::Result<()> {
+    let meta = fs::metadata(path)?;
+    if !meta.is_file() {
+        return Err(io::ErrorKind::PermissionDenied.into());
+    }
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt as _;
-        meta.is_file() && meta.permissions().mode() & 0o111 != 0
+        if meta.permissions().mode() & 0o111 == 0 {
+            return Err(io::ErrorKind::PermissionDenied.into());
+        }
     }
-    #[cfg(not(unix))]
-    {
-        meta.is_file()
-    }
+    Ok(())
+}
+
+/// Find `name` as an executable file in `search_path` (a `$PATH`-shaped
+/// `OsStr`), returning the first matching candidate. Mirrors a shell's
+/// `command -v` lookup without spawning one: the first directory holding a
+/// regular file (symlinks followed) with any execute bit set wins, so a
+/// non-executable stub earlier in the path cannot shadow a real executable
+/// further on. [`find_executable_on_path`] is the process-`$PATH` form.
+#[must_use]
+pub fn find_executable_in(name: &str, search_path: &OsStr) -> Option<PathBuf> {
+    std::env::split_paths(search_path)
+        .map(|dir| dir.join(name))
+        .find(|candidate| is_executable(candidate))
+}
+
+/// [`find_executable_in`] against the process `$PATH`: `None` when `$PATH` is
+/// unset or nothing resolves to an executable file.
+#[must_use]
+pub fn find_executable_on_path(name: &str) -> Option<PathBuf> {
+    std::env::var_os("PATH").and_then(|paths| find_executable_in(name, &paths))
+}
+
+/// Whether `name` resolves to an executable file on the process `$PATH` —
+/// `command -v <name>` without the shell.
+#[must_use]
+pub fn is_on_path(name: &str) -> bool {
+    find_executable_on_path(name).is_some()
 }
 
 /// Keep only the last `max` bytes of captured output, snapped forward to a
@@ -158,6 +193,41 @@ pub fn truncate_tail(s: &str, max: usize) -> String {
         .find(|&i| s.is_char_boundary(i))
         .unwrap_or(s.len());
     s[start..].trim().to_string()
+}
+
+/// Expand a leading tilde in `raw` against an explicit, optional home.
+///
+/// `~` resolves to the home itself and `~/rest` to `home/rest`; any other
+/// input — `~other/key`, a plain relative, an absolute path — and every input
+/// when no home is available is returned verbatim, so the caller's own
+/// validation still sees exactly what was configured (issue #15372: this is
+/// the one shared implementation the credential pools, fleet roster and
+/// forge identity used to carry as per-module copies).
+///
+/// The home *source* stays the caller's decision: `dirs::home_dir()`
+/// ([`expand_tilde`]), an env var read, or a value injected by a test — sites
+/// that must not fall back to OS account discovery pass their own lookup's
+/// result and get `None`-preserving behavior for free.
+#[must_use]
+pub(crate) fn expand_tilde_with_home(raw: &str, home: Option<&Path>) -> PathBuf {
+    if let Some(rest) = raw.strip_prefix("~/") {
+        if let Some(home) = home {
+            return home.join(rest);
+        }
+    } else if raw == "~" {
+        if let Some(home) = home {
+            return home.to_path_buf();
+        }
+    }
+    PathBuf::from(raw)
+}
+
+/// [`expand_tilde_with_home`] with the home from `dirs::home_dir()`: the
+/// form the credential pools use, where a discoverable account home is an
+/// acceptable substitute for `$HOME`.
+#[must_use]
+pub(crate) fn expand_tilde(raw: &str) -> PathBuf {
+    expand_tilde_with_home(raw, dirs::home_dir().as_deref())
 }
 
 #[cfg(test)]
@@ -188,6 +258,50 @@ mod tests {
             fs::set_permissions(&f, fs::Permissions::from_mode(0o755)).unwrap();
             assert!(is_executable(&f));
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn find_executable_in_skips_non_executable_shadows_and_directories() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let td = tempfile::tempdir().unwrap();
+        let early = td.path().join("early");
+        let late = td.path().join("late");
+        let dir_collision = td.path().join("collision");
+        for d in [&early, &late, &dir_collision.join("tool")] {
+            fs::create_dir_all(d).unwrap();
+        }
+
+        // A non-executable regular file earlier on the path must not shadow
+        // the real executable further on.
+        fs::write(early.join("tool"), b"stub").unwrap();
+        let real = late.join("tool");
+        fs::write(&real, b"#!/bin/sh\n").unwrap();
+        fs::set_permissions(&real, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let joined = std::env::join_paths([&early, &late]).expect("join_paths of two temp dirs");
+        assert_eq!(find_executable_in("tool", &joined), Some(real.clone()));
+
+        // Without the executable further on, nothing resolves at all.
+        let only_early = std::env::join_paths([&early]).unwrap();
+        assert_eq!(find_executable_in("tool", &only_early), None);
+        // A directory named like the tool is not a candidate either.
+        let only_collision = std::env::join_paths([&dir_collision]).unwrap();
+        assert_eq!(find_executable_in("tool", &only_collision), None);
+        // An empty search path finds nothing.
+        let empty = std::env::join_paths(std::iter::empty::<&Path>()).unwrap();
+        assert_eq!(find_executable_in("tool", &empty), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn is_on_path_matches_the_shared_lookup() {
+        // `sh` exists on every supported host; the bool form must agree with
+        // the resolving form on the same process `$PATH`.
+        assert_eq!(is_on_path("sh"), find_executable_on_path("sh").is_some());
+        assert!(is_on_path("sh"), "sh must resolve on a supported host's PATH");
+        assert!(!is_on_path("definitely-not-a-real-tool-loom-fs-util"));
     }
 
     #[test]
@@ -246,5 +360,46 @@ mod tests {
         let q = td.path().join("public");
         write_atomic(&q, b"x", AtomicOpts::default()).unwrap();
         assert_eq!(fs::metadata(&q).unwrap().permissions().mode() & 0o777, 0o644);
+    }
+
+    #[test]
+    fn expand_tilde_with_home_covers_the_tilde_forms() {
+        // The full-form callers (pools, monitor dir, roster root): a bare `~`
+        // is the home, `~/rest` joins under it, anything else passes through.
+        let home = Path::new("/home/tester");
+        let cases: &[(&str, &str)] = &[
+            ("~", "/home/tester"),
+            ("~/key", "/home/tester/key"),
+            ("~other/key", "~other/key"),
+            ("plain", "plain"),
+            ("./rel", "./rel"),
+            ("/abs/key", "/abs/key"),
+        ];
+        for (raw, want) in cases {
+            assert_eq!(
+                expand_tilde_with_home(raw, Some(home)),
+                PathBuf::from(*want),
+                "raw = {raw}"
+            );
+        }
+    }
+
+    #[test]
+    fn expand_tilde_without_a_home_returns_the_input_verbatim() {
+        for raw in ["~", "~/key", "~other/key", "plain", "/abs"] {
+            assert_eq!(expand_tilde_with_home(raw, None), PathBuf::from(raw));
+        }
+    }
+
+    #[test]
+    fn expand_tilde_delegates_to_dirs_home_dir() {
+        // Only the pass-through arm is host-independent enough to pin here;
+        // the tilde arms are [`expand_tilde_with_home`]'s table above.
+        assert_eq!(expand_tilde("plain"), PathBuf::from("plain"));
+        assert_eq!(
+            expand_tilde("/abs/key"),
+            PathBuf::from("/abs/key"),
+            "an absolute path must never be rewritten"
+        );
     }
 }

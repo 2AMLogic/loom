@@ -28,6 +28,13 @@ pub const CLAUDE_SESSION_ENV: &str = "LOOM_CLAUDE_SESSION_ID";
 pub const RESUME_SESSION_ENV: &str = "LOOM_RESUME_SESSION_ID";
 /// The prompt a resumed session is given (built by [`resume_prompt`]).
 pub const RESUME_PROMPT_ENV: &str = "LOOM_RESUME_PROMPT";
+/// The Claude account a resume must run in (#14981): `spawn-claude.sh` passes
+/// it to `tokens select --pin-account` and refuses the launch (78) rather than
+/// run in another account, whose config dir does not hold the transcript.
+pub const RESUME_ACCOUNT_ENV: &str = "LOOM_RESUME_ACCOUNT";
+/// The session store (the seat's `CLAUDE_CONFIG_DIR`) the resumed transcript
+/// lives in (#14981); `spawn-claude.sh` refuses a launch whose seat is not it.
+pub const RESUME_STORE_ENV: &str = "LOOM_RESUME_SESSION_STORE";
 /// Where a spawn script writes the live-captured handle (Codex).
 pub const HANDLE_FILE_ENV: &str = "LOOM_RESUME_HANDLE_FILE";
 /// The systemd scope unit name the daemon assigns to an agent.
@@ -182,16 +189,14 @@ pub fn read_handle(path: &Path) -> Option<CapturedHandle> {
     serde_json::from_str(&std::fs::read_to_string(path).ok()?).ok()
 }
 
-/// The first `session id: <uuid>` in a Codex stderr capture.
+/// The first `session id: <uuid>` in a Codex stderr capture: a line that IS
+/// the banner ([`crate::usage_source::codex_session_banner`]'s line-anchored
+/// rule, shared by every Codex banner reader) carrying a uuid-shaped id
+/// ([`valid_session_id`]).
 #[must_use]
 pub fn parse_codex_session_id(text: &str) -> Option<String> {
     text.lines().find_map(|line| {
-        let rest = line.split("session id:").nth(1)?.trim();
-        let id: String = rest
-            .chars()
-            .take_while(|c| c.is_ascii_hexdigit() || *c == '-')
-            .collect();
-        valid_session_id(&id).then_some(id)
+        crate::usage_source::codex_session_banner(line).filter(|id| valid_session_id(id))
     })
 }
 

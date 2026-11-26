@@ -218,6 +218,146 @@ capabilities honestly (`"partial"` where a real, if incomplete, mechanism
 exists; `"yes"` only where it is fully proven). Promotion is a manifest edit
 plus the missing artifacts, not a rewrite of the adapter shape.
 
+#### The pooled tier-3 pilot: Google Antigravity (`agy`, #14945)
+
+`agy` is a tier-3 adapter with one extra manifest-declared obligation: its
+launch **must** draw its credential from the API-key account pool. It is the
+second route of the Gemini pilot (2AMLogic/2am `docs/llm-policy.md` rule 6;
+OpenCode's `quick-flash` profile is the first), and the account's
+`maxConcurrent` cap — shared with OpenCode through the same `gemini`
+namespace — is the pilot's spend control.
+
+Top-level manifest keys (validated by `loom-daemon`, fail-closed at exit 78
+on a malformed declaration):
+
+| Key | Meaning |
+|---|---|
+| `credentialPool` | API-key pool namespace (`gemini`); shared with every tap that names it. |
+| `credentialEnv` | The child variable a pooled account supplies (`GEMINI_API_KEY`). |
+| `model` | Default model (`gemini-4-neon`, the 2026-11-22 canary's); `LOOM_MODEL` overrides it and is passed to the CLI exactly once via `launch.modelFlag`. |
+
+The launch semantics differ from every other tier-3 runtime in exactly one
+way: **the pool is mandatory**. `loom-daemon spawn-worker` selects the
+account in the worker process (so the in-flight lease is counted against the
+PID that becomes the CLI run) and injects the key into the child environment
+only. A missing, unreadable, disabled, exhausted or at-cap pool refuses the
+launch at 78 **before the CLI runs — including when an ambient
+`GEMINI_API_KEY` or a cached Google login exists**: an ambient key never
+reaches the child (the pool's selection replaces it), and the adapter's
+per-launch isolated `HOME` (a fresh `mktemp -d` holding the settings file
+that selects the gemini provider and pins the permission policy described
+below) keeps the CLI away from any stored session. The `# LOOM_LAUNCH`
+record names the account, never the key.
+At draw time the availability walk composes the binary gate with the shared
+pool check and reports `api_keys:gemini` — the same source a native tap on
+the namespace reports — so `hold_pool_slot` reserves either route against
+the one cap.
+
+- **Supported roles**: read-only roles with no `runtimeRequirements`
+  (Curator, Guide, Auditor). Builder and Doctor (worktreeIsolation +
+  loomControl) and Judge (loomControl) are refused by the manifest's
+  all-`"no"` capabilities, by the same mechanism as every other tier-3
+  runtime.
+- **Pilot invocation**: `LOOM_RUNTIME=agy .loom/scripts/spawn-worker.sh -p
+  "<prompt>"`, or a `runtimes.preference` / role-draw entry naming `agy`.
+- **Version pin**: a pin is a **recorded build** — the archive URL and the
+  release manifest's `sha512` for one build — because the vendor channel is
+  latest-only: the installer takes only `--dir` and installs whatever the
+  unversioned manifest names, the release bucket refuses anonymous listing,
+  and nothing vendor-published names a version for `agy update`. Recorded
+  and verified on linux-x64 with adapter `d83809d46` (#15059, 2026-11-26):
+  `agy --version` → `1.5.18`, archive
+  `https://storage.googleapis.com/antigravity-public/antigravity-cli/1.5.18-6386224290725888/linux-x64/cli_linux_x64.tar.gz`,
+  manifest `sha512`
+  `ef379ec869719112f696e8c7cfddf776618712e58fc38e53df80801d6528abb4677782c7c8778f9c09c9123fa44c2c32675d228c06f2a8f7a8f4214e75f5bb26`.
+  The canary's `1.5.14` has no recorded URL or checksum and no
+  vendor-published way to fetch it, so it is **not a reproducible pin**, and
+  nothing below was verified on it. Record a build's URL and `sha512` when
+  you pin it; the adapter never updates or re-downloads the CLI itself.
+- **Background self-update (#15474)** — `spawn-agy.sh` exports
+  `AGY_CLI_DISABLE_AUTO_UPDATE=true` for the child when the variable is
+  unset or empty. A non-empty value from the worker environment wins.
+  At the tested revision (`d83809d46`) the adapter only inherited the
+  variable, and a launch from a clean environment started the updater.
+
+  Three keyless runs of `1.5.18` distinguished updater suppression from its
+  15-minute debounce. Each exited 1. The CLI log identified what happened:
+
+  | Environment | CLI log | Observed effect |
+  |---|---|---|
+  | Fresh HOME, variable unset | `Spawned background update process` | A `--bg-updater` child wrote `updater/update.lock`, `updater/update_status.json` and `last_check.timestamp` under `~/.gemini/antigravity-cli/` and made one TLS connection to the vendor updater. |
+  | Same HOME 61 seconds later, variable unset | `Last check was less than 15 minutes ago, skipping update (fast path)` | The earlier files stayed unchanged. No updater child or updater connection appeared. |
+  | Fresh HOME, variable set to `true` | `Auto-update disabled via environment variable AGY_CLI_DISABLE_AUTO_UPDATE` | No updater child, updater files or updater connection appeared. |
+
+  The TLS connection went to
+  `antigravity-cli-auto-updater-974169037036.us-central1.run.app`. Treat the
+  `1.5.14` canary's updater as enabled until a run establishes otherwise.
+  [Recorded observations on #15059](https://github.com/2AMLogic/loom/issues/15059#issuecomment-7198012068)
+- **CLI flags** — On `1.5.18`, `--settings` honored both an inline JSON
+  object and a file path outside HOME. At `d83809d46` the adapter's settings
+  file was reachable only through the flag. In each case, selecting the Gemini
+  provider produced the expected missing-key diagnostic. The verification
+  host also logged `Terminal sandbox unavailable: AppArmor restricts
+  unprivileged user namespaces`. The vendor documents a fallback to the
+  default mode when the terminal sandbox is unavailable. The effective
+  mode on that host still needs a pooled run.
+- **Permission policy (#15474)** — `--sandbox` is terminal containment, not a
+  permission policy. Since v1.5.7 a headless run starts in `auto` mode
+  wherever that mode is available, where workspace file edits and sandboxed
+  commands run without approval, and an approval that headless mode cannot
+  give is a soft denial that still exits 0. The adapter therefore pins the
+  policy in the per-launch settings file and launches with
+  `--settings <that file> --sandbox`:
+
+  ```json
+  {
+    "modelProvider": "gemini",
+    "agentMode": "",
+    "toolPermission": "request-review",
+    "permissions": {
+      "allow": ["read_file(<workspace>)"],
+      "deny": ["write_file(*)", "command(*)", "mcp(*)"]
+    }
+  }
+  ```
+
+  The default execution mode and `request-review` are set explicitly, and
+  the vendor documents explicit rules as taking precedence over the mode,
+  with deny over ask over allow. The adapter writes the file to both the
+  `--settings` path and the CLI's documented default location under the isolated HOME
+  (`~/.gemini/antigravity-cli/settings.json`), so both paths supply the same
+  policy. The adapter screens `LOOM_GENERIC_EXTRA_ARGS` and the worker's own
+  arguments. A `--settings`, `--mode`,
+  `--dangerously-skip-permissions` (other than the bare form the tier-3
+  template consumes from the worker's argv) or `--sandbox` with any value but
+  `true` refuses the launch at 78 before anything is created or run. Every
+  other token follows the guarded argv, ahead of the model and the prompt; a
+  bare `--sandbox` in an override is dropped as a duplicate.
+- **Offline policy checks** — The `agy` tests in
+  `loom-daemon/tests/worker_spawn_api_keys.rs` check the argv, both settings
+  files and refusals against a fake CLI. The adapter leaves
+  `trustedWorkspaces` empty because a trusted workspace can supply hooks,
+  plugins and MCP configuration. A guarded read in an untrusted workspace
+  and both write denials still need live verification on the pinned build.
+- An on-disk `.loom/runtimes/agy.json` overrides the manifest without
+  recompiling.
+- **Effort is not mapped** — `agy models` lists `-low/medium/high/xhigh`
+  model variants an operator can pass through explicitly (the canary's
+  listing; key-less on `1.5.18` the subcommand refuses without a sign-in).
+  The canary's bare `gemini-4-neon` resolved with an undisclosed effort:
+  unknown.
+- **Live verification status** (#15059, 2026-11-26): the version, the
+  `--settings` argument and the updater control are verified on `1.5.18`
+  without a model call. The pooled launch was attempted through
+  `.loom/scripts/spawn-worker.sh` and refused at 78 (`stage=credential`)
+  because the verification host's `gemini` pool held one account,
+  bad-marked exhausted, so no `agy` process ran. Still open: everything on
+  `1.5.14`, `gemini-4-neon` resolving through the pool (key-less the CLI
+  logged `Model ID gemini-4-neon not in local config`), a guarded read, the
+  file-edit and shell-write denials with before/after fixture digests, and
+  updater suppression inside a pooled `spawn-worker` launch. Run those checks
+  with the policy shipped for #15474. Until then, treat `agy` as write-capable.
+
 ## The seven contract points
 
 Every runtime adapter implements the same seven-point contract. Each point below
@@ -1417,6 +1557,110 @@ Only native runtimes (`pi`, `opencode`, `kimi`) are checked, and only when the
 profile declares a provider for that harness. `loom-daemon validate` rejects an
 `excludedRoles` entry that is not a known role name.
 
+**Changing a bundled profile's model without a release (`runtimes.modelProfileOverrides`, #15252).**
+`runtimes.modelProfiles.<name>` *replaces* a bundled profile wholesale, so a copy
+that omits `excludedRoles` silently admits GLM to Judge and Curator (#11450).
+To change only what a bundled profile runs, overlay it instead:
+
+```jsonc
+"runtimes": { "modelProfileOverrides": { "zai-full": { "model": "glm-5.4" } } }
+```
+
+- The override is merged **onto** the bundled profile inside `profiles::lookup`,
+  so every launch, admission, billing and inspection path sees it. Providers,
+  credentials, `credentialProxy`, `providerOptions`/`providerDefinition`,
+  `billing` and `excludedRoles` always come from the bundled definition.
+- Allowed keys: `model`, `effort`, `allowedEfforts` (each replaces the bundled
+  value) and `excludedRolesAdd` (a list of known role names, **unioned** onto the
+  bundled `excludedRoles`, deduplicated by canonical role). `excludedRoles` itself
+  can never be replaced or reduced. `{}` is a valid no-op.
+- Rejected by `loom-daemon validate` **and** at launch (exit 78, so a bad store
+  config cannot half-apply): an unknown key (including `excludedRoles`), a name
+  that is not bundled, a name also defined under `runtimes.modelProfiles`, a
+  blank/non-string `model`/`effort`/`allowedEfforts` entry, and an unknown or
+  non-array `excludedRolesAdd`. Explicit `null` (a profile or a field) is "absent".
+- Works at every config tier and layers by `deep_merge`, so a host-tier override
+  (`fleet/hosts/<host>/defaults.json`, `.loom-local/local.json`) beats the fleet
+  default key by key, and a higher tier's `null` clears a lower tier's value. A
+  per-host override is therefore a canary: put the new model on one host, compare,
+  then promote it to the fleet defaults.
+- `loom-daemon worker profile-check <name>` prints the effective model and the
+  tier that decided it: `model: glm-5.4 (source: defaults)`. The source is
+  `local`, `fleet-repo`, `project`, `committed`, `defaults` (the rendered machine
+  tier) or `bundled` (no override). A `runtimes.modelProfiles` replacement reports
+  the tier it came from the same way.
+
+This is the sanctioned way to change a fleet-wide model: the fleet store must not
+define its own GLM profile under `runtimes.modelProfiles` (that is the #11450
+loophole), and uses this overlay instead.
+
+**Prompt modifier for a single-step run (`LOOM_PROMPT_MODIFIER`, #15017).** A caller
+that runs exactly one step can name a registered modifier, next to the
+`LOOM_RUNTIME` / `LOOM_MODEL_PROFILE` / `LOOM_EFFORT` pins above, so the run is
+distinguishable afterwards from a plain one. Off by default: unset (or blank) changes
+nothing, and nothing about the role draw or fleet dispatch changes.
+
+```json
+{ "runtimes": { "promptModifiers": {
+    "deep": { "claude": { "append": "ultrathink" }, "pi": { "append": "think hard" } }
+} } }
+```
+
+- **Registry.** `runtimes.promptModifiers.<name>.<runtime>.append` is the text added
+  after the prompt (after a blank line). Loom hard-codes no names: the caller owns
+  what each name means per harness. Only `append` exists: text *before* the prompt
+  would stop a `/loom:<role>` invocation from expanding. A name is 1-64 bytes of
+  `[A-Za-z0-9._:-]`.
+- **One application site per runtime kind**, both in `spawn-worker`
+  (`loom-daemon/src/worker_spawn/mod.rs`), never a role file: a legacy adapter
+  (`claude`, `codex`, ...) gets the modified `-p` / `--prompt` value in the argv it is
+  exec'd with; a native harness (`pi`, `opencode`, `kimi`) gets it after the expanded
+  role prompt, on its stdin.
+- **Fails closed at preflight.** A name that is malformed, not registered, or
+  registered but with no entry for the launch's runtime is refused with exit 78 and
+  `stage=prompt_modifier` (`loom.admission.stage` on the preflight span, ledger
+  reason `preflight_prompt_modifier`). So is a legacy adapter (`claude`, `codex`,
+  ...) paired with an argv that has no `-p` / `--prompt` to modify. A native
+  harness (`pi`, `opencode`, `kimi`) refuses a missing `--prompt` earlier still,
+  at `stage=worker_options` (ledger reason `preflight_worker_options`). Either way
+  it never runs plain under the modifier's name.
+- **Recorded.** `loom.prompt_modifier` is stamped like the other provenance keys,
+  so it is on `loom.dispatch.step`, `loom.role_attempt` and `loom.runtime.usage`
+  (and the other spans of that process), and is absent when no modifier is set. It is
+  also folded into `loom.hyperparams.digest`: two runs that differ only in the
+  modifier have different digests, and an unmodified run's digest is unchanged.
+
+Observed (`loom-daemon hyperparams`, same workspace, default vector; the second and
+third lines differ only in the modifier):
+
+```text
+$ loom-daemon hyperparams .
+digest: sha256:b5d41c0d0b7846806d6e697571e03b0c30376406b632dbcd437a8119f413656c
+$ LOOM_PROMPT_MODIFIER=deep loom-daemon hyperparams .
+digest: sha256:d06bfbfcc70c46ec3eacbd3286d2810dfacaca3f668a1e463c763ba23c854e87
+promptModifier                 = deep  [env]
+$ LOOM_PROMPT_MODIFIER=wide loom-daemon hyperparams .
+digest: sha256:832a0bf534ba97d5eb05d8efbdd5725809de4ba542c8e4db62bbc212dca8dc8b
+promptModifier                 = wide  [env]
+```
+
+and an unsupported (runtime, modifier) pair, with the registry above and
+`LOOM_RUNTIME=codex`:
+
+```text
+$ LOOM_RUNTIME=codex LOOM_PROMPT_MODIFIER=deep loom-daemon spawn-worker -- -p hello
+spawn-worker: runtime=codex (from global-environment)
+# LOOM_RUNTIME_RESOLVED runtime=codex
+prompt modifier "deep" has no entry for runtime "codex" under runtimes.promptModifiers.deep; refusing to run without it (#15017)
+# LOOM_LAUNCH_REJECTED code=78 stage=prompt_modifier
+$ echo $?
+78
+```
+
+Not covered here: which modifier names exist and what each does per harness (the
+caller's registry), and multi-agent usage accounting beyond what the runtime already
+reports.
+
 **GLM-first Builder and Doctor (fleet policy, tier 1).** The routing comes
 from the fleet state store `config.defaults`, rendered into each host's machine tier
 (`~/.local/share/loom/config/defaults.json`), not from this repo's
@@ -1518,7 +1762,8 @@ so the launch record shows the real runtime and model profile. A `claude`
 resolution prints `outcome=delegate-to-claude` and exits 0 without launching.
 Exit codes: 0 artifact, 1 no artifact, 2 usage (Judge/Curator refused),
 75 no eligible runtime/seat, 78 config, 124 timeout. The `/loom:sweep`
-orchestrator calls it before Builder/Doctor Task dispatch; see
+orchestrator calls it before Builder/Doctor Task dispatch only when it is a daemon-dispatched child
+(`LOOM_SWEEP_CLAIM_OWNED` / `--claim-owned`); an attended in-session sweep skips it (#15299); see
 `native-sweep.md` and `sweep-execution-model.md`.
 
 Because a phase can outlast the Bash tool cap (120s default / 600s max), the
@@ -1784,8 +2029,10 @@ unknown to known did not weaken this guard for other names.)
 
 Containers as a session-persistence and containment boundary for worker
 runtimes — per-account persistent session containers for runtimes with
-mutable interactive auth (Codex), per-sweep ephemeral containers for
-stateless-auth runtimes (Claude, Pi/OpenCode) — are specified in
+mutable interactive auth (Codex) and, opt-in per account, for Claude
+([below](#claude-per-seat-session-containers-issue-14371)); per-sweep
+ephemeral containers for stateless-auth runtimes (Claude by default,
+Pi/OpenCode) — are specified in
 [ADR-0017: Session-Container Architecture](https://github.com/2AMLogic/loom/blob/main/docs/adr/0017-session-container-architecture.md)
 (epic #6896). Both container lifetimes dispatch through the existing
 `spawn-worker.sh` → `spawn-<runtime>.sh` seam described above with **no new
@@ -1795,8 +2042,82 @@ This is a pointer only — no contract-point changes ship with it.
 | Runtime | Lifetime | Image | Enable with | Telemetry `containment=` |
 |---|---|---|---|---|
 | Claude | per-sweep **ephemeral** | `ghcr.io/2amlogic/loom-worker` | `runtimes.containment.enabled: true` (#7429) | `claude-ephemeral` |
+| Claude | per-seat **persistent session** (opt-in per account) | `ghcr.io/2amlogic/loom-worker-session` (or the `accounts.session.image` override, #14019) | `loom-daemon accounts session start <name> --provider claude` (#14371) | `claude-session` |
 | Codex | per-account **persistent session** | `ghcr.io/2amlogic/loom-worker-session` | ADR-0017 Phase 2 | — |
 | Pi, OpenCode | per-sweep **ephemeral** | `ghcr.io/2amlogic/loom-worker-native` | `runtimes.containment.native: "ephemeral"` (#8403) | `native-ephemeral` |
+
+#### Claude per-seat session containers (issue #14371)
+
+The operator ruled that every runtime's steps may run in one
+operator-built session image with **one login per container**. For Claude that
+is a *seat*: a Claude token-pool account whose persistent container
+`loom-claude-session-<name>` is managed like Codex's `loom-codex-session-<name>`
+and started from the same session image. It is a second **opt-in** shape beside
+`claude-ephemeral`, not a replacement, and it adds no dispatch path.
+
+**How a step reaches a seat.** `spawn-claude.sh` runs the existing token
+selector first (bad-token skipping, `.ranking`, `.allowlist`, then random). Only
+if the *selected* account is a registered seat does it `exec`
+`loom-daemon session-exec claude-seat`, which runs `spawn-claude.sh` inside that
+seat's container through the same supervised `docker exec` transport Codex uses.
+So seat selection is the pool selector's choice of account; there is no second
+selector and no in-container pool read. An exhausted or dead account is skipped
+exactly as on the host, and an empty or fully-excluded pool still exits `78`
+(`EX_CONFIG`) before any container is touched. A selected seat that is stopped,
+missing the workspace mount, or on an incompatible `session-exec` protocol
+**refuses the step** (named reason, no silent fall back to host dispatch). A
+credential-proxied dispatch is also refused for a seat, because the token must
+travel in the exec's process environment.
+
+**What lives where.**
+
+| | Per-sweep ephemeral (`claude-ephemeral`) | Per-seat session (`claude-session`) |
+|---|---|---|
+| Lifetime | one sweep, then removed | persistent; survives steps, daemon restarts, host reboots |
+| Token | process env, pool re-read inside the container | process env of the `docker exec` only; the pool is never mounted and the token is on no container path |
+| Claude state (config, sessions, transcripts) | clean filesystem per sweep | the seat's own `<seat root>/<name>/home`, mounted at `/home/loom/.claude`; two seats share no directory |
+| Resource limits | per-sweep CPU / memory cgroup payload | none per seat today (a seat is shared by that account's steps) |
+| Operator surface | none (config flag) | `accounts session start`, `stop`, `status` with `--provider claude`; `accounts list --provider claude` |
+
+What each shape costs: ephemeral pays a container create and teardown per sweep
+and gives up cross-step state; a seat pays an idle persistent container per
+enrolled account plus lifecycle operations (start, stop, recreate when the
+image rolls — #14112 will automate that), and its filesystem is **not** clean
+between steps. Which one starts a step sooner is measured, not assumed: a seat
+step's stderr log carries `# LOOM_SEAT_DISPATCH dispatched_at=<RFC 3339>` (the
+instant before `docker exec` is spawned) and `# LOOM_SEAT_FIRST_ACTIVITY
+dispatched_at=<..> first_activity_at=<..> elapsed_ms=<n>` (the first byte the
+worker writes to stderr; `first_activity_at=none` if it never wrote one).
+Stdout is not observable by the supervisor, so first activity is a stderr
+signal, not a first-model-token signal.
+
+**Telemetry.** The `# LOOM_DISPATCH_MODE` marker for a seat step reads
+`containment=claude-session` and adds `container_id=` and `image_digest=`
+(`sha256:…`) of the container instance the step was bound to, so a run record
+names the exact container and image. `accounts list --provider claude` and
+`accounts session status <name> --provider claude` show each seat's runtime,
+containment, container and image.
+
+**The Claude CLI in the image.** The session image does not install Claude
+itself: it is `FROM` the `loom-worker` image at the same release tag, which
+installs the CLI with `claude.ai/install.sh`. The CLI version is therefore the
+one that install served when that base image was built, and the image tag pins
+the pair together; it is **not** separately version-pinned. That follows
+`.github/workflows/harness-pins.yml`, which keeps Claude Code out of the pinned
+harnesses on purpose (the fleet tracks latest). Whether the in-container CLI
+self-updates past the built version is not asserted here.
+
+**Relation to the #7767 soak.** #7767 gates flipping the *fleet default* of
+`runtimes.containment.enabled` (the `claude-ephemeral` shape) on soak evidence.
+Per-seat sessions are opt-in per account, flip no default, and neither consume
+nor count toward those criteria; because the `containment=` value differs,
+soak data for one shape cannot be mistaken for the other. #7767 stays blocked
+on its own evidence.
+
+**Status.** Registration, supervised dispatch, selection, isolation and the
+fake-Docker/image-smoke tests are merged (#14499, #14596). A provider-backed
+Builder step inside a real seat on a fleet host has not been run as part of this
+documentation change.
 
 #### Why native harnesses do NOT reuse Codex's session container
 

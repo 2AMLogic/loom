@@ -337,7 +337,7 @@ fn a_pass_over_the_root_reports_the_change() {
             budget: None,
             elapsed: &|| Duration::ZERO,
             clock: &Utc::now,
-            pr_merged: &|_, _| None,
+            pr_head: &|_, _| None,
         };
         super::super::run(&env, &roots, memory)
     };
@@ -373,4 +373,29 @@ fn loom_reflog_tag_is_namespace_colon_op_and_only_that_counts_as_loom() {
     assert!(!is_loom_reflog_message("loomx: reset"));
     assert!(!is_loom_reflog_message("loom reset: moving to HEAD~1"));
     assert!(!is_loom_reflog_message("reset: moving to HEAD~1"));
+}
+
+#[test]
+fn repo_slug_accepts_trailing_slashes_and_repeated_git_suffixes() {
+    // #15372: the slug extraction delegates to the shared
+    // `parse_nwo_from_remote_url`, but the fleet checkout's own URL
+    // normalization — any number of trailing `/` and `.git` repetitions —
+    // must keep working on top of it.
+    let (_t, dir) = repo();
+    let urls = [
+        "git@github.com:acme/widgets.git",
+        "https://github.com/acme/widgets.git",
+        "https://github.com/acme/widgets/",
+        "https://github.com/acme/widgets.git/",
+        "https://github.com/acme/widgets.git.git",
+        "https://github.com/acme/widgets.git.git/",
+    ];
+    git(&dir, &["remote", "add", "origin", urls[0]]);
+    for url in urls {
+        git(&dir, &["remote", "set-url", "origin", url]);
+        assert_eq!(repo_slug(&dir).as_deref(), Some("acme/widgets"), "url = {url}");
+    }
+    // No origin at all is `None`, not a guess.
+    git(&dir, &["remote", "remove", "origin"]);
+    assert_eq!(repo_slug(&dir), None);
 }

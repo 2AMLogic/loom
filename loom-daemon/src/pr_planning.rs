@@ -150,6 +150,21 @@ fn round_trip_reads_hold(role: PrRole, row: &Value, park: &str) -> bool {
         && crate::work_finder::BLOCKED_HOLD_NAMES.contains(&park)
 }
 
+/// A label set no verdict transition may leave behind (#15185): a terminal
+/// verdict label beside `loom:review-requested` says two opposite things at
+/// once — the PR is reviewed and awaiting review. Every verdict transition
+/// removes `loom:review-requested` while adding its verdict label
+/// ([`gate::transition`]'s script twin), so the pair is always the debris of
+/// a half-applied one. Returns the contradicting verdict label.
+fn contradictory_review_request(row: &Value) -> Option<&'static str> {
+    if !has_label(row, "loom:review-requested") {
+        return None;
+    }
+    ["loom:pr", "loom:changes-requested"]
+        .into_iter()
+        .find(|l| has_label(row, l))
+}
+
 /// Stable role baseline followed by one shared preference. Inputs are REST
 /// pull objects, newest first, with `mergeable` resolved for Doctor conflicts.
 /// Deliberately retain `loom:reviewing` for Judge's existing stale-claim probe;
@@ -186,9 +201,29 @@ pub fn ordered_queue(
         .collect();
     candidates.retain(|r| match role {
         PrRole::Judge => {
-            !has_label(r, "loom:treating")
-                && (has_label(r, "loom:review-requested")
-                    || (fallback(r) && (!labeled_review || joins_busy_queue(r, prefer, trust))))
+            if let Some(verdict_label) = contradictory_review_request(r) {
+                // #15185: a half-applied verdict transition. Serving it
+                // re-dispatches Judge onto an already-reviewed PR until
+                // someone repairs the set, so the queue refuses it and says
+                // why. Which label is the debris is decided by the newest
+                // verdict marker's freshness for this head: a
+                // current one means `loom:review-requested` was left behind;
+                // a stale one (what verdict-staleness-guard.sh re-queues)
+                // means the verdict label was.
+                eprintln!(
+                    "pr-queue: PR #{} carries {} together with loom:review-requested — a \
+                     half-applied verdict transition (#15185); not serving it for review. The \
+                     newest verdict marker decides the repair: current for this head — remove \
+                     loom:review-requested; stale — remove {verdict_label}.",
+                    r["number"].as_u64().unwrap_or_default(),
+                    verdict_label
+                );
+                false
+            } else {
+                !has_label(r, "loom:treating")
+                    && (has_label(r, "loom:review-requested")
+                        || (fallback(r) && (!labeled_review || joins_busy_queue(r, prefer, trust))))
+            }
         }
         PrRole::Doctor => {
             !has_label(r, "loom:treating")

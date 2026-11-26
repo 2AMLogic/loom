@@ -9,6 +9,10 @@ use super::*;
 use crate::forge_listing::RestIssue;
 use crate::step_dispatch::gather::{build_inputs, draw_inputs, pull_from_row, IssueFacts};
 use crate::step_dispatch::item_draw::{replay_record, weigh, ItemWeights, PoolKnobs, WeighContext};
+use crate::step_dispatch::outcome_ledger::{
+    classify, parse_outcome_line, Effect, LedgerConfig, OutcomeClass, OutcomeLedger, PostState,
+    DEFAULT_NOOP_COOLDOWN,
+};
 use crate::work_finder::step_item::{self, HostInput, PullMarkers, RepoInput};
 
 fn now() -> DateTime<Utc> {
@@ -1764,4 +1768,351 @@ fn queue_rows_and_spawn_requests_carry_story_points() {
     assert_eq!(row_points, expected);
     let asked: BTreeMap<u32, Option<u32>> = spawner.points.into_iter().collect();
     assert_eq!(asked, expected);
+}
+
+// #14888's queue: 15 eligible Doctor PRs in one repo — issues 20..=34
+// (`loom:building`), each joined to a `loom:changes-requested` PR
+// 120..=134. PR #130 has failing CI inherited from main. The remaining
+// PRs have actionable review feedback.
+fn doctor_rows() -> Vec<RestIssue> {
+    let mut rows = Vec::new();
+    for n in 20u32..=34 {
+        rows.push(row(n, &["loom:building"], "", false));
+        let labels: &[&str] = if n == 30 {
+            &["loom:changes-requested", "loom:ci-failure"]
+        } else {
+            &["loom:changes-requested"]
+        };
+        rows.push(row(100 + n, labels, &format!("Closes #{n}"), true));
+    }
+    rows
+}
+
+/// Main is red and every PR is ordinary work in the normal lane.
+/// The second tick receives the cooldown recorded by the first Doctor.
+fn doctor_workspace(
+    idx: usize,
+    repo: &str,
+    rows: &[RestIssue],
+    cooldowns: crate::step_dispatch::outcome_ledger::StepCooldowns,
+) -> StepWorkspace {
+    let pulls = rows
+        .iter()
+        .filter(|r| r.is_pull_request)
+        .map(|r| pull_from_row(r, PullMarkers::default()))
+        .collect();
+    let inputs = build_inputs(
+        rows,
+        pulls,
+        &IssueFacts::default(),
+        RepoInput { main_red: true },
+        HostInput::default(),
+    );
+    let items = draw_inputs(step_item::classify(&inputs), rows, |_, _| None);
+    let ctx = WeighContext {
+        now: now(),
+        build_backoff_engaged: false,
+        pool_exhausted_roles: BTreeSet::new(),
+        workspace_idx: idx,
+        cooldowns,
+    };
+    StepWorkspace {
+        idx,
+        repo: repo.to_string(),
+        weight: 1,
+        in_flight: 0,
+        weighing: weigh(&items, &ctx, &ItemWeights::default()),
+        halted: false,
+        created_at: HashMap::new(),
+        merge_slots: 1,
+        merge_concurrency: 1,
+        merge_eligible: 0,
+        merges_in_flight: 0,
+        writer_hold: None,
+    }
+}
+
+/// The regression's fixed draw seed (#14888): the first `loom-draw/v3` roll
+/// over the 15-row pool lands on the inherited-red row, so the tick's first
+/// actual draw is that PR. `tick_counter` advances per tick, as the daemon's
+/// does.
+fn doctor_seed(tick_counter: u64) -> SeedBase {
+    SeedBase {
+        minute: 29_340_000,
+        host: "host-a".to_string(),
+        tick_counter,
+    }
+}
+
+/// #14888: one complete dispatch tick over a 15-row Doctor queue whose first
+/// actual draw is the inherited-main-red PR reaches fixable work in the same
+/// tick, and the completed inherited-red step's no-op cooldown — armed by the
+/// normal completion path, with the row's head and blocker unchanged — keeps
+/// that PR from taking the next tick's slot again.
+#[test]
+fn a_tick_walks_past_an_inherited_red_doctor_row_and_the_cooldown_keeps_it_out() {
+    let rows = doctor_rows();
+    let ws = doctor_workspace(0, "acme/one", &rows, Default::default());
+    // All 15 PRs reach the eligible pool before the first draw. A CI
+    // failure inherited from main still leaves PR #130 in the normal lane.
+    let doctor_steps = ws
+        .weighing
+        .pool
+        .iter()
+        .filter(|c| c.step == step_item::Step::Doctor)
+        .count();
+    assert_eq!(doctor_steps, 15);
+    let red = ws
+        .weighing
+        .pool
+        .iter()
+        .find(|c| c.target() == 130)
+        .expect("the inherited-red PR is pooled");
+    assert_eq!(red.item.lane, step_item::Lane::Normal);
+
+    // Tick 1: capacity for the inherited-red and a fixable step. Available
+    // slots, budget, ordered dispatches, stop reason.
+    let mut spawner = FakeSpawner::default();
+    let tick = run(vec![ws], limits(2), &doctor_seed(0), &PoolKnobs::default(), &mut spawner);
+    assert_eq!(tick.budget, 2);
+    assert_eq!(tick.report.dispatched, 2);
+    assert_eq!(tick.stop, TickStop::Filled);
+    let order: Vec<_> = spawner
+        .asked
+        .iter()
+        .map(|&(_, pr, role, _)| (pr, role))
+        .collect();
+    assert_eq!(order, [(130, StepRole::Doctor), (134, StepRole::Doctor)]);
+    // The first draw sees the full pool. The second sees the 14 rows left.
+    assert_eq!(spawner.terms[0].as_ref().unwrap().repo_items, 15);
+    assert_eq!(spawner.terms[1].as_ref().unwrap().repo_items, 14);
+
+    // The inherited-red step completes: Doctor found the CI failure
+    // inherited from main, posted its comment and stood down — head, labels
+    // and blocker unchanged, no park, claim released. Its own outcome line,
+    // read through the completion path's parser, and the forge post-state
+    // classify it.
+    let line = parse_outcome_line(
+        "LOOM_STEP_OUTCOME role=doctor target=130 class=noop reason=no_fix_needed",
+        StepRole::Doctor,
+        130,
+    )
+    .expect("the outcome line parses");
+    let post = PostState {
+        moved: false,
+        closed: false,
+        claim_held: false,
+    };
+    let outcome = classify(Some(&line), Some(post));
+    assert_eq!(outcome.class, OutcomeClass::Noop);
+    assert_eq!(outcome.reason, "no_fix_needed");
+
+    // Normal completion: the outcome ledger records it and arms the no-op
+    // cooldown for the pair. The step ran six minutes.
+    let ran_for = std::time::Duration::from_secs(6 * 60);
+    let ended = now() + chrono::Duration::minutes(6);
+    let mut ledger = OutcomeLedger::new(LedgerConfig::default());
+    let recorded = ledger.record(130, StepRole::Doctor, &outcome, ran_for, ended);
+    assert_eq!(recorded.effect, Effect::Cooldown(DEFAULT_NOOP_COOLDOWN));
+    let until = recorded.cooling_until.expect("the cooldown is in force");
+    assert_eq!(until, ended + chrono::Duration::hours(1));
+
+    // Tick 2, immediately (same minute, next tick counter), one free slot,
+    // every row unchanged: the queue is rebuilt through the ledger's
+    // cooldown query before the draw.
+    let cooldowns = ledger.snapshot(ended);
+    assert!(cooldowns.is_cooling(130, StepRole::Doctor, ended));
+    let ws2 = doctor_workspace(0, "acme/one", &rows, cooldowns);
+    // What made the inherited-red PR ineligible: the draw's cooldown
+    // exclusion with the ledger's window — not a park, claim or label, none
+    // of which the fixture carries.
+    assert_eq!(
+        ws2.weighing
+            .excluded
+            .get(&crate::step_dispatch::item_draw::Exclusion::CoolingDown),
+        Some(&1)
+    );
+    let excluded = ws2
+        .weighing
+        .excluded_items
+        .iter()
+        .find(|e| e.item.target() == Some(130))
+        .expect("the inherited-red row is excluded");
+    assert_eq!(excluded.gate_until, Some(until));
+    assert_eq!(ws2.weighing.pool.len(), 14);
+
+    let mut spawner2 = FakeSpawner::default();
+    let tick2 = run(vec![ws2], limits(1), &doctor_seed(1), &PoolKnobs::default(), &mut spawner2);
+    assert_eq!(tick2.report.dispatched, 1);
+    assert_eq!(tick2.budget, 1);
+    assert_eq!(tick2.stop, TickStop::Filled);
+    assert_eq!(tick2.report.skipped_noop_cooldown, 1);
+    let order: Vec<_> = spawner2
+        .asked
+        .iter()
+        .map(|&(_, pr, role, _)| (pr, role))
+        .collect();
+    assert_eq!(order, [(121, StepRole::Doctor)]);
+}
+
+/// The one-slot boundary of #14888: with capacity for exactly one step, the
+/// tick's single draw is the inherited-red PR and it stops `filled` — the
+/// fixable row waits on capacity, which the two-slot regression above
+/// distinguishes from a no-progress row monopolizing an available slot.
+#[test]
+fn a_one_slot_tick_draws_only_the_inherited_red_row() {
+    let rows = doctor_rows();
+    let mut spawner = FakeSpawner::default();
+    let tick = run(
+        vec![doctor_workspace(0, "acme/one", &rows, Default::default())],
+        limits(1),
+        &doctor_seed(0),
+        &PoolKnobs::default(),
+        &mut spawner,
+    );
+    let order: Vec<_> = spawner
+        .asked
+        .iter()
+        .map(|&(_, pr, role, _)| (pr, role))
+        .collect();
+    assert_eq!(order, [(130, StepRole::Doctor)]);
+    assert_eq!(tick.budget, 1);
+    assert_eq!(tick.report.dispatched, 1);
+    assert_eq!(tick.stop, TickStop::Filled);
+}
+
+#[test]
+#[serial_test::serial]
+fn live_queue_entries_gate_the_listing_to_spawn_path() {
+    use crate::discovery::{Chain, Discovery};
+    use crate::step_dispatch::{gather, stage_entry::StageEntryProvider};
+    use crate::sweep_registry::test_support::{forge_probing_registry, write_config};
+    use serde_json::json;
+    use std::fs;
+    use std::sync::{Arc, Mutex};
+
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    let slug = format!("acme/queue-{}", root.file_name().unwrap().to_string_lossy());
+    let _env = crate::env_test_support::EnvGuard::set("LOOM_REPO", &slug)
+        .and_set("LOOM_GH_BIN", None)
+        .and_set("LOOM_MERGE_MODE", None);
+    write_config(root, r#"{"champion":{"mergeMode":"queue"}}"#);
+    let prs = [7935, 7900, 7948].map(|n| json!({
+        "number": n, "state": "open", "labels": [{"name":"loom:pr"}], "pull_request": {},
+        "body":format!("Closes #{}", n - 100), "head": {"ref":"feature", "sha":"abc"}, "base": {"ref":"main"}
+    }));
+    let mut rows = prs.to_vec();
+    // Only the full pull identifies 7935 as approved. Falling back for
+    // every row would send it to Champion triage and fail this test.
+    rows[0]["labels"] = json!([]);
+    rows.extend(
+        [7835, 7800, 7848]
+            .map(|n| json!({"number":n,"state":"open","labels":[{"name":"loom:building"}]})),
+    );
+    rows.push(json!({"number":1,"state":"open","labels":[{"name":"loom:triage"}]}));
+    fs::write(root.join("issues"), json!(rows).to_string()).unwrap();
+    // PR 7900 deliberately has only an issues-listing row.
+    fs::write(root.join("pulls"), json!([prs[0], prs[2]]).to_string()).unwrap();
+    let registry = Arc::new(Mutex::new(forge_probing_registry(
+        root,
+        r#"#!/bin/sh
+cd "$(dirname "$0")" || exit 1
+case "$*" in
+  *'/issues?state=open'*) printf 'HTTP/2.0 200 OK\r\n\r\n'; cat issues ;;
+  *'/pulls?state=open'*) printf 'HTTP/2.0 200 OK\r\n\r\n'; cat pulls ;;
+  *'mergeQueueEntry'*) echo read >> queue-reads; cat queue ;;
+  *) exit 1 ;;
+esac
+"#,
+    )));
+    let dispatch =
+        |response: Option<&serde_json::Value>, queued: &[u32], unknown: &[u32], merges: &[u32]| {
+            if let Some(response) = response {
+                fs::write(root.join("queue"), response.to_string()).unwrap();
+            } else {
+                fs::remove_file(root.join("queue")).unwrap();
+            }
+            let snapshot = Discovery::default().begin_tick(Chain::standalone(), now());
+            let gathered = gather::gather(
+                root,
+                &registry,
+                &snapshot,
+                |_| false,
+                &BTreeSet::new(),
+                &mut StageEntryProvider::load(None, 0),
+                now(),
+            )
+            .unwrap()
+            .unwrap();
+            let mut ws = workspace(0, &slug, &[]);
+            ws.merge_slots = prs.len();
+            ws.weighing = weigh(
+                &gathered.inputs,
+                &WeighContext {
+                    now: now(),
+                    workspace_idx: 0,
+                    build_backoff_engaged: false,
+                    pool_exhausted_roles: BTreeSet::new(),
+                    cooldowns: Default::default(),
+                },
+                &ItemWeights::default(),
+            );
+            let mut spawner = FakeSpawner::default();
+            run_with(vec![ws], limits(rows.len()), &mut spawner);
+            let asked: BTreeSet<_> = spawner.asked.iter().map(|a| (a.1, a.2)).collect();
+            let expected = merges
+                .iter()
+                .map(|&n| (n, StepRole::ChampionMerge))
+                .chain([(1, StepRole::Curator)])
+                .collect();
+            assert_eq!(asked, expected);
+            for (numbers, reason) in [(queued, "queued"), (unknown, "queue_membership_unknown")] {
+                for &n in numbers {
+                    let item = &gathered
+                        .inputs
+                        .iter()
+                        .find(|i| i.item.pr == Some(n))
+                        .unwrap()
+                        .item;
+                    assert!(
+                        matches!(item.verdict, step_item::Verdict::Pass(p) if p.as_str() == reason),
+                        "#{n}: {:?}",
+                        item.verdict
+                    );
+                }
+            }
+        };
+
+    // GitHub response captured from 2AMLogic/klayout-tools on 2026-11-26.
+    let mut entries = json!({"data":{"repository":{
+        "pr7935":{"number":7935,"state":"OPEN","mergeQueueEntry":{"position":1,"headCommit":{"oid":"7d6a95a00ccbb3c4388c4ed402fe4ad8e50cab39"}}},
+        "pr7900":{"number":7900,"state":"OPEN","mergeQueueEntry":{"position":2,"headCommit":null}},
+        "pr7948":{"number":7948,"state":"OPEN","mergeQueueEntry":null}
+    }}});
+    dispatch(Some(&entries), &[7935, 7900], &[], &[7948]);
+    let reads = || {
+        fs::read_to_string(root.join("queue-reads"))
+            .unwrap()
+            .lines()
+            .count()
+    };
+    assert_eq!(reads(), 1);
+    entries["data"]["repository"]
+        .as_object_mut()
+        .unwrap()
+        .remove("pr7948");
+    dispatch(Some(&entries), &[7935, 7900], &[7948], &[]);
+    dispatch(None, &[], &[7935, 7900, 7948], &[]);
+
+    // The next complete response vouches for the removals.
+    for n in [7935, 7900, 7948] {
+        entries["data"]["repository"][format!("pr{n}")] =
+            json!({"number":n,"state":"OPEN","mergeQueueEntry":null});
+    }
+    dispatch(Some(&entries), &[], &[], &[7935, 7900, 7948]);
+    assert_eq!(reads(), 4);
+    write_config(root, r#"{"champion":{"mergeMode":"direct"}}"#);
+    dispatch(None, &[], &[], &[7935, 7900, 7948]);
+    assert_eq!(reads(), 4, "direct mode must skip queue discovery");
 }

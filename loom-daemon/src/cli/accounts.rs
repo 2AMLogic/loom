@@ -3,7 +3,7 @@
 //! `crate::tokens_pool::account_lifecycle`.
 
 use crate::tokens_pool::account_scope::{
-    resolve_accounts_registry, shadowed_shared_accounts, AccountsRegistry,
+    resolve_accounts_registry, resolve_shared_registry, shadowed_shared_accounts, AccountsRegistry,
 };
 use anyhow::{anyhow, Result};
 
@@ -131,7 +131,21 @@ pub(crate) fn handle_accounts_command(action: AccountsAction, workspace: &str) -
         Ok(())
     }
 
-    let registry = resolve_registry(workspace)?;
+    // `accounts list --provider claude` reads the Claude pool and its seats; it
+    // never touches the Codex registry below (#14371).
+    if let AccountsAction::List { provider, json } = &action {
+        if super::accounts_session_claude::is_claude(provider)? {
+            // Same workspace resolution as `accounts session status --provider claude`.
+            let registry = resolve_registry(workspace)?;
+            return super::accounts_session_claude::list(registry.workspace.clone(), *json);
+        }
+    }
+
+    let registry = match &action {
+        AccountsAction::Disable { shared: true, .. }
+        | AccountsAction::Enable { shared: true, .. } => resolve_shared_registry()?,
+        _ => resolve_registry(workspace)?,
+    };
     announce_registry(&registry);
     let workspace = registry.workspace.clone();
     let service = AccountLifecycle::new(workspace.clone(), ProcessCodexRunner)?;
@@ -194,6 +208,7 @@ pub(crate) fn handle_accounts_command(action: AccountsAction, workspace: &str) -
             provider,
             name,
             json,
+            ..
         } => {
             require_codex(&provider)?;
             print_status(&service.disable(&name)?, json)
@@ -202,6 +217,7 @@ pub(crate) fn handle_accounts_command(action: AccountsAction, workspace: &str) -
             provider,
             name,
             json,
+            ..
         } => {
             require_codex(&provider)?;
             print_status(&service.enable(&name)?, json)

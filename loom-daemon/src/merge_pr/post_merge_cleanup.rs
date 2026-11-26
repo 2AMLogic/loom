@@ -576,8 +576,32 @@ impl Run<'_> {
     }
 }
 
-/// Production wiring.
-pub struct SystemHost;
+/// Production wiring. The `mechanism` field names the caller in the
+/// worktree-removal ledger (#5950), so a removal the daemon's
+/// merge-observation pass (#14904) made is not misattributed to the shell
+/// that never ran.
+pub struct SystemHost {
+    /// The ledger `mechanism` string [`Host::record_removal`] writes.
+    pub mechanism: &'static str,
+}
+
+impl SystemHost {
+    /// `merge-pr post-merge-cleanup`'s identity: the shell verb.
+    pub const MERGE_PR: Self = Self {
+        mechanism: "merge-pr.sh",
+    };
+    /// The daemon's merge-observation pass (#14904): the same cleanup, run
+    /// from the reconciliation tick rather than the merge script.
+    pub const MERGE_OBSERVATION: Self = Self {
+        mechanism: "merge_observation",
+    };
+}
+
+impl Default for SystemHost {
+    fn default() -> Self {
+        Self::MERGE_PR
+    }
+}
 
 impl Host for SystemHost {
     fn is_dir(&self, path: &str) -> bool {
@@ -710,7 +734,7 @@ impl Host for SystemHost {
     fn record_removal(&self, repo_root: &str, worktree: &str, branch: Option<&str>) {
         crate::worktree_ops::removal_log::record(
             std::path::Path::new(repo_root),
-            "merge-pr.sh",
+            self.mechanism,
             std::path::Path::new(worktree),
             branch,
             "post_merge_cleanup",

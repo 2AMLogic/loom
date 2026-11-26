@@ -397,6 +397,14 @@ assert_doc_contains "$CHAMPION_MD" \
     'test(\"(Blocked by|Depends on|Requires)[*_:[:space:]]*#$CLOSED_ISSUE\"; \"i\")' \
     "champion-pr-merge.md BLOCKED_ISSUES jq filter ships the widened pattern"
 
+# warn-operator-gated.sh is REAL sourceable code (not markdown), so its
+# behaviour is asserted in test-warn-operator-gated.sh; this pin guards the
+# byte-identity of its mask against the shared expression above — the fifth
+# two-stage consumer must never grow a sixth sed variant (#15021).
+assert_doc_contains "$SCRIPTS_DIR/warn-operator-gated.sh" \
+    "sed -E 's/[Pp][Aa][Rr][Tt] [Oo][Ff][*_:.[:space:]]*([Ee][Pp][Ii][Cc][*_:.[:space:]]*)?([A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+)?#[0-9]+/ /g'" \
+    "warn-operator-gated.sh parse_operator_gate_deps masks the Part-of parent reference between its two stages, byte-identical to the shared expression (#14732/#14750, #15021)"
+
 echo
 echo "Results: $TESTS_PASSED/$TESTS_RUN passed, $TESTS_FAILED failed"
 [[ $TESTS_FAILED -eq 0 ]] || exit 1
