@@ -18,6 +18,9 @@ use crate::types::CredentialPreflightReport;
 
 /// The rule.
 pub const RULE: &str = "forge.credential-missing";
+/// The rule for a published primary token that outlived its `expires_at`
+/// (#15327), key `github`: the credential exists but every call 401s.
+pub const EXPIRED_RULE: &str = "forge.credential-expired";
 const KEY: &str = "github";
 
 fn ledger() -> &'static Mutex<Ledger> {
@@ -54,6 +57,59 @@ pub fn credential_restored() {
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .resolve(RULE, KEY, "A github-app refresh minted a usable credential.");
+    primary_token_checked(None);
+}
+
+/// The open alert for an expired primary writer token, `None` while it is live.
+#[must_use]
+pub fn expired_alert(reason: Option<&str>) -> Option<Alert> {
+    reason.map(|reason| {
+        Alert::new(
+            EXPIRED_RULE,
+            KEY,
+            "loom-daemon's GitHub writer token has expired: every forge write will fail",
+            Severity::Critical,
+            State::Open,
+        )
+        .with_detail(format!(
+            "{reason}. The primary github-app refresh is not rotating it; restart the daemon \
+             if it does not recover."
+        ))
+    })
+}
+
+/// Reconcile the expired-token alert with the monitor's latest reading
+/// (#15327): open it while `reason` is `Some`, resolve it once the token is
+/// replaced (or the reading is gone).
+pub fn primary_token_checked(reason: Option<&str>) {
+    let mut ledger = ledger()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    match expired_alert(reason) {
+        Some(alert) => {
+            ledger.open(alert);
+        }
+        None => {
+            ledger.resolve(EXPIRED_RULE, KEY, "The primary writer token was replaced.");
+        }
+    }
+}
+
+/// Whether the global ledger holds the expired-token alert, **tests only**.
+#[cfg(test)]
+pub(crate) fn expired_alert_open() -> bool {
+    ledger()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .is_open(EXPIRED_RULE, KEY)
+}
+
+/// Forget the global ledger's open set, **tests only**.
+#[cfg(test)]
+pub(crate) fn reset_expired_for_tests() {
+    *ledger()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Ledger::at(None, |_| {});
 }
 
 #[cfg(test)]
@@ -78,6 +134,28 @@ mod tests {
         assert_eq!(a.severity, Severity::Critical);
         assert!(a.detail.unwrap().contains("mechanism none"));
         assert!(alert(&report(true)).is_none());
+    }
+
+    #[test]
+    fn an_expired_token_opens_a_critical_alert_and_a_replacement_resolves_it() {
+        let seen = std::sync::Arc::new(Mutex::new(Vec::new()));
+        let sink = seen.clone();
+        let mut l = Ledger::at(None, move |a: Alert| sink.lock().unwrap().push((a.rule, a.state)));
+        let alert = expired_alert(Some("token expired at 13:00")).unwrap();
+        assert_eq!(alert.rule, EXPIRED_RULE);
+        assert_eq!(alert.severity, Severity::Critical);
+        assert!(alert.detail.as_deref().unwrap().contains("13:00"));
+        assert!(expired_alert(None).is_none());
+        assert!(l.open(alert.clone()));
+        assert!(!l.open(alert), "a second reading does not re-post");
+        assert!(l.resolve(EXPIRED_RULE, KEY, "replaced"));
+        assert_eq!(
+            *seen.lock().unwrap(),
+            [
+                (EXPIRED_RULE.to_string(), State::Open),
+                (EXPIRED_RULE.to_string(), State::Resolved)
+            ]
+        );
     }
 
     #[test]

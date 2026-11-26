@@ -354,7 +354,7 @@ pub(crate) async fn run_daemon() -> Result<()> {
     }
 
     // Unified operational hyperparameters (Issue #9683): resolve the vector
-    // down its tier chain (single-knob env > $LOOM_HYPERPARAMS vector >
+    // down its tier chain (single-knob env >
     // "hyperparameters" config block > legacy autonomous.* keys > defaults),
     // fail fast on any out-of-range/unknown/contradictory value on the
     // hyperparameters surface, and capture the resolved vector + digest into
