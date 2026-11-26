@@ -2662,14 +2662,16 @@ A headless sweep runs under `--dangerously-skip-permissions`, where the guard `P
 If you are a dispatched agent and you are about to trust a test suite's output — especially one that exercises guard-hook / force-push / reset-hard behavior — check first:
 
 ```bash
-env | grep -E '^LOOM_(FORCE_SCOPE|GUARD_DECISION_LOG)='
+env | grep -E '^LOOM_(FORCE_SCOPE|GUARD_DECISION_LOG|SWEEP_ID|WORKTREE_PATH|WORKSPACE)='
 ```
 
-If either is set and the suite under test asserts guard defaults, re-run it with the ambient overrides stripped before drawing any conclusion from the result:
+If any is set and the suite under test asserts guard defaults, re-run it with them all stripped before drawing any conclusion from the result:
 
 ```bash
-env -u LOOM_FORCE_SCOPE -u LOOM_GUARD_DECISION_LOG <test-suite-command>
+env -u LOOM_FORCE_SCOPE -u LOOM_GUARD_DECISION_LOG -u LOOM_SWEEP_ID -u LOOM_WORKTREE_PATH -u LOOM_WORKSPACE <test-suite-command>
 ```
+
+The last three are read by the primary-checkout mutation guard, not as behaviour overrides: `LOOM_SWEEP_ID` and `LOOM_WORKTREE_PATH` mark an agent step, `LOOM_WORKSPACE` names the workspace (#15483). With a marker ambient the guard denies `git commit` in a primary checkout — which is what a guard suite's fixture repository typically is — so a suite's `git commit -m <prose>` allow-assertions there are denied instead (#15496).
 
 This is also called out directly in the dispatched agent's own brief — see `defaults/roles/builder.md` → "Build Verification During Implementation" — rather than left as a fact an agent has to already know to look up here.
 
