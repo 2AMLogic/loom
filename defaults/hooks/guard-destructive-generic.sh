@@ -5114,64 +5114,300 @@ resolve_stash_cwd() {
 # running cwd). Leading `(`/`{`, `sudo`, and `VAR=val` env prefixes are
 # stripped; only a segment that STARTS with `git` or `gh pr checkout` counts,
 # so quoted text mentioning `git commit` is inert.
+#
+# COMMAND SUBSTITUTIONS (#15505). `$( ... )` and backquotes run their body as a
+# command, in a subshell that has the parent's cwd, wherever they sit: bare, in
+# double quotes, in an assignment, in an `if` condition. Before #15505 none of
+# those was a record, because a segment was judged only by its FIRST word
+# (`echo`, `x=$(git`, `if`, ...), so `x=$(git commit -m z)` parked the primary
+# checkout exactly as the bare form does and was allowed. Each segment now
+# also has its LIVE substitution bodies scanned as command text of their own
+# (pcm_bodies / pcm_text), recursively:
+#
+#   - cwd. A body is scanned with the cwd in effect where it appears (after
+#     the `cd` segments before it), and a `cd` inside the body stays inside
+#     the body: `cd <worktree> && echo "$(git commit -m z)"` commits in the
+#     worktree and is allowed.
+#   - live vs inert is the even-backslash rule has_live_subst() applies:
+#     single-quoted text and a backslashed `\$(` / backquote are data. Inside
+#     DOUBLE quotes a substitution is live and a single quote is just a
+#     character.
+#   - only `git commit|switch|checkout` and `gh pr checkout` make a record, so
+#     every read-only capture (`x=$(git rev-parse HEAD)`,
+#     `echo "$(git status)"`) is unaffected and needs no rule of its own.
+#
+# HEREDOC BODIES. The hook reads a command line by line, so it must know where
+# a heredoc body starts and ends -- otherwise `x=$(git commit -m z)` written
+# INSIDE one starts denying, and this repo's own comment idiom writes exactly
+# that text: `post-comment.sh N --body-file - <<'EOF'`. An opener on a line
+# (`<<DELIM`, `<<-DELIM`, `<<'DELIM'`, `<<"DELIM"`) puts the lines up to its
+# delimiter line into body mode. Body mode is only ever MORE literal than a
+# command line, never less, and gates ONLY the substitution scan:
+#   - quoted delimiter: the shell does not expand the body. Its segments are
+#     still scanned exactly as before #15505 (a bare `git commit -m z` line in
+#     it keeps denying -- a pre-existing false positive, #15487, not changed
+#     here), its substitutions are not scanned.
+#   - unquoted delimiter: the shell expands the body's substitutions before
+#     the sink reads a byte, inside single quotes in the body too, so they are
+#     scanned with quote characters as data -- the model im_hd_expand() uses.
+# `<<<` (a here-string) and a left shift in an arithmetic expansion are not
+# heredoc openers.
+#
+# KNOWN LIMITATIONS (recorded, each with its direction and measured against
+# real bash -- 1-4 come with the substitution scan, 5-6 predate it):
+#   1. FAIL-OPEN. A `case` pattern paren inside a substitution
+#      (`$(case $x in a) git commit -m z;; esac)`) is read as the closing
+#      paren of the substitution, so the arm's command is not scanned as a
+#      body.
+#   2. FAIL-OPEN. A substitution nested deeper than PCM_MAXD others is not
+#      resolved.
+#   3. FAIL-CLOSED. A left shift in the arithmetic COMMAND (`(( a << b ))`)
+#      is mistaken for an unquoted heredoc, so the lines up to one equal to
+#      `b` get the quote-blind substitution scan.
+#   4. FAIL-CLOSED on a shell that still honours it. A delimiter quoted with
+#      backquotes (`<<`EOF``, a deprecated spelling) is not recognised as a
+#      heredoc, so the body is scanned as ordinary lines. bash 5.2 ignores
+#      that quoting and expands the body anyway (measured), where the scan is
+#      right.
+#   5. Both directions, PRE-EXISTING line model -- unchanged here, and it
+#      binds substitution bodies exactly as it binds bare commands. A `cd`
+#      that is not a cd of the line -- inside a `( ... )` group, a pipeline
+#      element, the body of a heredoc with a quoted delimiter, or the first
+#      line of a substitution that spans LINES -- is taken as one, so it moves
+#      the cwd of everything scanned after it: from the primary, with a
+#      worktree named, a false allow; the other way round, a false deny. A
+#      substitution that spans lines also has its later lines scanned as lines
+#      of their own.
+#   6. Unchanged, out of scope here: a guarded command that does not START its
+#      segment (`then git commit`, `do git commit`, `time git commit`);
+#      (#14973) git/gh inside a child script or an interpreter argument
+#      (`bash -c '...'`); and a process substitution (`<(git commit -m z)`),
+#      which is a different construct from a command substitution.
 resolve_primary_mutations() {
     printf '%s' "$1" | awk -v startcwd="$2" -v home="$HOME" "$_QSPLIT_AWK""$_CDEXPAND_AWK""$_CDQUOTE_AWK""$_MASKWS_AWK"'
-    BEGIN { curcwd = startcwd }
-    {
-        $0 = qsplit($0)
-        n = split($0, segs, "\n")
-        for (i = 1; i <= n; i++) {
-            seg = segs[i]
-            sub(/^[ \t(){]+/, "", seg)
-            sub(/^sudo[ \t]+/, "", seg)
-            while (seg ~ /^[A-Za-z_][A-Za-z0-9_]*=[^ \t]*[ \t]+/) sub(/^[A-Za-z_][A-Za-z0-9_]*=[^ \t]*[ \t]+/, "", seg)
-            if (seg == "") continue
-            wseg = mask_ws(seg)
-            m = split(wseg, toks, /[ \t]+/)
-            if (m == 0) continue
-            for (j = 1; j <= m; j++) toks[j] = unmask_ws(toks[j])
-            if (toks[1] == "cd") {
-                if (m >= 2 && toks[2] != "" && toks[2] != "-") {
-                    cdarg = expand_cd_arg(toks[2], home)
-                    cdclass = strip_cd_quoting(cdarg)
-                    if (cdclass ~ /^\//) curcwd = cdarg
-                    else if (curcwd != "") curcwd = curcwd "/" cdarg
-                }
+    # ---- command substitutions (#15505); see the header above ----
+    #
+    # mode of the text being scanned:
+    #   0  not expanded by the shell -- the body of a heredoc with a QUOTED
+    #      delimiter: segments only, exactly as before #15505
+    #   1  ordinary command text
+    #   2  expanded by the shell with quote characters as DATA -- the body of
+    #      a heredoc with an unquoted delimiter, or an arithmetic expansion
+    # depth counts substitution nesting and is bounded by PCM_MAXD.
+
+    # Position of the character that ENDS a substitution whose body starts at
+    # i: the ")" closing a "$(" (quotes tracked, parens nested), or the
+    # backquote closing an old-style span -- there the first unescaped
+    # backquote ends it and quote characters inside carry no meaning.
+    # 0 = unterminated in s.
+    function pcm_close(s, i, kind,    n, c, st, dep, j) {
+        n = length(s); st = ""; dep = 0
+        while (i <= n) {
+            c = substr(s, i, 1)
+            if (st == SQ) { if (c == SQ) st = ""; i++; continue }
+            if (c == "\\") { i += 2; continue }
+            if (kind == "`") {
+                if (c == "`") return i
+                i++
                 continue
             }
-            # `gh pr checkout <N>` (#14973): gh fetches the PR head into the
-            # checkout and moves it there. Resolved from the segment cwd (a
-            # `cd` prefix threads through above; gh has no -C option). Emitted
-            # with a marker subcmd the caller denies outright: gh has no
-            # path-restore or main/master-exception shape.
-            if (toks[1] == "gh" && m >= 3 && toks[2] == "pr" && toks[3] == "checkout") {
-                args = ""
-                for (j = 4; j <= m; j++) args = args (j > 4 ? " " : "") toks[j]
-                printf "%s\037gh-pr-checkout\037%s\n", curcwd, args
+            if (st == DQ) {
+                if (c == DQ) st = ""
+                else if (c == "`") { j = pcm_close(s, i + 1, "`"); if (j == 0) return 0; i = j + 1; continue }
+                else if (c == "$" && substr(s, i + 1, 1) == "(") { j = pcm_close(s, i + 2, ")"); if (j == 0) return 0; i = j + 1; continue }
+                i++
                 continue
             }
-            if (toks[1] != "git") continue
-            gcwd = curcwd
-            k = 2
-            while (k <= m && toks[k] ~ /^-/) {
-                if (toks[k] == "-C" && k < m) {
-                    carg = expand_cd_arg(toks[k+1], home)
-                    if (strip_cd_quoting(carg) ~ /^\//) gcwd = carg
-                    else if (gcwd != "") gcwd = gcwd "/" carg
-                    k += 2
-                } else if ((toks[k] == "-c" || toks[k] == "--git-dir" || toks[k] == "--work-tree" || toks[k] == "--namespace") && k < m) {
-                    k += 2
-                } else {
-                    k++
-                }
-            }
-            if (k > m) continue
-            sub_ = toks[k]
-            if (sub_ != "checkout" && sub_ != "switch" && sub_ != "commit") continue
-            args = ""
-            for (j = k + 1; j <= m; j++) args = args (j > k + 1 ? " " : "") toks[j]
-            printf "%s\037%s\037%s\n", gcwd, sub_, args
+            if (c == SQ) { st = SQ; i++; continue }
+            if (c == DQ) { st = DQ; i++; continue }
+            if (c == "`") { j = pcm_close(s, i + 1, "`"); if (j == 0) return 0; i = j + 1; continue }
+            if (c == "$" && substr(s, i + 1, 1) == "(") { j = pcm_close(s, i + 2, ")"); if (j == 0) return 0; i = j + 1; continue }
+            if (c == "(") { dep++; i++; continue }
+            if (c == ")") { if (dep == 0) return i; dep--; i++; continue }
+            i++
         }
+        return 0
+    }
+
+    # Remember, for the lines that follow, the heredoc whose opener starts at
+    # the head of t. Only the first one on a line is followed.
+    function pcm_heredoc(t,    d) {
+        if (PCM_HDF || match(t, PCM_HDRE) == 0) return
+        d = substr(t, RSTART, RLENGTH)
+        PCM_HDF = 1
+        PCM_HDD = (substr(d, 3, 1) == "-")
+        sub(/^<<-?[ \t]*/, "", d)
+        PCM_HDQ = (substr(d, 1, 1) == SQ || substr(d, 1, 1) == DQ)
+        if (PCM_HDQ) d = substr(d, 2, length(d) - 2)
+        PCM_HD = d
+    }
+
+    # Every LIVE substitution body of s at the top level of s, in TEXT order,
+    # with the heredoc openers of s interleaved at their positions:
+    #   B[k, "k"]  "b" for a substitution body, "h" for a heredoc opener
+    #   B[k, "o"]  its position in s
+    #   B[k, "t"]  the body (all that is left of s when it is unterminated
+    #              there: it continues past a line break)
+    # pcm_close finds each end. Entries are appended from index base (a
+    # recursive call for an arithmetic expansion must not overwrite the
+    # entries already found). Returns the number of entries.
+    function pcm_bodies(s, mode, B, base,    n, i, c, st, j, pfrom, kind, ne, k0, ac) {
+        n = length(s); i = 1; st = ""; ne = base
+        while (i <= n) {
+            c = substr(s, i, 1)
+            if (mode == 1 && st == SQ) { if (c == SQ) st = ""; i++; continue }
+            if (c == "\\") { i += 2; continue }
+            if (mode == 1) {
+                if (st == "" && c == SQ) { st = SQ; i++; continue }
+                if (c == DQ) { st = (st == DQ) ? "" : DQ; i++; continue }
+                if (st == "" && c == "<" && substr(s, i, 2) == "<<" && substr(s, i + 2, 1) != "<") {
+                    ne++
+                    B[ne, "k"] = "h"; B[ne, "o"] = i
+                    i += 2
+                    continue
+                }
+            }
+            if (c == "$" && substr(s, i + 1, 2) == "((" \
+               && (ac = pcm_close(s, i + 3, ")")) > 0 && substr(s, ac + 1, 1) == ")") {
+                # An arithmetic expansion is not a command; a substitution
+                # nested in one is, and runs in the same cwd.
+                k0 = ne + 1
+                ne = pcm_bodies(substr(s, i + 3, ac - i - 3), 2, B, ne)
+                for (j = k0; j <= ne; j++) B[j, "o"] += i + 2
+                i = ac + 2
+                continue
+            }
+            kind = ""
+            if (c == "$" && substr(s, i + 1, 1) == "(") { kind = ")"; pfrom = i + 2 }
+            else if (c == "`") { kind = "`"; pfrom = i + 1 }
+            if (kind == "") { i++; continue }
+            j = pcm_close(s, pfrom, kind)
+            ne++
+            B[ne, "k"] = "b"; B[ne, "o"] = i
+            B[ne, "t"] = (j == 0) ? substr(s, pfrom) : substr(s, pfrom, j - pfrom)
+            i = (j == 0) ? n + 1 : j + 1
+        }
+        return ne
+    }
+
+    # One command segment, starting in cwd: returns the cwd after it.
+    function pcm_seg(seg, cwd,    wseg, m, j, toks, cdarg, cdclass, args, gcwd, k, sub_, carg) {
+        sub(/^[ \t(){]+/, "", seg)
+        sub(/^sudo[ \t]+/, "", seg)
+        while (seg ~ /^[A-Za-z_][A-Za-z0-9_]*=[^ \t]*[ \t]+/) sub(/^[A-Za-z_][A-Za-z0-9_]*=[^ \t]*[ \t]+/, "", seg)
+        if (seg == "") return cwd
+        wseg = mask_ws(seg)
+        m = split(wseg, toks, /[ \t]+/)
+        if (m == 0) return cwd
+        for (j = 1; j <= m; j++) toks[j] = unmask_ws(toks[j])
+        if (toks[1] == "cd") {
+            if (m >= 2 && toks[2] != "" && toks[2] != "-") {
+                cdarg = expand_cd_arg(toks[2], home)
+                cdclass = strip_cd_quoting(cdarg)
+                if (cdclass ~ /^\//) cwd = cdarg
+                else if (cwd != "") cwd = cwd "/" cdarg
+            }
+            return cwd
+        }
+        # `gh pr checkout <N>` (#14973): gh fetches the PR head into the
+        # checkout and moves it there. Resolved from the segment cwd (a
+        # `cd` prefix threads through above; gh has no -C option). Emitted
+        # with a marker subcmd the caller denies outright: gh has no
+        # path-restore or main/master-exception shape.
+        if (toks[1] == "gh" && m >= 3 && toks[2] == "pr" && toks[3] == "checkout") {
+            args = ""
+            for (j = 4; j <= m; j++) args = args (j > 4 ? " " : "") toks[j]
+            printf "%s\037gh-pr-checkout\037%s\n", cwd, args
+            return cwd
+        }
+        if (toks[1] != "git") return cwd
+        gcwd = cwd
+        k = 2
+        while (k <= m && toks[k] ~ /^-/) {
+            if (toks[k] == "-C" && k < m) {
+                carg = expand_cd_arg(toks[k+1], home)
+                if (strip_cd_quoting(carg) ~ /^\//) gcwd = carg
+                else if (gcwd != "") gcwd = gcwd "/" carg
+                k += 2
+            } else if ((toks[k] == "-c" || toks[k] == "--git-dir" || toks[k] == "--work-tree" || toks[k] == "--namespace") && k < m) {
+                k += 2
+            } else {
+                k++
+            }
+        }
+        if (k > m) return cwd
+        sub_ = toks[k]
+        if (sub_ != "checkout" && sub_ != "switch" && sub_ != "commit") return cwd
+        args = ""
+        for (j = k + 1; j <= m; j++) args = args (j > k + 1 ? " " : "") toks[j]
+        printf "%s\037%s\037%s\n", gcwd, sub_, args
+        return cwd
+    }
+
+    # Scan s -- a line of command text, or a substitution body -- segment by
+    # segment; returns the cwd after the LAST segment.
+    #
+    # The LIVE substitution bodies of s are found on the RAW text, not on the
+    # segments: qsplit cuts a line at a separator inside a substitution too
+    # (`echo "$(cd X && git commit)"`), which would lose the cd of the body.
+    # Each body is scanned before the segment its opener sits in, in the cwd
+    # in effect for that segment (a subshell, so the cd of a body does not
+    # come back out), and the heredoc openers are followed in the same text
+    # order.
+    function pcm_text(s, cwd, depth, mode,    n, i, segs, so, off, o, ne, B, k, hi) {
+        n = split(qsplit(s), segs, "\n")
+        # Start offset of every segment in s (qsplit keeps every other byte).
+        off = 1
+        for (i = 1; i <= n; i++) {
+            so[i] = off
+            if (segs[i] == "") continue
+            o = index(substr(s, off), segs[i])
+            if (o > 1) so[i] = off + o - 1
+            off = so[i] + length(segs[i])
+        }
+        ne = 0
+        if (mode != 0 && depth < PCM_MAXD) ne = pcm_bodies(s, mode, B, 0)
+        k = 1
+        for (i = 1; i <= n; i++) {
+            hi = (i < n) ? so[i + 1] : length(s) + 1
+            while (k <= ne && B[k, "o"] < hi) {
+                if (B[k, "k"] == "h") pcm_heredoc(substr(s, B[k, "o"]))
+                else pcm_text(B[k, "t"], cwd, depth + 1, 1)
+                k++
+            }
+            cwd = pcm_seg(segs[i], cwd)
+        }
+        return cwd
+    }
+
+    BEGIN {
+        SQ = sprintf("%c", 39)
+        DQ = sprintf("%c", 34)
+        PCM_HDRE = "<<-?[ \t]*(" SQ "[A-Za-z_][A-Za-z0-9_]*" SQ "|" DQ "[A-Za-z_][A-Za-z0-9_]*" DQ "|[A-Za-z_][A-Za-z0-9_]*)"
+        PCM_MAXD = 8
+        curcwd = startcwd
+        PCM_HD = ""     # delimiter of the heredoc whose body the next lines are
+        PCM_HDD = 0     # its `<<-` form
+        PCM_HDQ = 0     # its delimiter is quoted
+        PCM_HDF = 0     # an opener was already found on this line
+    }
+    {
+        if (PCM_HD != "") {
+            # A heredoc body line. Body mode gates ONLY the substitution scan:
+            # the segments are scanned as they always were.
+            hdline = $0
+            if (PCM_HDD) sub(/^\t+/, "", hdline)
+            sub(/[ \t]+$/, "", hdline)
+            if (hdline == PCM_HD) {
+                PCM_HD = ""
+                curcwd = pcm_text($0, curcwd, 0, 0)
+                next
+            }
+            curcwd = pcm_text($0, curcwd, 0, (PCM_HDQ ? 0 : 2))
+            next
+        }
+        PCM_HDF = 0
+        curcwd = pcm_text($0, curcwd, 0, 1)
     }'
 }
 
@@ -12447,6 +12683,13 @@ primary_checkout_target_is_path() {
 # same via gh. A target like that has no successful git meaning (a pathspec
 # matching no tracked file is an error), so denying it costs no working
 # invocation.
+# Also denied (#15505): the same mutation inside a LIVE command substitution
+# (`$(...)`, backquotes) — bare, in double quotes, in an assignment, in an
+# `if` condition — because the body is a command that runs in the parent's
+# cwd. It used to be allowed: resolve_primary_mutations() judged a segment
+# only by its first word. Single-quoted, backslash-escaped and quoted-heredoc
+# text stays inert, and read-only captures (`x=$(git rev-parse HEAD)`) are
+# unaffected. Scope and the recorded limits: that function's header.
 # Gated by primary_checkout_mutation_guard_enabled(), evaluated lazily.
 # =============================================================================
 if [[ -n "${LOOM_SWEEP_ID:-}${LOOM_WORKTREE_PATH:-}" ]] \

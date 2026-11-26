@@ -3,6 +3,11 @@
 # mutation guard (#13589): git commit / switch / checkout <branch> in a
 # workspace's PRIMARY checkout during an agent step is denied.
 #
+# #15505: the same mutation inside a live command substitution (`$(...)` or
+# backticks) is denied too — its body is a command that runs in the parent's
+# cwd — while inert text (single-quoted, backslash-escaped, quoted-delimiter
+# heredoc body) and read-only captures stay allowed.
+#
 # Usage: ./tests/hooks/test-guard-destructive-primary-checkout.sh
 
 set -euo pipefail
@@ -77,6 +82,91 @@ if echo "$PC_OUT" | jq -r '.hookSpecificOutput.permissionDecisionReason' | grep 
 else
     FAIL=$((FAIL + 1)); echo -e "  ${RED}FAIL${NC}: deny names worktree.sh and the toggle: $PC_OUT"
 fi
+
+# --- DENY (#15505): the mutation inside a LIVE command substitution ---
+# `$( ... )` and backticks run their body as a command, in a subshell that has
+# the parent's cwd, wherever they sit. Single-quoted literals below need no
+# escaping and cannot run anything while this suite loads.
+assert_deny_env "substitution inside double quotes: echo (git commit) in primary is denied" "$AGENT" \
+    'echo "$(git commit -m z)"' "$PC_REPO"
+assert_deny_env "unquoted substitution after echo in primary is denied" "$AGENT" \
+    'echo $(git commit -m z)' "$PC_REPO"
+assert_deny_env "assignment capture x=(git commit) in primary is denied" "$AGENT" \
+    'x=$(git commit -m z)' "$PC_REPO"
+assert_deny_env "backtick substitution inside double quotes in primary is denied" "$AGENT" \
+    'echo "`git commit -m z`"' "$PC_REPO"
+assert_deny_env "backtick substitution with an inner quoted argument in primary is denied" "$AGENT" \
+    'echo "`git commit -m "a b"`"' "$PC_REPO"
+assert_deny_env "substitution at top level in primary is denied" "$AGENT" \
+    '$(git commit -m z)' "$PC_REPO"
+assert_deny_env "substitution holding git checkout <branch> in primary is denied" "$AGENT" \
+    'echo "$(git checkout other)"' "$PC_REPO"
+assert_deny_env "substitution holding gh pr checkout in primary is denied" "$AGENT" \
+    'echo "$(gh pr checkout 7)"' "$PC_REPO"
+assert_deny_env "substitution as an if-condition in primary is denied" "$AGENT" \
+    'if $(git commit -m z); then echo y; fi' "$PC_REPO"
+assert_deny_env "nested substitution in primary is denied" "$AGENT" \
+    'echo "$(echo "$(git commit -m z)")"' "$PC_REPO"
+assert_deny_env "a substitution earlier on the line survives an arithmetic expansion later on it" "$AGENT" \
+    'x=$(git checkout other); y=$(( $(git commit -m z) + 1 ))' "$PC_REPO"
+assert_deny_env "single quotes inside double quotes are literal, so the substitution is live" "$AGENT" \
+    "echo \"note '\$(git commit -m z)'\"" "$PC_REPO"
+assert_deny_env "substitution with git -C <primary> commit from a worktree cwd is denied" "$AGENT" \
+    "echo \"\$(git -C $PC_REPO commit -m z)\"" "$PC_WT"
+
+# The body runs in the cwd in effect WHERE it appears, and its own cd stays in
+# the subshell.
+assert_deny_env "cd <primary> then a substitution, from a worktree cwd, is denied" "$AGENT" \
+    "cd $PC_REPO && echo \"\$(git commit -m z)\"" "$PC_WT"
+assert_deny_env "cd <worktree> then a substitution that cd's to <primary> is denied" "$AGENT" \
+    "cd $PC_WT && echo \"\$(cd $PC_REPO && git commit -m z)\"" "$PC_REPO"
+assert_deny_env "cd <worktree> then a substitution with git -C <primary> is denied" "$AGENT" \
+    "cd $PC_WT && echo \"\$(git -C $PC_REPO commit -m z)\"" "$PC_REPO"
+assert_deny_env "a cd inside a body that shares its line with the mutation is kept" "$AGENT" \
+    "cd $PC_WT && echo \"\$(cd $PC_REPO && git commit -m z)\"" "$PC_WT"
+
+# Heredoc bodies: a QUOTED delimiter makes the body literal; an unquoted one
+# does not (the shell expands it, even inside single quotes in the body).
+PC_NL=$'\n'
+PC_TAB=$'\t'
+assert_deny_env "substitution in an unquoted-delimiter heredoc body is denied" "$AGENT" \
+    "cat <<EOF${PC_NL}x=\$(git commit -m z)${PC_NL}EOF" "$PC_REPO"
+assert_deny_env "single-quoted substitution in an unquoted-delimiter heredoc body is denied" "$AGENT" \
+    "cat <<EOF${PC_NL}x='\$(git commit -m z)'${PC_NL}EOF" "$PC_REPO"
+assert_deny_env "a substitution after a quoted heredoc closes is live again" "$AGENT" \
+    "cat <<'EOF'${PC_NL}x=\$(git commit -m z)${PC_NL}EOF${PC_NL}echo \"\$(git commit -m z)\"" "$PC_REPO"
+
+# --- ALLOW controls (#15505): inert text and read-only captures ---
+assert_allow_env "read-only capture x=(git rev-parse HEAD) in primary is allowed" "$AGENT" \
+    'x=$(git rev-parse HEAD)' "$PC_REPO"
+assert_allow_env "read-only capture echo (git status) in primary is allowed" "$AGENT" \
+    'echo "$(git status)"' "$PC_REPO"
+assert_allow_env "read-only capture echo (git log -1) in primary is allowed" "$AGENT" \
+    'echo "$(git log -1)"' "$PC_REPO"
+assert_allow_env "read-only backtick capture in primary is allowed" "$AGENT" \
+    'x=`git rev-parse HEAD`' "$PC_REPO"
+assert_allow_env "read-only capture holding a pipe into a non-git command is allowed" "$AGENT" \
+    'echo "$(git log --oneline | grep commit)"' "$PC_REPO"
+assert_allow_env "a left shift in an arithmetic expansion does not open a heredoc" "$AGENT" \
+    "x=\$(( 1 << shift ))${PC_NL}echo '\$(git commit -m z)'" "$PC_REPO"
+assert_allow_env "single-quoted substitution text is inert" "$AGENT" \
+    "echo '\$(git commit -m z)'" "$PC_REPO"
+assert_allow_env "single-quoted backtick text is inert" "$AGENT" \
+    "echo '\`git commit -m z\`'" "$PC_REPO"
+assert_allow_env "backslash-escaped substitution in double quotes is inert" "$AGENT" \
+    'echo "\$(git commit -m z)"' "$PC_REPO"
+assert_allow_env "git commit -m (date) inside a worktree is allowed" "$AGENT" \
+    "git commit -m \"\$(date)\"" "$PC_WT"
+assert_allow_env "cd <worktree> then a substitution runs in the worktree and is allowed" "$AGENT" \
+    "cd $PC_WT && echo \"\$(git commit -m z)\"" "$PC_REPO"
+assert_allow_env "substitution in a quoted-delimiter heredoc body is inert" "$AGENT" \
+    "cat <<'EOF'${PC_NL}x=\$(git commit -m z)${PC_NL}EOF" "$PC_REPO"
+assert_allow_env "substitution in a dash-form quoted-delimiter heredoc body is inert" "$AGENT" \
+    "cat <<-'EOF'${PC_NL}${PC_TAB}x=\$(git commit -m z)${PC_NL}${PC_TAB}EOF" "$PC_REPO"
+assert_allow_env "body-comment heredoc idiom with inert text, then nothing chained, is allowed" "$AGENT" \
+    "gh pr comment 7 --body \"\$(cat <<'EOF'${PC_NL}x=\$(git commit -m z)${PC_NL}EOF${PC_NL})\"" "$PC_REPO"
+assert_allow_env "operator session substitution (no agent env) is untouched" "" \
+    'x=$(git commit -m z)' "$PC_REPO"
 
 # --- ALLOW: worktrees unaffected ---
 assert_allow_env "git commit inside a worktree is allowed" "$AGENT" "git commit -m x" "$PC_WT"
