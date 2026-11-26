@@ -259,7 +259,9 @@ fn artifact_dir_activity(
 ///
 /// The `is_dir` qualifier matters because `BUILD_ARTIFACT_PATTERNS` is a
 /// dirty-detection list, not a reclaim list — it names files (`Cargo.lock`,
-/// `pnpm-lock.yaml`, `.loom-in-use`) that [`crate::worktree_ops::clean::reclaim_worktree_artifacts`]
+/// `pnpm-lock.yaml`, `.loom-in-use`) that the worktree reaper's kept-worktree
+/// artifact reclaim
+/// ([`crate::worktree_reaper::reclaim_kept_worktree_artifacts`])
 /// never touches. Excluding those from the walk *as well as* from the depth-1
 /// artifact scan (which only looks at directories) would make editing
 /// `Cargo.lock` invisible to the probe.

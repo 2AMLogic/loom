@@ -82,10 +82,16 @@ them but does not decide them.
 
 ### Tier 3: generic passthrough
 
-A tier-3 adapter exists to try a low-trust CLI against a **read-only**
-role — Judge, Curator, Guide, Auditor — without first writing a full
-guardrail-parity document. It is deliberately a much thinner contract than
-tier-1/tier-2:
+A tier-3 adapter exists to try a low-trust CLI against a role with no
+`runtimeRequirements` — **Curator**, **Guide**, or **Auditor** — without first
+writing a full guardrail-parity document. For example, [Aider](https://aider.chat)
+is admitted for Curator (`check-runtime-capabilities.sh --role curator --runtime
+aider` exits `0`), while roles that declare capability requirements (Builder,
+Doctor, and Judge) fail closed until the manifest supplies them; see
+[7. Capability declaration](#7-capability-declaration) for the role-matching
+rule and the Aider/Judge counterexample.
+
+Tier-3 is deliberately a much thinner contract than tier-1/tier-2:
 
 - **Implements only contract points 1 and 3, and only partially.** Point 1
   (Spawn) is the full interface — args passthrough, prompt delivery, a
@@ -93,57 +99,51 @@ tier-1/tier-2:
   transcript, and no account/usage-pool integration (points 2 and 4 are
   skipped outright). Point 3 (Error classification) is satisfied by the
   **generic-transient fallthrough only**: a tier-3 runtime gets no bespoke
-  pattern table in the native classifier (`loom-daemon classify-error`). Passing its name as the
-  `classify_error` provider argument is safe by construction — an
-  unregistered provider matches no table and resolves through the shared
+  pattern table in the native classifier (`loom-daemon classify-error`). Passing
+  its name as the `classify_error` provider argument is safe by construction —
+  an unregistered provider matches no table and resolves through the shared
   engine's exit-code-first ordering and generic transients, exactly like any
   genuinely unknown provider already does today.
 - **No guardrail-parity document (point 6) and no CI smoke leg are required.**
   This is not a lowered bar for tier-1/tier-2 — those promotion criteria are
-  unchanged (see the issue's "Non-goals") — it is a *different* trust
-  boundary that does not need a documented residual gap, because the boundary
-  is enforced mechanically instead of by prose:
-- **The capability manifest (point 7) is what makes skipping the parity doc
-  safe.** A tier-3 runtime's `defaults/runtimes/<name>.json` declares
-  `worktreeIsolation: "no"` **explicitly** — not `"partial"`. There is no
-  ambiguity to record ("close but gapped"); it is flatly unverified. Because
-  Builder and Doctor both declare `runtimeRequirements: ["worktreeIsolation",
-  ...]`, `check-runtime-capabilities.sh --role builder --runtime <tier-3-name>`
-  fails closed with exit **78** (`EX_CONFIG`) by the exact same mechanism that
-  already keeps Codex's `worktreeIsolation: partial` out of Builder — **no
-  code change to the checker was needed**: it already treats any value other
-  than exactly `"yes"` as unmet, so `"no"` fails closed identically to
-  `"partial"`.
-- **Read-only admission is per-role, not automatic for the whole "read-only"
-  category.** `judge.json` declares `runtimeRequirements: ["loomControl"]`, so a
-  tier-3 runtime with no verified Loom control route is
-  refused for Judge too, for the same reason it is refused for Builder: a
-  declared `"no"` is not a declared `"yes"`. `curator.json`, `guide.json`, and
-  `auditor.json` declare **no** `runtimeRequirements` today, so they are the
-  roles an unverified tier-3 runtime is actually admitted for (any runtime is
-  trivially compatible with a role that declares no requirements). A tier-3
-  runtime with a verified control route can declare `loomControl: "yes"` and admit Judge
-  too — the manifest is the single source of truth, not a hardcoded
-  runtime-vs-role table.
+  unchanged — it is a *different* trust boundary enforced mechanically by the
+  capability manifest ([point 7](#7-capability-declaration)): a tier-3 runtime
+  declares every unverified capability `"no"` **explicitly** (including
+  `worktreeIsolation: "no"`, not `"partial"`), so mutating roles (Builder,
+  Doctor) and control-gated roles (Judge) fail closed with exit **78**
+  (`EX_CONFIG`) by construction.
 
-**The launch shape is manifest data, not a script (issue #8671).** The
-*primary* tier-3 route is a `launch` object in the runtime's existing
-capability manifest, `defaults/runtimes/<name>.json`. Onboarding another CLI
-is a manifest edit plus a three-line exec stub — **not** a new script carrying
-that CLI's flag knowledge:
+**Recipe: manifest data plus a three-line exec stub (issues #4780, #8671).**
+The *primary* tier-3 route is a `launch` object in `defaults/runtimes/<name>.json`
+paired with a thin exec stub at `defaults/scripts/spawn-<name>.sh` — **not** a
+new script carrying that CLI's flag knowledge. Aider is the worked example:
 
-```jsonc
-// defaults/runtimes/aider.json
-{
-  "runtime": "aider",
-  "capabilities": { /* unchanged — every capability "no" for tier-3 */ },
-  "launch": {
-    "cliBin": "aider",              // the underlying binary to exec
-    "promptFlag": "--message",      // headless prompt delivery
-    "extraArgs": ["--yes-always"]   // argv always prepended
-  }
-}
-```
+1. **Manifest (`defaults/runtimes/aider.json`)** — declare every unverified
+   capability `"no"` and put the CLI's headless launch shape under `launch`:
+
+   ```jsonc
+   // defaults/runtimes/aider.json
+   {
+     "runtime": "aider",
+     "capabilities": { /* every capability "no" for an unverified tier-3 CLI */ },
+     "launch": {
+       "cliBin": "aider",              // the underlying binary to exec
+       "promptFlag": "--message",      // headless prompt delivery
+       "extraArgs": ["--yes-always"]   // argv always prepended
+     }
+   }
+   ```
+
+2. **Exec stub (`defaults/scripts/spawn-<name>.sh`)** — copy Aider's stub
+   (`defaults/scripts/spawn-aider.sh`) verbatim and change the one runtime name
+   so `spawn-worker.sh` can resolve it by script name. Aider's own stub is:
+
+   ```bash
+   #!/usr/bin/env bash
+   set -euo pipefail
+   _SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+   exec "${_SCRIPT_DIR}/spawn-generic-launch.sh" aider "$@"
+   ```
 
 The full closed schema — every key `launch` accepts — is:
 
@@ -211,17 +211,6 @@ already resolves `spawn-<runtime>.sh` by name off disk, so
 `LOOM_RUNTIME=aider` (or `runtimes.default: "aider"`) reaches
 `spawn-aider.sh` → `spawn-generic-launch.sh` → `spawn-generic.sh` through the
 exact same seam Codex uses.
-
-**Worked example (issues #4780, #8671).** `defaults/scripts/spawn-aider.sh`
-wires the [Aider](https://aider.chat) CLI as a tier-3 runtime end-to-end. It
-is now a pure exec stub — `exec "$_SCRIPT_DIR/spawn-generic-launch.sh" aider
-"$@"` — with aider's entire launch shape living in
-`defaults/runtimes/aider.json`'s `launch` object. That manifest also declares
-every capability `"no"`, so `check-runtime-capabilities.sh --role builder
---runtime aider` exits 78 while `--role curator --runtime aider` exits 0. This
-is the *mechanism*, not a roster of new runtimes — onboarding any other
-specific CLI as tier-3 is a separate, per-CLI follow-up (see the issue's
-"Non-goals").
 
 **Promoting a tier-3 runtime to tier-2** means writing the guardrail-parity
 document, adding a CI smoke leg, and — critically — re-declaring its
@@ -705,12 +694,20 @@ prose, the manifest makes it enforceable.
 **every** capability `"no"`, including `worktreeIsolation: "no"` **explicitly**
 rather than `"partial"` — there is no residual gap to record in prose because
 there is no parity doc for tier-3 at all (see
-[Tier 3: generic passthrough](#tier-3-generic-passthrough)). The same "any
+[Tier 3: generic passthrough](#tier-3-generic-passthrough)). Role admission is
+per-role, not automatic for a whole "read-only" category, and the same "any
 non-`yes` value fails closed" matcher rule that enforces Codex's `partial`
-enforces this `no` identically — `--role builder --runtime aider` and
-`--role judge --runtime aider` (judge requires `loomControl`, declared `"no"` here)
-both exit 78, while `--role curator --runtime aider` exits 0 because
-`curator.json` declares no `runtimeRequirements` at all.
+enforces this `no` identically:
+
+- `--role curator --runtime aider` exits `0` because `curator.json` (like
+  `guide.json` and `auditor.json`) declares no `runtimeRequirements`.
+- `--role builder --runtime aider` exits `78`, naming unmet `worktreeIsolation`
+  and `loomControl`.
+- `--role judge --runtime aider` exits `78`, naming unmet `loomControl`
+  (`judge.json` declares `runtimeRequirements: ["loomControl"]`). A tier-3
+  runtime with a verified Loom control route can declare `loomControl: "yes"`
+  and qualify for Judge — the manifest is the single source of truth, not a
+  hardcoded runtime-vs-role table.
 
 **Why `hooks`/`worktreeIsolation` are still `partial` after #4495.** Loom *does*
 now wire Codex's `pre_tool_use` event (`defaults/hooks/guard-codex-bridge.sh`,
@@ -1210,12 +1207,12 @@ region, or an `account=unknown`/malformed identity. `category` is one of the
 
 Consumer: `sweep_registry::quarantine::apply_provider_health_feedback`, the
 only production caller, feeds the parsed `(provider, account, category,
-model)` into `tokens_pool::record_terminal_for_model` — a
+model)` into `tokens_pool::record_terminal_for_model_with_reset` — a
 `MODEL_CREDITS_EXHAUSTED` category with a recognized `model` writes a
 **class-scoped** `class_cooldowns` entry (`.loom/account-health.json`)
 rather than the account-wide `plan_exhausted` cooldown every other category
 (and every v1 record) still writes. See
-[`tokens_pool::health`'s module doc](https://github.com/rjwalters/loom/blob/main/loom-daemon/src/tokens_pool/health.rs)
+[`tokens_pool::health`'s module doc](https://github.com/2AMLogic/loom/blob/main/loom-daemon/src/tokens_pool/health.rs)
 for the full narrowing/fail-safe contract (#8058 Phase 2).
 
 An adapter emitting this record for the first time should start at `v=2`
@@ -1420,6 +1417,110 @@ Only native runtimes (`pi`, `opencode`, `kimi`) are checked, and only when the
 profile declares a provider for that harness. `loom-daemon validate` rejects an
 `excludedRoles` entry that is not a known role name.
 
+**Changing a bundled profile's model without a release (`runtimes.modelProfileOverrides`, #15252).**
+`runtimes.modelProfiles.<name>` *replaces* a bundled profile wholesale, so a copy
+that omits `excludedRoles` silently admits GLM to Judge and Curator (#11450).
+To change only what a bundled profile runs, overlay it instead:
+
+```jsonc
+"runtimes": { "modelProfileOverrides": { "zai-full": { "model": "glm-5.4" } } }
+```
+
+- The override is merged **onto** the bundled profile inside `profiles::lookup`,
+  so every launch, admission, billing and inspection path sees it. Providers,
+  credentials, `credentialProxy`, `providerOptions`/`providerDefinition`,
+  `billing` and `excludedRoles` always come from the bundled definition.
+- Allowed keys: `model`, `effort`, `allowedEfforts` (each replaces the bundled
+  value) and `excludedRolesAdd` (a list of known role names, **unioned** onto the
+  bundled `excludedRoles`, deduplicated by canonical role). `excludedRoles` itself
+  can never be replaced or reduced. `{}` is a valid no-op.
+- Rejected by `loom-daemon validate` **and** at launch (exit 78, so a bad store
+  config cannot half-apply): an unknown key (including `excludedRoles`), a name
+  that is not bundled, a name also defined under `runtimes.modelProfiles`, a
+  blank/non-string `model`/`effort`/`allowedEfforts` entry, and an unknown or
+  non-array `excludedRolesAdd`. Explicit `null` (a profile or a field) is "absent".
+- Works at every config tier and layers by `deep_merge`, so a host-tier override
+  (`fleet/hosts/<host>/defaults.json`, `.loom-local/local.json`) beats the fleet
+  default key by key, and a higher tier's `null` clears a lower tier's value. A
+  per-host override is therefore a canary: put the new model on one host, compare,
+  then promote it to the fleet defaults.
+- `loom-daemon worker profile-check <name>` prints the effective model and the
+  tier that decided it: `model: glm-5.4 (source: defaults)`. The source is
+  `local`, `fleet-repo`, `project`, `committed`, `defaults` (the rendered machine
+  tier) or `bundled` (no override). A `runtimes.modelProfiles` replacement reports
+  the tier it came from the same way.
+
+This is the sanctioned way to change a fleet-wide model: the fleet store must not
+define its own GLM profile under `runtimes.modelProfiles` (that is the #11450
+loophole), and uses this overlay instead.
+
+**Prompt modifier for a single-step run (`LOOM_PROMPT_MODIFIER`, #15017).** A caller
+that runs exactly one step can name a registered modifier, next to the
+`LOOM_RUNTIME` / `LOOM_MODEL_PROFILE` / `LOOM_EFFORT` pins above, so the run is
+distinguishable afterwards from a plain one. Off by default: unset (or blank) changes
+nothing, and nothing about the role draw or fleet dispatch changes.
+
+```json
+{ "runtimes": { "promptModifiers": {
+    "deep": { "claude": { "append": "ultrathink" }, "pi": { "append": "think hard" } }
+} } }
+```
+
+- **Registry.** `runtimes.promptModifiers.<name>.<runtime>.append` is the text added
+  after the prompt (after a blank line). Loom hard-codes no names: the caller owns
+  what each name means per harness. Only `append` exists: text *before* the prompt
+  would stop a `/loom:<role>` invocation from expanding. A name is 1-64 bytes of
+  `[A-Za-z0-9._:-]`.
+- **One application site per runtime kind**, both in `spawn-worker`
+  (`loom-daemon/src/worker_spawn/mod.rs`), never a role file: a legacy adapter
+  (`claude`, `codex`, ...) gets the modified `-p` / `--prompt` value in the argv it is
+  exec'd with; a native harness (`pi`, `opencode`, `kimi`) gets it after the expanded
+  role prompt, on its stdin.
+- **Fails closed at preflight.** A name that is malformed, not registered, or
+  registered but with no entry for the launch's runtime is refused with exit 78 and
+  `stage=prompt_modifier` (`loom.admission.stage` on the preflight span, ledger
+  reason `preflight_prompt_modifier`). So is a legacy adapter (`claude`, `codex`,
+  ...) paired with an argv that has no `-p` / `--prompt` to modify. A native
+  harness (`pi`, `opencode`, `kimi`) refuses a missing `--prompt` earlier still,
+  at `stage=worker_options` (ledger reason `preflight_worker_options`). Either way
+  it never runs plain under the modifier's name.
+- **Recorded.** `loom.prompt_modifier` is stamped like the other provenance keys,
+  so it is on `loom.dispatch.step`, `loom.role_attempt` and `loom.runtime.usage`
+  (and the other spans of that process), and is absent when no modifier is set. It is
+  also folded into `loom.hyperparams.digest`: two runs that differ only in the
+  modifier have different digests, and an unmodified run's digest is unchanged.
+
+Observed (`loom-daemon hyperparams`, same workspace, default vector; the second and
+third lines differ only in the modifier):
+
+```text
+$ loom-daemon hyperparams .
+digest: sha256:b5d41c0d0b7846806d6e697571e03b0c30376406b632dbcd437a8119f413656c
+$ LOOM_PROMPT_MODIFIER=deep loom-daemon hyperparams .
+digest: sha256:d06bfbfcc70c46ec3eacbd3286d2810dfacaca3f668a1e463c763ba23c854e87
+promptModifier                 = deep  [env]
+$ LOOM_PROMPT_MODIFIER=wide loom-daemon hyperparams .
+digest: sha256:832a0bf534ba97d5eb05d8efbdd5725809de4ba542c8e4db62bbc212dca8dc8b
+promptModifier                 = wide  [env]
+```
+
+and an unsupported (runtime, modifier) pair, with the registry above and
+`LOOM_RUNTIME=codex`:
+
+```text
+$ LOOM_RUNTIME=codex LOOM_PROMPT_MODIFIER=deep loom-daemon spawn-worker -- -p hello
+spawn-worker: runtime=codex (from global-environment)
+# LOOM_RUNTIME_RESOLVED runtime=codex
+prompt modifier "deep" has no entry for runtime "codex" under runtimes.promptModifiers.deep; refusing to run without it (#15017)
+# LOOM_LAUNCH_REJECTED code=78 stage=prompt_modifier
+$ echo $?
+78
+```
+
+Not covered here: which modifier names exist and what each does per harness (the
+caller's registry), and multi-agent usage accounting beyond what the runtime already
+reports.
+
 **GLM-first Builder and Doctor (fleet policy, tier 1).** The routing comes
 from the fleet state store `config.defaults`, rendered into each host's machine tier
 (`~/.local/share/loom/config/defaults.json`), not from this repo's
@@ -1521,7 +1622,8 @@ so the launch record shows the real runtime and model profile. A `claude`
 resolution prints `outcome=delegate-to-claude` and exits 0 without launching.
 Exit codes: 0 artifact, 1 no artifact, 2 usage (Judge/Curator refused),
 75 no eligible runtime/seat, 78 config, 124 timeout. The `/loom:sweep`
-orchestrator calls it before Builder/Doctor Task dispatch; see
+orchestrator calls it before Builder/Doctor Task dispatch only when it is a daemon-dispatched child
+(`LOOM_SWEEP_CLAIM_OWNED` / `--claim-owned`); an attended in-session sweep skips it (#15299); see
 `native-sweep.md` and `sweep-execution-model.md`.
 
 Because a phase can outlast the Bash tool cap (120s default / 600s max), the
@@ -1743,31 +1845,14 @@ capability manifest at `defaults/runtimes/<runtime>.json` (point 7) at the same
 time — declaring a capability `"partial"` fails role matching closed, which is
 how Codex is correctly kept out of Builder dispatch.
 
-**Want to skip both of those for now?** That is exactly what
-[tier-3 generic passthrough](#tier-3-generic-passthrough) is for, and it does
-**not** need a hand-written adapter at all. Since #8671 the tier-3 route is a
-manifest edit:
-
-1. Write `defaults/runtimes/<name>.json` with every capability `"no"`
-   (including `worktreeIsolation: "no"`, explicitly) — that is what refuses
-   Builder/Doctor with no parity doc required — plus a `launch` object
-   carrying the CLI's headless shape (`cliBin`, `promptFlag`, `extraArgs`,
-   and whichever of `modelFlag`/`modelEnv`/`effortFlag`/`effortValuePrefix`
-   apply). The [tier-3 section](#tier-3-generic-passthrough) has the full
-   closed schema; an unrecognized key there fails closed with exit 78.
-2. Add the three-line exec stub `defaults/scripts/spawn-<name>.sh`, whose
-   only content is `exec "$_SCRIPT_DIR/spawn-generic-launch.sh" <name> "$@"`
-   — it exists solely because `spawn-worker.sh` resolves runtimes by script
-   name. Copy `spawn-aider.sh` verbatim and change the one word.
-
-None of the four `spawn-codex.sh` lessons above need re-deriving for a tier-3
-CLI: flag translation, `nice` re-exec, and stdin neutralization all already
-live in the shared `spawn-generic.sh`, and the per-CLI differences those
-lessons produced (which flag carries the prompt, whether effort rides a `-c`
-key) are exactly what the manifest's `launch` object now encodes as data.
-
-Use tier-3 to try a CLI against a read-only role first; write the tier-2
-artifacts only once you are ready to trust it more broadly.
+**Want to skip both of those for now?** Use
+[Tier 3: generic passthrough](#tier-3-generic-passthrough) — it provides the
+manifest + exec-stub recipe and closed `launch` schema, and `spawn-generic.sh`
+already handles the flag translation, `nice` re-exec, and stdin neutralization
+lessons above. See [7. Capability declaration](#7-capability-declaration) for
+which roles an unverified tier-3 manifest admits (such as Curator) and what is
+needed to qualify for Judge, Builder, or Doctor; write the tier-2 artifacts
+only once you are ready to promote the runtime.
 
 ### Unknown-runtime failure (exit 78)
 
@@ -1804,9 +1889,11 @@ unknown to known did not weaken this guard for other names.)
 
 Containers as a session-persistence and containment boundary for worker
 runtimes — per-account persistent session containers for runtimes with
-mutable interactive auth (Codex), per-sweep ephemeral containers for
-stateless-auth runtimes (Claude, Pi/OpenCode) — are specified in
-[ADR-0017: Session-Container Architecture](https://github.com/rjwalters/loom/blob/main/docs/adr/0017-session-container-architecture.md)
+mutable interactive auth (Codex) and, opt-in per account, for Claude
+([below](#claude-per-seat-session-containers-issue-14371)); per-sweep
+ephemeral containers for stateless-auth runtimes (Claude by default,
+Pi/OpenCode) — are specified in
+[ADR-0017: Session-Container Architecture](https://github.com/2AMLogic/loom/blob/main/docs/adr/0017-session-container-architecture.md)
 (epic #6896). Both container lifetimes dispatch through the existing
 `spawn-worker.sh` → `spawn-<runtime>.sh` seam described above with **no new
 dispatch path**; this doc's seven contract points are unchanged by that ADR.
@@ -1814,9 +1901,83 @@ This is a pointer only — no contract-point changes ship with it.
 
 | Runtime | Lifetime | Image | Enable with | Telemetry `containment=` |
 |---|---|---|---|---|
-| Claude | per-sweep **ephemeral** | `ghcr.io/rjwalters/loom-worker` | `runtimes.containment.enabled: true` (#7429) | `claude-ephemeral` |
-| Codex | per-account **persistent session** | `ghcr.io/rjwalters/loom-worker-session` | ADR-0017 Phase 2 | — |
-| Pi, OpenCode | per-sweep **ephemeral** | `ghcr.io/rjwalters/loom-worker-native` | `runtimes.containment.native: "ephemeral"` (#8403) | `native-ephemeral` |
+| Claude | per-sweep **ephemeral** | `ghcr.io/2amlogic/loom-worker` | `runtimes.containment.enabled: true` (#7429) | `claude-ephemeral` |
+| Claude | per-seat **persistent session** (opt-in per account) | `ghcr.io/2amlogic/loom-worker-session` (or the `accounts.session.image` override, #14019) | `loom-daemon accounts session start <name> --provider claude` (#14371) | `claude-session` |
+| Codex | per-account **persistent session** | `ghcr.io/2amlogic/loom-worker-session` | ADR-0017 Phase 2 | — |
+| Pi, OpenCode | per-sweep **ephemeral** | `ghcr.io/2amlogic/loom-worker-native` | `runtimes.containment.native: "ephemeral"` (#8403) | `native-ephemeral` |
+
+#### Claude per-seat session containers (issue #14371)
+
+The operator ruled that every runtime's steps may run in one
+operator-built session image with **one login per container**. For Claude that
+is a *seat*: a Claude token-pool account whose persistent container
+`loom-claude-session-<name>` is managed like Codex's `loom-codex-session-<name>`
+and started from the same session image. It is a second **opt-in** shape beside
+`claude-ephemeral`, not a replacement, and it adds no dispatch path.
+
+**How a step reaches a seat.** `spawn-claude.sh` runs the existing token
+selector first (bad-token skipping, `.ranking`, `.allowlist`, then random). Only
+if the *selected* account is a registered seat does it `exec`
+`loom-daemon session-exec claude-seat`, which runs `spawn-claude.sh` inside that
+seat's container through the same supervised `docker exec` transport Codex uses.
+So seat selection is the pool selector's choice of account; there is no second
+selector and no in-container pool read. An exhausted or dead account is skipped
+exactly as on the host, and an empty or fully-excluded pool still exits `78`
+(`EX_CONFIG`) before any container is touched. A selected seat that is stopped,
+missing the workspace mount, or on an incompatible `session-exec` protocol
+**refuses the step** (named reason, no silent fall back to host dispatch). A
+credential-proxied dispatch is also refused for a seat, because the token must
+travel in the exec's process environment.
+
+**What lives where.**
+
+| | Per-sweep ephemeral (`claude-ephemeral`) | Per-seat session (`claude-session`) |
+|---|---|---|
+| Lifetime | one sweep, then removed | persistent; survives steps, daemon restarts, host reboots |
+| Token | process env, pool re-read inside the container | process env of the `docker exec` only; the pool is never mounted and the token is on no container path |
+| Claude state (config, sessions, transcripts) | clean filesystem per sweep | the seat's own `<seat root>/<name>/home`, mounted at `/home/loom/.claude`; two seats share no directory |
+| Resource limits | per-sweep CPU / memory cgroup payload | none per seat today (a seat is shared by that account's steps) |
+| Operator surface | none (config flag) | `accounts session start`, `stop`, `status` with `--provider claude`; `accounts list --provider claude` |
+
+What each shape costs: ephemeral pays a container create and teardown per sweep
+and gives up cross-step state; a seat pays an idle persistent container per
+enrolled account plus lifecycle operations (start, stop, recreate when the
+image rolls — #14112 will automate that), and its filesystem is **not** clean
+between steps. Which one starts a step sooner is measured, not assumed: a seat
+step's stderr log carries `# LOOM_SEAT_DISPATCH dispatched_at=<RFC 3339>` (the
+instant before `docker exec` is spawned) and `# LOOM_SEAT_FIRST_ACTIVITY
+dispatched_at=<..> first_activity_at=<..> elapsed_ms=<n>` (the first byte the
+worker writes to stderr; `first_activity_at=none` if it never wrote one).
+Stdout is not observable by the supervisor, so first activity is a stderr
+signal, not a first-model-token signal.
+
+**Telemetry.** The `# LOOM_DISPATCH_MODE` marker for a seat step reads
+`containment=claude-session` and adds `container_id=` and `image_digest=`
+(`sha256:…`) of the container instance the step was bound to, so a run record
+names the exact container and image. `accounts list --provider claude` and
+`accounts session status <name> --provider claude` show each seat's runtime,
+containment, container and image.
+
+**The Claude CLI in the image.** The session image does not install Claude
+itself: it is `FROM` the `loom-worker` image at the same release tag, which
+installs the CLI with `claude.ai/install.sh`. The CLI version is therefore the
+one that install served when that base image was built, and the image tag pins
+the pair together; it is **not** separately version-pinned. That follows
+`.github/workflows/harness-pins.yml`, which keeps Claude Code out of the pinned
+harnesses on purpose (the fleet tracks latest). Whether the in-container CLI
+self-updates past the built version is not asserted here.
+
+**Relation to the #7767 soak.** #7767 gates flipping the *fleet default* of
+`runtimes.containment.enabled` (the `claude-ephemeral` shape) on soak evidence.
+Per-seat sessions are opt-in per account, flip no default, and neither consume
+nor count toward those criteria; because the `containment=` value differs,
+soak data for one shape cannot be mistaken for the other. #7767 stays blocked
+on its own evidence.
+
+**Status.** Registration, supervised dispatch, selection, isolation and the
+fake-Docker/image-smoke tests are merged (#14499, #14596). A provider-backed
+Builder step inside a real seat on a fleet host has not been run as part of this
+documentation change.
 
 #### Why native harnesses do NOT reuse Codex's session container
 
@@ -1838,7 +1999,7 @@ Reusing the session shape here would therefore cost both of the properties the
 ephemeral shape gives for free — a guaranteed-clean filesystem per sweep, and a
 hard teardown at sweep end — in exchange for solving a problem native harnesses
 do not have. The two images differ by **lifetime**, not by which CLI they
-install; see [`docker/native/README.md`](https://github.com/rjwalters/loom/blob/main/docker/native/README.md).
+install; see [`docker/native/README.md`](https://github.com/2AMLogic/loom/blob/main/docker/native/README.md).
 
 ### Native-harness ephemeral containment (issue #8403, epic #6896 Phase 3)
 
@@ -1867,7 +2028,7 @@ purpose. That flag selects the `loom-worker` base image, which ships no Node and
 therefore neither native CLI, so inheriting it would dispatch a native sweep
 into an image that cannot run it. The image resolves
 `LOOM_NATIVE_CONTAINER_IMAGE` env → `runtimes.containment.nativeImage` config →
-`ghcr.io/rjwalters/loom-worker-native:latest`.
+`ghcr.io/2amlogic/loom-worker-native:latest`.
 
 **Mechanism.** The same one `spawn-claude.sh` uses — re-exec the dispatcher
 inside a `docker run`, guarded by the shared `LOOM_SPAWN_CONTAINERIZED=1`
@@ -1991,8 +2152,9 @@ stays env-passthrough even with the flag on.
   Validated at profile-selection time; userinfo, a query and a fragment are
   refused rather than normalised away.
 - `header` — `authorization-bearer` (Claude Code's `ANTHROPIC_AUTH_TOKEN`
-  shape, and most OpenAI-compatible endpoints) or `x-api-key` (Anthropic's
-  native API-key header).
+  shape, and most OpenAI-compatible endpoints), `x-api-key` (Anthropic's
+  native API-key header) or `x-goog-api-key` (the Google Gemini API-key
+  header).
 - `baseUrlEnv` — the environment variables set to the proxy's own base URL.
   Use this when the harness reads its base URL from the environment
   (`ANTHROPIC_BASE_URL`, `OPENAI_BASE_URL`, …).
@@ -2282,7 +2444,7 @@ adapter (not the `spawn-worker.sh` seam) decides whether "spawn" means
   "runtimes": {
     "containment": {
       "enabled": true,
-      "image": "ghcr.io/rjwalters/loom-worker:latest"
+      "image": "ghcr.io/2amlogic/loom-worker:latest"
     }
   }
 }
@@ -2296,7 +2458,7 @@ adapter (not the `spawn-worker.sh` seam) decides whether "spawn" means
 
 The image is resolved the same way (`LOOM_SWEEP_CONTAINER_IMAGE` env →
 `runtimes.containment.image` config → default
-`ghcr.io/rjwalters/loom-worker:latest`).
+`ghcr.io/2amlogic/loom-worker:latest`).
 
 **Mechanism.** When enabled, `spawn-claude.sh` re-execs *itself* inside
 `docker run <image> <workspace>/.loom/scripts/spawn-claude.sh <original args>`,
@@ -2305,7 +2467,7 @@ re-exec'd copy runs the ordinary (now-"bare-metal-inside-a-box") dispatch
 path straight through — CPU quota (advisory-only, same as any host with no
 reachable `systemd --user` manager), sleep-inhibit, and token selection all
 execute again, this time *inside* the container. This is deliberate, not
-incidental: it is the reason [`docker/worker/MOUNT-CONTRACT.md`](https://github.com/rjwalters/loom/blob/main/docker/worker/MOUNT-CONTRACT.md)
+incidental: it is the reason [`docker/worker/MOUNT-CONTRACT.md`](https://github.com/2AMLogic/loom/blob/main/docker/worker/MOUNT-CONTRACT.md)
 §2 can say a worker container reads a token "via the existing rotation logic
 in `spawn-claude.sh`" — there is only one implementation of that logic, ever.
 Niceness is the one exception: the host-side `LOOM_SWEEP_NICED` sentinel is
@@ -2543,7 +2705,7 @@ container as a **job spec** sent to a host-level executor, over the
 Pointer only — none of this doc's seven contract points change. The seam sits
 *beside* worker dispatch, not inside it: `spawn-worker.sh` still decides what
 a worker is, and a job is something a worker asks for while it runs. Job
-mounts follow the same [`MOUNT-CONTRACT.md`](https://github.com/rjwalters/loom/blob/main/docker/worker/MOUNT-CONTRACT.md)
+mounts follow the same [`MOUNT-CONTRACT.md`](https://github.com/2AMLogic/loom/blob/main/docker/worker/MOUNT-CONTRACT.md)
 §1 path-parity rule containerized dispatch does, and job resource limits
 mirror the per-sweep `--cpus`/`--memory` shape above. Migrating the
 docker-requiring callers (build-gate, sim/build wrappers) onto the seam is
@@ -2557,7 +2719,7 @@ sessions, never persisted) and user-scope `~/.claude/settings.json` entries; the
 project file stays repo-owned, and resync only reports hooks it does not wire
 (`report_unwired_hooks`). A hook that no non-mutating surface can carry is not
 delivered. Conflict, uninstall, malformed-file and upgrade behaviour are in
-[ADR-0026](https://github.com/rjwalters/loom/blob/main/docs/adr/0026-consumer-hook-settings-ownership.md).
+[ADR-0026](https://github.com/2AMLogic/loom/blob/main/docs/adr/0026-consumer-hook-settings-ownership.md).
 
 ## Fork mapping table
 
@@ -2605,7 +2767,7 @@ collaboration:
   `defaults/runtimes/aider.json` worked example, and the capability-manifest
   gate this section documents. Adapted from a survey of
   [stablyai/orca](https://github.com/stablyai/orca)
-  ([survey-orca-2026-07-31.md](https://github.com/rjwalters/loom/blob/main/.loom/docs/survey-orca-2026-07-31.md),
+  ([survey-orca-2026-07-31.md](https://github.com/2AMLogic/loom/blob/main/.loom/docs/survey-orca-2026-07-31.md),
   idea 5), filed from #4775.
 - **#8671** — the tier-3 launch shape (`cliBin`, `promptFlag`, `extraArgs`,
   `modelFlag`/`modelEnv`, `effortFlag`/`effortValuePrefix`) moved out of
@@ -2614,9 +2776,9 @@ collaboration:
   `spawn-generic-launch.sh`. Field set seeded from
   [superset-sh/superset](https://github.com/superset-sh/superset)'s
   declarative registry (21 coding CLIs), used as a reference table only.
-- [ADR-0012: Multi-Runtime Worker Support via a Runtime Adapter Contract](https://github.com/rjwalters/loom/blob/main/docs/adr/0012-runtime-adapter-contract.md).
+- [ADR-0012: Multi-Runtime Worker Support via a Runtime Adapter Contract](https://github.com/2AMLogic/loom/blob/main/docs/adr/0012-runtime-adapter-contract.md).
 - Fork: https://github.com/gpeyton/loom · `AGENTS.md` standard: https://agents.md
-- [`docker/worker/MOUNT-CONTRACT.md`](https://github.com/rjwalters/loom/blob/main/docker/worker/MOUNT-CONTRACT.md) —
+- [`docker/worker/MOUNT-CONTRACT.md`](https://github.com/2AMLogic/loom/blob/main/docker/worker/MOUNT-CONTRACT.md) —
   the normative container mount contract (path parity, secrets, uid mapping,
   build-cache placement) for anything that dispatches a worker runtime inside
-  a `ghcr.io/rjwalters/loom-worker`-derived container (epic #6896).
+  a `ghcr.io/2amlogic/loom-worker`-derived container (epic #6896).

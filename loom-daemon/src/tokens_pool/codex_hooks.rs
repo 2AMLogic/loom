@@ -456,6 +456,48 @@ pub fn trust_at(codex_home: &Path, runtime_home: &Path) -> (bool, &'static str) 
     }
 }
 
+/// A profile's hook trust as an operator reads it (#14105): `recorded` when
+/// Codex has a trust decision for Loom's entry where a session runs it,
+/// `sealed` when it has none but the registration vets as Loom's one entry
+/// (host-mode's workspace-independent command, or `private_command`, the
+/// image-owned bridge a private clone registers), so a launch passes the
+/// waiver instead, and `missing` otherwise. Profile-level only: a clone's
+/// project layers are vetted when a session launches.
+#[must_use]
+pub fn trust_state(codex_home: &Path, private_command: &str) -> &'static str {
+    if trust_at(codex_home, Path::new(SESSION_CODEX_HOME)).0 {
+        return "recorded";
+    }
+    let sealable = |command: Option<String>| {
+        let request = seal::Request {
+            command,
+            ..seal::Request::default()
+        };
+        seal::vet_profile(codex_home, Path::new(SESSION_CODEX_HOME), &request).is_ok()
+    };
+    if sealable(None) || sealable(Some(private_command.to_owned())) {
+        "sealed"
+    } else {
+        "missing"
+    }
+}
+
+/// [`trust_state`], but only when the profile could be assessed (#15292): a
+/// directory whose `hooks.json` and `config.toml` are readable (absent is
+/// readable, and genuinely `missing`). `trust_state` also answers `missing`
+/// after a read failure, which must not read as an untrusted profile.
+#[must_use]
+pub fn assessed_trust_state(codex_home: &Path, private_command: &str) -> Option<&'static str> {
+    if !codex_home.is_dir() || read_hooks(codex_home).is_err() {
+        return None;
+    }
+    let config = codex_home.join("config.toml");
+    if config.exists() && std::fs::read_to_string(&config).is_err() {
+        return None;
+    }
+    Some(trust_state(codex_home, private_command))
+}
+
 /// The `hooks.state` keys Codex looks Loom's entry up under with
 /// `CODEX_HOME=runtime_home`: one per `PreToolUse` position the entry holds.
 #[must_use]
@@ -620,6 +662,14 @@ pub(crate) mod test_support {
         guard_ready(profile, None);
         std::fs::write(profile.join("config.toml"), "").unwrap();
         std::fs::write(profile.join(".session-managed.json"), "{}").unwrap();
+    }
+
+    /// Register the bare profile and put a readable bridge in its fixture workspace.
+    pub(crate) fn guard_ready_in_workspace(workspace: &Path, profile: &Path) {
+        let hooks = workspace.join(".loom/hooks");
+        std::fs::create_dir_all(&hooks).unwrap();
+        std::fs::write(hooks.join("guard-codex-bridge.sh"), "#!/bin/sh\n").unwrap();
+        guard_ready(profile, None);
     }
 
     /// Make `profile` guard-ready for a run with `CODEX_HOME=runtime_home`

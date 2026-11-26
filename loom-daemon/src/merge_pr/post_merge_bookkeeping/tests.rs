@@ -9,6 +9,7 @@ struct Fake {
     commits: String,
     fail_helpers: Vec<&'static str>,
     close_fails: bool,
+    timeline: HashMap<String, String>,
     calls: RefCell<Vec<String>>,
 }
 
@@ -39,6 +40,10 @@ impl Host for Fake {
         self.calls.borrow_mut().push(format!("close {i}"));
         !self.close_fails
     }
+    fn label_events(&self, _: &str, i: &str) -> Option<String> {
+        self.calls.borrow_mut().push(format!("timeline {i}"));
+        self.timeline.get(i).cloned()
+    }
     fn timestamp(&self) -> String {
         "T".into()
     }
@@ -58,6 +63,7 @@ fn done(o: Outcome) -> Vec<Record> {
     match o {
         Outcome::Done(r) => r,
         Outcome::Need(n) => panic!("unexpected need {n:?}"),
+        Outcome::Defer(_) => panic!("unexpected defer"),
     }
 }
 
@@ -215,6 +221,66 @@ fn branch_close_failure_is_a_warning() {
     f.close_fails = true;
     let r = done(run(Pass::BranchClose, &inputs("x"), &facts(""), &f));
     assert_eq!(levels(&r), ["WARNING"]);
+}
+
+const MERGED_AT: &str = "2026-11-21T10:00:00Z";
+const AFTER_MERGE: &str = "2026-11-21T11:30:00Z";
+const BEFORE_MERGE: &str = "2026-11-20T08:00:00Z";
+
+/// The observation replay's input shape (#15145): `merged_at` set.
+fn observed(body: &str) -> Inputs {
+    Inputs {
+        merged_at: Some(MERGED_AT.into()),
+        ..inputs(body)
+    }
+}
+
+fn reopened_timeline(at: &str) -> String {
+    serde_json::json!([{"event": "reopened", "created_at": at}]).to_string()
+}
+
+#[test]
+fn branch_close_without_merged_at_never_reads_the_timeline() {
+    let mut f = Fake::default();
+    f.kinds.insert("42".into(), "open".into());
+    // No timeline seeded — and none consulted: the synchronous shell
+    // caller's close is exactly what it was (#15145).
+    let r = done(run(Pass::BranchClose, &inputs("x"), &facts(""), &f));
+    assert_eq!(levels(&r), ["SUCCESS"]);
+    assert!(!f.calls().iter().any(|c| c.starts_with("timeline")));
+}
+
+#[test]
+fn branch_close_with_merged_at_skips_a_reopened_issue() {
+    let mut f = Fake::default();
+    f.kinds.insert("42".into(), "open".into());
+    f.timeline
+        .insert("42".into(), reopened_timeline(AFTER_MERGE));
+    let r = done(run(Pass::BranchClose, &observed("x"), &facts(""), &f));
+    assert_eq!(levels(&r), ["INFO"]);
+    assert!(!f.calls().iter().any(|c| c.starts_with("close")));
+}
+
+#[test]
+fn branch_close_with_merged_at_closes_when_the_reopen_predates() {
+    let mut f = Fake::default();
+    f.kinds.insert("42".into(), "open".into());
+    f.timeline
+        .insert("42".into(), reopened_timeline(BEFORE_MERGE));
+    let r = done(run(Pass::BranchClose, &observed("x"), &facts(""), &f));
+    assert_eq!(levels(&r), ["SUCCESS"]);
+    assert_eq!(f.calls().iter().filter(|c| c.starts_with("close")).count(), 1);
+}
+
+#[test]
+fn branch_close_with_merged_at_defers_on_an_unreadable_timeline() {
+    let mut f = Fake::default();
+    f.kinds.insert("42".into(), "open".into());
+    match run(Pass::BranchClose, &observed("x"), &facts(""), &f) {
+        Outcome::Defer(recs) => assert_eq!(levels(&recs), ["WARNING"]),
+        other => panic!("expected a defer, got {other:?}"),
+    }
+    assert!(!f.calls().iter().any(|c| c.starts_with("close")));
 }
 
 #[test]

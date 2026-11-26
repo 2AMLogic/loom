@@ -157,15 +157,6 @@ pub(super) fn attempt(
     // refusal is this host's standing, not a failure: another host may hold
     // a credential that can, so there is no backoff and no alert.
     if let Err(why) = (env.may_write)(&root, &candidate.nwo) {
-        if memory
-            .noted
-            .insert(format!("scope:{}:{why}", root.display()))
-        {
-            log::warn!(
-                "workspace_resync: {}: not resynced from this host: {why} (reported once)",
-                candidate.nwo
-            );
-        }
         report.reason = Some(format!("not written from this host: {why}"));
         return false;
     }

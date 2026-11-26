@@ -51,12 +51,15 @@ pub const SUPPORTS_INSTALLED: &str = "0.19.175";
 /// 0.19.1312 is the first release with the `resolve-role-model` subcommand
 /// (#13956; 0.19.1311 was cut before the merge and lacks it), called by the
 /// `resolve-role-model.sh` script-helper, whose hard
-/// floor is the same release.
+/// floor is the same release. 0.20.5 is the first release after this change
+/// merges (#14371; `v0.20.4` was published from a `main` without it): the first
+/// with `session-exec claude-seat`, called by `spawn-claude.sh` for an adopted
+/// Claude seat, whose hard floor is the same.
 ///
 /// Keep this on one line in exactly this shape: the installer
 /// (`scripts/install/loom-source-path.sh`) reads it from this file with
 /// `sed`, because the tree it installs can be newer than any binary it has.
-pub const REQUIRES_DAEMON: &str = "0.19.1312";
+pub const REQUIRES_DAEMON: &str = "0.20.5";
 
 // compat:invoked-files:begin
 /// The installed files this daemon executes in a workspace. An installed tree
@@ -378,6 +381,12 @@ pub const TOOLS_COMMANDS: &[&str] = &[
     "resolve-model",
     "resolve-role-model",
     "capabilities",
+    "champion-hold classify",
+    "champion-hold merge-failed-marker",
+    "champion-hold ratification",
+    "champion-hold self-release-calibration",
+    "curation-complete",
+    "notify-cleared-blockers",
     "forge issue",
     "forge pr",
     "forge auth",
@@ -427,6 +436,8 @@ pub const TOOLS_COMMANDS: &[&str] = &[
     "forge claim-liveness",
     "forge verdict-stale-notice",
     "forge verdict-body-check",
+    "forge workflow-write-all-check",
+    "forge workflow-secrets-check",
     "forge verdict-gate",
     "forge may-write",
     "forge calls",
@@ -439,6 +450,7 @@ pub const TOOLS_COMMANDS: &[&str] = &[
     "park-record apply",
     "park-record released",
     "park-record decision",
+    "park-record guide-conflict-route",
     "park-record retract",
     "operator-decision validate",
     "operator-decision apply",
@@ -446,6 +458,7 @@ pub const TOOLS_COMMANDS: &[&str] = &[
     "lease ensure",
     "lease co-occupancy",
     "lease release",
+    "lease read",
     "lease renewer",
     "lease pr claim",
     "lease pr check",
@@ -470,6 +483,11 @@ pub const TOOLS_COMMANDS: &[&str] = &[
     "install-compat",
     "hooks-home",
     "claim",
+    // #14884: the session-mode gateway publisher. Daemon-free; `refresh`
+    // gates on mode = session, `status`/`clean` run ungated.
+    "gateway refresh",
+    "gateway status",
+    "gateway clean",
 ];
 
 /// The identity of the installed-file payload this binary was built against:

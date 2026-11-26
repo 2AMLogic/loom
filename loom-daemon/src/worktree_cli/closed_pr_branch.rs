@@ -93,7 +93,7 @@
 //! `LOOM_BRANCH_LANDED_OFFLINE=1` skips the probe, the same seam
 //! [`super::branch_landed::forge_probe`] honours.
 
-use crate::fs_util::is_executable;
+use crate::fs_util::is_on_path;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -310,9 +310,9 @@ pub fn forge_probe(repo: &Path, branch: &str) -> Probe {
     if std::env::var("LOOM_BRANCH_LANDED_OFFLINE").as_deref() == Ok("1") {
         return Probe::Unavailable;
     }
-    let (program, leading): (&str, &[&str]) = if on_path("loom-daemon") {
+    let (program, leading): (&str, &[&str]) = if is_on_path("loom-daemon") {
         ("loom-daemon", &["forge"])
-    } else if on_path("gh") {
+    } else if is_on_path("gh") {
         ("gh", &[])
     } else {
         return Probe::Unavailable;
@@ -394,16 +394,6 @@ pub fn parse_probe(text: &str) -> Probe {
             })
             .collect(),
     )
-}
-
-fn on_path(program: &str) -> bool {
-    let Some(path) = std::env::var_os("PATH") else {
-        return false;
-    };
-    std::env::split_paths(&path).any(|dir| {
-        let candidate = dir.join(program);
-        candidate.is_file() && is_executable(&candidate)
-    })
 }
 
 #[cfg(test)]

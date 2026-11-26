@@ -282,3 +282,27 @@ fn a_default_watch_detects_nothing_and_warns_nothing() {
     assert!(watch.startup_roots.is_empty());
     assert!(watch.take_warn_lines(vec![]).is_empty());
 }
+
+// ---------------------------------------------------------------------------
+// baseline adoption (#14450)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn an_empty_baseline_adopts_the_first_authoritative_snapshot() {
+    let mut watch = DriftWatch::new(Vec::new());
+    let current = pairs(&[("a", "Acme/widget")]);
+    assert!(watch.adopt_baseline_if_unset(&current));
+    assert_eq!(watch.startup_roots, current);
+    // Once set, a later snapshot is compared, never re-adopted.
+    assert!(!watch.adopt_baseline_if_unset(&pairs(&[("a", "Globex/widget")])));
+    assert_eq!(watch.startup_roots, current);
+}
+
+#[test]
+fn an_established_or_empty_current_never_adopts() {
+    let mut watch = DriftWatch::new(pairs(&[("a", "Acme/widget")]));
+    assert!(!watch.adopt_baseline_if_unset(&pairs(&[("b", "Acme/gadget")])));
+    let mut empty = DriftWatch::new(Vec::new());
+    assert!(!empty.adopt_baseline_if_unset(&[]));
+    assert!(empty.startup_roots.is_empty());
+}

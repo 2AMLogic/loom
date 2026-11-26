@@ -67,17 +67,7 @@ pub fn resolve_issue_script(
     cli_dir: &Path,
     fallback_override: Option<&Path>,
 ) -> Option<PathBuf> {
-    let executable = |p: &Path| -> bool {
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::metadata(p).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
-        }
-        #[cfg(not(unix))]
-        {
-            p.is_file()
-        }
-    };
+    use crate::fs_util::is_executable;
 
     if let Some(root) = repo_root {
         for rel in [
@@ -85,14 +75,14 @@ pub fn resolve_issue_script(
             "defaults/scripts/create-issue.sh",
         ] {
             let c = root.join(rel);
-            if executable(&c) {
+            if is_executable(&c) {
                 return Some(c);
             }
         }
     }
     let fallback = fallback_override.map_or_else(|| cli_dir.join(".."), Path::to_path_buf);
     let c = fallback.join("create-issue.sh");
-    executable(&c).then_some(c)
+    is_executable(&c).then_some(c)
 }
 
 /// Everything the issue body reports.
@@ -341,10 +331,8 @@ mod tests {
         }
     }
 
-    /// Save/restore guard for the knob a live daemon on this host may have
-    /// exported into this very process (#8328) — the `ClearedGhConfigDirEnv`
-    /// pattern from `role_runner::tests`: pin the exact hostile value, put
-    /// back whatever was there afterward.
+    /// Pin the knob a live daemon may have exported into this process
+    /// (#8328), and restore its previous value on drop.
     struct PinnedEscalateKnob(Option<String>);
 
     impl PinnedEscalateKnob {

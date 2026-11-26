@@ -5,16 +5,13 @@
 //!
 //! # Why a sibling file
 //!
-//! Per the file-size ratchet (`.loom/docs/file-size-policy.md`,
-//! `scripts/file-size-baseline.txt`), `claim_reconciliation.rs` is frozen at
-//! its current size: it may shrink, not grow. The #9124 carve-out is new
-//! production logic, so it goes in a new module with a thin dispatch left
-//! behind — the same treatment [`super::pr_label_info`],
-//! [`super::auto_merge_disarm`] and [`super::verdict_stale_comment`] already
-//! got. `invalidate_verdict` moves here with it rather than staying behind in
-//! [`super::forge`], because the carve-out and the clear are the two branches
-//! of one decision and splitting them across files would make the arm harder
-//! to read, not easier.
+//! The #9124 carve-out is new production logic, so it goes in a new module
+//! with a thin dispatch left behind — the same treatment
+//! [`super::pr_label_info`], [`super::auto_merge_disarm`] and
+//! [`super::verdict_stale_comment`] already got. `invalidate_verdict` moves
+//! here with it rather than staying behind in [`super::forge`], because the
+//! carve-out and the clear are the two branches of one decision and splitting
+//! them across files would make the arm harder to read, not easier.
 //!
 //! **This is a relocation, not a behavior change.** The decision logic, the
 //! comment bodies, the label writes, the counters and the log lines are
@@ -199,8 +196,7 @@ pub(super) fn handle_invalidate(
 /// Only [`VerdictKind::ChangesRequested`] is asked about — an approval is
 /// never a CI gate, so an approved verdict pays nothing and behaves exactly as
 /// it did before. The comment fetch is deliberately made here rather than
-/// carried on [`VerdictPr`]: `claim_reconciliation.rs` is frozen by the
-/// file-size ratchet, and this way the call happens only on the rare
+/// carried on [`VerdictPr`], so the call happens only on the rare
 /// equivalent-head-move path instead of once per listed PR.
 ///
 /// # Fail closed

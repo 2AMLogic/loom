@@ -63,6 +63,11 @@ pub struct SessionImageConfig {
     pub image: Option<String>,
     /// `accounts.session.extraMounts` — always read-only.
     pub extra_mounts: Vec<ExtraMount>,
+    /// `accounts.session.objectMirrors` — bind this host's read-only
+    /// per-repository origin object mirrors into new Codex seat containers
+    /// (#14680). Off by default: a seat keeps fully private Git objects
+    /// until the host opts in.
+    pub object_mirrors: bool,
 }
 
 impl SessionImageConfig {
@@ -100,9 +105,15 @@ pub fn read_session_image_config(repo_root: &Path) -> Result<SessionImageConfig>
         ),
     };
     let extra_mounts = parse_extra_mounts_config(block.get("extraMounts"))?;
+    let object_mirrors = match block.get("objectMirrors") {
+        None | Some(serde_json::Value::Null) => false,
+        Some(serde_json::Value::Bool(value)) => *value,
+        Some(other) => bail!("accounts.session.objectMirrors must be a boolean, got {other}"),
+    };
     Ok(SessionImageConfig {
         image,
         extra_mounts,
+        object_mirrors,
     })
 }
 

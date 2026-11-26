@@ -13,6 +13,15 @@
 //!   can see the repository (it served the repository recently, or answers
 //!   `GET repos/OWNER/REPO`) is the item's own answer — "this ref does not
 //!   exist" — not a coverage gap (#10718's concern).
+//! - **A pooled host with no published reader token** — a freshly provisioned
+//!   one whose daemon has never refreshed one — mints a reader installation
+//!   token for the store before the read is shed (#14730):
+//!   [`crate::forge_identity::provision_bootstrap_reader`] through the
+//!   workspace's own `github-app-token.sh`, published where the routing
+//!   looks, so the standalone `fleet-config render` that must advance the
+//!   cache past a stale `stopped` can. The read stays reader-only whatever
+//!   happens: a mint that cannot be provisioned fails the read with the
+//!   setup step named ([`GhTransport::bootstrap_failure`]), never the writer.
 //! - **On a host with no reader pool at all** the writer is the only
 //!   credential there is, and reads use it: the writer App (`forge.githubApp`)
 //!   installation token for the store, minted through the workspace's
@@ -40,8 +49,9 @@ use serde_json::Value;
 
 use super::fetch::{Reply, Transport};
 use crate::credential_preflight::{self as cp, GithubAppMinter, GithubAppOutcome};
+use crate::forge_bucket_book::Resource;
 use crate::forge_call_stats::{ops, ForgeOp};
-use crate::forge_identity::{served, Failure, IdentityRole};
+use crate::forge_identity::{served, Failure, IdentityRole, RouteDecision, RouteRequest};
 use crate::gh_invocation::{AccessIntent, GhCompletion, GhInvocation, GhTarget, Operation};
 use crate::proc_exec::Completion;
 
@@ -54,8 +64,18 @@ const MAX_READERS_TRIED: usize = 8;
 /// The next usable reader for the transport's repo: `(GH_CONFIG_DIR, app id)`.
 type NextReader = dyn Fn() -> Option<(PathBuf, String)>;
 
+/// The live gateway profile directory for an owner, if any.
+type GatewayLookup = dyn Fn(&str) -> Option<PathBuf>;
+
 /// `(app id, owner/repo, failure, why)` → withdraw that reader.
 type WithdrawReader = dyn Fn(&str, &str, Failure, &str);
+
+/// Provision a bootstrap reader for the transport's repository (#14730):
+/// mint-and-publish one through the workspace's own `github-app-token.sh`.
+/// `Err(reason)` names the reader setup to fix before starting the daemon.
+/// Wired only by the production constructor; test transports shed exactly as
+/// they did before.
+type BootstrapReader = dyn Fn() -> std::result::Result<(), String>;
 
 /// Which credential a request ran under, for messages.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -112,8 +132,15 @@ pub struct GhTransport {
     reader: RefCell<Option<(PathBuf, String)>>,
     next_reader: Box<NextReader>,
     withdraw: Box<WithdrawReader>,
+    /// The production bootstrap attempt, including reporting missing mint helpers (#14730).
+    bootstrap: Option<Box<BootstrapReader>>,
+    /// Why the last bootstrap mint failed, for the caller's recovery message.
+    bootstrap_error: RefCell<Option<String>>,
     writer: RefCell<Option<Credential>>,
     last_used: RefCell<Option<Credential>>,
+    /// The live gateway profile directory for an owner (2am#4367 P4);
+    /// [`crate::forge_gateway::profile_for`] in production.
+    gateway: Box<GatewayLookup>,
 }
 
 impl GhTransport {
@@ -147,27 +174,41 @@ impl GhTransport {
         repo: &str,
         roster_of: fn(&Path) -> crate::forge_identity::Roster,
     ) -> Self {
-        let (pooled, next_reader) = reader_pool(
-            crate::forge_identity::reader_root_with(workspace_root, published),
-            repo,
-            roster_of,
-        );
+        let reader_root = crate::forge_identity::reader_root_with(workspace_root, published);
+        let (pooled, next_reader) = reader_pool(reader_root.clone(), repo, roster_of);
+        // #14730: a pooled host whose daemon never published a reader token
+        // mints one through the workspace's own minting seam, at the same
+        // root the pool resolves against, before its first store read sheds.
+        let factory = crate::forge_identity::real_minter_factory(&reader_root);
+        let nwo = repo.to_string();
+        let bootstrap = Box::new(move || {
+            let roster = roster_of(&reader_root);
+            crate::forge_identity::provision_bootstrap_reader(
+                &reader_root,
+                &roster,
+                &nwo,
+                factory.as_ref(),
+            )
+        });
         Self::with_readers(
             workspace_root,
             repo,
             pooled,
             next_reader,
+            Some(bootstrap),
             Box::new(crate::forge_identity::withdraw_after),
         )
     }
 
     /// [`GhTransport::new`] with the reader pool injected: whether there is
     /// one (`pooled`), the reader lookup, and the withdrawal.
+    #[allow(clippy::type_complexity)]
     fn with_readers(
         workspace_root: &Path,
         repo: &str,
         pooled: bool,
         next_reader: Box<NextReader>,
+        bootstrap: Option<Box<BootstrapReader>>,
         withdraw: Box<WithdrawReader>,
     ) -> Self {
         let reader = if pooled { next_reader() } else { None };
@@ -178,14 +219,19 @@ impl GhTransport {
             pooled,
             reader: RefCell::new(reader),
             next_reader,
+            bootstrap,
+            bootstrap_error: RefCell::new(None),
             withdraw,
             writer: RefCell::new(None),
             last_used: RefCell::new(None),
+            gateway: Box::new(crate::forge_gateway::profile_for),
         }
     }
 
     /// A transport whose reader pool is a test's (see
-    /// [`GhTransport::with_readers`]).
+    /// [`GhTransport::with_readers`]) and whose gateway lookup finds none:
+    /// a test must not route through whatever gateway profile the host
+    /// running it has live (2am#15098). The gateway tests inject their own.
     #[cfg(test)]
     pub(crate) fn with_test_readers(
         workspace_root: &Path,
@@ -194,13 +240,24 @@ impl GhTransport {
         next_reader: Box<NextReader>,
         withdraw: Box<WithdrawReader>,
     ) -> Self {
-        Self::with_readers(workspace_root, repo, pooled, next_reader, withdraw)
+        let mut t = Self::with_readers(workspace_root, repo, pooled, next_reader, None, withdraw);
+        t.gateway = Box::new(|_| None);
+        t
     }
 
     /// The credential the most recent request ran under.
     #[must_use]
     pub fn last_credential(&self) -> Option<Credential> {
         self.last_used.borrow().clone()
+    }
+
+    /// Why the #14730 bootstrap mint last failed, when it was tried and did
+    /// not succeed: the recovery step a standalone `fleet-config` command
+    /// reports to the operator. `None` when it was never needed, or it
+    /// succeeded and the read was served.
+    #[must_use]
+    pub fn bootstrap_failure(&self) -> Option<String> {
+        self.bootstrap_error.borrow().clone()
     }
 
     fn writer(&self) -> Credential {
@@ -285,8 +342,12 @@ impl GhTransport {
             .program(&self.gh_bin)
             .current_dir(&self.workspace_root)
             .gh_config_dir(dir)
-            // 2am#4367 P4 break-glass: `fleet.json` is how a broken gateway
-            // is unset, so this fetch must never depend on it.
+            // 2am#4367 P4 break-glass: the facade never routes a store
+            // request through the gateway itself. The cacheable reads ask for
+            // it explicitly ([`GhTransport::gateway_read`]) and fall back to
+            // the readers; every other request (a fresh claim read, a
+            // write, the repo probe) stays off it, so `fleet.json` can always
+            // be read to unset a broken gateway.
             .gateway_exempt()
     }
 
@@ -317,22 +378,168 @@ impl GhTransport {
     /// # Errors
     /// `gh` could not complete the request at all, or no reader can serve
     /// it; any HTTP status is `Ok`.
+    ///
+    /// Never through the gateway: a claim read must not be answered from a
+    /// relay cache (2am#15098).
     pub(crate) fn get_fresh(&self, api_path: &str) -> Result<Reply> {
-        self.read(api_path, None, None)
+        self.read_direct(api_path, None, None)
     }
 
-    /// One store read (see the module docs): a reader's answer, the writer's
-    /// on a host with no reader pool, or an error when it was shed.
+    /// One cacheable store read (see the module docs): the github-read
+    /// gateway first when one is live for the store's owner, else (or when it
+    /// cannot answer) [`Self::read_direct`].
     fn read(&self, api_path: &str, accept: Option<&str>, etag: Option<&str>) -> Result<Reply> {
+        if let Some(reply) = self.gateway_read(api_path, accept, etag) {
+            return Ok(reply);
+        }
+        self.read_direct(api_path, accept, etag)
+    }
+
+    /// The cacheable read on the gateway profile, with its `If-None-Match`
+    /// intact so the relay answers an unchanged file from its ETag cache.
+    ///
+    /// `None` means "ask the readers instead": no live gateway for the owner,
+    /// or the gateway did not answer. A gateway that is down, slow, refuses
+    /// the credential or cannot see the repository never fails the read (the
+    /// store never *depends* on the gateway); a fault it signals itself
+    /// withdraws it, as for every other read. Only an answer (`2xx`/`304`)
+    /// is returned: a `404` is left to the readers, which judge coverage.
+    ///
+    /// The serving route is the attempt's accounting row: `route=gateway`
+    /// for this attempt, `route=direct_read` for a fallback's, each its own
+    /// `fleet_store` span; the fallback reason is logged and, when it
+    /// withdraws the gateway, recorded with the withdrawal.
+    fn gateway_read(
+        &self,
+        api_path: &str,
+        accept: Option<&str>,
+        etag: Option<&str>,
+    ) -> Option<Reply> {
+        use crate::forge_gateway::{outage, GATEWAY_APP_ID};
+        let now = SystemTime::now();
+        let request = RouteRequest::gate(&self.repo, None, Resource::Core);
+        let Some(RouteDecision::Reader { dir, .. }) =
+            crate::forge_gateway::decide(&request, now, &*self.gateway)
+        else {
+            return None;
+        };
+        let cred = Credential::ConfigDir {
+            dir,
+            label: format!("gateway app {GATEWAY_APP_ID}"),
+        };
+        let why = format!("fleet_store {api_path}");
+        let (response, stderr) = match self.run(&cred, Some(GATEWAY_APP_ID), api_path, accept, etag)
+        {
+            Ok((response, stderr, _)) => (response, stderr),
+            Err(e) => {
+                // A timeout or a spawn failure: the gateway did not answer.
+                log::info!("fleet_store: gateway read of {api_path} failed ({e}); using readers");
+                if outage::escalate(outage::Fault::Rerun) == outage::Fault::Withdraw {
+                    outage::withdraw_for_outage("fleet_store");
+                    crate::forge_gateway::note_outage_from_front();
+                }
+                return None;
+            }
+        };
+        let status = response.as_ref().map(|r| r.status);
+        if matches!(status, Some(200..=299 | 304)) {
+            served::note_reader_served(
+                GATEWAY_APP_ID,
+                &self.repo,
+                served::endpoint_family(api_path),
+                now,
+            );
+            return reply_of(api_path, response, &stderr).ok();
+        }
+        let fault = outage::escalate(outage::fault(response.as_ref(), "", &stderr));
+        if fault.reruns() {
+            if fault == outage::Fault::Withdraw {
+                outage::withdraw_for_outage("fleet_store");
+                crate::forge_gateway::note_outage_from_front();
+            }
+        } else if let Some(mut failure) = crate::forge_identity::classify_failure(
+            &stderr,
+            status,
+            response.as_ref().map(|r| &r.ratelimit),
+            Resource::Core,
+        ) {
+            let refusal = (failure == Failure::Coverage).then(|| {
+                served::judge_coverage(
+                    GATEWAY_APP_ID,
+                    &self.repo,
+                    served::endpoint_family(api_path),
+                    served::is_item_path(api_path),
+                    status,
+                    &stderr,
+                    now,
+                )
+            });
+            match refusal {
+                // The gateway sees the repository (or this is one item's
+                // answer): leave it in place; the readers decide.
+                Some(served::CoverageRefusal::Answer | served::CoverageRefusal::Shed) => {}
+                Some(served::CoverageRefusal::WithdrawUnproven) => {
+                    failure = Failure::CoverageUnproven;
+                    (self.withdraw)(GATEWAY_APP_ID, &self.repo, failure, &why);
+                }
+                Some(served::CoverageRefusal::Withdraw) | None => {
+                    (self.withdraw)(GATEWAY_APP_ID, &self.repo, failure, &why);
+                }
+            }
+        }
+        log::info!(
+            "fleet_store: gateway did not answer {api_path} (status {status:?}, fault {fault:?}); \
+             using readers"
+        );
+        None
+    }
+
+    /// One store read on the direct route (see the module docs): a reader's
+    /// answer, the writer's on a host with no reader pool, or an error when
+    /// it was shed.
+    fn read_direct(
+        &self,
+        api_path: &str,
+        accept: Option<&str>,
+        etag: Option<&str>,
+    ) -> Result<Reply> {
         if !self.pooled {
             let (response, stderr, _) = self.run(&self.writer(), None, api_path, accept, etag)?;
             return reply_of(api_path, response, &stderr);
         }
         let family = served::endpoint_family(api_path);
         let mut tried: Vec<String> = Vec::new();
+        let mut bootstrapped = false;
         loop {
             let Some((dir, app_id)) = self.reader.borrow().clone() else {
-                break;
+                // A reader withdrawn during this request must shed
+                // normally. Bootstrap serves the initial unpublished pool.
+                if bootstrapped || !tried.is_empty() {
+                    break;
+                }
+                bootstrapped = true;
+                let Some(bootstrap) = &self.bootstrap else {
+                    break;
+                };
+                match bootstrap() {
+                    Ok(()) => {
+                        *self.bootstrap_error.borrow_mut() = None;
+                        *self.reader.borrow_mut() = (self.next_reader)();
+                        continue;
+                    }
+                    Err(reason) => {
+                        *self.bootstrap_error.borrow_mut() = Some(reason.clone());
+                        anyhow::bail!(
+                            "gh api {api_path} was shed: no reader can serve {} and minting a \
+                             bootstrap reader failed: {reason} — fix the reader setup (a reader \
+                             GitHub App installed on the store with contents: read, its private \
+                             key readable at the configured path, and the workspace's \
+                             github-app-token.sh able to mint) before starting the daemon; the \
+                             writer is never used for reads, #12394 (#14730)",
+                            self.repo
+                        );
+                    }
+                }
             };
             if tried.contains(&app_id) || tried.len() >= MAX_READERS_TRIED {
                 break;

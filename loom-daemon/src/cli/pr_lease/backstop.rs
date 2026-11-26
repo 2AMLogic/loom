@@ -1,19 +1,28 @@
 //! The PR-lease half of the Judge no-verdict backstop (#11855): `release`
-//! records a Judge pass that ended without a verdict, and `claim` refuses a
-//! Judge a PR those records hold. The rules live in
-//! [`crate::judge_backstop`].
+//! records a Judge pass that ended without a verdict. `claim` enforces
+//! the hold, and `check` reports it. The rules live in
+//! [`crate::judge_backstop`]. `backstop-clear` (#15096) is the operator's
+//! release for those holds: it rewrites the records themselves.
 
+use std::path::PathBuf;
+
+use crate::comment_trust::TrustPolicy;
 use crate::forge_call_stats::ops;
-use crate::gh_invocation::AccessIntent;
+use crate::gh_invocation::{AccessIntent, GhInvocation, GhTarget};
 use crate::judge_backstop::{self as backstop, CiRead, CiState};
 use crate::step_role::StepRole;
 use chrono::{DateTime, Utc};
 
 use super::{Ctx, Gh, Role, Row};
 
-/// `claim`: a Judge refused by the backstop. Like 4 and 5, the prompt's
+/// `claim` or `check`: a Judge held by the backstop. Like 4 and 5, the prompt's
 /// `[[ $? =~ ^[02]$ ]]` reads it as "stand down; next PR".
 pub(crate) const EXIT_BACKSTOP: i32 = 6;
+
+/// `backstop-clear`: a read, the write target or a record rewrite failed.
+/// Deliberately not one of the lease-state codes (0/3/4/5/6/8) a caller may
+/// branch on: this verb has no lease state, only done-or-failed.
+pub(crate) const EXIT_CLEAR_FAILED: i32 = 1;
 
 impl Gh {
     /// `(open, head sha, labels)` for `pr`; `None` when unreadable.
@@ -53,6 +62,53 @@ impl Gh {
             serde_json::from_slice(&out.ok_output()?.stdout).ok()
         })
     }
+
+    /// The open PRs carrying `label`, by number, newest first: one paged
+    /// `pulls?state=open` read (the REST listing has no label filter, so the
+    /// `--jq` filters client-side, the `pr_planning` shape). `Err` names why
+    /// a failed read failed, so the operator's stand-down is diagnosable.
+    pub(crate) fn open_prs_with_label(&self, label: &str) -> Result<Vec<u64>, String> {
+        let jq = format!(r#".[] | select(any(.labels[].name; . == "{label}")) | .number"#);
+        let slug = self.read_slug();
+        let target = slug
+            .as_deref()
+            .and_then(|s| GhTarget::repo(s).ok())
+            .unwrap_or(GhTarget::None);
+        let repo_path = slug.unwrap_or_else(|| "{owner}/{repo}".to_string());
+        // Built through the gh facade (`Gh::inv_at` -> `GhInvocation`), so the
+        // `--paginate` read is counted and page-walkable; the explicit type
+        // also lets the per-file paginate-site lint see the facade.
+        let read: GhInvocation =
+            self.inv_at("pr_lease.prs_labelled", AccessIntent::Read, ops::PR_LIST_OPEN, target);
+        let out = read
+            .args([
+                "api",
+                &format!(
+                    "repos/{repo_path}/pulls?state=open&sort=created&direction=desc&per_page=100"
+                ),
+                "--paginate",
+                "--jq",
+                &jq,
+            ])
+            .run();
+        let out = match out.into_result() {
+            Ok(o) if o.status.success() => o,
+            Ok(o) => {
+                let err = String::from_utf8_lossy(&o.stderr);
+                let line = err
+                    .lines()
+                    .rev()
+                    .find(|l| !l.trim().is_empty())
+                    .unwrap_or("");
+                return Err(super::bounded_reason(line));
+            }
+            Err(u) => return Err(super::bounded_reason(&u.to_string())),
+        };
+        Ok(String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .filter_map(|line| line.trim().parse().ok())
+            .collect())
+    }
 }
 
 /// The fields a Judge release appends to its marker: the no-verdict record
@@ -90,6 +146,9 @@ pub(crate) fn release_fields(
 /// with no verdict; else nothing. Unlike [`release_fields`] there is no CI
 /// exemption: a pass the role runner killed at its timeout ceiling spent the
 /// whole ceiling, and is exactly the re-run the backstop exists to bound.
+/// A pass that never reached a review (`seat_busy`, a rejected launch, an
+/// exhausted provider; [`crate::pr_lease_reap::reason_never_reviewed`]) is
+/// not recorded (#14951): a runtime fault is not a no-verdict review.
 pub(crate) fn reaped_release_fields(
     role: Role,
     state: Option<(bool, String, Vec<String>)>,
@@ -97,7 +156,7 @@ pub(crate) fn reaped_release_fields(
 ) -> String {
     match state {
         Some((open, head, labels))
-            if reason != crate::session_exec::refusal::SEAT_BUSY_REASON
+            if !crate::pr_lease_reap::reason_never_reviewed(reason)
                 && role == Role::Judge
                 && backstop::ended_without_verdict(open, &labels) =>
         {
@@ -186,13 +245,199 @@ pub(crate) fn hold_with_reason(
     backstop::hold(&records, &head, &backstop::label_digest(&labels), now)
 }
 
+/// The comment ids `backstop-clear` rewrites on a PR whose current head is
+/// `head`: every trusted in-window no-verdict record at that head — plain,
+/// `reaped=` and `refused=` alike, whatever its label digest (a
+/// digest-mismatched record would hold the PR again if its labels reverted).
+/// A record at another head, or out of window, is left alone. Pure.
+#[must_use]
+pub(crate) fn clearable(rows: &[Row], head: &str, now: DateTime<Utc>) -> Vec<u64> {
+    let head = head.to_ascii_lowercase();
+    let window = chrono::Duration::hours(backstop::WINDOW_HOURS);
+    rows.iter()
+        .filter(|r| backstop::parse(&r.body).is_some_and(|nv| nv.head == head))
+        .filter(|r| now - r.updated_at < window)
+        .map(|r| r.id)
+        .collect()
+}
+
+/// Whether `lease pr check --role judge` would report this PR
+/// `held-backstop`: an active no-verdict hold and no live Judge lease (a
+/// live lease takes precedence over the hold). Pure.
+pub(crate) fn held_backstop(
+    rows: &[Row],
+    state: Option<(bool, String, Vec<String>)>,
+    now: DateTime<Utc>,
+    ttl: chrono::Duration,
+) -> bool {
+    hold_with_reason(rows, state, now).is_some()
+        && super::live_leases(rows, Role::Judge, now, ttl).is_empty()
+}
+
+/// Which PRs one `backstop-clear` run covers.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ClearTarget {
+    /// `--pr N`: clear this PR's records whatever holds it.
+    Pr(u64),
+    /// `--all`: clear only PRs `check` would answer `held-backstop`.
+    All,
+}
+
+/// One PR's share of `backstop-clear`: rewrite its in-window no-verdict
+/// records at its current head ([`clear_record`]). `only_if_held` (the
+/// `--all` shape) rewrites nothing unless the PR is [`held_backstop`], the
+/// condition `lease pr check --role judge` reports. Only trusted rows were
+/// read (`Gh::read_rows_retrying_why`), so an untrusted author's record is
+/// never rewritten; `Err` names why nothing could be done.
+fn clear_pr(
+    gh: &Gh,
+    policy: &TrustPolicy,
+    pr: u64,
+    only_if_held: bool,
+    ttl: chrono::Duration,
+) -> Result<usize, String> {
+    let rows = gh.read_rows_retrying_why(pr, policy)?;
+    let state = gh.pr_head(pr);
+    let Some((open, head, _)) = state.as_ref() else {
+        return Err(format!("could not read PR #{pr}'s head; nothing rewritten"));
+    };
+    if !*open || (only_if_held && !held_backstop(&rows, state.clone(), Utc::now(), ttl)) {
+        return Ok(0);
+    }
+    let mut cleared = 0;
+    for id in clearable(&rows, head, Utc::now()) {
+        let Some(row) = rows.iter().find(|r| r.id == id) else {
+            continue;
+        };
+        let Some(body) = backstop::clear_record(&row.body) else {
+            continue;
+        };
+        match gh.patch(id, &body) {
+            Ok(()) => cleared += 1,
+            // The comment is gone (404): it can no longer hold anything.
+            Err(true) => {}
+            Err(false) => return Err(format!("could not rewrite comment {id}")),
+        }
+    }
+    Ok(cleared)
+}
+
+/// `backstop-clear` over an already-resolved checkout (tests enter here;
+/// [`backstop_clear`] resolves the checkout and builds `gh`). Prints one
+/// `BACKSTOP_CLEAR pr=<n> cleared=<k>` line per PR (always for an explicit
+/// `--pr`, only when something cleared under `--all`), and returns the exit
+/// code: 0 done, [`EXIT_CLEAR_FAILED`] when any read or rewrite failed —
+/// a later PR still runs, so one bad PR cannot hide the rest.
+pub(crate) fn backstop_clear_on(
+    gh: &Gh,
+    policy: &TrustPolicy,
+    target: ClearTarget,
+    ttl: chrono::Duration,
+) -> i32 {
+    let prs = match target {
+        ClearTarget::Pr(pr) => vec![pr],
+        ClearTarget::All => {
+            // The `held-backstop` condition only exists while the backstop
+            // is on (`check` reports `free` with it off); nothing is held.
+            if !backstop::enabled() {
+                eprintln!(
+                    "lease pr backstop-clear: the backstop is off ({}=0); nothing is held",
+                    backstop::DISABLE_ENV
+                );
+                return super::EXIT_HELD;
+            }
+            match gh.open_prs_with_label(backstop::REVIEW_LABEL) {
+                Ok(prs) => prs,
+                Err(why) => {
+                    eprintln!(
+                        "lease pr backstop-clear: could not list open {} PRs: {why}",
+                        backstop::REVIEW_LABEL
+                    );
+                    return EXIT_CLEAR_FAILED;
+                }
+            }
+        }
+    };
+    let only_if_held = target == ClearTarget::All;
+    let mut failed = false;
+    let mut total = 0;
+    for pr in prs {
+        match clear_pr(gh, policy, pr, only_if_held, ttl) {
+            Ok(cleared) => {
+                if cleared > 0 || matches!(target, ClearTarget::Pr(_)) {
+                    println!("BACKSTOP_CLEAR pr={pr} cleared={cleared}");
+                }
+                total += cleared;
+            }
+            Err(why) => {
+                eprintln!("lease pr backstop-clear: PR #{pr}: {why}");
+                failed = true;
+            }
+        }
+    }
+    if target == ClearTarget::All {
+        eprintln!("lease pr backstop-clear: cleared {total} no-verdict record(s) in total");
+    }
+    if failed {
+        EXIT_CLEAR_FAILED
+    } else {
+        super::EXIT_HELD
+    }
+}
+
+/// The CLI verb's entry: resolve the checkout, vet the write target, and run
+/// [`backstop_clear_on`]. `loom-tools` refuses this verb
+/// (`PrLeaseAction::run_tools`): it is an operator write verb of
+/// `loom-daemon`.
+pub(crate) fn backstop_clear(args: &super::BackstopClearArgs) -> i32 {
+    let root = match crate::repo_root::resolve_repo_root(&args.workspace.to_string_lossy()) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("lease pr backstop-clear: not inside a Loom checkout ({e})");
+            return EXIT_CLEAR_FAILED;
+        }
+    };
+    use crate::forge_cmd::{detect_forge, ForgeType};
+    if detect_forge(Some(&root)) == ForgeType::Gitea {
+        eprintln!(
+            "lease pr backstop-clear: PR leases are GitHub-only; on Gitea there is nothing to clear"
+        );
+        return super::EXIT_HELD;
+    }
+    let gh = Gh {
+        bin: PathBuf::from(std::env::var("LOOM_GH_BIN").unwrap_or_else(|_| "gh".into())),
+        root: root.clone(),
+        write_repo: super::write_target(&root),
+    };
+    if let Err(why) = &gh.write_repo {
+        eprintln!("lease pr backstop-clear: refusing to write here (#9548): {why}");
+        return EXIT_CLEAR_FAILED;
+    }
+    let policy = TrustPolicy::for_root(&root);
+    let ttl_minutes = crate::claim_reconciliation::resolve_lease_ttl_minutes();
+    let target = match (args.pr, args.all) {
+        (Some(pr), _) => ClearTarget::Pr(pr),
+        (None, true) => ClearTarget::All,
+        (None, false) => {
+            eprintln!("lease pr backstop-clear: pass --pr N or --all");
+            return EXIT_CLEAR_FAILED;
+        }
+    };
+    backstop_clear_on(&gh, &policy, target, chrono::Duration::seconds((ttl_minutes * 60.0) as i64))
+}
+
 impl Ctx {
-    /// `claim`'s backstop check: `Some(exit)` when this Judge must stand down.
-    pub(crate) fn backstop_refusal(&self, rows: &[Row]) -> Option<i32> {
+    /// Active hold for an enabled Judge. Callers consult this when the role's lease is free.
+    pub(super) fn backstop_hold(&self, rows: &[Row]) -> Option<(DateTime<Utc>, Option<String>)> {
         if self.me.role != Role::Judge || !backstop::enabled() {
             return None;
         }
-        let (until, refused) = hold_with_reason(rows, self.gh.pr_head(self.pr()), (self.now)())?;
+        hold_with_reason(rows, self.gh.pr_head(self.pr()), (self.now)())
+    }
+
+    /// `claim`'s backstop check: `Some(exit)` when this Judge must stand down.
+    pub(crate) fn backstop_refusal(&self, rows: &[Row]) -> Option<i32> {
+        let (until, refused) = self.backstop_hold(rows)?;
         let why = match refused {
             Some(token) => format!(
                 "the last pass was refused by a gate (`{token}`), not a looping pass (#13135)"
@@ -262,6 +507,23 @@ mod tests {
         assert!(
             reaped_release_fields(Role::Judge, state(&waiting), "exited").contains("verdict=none")
         );
+    }
+
+    #[test]
+    fn a_pass_that_never_reached_a_review_does_not_stamp_a_judge_no_verdict() {
+        use crate::pr_lease_reap::{REASON_LAUNCH_REJECTED, REASON_PROVIDER_EXHAUSTED};
+        let waiting = ["loom:review-requested", "loom:reviewing"];
+        for reason in [REASON_LAUNCH_REJECTED, REASON_PROVIDER_EXHAUSTED] {
+            assert_eq!(reaped_release_fields(Role::Judge, state(&waiting), reason), "", "{reason}");
+        }
+        // A Judge that ran and ended without a verdict still counts toward the hold.
+        for reason in ["exited", "timeout"] {
+            let fields = reaped_release_fields(Role::Judge, state(&waiting), reason);
+            assert_eq!(
+                fields,
+                format!(" head={HEAD} verdict=none labels=review-requested reaped={reason}")
+            );
+        }
     }
 
     #[test]
