@@ -79,8 +79,21 @@ fn scan_proc(procfs: &Path, root: &Path) -> Option<bool> {
 
 #[cfg(target_os = "linux")]
 fn process_uses_root(process: &Path, root: &Path) -> std::io::Result<bool> {
-    if std::fs::read_link(process.join("cwd"))?.starts_with(root) {
-        return Ok(true);
+    match std::fs::read_link(process.join("cwd")) {
+        Ok(cwd) if cwd.starts_with(root) => return Ok(true),
+        Ok(_) => {}
+        // An exited child awaiting its parent's wait() keeps its /proc entry
+        // but has no cwd or descriptors. Skip it only when every task of the
+        // thread group is confirmed dead; any live or unreadable task keeps
+        // the scan inconclusive.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return if thread_group_exited(process)? {
+                Ok(false)
+            } else {
+                Err(e)
+            };
+        }
+        Err(e) => return Err(e),
     }
     for fd in std::fs::read_dir(process.join("fd"))? {
         match std::fs::read_link(fd?.path()) {
@@ -92,6 +105,27 @@ fn process_uses_root(process: &Path, root: &Path) -> std::io::Result<bool> {
         }
     }
     Ok(false)
+}
+
+/// True when every task in the process is a zombie or dead; errors when any
+/// task's state cannot be read.
+#[cfg(target_os = "linux")]
+fn thread_group_exited(process: &Path) -> std::io::Result<bool> {
+    let mut any = false;
+    for task in std::fs::read_dir(process.join("task"))? {
+        let stat = std::fs::read_to_string(task?.path().join("stat"))?;
+        // The command name may contain spaces and parentheses; the state
+        // follows the last ')'.
+        let state = stat
+            .rsplit_once(')')
+            .and_then(|(_, rest)| rest.trim_start().chars().next())
+            .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::InvalidData))?;
+        if !matches!(state, 'Z' | 'X' | 'x') {
+            return Ok(false);
+        }
+        any = true;
+    }
+    Ok(any)
 }
 
 #[cfg(target_os = "macos")]
@@ -251,6 +285,39 @@ mod tests {
         std::fs::create_dir(pid.join("fd")).unwrap();
         assert_eq!(scan_proc(&procfs, &root), Some(false));
         symlink(root.join("build.log"), pid.join("fd/5")).unwrap();
+        assert_eq!(scan_proc(&procfs, &root), Some(true));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn proc_scan_skips_exited_children_but_not_live_or_unreadable_tasks() {
+        use std::os::unix::fs::symlink;
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("candidate");
+        let procfs = tmp.path().join("proc");
+        // Idle control process with readable cwd and fds.
+        let idle = procfs.join("40");
+        std::fs::create_dir_all(idle.join("fd")).unwrap();
+        symlink(tmp.path(), idle.join("cwd")).unwrap();
+        // Zombie: no cwd or fd entries, every task in state Z.
+        let zombie = procfs.join("41");
+        let task = |tid: &str, stat: &str| {
+            let dir = zombie.join("task").join(tid);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("stat"), stat).unwrap();
+        };
+        task("41", "41 (a (b) c) Z 1 41 41 0 -1");
+        assert_eq!(scan_proc(&procfs, &root), Some(false));
+        // A live sibling thread whose cwd cannot be read is inconclusive.
+        task("42", "41 (worker) S 1 41 41 0 -1");
+        assert_eq!(scan_proc(&procfs, &root), None);
+        // An unreadable task state is inconclusive too.
+        std::fs::remove_dir_all(zombie.join("task/42")).unwrap();
+        std::fs::create_dir(zombie.join("task/43")).unwrap();
+        assert_eq!(scan_proc(&procfs, &root), None);
+        // A live file holder is still found next to an unreaped zombie.
+        std::fs::remove_dir_all(zombie.join("task/43")).unwrap();
+        symlink(root.join("build.log"), idle.join("fd/5")).unwrap();
         assert_eq!(scan_proc(&procfs, &root), Some(true));
     }
 
