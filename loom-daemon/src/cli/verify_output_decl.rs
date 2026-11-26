@@ -48,7 +48,7 @@
 //! a target with quotes in its name. Storing the path in a variable still
 //! matches as an argument (`REPORT = build/report.json`), but an assignment
 //! to a variable NAMED like the output declares nothing
-//! (`build/report.json := val`).
+//! (`build/report.json := val`, or the same with `=`, `+=`, `?=` and `!=`).
 //!
 //! # Exit-code contract
 //!
@@ -190,25 +190,90 @@ fn inline_flagged_recipe(line: &str) -> Option<&str> {
     None
 }
 
-/// What precedes the first unquoted colon of a line that is not a recipe.
+/// What precedes the first unquoted colon or equals sign of a line that is not
+/// a recipe.
 enum BeforeColon<'a> {
     /// The target list of a rule: `targets:` or `targets::`.
     Rule { targets: &'a str },
-    /// The variable name of an assignment: `name :=`, `name ::=` or `name :::=`.
+    /// The variable name of an assignment: `name :=`, `name ::=`, `name :::=`,
+    /// `name =`, `name +=`, `name ?=` or `name !=` (optionally preceded by
+    /// Make assignment modifiers such as `export`).
     Assignment { name: &'a str },
-    /// The colon belongs to an ordinary word: a comment, `=` or shell
-    /// operator precedes it, or there is no colon at all.
+    /// The colon or equals sign belongs to an ordinary word or command: a
+    /// comment, shell operator or non-modifier command word precedes it, or
+    /// there is no colon or equals sign at all.
     Word,
 }
 
-/// Find the colon that ends a Make rule's target list, without interpreting
-/// Make: the first colon outside quotes, escapes and expansions. Only return
-/// the portion of the header on the cited physical line.
+/// Whether `word` is a GNU Make modifier that may precede a variable name in
+/// an assignment.
+fn is_assignment_modifier(word: &str) -> bool {
+    matches!(word, "export" | "override" | "private" | "define")
+}
+
+/// Whether every unquoted word on continuation lines preceding `cited_start`
+/// is a Make assignment modifier.
+fn prior_words_are_assignment_modifiers(prior: &str) -> bool {
+    prior.lines().all(|phys| {
+        let phys = phys.strip_suffix('\\').unwrap_or(phys);
+        let mut unquoted = unquoted();
+        phys.split(|ch| unquoted(ch) && ch.is_ascii_whitespace())
+            .filter(|word| !word.is_empty())
+            .all(is_assignment_modifier)
+    })
+}
+
+/// Return the single literal variable name from the cited portion of a Make
+/// assignment's left-hand side when every earlier word on the logical line is
+/// a Make assignment modifier. Non-modifier command text returns `None` so it
+/// falls through to the ordinary argument scan.
+fn assignment_variable_name<'a>(prior: &str, cited: &'a str) -> Option<&'a str> {
+    if !prior_words_are_assignment_modifiers(prior) {
+        return None;
+    }
+    let mut unquoted = unquoted();
+    let mut words = cited
+        .split(|ch| unquoted(ch) && ch.is_ascii_whitespace())
+        .filter(|word| !word.is_empty());
+    let mut last = words.next()?;
+    for word in words {
+        if !is_assignment_modifier(last) {
+            return None;
+        }
+        last = word;
+    }
+    Some(last)
+}
+
+fn assignment_from_operator(line: &str, cited_start: usize, op_start: usize) -> BeforeColon<'_> {
+    let Some(cited) = line.get(cited_start..op_start) else {
+        return BeforeColon::Word;
+    };
+    match assignment_variable_name(&line[..cited_start], cited) {
+        Some(name) => BeforeColon::Assignment { name },
+        None => BeforeColon::Word,
+    }
+}
+
+/// Find the colon that ends a Make rule's target list or the operator that
+/// starts an assignment, without interpreting Make: the first unquoted `:` or
+/// `=` outside quotes, escapes and expansions. `+`, `?` and `!` form `+=`,
+/// `?=` and `!=` only when immediately adjacent to `=`; otherwise they stay
+/// part of the preceding word. Only return the portion of the header on the
+/// cited physical line.
 fn before_rule_colon(line: &str, cited_start: usize) -> BeforeColon<'_> {
     let mut unquoted = unquoted();
+    let mut prefix = None;
     for (index, ch) in line.char_indices().filter(|&(_, ch)| unquoted(ch)) {
         match ch {
-            '#' | '=' | ';' | '&' | '|' | '<' | '>' | '(' | ')' => break,
+            '#' | ';' | '&' | '|' | '<' | '>' | '(' | ')' => break,
+            '+' | '?' | '!' => prefix = Some(index),
+            '=' => {
+                // Only an adjacent `+`, `?` or `!` forms `+=`, `?=` or `!=`;
+                // intervening whitespace leaves it on the variable name.
+                let op_start = prefix.filter(|&start| start + 1 == index).unwrap_or(index);
+                return assignment_from_operator(line, cited_start, op_start);
+            }
             ':' => {
                 // `:=`, `::=` and `:::=` assign to a variable; `:` and `::` open a rule.
                 let Some(before) = line.get(cited_start..index) else {
@@ -223,7 +288,7 @@ fn before_rule_colon(line: &str, cited_start: usize) -> BeforeColon<'_> {
                     .take_while(|&b| b == b':')
                     .count();
                 return if after_first[extra..].starts_with('=') {
-                    BeforeColon::Assignment { name: before }
+                    assignment_from_operator(line, cited_start, index)
                 } else {
                     BeforeColon::Rule { targets: before }
                 };
@@ -234,22 +299,13 @@ fn before_rule_colon(line: &str, cited_start: usize) -> BeforeColon<'_> {
     BeforeColon::Word
 }
 
-/// Whether `needle` is one of the words of a rule's target list or an
-/// assignment's left side. Only unquoted whitespace separates words, and a
-/// word is compared as written: quotes, escapes and Make expansions belong
-/// to it.
+/// Whether `needle` is one of the words of a rule's target list. Only unquoted
+/// whitespace separates words, and a word is compared as written: quotes,
+/// escapes and Make expansions belong to it.
 fn has_exact_word(text: &str, needle: &str) -> bool {
     let mut unquoted = unquoted();
     text.split(|ch| unquoted(ch) && ch.is_ascii_whitespace())
         .any(|word| word == needle)
-}
-
-/// Whether `needle` is the last unquoted-whitespace-separated word of `text`.
-fn is_last_word(text: &str, needle: &str) -> bool {
-    let mut unquoted = unquoted();
-    text.split(|ch| unquoted(ch) && ch.is_ascii_whitespace())
-        .rfind(|word| !word.is_empty())
-        == Some(needle)
 }
 
 /// Inspect the Make logical line through the end of the citation. Its first
@@ -258,9 +314,7 @@ fn is_last_word(text: &str, needle: &str) -> bool {
 fn make_line_matches(logical: &str, cited_start: usize, needle: &str) -> bool {
     if !logical.starts_with('\t') && !needle.is_empty() {
         match before_rule_colon(logical, cited_start) {
-            // Only the final word names the variable. Earlier words may be
-            // modifiers or command arguments, as in make out MODE:=x.
-            BeforeColon::Assignment { name } if is_last_word(name, needle) => return false,
+            BeforeColon::Assignment { name } if name == needle => return false,
             BeforeColon::Rule { targets } if has_exact_word(targets, needle) => return true,
             _ => {}
         }
@@ -601,6 +655,94 @@ mod tests {
             assert!(!line_contains_complete_arg(line, output), "{line}");
         }
         assert!(line_contains_complete_arg("REPORT = build/report.json", output));
+    }
+
+    #[test]
+    fn an_assignment_without_a_colon_named_like_the_output_declares_nothing() {
+        let output = "build/report.json";
+        for line in [
+            "build/report.json = val",
+            "build/report.json += val",
+            "build/report.json ?= val",
+            "build/report.json != echo val",
+            "build/report.json=val",
+            "build/report.json+=val",
+            "build/report.json?=val",
+            "build/report.json!=echo val",
+            "export build/report.json = val",
+            "override build/report.json = val",
+            "private build/report.json += val",
+            "override export build/report.json ?= val",
+            "define build/report.json =",
+        ] {
+            assert!(!line_contains_complete_arg(line, output), "{line}");
+        }
+        assert_eq!(
+            producer_line_matches("Makefile", "export \\\nbuild/report.json = val", 2, output),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn whitespace_before_equals_keeps_punctuation_on_the_variable_name() {
+        let output = "build/report.json";
+        for suffix in ['+', '?', '!'] {
+            let var_name = format!("{output}{suffix}");
+            let line = format!("{var_name} = {output}");
+            assert!(!line_contains_complete_arg(&line, &var_name), "{line}");
+            assert!(line_contains_complete_arg(&line, output), "{line}");
+        }
+    }
+
+    #[test]
+    fn an_assignment_keeps_the_output_an_argument_outside_its_variable_name() {
+        let output = "build/report.json";
+        for line in [
+            "build/report.json: FOO = bar",
+            "build/report.json: FOO += bar",
+            "REPORT = build/report.json",
+            "REPORT != gen build/report.json",
+            "gen build/report.json --fmt=json",
+            "make build/report.json MODE=release",
+        ] {
+            assert!(line_contains_complete_arg(line, output), "{line}");
+        }
+    }
+
+    #[test]
+    fn a_tabless_command_before_equals_still_uses_the_argument_scan() {
+        let output = "build/report.json";
+        let define_fixture = "\
+define REPORT
+[ build/report.json = \"$$requested\" ] && touch \"$$requested\"
+endef
+report:
+\t$(REPORT)
+";
+        assert_eq!(producer_line_matches("Makefile", define_fixture, 2, output), Some(true));
+        for line in [
+            "[ build/report.json = \"$$requested\" ] && touch \"$$requested\"",
+            "[ build/report.json != \"$$requested\" ] && touch \"$$requested\"",
+        ] {
+            assert!(line_contains_complete_arg(line, output), "{line}");
+        }
+        assert!(line_contains_complete_arg(
+            "tar -cf build/report.tar =manifest",
+            "build/report.tar"
+        ));
+        assert!(line_contains_complete_arg(
+            "tar -cf build/report.tar :=manifest",
+            "build/report.tar"
+        ));
+        assert_eq!(
+            producer_line_matches(
+                "Makefile",
+                "[ \\\nbuild/report.json = \"$$requested\" ] && touch \"$$requested\"",
+                2,
+                output,
+            ),
+            Some(true)
+        );
     }
 
     #[test]
