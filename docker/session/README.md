@@ -475,17 +475,20 @@ a running seat's image is not the running daemon's release image, an **idle**
 seat is stopped, removed and recreated from the release image against the
 volume and profile it already had, so every clone, branch and credential
 stays where it was. A seat a job is using is left alone until it is idle;
-nothing is ever interrupted. Everything that can refuse the recreate —
-pulling the image, checking the recorded mounts and mirror binds,
-provisioning the profile's control files from the new image — happens before
-the seat is touched, so a refusal leaves it exactly as it was and is logged
-with the reason; a failed pull is retried on a doubling backoff, because the
-session image follows a release by about 25 minutes. `accounts session
-status` reports `expected_image` beside `image` whenever the two differ.
-Never replaced this way: a seat on a configured override image (rebuild it
-`FROM` the new base, update the digest pin, then stop and start the seat), a
-seat started with an explicit `--image`, or one on a release newer than the
-daemon's.
+nothing is ever interrupted. Before stopping the container, the reconciler
+obtains the image, checks mounts and mirror binds, and provisions the
+profile's control files. If the final idle or hold check defers the roll,
+the original container keeps running and the profile may already contain
+the new control files. A failed pull is retried on a doubling backoff,
+because the session image follows a release by about 25 minutes.
+`accounts session status` reports the running and expected images when they differ.
+
+An explicit `--image` selects the starting image. A tag or digest in the
+current or legacy stock repository still follows the daemon's release once
+idle, unless the seat is already on a newer release. The reconciler keeps
+images from other repositories and any recorded `accounts.session.image`
+digest pin. To move a derived image to a new release, rebuild it `FROM` the
+new base, update its configured digest, then stop and start the seat.
 
 **Several repositories per account (#10795).** The first `--private-clone`
 repository stays at `/workspace/repo` (an existing single-repository volume,

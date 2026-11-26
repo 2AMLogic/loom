@@ -38,8 +38,8 @@
 //!    a roll left behind — is rolled onto it once idle, under the seat's
 //!    exclusive account lease (a job using it defers the roll; nothing is
 //!    ever interrupted), with the same no-downgrade, one-attempt-per-pair
-//!    and pull-backoff rules. An override seat, or one on an image an
-//!    operator named explicitly, is never replaced.
+//!    and pull-backoff rules. The pass keeps recorded overrides and images
+//!    outside the stock repositories.
 //!
 //! Versions are compared numerically per component (`0.19.624 < 0.19.1151`),
 //! never as strings.
@@ -534,8 +534,8 @@ pub(super) fn reconcile_skew<R: ContainerRunner>(
 ///
 /// Only a session positively known to be configured private is acted on. A
 /// seat on the stock image is expected on the daemon's release image; the
-/// roll itself ([`crate::tokens_pool::private_workspace::roll`]) keeps an
-/// override seat, or one on an image an operator named explicitly, as it is.
+/// roll itself ([`crate::tokens_pool::private_workspace::roll`]) keeps a
+/// recorded override or an image from outside the stock repositories.
 /// The host path's rules apply: idle only (the roll holds the seat's exclusive
 /// account lease, so a job using it defers it and nothing is interrupted), no
 /// downgrade, one attempt per `(running, expected)` pair, and a pull that

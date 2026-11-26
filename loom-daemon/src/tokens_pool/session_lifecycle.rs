@@ -122,16 +122,15 @@ pub fn release_session_image(version: &str) -> String {
 
 /// An image reference without its digest (`repo:tag` for `repo:tag@sha256:…`,
 /// which `docker inspect` records for an image pulled by tag, #13479): the
-/// part a daemon asked for, and the part two references are compared by.
+/// reference used when comparing against an expected release tag.
 #[must_use]
 pub fn image_reference(image: &str) -> &str {
     image.split('@').next().unwrap_or(image)
 }
 
 /// Whether `image` names the stock session image — this release's repository
-/// or the legacy one — whatever its tag. Such an image follows the daemon's
-/// release ([`release_session_image`]); any other image was chosen explicitly
-/// and is never substituted (#14112).
+/// or the legacy one — at any tag or digest. In the absence of a recorded
+/// override these images follow the daemon's release ([`release_session_image`]).
 #[must_use]
 pub fn is_release_image(image: &str) -> bool {
     let name = image_reference(image);

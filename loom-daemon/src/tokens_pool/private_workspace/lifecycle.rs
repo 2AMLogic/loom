@@ -606,8 +606,8 @@ pub enum Rolled {
     /// The idle seat was recreated from the expected image, against the
     /// volume and profile it already had.
     Recreated,
-    /// Nothing was done: the seat runs an image the roll never replaces — its
-    /// recorded override (issue #14019), or one an operator named explicitly.
+    /// Nothing was done: the seat runs an image the roll never replaces — a
+    /// recorded override (issue #14019) or an image outside the stock repositories.
     Kept,
     /// Nothing to do: the seat already runs the expected image, or is not
     /// running (a stopped or missing one is [`recover`]'s, and is rolled by a
@@ -615,12 +615,10 @@ pub enum Rolled {
     Unchanged,
 }
 
-/// The image this daemon expects a private session to run (#14112), given the
-/// release image `release` of its version: the override recorded at the last
-/// operator `start` (#14451); else, for a seat on the stock image, the release
-/// image; else the image it runs, which an operator named explicitly and
-/// which is never substituted. `None` when nothing names it — no container
-/// and nothing recorded — and the recovery then refuses to substitute one.
+/// A recorded override takes precedence (#14451). Otherwise a seat in either
+/// stock repository expects `release`, even if started with an explicit tag
+/// or digest. A seat in another repository expects its running image. With
+/// neither a recorded override nor a container the expected image is unknown.
 pub(super) fn expected_image(
     config: &Config,
     running: Option<&str>,
@@ -657,19 +655,18 @@ const ROLL_CHANGED: &str =
 /// operator hold ([`OperatorHeld`]), never runs `prepare`, and re-verifies
 /// ownership, mounts and controls afterwards. A seat a job or an unleased
 /// worker is using is [`AccountBusy`]: the caller defers and never interrupts.
-/// A seat on a recorded override (issue #14019) or on an image an operator
-/// named explicitly is [`Rolled::Kept`].
+/// A seat on a recorded override (issue #14019) or an image outside the stock
+/// repositories is [`Rolled::Kept`].
 ///
-/// # Ordering: a refusal leaves the seat exactly as it was
+/// # Checks before stopping the container
 ///
 /// Everything that can refuse the recreate runs **before** the teardown — the
 /// image is obtained ([`ImageUnavailable`] when it cannot be), the recorded
 /// extra mounts and mirror binds are checked, the profile's control files are
 /// provisioned from the new image, and the seat is looked at once more under
-/// the lease. Only then is it stopped and removed. Past that point a failure
-/// is reported with the seat down, or still on its old container when the
-/// removal failed; the volume and the profile are untouched either way, and a
-/// later [`recover`] brings the seat back.
+/// the lease. A late deferral leaves the original container running with any
+/// profile controls already provisioned. After the stop, a failure can leave
+/// the seat down. The volume and profile survive for a later [`recover`].
 ///
 /// # Errors
 /// The seat is busy ([`AccountBusy`]) or held ([`OperatorHeld`]), `image`
@@ -729,8 +726,6 @@ pub fn roll(
         return Err(lease::AccountBusy(ROLL_BUSY).into());
     }
     held()?;
-    // Everything that can refuse the recreate runs before the teardown, so a
-    // refusal here leaves the seat exactly as it is.
     match docker::ensure_image(image) {
         Ok(()) => {}
         Err(error)
@@ -750,7 +745,7 @@ pub fn roll(
     // binds these files read-only, and the daemon then judges the seat
     // against its own enforced bundle.
     docker::provision_controls(&config, image)?;
-    // Looked at once more under the lease, right before the first mutation:
+    // Looked at once more under the lease, right before stopping the container:
     // the same container, still running, still provably idle.
     let now = docker::inspect(&config.container)?
         .context("private session disappeared while its image roll was prepared")?;

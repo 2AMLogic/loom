@@ -2461,6 +2461,7 @@ fn private_status_names_the_expected_image_beside_the_running_one() {
     let stale = read(&env);
     assert_eq!(stale.image.as_deref(), Some(LEGACY_LATEST));
     assert_eq!(stale.expected_image.as_deref(), Some(release().as_str()));
+    assert_eq!(stale.image_difference(), Some((LEGACY_LATEST, release().as_str())));
     let json = serde_json::to_value(&stale).unwrap();
     assert_eq!(json["image"], LEGACY_LATEST);
     assert_eq!(json["expected_image"], release().as_str());
@@ -2469,6 +2470,7 @@ fn private_status_names_the_expected_image_beside_the_running_one() {
     env.seed_container_on(CONTAINER_ID, true, &format!("{}@sha256:{}", release(), "a".repeat(64)));
     let current = read(&env);
     assert_eq!(current.expected_image.as_deref(), Some(release().as_str()));
+    assert_eq!(current.image_difference(), None);
     // A recorded override is what the seat is expected on.
     let env = setup();
     env.seed_volume();
@@ -2477,8 +2479,12 @@ fn private_status_names_the_expected_image_beside_the_running_one() {
     config.session_image = Some(DERIVED.into());
     save(&env.dir.join("workspace.json"), &config).unwrap();
     env.seed_container_on(CONTAINER_ID, true, DERIVED);
-    assert_eq!(read(&env).expected_image.as_deref(), Some(DERIVED));
-    // An image named explicitly expects itself; it is never substituted.
+    let pinned = read(&env);
+    assert_eq!(pinned.expected_image.as_deref(), Some(DERIVED));
+    assert_eq!(pinned.image_difference(), None, "matching configured digest pin");
+    env.seed_container_on(CONTAINER_ID, true, OTHER_DERIVED);
+    assert_eq!(read(&env).image_difference(), Some((OTHER_DERIVED, DERIVED)));
+    // An image outside the stock repositories expects itself.
     let env = setup();
     env.seed_volume();
     env.seed_container(CONTAINER_ID, true);
@@ -2489,6 +2495,25 @@ fn private_status_names_the_expected_image_beside_the_running_one() {
     let unknown = read(&env);
     assert_eq!(unknown.image, None);
     assert_eq!(unknown.expected_image, None);
+    assert_eq!(unknown.image_difference(), None);
+}
+
+#[test]
+#[serial]
+fn an_explicit_stock_tag_or_digest_follows_the_release() {
+    use crate::tokens_pool::session_lifecycle::SESSION_IMAGE_REPOSITORY;
+
+    for image in [
+        format!("{SESSION_IMAGE_REPOSITORY}:0.20.30"),
+        format!("{SESSION_IMAGE_REPOSITORY}@sha256:{}", "a".repeat(64)),
+    ] {
+        let env = setup();
+        env.seed_volume();
+        let started = operator_start(&env, Some(&image)).unwrap();
+        assert_eq!(started.image_difference(), Some((image.as_str(), release().as_str())));
+        assert_eq!(env.roll_to(&release()).unwrap(), Rolled::Recreated);
+        assert_eq!(created_runs(&env).last().unwrap().image, release());
+    }
 }
 
 #[test]
@@ -2516,7 +2541,7 @@ fn an_idle_seat_on_a_stale_stock_image_is_recreated_on_the_release_image_and_kee
                 .unwrap_or_else(|| panic!("no `{verb}` call in {calls:?}"))
         };
         // The image is obtained first, and everything that can refuse the
-        // recreate has run before the seat is touched.
+        // recreate has run before the container is stopped.
         assert!(first("pull") < first("stop"), "{calls:?}");
         assert_eq!(
             env.mutations(),
@@ -2682,7 +2707,7 @@ fn an_unobtainable_release_image_is_reported_and_nothing_is_touched() {
 
 #[test]
 #[serial]
-fn an_override_seat_and_an_explicitly_chosen_image_are_never_replaced() {
+fn an_override_seat_and_an_image_outside_the_stock_repositories_are_kept() {
     // A recorded override (#14451): the fix for its skew is a rebuilt image.
     let env = setup();
     env.seed_volume();
@@ -2694,7 +2719,7 @@ fn an_override_seat_and_an_explicitly_chosen_image_are_never_replaced() {
     assert_eq!(env.roll_to(&release()).unwrap(), Rolled::Kept);
     assert_eq!(env.mutations(), Vec::<String>::new());
 
-    // An image an operator named on the start command line.
+    // An image outside the stock repositories.
     let env = setup();
     env.seed_volume();
     env.seed_container(CONTAINER_ID, true);

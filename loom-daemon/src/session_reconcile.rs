@@ -16,7 +16,7 @@
 //! |-----------|--------|
 //! | held (operator `stop`) | nothing — skipped before any `docker` call |
 //! | running, mounts match the registry | nothing |
-//! | running, private-clone, on a stock image other than the daemon's release image | recreated from the release image against its own volume and profile once idle, deferred while a job uses it; an override seat or an explicitly chosen image is never replaced ([`skew`], #14112) |
+//! | running, private-clone, on a stock image other than the daemon's release image | recreated from the release image against its own volume and profile once idle, deferred while a job uses it; the pass keeps recorded overrides and images outside the stock repositories ([`skew`], #14112) |
 //! | running, mount drift, idle | stop + rm, then recreate ([`recreate_container`]) with the current registry roots (#10364; see [`drift`]) |
 //! | running, mount drift, in-flight exec | defer and re-check next pass — never killed |
 //! | running, mounts a positively denied path, idle, and no start would be accepted | stop + rm, not recreated, recorded on disk; never repeated (fails closed) |

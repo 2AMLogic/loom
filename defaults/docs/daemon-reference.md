@@ -10627,13 +10627,16 @@ created again against the volume and account profile it already had, so no
 clone, branch or credential moves. A seat a job or an unleased worker is
 using is deferred and re-checked next pass; nothing is interrupted. The
 image is pulled, the recorded mounts and mirror binds are checked and the
-profile's control files are provisioned from the new image **before** the
-seat is touched, so a refusal leaves it as it was, with a WARN naming the
-cause; a failed pull is retried on a doubling backoff (up to 30 passes), and
-a recreate that fails is attempted once per (running, expected) image pair.
-Never replaced this way: a seat on a recorded override, one started with an
-explicit `--image`, or one on a release newer than the daemon's (no
-downgrade).
+profile's control files are provisioned from the new image before stopping
+the container. If the final idle or hold check defers the roll, the original
+container stays up and the profile may already contain the new controls.
+A failed pull is retried on a doubling backoff (up to 30 passes), and a
+recreate that fails is attempted once per (running, expected) image pair.
+
+An explicit `--image` selects the starting image. Tags and digests in the
+current or legacy stock repository follow the daemon's release even when
+selected explicitly. The reconciler keeps newer releases, images from other
+repositories, and any recorded `accounts.session.image` digest pin.
 
 The pass makes no extra Docker call for an unset config, and a malformed
 `accounts.session` block refuses an operator `start` outright (the
@@ -10665,7 +10668,7 @@ across the registered roots:
 |---|---|
 | held (operator stop) | none, and no `docker` call |
 | running | none |
-| running, private-clone, on a stock image other than the daemon's release image | recreated from the release image against its own volume and profile once idle (#14112); deferred while a job uses the seat. An override seat, an explicit `--image` and a newer release are never replaced |
+| running, private-clone, on a stock image other than the daemon's release image | recreated from the release image against its own volume and profile once idle (#14112); deferred while a job uses the seat. The pass keeps recorded overrides, images outside the stock repositories and newer releases |
 | restarting, first pass | none (Docker's `unless-stopped` policy is retrying) |
 | restarting, 2+ consecutive passes | one WARN `crash loop`; never reused or stopped |
 | stopped, host-mounted | `docker start`, via the `accounts session start` path |
