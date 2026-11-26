@@ -10,7 +10,17 @@
 #
 # Options:
 #   --no-cleanup-worktree  Skip local worktree AND local branch cleanup after
-#                          merge
+#                          merge. It has no effect on the default GitHub path
+#                          (no --worktree-path, no --remove-ignored): the
+#                          daemon's merge-observation pass owns cleanup there
+#                          (#14905) and cannot see this flag. On a non-GitHub
+#                          forge, or alongside --worktree-path or
+#                          --remove-ignored, it skips only this script's own
+#                          inline cleanup; on GitHub the daemon's pass can
+#                          still clean up when it observes the merge.
+#                          LOOM_PRESERVE_WORKTREE=1 in the daemon's environment
+#                          makes that merge-observation pass skip cleanup (the
+#                          periodic reapers have their own settings).
 #   --cleanup-worktree     (no-op, worktree cleanup is now the default)
 #   --worktree-path <dir>  Explicit worktree path to clean up (bypasses
 #                          .loom-managed sentinel guard — caller asserts
@@ -71,6 +81,18 @@
 #                          deletes the merged branch automatically instead of
 #                          just printing manual instructions. Pass this to
 #                          always print the manual instructions instead.
+#                          Like --no-cleanup-worktree it has no effect on the
+#                          default GitHub path (no --worktree-path, no
+#                          --remove-ignored): the daemon's merge-observation
+#                          pass owns primary-checkout cleanup there (#14905)
+#                          and cannot see this flag. On a non-GitHub forge, or
+#                          alongside --worktree-path or --remove-ignored, it
+#                          skips only this script's own inline cleanup; on
+#                          GitHub the daemon's pass can still clean up when it
+#                          observes the merge. LOOM_PRESERVE_WORKTREE=1 in the
+#                          daemon's environment makes that merge-observation
+#                          pass skip cleanup (the periodic reapers have their
+#                          own settings).
 #   --cleanup-primary      (no-op, primary-checkout cleanup is the default)
 #   --expected-head <sha>  Fail-closed head pin (#11859): refuse (exit 8) unless
 #                          the PR's head is exactly this full SHA, checked on
@@ -88,12 +110,27 @@
 # By default, the local worktree AND the local branch it held are cleaned up
 # after a successful merge (#4100). Pass --no-cleanup-worktree to skip both
 # (e.g., when other terminals may have their CWD inside the worktree, or the
-# branch has unpushed commits you want to keep).
+# branch has unpushed commits you want to keep) wherever this script runs the
+# cleanup itself: a non-GitHub forge, or --worktree-path / --remove-ignored.
+# On the default GitHub path the flag has no effect (see "Cleanup ownership"
+# below).
 #
 # Cleanup is restricted to Loom-managed worktrees (those containing the
 # .loom-managed sentinel written by worktree.sh). Worktrees lacking the
 # sentinel are treated as user-owned and never removed. Set
-# LOOM_PRESERVE_WORKTREE=1 to disable cleanup unconditionally for a session.
+# LOOM_PRESERVE_WORKTREE=1 in the script's environment to skip its inline cleanup.
+#
+# Cleanup ownership on GitHub (#14905): unless --worktree-path or
+# --remove-ignored is passed, this script runs no cleanup itself. The
+# daemon's merge-observation pass removes the worktree, deletes its local
+# branch and auto-cleans the primary checkout on its own later tick, under
+# the same safety gates. It cannot see --no-cleanup-worktree or
+# --no-cleanup-primary, so both flags have no effect there, and neither does
+# a LOOM_PRESERVE_WORKTREE=1 set only for this script: the pass reads that
+# variable from the daemon's own environment, which is that pass's one
+# opt-out. It does not control the periodic worktree and primary-checkout
+# reapers, which have their own enable settings and eligibility checks and
+# can still reap an eligible merged worktree after its grace period.
 #
 # Local branch deletion (#4100): every cleanup path — the default
 # .loom/worktrees/issue-N convention, a discovered Loom-managed worktree at a
@@ -117,7 +154,10 @@
 # cached), the script checks out the default branch there and force-deletes
 # the branch automatically. A dirty tree, a stash entry, a tip mismatch, or
 # --no-cleanup-primary all fall back to printing the manual two-step
-# instructions unchanged.
+# instructions unchanged. On the default GitHub path --no-cleanup-primary has
+# no effect: the daemon's merge-observation pass owns primary-checkout
+# cleanup there (#14905) and cannot see the flag (see "Cleanup ownership"
+# above).
 #
 # Override: pass --worktree-path <dir> to opt into removing a non-Loom
 # worktree (the sentinel guard is bypassed only when this flag is supplied).
@@ -1401,7 +1441,7 @@ fi
 # .loom/worktrees/ (marked with a .loom-managed sentinel file by worktree.sh
 # or pr-worktree.sh). Any worktree lacking the sentinel is treated as
 # user-owned and is never removed by this script. Operators can also set
-# LOOM_PRESERVE_WORKTREE=1 to skip cleanup unconditionally.
+# LOOM_PRESERVE_WORKTREE=1 in the script's environment to skip its inline cleanup.
 #
 # Two worktree-path conventions are recognized:
 #   - .loom/worktrees/issue-<N>/  (Loom-issue branches: feature/issue-<N>;
