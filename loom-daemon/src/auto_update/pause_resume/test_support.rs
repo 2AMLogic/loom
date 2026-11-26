@@ -161,8 +161,8 @@ pub(crate) fn real_registry(root: &Path, gh: Option<PathBuf>, spawn_body: &str) 
     config.gh_bin = gh;
     config.journal_path = Some(root.join("sweeps.json"));
     if !config.skip_label_flip {
-        // A resume re-admits the recorded runtime, as a dispatch does.
-        test_support::install_runtime_admission_fixture(root);
+        // Resume runs the same workspace and runtime admission checks as dispatch.
+        test_support::touch_sweep_command(root);
     }
     SweepRegistry::new(config)
 }
