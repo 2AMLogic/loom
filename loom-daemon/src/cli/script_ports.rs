@@ -431,9 +431,10 @@ pub(crate) enum ScriptPortCommand {
     /// and this verb decides whether that is a valid citation or a miss, by
     /// reading the CITED line of the TRACKED producer from the pinned
     /// `--rev` (never the working tree) and requiring the output path to
-    /// appear on it as a complete argument. Exit 0 verified; 1 disproof with
-    /// a `BAD OUTPUT DECL: …` line on stdout the caller splices into its miss
-    /// list; 10 unreadable producer (inconclusive, never a miss); 2 usage.
+    /// appear on it as a complete argument or as an exact Make rule target.
+    /// Exit 0 verified; 1 disproof with a `BAD OUTPUT DECL: …` line on stdout
+    /// the caller splices into its miss list; 10 unreadable producer
+    /// (inconclusive, never a miss); 2 usage.
     /// Shares git_blob_lines' symlink-aware blob reader. Not a port: the
     /// shell never had this check — brand-new native verb per the shell
     /// language policy.

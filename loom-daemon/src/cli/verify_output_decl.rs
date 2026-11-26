@@ -29,17 +29,31 @@
 //! `origin/main`) via [`super::git_blob_lines::resolved_blob`] — the same
 //! symlink-aware reader the line-range check uses — and never executed and
 //! never read from the working tree, so a local edit or a locally generated
-//! report cannot satisfy the declaration. The cited line must contain the
-//! output path as a literal argument or the value of an option such as
-//! `--json="build/report.json"`. Quotes may delimit the path. Punctuation
+//! report cannot satisfy the declaration. The cited line must either contain
+//! the output path as a literal argument or the value of an option such as
+//! `--json="build/report.json"` (a recipe or command line), or name it as an
+//! exact target on a Make rule line. Quotes may delimit the path. Punctuation
 //! and Make expansions appended to a filename stay part of the word.
+//!
+//! A rule line (`build/report.json: dep`, also a `::` rule or an inline
+//! `targets: dep; @cmd` recipe) matches when the output is one whitespace-
+//! separated target before the line's first unquoted colon — the line an
+//! idiomatic Makefile names its output on, its recipe referring to it only as
+//! `$@`. A comment, `=` or shell operator before that colon makes the colon
+//! part of an ordinary word instead (`# build/report.json: dep` is a
+//! comment, not a rule), and a tab-indented line is always a recipe. A target
+//! is compared as written, quotes included: `'build/report.json': dep` names
+//! a target with quotes in its name. Storing the path in a variable still
+//! matches as an argument (`REPORT = build/report.json`), but an assignment
+//! to a variable NAMED like the output declares nothing
+//! (`build/report.json := val`).
 //!
 //! # Exit-code contract
 //!
 //! | Exit | Meaning | Output |
 //! |---|---|---|
-//! | `0` | The cited producer line contains the output as a complete argument | (none) |
-//! | [`EX_DECL_FAILED`] (1) | Disproof: the producer has no tree entry at the cited path, the cited line does not exist, or it does not pass the output as a complete argument | stdout: `BAD OUTPUT DECL: …` — the caller appends it to its own miss list |
+//! | `0` | The cited producer line contains the output as a complete argument or names it as a Make rule target | (none) |
+//! | [`EX_DECL_FAILED`] (1) | Disproof: the producer has no tree entry at the cited path, the cited line does not exist, or it neither passes the output as a complete argument nor names it as a Make rule target | stdout: `BAD OUTPUT DECL: …` — the caller appends it to its own miss list |
 //! | [`EX_USAGE`] (2) | Malformed `--producer` spec, `git` could not be run, or the rev does not resolve | stderr |
 //! | [`EX_UNREADABLE`] (10) | The producer entry exists but is unreadable (dangling symlink, unresolved cycle, non-blob) — the declaration could NOT be checked | stderr: `UNREADABLE PRODUCER: …`. **Not a miss**: an unreadable producer is an inconclusive check, not a disproof (#8593's distinction, applied here) |
 
@@ -73,7 +87,7 @@ pub(crate) struct VerifyOutputDeclArgs {
 
     /// The declared producer citation: `PATH:L`, where line `L` of the
     /// tracked `PATH` at `--rev` must contain the output path as a complete
-    /// argument.
+    /// argument or name it as a Make rule target.
     #[arg(long, value_name = "PATH:L")]
     producer: String,
 
@@ -174,12 +188,69 @@ fn inline_flagged_recipe(line: &str) -> Option<&str> {
     None
 }
 
-/// Compare whole recipe words without interpreting Make or running the shell.
-/// Only unquoted whitespace and shell operators separate words. In particular,
-/// `+` and `$(SUFFIX)` after the path are part of the same argument.
+/// What precedes the first unquoted colon of a line that is not a recipe.
+enum BeforeColon<'a> {
+    /// The target list of a rule: `targets:` or `targets::`.
+    Rule { targets: &'a str },
+    /// The variable name of an assignment: `name :=` or `name ::=`.
+    Assignment { name: &'a str },
+    /// The colon belongs to an ordinary word: a comment, `=` or shell
+    /// operator precedes it, or there is no colon at all.
+    Word,
+}
+
+/// Find the colon that ends a Make rule's target list, without interpreting
+/// Make: the first colon outside quotes, escapes and expansions.
+fn before_rule_colon(line: &str) -> BeforeColon<'_> {
+    let mut unquoted = unquoted();
+    for (index, ch) in line.char_indices().filter(|&(_, ch)| unquoted(ch)) {
+        match ch {
+            '#' | '=' | ';' | '&' | '|' | '<' | '>' | '(' | ')' => break,
+            ':' => {
+                // `:=` and `::=` assign to a variable; `:` and `::` open a rule.
+                let before = &line[..index];
+                let after_first = &line[index + 1..];
+                let after_colons = after_first.strip_prefix(':').unwrap_or(after_first);
+                return if after_colons.starts_with('=') {
+                    BeforeColon::Assignment { name: before }
+                } else {
+                    BeforeColon::Rule { targets: before }
+                };
+            }
+            _ => {}
+        }
+    }
+    BeforeColon::Word
+}
+
+/// Whether `needle` is one of the words of a rule's target list or an
+/// assignment's left side. Only unquoted whitespace separates words, and a
+/// word is compared as written: quotes, escapes and Make expansions belong
+/// to it.
+fn has_exact_word(text: &str, needle: &str) -> bool {
+    let mut unquoted = unquoted();
+    text.split(|ch| unquoted(ch) && ch.is_ascii_whitespace())
+        .any(|word| word == needle)
+}
+
+/// Compare whole words without interpreting Make or running the shell. A
+/// recipe or command line matches when only unquoted whitespace and shell
+/// operators separate its words and the output is one of them; in particular,
+/// `+` and `$(SUFFIX)` after the path are part of the same argument. A line
+/// that does not start with a tab may instead be a Make rule, and matches
+/// when the output is an exact target before the rule's colon.
 pub(crate) fn line_contains_complete_arg(line: &str, needle: &str) -> bool {
     if needle.is_empty() {
         return false;
+    }
+    if !line.starts_with('\t') {
+        match before_rule_colon(line) {
+            // The left side of an assignment is a variable name, not an
+            // argument: reject it before the scan below accepts it as a word.
+            BeforeColon::Assignment { name } if has_exact_word(name, needle) => return false,
+            BeforeColon::Rule { targets } if has_exact_word(targets, needle) => return true,
+            _ => {}
+        }
     }
     let recipe = line
         .strip_prefix('\t')
@@ -306,8 +377,8 @@ fn handle(
                 std::process::exit(0);
             }
             println!(
-                "BAD OUTPUT DECL: `{cite}` — {rev}:{resolved_path}:{line_no} does not pass \
-                 `{output}` as a complete argument"
+                "BAD OUTPUT DECL: `{cite}` — {rev}:{resolved_path}:{line_no} does not name \
+                 `{output}` as a complete argument or a Make rule target"
             );
             std::process::exit(EX_DECL_FAILED);
         }
@@ -410,6 +481,62 @@ mod tests {
         let line = "\t@echo hi";
         assert!(!line_contains_complete_arg(line, "build/verification/verify-fast.json"));
         assert!(!line_contains_complete_arg(line, ""));
+    }
+
+    #[test]
+    fn a_make_rule_target_line_declares_the_output() {
+        let output = "build/report.json";
+        for line in [
+            "build/report.json: dep",
+            "build/report.json : dep",
+            "a.out build/report.json: dep",
+            "build/report.json:: dep",
+            "build/report.json: dep; @tool $@",
+        ] {
+            assert!(line_contains_complete_arg(line, output), "{line}");
+        }
+        assert!(!line_contains_complete_arg("build/report.json: dep", "build/report.jso"));
+    }
+
+    #[test]
+    fn only_an_exact_literal_rule_target_declares_the_output() {
+        let output = "build/report.json";
+        for line in [
+            "build/report.json.bak: dep",
+            "build/report.json$(SUFFIX): dep",
+            "# build/report.json: dep",
+            "\tbuild/report.json: dep",
+            "'build/report.json': dep",
+            "a\\ build/report.json: dep",
+            "\"a build/report.json b\": dep",
+        ] {
+            assert!(!line_contains_complete_arg(line, output), "{line}");
+        }
+    }
+
+    #[test]
+    fn an_assignment_named_like_the_output_is_not_an_argument_for_it() {
+        let output = "build/report.json";
+        for line in [
+            "build/report.json := val",
+            "build/report.json ::= val",
+            "export build/report.json := val",
+        ] {
+            assert!(!line_contains_complete_arg(line, output), "{line}");
+        }
+        assert!(line_contains_complete_arg("REPORT = build/report.json", output));
+    }
+
+    #[test]
+    fn a_colon_inside_a_recipe_argument_does_not_separate_words() {
+        let output = "build/report.json";
+        for line in [
+            "\t@env PATH=foo:build/report.json tool",
+            "\t@tool build/report.json:extra",
+            "\t@tool host:build/report.json",
+        ] {
+            assert!(!line_contains_complete_arg(line, output), "{line}");
+        }
     }
 
     #[test]
