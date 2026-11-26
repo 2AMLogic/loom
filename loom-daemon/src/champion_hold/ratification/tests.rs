@@ -125,6 +125,90 @@ fn a_bare_status_line_needs_a_ratification_clause() {
     ));
 }
 
+const DR_PATH: &str = "spec/decision-records/DR-015-input-stage-screen.md";
+const DR_DENIAL: &str = "It is not ratified, and merging the PR that carries it does NOT ratify it or complete T1 item 5";
+const DR_DEFERRAL: &str =
+    "Ratification is a separate, operator-approved PR that flips this Status line";
+const MERGE_DECLARATION: &str = "Ratification happens on the operator's merge";
+
+fn dr_paragraph() -> String {
+    format!("**Status**: **proposed**. {DR_DENIAL}. {DR_DEFERRAL}.")
+}
+
+#[test]
+fn a_record_explicitly_deferring_ratification_clears() {
+    let paragraph = dr_paragraph();
+    for body in [
+        paragraph.clone(),
+        // Markdown soft wraps in the source paragraph.
+        paragraph
+            .replace("is not", "is\n  not")
+            .replace("or complete", "or\n  complete")
+            .replace("that flips", "that\n  flips"),
+        "Status: Proposed. not ratified by merging this PR.".into(),
+        "Status: Proposed. does not ratify on merge.".into(),
+    ] {
+        assert_eq!(
+            scan(&[file(DR_PATH, "modified", Some(&body))], &Config::default()),
+            Verdict::Clear,
+            "{body}"
+        );
+    }
+}
+
+#[test]
+fn a_denial_cannot_clear_an_independent_or_ambiguous_declaration() {
+    for separator in ["; ", ", but ", ". "] {
+        for (first, second) in [
+            (DR_DENIAL, MERGE_DECLARATION),
+            (MERGE_DECLARATION, DR_DENIAL),
+        ] {
+            let body = format!("Status: Proposed. {first}{separator}{second}.");
+            assert_eq!(
+                scan(&[file(DR_PATH, "modified", Some(&body))], &Config::default()),
+                Verdict::Hold(vec![DR_PATH.into()]),
+                "{body}"
+            );
+        }
+    }
+    for body in [
+        "The operator ratifies this by approving the PR, not by commenting.",
+        "Not ratified by merging this PR unless the operator agrees.",
+        "Ratification is pending; the operator will merge.",
+    ] {
+        assert!(
+            declares_ratification(&format!("Status: Proposed. {body}"), &Config::default()),
+            "{body}"
+        );
+    }
+}
+
+#[test]
+fn explicit_phrases_still_hold_a_deferred_record() {
+    let cfg = Config {
+        phrases: vec!["sign-off is merge".into()],
+        ..Config::default()
+    };
+    for phrase in ["ratified on merge", "sign-off is merge"] {
+        let body = format!("{}\n{phrase}", dr_paragraph());
+        assert_eq!(
+            scan(&[file(DR_PATH, "modified", Some(&body))], &cfg),
+            Verdict::Hold(vec![DR_PATH.into()]),
+            "{phrase}"
+        );
+    }
+}
+
+#[test]
+fn only_the_candidate_with_the_positive_declaration_holds() {
+    let positive = "spec/README.md";
+    let files = [
+        file(DR_PATH, "added", Some(&dr_paragraph())),
+        file(positive, "modified", Some(&format!("Status: Proposed. {MERGE_DECLARATION}."))),
+    ];
+    assert_eq!(scan(&files, &Config::default()), Verdict::Hold(vec![positive.into()]));
+}
+
 #[test]
 fn config_extends_paths_and_phrases_but_cannot_remove_built_ins() {
     let cfg = Config {

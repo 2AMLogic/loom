@@ -40,6 +40,14 @@ not hold (a PR that edits `spec/README.md` without declaring ratification), nor
 does a bare `Status: Proposed`. A fenced or quoted example of the phrase still
 holds: a false hold costs one operator comment, a false pass ratifies a spec.
 
+On a candidate path, a built-in or repository-configured phrase anywhere in the
+file always holds. The fallback checks a proposed or ratified status together
+with wording that links ratification to merge or approval. It skips a match
+only when the entire passage explicitly denies ratification by this merge or
+defers it to a separate PR, as in DR-015 (#15377). Mixed or ambiguous wording
+still holds, even when the denial and an affirmative declaration share a
+sentence. Each changed file is evaluated independently.
+
 A held PR that goes CONFLICTING is served by Doctor, hold intact (#13505): Doctor resolves and pushes, leaves `loom:blocked` and `loom:pr` on, and Judge re-reviews the new head; the operator then ratifies a clean head.
 
 ## Why it is distinct from the critical-file hold

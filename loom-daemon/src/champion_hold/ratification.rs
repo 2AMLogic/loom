@@ -25,6 +25,8 @@
 //!
 //! The marker strings are a wire format: they live in comments on open PRs.
 
+use std::sync::LazyLock;
+
 use regex::Regex;
 use serde_json::Value;
 
@@ -62,6 +64,23 @@ pub const DEFAULT_PHRASES: [&str; 3] = [
 pub(crate) const STATUS: &str = r"status:\s*(proposed|ratified)\b";
 /// "ratif…" within one clause of a merge / approval / operator.
 const CLAUSE: &str = r"ratif\w*[^.\n]{0,80}\b(merge|merging|merged|approv\w*|operator)\b";
+
+/// Complete denials and deferrals in proposed decision records. Both anchors
+/// matter: a qualifier or a second declaration makes the passage ambiguous.
+static EXPLICIT_DEFERRAL: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(concat!(
+        r"(?i)\A(?:",
+        r"(?:it\s+is\s+)?not\s+ratified\s+by\s+merging\s+this\s+pr",
+        r"|(?:this\s+pr\s+)?does\s+not\s+ratify\s+on\s+merge",
+        r"|(?:it\s+is\s+not\s+ratified,\s+and\s+)?",
+        r"merging\s+(?:this\s+pr|the\s+pr\s+that\s+carries\s+it)\s+does\s+not\s+ratify\s+it",
+        r"(?:\s+or\s+complete\s+t[0-9]+\s+item\s+[0-9]+)?",
+        r"|ratification\s+is\s+a\s+separate(?:,\s+operator-approved)?\s+pr",
+        r"(?:\s+that\s+flips\s+this\s+status\s+line)?",
+        r")\z",
+    ))
+    .expect("static deferral regex")
+});
 
 /// The repo's additions to the detector (`champion.ratificationPaths`,
 /// `champion.ratificationPhrases`). Additive only.
@@ -157,7 +176,14 @@ pub fn declares_ratification(content: &str, cfg: &Config) -> bool {
     if phrases.map(compile).any(|re| re.is_match(&text)) {
         return true;
     }
-    compile(STATUS).is_match(&text) && compile(CLAUSE).is_match(&text)
+    if !compile(STATUS).is_match(&text) {
+        return false;
+    }
+    // CLAUSE cannot cross a period. Keep every other boundary intact: a
+    // comma, semicolon or soft line wrap can introduce a qualification.
+    let clause = compile(CLAUSE);
+    text.split('.')
+        .any(|passage| clause.is_match(passage) && !EXPLICIT_DEFERRAL.is_match(passage.trim()))
 }
 
 /// Scan a PR's change list. Only files the PR adds, modifies or renames count:
