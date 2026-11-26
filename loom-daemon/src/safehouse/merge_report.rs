@@ -259,7 +259,11 @@ pub(super) async fn post_after_read(
 ) -> Outcome {
     match read_room(target).await {
         Ok(recent) if report.is_reported_in(&recent.bodies) => Outcome::AlreadyReported,
-        Ok(recent) if recent.covers(started) => attempt_send(target, &report.envelope()).await,
+        // An empty page supplies no historical coverage, but permits one
+        // best-effort retry of this specific send after a readable response.
+        Ok(recent) if recent.covers(started) || (recent.complete && recent.bodies.is_empty()) => {
+            attempt_send(target, &report.envelope()).await
+        }
         Ok(_) => Outcome::Uncertain("read-back incomplete".to_owned()),
         Err(why) => Outcome::Uncertain(format!("read-back failed: {why}")),
     }

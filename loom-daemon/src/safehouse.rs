@@ -453,14 +453,13 @@ pub struct RecentMessages {
 
 impl RecentMessages {
     /// Safehoused filters non-message events after limiting the timeline, so
-    /// even a short nonempty reply can be a truncated slice. Require a row
-    /// strictly before the instant in question (timestamps can tie). An empty
-    /// readable room retains the best-effort first-post behavior.
+    /// even an empty reply can be a truncated slice. Only a readable row
+    /// strictly before the instant in question establishes coverage (timestamps can tie).
     fn covers(&self, since: chrono::DateTime<chrono::Utc>) -> bool {
         self.complete
             && self
                 .oldest_ts
-                .is_none_or(|ts| ts < since.timestamp_millis())
+                .is_some_and(|ts| ts < since.timestamp_millis())
     }
 }
 

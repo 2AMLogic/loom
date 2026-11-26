@@ -477,8 +477,11 @@ unreadable events, an absent match is inconclusive. For a nonempty reply,
 the oldest visible message must predate the send attempt for a retry, or
 the merge for a captain backfill. Safehoused filters non-message events
 after limiting the timeline. Even a short reply can omit an older report.
-An empty readable reply allows a best-effort post. Later host events must
-read again before sending, including after a lost reply to the second send. A protocol refusal
+A page containing only reactions looks identical to a genuinely empty room.
+The captain defers historical backfill in both cases. The merging host can
+still make the first post and retry a specific lost send once after a readable
+empty reply. Later host events must read again before sending, including after
+a lost reply to the second send. A protocol refusal
 (`ok:false`, e.g. `'room' required`) or an unreachable socket means the line was
 certainly not sent and is not retried by the reporter; the captain's next scan
 will try again while the merge is inside the window. At most two `send`s are
@@ -504,6 +507,9 @@ The room read-back is what stops a retried scan from posting a line twice.
 | `LOOM_SAFEHOUSE_REPORT_CATCHUP_SECS` | `21600` (6 h) | How far back the captain reports an unreported merge; also the freshness bound on a host's own report. |
 | `LOOM_SAFEHOUSE_REPORT_GRACE_SECS` | `600` | How long the captain leaves a fresh merge to the merging host. |
 | `LOOM_SAFEHOUSE_GH_BIN` | `gh` | Test/operator override for the `gh` binary. |
+
+Catch-up and grace each fall back to their own default if the configured
+seconds or the resulting cutoff timestamp are out of range.
 
 **What Loom no longer sends** (#13946): per-step and per-sweep lifecycle lines
 (dispatch, phase, blocker, exit, crash, resume), dispatch digests, status

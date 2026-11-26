@@ -47,12 +47,12 @@ const DEFAULT_SCAN_INTERVAL: Duration = Duration::from_secs(300);
 /// room) and cost. Also the freshness bound on a host's own report: a merge
 /// older than this is not the one the exiting sweep just made.
 const CATCHUP_ENV: &str = "LOOM_SAFEHOUSE_REPORT_CATCHUP_SECS";
-const DEFAULT_CATCHUP: Duration = Duration::from_secs(6 * 60 * 60);
+const DEFAULT_CATCHUP: chrono::Duration = chrono::Duration::hours(6);
 
 /// How long the captain leaves a fresh merge to the host that made it, in
 /// seconds.
 const GRACE_ENV: &str = "LOOM_SAFEHOUSE_REPORT_GRACE_SECS";
-const DEFAULT_GRACE: Duration = Duration::from_secs(10 * 60);
+const DEFAULT_GRACE: chrono::Duration = chrono::Duration::minutes(10);
 
 /// A scan starts this far before its watermark, because the forge's search index
 /// trails a merge by seconds to minutes.
@@ -65,10 +65,11 @@ const MAX_PAGES: u32 = 5;
 /// Maximum local report keys. Confirmed keys may be evicted at capacity.
 const REPORTED_CAP: usize = 10_000;
 
-fn env_secs(name: &str, default: Duration) -> Duration {
+fn env_window(name: &str, default: chrono::Duration) -> chrono::Duration {
     super::env_nonempty(name)
         .and_then(|raw| raw.parse::<u64>().ok())
-        .map_or(default, Duration::from_secs)
+        .and_then(|secs| chrono::Duration::from_std(Duration::from_secs(secs)).ok())
+        .unwrap_or(default)
 }
 
 fn scan_interval() -> Duration {
@@ -155,8 +156,6 @@ pub(super) struct Reporter {
 
 impl Reporter {
     pub(super) fn new(target: ReportTarget, default_root: PathBuf) -> Self {
-        let secs =
-            |d: Duration| chrono::Duration::seconds(i64::try_from(d.as_secs()).unwrap_or(i64::MAX));
         Self {
             target,
             default_root,
@@ -165,9 +164,14 @@ impl Reporter {
             watermarks: Mutex::new(HashMap::new()),
             pending: Mutex::new(HashMap::new()),
             scan_in_flight: AtomicBool::new(false),
-            catchup: secs(env_secs(CATCHUP_ENV, DEFAULT_CATCHUP)),
-            grace: secs(env_secs(GRACE_ENV, DEFAULT_GRACE)),
+            catchup: env_window(CATCHUP_ENV, DEFAULT_CATCHUP),
+            grace: env_window(GRACE_ENV, DEFAULT_GRACE),
         }
+    }
+
+    fn catchup_start(&self, now: DateTime<Utc>) -> DateTime<Utc> {
+        now.checked_sub_signed(self.catchup)
+            .unwrap_or_else(|| now - DEFAULT_CATCHUP)
     }
 
     /// Windows for tests, which must not depend on the process environment.
@@ -209,7 +213,7 @@ impl Reporter {
                 return Outcome::Failed("room history does not reach the merge".into());
             }
             if states.len() >= REPORTED_CAP {
-                let cutoff = Utc::now() - self.catchup;
+                let cutoff = self.catchup_start(Utc::now());
                 states.retain(|_, state| match state {
                     ReportState::InFlight => true,
                     ReportState::Uncertain(at) => *at >= cutoff,
@@ -275,7 +279,7 @@ impl Reporter {
     /// The host path: post the line for a merge this host just saw confirmed.
     /// An earlier ambiguous attempt requires a room read before sending again.
     pub(super) async fn report_host_merge(&self, pr: &MergedPr, trigger: Trigger) {
-        if pr.merged_at < Utc::now() - self.catchup {
+        if pr.merged_at < self.catchup_start(Utc::now()) {
             log::debug!(
                 "safehouse: PR #{} merged at {} is outside the report window; skipping stale merge",
                 pr.number,
@@ -353,8 +357,10 @@ impl Reporter {
             feed::record_reconcile_pass(PassOutcome::Deferred);
             return 0;
         }
-        let cutoff = now - self.catchup;
-        let horizon = now - self.grace;
+        let cutoff = self.catchup_start(now);
+        let horizon = now
+            .checked_sub_signed(self.grace)
+            .unwrap_or_else(|| now - DEFAULT_GRACE);
         let since = {
             let marks = self
                 .watermarks
@@ -413,7 +419,13 @@ impl Reporter {
             self.watermarks
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
-                .insert(root_key, window.until - WATERMARK_SLACK);
+                .insert(
+                    root_key,
+                    window
+                        .until
+                        .checked_sub_signed(WATERMARK_SLACK)
+                        .unwrap_or(DateTime::<Utc>::MIN_UTC),
+                );
             feed::record_reconcile_pass(PassOutcome::Ran);
         } else {
             if !failures.is_empty() {

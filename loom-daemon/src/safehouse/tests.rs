@@ -908,6 +908,11 @@ fn captain_fixture(dir: &Path, captain: &str) -> Captain {
     let gh = FakeGh::new(dir);
     let env = CaptainEnv::set(&gh.bin(), &dir.join("workspaces.json"));
     let (socket, room) = start_room(dir);
+    // Normal catch-up fixtures have a visible message predating their merge window.
+    room.messages
+        .lock()
+        .unwrap()
+        .push(((Utc::now() - hours(8)).timestamp_millis(), "hello".into()));
     Captain {
         repos,
         _env: env,
@@ -962,7 +967,7 @@ async fn host_looks_up_the_numbered_merge_on_a_reused_branch() {
     })
     .unwrap();
     tokio::time::timeout(Duration::from_secs(5), async {
-        while c.room.lines().is_empty() {
+        while c.room.count_containing("a/b#50 ·") == 0 {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
     })
@@ -994,19 +999,52 @@ async fn the_captain_posts_a_merge_no_host_reported() {
 
 #[tokio::test]
 #[serial]
-async fn the_captain_stays_quiet_for_a_merge_a_host_reported() {
+async fn an_empty_room_defers_backfill_and_the_merging_host_can_post_first() {
     let dir = tempfile::tempdir().unwrap();
     let c = captain_fixture(dir.path(), &this_host());
     c.gh.rows(&[row(5, "a/b", minutes(60))]);
-    // The merging host (another reporter, another process) posts first.
+    c.room.messages.lock().unwrap().clear();
+    let captain = reporter(&c.socket, &c.root);
+    assert_eq!(captain.captain_pass().await, 0);
+    assert!(captain.watermark(&c.root).is_none());
+    assert_eq!(c.room.sends.load(Ordering::SeqCst), 0);
+    // A confirmed host merge does not need historical room coverage.
     let host = reporter(&c.socket, &c.root);
     host.report_host_merge(&merged(5, "a/b", minutes(60)), Trigger::SweepMerge)
         .await;
     assert_eq!(c.room.count_containing("a/b#5"), 1);
-    // The captain's own reporter has no memory of it: the room read-back decides.
-    let captain = reporter(&c.socket, &c.root);
+    // The captain's own reporter has no memory of the host post.
     assert_eq!(captain.captain_pass().await, 0);
     assert_eq!(c.room.count_containing("a/b#5"), 1, "two reporters, one line");
+}
+
+#[tokio::test]
+#[serial]
+async fn out_of_range_report_windows_use_their_own_defaults() {
+    // u64::MAX, one second beyond Chrono's duration limit, and a valid
+    // duration that would put the cutoff before Chrono's earliest date.
+    for invalid in ["18446744073709551615", "9223372036854776", "10000000000000"] {
+        for (catchup, grace, expected) in [(invalid, "0", 3), ("7200", invalid, 1)] {
+            let _windows = crate::env_test_support::EnvGuard::set(
+                "LOOM_SAFEHOUSE_REPORT_CATCHUP_SECS",
+                catchup,
+            )
+            .and_set("LOOM_SAFEHOUSE_REPORT_GRACE_SECS", Some(grace.as_ref()));
+            let dir = tempfile::tempdir().unwrap();
+            let c = captain_fixture(dir.path(), &this_host());
+            c.gh.rows(&[
+                row(1, "a/b", hours(7)),
+                row(2, "a/b", hours(5)),
+                row(3, "a/b", hours(1)),
+                row(4, "a/b", minutes(5)),
+            ]);
+            let captain = Reporter::new(target(&c.socket), c.root.clone());
+            assert_eq!(captain.captain_pass().await, expected, "catchup={catchup}, grace={grace}");
+            assert_eq!(c.room.count_containing("a/b#1 ·"), 0);
+            assert_eq!(c.room.count_containing("a/b#3 ·"), 1);
+            assert!(captain.watermark(&c.root).is_some());
+        }
+    }
 }
 
 #[tokio::test]
@@ -1017,7 +1055,7 @@ async fn the_captain_leaves_a_fresh_merge_to_the_host_that_made_it() {
     c.gh.rows(&[row(5, "a/b", minutes(2))]);
     let captain = reporter(&c.socket, &c.root);
     assert_eq!(captain.captain_pass().await, 0, "inside the grace period");
-    assert!(c.room.lines().is_empty());
+    assert_eq!(c.room.sends.load(Ordering::SeqCst), 0);
 }
 
 #[tokio::test]
@@ -1070,7 +1108,7 @@ async fn a_host_that_is_not_the_captain_never_scans_or_posts() {
     let worker = reporter(&c.socket, &c.root);
     assert_eq!(worker.captain_pass().await, 0);
     assert_eq!(c.gh.calls(), 0, "a refused gate makes no forge call");
-    assert!(c.room.lines().is_empty());
+    assert_eq!(c.room.sends.load(Ordering::SeqCst), 0);
 }
 
 #[tokio::test]
@@ -1145,6 +1183,17 @@ async fn a_fresh_captain_checks_how_far_back_the_room_read_reaches() {
     rows.push(row(21, "a/b", minutes(30)));
     c.gh.rows(&rows);
     let captain = reporter(&c.socket, &c.root);
+    // A page of reactions hides every earlier host report. Safehoused returns
+    // the same payload as an empty room on every pass.
+    *c.room.read_reply.lock().unwrap() = Some(json!({"ok":true,"messages":[],"undecryptable":0}));
+    for _ in 0..2 {
+        assert_eq!(captain.captain_pass().await, 0);
+        assert!(captain.watermark(&c.root).is_none());
+    }
+    assert_eq!(c.room.sends.load(Ordering::SeqCst), 0);
+    assert_eq!(c.room.count_containing("merged ✓"), 20);
+
+    *c.room.read_reply.lock().unwrap() = None;
     assert_eq!(captain.captain_pass().await, 1);
     assert_eq!(c.room.count_containing("merged ✓"), 21);
     assert_eq!(c.room.count_containing("a/b#21 ·"), 1);
@@ -1189,7 +1238,7 @@ async fn a_dense_burst_resumes_across_ticks_within_the_query_budget() {
         }
     }
     assert!(captain.watermark(&c.root).is_some());
-    assert_eq!(c.room.lines().len(), 101);
+    assert_eq!(c.room.count_containing("merged ✓"), 101);
     assert_eq!(c.room.count_containing("a/b#1 ·"), 1);
 }
 
@@ -1213,7 +1262,7 @@ async fn a_saturated_creation_order_page_does_not_hide_a_late_merge() {
 
     assert_eq!(captain.captain_pass().await, rows.len());
     assert_eq!(c.room.count_containing("a/b#1 ·"), 1);
-    assert_eq!(c.room.lines().len(), rows.len());
+    assert_eq!(c.room.count_containing("merged ✓"), rows.len());
     assert_eq!(c.gh.calls(), 4, "only the failed half needed a second query");
     assert!(captain.watermark(&c.root).is_some());
 }
@@ -1259,11 +1308,11 @@ async fn a_full_page_that_cannot_be_walked_back_is_not_marked_done() {
         }
         assert!(captain.watermark(&c.root).is_none());
     }
-    assert_eq!(c.room.lines().len(), rows.len());
+    assert_eq!(c.room.count_containing("merged ✓"), rows.len());
     assert!(captain.watermark(&c.root).is_none(), "incomplete scan holds the watermark");
     // Re-running posts nothing new: the room read-back already holds every line.
     assert_eq!(captain.captain_pass().await, 0);
-    assert_eq!(c.room.lines().len(), rows.len());
+    assert_eq!(c.room.count_containing("merged ✓"), rows.len());
 }
 
 // ---- rate-limit breaker (#8997) ---------------------------------------------
@@ -1309,7 +1358,7 @@ async fn a_cooling_breaker_defers_the_scan_with_no_forge_call() {
     let posted = forge_gate::scoped(gate(&cooling), captain.captain_pass()).await;
     assert_eq!(posted, 0);
     assert_eq!(c.gh.calls(), 0, "no `gh` call while the breaker cools");
-    assert!(c.room.lines().is_empty());
+    assert_eq!(c.room.sends.load(Ordering::SeqCst), 0);
     assert!(captain.watermark(&c.root).is_none(), "the deferred window stays open");
 
     // Once the breaker is out of the way the same window is scanned and posted.
