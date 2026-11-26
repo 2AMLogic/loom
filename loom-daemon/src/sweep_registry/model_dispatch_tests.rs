@@ -130,7 +130,7 @@ fn fixture(
     fs::write(
         root.join(".loom/scripts/spawn-claude.sh"),
         format!(
-            "#!/bin/sh\nprintf '%s\\n' \"$LOOM_RUNTIME\" \"$@\" > '{}'\nexit 0\n",
+            "#!/bin/sh\nprintf '%s\\n' \"$LOOM_RUNTIME\" \"$@\" \"profile=$LOOM_MODEL_PROFILE\" > '{}'\nexit 0\n",
             record.display()
         ),
     )
@@ -714,4 +714,186 @@ fn a_configured_role_model_on_claude_and_a_drawn_native_pin_are_forwarded_verbat
     assert!(error
         .message
         .contains("bare model differs from the selected profile"));
+}
+
+#[test]
+#[serial_test::serial(loom_shared_tokens_dir_env)]
+#[serial_test::serial]
+fn judge_recovers_from_claude_exhaustion_on_codex() {
+    judge_pool_recovery("codex");
+}
+
+#[test]
+#[serial_test::serial(loom_shared_tokens_dir_env)]
+#[serial_test::serial]
+fn judge_recovers_from_claude_exhaustion_on_gemini() {
+    judge_pool_recovery("opencode");
+}
+
+/// Weigh the same review-requested PR on both ticks, with both registry gates.
+fn judge_draw(root: &Path, registry: &Mutex<SweepRegistry>, pr: u32) -> Option<u32> {
+    use crate::step_dispatch::{
+        driver::probe_exhausted_roles,
+        gather::draw_inputs,
+        item_draw::{weigh, ItemWeights, WeighContext},
+    };
+    use crate::work_finder::step_item::{classify, Inputs, PullInput, Step};
+
+    let inputs = Inputs {
+        pulls: vec![PullInput {
+            number: pr,
+            labels: vec!["loom:review-requested".into()],
+            same_repo: true,
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    let items = draw_inputs(classify(&inputs), &[], |_, _| None);
+    let now = chrono::Utc::now();
+    let ctx = WeighContext {
+        now,
+        build_backoff_engaged: false,
+        pool_exhausted_roles: probe_exhausted_roles(root, registry, now).0,
+        workspace_idx: 0,
+        cooldowns: registry.lock().unwrap().step_cooldowns(now),
+    };
+    weigh(&items, &ctx, &ItemWeights::default())
+        .pool
+        .into_iter()
+        .find(|candidate| candidate.step == Step::Judge)
+        .map(|candidate| candidate.target())
+}
+
+fn judge_pool_recovery(runtime: &str) {
+    use crate::env_test_support::EnvGuard;
+    use crate::step_role::StepRole;
+    use crate::sweep_registry::step_spawn::{StepRefusal, StepSpawnRequest};
+
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let credentials = tempfile::tempdir().unwrap();
+    let _env = Environment::isolated(credentials.path());
+    let _credentials = EnvGuard::clear(&[
+        "GEMINI_API_KEY",
+        "LOOM_NATIVE_AUTH_FILE",
+        "LOOM_CODEX_NO_EXEC",
+        "LOOM_SPAWN_NO_EXPORT",
+    ])
+    .and_set("LOOM_SHARED_ACCOUNTS_ROOT", Some(std::ffi::OsStr::new("")));
+    let mut config = draw_config_for(
+        "judge",
+        "sonnet",
+        json!({"claude": 1, "codex/gpt-6.2-astra": 899, "opencode:quick-flash": 50}),
+    );
+    // The reported Judge configuration falls back to Claude alone on attempt two.
+    config["runtimes"]["roleDraw"]["judge"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!({"attempt": 2, "draw": {"claude": 100}}));
+    let (registry, record, _, _ws) = fixture(root, &config);
+    assert!(!registry.config.skip_label_flip);
+    let pool = crate::write_scope_test_support::SharedTokenPool::one_account();
+    crate::tokens_pool::bad_tokens::mark_bad_in_dir(pool.path(), "fake", "exhausted: rate limit")
+        .unwrap();
+    let registry = Arc::new(Mutex::new(registry));
+    let pr = 8715;
+    let request = StepSpawnRequest::new(judge_draw(root, &registry, pr).unwrap(), StepRole::Judge);
+    let assert_refused = || {
+        let err = SweepRegistry::spawn_step_unlocked(&registry, &request).unwrap_err();
+        let refusal = err.downcast_ref::<StepRefusal>().unwrap();
+        assert_eq!(refusal.reason, "pool_exhausted", "{refusal}");
+        assert!(refusal.detail.contains("ClaudeTokens"), "{refusal}");
+        assert!(!record.exists());
+        crate::step_dispatch::step_end::record_refusal(
+            root,
+            &registry,
+            &request,
+            Some(refusal),
+            false,
+        );
+    };
+    assert_refused();
+    assert_eq!(judge_draw(root, &registry, pr), None);
+    if runtime == "codex" {
+        crate::tokens_pool::codex_hooks::test_support::guard_ready_in_workspace(
+            root,
+            &credentials.path().join("codex-profiles/fixture-seat"),
+        );
+    } else {
+        std::env::set_var("GEMINI_API_KEY", "fixture-only");
+    }
+
+    {
+        let _pin = EnvGuard::set("LOOM_RUNTIME_JUDGE", "claude");
+        assert_refused();
+        assert_eq!(judge_draw(root, &registry, pr), None);
+    }
+
+    use crate::runtime_preference::role_draw::attempts;
+    attempts::record_failure(root, "judge");
+    assert_eq!(judge_draw(root, &registry, pr), None, "attempt two allows only Claude");
+    attempts::record_success(root, "judge");
+    assert!(
+        registry
+            .lock()
+            .unwrap()
+            .pool_exhausted_roles(chrono::Utc::now())
+            .contains("judge"),
+        "the refusal has not aged out"
+    );
+    assert_eq!(
+        judge_draw(root, &registry, pr),
+        Some(pr),
+        "tick two must draw the Judge step with {runtime} eligible"
+    );
+
+    let kind = SweepKind::Step {
+        item: request.item,
+        role: request.role,
+    };
+    let reg = registry.lock().unwrap();
+    let launch = SweepRegistry::resolve_step_launch(&reg.config, request.role, &kind).unwrap();
+    let admitted = launch.admission.admitted.as_ref().unwrap();
+    assert_eq!(admitted.runtime, runtime);
+    let stamp = admitted.preference.as_ref().unwrap();
+    assert_eq!(stamp.draw.as_ref().unwrap().attempt, 1);
+    let mut child = reg
+        .spawn_child_process_for(
+            &kind,
+            &root.join("step.log"),
+            "step-judge-fixture",
+            launch.model.as_deref(),
+            launch.effort.as_deref(),
+            None,
+            Some(admitted),
+            launch.selection.as_ref(),
+            None,
+        )
+        .unwrap()
+        .child;
+    assert!(child.wait().unwrap().success());
+    let args = fs::read_to_string(record).unwrap();
+    assert_eq!(args.lines().next(), Some(runtime));
+    assert!(args.lines().any(|arg| arg == "/loom:judge 8715"), "{args}");
+    let args: Vec<_> = args.lines().collect();
+    let model = args
+        .windows(2)
+        .find(|pair| pair[0] == "--model")
+        .map(|pair| pair[1]);
+    if runtime == "codex" {
+        assert_eq!(model, Some("gpt-6.2-astra"));
+    } else {
+        let profile = args.last().unwrap().strip_prefix("profile=").unwrap();
+        assert_eq!(profile, "quick-flash");
+        let options = Options {
+            model: model.map(str::to_owned),
+            profile: Some(profile.into()),
+            ..Options::default()
+        };
+        let selected = profiles::select(runtime, &options, &config).unwrap();
+        assert_eq!(
+            (selected.provider.as_str(), selected.model.as_str()),
+            ("google", "gemini-3.5-flash")
+        );
+    }
 }

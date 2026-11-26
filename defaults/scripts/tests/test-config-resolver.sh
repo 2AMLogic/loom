@@ -299,6 +299,47 @@ else
     pass "config-resolver.sh does not use --argjson"
 fi
 
+echo "Test 17: loom_config_get propagates a resolver failure (#15321)"
+repo=$(new_repo)
+errf="$repo/stderr.txt"
+# Subshell-scoped stub: the override never leaks into the other tests.
+rc=0
+out=$(
+    # shellcheck disable=SC2317  # invoked indirectly by loom_config_get
+    loom_resolve_config() { echo "stub resolver: boom" >&2; return 37; }
+    loom_config_get "$repo" sample.key fallback 2>"$errf"
+) || rc=$?
+assert_eq "$rc" "37" "getter returns the resolver's status"
+assert_eq "$out" "" "getter emits nothing on stdout (no fallback)"
+assert_eq "$(cat "$errf")" "stub resolver: boom" "resolver diagnostic reaches stderr"
+
+# Same failure, but with the getter tested in an `if` condition.
+cond=$(
+    # shellcheck disable=SC2317  # invoked indirectly by loom_config_get
+    loom_resolve_config() { echo "stub resolver: boom" >&2; return 37; }
+    if got=$(loom_config_get "$repo" sample.key fallback 2>/dev/null); then
+        echo "treated-as-success:$got"
+    else
+        echo "failed:$?"
+    fi
+)
+assert_eq "$cond" "failed:37" "failure is visible when the getter is an if condition"
+
+# Successful resolution still yields value / default with status 0.
+mkdir -p "$repo/.loom" "$repo/.loom-local"
+echo '{"present": "configured", "scalar": 1}' > "$repo/.loom/config.json"
+rc=0
+assert_eq "$(loom_config_get "$repo" present fallback)" "configured" "configured value returned"
+loom_config_get "$repo" present fallback >/dev/null || rc=$?
+assert_eq "$rc" "0" "configured value returns status 0"
+rc=0
+out=$(loom_config_get "$repo" absent fallback) || rc=$?
+assert_eq "$out/$rc" "fallback/0" "absent key returns default with status 0"
+rc=0
+out=$(loom_config_get "$repo" scalar.child fallback) || rc=$?
+assert_eq "$out/$rc" "fallback/0" "path through a scalar returns default with status 0"
+rm -rf "$repo"
+
 # --- Summary ---
 echo ""
 echo "────────────────────────────────"
