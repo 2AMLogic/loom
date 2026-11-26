@@ -13,17 +13,13 @@
 //! multi-root reaper tick does not walk the whole host once per root.
 
 use std::path::Path;
-use std::sync::{Mutex, OnceLock};
 
 use chrono::{DateTime, Utc};
 
+use crate::host_wide_cooldown::{active_since_secs, HostWideCooldown};
 use crate::worktree_reaper::ReclaimReport;
 
-static IDLE_LAST_RUN: OnceLock<Mutex<Option<DateTime<Utc>>>> = OnceLock::new();
-
-fn idle_slot() -> &'static Mutex<Option<DateTime<Utc>>> {
-    IDLE_LAST_RUN.get_or_init(|| Mutex::new(None))
-}
+static IDLE_COOLDOWN: HostWideCooldown = HostWideCooldown::new();
 
 /// Whether the cross-root pass is due: never run, or `min_interval_secs` or
 /// more since it last ran (a clock step backwards counts as due). Pure.
@@ -33,10 +29,7 @@ pub fn idle_pass_due(
     now: DateTime<Utc>,
     min_interval_secs: u64,
 ) -> bool {
-    last.is_none_or(|last| {
-        let since = (now - last).num_seconds();
-        since < 0 || since >= i64::try_from(min_interval_secs).unwrap_or(i64::MAX)
-    })
+    active_since_secs(last, now, min_interval_secs).is_none()
 }
 
 /// Run `idle(trigger_root, floor_gb)` if the host-wide window has elapsed,
@@ -50,14 +43,8 @@ pub fn run_idle_targets_if_due(
     min_interval_secs: u64,
     idle: &dyn Fn(&Path, u64) -> ReclaimReport,
 ) -> Option<ReclaimReport> {
-    {
-        let mut last = idle_slot()
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if !idle_pass_due(*last, now, min_interval_secs) {
-            return None;
-        }
-        *last = Some(now);
+    if !IDLE_COOLDOWN.claim_if_elapsed(now, min_interval_secs) {
+        return None;
     }
     Some(idle(trigger_root, floor_gb))
 }
@@ -111,7 +98,5 @@ pub fn scheduled_pressure_tier(repo_root: &Path, floor_gb: u64) {
 /// Forget when the cross-root pass last ran. Test-only seam.
 #[doc(hidden)]
 pub fn reset_idle_state_for_test() {
-    *idle_slot()
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+    IDLE_COOLDOWN.reset();
 }

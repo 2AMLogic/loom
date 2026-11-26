@@ -7,7 +7,7 @@
 //! `session-image-smoke` in `.github/workflows/ci.yml`, plus a fleet-side
 //! `audit-smoke`/`audit-test` flow outside this repo) build and tag images
 //! under a **fixed** tag (`loom-worker:ci-smoke`,
-//! `ghcr.io/rjwalters/loom-worker:ci-smoke`, `loom-worker-session:ci-smoke`,
+//! `ghcr.io/2amlogic/loom-worker:ci-smoke`, `loom-worker-session:ci-smoke`,
 //! …) on every run. Docker re-points that tag at the new image on each build
 //! and leaves the *previous* image dangling (untagged, unreferenced by any
 //! name) — it never disappears on its own. A host that runs these flows daily
@@ -110,14 +110,14 @@
 //! or `autonomous.dockerImageRetention.enabled=false`.
 
 use std::collections::BTreeMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 
 use crate::fs_util::human_size;
+use crate::host_wide_cooldown::HostWideCooldown;
 use serde::Deserialize;
 
 // ============================================================================
@@ -161,10 +161,19 @@ pub const DEFAULT_MIN_INTERVAL_SECS: u64 = 1_800;
 /// Membership is **exact repository-name equality** (see
 /// [`plan_retention`]), not a substring test — `loom-worker-native` is a
 /// distinct entry precisely because `loom-worker` does not cover it.
+///
+/// The `ghcr.io/rjwalters/*` entries are **legacy** (#14419): the repository
+/// moved to `2AMLogic` and the images publish under `ghcr.io/2amlogic/*`, but
+/// hosts still hold images pulled from the old path, which this pass must keep
+/// recognising so they are cleaned up rather than orphaned.
 pub const DEFAULT_TRACKED_REPOS: &[&str] = &[
     "loom-worker",
     "loom-worker-session",
     "loom-worker-native",
+    "ghcr.io/2amlogic/loom-worker",
+    "ghcr.io/2amlogic/loom-worker-session",
+    "ghcr.io/2amlogic/loom-worker-native",
+    // Legacy pre-transfer path (see above).
     "ghcr.io/rjwalters/loom-worker",
     "ghcr.io/rjwalters/loom-worker-session",
     "ghcr.io/rjwalters/loom-worker-native",
@@ -176,9 +185,15 @@ pub const DOCKER_RETENTION_SLOT_WAIT_SECS: u64 = 5;
 
 const DOCKER_RETENTION_SLOT_POLL: Duration = Duration::from_millis(500);
 
-/// docker CLI binary name — overridable only for tests (production always
-/// uses the system `docker`).
-const DOCKER_BIN: &str = "docker";
+/// The docker CLI binary the pass invokes — the shared lookup (#14885):
+/// `LOOM_DOCKER_BIN` override, `$PATH`, then the absolute fallback
+/// directories. A resolution failure yields an unlaunchable path carrying
+/// the reason, so the pass's existing "docker unqueryable" error paths fire
+/// (never a fall-through to a working docker an invalid override forbids).
+fn docker_bin() -> PathBuf {
+    crate::docker_bin::resolve()
+        .unwrap_or_else(|error| PathBuf::from(format!("/nonexistent/docker ({error})")))
+}
 
 /// Inventory stage labels (#14679) — the operation a failed evaluation names
 /// in its one WARN summary. Every stage of [`list_images`] that can fail
@@ -704,7 +719,7 @@ fn failure_detail(out: &std::process::Output) -> String {
 /// "zero images" (the same unknown-!=-zero discipline
 /// [`crate::deep_clean::evaluate`] applies to an unmeasurable `df`).
 pub fn list_images() -> Result<Vec<DockerImageRecord>, DockerInventoryError> {
-    let ids_output = Command::new(DOCKER_BIN)
+    let ids_output = Command::new(docker_bin())
         .args(["image", "ls", "-aq", "--no-trunc"])
         .output()
         .map_err(|e| DockerInventoryError {
@@ -731,7 +746,7 @@ pub fn list_images() -> Result<Vec<DockerImageRecord>, DockerInventoryError> {
 
     let in_use_ids = list_container_image_ids()?;
 
-    let mut cmd = Command::new(DOCKER_BIN);
+    let mut cmd = Command::new(docker_bin());
     cmd.arg("image").arg("inspect");
     cmd.args(&ids);
     let inspect_output = cmd.output().map_err(|e| DockerInventoryError {
@@ -771,7 +786,7 @@ pub fn list_images() -> Result<Vec<DockerImageRecord>, DockerInventoryError> {
 /// `Err` names the failed stage — unknown must never read as "no container
 /// uses it".
 fn list_container_image_ids() -> Result<std::collections::BTreeSet<String>, DockerInventoryError> {
-    let ps = Command::new(DOCKER_BIN)
+    let ps = Command::new(docker_bin())
         .args(["ps", "-aq", "--no-trunc"])
         .output()
         .map_err(|e| DockerInventoryError {
@@ -793,7 +808,7 @@ fn list_container_image_ids() -> Result<std::collections::BTreeSet<String>, Dock
     if containers.is_empty() {
         return Ok(std::collections::BTreeSet::new());
     }
-    let inspect = Command::new(DOCKER_BIN)
+    let inspect = Command::new(docker_bin())
         .args(["inspect", "--format", "{{.Image}}"])
         .args(&containers)
         .output()
@@ -821,7 +836,7 @@ fn list_container_image_ids() -> Result<std::collections::BTreeSet<String>, Dock
 /// container) is logged and treated as a soft per-image failure, not fatal to
 /// the rest of the pass.
 pub fn remove_image(id: &str) -> bool {
-    match Command::new(DOCKER_BIN).args(["rmi", id]).output() {
+    match Command::new(docker_bin()).args(["rmi", id]).output() {
         Ok(out) if out.status.success() => true,
         Ok(out) => {
             log::warn!(
@@ -1129,43 +1144,27 @@ pub fn log_pass_outcome(report: &DockerRetentionReport, pressure: Option<&Pressu
 /// deliberately host-wide (not per-repo, unlike `deep_clean`'s state map):
 /// Docker images are not scoped to any one registered repo, and a host with
 /// several repos ticking on the same reaper cadence must not re-shell to
-/// `docker` once per repo per tick.
-static LAST_EVALUATED_AT: OnceLock<Mutex<Option<DateTime<Utc>>>> = OnceLock::new();
-
-fn last_evaluated_slot() -> &'static Mutex<Option<DateTime<Utc>>> {
-    LAST_EVALUATED_AT.get_or_init(|| Mutex::new(None))
-}
+/// `docker` once per repo per tick. The elapsed/record logic lives in the
+/// shared [`HostWideCooldown`]; the instance is this module's own, so a
+/// pass here never suppresses the tmpfs or native-state passes.
+static COOLDOWN: HostWideCooldown = HostWideCooldown::new();
 
 /// Whether enough time has passed since the last evaluation to run another —
 /// the cooldown gate `run_for` applies before touching `docker` at all.
 #[must_use]
 fn cooldown_elapsed(now: DateTime<Utc>, min_interval_secs: u64) -> bool {
-    let guard = last_evaluated_slot()
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    match *guard {
-        None => true,
-        Some(last) => {
-            let since = (now - last).num_seconds();
-            since < 0 || since >= i64::try_from(min_interval_secs).unwrap_or(i64::MAX)
-        }
-    }
+    COOLDOWN.elapsed(now, min_interval_secs)
 }
 
 fn record_evaluated(now: DateTime<Utc>) {
-    let mut guard = last_evaluated_slot()
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    *guard = Some(now);
+    COOLDOWN.record(now);
 }
 
 /// Drop cooldown state. Test-only seam (the process-global would otherwise
 /// leak between `#[serial]` tests in the same binary).
 #[doc(hidden)]
 pub fn reset_state_for_test() {
-    *last_evaluated_slot()
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+    COOLDOWN.reset();
 }
 
 /// Arm the host-wide cooldown as if a pass had just evaluated at `now`.

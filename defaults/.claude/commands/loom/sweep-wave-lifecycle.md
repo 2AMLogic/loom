@@ -495,7 +495,14 @@ This section is the single home for the opt-in `--auto-stack` behavior. It is en
 # and EXCLUDES the `- [ ]` task-list form (not a stacking declaration).
 # Two-stage (#4508): select matching lines, tolerant of markdown emphasis/colon
 # before the first #N, then extract every #N on those lines.
-echo "$BODY" | grep -E '(Depends on|Requires)[*_:[:space:]]*#[0-9]+' | grep -oE '#[0-9]+' | tr -d '#' | sort -u
+# The sed stage between them is the #14732/#14750 parent-reference rule, identical
+# to champion-common.md's extract_blocker_refs: a reference introduced by
+# `Part of` (case-insensitive, optionally followed by the one bounded word `Epic`)
+# names the issue's PARENT, not a stacking edge, and is masked before extraction —
+# keys off the introducing phrase, never the number, and admits no wider word run.
+echo "$BODY" | grep -E '(Depends on|Requires)[*_:[:space:]]*#[0-9]+' \
+  | sed -E 's/[Pp][Aa][Rr][Tt] [Oo][Ff][*_:.[:space:]]*([Ee][Pp][Ii][Cc][*_:.[:space:]]*)?([A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+)?#[0-9]+/ /g' \
+  | grep -oE '#[0-9]+' | tr -d '#' | sort -u
 ```
 
 A matched `#A` becomes a **stacking edge only when `#A` is also a member of this sweep invocation's own deduplicated candidate list.** A `Depends on #A` naming an issue **outside** the candidate set is left completely untouched — it is not an edge, it does not stack, and it flows through the existing `loom:blocked` handling exactly as today (this feature never touches out-of-set references). This "same-candidate-set only" restriction is load-bearing: it is what keeps auto-stack scoped to one sweep's own resolved set and prevents it from silently reaching out to arbitrary external issues.
@@ -570,7 +577,7 @@ post_wave_integration_gate()                    # step 8 — buildGate-against-m
 - Load and follow the instructions in `.claude/commands/loom/judge.md` for the PR.
 - **In-session Judge dispatch (#13222):** do not hand the Judge the orchestrator's run id as `LOOM_SWEEP_ID` — the gate reads the review start from a `step-judge-<pr>-<epoch>` id or the PR judge lease, and a run id that predates the Curator's body edit makes `post-verdict.sh` refuse every approval (exit 7). Brief the Judge to run `loom-daemon lease pr claim <pr> --role judge --watch-pid "${LOOM_AGENT_SESSION_PID:-${CLAUDE_PID:-$PPID}}"` (and `release`) with that same `--watch-pid` value on every call (#13264): without it the claim records `pr-lease-unknown` and `post-verdict.sh` refuses the approval as a peer's lease (exit 10).
 - The judge uses `gh pr comment` (NOT `gh pr review --approve`) because GitHub's self-review API restriction applies — see `judge.md` for the full explanation.
-- Like the Builder above, the Judge files its own follow-up issues for out-of-scope discoveries via `./.loom/scripts/create-issue.sh` — see `judge.md` § "Creating Follow-up Issues"; the sweep orchestrator does not suppress this.
+- Like the Builder above, the Judge files its own follow-up issues for out-of-scope discoveries via `./.loom/scripts/create-issue.sh` — see [Creating Follow-up Issues](judge-followups.md#creating-follow-up-issues); the sweep orchestrator does not suppress this.
 - **If a previous Judge attempt for this PR died mid-flight without writing a fresh checkpoint** (rate limit, crash), re-verify forge state and complete only the missing steps before re-dispatching — see "Mid-phase-death recovery" above.
 - Expected exit states per PR:
   - **Approve** → PR labeled `loom:pr`. Write the `judge-done` checkpoint for this issue (carrying the PR number), then continue to Merge (step 7) for this PR, then advance to the next PR in the wave.

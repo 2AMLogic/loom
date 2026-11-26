@@ -83,13 +83,13 @@
 //! dir that end-of-run removal kept (a straggling process), a sweep that ended
 //! while no daemon was running, and a manual `spawn-worker.sh` run.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, OnceLock};
 
 use chrono::{DateTime, Utc};
 
 use crate::fs_util::newest_mtime_and_size;
+use crate::host_wide_cooldown::PerRepoCooldown;
 
 /// The category every reclaim log line carries.
 pub const CATEGORY: &str = "cargo_target_orphan";
@@ -861,38 +861,12 @@ pub fn run_scoped(
 // Per-repo cooldown (shared by the eager and scheduled tiers)
 // ============================================================================
 
-static LAST_RUN_AT: OnceLock<Mutex<BTreeMap<PathBuf, DateTime<Utc>>>> = OnceLock::new();
-
-fn last_run_slot() -> &'static Mutex<BTreeMap<PathBuf, DateTime<Utc>>> {
-    LAST_RUN_AT.get_or_init(|| Mutex::new(BTreeMap::new()))
-}
+static COOLDOWN: PerRepoCooldown = PerRepoCooldown::new();
 
 /// Drop cooldown state. Test-only seam.
 #[doc(hidden)]
 pub fn reset_state_for_test() {
-    last_run_slot()
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .clear();
-}
-
-/// `Some(reason)` when a pass for `repo_root` ran inside the cooldown.
-fn cooldown_reason(repo_root: &Path, now: DateTime<Utc>, min_interval_secs: u64) -> Option<String> {
-    let last = last_run_slot()
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .get(repo_root)
-        .copied()?;
-    let since = (now - last).num_seconds();
-    (since >= 0 && since < i64::try_from(min_interval_secs).unwrap_or(i64::MAX))
-        .then(|| format!("a pass ran {since}s ago (cooldown {min_interval_secs}s)"))
-}
-
-fn record_run(repo_root: &Path, now: DateTime<Utc>) {
-    last_run_slot()
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .insert(repo_root.to_path_buf(), now);
+    COOLDOWN.reset();
 }
 
 /// One production pass for the daemon tiers: config, enable switch, per-repo
@@ -912,7 +886,9 @@ pub fn run_for(repo_root: &Path) -> TargetOrphanReport {
         return base;
     }
     let ages = resolve_ages(&config);
-    if let Some(reason) = cooldown_reason(repo_root, now, resolve_min_interval_secs(&config)) {
+    if let Some(reason) =
+        COOLDOWN.deferred_reason(repo_root, now, resolve_min_interval_secs(&config))
+    {
         let report = TargetOrphanReport {
             deferred: Some(reason),
             ..run_scoped(repo_root, ages, false, true)
@@ -920,7 +896,7 @@ pub fn run_for(repo_root: &Path) -> TargetOrphanReport {
         log_report(&report);
         return report;
     }
-    record_run(repo_root, now);
+    COOLDOWN.record(repo_root, now);
     let report = run_now(repo_root, ages, false);
     log_report(&report);
     report

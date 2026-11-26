@@ -97,16 +97,15 @@ of writing if your claim is lost or another Judge's verdict already landed.
 PR_NUMBER=<number>
 MERGE_STATE=$(gh pr view $PR_NUMBER --json mergeStateStatus --jq '.mergeStateStatus')
 
-if [ "$MERGE_STATE" = "DIRTY" ]; then
-    # Checkout PR branch (worktree-aware — see "PR Branch Isolation")
-    ISSUE_NUM=$(gh pr view $PR_NUMBER --json headRefName --jq '.headRefName' | sed 's/feature\/issue-//')
-    if [ -d ".loom/worktrees/issue-${ISSUE_NUM}" ]; then
-        cd ".loom/worktrees/issue-${ISSUE_NUM}"
-    else
-        ./.loom/scripts/pr-worktree.sh $PR_NUMBER
-        cd ".loom/worktrees/pr-${PR_NUMBER}"
-    fi
+```
 
+If the merge state is `DIRTY`, run the verified selection in
+[Worktree-Aware Code Access](../loom-judge/SKILL.md#worktree-aware-code-access). Only after success,
+continue in the selected worktree:
+
+```bash
+if [ "$MERGE_STATE" = "DIRTY" ]; then
+    [[ "${WORKTREE_PR:-}" == "$PR_NUMBER" && "$(pwd -P)" == "${WORKTREE_ABS:-}" ]] || exit 1
     GATE_OK=true
     # Detached HEAD: skip the update, fall back to change request (below)
     BRANCH=$(git symbolic-ref --short HEAD 2>/dev/null) || GATE_OK=false
@@ -116,6 +115,13 @@ if [ "$MERGE_STATE" = "DIRTY" ]; then
 
     if [ "$GATE_OK" = true ]; then
         if [ "$BRANCH_UPDATE" = rebase ]; then git rebase origin/main; else git merge --no-ff -m "Merge origin/main into $BRANCH (Judge: resolve conflicts)" origin/main; fi || GATE_OK=false
+    fi
+    # Workflow-lint gate (#14156, as Doctor's #13896): a conflict union can leave a touched workflow with a duplicate step id / mapping key; GitHub then runs zero jobs and every rollup reads green. Fail closed: a lint defect, or lint unable to run, falls back to the change request below.
+    if [ "$GATE_OK" = true ]; then
+        WL_FILES=$(git diff --name-only --diff-filter=ACMR origin/main...HEAD -- '.github/workflows/') || { echo "Cannot list touched workflow files - not pushing" >&2; GATE_OK=false; }
+    fi
+    if [ "$GATE_OK" = true ] && [ -n "$WL_FILES" ]; then
+        loom-daemon workflow-lint $WL_FILES || { echo "workflow-lint failed - not pushing" >&2; GATE_OK=false; }
     fi
     # Version gate before the push; on failure never hand-patch the version-bearing files yourself or run `version.sh bump`.
     if [ "$GATE_OK" = true ] && [ -x ./.loom/scripts/version-check-gate.sh ] && ! ./.loom/scripts/version-check-gate.sh --fix-hint "then push."; then
@@ -188,6 +194,10 @@ or routed to Doctor.
 ```bash
 # Resolve the conflict (e.g., keep both additions), `git add <resolved-files>`, then finish
 if [ "$BRANCH_UPDATE" = rebase ]; then git rebase --continue; else git commit --no-edit; fi
+
+# Lint changed workflows after hand-resolving conflicts (#14156, as Doctor's #13896).
+WL_FILES=$(git diff --name-only --diff-filter=ACMR origin/main...HEAD -- '.github/workflows/') || { echo "Cannot list touched workflow files - not pushing" >&2; exit 1; }
+[ -z "$WL_FILES" ] || loom-daemon workflow-lint $WL_FILES || { echo "workflow-lint failed - not pushing" >&2; exit 1; }
 
 # Version gate before this push too.
 if [ -x ./.loom/scripts/version-check-gate.sh ] && ! ./.loom/scripts/version-check-gate.sh --fix-hint "then push."; then

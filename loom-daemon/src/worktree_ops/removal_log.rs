@@ -2,8 +2,8 @@
 //!
 //! Loom has eight independent code paths that can delete a worktree — the
 //! interactive `loom-daemon clean` pass, `clean --aggressive`, the daemon's
-//! periodic [`crate::worktree_reaper`], the daemon's terminal-destroy path
-//! ([`crate::terminal`]), `loom-recover-orphans`
+//! periodic [`crate::worktree_reaper`], the daemon's merge-observation pass
+//! ([`crate::merge_pr::post_merge_cleanup`]), `loom-recover-orphans`
 //! ([`super::orphan_recovery`]), `merge-pr.sh`'s post-merge cleanup,
 //! `worktree.sh remove`, and `agent-destroy.sh`. Each one reports its own
 //! decision to its own sink (stdout for the CLI passes, `log::debug!` for the

@@ -15,7 +15,7 @@ development workers using git worktrees and a forge (GitHub or Gitea) as the
 coordination layer, via manual roles, continuous autonomous orchestration (the
 Rust `loom-daemon` binary), and GitHub Actions cron schedules.
 
-**Loom Repository**: https://github.com/rjwalters/loom
+**Loom Repository**: https://github.com/2AMLogic/loom
 
 ## Orchestration Architecture
 
@@ -103,7 +103,7 @@ queue: the pinned hold digest (#6877) and label queries in
 
 > **Note on label cleanup**: Loom intentionally does **not** remove labels from
 > closed issues or merged PRs (harmless — all agents filter by open state — and it
-> saves gh API calls). Do not implement label cleanup on merge/close (see #2838) — exception: `merge-pr.sh` strips `loom:building` and (#11517, operator ruling 2026-10-13) `loom:issue` from an issue its own merge closes, see [`troubleshooting.md`](.loom/docs/troubleshooting.md) (#6199).
+> saves gh API calls). Do not implement label cleanup on merge/close (see #2838) — exception: the daemon's merge-observation pass (formerly `merge-pr.sh`, #14905) strips `loom:building` and (#11517, operator ruling 2026-10-13) `loom:issue` from an issue its own merge closes, see [`troubleshooting.md`](.loom/docs/troubleshooting.md) (#6199).
 
 ### Issues Are Suggestions (Role Autonomy)
 
@@ -306,7 +306,7 @@ See [credential policy](.loom/docs/credential-storage.md); `.gitignore` is insuf
   (the tested `head_sha`, via a `workflow_run` on `CI`, #10826) and also fires on
   a hand-created GitHub Release (`/repo:release` from
   [rjwalters/repo](https://github.com/rjwalters/repo) stays the hand-cut and
-  rollback path), and publishes the `ghcr.io/rjwalters/loom-worker:<version>` base
+  rollback path), and publishes the `ghcr.io/2amlogic/loom-worker:<version>` base
   image ([`docker/worker/README.md`](docker/worker/README.md)). **Cadence**: a
   `VERSION` bump lands at most once per `RELEASE_MIN_INTERVAL` (default 24 h,
   #11174; `force` dispatch for a hotfix), and not every `VERSION` gets a tag.

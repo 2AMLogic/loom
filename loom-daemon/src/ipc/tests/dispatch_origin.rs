@@ -39,7 +39,7 @@ fn dispatch_request(issue: u32, dispatch_origin: Option<DispatchOrigin>) -> Requ
 #[test]
 #[serial_test::serial]
 fn ipc_dispatch_records_the_requested_origin_or_unknown() {
-    let (tm, db, _, bus) = setup_test_context();
+    let ctx = setup_test_context();
     let (sr, _dir, _rec) = setup_sweep_registry_in_tempdir();
     let _registry_guard = seed_temp_registry(&[]);
 
@@ -47,7 +47,14 @@ fn ipc_dispatch_records_the_requested_origin_or_unknown() {
         (1_144_470, Some(DispatchOrigin::Operator)),
         (1_144_471, None),
     ] {
-        match handle_request(dispatch_request(issue, origin), &tm, &db, &sr, &bus, &test_pool()) {
+        match handle_request(
+            dispatch_request(issue, origin),
+            &ctx.terminal_manager,
+            &ctx.db,
+            &sr,
+            &ctx.bus,
+            &test_pool(),
+        ) {
             Response::SweepDispatched { .. } => {}
             other => panic!("expected SweepDispatched, got {other:?}"),
         }
@@ -61,14 +68,14 @@ fn ipc_dispatch_records_the_requested_origin_or_unknown() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial_test::serial]
 async fn nonblocking_ipc_dispatch_records_the_operator_origin() {
-    let (_, _, _, bus) = setup_test_context();
+    let ctx = setup_test_context();
     let (sr, _dir, _rec) = setup_sweep_registry_in_tempdir();
     let _registry_guard = seed_temp_registry(&[]);
 
     let response = dispatch_sweep_nonblocking(
         &sr,
         &test_pool(),
-        &bus,
+        &ctx.bus,
         SweepKind::Issue(1_144_472),
         None,
         None,

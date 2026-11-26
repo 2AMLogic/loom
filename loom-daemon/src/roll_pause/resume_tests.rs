@@ -48,6 +48,19 @@ fn the_codex_session_banner_is_parsed() {
     assert_eq!(parse_codex_session_id(""), None);
 }
 
+/// #15023: the banner is line-anchored, the rule every Codex banner reader
+/// shares. One quoted mid-line is not a session: it never answers for a
+/// missing banner and never shadows the real one printed after it.
+#[test]
+fn a_codex_banner_quoted_mid_line_is_not_a_session() {
+    let quoted_only = format!("OpenAI Codex v0.160\nthe runner echoed: session id: {CODEX_ID}\n");
+    assert_eq!(parse_codex_session_id(&quoted_only), None);
+    let quoted_then_real = format!(
+        "echoed: session id: 11111111-2222-3333-4444-555555555555\n   session id: {CODEX_ID}"
+    );
+    assert_eq!(parse_codex_session_id(&quoted_then_real).as_deref(), Some(CODEX_ID));
+}
+
 #[test]
 fn capture_writes_the_handle_while_the_session_is_still_running() {
     let tmp = tempfile::tempdir().unwrap();

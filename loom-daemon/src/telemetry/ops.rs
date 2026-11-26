@@ -153,6 +153,12 @@ pub const OPS_SPAN_ATTRIBUTE_KEYS: &[&str] = &[
     "loom.discovery.live_reads.ci",
     "loom.discovery.stale_repos",
     "loom.discovery.oldest_watermark_age_secs",
+    // #14738: one actual workspace-resync release tag lookup.
+    "loom.workspace_resync.verify.host",
+    "loom.workspace_resync.verify.attempt",
+    "loom.workspace_resync.verify.outcome",
+    "loom.workspace_resync.verify.why",
+    "loom.workspace_resync.verify.retry_at",
     // #12298: the spawn half's concurrency and its sub-phases.
     "loom.dispatch.spawn_concurrency",
     // #12310: what a `invoke github` span was for, and why a discovery read
@@ -402,6 +408,16 @@ pub const OPS_SPAN_ATTRIBUTE_KEYS: &[&str] = &[
     "loom.reaper.backed_up",
     "loom.reaper.backup_refs",
     "loom.reaper.preserved.backup_failed",
+    // #14889: `reaper.removal` spans — one per item a seat pass removed:
+    // kind, volume-relative path, the base name that keeps an over-long
+    // path correlatable with the local log, and the worktree's branch/tip
+    // or the scratch entry's bytes.
+    "loom.reaper.removal.kind",
+    "loom.reaper.removal.path",
+    "loom.reaper.removal.name",
+    "loom.reaper.removal.branch",
+    "loom.reaper.removal.tip",
+    "loom.reaper.removal.bytes",
 ];
 
 /// Longest label value kept, in bytes.
@@ -688,6 +704,21 @@ pub enum MetricName {
     /// point, labelled `task` and `reason` = `panic` / `overrun` / `exit`.
     #[serde(rename = "loom.daemon.task_faults")]
     DaemonTaskFaults,
+    // ---- Primary writer token freshness (Issue #15327) -------------------
+    /// Seconds since the daemon last published its primary writer token,
+    /// labelled `owner` (the installation owner). Climbs past ~600 s only
+    /// when rotation has stopped.
+    #[serde(rename = "loom.daemon.forge_token_age")]
+    DaemonForgeTokenAge,
+    /// Seconds until the published primary writer token's `expires_at`
+    /// (negative once past), labelled `owner`. Absent when the minter gave
+    /// no parseable expiry.
+    #[serde(rename = "loom.daemon.forge_token_remaining")]
+    DaemonForgeTokenRemaining,
+    /// Unix time of the last primary writer token publication, labelled
+    /// `owner`.
+    #[serde(rename = "loom.daemon.forge_token_last_rotation")]
+    DaemonForgeTokenLastRotation,
     // ---- IPC request latency (Issue #10765) -------------------------------
     /// Slowest IPC request answered in the interval, seconds from the request
     /// line being read to the response written, labelled `kind` (the
@@ -724,6 +755,40 @@ pub enum MetricName {
     /// `container` (#10600).
     #[serde(rename = "loom.codex_session.mount_drift")]
     CodexSessionMountDrift,
+    /// Per session-managed Codex account whose login was read this pass: 1
+    /// signed in, 0 signed out. Absent while unknown (container stopped,
+    /// docker or the probe unreadable). Labelled `account` and `container`
+    /// (#15292).
+    #[serde(rename = "loom.codex_session.login")]
+    CodexSessionLogin,
+    /// Age in seconds of the operator hold on a held account, by `reason` ∈
+    /// `operator_stop`, `other`. Absent when the account is not held or the
+    /// hold record cannot be decoded (#15292).
+    #[serde(rename = "loom.codex_session.hold_age")]
+    CodexSessionHoldAge,
+    /// Per account whose profile hook trust could be assessed, one point per
+    /// `state` ∈ `recorded`, `sealed`, `missing`: 1 for the current verdict,
+    /// 0 for the rest (#15292).
+    #[serde(rename = "loom.codex_session.hook_trust")]
+    CodexSessionHookTrust,
+    /// Latest rate-limit utilisation (0–1 fraction) per account, by `kind` ∈
+    /// `5h`, `7d`. Absent for a window with no current measurement (#15292).
+    #[serde(rename = "loom.codex_session.quota_used")]
+    CodexSessionQuotaUsed,
+    /// When the window in `loom.codex_session.quota_used` resets (Unix
+    /// seconds), by `kind` ∈ `5h`, `7d`. Absent when the window reports none
+    /// (#15292).
+    #[serde(rename = "loom.codex_session.quota_resets_at")]
+    CodexSessionQuotaResetsAt,
+    /// When the rate-limit reading behind the quota points was taken (Unix
+    /// seconds): now for a live probe, the rollout line's time for a local
+    /// snapshot (#15292).
+    #[serde(rename = "loom.codex_session.quota_observed_at")]
+    CodexSessionQuotaObservedAt,
+    /// Unused limit resets the account holds (`availableCount`). Absent when
+    /// the Codex CLI does not report it (#15292).
+    #[serde(rename = "loom.codex_session.reset_credits")]
+    CodexSessionResetCredits,
     /// Peak memory (`memory.peak`) of one finished agent scope, by `repo`
     /// (#11094).
     #[serde(rename = "loom.agent_scope.peak_memory_bytes")]
@@ -915,6 +980,9 @@ impl MetricName {
             Self::EgressTtft => "loom.egress.ttft",
             Self::DaemonTaskAlive => "loom.daemon.task_alive",
             Self::DaemonTaskFaults => "loom.daemon.task_faults",
+            Self::DaemonForgeTokenAge => "loom.daemon.forge_token_age",
+            Self::DaemonForgeTokenRemaining => "loom.daemon.forge_token_remaining",
+            Self::DaemonForgeTokenLastRotation => "loom.daemon.forge_token_last_rotation",
             Self::DaemonIpcLatencyMax => "loom.daemon.ipc.latency_max",
             Self::DaemonIpcLatency => "loom.daemon.ipc.latency",
             Self::DaemonIpcRequests => "loom.daemon.ipc.requests",
@@ -922,6 +990,13 @@ impl MetricName {
             Self::CodexSessionState => "loom.codex_session.state",
             Self::CodexSessionRecord => "loom.codex_session.record",
             Self::CodexSessionMountDrift => "loom.codex_session.mount_drift",
+            Self::CodexSessionLogin => "loom.codex_session.login",
+            Self::CodexSessionHoldAge => "loom.codex_session.hold_age",
+            Self::CodexSessionHookTrust => "loom.codex_session.hook_trust",
+            Self::CodexSessionQuotaUsed => "loom.codex_session.quota_used",
+            Self::CodexSessionQuotaResetsAt => "loom.codex_session.quota_resets_at",
+            Self::CodexSessionQuotaObservedAt => "loom.codex_session.quota_observed_at",
+            Self::CodexSessionResetCredits => "loom.codex_session.reset_credits",
             Self::AgentScopePeakMemoryBytes => "loom.agent_scope.peak_memory_bytes",
             Self::AgentScopeOomKills => "loom.agent_scope.oom_kills",
             Self::ForgeMirrorReads => "loom.forge.mirror.reads",
@@ -1056,12 +1131,22 @@ impl MetricName {
             Self::EgressLatency | Self::EgressTtft => "s",
             Self::DaemonTaskAlive => "1",
             Self::DaemonTaskFaults => "{fault}",
+            Self::DaemonForgeTokenAge
+            | Self::DaemonForgeTokenRemaining
+            | Self::DaemonForgeTokenLastRotation => "s",
             Self::DaemonIpcLatencyMax | Self::DaemonIpcLatency => "s",
             Self::DaemonIpcRequests => "{request}",
             Self::DaemonIpcStatusBuilds => "{build}",
             Self::CodexSessionState => "1",
             Self::CodexSessionRecord => "1",
             Self::CodexSessionMountDrift => "{path}",
+            Self::CodexSessionLogin | Self::CodexSessionHookTrust | Self::CodexSessionQuotaUsed => {
+                "1"
+            }
+            Self::CodexSessionHoldAge
+            | Self::CodexSessionQuotaResetsAt
+            | Self::CodexSessionQuotaObservedAt => "s",
+            Self::CodexSessionResetCredits => "{reset}",
             Self::ForgeMirrorReads => "{request}",
             Self::ForgeMirrorChanges => "{change}",
             Self::DiscoveryRecheck => "{request}",
@@ -1190,6 +1275,15 @@ impl MetricName {
             Self::EgressLatency => "Summed egress-proxy request latency, by seat.",
             Self::EgressTtft => "Summed egress-proxy time to first response byte, by seat.",
             Self::DaemonTaskFaults => "Faults of a long-running daemon loop, by task and reason.",
+            Self::DaemonForgeTokenAge => {
+                "Seconds since the primary writer token was last published, by owner."
+            }
+            Self::DaemonForgeTokenRemaining => {
+                "Seconds until the published primary writer token expires, by owner."
+            }
+            Self::DaemonForgeTokenLastRotation => {
+                "Unix time the primary writer token was last published, by owner."
+            }
             Self::DaemonIpcLatencyMax => "Slowest IPC request answered in the interval, by kind.",
             Self::DaemonIpcLatency => "Summed IPC request latency, by request kind.",
             Self::DaemonIpcRequests => "IPC requests answered, by request kind.",
@@ -1205,6 +1299,32 @@ impl MetricName {
             Self::CodexSessionMountDrift => {
                 "Workspace paths a Codex session container is missing, mounts extra, or \
                  mounts though denied, by kind."
+            }
+            Self::CodexSessionLogin => {
+                "1 when a Codex session account's login was read as signed in, 0 when \
+                 signed out; absent while unknown."
+            }
+            Self::CodexSessionHoldAge => {
+                "Age in seconds of a Codex session account's operator hold, by reason."
+            }
+            Self::CodexSessionHookTrust => {
+                "Codex session account hook trust: 1 for the current state (recorded, \
+                 sealed, missing), 0 for the others."
+            }
+            Self::CodexSessionQuotaUsed => {
+                "Latest Codex rate-limit utilisation (0-1) per session account, by window \
+                 (5h, 7d)."
+            }
+            Self::CodexSessionQuotaResetsAt => {
+                "When a Codex session account's rate-limit window resets (Unix seconds), \
+                 by window."
+            }
+            Self::CodexSessionQuotaObservedAt => {
+                "When the Codex rate-limit reading for a session account was taken (Unix \
+                 seconds)."
+            }
+            Self::CodexSessionResetCredits => {
+                "Unused rate-limit resets a Codex session account holds."
             }
             Self::AgentScopePeakMemoryBytes => {
                 "Peak memory (cgroup memory.peak) of one finished agent scope, by repo."

@@ -1,9 +1,8 @@
 #!/usr/bin/env bash
 # judge-fallback-guard.sh — deterministic gate for the Judge's fallback queue
-# (defaults/.claude/commands/loom/judge.md §"Fallback Queue (When No Labeled
-# Work)"), issue #5455.
+# (defaults/.claude/commands/loom/judge-fallback.md §"Fallback Queue (Review Only)"), issue #5455.
 #
-# Problem this closes: PR #4972 (rjwalters/loom) accumulated 199 fallback-mode
+# Problem this closes: PR #4972 (2AMLogic/loom) accumulated 199 fallback-mode
 # Judge comments over 37 hours before merging — a 2-line Dependabot Cargo.lock
 # bump. The existing SHA-based dedup (#5058) mostly works, but it is
 # prompt-embedded bash that an LLM must faithfully re-derive on every pass; a
@@ -88,7 +87,7 @@
 #
 # This script decides whether ONE given PR number should be evaluated. Finding
 # the candidate list of unlabeled open PRs itself (the `gh pr list ... | select
-# no loom: label` query) stays in judge.md — this is deliberately a single-PR
+# no loom: label` query) stays in judge-fallback.md — this is deliberately a single-PR
 # gate, called once per candidate in the fallback walk.
 
 # requires-daemon: forge optional   #9537 — `forge is-fleet` answers "is this PR author one of Loom's own Apps"; with no daemon, or one that predates the verb (clap exits 2), is_fleet_author falls back to the exact `loom-fleet-dispatch(-N)` family pattern (`app/` or `[bot]` spelling, #9340), so an old binary degrades to the pre-#9537 behaviour (plus the numbered members), never to a failure.
@@ -221,7 +220,7 @@ fi
 #     only the first page (default per_page=30, oldest-first), so a marker
 #     posted late in a long comment history (#4972 already had 129 comments
 #     when the #5058 dedup shipped) would never be seen — the same pitfall
-#     documented in judge.md's own fallback-queue example workflow.
+#     documented in judge-fallback.md's own fallback-queue example workflow.
 COMMENTS_JSON="$(gh api "repos/{owner}/{repo}/issues/$PR/comments" --paginate 2>"$GH_STDERR")" || {
   echo "ERROR: 'gh api .../issues/$PR/comments --paginate' failed: $(cat "$GH_STDERR" 2>/dev/null)" >&2
   exit 1

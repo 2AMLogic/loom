@@ -110,7 +110,8 @@ reclaim comment:
 # The lease first: a live peer lease (exit 4) means stand down, label untouched.
 [[ -n "$CLAIMED_AT" ]] && loom-daemon lease pr claim $N --role judge --watch-pid "${LOOM_AGENT_SESSION_PID:-${CLAUDE_PID:-$PPID}}"; [[ $? =~ ^[02]$ ]] &&
 gh pr edit $N --remove-label "loom:reviewing" &&
-gh pr comment $N --body "Reclaiming loom:reviewing claim: $STANDDOWN_COUNT stand-down passes against claim $CLAIMED_AT (age ≥ ${LOOM_STALE_REVIEWING_MINUTES:-45}m) with no actual review progress (bounded fallback, LOOM_MAX_STANDDOWN_STREAK=${LOOM_MAX_STANDDOWN_STREAK:-3}) — breaking the livelock." &&
+gh pr comment $N --body "Reclaiming loom:reviewing claim: $STANDDOWN_COUNT stand-down passes against claim $CLAIMED_AT (age ≥ ${LOOM_STALE_REVIEWING_MINUTES:-45}m) with no actual review progress (bounded fallback, LOOM_MAX_STANDDOWN_STREAK=${LOOM_MAX_STANDDOWN_STREAK:-3}) — breaking the livelock.
+<!-- loom:reclaim claim=$CLAIMED_AT -->" &&
 gh pr edit $N --add-label "loom:reviewing"
 # Continue to step 3 (Check merge state) and evaluate normally
 ```
@@ -121,10 +122,18 @@ gh pr edit $N --add-label "loom:reviewing"
 # The lease first: a live peer lease (exit 4) means stand down, label untouched.
 [[ -n "$CLAIMED_AT" ]] && loom-daemon lease pr claim $N --role judge --watch-pid "${LOOM_AGENT_SESSION_PID:-${CLAUDE_PID:-$PPID}}"; [[ $? =~ ^[02]$ ]] &&
 gh pr edit $N --remove-label "loom:reviewing" &&
-gh pr comment $N --body "Reclaiming stale loom:reviewing claim (idle ${IDLE_MINUTES}m > ${LOOM_STALE_REVIEWING_MINUTES:-45}m with no claimant activity) — the prior Judge likely died mid-review." &&
+gh pr comment $N --body "Reclaiming stale loom:reviewing claim (idle ${IDLE_MINUTES}m > ${LOOM_STALE_REVIEWING_MINUTES:-45}m with no claimant activity) — the prior Judge likely died mid-review.
+<!-- loom:reclaim claim=$CLAIMED_AT -->" &&
 gh pr edit $N --add-label "loom:reviewing"
 # Continue to step 3 (Check merge state) and evaluate normally
 ```
+
+**Both reclaim comments end with the `loom:reclaim` claim marker
+keyed to `$CLAIMED_AT` (#15044)**: the forge timeline can lag the label remove + re-add above,
+and `claim-staleness.sh` then matches this marker against the stale verdict it
+computed from the pre-reclaim timestamp — so your replacement claim reads
+`fresh` while you are active and is not reclaimed in turn (and `unknown`, never
+stale, once you go idle).
 
 **Env vars**: `LOOM_STALE_REVIEWING_MINUTES` (default **45**) — named to
 mirror `LOOM_STALE_BUILDING_HOURS` (`loom-daemon/src/claim_reconciliation.rs`,
@@ -146,7 +155,7 @@ precisely the defect this section exists to fix.
 pass also reclaims stale `loom:reviewing` (and `loom:treating`) on its tick,
 with the same env vars and defaults, aged from the label's own `labeled`
 event. See [`daemon-reference.md`'s "Stale-claim reconciliation"
-section](https://github.com/rjwalters/loom/blob/main/defaults/docs/daemon-reference.md#stale-claim-reconciliation--the-sweep-journal-3953-fixed-3975-extended-to-pr-side-claims-4367).
+section](https://github.com/2AMLogic/loom/blob/main/defaults/docs/daemon-reference.md#stale-claim-reconciliation--the-sweep-journal-3953-fixed-3975-extended-to-pr-side-claims-4367).
 
 **Applies everywhere a Judge claims a PR from a multi-PR pass** — not just
 this single-PR narrative. This same check-then-claim rule governs the batch

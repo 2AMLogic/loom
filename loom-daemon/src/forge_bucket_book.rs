@@ -190,7 +190,7 @@ pub enum Source {
     Header,
     /// A `gh api rate_limit` probe.
     Probe,
-    /// A rate-limit refusal of a real call ([`mark_exhausted`], W4-A): the
+    /// A rate-limit refusal of a real call ([`mark_exhausted_at`], W4-A): the
     /// bucket answered "no budget left" until its reset.
     Refusal,
 }
@@ -284,14 +284,10 @@ pub fn observe_at(key: BucketKey, headers: &RateLimitHeaders, source: Source, no
     );
 }
 
-/// Book `key` as exhausted until `reset_epoch` (W4-A): a call it served was
-/// refused with a primary rate limit. `limit` is kept from the held reading
-/// when one exists, so the projection reads it as 100 % used.
-pub fn mark_exhausted(key: BucketKey, reset_epoch: i64) {
-    mark_exhausted_at(key, reset_epoch, chrono::Utc::now().timestamp());
-}
-
-/// [`mark_exhausted`] at an explicit instant.
+/// Book `key` as exhausted until `reset_epoch` (W4-A) at an explicit
+/// instant: a call it served was refused with a primary rate limit. `limit`
+/// is kept from the held reading when one exists, so the projection reads it
+/// as 100 % used.
 pub fn mark_exhausted_at(key: BucketKey, reset_epoch: i64, now: i64) {
     if reset_epoch <= now {
         return;
@@ -408,7 +404,6 @@ struct Entry {
 ///
 /// When `dir` is not a private directory or the write fails.
 pub fn persist(dir: &Path, now: i64) -> std::io::Result<()> {
-    use std::io::Write;
     if !crate::forge_etag_store::private_dir(dir, true) {
         return Err(std::io::Error::other("untrusted sink dir"));
     }
@@ -417,11 +412,14 @@ pub fn persist(dir: &Path, now: i64) -> std::io::Result<()> {
         .map(|(key, reading)| Entry { key, reading })
         .collect();
     let body = serde_json::to_vec(&entries)?;
-    let tmp = dir.join(format!(".{SNAPSHOT_FILE}.{}", std::process::id()));
-    let _ = std::fs::remove_file(&tmp);
-    let mut file = crate::forge_etag_store::create_private_file(&tmp)?;
-    file.write_all(&body)?;
-    std::fs::rename(&tmp, dir.join(SNAPSHOT_FILE))
+    crate::fs_util::write_atomic(
+        &dir.join(SNAPSHOT_FILE),
+        &body,
+        crate::fs_util::AtomicOpts {
+            private: true,
+            sync_dir: true,
+        },
+    )
 }
 
 /// The readings in `dir`'s [`SNAPSHOT_FILE`] still believed at `now`. A

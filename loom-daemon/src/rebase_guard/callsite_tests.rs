@@ -90,15 +90,14 @@ fn judge_no_longer_carries_its_own_empty_diff_predicate() {
 /// predates the verb prints only clap's usage error.
 #[test]
 fn every_prompt_call_site_warns_when_the_guard_gives_no_answer() {
-    for (rel, expected) in [
-        (JUDGE_MERGE_CONFLICTS, 2),
-        (JUDGE_CORE, 0),
-        ("defaults/.claude/commands/loom/doctor.md", 2),
+    for (rel, base, expected) in [
+        (JUDGE_MERGE_CONFLICTS, "origin/main", 2),
+        (JUDGE_CORE, "origin/main", 0),
+        ("defaults/.claude/commands/loom/doctor.md", "\"$PR_BASE_SHA\"", 2),
     ] {
         let text = shipped(rel);
-        let calls = text
-            .matches("RG=0; loom-daemon forge rebase-guard --base origin/main || RG=$?")
-            .count();
+        let call = format!("RG=0; loom-daemon forge rebase-guard --base {base} || RG=$?");
+        let calls = text.matches(&call).count();
         let warnings = text
             .matches("WARNING: rebase-guard gave no answer (rc=$RG)")
             .count();

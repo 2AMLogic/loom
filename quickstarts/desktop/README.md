@@ -21,7 +21,7 @@ A modern desktop application template pre-configured for Loom AI-powered develop
 
 ## Prerequisites
 
-- [Node.js](https://nodejs.org/) 18+
+- [Node.js](https://nodejs.org/) `^20.19.0 || ^22.12.0 || >=24.0.0` (CI uses Node 24)
 - [pnpm](https://pnpm.io/)
 - [Rust](https://rustup.rs/)
 - Platform-specific dependencies:

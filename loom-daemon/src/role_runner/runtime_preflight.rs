@@ -344,6 +344,8 @@ pub(crate) struct CodexPoolState {
     /// release — see the module doc for why class-scoped holds and
     /// session-managed re-auth holds are not counted as blocking.
     pub spawnable: usize,
+    /// Enabled profiles excluded from this role's draw by hook readiness.
+    pub untrusted: Vec<String>,
     /// Enabled session-managed accounts whose `loom-codex-session-<name>`
     /// container the published session snapshot shows as down — stopped,
     /// restarting or missing (#10454, reason `SessionDown`). Never counted
@@ -371,10 +373,22 @@ pub(crate) struct CodexPoolState {
 /// per-account read this replaced re-parsed the file for every enabled
 /// account and left a window in which an account observed early and one
 /// observed late could disagree about the same tick's state.
-pub(crate) fn codex_pool_state(root: &Path, now: u64) -> CodexPoolState {
+pub(crate) fn codex_pool_state(root: &Path, now: u64, require_hook: bool) -> CodexPoolState {
+    codex_pool_state_for(root, now, require_hook, |_| true)
+}
+
+/// Restrict the pool read to profiles that can serve this launch. A role
+/// needing private-clone containment cannot recover on a shared profile.
+pub(crate) fn codex_pool_state_for(
+    root: &Path,
+    now: u64,
+    require_hook: bool,
+    include: impl Fn(&Path) -> bool,
+) -> CodexPoolState {
     let mut state = CodexPoolState {
         enabled: 0,
         spawnable: 0,
+        untrusted: Vec::new(),
         session_down: 0,
         session_held: 0,
         earliest_clear: None,
@@ -391,12 +405,15 @@ pub(crate) fn codex_pool_state(root: &Path, now: u64) -> CodexPoolState {
             return state;
         }
     };
+    let enabled = inventory
+        .iter()
+        .filter(|account| account.enabled && include(&account.credential_reference));
     let health_state = match health_snapshot(root) {
         Ok(health) => health,
         Err(e) => {
             // Count the pool first: `enabled` is what the skip reports as
             // `0/N`, and the inventory read that produced it did succeed.
-            state.enabled = inventory.iter().filter(|account| account.enabled).count();
+            state.enabled = enabled.count();
             state.read_error = Some((PoolStateFile::HealthState, format!("{e:#}")));
             return state;
         }
@@ -404,7 +421,7 @@ pub(crate) fn codex_pool_state(root: &Path, now: u64) -> CodexPoolState {
     // #10454/#10660: the session watch's published snapshot — a mutex read,
     // never a `docker` process on this per-tick path. Fail open on `None`.
     let liveness = crate::tokens_pool::session_lifecycle::liveness::published();
-    for account in inventory.iter().filter(|account| account.enabled) {
+    for account in enabled {
         state.enabled += 1;
         // Before the no-health-entry `continue` below: an account the health
         // file has never heard of is still unspawnable if its container is down.
@@ -415,6 +432,12 @@ pub(crate) fn codex_pool_state(root: &Path, now: u64) -> CodexPoolState {
             state.session_down += 1;
             state.session_held +=
                 usize::from(crate::tokens_pool::session_lifecycle::liveness::is_held(account));
+            continue;
+        }
+        if require_hook
+            && !crate::runtime_preference::codex_guard::ready(root, &account.credential_reference)
+        {
+            state.untrusted.push(account.id.name.clone());
             continue;
         }
         let Some(health) = health_state.get(&account.id) else {
@@ -444,9 +467,31 @@ pub(crate) fn codex_pool_state(root: &Path, now: u64) -> CodexPoolState {
 /// pre-spawn skip and `runtime_preference::availability`'s Exhausted detail so
 /// both name `SessionDown` (#10454) the same way.
 pub(crate) fn codex_exhausted_reason(state: &CodexPoolState) -> String {
+    if state.untrusted.is_empty() {
+        return codex_health_exhausted_reason(state);
+    }
+    let hook = format!(
+        "guard hook not ready on Codex profile(s) {}; run `provision-codex-hooks.sh verify \
+         --all-profiles --workspace <repo>` (#9390)",
+        state.untrusted.join(", ")
+    );
+    if state.untrusted.len() == state.enabled {
+        hook
+    } else {
+        format!("{hook}; {}", codex_health_exhausted_reason(state))
+    }
+}
+
+fn codex_health_exhausted_reason(state: &CodexPoolState) -> String {
     use crate::tokens_pool::session_hold::HOLD_REASON_OPERATOR_STOP;
+
+    let subject = if state.untrusted.is_empty() {
+        "every enabled account"
+    } else {
+        "every remaining enabled account"
+    };
     if state.session_down == 0 {
-        return "every enabled account is cooling down or needs re-auth".to_string();
+        return format!("{subject} is cooling down or needs re-auth");
     }
     // #10660: never tell the operator to start a container they stopped.
     let (down, held) = (state.session_down, state.session_held);
@@ -462,7 +507,7 @@ pub(crate) fn codex_exhausted_reason(state: &CodexPoolState) -> String {
         )
     };
     format!(
-        "every enabled account is cooling down, needs re-auth, or is {} ({down}/{} session \
+        "{subject} is cooling down, needs re-auth, or is {} ({down}/{} session \
          container(s) not running{remedy}; #10454)",
         crate::tokens_pool::session_lifecycle::liveness::SESSION_DOWN,
         state.enabled
@@ -534,7 +579,11 @@ fn codex_gate(
     }
     let now = chrono::Utc::now();
     let now_epoch = u64::try_from(now.timestamp()).unwrap_or(0);
-    let state = codex_pool_state(root, now_epoch);
+    let state = codex_pool_state(
+        root,
+        now_epoch,
+        admitted.execution.is_none() && crate::runtime_preference::codex_guard::guarded(role),
+    );
     if state.spawnable > 0 {
         return None;
     }
@@ -556,6 +605,9 @@ fn codex_gate(
         ),
         None if state.enabled == 0 => {
             (PoolHold::Unprovisioned, "no enabled codex account is provisioned".to_string())
+        }
+        None if state.untrusted.len() == state.enabled => {
+            (PoolHold::Unprovisioned, codex_exhausted_reason(&state))
         }
         None => (PoolHold::SelfHealing, codex_exhausted_reason(&state)),
     };

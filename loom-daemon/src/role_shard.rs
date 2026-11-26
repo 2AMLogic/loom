@@ -595,24 +595,9 @@ fn tracked_config_declares_shard_index(root: &Path) -> Option<usize> {
         .and_then(|v| usize::try_from(v).ok())
 }
 
-/// Resolve this host's sharding posture for `root`.
-///
-/// **Read per-root, but describing the host.** The index/count knobs are
-/// host- and fleet-level facts, yet they are resolved from whichever root's
-/// tick is asking — exactly as `autonomous.roleRunner.maxConcurrent` already
-/// is (see [`crate::role_runner::RoleRunnerConfig::max_concurrent`]). On a
-/// fleet host whose roots disagree, each root is gated by its own resolution;
-/// in the intended deployment `shardCount` is identical everywhere and
-/// `shardIndex` comes from the host's env, so they agree trivially.
-#[must_use]
-pub fn resolve_posture(root: &Path) -> ShardPosture {
-    let effective = crate::config_resolver::resolve_effective_config(root);
-    let block = crate::config_resolver::get_path(&effective, "autonomous.roleRunner");
-    resolve_posture_from(block, root)
-}
-
-/// The pure core of [`resolve_posture`], split out so tests can drive it with
-/// a synthetic config block instead of a temp-dir repo.
+/// The pure core of the posture resolution, split out so tests can drive it
+/// with a synthetic config block instead of a temp-dir repo (and `decide`
+/// can feed it the `autonomous.roleRunner` block it resolves).
 fn resolve_posture_from(block: Option<&serde_json::Value>, root: &Path) -> ShardPosture {
     let index_knob = resolve_knob(SHARD_INDEX_ENV, block, SHARD_INDEX_KEY);
     let count_knob = resolve_knob(SHARD_COUNT_ENV, block, SHARD_COUNT_KEY);

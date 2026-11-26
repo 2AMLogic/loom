@@ -660,6 +660,7 @@ fn arm(
         match declared.header {
             HeaderStyle::AuthorizationBearer => "authorization-bearer",
             HeaderStyle::XApiKey => "x-api-key",
+            HeaderStyle::XGoogApiKey => "x-goog-api-key",
         },
     );
     Ok(Prepared {

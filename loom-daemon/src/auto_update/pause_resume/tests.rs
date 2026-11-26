@@ -661,74 +661,16 @@ fn a_health_failure_restarts_probation_and_is_reported() {
     let plan = plan(dir.path());
     write(&plan, &manifest("rp-health", Phase::Paused, vec![sweep(dir.path(), "s-1", 1)]));
 
-    /// Healthy once, then one failure, then healthy.
-    struct Flaky(FakeHost, Mutex<u32>);
-    impl ResumeHost for Flaky {
-        fn health_sample(&self) -> Result<(), String> {
-            let mut n = self.1.lock().unwrap();
-            *n += 1;
-            if *n == 2 {
-                return Err("the heartbeat is 400s old".to_string());
-            }
-            Ok(())
-        }
-        fn hold_dispatch(&self) -> ResumeHold {
-            self.0.hold_dispatch()
-        }
-        fn safe_point(&self, i: &ManifestItem, r: &PauseRequest) -> Option<SafePointRecord> {
-            self.0.safe_point(i, r)
-        }
-        fn reap_residue(&self, i: &ManifestItem) -> TeardownReport {
-            self.0.reap_residue(i)
-        }
-        fn refresh_lease(&self, i: &ManifestItem, t: Duration) -> Result<(), String> {
-            self.0.refresh_lease(i, t)
-        }
-        fn already_resumed(&self, i: &ManifestItem) -> Option<String> {
-            self.0.already_resumed(i)
-        }
-        fn check(&self, i: &ManifestItem, l: &RollResumeLaunch) -> Result<(), RollResumeRefusal> {
-            self.0.check(i, l)
-        }
-        fn launch(
-            &self,
-            i: &ManifestItem,
-            l: &RollResumeLaunch,
-            w: Duration,
-        ) -> Result<Launched, RollResumeRefusal> {
-            self.0.launch(i, l, w)
-        }
-        fn liveness(&self, i: &ManifestItem, l: &Launched) -> Liveness {
-            self.0.liveness(i, l)
-        }
-        fn abandon(&self, i: &ManifestItem, l: &Launched) {
-            self.0.abandon(i, l)
-        }
-        fn settle(&self, m: &str, i: &ManifestItem, n: &str) {
-            self.0.settle(m, i, n)
-        }
-        fn requeue(&self, i: &ManifestItem, n: &RollRequeueNotice, f: bool) -> Result<(), String> {
-            self.0.requeue(i, n, f)
-        }
-        fn recover(&self, m: &str, i: &ManifestItem) {
-            self.0.recover(m, i)
-        }
-        fn finish(&self, m: &str, n: &str) {
-            self.0.finish(m, n)
-        }
-        fn emit(&self, t: &str, p: serde_json::Value) {
-            self.0.emit(t, p)
-        }
-        fn publish(&self, s: &PauseResumeStatus) {
-            self.0.publish(s)
-        }
-    }
-    let host = Arc::new(Flaky(FakeHost::default(), Mutex::new(0)));
+    // Healthy once, then one failure, then healthy.
+    let host = Arc::new(FakeHost {
+        fail_health_sample: Mutex::new(Some((2, "the heartbeat is 400s old".to_string()))),
+        ..FakeHost::default()
+    });
 
     let status = finished(run_h5(host.clone(), &plan));
 
     assert_eq!((status.health_failures, status.resumed), (1, 1));
-    let failed = &host.0.topic("daemon.roll.health_failed")[0];
+    let failed = &host.topic("daemon.roll.health_failed")[0];
     assert!(failed["reason"].as_str().unwrap().contains("heartbeat"), "{failed}");
     assert!(archived(&plan, "rp-health")
         .events
@@ -805,74 +747,14 @@ fn a_fleet_paused_host_does_not_dispatch_after_h5_completes() {
     };
     write(&plan, &manifest("rp-fleet-2", Phase::Paused, vec![sweep(dir.path(), "s-1", 1)]));
 
-    struct PausedMidway(FakeHost);
-    impl ResumeHost for PausedMidway {
-        fn check(&self, i: &ManifestItem, l: &RollResumeLaunch) -> Result<(), RollResumeRefusal> {
-            // The store flips to `paused` just before the relaunch.
-            assert!(self
-                .0
-                .drain
-                .hold_for_fleet_state("fleet says paused".to_string()));
-            self.0.check(i, l)
-        }
-        fn health_sample(&self) -> Result<(), String> {
-            self.0.health_sample()
-        }
-        fn hold_dispatch(&self) -> ResumeHold {
-            self.0.hold_dispatch()
-        }
-        fn safe_point(&self, i: &ManifestItem, r: &PauseRequest) -> Option<SafePointRecord> {
-            self.0.safe_point(i, r)
-        }
-        fn reap_residue(&self, i: &ManifestItem) -> TeardownReport {
-            self.0.reap_residue(i)
-        }
-        fn refresh_lease(&self, i: &ManifestItem, t: Duration) -> Result<(), String> {
-            self.0.refresh_lease(i, t)
-        }
-        fn already_resumed(&self, i: &ManifestItem) -> Option<String> {
-            self.0.already_resumed(i)
-        }
-        fn launch(
-            &self,
-            i: &ManifestItem,
-            l: &RollResumeLaunch,
-            w: Duration,
-        ) -> Result<Launched, RollResumeRefusal> {
-            self.0.launch(i, l, w)
-        }
-        fn liveness(&self, i: &ManifestItem, l: &Launched) -> Liveness {
-            self.0.liveness(i, l)
-        }
-        fn abandon(&self, i: &ManifestItem, l: &Launched) {
-            self.0.abandon(i, l);
-        }
-        fn settle(&self, m: &str, i: &ManifestItem, n: &str) {
-            self.0.settle(m, i, n);
-        }
-        fn requeue(&self, i: &ManifestItem, n: &RollRequeueNotice, f: bool) -> Result<(), String> {
-            self.0.requeue(i, n, f)
-        }
-        fn recover(&self, m: &str, i: &ManifestItem) {
-            self.0.recover(m, i);
-        }
-        fn finish(&self, m: &str, n: &str) {
-            self.0.finish(m, n);
-        }
-        fn emit(&self, t: &str, p: serde_json::Value) {
-            self.0.emit(t, p);
-        }
-        fn publish(&self, s: &PauseResumeStatus) {
-            self.0.publish(s);
-        }
-    }
-    let host = Arc::new(PausedMidway(FakeHost::default()));
+    // The store flips to `paused` just before the relaunch.
+    let host = Arc::new(FakeHost {
+        fleet_pause_on_check: Mutex::new(Some("fleet says paused".to_string())),
+        ..FakeHost::default()
+    });
     let status = finished(run_h5(host.clone(), &plan));
     assert_eq!(status.resumed, 1);
-    assert!(
-        host.0.drain.is_draining() && host.0.drain.is_fleet_held(),
-        "still paused after H5"
-    );
+    assert!(host.drain.is_draining() && host.drain.is_fleet_held(), "still paused after H5");
 }
 
 /// An operator stop is not a fleet pause: H5 resumes nothing under it, and

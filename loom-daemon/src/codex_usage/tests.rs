@@ -739,6 +739,109 @@ fn lookup_ids_says_why_no_rows_came_back() {
 // #14668: an incomplete read is never confirmed absence
 // ---------------------------------------------------------------------------
 
+/// #14883: the merge reader's by-id read — id alone, no window, no directory —
+/// opens only rollouts whose own FILENAME carries an exact id, then re-checks
+/// the id in `session_meta`. A Builder rollout created before any PR window,
+/// an unrelated sibling, and a filename coincidence the metadata rejects all
+/// behave as they must.
+#[serial_test::serial(codex_home_env)]
+#[test]
+fn tokens_by_session_ids_is_keyed_on_the_id_alone_and_reads_only_named_files() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = seed_codex_home(
+        tmp.path(),
+        &[
+            (
+                // The final Builder's rollout: created hours BEFORE the PR
+                // window would open, in a container-local cwd — both would
+                // drop it under the directory+window key (#14540), neither
+                // may under the merge reader's id key.
+                "2026/11/20",
+                "rollout-2026-11-20T09-00-00-aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee.jsonl",
+                rollout(
+                    "/workspace/work/repo-clone",
+                    "2026-11-20T09:00:31Z",
+                    "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+                    "gpt-5",
+                    &[(1_000, 400, 100, 40)],
+                ),
+            ),
+            (
+                // An unrelated rollout in the same profile: never named.
+                "2026/11/20",
+                "rollout-2026-11-20T11-00-00-0123456789abcdef0123456789abcdef.jsonl",
+                rollout(
+                    "/workspace/work/repo-clone",
+                    "2026-11-20T11:00:31Z",
+                    "01234567-89ab-cdef-0123-456789abcdef",
+                    "gpt-5",
+                    &[(9_000_000, 0, 900_000, 0)],
+                ),
+            ),
+            (
+                // A filename that carries the named id as a substring but
+                // whose session metadata names a DIFFERENT session: the
+                // metadata check must reject it.
+                "2026/11/21",
+                "rollout-2026-11-21T04-00-00-xaaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee.jsonl",
+                rollout(
+                    "/workspace/work/repo-clone",
+                    "2026-11-21T04:00:31Z",
+                    "99999999-8888-7777-6666-555555555555",
+                    "gpt-5",
+                    &[(7_000_000, 0, 700_000, 0)],
+                ),
+            ),
+        ],
+    );
+    let id = |s: &str| vec![s.to_string()];
+    let builder = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+
+    // An empty id set skips the read entirely.
+    assert_eq!(with_codex_home(&home, || tokens_by_session_ids(&[], None)), None);
+
+    let rows = with_codex_home(&home, || tokens_by_session_ids(&id(builder), None))
+        .expect("the named rollout is attributed");
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(rows[0].model, "gpt-5");
+    assert_eq!(rows[0].input, 600);
+    assert_eq!(rows[0].cache_read, 400);
+    assert_eq!(rows[0].output, 100);
+    // Disjoint counters, the module doc's mapping: cached input is moved out
+    // of `input` into `cache_read` (this fixture writes no cache-write field,
+    // so `cache_write_5m`/`cache_write_1h` stay 0).
+    assert_eq!(rows[0].cache_write_5m, 0);
+    assert_eq!(rows[0].cache_write_1h, 0);
+    assert_eq!(
+        rows[0].input + rows[0].cache_read + rows[0].cache_write_5m + rows[0].output,
+        1_100,
+        "the four counters sum to the billed total exactly once"
+    );
+
+    // An id no rollout holds contributes no row — unknown, never zero-rows.
+    assert_eq!(
+        with_codex_home(&home, || {
+            tokens_by_session_ids(&id("00000000-0000-0000-0000-000000000000"), None)
+        }),
+        None
+    );
+
+    // A repeated id still reads once.
+    assert_eq!(
+        with_codex_home(&home, || {
+            tokens_by_session_ids(
+                &id(builder)
+                    .into_iter()
+                    .chain(id(builder))
+                    .collect::<Vec<_>>(),
+                None,
+            )
+        })
+        .map(|rows| (rows.len(), rows[0].input)),
+        Some((1, 600))
+    );
+}
+
 /// A `token_count` event truncated mid-write: valid UTF-8, invalid JSON — the
 /// exact shape a Codex killed mid-turn leaves behind.
 fn truncated_token_line() -> String {
@@ -1207,6 +1310,9 @@ fn non_date_shaped_children_of_sessions_are_never_descended_into() {
 #[serial_test::serial(codex_home_env)]
 #[test]
 fn codex_home_prefers_the_loom_override_then_codex_own_then_the_default() {
+    // Crate-wide codex-home lock (#15174): this test mutates the variable
+    // directly, so it must not race the isolation helpers clearing it.
+    let _codex_home_lock = crate::tokens_pool::codex_home_env::lock();
     clear_home_env();
     assert_eq!(codex_home(Some(Path::new("/h"))), Some(PathBuf::from("/h/.codex")));
     std::env::set_var(CODEX_NATIVE_HOME_ENV, "/native/codex");
@@ -1227,16 +1333,24 @@ fn codex_home_prefers_the_loom_override_then_codex_own_then_the_default() {
 
 /// `LOOM_CODEX_PROFILE_ROOT` cleared too, so an injected `home` decides the
 /// profile root and the operator's real pool is never reached. The returned
-/// guard holds the crate-wide profile-root lock and restores it on drop (#9964).
-fn clear_all_home_env() -> crate::tokens_pool::profile_root_env::ProfileRootEnv {
-    clear_home_env();
-    crate::tokens_pool::profile_root_env::ProfileRootEnv::unset()
+/// guard holds the crate-wide profile-root lock and restores it on drop
+/// (#9964), plus the crate-wide codex-home lock for the `LOOM_CODEX_HOME`
+/// removal (#15174) — codex-home first, profile-root inner, per
+/// `codex_home_env`'s documented lock order.
+fn clear_all_home_env() -> (
+    crate::tokens_pool::profile_root_env::ProfileRootEnv,
+    crate::tokens_pool::codex_home_env::CodexHomeEnv,
+) {
+    let codex_home = crate::tokens_pool::codex_home_env::CodexHomeEnv::unset();
+    let profile_root = crate::tokens_pool::profile_root_env::ProfileRootEnv::unset();
+    std::env::remove_var(CODEX_NATIVE_HOME_ENV);
+    (profile_root, codex_home)
 }
 
 #[serial_test::serial(codex_home_env)]
 #[test]
 fn codex_homes_is_the_ambient_home_plus_every_pooled_profile_unless_pinned() {
-    let _profile_root = clear_all_home_env();
+    let _home_env = clear_all_home_env();
     let tmp = tempfile::tempdir().unwrap();
     let profiles = tmp.path().join(".loom/codex-profiles");
     std::fs::create_dir_all(profiles.join("work-b")).unwrap();
@@ -1271,7 +1385,7 @@ fn codex_homes_is_the_ambient_home_plus_every_pooled_profile_unless_pinned() {
 #[serial_test::serial(codex_home_env)]
 #[test]
 fn profile_rollouts_are_read_and_a_symlinked_shared_tree_is_counted_once() {
-    let _profile_root = clear_all_home_env();
+    let _home_env = clear_all_home_env();
     let tmp = tempfile::tempdir().unwrap();
     // The default account's home, holding one session.
     let default_home = seed_codex_home(
@@ -1322,8 +1436,12 @@ fn profile_rollouts_are_read_and_a_symlinked_shared_tree_is_counted_once() {
 /// process per test — see `lib.rs`'s "Test isolation convention"), and every
 /// caller additionally carries `#[serial_test::serial(codex_home_env)]` so a
 /// plain `cargo test` run is safe too: the same discipline
-/// `opencode_usage`'s tests apply to `LOOM_OPENCODE_DB`.
+/// `opencode_usage`'s tests apply to `LOOM_OPENCODE_DB`. The pin also holds
+/// the crate-wide codex-home lock for its whole scope (#15174), so it cannot
+/// race the runtime-isolation helpers that clear the variable under other
+/// `serial_test` keys.
 fn with_codex_home<T>(home: &Path, f: impl FnOnce() -> T) -> T {
+    let _codex_home_lock = crate::tokens_pool::codex_home_env::lock();
     clear_home_env();
     std::env::set_var(CODEX_HOME_ENV, home);
     let out = f();
@@ -1339,7 +1457,7 @@ fn clear_home_env() {
 #[serial_test::serial(codex_home_env)]
 #[test]
 fn an_unused_profile_does_not_poison_a_readable_home() {
-    let _profile_root = clear_all_home_env();
+    let _home_env = clear_all_home_env();
     let tmp = tempfile::tempdir().unwrap();
     let _ambient = seed_codex_home(
         tmp.path(),

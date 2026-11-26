@@ -45,18 +45,11 @@ This reduces unnecessary round-trips where a one-line fix creates a full change 
 
 ### How to Fix Trivial Issues
 
-**Step 1: Check out the PR branch (worktree-aware)**
+**Step 1: Select the PR worktree**
 
-```bash
-# Use existing worktree if available (see "PR Branch Isolation" and
-# "Worktree-Aware Code Access")
-ISSUE_NUM=$(gh pr view <number> --json headRefName --jq '.headRefName' | sed 's/feature\/issue-//')
-if [ -d ".loom/worktrees/issue-${ISSUE_NUM}" ]; then
-    cd ".loom/worktrees/issue-${ISSUE_NUM}"
-else
-    ./.loom/scripts/pr-worktree.sh <number> && cd ".loom/worktrees/pr-<number>"
-fi
-```
+Run [Worktree-Aware Code Access](../loom-judge/SKILL.md#worktree-aware-code-access) and its
+verification. Continue in that worktree only after success. If it is detached,
+stop before making any fix.
 
 **Step 2: Make the fix**
 

@@ -25,7 +25,7 @@ Applies only when **your environment** cannot run a command you need to reach a 
 
 Declining to approve is not enough: left alone the PR stays `loom:review-requested` and waits silently for an attended session. Route it:
 
-1. **Comment** on the PR naming the missing tool or failing command and the observed error, quoted verbatim (e.g. `tests/test_sim_batch.py`: "no Python executable"; `ruff`: "Exec format error"; `post-verdict.sh` exit 5).
+1. **Comment** on the PR naming the missing tool or failing command and the observed error, quoted verbatim (e.g. `tests/test_sim_batch.py`: "no Python executable"; `ruff`: "Exec format error"; `post-verdict.sh` exit 5), ending the note with `<!-- loom:judge-note -->` (#13222).
 2. **Park** it: `loom-daemon park-record apply --pr <N> --reason "<missing tool>" --by judge` (body park record plus `loom:blocked`; `pr-queue` drops parked PRs, so it leaves the Judge queue). Use `--dry-run` first if unsure.
 3. **Release** `loom:reviewing` and the PR lease as on any stand-down (`loom-daemon lease pr release <n> --role judge --watch-pid …`).
 

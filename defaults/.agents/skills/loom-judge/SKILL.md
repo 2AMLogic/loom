@@ -136,18 +136,19 @@ own discipline:
 
 **Never run `gh pr checkout <N>` in the orchestrator's main worktree.** Doing so switches the orchestrator's `HEAD` to the PR branch and can leave behind untracked files from the PR when you switch back — see issue #3358 for a concrete incident. This applies to every checkout call site in this document: fallback-queue evaluation, DIRTY-PR automated-rebase attempts, trivial-fix commits, and any ad-hoc `gh pr checkout` you run while reviewing.
 
-Pick the right path before any `gh pr checkout` mutation:
+Run [Before Running `gh pr checkout`](#before-running-gh-pr-checkout) for every PR.
+Only a verified same-repository issue branch can reuse its existing builder
+worktree. For all other verified heads, use `./.loom/scripts/pr-worktree.sh <PR_NUMBER>`.
 
-- **An existing builder worktree** (`.loom/worktrees/issue-N`, left behind by an active `/loom:sweep` that already ran Builder) — reuse it directly, no checkout needed (see "Worktree-Aware Code Access" below).
-- **No builder worktree (any PR shape)** — use the supported review helper:
-  ```bash
-  ./.loom/scripts/pr-worktree.sh <PR_NUMBER>
-  cd .loom/worktrees/pr-<PR_NUMBER>
-  # pr-worktree.sh already ran `gh pr checkout` inside the worktree
-  ```
-  **Honor its result.** Exit `0`: ready, reusing `pr-<N>` if present. Non-zero: stop. On a branch collision, reuse the named builder `issue-N` holder after "Verify the Worktree Matches the PR" below; otherwise stop/report or use `git merge-tree`/`gh pr diff` read-only review. If the **primary clone** holds the branch (an attended author left it checked out), the helper itself creates `pr-<N>` **detached** at the PR head sha, says so, and exits `0`: that detached worktree is sanctioned for review (no `git archive` export). Record `reviewed at detached worktree <sha>` in the verdict, and never commit or push from it. **Never** invent a `judge-*`/`review-*` directory or another naming scheme, run raw `git worktree add`, or use bare `gh pr checkout` to bypass failure.
+**Honor the helper result.** Exit `0` means `pr-<N>` is ready. A nonzero exit
+ends selection. On a collision, keep the named holder untouched and use
+`git merge-tree` or `gh pr diff` for read-only evidence if needed. If the
+primary clone holds the PR branch, the helper creates a detached `pr-<N>` at
+the PR head. Use it for review, record its SHA in the verdict, and leave it
+unmodified. **Never** invent a `judge-*` or `review-*` directory or use
+raw `git worktree add` or bare `gh pr checkout` to continue after a refusal.
 
-`pr-worktree.sh` writes a `.loom-managed` sentinel; `merge-pr.sh` auto-cleans it on merge. Every "no worktree exists" branch in this document routes through it, mirroring `doctor.md`.
+The helper writes a `.loom-managed` sentinel for merge cleanup.
 
 ## Issues Are Suggestions — Close or Rescope With Rationale (Role Autonomy)
 
@@ -186,7 +187,7 @@ Check for an argument passed via the slash command:
 **Arguments**: `$ARGUMENTS`
 
 If a number is provided (e.g., `/judge 123`), it is the target **PR**: skip "Finding Work", and gate it before any claim, label or comment (#11863):
-1. **Kind and state probe** (live, one REST read): `gh api "repos/{owner}/{repo}/issues/<number>" --jq '[(.pull_request != null), .state, ([.labels[].name] | join(","))] | @tsv'`. Refuse, writing nothing, on `false` (an issue number; Judge is a PR role), `closed`, `loom:frozen`, any `loom:operator*` label (#11861; retired names too), or a failed read.
+1. **Kind and state probe** (live, one REST read): `gh api "repos/{owner}/{repo}/issues/<number>" --jq '[(.pull_request != null), .state, ([.labels[].name] | join(","))] | @tsv'`. Refuse, writing nothing, on `false` (an issue number; Judge is a PR role), `closed`, `loom:frozen`, any `loom:operator*` label (#11861; retired names too), or a failed read. A Gitea checkout has no `gh` to read — `gh` fails there with `none of the git remotes … point to a known GitHub host` — so the probe is instead `loom-daemon forge pr view <number> --json number,state,labels,headRefOid,mergeable` (#14939), served from the Gitea API on the inherited `GITEA_URL` and `GITEA_TOKEN` (`GITEA_USERNAME` for Basic auth). Its non-zero exit is the refusal: it names an issue number, an unknown number, a missing credential or an unreadable answer. On success read the row as the TSV above — refuse on `CLOSED` or `MERGED` state, `loom:frozen`, any `loom:operator*` label, an unreadable field — and keep `.headRefOid` as the head you evaluate and `.mergeable` (`CONFLICTING` is the merge-conflict case below).
 2. **Stage**: `loom:review-requested` (or `loom:reviewing` alone) → claim exactly as Primary Queue step 2 (stale check, PR lease, then the label) and evaluate. A lease held by your own `$LOOM_SWEEP_ID` is yours, not a peer's: a daemon step pre-takes it, and `lease pr claim` re-attaches (exit 0, "already held by this claimant") — continue and add `loom:reviewing` yourself, the same override `LEASE_ALREADY_HELD` has in `builder.md`. Neither those nor a verdict label (e.g. only `loom:important`) → "Fallback Queue" rules (guard, review only, never claim or label), in [judge-fallback.md](../loom-judge-fallback/SKILL.md). A verdict label without `loom:review-requested` → no-op, unless the operator asked for this re-review (see "Exception").
 3. End with the outcome line from `.loom/docs/targeted-role-invocation.md`: `LOOM_STEP_OUTCOME role=judge target=<n> class=<verdict|noop|refused|failed> reason=<token>`.
 
@@ -372,8 +373,8 @@ Full policy, TTL/invalidation semantics, and the manual verification steps:
 0. **Sweep stale verdicts first**: run the Stale-Verdict Sweep (see below) over the open `loom:pr` / `loom:changes-requested` PRs. Any PR it re-queues joins step 1's queue on this same pass.
 1. **Find work**: `loom-daemon pr-queue --role judge`. Walk its JSON rows in order; `mode=workflow` uses this workflow, `mode=fallback` uses the Fallback Queue ([judge-fallback.md](../loom-judge-fallback/SKILL.md)). Follow `.loom/docs/pr-planning.md`; skip non-actionable rows and continue. Never change origin or a priority label.
 2. **Claim PR** (run the "Stale `loom:reviewing` Claim Check" below first): PR lease, then the label — `loom-daemon lease pr claim <number> --role judge --watch-pid "${LOOM_AGENT_SESSION_PID:-${CLAUDE_PID:-$PPID}}"; [[ $? =~ ^[02]$ ]] && gh pr edit <number> --add-label "loom:reviewing"`. Any other exit: stand down, touch no worktree (see "PR Lease")
-2b. **CI pre-check (before any checkout or test, #11690)**: CI is the test gate, so read it first: `first="$(loom-daemon forge wait-checks <number> --timeout 20 --settle-red 2>/dev/null | head -n1)"` (`--timeout` is **seconds**, so 20 is a short slice, not minutes; a build taking tens of minutes needs one long wait such as `--timeout 1800`, never a loop of 20 s polls; `--settle-red`: no RED until the run finishes, #12011). `LOOM-CHECKS-TIMEOUT*` / `-HEAD-MOVED*` (pending, including checks queued behind the CI job cap) → "When CI is Pending": no review, no end-state label. `LOOM-CHECKS-RED*` → no code review; "When CI Fails". `GREEN` → continue. `NONE` → continue the review, but no test ever ran — before any approving verdict, run the repo's documented test command on the PR head ("No-Checks PRs" under "How to Check CI Status"). Pending is never red.
-3. **Check merge state**: Check for conflicts and attempt automated rebase if DIRTY (see [judge-merge-conflicts.md](../loom-judge-merge-conflicts/SKILL.md))
+2b. **CI pre-check (before any checkout or test, #11690)**: CI is the test gate, so read it first: `err="$(mktemp)"; first="$(loom-daemon forge wait-checks <number> --timeout 20 --settle-red 2>"$err" | head -n1)"` (`--timeout` is **seconds**, so 20 is a short slice, not minutes; a build taking tens of minutes needs one long wait such as `--timeout 1800`, never a loop of 20 s polls — and that long wait is the attended/manual foreground path only, "Never End Your Turn on a Background CI Monitor"; a daemon step (`step-judge-*` sweep id) hands back via "When CI is Pending" instead; `--settle-red`: no RED until the run finishes, #12011). `LOOM-CHECKS-TIMEOUT*` / `-HEAD-MOVED*` (pending, including checks queued behind the CI job cap) → "When CI is Pending": no review, no end-state label. `LOOM-CHECKS-RED*` → no code review; "When CI Fails". `GREEN` → continue. `NONE` → continue the review, but no test ever ran — before any approving verdict, run the repo's documented test command on the PR head ("No-Checks PRs" under "How to Check CI Status"). Pending is never red.
+3. **Check merge state**: Check for conflicts and attempt automated rebase if DIRTY (see [judge-merge-conflicts.md](../loom-judge-merge-conflicts/SKILL.md)). Review `BEHIND` as-is. Do not merge or rebase `origin/main` into it. Before any merge simulation or inspection, load the same sub-skill. Never mutate the main checkout’s index, worktree or stash during a merge simulation.
    ```bash
    # Plain `gh` — merge state is verdict-gating and must be live (see "Cached Forge Reads")
    MERGE_STATE=$(gh pr view <number> --json mergeStateStatus --jq '.mergeStateStatus')
@@ -382,11 +383,11 @@ Full policy, TTL/invalidation semantics, and the manual verification steps:
    fi
    ```
 4. **Understand context** (first capture `REVIEW_STARTED=$(date -u +%Y-%m-%dT%H:%M:%SZ)`, before reading anything — and for each linked issue `N` the hash of the body you read: `ISSUE_HASH_N=$(printf %s "$(gh api repos/<owner>/<repo>/issues/N --jq .body)" | sha256sum | cut -d' ' -f1)` (a hash that keeps jq's trailing newline is accepted too, as is the raw body's own hash with or without that newline); see the Stale-Read Gate under Label Workflow above): Read PR description and linked issues, and run the "Spec Reconciliation" step below on each `Closes`/`Fixes`/`Resolves`/`Part of`/`Contributes to` reference (current body + trusted comments, not the PR's account of them)
-4b. **Check docs-only fast-path eligibility** (#6134): if **every** changed file is root-level `WORK_LOG.md`, `WORK_PLAN.md` or `README.md`, or a month-rotated `work_log/WORK_LOG_YYYY-MM.md` / `work_plan/WORK_PLAN_YYYY-MM.md` archive, load [judge-fast-paths.md](../loom-judge-fast-paths/SKILL.md) and run its `docs_only_fast_path_check` (the authoritative check: paginated file list, exact allowlist; this sentence is only the load trigger) **and then its Step 3 closing-issue check — the PR must have no closing-issue reference (#14182; a failed closing-reference read counts as a reference)**. If it prints `ELIGIBLE`, skip steps 5-7b and the "Evaluation Focus Areas" review entirely; go straight to CI Status Check (step 8), the formal-review reconciliation gate (step 8b — **not** skipped: a docs-only diff can still carry an unresolved formal review, #7647) and the fast-path approval write. Otherwise continue normally.
+4b. **Check docs-only fast-path eligibility** (#6134): if **every** changed file is root-level `WORK_LOG.md`, `WORK_PLAN.md` or `README.md`, or a month-rotated `work_log/WORK_LOG_YYYY-MM.md` / `work_plan/WORK_PLAN_YYYY-MM.md` archive, load [judge-fast-paths.md](../loom-judge-fast-paths/SKILL.md) and run its `docs_only_fast_path_check`. For Steps 3 and 4, the PR must have no closing-issue reference (#14182) and every WORK_LOG record the diff adds verifies against the base repository (#13760). Step 5 requires that any change to WORK_PLAN.md’s `guide:plan-body` region carries the machine-rendered `written` receipt with a matching render-hash (#15220). A failed read makes the PR ineligible. If all checks pass, skip steps 5-7b and the "Evaluation Focus Areas" review entirely; go straight to CI Status Check (step 8), the formal-review reconciliation gate (step 8b — **not** skipped: a docs-only diff can still carry an unresolved formal review, #7647) and the fast-path approval write. Otherwise continue normally.
 4c. **Check conflict-only fast-track eligibility**: if a trusted `<!-- loom:conflict-only -->` marker is present in the PR's comments (`loom-daemon forge trusted-comments --fetch <number> | jq -e 'any(.[]; .body | contains("<!-- loom:conflict-only -->"))'` — trusted authors only, #9548; non-zero exit = not eligible), load [judge-fast-paths.md](../loom-judge-fast-paths/SKILL.md) and run its abbreviated fast-track: verify the diff is conflict-resolution-only, re-check CI and merge state, then approve with its fast-track audit trail — escalating to the full evaluation on any unexpected change. Step 8b's formal-review reconciliation is **not** skipped (#7647): a conflict-only re-push does not resolve anyone's outstanding review, and the sub-skill runs `check-review-feedback.sh` itself.
-5. **Check out code**: Use the existing builder worktree, else `./.loom/scripts/pr-worktree.sh <number>` — never a bare `gh pr checkout` in the main checkout (see "PR Branch Isolation" and Worktree-Aware Code Access below). Capture `REVIEW_HEAD_SHA=$(gh pr view <number> --json headRefOid --jq '.headRefOid')` here — step 11's recheck compares against it, and your verdict marker records it.
+5. **Check out code**: Run the verified worktree selection in [Worktree-Aware Code Access](#worktree-aware-code-access). Capture `REVIEW_HEAD_SHA=$(gh pr view <number> --json headRefOid --jq '.headRefOid')` here — step 11's recheck compares against it, and your verdict marker records it.
 6. **Rebase check**: Verify PR has no merge conflicts with main (see [judge-merge-conflicts.md](../loom-judge-merge-conflicts/SKILL.md); load when DIRTY)
-7. **Targeted checks only**: read the diff and trust the green CI from step 2b. At most run scoped tests for a specific doubt (Scoped Test Execution below); never the full suite or `buildGate.command`. If the *environment* cannot run a command you need for a verdict, see [judge-env-gap.md](../loom-judge-env-gap/SKILL.md)
+7. **Targeted checks only**: read the diff and trust the green CI from step 2b. At most run scoped tests for a specific doubt (Scoped Test Execution below); never the full suite or `buildGate.command`. If the *environment* cannot run a command you need for a verdict, load [judge-env-gap.md](../loom-judge-env-gap/SKILL.md) and follow its parking procedure. This never relaxes approval. Approve only after the required tests run.
 7b. **Execute test plan**: Parse PR description for "## Test Plan" section.
     If found, classify each step as automatable or observation-only.
     Execute automatable steps and document results in evaluation comment.
@@ -501,7 +502,7 @@ comment templates) and the race-window rationale:
       and NOT `gh pr review` — it is the sole merge-gating writer (#12136)
 - [ ] I understand `gh pr review --approve` WILL fail with "cannot approve your own PR"
 - [ ] All CI checks pass (verified via `loom-daemon forge wait-checks`)
-- [ ] Merge state is CLEAN or BEHIND (verified via `gh pr view --json mergeStateStatus`; BEHIND is reviewed as-is, see "BEHIND: review as-is")
+- [ ] Merge state is CLEAN or BEHIND (verified via `gh pr view --json mergeStateStatus`; review BEHIND as-is per step 3)
 - [ ] I will NEVER call `gh pr review` in any form
 - [ ] `post-verdict.sh` exited 0 (it applied the verdict label; exit 8 = run its repair command)
 - [ ] If my review body came from a scratch file, the filename is namespaced by
@@ -640,26 +641,53 @@ change the stand-down behavior to accommodate this sweep.
 
 ### Before Running `gh pr checkout`
 
-Always check for an existing worktree first. If none exists, route through
-`pr-worktree.sh` — never a bare `gh pr checkout` in the current directory (see
-"CRITICAL: PR Branch Isolation" above):
+Run the selection below in Bash from the primary checkout. Set `PR_NUMBER`
+to the PR number and `PR_REPO` to the checkout's origin repository
+(`OWNER/REPO`, or `HOST/OWNER/REPO` on GitHub Enterprise). Use the same
+repository for subsequent Forge reads. A failed read, invalid head ref or
+repository identity, or cross-repository flag that contradicts that identity
+stops selection before any worktree or checkout action.
+
+On a verified same-repository issue branch, reuse an existing worktree and
+verify it below. For other verified heads and when the issue checkout is
+absent, enter the dedicated PR worktree only after the helper succeeds.
 
 ```bash
-# Extract issue number from PR (via branch name or body)
-ISSUE_NUM=$(gh pr view <number> --json headRefName --jq '.headRefName' | sed 's/feature\/issue-//')
-
-# Check if builder worktree exists
-if [ -d ".loom/worktrees/issue-${ISSUE_NUM}" ]; then
-    echo "Builder worktree exists - using it directly"
-    cd ".loom/worktrees/issue-${ISSUE_NUM}"
-    # Verify it actually reflects this PR before evaluating anything in it —
-    # see "Verify the Worktree Matches the PR Before Using It" below.
-else
-    # No builder worktree — self-cleaning worktree via pr-worktree.sh, not a
-    # bare checkout in the current directory
-    # On a non-zero exit the cd is skipped: reuse the named holder or stop
-    ./.loom/scripts/pr-worktree.sh <number> && cd ".loom/worktrees/pr-<number>"
+# PR worktree selection
+unset WORKTREE_PR WORKTREE_ABS ISSUE_NUM
+[[ "$PR_NUMBER" =~ ^[0-9]+$ ]] || exit 1
+[[ "$PR_REPO" =~ ^([[:alnum:].-]+/)?[[:alnum:]_.-]+/[[:alnum:]_.-]+$ ]] || exit 1
+BASE_OWNER="${PR_REPO%/*}"
+BASE_REPO="${BASE_OWNER##*/}/${PR_REPO##*/}"
+PR_HEAD=$(gh pr view "$PR_NUMBER" --repo "$PR_REPO" \
+  --json isCrossRepository,headRefName,headRepository) || exit 1
+PR_BRANCH=$(jq -ers --arg base "$BASE_REPO" '
+  select(length == 1) | .[0]
+  | select((.isCrossRepository | type) == "boolean")
+  | . as $pr
+  | .headRepository.nameWithOwner | strings
+  | select(test("^[a-zA-Z0-9_][a-zA-Z0-9_.-]{0,99}/[a-zA-Z0-9_.][a-zA-Z0-9_.-]{0,99}\\z"))
+  | select((split("/")[1]) as $repo | $repo != "." and $repo != "..")
+  | select(((ascii_downcase) != ($base | ascii_downcase)) == $pr.isCrossRepository)
+  | $pr.headRefName | strings | select(test("[[:cntrl:]]") | not)
+' <<<"$PR_HEAD") || exit 1
+git check-ref-format "refs/heads/$PR_BRANCH" || exit 1
+source ./.loom/scripts/lib/worktree-root.sh || exit 1
+WORKTREE_ROOT_DIR=$(loom_worktree_root "$(pwd -P)") || exit 1
+if jq -e '.isCrossRepository == false' <<<"$PR_HEAD" >/dev/null &&
+   [[ "$PR_BRANCH" =~ ^feature/issue-([0-9]+)$ ]]; then
+    ISSUE_NUM="${BASH_REMATCH[1]}"
 fi
+
+if [[ -n "${ISSUE_NUM:-}" && -d "$WORKTREE_ROOT_DIR/issue-$ISSUE_NUM" ]]; then
+    cd "$WORKTREE_ROOT_DIR/issue-$ISSUE_NUM" || exit 1
+else
+    GH_REPO="$PR_REPO" ./.loom/scripts/pr-worktree.sh "$PR_NUMBER" || exit 1
+    cd "$WORKTREE_ROOT_DIR/pr-$PR_NUMBER" || exit 1
+fi
+WORKTREE_ABS=$(pwd -P) || exit 1
+WORKTREE_PR="$PR_NUMBER"
+# End PR worktree selection
 ```
 
 ### Verify the Worktree Matches the PR Before Using It (#6257)
@@ -678,24 +706,85 @@ from a single `cd`'d `git status` (#6373). `-C` makes the target directory
 explicit in the command itself, so it can't be hijacked by a stale `cd`:
 
 ```bash
-WORKTREE_ABS="$(pwd)"   # already inside the worktree from the `cd` above
-PR_HEAD_SHA=$(gh pr view <number> --json headRefOid --jq '.headRefOid')
-WT_HEAD_SHA=$(git -C "$WORKTREE_ABS" rev-parse HEAD)
-WT_STATUS=$(git -C "$WORKTREE_ABS" status --porcelain)
+WORKTREE_ABS="$(pwd -P)"   # already in the isolated worktree; PR_NUMBER names the PR
+PR_HEAD=$(gh pr view "$PR_NUMBER" --json headRefName,headRefOid,isCrossRepository) || exit 1
+PR_HEAD_REF=$(jq -er '.headRefName | strings | select(length > 0)' <<<"$PR_HEAD") || exit 1
+PR_HEAD_SHA=$(jq -er '.headRefOid | strings | select(test("^[0-9a-f]{40}$"))' <<<"$PR_HEAD") || exit 1
+[ "${REVIEW_HEAD_SHA:-$PR_HEAD_SHA}" = "$PR_HEAD_SHA" ] || { echo 'PR head moved. Re-evaluate the PR.'; exit 1; }
+WT_HEAD_SHA=$(git -C "$WORKTREE_ABS" rev-parse HEAD) || exit 1
+WT_STATUS=$(git -C "$WORKTREE_ABS" status --porcelain) || exit 1
+WT_BRANCH=$(git -C "$WORKTREE_ABS" symbolic-ref --quiet --short HEAD || true)
 
-if [ "$WT_HEAD_SHA" != "$PR_HEAD_SHA" ] || [ -n "$WT_STATUS" ]; then
-    echo "Worktree drift detected (HEAD=$WT_HEAD_SHA, PR head=$PR_HEAD_SHA, dirty=$([ -n "$WT_STATUS" ] && echo yes || echo no)) - resyncing"
-    # Preserve any uncommitted WIP first (never a bare `git stash` — see
-    # "Never use bare `git stash` for ad-hoc WIP" in doctor.md):
-    if [ -n "$WT_STATUS" ]; then
-        ./.loom/scripts/worktree.sh snapshot "$ISSUE_NUM" --include-untracked
-        git -C "$WORKTREE_ABS" checkout -- .
-    fi
-    git -C "$WORKTREE_ABS" pull --ff-only
+ISSUE_NUM=
+if jq -e '.isCrossRepository == false' <<<"$PR_HEAD" >/dev/null &&
+   [[ "$PR_HEAD_REF" =~ ^feature/issue-([0-9]+)$ ]] && [ -n "$WT_BRANCH" ]; then
+    [ "$WT_BRANCH" = "$PR_HEAD_REF" ] || { echo 'Unexpected local branch. Stop recovery.'; exit 1; }
+    ISSUE_NUM="${PR_HEAD_REF#feature/issue-}"
 fi
+if [ -n "$WT_STATUS" ]; then
+    if [ -n "$ISSUE_NUM" ]; then
+        (cd "$WORKTREE_ABS" && ./.loom/scripts/worktree.sh snapshot "$ISSUE_NUM" --include-untracked) || exit 1
+    fi
+    echo 'Preserve the dirty worktree and stop recovery.'
+    exit 1
+fi
+
+if [ -n "$ISSUE_NUM" ]; then
+    PR_TRACKING_REF="refs/remotes/origin/$PR_HEAD_REF"
+    WT_UPSTREAM=$(git -C "$WORKTREE_ABS" rev-parse --symbolic-full-name '@{upstream}' 2>/dev/null || true)
+    if [ "$WT_HEAD_SHA" != "$PR_HEAD_SHA" ] || [ "$WT_UPSTREAM" != "$PR_TRACKING_REF" ]; then
+        git -C "$WORKTREE_ABS" fetch --no-tags origin "+refs/heads/$PR_HEAD_REF:$PR_TRACKING_REF" || exit 1
+        FETCHED_SHA=$(git -C "$WORKTREE_ABS" rev-parse --verify 'FETCH_HEAD^{commit}') || exit 1
+        CURRENT_SHA=$(gh pr view "$PR_NUMBER" --json headRefOid --jq '.headRefOid') || exit 1
+        [ "$FETCHED_SHA" = "$PR_HEAD_SHA" ] && [ "$CURRENT_SHA" = "$PR_HEAD_SHA" ] || {
+            echo 'Fetched branch or current PR head differs from the pinned head. Stop recovery.'
+            exit 1
+        }
+        git -C "$WORKTREE_ABS" merge-base --is-ancestor HEAD "$FETCHED_SHA" || {
+            echo 'Preserve the local commits before recovery.'
+            exit 1
+        }
+        WT_STATUS=$(git -C "$WORKTREE_ABS" status --porcelain) || exit 1
+        [ -z "$WT_STATUS" ] || exit 1
+        git -C "$WORKTREE_ABS" merge --ff-only "$FETCHED_SHA" || exit 1
+        [ "$(git -C "$WORKTREE_ABS" rev-parse --verify "$PR_TRACKING_REF")" = "$FETCHED_SHA" ] || exit 1
+        git -C "$WORKTREE_ABS" branch --set-upstream-to="$PR_TRACKING_REF" "$PR_HEAD_REF" || exit 1
+    fi
+fi
+
+WT_HEAD_SHA=$(git -C "$WORKTREE_ABS" rev-parse HEAD) || exit 1
+WT_STATUS=$(git -C "$WORKTREE_ABS" status --porcelain) || exit 1
+[ "$WT_HEAD_SHA" = "$PR_HEAD_SHA" ] && [ -z "$WT_STATUS" ] || exit 1
 ```
 
-Only proceed to evaluation once `WT_HEAD_SHA` matches `PR_HEAD_SHA` and `WT_STATUS` is empty. If `git pull --ff-only` fails (local history has actually diverged, not just fallen behind), do not force anything — fall back to `git fetch && git reset --hard origin/feature/issue-${ISSUE_NUM}` then re-point the upstream (`git branch --set-upstream-to=origin/feature/issue-${ISSUE_NUM}`), same as the manual recovery `doctor.md` documents under "Expected worktree state after setup".
+Proceed with reviewing once the final checks pass. The recovery uses the fetched
+commit object that matches both forge reads and sets tracking only after a
+successful fast-forward. The `+` refreshes only the named remote-tracking ref when its
+cache is stale. The local branch advances by fast-forward after verification.
+
+For a dirty worktree, the refusal is the disposition: the snapshot (when one was
+taken) preserved the WIP as a patch under
+`<worktree-root>/.snapshots/issue-<N>-<UTC-timestamp>.patch`. Post a PR comment
+ending with `<!-- loom:judge-note -->` (#13222 — an unmarked note trips the
+Stale-Read Gate if you approve after read-only review); when a snapshot exists,
+name only the relative `.snapshots/issue-<N>-<UTC-timestamp>.patch` under the
+managed worktree root, keeping the absolute path (the helper's `patchPath`
+output carries the workstation username and directory layout) and the patch
+contents local, never pasted into the PR. Then fall back to read-only
+review (`gh pr diff` / `git merge-tree`) per "PR Branch Isolation", or park the
+PR per [judge-env-gap.md](../loom-judge-env-gap/SKILL.md).
+
+For a fork or a nonstandard head, use the existing `pr-worktree.sh` route and
+check the exact head and clean state there. The named `origin` recovery
+applies only to the matching same-repository issue branch. If the dedicated
+checkout already has local changes or commits, preserve it before refreshing.
+The detached-checkout rules above still apply.
+
+For divergence, leave the local tip in place and report it. In a separately
+authorized manual recovery, preserve the old tip under a named backup ref and
+save any worktree changes first. Fetch and verify the named remote branch
+against the current forge head again before using `git reset --hard` to that
+verified commit and setting its upstream.
 
 If your evaluation also needs to state that the main checkout is clean (e.g.
 confirming a contamination scare is resolved), name `$WORKTREE_ABS` and the
@@ -734,13 +823,17 @@ read via ETag, so it is live too.) See "Cached Forge Reads" for the full policy.
 
 ### How to Check CI Status
 
-**Step 1: Snapshot all PR checks** (`--timeout 0` would read a no-checks repo as `TIMEOUT`)
+**Step 1: Snapshot all PR checks.** Reuse step 2b's result for the same head if
+you have it. Otherwise take the bounded snapshot below. `--timeout 0` would
+read a no-checks repo as `TIMEOUT`.
 
 ```bash
-loom-daemon forge wait-checks <PR_NUMBER> --timeout 20   # seconds
+err="$(mktemp)"; first="$(loom-daemon forge wait-checks <PR_NUMBER> --timeout 20 --settle-red 2>"$err" | head -n1)"
 ```
 
-Branch on the first stdout line:
+Branch on the first stdout line. Treat a snapshot stamped for a different
+head as `LOOM-CHECKS-HEAD-MOVED`.
+
 - ✅ `LOOM-CHECKS-GREEN` - Safe to approve
 - ⚠️ `LOOM-CHECKS-NONE` (no checks) - Continue the review, but no test ever ran: before any approving verdict, run the repo's documented test command on the PR head and record the result in the verdict ("No-Checks PRs" below)
 - ❌ `-RED` - "When CI Fails"
@@ -786,35 +879,23 @@ If the PR has merge conflicts (`mergeStateStatus` is `DIRTY`), **attempt the aut
 
 ### When CI is Pending
 
-If checks are still running, **do not block on them or approve on a guess**:
-leave `loom:review-requested` (no end-state label), release `loom:reviewing`
-and the lease with `--skip-reason ci-pending`, and skip to the next PR in batch
-mode — or wait in the foreground (`loom-daemon forge wait-checks <n> --timeout
-1800 --settle-red`, branch on the first stdout line) in single-PR mode. Never
-settle a pending CI by arming a background monitor (`Monitor`/`ScheduleWakeup`/
-`run_in_background`) and ending your turn — in headless mode the monitor dies
-with the process and the PR is left claimed with no verdict (#4883).
+If checks are still running, **do not block on them or approve on a guess**: in batch mode, waiting stalls the whole queue.
 
-**Pending-CI skip check.** Reuse Step 1's snapshot (`--timeout 20`, seconds;
-`--timeout 0` would read a no-checks repo as `TIMEOUT` and skip a PR that has
-nothing to wait for). Branch on the first **stdout** line. **One exception
-first**: if that line is `LOOM-CHECKS-TIMEOUT*` or `-NO-RUN*` and the head
-commit is more than 2 hours old, CI may never have started (2am#6467) — load
-**[judge-ci-pending.md](../loom-judge-ci-pending/SKILL.md)** and run its zero-check-runs test
-before releasing.
+1. **No end-state label** — leave `loom:review-requested` (no `loom:pr` / `loom:changes-requested`); the PR stays queued.
+2. **Release your claim** — remove `loom:reviewing`; release the lease with `--skip-reason ci-pending` (below).
+3. **Skip and continue the batch** — next PR; a later tick re-evaluates this one once CI settles.
+
+**Pending-CI handback.** Use the result that sent you here. On
+`LOOM-CHECKS-HEAD-MOVED*`, or a snapshot stamped for a different head, go
+straight to the generic release below so the next Judge starts with the new
+head. A successful flake rerun or an approval refusal for pending CI also
+goes straight to that release when taking the handback path.
+
+On `LOOM-CHECKS-TIMEOUT` or `LOOM-CHECKS-NO-RUN` with a head more than two hours old, load [judge-ci-pending.md](../loom-judge-ci-pending/SKILL.md) and check for missing CI before releasing.
 
 ```bash
-first="$(loom-daemon forge wait-checks <PR_NUMBER> --timeout 20 2>/dev/null | head -n1)"
-case "$first" in
-  LOOM-CHECKS-TIMEOUT*)   # still pending: release and skip; PR stays loom:review-requested
-    gh pr comment <number> --body "CI still running; skipping until it settles."
-    gh pr edit <number> --remove-label "loom:reviewing"
-    loom-daemon lease pr release <number> --role judge --watch-pid "${LOOM_AGENT_SESSION_PID:-${CLAUDE_PID:-$PPID}}" --skip-reason ci-pending
-    ;;
-  LOOM-CHECKS-RED*) ;;    # "When CI Fails"
-  LOOM-CHECKS-GREEN*|LOOM-CHECKS-NONE*) ;;   # continue (-NONE = no checks: "No-Checks PRs" — run the documented test command yourself)
-  *) gh pr checks <PR_NUMBER> ;;   # no sentinel (older binary / Gitea): one snapshot, no loop
-esac
+gh pr edit <number> --remove-label "loom:reviewing"
+loom-daemon lease pr release <number> --role judge --watch-pid "${LOOM_AGENT_SESSION_PID:-${CLAUDE_PID:-$PPID}}" --skip-reason ci-pending
 ```
 
 ### CRITICAL: Never End Your Turn on a Background CI Monitor
@@ -823,28 +904,14 @@ esac
 
 This mirrors `sweep.md`'s guardrail ("ending your turn IS the kill signal", #4257). In a headless `claude -p` sweep ending the turn **terminates the process**: the monitor dies with it, no verdict is issued, and the PR stays claimed (`loom:reviewing`) with nobody to release it (#4883).
 
+**A daemon step never waits out CI (#14804).** If your `$LOOM_SWEEP_ID` matches `step-judge-<pr>-<epoch>` (the same test as the `LOOM_SWEEP_ID` rule under Label Workflow), you are a daemon step judging exactly one PR inside a step budget (30 min, `daemon-reference.md`) that a slow repo's CI can outlive — the `--timeout 1800` foreground wait in path 2 would be killed mid-wait with no verdict. Use the bounded snapshot from step 2b. On `LOOM-CHECKS-TIMEOUT*` / `-HEAD-MOVED*`, follow "When CI is Pending" above: release `loom:reviewing`, release the lease with `--skip-reason ci-pending`, and end with `LOOM_STEP_OUTCOME role=judge target=<n> class=noop reason=ci_pending` (a `noop` that does not count toward the repeat cap). Path 1 is your path, always.
+
 **There are exactly two safe paths when CI is pending and you cannot approve on a guess:**
 
-1. **Batch mode (there is a next PR to move to): skip and continue.** Use the "When CI is Pending" procedure above — release `loom:reviewing`, leave `loom:review-requested` in place, move on to the next PR. This is not a fallback of last resort; it is the correct default whenever a next PR exists, because a later tick re-evaluates this one.
-2. **Single-PR / manual invocation (there is no next PR — you were dispatched to judge exactly this one PR and a verdict is expected before your turn ends): wait in the foreground.** Run `loom-daemon forge wait-checks` **inside this same turn** (bounded by `--timeout`; it also handles the empty-rollup trap, #6169). It returns control before you write your final message; nothing about it depends on a future turn. Branch on the first **stdout** line, never the exit code; keep stderr separate (RED detail).
+1. **Hand back (a daemon step always; batch mode whenever a next PR exists): skip and continue.** Use the "When CI is Pending" procedure above — release `loom:reviewing`, leave `loom:review-requested` in place, move on to the next PR if one remains (a daemon step judges exactly one PR, so none remains: end with the `ci_pending` outcome line above). This is not a fallback of last resort; it is the correct default whenever a next PR exists, because a later tick re-evaluates this one.
+2. **Attended / manual single-PR invocation (no `step-judge-*` sweep id — an operator ran `/loom:judge <n>` in a terminal and expects a settled verdict before your turn ends): wait in the foreground.** Run `loom-daemon forge wait-checks` **inside this same turn** (bounded by `--timeout`; it also handles the empty-rollup trap, #6169). It returns control before you write your final message; nothing about it depends on a future turn. Branch on the first **stdout** line, never the exit code; keep stderr separate (RED detail).
 
-```bash
-err="$(mktemp)"; out="$(loom-daemon forge wait-checks <PR_NUMBER> --timeout 1800 --settle-red 2>"$err")"; first="${out%%$'\n'*}"
-case "$first" in
-  LOOM-CHECKS-GREEN*|LOOM-CHECKS-NONE*) ;;   # settled green (-NONE = no checks: "No-Checks PRs" — run the documented test command yourself)
-  LOOM-CHECKS-RED*) cat "$err" ;;            # <name>\t<url>\t<run_id>; "When CI Fails"
-  LOOM-CHECKS-TIMEOUT*|LOOM-CHECKS-HEAD-MOVED*|LOOM-CHECKS-ERROR*) ;;   # unsettled: conditional verdict below
-  *) gh pr checks <PR_NUMBER> ;;             # no sentinel (older binary / Gitea): one snapshot, no loop
-esac
-```
-
-**If the cap is reached and CI is still pending, do not extend the wait and do not reach for a background watcher instead.** Post a conditional-verdict comment stating plainly that the code review passed but CI had not settled after the bounded wait, then — since there is no batch to hand this off to — release `loom:reviewing` and leave `loom:review-requested` in place, exactly as the skip-and-continue path does, so a later Judge invocation (the next cron tick, or a fresh manual dispatch) can re-evaluate once CI has settled.
-
-**Never substitute an armed `Monitor`/`ScheduleWakeup` timer or a `run_in_background` watcher for either path above.** A timer or background task that is still armed when you end your turn is not "waiting" — in headless `-p` mode it is simply killed along with the process, and the PR is orphaned with a stale claim and no verdict. If you have not personally observed the CI result (a CI result you read in this turn), you have not verified it, and you MUST NOT write a final message that implies the verdict is settled or "in progress elsewhere."
-
-Also load **[judge-ci-pending.md](../loom-judge-ci-pending/SKILL.md)** for a single-PR
-foreground wait: it has the bounded-wait recipe and the conditional-verdict
-fallback for a wait that hits its cap.
+Load [judge-ci-pending.md](../loom-judge-ci-pending/SKILL.md) for the bounded foreground wait and its handback procedure.
 
 ### Why CI Verification Matters
 

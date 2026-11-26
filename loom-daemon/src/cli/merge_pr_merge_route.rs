@@ -16,7 +16,7 @@
 //! silence is read by the shell as "the verb could not run": it routes on the
 //! classifier's kind and the same `attempt < max` budget itself and narrates
 //! generic lines. The degraded path still never retries a moved head, still
-//! syncs-and-retries a stale base within the same budget, and still refuses
+//! sleeps-and-retries a stale base within the same budget, and still refuses
 //! (exit 1) everything else; only the wording degrades.
 
 use std::io::{Read, Write};

@@ -48,6 +48,11 @@ struct Engine {
     /// The verbatim body the fake returns for `private-workspace recover`
     /// execs; `None` answers with an empty published report (#14030).
     recover_response: Option<String>,
+    /// Exec records as the Engine API `/exec/{id}/json` would report them
+    /// (#14943), keyed by exec id.
+    execs: BTreeMap<String, Value>,
+    /// Every exec inspection fails: the engine API is unreachable.
+    exec_inspect_unreachable: bool,
     /// The verbatim body for `private-workspace rebind` execs (#14357).
     rebind_response: Option<String>,
     /// What the sealed-bundle probe of a configured override image prints
@@ -111,6 +116,16 @@ impl Engine {
             ["inspect", target] => {
                 let container = self.find(target).context("no such container")?;
                 Ok(json!([container]).to_string())
+            }
+            // The Engine API exec probe's pseudo-argv (docker.rs
+            // `exec_inspect_body`): the body of `/exec/{id}/json`, or an
+            // error for an inspection that could not answer (#14943).
+            ["exec-inspect", id] => {
+                if self.exec_inspect_unreachable {
+                    bail!("fake Docker: engine API unreachable");
+                }
+                let record = self.execs.get(*id).context("fake Docker: no such exec")?;
+                Ok(record.to_string())
             }
             ["ps", "-a", "--filter", filter, "--format", "{{.Names}}"] => {
                 let source = filter
@@ -277,6 +292,43 @@ fn idle_processes() -> Vec<String> {
     ]
 }
 
+/// A valid engine exec id for fixtures (`seed` rendered as 64 hex digits).
+fn exec_id(seed: u64) -> String {
+    format!("{seed:064x}")
+}
+
+/// One Engine API exec record as `/exec/{id}/json` reports it (#14943). The
+/// `ProcessConfig` payload is deliberately present: classification and the
+/// refusal clause must never lean on it.
+fn exec_record(id: &str, container: &str, running: bool, exit_code: Value, pid: i64) -> Value {
+    json!({
+        "ID": id,
+        "Running": running,
+        "ExitCode": exit_code,
+        "Pid": pid,
+        "ContainerID": container,
+        "ProcessConfig": {"entrypoint": "loom-daemon",
+                          "arguments": ["private-workspace", "snapshot"]}
+    })
+}
+
+/// The stale job of the reported incident (#14943): a finished step's
+/// durable lease naming the still-running container, with a live host pid,
+/// so only the idle proof can retire it.
+fn stale_job(container: &str) -> lease::Job {
+    lease::Job {
+        owner: "sweep-1".into(),
+        kind: JobKind::Sweep,
+        issue: None,
+        branch: None,
+        container_id: container.into(),
+        base_revision: "a".repeat(40),
+        host_pid: std::process::id(),
+        control: String::new(),
+        repository: String::new(),
+    }
+}
+
 fn labels_of(args: &[&str]) -> BTreeMap<String, String> {
     args.windows(2)
         .filter(|w| w[0] == "--label")
@@ -394,7 +446,7 @@ fn parse_run(args: &[&str]) -> Run {
                 run.labels.insert(k.into(), v.into());
                 i += 2;
             }
-            "--tmpfs" | "--env" | "--network" | "--cap-add" => i += 2,
+            "--tmpfs" | "--env" | "--network" | "--cap-add" | "--restart" => i += 2,
             "--entrypoint" => {
                 run.entrypoint = args[i + 1].into();
                 i += 2;
@@ -436,6 +488,19 @@ fn session_container(config: &Config, id: &str, running: bool, image: &str) -> V
             "Source": extra.host,
             "RW": false,
         }));
+    }
+    // The origin mirror binds the container was created with (#14680): the
+    // host objects directories of exactly the recorded slugs, read-only.
+    if !config.mirror_binds.is_empty() {
+        let root = mirror::mirror_root().unwrap();
+        for slug in &config.mirror_binds {
+            mounts.push(json!({
+                "Destination": mirror::in_container_objects(slug),
+                "Type": "bind",
+                "Source": mirror::objects_dir(&root, slug),
+                "RW": false,
+            }));
+        }
     }
     Run {
         name: config.container.clone(),
@@ -491,6 +556,20 @@ impl Env {
             e.volumes
                 .insert(self.config.volume.clone(), volume_json(&self.config.volume, &labels));
         });
+    }
+    /// List one exec record under the session container's `ExecIDs` and
+    /// answer the engine API's `/exec/{id}/json` with `record` (#14943).
+    fn seed_exec_for(&self, container: &str, id: &str, record: Value) {
+        self.with(|e| {
+            e.execs.insert(id.to_owned(), record);
+            let state = e.containers.get_mut(container).unwrap();
+            let mut ids = state["ExecIDs"].as_array().cloned().unwrap_or_default();
+            ids.push(json!(id));
+            state["ExecIDs"] = json!(ids);
+        });
+    }
+    fn seed_exec(&self, id: &str, record: Value) {
+        self.seed_exec_for(&self.config.container.clone(), id, record);
     }
     fn mutations(&self) -> Vec<String> {
         self.engine().mutations()
@@ -558,6 +637,7 @@ fn setup() -> Env {
         gh_config: None,
         session_image: None,
         extra_mounts: Vec::new(),
+        mirror_binds: Vec::new(),
     };
     let dir = state_dir(&account.credential_reference).unwrap();
     std::fs::create_dir_all(&dir).unwrap();
@@ -647,6 +727,40 @@ fn a_missing_private_session_is_recreated_only_against_its_surviving_volume() {
     let run: Vec<&str> = run.iter().map(String::as_str).collect();
     let created = parse_run(&run[1..]);
     assert_eq!(created.name, env.config.container);
+    // Exactly one restart policy, before the image (#14912): on a
+    // session-only host no daemon reconciles the seat, so Docker's own
+    // policy is what brings it back after an engine restart. `unless-stopped`
+    // (not `always`) like the host-mounted seat (#10452), because `stop`
+    // removes the container — the policy never fights an operator's
+    // deliberate stop.
+    let at = run
+        .iter()
+        .position(|a| *a == "--restart")
+        .expect("the persistent private seat sets a restart policy");
+    assert_eq!(run[at + 1], "unless-stopped");
+    assert_eq!(
+        run.iter().filter(|a| **a == "--restart").count(),
+        1,
+        "exactly one restart policy: {run:?}"
+    );
+    let image_at = run
+        .iter()
+        .position(|a| *a == IMAGE)
+        .expect("the detached run names the image");
+    assert!(at < image_at, "the policy precedes the image: {run:?}");
+    // The `--rm` helper runs (control provisioning here; the fresh-volume
+    // initializer and bundle probe on other paths) stay ephemeral.
+    for call in env
+        .engine()
+        .calls
+        .iter()
+        .filter(|c| c.first().is_some_and(|v| v == "run") && c.contains(&"--rm".to_owned()))
+    {
+        assert!(
+            !call.iter().any(|a| a == "--restart"),
+            "an ephemeral helper run must not set a restart policy: {call:?}"
+        );
+    }
     assert!(created.mounts.iter().any(|m| {
         m["Type"] == "volume" && m["Name"] == env.config.volume && m["Destination"] == ROOT
     }));
@@ -659,6 +773,28 @@ fn a_missing_private_session_is_recreated_only_against_its_surviving_volume() {
         .collect();
     assert!(
         envs.contains(&"LOOM_LEASE_RENEW_STATE_DIR=/workspace/cache/lease-renew"),
+        "{envs:?}"
+    );
+    // Every long-lived cache and Loom state dir the seat's 512 MB `/tmp`
+    // tmpfs grew across days (#14929) is pinned to the persistent cache
+    // volume instead — uv's cache alone was 395 MB after two days, and the
+    // forge listing / call-stats / write-scope state dirs surfaced untracked
+    // in the clone when the tmpfs filled.
+    for pinned in [
+        "UV_CACHE_DIR=/workspace/cache/uv",
+        "GH_CACHE_DIR=/workspace/cache/gh",
+        "LOOM_LISTING_CACHE_DIR=/workspace/cache/forge-listing",
+        "LOOM_FORGE_CALL_STATS_DIR=/workspace/cache/forge-call-stats",
+        "LOOM_WRITE_SCOPE_CACHE_DIR=/workspace/cache/write-scope",
+    ] {
+        assert!(envs.contains(&pinned), "missing cache-volume pin {pinned}: {envs:?}");
+    }
+    // The per-container venv is NOT a growing cache and stays on /tmp
+    // (curator scope: `UV_PROJECT_ENVIRONMENT` unchanged).
+    assert!(
+        !envs
+            .iter()
+            .any(|e| e.starts_with("UV_PROJECT_ENVIRONMENT=")),
         "{envs:?}"
     );
     // What it made passes the same validation a reused container must.
@@ -794,6 +930,131 @@ fn recovery_never_breaks_the_exclusive_account_lease() {
     assert!(!env.dir.join("job.json").exists());
     assert!(env.dir.join("last-job.json").exists());
     assert_eq!(env.mutations()[0], format!("start {}", env.config.container));
+}
+
+#[test]
+#[serial]
+fn a_never_started_or_exited_exec_no_longer_wedges_stale_job_recovery() {
+    // The reported incident (#14943): the snapshot exec's create succeeded
+    // and its start never came (`Running=false`, `ExitCode=null`, `Pid=0`),
+    // and the record refused every later idle proof forever. A confirmed
+    // exited record is equally ignorable; each is inspected through the
+    // engine API, never assumed.
+    for (name, exit_code, pid) in [
+        ("never-started", json!(null), 0),
+        ("exited", json!(0), 4242),
+    ] {
+        let env = setup();
+        env.seed_volume();
+        env.seed_container(CONTAINER_ID, true);
+        save(&env.dir.join("job.json"), &stale_job(CONTAINER_ID)).unwrap();
+        let id = exec_id(1);
+        env.seed_exec(&id, exec_record(&id, CONTAINER_ID, false, exit_code, pid));
+        let status = env.recover(Some(IMAGE)).unwrap();
+        assert!(status.running, "{name}");
+        // The old job was archived — not deleted — and the seat stayed on
+        // the original container, with no restart of anything.
+        assert!(!env.dir.join("job.json").exists(), "{name}");
+        assert!(env.dir.join("last-job.json").exists(), "{name}");
+        assert_eq!(status.container_id.as_deref(), Some(CONTAINER_ID), "{name}");
+        assert!(
+            !env.mutations()
+                .iter()
+                .any(|m| m.starts_with("start ") || m.starts_with("rm ") || m.starts_with("run ")),
+            "{name}: {:?}",
+            env.mutations()
+        );
+        assert!(
+            env.engine()
+                .calls
+                .iter()
+                .any(|call| call.first().is_some_and(|arg| arg == "exec-inspect")),
+            "{name}: the record was inspected, not assumed"
+        );
+    }
+}
+
+#[test]
+#[serial]
+fn an_active_pending_or_foreign_exec_still_blocks_stale_job_recovery() {
+    for (name, running, exit_code, pid, clause) in [
+        ("running", true, json!(null), 99, "is running"),
+        ("pending", false, json!(null), 99, "has not started and has not exited"),
+    ] {
+        let env = setup();
+        env.seed_volume();
+        env.seed_container(CONTAINER_ID, true);
+        save(&env.dir.join("job.json"), &stale_job(CONTAINER_ID)).unwrap();
+        // A stranded never-started record next to the blocking one: each is
+        // classified, and the active one still holds the seat (#14943).
+        let stranded = exec_id(1);
+        env.seed_exec(&stranded, exec_record(&stranded, CONTAINER_ID, false, json!(null), 0));
+        let blocking = exec_id(2);
+        env.seed_exec(&blocking, exec_record(&blocking, CONTAINER_ID, running, exit_code, pid));
+        let error = env.recover(Some(IMAGE)).unwrap_err();
+        let text = message(&error);
+        assert!(text.contains(&blocking), "{name}: {text}");
+        assert!(text.contains(clause), "{name}: {text}");
+        assert!(!text.contains(&stranded), "{name}: {text}");
+        assert!(!text.contains("arguments"), "{name}: {text}");
+        // The durable lease and the workspace survive the refusal intact.
+        assert!(env.dir.join("job.json").exists(), "{name}");
+        assert!(!env.dir.join("last-job.json").exists(), "{name}");
+        assert_eq!(env.mutations(), Vec::<String>::new(), "{name}");
+        drop(super::tests::reacquire(&env.dir));
+    }
+
+    // A record the engine answers for another container is not this
+    // proof's to use.
+    let env = setup();
+    env.seed_volume();
+    env.seed_container(CONTAINER_ID, true);
+    save(&env.dir.join("job.json"), &stale_job(CONTAINER_ID)).unwrap();
+    let foreign = exec_id(3);
+    env.seed_exec(&foreign, exec_record(&foreign, OTHER_ID, true, json!(null), 7));
+    let error = env.recover(Some(IMAGE)).unwrap_err();
+    let text = message(&error);
+    assert!(text.contains(&foreign), "{text}");
+    assert!(text.contains("belongs to another container"), "{text}");
+    assert!(env.dir.join("job.json").exists());
+    drop(super::tests::reacquire(&env.dir));
+}
+
+#[test]
+#[serial]
+fn an_unresolvable_exec_inspection_blocks_with_an_explicit_unknown() {
+    // The engine API unreachable: the refusal says unknown, and the job and
+    // workspace survive (#14943).
+    let env = setup();
+    env.seed_volume();
+    env.seed_container(CONTAINER_ID, true);
+    save(&env.dir.join("job.json"), &stale_job(CONTAINER_ID)).unwrap();
+    let id = exec_id(1);
+    env.seed_exec(&id, exec_record(&id, CONTAINER_ID, false, json!(null), 0));
+    env.with(|e| e.exec_inspect_unreachable = true);
+    let error = env.recover(Some(IMAGE)).unwrap_err();
+    let text = message(&error);
+    assert!(
+        text.contains(&id) && text.contains("state unknown (exec inspect failed)"),
+        "{text}"
+    );
+    assert!(env.dir.join("job.json").exists());
+    assert_eq!(env.mutations(), Vec::<String>::new());
+
+    // A body the classifier does not recognize is the same explicit
+    // unknown, never a guess.
+    let env = setup();
+    env.seed_volume();
+    env.seed_container(CONTAINER_ID, true);
+    save(&env.dir.join("job.json"), &stale_job(CONTAINER_ID)).unwrap();
+    env.seed_exec(&id, json!({"ID": id}));
+    let error = env.recover(Some(IMAGE)).unwrap_err();
+    let text = message(&error);
+    assert!(
+        text.contains(&id) && text.contains("state unknown (exec state unrecognized)"),
+        "{text}"
+    );
+    assert!(env.dir.join("job.json").exists());
 }
 
 #[test]
@@ -1145,6 +1406,9 @@ fn session_recover_publish_without_a_github_credential_is_refused_before_exec() 
     let text = message(&error);
     assert!(text.contains("no GitHub write credential"), "{text}");
     assert!(text.contains("GH_TOKEN") && text.contains("gh-config-by-owner"), "{text}");
+    // #14534: the export is an override, not the normal route.
+    assert!(text.contains("override"), "{text}");
+    assert!(!text.contains("set LOOM_MACHINE_CHECKOUT to that root"), "{text}");
     assert_eq!(recover_calls(&env), 0, "refused before any exec");
 
     // Listing pushes nothing: it still reaches the worker (both clones).
@@ -1775,6 +2039,16 @@ fn intact_probe() -> String {
 
 /// Write `accounts.session` into the workspace's own config tier.
 fn configure(env: &Env, image: Option<&str>, mounts: &[(&Path, &str)]) {
+    configure_session(env, image, mounts, false)
+}
+
+/// [`configure`] with the origin object mirror opt-in (#14680).
+fn configure_session(
+    env: &Env,
+    image: Option<&str>,
+    mounts: &[(&Path, &str)],
+    object_mirrors: bool,
+) {
     let mounts: Vec<Value> = mounts
         .iter()
         .map(|(host, container)| json!({"host": host, "container": container}))
@@ -1782,6 +2056,9 @@ fn configure(env: &Env, image: Option<&str>, mounts: &[(&Path, &str)]) {
     let mut session = json!({"extraMounts": mounts});
     if let Some(image) = image {
         session["image"] = json!(image);
+    }
+    if object_mirrors {
+        session["objectMirrors"] = json!(true);
     }
     let dir = env.workspace.path().join(".loom");
     std::fs::create_dir_all(&dir).unwrap();
@@ -2110,6 +2387,9 @@ fn idle_refusal_uses_the_draw_snapshot_when_inventory_changes() {
     use crate::tokens_pool::health::{self, TerminalClassification};
     use crate::tokens_pool::session_lifecycle::liveness::test_support::set_selector_docker;
 
+    // Crate-wide `LOOM_CODEX_HOME` lock (#15174): the clear-list below takes it
+    // so it cannot race the `codex_home_env`-keyed tests that pin the variable.
+    let _codex_home_lock = crate::tokens_pool::codex_home_env::lock();
     let _environment = crate::env_test_support::EnvGuard::clear(&[
         "CODEX_HOME",
         "LOOM_CODEX_HOME",
@@ -2156,8 +2436,14 @@ fn idle_refusal_uses_the_draw_snapshot_when_inventory_changes() {
         );
         let _liveness = set_selector_docker(fake_docker.to_str().unwrap(), false);
 
-        let result =
-            dispatch::Selection::prepare_idle(root, None, JobKind::Sweep, None, "fixture", false);
+        let result = dispatch::Selection::prepare_idle(
+            root,
+            None,
+            JobKind::Sweep,
+            None,
+            "fixture",
+            "curator",
+        );
         assert_eq!(std::fs::read(file).unwrap(), changed, "snapshot must have run");
         let error = result.err().expect("the matching account is not healthy");
         assert!(error.is::<health::NoHealthyAccountError>(), "{error:#}");
@@ -2175,6 +2461,9 @@ fn legacy_sweep_prepares_one_target_and_hands_its_selection_to_launch() {
     };
     use crate::types::SweepKind;
 
+    // Crate-wide `LOOM_CODEX_HOME` lock (#15174): the clear-list below takes it
+    // so it cannot race the `codex_home_env`-keyed tests that pin the variable.
+    let _codex_home_lock = crate::tokens_pool::codex_home_env::lock();
     let _environment = crate::env_test_support::EnvGuard::clear(&[
         "CODEX_HOME",
         "LOOM_CODEX_HOME",
@@ -2310,6 +2599,9 @@ fn idle_reservation_retries_a_busy_weekly_favorite_and_hands_off_the_next_lease(
 
     let _fork = super::tests::fork_guard();
     let home = tempfile::tempdir().unwrap();
+    // Crate-wide `LOOM_CODEX_HOME` lock (#15174): the clear-list below takes it
+    // so it cannot race the `codex_home_env`-keyed tests that pin the variable.
+    let _codex_home_lock = crate::tokens_pool::codex_home_env::lock();
     let _runtime_env = EnvGuard::clear(&[
         "CODEX_HOME",
         "LOOM_CODEX_HOME",
@@ -2372,9 +2664,16 @@ fn idle_reservation_retries_a_busy_weekly_favorite_and_hands_off_the_next_lease(
     save(&runtimes.join("codex.json"), &json!({"accountProvider": "codex"})).unwrap();
 
     let reserve = |issue, owner| {
-        dispatch::Selection::prepare_idle(&root, None, JobKind::Sweep, Some(issue), owner, false)
-            .unwrap()
-            .unwrap()
+        dispatch::Selection::prepare_idle(
+            &root,
+            None,
+            JobKind::Sweep,
+            Some(issue),
+            owner,
+            "curator",
+        )
+        .unwrap()
+        .unwrap()
     };
     // Advance the cursor past Alice with a real locked draw. The next draw
     // would still favor Alice on usage, independent of the cursor.
@@ -2430,6 +2729,9 @@ fn concurrent_judge_draws_share_one_idle_seat() {
     use std::os::unix::fs::PermissionsExt;
     use std::sync::Barrier;
 
+    // Crate-wide `LOOM_CODEX_HOME` lock (#15174): the clear-list below takes it
+    // so it cannot race the `codex_home_env`-keyed tests that pin the variable.
+    let _codex_home_lock = crate::tokens_pool::codex_home_env::lock();
     let _runtime_env = crate::env_test_support::EnvGuard::clear(&[
         "CODEX_HOME",
         "LOOM_CODEX_HOME",
@@ -2720,6 +3022,7 @@ fn seed_seat(env: &Env, name: &str, id: &str, trusted: bool) -> Seat {
         gh_config: None,
         session_image: None,
         extra_mounts: Vec::new(),
+        mirror_binds: Vec::new(),
     };
     let dir = state_dir(&account.credential_reference).unwrap();
     std::fs::create_dir_all(&dir).unwrap();
@@ -2846,6 +3149,9 @@ fn builder_stage_of(doc: &serde_json::Value) -> &serde_json::Value {
 #[serial]
 fn a_builder_draw_admits_the_idle_seat_while_another_seat_is_busy() {
     use crate::runtime_preference::role_draw;
+    // Crate-wide `LOOM_CODEX_HOME` lock (#15174): the clear-list below takes it
+    // so it cannot race the `codex_home_env`-keyed tests that pin the variable.
+    let _codex_home_lock = crate::tokens_pool::codex_home_env::lock();
     let _runtime_env = crate::env_test_support::EnvGuard::clear(&[
         "CODEX_HOME",
         "LOOM_CODEX_HOME",
@@ -2905,6 +3211,9 @@ fn a_builder_draw_admits_the_idle_seat_while_another_seat_is_busy() {
 #[serial]
 fn a_builder_draw_names_every_tried_seat_when_all_are_busy() {
     use crate::runtime_preference::role_draw;
+    // Crate-wide `LOOM_CODEX_HOME` lock (#15174): the clear-list below takes it
+    // so it cannot race the `codex_home_env`-keyed tests that pin the variable.
+    let _codex_home_lock = crate::tokens_pool::codex_home_env::lock();
     let _runtime_env = crate::env_test_support::EnvGuard::clear(&[
         "CODEX_HOME",
         "LOOM_CODEX_HOME",
@@ -2970,6 +3279,77 @@ fn a_builder_draw_names_every_tried_seat_when_all_are_busy() {
     drop(reacquire_probe(&bob.dir, held_b));
 }
 
+/// A marked Builder can retry private containment once a healthy account appears.
+/// The launch alone discovers a busy lease, so its refusal must cool the item.
+#[test]
+#[serial(loom_shared_tokens_dir_env)]
+#[serial]
+fn builder_pool_recovery_backs_off_busy_seats_and_excludes_exhausted_accounts() {
+    use crate::step_dispatch::{driver::probe_exhausted_roles, step_end::record_refusal};
+    use crate::step_role::StepRole;
+    use crate::sweep_registry::{
+        step_spawn::StepSpawnRequest, test_support::open_pr_guard_registry, SweepRegistry,
+    };
+    use crate::tokens_pool::health::{record_terminal_at, TerminalClassification};
+    use std::sync::{Arc, Mutex};
+
+    let _home = crate::tokens_pool::codex_home_env::lock();
+    let _runtime = crate::env_test_support::EnvGuard::clear(&[
+        "CODEX_HOME",
+        "LOOM_CODEX_HOME",
+        "LOOM_CODEX_PROFILE",
+        "LOOM_CODEX_NO_EXEC",
+        "LOOM_CODEX_SESSION_EXEC",
+        "LOOM_RUNTIME",
+        "LOOM_RUNTIME_BUILDER",
+        "LOOM_SPAWN_NO_EXEC",
+        "LOOM_SPAWN_NO_EXPORT",
+    ])
+    .and_set("LOOM_CODEX_SESSION_PROBE", Some(std::ffi::OsStr::new("0")));
+    let env = setup();
+    let root = env.workspace.path();
+    let (mut reg, _) = open_pr_guard_registry(root, "", 0, false);
+    let bob = builder_draw_env(&env, true);
+    let claude = crate::write_scope_test_support::SharedTokenPool::one_account();
+    crate::tokens_pool::bad_tokens::mark_bad_in_dir(claude.path(), "fake", "exhausted").unwrap();
+    let _alice_lease = lease::Lease::acquire(&env.dir).unwrap();
+    let _bob_lease = lease::Lease::acquire(&bob.dir).unwrap();
+
+    let role = StepRole::Builder;
+    let item = 8715;
+    let kind = crate::types::SweepKind::Step { item, role };
+    let refusal = SweepRegistry::resolve_step_launch(reg.config(), role, &kind)
+        .err()
+        .unwrap();
+    assert_eq!(refusal.reason, "pool_exhausted", "{refusal}");
+    assert!(refusal.seat_unavailable, "{refusal}");
+    reg.record_role_tick_pool_exhausted("builder");
+    let registry = Arc::new(Mutex::new(reg));
+    let now = chrono::Utc::now();
+    let request = StepSpawnRequest::new(item, role);
+    // A busy-seat refusal cools even the first launch, before any probe.
+    record_refusal(root, &registry, &request, Some(&refusal), false);
+    let cooldowns = registry.lock().unwrap().step_cooldowns(now);
+    assert!(cooldowns.is_cooling(item, role, now));
+    assert!(!cooldowns.is_cooling(item + 1, role, now));
+    let (excluded, retryable) = probe_exhausted_roles(root, &registry, now);
+    assert!(!excluded.contains("builder") && retryable.contains("builder"));
+
+    // Pool exhaustion can be observed without attempting either lease.
+    for account in account_inventory(root, AccountProvider::Codex).unwrap() {
+        record_terminal_at(
+            root,
+            &account.id,
+            TerminalClassification::TokenExhausted,
+            "test",
+            now.timestamp().try_into().unwrap(),
+        )
+        .unwrap();
+    }
+    let (excluded, retryable) = probe_exhausted_roles(root, &registry, now);
+    assert!(excluded.contains("builder") && !retryable.contains("builder"));
+}
+
 /// A held lease this test owns is re-acquirable only by dropping the holder;
 /// the bounded retry waits out unrelated forks (#9409) without hiding a leak.
 fn reacquire_probe(dir: &Path, holder: lease::Lease) -> lease::Lease {
@@ -2980,6 +3360,9 @@ fn reacquire_probe(dir: &Path, holder: lease::Lease) -> lease::Lease {
 #[test]
 #[serial]
 fn an_explicit_profile_pin_keeps_binding_while_its_seat_is_busy() {
+    // Crate-wide `LOOM_CODEX_HOME` lock (#15174): the clear-list below takes it
+    // so it cannot race the `codex_home_env`-keyed tests that pin the variable.
+    let _codex_home_lock = crate::tokens_pool::codex_home_env::lock();
     let _runtime_env = crate::env_test_support::EnvGuard::clear(&[
         "CODEX_HOME",
         "LOOM_CODEX_HOME",
@@ -3025,6 +3408,9 @@ fn an_explicit_profile_pin_keeps_binding_while_its_seat_is_busy() {
 #[test]
 #[serial]
 fn an_idle_seat_that_cannot_prove_containment_is_never_counted_as_busy() {
+    // Crate-wide `LOOM_CODEX_HOME` lock (#15174): the clear-list below takes it
+    // so it cannot race the `codex_home_env`-keyed tests that pin the variable.
+    let _codex_home_lock = crate::tokens_pool::codex_home_env::lock();
     let _runtime_env = crate::env_test_support::EnvGuard::clear(&[
         "CODEX_HOME",
         "LOOM_CODEX_HOME",
@@ -3072,11 +3458,184 @@ fn an_idle_seat_that_cannot_prove_containment_is_never_counted_as_busy() {
 
 #[test]
 #[serial]
+fn a_blocking_exec_is_named_by_the_admission_refusal_and_the_explain_view() {
+    use crate::runtime_preference::role_draw;
+    // Crate-wide `LOOM_CODEX_HOME` lock (#15174): the clear-list below takes it
+    // so it cannot race the `codex_home_env`-keyed tests that pin the variable.
+    let _codex_home_lock = crate::tokens_pool::codex_home_env::lock();
+    let _runtime_env = crate::env_test_support::EnvGuard::clear(&[
+        "CODEX_HOME",
+        "LOOM_CODEX_HOME",
+        "LOOM_CODEX_PROFILE",
+        "LOOM_CODEX_NO_EXEC",
+        "LOOM_CODEX_SESSION_EXEC",
+        "LOOM_RUNTIME",
+        "LOOM_RUNTIME_BUILDER",
+        "LOOM_SPAWN_NO_EXPORT",
+    ]);
+    let _probe = crate::env_test_support::EnvGuard::set("LOOM_CODEX_SESSION_PROBE", "0");
+    let env = setup();
+    env.seed_volume();
+    env.seed_container(CONTAINER_ID, true);
+    let bob = builder_draw_env(&env, true);
+    let tokens = tempfile::tempdir().unwrap();
+    std::fs::write(tokens.path().join("fixture.token"), "sk-ant-oat-fixture\n").unwrap();
+    let _tokens_env = crate::env_test_support::EnvGuard::set(
+        crate::tokens_pool::paths::SHARED_TOKENS_DIR_ENV,
+        tokens.path(),
+    );
+    let root = env.workspace.path();
+
+    // Both seats carry the incident's shape (#14943): a stale job plus a
+    // stranded never-started snapshot exec next to one live exec. The live
+    // one holds the seat; the stranded one is named nowhere. Exec ids are
+    // engine-global, so each seat gets its own pair.
+    let stranded = exec_id(1);
+    let live = exec_id(2);
+    let bob_stranded = exec_id(3);
+    let bob_live = exec_id(4);
+    save(&env.dir.join("job.json"), &stale_job(CONTAINER_ID)).unwrap();
+    env.seed_exec(&stranded, exec_record(&stranded, CONTAINER_ID, false, json!(null), 0));
+    env.seed_exec(&live, exec_record(&live, CONTAINER_ID, true, json!(null), 9));
+    let bob_container = container_name("bob");
+    save(&bob.dir.join("job.json"), &stale_job(OTHER_ID)).unwrap();
+    env.seed_exec_for(
+        &bob_container,
+        &bob_stranded,
+        exec_record(&bob_stranded, OTHER_ID, false, json!(null), 0),
+    );
+    env.seed_exec_for(
+        &bob_container,
+        &bob_live,
+        exec_record(&bob_live, OTHER_ID, true, json!(null), 9),
+    );
+
+    // The real dispatch falls through to the configured fallback. The walk's
+    // one-line marker names the seat and the stale-lease refusal (its
+    // wording is capped by design, resolve.rs `SUMMARY_DETAIL_MAX`).
+    let mut draw = builder_draw(root);
+    let (runtime, record, selection, seat_unavailable) = draw("builder-11".into());
+    assert_eq!(runtime, "claude");
+    assert!(selection.is_none());
+    assert!(!seat_unavailable, "a proof failure is not a busy pool");
+    let passed = record
+        .passed_over
+        .iter()
+        .find(|reason| reason.contains("no eligible seat could be prepared"))
+        .expect("the codex refusal names the walk");
+    assert!(passed.contains("alice failed: stale lease"), "{passed}");
+    assert!(!passed.contains(&stranded), "{passed}");
+    assert!(!passed.contains("arguments"), "{passed}");
+
+    // `roles draw --explain` reads the same refusal through the real
+    // admission probe, uncapped: the exec id and its known state, and
+    // nothing of the record's payload (#14943).
+    let doc = role_draw::explain::explain_json(root);
+    let codex = &builder_stage_of(&doc)["roleDraw"][0]["candidates"][0];
+    assert_eq!(codex["candidate"], "codex");
+    assert_eq!(codex["admitted"], false);
+    let reason = codex["reason"].as_str().unwrap();
+    assert!(
+        reason.contains(&format!(
+            "alice failed: stale lease still has a surviving or unverified container worker \
+             (container exec {live} is running); retain lease and workspace"
+        )),
+        "{reason}"
+    );
+    assert!(
+        reason.contains(&format!(
+            "bob failed: stale lease still has a surviving or unverified container worker \
+             (container exec {bob_live} is running); retain lease and workspace"
+        )),
+        "{reason}"
+    );
+    assert!(!reason.contains(&stranded), "{reason}");
+    assert!(!reason.contains(&bob_stranded), "{reason}");
+    assert!(!reason.contains("arguments"), "{reason}");
+}
+
+#[test]
+#[serial]
+fn a_failed_or_timed_out_snapshot_records_an_operation_diagnostic() {
+    // The stub `docker`s spawn, and the stripped PATH must not leak into a
+    // concurrently forking `git` fixture (mirror tests hold their own lock).
+    let _fork = super::tests::fork_guard();
+    let env = setup();
+    env.seed_volume();
+    env.seed_container(CONTAINER_ID, true);
+    let root = env.workspace.path().to_path_buf();
+    let job = lease::Job {
+        issue: Some(31),
+        branch: Some("feature/issue-31".into()),
+        ..stale_job(CONTAINER_ID)
+    };
+    let record = export::record_prepared(&root, &env.config, &job).unwrap();
+    drop(record);
+    let record_path = root.join(".loom/private-jobs/issue-31.json");
+    let read_record = || -> export::Record {
+        serde_json::from_slice(&std::fs::read(&record_path).unwrap()).unwrap()
+    };
+
+    // A snapshot exec whose start failed, and one that never answered in
+    // time — the incident's own shape (#14943) — each record the operation
+    // by name, and never the payload. The stub dir is the whole PATH, so
+    // nothing external is callable from the stubs.
+    for (stub, expected) in [
+        ("#!/bin/sh\nexit 1\n", "private-workspace snapshot failed"),
+        ("#!/bin/sh\n/bin/sleep 5\n", "private-workspace snapshot timed out after 2s"),
+    ] {
+        let stubs = tempfile::tempdir().unwrap();
+        crate::exec_test_support::write_executable(&stubs.path().join("docker"), stub);
+        let _path = crate::env_test_support::EnvGuard::set("PATH", stubs.path().to_str().unwrap());
+        export::update(&root, &env.config, &job, "completed").unwrap();
+        let record = read_record();
+        assert_eq!(record.snapshot_diagnostic.as_deref(), Some(expected));
+        // An uncertified completion stays uncertified.
+        assert_eq!(record.outcome, "recovery-required");
+    }
+
+    // A snapshot that never started at all records the same way. An empty
+    // PATH no longer expresses "docker is unreachable" — the shared lookup's
+    // absolute fallbacks (`/usr/bin`, …) can still find a host docker (#14885)
+    // — so pin `LOOM_DOCKER_BIN` at a path that is not an executable file.
+    let empty = tempfile::tempdir().unwrap();
+    let _path = crate::env_test_support::EnvGuard::set("PATH", empty.path().to_str().unwrap());
+    {
+        let _docker = crate::env_test_support::EnvGuard::set(
+            crate::docker_bin::DOCKER_BIN_ENV,
+            empty.path().join("docker"),
+        );
+        export::update(&root, &env.config, &job, "running").unwrap();
+        assert_eq!(
+            read_record().snapshot_diagnostic.as_deref(),
+            Some("private-workspace snapshot could not be executed")
+        );
+    }
+
+    // A fresh snapshot clears the diagnostic and certifies the completion.
+    let stubs = tempfile::tempdir().unwrap();
+    crate::exec_test_support::write_executable(
+        &stubs.path().join("docker"),
+        "#!/bin/sh\nprintf '%s\\n' '{\"issue\":31,\"branch\":\"feature/issue-31\",\"revision\":null,\"published\":true,\"dirty\":false,\"checkpoint\":null}'\n",
+    );
+    let _path = crate::env_test_support::EnvGuard::set("PATH", stubs.path().to_str().unwrap());
+    export::update(&root, &env.config, &job, "completed").unwrap();
+    let record = read_record();
+    assert_eq!(record.snapshot_diagnostic, None);
+    assert_eq!(record.outcome, "completed");
+    assert!(record.snapshot.is_some());
+}
+
+#[test]
+#[serial]
 fn a_named_manual_exec_refuses_on_its_own_busy_seat_never_another() {
     use crate::env_test_support::EnvGuard;
     use std::ffi::OsStr;
     use std::os::unix::fs::PermissionsExt;
 
+    // Crate-wide `LOOM_CODEX_HOME` lock (#15174): the clear-list below takes it
+    // so it cannot race the `codex_home_env`-keyed tests that pin the variable.
+    let _codex_home_lock = crate::tokens_pool::codex_home_env::lock();
     let _runtime_env = EnvGuard::clear(&[
         "CODEX_HOME",
         "LOOM_CODEX_HOME",
@@ -3158,4 +3717,219 @@ fn a_named_manual_exec_refuses_on_its_own_busy_seat_never_another() {
     assert!(!bob.dir.join(lease::ADMISSION).exists());
     drop(held);
     drop(super::tests::reacquire(&env.dir));
+}
+
+// ---------------------------------------------------------------------------
+// Origin object mirrors (#14680): creation binds, mount validation, and the
+// preparation hand-down, all through the fake Docker and mirror seams.
+// ---------------------------------------------------------------------------
+
+/// Point the host mirror root at a throwaway directory for one test. The env
+/// is process-global, so every test that touches it is `#[serial]`.
+struct MirrorRoot(Option<std::ffi::OsString>);
+
+impl MirrorRoot {
+    fn set(path: &Path) -> Self {
+        let previous = std::env::var_os(mirror::MIRROR_ROOT_ENV);
+        std::fs::create_dir_all(path).unwrap();
+        std::env::set_var(mirror::MIRROR_ROOT_ENV, path);
+        Self(previous)
+    }
+}
+
+impl Drop for MirrorRoot {
+    fn drop(&mut self) {
+        match self.0.take() {
+            Some(value) => std::env::set_var(mirror::MIRROR_ROOT_ENV, value),
+            None => std::env::remove_var(mirror::MIRROR_ROOT_ENV),
+        }
+    }
+}
+
+/// A mirror store populated on disk (its objects directory is all a bind
+/// and its borrowers need).
+fn seed_mirror(root: &Path, slug: &str) -> PathBuf {
+    let objects = mirror::objects_dir(root, slug);
+    std::fs::create_dir_all(&objects).unwrap();
+    objects
+}
+
+/// A start with `accounts.session.objectMirrors` on binds exactly the
+/// repository's own mirror read-only, records the bind, and hands the
+/// in-container preparation exactly that objects path.
+#[test]
+#[serial]
+fn a_start_with_mirrors_binds_them_read_only_and_hands_them_down() {
+    let env = setup();
+    env.seed_volume();
+    let mirrors = tempfile::tempdir().unwrap();
+    let _root = MirrorRoot::set(mirrors.path());
+    let id = identify(&env.config.repository).unwrap();
+    seed_mirror(mirrors.path(), &id.slug);
+    let planned = Rc::new(RefCell::new(Vec::<String>::new()));
+    let recorder = planned.clone();
+    let _fake = mirror::fake::install(Box::new(move |repo| {
+        recorder.borrow_mut().push(repo.slug.clone());
+        Ok(())
+    }));
+    configure_session(&env, None, &[], true);
+    let status = operator_start(&env, None).unwrap();
+    assert!(status.running);
+    let runs = created_runs(&env);
+    let bind = runs[0]
+        .mounts
+        .iter()
+        .find(|m| m["Destination"] == mirror::in_container_objects(&id.slug))
+        .expect("the mirror objects bind is created");
+    assert_eq!(bind["RW"], json!(false));
+    assert_eq!(bind["Source"], json!(mirror::objects_dir(mirrors.path(), &id.slug)));
+    assert_eq!(recorded(&env).mirror_binds, vec![id.slug.clone()]);
+    assert_eq!(*planned.borrow(), vec![id.slug.clone()]);
+    // The in-container prepare verb is told exactly this objects path.
+    assert!(env.engine().calls.iter().any(|c| {
+        c.contains(&"--mirror-objects".to_owned())
+            && c.contains(&mirror::in_container_objects(&id.slug))
+    }));
+}
+
+/// A mirror that cannot be populated is skipped, not fatal: the seat starts
+/// with a fully private clone (no bind, no alternate handed down).
+#[test]
+#[serial]
+fn an_unusable_mirror_keeps_the_seat_fully_private() {
+    let env = setup();
+    env.seed_volume();
+    let mirrors = tempfile::tempdir().unwrap();
+    let _root = MirrorRoot::set(mirrors.path());
+    let _fake = mirror::fake::install(Box::new(|_| bail!("origin unreachable")));
+    configure_session(&env, None, &[], true);
+    let status = operator_start(&env, None).unwrap();
+    assert!(status.running);
+    assert!(recorded(&env).mirror_binds.is_empty());
+    let runs = created_runs(&env);
+    assert!(!runs[0].mounts.iter().any(|m| m["Destination"]
+        .as_str()
+        .is_some_and(|d| d.starts_with(MIRRORS))));
+    assert!(!env
+        .engine()
+        .calls
+        .iter()
+        .any(|c| c.contains(&"--mirror-objects".to_owned())));
+}
+
+/// The recorded binds are checked against Docker's own mount inventory: a
+/// wrong source, a writable bind, a missing bind, or a bind for a repository
+/// of another account all refuse the session.
+#[test]
+#[serial]
+fn mirror_binds_are_validated_against_the_mount_inventory() {
+    let mut env = setup();
+    env.seed_volume();
+    env.seed_container(CONTAINER_ID, true);
+    let mirrors = tempfile::tempdir().unwrap();
+    let _root = MirrorRoot::set(mirrors.path());
+    let id = identify(&env.config.repository).unwrap();
+    let source = seed_mirror(mirrors.path(), &id.slug);
+    let container_name = env.config.container.clone();
+    env.config.mirror_binds = vec![id.slug.clone()];
+    save(&env.dir.join("workspace.json"), &env.config).unwrap();
+    let destination = mirror::in_container_objects(&id.slug);
+    let bind = |dst: &str, src: &Path, rw: bool| json!({"Destination": dst, "Type": "bind", "Source": src, "RW": rw});
+    let mounts_reset = |e: &mut Engine| {
+        let mounts = e.containers.get_mut(&container_name).unwrap()["Mounts"]
+            .as_array_mut()
+            .unwrap();
+        mounts.retain(|m| {
+            !m["Destination"]
+                .as_str()
+                .unwrap_or_default()
+                .starts_with(MIRRORS)
+        });
+    };
+    env.with(|e| mounts_reset(e));
+    env.with(|e| {
+        e.containers.get_mut(&container_name).unwrap()["Mounts"]
+            .as_array_mut()
+            .unwrap()
+            .push(bind(&destination, &source, false));
+    });
+    assert!(env.recover(None).is_ok(), "the honest bind must validate");
+
+    for tamper in [
+        "wrong-source",
+        "writable",
+        "second-alternate",
+        "missing",
+        "unauthorized-slug",
+    ] {
+        if tamper == "unauthorized-slug" {
+            env.config.mirror_binds = vec!["other-repo-22222222".into()];
+            save(&env.dir.join("workspace.json"), &env.config).unwrap();
+        }
+        env.with(|e| mounts_reset(e));
+        env.with(|e| {
+            let mounts = e.containers.get_mut(&container_name).unwrap()["Mounts"]
+                .as_array_mut()
+                .unwrap();
+            match tamper {
+                "wrong-source" => {
+                    mounts.push(bind(&destination, Path::new("/somewhere/else"), false))
+                }
+                "writable" => mounts.push(bind(&destination, &source, true)),
+                "second-alternate" => {
+                    mounts.push(bind(&destination, &source, false));
+                    mounts.push(bind(&format!("{MIRRORS}/a-b-11111111/objects"), &source, false));
+                }
+                "missing" => {}
+                "unauthorized-slug" => mounts.push(bind(
+                    &mirror::in_container_objects("other-repo-22222222"),
+                    &source,
+                    false,
+                )),
+                _ => unreachable!(),
+            }
+        });
+        assert!(env.recover(None).is_err(), "{tamper} must refuse");
+        // Restore the recorded binds for the next round.
+        env.config.mirror_binds = vec![id.slug.clone()];
+        save(&env.dir.join("workspace.json"), &env.config).unwrap();
+    }
+}
+
+/// A session recreated by recovery gets exactly its recorded binds back —
+/// and refuses to come back without them when the store is unusable, rather
+/// than leaving borrowed-from clones on a dangling alternate.
+#[test]
+#[serial]
+fn a_recreated_session_needs_its_bound_mirrors_back() {
+    let mut env = setup();
+    env.seed_volume();
+    let mirrors = tempfile::tempdir().unwrap();
+    let _root = MirrorRoot::set(mirrors.path());
+    let id = identify(&env.config.repository).unwrap();
+    seed_mirror(mirrors.path(), &id.slug);
+    env.config.mirror_binds = vec![id.slug.clone()];
+    save(&env.dir.join("workspace.json"), &env.config).unwrap();
+    let _fake = mirror::fake::install(Box::new(|_| Ok(())));
+    let status = env.recover(Some(IMAGE)).unwrap();
+    assert!(status.running);
+    let runs = created_runs(&env);
+    assert!(runs[0]
+        .mounts
+        .iter()
+        .any(|m| m["Destination"] == mirror::in_container_objects(&id.slug)));
+
+    // The store gone and origin unreachable: the recreation refuses.
+    let mut env = setup();
+    env.seed_volume();
+    let mirrors = tempfile::tempdir().unwrap();
+    let _root = MirrorRoot::set(mirrors.path());
+    let id = identify(&env.config.repository).unwrap();
+    env.config.mirror_binds = vec![id.slug.clone()];
+    save(&env.dir.join("workspace.json"), &env.config).unwrap();
+    let _fake = mirror::fake::install(Box::new(|_| bail!("origin unreachable")));
+    let error = env.recover(Some(IMAGE)).unwrap_err();
+    let text = format!("{error:#}");
+    assert!(text.contains("not usable"), "{text}");
+    assert!(created_runs(&env).is_empty());
 }

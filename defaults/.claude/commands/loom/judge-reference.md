@@ -228,10 +228,13 @@ done
 # Find PRs ready for evaluation (green badges) — cached; see "Cached Forge Reads"
 loom-daemon pr-queue --role judge
 
-# Check out the PR (worktree-aware — see "PR Branch Isolation" above; this is
-# a simplified illustration, not a bare checkout in the current directory)
-./.loom/scripts/pr-worktree.sh 42
-cd .loom/worktrees/pr-42
+```
+
+Run [Worktree-Aware Code Access](judge.md#worktree-aware-code-access) for PR 42.
+Continue below only after it verifies and enters the selected worktree.
+
+```bash
+[[ "${WORKTREE_PR:-}" == 42 && "$(pwd -P)" == "${WORKTREE_ABS:-}" ]] || exit 1
 REVIEW_HEAD_SHA=$(gh pr view 42 --json headRefOid --jq '.headRefOid')
 
 # Run checks

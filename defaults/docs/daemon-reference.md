@@ -204,7 +204,7 @@ which holds the connection open and streams one `EventStream` frame per
 event. Connection framing matches the existing terminal-management IPC
 surface; no new transport is introduced.
 
-Source of truth: [`loom-daemon/src/types.rs`](https://github.com/rjwalters/loom/blob/main/loom-daemon/src/types.rs)
+Source of truth: [`loom-daemon/src/types.rs`](https://github.com/2AMLogic/loom/blob/main/loom-daemon/src/types.rs)
 (upstream Loom repo — not shipped to consumer installs).
 
 | Request | MCP tool | Response | Phase |
@@ -339,7 +339,7 @@ In addition, the bus internally emits:
 
 Topic matching is **segment-aligned prefix** (`sweep.issue` matches
 `sweep.issue.123.phase` but not `sweep.issuetype.foo`). See
-[`event_bus::topic_matches`](https://github.com/rjwalters/loom/blob/main/loom-daemon/src/event_bus.rs)
+[`event_bus::topic_matches`](https://github.com/2AMLogic/loom/blob/main/loom-daemon/src/event_bus.rs)
 (upstream Loom repo — not shipped to consumer installs) for the
 authoritative routing rule.
 
@@ -2140,7 +2140,7 @@ embeds, so the binary must be a release's. Both of these must hold:
    in. A developer's build, a feature branch's, a CI build and
    `scripts/daemon-build.sh` carry no stamp.
 2. Once per process, the daemon asks the forge which commit tag `v<version>`
-   of `rjwalters/loom` names, and it is the commit the binary was built from.
+   of `2AMLogic/loom` names, and it is the commit the binary was built from.
 
 A binary that fails either is reported once for the host
 (`host never resyncs: this daemon is not an official release build`) and never
@@ -2315,7 +2315,7 @@ same head: every changed file is an added/modified byte-copy (blob SHA) of its
 `.agents/skills/<f>` to `defaults/.agents/skills/<f>`). Operator ruling r7-q33
 makes the release tag the review point for gate content, so **byte-identical
 merge-gate files land without a Judge**, provided the tag is a published,
-non-draft GitHub Release in `rjwalters/loom` (a bare ref is not enough). Any
+non-draft GitHub Release in `2AMLogic/loom` (a bare ref is not enough). Any
 other outcome keeps the `loom:review-requested` lane: a differing byte, a
 rename or removal, an unmapped file or one outside the install set, or a path
 pinned in `.loom/resync-ignore` at the PR head (or an unreadable pin file). The
@@ -2576,17 +2576,21 @@ blocker is Loom-owned:
   back on the default branch (`checkout`, with a `refs/loom/rescue/<ts>` ref at
   the old HEAD, kind `rehomed`); the ordinary rules then fast-forward it. It
   qualifies only when every commit on HEAD is on `origin/<default>`, or HEAD
-  is the head of a pull request the forge reports as merged. The lookup is
-  `gh api repos/{owner}/{repo}/commits/<sha>/pulls`; no network, an open
-  breaker or any failure means "not merged" and the hold stays (fail closed).
+  is the head of a pull request the forge reports — **open or merged**
+  (#14973: the checkout a reviewer leaves behind is parked on an OPEN PR's
+  head, and `refs/pull/N/head` keeps the commits on the forge either way; a
+  rescue ref is written first regardless). The lookup is
+  `gh api repos/{owner}/{repo}/commits/<sha>/pulls --jq 'any(.[]; .head.sha == "<sha>")'`;
+  no network, an open breaker or any failure means "not known" and the hold
+  stays (fail closed).
   It is the **last** question the rule asks (#13835), after the clean-tree,
   `detached=keep`, six-hour and live-`git` checks, so a checkout any of those
   refuses costs no forge read at all; only one they all pass pays for it.
   **A squash- or rebase-merged PR's head qualifies too**, measured 2026-11-13
-  against the production query on three squash-merged rjwalters/loom PRs
+  against the production query on three squash-merged 2AMLogic/loom PRs
   (#9216 head `3e0393d7`, #9240 head `5f35ef2e`, #9212 head `07af0cb5`, none
   of them an ancestor of `origin/main`):
-  `gh api repos/rjwalters/loom/commits/<sha>/pulls --jq 'any(.[]; .merged_at != null and .head.sha == "<sha>")'`
+  `gh api repos/2AMLogic/loom/commits/<sha>/pulls --jq 'any(.[]; .merged_at != null and .head.sha == "<sha>")'`
   answered `true` for each. So the endpoint does list a merged PR for a head
   commit that is not on the default branch, and a checkout left on a squashed
   branch is put back rather than held.
@@ -2599,7 +2603,9 @@ blocker is Loom-owned:
   A stranded checkout that is not repaired stays `wrong-branch`, and is said
   again as a `still-held` transition (log line plus an event on the checkout
   topic) every hour (`LOOM_CHECKOUT_REREPORT_AFTER_MINUTES`) so it can be
-  counted, instead of once.
+  counted, instead of once. Since #14973 that line names why this pass's
+  self-heal declined the rehome (`not repaired: … (self-heal: stays off
+  \`main\`: HEAD moved recently)`), where the reason used to be `debug`-only.
 - **Repair, in order.** `refs/loom/rescue/<UTC ts>` at HEAD (and `<ts>-branch`
   at the branch tip when an operation moved HEAD); the lock; `stash push` of
   the dirty paths as `loom-rescue-<ts>` (not during an operation, whose abort
@@ -2623,6 +2629,40 @@ blocker is Loom-owned:
   `rehomed`, `still-held`, `repair-failed`, `rescue-pruned` or `escalated`, and
   a log line naming the repo path. Carrying
   these to SigNoz is #11386.
+
+## Changing a bundled model profile's model (`runtimes.modelProfileOverrides`, #15252)
+
+A config tier (fleet defaults, `fleet/hosts/<host>/`, or `.loom-local/local.json`)
+can change the model a **bundled** profile runs without a Loom release:
+
+```jsonc
+"runtimes": { "modelProfileOverrides": { "zai-full": { "model": "glm-5.4" } } }
+```
+
+The override is overlaid on the bundled profile inside `profiles::lookup` — it never
+replaces it — so `excludedRoles` (`judge`, `curator` on the GLM profiles), providers,
+credentials, `credentialProxy` and billing are inherited unchanged.
+
+| Key | Effect |
+|-----|--------|
+| `model`, `effort` | replaces the bundled value |
+| `allowedEfforts` | replaces the bundled list |
+| `excludedRolesAdd` | known role names **added** to the bundled `excludedRoles` (never removes) |
+
+Anything else is an error: `loom-daemon validate` reports it, and a launch refuses
+at exit 78 with the same text. That covers an unknown key (`excludedRoles`
+included), a name that is not in `defaults/model-profiles.json`, the same name under
+both `runtimes.modelProfiles` and `runtimes.modelProfileOverrides`, a blank
+`model`/`effort`/`allowedEfforts` entry, and an unknown `excludedRolesAdd` role.
+An explicit `null` clears a lower tier's entry or field. Tier precedence is the
+ordinary `deep_merge` order (local > fleet-repo > project > committed > machine
+defaults), and `fleet-config render` applies a host overlay over the fleet default
+the same way, so a per-host override is a canary.
+
+`loom-daemon worker profile-check <name>` prints `model: <id> (source: <tier>)`,
+where `<tier>` is `local`, `fleet-repo`, `project`, `committed`, `defaults` or
+`bundled`. Full semantics: [`runtime-adapters.md`](runtime-adapters.md)
+§ "Changing a bundled profile's model without a release".
 
 ## Fleet model A/B — `sweep-experiment plan` (#8055 phase 1)
 
@@ -4750,7 +4790,7 @@ the single `loom:epic` label and are **derived** — computed each tick from two
 already-visible facts: the number of `### Phase` sections in the epic body, and
 the open/closed status of the epic's `loom:epic-phase` children. The five states
 (implemented as `EpicState` in
-[`loom-daemon/src/epic_state.rs`](https://github.com/rjwalters/loom/blob/main/loom-daemon/src/epic_state.rs)
+[`loom-daemon/src/epic_state.rs`](https://github.com/2AMLogic/loom/blob/main/loom-daemon/src/epic_state.rs)
 (upstream Loom repo — not shipped to consumer installs)) are the derived
 epic lane (#3841):
 
@@ -4777,7 +4817,7 @@ epic:phase_join   → epic:done        (Supervisor, barrier)        [close]
 
 Every edge touching `epic:phase_join` is a **phase-boundary edge** and declares
 a non-empty fork-join barrier
-([`loom-daemon/src/phase_join.rs`](https://github.com/rjwalters/loom/blob/main/loom-daemon/src/phase_join.rs)
+([`loom-daemon/src/phase_join.rs`](https://github.com/2AMLogic/loom/blob/main/loom-daemon/src/phase_join.rs)
 (upstream Loom repo — not shipped to consumer installs)): the
 barrier holds — degrading the plan to a no-op — until every child of the current
 phase is closed, so phase N+1 (or epic close) never fires while a current-phase
@@ -4792,7 +4832,7 @@ the epic lane (#4310) — there is no second, independently-maintained
 implementation it is checked against. Its structural invariants (exactly five
 states, `epic:done` the sole terminal state, exactly five intra-lane edges,
 non-empty barriers on every `epic:phase_join` edge) are asserted directly by
-[`loom-daemon/tests/epic_state_invariants.rs`](https://github.com/rjwalters/loom/blob/main/loom-daemon/tests/epic_state_invariants.rs)
+[`loom-daemon/tests/epic_state_invariants.rs`](https://github.com/2AMLogic/loom/blob/main/loom-daemon/tests/epic_state_invariants.rs)
 (upstream Loom repo — not shipped to consumer installs), which always runs (no
 skip path).
 
@@ -4801,7 +4841,7 @@ skip path).
 The two issue-creating expand bursts (`decompose`'s downstream and both
 `expand`/`join` Champion dispatches that run `gh issue create`) are serialized
 through the global **#3707 issue-creation mutex**
-([`loom-daemon/src/issue_creation_mutex.rs`](https://github.com/rjwalters/loom/blob/main/loom-daemon/src/issue_creation_mutex.rs)
+([`loom-daemon/src/issue_creation_mutex.rs`](https://github.com/2AMLogic/loom/blob/main/loom-daemon/src/issue_creation_mutex.rs)
 (upstream Loom repo — not shipped to consumer installs)).
 The supervisor holds the async guard across the whole (spawn-and-wait) dispatch
 so a burst never interleaves with any other issue-creating burst anywhere in the
@@ -4933,7 +4973,7 @@ Neither loop had a config key, so no fleet configuration needs to change.
 ## Autonomous work finder (#3810)
 
 The **work finder** (Phase A of epic #3809,
-[`loom-daemon/src/work_finder.rs`](https://github.com/rjwalters/loom/blob/main/loom-daemon/src/work_finder.rs)
+[`loom-daemon/src/work_finder.rs`](https://github.com/2AMLogic/loom/blob/main/loom-daemon/src/work_finder.rs)
 (upstream Loom repo — not shipped to consumer installs)) is the
 daemon-native poller that turns a human-approved `loom:issue` into a dispatched
 build **without an operator** — restoring the one capability the deleted v0.10.0
@@ -6164,8 +6204,8 @@ concurrency ceiling 5" and share it with the team:
 > **Operational tunables have their own surface (#9683/#9768).** The knobs that
 > govern *how fast and how much* the engine runs — tick cadence, concurrency,
 > admission ramps, lease TTL, review-debt backoff — live in the validated
-> [`hyperparameters`](hyperparameters.md) block (with the `$LOOM_HYPERPARAMS`
-> optimizer vector and the `loom.hyperparams.digest` run-provenance stamp), not
+> [`hyperparameters`](hyperparameters.md) block (with the
+> `loom.hyperparams.digest` run-provenance stamp), not
 > in the `autonomous` feature block below. The two compose: the
 > `hyperparameters` layer wins per-field where both set the same knob.
 
@@ -6702,6 +6742,51 @@ path for (provider console/CLI restart, tailnet-identity survival,
 re-registration), documented in full at that step, along with the #4697
 `fleet status` "expected power-off" classification.
 
+### Docker CLI lookup and the `LOOM_DOCKER_BIN` override (#14885)
+
+Every daemon path that launches `docker` — session-container startup and
+teardown, the accounts `check --live` probes, private-workspace exports,
+image cleanup, native containment — resolves the CLI through one shared
+lookup (`loom-daemon/src/docker_bin.rs`), never a bare
+`Command::new("docker")`. Before #14885, a daemon started by launchd (or a
+minimal systemd unit) inherited `PATH=/usr/bin:/bin:/usr/sbin:/sbin`, which
+names none of the directories Docker Desktop installs its CLI into, and
+every docker launch failed at spawn with not-found.
+
+Resolution order:
+
+1. `LOOM_DOCKER_BIN` when set (trimmed; empty/whitespace counts as unset).
+2. Each `$PATH` entry, in order.
+3. Absolute fallback directories, in order: `/usr/local/bin`,
+   `/opt/homebrew/bin`, `~/.docker/bin` (expanded from the process's home),
+   `/Applications/Docker.app/Contents/Resources/bin`, `/usr/bin`.
+
+A candidate qualifies only if it is an existing regular file (symlinks
+followed — how Docker Desktop links its CLI) with an execute bit. The
+caller's `$PATH` is never modified: the child gets the resolved absolute
+path.
+
+**`LOOM_DOCKER_BIN` is fail-closed, fleet-wide.** An override that does not
+name an executable file is a hard error at the call site — it never falls
+through to a working `docker` elsewhere — so a broken explicit override
+fails even when another docker exists. That is deliberate (#14885): an
+operator who points the daemon at a moved CLI wants the misconfiguration to
+surface, not be masked by an incidental fallback. Practically, a stale
+`LOOM_DOCKER_BIN` left on one host disables every daemon Docker launch on
+that host (sessions read `unknown`/`session_probe_error`, containment
+refuses to start), which is the blast radius to check when clearing one.
+
+**The one exception: the sweep reaper's `container_stop::docker_program()`.**
+It takes `LOOM_DOCKER_BIN` verbatim (trimmed, non-empty) with no
+executability check, and only falls back to the shared lookup when the
+override is unset. There the spawn failure itself is the fail-safe: a
+container stop that cannot spawn its docker logs and skips (the teardown
+must never block a cancel), exactly as it did before #14885.
+
+A scoped `--docker` CLI argument (or `LOOM_CODEX_SESSION_DOCKER`) still wins
+verbatim over all of the above at its call sites; the literal `docker`
+default value means "resolve through this shared lookup".
+
 ### Daemon log path override (`LOOM_DAEMON_LOG`, #4010)
 
 `setup_logging()` writes every daemon log line to `$HOME/.loom/daemon.log` by
@@ -7181,7 +7266,7 @@ request. `reap_once`'s `checkpoint_progress` arm reads that rewritten
 checkpoint as proof of forward progress and actively **clears** the dispatch
 backoff, the quarantine tally and the resume runway — so the next tick
 re-offers the issue immediately, and the cycle repeats with nothing counting
-it. Observed on `rjwalters/loom#7893`: **14 claims in just over four hours, 55
+it. Observed on `2AMLogic/loom#7893`: **14 claims in just over four hours, 55
 `loom:issue`/`loom:building` label events, several claim/release pairs inside
 the same minute, zero PRs** — plus an urgent label (since retired, #9244) that made a stuck
 dispatcher look like a priority item.
@@ -7215,7 +7300,7 @@ dispatch left a pull request behind** — the one thing that loop could not fake
   (`<!-- loom:prless-retry-kind=attempt -->` / `…=hold` / `…=hold-failed`,
   #9239) in addition to the shared `<!-- loom:prless-retry (#7972) -->` marker,
   so an audit never has to infer the difference from prose — before #9239 it had
-  to, and got it wrong: on `rjwalters/loom#8812` four of five "holds" were
+  to, and got it wrong: on `2AMLogic/loom#8812` four of five "holds" were
   `Attempt 2 of 3` notes, one per dispatch host.
 - **Hold (`threshold`).** The `threshold`-th consecutive PR-less release
   fleet-wide adds `loom:blocked`, removes `loom:issue`, and comments with the
@@ -9475,7 +9560,7 @@ digest — into one unit) and:
    safe, since nothing can be "using" an unreferenced image by name.
 2. For each **tracked** repository (default: `loom-worker`,
    `loom-worker-session`, `loom-worker-native`, and their
-   `ghcr.io/rjwalters/...` aliases), keeps
+   `ghcr.io/2amlogic/...` aliases), keeps
    only the `keepLastN` (default 2) most-recently-built tagged images and
    removes the rest **by image ID**, so every alias tag riding on that ID goes
    with it in one `docker rmi` call.
@@ -9527,7 +9612,7 @@ flows outside GitHub-hosted CI (see `docker/worker/README.md` and
 | `LOOM_DOCKER_IMAGE_RETENTION` | `autonomous.dockerImageRetention.enabled` | env > config > default | `true` (on) |
 | `LOOM_DOCKER_IMAGE_RETENTION_KEEP_N` | `autonomous.dockerImageRetention.keepLastN` | env > config > default | `2` |
 | `LOOM_DOCKER_IMAGE_RETENTION_MIN_INTERVAL_SECS` | `autonomous.dockerImageRetention.minIntervalSecs` | env > config > default | `1800` (30 min) |
-| — | `autonomous.dockerImageRetention.trackedRepos` | config > default | `loom-worker`, `loom-worker-session`, `loom-worker-native`, and their `ghcr.io/rjwalters/...` aliases |
+| — | `autonomous.dockerImageRetention.trackedRepos` | config > default | `loom-worker`, `loom-worker-session`, `loom-worker-native`, and their `ghcr.io/2amlogic/...` aliases |
 | — | `autonomous.dockerImageRetention.allowlist` | config > default | `[]` (empty — a shared long-lived image must be opted in explicitly) |
 | `LOOM_DOCKER_IMAGE_RETENTION_UNUSED_MAX_AGE_DAYS` | `autonomous.dockerImageRetention.unusedMaxAgeDays` | env > config > default | `7` |
 
@@ -10457,7 +10542,7 @@ detection, which is Builder-workflow-invoked rather than periodic. See
 ### Configured session image and extra read-only mounts (#14019)
 
 By default a contained session runs from the released
-`ghcr.io/rjwalters/loom-worker-session:<daemon version>` image, selected by
+`ghcr.io/2amlogic/loom-worker-session:<daemon version>` image, selected by
 the daemon's own version. A repo whose checks need a domain toolchain (EDA
 tools, a Rust toolchain, simulators) can instead run its sessions from a
 **derived image** and give them **extra read-only data mounts**, via two
@@ -10481,6 +10566,7 @@ through `.loom-local/local.json`):
 |---|---|---|
 | — | `accounts.session.image` | The image a session container is created from, **digest-pinned** (`repo@sha256:<64 hex>`). A tag-only reference is refused at parse. Unset = today's behaviour byte for byte. |
 | — | `accounts.session.extraMounts` | A list of `{ "host": …, "container": … }` bind mounts, **always read-only**. An entry carrying any other key (`rw`/`mode`/…) is refused at parse. A container target must lie outside the mounted workspace (the `--mount-workspace` path, not only the registered repositories beneath it); one inside it is refused at `create`. |
+| — | `accounts.session.objectMirrors` | `true` to create new private-session containers with one read-only bind per registered repository, at `/mirrors/<slug>/objects`, from this host's origin-only object mirror (#14680); each bound clone's sole object alternate names exactly that path. Unset/`false` (the default) keeps fully private clones. A mirror that cannot be proved or fetched skips that repository, never the session. Opting in is one-way per seat: a clone that already borrows keeps needing its bind, so with the flag back off the seat's next recreation carries no bind and preparation refuses fail-closed — "workspace must own a real clone and private Git objects; its object alternate is not authorized for this session (a clone that already borrows needs its mirror bind back: restore the mirror, or re-enable accounts.session.objectMirrors)". The supported remedies are (a) restore the mirror / re-enable the flag, or (b) discard that seat's clone and re-clone; there is no supported un-borrow of a live clone. |
 
 **Precedence**: `accounts session start --image IMAGE` (the operator's own
 invocation) beats `accounts.session.image`, which beats the stock default.
@@ -10797,6 +10883,17 @@ a reconciler that is opted out, or a restart the reconciler does not make
 (changed profile control files), is in
 [`guardrail-parity-codex.md`](guardrail-parity-codex.md#restarting-or-recreating-session-containers-by-hand).
 
+**No daemon at all (session-only hosts, #14912).** On an attended host
+running sessions without `loom-daemon` (#12708) there is no reconcile pass;
+what recovers a seat after a Docker engine restart is Docker's own
+`--restart unless-stopped` policy, which `accounts session start` sets on
+both host-mounted (#10452) and private-clone (#14912) seats. A one-time
+`docker update --restart unless-stopped` migrates a running, unheld legacy
+seat in place; an operator-stopped account stays held and down; recreating
+a missing container remains the operator's `session start`. The procedure
+and the disposable-host check are in `docker/session/README.md` § "Seat
+restart policy and engine-restart recovery (issue #14912)".
+
 **Mount drift (#10364).** A host-mode container's workspace mounts are fixed
 when it is created, so a later `loom-daemon workspace add` never reaches it
 (every Codex tick in the new repository fails `chdir to cwd`) and a later
@@ -10931,7 +11028,7 @@ yields `not-running`.
 
 ### Autonomous periodic support-role runner (#4015)
 
-> **Step dispatch (#11894, live since #11909).** The item roles (Curator, Champion promote and merge, Judge, Doctor) are dispatched as steps by the work finder, never on these intervals: Curator, Judge and Doctor named in `roles` or `onIdle` are ignored with a warning, and `demandWidth` doesn't apply to them. Champion runs here as `/loom:champion --non-item` only; `championMode` is retired and ignored with a warning. The two concurrency budgets merge in #11911. See [`docs/design/work-finder-step-dispatch.md`](https://github.com/rjwalters/loom/blob/main/docs/design/work-finder-step-dispatch.md) §12. The Judge CI gate (#12003) lives on the step path too (#12042): a Judge step whose PR head has CI running is a `ci_pending` pass until CI concludes, and a `ci_pending` no-op cools down for 10 min, not the 1 h no-op window ([`pr-planning.md`](pr-planning.md)).
+> **Step dispatch (#11894, live since #11909).** The item roles (Curator, Champion promote and merge, Judge, Doctor) are dispatched as steps by the work finder, never on these intervals: Curator, Judge and Doctor named in `roles` or `onIdle` are ignored with a warning, and `demandWidth` doesn't apply to them. Champion runs here as `/loom:champion --non-item` only; `championMode` is retired and ignored with a warning. The two concurrency budgets merge in #11911. See [`docs/design/work-finder-step-dispatch.md`](https://github.com/2AMLogic/loom/blob/main/docs/design/work-finder-step-dispatch.md) §12. The Judge CI gate (#12003) lives on the step path too (#12042): a Judge step whose PR head has CI running is a `ci_pending` pass until CI concludes, and a `ci_pending` no-op cools down for 10 min, not the 1 h no-op window ([`pr-planning.md`](pr-planning.md)).
 
 Before this loop, the periodic **standalone** support roles — Champion,
 Curator, Judge, Auditor, Guide — ran ONLY via GitHub Actions cron
@@ -11121,6 +11218,24 @@ naming a runtime that never launches is simply never matched.
   and not validated against a vocabulary — the runtime owns that list (the
   sweep-dispatch path forwards `effort` the same way), so a bad level fails the
   tick loudly at the CLI instead of being silently dropped.
+- **An unqualified tier reconciles against a native profile's
+  `allowedEfforts` (#14963).** A bare `roleEfforts.<role>` or the global
+  `effort` is a runtime-neutral default, so it may name a level a native
+  model profile's vocabulary does not include. When the launch it reaches is
+  a native one (`opencode`, `pi`, `kimi`) whose selected profile (the
+  preference tap's `modelProfile`, then `LOOM_MODEL_PROFILE`,
+  `runtimes.defaultModelProfile`, then the bundled `zai-flash`) declares an
+  `allowedEfforts` list that does not contain the value, the daemon drops
+  the override and the child launches with the profile's own `effort`
+  instead of the launch being refused before the CLI starts
+  (`profile_selection`, exit 78). The drop is logged, and the per-tick
+  header's source names it, e.g.
+  `effort=<runtime CLI default> (source=autonomous.roleRunner.roleEfforts.builder (profile default for opencode:zai-flash))`.
+  A runtime-qualified `roleEfforts.<role>@<runtime>` entry is an explicit
+  statement of intent about that runtime and is **never** dropped: a value
+  the profile disallows is still forwarded and still refused loudly — pin it
+  inside the profile's vocabulary instead (`"builder@opencode": "high"`).
+  Claude and Codex launches are unaffected.
 - **Keys are trimmed + lower-cased**, matching `roleModels`/`onIdleMaxWait`, so
   a `"Judge"` config key matches the `judge` role the runner dispatches under.
 - **Logged per tick** in the header line above as
@@ -11169,6 +11284,38 @@ The same pass-through can be requested deliberately with
 `autonomous.roleRunner.roleModels.<role> = "default"` (or the global
 `autonomous.roleRunner.model`); see
 [`runtime-adapters.md` § "Per-role model override"](runtime-adapters.md#per-role-model-override-autonomousrolerunnerrolemodels).
+
+**A configured tier reconciles against a native profile's own model
+(#14962).** A `roleModels.<role>` pin (or the global
+`autonomous.roleRunner.model` / `autonomous.model`) is a runtime-neutral
+default, so it may name a model the native pick the draw landed on does not
+run: an `opencode:<profile>` candidate pins a *profile*, and
+`worker_spawn::profiles::select` refuses a launch whose `--model` differs
+from that profile's own `model` (`bare model differs from the selected
+profile`, `profile_selection`, exit 78) — before #14962 this lost whole
+Judge/Guide steps whose `roleModels.<role>` was aimed at the Claude picks.
+Both launch sites (the sweep step spawn and the role runner's invocation) now
+resolve the model through `resolve_role_runner_model_for_launch`: when the
+admitted runtime is native (`opencode`, `pi`, `kimi`) and the profile the
+launch will select (the preference tap's `modelProfile`, then
+`LOOM_MODEL_PROFILE`, `runtimes.defaultModelProfile`, then the bundled
+`zai-flash`) declares a different `model`, the configured pin is dropped and
+the child launches with the profile's own model instead of the launch being
+refused. **A qualified `provider/model` pin is kept** when no profile was
+requested (no tap `modelProfile`, no `LOOM_MODEL_PROFILE`): `select` honours it
+verbatim before any profile lookup — the documented
+`"roleModels": {"judge": "google/gemini-2.5-pro"}` shape
+(`configuring-resources.md`) — so only a bare tier name (or a qualified value
+differing from an *explicitly requested* profile's model) is dropped. The drop
+is logged, and the per-tick header's source names it, e.g.
+`model=<runtime CLI default> (source=autonomous.roleRunner.roleModels.judge (profile model for opencode:zai-flash))`.
+A model the pick itself pins (`claude/opus`, `opencode:<profile>/<model>`)
+is an explicit statement of intent about that launch and is **never** dropped:
+a value the profile disallows is still forwarded and still refused loudly —
+pin `opencode:<profile>/<the profile's model>` (or nothing) instead. Claude
+and Codex launches are unaffected, so #5028's
+`model_runtime_mismatch` refusal of a genuinely wrong cross-family pin
+survives verbatim.
 
 **Pinned models fall back one rung at selection time when their class limit
 is hit (#13873).** A model pin has no answer to an org-wide class ceiling:
@@ -11585,7 +11732,7 @@ difference between one edit and dozens. Notes:
   `source=config:autonomous.roleRunner.intervalSecs from private/shared
   defaults (/path/to/defaults.json)`.
 - Full tier semantics and the deep-merge rules:
-  [`docs/design/config-resolution-tiers.md`](https://github.com/rjwalters/loom/blob/main/docs/design/config-resolution-tiers.md).
+  [`docs/design/config-resolution-tiers.md`](https://github.com/2AMLogic/loom/blob/main/docs/design/config-resolution-tiers.md).
 
 Either way — machine-level or per-repo — the JSON block is the same shape as
 the example above:
@@ -14049,7 +14196,7 @@ and prints exactly one JSON object on stdout (every other line the script emits
 goes to stderr in this mode):
 
 ```json
-{"ok":true,"reason":null,"repo":"rjwalters/loom","target":"aarch64-apple-darwin",
+{"ok":true,"reason":null,"repo":"2AMLogic/loom","target":"aarch64-apple-darwin",
  "tag":"v0.19.24","version":"0.19.24","published_at":"2026-09-13T12:00:00Z",
  "asset_sha256":"…","installed_bin":"/Users/you/.local/bin/loom-daemon",
  "installed_version":"0.19.21","installed_commit":"…","installed_sha256":"…",
@@ -14456,7 +14603,7 @@ same warning every tick it is active, independent of `decide()`'s gates.
 
 The goal state — "file a `loom:triage` issue, watch it build" with zero operator
 dispatch — is validated by the E2E playbook at
-[`docs/autonomous-mode-e2e.md`](https://github.com/rjwalters/loom/blob/main/docs/autonomous-mode-e2e.md)
+[`docs/autonomous-mode-e2e.md`](https://github.com/2AMLogic/loom/blob/main/docs/autonomous-mode-e2e.md)
 (upstream Loom repo — not shipped to consumer installs): it walks a
 throwaway issue from `loom:triage` → Curator → `loom:issue` → work-finder
 dispatch → PR → merge, with a scripted label-transition assertion, and confirms
@@ -14870,13 +15017,13 @@ what Phase 3 deletes vs preserves".
 
 ## Related resources
 
-- **Architecture epic**: [#3449](https://github.com/rjwalters/loom/issues/3449)
+- **Architecture epic**: [#3449](https://github.com/2AMLogic/loom/issues/3449)
   (rebuild of the daemon backend).
 - **Phase A** (dispatch surface): #3452 / PR #3459.
 - **Phase B** (event bus): #3453 / PR #3460.
 - **Phase C** (monitoring + subscription tools): #3455.
 - **Migration guide**:
-  [`docs/migration/v0.10.0-shepherd-deprecation.md`](https://github.com/rjwalters/loom/blob/main/docs/migration/v0.10.0-shepherd-deprecation.md)
+  [`docs/migration/v0.10.0-shepherd-deprecation.md`](https://github.com/2AMLogic/loom/blob/main/docs/migration/v0.10.0-shepherd-deprecation.md)
   (upstream Loom repo — not shipped to consumer installs).
 - **Config resolution layer** (#4039, Epic #3835 Phase 2): a single resolver
   over private defaults + tracked `.loom-project/project.json` + ignored
@@ -14884,7 +15031,7 @@ what Phase 3 deletes vs preserves".
   existing call site — including this doc's `.loom/config.json` references
   above — has been migrated onto it yet; see follow-up #4047). Schema,
   precedence, and how it composes with `env > config > default`:
-  [`docs/design/config-resolution-tiers.md`](https://github.com/rjwalters/loom/blob/main/docs/design/config-resolution-tiers.md)
+  [`docs/design/config-resolution-tiers.md`](https://github.com/2AMLogic/loom/blob/main/docs/design/config-resolution-tiers.md)
   (upstream Loom repo — not shipped to consumer installs).
 - **`loom-daemon inflight` (#8268)**: a separate, no-daemon-required CLI
   surface — a machine-wide registry that lets a coordinator and any
@@ -14893,9 +15040,9 @@ what Phase 3 deletes vs preserves".
   Not part of the IPC/MCP surface documented above (it needs no running
   daemon process). Full reference: [`verification-ownership.md`](verification-ownership.md).
 - **Source** (upstream Loom repo — not shipped to consumer installs):
-  - [`loom-daemon/src/types.rs`](https://github.com/rjwalters/loom/blob/main/loom-daemon/src/types.rs) — IPC types.
-  - [`loom-daemon/src/sweep_registry.rs`](https://github.com/rjwalters/loom/blob/main/loom-daemon/src/sweep_registry.rs) — registry + reaper.
-  - [`loom-daemon/src/event_bus.rs`](https://github.com/rjwalters/loom/blob/main/loom-daemon/src/event_bus.rs) — pub/sub bus.
-  - [`loom-daemon/src/ipc.rs`](https://github.com/rjwalters/loom/blob/main/loom-daemon/src/ipc.rs) — request dispatcher.
-  - [`mcp-loom/src/tools/sweeps.ts`](https://github.com/rjwalters/loom/blob/main/mcp-loom/src/tools/sweeps.ts) — MCP tool definitions.
-  - [`loom-daemon/src/inflight.rs`](https://github.com/rjwalters/loom/blob/main/loom-daemon/src/inflight.rs) — the in-flight registry.
+  - [`loom-daemon/src/types.rs`](https://github.com/2AMLogic/loom/blob/main/loom-daemon/src/types.rs) — IPC types.
+  - [`loom-daemon/src/sweep_registry.rs`](https://github.com/2AMLogic/loom/blob/main/loom-daemon/src/sweep_registry.rs) — registry + reaper.
+  - [`loom-daemon/src/event_bus.rs`](https://github.com/2AMLogic/loom/blob/main/loom-daemon/src/event_bus.rs) — pub/sub bus.
+  - [`loom-daemon/src/ipc.rs`](https://github.com/2AMLogic/loom/blob/main/loom-daemon/src/ipc.rs) — request dispatcher.
+  - [`mcp-loom/src/tools/sweeps.ts`](https://github.com/2AMLogic/loom/blob/main/mcp-loom/src/tools/sweeps.ts) — MCP tool definitions.
+  - [`loom-daemon/src/inflight.rs`](https://github.com/2AMLogic/loom/blob/main/loom-daemon/src/inflight.rs) — the in-flight registry.
