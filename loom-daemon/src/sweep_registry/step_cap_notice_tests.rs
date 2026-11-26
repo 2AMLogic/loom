@@ -44,6 +44,7 @@ fn the_third_builder_run_claims_the_notice_and_the_fourth_does_not() {
         outcome: StepOutcome::new(class, reason),
         ran_for: Duration::from_secs(600),
         failure_class: None,
+        attempt: None,
     };
     struct NoForge;
     impl crate::step_dispatch::reeval_ladder::BodyForge for NoForge {

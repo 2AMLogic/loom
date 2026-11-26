@@ -664,6 +664,10 @@ pub struct SweepRegistry {
     step_cap_notices: HashMap<u32, DateTime<Utc>>,
     /// Sweep ids whose Builder `noop` / `failed` reason comment was posted (#13054).
     step_outcome_notices: std::collections::HashSet<String>,
+    /// Attempt lines per issue whose outcome comment could not be read when
+    /// they ended (#15413); folded into the next successful write so a
+    /// transient read failure never splits the history into a fresh comment.
+    step_outcome_pending: HashMap<u32, Vec<String>>,
     /// No-op re-dispatch cooldown parameters (Issue #6670). `main.rs` /
     /// [`crate::workspace_pool::WorkspacePool`] set the resolved env > config >
     /// default value at provision time, mirroring
@@ -1092,6 +1096,7 @@ impl SweepRegistry {
             step_ledger_persisted: String::new(),
             step_cap_notices: HashMap::new(),
             step_outcome_notices: std::collections::HashSet::new(),
+            step_outcome_pending: HashMap::new(),
             noop_cooldown_config: NoopCooldownConfig::default(),
             noop_cooldown: NoopCooldownTable::default(),
             decline_cooldown_config: DeclineCooldownConfig::default(),

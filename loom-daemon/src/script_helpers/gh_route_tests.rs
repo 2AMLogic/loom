@@ -335,6 +335,7 @@ fn a_json_query_and_a_repo_flag_target_their_owner() {
         root,
         false,
         None,
+        crate::cmd_out::DEFAULT_TIMEOUT,
     )
     .expect("a correctly labelled call builds");
     assert_eq!(inv.target().slug().as_deref(), Some("acme/widgets"));

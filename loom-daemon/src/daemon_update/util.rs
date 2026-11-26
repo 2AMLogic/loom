@@ -122,15 +122,6 @@ pub fn realpath(target: &Path) -> String {
     }
 }
 
-/// [`realpath`] over a `&str`, with the empty string passing straight through.
-#[must_use]
-pub fn realpath_str(target: &str) -> String {
-    if target.is_empty() {
-        return String::new();
-    }
-    realpath(Path::new(target))
-}
-
 /// `extract_commit` — the first `commit <hex>` in `loom-daemon --version`
 /// output, or `""`.
 #[must_use]
@@ -308,6 +299,5 @@ mod tests {
     #[test]
     fn realpath_of_a_nonexistent_path_is_empty_not_the_input() {
         assert_eq!(realpath(Path::new("/definitely/not/here/at/all")), "");
-        assert_eq!(realpath_str(""), "");
     }
 }
