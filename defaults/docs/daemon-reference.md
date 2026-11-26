@@ -10046,11 +10046,13 @@ preserves (fail closed):
 1. the linked ticket is `CLOSED`/`MERGED` on the repo identified by a
    worktree's `origin` remote. Every discovered origin must match the same
    registered workspace (or the daemon workspace when the registry is empty).
-   A mixed or ambiguous origin preserves the root. Only its owning workspace
-   can apply its `scratchReclaim` settings, including when workspaces share
-   a volume, home or temporary directory. The search covers the root and
-   six directory levels below it. A missing worktree, a non-GitHub origin
-   or a failed ticket lookup preserves the root.
+   HTTPS, SSH and scp-style origins for the same GitHub repository count
+   as one identity. If a registered peer has the same identity or its
+   GitHub origin cannot be resolved, the pass preserves the root. Only the
+   owning workspace can apply its `scratchReclaim` settings, including
+   when workspaces share a volume, home or temporary directory. The search
+   covers the root and six directory levels below it. A missing worktree,
+   a non-GitHub origin or a failed ticket lookup preserves the root.
 2. a `watch-pid` file at the root's top level names a dead process (absent
    passes; unreadable/unparseable counts as alive);
 3. no process has its cwd or an open file under the root;

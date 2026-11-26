@@ -269,8 +269,10 @@ fn walk_idle(path: &Path, cutoff_epoch: i64, now_epoch: i64, visited: &mut usize
     let Some(mtime) = mtime_epoch(path) else {
         return IdleProbe::Unknown;
     };
+    let recent =
+        |mtime| IdleProbe::Recent(u64::try_from(now_epoch.saturating_sub(mtime)).unwrap_or(0));
     if mtime >= cutoff_epoch || mtime > now_epoch {
-        return IdleProbe::Recent(0);
+        return recent(mtime);
     }
     let Ok(entries) = std::fs::read_dir(path) else {
         return IdleProbe::Unknown;
@@ -287,7 +289,7 @@ fn walk_idle(path: &Path, cutoff_epoch: i64, now_epoch: i64, visited: &mut usize
                 return IdleProbe::Unknown;
             };
             if m >= cutoff_epoch || m > now_epoch {
-                return IdleProbe::Recent(0);
+                return recent(m);
             }
             continue;
         }
@@ -301,7 +303,7 @@ fn walk_idle(path: &Path, cutoff_epoch: i64, now_epoch: i64, visited: &mut usize
                 return IdleProbe::Unknown;
             };
             if m >= cutoff_epoch || m > now_epoch {
-                return IdleProbe::Recent(0);
+                return recent(m);
             }
         }
     }
@@ -506,28 +508,35 @@ pub fn origin_url(worktree: &Path) -> Option<String> {
 /// and the root is preserved, never removed on a guess.
 #[must_use]
 pub fn github_slug_from_url(url: &str, gh_host: &str) -> Option<String> {
-    let (host, path) = if let Some(rest) = url.strip_prefix("https://") {
-        let (host, path) = rest.split_once('/')?;
-        (host.split(':').next()?.to_string(), path.to_string())
-    } else if let Some(rest) = url.strip_prefix("ssh://") {
-        let rest = rest.strip_prefix("git@").unwrap_or(rest);
-        let (host, path) = rest.split_once('/')?;
-        (host.to_string(), path.to_string())
+    let parsed;
+    let (host, path) = if let Some(rest) = url.strip_prefix("git@") {
+        rest.split_once(':')?
+    } else if url.starts_with("https://") || url.starts_with("ssh://") {
+        parsed = reqwest::Url::parse(url).ok()?;
+        // HTTPS parsing already folds its default port; SSH retains explicit :22.
+        if !matches!((parsed.scheme(), parsed.port()), ("https", None) | ("ssh", None | Some(22)))
+            || parsed.query().is_some()
+            || parsed.fragment().is_some()
+        {
+            return None;
+        }
+        (parsed.host_str()?, parsed.path())
     } else {
-        let rest = url.strip_prefix("git@")?;
-        let (host, path) = rest.split_once(':')?;
-        (host.to_string(), path.to_string())
+        return None;
     };
-    if host != gh_host {
-        return None;
-    }
     let path = path.trim_matches('/');
-    let name = path.strip_suffix(".git").unwrap_or(path);
-    let (owner, repo) = name.split_once('/')?;
-    if owner.is_empty() || repo.is_empty() {
+    let slug = path.strip_suffix(".git").unwrap_or(path);
+    (host.eq_ignore_ascii_case(gh_host) && crate::forge_slug::valid_slug(slug))
+        .then(|| slug.to_owned())
+}
+
+/// Read the origin of this checkout only. Git would otherwise walk up to
+/// an enclosing repository when a registered checkout has disappeared.
+fn github_origin(worktree: &Path, host: &str) -> Option<String> {
+    if !worktree.join(".git").exists() {
         return None;
     }
-    Some(format!("{owner}/{repo}"))
+    github_slug_from_url(&origin_url(worktree)?, host)
 }
 
 /// The GitHub host scratch-root repo resolution accepts.
@@ -541,22 +550,18 @@ fn gh_host() -> String {
 /// test: their configuration is just as authoritative as an enabled one's.
 fn unique_workspace_slug(workspace: &Path) -> Option<String> {
     let host = gh_host();
-    let slug_for = |path: &Path| {
-        if !path.join(".git").exists() {
-            return None;
-        }
-        github_slug_from_url(&origin_url(path)?, &host)
-    };
     let workspace = workspace.canonicalize().ok()?;
-    let slug = slug_for(&workspace)?;
+    let slug = github_origin(&workspace, &host)?;
     let registry = crate::workspace_registry::WorkspaceRegistry::load_default().ok()?;
     let roots = registry.effective_roots(&workspace);
-    if !roots.contains(&workspace)
-        || roots.iter().any(|other| {
-            other != &workspace && slug_for(other).is_some_and(|s| s.eq_ignore_ascii_case(&slug))
-        })
-    {
+    if !roots.contains(&workspace) {
         return None;
+    }
+    for peer in roots.iter().filter(|path| **path != workspace) {
+        // An unknown peer could be another checkout with its own cleanup policy.
+        if github_origin(peer, &host)?.eq_ignore_ascii_case(&slug) {
+            return None;
+        }
     }
     Some(slug)
 }
@@ -654,6 +659,12 @@ pub fn evaluate_root(root: &Path, owner: &str, probes: &ScratchRootProbes<'_>) -
     if !crate::scratch_reclaim::is_reclaimable_age(root_age, probes.max_age_secs) {
         return RootVerdict::Preserve("root younger than scratchReclaim.maxAgeHours");
     }
+    match watch_pid_state(root, probes.pid_alive) {
+        WatchPidState::Alive | WatchPidState::Unreadable => {
+            return RootVerdict::Preserve("watch-pid file names a live process");
+        }
+        WatchPidState::Dead | WatchPidState::Absent => {}
+    }
     let Some(worktrees) = find_git_worktrees(root) else {
         return RootVerdict::Preserve("worktree search could not answer (unreadable subtree)");
     };
@@ -662,8 +673,7 @@ pub fn evaluate_root(root: &Path, owner: &str, probes: &ScratchRootProbes<'_>) -
     };
     let host = gh_host();
     for worktree in &worktrees {
-        let Some(slug) = origin_url(worktree).and_then(|url| github_slug_from_url(&url, &host))
-        else {
+        let Some(slug) = github_origin(worktree, &host) else {
             return RootVerdict::Preserve("no resolvable GitHub origin repository");
         };
         if !slug.eq_ignore_ascii_case(owner) {
@@ -689,12 +699,6 @@ pub fn evaluate_root(root: &Path, owner: &str, probes: &ScratchRootProbes<'_>) -
             }
             WorktreeSafety::NotSafe(reason) => return RootVerdict::Preserve(reason),
         }
-    }
-    match watch_pid_state(root, probes.pid_alive) {
-        WatchPidState::Alive | WatchPidState::Unreadable => {
-            return RootVerdict::Preserve("watch-pid file names a live process");
-        }
-        WatchPidState::Dead | WatchPidState::Absent => {}
     }
     match (probes.ticket_finished)(probe_cwd, owner, name.ticket) {
         Some(true) => {}
@@ -1340,22 +1344,21 @@ mod tests {
 
     #[test]
     fn test_github_slug_from_url_forms() {
-        assert_eq!(
-            github_slug_from_url("https://github.com/acme/widgets.git", "github.com").as_deref(),
-            Some("acme/widgets")
-        );
-        assert_eq!(
-            github_slug_from_url("https://github.com/acme/widgets", "github.com").as_deref(),
-            Some("acme/widgets")
-        );
-        assert_eq!(
-            github_slug_from_url("git@github.com:acme/widgets.git", "github.com").as_deref(),
-            Some("acme/widgets")
-        );
-        assert_eq!(
-            github_slug_from_url("ssh://git@github.com/acme/widgets.git", "github.com").as_deref(),
-            Some("acme/widgets")
-        );
+        for url in [
+            "https://github.com/acme/widgets.git",
+            "https://github.com/acme/widgets",
+            "git@github.com:acme/widgets.git",
+            "ssh://git@github.com/acme/widgets.git",
+            "ssh://git@github.com:22/acme/widgets.git",
+            "https://alice@github.com/acme/widgets.git",
+            "https://GITHUB.COM:443/acme/widgets.git/",
+        ] {
+            assert_eq!(
+                github_slug_from_url(url, "github.com").as_deref(),
+                Some("acme/widgets"),
+                "{url}"
+            );
+        }
     }
 
     #[test]
@@ -1367,6 +1370,16 @@ mod tests {
             .is_none());
         assert!(github_slug_from_url("file:///srv/git/widgets", "github.com").is_none());
         assert!(github_slug_from_url("https://github.com/acme", "github.com").is_none());
+        for url in [
+            "ssh://git@github.com:2222/acme/widgets.git",
+            "https://github.com:8443/acme/widgets.git",
+            "https://github.com@other.example/acme/widgets.git",
+            "https://github.com/acme/widgets.git?mirror=1",
+            "https://github.com/acme/widgets/extra",
+            "https:github.com/acme/widgets",
+        ] {
+            assert!(github_slug_from_url(url, "github.com").is_none(), "{url}");
+        }
     }
 
     // ===================================================================
@@ -1383,8 +1396,8 @@ mod tests {
         backdate(root, old);
         assert_eq!(probe_idle(root, 24 * 3600, now), IdleProbe::Idle);
 
-        std::fs::write(root.join("new.txt"), b"new").unwrap();
-        assert!(matches!(probe_idle(root, 24 * 3600, now), IdleProbe::Recent(_)));
+        backdate(&root.join("old.txt"), now.timestamp() - 90);
+        assert_eq!(probe_idle(root, 24 * 3600, now), IdleProbe::Recent(90));
 
         // Unreadable subtree -> Unknown (unless running as root, where the
         // 0000 dir is still readable and the walk completes as Idle).
@@ -1412,7 +1425,7 @@ mod tests {
         // The write above is at real now; probe with now in the past so the
         // file's mtime is in the future.
         let past = Utc::now() - chrono::Duration::hours(48);
-        assert!(matches!(probe_idle(tmp.path(), 24 * 3600, past), IdleProbe::Recent(_)));
+        assert_eq!(probe_idle(tmp.path(), 24 * 3600, past), IdleProbe::Recent(0));
     }
 
     // ===================================================================
@@ -1704,7 +1717,7 @@ mod tests {
         };
         assert_eq!(
             evaluate_root(&root, "acme/widgets", &probing),
-            RootVerdict::Preserve("no git worktree inside the root")
+            RootVerdict::Preserve("watch-pid file names a live process")
         );
 
         // Dead pid passes the gate (falls through to the next).
@@ -1715,24 +1728,7 @@ mod tests {
             RootVerdict::Preserve("no git worktree inside the root")
         );
 
-        // Unparseable watch-pid counts as alive -> but the worktree gate
-        // fires first here; assert on a root with a worktree below instead.
-        let with_wt = root.join("source");
-        std::fs::create_dir_all(&with_wt).unwrap();
-        git(&with_wt, &["init", "-q", "--initial-branch=main"]);
-        git(&with_wt, &["config", "user.email", "loom@example.com"]);
-        git(&with_wt, &["config", "user.name", "Loom Test"]);
-        git(&with_wt, &["commit", "-q", "--allow-empty", "-m", "seed"]);
-        git(
-            &with_wt,
-            &[
-                "remote",
-                "add",
-                "origin",
-                "https://github.com/acme/widgets.git",
-            ],
-        );
-        git(&with_wt, &["update-ref", "refs/remotes/origin/main", "HEAD"]);
+        // A malformed marker also preserves the root before any worktree scan.
         std::fs::write(root.join("watch-pid"), "not-a-pid").unwrap();
         backdate(&root, now.timestamp() - 48 * 3600);
         assert_eq!(
@@ -2250,7 +2246,15 @@ mod tests {
         let source = candidate.join("source");
         init_main_with_origin(&source, &tmp.path().join("origin.git"));
         let url_b = "https://github.com/acme/b.git";
-        git(&source, &["remote", "set-url", "origin", url_b]);
+        git(
+            &source,
+            &[
+                "remote",
+                "set-url",
+                "origin",
+                "https://alice@GITHUB.COM/acme/b.git",
+            ],
+        );
         backdate(&candidate, Utc::now().timestamp() - 48 * 3600);
 
         let mut registry = WorkspaceRegistry::default();
@@ -2262,17 +2266,28 @@ mod tests {
         };
         let a = tmp.path().join("a");
         let b = tmp.path().join("b");
-        for (ws, url) in [(&a, "https://github.com/acme/a.git"), (&b, url_b)] {
+        let url_a = "https://github.com/acme/a.git";
+        for (ws, url) in [(&a, url_a), (&b, "ssh://git@github.com:22/Acme/B.git")] {
             std::fs::create_dir_all(ws.join(".loom")).unwrap();
             git(ws, &["init", "-q"]);
             git(ws, &["remote", "add", "origin", url]);
-            registry.add(ws, None).unwrap();
         }
+        registry.add(&b, None).unwrap();
         registry.save(&registry_file).unwrap();
         configure(&a, true, false);
         configure(&b, true, true);
         let records = Mutex::new(Vec::new());
         let run = |ws: &Path| run_for_roots(ws, &roots, &always_finished, &records);
+        let single = run(&b);
+        assert_eq!(single.planned.len(), 1);
+        assert_eq!(single.planned[0].path, candidate);
+        assert!(single.removed.is_empty());
+        assert!(candidate.is_dir());
+
+        registry.add(&a, None).unwrap();
+        registry.save(&registry_file).unwrap();
+        reset_state_for_test();
+        records.lock().unwrap().clear();
         for _ in 0..2 {
             assert!(run(&a).removed.is_empty());
             run(&b);
@@ -2281,7 +2296,7 @@ mod tests {
         assert_eq!(events.len(), 1);
         assert!(events[0].dry_run);
         assert_eq!(events[0].path, candidate);
-        assert_eq!(events[0].repo, "acme/b");
+        assert!(events[0].repo.eq_ignore_ascii_case("acme/b"));
         assert!(candidate.is_dir());
 
         configure(&b, false, false);
@@ -2291,12 +2306,26 @@ mod tests {
         assert_eq!(records.lock().unwrap().len(), 1);
         assert!(candidate.is_dir());
 
-        // A second registered checkout of B cannot inherit authority over it.
+        // Both can now claim the same candidate using different transports.
         git(&a, &["remote", "set-url", "origin", url_b]);
-        reset_state_for_test();
-        assert!(run(&a).removed.is_empty());
-        assert_eq!(records.lock().unwrap().len(), 1);
-        assert!(candidate.is_dir());
+        configure(&b, true, true);
+        let assert_no_actions = || {
+            reset_state_for_test();
+            for ws in [&a, &b] {
+                let report = run(ws);
+                assert!(report.planned.is_empty());
+                assert!(report.removed.is_empty());
+            }
+            assert_eq!(records.lock().unwrap().len(), 1);
+            assert!(candidate.is_dir());
+        };
+        assert_no_actions();
+        configure(&b, false, false);
+        assert_no_actions();
+
+        // Without B's origin, A still cannot prove unique ownership.
+        git(&b, &["remote", "remove", "origin"]);
+        assert_no_actions();
     }
 
     #[test]
