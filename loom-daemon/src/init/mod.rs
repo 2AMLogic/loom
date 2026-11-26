@@ -63,6 +63,10 @@ pub use post_init::{update_gitignore, update_gitignore_in};
 // The credential-bearing subset of EPHEMERAL_PATTERNS (#8005): the single
 // declared class every Loom stager must refuse regardless of `.gitignore`.
 pub use post_init::{is_credential_path, CREDENTIAL_PATTERNS};
+// The daemon-written subset of EPHEMERAL_PATTERNS (#15479) that both
+// `LOOM_OWNED_PREFIXES` dirty-tree backstops must carry, re-exported for the
+// parity test in `main_health_gate/owned_paths.rs`.
+pub use post_init::{DAEMON_RUNTIME_PATTERNS, EPHEMERAL_PATTERNS};
 
 // Import the rest for internal use
 pub(crate) use git::link_dogfood_symlinks;
