@@ -503,11 +503,16 @@ fn the_cooldown_defers_a_second_pass_for_the_same_repo_only() {
     reset_state_for_test();
     let now = Utc::now();
     let a = Path::new("/repo-a");
-    assert_eq!(cooldown_reason(a, now, 1800), None);
-    record_run(a, now);
-    assert!(cooldown_reason(a, now + chrono::Duration::seconds(60), 1800).is_some());
-    assert_eq!(cooldown_reason(a, now + chrono::Duration::seconds(1801), 1800), None);
-    assert_eq!(cooldown_reason(Path::new("/repo-b"), now, 1800), None);
+    assert_eq!(COOLDOWN.deferred_reason(a, now, 1800), None);
+    COOLDOWN.record(a, now);
+    assert_eq!(
+        COOLDOWN
+            .deferred_reason(a, now + chrono::Duration::seconds(60), 1800)
+            .as_deref(),
+        Some("a pass ran 60s ago (cooldown 1800s)")
+    );
+    assert_eq!(COOLDOWN.deferred_reason(a, now + chrono::Duration::seconds(1801), 1800), None);
+    assert_eq!(COOLDOWN.deferred_reason(Path::new("/repo-b"), now, 1800), None);
     reset_state_for_test();
 }
 
