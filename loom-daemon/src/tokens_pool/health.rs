@@ -537,12 +537,7 @@ pub fn record_terminal_for_model_with_reset(
         reset_at,
         provenance,
         now_epoch_secs(),
-    )?;
-    if classification == TerminalClassification::Success && id.provider == AccountProvider::Codex {
-        super::sandbox_seat_hold::clear_on_success(workspace, id)
-            .context("failed to release the successful Codex profile's sandbox hold")?;
-    }
-    Ok(())
+    )
 }
 
 /// Record terminal feedback with no model information: every hold it writes is
@@ -767,7 +762,12 @@ pub fn record_terminal_for_class_with_reset_at(
             .accounts
             .sort_by(|a, b| (a.provider as u8, &a.name).cmp(&(b.provider as u8, &b.name)));
         Ok(())
-    })
+    })?;
+    if classification == TerminalClassification::Success && id.provider == AccountProvider::Codex {
+        super::sandbox_seat_hold::clear_on_success(workspace, id)
+            .context("failed to release the successful Codex profile's sandbox hold")?;
+    }
+    Ok(())
 }
 
 /// Conclusive result of a *proactive* auth-state probe (issue #6927). Only
