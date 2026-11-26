@@ -1073,3 +1073,68 @@ fn spawning_the_deferred_publisher_logs_a_self_spawn_start_line_only() {
     assert!(!starts[0].1.contains("hunter2"), "{}", starts[0].1);
     assert!(!logs.iter().any(|(_, m)| m.starts_with("self_spawn exit")), "{logs:?}");
 }
+
+// --- Strict admission of a dispatched claim (#14376) ---------------------------
+
+fn dispatched_outcome(rows: &[crate::cli::lease_co_occupancy::LeaseRow]) -> Outcome {
+    dispatched_claimant_outcome(rows, chrono::Utc::now(), ttl(), &mine(), "original-session")
+}
+
+#[test]
+fn a_dispatcher_that_still_owns_the_lease_is_admitted() {
+    let rows = [lease_row("h-me", "original-session", 30)];
+    assert_eq!(dispatched_outcome(&rows), Outcome::AlreadyDispatched);
+}
+
+#[test]
+fn a_displaced_dispatcher_is_a_peer_owned_refusal() {
+    // The original lease lapsed and a same-host sibling acquired the claim.
+    let rows = [
+        lease_row("h-me", "original-session", 3600),
+        lease_row("h-me", "peer-session", 30),
+    ];
+    let outcome = dispatched_outcome(&rows);
+    assert_eq!(
+        outcome,
+        Outcome::DispatchedDisplaced {
+            host: "h-me".to_string(),
+            sweep_id: "peer-session".to_string()
+        }
+    );
+    assert_eq!(outcome.ownership(), Ownership::PeerOwned);
+    // A live peer beside a live original is still a refusal.
+    let both = [
+        lease_row("h-me", "original-session", 30),
+        lease_row("h-other", "peer-session", 30),
+    ];
+    assert_eq!(dispatched_outcome(&both).ownership(), Ownership::PeerOwned);
+}
+
+#[test]
+fn a_dispatched_claim_with_no_live_own_lease_is_indeterminate() {
+    assert_eq!(dispatched_outcome(&[]).ownership(), Ownership::Indeterminate);
+    let expired = [lease_row("h-me", "original-session", 3600)];
+    assert_eq!(dispatched_outcome(&expired).ownership(), Ownership::Indeterminate);
+    // Same sweep id from another host is not the dispatched claimant.
+    let other_host = [lease_row("h-other", "original-session", 30)];
+    assert_eq!(dispatched_outcome(&other_host).ownership(), Ownership::PeerOwned);
+}
+
+#[test]
+fn strict_dispatched_admission_without_evidence_is_indeterminate_but_plain_ensure_is_unchanged() {
+    let dir = checkout(PUBLISH_OK, RENEW_OK);
+    let env = SessionEnv {
+        dispatched_issue: Some("8193".to_string()),
+        session_present: true,
+        ..Default::default()
+    };
+    let mut strict = args(&dir);
+    strict.require_ownership = true;
+    assert_eq!(strict.ensure(&env).ownership(), Ownership::Indeterminate);
+    // Forge without `gh` rows (Gitea) keeps the daemon-publish trust.
+    let gitea = SessionEnv {
+        lease_rows_unsupported: true,
+        ..env
+    };
+    assert_eq!(strict.ensure(&gitea), Outcome::AlreadyDispatched);
+}

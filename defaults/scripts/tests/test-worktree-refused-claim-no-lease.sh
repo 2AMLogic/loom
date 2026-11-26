@@ -101,6 +101,7 @@ cat > "$TMP/shim/git" <<SHIMEOF
 if [[ "\${GIT_SHIM_FAIL_ADD:-}" == "1" && "\${1:-}" == "worktree" && "\${2:-}" == "add" ]]; then
     echo "fatal: simulated worktree add failure" >&2; exit 1
 fi
+[[ "\${1:-}" == "worktree" && "\${2:-}" == "add" ]] && echo "\$*" >> "$TMP/git-add.log"
 exec "$REAL_GIT" "\$@"
 SHIMEOF
 chmod +x "$TMP/shim/git"
@@ -283,7 +284,7 @@ echo "Test 20: indeterminate ownership (exit 0) and Doctor origin reuse keep the
 git checkout -q -b feature/issue-520 && echo w > w520.txt && git add w520.txt && git commit -q -m w520
 git push -q origin feature/issue-520 && git checkout -q main && git branch -D -q feature/issue-520
 git fetch -q origin
-STUB_OWNERSHIP_RC=4 run_wt 520
+STUB_OWNERSHIP_RC=4 STUB_STANDALONE=1 run_wt 520
 if [[ "$RC" -eq 0 ]] && grep -q '^lease ensure 520 --watch-pid' "$LOG" && ! grep -q -- '--require-ownership' "$LOG"; then pass "authorized branch reuse unaffected"; else fail "rc=$RC"; cat "$LOG" "$TMP/out.log"; fi
 
 echo "Test 23: standalone (non-Builder) fresh creation keeps the fail-open lease even when ownership is unverifiable"
@@ -301,6 +302,27 @@ if [[ "$RC" -ne 0 && "$(lease_calls)" -eq 0 ]]; then pass "unclaimed Builder reu
 rm .loom/worktrees/issue-524/.loom-unclaimed
 run_wt 524
 if [[ "$RC" -eq 0 ]]; then pass "ready managed checkout remains reusable"; else fail "ready checkout refused"; cat "$TMP/out.log"; fi
+
+echo "Test 27: Builder on an existing LOCAL branch, peer owns -> refused, branch kept, no lease/hook"
+git branch feature/issue-527
+rm -f "$STUB_HOOK_MARK"
+STUB_OWNERSHIP_RC=4 STUB_OWNERSHIP_TOKEN=PEER_OWNED run_wt 527
+if [[ "$RC" -ne 0 && ! -e .loom/worktrees/issue-527/.git && ! -e "$STUB_HOOK_MARK" ]] && grep -q '^lease ensure 527 --require-ownership' "$LOG"; then pass "local-branch Builder refused by strict ownership"; else fail "rc=$RC"; cat "$LOG" "$TMP/out.log"; fi
+if git show-ref --verify --quiet refs/heads/feature/issue-527; then pass "pre-existing local branch preserved"; else fail "pre-existing branch deleted"; fi
+
+echo "Test 28: Builder on an existing ORIGIN branch, peer owns -> refused, origin branch kept, no hook"
+git checkout -q -b feature/issue-528 && echo w > w528.txt && git add w528.txt && git commit -q -m w528
+git push -q origin feature/issue-528 && git checkout -q main && git branch -D -q feature/issue-528
+git fetch -q origin
+STUB_OWNERSHIP_RC=4 STUB_OWNERSHIP_TOKEN=PEER_OWNED run_wt 528
+if [[ "$RC" -ne 0 && ! -e .loom/worktrees/issue-528/.git && ! -e "$STUB_HOOK_MARK" ]] && grep -q '^lease ensure 528 --require-ownership' "$LOG"; then pass "origin-branch Builder refused by strict ownership"; else fail "rc=$RC"; cat "$LOG" "$TMP/out.log"; fi
+if git ls-remote --exit-code --heads origin feature/issue-528 >/dev/null; then pass "origin branch untouched"; else fail "origin branch lost"; fi
+
+echo "Test 29: Gitea (check-claim declined, exit 3) with a visible peer lease -> refused BEFORE git worktree add"
+: > "$TMP/git-add.log"
+STUB_CHECK_CLAIM_RC=3 STUB_OWNERSHIP_RC=4 STUB_OWNERSHIP_TOKEN=PEER_OWNED run_wt 529
+if [[ "$RC" -ne 0 && ! -s "$TMP/git-add.log" ]]; then pass "no git worktree add on a declined probe with a peer lease"; else fail "rc=$RC adds=$(cat "$TMP/git-add.log")"; cat "$LOG" "$TMP/out.log"; fi
+if git show-ref --verify --quiet refs/heads/feature/issue-529; then fail "branch allocated"; else pass "no branch allocated"; fi
 
 echo
 echo "Tests run: $TESTS_RUN, failed: $TESTS_FAILED"

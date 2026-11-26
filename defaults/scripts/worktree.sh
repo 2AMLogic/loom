@@ -1600,14 +1600,40 @@ _wt_lease_claim_owned() {
     return 0
 }
 
+# Print the refusal for a non-zero `_wt_lease_claim_owned` result and exit 1.
+_wt_ownership_refusal() {
+    local _own_rc="$1"
+    local _own_tok=PEER_OWNED
+    if [[ "$_own_rc" -eq 4 ]]; then
+        print_error "Issue #$ISSUE_NUMBER is owned by a peer (live lease held by another sweep); refusing to hand over a worktree. The peer's labels, lease and branch are untouched."
+    else
+        _own_tok=OWNERSHIP_UNVERIFIED
+        if [[ "$_own_rc" -eq 6 ]]; then
+            _own_tok=DAEMON_INCOMPATIBLE
+            print_error "Issue #$ISSUE_NUMBER: loom-daemon is missing or did not recognize lease ensure --require-ownership; refusing to hand over a worktree."
+            print_error "Update loom-daemon with .loom/scripts/cli/loom-daemon-update.sh --fetch and retry."
+        else
+            print_error "Issue #$ISSUE_NUMBER: ownership could not be positively verified (lease ensure --require-ownership did not report OWNED); refusing to hand over a worktree."
+        fi
+    fi
+    if [[ "$JSON_OUTPUT" == "true" ]]; then
+        echo '{"success": false, "error": "'"$_own_tok"'", "issueNumber": '"$ISSUE_NUMBER"'}' >&3
+    else
+        echo "$_own_tok" >&3
+    fi
+    exit 1
+}
+
 # The checkout this invocation JUST created for a refused Builder claim: it is at
 # BASE_REF with no commits and no `.loom-managed` sentinel, so removing it (and
 # its fresh branch) leaves the peer's state untouched. If git cannot remove it,
 # mark it so cleanup can tell it is unclaimed.
 _wt_discard_unclaimed() {
-    local _path="$1" _branch="$2"
+    local _path="$1" _branch="$2" _keep_branch="${3:-}"
     if git worktree remove --force "$_path" >/dev/null 2>&1; then
-        git branch -D "$_branch" >/dev/null 2>&1 || true
+        # A branch that existed before this invocation (local or origin reuse) is
+        # a peer's or a prior cycle's work: only the checkout is discarded.
+        [[ -n "$_keep_branch" ]] || git branch -D "$_branch" >/dev/null 2>&1 || true
     else
         echo "unclaimed: issue #$ISSUE_NUMBER is held by a peer lease; safe to remove" > "$_path/.loom-unclaimed" 2>/dev/null || true
     fi
@@ -1678,6 +1704,10 @@ fi
 # Set only on the fresh-branch Builder-claim arm below (#14376): origin/local branch
 # reuse (a Doctor continuing a PR) and standalone operations keep the fail-open lease.
 _WT_FRESH_BUILDER_CLAIM=false
+# Pre-existing LOCAL branch reused for a NEW checkout: strict admission still
+# applies to a Builder claim (#14376), but a refusal keeps the branch.
+_WT_PREEXISTING_BRANCH=false
+_wt_builder_strict() { [[ "${LOOM_SWEEP_CLAIM_OWNED:-}" == "$ISSUE_NUMBER" || "${LOOM_BUILDER_CLAIM:-}" == "1" ]]; }
 
 # Check if branch already exists
 if git show-ref --verify --quiet "refs/heads/$BRANCH_NAME"; then
@@ -1691,6 +1721,8 @@ if git show-ref --verify --quiet "refs/heads/$BRANCH_NAME"; then
     # loom-daemon/src/worktree_cli/branch_reuse.rs.
     _worktree_branch_reuse
 
+    _WT_PREEXISTING_BRANCH=true
+    ! _wt_builder_strict || _WT_FRESH_BUILDER_CLAIM=true
     CREATE_ARGS=("$WORKTREE_PATH" "$BRANCH_NAME")
 else
     # No local branch by this name. Before falling back to a fresh branch off
@@ -1719,6 +1751,9 @@ else
                 print_warning "origin/$BRANCH_NAME has diverged from $BASE_DISPLAY (does not contain all of its history) - tracking origin/$BRANCH_NAME as-is"
             fi
         fi
+        # The LOCAL branch is created by this invocation (origin's is untouched
+        # by a refusal), so a refusal may drop it with the checkout.
+        ! _wt_builder_strict || _WT_FRESH_BUILDER_CLAIM=true
         CREATE_ARGS=("$WORKTREE_PATH" "-b" "$BRANCH_NAME" "origin/$BRANCH_NAME")
     else
         # --- Pre-creation claim probe (#9453 Phase 1; fresh-branch only, #9828) ---
@@ -1758,7 +1793,20 @@ else
         fi
         # requires-daemon: forge optional   #9453 — `forge check-claim` at worktree creation; without it (absent or pre-#9453 binary) no pre-create OPEN_PR gate is performed and creation proceeds as before
         # shellcheck disable=SC2015  # the trailing `|| true` IS the fail-open path: only exit 0 (blocked) refuses
-        [[ -n "$_WT_DAEMON_BIN" ]] && "$_WT_DAEMON_BIN" forge check-claim "$ISSUE_NUMBER" ${_wt_claim_flags[@]+"${_wt_claim_flags[@]}"} >&3 && exit 1 || true
+        _cc_rc=1
+        if [[ -n "$_WT_DAEMON_BIN" ]]; then
+            _cc_rc=0
+            "$_WT_DAEMON_BIN" forge check-claim "$ISSUE_NUMBER" ${_wt_claim_flags[@]+"${_wt_claim_flags[@]}"} >&3 || _cc_rc=$?
+            [[ "$_cc_rc" -ne 0 ]] || exit 1
+        fi
+        # Exit 3 = the probe declined (Gitea: legs 1-3 are GitHub-only). A strict
+        # Builder claim must not allocate a branch and checkout while a peer lease
+        # is already visible, so read ownership BEFORE `git worktree add` (#14376).
+        if [[ "$_cc_rc" -eq 3 && "$_WT_FRESH_BUILDER_CLAIM" == "true" ]]; then
+            _pre_rc=0
+            _wt_lease_claim_owned || _pre_rc=$?
+            [[ "$_pre_rc" -eq 0 ]] || _wt_ownership_refusal "$_pre_rc"
+        fi
         # Create new branch from the base ref (origin/$DEFAULT_BRANCH by default, or
         # the --base override for a stacked child — #3729).
         [[ "$JSON_OUTPUT" == "true" ]] || print_info "Creating new branch from $BASE_DISPLAY"
@@ -1890,26 +1938,12 @@ if _try_worktree_add; then
         _own_rc=0
         _wt_lease_claim_owned || _own_rc=$?
         if [[ "$_own_rc" -ne 0 ]]; then
-            _wt_discard_unclaimed "$WORKTREE_PATH" "$BRANCH_NAME"
-            _own_tok=PEER_OWNED
-            if [[ "$_own_rc" -eq 4 ]]; then
-                print_error "Issue #$ISSUE_NUMBER is owned by a peer (live lease held by another sweep); refusing to hand over a worktree. The peer's labels, lease and branch are untouched."
+            if [[ "$_WT_PREEXISTING_BRANCH" == "true" ]]; then
+                _wt_discard_unclaimed "$WORKTREE_PATH" "$BRANCH_NAME" keep-branch
             else
-                _own_tok=OWNERSHIP_UNVERIFIED
-                if [[ "$_own_rc" -eq 6 ]]; then
-                    _own_tok=DAEMON_INCOMPATIBLE
-                    print_error "Issue #$ISSUE_NUMBER: loom-daemon is missing or did not recognize lease ensure --require-ownership; refusing to hand over a worktree."
-                    print_error "Update loom-daemon with .loom/scripts/cli/loom-daemon-update.sh --fetch and retry."
-                else
-                    print_error "Issue #$ISSUE_NUMBER: ownership could not be positively verified (lease ensure --require-ownership did not report OWNED); refusing to hand over a worktree."
-                fi
+                _wt_discard_unclaimed "$WORKTREE_PATH" "$BRANCH_NAME"
             fi
-            if [[ "$JSON_OUTPUT" == "true" ]]; then
-                echo '{"success": false, "error": "'"$_own_tok"'", "issueNumber": '"$ISSUE_NUMBER"'}' >&3
-            else
-                echo "$_own_tok" >&3
-            fi
-            exit 1
+            _wt_ownership_refusal "$_own_rc"
         fi
     else
         _wt_lease_claim

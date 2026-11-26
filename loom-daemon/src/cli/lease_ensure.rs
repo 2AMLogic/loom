@@ -240,6 +240,12 @@ pub(crate) struct SessionEnv {
     /// The issue's trusted lease + lease-yield comments, when they were read
     /// (#13252). `None` = unread, so no reuse is attempted.
     pub(crate) lease_rows: Option<Vec<super::lease_co_occupancy::LeaseRow>>,
+    /// `LOOM_SWEEP_ID`: the dispatched claimant a strict admission must find
+    /// holding the live lease (#14376).
+    pub(crate) own_sweep: Option<String>,
+    /// The forge cannot be read through `gh` (Gitea), so a dispatched claim
+    /// keeps the daemon-publish trust it had before strict admission.
+    pub(crate) lease_rows_unsupported: bool,
 }
 
 impl SessionEnv {
@@ -262,6 +268,8 @@ impl SessionEnv {
             session_present: SESSION_MARKERS.iter().any(|k| non_empty(k).is_some()),
             run_id_set: non_empty("LOOM_SWEEP_RUN_ID").is_some(),
             lease_rows: None,
+            own_sweep: non_empty("LOOM_SWEEP_ID"),
+            lease_rows_unsupported: false,
         }
     }
 
@@ -278,6 +286,7 @@ impl SessionEnv {
         // comments through the Gitea API itself and reuses its own fresh lease,
         // so no `gh` call is made on a Gitea checkout.
         if crate::forge_cmd::detect_forge(Some(&root)) == crate::forge_cmd::ForgeType::Gitea {
+            self.lease_rows_unsupported = true;
             return self;
         }
         let policy = crate::comment_trust::TrustPolicy::for_root(&root);
@@ -312,6 +321,34 @@ pub(crate) fn reusable_lease(
         return None;
     }
     (own.len() == 1).then(|| own.into_iter().next()).flatten()
+}
+
+/// Strict admission of a dispatched claim (#14376). Pure. Owned only when the
+/// dispatched claimant (`own`, on one of this host's ids) holds a live lease and
+/// no other sweep does; any other live lease is a displacing peer; no live lease
+/// at all proves nothing.
+pub(crate) fn dispatched_claimant_outcome(
+    rows: &[super::lease_co_occupancy::LeaseRow],
+    now: chrono::DateTime<chrono::Utc>,
+    ttl: chrono::Duration,
+    mine: &[String],
+    own: &str,
+) -> Outcome {
+    let live = super::lease_co_occupancy::live_pairs(rows, now, ttl);
+    let is_own = |(h, s): &(String, String)| s == own && mine.contains(h);
+    if let Some((host, sweep_id)) = live.iter().find(|p| !is_own(p)) {
+        return Outcome::DispatchedDisplaced {
+            host: host.clone(),
+            sweep_id: sweep_id.clone(),
+        };
+    }
+    if live.iter().any(is_own) {
+        Outcome::AlreadyDispatched
+    } else {
+        Outcome::DispatchedUnverified(
+            "no live lease is held by the dispatched claimant".to_string(),
+        )
+    }
 }
 
 /// The lease identity an attended session publishes under (#10570): stable for
@@ -382,6 +419,12 @@ pub(crate) enum Outcome {
     /// This host's live lease from the orchestrator was reused (#13252): no
     /// second lease comment, no second renewer.
     ReusedExisting { host: String, sweep_id: String },
+    /// Strict admission of a dispatched claim (#14376): the live lease belongs
+    /// to a different sweep than the dispatched claimant.
+    DispatchedDisplaced { host: String, sweep_id: String },
+    /// Strict admission of a dispatched claim: the claimant's own live lease
+    /// could not be positively found (unread, no identity, or expired).
+    DispatchedUnverified(String),
     /// Published (or already held) and the renewal loop is running.
     Renewing {
         host: String,
@@ -412,7 +455,9 @@ impl Outcome {
             | Self::ReusedExisting { .. }
             | Self::Renewing { .. }
             | Self::RenewalFailed(_) => Ownership::Owned,
-            Self::PublishDeclined(Some(EX_PEER_OWNED)) => Ownership::PeerOwned,
+            Self::PublishDeclined(Some(EX_PEER_OWNED)) | Self::DispatchedDisplaced { .. } => {
+                Ownership::PeerOwned
+            }
             _ => Ownership::Indeterminate,
         }
     }
@@ -430,6 +475,14 @@ impl Outcome {
                 "issue #{issue} already carries this host's live lease (host={host} \
                  sweep={sweep_id}) — reusing it: no second lease published, no second renewer \
                  started (its owner keeps it fresh)"
+            ),
+            Self::DispatchedDisplaced { host, sweep_id } => format!(
+                "issue #{issue} is dispatched, but its live lease belongs to another sweep \
+                 (host={host} sweep={sweep_id}), not the dispatched claimant — refusing"
+            ),
+            Self::DispatchedUnverified(why) => format!(
+                "issue #{issue} is dispatched, but the claimant's own live lease could not be \
+                 verified: {why}"
             ),
             Self::NoAgentSession => format!(
                 "no agent session in the environment (none of {}) — not publishing a lease for \
@@ -483,7 +536,10 @@ impl LeaseEnsureArgs {
             return Ok(());
         }
         let env = SessionEnv::from_process();
-        let env = if self.require_ownership || env.run_id_set || env.dispatched_issue.is_some() {
+        let strict_dispatched = self.require_ownership && self.names_dispatched(&env);
+        let env = if strict_dispatched {
+            env.with_lease_rows(&self)
+        } else if self.require_ownership || env.run_id_set || env.dispatched_issue.is_some() {
             env
         } else {
             env.with_lease_rows(&self)
@@ -517,6 +573,35 @@ impl LeaseEnsureArgs {
         Ok(())
     }
 
+    fn names_dispatched(&self, env: &SessionEnv) -> bool {
+        env.dispatched_issue
+            .as_deref()
+            .is_some_and(|d| d == self.issue.to_string())
+    }
+
+    /// A dispatched claim. Without `--require-ownership` the marker alone is
+    /// enough (#8193). Strict admission (#14376) also checks that the live lease
+    /// is the dispatched claimant's own: a sibling that acquired the claim after
+    /// the original lease lapsed must not be admitted on the strength of the
+    /// inherited marker.
+    fn dispatched_outcome(&self, env: &SessionEnv) -> Outcome {
+        if !self.require_ownership || env.lease_rows_unsupported {
+            return Outcome::AlreadyDispatched;
+        }
+        let (Some(rows), Some(own)) = (env.lease_rows.as_deref(), env.own_sweep.as_deref()) else {
+            return Outcome::DispatchedUnverified(
+                "no lease rows or no LOOM_SWEEP_ID to compare".to_string(),
+            );
+        };
+        dispatched_claimant_outcome(
+            rows,
+            chrono::Utc::now(),
+            reuse_ttl(),
+            &super::lease_release::my_host_ids(),
+            own,
+        )
+    }
+
     /// The two outcomes settled from the environment alone, before any script
     /// runs or the forge is touched. Neither starts a publisher or a renewer.
     fn settled_early(&self, env: &SessionEnv) -> Option<Outcome> {
@@ -526,12 +611,8 @@ impl LeaseEnsureArgs {
         // started renewal against this same child process (#7672) before
         // spawning it. Publishing again is safe — readers take the freshest
         // record — but leaves a duplicate lease comment on the issue, so no-op.
-        if env
-            .dispatched_issue
-            .as_deref()
-            .is_some_and(|d| d == self.issue.to_string())
-        {
-            return Some(Outcome::AlreadyDispatched);
+        if self.names_dispatched(env) {
+            return Some(self.dispatched_outcome(env));
         }
 
         if !env.session_present && !self.force {
@@ -545,7 +626,9 @@ impl LeaseEnsureArgs {
     /// are printed by [`Self::ensure`] without touching it, so a plain shell
     /// (`worktree.sh` calls this unconditionally) gets them with `mode` unset.
     pub(crate) fn reaches_forge(&self, env: &SessionEnv) -> bool {
-        self.deferred || self.settled_early(env).is_none()
+        self.deferred
+            || self.settled_early(env).is_none()
+            || (self.require_ownership && self.names_dispatched(env))
     }
 
     /// The whole decision, with the environment injected so it is testable.
