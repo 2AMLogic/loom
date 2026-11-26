@@ -43,8 +43,8 @@ echo gone > "$PC_REPO/space gone"
 git -C "$PC_REPO" add "space gone"
 # Keep literal quoting and expansion distinguishable in the path probe.
 PC_NOTES="release 'v2' notes.md"
-touch "$PC_REPO/$PC_NOTES" "$PC_REPO/"'$UNBOUND'
-git -C "$PC_REPO" add -- "$PC_NOTES" '$UNBOUND'
+touch "$PC_REPO/$PC_NOTES" "$PC_REPO/"'$UNBOUND' "$PC_REPO/"'prices$.md' "$PC_REPO/"'prices$1.md'
+git -C "$PC_REPO" add -- "$PC_NOTES" '$UNBOUND' 'prices$.md' 'prices$1.md'
 echo dash > "$PC_REPO/-"
 git -C "$PC_REPO" add ./-
 git -C "$PC_REPO" -c user.email=loom@test -c user.name=loom \
@@ -114,6 +114,14 @@ assert_allow_env "single quotes preserve a literal dollar in a tracked path" "$A
     "git checkout '\$UNBOUND'" "$PC_REPO"
 assert_deny_env "unknown expansion cannot match a literal dollar filename" "$AGENT" \
     'git checkout "$UNBOUND"' "$PC_REPO"
+assert_allow_env "a dollar before a period is literal in an unquoted path" "$AGENT" \
+    'git checkout prices$.md' "$PC_REPO"
+assert_allow_env "a dollar before a period is literal in a double-quoted path" "$AGENT" \
+    'git checkout "prices$.md"' "$PC_REPO"
+assert_allow_env "a literal dollar is preserved in an assigned path" "$AGENT" \
+    'FILE=prices$.md; git checkout "$FILE"' "$PC_REPO"
+assert_deny_env "a positional parameter cannot establish a literal dollar path" "$AGENT" \
+    'git checkout "prices$1.md"' "$PC_REPO"
 
 # --- #15003 gap 2: gh global flags before `pr checkout` ---
 assert_deny_env "gh --repo owner/repo pr checkout in primary is denied" "$AGENT" \
@@ -184,6 +192,14 @@ unset _pcm_probe _pcm_cmd _pcm_want _pcm_dl
 # --- #15003: same-command literal assignment resolves a "$VAR" checkout target ---
 assert_allow_env "BR=main; git checkout \"\$BR\" matches the literal branch" "$AGENT" \
     'BR=main; git checkout "$BR"' "$PC_REPO"
+assert_allow_env "a literal assignment on the preceding line establishes the branch" "$AGENT" \
+    $'BR=main\ngit checkout "$BR"' "$PC_REPO"
+assert_allow_env "a later literal export on its own line updates the binding" "$AGENT" \
+    $'BR=other\nexport BR=main;\n\ngit checkout "$BR"' "$PC_REPO"
+assert_deny_env "a skipped assignment on the preceding line stays unknown" "$AGENT" \
+    $'false && BR=main\ngit checkout "$BR"' "$PC_REPO"
+assert_deny_env "a background assignment on the preceding line stays unknown" "$AGENT" \
+    $'BR=main &\ngit checkout "$BR"' "$PC_REPO"
 assert_allow_env "BR=main && git switch \"\$BR\" matches the literal branch" "$AGENT" \
     'BR=main && git switch "$BR"' "$PC_REPO"
 assert_allow_env "BR=main; git checkout \$BR (unquoted) matches the literal branch" "$AGENT" \

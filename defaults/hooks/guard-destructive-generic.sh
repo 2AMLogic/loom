@@ -5131,7 +5131,7 @@ resolve_primary_mutations() {
     }
     # Expand simple parameters only. Substituted bytes are data and never
     # go back through quote removal or parameter expansion.
-    function pcm_word(raw, assignment,   out, q, i, c, tail, name, value) {
+    function pcm_word(raw, assignment,   out, q, i, c, tail, after, name, value) {
         if (raw ~ /[\001\036\037]/) return UNKNOWN   # reserved by the record format
         out = q = ""
         for (i = 1; i <= length(raw); i++) {
@@ -5149,8 +5149,16 @@ resolve_primary_mutations() {
                 else out = out c
             } else if (c == "$") {
                 tail = substr(raw, i)
+                if (!match(tail, /^\$(\{[A-Za-z_][A-Za-z0-9_]*\}|[A-Za-z_][A-Za-z0-9_]*)/)) {
+                    # Special parameters, substitutions and dollar-prefixed
+                    # quotes are unsupported. Else the dollar is literal.
+                    after = substr(tail, 2, 1)
+                    if (after != "" && (index("{([0123456789@*#?$!-", after) ||
+                        (q == "" && (after == SQ || after == DQ)))) return UNKNOWN
+                    out = out c
+                    continue
+                }
                 if (assignment || !use_bindings) return UNKNOWN
-                if (!match(tail, /^\$(\{[A-Za-z_][A-Za-z0-9_]*\}|[A-Za-z_][A-Za-z0-9_]*)/)) return UNKNOWN
                 name = substr(tail, 2, RLENGTH - 1)
                 i += RLENGTH - 1
                 if (substr(name, 1, 1) == "{") name = substr(name, 2, length(name) - 2)
@@ -5186,8 +5194,11 @@ resolve_primary_mutations() {
         for (i = 1; i <= n; i++) {
             seg = segs[i]
             sub(/^[ \t]+/, "", seg); sub(/[ \t]+$/, "", seg)
-            if (NR > 1 || (i > 1 && qsplit_op[i-1] != ";" && qsplit_op[i-1] != "&&"))
+            # A new input line continues the same shell. Check its preceding
+            # operator before skipping an empty segment (including after &).
+            if (i > 1 && qsplit_op[i-1] != ";" && qsplit_op[i-1] != "&&")
                 assignment_prefix = 0
+            if (seg == "") continue
             if (assignment_prefix && pcm_assignments(seg)) continue
             use_bindings = assignment_prefix
             assignment_prefix = 0

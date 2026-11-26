@@ -2174,8 +2174,10 @@ Builder and Doctor work in `.loom/worktrees/issue-<N>`.
   `git checkout -- <path>` and `git checkout <path>` file restores (a path
   present in the working tree, or tracked — including one deleted from the
   worktree), quoted or unquoted. Quote removal preserves literal characters in
-  filenames. A leading sequence of literal assignments (including `export`)
-  can establish the target of the next command, as in `BR=main; git checkout "$BR"`.
+  filenames, including the dollar sign in `prices$.md`. A leading sequence of
+  literal assignments (including `export`) can establish the target of the next
+  command, as in `BR=main; git checkout "$BR"` or the same two commands on
+  consecutive lines.
   A conditional or intervening command can leave the value unknown, in which
   case it cannot establish a default branch or file restore. The guard allows
   `-h` and `--help` when they occupy an option position. Also allowed are
