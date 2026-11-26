@@ -92,7 +92,7 @@ const MARKER_FILES: &[(&str, &str)] = &[
     (
         "gitea_builder.rs",
         "Gitea claim-probe lease + yield reader in lease (FETCH_SITES, #14938); authors are \
-         filtered by TrustedAuthors (allowlist + Gitea assignees roster), the Gitea stand-in \
+         filtered by TrustedAuthors (allowlist or repository write access), the Gitea stand-in \
          for author_association",
     ),
     (

@@ -222,7 +222,6 @@ fn an_unlinked_open_issue_branch_blocks_only_in_its_own_repository() {
         pr["head"]["repo"]["full_name"] = json!(repo);
         f.route(&format!("{PULLS}1"), json!([pr]));
         f.route(&format!("{PULLS}2"), json!([]));
-        f.route("/assignees", json!([{"login":"alice"}]));
         f.permission("alice", "write");
         f.defaults();
         std::fs::write(f.dir.path().join("branch"), "abc refs/heads/feature/issue-12\n").unwrap();
@@ -282,8 +281,8 @@ fn only_trusted_live_unyielded_leases_block_dispatcher_owned_claims() {
         let f = Fixture::new();
         f.route("/issues/12", issue(12, "open", &["loom:building"]));
         f.route("/issues/12/comments", rows);
-        f.route("/assignees", json!([{"login":"worker"}]));
         f.permission("worker", "write");
+        f.permission("outsider", "none");
         f.defaults();
         f.expect(CLAIM, true, code, token);
     }
@@ -346,18 +345,21 @@ fn a_successful_empty_response_cannot_hide_advertised_rows() {
 
 #[test]
 fn a_link_from_a_fork_requires_a_trusted_author() {
-    for (writers, code, token) in [
-        (json!([]), 1, ""),
-        (json!([{"login":"alice"}]), 0, "OPEN_PR #8\n"),
+    for (login, permission, code, token) in [
+        ("assignee", "read", 1, ""),
+        ("outsider", "none", 1, ""),
+        ("assignee", "write", 0, "OPEN_PR #8\n"),
+        ("site-admin", "owner", 0, "OPEN_PR #8\n"),
     ] {
         let f = Fixture::new();
         let mut pr = pull(8, "open", &[], "abc");
         pr["head"]["repo"]["full_name"] = json!("outsider/fork");
         pr["body"] = json!("Contributes to #12");
+        pr["user"]["login"] = json!(login);
         f.route(&format!("{PULLS}1"), json!([pr]));
         f.route(&format!("{PULLS}2"), json!([]));
-        f.route("/assignees", writers);
-        f.permission("alice", "write");
+        f.route("/assignees", json!([{"login":"assignee"}]));
+        f.permission(login, permission);
         f.defaults();
         f.expect(CLAIM, false, code, token);
     }
@@ -399,38 +401,27 @@ fn the_unpaged_timeline_must_account_for_every_visible_row() {
 }
 
 #[test]
-fn a_read_only_assignee_is_not_a_trusted_author() {
+fn a_lease_author_is_trusted_by_repository_permission() {
     let now = chrono::Utc::now();
     let marker = "<!-- loom:lease host=peer sweep=other -->";
-    // Gitea lists read-team members as assignees. Only write access is trust.
-    for (level, code, token) in [
-        ("read", 1, ""),
-        ("none", 1, ""),
-        ("write", 0, "LEASE_ALREADY_HELD peer other\n"),
-        ("admin", 0, "LEASE_ALREADY_HELD peer other\n"),
+    // Gitea may list a read-only team member and omit a site administrator.
+    for (login, permission, code, token) in [
+        ("assignee", "read", 1, ""),
+        ("assignee", "none", 1, ""),
+        ("assignee", "write", 0, "LEASE_ALREADY_HELD peer other\n"),
+        ("assignee", "admin", 0, "LEASE_ALREADY_HELD peer other\n"),
+        ("site-admin", "owner", 0, "LEASE_ALREADY_HELD peer other\n"),
     ] {
         let f = Fixture::new();
         f.route("/issues/12", issue(12, "open", &["loom:building"]));
         f.route(
             "/issues/12/comments",
-            json!([{"body":marker, "updated_at":now, "user":{"login":"reader"}}]),
+            json!([{"body":marker, "updated_at":now, "user":{"login":login}}]),
         );
-        f.route("/assignees", json!([{"login":"reader"}]));
-        f.permission("reader", level);
+        f.route("/assignees", json!([{"login":"assignee"}]));
+        f.permission(login, permission);
         f.defaults();
         f.expect(CLAIM, true, code, token);
-    }
-    for (level, code, token) in [("read", 1, ""), ("write", 0, "OPEN_PR #8\n")] {
-        let f = Fixture::new();
-        let mut pr = pull(8, "open", &[], "abc");
-        pr["head"]["repo"]["full_name"] = json!("outsider/fork");
-        pr["body"] = json!("Contributes to #12");
-        f.route(&format!("{PULLS}1"), json!([pr]));
-        f.route(&format!("{PULLS}2"), json!([]));
-        f.route("/assignees", json!([{"login":"alice"}]));
-        f.permission("alice", level);
-        f.defaults();
-        f.expect(CLAIM, false, code, token);
     }
 }
 
@@ -444,7 +435,7 @@ fn an_unreadable_permission_fails_closed() {
         json!([{"body":"<!-- loom:lease host=peer sweep=other -->", "updated_at":now,
                 "user":{"login":"worker"}}]),
     );
-    f.route("/assignees", json!([{"login":"worker"}]));
+    f.route("/assignees", json!([]));
     f.stub.route(
         &format!("{REPO}/collaborators/worker/permission"),
         Reply::json("403 Forbidden", json!({"message":"admins only"})),

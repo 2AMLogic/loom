@@ -126,7 +126,8 @@
 //! # Cost
 //!
 //! On Gitea the two PR legs share a paginated listing. The probe reads promotion
-//! history for merged candidates and the assignee roster for trust decisions.
+//! history for merged candidates and checks repository write access once per
+//! distinct author who needs a trust decision outside the configured allowlist.
 //! Both forges use the same label, lease, branch and verdict rules.
 
 use std::path::{Path, PathBuf};

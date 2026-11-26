@@ -262,14 +262,10 @@ impl Repository {
     }
 }
 
-/// Gitea does not supply GitHub's author_association. Its unpaginated
-/// assignees endpoint is only a candidate list: on organization repositories
-/// it also includes members of read-only teams. A candidate is trusted only
-/// when the repository permission endpoint reports write access or better.
-/// Both reads happen lazily, only when a marker or a fork PR actually needs
-/// an author decision.
+/// Gitea assignees can include readers and omit site administrators. For
+/// authors outside the allowlist, cache their effective repository permission
+/// when a lease marker or linked fork PR first needs a trust decision.
 pub(crate) struct TrustedAuthors {
-    writers: Option<Vec<String>>,
     permitted: HashMap<String, bool>,
     allowlist: Vec<String>,
 }
@@ -277,7 +273,6 @@ pub(crate) struct TrustedAuthors {
 impl TrustedAuthors {
     pub(crate) fn for_root(root: &Path) -> Self {
         Self {
-            writers: None,
             permitted: HashMap::new(),
             allowlist: allowlist_from_config(&crate::config_resolver::resolve_effective_config(
                 root,
@@ -294,23 +289,6 @@ impl TrustedAuthors {
         let author = Author::new(Some(login), None);
         if trusted_by(&author, |_| false, None, &self.allowlist) {
             return Ok(true);
-        }
-        if self.writers.is_none() {
-            let (users, count) = repo.get("assignees")?;
-            let users = users.as_array().context("expected Gitea assignees")?;
-            ensure!(count.is_none_or(|n| n == users.len()), "incomplete Gitea assignees");
-            let writers = users
-                .iter()
-                .map(|u| Ok(string(u, "login")?.to_owned()))
-                .collect::<Result<_>>()?;
-            self.writers = Some(writers);
-        }
-        let candidate = self
-            .writers
-            .as_ref()
-            .is_some_and(|writers| writers.iter().any(|w| w.eq_ignore_ascii_case(login)));
-        if !candidate {
-            return Ok(false);
         }
         let key = login.to_ascii_lowercase();
         if let Some(&writer) = self.permitted.get(&key) {
