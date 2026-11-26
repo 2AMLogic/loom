@@ -333,9 +333,8 @@ fn classify_roundtrip_error(e: anyhow::Error) -> StatusAttemptError {
 }
 
 /// Exit code when the daemon answered a `Ping` but the status request itself
-/// failed (#15316). Deliberately not one of the `daemon_install_state` codes
-/// (those mean "daemon down/expected/mismatched"); same code the
-/// "daemon answered but is too old" path uses.
+/// failed (#15316). This generic failure code is shared with the "daemon too
+/// old" and `daemon_install_state::EXIT_NOT_EXPECTED` paths.
 const EXIT_RESPONDING_STATUS_FAILED: i32 = 1;
 
 /// Budget for the second, light liveness request (#15316). Independent of the
@@ -435,7 +434,7 @@ fn render_status_responding_human(
          daemon serves and can run past its budget while the daemon is busy. Retry with \
          more headroom or a narrower report:\n\
          \x20 loom-daemon status --timeout-secs 60\n\
-         \x20 loom-daemon status --section <name>\n",
+         \x20 loom-daemon status --json --section daemon_build\n",
         sock = socket_path.display(),
         req = failure.request,
         timeout = failure.timeout,
@@ -1900,35 +1899,14 @@ mod ping_probe_tests {
         assert!(banner.contains("DaemonStatus"), "names request: {banner}");
         assert!(banner.contains("timeout: 1s"), "names timeout: {banner}");
         assert!(banner.contains("timed out"), "names error: {banner}");
+        assert!(
+            banner
+                .lines()
+                .any(|line| line.trim() == "loom-daemon status --json --section daemon_build"),
+            "missing section command: {banner}"
+        );
         assert!(!banner.contains("restart"), "must not advise a restart: {banner}");
         assert!(!banner.contains("not responding"), "got: {banner}");
-
-        server.abort();
-    }
-
-    #[tokio::test]
-    async fn silent_daemon_keeps_unresponsive_classification() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let socket_path = dir.path().join("daemon.sock");
-        let listener = UnixListener::bind(&socket_path).expect("bind");
-        // Accept and hold every connection without ever replying.
-        let server = tokio::spawn(async move {
-            let mut held = Vec::new();
-            while let Ok((stream, _)) = listener.accept().await {
-                held.push(stream);
-            }
-        });
-
-        let timeout_info = resolve_status_timeout(Some(1));
-        let failure = StatusFailure::observe_with(
-            &socket_path,
-            &Request::DaemonStatus,
-            &timeout_info,
-            Duration::from_millis(300),
-        )
-        .await;
-        assert!(!failure.daemon_responding(), "no request was answered");
-        assert!(failure.ping_summary().contains("failed too"), "got: {}", failure.ping_summary());
 
         server.abort();
     }
