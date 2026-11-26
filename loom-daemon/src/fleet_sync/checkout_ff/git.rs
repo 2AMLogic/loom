@@ -62,11 +62,25 @@ pub(super) fn run(
     args: &[&str],
     timeout: Duration,
 ) -> Result<Output, String> {
-    run_with_index(root, config, args, timeout, None)
+    run_as("checkout_ff", root, config, args, timeout, None)
 }
 
 /// [`run`], with `GIT_INDEX_FILE` set to `index` when it is `Some`.
 fn run_with_index(
+    root: &Path,
+    config: &[&str],
+    args: &[&str],
+    timeout: Duration,
+    index: Option<&Path>,
+) -> Result<Output, String> {
+    run_as("checkout_ff", root, config, args, timeout, index)
+}
+
+/// [`run_with_index`], logging the spawn under `site` (#15301): a read-only
+/// probe that reuses this module's `git` runner must not show up in
+/// `git_spawn` as a `checkout_ff` pass.
+fn run_as(
+    site: &'static str,
     root: &Path,
     config: &[&str],
     args: &[&str],
@@ -78,7 +92,7 @@ fn run_with_index(
         cmd.env("GIT_INDEX_FILE", index);
     }
     crate::credential_preflight::apply_gh_config_for_root(&mut cmd, root);
-    let result = run_logged("checkout_ff", root, cmd, timeout);
+    let result = run_logged(site, root, cmd, timeout);
     match crate::cmd_out::outcome_of(result, timeout) {
         CmdOutcome::Ran(out) => Ok(out),
         CmdOutcome::Unavailable(why) => Err(format!("git {}: {why}", args.join(" "))),
@@ -122,7 +136,19 @@ pub(super) fn stdout(out: &Output) -> String {
 
 /// [`run`], requiring exit 0. Returns trimmed stdout.
 pub(crate) fn ok(root: &Path, args: &[&str], timeout: Duration) -> Result<String, String> {
-    let out = run(root, &[], args, timeout)?;
+    ok_as("checkout_ff", root, args, timeout)
+}
+
+/// [`ok`], with the spawn logged under `site` rather than `checkout_ff`
+/// (#15301), so `daemon_root_freshness` and `prompt_tree` probes are
+/// attributable in `git_spawn`.
+pub(crate) fn ok_as(
+    site: &'static str,
+    root: &Path,
+    args: &[&str],
+    timeout: Duration,
+) -> Result<String, String> {
+    let out = run_as(site, root, &[], args, timeout, None)?;
     if out.status.success() {
         Ok(stdout(&out))
     } else {

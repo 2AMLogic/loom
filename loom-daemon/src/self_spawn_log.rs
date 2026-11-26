@@ -10,15 +10,16 @@
 //! line. A child killed by a signal (an OOM kill included) is recorded with the
 //! signal in `status`.
 //!
-//! It wraps an already-spawned [`std::process::Child`] rather than running it,
-//! so each caller keeps its own stdio and timeout handling. Only argv is
+//! [`track`] wraps an already-spawned [`std::process::Child`] rather than running it,
+//! so callers can keep their own stdio and timeout handling. `output_tracked`
+//! handles self-spawns that capture both output streams. Only argv is
 //! recorded, never the environment, so credentials set on the command (the
 //! per-owner `gh` config) cannot leak. Peak RSS comes from the same `/proc`
 //! `VmHWM` sampler the fleet-sync git children use
 //! ([`crate::fleet_sync::git_spawn_log`]); it is `None` off Linux.
 
 use std::fmt::Display;
-use std::process::Command;
+use std::process::{Command, Output, Stdio};
 use std::time::{Duration, Instant};
 
 use crate::fleet_sync::git_spawn_log::{argv_of, Sampler};
@@ -84,6 +85,20 @@ pub fn track(site: &'static str, cmd: &Command, child_pid: u32) -> Tracked {
     }
 }
 
+/// Run a self-spawn with null stdin and capture stdout and stderr separately.
+/// Log its start and exit, returning the output even for a nonzero exit status.
+pub(crate) fn output_tracked(site: &'static str, cmd: &mut Command) -> std::io::Result<Output> {
+    let child = cmd
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let tracked = track(site, cmd, child.id());
+    let out = child.wait_with_output()?;
+    tracked.finish(out.status);
+    Ok(out)
+}
+
 impl Tracked {
     /// Log and return the exit line. `status` is the child's `ExitStatus`
     /// (whose text names a fatal signal) or a caller note such as `timed out`.
@@ -117,7 +132,6 @@ impl Drop for Tracked {
 mod tests {
     use super::*;
     use std::os::unix::process::ExitStatusExt;
-    use std::process::Stdio;
 
     fn sh(script: &str) -> Command {
         let mut cmd = Command::new("sh");
@@ -126,6 +140,40 @@ mod tests {
             .stdout(Stdio::null())
             .stderr(Stdio::null());
         cmd
+    }
+
+    #[test]
+    fn output_tracked_captures_output_and_logs_start_and_exit() {
+        let mut cmd = sh("cat; printf stdout; printf stderr >&2; exit 3");
+        // Any inherited input would be copied into stdout by `cat`.
+        cmd.stdin(std::fs::File::open(concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml")).unwrap());
+        let records = crate::test_log_capture::capture_logs(|| {
+            let out = output_tracked("test_capture", &mut cmd).unwrap();
+            assert_eq!(out.stdout, b"stdout");
+            assert_eq!(out.stderr, b"stderr");
+            assert_eq!(out.status.code(), Some(3));
+        });
+        assert!(
+            records
+                .iter()
+                .any(|(_, line)| line.starts_with("self_spawn start pid=")
+                    && line.contains(" site=test_capture ")),
+            "{records:?}"
+        );
+        assert!(
+            records
+                .iter()
+                .any(|(_, line)| line.starts_with("self_spawn exit pid=")
+                    && line.contains(" site=test_capture status=exit status: 3 ")),
+            "{records:?}"
+        );
+    }
+
+    #[test]
+    fn output_tracked_returns_spawn_error() {
+        let mut cmd = Command::new("/nonexistent/loom-daemon");
+        let err = output_tracked("test_capture", &mut cmd).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
     }
 
     #[test]
