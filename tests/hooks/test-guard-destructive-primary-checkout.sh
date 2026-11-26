@@ -192,6 +192,30 @@ unset _pcm_probe _pcm_cmd _pcm_want _pcm_dl
 # --- #15003: same-command literal assignment resolves a "$VAR" checkout target ---
 assert_allow_env "BR=main; git checkout \"\$BR\" matches the literal branch" "$AGENT" \
     'BR=main; git checkout "$BR"' "$PC_REPO"
+assert_allow_env "a literal default branch after pwd is allowed" "$AGENT" \
+    'pwd; BR=main; git checkout main' "$PC_REPO"
+assert_allow_env "a fresh assignment after pwd matches the literal checkout" "$AGENT" \
+    'pwd; BR=main; git checkout "$BR"' "$PC_REPO"
+assert_allow_env "a fresh export after pwd matches the literal checkout" "$AGENT" \
+    'pwd; export BR=main; git checkout "$BR"' "$PC_REPO"
+assert_allow_env "a fresh assignment after pwd establishes the switch target" "$AGENT" \
+    'pwd; BR=main; git switch "$BR"' "$PC_REPO"
+assert_allow_env "a new assignment on its own line supersedes a skipped assignment" "$AGENT" \
+    $'false && BR=other\nBR=main\ngit checkout "$BR"' "$PC_REPO"
+assert_allow_env "an ordinary command with a variable argument permits a fresh assignment" "$AGENT" \
+    'git status --short -- "$FILE"; BR=main; git switch "$BR"' "$PC_REPO"
+assert_allow_env "a fresh literal assignment supersedes an unknown value" "$AGENT" \
+    'BR="$UNBOUND"; BR=main; git checkout "$BR"' "$PC_REPO"
+assert_deny_env "an unknown value supersedes an earlier literal assignment" "$AGENT" \
+    'pwd; BR=main; BR="$UNBOUND"; git checkout "$BR"' "$PC_REPO"
+assert_deny_env "a new assignment does not revive a stale binding of another name" "$AGENT" \
+    'BR=main; unset BR; FILE=somefile; git checkout "$BR"' "$PC_REPO"
+assert_deny_env "a conditional assignment after a continued operator stays unknown" "$AGENT" \
+    $'false &&\n\nBR=main; git checkout "$BR"' "$PC_REPO"
+assert_deny_env "assignments in a skipped compound command stay unknown" "$AGENT" \
+    'if false; then pwd; BR=main; fi; git checkout "$BR"' "$PC_REPO"
+assert_deny_env "a later assignment to a readonly variable stays unknown" "$AGENT" \
+    'readonly BR=other; BR=main; git checkout "$BR"' "$PC_REPO"
 assert_allow_env "a literal assignment on the preceding line establishes the branch" "$AGENT" \
     $'BR=main\ngit checkout "$BR"' "$PC_REPO"
 assert_allow_env "a later literal export on its own line updates the binding" "$AGENT" \

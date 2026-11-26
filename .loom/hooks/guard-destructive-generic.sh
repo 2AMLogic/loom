@@ -5120,18 +5120,19 @@ resolve_stash_cwd() {
 # tokens joined by \036 (PCMSEP) rather than spaces, so a quoted token that
 # CONTAINS spaces (`git checkout "file with spaces"`) survives the bash-side
 # re-split as one token.
-# Decode words once while their quotes are available. Only a leading sequence
-# of literal assignments can establish bindings for the next command.
+# Decode words once while their quotes are available. Consecutive literal
+# assignments in a simple command list can establish the next command's target.
 resolve_primary_mutations() {
-    printf '%s' "$1" | awk -v startcwd="$2" -v home="$HOME" "$_QSPLIT_AWK""$_CDEXPAND_AWK""$_CDQUOTE_AWK""$_MASKWS_AWK"'
+    printf '%s' "$1" | awk -v startcwd="$2" -v home="$HOME" -v shell_words="$(compgen -A keyword -b)" \
+        "$_QSPLIT_AWK""$_CDEXPAND_AWK""$_CDQUOTE_AWK""$_MASKWS_AWK"'
     BEGIN {
         PCMSEP = sprintf("%c", 30); UNKNOWN = sprintf("%c", 1)
         SQ = sprintf("%c", 39); DQ = sprintf("%c", 34); curcwd = startcwd
-        assignment_prefix = 1
+        simple_list = 1; next_op = ";"
     }
     # Expand simple parameters only. Substituted bytes are data and never
     # go back through quote removal or parameter expansion.
-    function pcm_word(raw, assignment,   out, q, i, c, tail, after, name, value) {
+    function pcm_word(raw, mode,   out, q, i, c, tail, after, name, value) {
         if (raw ~ /[\001\036\037]/) return UNKNOWN   # reserved by the record format
         out = q = ""
         for (i = 1; i <= length(raw); i++) {
@@ -5158,34 +5159,53 @@ resolve_primary_mutations() {
                     out = out c
                     continue
                 }
-                if (assignment || !use_bindings) return UNKNOWN
+                if (mode == "assignment") return UNKNOWN
                 name = substr(tail, 2, RLENGTH - 1)
                 i += RLENGTH - 1
+                # A simple expansion in an earlier argument cannot introduce
+                # shell syntax. Its value is immaterial when checking syntax.
+                if (mode == "syntax") continue
                 if (substr(name, 1, 1) == "{") name = substr(name, 2, length(name) - 2)
                 if (!(name in binding)) return UNKNOWN
                 value = binding[name]
                 if (q == "" && value !~ /^[a-zA-Z0-9_.\/-]+$/) return UNKNOWN
                 out = out value
-            } else if (c == "`" || (assignment && q == "" && c !~ /[a-zA-Z0-9_.\/-]/)) {
+            } else if (c == "`" ||
+                       (mode == "assignment" && q == "" && c !~ /[a-zA-Z0-9_.\/-]/) ||
+                       (mode == "syntax" && q == "" && c !~ /[a-zA-Z0-9_.\/:@%+=,-]/)) {
                 return UNKNOWN
             } else out = out c
         }
         return (q == "" ? out : UNKNOWN)
     }
-    # An intervening command can change shell state. Track only an initial
-    # sequence of assignment-only segments, including literal export writes.
-    function pcm_assignments(seg,   words, n, first, j, at, value) {
-        n = split(mask_ws(seg), words, /[ \t]+/)
+    # Recognize assignment-only segments, including literal export writes.
+    function pcm_assignments(words, n,   first, j, at, name, raw, value) {
         first = (words[1] == "export" ? 2 : 1)
         if (first > n) return 0
         for (j = first; j <= n; j++)
             if (words[j] !~ /^[A-Za-z_][A-Za-z0-9_]*=/) return 0
         for (j = first; j <= n; j++) {
             at = index(words[j], "=")
-            value = pcm_word(unmask_ws(substr(words[j], at + 1)), 1)
-            if (value == UNKNOWN) return 0
-            binding[substr(words[j], 1, at - 1)] = value
+            name = substr(words[j], 1, at - 1)
+            raw = unmask_ws(substr(words[j], at + 1))
+            value = pcm_word(raw, "assignment")
+            if (value == UNKNOWN) {
+                if (pcm_word(raw, "syntax") == UNKNOWN) return 0
+                delete binding[name]
+            } else binding[name] = value
         }
+        return 1
+    }
+    # A plain command ends the current bindings but permits fresh ones later.
+    # With compound syntax or a shell builtin that can change how a later
+    # assignment behaves (e.g. readonly), the scanner cannot prove that write.
+    function pcm_plain_command(words, n,   j, cmd) {
+        cmd = words[1]
+        if (cmd !~ /^[a-zA-Z0-9_.\/:+-]+$/ || shell_words == "") return 0
+        if (index("\n" shell_words "\n", "\n" cmd "\n") &&
+            cmd !~ /^(:|cd|echo|false|printf|pwd|test|true|unset)$/) return 0
+        for (j = 2; j <= n; j++)
+            if (pcm_word(unmask_ws(words[j]), "syntax") == UNKNOWN) return 0
         return 1
     }
     {
@@ -5194,14 +5214,23 @@ resolve_primary_mutations() {
         for (i = 1; i <= n; i++) {
             seg = segs[i]
             sub(/^[ \t]+/, "", seg); sub(/[ \t]+$/, "", seg)
-            # A new input line continues the same shell. Check its preceding
-            # operator before skipping an empty segment (including after &).
-            if (i > 1 && qsplit_op[i-1] != ";" && qsplit_op[i-1] != "&&")
-                assignment_prefix = 0
             if (seg == "") continue
-            if (assignment_prefix && pcm_assignments(seg)) continue
-            use_bindings = assignment_prefix
-            assignment_prefix = 0
+            # Keep a trailing operator across physical lines, including blanks.
+            before = next_op
+            next_op = (i <= qsplit_nops ? qsplit_op[i] : ";")
+            inherit_bindings = previous_assignment && (before == ";" || before == "&&")
+            if (!inherit_bindings) for (name in binding) delete binding[name]
+            if (simple_list) {
+                m = split(mask_ws(seg), words, /[ \t]+/)
+                if (pcm_assignments(words, m)) {
+                    # Only an unconditional assignment sequence can supply
+                    # values past a statement boundary.
+                    previous_assignment = (before == ";" || before == "&" || inherit_bindings)
+                    continue
+                }
+                simple_list = pcm_plain_command(words, m)
+            }
+            previous_assignment = 0
             sub(/^[ \t(){]+/, "", seg)
             sub(/^sudo[ \t]+/, "", seg)
             while (seg ~ /^[A-Za-z_][A-Za-z0-9_]*=[^ \t]*[ \t]+/) sub(/^[A-Za-z_][A-Za-z0-9_]*=[^ \t]*[ \t]+/, "", seg)
@@ -5230,14 +5259,14 @@ resolve_primary_mutations() {
             # shape. Carry only actual global help and the checkout arguments.
             if (toks[1] == "gh") {
                 k = 2; global_help = 0
-                while (k <= m && (opt = pcm_word(toks[k], 0)) ~ /^-/) {
+                while (k <= m && (opt = pcm_word(toks[k])) ~ /^-/) {
                     if (opt == "-R" || opt == "--repo") k++
                     else if (opt == "-h" || opt == "--help") global_help = 1
                     k++
                 }
                 if (k + 1 <= m && toks[k] == "pr" && toks[k+1] == "checkout") {
                     args = (global_help ? "--help" : "")
-                    for (j = k + 2; j <= m; j++) args = args (global_help || j > k + 2 ? PCMSEP : "") pcm_word(toks[j], 0)
+                    for (j = k + 2; j <= m; j++) args = args (global_help || j > k + 2 ? PCMSEP : "") pcm_word(toks[j])
                     printf "%s\037gh-pr-checkout\037%s\n", curcwd, args
                 }
                 continue
@@ -5261,7 +5290,7 @@ resolve_primary_mutations() {
             sub_ = toks[k]
             if (sub_ != "checkout" && sub_ != "switch" && sub_ != "commit") continue
             args = ""
-            for (j = k + 1; j <= m; j++) args = args (j > k + 1 ? PCMSEP : "") pcm_word(toks[j], 0)
+            for (j = k + 1; j <= m; j++) args = args (j > k + 1 ? PCMSEP : "") pcm_word(toks[j])
             printf "%s\037%s\037%s\n", gcwd, sub_, args
         }
     }'
