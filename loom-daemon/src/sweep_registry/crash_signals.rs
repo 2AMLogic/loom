@@ -110,7 +110,7 @@ pub(crate) fn dispatch_terminal_result<'a>(
     Some((parse_terminal_result_in(region)?, region))
 }
 
-fn parse_terminal_result_in(region: &str) -> Option<TerminalResult> {
+pub(crate) fn parse_terminal_result_in(region: &str) -> Option<TerminalResult> {
     let records: Vec<_> = region
         .lines()
         .filter(|line| line.starts_with(TERMINAL_RESULT_MARKER))
@@ -419,8 +419,10 @@ pub fn log_has_progress(contents: &str) -> bool {
 pub(crate) fn parse_token_name_after(contents: &str, header_anchor: &str) -> Option<String> {
     // Use the LAST header occurrence: reruns append a fresh header, and the
     // current child logs its selection after the most recent one.
-    let region_start = contents.rfind(header_anchor)?;
-    let region = &contents[region_start..];
+    parse_token_name_in(&contents[contents.rfind(header_anchor)?..])
+}
+
+pub(crate) fn parse_token_name_in(region: &str) -> Option<String> {
     let (marker_at, terminator) = if let Some(i) = region.find(ACCOUNT_LOG_MARKER) {
         (i + ACCOUNT_LOG_MARKER.len(), '\n')
     } else {

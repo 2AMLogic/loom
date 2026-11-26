@@ -123,6 +123,12 @@ impl SweepRegistry {
                 ),
             }
         }
+        tokens_pool::sandbox_seat_hold::observe_terminal(
+            &self.config.workspace_root,
+            &id,
+            result.category,
+            region,
+        );
         match tokens_pool::record_terminal_for_model_with_reset(
             &self.config.workspace_root,
             &id,

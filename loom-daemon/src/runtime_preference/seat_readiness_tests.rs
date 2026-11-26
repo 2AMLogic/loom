@@ -185,7 +185,64 @@ fn a_shared_sandbox_hold_follows_the_profile_across_workspaces() {
         "test",
     )
     .unwrap();
+    assert!(
+        pick(b.path(), "agent-2").is_err(),
+        "credential success cannot release a sandbox hold"
+    );
+    crate::tokens_pool::sandbox_seat_hold::observe_terminal(
+        b.path(),
+        &codex_id("agent-2"),
+        TerminalClassification::Success,
+        "exec\n/bin/sh -c pwd in /w\n succeeded in 2ms:\n/w\n",
+    );
     assert!(pick(a.path(), "agent-1").is_ok());
     assert!(pick(b.path(), "agent-2").is_ok());
     assert!(pick(a.path(), "agent-2").is_err());
+}
+
+/// A profile-local read failure excludes just that seat from each view of the pool.
+#[test]
+#[serial_test::serial]
+fn an_unreadable_sandbox_hold_leaves_other_seats_drawable() {
+    use crate::tokens_pool::account_registry::select_codex_account_where;
+    use crate::tokens_pool::{account_inventory, provider_capacity_at};
+    let _env = ClearedRuntimeEnv::new();
+    let dir = workspace();
+    let root = dir.path();
+    provision_codex_account("agent-1", false);
+    provision_codex_account("agent-2", false);
+    let provider = AccountProvider::Codex;
+    let inventory = account_inventory(root, provider).unwrap();
+    let bad = inventory
+        .iter()
+        .find(|account| account.id.name == "agent-1")
+        .unwrap();
+    // EISDIR is deterministic even for a privileged test process.
+    let hold = bad.credential_reference.join(".sandbox-seat-hold.json");
+    fs::create_dir(&hold).unwrap();
+    assert_eq!(
+        select_codex_account_where(root, None, |_| true)
+            .unwrap()
+            .id
+            .name,
+        "agent-2"
+    );
+    let why = select_codex_account_where(root, None, |a| a.id == bad.id)
+        .unwrap_err()
+        .to_string();
+    assert!(why.contains("agent-1=sandbox_hold_unreadable"), "{why}");
+    assert_eq!(
+        provider_capacity_at(root, provider, &inventory, now())
+            .unwrap()
+            .healthy,
+        1
+    );
+    assert_eq!(curator_walk(root), ("codex".to_string(), vec![]));
+
+    assert!(hold_seat(root, &codex_id("agent-2"), 600, now()).unwrap());
+    let (chosen, skipped) = curator_walk(root);
+    assert_eq!(chosen, "claude");
+    assert!(skipped[0].contains("unreadable sandbox hold on agent-1"), "{skipped:?}");
+    fs::remove_dir(hold).unwrap();
+    assert_eq!(select_codex_account_where(root, None, |_| true).unwrap().id, bad.id);
 }

@@ -165,6 +165,9 @@ pub enum HealthReason {
     /// holding a `PlanExhausted`/`TransientFailure`/`SessionLimit` cooldown
     /// keeps it, because the wider hold is the one that decides selection.
     ModelCreditsExhausted,
+    /// A read-only inventory overlay. Re-read this profile's hold on the next draw.
+    #[serde(skip)]
+    SandboxHoldUnreadable,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -238,7 +241,8 @@ impl AccountHealth {
     /// (`ReauthRequired`, `cooldown_until`) is checked first and identically.
     #[must_use]
     pub fn is_eligible_for_class_at(&self, now: u64, model_class: Option<&str>) -> bool {
-        if self.reason == HealthReason::ReauthRequired {
+        if matches!(self.reason, HealthReason::ReauthRequired | HealthReason::SandboxHoldUnreadable)
+        {
             return false;
         }
         if self.cooldown_until.is_some_and(|deadline| deadline > now) {
@@ -762,12 +766,7 @@ pub fn record_terminal_for_class_with_reset_at(
             .accounts
             .sort_by(|a, b| (a.provider as u8, &a.name).cmp(&(b.provider as u8, &b.name)));
         Ok(())
-    })?;
-    if classification == TerminalClassification::Success && id.provider == AccountProvider::Codex {
-        super::sandbox_seat_hold::clear_on_success(workspace, id)
-            .context("failed to release the successful Codex profile's sandbox hold")?;
-    }
-    Ok(())
+    })
 }
 
 /// Conclusive result of a *proactive* auth-state probe (issue #6927). Only
@@ -1041,7 +1040,7 @@ pub(crate) fn inventory_health_snapshot(
     now: u64,
 ) -> Result<HashMap<AccountId, AccountHealth>> {
     let mut health = health_snapshot(workspace)?;
-    super::sandbox_seat_hold::apply_to_snapshot(&mut health, inventory, now)?;
+    super::sandbox_seat_hold::apply_to_snapshot(&mut health, inventory, now);
     Ok(health)
 }
 
@@ -1189,7 +1188,7 @@ pub fn select_healthy_for_class_at(
             .cloned()
             .map(|entry| (entry.id(), entry))
             .collect();
-        super::sandbox_seat_hold::apply_to_snapshot(&mut health, inventory, now)?;
+        super::sandbox_seat_hold::apply_to_snapshot(&mut health, inventory, now);
         let mut candidates: Vec<_> = inventory
             .iter()
             .filter(|account| account.id.provider == provider && account.enabled)
@@ -1218,6 +1217,9 @@ pub fn select_healthy_for_class_at(
                     } else if let Some(entry) = health.get(&account.id) {
                         match entry.reason {
                             HealthReason::ReauthRequired => "reauth_required".to_string(),
+                            HealthReason::SandboxHoldUnreadable => {
+                                "sandbox_hold_unreadable".to_string()
+                            }
                             // An account-wide cooldown is reported exactly as
                             // before; only when there is none does a live
                             // class hold get named, so the operator can see
@@ -1289,9 +1291,7 @@ pub fn provider_capacity_at(
         .iter()
         .filter(|account| {
             health.get(&account.id).is_some_and(|entry| {
-                entry.reason != HealthReason::ReauthRequired
-                    && (entry.cooldown_until.is_some_and(|until| until > now)
-                        || entry.blocking_class_cooldown_at(now, None).is_some())
+                entry.reason != HealthReason::ReauthRequired && !entry.is_eligible_at(now)
             })
         })
         .count();

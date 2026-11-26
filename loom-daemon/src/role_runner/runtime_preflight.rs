@@ -367,6 +367,8 @@ pub(crate) struct CodexPoolState {
     /// Enabled seats held by a `SANDBOX_UNAVAILABLE` tick of their own
     /// (`sandbox_seat_hold`, #14455), a subset of the seats in cooldown.
     pub sandbox_held: usize,
+    /// Enabled accounts excluded because their profile's sandbox hold could not be read.
+    pub unreadable_sandbox_holds: Vec<String>,
     /// Earliest account-wide cooldown deadline (epoch seconds) among the
     /// blocked accounts, when any has one.
     pub earliest_clear: Option<u64>,
@@ -404,6 +406,7 @@ pub(crate) fn codex_pool_state_for(
         session_held: 0,
         bare_sandbox_blocked: 0,
         sandbox_held: 0,
+        unreadable_sandbox_holds: Vec::new(),
         earliest_clear: None,
         read_error: None,
     };
@@ -461,6 +464,10 @@ pub(crate) fn codex_pool_state_for(
             state.spawnable += 1;
             continue;
         };
+        if health.reason == HealthReason::SandboxHoldUnreadable {
+            state.unreadable_sandbox_holds.push(account.id.name.clone());
+            continue;
+        }
         if let Some(deadline) = health.cooldown_until.filter(|deadline| *deadline > now) {
             state.sandbox_held += usize::from(
                 health.signal_provenance == crate::tokens_pool::sandbox_seat_hold::PROVENANCE,
@@ -512,6 +519,12 @@ fn codex_health_exhausted_reason(state: &CodexPoolState) -> String {
         named.push(format!(
             "{}/{} not-admitted(sessionSeat: the host Codex sandbox cannot run a command for bare-metal seats; #14455)",
             state.bare_sandbox_blocked, state.enabled
+        ));
+    }
+    if !state.unreadable_sandbox_holds.is_empty() {
+        named.push(format!(
+            "unreadable sandbox hold on {}",
+            state.unreadable_sandbox_holds.join(", ")
         ));
     }
     if state.sandbox_held > 0 {

@@ -71,8 +71,24 @@ pub fn hold_seat(workspace: &Path, id: &AccountId, secs: u64, now: u64) -> Resul
     Ok(true)
 }
 
-/// A successful launch on this profile releases the hold for every workspace.
-pub(super) fn clear_on_success(workspace: &Path, id: &AccountId) -> Result<()> {
+/// Credential success alone says nothing about the sandbox. Only release this
+/// profile's shared hold on positive command evidence from the same dispatch.
+pub(crate) fn observe_terminal(
+    workspace: &Path,
+    id: &AccountId,
+    category: super::TerminalClassification,
+    region: &str,
+) {
+    if category == super::TerminalClassification::Success
+        && crate::codex_sandbox_noop::ran_a_command(region)
+    {
+        if let Err(error) = clear(workspace, id) {
+            log::warn!("failed to release sandbox hold for Codex account {}: {error:#}", id.name);
+        }
+    }
+}
+
+fn clear(workspace: &Path, id: &AccountId) -> Result<()> {
     let Some(profile) = profile_for(workspace, id)? else {
         return Ok(());
     };
@@ -94,14 +110,18 @@ pub(super) fn apply_to_snapshot(
     health: &mut HashMap<AccountId, AccountHealth>,
     inventory: &[AccountDescriptor],
     now: u64,
-) -> Result<()> {
+) {
     for account in inventory
         .iter()
         .filter(|a| a.enabled && a.id.provider == AccountProvider::Codex)
     {
-        let Some(hold) = read(&account.credential_reference)?.filter(|hold| hold.until > now)
-        else {
-            continue;
+        let hold = match read(&account.credential_reference) {
+            Ok(Some(hold)) if hold.until > now => Some(hold),
+            Ok(_) => continue,
+            Err(error) => {
+                log::warn!("skipping Codex account {}: {error:#}", account.id.name);
+                None
+            }
         };
         let entry = health
             .entry(account.id.clone())
@@ -109,7 +129,7 @@ pub(super) fn apply_to_snapshot(
                 provider: account.id.provider,
                 name: account.id.name.clone(),
                 reason: HealthReason::Healthy,
-                updated_at: hold.held_at,
+                updated_at: hold.as_ref().map_or(now, |hold| hold.held_at),
                 signal_provenance: PROVENANCE.to_owned(),
                 cooldown_until: None,
                 consecutive_transient_failures: 0,
@@ -117,6 +137,10 @@ pub(super) fn apply_to_snapshot(
                 last_probe: None,
                 class_cooldowns: HashMap::new(),
             });
+        let Some(hold) = hold else {
+            entry.reason = HealthReason::SandboxHoldUnreadable;
+            continue;
+        };
         if entry.cooldown_until.is_none_or(|until| until < hold.until) {
             entry.cooldown_until = Some(hold.until);
             // Re-auth stays sticky. Preflight also needs the deadline for
@@ -127,7 +151,6 @@ pub(super) fn apply_to_snapshot(
             entry.signal_provenance = PROVENANCE.to_owned();
         }
     }
-    Ok(())
 }
 
 #[cfg(test)]

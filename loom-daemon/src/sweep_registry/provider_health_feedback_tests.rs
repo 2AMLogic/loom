@@ -89,7 +89,13 @@ fn a_sandbox_hold_reads_only_the_reaped_dispatch() {
     let inventory = account_inventory(workspace.path(), AccountProvider::Codex).unwrap();
     let failure = "# LOOM_TERMINAL_RESULT v=2 provider=codex account=seat category=SANDBOX_UNAVAILABLE exit_code=0 model=none\n";
     let success = "# LOOM_TERMINAL_RESULT v=2 provider=codex account=seat category=SUCCESS exit_code=0 model=none\n";
-    for (earlier, later, held) in [("", failure, false), (failure, success, true)] {
+    let ran = format!("exec\n/bin/sh -c pwd in /w\n succeeded in 2ms:\n/w\n{success}");
+    for (earlier, later, held) in [
+        ("", failure, false),
+        (failure, success, true),
+        (success, ran.as_str(), true),
+        (ran.as_str(), failure, false),
+    ] {
         let log =
             format!("{earlier}==== loom-daemon dispatch: t sweep_id=later issue=74 ====\n{later}");
         let sweep = insert_codex_entry_with_log(&mut registry, 74, "seat", &log);

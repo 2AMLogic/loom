@@ -560,9 +560,11 @@ pub fn assess_account(
         row.error = Some("disabled".to_string());
         return row;
     }
-    if health.is_some_and(|h| h.reason == HealthReason::ReauthRequired) {
+    if let Some(entry) = health.filter(|h| {
+        matches!(h.reason, HealthReason::ReauthRequired | HealthReason::SandboxHoldUnreadable)
+    }) {
         let mut row = AccountResult::new(name, "blocked");
-        row.error = Some("reauth_required".to_string());
+        row.error = Some(health_hold_label(entry.reason).to_string());
         return row;
     }
 
@@ -631,6 +633,7 @@ fn health_hold_label(reason: HealthReason) -> &'static str {
     match reason {
         HealthReason::Healthy => "cooldown",
         HealthReason::ReauthRequired => "reauth_required",
+        HealthReason::SandboxHoldUnreadable => "sandbox_hold_unreadable",
         HealthReason::PlanExhausted => "plan_exhausted",
         HealthReason::TransientFailure => "transient_backoff",
         HealthReason::SessionLimit => "session_limit",

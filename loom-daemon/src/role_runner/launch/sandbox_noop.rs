@@ -81,12 +81,13 @@ pub(super) fn verdict_in(contents: &str, runtime: &str, tick_anchor: &str) -> Ve
     if runtime != "codex" || tick_anchor.is_empty() {
         return Verdict::NoOpinion;
     }
-    let Some(result) = crate::sweep_registry::parse_terminal_result_after(contents, tick_anchor)
+    let Some(region) = super::super::model_resolution::role_log_section(contents, tick_anchor)
     else {
         return Verdict::NoOpinion;
     };
-    // `parse_terminal_result_after` already proved the anchor is present.
-    let region = contents.rfind(tick_anchor).map_or("", |at| &contents[at..]);
+    let Some(result) = crate::sweep_registry::parse_terminal_result_in(region) else {
+        return Verdict::NoOpinion;
+    };
     match result.category {
         TerminalClassification::SandboxUnavailable => {
             let shape = region
