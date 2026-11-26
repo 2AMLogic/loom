@@ -41,7 +41,8 @@ function extractDaemonErrorMessage(response: {
   message?: string;
 }): string | null {
   if (response.type === "Error") {
-    return response.message || "Unknown error";
+    const payload = response.payload as { message?: string } | undefined;
+    return payload?.message || response.message || "Unknown error";
   }
   if (response.type === "StructuredError") {
     const payload = response.payload as { message?: string } | undefined;
