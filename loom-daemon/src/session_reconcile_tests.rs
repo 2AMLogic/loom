@@ -256,6 +256,8 @@ esac
 mod drift_tests;
 #[path = "session_reconcile_hold_tests.rs"]
 mod hold_tests;
+#[path = "session_reconcile_private_image_tests.rs"]
+mod private_image_tests;
 #[path = "session_reconcile_removal_tests.rs"]
 mod removal_tests;
 #[path = "session_reconcile_safety_tests.rs"]
@@ -675,6 +677,7 @@ fn fake_inputs<'a>(
         index,
         is_private_clone: private,
         recover_private: &|_, _, _| Ok(()),
+        roll_private: &|_, _, _| Ok(private_workspace::Rolled::Unchanged),
         fallback_workspace: fallback,
         registered: Some(registered),
         denials_for: &|_| Ok(drift::Denials::default()),

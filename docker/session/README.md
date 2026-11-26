@@ -464,6 +464,29 @@ Local-path/SSH remotes and URL credentials are unsupported and fail before
 creation. The account's existing persistent authentication profile remains its
 single refresh owner.
 
+**The seat image follows the daemon's release (#14112).** A private-clone
+seat started without `--image` is created from
+`ghcr.io/2amlogic/loom-worker-session:<daemon version>` — the tag this
+release publishes, never the mutable `:latest` (which a seat created from an
+older daemon still runs). `accounts.session.image` wins when it is
+configured, and an explicit `--image` wins over both. The daemon's session
+reconcile pass keeps a seat on the stock image in step with the daemon: when
+a running seat's image is not the running daemon's release image, an **idle**
+seat is stopped, removed and recreated from the release image against the
+volume and profile it already had, so every clone, branch and credential
+stays where it was. A seat a job is using is left alone until it is idle;
+nothing is ever interrupted. Everything that can refuse the recreate —
+pulling the image, checking the recorded mounts and mirror binds,
+provisioning the profile's control files from the new image — happens before
+the seat is touched, so a refusal leaves it exactly as it was and is logged
+with the reason; a failed pull is retried on a doubling backoff, because the
+session image follows a release by about 25 minutes. `accounts session
+status` reports `expected_image` beside `image` whenever the two differ.
+Never replaced this way: a seat on a configured override image (rebuild it
+`FROM` the new base, update the digest pin, then stop and start the seat), a
+seat started with an explicit `--image`, or one on a release newer than the
+daemon's.
+
 **Several repositories per account (#10795).** The first `--private-clone`
 repository stays at `/workspace/repo` (an existing single-repository volume,
 container and unfinished work are untouched). Repeating `session start

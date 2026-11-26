@@ -58,6 +58,17 @@ struct Engine {
     /// What the sealed-bundle probe of a configured override image prints
     /// (#14451); `None` fails the probe.
     probe_output: Option<String>,
+    /// `docker pull` fails: the image is neither local nor obtainable (#14112).
+    pull_fails: bool,
+    /// The control-provisioning helper run fails (#14112).
+    provision_fails: bool,
+    /// The detached session `docker run` fails (#14112).
+    create_fails: bool,
+    /// `docker rm` of the session container fails (#14112).
+    rm_fails: bool,
+    /// A worker appears in the seat while an image is being pulled: the seat
+    /// changed between a roll's two looks at it (#14112).
+    busy_after_pull: bool,
     calls: Vec<Vec<String>>,
     created: u32,
 }
@@ -161,6 +172,20 @@ impl Engine {
                     bail!("Docker image failed (exit status: 1)")
                 }
             }
+            ["pull", image] => {
+                if self.pull_fails {
+                    bail!("fake Docker: pull failed");
+                }
+                self.images.push((*image).to_owned());
+                if self.busy_after_pull {
+                    let name = self.containers.keys().next().cloned();
+                    if let Some(processes) = name.as_deref().and_then(|n| self.processes.get_mut(n))
+                    {
+                        processes.push("codex exec".into());
+                    }
+                }
+                Ok(String::new())
+            }
             ["start", _] if self.start_times_out => Err(docker_cli::DockerTimedOut {
                 subcommand: "start".into(),
                 secs: docker_cli::DOCKER_CALL_TIMEOUT.as_secs(),
@@ -184,6 +209,9 @@ impl Engine {
                 .context("fake Docker: bundle probe failed"),
             ["run", rest @ ..] if rest.contains(&"--rm") => {
                 if rest.ends_with(&["private-workspace", "provision-controls"]) {
+                    if self.provision_fails {
+                        bail!("Docker run failed (fake: provisioning)");
+                    }
                     Ok(json!({"protocol": PROTOCOL, "status": "ready"}).to_string())
                 } else {
                     // The fresh-volume `chown` initializer.
@@ -191,6 +219,9 @@ impl Engine {
                 }
             }
             ["run", rest @ ..] => {
+                if self.create_fails {
+                    bail!("Docker run failed (fake: create)");
+                }
                 let run = parse_run(rest);
                 self.created += 1;
                 let id = format!("{:0>64}", format!("c{}", self.created));
@@ -252,6 +283,9 @@ impl Engine {
                 Ok(String::new())
             }
             ["rm", container] => {
+                if self.rm_fails {
+                    bail!("Docker rm failed (fake)");
+                }
                 let name = self.find_name(container).context("no such container")?;
                 self.containers.remove(&name);
                 self.processes.remove(&name);
@@ -536,7 +570,11 @@ impl Env {
         f(&mut self.engine.borrow_mut());
     }
     fn seed_container(&self, id: &str, running: bool) {
-        let container = session_container(&self.config, id, running, IMAGE);
+        self.seed_container_on(id, running, IMAGE);
+    }
+    /// [`Env::seed_container`] with the seat created from `image` (#14112).
+    fn seed_container_on(&self, id: &str, running: bool, image: &str) {
+        let container = session_container(&self.config, id, running, image);
         self.with(|e| {
             e.containers
                 .insert(self.config.container.clone(), container);
@@ -601,6 +639,10 @@ impl Env {
     }
     fn held(&self) -> bool {
         session_hold::held_across(std::slice::from_ref(&self.account.credential_reference))
+    }
+    /// An unattended image roll of alice's seat onto `image` (#14112).
+    fn roll_to(&self, image: &str) -> Result<Rolled> {
+        roll(self.workspace.path(), "alice", image, &|| Ok(()))
     }
 }
 
@@ -2364,13 +2406,346 @@ fn without_the_configuration_a_private_start_is_unchanged() {
     env.seed_volume();
     let status = operator_start(&env, None).unwrap();
     let runs = created_runs(&env);
-    assert_eq!(runs[0].image, crate::tokens_pool::session_lifecycle::DEFAULT_SESSION_IMAGE);
+    assert_eq!(runs[0].image, release());
     assert_eq!(runs[0].mounts.len(), 2 + bundle::PROFILE_CONTROLS.len());
     assert!(!runs[0].labels.contains_key("loom.extra-mounts"));
     assert_eq!(probes(&env), 0);
     assert!(status.extra_mounts.is_empty());
     let text = std::fs::read_to_string(env.dir.join("workspace.json")).unwrap();
     assert!(!text.contains("extra_mounts") && !text.contains("session_image"), "{text}");
+}
+
+// ---------------------------------------------------------------------------
+// Issue #14112: the seat's image follows the daemon's release.
+// ---------------------------------------------------------------------------
+
+const LEGACY_LATEST: &str = "ghcr.io/2amlogic/loom-worker-session:latest";
+
+/// The release image of the daemon under test.
+fn release() -> String {
+    crate::tokens_pool::session_lifecycle::release_session_image(
+        crate::tokens_pool::session_lifecycle::DAEMON_RELEASE_TAG,
+    )
+}
+
+#[test]
+#[serial]
+fn a_private_start_without_an_image_uses_the_daemons_release_image() {
+    use crate::tokens_pool::session_lifecycle::{DAEMON_RELEASE_TAG, DEFAULT_SESSION_IMAGE};
+    let env = setup();
+    env.seed_volume();
+    let status = operator_start(&env, None).unwrap();
+    // The tag the release workflow publishes, never the mutable `:latest`.
+    assert!(release().ends_with(DAEMON_RELEASE_TAG), "{}", release());
+    assert_ne!(release(), DEFAULT_SESSION_IMAGE);
+    assert_eq!(created_runs(&env)[0].image, release());
+    // The stock image is not recorded as a configured one: `recover` of a
+    // missing stock seat still refuses to invent an image.
+    assert_eq!(recorded(&env).session_image, None);
+    assert_eq!(status.image.as_deref(), Some(release().as_str()));
+    assert_eq!(status.expected_image.as_deref(), Some(release().as_str()));
+    // A plain start never swaps a running seat's image, not even for an
+    // explicit one: that takes a stop first.
+    let error = operator_start(&env, Some(IMAGE)).unwrap_err();
+    assert!(message(&error).contains("session image differs"), "{error:#}");
+}
+
+#[test]
+#[serial]
+fn private_status_names_the_expected_image_beside_the_running_one() {
+    let read = |env: &Env| status(env.workspace.path(), "alice").unwrap();
+    // A seat a roll left behind: the two differ, and the difference is reported.
+    let env = setup();
+    env.seed_volume();
+    env.seed_container_on(CONTAINER_ID, true, LEGACY_LATEST);
+    let stale = read(&env);
+    assert_eq!(stale.image.as_deref(), Some(LEGACY_LATEST));
+    assert_eq!(stale.expected_image.as_deref(), Some(release().as_str()));
+    let json = serde_json::to_value(&stale).unwrap();
+    assert_eq!(json["image"], LEGACY_LATEST);
+    assert_eq!(json["expected_image"], release().as_str());
+    // On the release image, as Docker records it with the pull's digest
+    // (#13479): expected and running agree.
+    env.seed_container_on(CONTAINER_ID, true, &format!("{}@sha256:{}", release(), "a".repeat(64)));
+    let current = read(&env);
+    assert_eq!(current.expected_image.as_deref(), Some(release().as_str()));
+    // A recorded override is what the seat is expected on.
+    let env = setup();
+    env.seed_volume();
+    env.with(|e| e.images.push(DERIVED.into()));
+    let mut config = env.config.clone();
+    config.session_image = Some(DERIVED.into());
+    save(&env.dir.join("workspace.json"), &config).unwrap();
+    env.seed_container_on(CONTAINER_ID, true, DERIVED);
+    assert_eq!(read(&env).expected_image.as_deref(), Some(DERIVED));
+    // An image named explicitly expects itself; it is never substituted.
+    let env = setup();
+    env.seed_volume();
+    env.seed_container(CONTAINER_ID, true);
+    let explicit = read(&env);
+    assert_eq!(explicit.expected_image.as_deref(), Some(IMAGE));
+    // No container and nothing recorded: unknown, not the release image.
+    let env = setup();
+    let unknown = read(&env);
+    assert_eq!(unknown.image, None);
+    assert_eq!(unknown.expected_image, None);
+}
+
+#[test]
+#[serial]
+fn an_idle_seat_on_a_stale_stock_image_is_recreated_on_the_release_image_and_keeps_everything() {
+    for stale in [
+        LEGACY_LATEST,
+        "ghcr.io/rjwalters/loom-worker-session:latest",
+    ] {
+        let env = setup();
+        env.seed_volume();
+        env.seed_container_on(CONTAINER_ID, true, stale);
+        let profile = env.config.profile.clone();
+        let before = (
+            std::fs::read_to_string(env.dir.join("workspace.json")).unwrap(),
+            std::fs::read_to_string(profile.join("auth.json")).unwrap(),
+            env.engine().volumes.clone(),
+        );
+        assert_eq!(env.roll_to(&release()).unwrap(), Rolled::Recreated);
+        let calls = env.engine().calls.clone();
+        let first = |verb: &str| {
+            calls
+                .iter()
+                .position(|call| call.first().is_some_and(|arg| arg == verb))
+                .unwrap_or_else(|| panic!("no `{verb}` call in {calls:?}"))
+        };
+        // The image is obtained first, and everything that can refuse the
+        // recreate has run before the seat is touched.
+        assert!(first("pull") < first("stop"), "{calls:?}");
+        assert_eq!(
+            env.mutations(),
+            vec![
+                "run --rm provision-controls".to_owned(),
+                format!("stop {}", env.config.container),
+                format!("rm {}", env.config.container),
+                format!("run {}", release()),
+                "exec setup".to_owned(),
+                "exec control".to_owned(),
+            ],
+            "{calls:?}"
+        );
+        // The account volume (and every clone on it), the credentials and
+        // the seat's record are exactly as they were; no `prepare` ran.
+        assert_eq!(
+            (
+                std::fs::read_to_string(env.dir.join("workspace.json")).unwrap(),
+                std::fs::read_to_string(profile.join("auth.json")).unwrap(),
+                env.engine().volumes.clone(),
+            ),
+            before
+        );
+        assert!(calls.iter().all(|c| !c.iter().any(|a| a == "prepare")));
+        let state = env.engine().containers[&env.config.container].clone();
+        assert_ne!(state["Id"], CONTAINER_ID, "a fresh container");
+        assert_eq!(state["Config"]["Image"], release().as_str());
+        assert!(state["State"]["Running"] == true);
+        assert!(state["Mounts"].as_array().unwrap().iter().any(|m| {
+            m["Type"] == "volume" && m["Name"] == env.config.volume && m["Destination"] == ROOT
+        }));
+        docker::validate_settings(&env.config, &state).unwrap();
+        let status = status(env.workspace.path(), "alice").unwrap();
+        assert_eq!(status.image.as_deref(), Some(release().as_str()));
+        assert_eq!(status.expected_image.as_deref(), Some(release().as_str()));
+        // A second roll finds nothing to do and touches nothing.
+        let done = env.mutations().len();
+        assert_eq!(env.roll_to(&release()).unwrap(), Rolled::Unchanged);
+        assert_eq!(env.mutations().len(), done);
+    }
+}
+
+#[test]
+#[serial]
+fn a_seat_a_job_or_worker_is_using_defers_its_roll_and_is_never_interrupted() {
+    // Another holder of the exclusive account lease (a job, a sweep, a
+    // lifecycle command): typed busy, and not one container call.
+    let env = setup();
+    env.seed_volume();
+    env.seed_container_on(CONTAINER_ID, true, LEGACY_LATEST);
+    let holder = lease::Lease::acquire(&env.dir).unwrap();
+    let error = env.roll_to(&release()).unwrap_err();
+    assert!(error.downcast_ref::<AccountBusy>().is_some(), "{error:#}");
+    assert_eq!(env.engine().calls, vec![vec!["info", "--format", "{{.ID}}"]]);
+    drop(holder);
+
+    // No lease names it, but a worker is alive inside the seat.
+    let env = setup();
+    env.seed_volume();
+    env.seed_container_on(CONTAINER_ID, true, LEGACY_LATEST);
+    env.with(|e| {
+        e.processes
+            .get_mut(&env.config.container)
+            .unwrap()
+            .push("codex exec".into());
+    });
+    let error = env.roll_to(&release()).unwrap_err();
+    assert!(error.downcast_ref::<AccountBusy>().is_some(), "{error:#}");
+    assert_eq!(env.mutations(), Vec::<String>::new(), "{:?}", env.engine().calls);
+    assert_eq!(env.engine().containers[&env.config.container]["State"]["Running"], true);
+    // Nothing was pulled for a seat that could not be rolled.
+    assert!(!env.engine().calls.iter().any(|c| c[0] == "pull"));
+
+    // A live exec record under a durable job lease: the stale-lease refusal
+    // stands, and the seat is not touched either.
+    let env = setup();
+    env.seed_volume();
+    env.seed_container_on(CONTAINER_ID, true, LEGACY_LATEST);
+    save(&env.dir.join("job.json"), &stale_job(CONTAINER_ID)).unwrap();
+    let id = exec_id(1);
+    env.seed_exec(&id, exec_record(&id, CONTAINER_ID, true, json!(null), 99));
+    assert!(env.roll_to(&release()).is_err());
+    assert_eq!(env.mutations(), Vec::<String>::new());
+    assert!(env.dir.join("job.json").exists());
+
+    // A stopped seat is the recovery's, not the roll's: it is started in
+    // place, and a later pass rolls it once it runs.
+    let env = setup();
+    env.seed_volume();
+    env.seed_container_on(CONTAINER_ID, false, LEGACY_LATEST);
+    assert_eq!(env.roll_to(&release()).unwrap(), Rolled::Unchanged);
+    assert_eq!(env.mutations(), Vec::<String>::new());
+}
+
+#[test]
+#[serial]
+fn a_roll_that_fails_after_the_pull_leaves_the_previous_container_intact() {
+    // The new image cannot provision the profile's controls.
+    let env = setup();
+    env.seed_volume();
+    env.seed_container_on(CONTAINER_ID, true, LEGACY_LATEST);
+    env.with(|e| e.provision_fails = true);
+    let error = env.roll_to(&release()).unwrap_err();
+    assert!(message(&error).contains("Docker run failed"), "{error:#}");
+    assert!(
+        env.engine()
+            .calls
+            .iter()
+            .any(|c| c[0] == "pull" && c[1] == release()),
+        "the image was obtained first"
+    );
+    assert_eq!(env.mutations(), vec!["run --rm provision-controls".to_owned()]);
+    // The previous container is exactly as it was, and usable.
+    let state = env.engine().containers[&env.config.container].clone();
+    assert_eq!(state["Id"], CONTAINER_ID);
+    assert_eq!(state["Config"]["Image"], LEGACY_LATEST);
+    assert_eq!(state["State"]["Running"], true);
+    assert!(status(env.workspace.path(), "alice").unwrap().running);
+    assert!(env.recover(None).unwrap().running);
+    assert_eq!(env.engine().containers[&env.config.container]["Id"], CONTAINER_ID);
+
+    // An operator hold appearing at the mutation boundary: the same.
+    let env = setup();
+    env.seed_volume();
+    env.seed_container_on(CONTAINER_ID, true, LEGACY_LATEST);
+    let error =
+        roll(env.workspace.path(), "alice", &release(), &|| Err(OperatorHeld.into())).unwrap_err();
+    assert!(error.downcast_ref::<OperatorHeld>().is_some(), "{error:#}");
+    assert_eq!(env.mutations(), Vec::<String>::new());
+    assert_eq!(env.engine().containers[&env.config.container]["Id"], CONTAINER_ID);
+    // The hold written by `stop` is honoured whatever the caller probes.
+    session_hold::write_hold(&env.config.profile, session_hold::now_unix_ms()).unwrap();
+    let error = env.roll_to(&release()).unwrap_err();
+    assert!(error.downcast_ref::<OperatorHeld>().is_some(), "{error:#}");
+    assert_eq!(env.mutations(), Vec::<String>::new());
+
+    // The seat got busy between the roll's two looks at it: deferred, intact.
+    let env = setup();
+    env.seed_volume();
+    env.seed_container_on(CONTAINER_ID, true, LEGACY_LATEST);
+    env.with(|e| e.busy_after_pull = true);
+    let error = env.roll_to(&release()).unwrap_err();
+    assert!(error.downcast_ref::<AccountBusy>().is_some(), "{error:#}");
+    // Only the idempotent provisioning helper ran; the seat was not touched.
+    assert_eq!(env.mutations(), vec!["run --rm provision-controls".to_owned()]);
+    assert_eq!(env.engine().containers[&env.config.container]["Id"], CONTAINER_ID);
+    assert_eq!(env.engine().containers[&env.config.container]["State"]["Running"], true);
+}
+
+#[test]
+#[serial]
+fn an_unobtainable_release_image_is_reported_and_nothing_is_touched() {
+    let env = setup();
+    env.seed_volume();
+    env.seed_container_on(CONTAINER_ID, true, LEGACY_LATEST);
+    env.with(|e| e.pull_fails = true);
+    let error = env.roll_to(&release()).unwrap_err();
+    assert!(error.downcast_ref::<ImageUnavailable>().is_some(), "{error:#}");
+    assert_eq!(env.mutations(), Vec::<String>::new());
+    assert_eq!(env.engine().containers[&env.config.container]["Id"], CONTAINER_ID);
+    assert_eq!(env.engine().containers[&env.config.container]["State"]["Running"], true);
+}
+
+#[test]
+#[serial]
+fn an_override_seat_and_an_explicitly_chosen_image_are_never_replaced() {
+    // A recorded override (#14451): the fix for its skew is a rebuilt image.
+    let env = setup();
+    env.seed_volume();
+    env.with(|e| e.images.push(DERIVED.into()));
+    let mut config = env.config.clone();
+    config.session_image = Some(DERIVED.into());
+    save(&env.dir.join("workspace.json"), &config).unwrap();
+    env.seed_container_on(CONTAINER_ID, true, DERIVED);
+    assert_eq!(env.roll_to(&release()).unwrap(), Rolled::Kept);
+    assert_eq!(env.mutations(), Vec::<String>::new());
+
+    // An image an operator named on the start command line.
+    let env = setup();
+    env.seed_volume();
+    env.seed_container(CONTAINER_ID, true);
+    assert_eq!(env.roll_to(&release()).unwrap(), Rolled::Kept);
+    assert_eq!(env.mutations(), Vec::<String>::new());
+    assert_eq!(env.engine().containers[&env.config.container]["Config"]["Image"], IMAGE);
+    assert!(!env.engine().calls.iter().any(|c| c[0] == "pull"));
+}
+
+#[test]
+#[serial]
+fn a_roll_failing_after_the_teardown_leaves_the_volume_and_profile_for_recovery() {
+    // The removal fails: the previous container is still there, stopped, and
+    // the recovery starts that very container in place.
+    let env = setup();
+    env.seed_volume();
+    env.seed_container_on(CONTAINER_ID, true, LEGACY_LATEST);
+    env.with(|e| e.rm_fails = true);
+    let error = env.roll_to(&release()).unwrap_err();
+    assert!(message(&error).contains("Docker rm failed"), "{error:#}");
+    // The removal was attempted and refused; nothing was created.
+    assert_eq!(
+        env.mutations(),
+        vec![
+            "run --rm provision-controls".to_owned(),
+            format!("stop {}", env.config.container),
+            format!("rm {}", env.config.container),
+        ]
+    );
+    assert_eq!(env.engine().containers[&env.config.container]["Id"], CONTAINER_ID);
+    assert!(env.recover(None).unwrap().running);
+    assert_eq!(env.engine().containers[&env.config.container]["Id"], CONTAINER_ID);
+
+    // The recreate fails: nothing is left running, and everything the seat
+    // needs to come back is where it was.
+    let env = setup();
+    env.seed_volume();
+    env.seed_container_on(CONTAINER_ID, true, LEGACY_LATEST);
+    let record = std::fs::read_to_string(env.dir.join("workspace.json")).unwrap();
+    env.with(|e| e.create_fails = true);
+    let error = env.roll_to(&release()).unwrap_err();
+    assert!(message(&error).contains("Docker run failed"), "{error:#}");
+    assert!(env.engine().containers.is_empty());
+    assert!(env.engine().volumes.contains_key(&env.config.volume));
+    assert_eq!(std::fs::read_to_string(env.dir.join("workspace.json")).unwrap(), record);
+    assert!(env.config.profile.join("auth.json").is_file());
+    // Handed the image the roll was moving to, the recovery brings the seat
+    // back on it.
+    env.with(|e| e.create_fails = false);
+    assert!(env.recover(Some(&release())).unwrap().running);
+    assert_eq!(created_runs(&env).last().unwrap().image, release());
 }
 
 /// Give a disposable workspace the same Codex provider manifest as a launch.

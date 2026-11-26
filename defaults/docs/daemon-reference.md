@@ -10595,7 +10595,9 @@ session status` (text and `--json`) reports them.
 
 **Private-clone sessions (#14451)** take the same two keys. An operator
 `session start` resolves them once, when it creates the container, in the
-order explicit `--image` > `accounts.session.image` > stock, and records the
+order explicit `--image` > `accounts.session.image` > the daemon's release
+image (`ghcr.io/2amlogic/loom-worker-session:<daemon version>`, #14112 —
+never the mutable `:latest`), and records the
 configured image and the mounts in the seat's `workspace.json`
 (`session_image`, `extra_mounts`; absent state reads as unset). The **host
 tier** decides for a seat that serves several repositories: the keys are read
@@ -10613,7 +10615,25 @@ never the config as edited since and never the stock image, re-running the
 bundle verification: a daemon roll that leaves the derived image not yet
 rebuilt refuses with a WARN. A configuration edit applies to a seat after
 `accounts session stop` and a new `start`. `accounts session status` reports
-the image and the extra mounts of a private-clone seat.
+the image and the extra mounts of a private-clone seat, and `expected_image`
+beside `image` when the two differ.
+
+**A private seat's image follows the daemon's release (#14112).** The
+reconcile pass compares each running private-clone seat's image with the
+running daemon's release image. A seat on the stock image that is not on it —
+a `:latest` seat an older daemon created, or one on the previous release — is
+recreated from the release image once it is idle: stopped, removed, and
+created again against the volume and account profile it already had, so no
+clone, branch or credential moves. A seat a job or an unleased worker is
+using is deferred and re-checked next pass; nothing is interrupted. The
+image is pulled, the recorded mounts and mirror binds are checked and the
+profile's control files are provisioned from the new image **before** the
+seat is touched, so a refusal leaves it as it was, with a WARN naming the
+cause; a failed pull is retried on a doubling backoff (up to 30 passes), and
+a recreate that fails is attempted once per (running, expected) image pair.
+Never replaced this way: a seat on a recorded override, one started with an
+explicit `--image`, or one on a release newer than the daemon's (no
+downgrade).
 
 The pass makes no extra Docker call for an unset config, and a malformed
 `accounts.session` block refuses an operator `start` outright (the
@@ -10645,6 +10665,7 @@ across the registered roots:
 |---|---|
 | held (operator stop) | none, and no `docker` call |
 | running | none |
+| running, private-clone, on a stock image other than the daemon's release image | recreated from the release image against its own volume and profile once idle (#14112); deferred while a job uses the seat. An override seat, an explicit `--image` and a newer release are never replaced |
 | restarting, first pass | none (Docker's `unless-stopped` policy is retrying) |
 | restarting, 2+ consecutive passes | one WARN `crash loop`; never reused or stopped |
 | stopped, host-mounted | `docker start`, via the `accounts session start` path |

@@ -15,8 +15,10 @@ pub(crate) enum SessionAction {
         /// (issue #7389 -- see `accounts add --email`).
         #[arg(value_name = "NAME")]
         name: String,
-        /// Override the session image (default:
-        /// `ghcr.io/2amlogic/loom-worker-session:latest`).
+        /// Override the session image (default for a host-mounted session:
+        /// `ghcr.io/2amlogic/loom-worker-session:latest`; for a private-clone
+        /// session: the running daemon's release tag, unless
+        /// `accounts.session.image` is configured).
         #[arg(long, value_name = "IMAGE")]
         image: Option<String>,
         /// Directory to bind-mount read-write at the identical absolute
@@ -293,6 +295,7 @@ pub(crate) fn handle_session_command(
     }
 
     use crate::tokens_pool::private_workspace as private;
+    use crate::tokens_pool::session_lifecycle::image_reference;
     fn print_private(status: &private::Status, json: bool) -> Result<()> {
         let trust = crate::tokens_pool::private_workspace::containment::trust_state(
             std::path::Path::new(&status.config.profile),
@@ -328,6 +331,24 @@ pub(crate) fn handle_session_command(
                 trust
             );
             println!("{}: image={}", status.config.account, status.image.as_deref().unwrap_or("-"));
+            // The two differ only for a seat on the stock image that is not
+            // on this daemon's release (#14112): one a roll left behind, which
+            // the reconciler moves once idle, or a newer one it never downgrades.
+            if let Some(expected) = status.expected_image.as_deref().filter(|expected| {
+                status
+                    .image
+                    .as_deref()
+                    .is_some_and(|running| image_reference(running) != *expected)
+            }) {
+                println!(
+                    "{}: image differs from the expected one: running {}, expected {}; the \
+                     session reconciler recreates an idle seat on the expected image unless the \
+                     running one is newer than this daemon's release",
+                    status.config.account,
+                    status.image.as_deref().unwrap_or("-"),
+                    expected
+                );
+            }
             if !status.extra_mounts.is_empty() {
                 let mounts: Vec<String> = status
                     .extra_mounts

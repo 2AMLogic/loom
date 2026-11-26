@@ -1519,6 +1519,49 @@ fn extra_mount_targets_may_not_be_relative_and_may_not_overlap_each_other() {
     assert!(err.contains("overlapping"), "{err}");
 }
 
+/// Issue #14112: the stock session image follows the daemon's release tag.
+#[test]
+fn release_images_follow_the_daemon_version_and_are_recognised_by_repository() {
+    use super::super::session_lifecycle::{
+        image_reference, is_release_image, release_session_image, DAEMON_RELEASE_TAG,
+        DEFAULT_SESSION_IMAGE, LEGACY_SESSION_IMAGE_REPOSITORY, SESSION_IMAGE_REPOSITORY,
+    };
+    assert_eq!(release_session_image("0.20.41"), "ghcr.io/2amlogic/loom-worker-session:0.20.41");
+    assert_eq!(SESSION_IMAGE_REPOSITORY, "ghcr.io/2amlogic/loom-worker-session");
+    assert_eq!(LEGACY_SESSION_IMAGE_REPOSITORY, "ghcr.io/rjwalters/loom-worker-session");
+    // The running daemon's release image is its own version's tag: what the
+    // release workflow publishes, never the mutable `:latest`.
+    assert_eq!(
+        release_session_image(DAEMON_RELEASE_TAG),
+        format!("{SESSION_IMAGE_REPOSITORY}:{DAEMON_RELEASE_TAG}")
+    );
+    assert_ne!(release_session_image(DAEMON_RELEASE_TAG), DEFAULT_SESSION_IMAGE);
+    assert!(DEFAULT_SESSION_IMAGE.starts_with(SESSION_IMAGE_REPOSITORY));
+
+    for stock in [
+        "ghcr.io/2amlogic/loom-worker-session:latest",
+        "ghcr.io/2amlogic/loom-worker-session:0.20.41",
+        "ghcr.io/2amlogic/loom-worker-session:0.20.41@sha256:305364f5",
+        "ghcr.io/2amlogic/loom-worker-session",
+        "ghcr.io/rjwalters/loom-worker-session:latest",
+    ] {
+        assert!(is_release_image(stock), "{stock}");
+    }
+    for other in [
+        "ghcr.io/2amlogic/loom-worker-session-eda:2026-11-01",
+        "ghcr.io/2amlogic/loom-worker-session-eda@sha256:0123abcd",
+        "ghcr.io/2amlogic/loom-worker:latest",
+        "ghcr.io/rjwalters/loom-worker:latest",
+        "example/session:pinned",
+        "loom-worker-session:latest",
+        "",
+    ] {
+        assert!(!is_release_image(other), "{other}");
+    }
+    assert_eq!(image_reference("r/s:0.19.1209@sha256:305364f5"), "r/s:0.19.1209");
+    assert_eq!(image_reference("r/s:0.19.1209"), "r/s:0.19.1209");
+}
+
 #[path = "session_lifecycle_controls_tests.rs"]
 mod controls;
 

@@ -36,7 +36,7 @@ pub use lease::AccountBusy;
 pub(crate) use lifecycle::ConfiguredSeatMissing;
 pub use lifecycle::{
     check_binding, configured, converge, rebind, recover, registered_repositories, registrations,
-    run_job, session_recover, start, status, stop, Converged,
+    roll, run_job, session_recover, start, status, stop, Converged, ImageUnavailable, Rolled,
 };
 /// The read-authority proof contract for host mirror admission (#14716):
 /// the stable grant a store pins, the verified credential a proof carries,
@@ -265,6 +265,12 @@ pub struct Status {
     /// The image the session container was created from, as Docker reports it
     /// (#14451); `None` while there is no container.
     pub image: Option<String>,
+    /// The image this daemon expects the seat to run (#14112): the override
+    /// recorded at its last operator `start`, else the release image for a
+    /// seat on the stock session image, else the image it was started with
+    /// explicitly. `None` when nothing names it (no container, nothing
+    /// recorded); reported beside `image` so a difference between them shows.
+    pub expected_image: Option<String>,
     /// The read-only extra mounts the session is validated against (#14451).
     /// Also under `config.extra_mounts`; empty without the setting.
     pub extra_mounts: Vec<ExtraMount>,

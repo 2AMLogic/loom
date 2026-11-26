@@ -721,6 +721,26 @@ pub(super) fn image_present_with(image: &str, timeout: Duration) -> Result<()> {
         .with_context(|| format!("recorded session image {image} is not available locally"))
 }
 
+/// Make sure `image` is on hand before a seat is torn down to be recreated
+/// from it (#14112): present locally, else pulled within the `pull` budget.
+/// Unlike [`image_present`], which only ever checks (recovery never pulls),
+/// this obtains the image a daemon roll has just published.
+///
+/// # Errors
+/// Docker cannot be asked, or the pull fails.
+pub(super) fn ensure_image(image: &str) -> Result<()> {
+    match image_present(image) {
+        Ok(()) => Ok(()),
+        Err(error) if error.downcast_ref::<docker_cli::DockerTimedOut>().is_some() => Err(error),
+        Err(error) => {
+            log::debug!("session image {image} is not on hand ({error:#}); pulling it");
+            command(&["pull", image])
+                .with_context(|| format!("pulling session image {image} failed"))?;
+            image_present(image)
+        }
+    }
+}
+
 pub(super) fn create(config: &Config, image: &str) -> Result<()> {
     let volumes = command(&["volume", "ls", "--format", "{{.Name}}"])?;
     if volumes.lines().any(|name| name == config.volume) {

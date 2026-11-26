@@ -1,6 +1,7 @@
 use super::super::session_hold::{self, OperatorHeld};
 use super::super::session_lifecycle::{
-    container_name, mark_session_managed, DEFAULT_SESSION_IMAGE,
+    container_name, image_reference, is_release_image, mark_session_managed, release_session_image,
+    DAEMON_RELEASE_TAG,
 };
 use super::*;
 
@@ -369,7 +370,11 @@ fn start_with(
     }
     match state {
         None => {
-            let image = start_image.as_deref().unwrap_or(DEFAULT_SESSION_IMAGE);
+            // Without an explicit or configured image the seat starts from
+            // the running daemon's release image, never the mutable `:latest`
+            // that a daemon roll would leave behind (#14112).
+            let release = release_session_image(DAEMON_RELEASE_TAG);
+            let image = start_image.as_deref().unwrap_or(&release);
             // The account profile's hook registration, Codex trust state and
             // readiness receipt are established HERE, in a throwaway container
             // carrying nothing but the profile — because the session created on
@@ -572,6 +577,217 @@ pub fn recover(
     docker::setup(&config)?;
     docker::control(&config, id)?;
     snapshot(config, &dir)
+}
+
+/// The image a roll needed could not be obtained: neither on hand nor
+/// pullable. Typed so the reconcile pass retries the pull on a backoff instead
+/// of counting a failure — right after a daemon roll the release workflow has
+/// usually not published the session image yet (#14112, as #13493 is for the
+/// host-mounted path). The seat was not touched.
+#[derive(Debug)]
+pub struct ImageUnavailable(pub String);
+
+impl std::fmt::Display for ImageUnavailable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "the expected session image {} is not available (neither local nor pullable); the \
+                         seat was left as it was",
+            self.0
+        )
+    }
+}
+
+impl std::error::Error for ImageUnavailable {}
+
+/// What an unattended image roll of a private session did (#14112).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Rolled {
+    /// The idle seat was recreated from the expected image, against the
+    /// volume and profile it already had.
+    Recreated,
+    /// Nothing was done: the seat runs an image the roll never replaces — its
+    /// recorded override (issue #14019), or one an operator named explicitly.
+    Kept,
+    /// Nothing to do: the seat already runs the expected image, or is not
+    /// running (a stopped or missing one is [`recover`]'s, and is rolled by a
+    /// later pass once it runs again).
+    Unchanged,
+}
+
+/// The image this daemon expects a private session to run (#14112), given the
+/// release image `release` of its version: the override recorded at the last
+/// operator `start` (#14451); else, for a seat on the stock image, the release
+/// image; else the image it runs, which an operator named explicitly and
+/// which is never substituted. `None` when nothing names it — no container
+/// and nothing recorded — and the recovery then refuses to substitute one.
+pub(super) fn expected_image(
+    config: &Config,
+    running: Option<&str>,
+    release: &str,
+) -> Option<String> {
+    if let Some(recorded) = config.session_image.as_deref() {
+        return Some(recorded.to_owned());
+    }
+    let running = running?;
+    Some(if is_release_image(running) {
+        release.to_owned()
+    } else {
+        running.to_owned()
+    })
+}
+
+/// [`AccountBusy`] for a seat a job or an unleased worker is using: its image
+/// roll waits, and nothing of it is interrupted.
+const ROLL_BUSY: &str =
+    "private session is busy; moving it onto the daemon's release image waits until it is idle";
+/// [`AccountBusy`] for a seat that changed, or stopped being provably idle,
+/// between the roll's two looks at it.
+const ROLL_CHANGED: &str =
+    "private session changed while its image roll was prepared; the roll is retried once it is idle";
+
+/// Unattended image roll of a configured private session (#14112): the
+/// counterpart of [`recover`] for a seat that is **running** on an image other
+/// than the one the daemon's release expects — a `:latest` seat a daemon roll
+/// left behind, or one on the previous release tag. The idle seat is removed
+/// and recreated from `image` against its surviving volume and profile, so
+/// every clone, branch and credential stays where it was.
+///
+/// Like [`recover`] it runs under the exclusive account lease, never lifts an
+/// operator hold ([`OperatorHeld`]), never runs `prepare`, and re-verifies
+/// ownership, mounts and controls afterwards. A seat a job or an unleased
+/// worker is using is [`AccountBusy`]: the caller defers and never interrupts.
+/// A seat on a recorded override (issue #14019) or on an image an operator
+/// named explicitly is [`Rolled::Kept`].
+///
+/// # Ordering: a refusal leaves the seat exactly as it was
+///
+/// Everything that can refuse the recreate runs **before** the teardown — the
+/// image is obtained ([`ImageUnavailable`] when it cannot be), the recorded
+/// extra mounts and mirror binds are checked, the profile's control files are
+/// provisioned from the new image, and the seat is looked at once more under
+/// the lease. Only then is it stopped and removed. Past that point a failure
+/// is reported with the seat down, or still on its old container when the
+/// removal failed; the volume and the profile are untouched either way, and a
+/// later [`recover`] brings the seat back.
+///
+/// # Errors
+/// The seat is busy ([`AccountBusy`]) or held ([`OperatorHeld`]), `image`
+/// could not be obtained ([`ImageUnavailable`]), the seat fails validation, or
+/// a Docker call fails.
+pub fn roll(
+    workspace: &Path,
+    name: &str,
+    image: &str,
+    check_hold: &dyn Fn() -> Result<()>,
+) -> Result<Rolled> {
+    let (config, dir) = resolve(workspace, name)?;
+    // An override seat is never rolled (issue #14019): its derived image
+    // carries the daemon it was built on, so recreating from it reproduces
+    // the same skew, and the stock image is not a replacement for it. The fix
+    // is a rebuild FROM the new base, a new digest pin, then stop and start.
+    if config.session_image.is_some() {
+        log::warn!(
+            "private session {}: runs the configured override image {}; a daemon roll does not \
+                         move an override seat (rebuild it FROM the base session image of this \
+                         release, update the digest pin, then stop and start the seat)",
+            config.account,
+            config.session_image.as_deref().unwrap_or_default()
+        );
+        return Ok(Rolled::Kept);
+    }
+    let lease = lease::Lease::acquire(&dir)?;
+    let held = || -> Result<()> {
+        if session_hold::held_across(std::slice::from_ref(&config.profile)) {
+            return Err(OperatorHeld.into());
+        }
+        check_hold()
+    };
+    let state = docker::inspect(&config.container)?;
+    let Some(state) = state.filter(|state| reports_running(Some(state))) else {
+        // Stopped, restarting or missing: `recover` brings it back in place,
+        // and a later pass rolls it once it runs.
+        return Ok(Rolled::Unchanged);
+    };
+    let running = state["Config"]["Image"].as_str().unwrap_or_default();
+    if !is_release_image(running) {
+        log::warn!(
+            "private session {}: runs {}, an image named explicitly rather than the stock \
+                         session image; the daemon never substitutes one for it (stop and start \
+                         the seat with the image you want)",
+            config.account,
+            running
+        );
+        return Ok(Rolled::Kept);
+    }
+    if image_reference(running) == image {
+        return Ok(Rolled::Unchanged);
+    }
+    docker::validate(&config, &state)?;
+    lease.recover(&config, Some(&state))?;
+    if !docker::idle(Some(&state), &config.container)? {
+        return Err(lease::AccountBusy(ROLL_BUSY).into());
+    }
+    held()?;
+    // Everything that can refuse the recreate runs before the teardown, so a
+    // refusal here leaves the seat exactly as it is.
+    match docker::ensure_image(image) {
+        Ok(()) => {}
+        Err(error)
+            if error
+                .downcast_ref::<super::super::docker_cli::DockerTimedOut>()
+                .is_some() =>
+        {
+            return Err(error);
+        }
+        Err(error) => return Err(error.context(ImageUnavailable(image.to_owned()))),
+    }
+    check_extra_mounts(workspace, &config)?;
+    // The recreation must carry exactly the mirror binds the seat has
+    // (#14680): a clone that borrows through one dangles without it.
+    mirror::ensure_bound(workspace, &config)?;
+    // From the new image, as a fresh seat's are: the session that follows
+    // binds these files read-only, and the daemon then judges the seat
+    // against its own enforced bundle.
+    docker::provision_controls(&config, image)?;
+    // Looked at once more under the lease, right before the first mutation:
+    // the same container, still running, still provably idle.
+    let now = docker::inspect(&config.container)?
+        .context("private session disappeared while its image roll was prepared")?;
+    if !reports_running(Some(&now))
+        || now["Id"] != state["Id"]
+        || !docker::idle(Some(&now), &config.container)?
+    {
+        return Err(lease::AccountBusy(ROLL_CHANGED).into());
+    }
+    held()?;
+    docker::command(&["stop", "--time", "15", &config.container])?;
+    let stopped =
+        docker::inspect(&config.container)?.context("container disappeared during the roll")?;
+    if stopped["State"]["Running"] != false {
+        bail!("container stop not confirmed");
+    }
+    // Deliberately retain the volume, the account profile and the clone identity.
+    docker::command(&["rm", &config.container])?;
+    docker::create(&config, image)?;
+    let state =
+        docker::inspect(&config.container)?.context("rolled private session disappeared")?;
+    docker::validate(&config, &state)?;
+    if state["State"]["Running"] != true {
+        bail!("rolled private session is not running");
+    }
+    mark_session_managed(&config.profile, &config.container)?;
+    let id = state["Id"].as_str().context("container id unavailable")?;
+    docker::setup(&config)?;
+    docker::control(&config, id)?;
+    log::warn!(
+        "private session {}: ran {}; recreated it from {} against its existing volume, clones \
+                 and profile",
+        config.account,
+        running,
+        image
+    );
+    snapshot(config, &dir).map(|_| Rolled::Recreated)
 }
 
 /// Refuse the recorded extra read-only mounts a private session must never
@@ -907,15 +1123,16 @@ fn snapshot(config: Config, dir: &Path) -> Result<Status> {
     if let Some(state) = &state {
         docker::validate(&config, state)?;
     }
+    let running = state.as_ref().and_then(|s| s["Config"]["Image"].as_str());
+    let release = release_session_image(DAEMON_RELEASE_TAG);
     Ok(Status {
         workspace_mode: MODE,
         private_root: REPO,
         container_id: state
             .as_ref()
             .and_then(|s| s["Id"].as_str().map(str::to_owned)),
-        image: state
-            .as_ref()
-            .and_then(|s| s["Config"]["Image"].as_str().map(str::to_owned)),
+        image: running.map(str::to_owned),
+        expected_image: expected_image(&config, running, &release),
         extra_mounts: config.extra_mounts.clone(),
         running: reports_running(state.as_ref()),
         held: session_hold::held_across(std::slice::from_ref(&config.profile)),

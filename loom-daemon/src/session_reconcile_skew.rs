@@ -29,8 +29,17 @@
 //!    pull is retried with a doubling pass backoff
 //!    ([`PULL_RETRY_MAX_SKIP`] passes at most) until it succeeds or a version
 //!    changes (#13493).
-//! 4. **Private-clone sessions** and accounts whose mode cannot be ruled out
-//!    are never touched; the workspace registry must be readable.
+//! 4. **Private-clone sessions** are never version-probed and never recreated
+//!    host-mounted, and an account whose mode cannot be ruled out is never
+//!    touched; the host-mounted path also needs a readable workspace
+//!    registry. A running private-clone seat converges by **image identity**
+//!    instead (`reconcile_private_image`, #14112): a seat on the stock
+//!    image whose image is not the daemon's release image — a `:latest` seat
+//!    a roll left behind — is rolled onto it once idle, under the seat's
+//!    exclusive account lease (a job using it defers the roll; nothing is
+//!    ever interrupted), with the same no-downgrade, one-attempt-per-pair
+//!    and pull-backoff rules. An override seat, or one on an image an
+//!    operator named explicitly, is never replaced.
 //!
 //! Versions are compared numerically per component (`0.19.624 < 0.19.1151`),
 //! never as strings.
@@ -43,10 +52,12 @@ use serde_json::Value;
 use super::drift::DeferReason;
 use super::{recreate_container, AccountMemory, Outcome, PassInputs};
 use crate::tokens_pool::account_registry::AccountDescriptor;
+use crate::tokens_pool::private_workspace::{AccountBusy, ImageUnavailable, Rolled};
 use crate::tokens_pool::session_dispatch_lock::{self, Exclusive};
 use crate::tokens_pool::session_hold::OperatorHeld;
 use crate::tokens_pool::session_lifecycle::{
-    container_name, ContainerRunner, SessionLifecycle, UndoLock, STOP_GRACE,
+    container_name, image_reference, release_session_image, ContainerRunner, SessionLifecycle,
+    UndoLock, STOP_GRACE,
 };
 use crate::tokens_pool::session_state::{container_running, is_private_clone, workspace_label};
 
@@ -200,12 +211,26 @@ pub(super) struct SkewMemory {
     /// A pinned image the pass could not pull for `(container, host)`: how
     /// many pulls failed and how many passes remain to skip before the next.
     pull: Option<PullRetry>,
+    /// A private-clone seat's image roll (#14112).
+    private: PrivateImageMemory,
 }
 
-/// Backoff state for a pinned image that is not available yet (rule 3).
+/// What the pass remembers about one private-clone seat's image (#14112).
+#[derive(Debug, Default, Clone)]
+pub(super) struct PrivateImageMemory {
+    /// The `(running, expected)` images a roll was already attempted — or
+    /// declined — for: not again until one of them changes (rule 3).
+    attempted: Option<(String, String)>,
+    /// The expected image the roll could not obtain, and its pull backoff.
+    pull: Option<PullRetry>,
+}
+
+/// Backoff state for an image that is not available yet (rule 3), for
+/// whichever `(from, to)` pair — daemon versions or image references —
+/// asked for it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct PullRetry {
-    versions: (DaemonVersion, DaemonVersion),
+    key: (String, String),
     failures: u32,
     skip: u32,
 }
@@ -220,11 +245,11 @@ impl PullRetry {
     }
 }
 
-/// Whether this pass should pull the pinned image for `versions` or sit out
-/// the backoff. Counts the pass down when it sits out.
-fn pull_due(mem: &mut SkewMemory, versions: &(DaemonVersion, DaemonVersion)) -> bool {
-    match &mut mem.pull {
-        Some(retry) if retry.versions == *versions && retry.skip > 0 => {
+/// Whether this pass should pull the image `key` asks for or sit out the
+/// backoff. Counts the pass down when it sits out.
+fn pull_due(retry: &mut Option<PullRetry>, key: &(String, String)) -> bool {
+    match retry {
+        Some(retry) if &retry.key == key && retry.skip > 0 => {
             retry.skip -= 1;
             false
         }
@@ -232,15 +257,15 @@ fn pull_due(mem: &mut SkewMemory, versions: &(DaemonVersion, DaemonVersion)) -> 
     }
 }
 
-/// A pull of the pinned image for `versions` failed: schedule the next one.
-fn note_pull_failure(mem: &mut SkewMemory, versions: (DaemonVersion, DaemonVersion)) -> u32 {
-    let failures = match &mem.pull {
-        Some(retry) if retry.versions == versions => retry.failures + 1,
+/// A pull of the image `key` asks for failed: schedule the next one.
+fn note_pull_failure(retry: &mut Option<PullRetry>, key: (String, String)) -> u32 {
+    let failures = match retry {
+        Some(retry) if retry.key == key => retry.failures + 1,
         _ => 1,
     };
     let skip = PullRetry::skip_after(failures);
-    mem.pull = Some(PullRetry {
-        versions,
+    *retry = Some(PullRetry {
+        key,
         failures,
         skip,
     });
@@ -282,14 +307,35 @@ fn probe<R: ContainerRunner>(
     Some(version)
 }
 
-fn defer(container: &str, reason: DeferReason, detail: &str, mem: &mut SkewMemory) -> Outcome {
+/// Report a step that found something to do but may not act this pass: INFO
+/// the first time a given reason defers it, DEBUG while the same reason
+/// stands. `found` names the finding; `outcome` is the variant to report.
+fn defer(
+    container: &str,
+    reason: DeferReason,
+    found: &str,
+    detail: &str,
+    mem: &mut SkewMemory,
+    outcome: fn(DeferReason) -> Outcome,
+) -> Outcome {
     if mem.deferred == Some(reason) {
-        log::debug!("session_reconcile: {container}: version skew still deferred ({reason:?})");
+        log::debug!("session_reconcile: {container}: {found}; still deferred ({reason:?})");
     } else {
-        log::info!("session_reconcile: {container}: daemon older than the host's; {detail}");
+        log::info!("session_reconcile: {container}: {found}; {detail}");
     }
     mem.deferred = Some(reason);
+    outcome(reason)
+}
+
+const HOST_SKEW: &str = "daemon older than the host's";
+const PRIVATE_IMAGE: &str = "image is not this daemon's release image";
+
+fn skew_deferred(reason: DeferReason) -> Outcome {
     Outcome::SkewDeferred { reason }
+}
+
+fn image_deferred(reason: DeferReason) -> Outcome {
+    Outcome::PrivateImageDeferred { reason }
 }
 
 /// The version-skew step for a healthy running container. `None`: nothing to
@@ -304,14 +350,19 @@ pub(super) fn reconcile_skew<R: ContainerRunner>(
 ) -> anyhow::Result<Option<Outcome>> {
     let name = account.id.name.as_str();
     let container = container_name(name);
-    let (Some(host), Some(label), Some(_)) =
-        (inputs.host_version.as_ref(), workspace_label(inspect), inputs.registered)
-    else {
+    let Some(host) = inputs.host_version.as_ref() else {
         return Ok(None);
     };
-    if !container_running(inspect) || is_private_clone(inspect) {
+    if !container_running(inspect) {
         return Ok(None);
     }
+    // A private-clone seat converges by image identity, not by version probe.
+    if is_private_clone(inspect) {
+        return reconcile_private_image(account, inspect, inputs, account_mem, host);
+    }
+    let (Some(label), Some(_)) = (workspace_label(inspect), inputs.registered) else {
+        return Ok(None);
+    };
     let id = inspect["Id"].as_str().unwrap_or_default();
     let image = inspect["Config"]["Image"].as_str().map(str::to_string);
     let mem = &mut account_mem.skew;
@@ -349,7 +400,7 @@ pub(super) fn reconcile_skew<R: ContainerRunner>(
         mem.attempted = Some((have, host.clone()));
         return Ok(None);
     }
-    if !pull_due(mem, &(have.clone(), host.clone())) {
+    if !pull_due(&mut mem.pull, &(have.to_string(), host.to_string())) {
         log::debug!(
             "session_reconcile: {container}: pinned image still backing off after a failed pull"
         );
@@ -385,14 +436,23 @@ pub(super) fn reconcile_skew<R: ContainerRunner>(
             return Ok(Some(defer(
                 &container,
                 DeferReason::Changed,
+                HOST_SKEW,
                 "it changed since the read",
                 mem,
+                skew_deferred,
             )))
         }
     }
     if lifecycle.runner().has_active_exec(&container)? {
         let detail = "an in-flight `docker exec`; deferring and re-checking next pass";
-        return Ok(Some(defer(&container, DeferReason::Busy, detail, mem)));
+        return Ok(Some(defer(
+            &container,
+            DeferReason::Busy,
+            HOST_SKEW,
+            detail,
+            mem,
+            skew_deferred,
+        )));
     }
     let is_held = || inputs.index.is_held(name);
     if is_held() {
@@ -402,11 +462,25 @@ pub(super) fn reconcile_skew<R: ContainerRunner>(
         Exclusive::Acquired(lock) => lock,
         Exclusive::Busy => {
             let detail = "a dispatch is starting or running; deferring and re-checking next pass";
-            return Ok(Some(defer(&container, DeferReason::Busy, detail, mem)));
+            return Ok(Some(defer(
+                &container,
+                DeferReason::Busy,
+                HOST_SKEW,
+                detail,
+                mem,
+                skew_deferred,
+            )));
         }
         Exclusive::Unknown(why) => {
             let detail = format!("the dispatch lock is unusable ({why}); not stopping it");
-            return Ok(Some(defer(&container, DeferReason::LockUnknown, &detail, mem)));
+            return Ok(Some(defer(
+                &container,
+                DeferReason::LockUnknown,
+                HOST_SKEW,
+                &detail,
+                mem,
+                skew_deferred,
+            )));
         }
     };
     mem.deferred = None;
@@ -417,7 +491,7 @@ pub(super) fn reconcile_skew<R: ContainerRunner>(
     // the tag is usually a release workflow that has not published the
     // session image yet.
     if let Err(error) = lifecycle.runner().ensure_image(&pinned) {
-        let skip = note_pull_failure(mem, (have, host.clone()));
+        let skip = note_pull_failure(&mut mem.pull, (have.to_string(), host.to_string()));
         let failures = mem.pull.as_ref().map_or(1, |r| r.failures);
         if failures == 1 {
             log::warn!(
@@ -451,4 +525,133 @@ pub(super) fn reconcile_skew<R: ContainerRunner>(
         from: have,
         to: host.clone(),
     }))
+}
+
+/// The image-convergence step for a running private-clone seat (#14112). Its
+/// container is never version-probed: what decides is the image it was
+/// created from, since that is the daemon and control bundle it carries.
+/// `None`: nothing to do this pass.
+///
+/// Only a session positively known to be configured private is acted on. A
+/// seat on the stock image is expected on the daemon's release image; the
+/// roll itself ([`crate::tokens_pool::private_workspace::roll`]) keeps an
+/// override seat, or one on an image an operator named explicitly, as it is.
+/// The host path's rules apply: idle only (the roll holds the seat's exclusive
+/// account lease, so a job using it defers it and nothing is interrupted), no
+/// downgrade, one attempt per `(running, expected)` pair, and a pull that
+/// fails before any teardown retried on a doubling backoff.
+#[allow(clippy::too_many_lines)]
+fn reconcile_private_image(
+    account: &AccountDescriptor,
+    inspect: &Value,
+    inputs: &PassInputs<'_>,
+    account_mem: &mut AccountMemory,
+    host: &DaemonVersion,
+) -> anyhow::Result<Option<Outcome>> {
+    let name = account.id.name.as_str();
+    let container = container_name(name);
+    if !matches!((inputs.is_private_clone)(account), Ok(true)) {
+        return Ok(None);
+    }
+    let Some(running) = inspect["Config"]["Image"].as_str().map(image_reference) else {
+        return Ok(None);
+    };
+    let release = release_session_image(&host.to_string());
+    let mem = &mut account_mem.skew;
+    if running == release {
+        mem.private = PrivateImageMemory::default();
+        return Ok(None);
+    }
+    let pair = (running.to_owned(), release.clone());
+    if mem.private.attempted.as_ref() == Some(&pair) {
+        log::debug!(
+            "session_reconcile: {container}: image roll already attempted for {running} -> {release}"
+        );
+        return Ok(None);
+    }
+    // No downgrade: a seat on a newer release than this daemon's stays there.
+    if DaemonVersion::from_image(running).is_some_and(|running| running > *host) {
+        log::warn!(
+            "session_reconcile: {container}: runs {running}, newer than this daemon's release \
+             {host}; not downgrading it"
+        );
+        mem.private.attempted = Some(pair);
+        return Ok(None);
+    }
+    if !pull_due(&mut mem.private.pull, &pair) {
+        log::debug!(
+            "session_reconcile: {container}: release image still backing off after a failed pull"
+        );
+        return Ok(None);
+    }
+    let is_held = || inputs.index.is_held(name);
+    let rolled = match (inputs.roll_private)(account, &release, &is_held) {
+        Ok(rolled) => rolled,
+        Err(error) if error.downcast_ref::<AccountBusy>().is_some() => {
+            let detail =
+                "a job or worker is using it; deferring its image roll and re-checking next pass";
+            return Ok(Some(defer(
+                &container,
+                DeferReason::Busy,
+                PRIVATE_IMAGE,
+                detail,
+                mem,
+                image_deferred,
+            )));
+        }
+        Err(error) if error.downcast_ref::<OperatorHeld>().is_some() => return Err(error),
+        Err(error) if error.downcast_ref::<ImageUnavailable>().is_some() => {
+            let skip = note_pull_failure(&mut mem.private.pull, pair);
+            if mem
+                .private
+                .pull
+                .as_ref()
+                .is_some_and(|retry| retry.failures == 1)
+            {
+                log::warn!(
+                    "session_reconcile: {container}: not rolling it onto {release}: {error:#}; \
+                     left running, pull retried after {skip} pass(es)"
+                );
+            } else {
+                log::debug!(
+                    "session_reconcile: {container}: {release} still not available ({error:#}); \
+                     next pull after {skip} pass(es)"
+                );
+            }
+            return Ok(None);
+        }
+        Err(error) => {
+            // Recorded before reporting: a recreate that fails past the
+            // roll's own checks is not attempted again until an image changes
+            // (rule 3), and must not have churned the seat every pass.
+            mem.private.attempted = Some(pair);
+            mem.private.pull = None;
+            // If the teardown had begun, whatever brings the seat back next
+            // must not be the image it was leaving: the next sighting of the
+            // old container overwrites this, a missing one recovers on it.
+            account_mem.image = Some(release);
+            return Err(error);
+        }
+    };
+    mem.private.pull = None;
+    match rolled {
+        Rolled::Recreated => {
+            mem.private.attempted = Some(pair);
+            mem.deferred = None;
+            account_mem.awaiting_confirm = true;
+            log::warn!(
+                "session_reconcile: {container}: ran {running}, not this daemon's release image; \
+                 recreated it from {release} against its existing volume and profile"
+            );
+            Ok(Some(Outcome::PrivateImageRecreated {
+                from: running.to_owned(),
+                to: release,
+            }))
+        }
+        Rolled::Kept => {
+            mem.private.attempted = Some(pair);
+            Ok(None)
+        }
+        Rolled::Unchanged => Ok(None),
+    }
 }
