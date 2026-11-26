@@ -5114,9 +5114,23 @@ resolve_stash_cwd() {
 # running cwd). Leading `(`/`{`, `sudo`, and `VAR=val` env prefixes are
 # stripped; only a segment that STARTS with `git` or `gh pr checkout` counts,
 # so quoted text mentioning `git commit` is inert.
+# #15003: gh GLOBAL flags may precede `pr` (`gh --repo owner/repo pr checkout
+# 7`, `gh -Rowner/repo pr checkout 7`, `gh --repo=… pr checkout 7`) — the gh
+# arm below walks them before matching `pr checkout`. Args are emitted with
+# tokens joined by \036 (PCMSEP) rather than spaces, so a quoted token that
+# CONTAINS spaces (`git checkout "file with spaces"`) survives the bash-side
+# re-split as one token; and each arg token goes through resolve_var_q() —
+# qsplit() keeps quote characters verbatim (#3755), so without it a
+# double-quoted `"$VAR"` idiom fed by an earlier same-command literal
+# assignment (`BR=main; git checkout "$BR"`) would arrive unexpanded. Only
+# assignments from a segment made ENTIRELY of `NAME=value` words feed the
+# resolver: the `VAR=val cmd …` env-prefix shape is deliberately left
+# unresolved (the shell expands "$VAR" from the OUTER environment there, so
+# resolving it from varmap would fabricate a target the real command never
+# uses — it keeps the conservative catch-all deny).
 resolve_primary_mutations() {
-    printf '%s' "$1" | awk -v startcwd="$2" -v home="$HOME" "$_QSPLIT_AWK""$_CDEXPAND_AWK""$_CDQUOTE_AWK""$_MASKWS_AWK"'
-    BEGIN { curcwd = startcwd }
+    printf '%s' "$1" | awk -v startcwd="$2" -v home="$HOME" "$_QSPLIT_AWK""$_CDEXPAND_AWK""$_CDQUOTE_AWK""$_MASKWS_AWK""$_VARRESOLVE_AWK"'
+    BEGIN { PCMSEP = sprintf("%c", 30); curcwd = startcwd }
     {
         $0 = qsplit($0)
         n = split($0, segs, "\n")
@@ -5124,6 +5138,27 @@ resolve_primary_mutations() {
             seg = segs[i]
             sub(/^[ \t(){]+/, "", seg)
             sub(/^sudo[ \t]+/, "", seg)
+            # A segment that is ENTIRELY literal `NAME=value` words
+            # (`BR=main; git checkout "$BR"`): record the values into varmap
+            # (match_assignword is the quote-aware length helper shared with
+            # extract_write_targets/parse_force_ops, #6953). Two-pass — record
+            # only when nothing but assignments and whitespace remains — so
+            # the env-prefix strip below stays unrecorded.
+            awseg = seg; awcount = 0
+            while ((awlen = match_assignword(awseg)) > 0) {
+                awcount++
+                awseg = substr(awseg, awlen + 1)
+            }
+            if (awcount > 0 && awseg ~ /^[ \t]*$/) {
+                awrest = seg
+                while ((awlen = match_assignword(awrest)) > 0) {
+                    awword = substr(awrest, 1, awlen)
+                    awrest = substr(awrest, awlen + 1)
+                    sub(/[ \t]+$/, "", awword)
+                    record_assign(awword)
+                }
+                continue
+            }
             while (seg ~ /^[A-Za-z_][A-Za-z0-9_]*=[^ \t]*[ \t]+/) sub(/^[A-Za-z_][A-Za-z0-9_]*=[^ \t]*[ \t]+/, "", seg)
             if (seg == "") continue
             wseg = mask_ws(seg)
@@ -5139,15 +5174,32 @@ resolve_primary_mutations() {
                 }
                 continue
             }
-            # `gh pr checkout <N>` (#14973): gh fetches the PR head into the
-            # checkout and moves it there. Resolved from the segment cwd (a
-            # `cd` prefix threads through above; gh has no -C option). Emitted
-            # with a marker subcmd the caller denies outright: gh has no
-            # path-restore or main/master-exception shape.
-            if (toks[1] == "gh" && m >= 3 && toks[2] == "pr" && toks[3] == "checkout") {
-                args = ""
-                for (j = 4; j <= m; j++) args = args (j > 4 ? " " : "") toks[j]
-                printf "%s\037gh-pr-checkout\037%s\n", curcwd, args
+            # `gh [global flags] pr checkout <N>` (#14973, #15003): gh fetches
+            # the PR head into the checkout and moves it there. Global flags
+            # may precede `pr` — walk them (consuming the value of the
+            # two-token `-R` / `--repo` form; `--repo=…` / `-R…` are single
+            # tokens), then match `pr checkout`. Resolved from the segment
+            # cwd (a `cd` prefix threads through above; gh has no -C
+            # option). Emitted with a marker subcmd the caller denies
+            # outright: gh has no path-restore or main/master-exception
+            # shape. ALL tokens after `gh` flow into args so an
+            # `-h`/`--help` ANYWHERE — including among the global flags —
+            # reaches the caller'"'"'s `_pcm_help` skip; the remaining
+            # positionals are inert for the unconditional deny.
+            if (toks[1] == "gh") {
+                k = 2
+                while (k <= m && toks[k] ~ /^-/) {
+                    if ((toks[k] == "-R" || toks[k] == "--repo") && k < m) {
+                        k += 2
+                    } else {
+                        k++
+                    }
+                }
+                if (k + 1 <= m && toks[k] == "pr" && toks[k+1] == "checkout") {
+                    args = ""
+                    for (j = 2; j <= m; j++) args = args (j > 2 ? PCMSEP : "") resolve_var_q(toks[j])
+                    printf "%s\037gh-pr-checkout\037%s\n", curcwd, args
+                }
                 continue
             }
             if (toks[1] != "git") continue
@@ -5169,7 +5221,7 @@ resolve_primary_mutations() {
             sub_ = toks[k]
             if (sub_ != "checkout" && sub_ != "switch" && sub_ != "commit") continue
             args = ""
-            for (j = k + 1; j <= m; j++) args = args (j > k + 1 ? " " : "") toks[j]
+            for (j = k + 1; j <= m; j++) args = args (j > k + 1 ? PCMSEP : "") resolve_var_q(toks[j])
             printf "%s\037%s\037%s\n", gcwd, sub_, args
         }
     }'
@@ -12416,10 +12468,20 @@ primary_checkout_target_is_path() {
 # same via gh. A target like that has no successful git meaning (a pathspec
 # matching no tracked file is an error), so denying it costs no working
 # invocation.
+# Also denied (#15003): `gh [global flags] pr checkout <N>` (the `-R
+# owner/repo` / `--repo owner/repo` / `--repo=…` / `-R…` forms before `pr`),
+# and a bare `git checkout -` (always the @{-1} previous-branch switch, even
+# when a file literally named `-` exists — only `git checkout -- -` restores
+# such a file). Quoted targets (`git checkout '*.md'`, `git checkout "path
+# with spaces"`, `git checkout 'main'`) are unquoted — and a `"$VAR"` target
+# fed by an earlier same-command literal assignment (`BR=main; git checkout
+# "$BR"`) is resolved — before the main/master, ref and path classification,
+# so a legitimate quoted restore or return-to-default is no longer misread as
+# the #14973 catch-all (a false deny).
 # Gated by primary_checkout_mutation_guard_enabled(), evaluated lazily.
 # =============================================================================
 if [[ -n "${LOOM_SWEEP_ID:-}${LOOM_WORKTREE_PATH:-}" ]] \
-   && echo "$COMMAND_NO_COMMENT" | grep -qE '(^|[;&|(`{]|[[:space:]])((git[[:space:]].*(checkout|switch|commit))|(gh[[:space:]]+pr[[:space:]]+checkout))' \
+   && echo "$COMMAND_NO_COMMENT" | grep -qE '(^|[;&|(`{]|[[:space:]])((git[[:space:]].*(checkout|switch|commit))|(gh[[:space:]].*pr[[:space:]]+checkout))' \
    && primary_checkout_mutation_guard_enabled; then
     while IFS=$'\037' read -r _pcm_cwd _pcm_sub _pcm_args; do
         [[ -z "$_pcm_sub" ]] && continue
@@ -12433,7 +12495,11 @@ if [[ -n "${LOOM_SWEEP_ID:-}${LOOM_WORKTREE_PATH:-}" ]] \
         _pcm_parent=$(cd "$_pcm_cwd" 2>/dev/null && cd "$_pcm_common/.." 2>/dev/null && pwd -P) || continue
         [[ "$_pcm_top" == "$_pcm_parent" ]] || continue   # linked worktree: unaffected
 
-        read -r -a _pcm_t <<< "$_pcm_args"
+        # #15003: args arrive PCMSEP-joined (\036, see
+        # resolve_primary_mutations) so a quoted token containing spaces
+        # stays ONE field here; IFS is a non-whitespace separator, so read
+        # performs no whitespace trimming/collapsing on the tokens.
+        IFS=$'\036' read -r -a _pcm_t <<< "$_pcm_args"
         _pcm_deny=false
         _pcm_help=false
         _pcm_dashdash=false
@@ -12450,11 +12516,29 @@ if [[ -n "${LOOM_SWEEP_ID:-}${LOOM_WORKTREE_PATH:-}" ]] \
                 --) _pcm_dashdash=true; break ;;
                 -b|-B|-c|-C) _pcm_makes=true; _pcm_prev="$_pcm_a" ;;
                 --orphan|--detach|-d|--create|--force-create) _pcm_makes=true ;;
+                # #15003: a BARE `-` is a positional (the @{-1} switch), not
+                # a flag — `git checkout -` must reach the checkout arm, not
+                # vanish into the -*) arm with _pcm_pos empty.
+                -) [[ -z "$_pcm_pos" ]] && _pcm_pos="-" ;;
                 -*) ;;
                 *) [[ -z "$_pcm_pos" ]] && _pcm_pos="$_pcm_a" ;;
             esac
         done
         [[ "$_pcm_help" == true ]] && continue
+        # #15003: the target tokens keep their shell quoting (qsplit's raw
+        # contract, #3755), so unquote them — shell-accurate quote removal
+        # with backslash unescaping, falling back to the RAW token on an
+        # unbalanced quote (strip_target_quoting's contract) — before the
+        # main/master, rev-parse and path classification below. Without this
+        # `git checkout '*.md'` / `git checkout 'main'` / `git checkout "path
+        # with spaces"` reach the probes still quoted and fall into the
+        # #14973 catch-all deny.
+        if [[ -n "$_pcm_pos" ]]; then
+            strip_target_quoting "$_pcm_pos" && _pcm_pos="$_UNQUOTED_TARGET"
+        fi
+        if [[ -n "$_pcm_new" ]]; then
+            strip_target_quoting "$_pcm_new" && _pcm_new="$_UNQUOTED_TARGET"
+        fi
         _pcm_target="${_pcm_new:-$_pcm_pos}"
         _pcm_cmd="git $_pcm_sub"
         case "$_pcm_sub" in
@@ -12473,6 +12557,13 @@ if [[ -n "${LOOM_SWEEP_ID:-}${LOOM_WORKTREE_PATH:-}" ]] \
                 if [[ "$_pcm_target" == "main" || "$_pcm_target" == "master" ]]; then
                     :   # return to / refresh the default branch
                 elif [[ "$_pcm_makes" == true ]]; then
+                    _pcm_deny=true
+                elif [[ "$_pcm_pos" == "-" ]]; then
+                    # #15003: `git checkout -` always switches to @{-1} — git
+                    # treats a bare `-` as the previous branch even when a
+                    # file literally named `-` exists, so this is checked
+                    # BEFORE the path probe (restoring such a file takes
+                    # `git checkout -- -`, the dashdash early-continue above).
                     _pcm_deny=true
                 elif [[ -n "$_pcm_pos" ]] \
                      && (cd "$_pcm_cwd" 2>/dev/null && git rev-parse --verify --quiet "${_pcm_pos}^{commit}" >/dev/null 2>&1); then

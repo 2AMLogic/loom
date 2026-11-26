@@ -31,9 +31,22 @@ echo present > "$PC_REPO/somefile"
 git -C "$PC_REPO" add somefile
 echo gone > "$PC_REPO/gonefile"
 git -C "$PC_REPO" add gonefile
+# #15003: quoted pathspec targets ('*.md'), quoted paths with spaces (present
+# AND deleted-from-worktree tracked), and a tracked file literally named `-`
+# (git still treats a bare `git checkout -` as the @{-1} switch even when that
+# file exists — only `git checkout -- -` restores it).
+echo doc > "$PC_REPO/doc.md"
+git -C "$PC_REPO" add doc.md
+echo present > "$PC_REPO/space file"
+git -C "$PC_REPO" add "space file"
+echo gone > "$PC_REPO/space gone"
+git -C "$PC_REPO" add "space gone"
+echo dash > "$PC_REPO/-"
+git -C "$PC_REPO" add ./-
 git -C "$PC_REPO" -c user.email=loom@test -c user.name=loom \
     commit -q -m files >/dev/null 2>&1
 rm "$PC_REPO/gonefile"
+rm "$PC_REPO/space gone"
 
 # --- DENY in the primary checkout during an agent step ---
 assert_deny_env "git commit in primary is denied" "$AGENT" "git commit -m x" "$PC_REPO"
@@ -77,6 +90,81 @@ if echo "$PC_OUT" | jq -r '.hookSpecificOutput.permissionDecisionReason' | grep 
 else
     FAIL=$((FAIL + 1)); echo -e "  ${RED}FAIL${NC}: deny names worktree.sh and the toggle: $PC_OUT"
 fi
+
+# --- #15003 gap 1: a quoted positional is unquoted before classification ---
+assert_allow_env "git checkout '<quoted pathspec>' is allowed" "$AGENT" "git checkout '*.md'" "$PC_REPO"
+assert_allow_env "git checkout \"<quoted pathspec>\" is allowed" "$AGENT" 'git checkout "*.md"' "$PC_REPO"
+assert_allow_env "git checkout \"<path with spaces>\" (present) is allowed" "$AGENT" 'git checkout "space file"' "$PC_REPO"
+assert_allow_env "git checkout '<deleted tracked path with spaces>' is allowed" "$AGENT" "git checkout 'space gone'" "$PC_REPO"
+assert_allow_env "git checkout 'main' (quoted default branch) is allowed" "$AGENT" "git checkout 'main'" "$PC_REPO"
+assert_allow_env "git checkout \"main\" (quoted default branch) is allowed" "$AGENT" 'git checkout "main"' "$PC_REPO"
+assert_allow_env "git switch 'main' (quoted default branch) is allowed" "$AGENT" "git switch 'main'" "$PC_REPO"
+assert_deny_env "git checkout 'other' (quoted non-default branch) is denied" "$AGENT" "git checkout 'other'" "$PC_REPO"
+assert_deny_env "git checkout \"nosuchref\" (quoted unknown target) is denied" "$AGENT" 'git checkout "nosuchref"' "$PC_REPO"
+
+# --- #15003 gap 2: gh global flags before `pr checkout` ---
+assert_deny_env "gh --repo owner/repo pr checkout in primary is denied" "$AGENT" \
+    "gh --repo 2AMLogic/loom pr checkout 7" "$PC_REPO"
+assert_deny_env "gh -R owner/repo pr checkout in primary is denied" "$AGENT" \
+    "gh -R 2AMLogic/loom pr checkout 7" "$PC_REPO"
+assert_deny_env "gh --repo=owner/repo pr checkout in primary is denied" "$AGENT" \
+    "gh --repo=2AMLogic/loom pr checkout 7" "$PC_REPO"
+assert_deny_env "gh -Rowner/repo (attached) pr checkout in primary is denied" "$AGENT" \
+    "gh -R2AMLogic/loom pr checkout 7" "$PC_REPO"
+assert_deny_env "cd <primary> && gh --repo owner/repo pr checkout from a worktree cwd is denied" "$AGENT" \
+    "cd $PC_REPO && gh --repo 2AMLogic/loom pr checkout 7" "$PC_WT"
+assert_allow_env "gh -h before pr checkout is help, allowed" "$AGENT" "gh -h pr checkout 7" "$PC_REPO"
+assert_allow_env "gh ... pr checkout --help is allowed" "$AGENT" \
+    "gh -R 2AMLogic/loom pr checkout 7 --help" "$PC_REPO"
+assert_allow_env "gh --repo owner/repo pr checkout inside a worktree is allowed" "$AGENT" \
+    "gh --repo 2AMLogic/loom pr checkout 7" "$PC_WT"
+assert_allow_env "operator session gh --repo ... pr checkout (no agent env) is untouched" "" \
+    "gh --repo 2AMLogic/loom pr checkout 7" "$PC_REPO"
+
+# --- #15003 gap 3: bare `git checkout -` is a branch switch, not a flag ---
+assert_deny_env "git checkout - (previous-branch switch) is denied" "$AGENT" "git checkout -" "$PC_REPO"
+assert_deny_env "git checkout - stays denied with a tracked file named -" "$AGENT" "git checkout -" "$PC_REPO"
+assert_allow_env "git checkout -- - (path restore) is allowed" "$AGENT" "git checkout -- -" "$PC_REPO"
+assert_allow_env "git checkout - inside a worktree is allowed" "$AGENT" "git checkout -" "$PC_WT"
+
+# --- #15003: the new deny shapes log their documented decision-log tags ---
+# (the tag is the JSONL record's pattern field, #3772 — same seam the
+# decision-log suite asserts on, see test-guard-destructive-decision-log.sh)
+for _pcm_probe in "gh --repo 2AMLogic/loom pr checkout 7:primary-checkout-mutation:gh-pr-checkout" \
+                  "git checkout -:primary-checkout-mutation:checkout"; do
+    _pcm_cmd="${_pcm_probe%%:*}"
+    _pcm_want="${_pcm_probe#*:}"
+    _pcm_dl="$(mktemp)"
+    make_input "$_pcm_cmd" "$PC_REPO" | \
+        env LOOM_SWEEP_ID=step-builder-1-1 LOOM_GUARD_DECISION_LOG=1 \
+            LOOM_GUARD_DECISION_LOG_FILE="$_pcm_dl" "$GUARD" >/dev/null 2>&1 || true
+    TOTAL=$((TOTAL + 1))
+    if [[ "$(tail -1 "$_pcm_dl" 2>/dev/null | jq -r '.pattern' 2>/dev/null)" == "$_pcm_want" ]]; then
+        PASS=$((PASS + 1)); echo -e "  ${GREEN}PASS${NC}: $_pcm_cmd denies with tag $_pcm_want"
+    else
+        FAIL=$((FAIL + 1)); echo -e "  ${RED}FAIL${NC}: $_pcm_cmd denies with tag $_pcm_want"
+        echo "       Record: $(cat "$_pcm_dl" 2>/dev/null)"
+    fi
+    rm -f "$_pcm_dl"
+done
+unset _pcm_probe _pcm_cmd _pcm_want _pcm_dl
+
+
+# --- #15003: same-command literal assignment resolves a "$VAR" checkout target ---
+assert_allow_env "BR=main; git checkout \"\$BR\" matches the literal branch" "$AGENT" \
+    'BR=main; git checkout "$BR"' "$PC_REPO"
+assert_allow_env "BR=main && git switch \"\$BR\" matches the literal branch" "$AGENT" \
+    'BR=main && git switch "$BR"' "$PC_REPO"
+assert_allow_env "BR=main; git checkout \$BR (unquoted) matches the literal branch" "$AGENT" \
+    'BR=main; git checkout $BR' "$PC_REPO"
+assert_deny_env "BR=other; git checkout \"\$BR\" (non-default) is denied" "$AGENT" \
+    'BR=other; git checkout "$BR"' "$PC_REPO"
+assert_deny_env "BR=nosuchref; git checkout \"\$BR\" (unknown value) stays denied" "$AGENT" \
+    'BR=nosuchref; git checkout "$BR"' "$PC_REPO"
+assert_deny_env "single-quoted '\$BR' stays a literal, unresolved target" "$AGENT" \
+    'BR=main; git checkout '"'"'$BR'"'"'' "$PC_REPO"
+assert_deny_env "env-prefix BR=main git checkout \"\$BR\" stays unresolved" "$AGENT" \
+    'BR=main git checkout "$BR"' "$PC_REPO"
 
 # --- ALLOW: worktrees unaffected ---
 assert_allow_env "git commit inside a worktree is allowed" "$AGENT" "git commit -m x" "$PC_WT"
