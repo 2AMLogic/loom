@@ -23,6 +23,9 @@ pub const SAMPLE_INTERVAL: Duration = Duration::from_secs(15 * 60);
 const FIRST_SAMPLE_DELAY: Duration = Duration::from_secs(60);
 const PROBE_TIMEOUT: Duration = Duration::from_secs(15);
 const ROLE: &str = "daemon-root";
+/// The `git_spawn` site this sampler's git children are logged under
+/// (#15301), so its read-only probes are not mistaken for `checkout_ff` passes.
+const SITE: &str = "daemon_root_freshness";
 
 /// Spawn the sampler for `root`. Inert unless the OTLP exporter is configured.
 pub fn spawn_task(root: PathBuf) -> tokio::task::JoinHandle<()> {
@@ -31,8 +34,12 @@ pub fn spawn_task(root: PathBuf) -> tokio::task::JoinHandle<()> {
         loop {
             if crate::observability::ops::records_exported() {
                 let root = root.clone();
-                match tokio::task::spawn_blocking(move || measure(&root)).await {
+                let sampled = root.clone();
+                match tokio::task::spawn_blocking(move || measure(&sampled)).await {
                     Ok(Some(record)) => {
+                        if let Some(line) = warn_line(&root, &record) {
+                            log::warn!("daemon_root_freshness: {line}");
+                        }
                         crate::observability::ops::emit_record(TelemetryRecord::CheckoutFreshness(
                             record,
                         ));
@@ -47,14 +54,15 @@ pub fn spawn_task(root: PathBuf) -> tokio::task::JoinHandle<()> {
 }
 
 fn local(root: &Path, args: &[&str]) -> Option<String> {
-    git::ok(root, args, LOCAL_TIMEOUT).ok()
+    git::ok_as(SITE, root, args, LOCAL_TIMEOUT).ok()
 }
 
 /// The remote tip of `branch`, by `git ls-remote` (writes nothing).
 fn remote_tip(root: &Path, branch: &str) -> Option<String> {
     let name = format!("refs/heads/{branch}");
     let listed =
-        git::ok(root, &["ls-remote", "--quiet", "origin", "--", &name], PROBE_TIMEOUT).ok()?;
+        git::ok_as(SITE, root, &["ls-remote", "--quiet", "origin", "--", &name], PROBE_TIMEOUT)
+            .ok()?;
     listed
         .lines()
         .filter_map(|l| l.split_once('\t'))
@@ -101,8 +109,50 @@ pub fn measure(root: &Path) -> Option<CheckoutFreshnessRecord> {
         checkout_role: Some(ROLE.to_string()),
         dirty_tracked_files,
         dirty_identical_to_remote,
+        checkout_state: None,
         prompt: Some(tree),
     })
+}
+
+/// The one `WARN` line for a sample that shows the daemon root stalled
+/// (#15301), or `None` when it is current. A stall is an `origin/<branch>`
+/// the checkout never fetched (`origin_ref_stale`, which includes a tip object
+/// missing locally, so the remote count is unknown), or any commit lag. It
+/// names the root, why, and how far behind, so the checkout does not drift
+/// hundreds of commits before anyone is told. Pure: the caller logs it.
+#[must_use]
+pub fn warn_line(root: &Path, record: &CheckoutFreshnessRecord) -> Option<String> {
+    let tree = record.prompt.as_ref()?;
+    let stale = tree.origin_ref_stale == Some(true);
+    let behind_remote = tree.commits_behind_remote.filter(|n| *n > 0);
+    let behind_local = tree.commits_behind.filter(|n| *n > 0);
+    if !stale && behind_remote.is_none() && behind_local.is_none() {
+        return None;
+    }
+    let mut reasons = Vec::new();
+    if stale && tree.remote_tip.is_some() && tree.commits_behind_remote.is_none() {
+        reasons.push("tip object missing (origin ref stale)".to_string());
+    } else if stale {
+        reasons.push("origin ref stale".to_string());
+    }
+    if let Some(n) = record.dirty_tracked_files.filter(|n| *n > 0) {
+        reasons.push(format!("{n} dirty tracked file(s)"));
+    }
+    if reasons.is_empty() {
+        reasons.push("behind".to_string());
+    }
+    let behind = match (behind_remote, behind_local) {
+        (Some(n), _) => format!("{n} behind the remote tip"),
+        (None, Some(n)) if tree.commits_behind_remote.is_none() => {
+            format!("unknown (tip not fetched); {n} behind the local origin ref")
+        }
+        (None, Some(n)) => format!("{n} behind the local origin ref"),
+        (None, None) if tree.commits_behind_remote.is_none() => {
+            "unknown (tip not fetched)".to_string()
+        }
+        (None, None) => "0 behind the remote tip".to_string(),
+    };
+    Some(format!("{}: {}; {behind}", root.display(), reasons.join(", ")))
 }
 
 #[cfg(test)]
@@ -172,6 +222,72 @@ mod tests {
         assert_eq!(r.dirty_identical_to_remote, Some(true));
         // A local-path origin is "foreign" to the forge, so only the local ref count is set.
         assert_eq!(r.prompt.unwrap().commits_behind, Some(1));
+    }
+
+    fn sample(
+        tree: crate::role_tick_telemetry::prompt_tree::PromptTree,
+        dirty: Option<u64>,
+    ) -> CheckoutFreshnessRecord {
+        CheckoutFreshnessRecord {
+            captured_at: Utc::now(),
+            repo: None,
+            pass_skipped_reason: None,
+            remote_tip_age_s: None,
+            checkout_role: Some(ROLE.to_string()),
+            dirty_tracked_files: dirty,
+            dirty_identical_to_remote: None,
+            checkout_state: None,
+            prompt: Some(tree),
+        }
+    }
+
+    fn tree() -> crate::role_tick_telemetry::prompt_tree::PromptTree {
+        crate::role_tick_telemetry::prompt_tree::PromptTree {
+            commit: "a".repeat(40),
+            loom_version: None,
+            commits_behind: Some(0),
+            on_branch: Some(true),
+            remote_tip: Some("b".repeat(40)),
+            commits_behind_remote: Some(0),
+            origin_ref_stale: Some(false),
+            remote_repo: None,
+            remote_foreign: Some(false),
+        }
+    }
+
+    #[test]
+    fn a_current_sample_says_nothing() {
+        assert_eq!(warn_line(Path::new("/r"), &sample(tree(), Some(0))), None);
+    }
+
+    #[test]
+    fn a_missing_tip_object_warns_with_an_unknown_count() {
+        let mut t = tree();
+        t.origin_ref_stale = Some(true);
+        t.commits_behind_remote = None;
+        let line = warn_line(Path::new("/r"), &sample(t, Some(1))).unwrap();
+        assert!(line.starts_with("/r: "), "{line}");
+        assert!(line.contains("tip object missing"), "{line}");
+        assert!(line.contains("1 dirty tracked file(s)"), "{line}");
+        assert!(line.contains("unknown (tip not fetched)"), "{line}");
+    }
+
+    #[test]
+    fn a_stale_ref_with_the_tip_present_names_the_remote_count() {
+        let mut t = tree();
+        t.origin_ref_stale = Some(true);
+        t.commits_behind_remote = Some(490);
+        let line = warn_line(Path::new("/r"), &sample(t, None)).unwrap();
+        assert!(line.contains("origin ref stale"), "{line}");
+        assert!(line.contains("490 behind the remote tip"), "{line}");
+    }
+
+    #[test]
+    fn lag_alone_warns() {
+        let mut t = tree();
+        t.commits_behind_remote = Some(3);
+        let line = warn_line(Path::new("/r"), &sample(t, None)).unwrap();
+        assert!(line.contains("3 behind the remote tip"), "{line}");
     }
 
     #[test]
