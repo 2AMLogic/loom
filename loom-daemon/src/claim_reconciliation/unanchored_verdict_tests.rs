@@ -22,6 +22,7 @@ fn unmarked(kind: VerdictKind, head: Option<&str>) -> VerdictPr {
         marker_scan_ok: true,
         on_hold: false,
         invalidation_recorded: false,
+        operator_send_back: None,
     }
 }
 

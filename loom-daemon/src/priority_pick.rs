@@ -17,9 +17,8 @@
 //!    red-main fix (#11547), `loom:very-important` work or `loom:important`
 //!    work. There are no pool tiers: urgent work makes a workspace more
 //!    likely to be drawn, never certain.
-//! 2. [`order_in_workspace`] / [`next_in_workspace`] pick the issue inside
-//!    the workspace: verified red-main fix first, then level, then oldest
-//!    `createdAt`, then issue number.
+//! 2. [`issue_cmp`] orders the issues inside the workspace by verified red-main fix,
+//!    then level, then oldest `createdAt`, then issue number.
 //!
 //! `loom:very-important` is capped per workspace ([`VERY_IMPORTANT_CAP`],
 //! #11509): [`very_important_holders`] names the oldest open one, which keeps
@@ -153,19 +152,6 @@ pub fn issue_cmp(a: &IssueKey, b: &IssueKey) -> Ordering {
         .then_with(|| a.number.cmp(&b.number))
 }
 
-/// `items` sorted by [`issue_cmp`].
-#[must_use]
-pub fn order_in_workspace(mut items: Vec<IssueKey>) -> Vec<IssueKey> {
-    items.sort_by(issue_cmp);
-    items
-}
-
-/// The next issue to dispatch in a workspace, if any.
-#[must_use]
-pub fn next_in_workspace(items: &[IssueKey]) -> Option<&IssueKey> {
-    items.iter().min_by(|a, b| issue_cmp(a, b))
-}
-
 /// The open `loom:very-important` issues of one workspace that keep the
 /// level: the [`VERY_IMPORTANT_CAP`] oldest, by `createdAt` (a dated issue
 /// before an undated one) then issue number. `open` is every open
@@ -209,9 +195,6 @@ pub const DEFAULT_BONUS_VERY_IMPORTANT: u32 = 100;
 /// Default bonus while the workspace has dispatchable `loom:important` work
 /// (`dispatch.weightBonusImportant`, #11742).
 pub const DEFAULT_BONUS_IMPORTANT: u32 = 20;
-/// The accepted range of each weight bonus. An integer on purpose: the draw
-/// records derive `Eq`, and the hyperparams range check is integer-only.
-pub const WEIGHT_BONUS_RANGE: (u64, u64) = (0, 1_000_000);
 
 /// The bonus points a workspace's weight gains while it holds each kind of
 /// prioritised work (#11742, operator ruling 2026-10-13 on 2AMLogic/2am#4344).

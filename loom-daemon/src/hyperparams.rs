@@ -3,19 +3,21 @@
 //! Loom's operational tunables — tick intervals, concurrency ceilings,
 //! admission caps, lease TTLs, backoff thresholds — were scattered across
 //! per-module built-in constants, one-off `LOOM_*` env vars, and
-//! module-specific `autonomous.*` config blocks. That dispersion made two
-//! things impossible: recording *which* hyperparameter vector a given run
-//! executed under (run provenance), and having an external optimizer (CMA-ES,
-//! Bayesian search) sample the vector programmatically.
+//! module-specific `autonomous.*` config blocks. That dispersion made it
+//! impossible to record *which* hyperparameter vector a given run
+//! executed under (run provenance). (The original motivation also cited
+//! letting an external optimizer (CMA-ES, Bayesian search) sample the
+//! vector programmatically; both that optimizer (#9766/#9767) and the
+//! `$LOOM_HYPERPARAMS` vector tier it would have sampled (#11107) are
+//! retired — only the provenance motivation is live.)
 //!
 //! This module is the consolidation seam. It defines one typed, validated
 //! vector over a first tranche of those tunables, addresses it at a single
-//! config surface — `.loom/config.json → "hyperparameters"` — and layers an
-//! env-var parameter vector on top for programmatic injection:
+//! config surface — `.loom/config.json → "hyperparameters"` — with single-knob
+//! env vars layered on top:
 //!
 //! ```text
 //! single-knob env (LOOM_WORK_FINDER_INTERVAL_SECS, LOOM_LEASE_TTL_MINUTES, …)
-//!   > $LOOM_HYPERPARAMS vector (JSON, transient override for optimizer loops)
 //!   > .loom/config.json "hyperparameters" block (the committed, validated home)
 //!   > legacy per-module config key (autonomous.workFinder.*, autonomous.idleExit.*)
 //!   > built-in default (the constant each knob uses today)
@@ -25,7 +27,7 @@
 //! never breaks across this upgrade — but the `hyperparameters` block wins
 //! where both are present, and new tuning should target it.
 //!
-//! Three guarantees, matching the issue's acceptance criteria:
+//! Guarantees, matching the issue's acceptance criteria:
 //!
 //! 1. **Typed schema + one structured surface** — [`Hyperparameters`] groups
 //!    the knobs (`dispatch`, `lifecycle`, `rework`, `champion`) with documented ranges.
@@ -39,7 +41,9 @@
 //!    SHA-256 digest into a process global that
 //!    [`crate::telemetry::trace::provenance`] records as
 //!    `loom.hyperparams.digest` on every `loom.*` span, so telemetry from a
-//!    run is reproducible from the exact vector it ran under.
+//!    run is reproducible from the exact vector it ran under, alongside
+//!    per-field [`Source`] provenance reported by [`resolve_effective`] and
+//!    `loom-daemon hyperparams`.
 //!
 //! Tranche 1 fields (each a real consumed tunable — see the field docs):
 //! `dispatch.{tickIntervalSecs,maxConcurrent}` (plus
@@ -62,7 +66,7 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
+use std::sync::{Once, OnceLock};
 
 use crate::config_resolver;
 use crate::step_dispatch::item_draw;
@@ -71,18 +75,28 @@ use crate::work_finder::{
     DEFAULT_WORK_FINDER_INTERVAL_SECS, DEFAULT_WORK_FINDER_MAX_CONCURRENT,
 };
 
-/// Env var carrying a **hyperparameter vector** as a JSON object — the
-/// programmatic injection surface external optimizers (CMA-ES loops) set per
-/// run. Keys may be nested (`{"dispatch":{"maxConcurrent":6}}`) or flat
-/// dotted (`{"dispatch.maxConcurrent":6}`); both normalize to the schema
-/// shape. It sits **below** the single-knob env vars and **above** the
-/// committed `hyperparameters` config block, so one shell export tunes a
-/// whole run without touching any file.
+/// Retired env var that used to carry a JSON hyperparameter vector (Issue
+/// #11107). It is no longer read as a tier; it is only named so a stale
+/// export gets one warning instead of silently doing nothing.
 pub const HYPERPARAMS_ENV: &str = "LOOM_HYPERPARAMS";
 
 /// Attribute key the provenance stamper records the resolved vector's digest
 /// under (see [`crate::telemetry::trace::provenance`]).
 pub const DIGEST_ATTRIBUTE: &str = "loom.hyperparams.digest";
+
+static WARN_RETIRED_ENV: Once = Once::new();
+
+/// Warn once per process when the retired `$LOOM_HYPERPARAMS` variable is set.
+pub fn warn_if_retired_env_set() {
+    if std::env::var_os(HYPERPARAMS_ENV).is_some() {
+        WARN_RETIRED_ENV.call_once(|| {
+            log::warn!(
+                "hyperparams: ${HYPERPARAMS_ENV} is no longer supported and is ignored; \
+                 set the `hyperparameters` block in .loom/config.json or a single-knob env var instead"
+            );
+        });
+    }
+}
 
 /// The resolved vector, captured once at daemon startup.
 static RESOLVED: OnceLock<Resolved> = OnceLock::new();
@@ -251,90 +265,20 @@ impl Default for Hyperparameters {
 }
 
 // ============================================================================
-// The hyperparameters layer: config block + env vector
+// The hyperparameters layer: config block
 // ============================================================================
 
-/// Parse and normalize a `$LOOM_HYPERPARAMS` value into a schema-shaped
-/// object. Dotted keys (`"dispatch.maxConcurrent"`) become nested groups;
-/// collisions deep-merge with the last key winning. `Err` names the problem
-/// for the caller to choose its policy: [`startup_init`] fails fast,
-/// per-tick readers warn and ignore.
-pub fn parse_env_vector(raw: &str) -> Result<Value, String> {
-    let parsed: Value = serde_json::from_str(raw)
-        .map_err(|e| format!("{HYPERPARAMS_ENV} is not valid JSON: {e}"))?;
-    if !parsed.is_object() {
-        return Err(format!("{HYPERPARAMS_ENV} must be a JSON object of hyperparameters"));
-    }
-    Ok(normalize_dotted(&parsed))
-}
-
-/// The `$LOOM_HYPERPARAMS` vector, if set and parseable. Empty/unset is
-/// `Ok(None)`; a parse failure is `Err` (policy decided by the caller).
-pub fn env_vector() -> Result<Option<Value>, String> {
-    match std::env::var(HYPERPARAMS_ENV) {
-        Ok(raw) if !raw.trim().is_empty() => parse_env_vector(&raw).map(Some),
-        _ => Ok(None),
-    }
-}
-
-/// Normalize an object's dotted keys into nested groups: `{"a.b": 1}` becomes
-/// `{"a": {"b": 1}}`, merging (last wins) when a dotted key splits into an
-/// existing group. Non-object values pass through untouched.
-#[must_use]
-pub fn normalize_dotted(value: &Value) -> Value {
-    let Some(obj) = value.as_object() else {
-        return value.clone();
-    };
-    let mut out = serde_json::Map::new();
-    for (key, val) in obj {
-        match key.split_once('.') {
-            None => {
-                let normalized = normalize_dotted(val);
-                // A plain key and a dotted key can address the same group
-                // (e.g. `dispatch` and `dispatch.maxConcurrent`); deep-merge
-                // so both survive, the later key winning per field.
-                out.insert(
-                    key.clone(),
-                    match out.get(key) {
-                        Some(existing) => config_resolver::deep_merge(existing, &normalized),
-                        None => normalized,
-                    },
-                );
-            }
-            Some((head, tail)) => {
-                let nested = normalize_dotted(&Value::Object(
-                    [(tail.to_string(), val.clone())].into_iter().collect(),
-                ));
-                let merged = match out.get(head) {
-                    Some(existing) => config_resolver::deep_merge(existing, &nested),
-                    None => nested,
-                };
-                out.insert(head.to_string(), merged);
-            }
-        }
-    }
-    Value::Object(out)
-}
-
 /// The hyperparameters layer for an already-resolved effective config: the
-/// committed `"hyperparameters"` block with the env vector (if any)
-/// deep-merged over it, vector winning per field. An unparseable env vector
-/// is *not* an error here — per-tick readers soft-ignore it (startup already
-/// named it) — it just contributes nothing.
+/// committed `"hyperparameters"` block.
 #[must_use]
 pub fn overlay_from_effective(effective: &Value) -> Value {
-    let block = effective
+    // Called on every config read so a stale $LOOM_HYPERPARAMS export warns
+    // at most once per process, whichever reader gets there first.
+    warn_if_retired_env_set();
+    effective
         .get("hyperparameters")
         .cloned()
-        .unwrap_or(Value::Null);
-    match env_vector() {
-        Ok(Some(vector)) => config_resolver::deep_merge(&block, &vector),
-        Ok(None) => block,
-        Err(problem) => {
-            log::warn!("hyperparams: {problem} — vector ignored for this read");
-            block
-        }
-    }
+        .unwrap_or(Value::Null)
 }
 
 /// Convenience wrapper: resolve the effective config for `root`, then
@@ -400,7 +344,7 @@ fn champion_env_value(raw: &str) -> Option<u64> {
     raw.parse().ok()
 }
 
-/// Validate the hyperparameters layer (config block + env vector): every key
+/// Validate the hyperparameters layer (config block): every key
 /// must be known, correctly typed, and in range, and the backoff pair must
 /// satisfy `low < high`. Absent keys are fine — they fall through to the
 /// legacy tier / defaults. An explicit `null` layer (or group) is absent.
@@ -634,8 +578,6 @@ pub enum Source {
     /// A single-knob env var (today only the `LOOM_CHAMPION_*` knobs report
     /// this tier — #10753).
     Env,
-    /// `$LOOM_HYPERPARAMS` vector.
-    EnvVector,
     /// `.loom/config.json → "hyperparameters"` block.
     Config,
     /// The legacy per-module key (`autonomous.workFinder.*`, …).
@@ -650,7 +592,6 @@ impl Source {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Env => "env",
-            Self::EnvVector => "env-vector",
             Self::Config => "config",
             Self::Legacy => "legacy",
             Self::Default => "default",
@@ -714,23 +655,13 @@ pub fn digest_with(params: &Hyperparameters, prompt_modifier: Option<&str>) -> S
     format!("sha256:{}", hex::encode(hash))
 }
 
-/// A layer group lookup: the vector first, then the committed block.
-fn tier_value<'a>(
-    vector: Option<&'a Value>,
-    block: &'a Value,
-    group: &str,
-    key: &str,
-) -> Option<&'a Value> {
-    vector
-        .and_then(|v| v.get(group))
-        .and_then(|g| g.get(key))
-        .or_else(|| block.get(group).and_then(|g| g.get(key)))
+/// A layer group lookup in the committed block.
+fn tier_value<'a>(block: &'a Value, group: &str, key: &str) -> Option<&'a Value> {
+    block.get(group).and_then(|g| g.get(key))
 }
 
 /// Pick one `u64` field down the tier chain, recording its source.
-#[allow(clippy::too_many_arguments)]
 fn pick_u64(
-    vector: Option<&Value>,
     block: &Value,
     group: &str,
     key: &str,
@@ -738,20 +669,11 @@ fn pick_u64(
     default: u64,
     sources: &mut BTreeMap<String, Source>,
 ) -> u64 {
-    let from_layer = tier_value(vector, block, group, key)
+    let from_layer = tier_value(block, group, key)
         .filter(|v| !v.is_null())
         .and_then(Value::as_u64);
     let (value, source) = if let Some(n) = from_layer {
-        let source = if vector
-            .and_then(|v| v.get(group))
-            .and_then(|g| g.get(key))
-            .is_some()
-        {
-            Source::EnvVector
-        } else {
-            Source::Config
-        };
-        (n, source)
+        (n, Source::Config)
     } else if let Some(n) = legacy {
         (n, Source::Legacy)
     } else {
@@ -761,35 +683,21 @@ fn pick_u64(
     value
 }
 
-/// Pick one `dispatch` float field (vector > block > default), recording its
+/// Pick one `dispatch` float field (block > default), recording its
 /// source. A value outside `range` or not finite reads as absent, like
 /// [`pick_u64`]'s mistyped values; [`validate_layer`] is the strict gate.
 fn pick_f64(
-    vector: Option<&Value>,
     block: &Value,
     key: &str,
     (lo, hi): (f64, f64),
     default: f64,
     sources: &mut BTreeMap<String, Source>,
 ) -> f64 {
-    let from_layer = tier_value(vector, block, "dispatch", key)
+    let from_layer = tier_value(block, "dispatch", key)
         .and_then(Value::as_f64)
         .filter(|x| x.is_finite() && (lo..=hi).contains(x));
     let (value, source) = match from_layer {
-        Some(x) => {
-            let from_vector = vector
-                .and_then(|v| v.get("dispatch"))
-                .and_then(|g| g.get(key))
-                .is_some();
-            (
-                x,
-                if from_vector {
-                    Source::EnvVector
-                } else {
-                    Source::Config
-                },
-            )
-        }
+        Some(value) => (value, Source::Config),
         None => (default, Source::Default),
     };
     sources.insert(format!("dispatch.{key}"), source);
@@ -806,11 +714,7 @@ fn pick_f64(
 #[must_use]
 pub fn resolve_effective(root: &Path) -> Resolved {
     let effective = config_resolver::resolve_effective_config(root);
-    let vector = env_vector().ok().flatten();
-    let block = effective
-        .get("hyperparameters")
-        .cloned()
-        .unwrap_or(Value::Null);
+    let block = overlay_from_effective(&effective);
 
     // Legacy tier, read through each module's own parser (no hyperparams
     // overlay — that is exactly the distinction this provenance reports).
@@ -836,7 +740,6 @@ pub fn resolve_effective(root: &Path) -> Resolved {
     let mut pick_item = |i: usize, default: u32| -> u32 {
         let key = item_draw::HYPERPARAM_KEYS[i].0;
         u32::try_from(pick_u64(
-            vector.as_ref(),
             &block,
             "dispatch",
             key,
@@ -849,7 +752,6 @@ pub fn resolve_effective(root: &Path) -> Resolved {
     let params = Hyperparameters {
         dispatch: DispatchParams {
             tick_interval_secs: pick_u64(
-                vector.as_ref(),
                 &block,
                 "dispatch",
                 "tickIntervalSecs",
@@ -858,7 +760,6 @@ pub fn resolve_effective(root: &Path) -> Resolved {
                 &mut sources,
             ),
             max_concurrent: pick_u64(
-                vector.as_ref(),
                 &block,
                 "dispatch",
                 "maxConcurrent",
@@ -872,7 +773,6 @@ pub fn resolve_effective(root: &Path) -> Resolved {
             item_age_cap_days: pick_item(3, item_draw::DEFAULT_AGE_CAP_DAYS),
             item_age_divisor_days: pick_item(4, item_draw::DEFAULT_AGE_DIVISOR_DAYS),
             backlog_exponent: pick_f64(
-                vector.as_ref(),
                 &block,
                 item_draw::BACKLOG_EXPONENT_KEY,
                 item_draw::BACKLOG_EXPONENT_RANGE,
@@ -880,7 +780,6 @@ pub fn resolve_effective(root: &Path) -> Resolved {
                 &mut item_sources,
             ),
             busy_exponent: pick_f64(
-                vector.as_ref(),
                 &block,
                 item_draw::BUSY_EXPONENT_KEY,
                 item_draw::BUSY_EXPONENT_RANGE,
@@ -891,20 +790,12 @@ pub fn resolve_effective(root: &Path) -> Resolved {
         lifecycle: LifecycleParams {
             lease_ttl_minutes: {
                 // No legacy config tier for the lease TTL (env-only until
-                // this module) — the chain is vector > block > default.
-                let value = tier_value(vector.as_ref(), &block, "lifecycle", "leaseTtlMinutes")
+                // this module) — the chain is block > default.
+                let value = tier_value(&block, "lifecycle", "leaseTtlMinutes")
                     .filter(|v| !v.is_null())
                     .and_then(Value::as_f64)
                     .filter(|mins| *mins > 0.0);
-                let source = if value.is_some()
-                    && vector
-                        .as_ref()
-                        .and_then(|v| v.get("lifecycle"))
-                        .and_then(|g| g.get("leaseTtlMinutes"))
-                        .is_some()
-                {
-                    Source::EnvVector
-                } else if value.is_some() {
+                let source = if value.is_some() {
                     Source::Config
                 } else {
                     Source::Default
@@ -913,7 +804,6 @@ pub fn resolve_effective(root: &Path) -> Resolved {
                 value.unwrap_or(crate::claim_reconciliation::DEFAULT_LEASE_TTL_MINUTES)
             },
             idle_exit_minutes: pick_u64(
-                vector.as_ref(),
                 &block,
                 "lifecycle",
                 "idleExitMinutes",
@@ -924,7 +814,6 @@ pub fn resolve_effective(root: &Path) -> Resolved {
         },
         rework: ReworkParams {
             build_backoff_high: pick_u64(
-                vector.as_ref(),
                 &block,
                 "rework",
                 "buildBackoffHigh",
@@ -933,7 +822,6 @@ pub fn resolve_effective(root: &Path) -> Resolved {
                 &mut sources,
             ) as usize,
             build_backoff_low: pick_u64(
-                vector.as_ref(),
                 &block,
                 "rework",
                 "buildBackoffLow",
@@ -944,9 +832,9 @@ pub fn resolve_effective(root: &Path) -> Resolved {
         },
         champion: {
             // The `LOOM_CHAMPION_*` single-knob env tier is what Champion's
-            // shell actually consumes, so it outranks the vector/block here
-            // and reports `Source::Env` — the digest then names the values
-            // the role really ran under (#10753).
+            // shell actually consumes, so it outranks the block here and
+            // reports `Source::Env` — the digest then names the values the
+            // role really ran under (#10753).
             let d = Hyperparameters::default().champion;
             let mut pick = |key: &str, default: usize| {
                 let env_var = CHAMPION_KEYS
@@ -960,15 +848,7 @@ pub fn resolve_effective(root: &Path) -> Resolved {
                     sources.insert(format!("champion.{key}"), Source::Env);
                     return n as usize;
                 }
-                pick_u64(
-                    vector.as_ref(),
-                    &block,
-                    "champion",
-                    key,
-                    None,
-                    default as u64,
-                    &mut sources,
-                ) as usize
+                pick_u64(&block, "champion", key, None, default as u64, &mut sources) as usize
             };
             ChampionParams {
                 pr_slice: pick("prSlice", d.pr_slice),
@@ -1010,7 +890,7 @@ pub fn digest_global() -> Option<&'static str> {
 #[must_use]
 pub fn lease_ttl_minutes_from_layer() -> Option<f64> {
     // Hot-applied (#9768): re-resolve the layer against the startup root on
-    // every call, so a committed-block or vector edit lands without a daemon
+    // every call, so a committed-block edit lands without a daemon
     // restart. Returns the layer value only when the layer itself supplies
     // one — a legacy `autonomous.*` value keeps this `None` (the lease TTL
     // has no legacy config tier), falling through to the caller's default.
@@ -1033,21 +913,15 @@ pub fn lease_ttl_minutes_from_layer() -> Option<f64> {
 /// the run carries the digest of the vector it started under.
 ///
 /// # Errors
-/// Aborts startup when the layer has any schema violation, or when
-/// `$LOOM_HYPERPARAMS` is set but unparseable.
+/// Aborts startup when the layer has any schema violation. A set
+/// `$LOOM_HYPERPARAMS` only logs a warning.
 pub fn startup_init(root: &Path) -> Result<()> {
-    // Fail loudly on an unparseable vector before anything else: an optimizer
-    // loop that hands the daemon garbage must get garbage named back at it,
-    // not a silently-default run.
-    if let Err(problem) = env_vector() {
-        bail!("hyperparams: {problem}");
-    }
     let layer = layer(root);
     let violations = validate_layer(&layer);
     if !violations.is_empty() {
         let listed: String = violations.iter().map(|v| format!("\n  - {v}")).collect();
         bail!(
-            "hyperparams: {} invalid hyperparameter value(s) in `{}` or ${HYPERPARAMS_ENV}:{listed}\n\
+            "hyperparams: {} invalid hyperparameter value(s) in `{}`:{listed}\n\
              Fix the named path(s) and restart the daemon.",
             violations.len(),
             root.join(".loom/config.json").display(),
@@ -1079,12 +953,10 @@ pub fn startup_init(root: &Path) -> Result<()> {
 // ============================================================================
 
 /// Print the resolved hyperparameter vector, its provenance and its digest —
-/// the inspection surface optimizer loops (CMA-ES) use to confirm an
-/// injected vector actually took effect. With `--validate`, run the same
+/// the inspection surface for checking the effective configuration. With `--validate`, run the same
 /// strict gate daemon startup runs (`startup_init`: unknown keys, types,
-/// ranges, crossed pair, unparseable vector) **without starting a daemon** —
-/// a config lint for a proposed `.loom/config.json` edit or `$LOOM_HYPERPARAMS`
-/// vector (#9768).
+/// ranges, crossed pair) **without starting a daemon** — a config lint for a
+/// proposed `.loom/config.json` edit (#9768).
 #[derive(Debug, Args)]
 pub struct HyperparamsArgs {
     /// Emit machine-readable JSON (`params`, `sources`, `digest`, plus
@@ -1110,10 +982,6 @@ impl HyperparamsArgs {
     /// The `--validate` gate: the same checks `startup_init` enforces at
     /// daemon startup, runnable against a workspace without booting one.
     fn run_validate(&self) -> Result<()> {
-        // Same hard-fail on an unparseable vector as startup_init.
-        if let Err(problem) = env_vector() {
-            bail!("hyperparams: {problem}");
-        }
         let layer = layer(&self.workspace);
         let violations = validate_layer(&layer);
         for key in retired_dispatch_keys(&layer) {
@@ -1139,7 +1007,7 @@ impl HyperparamsArgs {
             println!("[{}]", rows.join(","));
         }
         bail!(
-            "hyperparams: {} invalid hyperparameter value(s) in `{}` or ${HYPERPARAMS_ENV}:{listed}",
+            "hyperparams: {} invalid hyperparameter value(s) in `{}`:{listed}",
             violations.len(),
             self.workspace.join(".loom/config.json").display(),
         )
