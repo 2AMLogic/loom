@@ -22,7 +22,6 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 - **PR #15465**: fix: export LOOM_AGENT_SESSION_PID from the native launcher
 - **Issue #15450** (closed): Document queue_membership_unknown under backoff in the pick-decision guide
 - **PR #15468**: docs: add queue_membership_unknown to the from_exclusion backoff group
-- **Issue #14945** (closed): runtime: add Google Antigravity CLI (agy), keyed from the gemini api-keys pool
 - **PR #15060**: feat: add agy tier-3 runtime keyed from the gemini API-key pool
 - **Issue #14981** (closed): Pin the account on a seat-stored Claude session resume (follow-up to #14371 / PR #14596)
 - **PR #15320**: feat(daemon): pin the account on a seat-stored Claude session resume
