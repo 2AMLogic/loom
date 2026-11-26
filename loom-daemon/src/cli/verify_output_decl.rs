@@ -192,7 +192,7 @@ fn inline_flagged_recipe(line: &str) -> Option<&str> {
 enum BeforeColon<'a> {
     /// The target list of a rule: `targets:` or `targets::`.
     Rule { targets: &'a str },
-    /// The variable name of an assignment: `name :=` or `name ::=`.
+    /// The variable name of an assignment: `name :=`, `name ::=` or `name :::=`.
     Assignment { name: &'a str },
     /// The colon belongs to an ordinary word: a comment, `=` or shell
     /// operator precedes it, or there is no colon at all.
@@ -207,11 +207,16 @@ fn before_rule_colon(line: &str) -> BeforeColon<'_> {
         match ch {
             '#' | '=' | ';' | '&' | '|' | '<' | '>' | '(' | ')' => break,
             ':' => {
-                // `:=` and `::=` assign to a variable; `:` and `::` open a rule.
+                // `:=`, `::=` and `:::=` assign to a variable; `:` and `::` open a rule.
                 let before = &line[..index];
                 let after_first = &line[index + 1..];
-                let after_colons = after_first.strip_prefix(':').unwrap_or(after_first);
-                return if after_colons.starts_with('=') {
+                // `:::=` is the third assignment spelling; `:::` alone is a rule.
+                let extra = after_first
+                    .bytes()
+                    .take(2)
+                    .take_while(|&b| b == b':')
+                    .count();
+                return if after_first[extra..].starts_with('=') {
                     BeforeColon::Assignment { name: before }
                 } else {
                     BeforeColon::Rule { targets: before }
@@ -233,6 +238,14 @@ fn has_exact_word(text: &str, needle: &str) -> bool {
         .any(|word| word == needle)
 }
 
+/// Whether `needle` is the last unquoted-whitespace-separated word of `text`.
+fn is_last_word(text: &str, needle: &str) -> bool {
+    let mut unquoted = unquoted();
+    text.split(|ch| unquoted(ch) && ch.is_ascii_whitespace())
+        .rfind(|word| !word.is_empty())
+        == Some(needle)
+}
+
 /// Compare whole words without interpreting Make or running the shell. A
 /// recipe or command line matches when only unquoted whitespace and shell
 /// operators separate its words and the output is one of them; in particular,
@@ -247,7 +260,9 @@ pub(crate) fn line_contains_complete_arg(line: &str, needle: &str) -> bool {
         match before_rule_colon(line) {
             // The left side of an assignment is a variable name, not an
             // argument: reject it before the scan below accepts it as a word.
-            BeforeColon::Assignment { name } if has_exact_word(name, needle) => return false,
+            // Only the last word names the variable; earlier words are modifiers
+            // such as `export`, or the arguments of a command (`make out MODE:=x`).
+            BeforeColon::Assignment { name } if is_last_word(name, needle) => return false,
             BeforeColon::Rule { targets } if has_exact_word(targets, needle) => return true,
             _ => {}
         }
@@ -521,10 +536,24 @@ mod tests {
             "build/report.json := val",
             "build/report.json ::= val",
             "export build/report.json := val",
+            "build/report.json:::=value",
+            "build/report.json :::= val",
         ] {
             assert!(!line_contains_complete_arg(line, output), "{line}");
         }
         assert!(line_contains_complete_arg("REPORT = build/report.json", output));
+    }
+
+    #[test]
+    fn a_command_argument_before_a_make_assignment_is_still_an_argument() {
+        let output = "build/report.json";
+        for line in [
+            "make build/report.json MODE:=release",
+            "make build/report.json MODE::=release",
+            "make MODE:=release build/report.json",
+        ] {
+            assert!(line_contains_complete_arg(line, output), "{line}");
+        }
     }
 
     #[test]
