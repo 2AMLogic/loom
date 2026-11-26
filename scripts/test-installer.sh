@@ -4145,6 +4145,12 @@ mkdir "$held_tools"
 for tool in grep head sed; do
   ln -s "$(command -v "$tool")" "$held_tools/$tool"
 done
+# The Node reader sees the same tools plus node, and no jq.
+held_node_tools="$TEST_DIR/held-back-node-tools"
+mkdir "$held_node_tools"
+for tool in grep head sed node; do
+  command -v "$tool" >/dev/null 2>&1 && ln -s "$(command -v "$tool")" "$held_node_tools/$tool"
+done
 
 # Stock Bash 3.2 cannot reliably source process-substituted slices.
 held_funcs="$TEST_DIR/held-back-funcs.sh"
@@ -4185,7 +4191,8 @@ held_stamp_before="$TEST_DIR/held-back-stamp.before"
 held_hook_before="$TEST_DIR/held-back-hook.before"
 
 held_readers="fallback"
-command -v jq >/dev/null 2>&1 && held_readers="jq fallback"
+command -v node >/dev/null 2>&1 && held_readers="node $held_readers"
+command -v jq >/dev/null 2>&1 && held_readers="jq $held_readers"
 
 # Stamp $held_stamp with the given shape of the held_back field and set
 # held_paths to the paths a gate may list for it, one per line.
@@ -4210,35 +4217,49 @@ held_stamp_write() {
                 held_paths=$'docs/a\\b.sh' ;;
     linebreak)  field=',\n  "held_back": [\n    "hooks/guard.sh",\n    "a\\nb"\n  ]' ;;
     trailing)   field=',\n  "held_back": [\n    "hooks/guard.sh",\n  ]' ;;
+    split-key)  # valid JSON, key and colon on separate lines
+                field=',\n  "held_back"\n  : [\n    "hooks/guard.sh"\n  ]'
+                held_paths=$'hooks/guard.sh' ;;
+    esc-key)    field=',\n  "held\\u005fback": [\n    "hooks/guard.sh"\n  ]'
+                held_paths=$'hooks/guard.sh' ;;
+    nested)     # a held list only inside a history object: top level holds nothing
+                field=',\n  "history": {\n    "held_back": [\n      "hooks/old.sh"\n    ]\n  }' ;;
+    junk)       field=',\n  "held_back": []oops' ;;
+    rawnl)      field=',\n  "held_back": [\n    "a\nb"\n  ]' ;;
+    nul)        field=',\n  "held_back": [\n    "hooks/a\\u0000b.sh"\n  ]' ;;
     upgrade)    version="0.19.1300"
                 field=',\n  "held_back": [\n    "hooks/guard.sh"\n  ]' ;;
   esac
   printf '{\n  "loom_version": "%s"%b\n}\n' "$version" "$field" > "$held_stamp"
 }
 
-# shape:expected-from-jq:expected-from-the-fallback.
+# shape:expected-from-jq:expected-from-node:expected-from-the-grep-fallback.
 #   plain      the no-op with its reinstall options, and no resync
 #   held       the paths plus the dry run, never a reinstall
 #   unverified "Could not verify" plus the dry run, no path, no reinstall
 #   upgrade    a different version: on to Check 2
-#   unparsed   jq cannot read the stamp at all, so there is no same-version
-#              install to report on and the gate stands aside, as before
-# jq decodes an escape and lists the path it names (python's json.dump writes
-# non-ASCII as \uXXXX). What the fallback cannot read exactly is unverified
-# there, never a guess -- and a path holding a line break is unverified for
-# jq too, since it reads one path per line.
-held_cases="absent:plain:plain empty:plain:plain held:held:held"
-held_cases="$held_cases string:unverified:unverified null:unverified:unverified"
-held_cases="$held_cases object:unverified:unverified non-string:unverified:unverified"
-held_cases="$held_cases unclosed:unparsed:unverified"
-held_cases="$held_cases unicode:held:unverified quote:held:unverified"
-held_cases="$held_cases backslash:held:unverified linebreak:unverified:unverified"
-held_cases="$held_cases trailing:unparsed:unverified upgrade:upgrade:upgrade"
+# A stamp jq cannot parse that still names this version is unverified, not a
+# missing stamp. jq and Node decode an escape and list the path it names
+# (python's json.dump writes non-ASCII as \uXXXX). What the grep fallback
+# cannot read exactly is unverified there, never a guess; so is a path holding
+# a line break or NUL, which Bash cannot print as it is.
+held_cases="absent:plain:plain:plain empty:plain:plain:plain held:held:held:held"
+held_cases="$held_cases string:unverified:unverified:unverified null:unverified:unverified:unverified"
+held_cases="$held_cases object:unverified:unverified:unverified non-string:unverified:unverified:unverified"
+held_cases="$held_cases unclosed:unverified:unverified:unverified"
+held_cases="$held_cases unicode:held:held:unverified quote:held:held:unverified"
+held_cases="$held_cases backslash:held:held:unverified linebreak:unverified:unverified:unverified"
+held_cases="$held_cases trailing:unverified:unverified:unverified upgrade:upgrade:upgrade:upgrade"
+held_cases="$held_cases split-key:held:held:unverified esc-key:held:held:unverified"
+held_cases="$held_cases nested:plain:plain:unverified junk:unverified:unverified:unverified"
+held_cases="$held_cases rawnl:unverified:unverified:unverified nul:unverified:unverified:unverified"
 
 for held_case in $held_cases; do
   held_shape="${held_case%%:*}"
   held_rest="${held_case#*:}"
   held_want_jq="${held_rest%%:*}"
+  held_rest="${held_rest#*:}"
+  held_want_node="${held_rest%%:*}"
   held_want_fallback="${held_rest##*:}"
   held_stamp_write "$held_shape"
   cp "$held_stamp" "$held_stamp_before"
@@ -4250,6 +4271,9 @@ for held_case in $held_cases; do
     if [[ "$held_reader" == "jq" ]]; then
       held_path="$PATH"
       held_want="$held_want_jq"
+    elif [[ "$held_reader" == "node" ]]; then
+      held_path="$held_node_tools"
+      held_want="$held_want_node"
     fi
     held_rc=0
     held_out="$(held_gate_run "$held_repo" "$held_path" 2>&1)" || held_rc=$?
@@ -4258,7 +4282,7 @@ for held_case in $held_cases; do
     [[ "$held_rc" -eq 0 ]] || held_problems+=" exit=$held_rc"
     cmp -s "$held_stamp" "$held_stamp_before" || held_problems+=" rewrote-the-stamp"
     cmp -s "$held_hook" "$held_hook_before" || held_problems+=" rewrote-the-local-hook"
-    if [[ "$held_want" == "upgrade" || "$held_want" == "unparsed" ]]; then
+    if [[ "$held_want" == "upgrade" ]]; then
       if ! grep -q '^gate fell through$' <<< "$held_out"; then
         held_problems+=" stopped-the-fall-through-to-Check-2"
       fi
@@ -4308,7 +4332,6 @@ for held_case in $held_cases; do
       held)      held_says="lists the held paths and the resync dry run, never a reinstall" ;;
       unverified) held_says="reports the status as unverified, naming no path and no reinstall" ;;
       upgrade)   held_says="lets the upgrade through to Check 2" ;;
-      unparsed)  held_says="stands aside for a stamp the reader cannot parse, as before" ;;
     esac
     if [[ -z "$held_problems" ]]; then
       pass "$held_reader reader, held_back=$held_shape: $held_says; exit 0, stamp and local hook byte-identical (#14460)"

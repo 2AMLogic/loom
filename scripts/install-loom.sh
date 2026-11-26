@@ -1229,11 +1229,17 @@ held_back_read_plain_array() {
   while :; do
     rest="${rest#"${rest%%[![:space:]]*}"}"
     if [[ "$rest" == ']'* ]]; then
+      # Only the rest of the object may follow the array.
+      rest="${rest#\]}"
+      rest="${rest#"${rest%%[![:space:]]*}"}"
+      [[ -z "$rest" || "$rest" == ','* || "$rest" == '}'* ]] || return 1
       return 0
     fi
     [[ "$rest" == '"'* ]] || return 1
     rel="${rest#\"}"
     rel="${rel%%\"*}"
+    # A raw line break is not valid JSON inside a string.
+    [[ "$rel" != *$'\n'* && "$rel" != *$'\r'* ]] || return 1
     # A backslash is an escape, an escaped quote included; decoding those is a
     # JSON parser's job.
     [[ "$rel" != *\\* ]] || return 1
@@ -1281,7 +1287,9 @@ held_back_load() {
       if has("held_back") | not then "absent"
       elif (.held_back | type) != "array" then "invalid"
       elif (.held_back | length) == 0 then "empty"
-      elif (.held_back | map(type) | unique) == ["string"] then "held"
+      elif (.held_back | map(type) | unique) == ["string"] then
+        # Bash cannot hold a NUL, so such a path would print as another name.
+        if any(.held_back[]; contains("\u0000")) then "nul" else "held" end
       else "invalid"
       end' "$meta" 2>/dev/null || true)"
     HELD_BACK_STATE="$state"
@@ -1296,27 +1304,60 @@ held_back_load() {
       held_back_refuse "install-metadata.json is not a JSON object"
     elif [[ "$state" == "invalid" ]]; then
       held_back_refuse "held_back is not an array of paths"
+    elif [[ "$state" == "nul" ]]; then
+      held_back_refuse "a held path holds a NUL character"
     fi
     return 0
   fi
 
-  # No jq. Every key the resync writes starts a line, so that is where the
-  # field is looked for; anywhere else it is not a form this can read.
-  key_re='^[[:space:]]*"held_back"[[:space:]]*:'
+  # No jq: Node, which the installer already needs, is the other JSON parser.
+  # It prints the state, then one path per line, and refuses a path it cannot
+  # print on one line.
+  if command -v node >/dev/null 2>&1; then
+    state=""
+    if ! state="$(node -e '
+      const fs = require("fs");
+      let d;
+      try { d = JSON.parse(fs.readFileSync(process.argv[1], "utf8")); }
+      catch (e) { console.log("noobject"); process.exit(0); }
+      if (d === null || typeof d !== "object" || Array.isArray(d)) { console.log("noobject"); process.exit(0); }
+      if (!Object.prototype.hasOwnProperty.call(d, "held_back")) { console.log("absent"); process.exit(0); }
+      const h = d.held_back;
+      if (!Array.isArray(h) || !h.every((x) => typeof x === "string")) { console.log("invalid"); process.exit(0); }
+      if (h.length === 0) { console.log("empty"); process.exit(0); }
+      if (h.some((x) => /[\n\r\0]/.test(x))) { console.log("linebreak"); process.exit(0); }
+      console.log("held\n" + h.join("\n"));
+    ' "$meta" 2>/dev/null)"; then
+      state="noobject"
+    fi
+    HELD_BACK_STATE="${state%%$'\n'*}"
+    case "$HELD_BACK_STATE" in
+      held)
+        while IFS= read -r rel; do
+          HELD_BACK_PATHS+=("$rel")
+        done <<< "${state#*$'\n'}"
+        ;;
+      absent | empty) ;;
+      noobject) held_back_refuse "install-metadata.json is not a JSON object" ;;
+      linebreak) held_back_refuse "a held path holds a line break or NUL character" ;;
+      *) held_back_refuse "held_back is not an array of paths" ;;
+    esac
+    return 0
+  fi
+
+  # Neither jq nor node. The resync writes JSON with a two-space indent, so its
+  # top-level `held_back` key sits at exactly that indent and nothing else in
+  # the file mentions "held". Any other mention -- a key split over two lines,
+  # an escaped spelling, a nested copy -- is a form this cannot read.
+  key_re='^  "held_back"[[:space:]]*:'
   found="$(grep -c "$key_re" "$meta" 2>/dev/null || true)"
-  case "$found" in
-    1) ;;
-    0)
-      if grep -q '"held_back"[[:space:]]*:' "$meta" 2>/dev/null; then
-        held_back_refuse "held_back is not written the way the resync writes it"
-      fi
-      return 0
-      ;;
-    *)
-      held_back_refuse "held_back could not be located as a single key"
-      return 0
-      ;;
-  esac
+  mentions="$(grep -c 'held' "$meta" 2>/dev/null || true)"
+  if [[ "$mentions" == "0" ]]; then
+    return 0
+  elif [[ "$found" != "1" || "$mentions" != "1" ]]; then
+    held_back_refuse "held_back is not written the way the resync writes it"
+    return 0
+  fi
   if ! held_back_read_plain_array "$(sed -n "/$key_re/,\$p" "$meta" 2>/dev/null)"; then
     held_back_refuse "held_back is not an array of plain paths"
   elif [[ "${#HELD_BACK_PATHS[@]}" -eq 0 ]]; then
@@ -1405,10 +1446,14 @@ if [[ "$FORCE_OVERWRITE" != "true" ]] && [[ "$CLEAN_FIRST" != "true" ]]; then
 
   # Source 1: .loom/install-metadata.json (preferred — deterministic JSON)
   if [[ -f "$TARGET_PATH/.loom/install-metadata.json" ]]; then
-    if command -v jq >/dev/null 2>&1; then
-      INSTALLED_VERSION=$(jq -r '.loom_version // empty' "$TARGET_PATH/.loom/install-metadata.json" 2>/dev/null || true)
+    # A stamp jq cannot parse is read as text, so one that still names this
+    # version reaches the same-version gate (which reports it as unverified)
+    # instead of passing for a missing stamp.
+    if command -v jq >/dev/null 2>&1 \
+      && INSTALLED_VERSION=$(jq -r '.loom_version // empty' "$TARGET_PATH/.loom/install-metadata.json" 2>/dev/null); then
+      :
     else
-      # Robust grep fallback when jq is unavailable
+      # Robust grep fallback when jq is unavailable or cannot parse the stamp
       INSTALLED_VERSION=$(grep -o '"loom_version"[[:space:]]*:[[:space:]]*"[^"]*"' "$TARGET_PATH/.loom/install-metadata.json" 2>/dev/null | head -1 | sed 's/.*"loom_version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/' || true)
     fi
   fi
