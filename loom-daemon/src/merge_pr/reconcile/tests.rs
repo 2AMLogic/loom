@@ -3,11 +3,12 @@
 //!
 //! The behavioural end-to-end cases (a safe child reaches `reconcile-stack.sh`,
 //! an unsafe one gets a comment instead, a mixed set splits, the #8010 item-2
-//! snapshot preference) live in `defaults/scripts/tests/test-merge-pr-auto-reconcile.sh`
-//! and are UNCHANGED by the port — they drive `merge-pr.sh`'s real functions,
-//! which now call this module. What is here is the per-predicate detail that
-//! suite could not reach through a `gh` stub, plus the fidelity properties the
-//! module's own docs claim.
+//! snapshot preference) lived in `test-merge-pr-auto-reconcile.sh` until #14905
+//! retired the script's post-merge reconcile; they are now carried by
+//! `stacked_reconcile/tests.rs` (the verb) and
+//! `claim_reconciliation/merged_stack_tests.rs` (the daemon tick, on real git
+//! checkouts). What is here is the per-predicate detail, plus the fidelity
+//! properties the module's own docs claim.
 
 use super::*;
 

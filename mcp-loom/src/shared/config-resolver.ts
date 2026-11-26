@@ -24,9 +24,11 @@
  *
  * NOTE: all existing resolvers (Rust/Python/Bash) are read-only. This module
  * is likewise read-only — it never writes. The write-target policy for
- * `configure_terminal` is enforced separately via `hasNonLegacyTier` (see
- * issue #4064's write-policy decision): the writer refuses to flatten the
- * merged view back into the legacy file when a non-legacy tier is present.
+ * `configure_terminal` consumes `resolveEffectiveConfigWithTiers` (see issue
+ * #4064's write-policy decision): the writer refuses to flatten the merged
+ * view back into the legacy file when a non-legacy tier is present. That flag
+ * is computed in the same pass that builds the merge (#15414), so the tier
+ * list lives in exactly one place.
  */
 
 import { readFile } from "node:fs/promises";
@@ -127,27 +129,70 @@ export function deepMerge(base: unknown, overlay: unknown): unknown {
   return overlay;
 }
 
+/** Result of {@link resolveEffectiveConfigWithTiers}. */
+export interface EffectiveConfigResolution {
+  /** The deep-merged effective config across every tier. */
+  config: JsonObject;
+  /**
+   * True when any non-legacy tier (private defaults, project, per-repo fleet,
+   * or local) contributed a nonempty object to {@link config}.
+   */
+  hasNonLegacyTier: boolean;
+}
+
+/**
+ * Resolve the effective config tree for `repoRoot` AND report whether any
+ * non-legacy tier contributed to it, in a single pass over the tier chain
+ * (lowest → highest precedence). A missing or malformed file at any tier
+ * soft-fails to that tier contributing nothing.
+ *
+ * The `hasNonLegacyTier` flag is the guard behind the #4064 write-policy
+ * decision (option 3): when a non-legacy tier is present, `configure_terminal`
+ * must NOT write the merged view back to `.loom/config.json`, because doing so
+ * would flatten every higher-tier override into the legacy file and de-sync it
+ * from its source of truth. The writer refuses instead, directing the operator
+ * to edit the tier file directly. Deriving the flag from the same reads that
+ * produced `config` keeps the merge and the write decision on one tier list
+ * and one snapshot of the files (#15414).
+ */
+export async function resolveEffectiveConfigWithTiers(
+  repoRoot: string
+): Promise<EffectiveConfigResolution> {
+  let effective: JsonObject = {};
+  let hasNonLegacyTier = false;
+
+  const overlay = async (path: string, legacy: boolean): Promise<void> => {
+    const tier = await softReadJsonObject(path);
+    if (!legacy && Object.keys(tier).length > 0) {
+      hasNonLegacyTier = true;
+    }
+    effective = deepMerge(effective, tier) as JsonObject;
+  };
+
+  const defaultsPath = privateDefaultsPath();
+  if (defaultsPath !== null) {
+    await overlay(defaultsPath, false);
+  }
+  await overlay(join(repoRoot, LEGACY_CONFIG_REL), true);
+  await overlay(join(repoRoot, PROJECT_CONFIG_REL), false);
+  await overlay(join(repoRoot, FLEET_REPO_CONFIG_REL), false);
+  await overlay(join(repoRoot, LOCAL_CONFIG_REL), false);
+
+  return { config: effective, hasNonLegacyTier };
+}
+
 /**
  * Resolve the full effective config tree for `repoRoot` by deep-merging the
  * tier chain lowest → highest. A missing or malformed file at any tier
  * soft-fails to that tier contributing nothing. When only the legacy tier has
  * content — the state of every repo today — the result is byte-for-byte the
  * parsed content of `.loom/config.json`, preserving existing behavior.
+ *
+ * Read-only callers use this; callers that may write back use
+ * {@link resolveEffectiveConfigWithTiers}.
  */
 export async function resolveEffectiveConfig(repoRoot: string): Promise<JsonObject> {
-  let effective: JsonObject = {};
-
-  const defaultsPath = privateDefaultsPath();
-  if (defaultsPath !== null) {
-    effective = deepMerge(effective, await softReadJsonObject(defaultsPath)) as JsonObject;
-  }
-
-  effective = deepMerge(effective, await softReadJsonObject(join(repoRoot, LEGACY_CONFIG_REL))) as JsonObject;
-  effective = deepMerge(effective, await softReadJsonObject(join(repoRoot, PROJECT_CONFIG_REL))) as JsonObject;
-  effective = deepMerge(effective, await softReadJsonObject(join(repoRoot, FLEET_REPO_CONFIG_REL))) as JsonObject;
-  effective = deepMerge(effective, await softReadJsonObject(join(repoRoot, LOCAL_CONFIG_REL))) as JsonObject;
-
-  return effective;
+  return (await resolveEffectiveConfigWithTiers(repoRoot)).config;
 }
 
 /**
@@ -165,35 +210,4 @@ export function getPath(config: unknown, dotted: string): unknown {
     cur = cur[segment];
   }
   return cur;
-}
-
-/**
- * True when a non-legacy tier (private defaults, `.loom-project/project.json`,
- * the per-repo fleet tier `.loom-local/fleet-repo.json`, or
- * `.loom-local/local.json`) contributes any content for `repoRoot`.
- *
- * This is the guard behind the #4064 write-policy decision (option 3): when a
- * non-legacy tier is present, `configure_terminal` must NOT write the merged
- * view back to `.loom/config.json`, because doing so would flatten every
- * higher-tier override into the legacy file and de-sync it from its source of
- * truth. The writer refuses instead, directing the operator to edit the tier
- * file directly.
- */
-export async function hasNonLegacyTier(repoRoot: string): Promise<boolean> {
-  const defaultsPath = privateDefaultsPath();
-  if (defaultsPath !== null) {
-    if (Object.keys(await softReadJsonObject(defaultsPath)).length > 0) {
-      return true;
-    }
-  }
-  if (Object.keys(await softReadJsonObject(join(repoRoot, PROJECT_CONFIG_REL))).length > 0) {
-    return true;
-  }
-  if (Object.keys(await softReadJsonObject(join(repoRoot, FLEET_REPO_CONFIG_REL))).length > 0) {
-    return true;
-  }
-  if (Object.keys(await softReadJsonObject(join(repoRoot, LOCAL_CONFIG_REL))).length > 0) {
-    return true;
-  }
-  return false;
 }

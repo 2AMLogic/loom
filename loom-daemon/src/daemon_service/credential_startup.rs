@@ -107,6 +107,13 @@ pub(super) fn run_startup(sweep_workspace: &Path) -> CredentialStartup {
     if let Some(minted) = &github_app_preflight.minted {
         match credential_preflight::publish_minted(&github_app_config_dir, minted) {
             Ok(()) => {
+                // #15327: the expiry watch starts from the startup publish.
+                if let Some(owner_repo) = &github_app_owner_repo {
+                    credential_preflight::primary_token::record_published(
+                        owner_repo,
+                        &minted.expires_at,
+                    );
+                }
                 std::env::remove_var("GH_TOKEN");
                 std::env::remove_var("GITHUB_TOKEN");
                 std::env::set_var("GH_CONFIG_DIR", &github_app_config_dir);

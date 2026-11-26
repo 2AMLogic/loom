@@ -241,15 +241,11 @@ pub fn decide(
     if record.context_size > cfg.context_cap {
         return fresh(FreshReason::OverContextCap, Some(record));
     }
-    // A transcript written inside a persistent seat can be resumed only by a
-    // launch that lands in that same seat. Nothing pins the Claude dispatch's
-    // account yet (Codex fails closed the same way), so a resume would hit a
-    // draw-dependent "no conversation found". Fresh until the follow-up pin
-    // (a `tokens select` account input + the Claude arm of
-    // `resume_handle::apply_env`) lands; tracked on #14371.
-    if record.runtime == "claude" && (record.session_store.is_some() || record.account.is_some()) {
-        return fresh(FreshReason::StoreUnreachable, Some(record));
-    }
+    // A transcript written inside a persistent seat resumes only in that seat
+    // (#14371). The launch pins the record's account and store (#14981), so a
+    // seat-stored record resumes like any other; `store_reachable` is also
+    // where a pin that cannot be honoured (account gone, bad-marked,
+    // exhausted) resolves Fresh with a handoff, instead of a failed launch.
     if !store_reachable(record) {
         return fresh(FreshReason::StoreUnreachable, Some(record));
     }
@@ -331,18 +327,13 @@ pub fn load(root: &Path) -> Ledger {
         .unwrap_or_default()
 }
 
-/// Write the ledger atomically (temp file, then rename).
+/// Write the ledger atomically ([`crate::fs_util::write_atomic`]).
 ///
 /// # Errors
 /// The filesystem's.
 pub fn save(root: &Path, ledger: &Ledger) -> std::io::Result<()> {
-    let path = path_for(root);
-    if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir)?;
-    }
-    let tmp = path.with_extension(format!("json.tmp{}", std::process::id()));
-    std::fs::write(&tmp, serde_json::to_vec_pretty(ledger).map_err(std::io::Error::other)?)?;
-    std::fs::rename(&tmp, &path)
+    let bytes = serde_json::to_vec_pretty(ledger).map_err(std::io::Error::other)?;
+    crate::fs_util::write_atomic(&path_for(root), &bytes, crate::fs_util::AtomicOpts::default())
 }
 
 /// The Claude session a spawned step runs, noted at spawn and taken at its
@@ -498,6 +489,16 @@ pub fn record_ended(
     }
 }
 
+/// Whether the account `record` must resume in can be selected now (#14981):
+/// the same check `tokens select --pin-account` makes at launch, asked early so
+/// a pin that cannot be honoured runs Fresh with a handoff rather than failing
+/// the spawn. A record with no account (host-stored) has nothing to pin.
+fn pinned_account_usable(root: &Path, record: &SessionRecord) -> bool {
+    record.account.as_deref().is_none_or(|account| {
+        crate::tokens_pool::select::select_pinned_token(root, account, None).is_ok()
+    })
+}
+
 /// [`decide`] for the workspace at `root`, against the real ledger, host and
 /// session stores.
 #[must_use]
@@ -523,6 +524,7 @@ pub fn decide_for(root: &Path, item: u32, role: StepRole) -> Decision {
                 r.session_store.as_deref(),
             )
             .is_ok()
+                && pinned_account_usable(root, r)
         },
     )
 }

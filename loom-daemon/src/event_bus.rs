@@ -73,8 +73,8 @@
 //! The `step.item.{N}.ended` topic was authorized by **#12152**: a step
 //! (#11898) is not an issue sweep and never emits `sweep.issue.{N}.exited`,
 //! so after the step-dispatch cutover nothing on the bus said a step had
-//! ended, and the narration sink's public-feed `completion` (which keyed on
-//! `.exited`) went quiet. It is published once per ended step, after the
+//! ended, and the safehouse merged-PR report (which keyed on `.exited`) went
+//! quiet. It is published once per ended step, after the
 //! step ledger classified it, and carries the ledger's `class` / `reason`.
 //! Per-death classification (`death_class`) rides the existing frozen
 //! `sweep.issue.{N}.exited` / `.crashed` topics as an additive payload field
@@ -100,9 +100,9 @@
 //! #9268 failure mode: four agents commented for seven hours). Its original
 //! publisher, the star-liveness pass, was removed by #11104; the remaining
 //! publisher is `fleet_alert` (#10164)
-//! ([`crate::types::Event::OperatorPriorityEscalation`]); consumer: the
-//! Safehouse narration sink, which renders it as a `handoff` envelope into the
-//! `Signal` attention room.
+//! ([`crate::types::Event::OperatorPriorityEscalation`]); it no longer reaches
+//! Matrix (the narration sink that rendered it was retired in #13946), so the
+//! forge comment and the pinned hold digest are how the ask reaches the human.
 //!
 //! It is emitted on a **state change**, the same dedup discipline as the three
 //! `*.advisory` topics above, but keyed rather than boolean: exactly once per

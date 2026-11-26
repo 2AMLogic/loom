@@ -276,6 +276,43 @@ fn the_park_comment_names_the_failure_class() {
     assert!(log.contains(QUARANTINE_COMMENT_MARKER), "{log}");
 }
 
+/// #15413: both parks — this host's own streak and the captain's order — tell
+/// the operator how to find each attempt of the streak, including attempts on
+/// other workers: the outcome comment's per-attempt lines, then the log path
+/// and the dispatch header on the host a line names.
+#[test]
+fn both_parks_say_where_to_find_each_attempt() {
+    for ordered in [false, true] {
+        let dir = tempdir().unwrap();
+        let gh_log = dir.path().join("gh.log");
+        let fake_gh = crate::sweep_registry::test_support::install_fake_gh_env_logger(
+            dir.path(),
+            &gh_log,
+            "",
+            0,
+        );
+        let mut reg = registry(dir.path());
+        reg.config.skip_label_flip = false;
+        reg.config.gh_bin = Some(fake_gh);
+        if ordered {
+            assert!(reg.park_ordered_fast_failure(55));
+        } else {
+            for sweep in ["a", "b", "c"] {
+                reg.charge_fast_failure(sweep, 55, UNCLASSIFIED_CLASS, false);
+            }
+        }
+        assert!(reg.is_quarantined(55));
+        let log = std::fs::read_to_string(&gh_log).unwrap_or_default();
+        assert!(log.contains("To see why each attempt ended"), "ordered={ordered}: {log}");
+        assert!(log.contains("other workers"), "ordered={ordered}: {log}");
+        assert!(log.contains(super::super::DISPATCH_HEADER_MARKER), "ordered={ordered}: {log}");
+        assert!(
+            log.contains(super::super::step_outcome_notice::STEP_OUTCOME_COMMENT_MARKER),
+            "ordered={ordered}: {log}"
+        );
+    }
+}
+
 /// Park counting (Judge on #11872): only issue-attributable fast failures
 /// count. Transient events in front of one genuine failure never park.
 #[test]

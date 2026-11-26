@@ -2,7 +2,7 @@
 //! landing (#13487). Thin on purpose: the rules are in [`super::waiver`].
 
 use std::path::Path;
-use std::process::{Command, Output, Stdio};
+use std::process::{Command, Stdio};
 use std::time::Duration;
 
 use serde_json::Value;
@@ -10,6 +10,7 @@ use serde_json::Value;
 use super::waiver::{self, Checks, File, Kind, Landing, Pr, Source, Waived};
 use crate::cmd_out::CmdOutcome;
 use crate::gh_invocation::{AccessIntent, GhInvocation, GhTarget, Operation};
+use crate::self_spawn_log::output_tracked;
 
 /// Per-call deadline for one `gh` request.
 const GH_TIMEOUT: Duration = Duration::from_secs(60);
@@ -167,24 +168,6 @@ impl Source for Gh<'_> {
     }
 }
 
-/// `cmd.output()` for a `loom-daemon` self-spawn, attributed in `daemon.log`
-/// (#14417, #14100): a `self_spawn start` line when the child spawns and a
-/// `self_spawn exit` line (status, wall time, peak RSS) once it is reaped, so a
-/// kernel `Killed process <pid> (loom-daemon)` line names this site. Captures
-/// stdout and stderr with null stdin, as at the original `.output()` call
-/// sites. Spawn failures still return `Err`.
-fn output_tracked(site: &'static str, cmd: &mut Command) -> std::io::Result<Output> {
-    let child = cmd
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()?;
-    let tracked = crate::self_spawn_log::track(site, cmd, child.id());
-    let out = child.wait_with_output()?;
-    tracked.finish(out.status);
-    Ok(out)
-}
-
 impl Landing for Gh<'_> {
     fn checks(&self, _number: u32, head: &str) -> Checks {
         let Ok(exe) = std::env::current_exe() else {
@@ -200,8 +183,7 @@ impl Landing for Gh<'_> {
             "--timeout",
             "0",
         ])
-        .current_dir(self.root)
-        .stdin(Stdio::null());
+        .current_dir(self.root);
         let out = output_tracked("workspace_resync_waiver_checks", &mut cmd);
         let text = out.map(|o| String::from_utf8_lossy(&o.stdout).into_owned());
         match text.as_deref().map(str::trim) {
@@ -376,43 +358,5 @@ pub fn cli(pr: u32, repo: Option<&str>, strict: bool) -> i32 {
             eprintln!("{why}");
             1
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn output_tracked_captures_output_and_logs_start_and_exit() {
-        let mut cmd = Command::new("sh");
-        cmd.args(["-c", "echo LOOM-CHECKS-GREEN; echo oops >&2; exit 3"])
-            .stdin(Stdio::null());
-        let mut out = None;
-        let records = crate::test_log_capture::capture_logs(|| {
-            out = Some(output_tracked("workspace_resync_waiver_checks", &mut cmd));
-        });
-        let out = out.unwrap().unwrap();
-        assert_eq!(out.status.code(), Some(3));
-        assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "LOOM-CHECKS-GREEN");
-        assert_eq!(String::from_utf8_lossy(&out.stderr).trim(), "oops");
-        let lines: Vec<&str> = records.iter().map(|(_, m)| m.as_str()).collect();
-        assert!(
-            lines.iter().any(|l| l.starts_with("self_spawn start pid=")
-                && l.contains("site=workspace_resync_waiver_checks")),
-            "{lines:?}"
-        );
-        assert!(
-            lines.iter().any(|l| l.starts_with("self_spawn exit pid=")
-                && l.contains("site=workspace_resync_waiver_checks")
-                && l.contains("exit status: 3")),
-            "{lines:?}"
-        );
-    }
-
-    #[test]
-    fn output_tracked_spawn_failure_is_an_err_not_a_panic() {
-        let mut cmd = Command::new("/nonexistent/loom-daemon");
-        assert!(output_tracked("workspace_resync_waiver_checks", &mut cmd).is_err());
     }
 }

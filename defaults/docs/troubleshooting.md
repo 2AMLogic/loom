@@ -1909,9 +1909,11 @@ carries `assessment_failed` / `assessment_errors` for automation.
 
 The above covers a stuck OPEN issue. A different, purely cosmetic case: a
 **closed** issue that still carries `loom:building` — `gh issue list --label
-loom:building` without `--state open` returns these as noise. `merge-pr.sh`
-strips the label from any issue its own merge closes (`Closes #N` / `Fixes
-#N` / `Resolves #N`), but issues closed by other means (manually, as a
+loom:building` without `--state open` returns these as noise. The daemon's
+merge-observation pass (since #14905; `merge-pr.sh` used to) strips the label
+from any issue a merge closes (`Closes #N` / `Fixes #N` / `Resolves #N`) —
+whoever made the merge, within one reconciliation tick, provided the host's
+`loom-daemon` is >= 0.20.29 — but issues closed by other means (manually, as a
 duplicate, or `--reason "not planned"`) are not covered automatically —
 run `./.loom/scripts/clean-stale-building-labels.sh [--repo OWNER/NAME]
 [--dry-run]` to sweep those (idempotent, safe to re-run).
@@ -2079,9 +2081,10 @@ The daemon automatically prunes them once they are older than the
 4. **Replay, don't pop.** To recover the work, apply the diff **inside the
    owning issue worktree** rather than `git stash pop`-ing it back into the
    primary clone — a pop in a shared stack can restore someone else's entry
-   (see "Never use bare `git stash` for ad-hoc WIP" in `builder.md`), and it
-   puts the contamination straight back where the backstop will quarantine it
-   again.
+   (see
+   [`builder-worktree.md` → "Replay quarantined edits"](https://github.com/2AMLogic/loom/blob/main/defaults/.claude/commands/loom/builder-worktree.md#replay-quarantined-edits)),
+   and it puts the contamination straight back where the backstop will
+   quarantine it again.
 
 **Empty entries**: an entry flagged `[EMPTY]` recorded nothing. These came from
 a race between the contamination snapshot and the stash push; the push is now
@@ -3218,6 +3221,14 @@ git merge --ff-only origin/main                 # bring defaults/ current
 ./.loom/scripts/resync-installed.sh             # apply
 ./.loom/scripts/land-resync-commit.sh           # commit + land it (never rebases/bypass-pushes, #6646)
 ```
+
+**Exit codes (#14434):** `0` synced / in sync; `1` error (or a file failed to sync);
+`2` `--dry-run` found drift; `3` synced, but the local-divergence protection (#7864)
+**held back** one or more files that look like a local fix. On exit `3` everything
+else is applied and `.loom/install-metadata.json` records the withheld paths under
+`held_back` (the version stamp still advances; the daemon's install classifier treats
+a non-empty `held_back` as a resync owed, never as current). Review each file, then
+re-run with `--force`; the next run that holds nothing back clears `held_back`.
 
 The last step is what actually commits and pushes the refreshed surfaces onto
 the primary clone's default branch — see "Landing a resync commit on the

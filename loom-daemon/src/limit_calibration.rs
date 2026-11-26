@@ -338,17 +338,12 @@ pub fn default_monitor_db_path() -> PathBuf {
 /// `~/.loom/activity.db`, or `LOOM_ACTIVITY_DB` if set — matches
 /// `loom-daemon usage-report`'s own resolution
 /// (`crate::cli::usage_report_cli`).
-#[must_use]
-pub fn default_activity_db_path() -> PathBuf {
-    std::env::var_os("LOOM_ACTIVITY_DB")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| {
-            dirs::home_dir()
-                .unwrap_or_else(|| PathBuf::from("."))
-                .join(".loom")
-                .join("activity.db")
-        })
-}
+///
+/// Re-export of the one shared implementation in
+/// [`crate::activity::weekly_point_history`] (issue #15372), kept so the
+/// historical `limit_calibration::default_activity_db_path` import path
+/// stays publicly callable.
+pub use crate::activity::default_activity_db_path;
 
 /// Read claude-monitor's `usage_history` table read-only and return the
 /// fleet-wide daily weekly-points-delta series since `since`.

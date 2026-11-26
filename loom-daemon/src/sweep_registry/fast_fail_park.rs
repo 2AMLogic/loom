@@ -230,10 +230,11 @@ impl SweepRegistry {
              work, so the dispatch backoff (#4485) parked it instead of retrying it around the \
              clock (#11854). Once the cause is fixed, clear the park with `loom-daemon quarantine \
              clear {issue}`, or wait for the {ttl}s TTL — both release the in-memory pause AND \
-             restore `loom:issue`.{hold_note}{escalation}",
+             restore `loom:issue`.{lookup}{hold_note}{escalation}",
             marker = QUARANTINE_COMMENT_MARKER,
             secs = FAST_FAIL_WINDOW_SECS.max(self.quarantine_config.insta_crash_secs),
             ttl = self.effective_quarantine_ttl(issue).as_secs(),
+            lookup = super::step_outcome_notice::attempt_lookup_note(),
             hold_note = super::quarantine::no_progress_hold_note(issue),
             escalation = self.quarantine_escalation_note(issue),
         );
