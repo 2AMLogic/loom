@@ -7745,6 +7745,11 @@ _extract_rm_targets_scan() {
             if (index(s, substr(BAD, q, 1)) > 0) return 1
         return 0
     }
+    function push_cwd() {
+        sdepth++
+        st_cwd[sdepth] = curcwd; st_seen[sdepth] = cdseen; st_unres[sdepth] = cdunres
+        st_link[sdepth] = cdlink; st_why[sdepth] = cdwhy
+    }
     # Resolve one `cd` segment (toks[1..m]); updates curcwd/cdunres/cdseen.
     function track_cd(   k, arg, cls, bad, wasbroken) {
         # A prior cd whose effect no longer reliably reaches this point (a `;`,
@@ -7831,20 +7836,20 @@ _extract_rm_targets_scan() {
             # never remove one: it deletes shell structure preceding the
             # command word only, and a segment whose first word already is `rm`
             # matches none of these shapes.
-            subopen = 0   # did the strip loop consume a SUBSHELL-opening paren?
+            lead = 0   # number of subshells enclosing the command word
             while (1) {
                 if (seg ~ /^[A-Za-z0-9_./+@%,:?~-]+[ \t]*\(\)[ \t]*[\{(]/) {
-                    if (seg ~ /^[A-Za-z0-9_./+@%,:?~-]+[ \t]*\(\)[ \t]*\(/) subopen = 1
+                    if (seg ~ /^[A-Za-z0-9_./+@%,:?~-]+[ \t]*\(\)[ \t]*\(/) lead++
                     sub(/^[A-Za-z0-9_./+@%,:?~-]+[ \t]*\(\)[ \t]*[\{(][ \t]*/, "", seg)
                 }
                 else if (seg ~ /^function[ \t]+[A-Za-z0-9_./+@%,:?~-]+([ \t]*\(\))?[ \t]*[\{(]/) {
-                    if (seg ~ /^function[ \t]+[A-Za-z0-9_./+@%,:?~-]+([ \t]*\(\))?[ \t]*\(/) subopen = 1
+                    if (seg ~ /^function[ \t]+[A-Za-z0-9_./+@%,:?~-]+([ \t]*\(\))?[ \t]*\(/) lead++
                     sub(/^function[ \t]+[A-Za-z0-9_./+@%,:?~-]+([ \t]*\(\))?[ \t]*[\{(][ \t]*/, "", seg)
                 }
                 else if (seg ~ /^\{[ \t]/)
                     sub(/^\{[ \t]+/, "", seg)
                 else if (seg ~ /^\(/ && seg !~ /^\(\(/) {
-                    subopen = 1
+                    lead++
                     sub(/^\([ \t]*/, "", seg)
                 }
                 else break
@@ -7865,15 +7870,11 @@ _extract_rm_targets_scan() {
             # A leading `(` encloses this segment, so the state is saved before
             # it; a `$(` later in the segment opens AFTER the segment own
             # command ran in the outer shell, so that save happens after it.
-            lead = subopen ? 1 : 0
             npush = (popen - pclose > lead) ? popen - pclose : lead
             if (npush > popen) npush = popen
             npop = pclose - (popen - npush)
             if (lead > npush) lead = npush
-            if (lead) {
-                sdepth++
-                st_cwd[sdepth] = curcwd; st_seen[sdepth] = cdseen; st_unres[sdepth] = cdunres; st_link[sdepth] = cdlink; st_why[sdepth] = cdwhy
-            }
+            for (q = 0; q < lead; q++) push_cwd()
             while (seg ~ /^\([ \t]*/ && seg !~ /^\(\(/) sub(/^\([ \t]*/, "", seg)
             if (!sudo && seg ~ /^cd([ \t]|$)/) {
                 m = split(seg, toks, /[ \t]+/)
@@ -7897,10 +7898,7 @@ _extract_rm_targets_scan() {
             else if (seg ~ /^rm([ \t]|$)/) {
                 emit_rm()
             }
-            for (q = lead; q < npush; q++) {
-                sdepth++
-                st_cwd[sdepth] = curcwd; st_seen[sdepth] = cdseen; st_unres[sdepth] = cdunres; st_link[sdepth] = cdlink; st_why[sdepth] = cdwhy
-            }
+            for (q = lead; q < npush; q++) push_cwd()
             for (q = 0; q < npop && sdepth > 0; q++) {
                 curcwd = st_cwd[sdepth]; cdseen = st_seen[sdepth]; cdunres = st_unres[sdepth]; cdlink = st_link[sdepth]; cdwhy = st_why[sdepth]
                 sdepth--
@@ -7931,7 +7929,7 @@ _extract_rm_targets_scan() {
                 if (tail ~ /^[) \t]+$/) return args
                 # A redirection or comment can follow the subshell. Only
                 # discard that trailer when no unquoted ${...} is still open.
-                if (tail !~ /^[) \t]+([0-9]*[<>]|#)/) continue
+                if (tail !~ /^[) \t]+(([0-9]+|\{[a-zA-Z_][a-zA-Z0-9_]*\})?[<>]|#)/) continue
                 # Only an unquoted, still-open ${...} could hide this paren;
                 # quoted text was skipped by the scan above.
                 if (bdepth == 0) return args

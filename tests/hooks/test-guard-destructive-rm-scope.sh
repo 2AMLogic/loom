@@ -298,6 +298,10 @@ assert_allow "rmScope default (#15221): nested subshell closes after a proven mk
     'D=$(mktemp -d); function finish { ( ( rm -rf "$D") ); }; finish' "$REPO_ROOT"
 assert_allow "rmScope default (#15221): redirection on the subshell body follows the rm operands" \
     'cd /usr && finish() ( rm -f /tmp/x/foo ) >/dev/null; finish' "$REPO_ROOT"
+for fd_redirect in '{logfd}>/dev/null' '{logfd}>>/dev/null' '{logfd}</dev/null'; do
+    assert_allow "rmScope default (#15221): group redirection $fd_redirect follows the rm operands" \
+        "cd /usr && finish() ( rm -f /tmp/x/foo ) $fd_redirect; finish" "$REPO_ROOT"
+done
 assert_allow "rmScope default (#15221): quoted \$(...) filename plus redirected subshell close" \
     "cd /usr && finish() ( rm -f '/tmp/loom-judge-15224-\$(template)' ) 2>/dev/null; finish" "$REPO_ROOT"
 assert_allow "rmScope default (#15221): quoted \${VAR:-x} filename plus redirected subshell close" \
@@ -1402,8 +1406,7 @@ assert_deny "#15112 review: non-literal cd arg still denies" \
     'cd $D && rm -rf x' "$REPO_ROOT"
 assert_allow "#15112 review: 2>&1 redirect after cd is not a background operator" \
     'cd -- /tmp/x/work >/dev/null 2>&1 && rm -f ../note.md' "$REPO_ROOT"
-# Subshell cd containment must survive the #15221 opener strip: `lead` is
-# set when the strip loop consumes a subshell-opening paren (any wrapper), so `(cd X) && rm ...` never leaks X.
+# Each subshell restores its own cwd, including nested groups in function bodies.
 assert_allow "#15221 merge: (cd /tmp) && rm -rf data keeps the subshell cd contained" \
     '(cd /tmp) && rm -rf data' "$REPO_ROOT"
 assert_allow "#15221 merge: (cd \"\$HOME\") && rm -rf scratch keeps the subshell cd contained" \
@@ -1414,6 +1417,12 @@ assert_allow "#15221 merge: function-body (cd ...) keeps the subshell cd contain
     'probe() { (cd /tmp) && rm -rf data; }; probe' "$REPO_ROOT"
 assert_allow "#15221 merge: name() ( cd ... ) body opener keeps the cd contained" \
     'probe() ( cd /tmp ) && rm -rf data' "$REPO_ROOT"
+assert_allow "#15221: inner cd in a subshell function body leaves the cleanup in the repo" \
+    'finish() ( ( cd /usr ) && rm -f local-note ); finish' "$REPO_ROOT"
+assert_allow "#15221: inner cd in a function-keyword subshell body leaves the cleanup in the repo" \
+    'function finish ( ( cd /usr ) && rm -f local-note ); finish' "$REPO_ROOT"
+assert_allow "#15221: two nested groups in a brace body each restore the repo cwd" \
+    'finish() { ( ( cd /usr ) && rm -f inner-note ) && rm -f outer-note; }; finish' "$REPO_ROOT"
 assert_deny "#15221: non-subshell function-body cd DOES move the rm (true positive)" \
     'probe() { cd /usr && rm -rf lib; }; probe' "$REPO_ROOT"
 
