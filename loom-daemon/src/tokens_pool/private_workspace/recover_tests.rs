@@ -3279,6 +3279,77 @@ fn a_builder_draw_names_every_tried_seat_when_all_are_busy() {
     drop(reacquire_probe(&bob.dir, held_b));
 }
 
+/// A marked Builder can retry private containment once a healthy account appears.
+/// The launch alone discovers a busy lease, so its refusal must cool the item.
+#[test]
+#[serial(loom_shared_tokens_dir_env)]
+#[serial]
+fn builder_pool_recovery_backs_off_busy_seats_and_excludes_exhausted_accounts() {
+    use crate::step_dispatch::{driver::probe_exhausted_roles, step_end::record_refusal};
+    use crate::step_role::StepRole;
+    use crate::sweep_registry::{
+        step_spawn::StepSpawnRequest, test_support::open_pr_guard_registry, SweepRegistry,
+    };
+    use crate::tokens_pool::health::{record_terminal_at, TerminalClassification};
+    use std::sync::{Arc, Mutex};
+
+    let _home = crate::tokens_pool::codex_home_env::lock();
+    let _runtime = crate::env_test_support::EnvGuard::clear(&[
+        "CODEX_HOME",
+        "LOOM_CODEX_HOME",
+        "LOOM_CODEX_PROFILE",
+        "LOOM_CODEX_NO_EXEC",
+        "LOOM_CODEX_SESSION_EXEC",
+        "LOOM_RUNTIME",
+        "LOOM_RUNTIME_BUILDER",
+        "LOOM_SPAWN_NO_EXEC",
+        "LOOM_SPAWN_NO_EXPORT",
+    ])
+    .and_set("LOOM_CODEX_SESSION_PROBE", Some(std::ffi::OsStr::new("0")));
+    let env = setup();
+    let root = env.workspace.path();
+    let (mut reg, _) = open_pr_guard_registry(root, "", 0, false);
+    let bob = builder_draw_env(&env, true);
+    let claude = crate::write_scope_test_support::SharedTokenPool::one_account();
+    crate::tokens_pool::bad_tokens::mark_bad_in_dir(claude.path(), "fake", "exhausted").unwrap();
+    let _alice_lease = lease::Lease::acquire(&env.dir).unwrap();
+    let _bob_lease = lease::Lease::acquire(&bob.dir).unwrap();
+
+    let role = StepRole::Builder;
+    let item = 8715;
+    let kind = crate::types::SweepKind::Step { item, role };
+    let refusal = SweepRegistry::resolve_step_launch(reg.config(), role, &kind)
+        .err()
+        .unwrap();
+    assert_eq!(refusal.reason, "pool_exhausted", "{refusal}");
+    assert!(refusal.seat_unavailable, "{refusal}");
+    reg.record_role_tick_pool_exhausted("builder");
+    let registry = Arc::new(Mutex::new(reg));
+    let now = chrono::Utc::now();
+    let request = StepSpawnRequest::new(item, role);
+    // A busy-seat refusal cools even the first launch, before any probe.
+    record_refusal(root, &registry, &request, Some(&refusal), false);
+    let cooldowns = registry.lock().unwrap().step_cooldowns(now);
+    assert!(cooldowns.is_cooling(item, role, now));
+    assert!(!cooldowns.is_cooling(item + 1, role, now));
+    let (excluded, retryable) = probe_exhausted_roles(root, &registry, now);
+    assert!(!excluded.contains("builder") && retryable.contains("builder"));
+
+    // Pool exhaustion can be observed without attempting either lease.
+    for account in account_inventory(root, AccountProvider::Codex).unwrap() {
+        record_terminal_at(
+            root,
+            &account.id,
+            TerminalClassification::TokenExhausted,
+            "test",
+            now.timestamp().try_into().unwrap(),
+        )
+        .unwrap();
+    }
+    let (excluded, retryable) = probe_exhausted_roles(root, &registry, now);
+    assert!(excluded.contains("builder") && !retryable.contains("builder"));
+}
+
 /// A held lease this test owns is re-acquirable only by dropping the holder;
 /// the bounded retry waits out unrelated forks (#9409) without hiding a leak.
 fn reacquire_probe(dir: &Path, holder: lease::Lease) -> lease::Lease {
