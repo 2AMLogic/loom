@@ -4662,8 +4662,11 @@ a terminal state and its issue carries `loom:blocked`, the reaper emits
 `sweep.issue.{child}.blocker` on the existing frozen topic (#3453 — no new
 topic) for every live child whose `depends_on` names that parent, so the stuck
 stack surfaces to the operator and the child does not auto-progress. This is
-implemented via `SweepRegistry::children_of` + `block_children_of`. Auto-detach
-(rebasing an orphaned child onto the default branch) is **out of scope for v1**.
+implemented inline in `reap_once_impl`: it calls `SweepRegistry::children_of`
+and, only when the parent issue carries `loom:blocked`, buffers one
+`Event::SweepBlocker` per child for emission once the pass has finished
+mutating the registry. Auto-detach (rebasing an orphaned child onto the default
+branch) is **out of scope for v1**.
 
 **Reconciliation is triggered automatically on parent merge (v2 item 1,
 #3747).** After the parent merges to the default branch (as a merge commit,

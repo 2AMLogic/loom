@@ -882,29 +882,6 @@ fn owner_of(owner_repo: &str) -> &str {
     owner_repo.split('/').next().unwrap_or(owner_repo)
 }
 
-/// #5401: the GitHub App mechanism mints exactly ONE installation token per
-/// daemon process, keyed on `root_owner_repo` (the workspace root's own
-/// `owner/repo`, from [`nwo_from_git_remote`]). An installation token is
-/// scoped to its own installation's repositories, so any OTHER managed repo
-/// whose owner differs from `root_owner_repo`'s is unreachable for private
-/// data under that token — no single-token configuration can serve a fleet
-/// spanning multiple owners. This is the pure filter behind the startup
-/// warning in `daemon_service.rs`: given the root's `owner/repo` and every
-/// other managed repo's resolved `owner/repo`, return the subset whose owner
-/// differs.
-#[must_use]
-pub fn detect_cross_owner_repos(
-    root_owner_repo: &str,
-    managed_owner_repos: &[String],
-) -> Vec<String> {
-    let root_owner = owner_of(root_owner_repo);
-    managed_owner_repos
-        .iter()
-        .filter(|nwo| owner_of(nwo) != root_owner)
-        .cloned()
-        .collect()
-}
-
 /// The full startup preflight result when the GitHub App mechanism is in
 /// play: the report to surface (log line, `loom-daemon status`,
 /// [`crate::types::DaemonStatusReport`]) plus the minted token — if any —
@@ -1235,16 +1212,6 @@ pub fn gh_config_dir_for_root(root: &Path) -> Option<PathBuf> {
 pub fn apply_gh_config_for_root(cmd: &mut Command, root: &Path) {
     if let Some(dir) = gh_config_dir_for_root(root) {
         cmd.env("GH_CONFIG_DIR", dir);
-    }
-}
-
-/// As [`apply_gh_config_for_root`] but for a call site that carries an
-/// `Option<&Path>` cwd (the [`crate::forge_listing`] cached-listing path): a
-/// `None` cwd (the daemon's own workspace) is left on the process-global
-/// `GH_CONFIG_DIR`.
-pub fn apply_gh_config_for_cwd(cmd: &mut Command, cwd: Option<&Path>) {
-    if let Some(root) = cwd {
-        apply_gh_config_for_root(cmd, root);
     }
 }
 
@@ -2072,34 +2039,6 @@ mod tests {
         assert_eq!(nwo_from_git_remote(dir.path()), None);
     }
 
-    #[test]
-    fn detect_cross_owner_repos_flags_only_differing_owners() {
-        let managed = vec![
-            "rjwalters/anvil".to_string(),
-            "2AMLogic/marketing".to_string(),
-            "2AMLogic/2am".to_string(),
-            "rjwalters/safehouse".to_string(),
-        ];
-        let flagged = detect_cross_owner_repos("rjwalters/loom", &managed);
-        assert_eq!(flagged, vec!["2AMLogic/marketing".to_string(), "2AMLogic/2am".to_string()]);
-    }
-
-    #[test]
-    fn detect_cross_owner_repos_single_owner_fleet_is_a_no_op() {
-        // #5401 edge case: a fleet with managed repos under a single owner
-        // (the common case pre-#5401) must see zero flagged repos.
-        let managed = vec![
-            "rjwalters/anvil".to_string(),
-            "rjwalters/safehouse".to_string(),
-        ];
-        assert!(detect_cross_owner_repos("rjwalters/loom", &managed).is_empty());
-    }
-
-    #[test]
-    fn detect_cross_owner_repos_empty_managed_list_is_a_no_op() {
-        assert!(detect_cross_owner_repos("rjwalters/loom", &[]).is_empty());
-    }
-
     // ------------------------------------------------------------------
     // Per-owner credential delivery (#5401)
     // ------------------------------------------------------------------
@@ -2269,16 +2208,6 @@ mod tests {
         );
         assert_eq!(owner_for_gh_config_dir(&owner_cfg).as_deref(), Some("xowner-12606"));
         assert_eq!(owner_for_gh_config_dir(&root_cfg), None);
-        clear_owner_root_registry();
-    }
-
-    #[test]
-    #[serial_test::serial]
-    fn apply_gh_config_for_cwd_none_is_a_no_op() {
-        clear_owner_root_registry();
-        let mut cmd = Command::new("true");
-        apply_gh_config_for_cwd(&mut cmd, None);
-        assert!(cmd.get_envs().all(|(k, _)| k != "GH_CONFIG_DIR"));
         clear_owner_root_registry();
     }
 
