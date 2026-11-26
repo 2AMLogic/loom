@@ -156,6 +156,31 @@ assert_deny "write-confinement (#15417): date conversion can produce separators"
 assert_deny "write-confinement (#15417): complete substitution with unknown filename output" \
     'echo x > "/tmp/x-$(cat labels.txt).log"' "$WT_DIR"
 
+# A same-command literal directory binding composes with the bounded filename
+# substitution; an unbound or checkout-bound directory keeps its usual verdict.
+assert_allow "write-confinement (#15417): bound scratch directory with timestamp" \
+    'OUT=/tmp; echo ok > "$OUT/report-$(date +%s).log"' "$WT_REPO"
+assert_allow "write-confinement (#15417): bound scratch directory with timestamp, append" \
+    'OUT=/tmp; echo ok >> "$OUT/report-$(date +%s).log"' "$WT_REPO"
+assert_allow "write-confinement (#15417): bound scratch directory with attached stderr" \
+    'OUT=/tmp; echo ok 2>"$OUT/report-$(date +%s).log"' "$WT_REPO"
+assert_allow "write-confinement (#15417): bound managed-worktree directory with timestamp" \
+    "OUT=$WT_DIR; echo ok > \"\$OUT/report-\$(date +%s).log\"" "$WT_REPO"
+assert_deny "write-confinement (#15417): bound checkout directory with timestamp" \
+    "OUT=$WT_REPO; echo ok > \"\$OUT/report-\$(date +%s).log\"" "$WT_DIR"
+assert_deny "write-confinement (#15417): unbound directory with timestamp" \
+    'echo ok > "$OUT/report-$(date +%s).log"' "$WT_DIR"
+assert_deny "write-confinement (#15417): bound directory, unknown filename output" \
+    'OUT=/tmp; echo ok > "$OUT/report-$(cat labels.txt).log"' "$WT_DIR"
+
+# Common timestamp conversions stay within one filename component.
+assert_allow "write-confinement (#15417): two-digit year conversion" \
+    'echo ok > "/tmp/report-$(date +%y%m%d).log"' "$WT_REPO"
+assert_allow "write-confinement (#15417): ISO-style stamp with literal T and Z" \
+    'echo ok > "/tmp/report-$(date -u +%Y-%m-%dT%H%M%SZ).log"' "$WT_REPO"
+assert_deny "write-confinement (#15417): other literal letters are not admitted" \
+    'echo ok > "/tmp/report-$(date +%Y/x).log"' "$WT_DIR"
+
 # --- #7415: a git worktree NESTED under the main checkout, created by a plain
 # `git worktree add` (so carrying no `.loom-managed` sentinel), was
 # indistinguishable from the main checkout: the sentinel walk-up found nothing

@@ -8938,7 +8938,7 @@ resolve_loop_label_redirect() {
 wt_write_filename_subst_only() {
     local path_text='[^"$`\\]*' leaf_text='[^/"$`\\]*'
     # Only literal separators and numeric date conversions within the filename.
-    local stamp='date[[:blank:]]+(-u[[:blank:]]+)?\+([0-9._:+-]|%[YmdHMSsjFTN])+'
+    local stamp='date[[:blank:]]+(-u[[:blank:]]+)?\+([0-9._:+TZ-]|%[YymdHMSsjFTN])+'
     local subst='\$\(('"$stamp"'|hostname|id[[:blank:]]+-un)\)'
     local operand_re="^\"(${path_text}/)?${leaf_text}(${subst}${leaf_text})+\"$"
     [[ "$1" =~ $operand_re ]]
@@ -9158,8 +9158,16 @@ _extract_write_targets_scan() {
     # never make one disappear.
     # Keep the opening quote on substitution-bearing redirect operands,
     # even if qsplit returned only the fragment before a pipe (#15417).
-    function redirect_target(tok) {
-        if (substr(tok, 1, 1) == DQ && tok ~ /\$\([^(]/) return tok
+    function redirect_target(tok,   inner, closed) {
+        if (substr(tok, 1, 1) == DQ && tok ~ /\$\([^(]/) {
+            # Prove a same-command literal directory binding, but keep the
+            # quote shape so the shell-side filename check still sees one
+            # complete double-quoted operand. An unbound name stays `$NAME`.
+            inner = substr(tok, 2)
+            closed = (length(inner) > 0 && substr(inner, length(inner), 1) == DQ)
+            if (closed) inner = substr(inner, 1, length(inner) - 1)
+            return DQ resolve_var(inner) (closed ? DQ : "")
+        }
         return resolve_var_q(tok)
     }
     BEGIN {
