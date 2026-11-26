@@ -130,3 +130,50 @@ fn the_snapshot_merges_a_live_captured_codex_session() {
     assert_eq!(h.container.as_deref(), Some("loom-codex-session-agent-3"));
     assert_eq!(h.runtime, "codex");
 }
+
+fn claude_launch(account: Option<&str>, store: Option<&str>) -> RollResumeLaunch {
+    RollResumeLaunch {
+        runtime: "claude".into(),
+        session_id: CODEX_ID.into(),
+        prompt: "go".into(),
+        resume_of: "step-ledger:7:judge".into(),
+        resume_count: 1,
+        session_store: store.map(str::to_string),
+        account: account.map(str::to_string),
+        ..RollResumeLaunch::default()
+    }
+}
+
+#[test]
+fn a_claude_resume_pins_the_recorded_account_and_store() {
+    let tmp = tempfile::tempdir().unwrap();
+    let launch = claude_launch(Some("beta"), Some("/seats/beta/home"));
+    let s = DispatchSession::resumed("step-judge-7-x", tmp.path(), &launch).unwrap();
+    let mut cmd = Command::new("true");
+    s.apply_env(&mut cmd);
+    assert_eq!(env_of(&cmd, resume::RESUME_ACCOUNT_ENV), Some(Some("beta".into())));
+    assert_eq!(env_of(&cmd, resume::RESUME_STORE_ENV), Some(Some("/seats/beta/home".into())));
+    // The Codex-only pins are not set for Claude.
+    assert_eq!(env_of(&cmd, "LOOM_CODEX_HOME"), None);
+}
+
+#[test]
+fn a_host_stored_claude_resume_clears_any_inherited_pin() {
+    let tmp = tempfile::tempdir().unwrap();
+    let s =
+        DispatchSession::resumed("step-judge-7-y", tmp.path(), &claude_launch(None, None)).unwrap();
+    let mut cmd = Command::new("true");
+    s.apply_env(&mut cmd);
+    assert_eq!(env_of(&cmd, resume::RESUME_ACCOUNT_ENV), Some(None));
+    assert_eq!(env_of(&cmd, resume::RESUME_STORE_ENV), Some(None));
+}
+
+#[test]
+fn a_fresh_dispatch_clears_any_inherited_resume_pin() {
+    let tmp = tempfile::tempdir().unwrap();
+    let s = DispatchSession::new("sweep-issue-9-z", tmp.path(), None).unwrap();
+    let mut cmd = Command::new("true");
+    s.apply_env(&mut cmd);
+    assert_eq!(env_of(&cmd, resume::RESUME_ACCOUNT_ENV), Some(None));
+    assert_eq!(env_of(&cmd, resume::RESUME_STORE_ENV), Some(None));
+}

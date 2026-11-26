@@ -611,6 +611,7 @@ const BUNDLED_RUNTIME_MANIFESTS: &[(&str, &str)] = &[
     ("claude", include_str!("../../defaults/runtimes/claude.json")),
     ("codex", include_str!("../../defaults/runtimes/codex.json")),
     ("aider", include_str!("../../defaults/runtimes/aider.json")),
+    ("agy", include_str!("../../defaults/runtimes/agy.json")),
     ("pi", include_str!("../../defaults/runtimes/pi.json")),
     ("opencode", include_str!("../../defaults/runtimes/opencode.json")),
     ("kimi", include_str!("../../defaults/runtimes/kimi.json")),

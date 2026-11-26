@@ -600,11 +600,16 @@ fn writers_warnings_with(effective: &Value, env_override: bool) -> Vec<String> {
 /// `~/…` → `$HOME/…`. `github-app-token.sh` does not expand `~`, so a
 /// tilde path in config silently reads as "key not readable"; expanding it
 /// here keeps the broker's own minting honest about the same config.
+///
+/// Deliberately prefix-only and `HOME`-env-only (issue #15372): a bare `~`
+/// stays literal, and the home must come from `$HOME` — **not**
+/// `dirs::home_dir()`, which would still resolve an account home on a host
+/// with `$HOME` unset and silently change which key file is read.
 fn expand_home(path: &str) -> PathBuf {
-    match (path.strip_prefix("~/"), std::env::var_os("HOME")) {
-        (Some(rest), Some(home)) => PathBuf::from(home).join(rest),
-        _ => PathBuf::from(path),
+    if !path.starts_with("~/") {
+        return PathBuf::from(path);
     }
+    crate::fs_util::expand_tilde_with_home(path, std::env::var_os("HOME").as_deref().map(Path::new))
 }
 
 /// The roster for `root`, cached for [`ROSTER_TTL`].
