@@ -397,9 +397,6 @@ impl From<anyhow::Error> for DaemonError {
     }
 }
 
-/// Result type alias for daemon operations
-pub type DaemonResult<T> = Result<T, DaemonError>;
-
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {

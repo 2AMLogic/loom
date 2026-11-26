@@ -179,8 +179,8 @@ const TABLE: &[(&str, Reloadability)] = &[
     ("forge.githubApp", Reloadability::Live),
     ("forge.githubAppReadPool", Reloadability::Live),
     // `safehouse::resolve_config` is called once by
-    // `WorkspacePool::start_safehouse_narration` / peer-claim coordination at
-    // start, and the sink/coordinator it builds is held for the process.
+    // `WorkspacePool::start_merge_reporter` at start, and the reporter it
+    // builds is held for the process.
     ("safehouse", Reloadability::RestartRequired),
     // `codesign.identity` is resolved fresh each time it is needed
     // (`health::codesign::assess_codesign_identity`, the provisioning
