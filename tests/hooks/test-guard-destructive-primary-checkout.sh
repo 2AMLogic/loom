@@ -160,6 +160,34 @@ assert_deny_env "checkout branch operand is distinct from gh help" "$AGENT" \
 assert_allow_env "gh help remains available after a branch operand" "$AGENT" \
     'gh pr checkout 7 --branch topic --help' "$PC_REPO"
 
+# Known option position with an unknown ($VAR) attached value keeps the option
+# name, so help is still recognized and an operand is not mistaken for one.
+assert_allow_env "gh --repo=\$VAR with trailing --help is help" "$AGENT" \
+    'gh pr checkout --repo="$REVIEW_REPO" --help' "$PC_REPO"
+assert_allow_env "gh --branch=\$VAR with trailing --help is help" "$AGENT" \
+    'gh pr checkout --branch="$REVIEW_BRANCH" --help' "$PC_REPO"
+assert_allow_env "git commit --message=\$VAR -h is help" "$AGENT" \
+    'git commit --message="$MSG" -h' "$PC_REPO"
+assert_allow_env "git checkout --conflict=\$VAR -h is help" "$AGENT" \
+    'git checkout --conflict="$STYLE" -h' "$PC_REPO"
+assert_allow_env "git switch --conflict=\$VAR -h is help" "$AGENT" \
+    'git switch --conflict="$STYLE" -h' "$PC_REPO"
+assert_deny_env "gh --repo=\$VAR pr checkout without help is still denied" "$AGENT" \
+    'gh --repo="$REVIEW_REPO" pr checkout 7' "$PC_REPO"
+assert_deny_env "git checkout --conflict=\$VAR <unknown target> stays denied" "$AGENT" \
+    'git checkout --conflict="$STYLE" "$TARGET"' "$PC_REPO"
+# Explicit gh help spellings: affirmative values and short-flag bundles.
+assert_allow_env "gh --help=true before pr checkout is help" "$AGENT" \
+    'gh --help=true pr checkout 7' "$PC_REPO"
+assert_allow_env "gh pr checkout --help=true is help" "$AGENT" \
+    'gh pr checkout --help=true' "$PC_REPO"
+assert_allow_env "gh pr checkout -fh bundle is help" "$AGENT" \
+    'gh pr checkout -fh' "$PC_REPO"
+assert_deny_env "gh pr checkout --help=false is not help" "$AGENT" \
+    'gh pr checkout 7 --help=false' "$PC_REPO"
+assert_deny_env "gh pr checkout -bh (h is the branch value) is not help" "$AGENT" \
+    'gh pr checkout 7 -bh' "$PC_REPO"
+
 # --- #15003 gap 3: bare `git checkout -` is a branch switch, not a flag ---
 assert_deny_env "git checkout - (previous-branch switch) is denied" "$AGENT" "git checkout -" "$PC_REPO"
 assert_deny_env "git checkout - stays denied with a tracked file named -" "$AGENT" "git checkout -" "$PC_REPO"

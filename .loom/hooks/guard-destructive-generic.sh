@@ -5178,6 +5178,17 @@ resolve_primary_mutations() {
         }
         return (q == "" ? out : UNKNOWN)
     }
+    # An argument word whose unresolvable value hides only the part after a
+    # literal `--name=` / `-n=` prefix keeps that prefix (#15003): the option
+    # name is literal even when its attached value is not, so option
+    # position and help flags still classify. A bare unknown word stays
+    # UNKNOWN (conservative).
+    function pcm_arg(raw,   v) {
+        v = pcm_word(raw)
+        if (v == UNKNOWN && match(raw, /^--?[A-Za-z][A-Za-z0-9-]*=/))
+            return substr(raw, 1, RLENGTH) UNKNOWN
+        return v
+    }
     # Recognize assignment-only segments, including literal export writes.
     function pcm_assignments(words, n,   first, j, at, name, raw, value) {
         first = (words[1] == "export" ? 2 : 1)
@@ -5259,14 +5270,14 @@ resolve_primary_mutations() {
             # shape. Carry only actual global help and the checkout arguments.
             if (toks[1] == "gh") {
                 k = 2; global_help = 0
-                while (k <= m && (opt = pcm_word(toks[k])) ~ /^-/) {
+                while (k <= m && (opt = pcm_arg(toks[k])) ~ /^-/) {
                     if (opt == "-R" || opt == "--repo") k++
-                    else if (opt == "-h" || opt == "--help") global_help = 1
+                    else if (opt ~ /^(-h|--help)(=(1|t|T|true|TRUE|True))?$/) global_help = 1
                     k++
                 }
                 if (k + 1 <= m && toks[k] == "pr" && toks[k+1] == "checkout") {
                     args = (global_help ? "--help" : "")
-                    for (j = k + 2; j <= m; j++) args = args (global_help || j > k + 2 ? PCMSEP : "") pcm_word(toks[j])
+                    for (j = k + 2; j <= m; j++) args = args (global_help || j > k + 2 ? PCMSEP : "") pcm_arg(toks[j])
                     printf "%s\037gh-pr-checkout\037%s\n", curcwd, args
                 }
                 continue
@@ -5290,7 +5301,7 @@ resolve_primary_mutations() {
             sub_ = toks[k]
             if (sub_ != "checkout" && sub_ != "switch" && sub_ != "commit") continue
             args = ""
-            for (j = k + 1; j <= m; j++) args = args (j > k + 1 ? PCMSEP : "") pcm_word(toks[j])
+            for (j = k + 1; j <= m; j++) args = args (j > k + 1 ? PCMSEP : "") pcm_arg(toks[j])
             printf "%s\037%s\037%s\n", gcwd, sub_, args
         }
     }'
@@ -12499,36 +12510,44 @@ index_mutation_unisolated() {
 # Git permits abbreviated long options and both CLIs accept short-option
 # bundles. Only a value-taking short option at the end needs the next word.
 primary_checkout_has_help() {
-    local sub="$1" arg opt short_value take_next=false
+    local sub="$1" arg opt short_value short_chars take_next=false
     local -a long_values
     shift
     case "$sub" in
         commit)
-            short_value='^-[^-mFcCt]*[mFcCt]$'
+            short_chars='mFcCt'
             long_values=(--message --file --reedit-message --reuse-message --template
                 --author --date --fixup --squash --trailer --cleanup --pathspec-from-file) ;;
         gh-pr-checkout)
-            short_value='^-[^-Rb]*[Rb]$'
+            short_chars='Rb'
             long_values=(--repo --branch --worktree) ;;
         checkout)
-            short_value='^-[^-bB]*[bB]$'
+            short_chars='bB'
             long_values=(--orphan --conflict --pathspec-from-file) ;;
         switch)
-            short_value='^-[^-cC]*[cC]$'
+            short_chars='cC'
             long_values=(--orphan --conflict --create --force-create) ;;
         *) return 1 ;;
     esac
+    short_value="^-[^-$short_chars]*[$short_chars]\$"
     for arg in "$@"; do
         if [[ "$take_next" == true ]]; then take_next=false; continue; fi
         case "$arg" in
             -h|--help) return 0 ;;
+            # gh (pflag) accepts an affirmative boolean value on its help flag.
+            -h=1|--help=1|-h=t|--help=t|-h=T|--help=T|-h=true|--help=true|-h=TRUE|--help=TRUE|-h=True|--help=True)
+                [[ "$sub" == gh-pr-checkout ]] && return 0 ;;
             --|$'\001') return 1 ;;  # end of options or unknown argument arity
             --*=*) ;;
             --*)
                 for opt in "${long_values[@]}"; do
                     if [[ "$opt" == "$arg"* ]]; then take_next=true; break; fi
                 done ;;
-            -?*) [[ "$arg" =~ $short_value ]] && take_next=true ;;
+            -?*)
+                # A bundle reaches `h` only through boolean short flags: a
+                # value-taking flag earlier in the bundle consumes the rest.
+                [[ "$arg" =~ ^-[^-$short_chars]*h ]] && return 0
+                [[ "$arg" =~ $short_value ]] && take_next=true ;;
         esac
     done
     return 1
