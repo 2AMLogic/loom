@@ -273,15 +273,14 @@ fn an_unavailable_release_image_leaves_the_seat_running_and_backs_the_pull_off()
 
 #[test]
 #[serial]
-fn a_failed_roll_is_attempted_once_per_image_pair_and_hands_the_next_recovery_its_image() {
+fn a_failed_replacement_is_attempted_once_per_pair_and_recovery_keeps_the_last_seen_image() {
     let env = setup(&["alice"], &["alice"]);
     let mut lifecycle = SessionLifecycle::new(env.workspace.path(), Fake::default(), None);
     seed_stale(&lifecycle, "0.20.41", LATEST);
-    let expected = release("0.20.41");
     let rolls = Cell::new(0);
     let failing = |_: &AccountDescriptor, image: &str, _: &dyn Fn() -> bool| {
         rolls.set(rolls.get() + 1);
-        bail!("docker run {image} failed")
+        Err(anyhow::anyhow!("docker run {image} failed").context(private_workspace::RollAttempted))
     };
     let hints = RefCell::new(Vec::new());
     let recover = |_: &AccountDescriptor, image: Option<&str>, _: &dyn Fn() -> bool| {
@@ -299,8 +298,8 @@ fn a_failed_roll_is_attempted_once_per_image_pair_and_hands_the_next_recovery_it
     );
     assert!(matches!(run(&mut lifecycle, 60)[..], [Outcome::BackingOff { .. }]));
     assert_eq!(rolls.get(), 1);
-    // The teardown had begun and the seat is gone: the recovery is handed the
-    // image the roll was moving to, never the one it was leaving.
+    // If the seat disappears independently, the failed replacement never
+    // became its last observed image.
     lifecycle
         .runner()
         .containers
@@ -308,7 +307,7 @@ fn a_failed_roll_is_attempted_once_per_image_pair_and_hands_the_next_recovery_it
         .unwrap()
         .remove(&container_name("alice"));
     assert_eq!(run(&mut lifecycle, 120), vec![Outcome::PrivateRecovered]);
-    assert_eq!(*hints.borrow(), [Some(expected.clone())], "{:?}", hints.borrow());
+    assert_eq!(*hints.borrow(), [Some(LATEST.to_owned())], "{:?}", hints.borrow());
     // The same (running, expected) pair is not attempted again while the seat
     // shows that stale image: a broken recreate must not churn it every pass.
     seed_stale(&lifecycle, "0.20.41", LATEST);
@@ -488,4 +487,9 @@ fn a_timed_out_roll_ends_the_pass_as_docker_unavailable() {
         roll_pass(&mut lifecycle, &env, &private(), &slow, &mut state, 60)[..],
         [Outcome::BackingOff { .. }]
     ));
+    let asked = Cell::new(0);
+    let roll = rolling(lifecycle.runner().clone(), &asked);
+    let out = roll_pass(&mut lifecycle, &env, &private(), &roll, &mut state, 120);
+    assert!(matches!(out.as_slice(), [Outcome::PrivateImageRecreated { .. }]), "{out:?}");
+    assert_eq!(asked.get(), 1);
 }

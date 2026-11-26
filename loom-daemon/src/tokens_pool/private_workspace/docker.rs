@@ -117,12 +117,20 @@ pub(super) fn inspect_id(id: &str) -> Result<Option<Value>> {
 }
 
 pub(super) fn validate(config: &Config, state: &Value) -> Result<()> {
-    validate_settings(config, state)?;
-    validate_volume(config)?;
-    validate_ownership(config)
+    validate_replacing(config, state, None)
 }
 
-fn validate_ownership(config: &Config) -> Result<()> {
+pub(super) fn validate_replacing(
+    config: &Config,
+    state: &Value,
+    retained: Option<&str>,
+) -> Result<()> {
+    validate_settings(config, state)?;
+    validate_volume(config)?;
+    validate_ownership(config, retained)
+}
+
+fn validate_ownership(config: &Config, retained: Option<&str>) -> Result<()> {
     let mut sources = vec![
         config.volume.clone(),
         config.profile.to_string_lossy().into_owned(),
@@ -139,7 +147,14 @@ fn validate_ownership(config: &Config) -> Result<()> {
             "--format",
             "{{.Names}}",
         ])?;
-        if peers.lines().any(|peer| peer != config.container) {
+        for peer in peers.lines().filter(|peer| *peer != config.container) {
+            // Only the roll that holds this account's lease may share attachments
+            // with the exact container it stopped. No other peer is permissible.
+            if let Some(id) = retained {
+                if inspect(peer)?.is_some_and(|s| s["Id"] == id && s["State"]["Running"] == false) {
+                    continue;
+                }
+            }
             bail!("private workspace or account profile is attached to another container; refuse shared ownership");
         }
     }
@@ -742,8 +757,14 @@ pub(super) fn ensure_image(image: &str) -> Result<()> {
 }
 
 pub(super) fn create(config: &Config, image: &str) -> Result<()> {
+    create_replacing(config, image, None)
+}
+
+pub(super) const REPLACES_LABEL: &str = "loom.roll-replaces";
+
+pub(super) fn create_replacing(config: &Config, image: &str, retained: Option<&str>) -> Result<()> {
     let volumes = command(&["volume", "ls", "--format", "{{.Name}}"])?;
-    if volumes.lines().any(|name| name == config.volume) {
+    if retained.is_some() || volumes.lines().any(|name| name == config.volume) {
         validate_volume(config)?;
     } else {
         command(&[
@@ -781,7 +802,7 @@ pub(super) fn create(config: &Config, image: &str) -> Result<()> {
             ROOT,
         ])?;
     }
-    validate_ownership(config)?;
+    validate_ownership(config, retained)?;
     // `--restart unless-stopped` (#14912): on a session-only host no daemon
     // runs the reconcile pass, so Docker's own policy is what returns the
     // seat after an engine restart or host reboot — the same policy the
@@ -858,6 +879,9 @@ pub(super) fn create(config: &Config, image: &str) -> Result<()> {
             "--env".into(),
             format!("GH_CONFIG_DIR={GH_CONFIG}"),
         ]);
+    }
+    if let Some(id) = retained {
+        args.extend(["--label".into(), format!("{REPLACES_LABEL}={id}")]);
     }
     // The configured extra mounts, always read-only (#14451). Their JSON is
     // labelled only when there are any, so an unconfigured create is

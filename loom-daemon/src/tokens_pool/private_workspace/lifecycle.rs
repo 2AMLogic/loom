@@ -4,6 +4,7 @@ use super::super::session_lifecycle::{
     DAEMON_RELEASE_TAG,
 };
 use super::*;
+use crate::session_reconcile::skew::{refuse_downgrade, DaemonVersion};
 
 /// An unattended registration found the recorded seat absent. Only a fresh
 /// observation of that same seat can make its binding retry early.
@@ -607,7 +608,8 @@ pub enum Rolled {
     /// volume and profile it already had.
     Recreated,
     /// Nothing was done: the seat runs an image the roll never replaces — a
-    /// recorded override (issue #14019) or an image outside the stock repositories.
+    /// recorded override (issue #14019), an image outside the stock repositories,
+    /// or a newer release than the target.
     Kept,
     /// Nothing to do: the seat already runs the expected image, or is not
     /// running (a stopped or missing one is [`recover`]'s, and is rolled by a
@@ -660,13 +662,9 @@ const ROLL_CHANGED: &str =
 ///
 /// # Checks before stopping the container
 ///
-/// Everything that can refuse the recreate runs **before** the teardown — the
-/// image is obtained ([`ImageUnavailable`] when it cannot be), the recorded
-/// extra mounts and mirror binds are checked, the profile's control files are
-/// provisioned from the new image, and the seat is looked at once more under
-/// the lease. A late deferral leaves the original container running with any
-/// profile controls already provisioned. After the stop, a failure can leave
-/// the seat down. The volume and profile survive for a later [`recover`].
+/// Obtain the image, check the recorded mounts and recheck idle/hold before
+/// changing the seat. Keep the original container stopped until its replacement
+/// passes verification. A failed replacement restores the original under the lease.
 ///
 /// # Errors
 /// The seat is busy ([`AccountBusy`]) or held ([`OperatorHeld`]), `image`
@@ -694,6 +692,9 @@ pub fn roll(
         return Ok(Rolled::Kept);
     }
     let lease = lease::Lease::acquire(&dir)?;
+    if load(&dir)? != config {
+        return Err(lease::AccountBusy(ROLL_CHANGED).into());
+    }
     let held = || -> Result<()> {
         if session_hold::held_across(std::slice::from_ref(&config.profile)) {
             return Err(OperatorHeld.into());
@@ -717,14 +718,23 @@ pub fn roll(
         );
         return Ok(Rolled::Kept);
     }
-    if image_reference(running) == image {
+    let running_ref = image_reference(running);
+    if running_ref == image {
         return Ok(Rolled::Unchanged);
     }
+    // The reconciler's earlier snapshot may describe a different container.
+    if DaemonVersion::from_image(running_ref)
+        .is_some_and(|version| refuse_downgrade(image, &[&version]).is_err())
+    {
+        return Ok(Rolled::Kept);
+    }
     docker::validate(&config, &state)?;
-    lease.recover(&config, Some(&state))?;
+    // A released flock can leave a live worker named in job.json. Defer before
+    // stale-lease recovery so its record survives and the next pass retries.
     if !docker::idle(Some(&state), &config.container)? {
         return Err(lease::AccountBusy(ROLL_BUSY).into());
     }
+    lease.recover(&config, Some(&state))?;
     held()?;
     match docker::ensure_image(image) {
         Ok(()) => {}
@@ -741,10 +751,6 @@ pub fn roll(
     // The recreation must carry exactly the mirror binds the seat has
     // (#14680): a clone that borrows through one dangles without it.
     mirror::ensure_bound(workspace, &config)?;
-    // From the new image, as a fresh seat's are: the session that follows
-    // binds these files read-only, and the daemon then judges the seat
-    // against its own enforced bundle.
-    docker::provision_controls(&config, image)?;
     // Looked at once more under the lease, right before stopping the container:
     // the same container, still running, still provably idle.
     let now = docker::inspect(&config.container)?
@@ -756,25 +762,7 @@ pub fn roll(
         return Err(lease::AccountBusy(ROLL_CHANGED).into());
     }
     held()?;
-    docker::command(&["stop", "--time", "15", &config.container])?;
-    let stopped =
-        docker::inspect(&config.container)?.context("container disappeared during the roll")?;
-    if stopped["State"]["Running"] != false {
-        bail!("container stop not confirmed");
-    }
-    // Deliberately retain the volume, the account profile and the clone identity.
-    docker::command(&["rm", &config.container])?;
-    docker::create(&config, image)?;
-    let state =
-        docker::inspect(&config.container)?.context("rolled private session disappeared")?;
-    docker::validate(&config, &state)?;
-    if state["State"]["Running"] != true {
-        bail!("rolled private session is not running");
-    }
-    mark_session_managed(&config.profile, &config.container)?;
-    let id = state["Id"].as_str().context("container id unavailable")?;
-    docker::setup(&config)?;
-    docker::control(&config, id)?;
+    image_roll::replace(&config, &now, image)?;
     log::warn!(
         "private session {}: ran {}; recreated it from {} against its existing volume, clones \
                  and profile",
@@ -782,7 +770,7 @@ pub fn roll(
         running,
         image
     );
-    snapshot(config, &dir).map(|_| Rolled::Recreated)
+    Ok(Rolled::Recreated)
 }
 
 /// Refuse the recorded extra read-only mounts a private session must never

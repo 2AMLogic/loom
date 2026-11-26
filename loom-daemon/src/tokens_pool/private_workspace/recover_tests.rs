@@ -22,7 +22,17 @@ use std::rc::Rc;
 const ENGINE: &str = "engine-a";
 const IMAGE: &str = "example/private-session:pinned";
 const CONTAINER_ID: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+const ORIGINAL_IMAGE_ID: &str =
+    "sha256:abababababababababababababababababababababababababababababababab";
 const OTHER_ID: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ReplacementFailure {
+    Create,
+    Start,
+    Control,
+    RemoveOriginal,
+}
 
 /// One fake engine: containers and volumes as `docker inspect` would report
 /// them, the local images, and every call made against it.
@@ -62,10 +72,8 @@ struct Engine {
     pull_fails: bool,
     /// The control-provisioning helper run fails (#14112).
     provision_fails: bool,
-    /// The detached session `docker run` fails (#14112).
-    create_fails: bool,
-    /// `docker rm` of the session container fails (#14112).
-    rm_fails: bool,
+    /// Stage of an idle seat replacement at which Docker refuses the operation.
+    replacement_failure: Option<ReplacementFailure>,
     /// A worker appears in the seat while an image is being pulled: the seat
     /// changed between a roll's two looks at it (#14112).
     busy_after_pull: bool,
@@ -191,15 +199,26 @@ impl Engine {
                 secs: docker_cli::DOCKER_CALL_TIMEOUT.as_secs(),
             }
             .into()),
-            ["start", container] => {
+            ["rename", target, new_name] => {
+                let name = self.find_name(target).context("no such container")?;
+                anyhow::ensure!(!self.containers.contains_key(*new_name), "name in use");
+                let mut state = self.containers.remove(&name).unwrap();
+                state["Name"] = json!(format!("/{new_name}"));
+                self.containers.insert((*new_name).to_owned(), state);
+                if let Some(processes) = self.processes.remove(&name) {
+                    self.processes.insert((*new_name).to_owned(), processes);
+                }
+                Ok(String::new())
+            }
+            ["start", target] => {
+                let container = self.find_name(target).context("no such container")?;
                 let state = self
                     .containers
-                    .get_mut(*container)
+                    .get_mut(&container)
                     .context("no such container")?;
                 if !self.start_dies {
                     state["State"]["Running"] = json!(true);
-                    self.processes
-                        .insert((*container).to_owned(), idle_processes());
+                    self.processes.insert(container, idle_processes());
                 }
                 Ok(String::new())
             }
@@ -209,7 +228,7 @@ impl Engine {
                 .context("fake Docker: bundle probe failed"),
             ["run", rest @ ..] if rest.contains(&"--rm") => {
                 if rest.ends_with(&["private-workspace", "provision-controls"]) {
-                    if self.provision_fails {
+                    if self.provision_fails && !rest.contains(&ORIGINAL_IMAGE_ID) {
                         bail!("Docker run failed (fake: provisioning)");
                     }
                     Ok(json!({"protocol": PROTOCOL, "status": "ready"}).to_string())
@@ -219,15 +238,29 @@ impl Engine {
                 }
             }
             ["run", rest @ ..] => {
-                if self.create_fails {
+                if self.replacement_failure == Some(ReplacementFailure::Create) {
                     bail!("Docker run failed (fake: create)");
                 }
                 let run = parse_run(rest);
+                anyhow::ensure!(!self.containers.contains_key(&run.name), "name in use");
+                assert!(
+                    self.containers
+                        .values()
+                        .all(|c| c["State"]["Running"] == false
+                            || !run.mounts.iter().any(|m| (m["Destination"] == ROOT
+                                || m["Destination"] == PROFILE)
+                                && c["Mounts"].as_array().unwrap().contains(m))),
+                    "two running owners of a workspace volume or profile"
+                );
                 self.created += 1;
                 let id = format!("{:0>64}", format!("c{}", self.created));
                 let name = run.name.clone();
-                let container = run.inspect(&id, true);
+                let start_failed = self.replacement_failure == Some(ReplacementFailure::Start);
+                let container = run.inspect(&id, !start_failed);
                 self.containers.insert(name.clone(), container);
+                if start_failed {
+                    bail!("Docker run failed (fake: container created but failed to start)");
+                }
                 self.processes.insert(name, idle_processes());
                 Ok(id)
             }
@@ -236,6 +269,11 @@ impl Engine {
             }
             ["exec", target, "loom-daemon", "private-workspace", "control"] => {
                 // Addressed by immutable id, never by name.
+                if self.replacement_failure == Some(ReplacementFailure::Control)
+                    && *target != CONTAINER_ID
+                {
+                    bail!("replacement control probe failed");
+                }
                 assert_eq!(target.len(), 64, "control probe must address the container id");
                 self.find(target).context("no such container")?;
                 let profile = self
@@ -282,8 +320,12 @@ impl Engine {
                 self.processes.remove(&name);
                 Ok(String::new())
             }
-            ["rm", container] => {
-                if self.rm_fails {
+            ["rm", container] | ["rm", "-f", container] => {
+                if self.replacement_failure == Some(ReplacementFailure::RemoveOriginal)
+                    && self
+                        .find(container)
+                        .is_some_and(|c| c["Id"] == CONTAINER_ID)
+                {
                     bail!("Docker rm failed (fake)");
                 }
                 let name = self.find_name(container).context("no such container")?;
@@ -304,7 +346,8 @@ impl Engine {
                 Some(match args.as_slice() {
                     ["start", c] => format!("start {c}"),
                     ["stop", .., c] => format!("stop {c}"),
-                    ["rm", c] => format!("rm {c}"),
+                    ["rename", c, name] => format!("rename {c} {name}"),
+                    ["rm", c] | ["rm", "-f", c] => format!("rm {c}"),
                     ["volume", "create", .., v] => format!("volume create {v}"),
                     ["volume", "rm", v] => format!("volume rm {v}"),
                     ["run", rest @ ..] if rest.contains(&"--rm") => {
@@ -393,6 +436,7 @@ impl Run {
     fn inspect(&self, id: &str, running: bool) -> Value {
         json!({
             "Id": id,
+            "Image": ORIGINAL_IMAGE_ID,
             "Name": format!("/{}", self.name),
             "State": {"Running": running, "Restarting": false, "Paused": false},
             "ExecIDs": null,
@@ -2540,21 +2584,21 @@ fn an_idle_seat_on_a_stale_stock_image_is_recreated_on_the_release_image_and_kee
                 .position(|call| call.first().is_some_and(|arg| arg == verb))
                 .unwrap_or_else(|| panic!("no `{verb}` call in {calls:?}"))
         };
-        // The image is obtained first, and everything that can refuse the
-        // recreate has run before the container is stopped.
         assert!(first("pull") < first("stop"), "{calls:?}");
+        assert!(first("stop") < first("run"), "{calls:?}");
         assert_eq!(
             env.mutations(),
-            vec![
-                "run --rm provision-controls".to_owned(),
-                format!("stop {}", env.config.container),
-                format!("rm {}", env.config.container),
+            [
+                format!("stop {CONTAINER_ID}"),
+                format!("rename {CONTAINER_ID} {}-previous-{CONTAINER_ID}", env.config.container),
+                "run --rm provision-controls".into(),
                 format!("run {}", release()),
-                "exec setup".to_owned(),
-                "exec control".to_owned(),
-            ],
-            "{calls:?}"
+                "exec setup".into(),
+                "exec control".into(),
+                format!("rm {CONTAINER_ID}"),
+            ]
         );
+        assert_eq!(env.engine().containers.len(), 1);
         // The account volume (and every clone on it), the credentials and
         // the seat's record are exactly as they were; no `prepare` ran.
         assert_eq!(
@@ -2623,9 +2667,14 @@ fn a_seat_a_job_or_worker_is_using_defers_its_roll_and_is_never_interrupted() {
     save(&env.dir.join("job.json"), &stale_job(CONTAINER_ID)).unwrap();
     let id = exec_id(1);
     env.seed_exec(&id, exec_record(&id, CONTAINER_ID, true, json!(null), 99));
-    assert!(env.roll_to(&release()).is_err());
+    let error = env.roll_to(&release()).unwrap_err();
+    assert!(error.is::<AccountBusy>(), "{error:#}");
     assert_eq!(env.mutations(), Vec::<String>::new());
     assert!(env.dir.join("job.json").exists());
+    assert_eq!(env.engine().containers[&env.config.container]["Id"], CONTAINER_ID);
+    env.with(|e| e.containers.get_mut(&env.config.container).unwrap()["ExecIDs"] = json!(null));
+    assert_eq!(env.roll_to(&release()).unwrap(), Rolled::Recreated);
+    assert!(!env.dir.join("job.json").exists());
 
     // A stopped seat is the recovery's, not the roll's: it is started in
     // place, and a later pass rolls it once it runs.
@@ -2653,7 +2702,6 @@ fn a_roll_that_fails_after_the_pull_leaves_the_previous_container_intact() {
             .any(|c| c[0] == "pull" && c[1] == release()),
         "the image was obtained first"
     );
-    assert_eq!(env.mutations(), vec!["run --rm provision-controls".to_owned()]);
     // The previous container is exactly as it was, and usable.
     let state = env.engine().containers[&env.config.container].clone();
     assert_eq!(state["Id"], CONTAINER_ID);
@@ -2685,8 +2733,7 @@ fn a_roll_that_fails_after_the_pull_leaves_the_previous_container_intact() {
     env.with(|e| e.busy_after_pull = true);
     let error = env.roll_to(&release()).unwrap_err();
     assert!(error.downcast_ref::<AccountBusy>().is_some(), "{error:#}");
-    // Only the idempotent provisioning helper ran; the seat was not touched.
-    assert_eq!(env.mutations(), vec!["run --rm provision-controls".to_owned()]);
+    assert!(env.mutations().is_empty());
     assert_eq!(env.engine().containers[&env.config.container]["Id"], CONTAINER_ID);
     assert_eq!(env.engine().containers[&env.config.container]["State"]["Running"], true);
 }
@@ -2731,46 +2778,73 @@ fn an_override_seat_and_an_image_outside_the_stock_repositories_are_kept() {
 
 #[test]
 #[serial]
-fn a_roll_failing_after_the_teardown_leaves_the_volume_and_profile_for_recovery() {
-    // The removal fails: the previous container is still there, stopped, and
-    // the recovery starts that very container in place.
-    let env = setup();
-    env.seed_volume();
-    env.seed_container_on(CONTAINER_ID, true, LEGACY_LATEST);
-    env.with(|e| e.rm_fails = true);
-    let error = env.roll_to(&release()).unwrap_err();
-    assert!(message(&error).contains("Docker rm failed"), "{error:#}");
-    // The removal was attempted and refused; nothing was created.
-    assert_eq!(
-        env.mutations(),
-        vec![
-            "run --rm provision-controls".to_owned(),
-            format!("stop {}", env.config.container),
-            format!("rm {}", env.config.container),
-        ]
-    );
-    assert_eq!(env.engine().containers[&env.config.container]["Id"], CONTAINER_ID);
-    assert!(env.recover(None).unwrap().running);
-    assert_eq!(env.engine().containers[&env.config.container]["Id"], CONTAINER_ID);
+fn a_failed_replacement_restores_the_original_running_seat_before_returning() {
+    use ReplacementFailure::{Control, Create, RemoveOriginal, Start};
+    for (failure, expected) in [
+        (Create, "Docker run failed"),
+        (Start, "Docker run failed"),
+        (Control, "replacement control probe failed"),
+        (RemoveOriginal, "Docker rm failed"),
+    ] {
+        let env = setup();
+        env.seed_volume();
+        env.seed_container_on(CONTAINER_ID, true, LEGACY_LATEST);
+        let record = std::fs::read(env.dir.join("workspace.json")).unwrap();
+        env.with(|e| e.replacement_failure = Some(failure));
+        let err = env.roll_to(&release()).unwrap_err();
+        assert!(message(&err).contains(expected), "{failure:?}: {err:#}");
+        assert!(!message(&err).contains("rollback failed"), "{failure:?}: {err:#}");
+        assert!(
+            env.engine().calls.iter().any(|args| args.ends_with(&[
+                ORIGINAL_IMAGE_ID.to_owned(),
+                "private-workspace".into(),
+                "provision-controls".into()
+            ])),
+            "restore controls from the exact original image"
+        );
+        // No separate recover or retry. The canonical name resolves to the same usable seat.
+        assert_eq!(env.engine().containers.len(), 1, "{failure:?}");
+        let seat = status(env.workspace.path(), "alice").unwrap();
+        assert_eq!(seat.container_id.as_deref(), Some(CONTAINER_ID));
+        assert_eq!(seat.image.as_deref(), Some(LEGACY_LATEST));
+        assert!(seat.running);
+        docker::setup(&env.config).unwrap();
+        docker::control(&env.config, CONTAINER_ID).unwrap();
+        assert_eq!(std::fs::read(env.dir.join("workspace.json")).unwrap(), record);
+        assert!(env.config.profile.join("auth.json").is_file());
+    }
+}
 
-    // The recreate fails: nothing is left running, and everything the seat
-    // needs to come back is where it was.
+#[test]
+#[serial]
+fn a_roll_can_only_share_mounts_with_its_exact_stopped_original() {
     let env = setup();
     env.seed_volume();
     env.seed_container_on(CONTAINER_ID, true, LEGACY_LATEST);
-    let record = std::fs::read_to_string(env.dir.join("workspace.json")).unwrap();
-    env.with(|e| e.create_fails = true);
-    let error = env.roll_to(&release()).unwrap_err();
-    assert!(message(&error).contains("Docker run failed"), "{error:#}");
-    assert!(env.engine().containers.is_empty());
-    assert!(env.engine().volumes.contains_key(&env.config.volume));
-    assert_eq!(std::fs::read_to_string(env.dir.join("workspace.json")).unwrap(), record);
-    assert!(env.config.profile.join("auth.json").is_file());
-    // Handed the image the roll was moving to, the recovery brings the seat
-    // back on it.
-    env.with(|e| e.create_fails = false);
-    assert!(env.recover(Some(&release())).unwrap().running);
-    assert_eq!(created_runs(&env).last().unwrap().image, release());
+    docker::command(&["rename", CONTAINER_ID, "old"]).unwrap();
+    let create = |retained| docker::create_replacing(&env.config, &release(), retained);
+    assert!(create(Some(CONTAINER_ID)).is_err(), "original is running");
+    docker::command(&["stop", CONTAINER_ID]).unwrap();
+    assert!(create(None).is_err(), "ordinary create still refuses a stopped peer");
+    assert!(create(Some(OTHER_ID)).is_err(), "a different stopped peer");
+    assert_eq!(env.engine().containers.len(), 1);
+    create(Some(CONTAINER_ID)).unwrap();
+}
+
+#[test]
+#[serial]
+fn the_locked_roll_keeps_a_newer_stock_release() {
+    let env = setup();
+    env.seed_volume();
+    let newer = format!("ghcr.io/2amlogic/loom-worker-session:0.20.43@sha256:{}", "a".repeat(64));
+    env.seed_container_on(OTHER_ID, true, &newer);
+    assert_eq!(
+        env.roll_to("ghcr.io/2amlogic/loom-worker-session:0.20.42")
+            .unwrap(),
+        Rolled::Kept
+    );
+    assert!(env.mutations().is_empty());
+    assert_eq!(env.engine().containers[&env.config.container]["Id"], OTHER_ID);
 }
 
 /// Give a disposable workspace the same Codex provider manifest as a launch.

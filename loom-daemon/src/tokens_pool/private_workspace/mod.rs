@@ -14,6 +14,7 @@ pub mod dispatch;
 mod docker;
 pub mod export;
 mod forge_auth;
+mod image_roll;
 mod lease;
 mod lifecycle;
 mod mirror;
@@ -32,6 +33,7 @@ pub mod transport;
 mod volume_usage;
 mod worker_setup;
 
+pub(crate) use image_roll::RollAttempted;
 pub use lease::AccountBusy;
 pub(crate) use lifecycle::ConfiguredSeatMissing;
 pub use lifecycle::{

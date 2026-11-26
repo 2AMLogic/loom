@@ -10622,16 +10622,20 @@ beside `image` when the two differ.
 reconcile pass compares each running private-clone seat's image with the
 running daemon's release image. A seat on the stock image that is not on it —
 a `:latest` seat an older daemon created, or one on the previous release — is
-recreated from the release image once it is idle: stopped, removed, and
-created again against the volume and account profile it already had, so no
-clone, branch or credential moves. A seat a job or an unleased worker is
-using is deferred and re-checked next pass; nothing is interrupted. The
-image is pulled, the recorded mounts and mirror binds are checked and the
-profile's control files are provisioned from the new image before stopping
-the container. If the final idle or hold check defers the roll, the original
-container stays up and the profile may already contain the new controls.
-A failed pull is retried on a doubling backoff (up to 30 passes), and a
-recreate that fails is attempted once per (running, expected) image pair.
+recreated from the release image once it is idle. The reconciler pulls the
+image, checks the mounts and mirror binds, then rechecks the running seat
+and any operator hold under the account lease. A surviving worker defers the
+roll until an idle pass. A failed pull backs off, and a Docker timeout retries
+when the engine backoff expires.
+
+The reconciler stops the original container and retains it by ID while it
+provisions controls and verifies the replacement against the same volume and
+profile. Only one session runs on those mounts at a time. It removes the
+original after the replacement passes its mount, setup and control checks.
+If replacement fails, it removes its candidate, restores the original name
+and controls, and restarts and verifies the original container. If Docker also
+refuses rollback, the error includes the original ID for operator recovery.
+A replacement that reached the stop is attempted once per image pair.
 
 An explicit `--image` selects the starting image. Tags and digests in the
 current or legacy stock repository follow the daemon's release even when

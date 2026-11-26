@@ -52,7 +52,7 @@ use serde_json::Value;
 use super::drift::DeferReason;
 use super::{recreate_container, AccountMemory, Outcome, PassInputs};
 use crate::tokens_pool::account_registry::AccountDescriptor;
-use crate::tokens_pool::private_workspace::{AccountBusy, ImageUnavailable, Rolled};
+use crate::tokens_pool::private_workspace::{AccountBusy, ImageUnavailable, RollAttempted, Rolled};
 use crate::tokens_pool::session_dispatch_lock::{self, Exclusive};
 use crate::tokens_pool::session_hold::OperatorHeld;
 use crate::tokens_pool::session_lifecycle::{
@@ -621,15 +621,12 @@ fn reconcile_private_image(
             return Ok(None);
         }
         Err(error) => {
-            // Recorded before reporting: a recreate that fails past the
-            // roll's own checks is not attempted again until an image changes
-            // (rule 3), and must not have churned the seat every pass.
-            mem.private.attempted = Some(pair);
-            mem.private.pull = None;
-            // If the teardown had begun, whatever brings the seat back next
-            // must not be the image it was leaving: the next sighting of the
-            // old container overwrites this, a missing one recovers on it.
-            account_mem.image = Some(release);
+            // Only a stop/replacement attempt can churn the seat. In particular a
+            // wedged Docker read or pull must remain eligible after engine backoff.
+            if error.is::<RollAttempted>() {
+                mem.private.attempted = Some(pair);
+                mem.private.pull = None;
+            }
             return Err(error);
         }
     };

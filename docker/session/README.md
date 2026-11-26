@@ -472,15 +472,14 @@ older daemon still runs). `accounts.session.image` wins when it is
 configured, and an explicit `--image` wins over both. The daemon's session
 reconcile pass keeps a seat on the stock image in step with the daemon: when
 a running seat's image is not the running daemon's release image, an **idle**
-seat is stopped, removed and recreated from the release image against the
-volume and profile it already had, so every clone, branch and credential
-stays where it was. A seat a job is using is left alone until it is idle;
-nothing is ever interrupted. Before stopping the container, the reconciler
-obtains the image, checks mounts and mirror binds, and provisions the
-profile's control files. If the final idle or hold check defers the roll,
-the original container keeps running and the profile may already contain
-the new control files. A failed pull is retried on a doubling backoff,
-because the session image follows a release by about 25 minutes.
+seat moves to the release image using its existing volume, clones and profile.
+A busy seat waits. The reconciler obtains the image, checks mounts and rechecks
+the seat and holds under the account lease. It keeps the original container
+stopped while it provisions and verifies the replacement. If the replacement
+fails, it restores the original container's name, controls and running state
+before returning the error. If Docker also refuses restoration, the error
+identifies the original container for recovery. Failed pulls back off because
+the session image follows a release by about 25 minutes.
 `accounts session status` reports the running and expected images when they differ.
 
 An explicit `--image` selects the starting image. A tag or digest in the
