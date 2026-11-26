@@ -811,7 +811,10 @@ fn runtime_spans_follow_the_account_launched_by_the_codex_adapter() {
                 .env("LOOM_DAEMON_SELF_BIN", env!("CARGO_BIN_EXE_loom-daemon"))
                 .env("LOOM_SWEEP_NICE", "0")
                 .env("LOOM_CODEX_NO_CAPTURE", "1")
-                .env("FIXTURE_PRINT_ENV", "CODEX_HOME,LOOM_ACCOUNT_NAME,LOOM_ACCOUNT_PROVIDER");
+                .env(
+                    "FIXTURE_PRINT_ENV",
+                    "CODEX_HOME,LOOM_CODEX_HOME,LOOM_ACCOUNT_NAME,LOOM_ACCOUNT_PROVIDER",
+                );
             match binding {
                 "mixed" => {
                     cmd.env("LOOM_CODEX_PROFILE", "agent-2");
@@ -840,6 +843,11 @@ fn runtime_spans_follow_the_account_launched_by_the_codex_adapter() {
             assert!(stdout
                 .lines()
                 .any(|line| line == format!("child_env CODEX_HOME={}", profile.display())));
+            if binding == "pool" {
+                assert!(stdout
+                    .lines()
+                    .any(|line| line == "child_env LOOM_CODEX_HOME="));
+            }
             assert!(stdout
                 .lines()
                 .any(|line| line == "child_env LOOM_ACCOUNT_PROVIDER=codex"));

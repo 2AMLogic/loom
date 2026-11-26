@@ -1189,7 +1189,8 @@ fn run_preflight(
     // and not a native harness either, which holds a routed key only under
     // its own provider-key variable (`llm_gateway::Route::credential`).
     llm_gateway::scrub(&mut command);
-    let codex_selection = if runtime == "codex"
+    let mut codex_account = None;
+    let private_selection = if runtime == "codex"
         && std::env::var_os("LOOM_PRIVATE_LEASE_FD").is_none_or(|fd| fd.is_empty())
         && nonempty_env("LOOM_CODEX_NO_EXEC").is_none()
     {
@@ -1255,42 +1256,47 @@ fn run_preflight(
             // binding on the child so spawn-codex.sh cannot draw a second seat
             // after the accepted preflight and run have been recorded.
             let (env_model, _) = codex_env_model_split(env_models.each_ref().map(Option::as_deref));
-            Some(
-                crate::tokens_pool::private_workspace::dispatch::Selection::shared(
-                    root,
-                    nonempty_env("LOOM_ROLE").as_deref(),
-                    explicit_model.or(env_model.as_deref()),
-                )
-                .map_err(|error| {
-                    LaunchError::config(format!("Codex account selection failed: {error}"))
-                        .with_stage(LaunchStage::Credential)
-                })?,
+            let selected = crate::runtime_preference::codex_guard::select_shared(
+                root,
+                explicit_model.or(env_model.as_deref()),
+                nonempty_env("LOOM_ROLE").as_deref(),
             )
-        } else {
-            prepared
+            .map_err(|error| {
+                LaunchError::config(format!("Codex account selection failed: {error}"))
+                    .with_stage(LaunchStage::Credential)
+            })?;
+            let crate::tokens_pool::AccountBinding::CodexHome { directory } = &selected.binding
+            else {
+                unreachable!("Codex selection returned a non-Codex binding");
+            };
+            // Match tokens select --export. A normal pool draw sets CODEX_HOME
+            // without introducing the higher-priority LOOM_CODEX_HOME pin.
+            command
+                .env("CODEX_HOME", directory)
+                .envs(selected.identity_env());
+            codex_account = Some(selected.id.name);
         }
+        prepared
     } else {
         None
     };
-    if let Some(selection) = &codex_selection {
+    if let Some(selection) = &private_selection {
         selection.apply(&mut command);
-        crate::observability::codex_seat::stamp(
-            &mut trace_identity,
-            &runtime,
-            Some(&selection.name),
-        );
-    } else if runtime == "codex" {
-        if let Some(name) = inherited_codex_account(root)
-            .filter(|name| egress_proxy::rotation::is_account_name(name))
-        {
-            // Explicit profiles use the same identity in the adapter and in
-            // telemetry, including when the caller inherited a stale name.
+        codex_account = Some(selection.name.clone());
+    } else if runtime == "codex" && codex_account.is_none() {
+        codex_account = inherited_codex_account(root)
+            .filter(|name| egress_proxy::rotation::is_account_name(name));
+        if let Some(name) = &codex_account {
             command
-                .env("LOOM_ACCOUNT_NAME", &name)
+                .env("LOOM_ACCOUNT_NAME", name)
                 .env("LOOM_ACCOUNT_PROVIDER", "codex");
-            crate::observability::codex_seat::stamp(&mut trace_identity, &runtime, Some(&name));
         }
     }
+    crate::observability::codex_seat::stamp(
+        &mut trace_identity,
+        &runtime,
+        codex_account.as_deref(),
+    );
     command.env("LOOM_RUNTIME", &runtime);
     // #10607: the same sink variables every tmux session gets (W5,
     // `agent_session::isolation`), so the worker's `gh` front books into this
