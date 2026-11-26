@@ -479,7 +479,14 @@ mod agy {
 
     impl AgyWorkspace {
         fn new() -> Self {
-            let root = tempfile::tempdir().unwrap();
+            Self::in_workspace(".tmp")
+        }
+
+        /// A disposable workspace whose directory name is `prefix` followed
+        /// by tempfile's random suffix — how the policy's read rule meets a
+        /// path that needs JSON escaping, or cannot be a rule at all.
+        fn in_workspace(prefix: &str) -> Self {
+            let root = tempfile::Builder::new().prefix(prefix).tempdir().unwrap();
             let bin = tempfile::tempdir().unwrap();
             let repo = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
             let src = repo.join("defaults/scripts");
@@ -509,15 +516,25 @@ mod agy {
                 .unwrap();
             }
             // The fake CLI records one `ARG <token>` line per argv element
-            // plus the two environment facts under test, and prints
-            // NOTHING to stdout — a leaked key must have nowhere to hide.
+            // plus the environment facts under test, and prints NOTHING to
+            // stdout — a leaked key must have nowhere to hide. The settings
+            // are captured flattened, both from the file the `--settings`
+            // argument names and from the CLI's documented default location
+            // under the isolated HOME. The capture path travels by
+            // environment: it sits in the workspace, whose name some tests
+            // make unquotable in shell source.
             let capture = root.path().join("agy-capture.txt");
             std::fs::write(
                 bin.path().join("agy"),
-                format!(
-                    "#!/bin/sh\nprintf 'ARG %s\\n' \"$@\" >{c}\nprintf 'HOME=%s\\n' \"$HOME\" >>{c}\nprintf 'KEY=%s\\n' \"${{GEMINI_API_KEY:-<unset>}}\" >>{c}\nprintf 'SETTINGS=%s\\n' \"$(cat \"$HOME/settings.json\" 2>/dev/null || printf absent)\" >>{c}\n",
-                    c = capture.display()
-                ),
+                r#"#!/bin/sh
+flat() { if [ -f "$1" ]; then tr -d '\n\r' <"$1"; else printf absent; fi; }
+printf 'ARG %s\n' "$@" >"$AGY_CAPTURE"
+printf 'HOME=%s\n' "$HOME" >>"$AGY_CAPTURE"
+printf 'KEY=%s\n' "${GEMINI_API_KEY:-<unset>}" >>"$AGY_CAPTURE"
+printf 'UPDATER=%s\n' "${AGY_CLI_DISABLE_AUTO_UPDATE:-<unset>}" >>"$AGY_CAPTURE"
+printf 'SETTINGS=%s\n' "$(flat "$HOME/settings.json")" >>"$AGY_CAPTURE"
+printf 'DEFAULT_SETTINGS=%s\n' "$(flat "$HOME/.gemini/antigravity-cli/settings.json")" >>"$AGY_CAPTURE"
+"#,
             )
             .unwrap();
             std::fs::set_permissions(
@@ -552,7 +569,12 @@ mod agy {
                 .env_remove("LOOM_MODEL_PROFILE")
                 .env("LOOM_CONFIG_DEFAULTS_FILE", "")
                 .env("LOOM_SHARED_API_KEYS_DIR", "")
+                .env("AGY_CAPTURE", &self.capture)
                 .env_remove("GEMINI_API_KEY")
+                // The updater kill switch is the adapter's to default: what
+                // the dispatch host exported must not answer for it.
+                .env_remove("AGY_CLI_DISABLE_AUTO_UPDATE")
+                .env_remove("LOOM_GENERIC_EXTRA_ARGS")
                 // spawn-generic-launch.sh resolves a daemon binary, and the
                 // dispatch environment this suite may run under exports its
                 // own pins (LOOM_DAEMON_SELF_BIN names the HOST daemon and
@@ -588,12 +610,68 @@ mod agy {
                 .trim_start_matches(prefix)
                 .to_string()
         }
+
+        /// The settings the CLI child found at the per-launch path the
+        /// `--settings` argument names.
+        fn policy(&self) -> serde_json::Value {
+            let raw = self.fact("SETTINGS=");
+            serde_json::from_str(&raw)
+                .unwrap_or_else(|e| panic!("settings are not JSON ({e}): {raw}"))
+        }
+
+        /// Everything a launch must carry whatever the operator overrode:
+        /// the guarded argv, the policy in both settings locations, and the
+        /// updater kill switch the child saw (`updater`).
+        fn assert_launches_with_pinned_policy(&self, args: &[String], updater: &str) {
+            // The guarded policy leads the argv: the per-launch settings
+            // file, then containment.
+            assert_eq!(args[0], "--settings", "{args:?}");
+            let settings = PathBuf::from(&args[1]);
+            assert!(settings.is_file(), "settings file missing: {settings:?}");
+            assert_eq!(
+                settings,
+                PathBuf::from(self.fact("HOME=")).join("settings.json"),
+                "--settings must name the file under the isolated HOME"
+            );
+            assert_eq!(args[2], "--sandbox", "{args:?}");
+            assert_eq!(args.iter().filter(|a| *a == "--sandbox").count(), 1, "{args:?}");
+            assert_eq!(self.policy(), expected_policy(&self.workspace()));
+            // The same policy sits at the CLI's documented default settings
+            // location, so it holds whether or not the binary honours
+            // `--settings`.
+            assert_eq!(self.fact("DEFAULT_SETTINGS="), self.fact("SETTINGS="));
+            assert_eq!(self.fact("UPDATER="), updater);
+        }
+
+        /// The physical workspace path: what the adapter's shell reports as
+        /// its cwd is what the CLI takes as its workspace root.
+        fn workspace(&self) -> PathBuf {
+            self.root.path().canonicalize().unwrap()
+        }
+    }
+
+    /// The read-only policy spawn-agy.sh pins (#15474): the gemini provider,
+    /// the default execution mode, and explicit rules that hold in every
+    /// mode — the workspace readable through the file-read tool, file
+    /// writes, shell commands and MCP tools denied.
+    fn expected_policy(workspace: &Path) -> serde_json::Value {
+        serde_json::json!({
+            "modelProvider": "gemini",
+            "agentMode": "",
+            "toolPermission": "request-review",
+            "permissions": {
+                "allow": [format!("read_file({})", workspace.display())],
+                "deny": ["write_file(*)", "command(*)", "mcp(*)"],
+            }
+        })
     }
 
     /// Happy path: prompt once, the configured model once, the guarded
-    /// launch flags, an isolated HOME holding the gemini provider settings,
+    /// launch flags carrying the read-only permission policy, an isolated
+    /// HOME holding that policy, the self-update kill switch defaulted on,
     /// and the POOL's key in the child environment only — an ambient
-    /// GEMINI_API_KEY neither wins nor rides along (#14945 criteria 1-2).
+    /// GEMINI_API_KEY neither wins nor rides along (#14945 criteria 1-2,
+    /// #15474).
     #[test]
     fn pooled_agy_launch_passes_prompt_model_and_flags_with_child_only_key() {
         let w = AgyWorkspace::new();
@@ -614,16 +692,11 @@ mod agy {
         let args = w.args();
         assert_eq!(args.len(), 7, "{args:?}");
         assert!(!args.iter().any(|a| a.contains("dangerously")), "{args:?}");
-        assert_eq!(args[0], "--settings");
-        let settings = PathBuf::from(&args[1]);
-        assert!(settings.is_file(), "settings file missing: {settings:?}");
-        assert_eq!(args[2], "--sandbox");
         assert_eq!(args[3], "--model");
         assert_eq!(args[4], "gemini-4-neon");
         assert_eq!(args[5], "-p");
         assert_eq!(args[6], "hello");
-        // The isolated settings select the gemini provider (canary shape).
-        assert_eq!(w.fact("SETTINGS="), r#"{"modelProvider": "gemini"}"#);
+        w.assert_launches_with_pinned_policy(&args, "true");
         // HOME was redirected outside every checkout.
         let home = w.fact("HOME=");
         assert!(!home.is_empty());
@@ -739,11 +812,12 @@ mod agy {
         assert_eq!(w.capture(), "");
     }
 
-    /// An operator's LOOM_GENERIC_EXTRA_ARGS stays authoritative over the
-    /// stub's guarded defaults (the env > manifest tier), and the manifest's
-    /// launch shape still applies around it.
+    /// An operator's LOOM_GENERIC_EXTRA_ARGS still rides along (the env >
+    /// manifest tier) but no longer REPLACES the guarded argv: the override
+    /// that used to launch with `--sandbox` alone keeps the settings file
+    /// that carries the permission policy.
     #[test]
-    fn an_operator_pinned_extra_args_wins_over_the_stub_defaults() {
+    fn a_sandbox_only_override_keeps_the_permission_policy() {
         let w = AgyWorkspace::new();
         w.register_pool("alpha");
         let out = w
@@ -755,7 +829,182 @@ mod agy {
         let stderr = String::from_utf8_lossy(&out.stderr);
         assert!(out.status.success(), "{stderr}");
         let args = w.args();
-        assert_eq!(args[0], "--sandbox", "{args:?}");
-        assert!(!args.iter().any(|a| a.starts_with("--settings")), "{args:?}");
+        assert_eq!(args.len(), 7, "{args:?}");
+        w.assert_launches_with_pinned_policy(&args, "true");
+        assert_eq!(args[3], "--model");
+        assert_eq!(args[4], "gemini-4-neon");
+        assert_eq!(args[5], "-p");
+        assert_eq!(args[6], "hello");
+    }
+
+    /// Extra arguments that do not touch the policy survive it, ahead of the
+    /// model and the prompt.
+    #[test]
+    fn compatible_extra_args_survive_after_the_guarded_policy() {
+        let w = AgyWorkspace::new();
+        w.register_pool("alpha");
+        let out = w
+            .worker()
+            .env("LOOM_GENERIC_EXTRA_ARGS", "--output-format json --print-timeout=5m")
+            .args(["-p", "hello"])
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(out.status.success(), "{stderr}");
+        let args = w.args();
+        w.assert_launches_with_pinned_policy(&args, "true");
+        let settings = PathBuf::from(w.fact("HOME=")).join("settings.json");
+        assert_eq!(
+            args,
+            [
+                "--settings",
+                &settings.display().to_string(),
+                "--sandbox",
+                "--output-format",
+                "json",
+                "--print-timeout=5m",
+                "--model",
+                "gemini-4-neon",
+                "-p",
+                "hello",
+            ]
+            .map(String::from)
+        );
+    }
+
+    /// A refused launch (#15474): exit 78 with the offending argument and a
+    /// remediation on stderr, no key material, the CLI never run, and no
+    /// per-launch HOME left behind — the policy is checked before anything
+    /// is created for the run.
+    fn assert_refused(out: &std::process::Output, scratch: &Path, needles: &[&str]) {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(78), "{stderr}");
+        for needle in needles {
+            assert!(stderr.contains(needle), "missing {needle:?} in: {stderr}");
+        }
+        assert!(stderr.contains("REMEDIATION"), "{stderr}");
+        assert!(!stderr.contains(POOL_KEY), "key material leaked: {stderr}");
+        assert!(out.stdout.is_empty(), "{}", String::from_utf8_lossy(&out.stdout));
+        // A private TMPDIR is where the stub would have created the HOME.
+        let homes = std::fs::read_dir(scratch)
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|e| e.file_name().to_string_lossy().starts_with("loom-agy-"))
+            .count();
+        assert_eq!(homes, 0, "a refused launch created a per-launch HOME");
+    }
+
+    /// An LOOM_GENERIC_EXTRA_ARGS override that drops or contradicts the
+    /// policy refuses before the task runs; the stub does not try to layer
+    /// its policy around a foreign settings file or a mode it did not pin.
+    #[test]
+    fn an_extra_args_override_that_drops_or_contradicts_the_policy_refuses_before_exec() {
+        for (extra, offending) in [
+            ("--dangerously-skip-permissions", "--dangerously-skip-permissions"),
+            ("--mode auto", "--mode"),
+            ("--mode=plan", "--mode=plan"),
+            ("--settings /elsewhere/settings.json", "--settings"),
+            ("--settings=/elsewhere/settings.json", "--settings=/elsewhere/settings.json"),
+            ("--sandbox=false", "--sandbox=false"),
+            (
+                "--output-format json --dangerously-skip-permissions",
+                "--dangerously-skip-permissions",
+            ),
+        ] {
+            let w = AgyWorkspace::new();
+            w.register_pool("alpha");
+            let scratch = tempfile::tempdir().unwrap();
+            let out = w
+                .worker()
+                .env("TMPDIR", scratch.path())
+                .env("LOOM_GENERIC_EXTRA_ARGS", extra)
+                .args(["-p", "hello"])
+                .output()
+                .unwrap();
+            assert_refused(
+                &out,
+                scratch.path(),
+                &["spawn-agy", "LOOM_GENERIC_EXTRA_ARGS", offending],
+            );
+        }
+    }
+
+    /// The worker's own argv reaches the CLI as verbatim as extra arguments
+    /// do, so it meets the same check. The one exception is the bare
+    /// `--dangerously-skip-permissions`, which the tier-3 template consumes
+    /// (the happy-path test above launches with it); with a value attached
+    /// the template would forward it.
+    #[test]
+    fn a_worker_argument_that_drops_or_contradicts_the_policy_refuses_before_exec() {
+        for (args, offending) in [
+            (vec!["--mode", "auto", "-p", "hello"], "--mode"),
+            (vec!["--settings", "/elsewhere/settings.json", "-p", "hello"], "--settings"),
+            (vec!["--sandbox=false", "-p", "hello"], "--sandbox=false"),
+            (
+                vec!["--dangerously-skip-permissions=true", "-p", "hello"],
+                "--dangerously-skip-permissions=true",
+            ),
+        ] {
+            let w = AgyWorkspace::new();
+            w.register_pool("alpha");
+            let scratch = tempfile::tempdir().unwrap();
+            let out = w
+                .worker()
+                .env("TMPDIR", scratch.path())
+                .args(&args)
+                .output()
+                .unwrap();
+            assert_refused(&out, scratch.path(), &["spawn-agy", offending]);
+        }
+    }
+
+    /// The self-update kill switch is the adapter's default, and an
+    /// operator-exported value still reaches the child unchanged (#15474).
+    /// Only a non-empty export is the operator's: an exported empty string
+    /// would reach the CLI as "not disabled".
+    #[test]
+    fn an_operator_exported_updater_setting_wins_over_the_default() {
+        for (exported, expected) in [("false", "false"), ("", "true")] {
+            let w = AgyWorkspace::new();
+            w.register_pool("alpha");
+            let out = w
+                .worker()
+                .env("AGY_CLI_DISABLE_AUTO_UPDATE", exported)
+                .args(["-p", "hello"])
+                .output()
+                .unwrap();
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            assert!(out.status.success(), "{exported:?}: {stderr}");
+            assert_eq!(w.fact("UPDATER="), expected, "{exported:?}");
+            w.assert_launches_with_pinned_policy(&w.args(), expected);
+        }
+    }
+
+    /// The read rule names the workspace, so a path carrying a JSON
+    /// metacharacter must still produce the policy the CLI can parse.
+    #[test]
+    fn a_workspace_path_is_json_escaped_in_the_read_rule() {
+        let w = AgyWorkspace::in_workspace("loom\"agy\\ws");
+        w.register_pool("alpha");
+        let out = w.worker().args(["-p", "hello"]).output().unwrap();
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(out.status.success(), "{stderr}");
+        w.assert_launches_with_pinned_policy(&w.args(), "true");
+    }
+
+    /// A workspace path that cannot be written into a rule at all is a
+    /// launch that cannot express the policy.
+    #[test]
+    fn a_workspace_path_with_a_control_character_refuses_before_exec() {
+        let w = AgyWorkspace::in_workspace("loom\tagy");
+        w.register_pool("alpha");
+        let scratch = tempfile::tempdir().unwrap();
+        let out = w
+            .worker()
+            .env("TMPDIR", scratch.path())
+            .args(["-p", "hello"])
+            .output()
+            .unwrap();
+        assert_refused(&out, scratch.path(), &["spawn-agy", "workspace", "control character"]);
     }
 }
