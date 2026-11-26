@@ -10055,8 +10055,8 @@ preserves (fail closed):
    a non-GitHub origin or a failed ticket lookup preserves the root.
 2. the `watch-pid` marker is absent or names a process confirmed dead.
    An unreadable marker, invalid PID or inconclusive probe preserves the root.
-3. the process scan confirms that no process has its cwd or an open file under
-   the root. Incomplete process visibility preserves it. Linux checks procfs
+3. the process scan confirms that no process has its cwd, executable or an open
+   file under the root. Incomplete process visibility preserves it. Linux checks procfs
    and macOS checks the full `lsof` listing against the process table.
 4. the idle walk finds no writes in the last 24 h. An unreadable subtree
    preserves the root. The walk stops descending after 50,000 directories,

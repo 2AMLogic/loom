@@ -34,7 +34,7 @@
 //!    failure is `UNKNOWN` → preserve);
 //! 2. a `watch-pid` file at the root's top level names a dead process (absent
 //!    passes; unparseable is treated as alive);
-//! 3. a complete process scan finds no cwd or open fd under the root;
+//! 3. a complete process scan finds no cwd, executable or open fd under the root;
 //! 4. the bounded idle walk finds no change within the idle window (24 h).
 //!    An unreadable subtree is `Unknown` and preserves the root.
 //! 5. every git worktree inside is clean **and** its `HEAD` is reachable from
@@ -764,7 +764,9 @@ pub fn evaluate_root(root: &Path, owner: &str, probes: &ScratchRootProbes<'_>) -
     }
     match (probes.directory_in_use)(&canonical_root) {
         Some(true) => {
-            return RootVerdict::Preserve("a process has its cwd or an open file under the root")
+            return RootVerdict::Preserve(
+                "a process has its cwd, executable or an open file under the root",
+            )
         }
         None => {
             return RootVerdict::Preserve("process activity under the root could not be verified")
@@ -1888,6 +1890,72 @@ mod tests {
         assert!(matches!(watch_pid_state(&marker, &never_alive), WatchPidState::Unreadable));
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn preview_skips_a_running_executable_with_cwd_and_fds_outside_the_root() {
+        use std::os::unix::fs::symlink;
+        use std::process::Stdio;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("loom-203-builder.cafe");
+        let source = root.join("source");
+        init_main_with_origin(&source, &tmp.path().join("origin.git"));
+        git(
+            &source,
+            &[
+                "remote",
+                "set-url",
+                "origin",
+                "https://github.com/acme/widgets.git",
+            ],
+        );
+        let worker = root.join("worker");
+        std::fs::copy("/bin/cat", &worker).unwrap();
+
+        // Limit the scan to real procfs entries we can inspect on any CI host.
+        let procfs = tmp.path().join("proc");
+        std::fs::create_dir(&procfs).unwrap();
+        symlink("/proc/self", procfs.join(std::process::id().to_string())).unwrap();
+        let (probes, now) = probes_now(IDLE_WINDOW_SECS, IDLE_WINDOW_SECS);
+        let probes = ScratchRootProbes {
+            directory_in_use: &|path| process_activity::scan_proc(&procfs, path),
+            ..probes
+        };
+        backdate(&root, now.timestamp() - 2 * IDLE_WINDOW_SECS);
+        let preview = || {
+            let events = Mutex::new(Vec::new());
+            let report = sweep(
+                tmp.path(),
+                Some("acme/widgets"),
+                &[tmp.path().to_owned()],
+                &probes,
+                true,
+                &events,
+            );
+            assert_eq!(report.planned, events.into_inner().unwrap());
+            report
+        };
+        assert_eq!(preview().planned.len(), 1);
+
+        // cat waits for EOF on its input pipe. Its executable is the only
+        // reference to the candidate while it runs.
+        let mut child = Command::new(&worker)
+            .current_dir(tmp.path())
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        symlink(format!("/proc/{}", child.id()), procfs.join(child.id().to_string())).unwrap();
+        let active = preview();
+        assert!(child.wait().unwrap().success());
+        assert!(active.planned.is_empty());
+        assert_eq!(
+            active.preserved[0].reason,
+            "a process has its cwd, executable or an open file under the root"
+        );
+    }
+
     #[test]
     fn test_evaluate_root_open_and_unknown_ticket_preserved() {
         let tmp = tempfile::tempdir().unwrap();
@@ -2236,7 +2304,7 @@ mod tests {
         assert_eq!(reason_for("loom-102-builder.cccc"), "watch-pid file names a live process");
         assert_eq!(
             reason_for("loom-103-builder.dddd"),
-            "a process has its cwd or an open file under the root"
+            "a process has its cwd, executable or an open file under the root"
         );
         assert_eq!(reason_for("loom-104-builder.eeee"), "files changed within the 24h idle window");
         assert_eq!(reason_for("loom-105-builder.ffff"), "worktree has tracked changes");

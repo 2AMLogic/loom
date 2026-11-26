@@ -57,7 +57,7 @@ fn unrestricted_proc_mount(mounts: &str) -> bool {
 }
 
 #[cfg(target_os = "linux")]
-fn scan_proc(procfs: &Path, root: &Path) -> Option<bool> {
+pub(super) fn scan_proc(procfs: &Path, root: &Path) -> Option<bool> {
     use std::io::ErrorKind::NotFound;
     let mut saw_process = false;
     for entry in std::fs::read_dir(procfs).ok()? {
@@ -92,6 +92,20 @@ fn process_uses_root(process: &Path, root: &Path) -> std::io::Result<bool> {
             } else {
                 Err(e)
             };
+        }
+        Err(e) => return Err(e),
+    }
+    // The executable image need not appear in the numbered descriptors.
+    match std::fs::read_link(process.join("exe")) {
+        Ok(exe) if exe.starts_with(root) => return Ok(true),
+        Ok(_) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            // Kernel threads have no userspace executable. Still check their
+            // descriptors, and preserve on a missing image for any other task.
+            let status = std::fs::read_to_string(process.join("status"))?;
+            if !status.lines().any(|line| line == "Kthread:\t1") {
+                return Err(e);
+            }
         }
         Err(e) => return Err(e),
     }
@@ -271,7 +285,7 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn proc_scan_requires_both_cwd_and_fds_to_be_inspectable() {
+    fn proc_scan_requires_cwd_exe_and_fds_to_be_inspectable() {
         use std::os::unix::fs::symlink;
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().join("candidate");
@@ -281,8 +295,14 @@ mod tests {
         std::fs::create_dir_all(&pid).unwrap();
         assert_eq!(scan_proc(&procfs, &root), None);
         symlink(tmp.path(), pid.join("cwd")).unwrap();
+        symlink(tmp.path().join("worker"), pid.join("exe")).unwrap();
         assert_eq!(scan_proc(&procfs, &root), None);
         std::fs::create_dir(pid.join("fd")).unwrap();
+        assert_eq!(scan_proc(&procfs, &root), Some(false));
+        std::fs::remove_file(pid.join("exe")).unwrap();
+        std::fs::write(pid.join("status"), "Kthread:\t0\n").unwrap();
+        assert_eq!(scan_proc(&procfs, &root), None);
+        std::fs::write(pid.join("status"), "Kthread:\t1\n").unwrap();
         assert_eq!(scan_proc(&procfs, &root), Some(false));
         symlink(root.join("build.log"), pid.join("fd/5")).unwrap();
         assert_eq!(scan_proc(&procfs, &root), Some(true));
@@ -295,10 +315,11 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().join("candidate");
         let procfs = tmp.path().join("proc");
-        // Idle control process with readable cwd and fds.
+        // Idle control process with readable cwd, executable and fds.
         let idle = procfs.join("40");
         std::fs::create_dir_all(idle.join("fd")).unwrap();
         symlink(tmp.path(), idle.join("cwd")).unwrap();
+        symlink(tmp.path().join("worker"), idle.join("exe")).unwrap();
         // Zombie: no cwd or fd entries, every task in state Z.
         let zombie = procfs.join("41");
         let task = |tid: &str, stat: &str| {
