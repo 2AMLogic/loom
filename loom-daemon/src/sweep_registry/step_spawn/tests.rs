@@ -728,12 +728,22 @@ fn a_sandbox_unavailable_terminal_record_is_read_from_this_steps_own_region() {
     )
     .unwrap();
     assert!(!sandbox_unavailable_in(&log, "step-curator-4-2"));
+    assert!(sandbox_unavailable_in(&log, "step-curator-4-1"));
+
+    // A prefix match or a transcript mention of the earlier id cannot lend
+    // it the next dispatch's refusal.
     std::fs::write(
         &log,
-        format!("{}{}", header("step-curator-4-1"), record("SANDBOX_UNAVAILABLE")),
+        format!(
+            "{}{}sweep_id=step-curator-4-1\n{}",
+            header("step-curator-4-1"),
+            header("step-curator-4-10"),
+            record("SANDBOX_UNAVAILABLE")
+        ),
     )
     .unwrap();
-    assert!(sandbox_unavailable_in(&log, "step-curator-4-1"));
+    assert!(!sandbox_unavailable_in(&log, "step-curator-4-1"));
+    assert!(sandbox_unavailable_in(&log, "step-curator-4-10"));
     // Prose about a sandbox with no record is no verdict, and neither is an
     // unreadable log.
     std::fs::write(

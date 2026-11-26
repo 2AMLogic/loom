@@ -14,7 +14,7 @@ use tempfile::tempdir;
 /// Insert a `codex`-runtime entry with `token` already captured (so
 /// [`SweepRegistry::apply_provider_health_feedback`] does not bail on the
 /// `UNKNOWN_TOKEN_NAME` guard) and write `log_body` to its log path,
-/// anchored so `parse_terminal_result_after` finds it.
+/// under the same dispatch header that the spawner writes.
 fn insert_codex_entry_with_log(
     registry: &mut SweepRegistry,
     issue: u32,
@@ -63,10 +63,45 @@ fn insert_codex_entry_with_prefixed_log(
     std::fs::create_dir_all(log_path.parent().unwrap()).unwrap();
     std::fs::write(
         &log_path,
-        format!("{log_prefix}sweep_id={sweep_id} issue={issue} ====\n{log_body}"),
+        format!("{log_prefix}==== loom-daemon dispatch: t sweep_id={sweep_id} issue={issue} ====\n{log_body}"),
     )
     .unwrap();
     sweep_id
+}
+
+/// A later attempt on the same item and seat can neither create nor mask
+/// sandbox feedback for the dispatch being reaped.
+#[test]
+fn a_sandbox_hold_reads_only_the_reaped_dispatch() {
+    use crate::tokens_pool::{
+        account_inventory, health::inventory_health_snapshot, profile_root_env::ProfileRootEnv,
+    };
+    let _window = crate::env_test_support::EnvGuard::set(
+        crate::runtime_preference::sandbox_hold::HOLD_SECS_ENV,
+        "600",
+    );
+    let profiles = tempdir().unwrap();
+    let _root = ProfileRootEnv::set(profiles.path());
+    std::fs::create_dir(profiles.path().join("seat")).unwrap();
+    let workspace = tempdir().unwrap();
+    let (mut registry, _) = fixture_registry(workspace.path());
+    let inventory = account_inventory(workspace.path(), AccountProvider::Codex).unwrap();
+    let failure = "# LOOM_TERMINAL_RESULT v=2 provider=codex account=seat category=SANDBOX_UNAVAILABLE exit_code=0 model=none\n";
+    let success = "# LOOM_TERMINAL_RESULT v=2 provider=codex account=seat category=SUCCESS exit_code=0 model=none\n";
+    for (earlier, later, held) in [("", failure, false), (failure, success, true)] {
+        let log =
+            format!("{earlier}==== loom-daemon dispatch: t sweep_id=later issue=74 ====\n{later}");
+        let sweep = insert_codex_entry_with_log(&mut registry, 74, "seat", &log);
+        registry.apply_provider_health_feedback(&sweep, Some(0));
+        let now = crate::script_helpers::now_epoch_secs();
+        let health = inventory_health_snapshot(workspace.path(), &inventory, now).unwrap();
+        assert_eq!(
+            health
+                .get(&inventory[0].id)
+                .is_some_and(|h| !h.is_eligible_at(now)),
+            held
+        );
+    }
 }
 
 /// A horizon `days` out from now, as the (instant, refusal-line) pair a test
@@ -408,6 +443,8 @@ fn a_persisted_codex_mark_emits_exactly_one_reason_classified_point() {
 /// A Codex outcome that records no hold (`SUCCESS`) emits no mark.
 #[test]
 fn a_codex_success_emits_no_mark() {
+    let profiles = tempdir().unwrap();
+    let _profiles = crate::tokens_pool::profile_root_env::ProfileRootEnv::set(profiles.path());
     let dir = tempdir().unwrap();
     let (mut registry, _record_log) = fixture_registry(dir.path());
     let sweep_id = insert_codex_entry_with_log(

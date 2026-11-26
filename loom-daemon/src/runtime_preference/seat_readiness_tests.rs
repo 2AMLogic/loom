@@ -136,3 +136,56 @@ fn a_sandbox_held_seat_is_passed_over_on_its_own() {
     assert_eq!(chosen, "claude");
     assert!(skipped[0].contains("2/2 held(sandbox-unavailable"), "{skipped:?}");
 }
+
+/// The same profile can have a different account name in another registry.
+#[test]
+#[serial_test::serial]
+fn a_shared_sandbox_hold_follows_the_profile_across_workspaces() {
+    use crate::tokens_pool::account_registry::{
+        register_codex_account, select_codex_account_where,
+    };
+    use crate::tokens_pool::{record_terminal_for_model_with_reset, TerminalClassification};
+    let _env = ClearedRuntimeEnv::new();
+    let a = workspace();
+    let b = workspace();
+    provision_codex_account("agent-1", false);
+    provision_codex_account("agent-2", false);
+    // B registers the same profiles with the names swapped.
+    register_codex_account(b.path(), "agent-2", "agent-1", true, None).unwrap();
+    register_codex_account(b.path(), "agent-1", "agent-2", true, None).unwrap();
+
+    let pick = |root: &Path, name: &str| {
+        select_codex_account_where(root, None, |account| account.id.name == name)
+    };
+    assert!(hold_seat(a.path(), &codex_id("agent-1"), 600, now()).unwrap());
+    for (root, held, free) in [
+        (a.path(), "agent-1", "agent-2"),
+        (b.path(), "agent-2", "agent-1"),
+    ] {
+        assert!(pick(root, held)
+            .unwrap_err()
+            .to_string()
+            .contains("cooldown_until="));
+        assert_eq!(pick(root, free).unwrap().id.name, free);
+        assert_eq!(curator_walk(root), ("codex".to_string(), vec![]));
+    }
+
+    assert!(hold_seat(a.path(), &codex_id("agent-2"), 600, now()).unwrap());
+    for root in [a.path(), b.path()] {
+        let (chosen, skipped) = curator_walk(root);
+        assert_eq!(chosen, "claude");
+        assert!(skipped[0].contains("2/2 held(sandbox-unavailable"), "{skipped:?}");
+    }
+    record_terminal_for_model_with_reset(
+        b.path(),
+        &codex_id("agent-2"),
+        TerminalClassification::Success,
+        None,
+        None,
+        "test",
+    )
+    .unwrap();
+    assert!(pick(a.path(), "agent-1").is_ok());
+    assert!(pick(b.path(), "agent-2").is_ok());
+    assert!(pick(a.path(), "agent-2").is_err());
+}

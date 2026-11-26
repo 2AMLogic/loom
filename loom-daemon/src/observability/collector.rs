@@ -71,7 +71,7 @@ use crate::telemetry::{
     RoleTickHealth, SweepResult, SweepStartedRecord, TelemetryEnvelope, TelemetryRecord,
     TokenAccountState, TokenSnapshotRecord,
 };
-use crate::tokens_pool::{account_inventory, health_snapshot, AccountProvider};
+use crate::tokens_pool::{account_inventory, AccountProvider};
 use crate::types::{Event, RoleTickRecord, SweepKind};
 use crate::workspace_pool::WorkspacePool;
 
@@ -1237,11 +1237,6 @@ fn sample_token_snapshot(workspace_root: &Path) -> TokenSnapshotRecord {
 /// health file degrades to no rows for that provider rather than an error,
 /// matching the `.ranking` soft-fail above.
 fn sample_registry_provider_accounts(workspace_root: &Path) -> Vec<TokenAccountState> {
-    // One consistent read for the whole sample. A failed read is unknown
-    // capacity; only a successfully read snapshot can imply no health hold.
-    let Ok(health) = health_snapshot(workspace_root) else {
-        return Vec::new();
-    };
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
@@ -1252,6 +1247,11 @@ fn sample_registry_provider_accounts(workspace_root: &Path) -> Vec<TokenAccountS
             continue;
         }
         let Ok(inventory) = account_inventory(workspace_root, provider) else {
+            continue;
+        };
+        let Ok(health) =
+            crate::tokens_pool::health::inventory_health_snapshot(workspace_root, &inventory, now)
+        else {
             continue;
         };
         for descriptor in inventory.into_iter().filter(|account| account.enabled) {

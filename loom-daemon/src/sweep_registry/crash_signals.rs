@@ -94,7 +94,23 @@ pub(crate) fn parse_terminal_result_after(
     contents: &str,
     header_anchor: &str,
 ) -> Option<TerminalResult> {
-    let region = &contents[contents.rfind(header_anchor)?..];
+    parse_terminal_result_in(&contents[contents.rfind(header_anchor)?..])
+}
+
+/// Both sweep consumers use the same exact header and end boundary. Keep the
+/// section with the result so a reset horizon is read from the same dispatch.
+pub(crate) fn dispatch_terminal_result<'a>(
+    contents: &'a str,
+    sweep_id: &str,
+) -> Option<(TerminalResult, &'a str)> {
+    use crate::step_dispatch::outcome_ledger::{dispatch_section, DispatchSection};
+    let DispatchSection::Section(region) = dispatch_section(contents, sweep_id) else {
+        return None;
+    };
+    Some((parse_terminal_result_in(region)?, region))
+}
+
+fn parse_terminal_result_in(region: &str) -> Option<TerminalResult> {
     let records: Vec<_> = region
         .lines()
         .filter(|line| line.starts_with(TERMINAL_RESULT_MARKER))

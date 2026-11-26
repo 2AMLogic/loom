@@ -705,8 +705,13 @@ pub fn run_check_with<T: super::codex_probe::ProbeTransport + ?Sized>(
     } else {
         None
     };
+    let health = health::inventory_health_snapshot(
+        workspace,
+        &inventory,
+        u64::try_from(now.timestamp()).unwrap_or(0),
+    )?;
     for account in &inventory {
-        let stored = health::account_health(workspace, &account.id)?;
+        let stored = health.get(&account.id);
         let live_probe = account.enabled && options.live;
         let (snapshot, probe_detail) = if !account.enabled {
             (None, None)
@@ -733,7 +738,7 @@ pub fn run_check_with<T: super::codex_probe::ProbeTransport + ?Sized>(
         } else {
             (latest_usage_snapshot(&account.credential_reference), None)
         };
-        let mut row = assess_account(account, stored.as_ref(), snapshot.as_ref(), now);
+        let mut row = assess_account(account, stored, snapshot.as_ref(), now);
         // A live probe was attempted for this row (#8972's `probed` key).
         row.probed = live_probe;
         // A live probe that measured nothing says *why* (not logged in, no

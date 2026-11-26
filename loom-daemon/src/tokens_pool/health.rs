@@ -358,10 +358,10 @@ pub fn model_class_of(model: &str) -> Option<String> {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(super) struct HealthFile {
+struct HealthFile {
     version: u32,
     #[serde(default)]
-    pub(super) accounts: Vec<AccountHealth>,
+    accounts: Vec<AccountHealth>,
     #[serde(default)]
     cursors: HashMap<String, u64>,
 }
@@ -462,7 +462,7 @@ fn write_state(workspace: &Path, state: &HealthFile) -> Result<()> {
     Ok(())
 }
 
-pub(super) fn with_state<T>(
+fn with_state<T>(
     workspace: &Path,
     operation: impl FnOnce(&mut HealthFile) -> Result<T>,
 ) -> Result<T> {
@@ -537,7 +537,12 @@ pub fn record_terminal_for_model_with_reset(
         reset_at,
         provenance,
         now_epoch_secs(),
-    )
+    )?;
+    if classification == TerminalClassification::Success && id.provider == AccountProvider::Codex {
+        super::sandbox_seat_hold::clear_on_success(workspace, id)
+            .context("failed to release the successful Codex profile's sandbox hold")?;
+    }
+    Ok(())
 }
 
 /// Record terminal feedback with no model information: every hold it writes is
@@ -1029,6 +1034,17 @@ pub fn health_snapshot(workspace: &Path) -> Result<HashMap<AccountId, AccountHea
         .collect())
 }
 
+/// Workspace credential health plus any sandbox holds on these shared profiles.
+pub(crate) fn inventory_health_snapshot(
+    workspace: &Path,
+    inventory: &[AccountDescriptor],
+    now: u64,
+) -> Result<HashMap<AccountId, AccountHealth>> {
+    let mut health = health_snapshot(workspace)?;
+    super::sandbox_seat_hold::apply_to_snapshot(&mut health, inventory, now)?;
+    Ok(health)
+}
+
 /// Select a healthy account for `provider` — the account-wide question, whose
 /// meaning is unchanged by #8058 Phase 2 (a live class-scoped hold still
 /// excludes the account). Callers that know which model they are about to run
@@ -1167,12 +1183,13 @@ pub fn select_healthy_for_class_at(
                 entry.updated_at = now;
             }
         }
-        let health: HashMap<AccountId, AccountHealth> = state
+        let mut health: HashMap<AccountId, AccountHealth> = state
             .accounts
             .iter()
             .cloned()
             .map(|entry| (entry.id(), entry))
             .collect();
+        super::sandbox_seat_hold::apply_to_snapshot(&mut health, inventory, now)?;
         let mut candidates: Vec<_> = inventory
             .iter()
             .filter(|account| account.id.provider == provider && account.enabled)
@@ -1250,12 +1267,7 @@ pub fn provider_capacity_at(
     inventory: &[AccountDescriptor],
     now: u64,
 ) -> Result<ProviderCapacity> {
-    let state = read_state(workspace)?;
-    let health: HashMap<_, _> = state
-        .accounts
-        .into_iter()
-        .map(|entry| (entry.id(), entry))
-        .collect();
+    let health = inventory_health_snapshot(workspace, inventory, now)?;
     let accounts: Vec<_> = inventory
         .iter()
         .filter(|account| account.id.provider == provider)

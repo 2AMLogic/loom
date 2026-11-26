@@ -20,7 +20,7 @@
 //! #8058 Phase 2's class-scoped `class_cooldowns` marks.
 
 use super::*;
-use crate::tokens_pool::codex_reset::exhaustion_reset_horizon;
+use crate::tokens_pool::codex_reset::exhaustion_reset_horizon_in;
 
 /// One live sweep's in-run watcher and the mark it wrote, if any (#11286).
 struct InRunWatch {
@@ -70,8 +70,7 @@ impl SweepRegistry {
         let Ok(contents) = std::fs::read_to_string(&info.log_path) else {
             return;
         };
-        let anchor = format!("sweep_id={sweep_id}");
-        let Some(result) = parse_terminal_result_after(&contents, &anchor) else {
+        let Some((result, region)) = dispatch_terminal_result(&contents, sweep_id) else {
             return;
         };
         if result.provider != AccountProvider::Codex
@@ -89,7 +88,7 @@ impl SweepRegistry {
         // Read from the same region, gated on the adapter's classification —
         // see `tokens_pool::codex_reset` for why the text may only ever say
         // *when* a hold ends, never *whether* there is one.
-        let reset_at = exhaustion_reset_horizon(&contents, &anchor, result.category);
+        let reset_at = exhaustion_reset_horizon_in(region, result.category);
         // #9013 item 4: captured *before* the persist call — `health.rs`'s
         // `ReauthRequired` hold is sticky, so a classification recorded while
         // it was already set writes no new hold, and a mark for one would
@@ -101,7 +100,7 @@ impl SweepRegistry {
         // #14455: a sandbox that ran nothing holds THIS seat, not the runtime
         // and not the account's credentials: the next draw passes it over
         // (in-process walk and the `tokens select` child alike, through the
-        // shared health file) until the hold ages out or a tick on it runs.
+        // shared profile) until the hold ages out or a tick on it succeeds.
         if result.category == tokens_pool::TerminalClassification::SandboxUnavailable {
             let secs = crate::runtime_preference::sandbox_hold::hold_secs();
             let now = crate::script_helpers::now_epoch_secs();

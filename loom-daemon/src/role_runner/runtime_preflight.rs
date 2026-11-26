@@ -65,7 +65,8 @@
 use super::*;
 use crate::role_runner::outcome::{PoolHold, PoolStateFile};
 use crate::runtime_admission::{ResolvedRuntime, RuntimeRejection};
-use crate::tokens_pool::{account_inventory_quiet, health_snapshot, AccountProvider, HealthReason};
+use crate::tokens_pool::health::inventory_health_snapshot;
+use crate::tokens_pool::{account_inventory_quiet, AccountProvider, HealthReason};
 
 /// Environment variables under which `spawn-codex.sh` never reaches the
 /// provider-aware account selector: the three explicit profile pins (auth
@@ -420,7 +421,7 @@ pub(crate) fn codex_pool_state_for(
     let enabled = inventory
         .iter()
         .filter(|account| account.enabled && include(&account.credential_reference));
-    let health_state = match health_snapshot(root) {
+    let health_state = match inventory_health_snapshot(root, &inventory, now) {
         Ok(health) => health,
         Err(e) => {
             // Count the pool first: `enabled` is what the skip reports as

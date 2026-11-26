@@ -1,170 +1,187 @@
-//! A **per-seat** hold for a Codex account whose sandbox just refused every
-//! tool call (#14455).
-//!
-//! `runtime_preference::sandbox_hold` holds the *runtime* host-wide, in daemon
-//! memory, for a role-runner tick. That is the wrong grain for a pool where one
-//! seat is a sealed session container and another is a bare-metal profile on a
-//! host whose kernel refuses user namespaces: the first runs commands, the
-//! second never will. Holding the whole runtime idles the good seat; holding
-//! nothing re-draws the bad one on every step.
-//!
-//! The hold is written to the account's own record in `account-health.json`
-//! as a short account-wide cooldown, because the readers that must honour it
-//! are not all in the daemon: `tokens select` (run by `spawn-codex.sh`) draws
-//! the seat in a child process, and an in-memory table would not reach it.
-//! The existing selection and pool-state reads already skip a seat in
-//! cooldown, so the hold needs no reader of its own.
-//!
-//! It reuses [`HealthReason::TransientFailure`] with this module's
-//! provenance, adding no `HealthReason` variant: a variant would make every
-//! older daemon on a shared `account-health.json` refuse to parse the file.
-//! It never touches `consecutive_transient_failures`, never overrides a sticky
-//! `ReauthRequired`, and never shortens a longer live cooldown.
-//!
-//! It ends when it ages out (the same window as the runtime hold,
-//! `LOOM_RUNTIME_SANDBOX_HOLD_SECS`; `0` disables), when a tick on the seat
-//! succeeds (the `SUCCESS` terminal arm clears the cooldown), or when an
-//! operator clears the account's health. The next draw after it ages out
-//! re-tests the seat and re-arms the hold if it is still broken.
+//! A Codex sandbox refusal holds the selected profile across every workspace
+//! that uses it (#14455). Each profile carries its own deadline. Credential
+//! health, selection cursors and model cooldowns stay in their workspace.
 
-use std::path::Path;
+use std::collections::HashMap;
+use std::fs;
+use std::io::ErrorKind;
+use std::path::{Path, PathBuf};
 
-use anyhow::{bail, Result};
+use anyhow::{Context, Result};
+use serde::{Deserialize, Serialize};
 
-use super::account_registry::AccountId;
-use super::health::{with_state, AccountHealth, HealthReason};
+use super::account_registry::{
+    account_inventory_quiet, AccountDescriptor, AccountId, AccountProvider,
+};
+use super::health::{AccountHealth, HealthReason};
+use super::locking::MkdirLock;
 
-/// The `signal_provenance` a seat hold carries, so `accounts status` and a
-/// grep of `account-health.json` can tell it from an ordinary backoff.
 pub const PROVENANCE: &str = "sandbox-unavailable:v1";
+const FILE: &str = ".sandbox-seat-hold.json";
+const LOCK: &str = ".sandbox-seat-hold.lock";
 
-/// Hold `id` for `secs` from `now`. Returns whether a hold was written:
-/// `false` for `secs == 0` (disabled), a sticky re-auth hold, or a live
-/// cooldown that already lasts longer.
-///
-/// # Errors
-/// An empty account name, or the health file cannot be locked, read or
-/// written.
-pub fn hold_seat(workspace: &Path, id: &AccountId, secs: u64, now: u64) -> Result<bool> {
-    if id.name.is_empty() {
-        bail!("account identity is required");
+#[derive(Serialize, Deserialize)]
+struct Hold {
+    held_at: u64,
+    until: u64,
+}
+
+fn read(profile: &Path) -> Result<Option<Hold>> {
+    let path = profile.join(FILE);
+    match fs::read(&path) {
+        Ok(bytes) => serde_json::from_slice(&bytes)
+            .map(Some)
+            .with_context(|| format!("malformed sandbox hold {}", path.display())),
+        Err(error) if error.kind() == ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error).with_context(|| format!("cannot read {}", path.display())),
     }
+}
+
+fn profile_for(workspace: &Path, id: &AccountId) -> Result<Option<PathBuf>> {
+    Ok(account_inventory_quiet(workspace, AccountProvider::Codex)?
+        .into_iter()
+        .find(|account| account.id == *id)
+        .map(|account| account.credential_reference))
+}
+
+/// Hold the resolved seat even if this workspace has a longer credential
+/// cooldown: another workspace sharing that profile may have none.
+pub fn hold_seat(workspace: &Path, id: &AccountId, secs: u64, now: u64) -> Result<bool> {
     if secs == 0 {
         return Ok(false);
     }
+    let profile =
+        profile_for(workspace, id)?.with_context(|| format!("unknown Codex seat {}", id.name))?;
+    let _lock = MkdirLock::acquire(&profile.join(LOCK)).map_err(anyhow::Error::msg)?;
     let until = now.saturating_add(secs);
-    with_state(workspace, |state| {
-        let existing = state.accounts.iter().position(|entry| entry.id() == *id);
-        let mut entry = existing.map_or_else(
-            || AccountHealth {
-                provider: id.provider,
-                name: id.name.clone(),
+    if read(&profile)?.is_some_and(|hold| hold.until >= until) {
+        return Ok(false);
+    }
+    super::session_hold::write_json_atomic(
+        &profile,
+        FILE,
+        &Hold {
+            held_at: now,
+            until,
+        },
+    )?;
+    Ok(true)
+}
+
+/// A successful launch on this profile releases the hold for every workspace.
+pub(super) fn clear_on_success(workspace: &Path, id: &AccountId) -> Result<()> {
+    let Some(profile) = profile_for(workspace, id)? else {
+        return Ok(());
+    };
+    let path = profile.join(FILE);
+    if !path.try_exists()? {
+        return Ok(());
+    }
+    let _lock = MkdirLock::acquire(&profile.join(LOCK)).map_err(anyhow::Error::msg)?;
+    match fs::remove_file(path) {
+        Err(error) if error.kind() != ErrorKind::NotFound => Err(error.into()),
+        _ => Ok(()),
+    }
+}
+
+/// Overlay the profile deadlines on a read-only view of workspace health.
+/// Selection may persist its cursor, but must never copy a shared hold into
+/// that workspace or a success elsewhere could not release it.
+pub(super) fn apply_to_snapshot(
+    health: &mut HashMap<AccountId, AccountHealth>,
+    inventory: &[AccountDescriptor],
+    now: u64,
+) -> Result<()> {
+    for account in inventory
+        .iter()
+        .filter(|a| a.enabled && a.id.provider == AccountProvider::Codex)
+    {
+        let Some(hold) = read(&account.credential_reference)?.filter(|hold| hold.until > now)
+        else {
+            continue;
+        };
+        let entry = health
+            .entry(account.id.clone())
+            .or_insert_with(|| AccountHealth {
+                provider: account.id.provider,
+                name: account.id.name.clone(),
                 reason: HealthReason::Healthy,
-                updated_at: now,
-                signal_provenance: PROVENANCE.to_string(),
+                updated_at: hold.held_at,
+                signal_provenance: PROVENANCE.to_owned(),
                 cooldown_until: None,
                 consecutive_transient_failures: 0,
                 last_success: None,
                 last_probe: None,
-                class_cooldowns: std::collections::HashMap::new(),
-            },
-            |index| state.accounts.remove(index),
-        );
-        let wins = entry.reason != HealthReason::ReauthRequired
-            && !entry.cooldown_until.is_some_and(|live| live >= until);
-        if wins {
-            entry.reason = HealthReason::TransientFailure;
-            entry.cooldown_until = Some(until);
-            entry.updated_at = now;
-            entry.signal_provenance = PROVENANCE.to_string();
+                class_cooldowns: HashMap::new(),
+            });
+        if entry.cooldown_until.is_none_or(|until| until < hold.until) {
+            entry.cooldown_until = Some(hold.until);
+            // Re-auth stays sticky. Preflight also needs the deadline for
+            // a session-managed seat whose re-auth would otherwise be probed.
+            if entry.reason != HealthReason::ReauthRequired {
+                entry.reason = HealthReason::TransientFailure;
+            }
+            entry.signal_provenance = PROVENANCE.to_owned();
         }
-        state.accounts.push(entry);
-        state
-            .accounts
-            .sort_by(|a, b| (a.provider as u8, &a.name).cmp(&(b.provider as u8, &b.name)));
-        Ok(wins)
-    })
+    }
+    Ok(())
 }
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
-    use crate::tokens_pool::account_registry::AccountProvider;
-    use crate::tokens_pool::health::{account_health, record_terminal_for_model_at};
-    use crate::tokens_pool::TerminalClassification;
+    use crate::tokens_pool::health::{
+        account_health, inventory_health_snapshot, record_terminal_for_model_at,
+        TerminalClassification,
+    };
+    use crate::tokens_pool::profile_root_env::ProfileRootEnv;
+    use tempfile::tempdir;
 
-    fn id(name: &str) -> AccountId {
-        AccountId {
-            provider: AccountProvider::Codex,
-            name: name.to_string(),
-        }
+    #[test]
+    fn hold_deadlines_age_out_and_a_shorter_window_cannot_replace_them() {
+        let workspace = tempdir().unwrap();
+        let profiles = tempdir().unwrap();
+        let _root = ProfileRootEnv::set(profiles.path());
+        fs::create_dir(profiles.path().join("one")).unwrap();
+        let inventory = account_inventory_quiet(workspace.path(), AccountProvider::Codex).unwrap();
+        let id = &inventory[0].id;
+        assert!(!hold_seat(workspace.path(), id, 0, 1000).unwrap());
+        assert!(!profiles.path().join("one").join(FILE).exists());
+        assert!(hold_seat(workspace.path(), id, 600, 1000).unwrap());
+        assert!(!hold_seat(workspace.path(), id, 10, 1001).unwrap());
+        let before = inventory_health_snapshot(workspace.path(), &inventory, 1599).unwrap();
+        assert_eq!(before[id].signal_provenance, PROVENANCE);
+        assert!(!before[id].is_eligible_at(1599));
+        assert!(inventory_health_snapshot(workspace.path(), &inventory, 1600)
+            .unwrap()
+            .is_empty());
     }
 
     #[test]
-    fn a_held_seat_is_ineligible_until_the_window_ends() {
-        let dir = tempfile::tempdir().unwrap();
-        assert!(hold_seat(dir.path(), &id("agent-3"), 600, 1_000).unwrap());
-        let health = account_health(dir.path(), &id("agent-3")).unwrap().unwrap();
-        assert_eq!(health.signal_provenance, PROVENANCE);
-        assert_eq!(health.consecutive_transient_failures, 0);
-        assert!(!health.is_eligible_at(1_599));
-        assert!(health.is_eligible_at(1_600), "ages out at `until`");
-        assert_eq!(account_health(dir.path(), &id("agent-4")).unwrap(), None, "per seat");
-    }
-
-    #[test]
-    fn a_disabled_hold_writes_nothing() {
-        let dir = tempfile::tempdir().unwrap();
-        assert!(!hold_seat(dir.path(), &id("agent-3"), 0, 1_000).unwrap());
-        assert_eq!(account_health(dir.path(), &id("agent-3")).unwrap(), None);
-    }
-
-    #[test]
-    fn a_longer_live_cooldown_and_a_sticky_reauth_hold_are_never_overridden() {
-        let dir = tempfile::tempdir().unwrap();
-        let now = u64::try_from(chrono::Utc::now().timestamp()).unwrap();
-        record_terminal_for_model_at(
-            dir.path(),
-            &id("agent-3"),
+    fn a_sandbox_hold_preserves_longer_cooldowns_and_sticky_reauth() {
+        let workspace = tempdir().unwrap();
+        let profiles = tempdir().unwrap();
+        let _root = ProfileRootEnv::set(profiles.path());
+        fs::create_dir(profiles.path().join("one")).unwrap();
+        let inventory = account_inventory_quiet(workspace.path(), AccountProvider::Codex).unwrap();
+        let id = &inventory[0].id;
+        let now = 1_000;
+        for category in [
             TerminalClassification::TokenExhausted,
-            None,
-            "test",
-            now,
-        )
-        .unwrap();
-        let before = account_health(dir.path(), &id("agent-3")).unwrap().unwrap();
-        assert!(!hold_seat(dir.path(), &id("agent-3"), 600, now).unwrap());
-        assert_eq!(account_health(dir.path(), &id("agent-3")).unwrap().unwrap(), before);
-
-        record_terminal_for_model_at(
-            dir.path(),
-            &id("agent-4"),
             TerminalClassification::TokenExpired,
-            None,
-            "test",
-            now,
-        )
-        .unwrap();
-        assert!(!hold_seat(dir.path(), &id("agent-4"), 600, now).unwrap());
-        let reauth = account_health(dir.path(), &id("agent-4")).unwrap().unwrap();
-        assert_eq!(reauth.reason, HealthReason::ReauthRequired);
-    }
-
-    #[test]
-    fn a_success_on_the_seat_clears_the_hold() {
-        let dir = tempfile::tempdir().unwrap();
-        hold_seat(dir.path(), &id("agent-3"), 3_600, 1_000).unwrap();
-        record_terminal_for_model_at(
-            dir.path(),
-            &id("agent-3"),
-            TerminalClassification::Success,
-            None,
-            "test",
-            1_000,
-        )
-        .unwrap();
-        let health = account_health(dir.path(), &id("agent-3")).unwrap().unwrap();
-        assert!(health.is_eligible_at(1_001));
+        ] {
+            record_terminal_for_model_at(workspace.path(), id, category, None, "test", now)
+                .unwrap();
+            let original = account_health(workspace.path(), id).unwrap().unwrap();
+            hold_seat(workspace.path(), id, 60, now).unwrap();
+            let effective = inventory_health_snapshot(workspace.path(), &inventory, now).unwrap();
+            assert_eq!(effective[id].reason, original.reason);
+            assert_eq!(account_health(workspace.path(), id).unwrap().unwrap(), original);
+            assert!(!effective[id].is_eligible_at(now));
+            if let Some(until) = original.cooldown_until {
+                assert_eq!(effective[id].cooldown_until, Some(until));
+            }
+        }
     }
 }

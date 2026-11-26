@@ -236,12 +236,21 @@ pub fn exhaustion_reset_horizon(
     anchor: &str,
     category: TerminalClassification,
 ) -> Option<u64> {
-    matches!(
+    exhaustion_reset_horizon_in(&contents[contents.rfind(anchor)?..], category)
+}
+
+/// The provider reset time from an already bounded dispatch section.
+pub(crate) fn exhaustion_reset_horizon_in(
+    region: &str,
+    category: TerminalClassification,
+) -> Option<u64> {
+    if !matches!(
         category,
         TerminalClassification::TokenExhausted | TerminalClassification::ModelCreditsExhausted
-    )
-    .then(|| usage_limit_reset_epoch_after(contents, anchor))
-    .flatten()
+    ) {
+        return None;
+    }
+    u64::try_from(usage_limit_reset_in(region)?.timestamp()).ok()
 }
 
 #[cfg(test)]

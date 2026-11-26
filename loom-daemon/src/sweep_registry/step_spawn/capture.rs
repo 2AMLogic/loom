@@ -171,10 +171,10 @@ pub(crate) fn sandbox_unavailable_in(log: &Path, sweep_id: &str) -> bool {
     let Ok(text) = std::fs::read_to_string(log) else {
         return false;
     };
-    crate::sweep_registry::parse_terminal_result_after(&text, &format!("sweep_id={sweep_id}"))
-        .is_some_and(|result| {
-            result.category == crate::tokens_pool::TerminalClassification::SandboxUnavailable
-        })
+    crate::sweep_registry::dispatch_terminal_result(&text, sweep_id).is_some_and(|(result, _)| {
+        result.provider == crate::tokens_pool::AccountProvider::Codex
+            && result.category == crate::tokens_pool::TerminalClassification::SandboxUnavailable
+    })
 }
 
 /// The fast-fail window: the wider of `FAST_FAIL_WINDOW_SECS` and this
