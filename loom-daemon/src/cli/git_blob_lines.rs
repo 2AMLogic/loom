@@ -35,6 +35,9 @@
 //!
 //! ## Report mode (no `--range`)
 //!
+//! The count is `wc -l` semantics — the number of `\n` bytes — so an
+//! unterminated final line is NOT counted here.
+//!
 //! | Exit | Meaning | stdout |
 //! |---|---|---|
 //! | `0` | Resolved to a regular blob | `<resolved-path>\t<line-count>` |
@@ -47,6 +50,9 @@
 //! the exit code and the whole diagnostic is rendered here — that is the point
 //! of the port (`verify-proposal-refs.sh` is `contract`-category shell whose
 //! portable line count may not grow, `.loom/docs/shell-language-policy.md`).
+//! The span is checked against the blob's **citable** lines — the report count
+//! plus an unterminated final line, when there is one (#15467) — and the
+//! diagnostic reports that count.
 //!
 //! | Exit | Meaning | Output |
 //! |---|---|---|
@@ -85,9 +91,18 @@ const MAX_HOPS: u32 = 3;
 /// One resolution outcome.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Resolution {
-    /// Resolved to a regular (`100644`/`100755`) blob with this many lines
-    /// (`wc -l` semantics: the count of `\n` bytes in the content).
-    Lines { resolved_path: String, count: u64 },
+    /// Resolved to a regular (`100644`/`100755`) blob.
+    ///
+    /// - `count`: the report-mode line count (`wc -l` semantics: the count of
+    ///   `\n` bytes in the content).
+    /// - `citable`: the number of lines a citation may address — `count`, plus
+    ///   one when the blob is nonempty and its last byte is not `\n`, because
+    ///   that unterminated final segment is a real line (#15467).
+    Lines {
+        resolved_path: String,
+        count: u64,
+        citable: u64,
+    },
     /// Dangling symlink, unresolved cycle, or non-blob entry.
     Unreadable { resolved_path: String },
 }
@@ -229,6 +244,19 @@ fn normalize_lexically(dir: &str, path: &str) -> Option<String> {
     Some(stack.join("/"))
 }
 
+/// Report-mode line count (`wc -l` semantics): the number of `\n` bytes.
+fn newline_count(bytes: &[u8]) -> u64 {
+    bytes.iter().filter(|&&b| b == b'\n').count() as u64
+}
+
+/// Number of lines a citation may address (#15467): [`newline_count`], plus one
+/// when the content is nonempty and its last byte is not `\n` — that final
+/// segment is a real line. A trailing `\n` adds none, and an empty blob has
+/// none.
+fn citable_lines(bytes: &[u8]) -> u64 {
+    newline_count(bytes) + u64::from(!bytes.is_empty() && bytes.last() != Some(&b'\n'))
+}
+
 /// Resolve `path` against `rev` in `workspace`, then classify the result.
 /// "Absent" folds into [`Resolution::Unreadable`] — the range check's
 /// question ("does this span fit?") cannot be asked of a path that is not
@@ -250,7 +278,8 @@ pub(crate) fn resolve(workspace: &Path, rev: &str, path: &str) -> Result<Resolut
             bytes,
         } => Ok(Resolution::Lines {
             resolved_path,
-            count: bytes.iter().filter(|&&b| b == b'\n').count() as u64,
+            count: newline_count(&bytes),
+            citable: citable_lines(&bytes),
         }),
         ResolvedBlob::Unreadable { resolved_path } | ResolvedBlob::Absent { resolved_path } => {
             Ok(Resolution::Unreadable { resolved_path })
@@ -278,7 +307,8 @@ pub(crate) fn parse_range(spec: &str) -> Result<(u64, u64)> {
 pub(crate) enum RangeVerdict {
     /// The cited span fits inside the resolved blob.
     InRange,
-    /// The span runs past the end of the resolved blob — a real miss.
+    /// The span runs past the end of the resolved blob — a real miss. `count`
+    /// is the blob's citable line count, which the diagnostic reports.
     OutOfRange { resolved_path: String, count: u64 },
     /// The target could not be read, so the span was never checked.
     Unreadable { resolved_path: String },
@@ -298,12 +328,13 @@ pub(crate) fn check_range(
     match resolve(workspace, rev, path)? {
         Resolution::Lines {
             resolved_path,
-            count,
+            citable,
+            ..
         } => {
-            if start > count || end > count {
+            if start > citable || end > citable {
                 Ok(RangeVerdict::OutOfRange {
                     resolved_path,
-                    count,
+                    count: citable,
                 })
             } else {
                 Ok(RangeVerdict::InRange)
@@ -429,6 +460,7 @@ fn handle(
         Resolution::Lines {
             resolved_path,
             count,
+            ..
         } => {
             println!("{resolved_path}\t{count}");
             std::process::exit(0);
@@ -462,6 +494,8 @@ mod tests {
     ///   link's own directory, exercising the cross-directory relative case)
     /// - `docs/dangling.md` -> `../missing.md` (a symlink to nothing)
     /// - `a.md` -> `b.md`, `b.md` -> `a.md` (a 2-hop cycle)
+    /// - `last.md` (`last`), `unterminated.md` (`first\nlast`), `empty.md`
+    ///   and `blank.md` (`\n`) — the EOF shapes of #15467
     fn build_fixture() -> tempfile::TempDir {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
@@ -491,6 +525,10 @@ mod tests {
         symlink("../missing.md", root.join("docs/dangling.md")).unwrap();
         symlink("b.md", root.join("a.md")).unwrap();
         symlink("a.md", root.join("b.md")).unwrap();
+        fs::write(root.join("last.md"), "last").unwrap();
+        fs::write(root.join("unterminated.md"), "first\nlast").unwrap();
+        fs::write(root.join("empty.md"), "").unwrap();
+        fs::write(root.join("blank.md"), "\n").unwrap();
 
         assert!(Command::new("git")
             .args(["add", "-A"])
@@ -516,7 +554,8 @@ mod tests {
             r,
             Resolution::Lines {
                 resolved_path: "regular.md".to_string(),
-                count: 3
+                count: 3,
+                citable: 3,
             }
         );
     }
@@ -530,7 +569,8 @@ mod tests {
             r,
             Resolution::Lines {
                 resolved_path: "regular.md".to_string(),
-                count: 3
+                count: 3,
+                citable: 3,
             }
         );
     }
@@ -602,6 +642,124 @@ mod tests {
             },
             "an unreadable target is an inconclusive check, never a 0-line disproof"
         );
+    }
+
+    // --- EOF boundary (#15467): a final line with no `\n` after it is a real
+    // line a citation may address, while report mode keeps the `wc -l` count.
+
+    #[test]
+    fn an_unterminated_final_line_is_citable() {
+        let dir = build_fixture();
+        for (path, start, end) in [
+            ("last.md", 1, 1),
+            ("unterminated.md", 2, 2),
+            ("unterminated.md", 1, 2),
+        ] {
+            assert_eq!(
+                check_range(dir.path(), "HEAD", path, start, end).unwrap(),
+                RangeVerdict::InRange,
+                "{path}:{start}-{end}"
+            );
+        }
+    }
+
+    #[test]
+    fn one_past_an_unterminated_final_line_reports_the_citable_count() {
+        let dir = build_fixture();
+        assert_eq!(
+            check_range(dir.path(), "HEAD", "unterminated.md", 3, 3).unwrap(),
+            RangeVerdict::OutOfRange {
+                resolved_path: "unterminated.md".to_string(),
+                count: 2
+            }
+        );
+        assert_eq!(
+            check_range(dir.path(), "HEAD", "last.md", 2, 2).unwrap(),
+            RangeVerdict::OutOfRange {
+                resolved_path: "last.md".to_string(),
+                count: 1
+            }
+        );
+    }
+
+    #[test]
+    fn an_empty_blob_has_no_citable_lines() {
+        let dir = build_fixture();
+        assert_eq!(
+            check_range(dir.path(), "HEAD", "empty.md", 1, 1).unwrap(),
+            RangeVerdict::OutOfRange {
+                resolved_path: "empty.md".to_string(),
+                count: 0
+            }
+        );
+    }
+
+    #[test]
+    fn a_blank_line_is_citable_and_a_trailing_newline_adds_none() {
+        let dir = build_fixture();
+        for (path, start, end, verdict) in [
+            ("blank.md", 1, 1, RangeVerdict::InRange),
+            (
+                "blank.md",
+                2,
+                2,
+                RangeVerdict::OutOfRange {
+                    resolved_path: "blank.md".to_string(),
+                    count: 1,
+                },
+            ),
+            ("regular.md", 3, 3, RangeVerdict::InRange),
+            (
+                "regular.md",
+                4,
+                4,
+                RangeVerdict::OutOfRange {
+                    resolved_path: "regular.md".to_string(),
+                    count: 3,
+                },
+            ),
+        ] {
+            assert_eq!(
+                check_range(dir.path(), "HEAD", path, start, end).unwrap(),
+                verdict,
+                "{path}:{start}-{end}"
+            );
+        }
+    }
+
+    #[test]
+    fn report_mode_still_counts_newline_bytes() {
+        let dir = build_fixture();
+        for (path, count, citable) in [
+            ("last.md", 0, 1),
+            ("unterminated.md", 1, 2),
+            ("empty.md", 0, 0),
+            ("blank.md", 1, 1),
+            ("regular.md", 3, 3),
+        ] {
+            match resolve(dir.path(), "HEAD", path).unwrap() {
+                Resolution::Lines {
+                    count: actual,
+                    citable: actual_citable,
+                    ..
+                } => {
+                    assert_eq!(actual, count, "{path}: report count");
+                    assert_eq!(actual_citable, citable, "{path}: citable count");
+                }
+                other => panic!("{path}: expected Lines, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn citable_lines_counts_an_unterminated_final_line_once() {
+        assert_eq!(citable_lines(b""), 0);
+        assert_eq!(citable_lines(b"last"), 1);
+        assert_eq!(citable_lines(b"first\nlast"), 2);
+        assert_eq!(citable_lines(b"first\nlast\n"), 2);
+        assert_eq!(citable_lines(b"a\n\nb\n"), 3);
+        // Counted by bytes, so content that is not UTF-8 is no different.
+        assert_eq!(citable_lines(b"\xff\xfe\n\r\n"), 2);
     }
 
     #[test]
