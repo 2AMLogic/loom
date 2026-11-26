@@ -66,6 +66,40 @@ describe("list_terminals (daemon-only since #13821)", () => {
     // a daemon-confirmed empty registry needs no caveat.
     expect(text).not.toContain("UNVERIFIED");
   });
+
+  it.each([
+    { type: "Error", message: "registry unavailable" },
+    { type: "StructuredError", payload: { message: "registry unavailable" } },
+  ])("propagates the daemon's $type message", async (reply) => {
+    sendDaemonRequest.mockResolvedValueOnce(reply);
+
+    await expect(handleTerminalTool("list_terminals")).rejects.toThrow("registry unavailable");
+  });
+
+  it.each([
+    { type: "Success", payload: { terminals: [] } },
+    { type: "TerminalList", payload: {} },
+    { type: "TerminalList", payload: { terminals: "" } },
+    { type: "TerminalList", payload: { terminals: {} } },
+  ])("rejects an unusable registry reply %j", async (reply) => {
+    sendDaemonRequest.mockResolvedValueOnce(reply);
+
+    await expect(handleTerminalTool("list_terminals")).rejects.toThrow(/ListTerminals/);
+  });
+});
+
+describe("create_terminal", () => {
+  it("stops before creation when the registry lookup fails", async () => {
+    sendDaemonRequest.mockResolvedValueOnce({
+      type: "StructuredError",
+      payload: { message: "registry unavailable" },
+    });
+
+    const [{ text }] = await handleTerminalTool("create_terminal");
+
+    expect(sendDaemonRequest.mock.calls).toEqual([[{ type: "ListTerminals" }]]);
+    expect(text).toContain("registry unavailable");
+  });
 });
 
 describe("removed state.json tools (#13821)", () => {
