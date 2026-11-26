@@ -23,9 +23,39 @@ fn pulls_300() -> String {
     pulls_arm(&[row(300, &["loom:pr"]).sha(SHA_B)])
 }
 
+/// Guard for the `reconcile*` tests below: each holds BOTH the crate-default
+/// `#[serial]` lock and `loom_config_env`. `serial_test` only mutually
+/// excludes tests that share the *same* key, and its macro cannot name the
+/// default key next to a named one, so a test nests: the
+/// `#[serial(loom_config_env)]` test calls a `#[serial] fn *_body()`.
+/// `loom_config_env` is the crate's one writer group for `LOOM_GH_BIN`
+/// (#8480) and must be the OUTER lock — the order
+/// `lock_order_tests::loom_config_env_is_only_ever_the_outer_lock`
+/// enforces. The default lock stays inner and load-bearing:
+/// `VERDICT_ANCHOR_ENABLED_ENV` is also mutated under it in `tests.rs`. On
+/// the bare `#[serial]` alone these tests ran concurrently with
+/// `labels_verify_tests` and swapped `LOOM_GH_BIN` under it (#15435); nesting
+/// fixes that, and this fails loudly if either lock is ever dropped from a
+/// caller.
+fn assert_holds_default_and_config_env_locks() {
+    assert!(
+        serial_test::is_locked_serially(Some("loom_config_env")),
+        "caller must hold the loom_config_env lock: writes LOOM_GH_BIN (#8480)"
+    );
+    assert!(
+        serial_test::is_locked_serially(None),
+        "caller must hold the bare #[serial] lock: writes {VERDICT_ANCHOR_ENABLED_ENV}"
+    );
+}
+
 /// PR #300 carries `loom:pr` at head `SHA_B`; its comment listing is
 /// `comments` (a JSON array).
+///
+/// Writes the process-global `LOOM_GH_BIN` and `VERDICT_ANCHOR_ENABLED_ENV`:
+/// a caller MUST hold both locks — see
+/// [`assert_holds_default_and_config_env_locks`].
 fn reconcile(comments: &str) -> VerdictReconcileStats {
+    assert_holds_default_and_config_env_locks();
     let dir = tempdir().unwrap();
     let root = dir.path().join("repo");
     std::fs::create_dir_all(&root).unwrap();
@@ -63,8 +93,13 @@ esac
 }
 
 #[test]
-#[serial]
+#[serial(loom_config_env)]
 fn an_untrusted_marker_for_the_current_head_cannot_keep_a_stale_approval() {
+    an_untrusted_marker_for_the_current_head_cannot_keep_a_stale_approval_body();
+}
+
+#[serial]
+fn an_untrusted_marker_for_the_current_head_cannot_keep_a_stale_approval_body() {
     // The fleet approved SHA_A; the head moved to SHA_B. Later markers
     // naming SHA_B from an outsider, a contributor, a user squatting the
     // fleet App's bare name, and another fleet's App are all prose.
@@ -81,16 +116,26 @@ fn an_untrusted_marker_for_the_current_head_cannot_keep_a_stale_approval() {
 }
 
 #[test]
-#[serial]
+#[serial(loom_config_env)]
 fn only_untrusted_markers_read_as_no_marker() {
+    only_untrusted_markers_read_as_no_marker_body();
+}
+
+#[serial]
+fn only_untrusted_markers_read_as_no_marker_body() {
     let listing = format!("[{}]", comment("drive-by", "User", "NONE", SHA_B));
     let stats = reconcile(&listing);
     assert_eq!((stats.invalidated, stats.unverifiable), (0, 1), "{stats:?}");
 }
 
 #[test]
-#[serial]
+#[serial(loom_config_env)]
 fn an_insiders_marker_still_counts() {
+    an_insiders_marker_still_counts_body();
+}
+
+#[serial]
+fn an_insiders_marker_still_counts_body() {
     let listing = format!("[{}]", comment("maintainer", "User", "COLLABORATOR", SHA_B));
     let stats = reconcile(&listing);
     assert_eq!((stats.invalidated, stats.unverifiable), (0, 0), "{stats:?}");
@@ -168,7 +213,12 @@ fn claim_activity_counts_only_from_trusted_authors() {
 /// reports as `CONTRIBUTOR`. The verdict is still cleared (trust unchanged),
 /// but the posted notice names the login and `forge.trustedCommenters`
 /// instead of asserting a head move. Returns the posted comment bodies.
+///
+/// Writes the process-global `LOOM_GH_BIN` and `VERDICT_ANCHOR_ENABLED_ENV`:
+/// a caller MUST hold both locks — see
+/// [`assert_holds_default_and_config_env_locks`].
 fn reconcile_capturing_notice(comments: &str) -> (VerdictReconcileStats, String) {
+    assert_holds_default_and_config_env_locks();
     let dir = tempdir().unwrap();
     let root = dir.path().join("repo");
     std::fs::create_dir_all(&root).unwrap();
@@ -209,8 +259,13 @@ esac
 }
 
 #[test]
-#[serial]
+#[serial(loom_config_env)]
 fn a_dropped_newer_approval_is_named_in_the_stale_notice() {
+    a_dropped_newer_approval_is_named_in_the_stale_notice_body();
+}
+
+#[serial]
+fn a_dropped_newer_approval_is_named_in_the_stale_notice_body() {
     let listing = format!(
         "[{},{}]",
         comment("maintainer", "User", "COLLABORATOR", SHA_A),
@@ -226,8 +281,13 @@ fn a_dropped_newer_approval_is_named_in_the_stale_notice() {
 }
 
 #[test]
-#[serial]
+#[serial(loom_config_env)]
 fn a_genuine_head_move_still_says_head_sha_moved() {
+    a_genuine_head_move_still_says_head_sha_moved_body();
+}
+
+#[serial]
+fn a_genuine_head_move_still_says_head_sha_moved_body() {
     let listing = format!("[{}]", comment("maintainer", "User", "COLLABORATOR", SHA_A));
     let (stats, posted) = reconcile_capturing_notice(&listing);
     assert_eq!(stats.invalidated, 1, "{stats:?}");
