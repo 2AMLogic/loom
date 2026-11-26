@@ -158,11 +158,12 @@ it, only a hold label names a reason; other candidates are undecided.
 *acted*. The mapping is a total match in
 `PickSkipReason::from_disposition`, so a new disposition must be classified
 there. The step engine's weight-0 exclusions map through the parallel total match
-`PickSkipReason::from_exclusion` (26 wire names: `Exclusion::as_str` and
+`PickSkipReason::from_exclusion` (27 wire names: `Exclusion::as_str` and
 `PassReason::as_str`): `pool_exhausted` → `quota`, `build_backoff` /
 `cooling_down` → `backoff`, `ci_pending` (a Judge step whose PR head has CI
 running, #12042) / `held_at_head` / `author_gate_held` / `conflicting` /
-`stacked` / `backstop_held` / `operator_link_unverified` → `backoff`,
+`stacked` / `backstop_held` / `operator_link_unverified` /
+`queue_membership_unknown` → `backoff`,
 `frozen` / `operator` / `hard_exclusion` → `operator_hold`, `claimed` / `queued`
 / `merge_in_flight` → `in_flight`, `shared_pr` → `pr_open_skip`, `sequenced` →
 `overlap_chain`, `blocked` → `blocked`, `capability_missing` / `host_skip_label`
