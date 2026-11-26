@@ -304,6 +304,26 @@ assert_allow "#15221: continued redirection follows the subshell close" \
 assert_allow "#15221: continued AND-list follows the subshell close" \
     'cd /usr && finish() ( rm -f /tmp/x/foo ) \
         && finish' "$REPO_ROOT"
+# Judge round 4: operands are what Bash passes to rm, and a function body's
+# relative operand resolves in the directory of the CALL, not the definition.
+assert_allow "#15221: quoted filename with spaces stays one operand in a function body" \
+    'cd /usr && finish() { rm -f "/tmp/loom judge note"; }; finish' "$REPO_ROOT"
+assert_allow "#15221: redirection attached to a function-body rm is not an operand" \
+    'cd /usr && finish() { rm -f /tmp/loom-judge-note 2>/dev/null; }; finish' "$REPO_ROOT"
+assert_allow "#15221: top-level quoted filename with spaces stays one operand" \
+    'rm -f "/tmp/loom judge note"' "$REPO_ROOT"
+assert_allow "#15221: top-level attached redirection is not an operand" \
+    'rm -f /tmp/loom-judge-note 2>/dev/null' "$REPO_ROOT"
+assert_allow "#15221: function defined under /usr but called after cd /tmp resolves in /tmp" \
+    'cd /usr && finish() { rm -f local-note; }; cd /tmp && finish' "$REPO_ROOT"
+assert_allow "#15221: same call-directory rule for a subshell body" \
+    'cd /usr && finish() ( rm -f local-note ); cd /tmp && finish' "$REPO_ROOT"
+assert_allow "#15221: same call-directory rule for the function keyword form" \
+    'cd /usr && function finish { rm -f local-note; }; cd /tmp && finish' "$REPO_ROOT"
+assert_deny_reason_matches "#15221: function called under /usr resolves its relative operand there" \
+    'cd /usr && finish() ( rm -f local-note ) && finish' '/usr/local-note$' "$REPO_ROOT"
+assert_deny_reason_matches "#15221: redirection after a quoted-space operand does not hide the real target" \
+    'cd /usr && rm -f "local note" 2>/dev/null' '/usr/local note$' "$REPO_ROOT"
 assert_deny_reason_matches "#15221: continued AND-list keeps the outer directory for the next rm" \
     'cd /usr && finish() ( rm -f /tmp/x/foo ) \
         && rm -f local-note' '/usr/local-note$' "$REPO_ROOT"

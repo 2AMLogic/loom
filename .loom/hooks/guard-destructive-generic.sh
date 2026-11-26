@@ -7741,6 +7741,9 @@ _extract_rm_targets_scan() {
         CDM = sprintf("%c", 31); UNRM = sprintf("%c", 29); RSM = sprintf("%c", 30)
         SQ = sprintf("%c", 39); DQ = sprintf("%c", 34); BS = sprintf("%c", 92)
         BAD = "$`*?[ \t" SQ DQ BS CDM UNRM RSM
+        # SPM stands in for whitespace INSIDE one rm operand so the caller word
+        # split keeps a quoted/escaped filename whole; the caller maps it back.
+        SPM = sprintf("%c", 28)
     }
     # True if `s` has a byte that makes a cd path non-literal (expansion, glob,
     # quote, escape, whitespace) or collides with an output mark.
@@ -7845,12 +7848,15 @@ _extract_rm_targets_scan() {
             # command word only, and a segment whose first word already is `rm`
             # matches none of these shapes.
             lead = 0   # number of subshells enclosing the command word
+            fname = "" # function whose body this segment starts (its rm runs at CALL time)
             while (1) {
                 if (seg ~ /^[A-Za-z0-9_./+@%,:?~-]+[ \t]*\(\)[ \t]*[\{(]/) {
+                    fname = seg; sub(/[ \t]*\(\).*$/, "", fname)
                     if (seg ~ /^[A-Za-z0-9_./+@%,:?~-]+[ \t]*\(\)[ \t]*\(/) lead++
                     sub(/^[A-Za-z0-9_./+@%,:?~-]+[ \t]*\(\)[ \t]*[\{(][ \t]*/, "", seg)
                 }
                 else if (seg ~ /^function[ \t]+[A-Za-z0-9_./+@%,:?~-]+([ \t]*\(\))?[ \t]*[\{(]/) {
+                    fname = seg; sub(/^function[ \t]+/, "", fname); sub(/[ \t]*(\(\))?[ \t]*[\{(].*$/, "", fname)
                     if (seg ~ /^function[ \t]+[A-Za-z0-9_./+@%,:?~-]+([ \t]*\(\))?[ \t]*\(/) lead++
                     sub(/^function[ \t]+[A-Za-z0-9_./+@%,:?~-]+([ \t]*\(\))?[ \t]*[\{(][ \t]*/, "", seg)
                 }
@@ -7906,6 +7912,13 @@ _extract_rm_targets_scan() {
             else if (seg ~ /^rm([ \t]|$)/) {
                 emit_rm()
             }
+            else {
+                # A call to a function defined earlier in this command: its
+                # relative rm operands resolve in THIS directory, not the one
+                # in effect where the body was written.
+                wd = seg; sub(/[ \t].*$/, "", wd)
+                if (wd != "" && (wd in fn_tok)) replay_fn(wd)
+            }
             for (q = lead; q < npush; q++) push_cwd()
             for (q = 0; q < npop && sdepth > 0; q++) {
                 curcwd = st_cwd[sdepth]; cdseen = st_seen[sdepth]; cdunres = st_unres[sdepth]; cdlink = st_link[sdepth]; cdwhy = st_why[sdepth]
@@ -7945,23 +7958,81 @@ _extract_rm_targets_scan() {
         }
         return s
     }
-    function emit_rm(   j, has_rf) {
-        if (sdepth && index(seg, ")")) seg = rm_command_text(seg)
-        m = split(seg, toks, /[ \t]+/)
-        has_rf = 0
-        for (j = 2; j <= m; j++)
-            if (toks[j] ~ /^-/ && toks[j] ~ /[rRfF]/) has_rf = 1
-        if (!has_rf) return
-        for (j = 2; j <= m; j++) {
-            if (toks[j] == "") continue
-            if (toks[j] ~ /^-/) continue
-            if (cdlink && !cdunres && curcwd ~ /^\//)
-                print mark CDM curcwd CDM toks[j]
-            else if (cdlink || index(toks[j], CDM) > 0 || index(toks[j], UNRM) > 0)
-                print mark UNRM (cdlink && cdunres && cdwhy != "" ? cdwhy : "c") toks[j]
-            else
-                print mark toks[j]
+    # Print one operand with the provenance prefix for the directory in effect.
+    function emit_tok(t) {
+        if (cdlink && !cdunres && curcwd ~ /^\//)
+            print mark CDM curcwd CDM t
+        else if (cdlink || index(t, CDM) > 0 || index(t, UNRM) > 0)
+            print mark UNRM (cdlink && cdunres && cdwhy != "" ? cdwhy : "c") t
+        else
+            print mark t
+    }
+    # Replay the operands of a function-body rm at a call site.
+    function replay_fn(name,   k, cnt, parts) {
+        cnt = split(fn_tok[name], parts, " ")
+        for (k = 1; k <= cnt; k++) emit_tok(parts[k])
+    }
+    # Split on unquoted whitespace so a quoted or escaped filename stays one
+    # word (spaces inside it become SPM); toks[1..m] as before.
+    function rm_words(s,   pos, c, w, q, inw, nc) {
+        m = 0; w = ""; q = ""; inw = 0
+        for (pos = 1; pos <= length(s); pos++) {
+            c = substr(s, pos, 1)
+            if (q == "" && (c == " " || c == "\t")) {
+                if (inw) { toks[++m] = w; w = ""; inw = 0 }
+                continue
+            }
+            inw = 1
+            if (c == BS && q != SQ) {
+                nc = substr(s, pos + 1, 1); pos++
+                if (nc == " " || nc == "\t") nc = SPM
+                w = w c nc
+                continue
+            }
+            if (q != "") {
+                if (c == q) q = ""
+                w = w ((c == " " || c == "\t") ? SPM : c)
+                continue
+            }
+            if (c == SQ || c == DQ) q = c
+            w = w c
         }
+        if (inw) toks[++m] = w
+    }
+    function emit_rm(   j, has_rf, collide, t, rest, nt, tg, k, redir) {
+        if (sdepth && index(seg, ")")) seg = rm_command_text(seg)
+        collide = (index(seg, SPM) > 0)
+        rm_words(seg)
+        redir = "^([0-9]*|&|\\{[a-zA-Z_][a-zA-Z0-9_]*\\})(>>|>\\||>&|<&|<<<|<<|>|<)"
+        has_rf = 0; nt = 0
+        for (j = 2; j <= m; j++) {
+            t = toks[j]
+            if (t ~ /^&?[0-9]*[<>]/ || t ~ redir || t ~ /^&>/) {
+                # A redirection attached to the command is not an operand; a
+                # bare operator takes the following word with it.
+                rest = t; sub(redir, "", rest)
+                if (rest == "" || t ~ /^[0-9]*[<>]+$/) j++
+                continue
+            }
+            if (t ~ /^-/) { if (t ~ /[rRfF]/) has_rf = 1; continue }
+            if (t != "") tg[++nt] = t
+        }
+        if (!has_rf) return
+        for (k = 1; k <= nt; k++) {
+            t = tg[k]
+            if (collide) { print mark UNRM "c" t; continue }
+            if (fname != "") {
+                # Body of a function definition: judge the operand now against the
+                # session verdict (no directory guess) and again, with the
+                # directory in effect, at every call.
+                if (index(t, CDM) > 0 || index(t, UNRM) > 0) print mark UNRM "c" t
+                else print mark t
+                fn_tok[fname] = fn_tok[fname] " " t
+                continue
+            }
+            emit_tok(t)
+        }
+        if (fname != "" && !(fname in fn_tok)) fn_tok[fname] = ""
     }'
 }
 
@@ -10044,6 +10115,10 @@ if echo "$COMMAND_RM_SCAN" | grep -qE 'rm[[:space:]]+-[a-zA-Z]*[rf]'; then
                 target="${target:1}"
                 ;;
         esac
+
+        # Whitespace inside one quoted/escaped operand travels as 0x1C so the
+        # word split above keeps the filename whole; restore it.
+        target="${target//$'\034'/ }"
 
         # Skip empty targets
         [[ -z "$target" ]] && continue
