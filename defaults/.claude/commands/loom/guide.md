@@ -3073,10 +3073,10 @@ verify_plan_provenance() {
       # or dropped ` *(held…)*` fails like a wrong closes list does. The
       # Operator Attention section carries the suffix but never the closes
       # list (held rows stay `title` + suffix).
-      hsfx="$(jq -c --argjson n "$num" '.[] | select(.number == $n)' <<<"$approved_json" | approved_hold_suffix)"
+      hsfx="$(jq -c --argjson n "$num" '.[] | select(.number == $n)' <<<"$approved_json" | approved_hold_suffix)" || return 1
       if [ "$opatt" -eq 1 ]; then
-        if [ "$rest" != "$got$hsfx" ]; then
-          echo "provenance: #$num Operator Attention title or hold suffix differs from $GUIDE_REPO" >&2; bad=1
+        if [ -z "$hsfx" ] || [ "$rest" != "$got$hsfx" ]; then
+          echo "provenance: #$num Operator Attention row does not match a held approval in $GUIDE_REPO" >&2; bad=1
         fi
       elif [ "$rest" != "$got${refs:+ — closes $refs}$hsfx" ]; then
         echo "provenance: #$num Approved title, closing refs or hold suffix differ from $GUIDE_REPO" >&2; bad=1

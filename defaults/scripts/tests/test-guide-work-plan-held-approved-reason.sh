@@ -71,10 +71,10 @@ extract_fn() { awk -v re="^$1\\\\(\\\\) \\\\{" '$0 ~ re {f=1} f{print} /^\}/{if(
 RPB_BODY="$(extract_fn render_plan_body)"
 HSFX_BODY="$(extract_fn approved_hold_suffix)"
 VPP_BODY="$(extract_fn verify_plan_provenance)"
-LINK_BODY="$(extract_fn open_pr_linkage_rows; extract_fn open_pr_annotation)"
+HELPERS_BODY="$(awk -f "$SCRIPT_DIR/lib/guide-plan-helpers.awk" "$GUIDE_MD")" || exit 1
 
 for pair in "render_plan_body:$RPB_BODY" "approved_hold_suffix:$HSFX_BODY" \
-            "verify_plan_provenance:$VPP_BODY" "open_pr_linkage_rows:$LINK_BODY"; do
+            "verify_plan_provenance:$VPP_BODY"; do
     if [[ -z "${pair#*:}" ]]; then
         fail "could not extract ${pair%%:*}() from guide.md"
         echo -e "${RED}FATAL${NC}: cannot continue"
@@ -220,7 +220,7 @@ JSON
 # One runner file: the extracted functions + a command to run.
 {
     printf 'PATH="%s/bin:$PATH"\n' "$TMPROOT"
-    printf '%s\n' "$LINK_BODY" "$HSFX_BODY" "$RPB_BODY" "$VPP_BODY"
+    printf '%s\n' "$HELPERS_BODY" "$RPB_BODY" "$VPP_BODY"
 } > "$TMPROOT/fns.sh"
 run() { LOOM_FIXTURE_DIR="$FIX" GH_READ="$TMPROOT/gh-stub" GUIDE_REPO=owner/mine bash -c 'source "$1"; shift; eval "$@"' _ "$TMPROOT/fns.sh" "$@"; }
 
@@ -290,20 +290,16 @@ else
     fail "hostile reason broke the one-row grammar: $HOSTILE_ROW"
 fi
 INNER="${HOSTILE_SFX# \*(held: }"; INNER="${INNER%)\*}"
-if [[ "$HOSTILE_SFX" == " *(held: "*")*" ]] && ! grep -q '[`|*<>[]\\]' <<<"$INNER" && ! grep -qF ']' <<<"$INNER"; then
-    pass "no backtick, pipe, asterisk, angle bracket, square bracket or backslash survives in the reason"
+clean_prefix="needs 'v0.10.0' / tag now bx/b link(http://x) --bold-- backslash second line"
+if [[ "$HOSTILE_SFX" == " *(held: $clean_prefix long "*")*" ]]; then
+    pass "the held suffix preserves readable text and sanitizes Markdown and whitespace"
 else
-    fail "unsafe characters survived: $HOSTILE_SFX"
+    fail "unexpected sanitized hold suffix: $HOSTILE_SFX"
 fi
 if [[ "${#INNER}" -le 160 ]] && [[ "$INNER" == *"…" ]]; then
     pass "reason capped at 160 characters with an ellipsis (${#INNER})"
 else
     fail "reason not bounded/ellipsised (${#INNER}): $INNER"
-fi
-if grep -qF 'needs' <<<"$INNER" && grep -qF 'v0.10.0' <<<"$INNER"; then
-    pass "the readable text of the reason survives sanitising"
-else
-    fail "sanitising ate the readable reason: $INNER"
 fi
 
 # ---------------------------------------------------------------------------
@@ -316,6 +312,8 @@ vok() { if vrun "$1"; then pass "accepted: $2"; else fail "rejected: $2"; fi; }
 vno() { if vrun "$1"; then fail "accepted: $2"; else pass "rejected: $2"; fi; }
 
 vok "$RENDER1" "the full render (held suffixes, hostile reason, closes annotations)"
+vno "$(printf '## Operator Attention: Merge-Risk-Hold Pileup\n%s' "$(row "$APPROVED" 9006)")" \
+    "an unheld Approved row copied into Operator Attention, even with a stale park record"
 vno "${RENDER1//"$REL"/}" "every held reason dropped (Approved and Operator Attention)"
 vno "${RENDER1//bridge release PR must land/bridge release PR may land}" "tampered reason text"
 vno "${RENDER1/"- **#9001**: Ordinary approved PR — closes #7001"/"- **#9001**: Ordinary approved PR — closes #7001 *(held)*"}" \
