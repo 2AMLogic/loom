@@ -10053,9 +10053,11 @@ preserves (fail closed):
    when workspaces share a volume, home or temporary directory. The search
    covers the root and six directory levels below it. A missing worktree,
    a non-GitHub origin or a failed ticket lookup preserves the root.
-2. a `watch-pid` file at the root's top level names a dead process (absent
-   passes; unreadable/unparseable counts as alive);
-3. no process has its cwd or an open file under the root;
+2. the `watch-pid` marker is absent or names a process confirmed dead.
+   An unreadable marker, invalid PID or inconclusive probe preserves the root.
+3. the process scan confirms that no process has its cwd or an open file under
+   the root. Incomplete process visibility preserves it. Linux checks procfs
+   and macOS checks the full `lsof` listing against the process table.
 4. the idle walk finds no writes in the last 24 h. An unreadable subtree
    preserves the root. The walk stops descending after 50,000 directories,
    so a recent write in an unexamined subtree can be missed.
@@ -10064,10 +10066,12 @@ preserves (fail closed):
    repo is gone, is "not safe", never clean — and report no **tracked**
    change) and its `HEAD` is reachable from a remote ref
    (`git rev-list --count HEAD --not --remotes` == 0, never `--branches`
-   for a linked worktree, whose refs are its parent's). A self-contained clone
-   (`.git` is a directory) owns its refs, so it must additionally have no
-   local branch a remote lacks (`git rev-list --count --branches --not
-   --remotes` == 0) and no `refs/stash`;
+   for a linked worktree whose common Git directory survives). When the
+   common Git directory lies inside the candidate, every registered checkout
+   must be among the worktrees inspected inside it. All commits reachable
+   from local refs, including tags, must be published
+   (`git rev-list --count --all --not --remotes` equals zero), and the store
+   must have no stash.
 6. the root itself is at least `scratchReclaim.maxAgeHours` old.
 
 Removal runs `chmod -R u+w` first (Go module caches and cert stores are

@@ -34,8 +34,7 @@
 //!    failure is `UNKNOWN` → preserve);
 //! 2. a `watch-pid` file at the root's top level names a dead process (absent
 //!    passes; unparseable is treated as alive);
-//! 3. no process has its cwd or an open fd under the root
-//!    ([`crate::worktree_ops::safety::find_processes_using_directory`]);
+//! 3. a complete process scan finds no cwd or open fd under the root;
 //! 4. the bounded idle walk finds no change within the idle window (24 h).
 //!    An unreadable subtree is `Unknown` and preserves the root.
 //! 5. every git worktree inside is clean **and** its `HEAD` is reachable from
@@ -81,6 +80,8 @@ use chrono::{DateTime, Utc};
 use regex::Regex;
 
 use crate::fs_util::human_size;
+
+mod process_activity;
 
 /// The topic published for every (planned) root removal.
 pub const EVENT_TOPIC: &str = "daemon.scratch_root.reaped";
@@ -383,6 +384,8 @@ pub enum WorktreeSafety {
 /// [`crate::worktree_ops::clean::branch_reachable_from_remotes`] probe —
 /// `git rev-list --count HEAD --not --remotes`, never `--branches` (which
 /// counts every local branch of the shared repo, not this worktree's).
+/// A common store inside the removal boundary also needs every registered
+/// checkout accounted for, every ref published, and an empty stash.
 ///
 /// `--no-optional-locks` is load-bearing, not hygiene: a plain `git status`
 /// opportunistically refreshes and **writes** the index, which would stamp
@@ -390,6 +393,13 @@ pub enum WorktreeSafety {
 /// never let a root the pass itself looked at become eligible.
 #[must_use]
 pub fn worktree_safety(worktree: &Path) -> WorktreeSafety {
+    let Ok(root) = worktree.canonicalize() else {
+        return WorktreeSafety::NotSafe("worktree path could not be resolved");
+    };
+    worktree_safety_in_root(&root, &root, std::slice::from_ref(&root))
+}
+
+fn worktree_safety_in_root(worktree: &Path, root: &Path, discovered: &[PathBuf]) -> WorktreeSafety {
     let out = Command::new("git")
         .args(["--no-optional-locks", "-C"])
         .arg(worktree)
@@ -410,37 +420,71 @@ pub fn worktree_safety(worktree: &Path) -> WorktreeSafety {
     if !crate::worktree_ops::clean::branch_reachable_from_remotes(worktree, "HEAD") {
         return WorktreeSafety::NotSafe("worktree HEAD has commits no remote holds");
     }
-    // A self-contained clone (`.git` is a DIRECTORY) owns its whole ref
-    // namespace, so `HEAD` alone does not prove its work is published: a
-    // commit on a non-`HEAD` local branch, or a stash, is invisible to both
-    // probes above. The linked-worktree form (`.git` FILE) shares its
-    // parent's refs and keeps the HEAD-only probe, which is exactly why
-    // `--branches` is wrong there.
-    if std::fs::symlink_metadata(worktree.join(".git")).is_ok_and(|m| m.is_dir()) {
-        if !clone_branches_published(worktree) {
-            return WorktreeSafety::NotSafe("clone has local branches no remote holds");
+    // A gitfile may also point at a separate Git directory inside the root.
+    // Use the directory that will actually be lost to select the ref scope.
+    let common_dir =
+        git_answer(worktree, &["rev-parse", "--path-format=absolute", "--git-common-dir"])
+            .and_then(|s| Path::new(s.strip_suffix('\n')?).canonicalize().ok());
+    let Some(common_dir) = common_dir else {
+        return WorktreeSafety::NotSafe("cannot locate the common Git directory");
+    };
+    if common_dir.starts_with(root) {
+        if !registered_worktrees_checked(worktree, discovered) {
+            return WorktreeSafety::NotSafe("clone backs a checkout outside the inspected worktrees or its registrations are unreadable");
         }
         if clone_has_stash(worktree) {
             return WorktreeSafety::NotSafe("clone has a stash");
+        }
+        let unpublished = git_answer(
+            worktree,
+            &[
+                "--no-replace-objects",
+                "rev-list",
+                "--count",
+                "--all",
+                "--not",
+                "--remotes",
+            ],
+        );
+        if unpublished.as_deref() != Some("0\n") {
+            return WorktreeSafety::NotSafe("clone has local refs not proven published");
         }
     }
     WorktreeSafety::Safe
 }
 
-/// `git rev-list --count --branches --not --remotes == 0` in a self-contained
-/// clone. Fail-closed: any failure to run or parse reads as "not published".
-fn clone_branches_published(clone: &Path) -> bool {
+fn git_answer(worktree: &Path, args: &[&str]) -> Option<String> {
     let out = Command::new("git")
-        .args(["--no-optional-locks", "-C"])
-        .arg(clone)
-        .args(["rev-list", "--count", "--branches", "--not", "--remotes"])
-        .output();
-    let Ok(out) = out else { return false };
-    out.status.success()
-        && String::from_utf8_lossy(&out.stdout)
-            .trim()
-            .parse::<u64>()
-            .is_ok_and(|n| n == 0)
+        .current_dir(worktree)
+        .args(args)
+        .output()
+        .ok()?;
+    if !out.status.success() || !out.stderr.is_empty() {
+        return None;
+    }
+    String::from_utf8(out.stdout).ok()
+}
+
+/// A surviving checkout needs this store even if every commit is published.
+/// Each registered path must be one of the worktrees evaluated by this pass.
+fn registered_worktrees_checked(worktree: &Path, discovered: &[PathBuf]) -> bool {
+    let Some(list) = git_answer(worktree, &["worktree", "list", "--porcelain", "-z"]) else {
+        return false;
+    };
+    let Some(records) = list.strip_suffix("\0\0") else {
+        return false;
+    };
+    records.split("\0\0").all(|record| {
+        let Some((path, _)) = record
+            .strip_prefix("worktree ")
+            .and_then(|s| s.split_once('\0'))
+        else {
+            return false;
+        };
+        Path::new(path)
+            .canonicalize()
+            .is_ok_and(|p| discovered.contains(&p))
+    })
 }
 
 /// Whether a self-contained clone has a `refs/stash` entry. Fail-closed: a
@@ -567,27 +611,33 @@ fn unique_workspace_slug(workspace: &Path) -> Option<String> {
 }
 
 /// Gate 2's watch-pid reading. Fails closed: an existing `watch-pid` file
-/// that cannot be read or parsed counts as **alive** — only a dead pid or
+/// that cannot be read or parsed preserves the root. Only a dead pid or
 /// no file at all passes the gate.
 enum WatchPidState {
     Absent,
     Dead,
     Alive,
     Unreadable,
+    Unknown,
 }
 
-fn watch_pid_state(root: &Path, pid_alive: &dyn Fn(u32) -> bool) -> WatchPidState {
+fn watch_pid_state(root: &Path, pid_alive: &dyn Fn(u32) -> Option<bool>) -> WatchPidState {
     let marker = root.join("watch-pid");
-    if std::fs::symlink_metadata(&marker).is_err() {
-        return WatchPidState::Absent;
+    match std::fs::symlink_metadata(&marker) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return WatchPidState::Absent,
+        Ok(meta) if meta.is_file() => {}
+        _ => return WatchPidState::Unreadable,
     }
-    let Ok(text) = std::fs::read_to_string(&marker) else {
-        return WatchPidState::Unreadable;
-    };
-    match text.trim().parse::<u32>() {
-        Ok(pid) if pid_alive(pid) => WatchPidState::Alive,
-        Ok(_) => WatchPidState::Dead,
-        Err(_) => WatchPidState::Unreadable,
+    let pid = std::fs::read_to_string(&marker)
+        .ok()
+        .and_then(|text| text.trim().parse().ok());
+    match pid {
+        Some(pid) => match pid_alive(pid) {
+            Some(true) => WatchPidState::Alive,
+            Some(false) => WatchPidState::Dead,
+            None => WatchPidState::Unknown,
+        },
+        None => WatchPidState::Unreadable,
     }
 }
 
@@ -619,9 +669,9 @@ pub struct ScratchRootProbes<'a> {
     /// `None` = the probe could not answer (preserve).
     pub ticket_finished: &'a dyn Fn(&Path, &str, u32) -> Option<bool>,
     /// Whether a pid is alive (gate 2).
-    pub pid_alive: &'a dyn Fn(u32) -> bool,
-    /// Pids with cwd or an open fd under a path (gate 3).
-    pub processes_using: &'a dyn Fn(&Path) -> Vec<u32>,
+    pub pid_alive: &'a dyn Fn(u32) -> Option<bool>,
+    /// Whether any process holds the root. An incomplete scan returns `None`.
+    pub directory_in_use: &'a dyn Fn(&Path) -> Option<bool>,
     /// Device id of a path, for the mount-point refusal (gate on candidate
     /// vs its parent differing). `None` = cannot determine → gate passes
     /// (defense in depth; the canonical deployment is Linux, where it works).
@@ -666,9 +716,13 @@ pub fn evaluate_root(root: &Path, owner: &str, probes: &ScratchRootProbes<'_>) -
         WatchPidState::Unreadable => {
             return RootVerdict::Preserve("watch-pid file could not be read or parsed");
         }
+        WatchPidState::Unknown => return RootVerdict::Preserve("watch-pid liveness unknown"),
         WatchPidState::Dead | WatchPidState::Absent => {}
     }
-    let Some(worktrees) = find_git_worktrees(root) else {
+    let Ok(canonical_root) = root.canonicalize() else {
+        return RootVerdict::Preserve("root path could not be resolved");
+    };
+    let Some(worktrees) = find_git_worktrees(&canonical_root) else {
         return RootVerdict::Preserve("worktree search could not answer (unreadable subtree)");
     };
     let Some(probe_cwd) = worktrees.first() else {
@@ -694,7 +748,7 @@ pub fn evaluate_root(root: &Path, owner: &str, probes: &ScratchRootProbes<'_>) -
     }
     let mut prune = BTreeSet::new();
     for worktree in &worktrees {
-        match worktree_safety(worktree) {
+        match worktree_safety_in_root(worktree, &canonical_root, &worktrees) {
             WorktreeSafety::Safe => {
                 if let Some(parent) = parent_repo_of(worktree) {
                     prune.insert(parent);
@@ -708,8 +762,14 @@ pub fn evaluate_root(root: &Path, owner: &str, probes: &ScratchRootProbes<'_>) -
         Some(false) => return RootVerdict::Preserve("linked ticket is open"),
         None => return RootVerdict::Preserve("linked ticket state unknown (probe failed)"),
     }
-    if !(probes.processes_using)(root).is_empty() {
-        return RootVerdict::Preserve("a process has its cwd or an open file under the root");
+    match (probes.directory_in_use)(&canonical_root) {
+        Some(true) => {
+            return RootVerdict::Preserve("a process has its cwd or an open file under the root")
+        }
+        None => {
+            return RootVerdict::Preserve("process activity under the root could not be verified")
+        }
+        Some(false) => {}
     }
     RootVerdict::Remove {
         ticket: name.ticket,
@@ -1076,14 +1136,6 @@ fn prod_ticket_finished(cwd: &Path, slug: &str, ticket: u32) -> Option<bool> {
     }
 }
 
-fn prod_pid_alive(pid: u32) -> bool {
-    crate::daemon_install_state::pid_alive(pid)
-}
-
-fn prod_processes_using(path: &Path) -> Vec<u32> {
-    crate::worktree_ops::safety::find_processes_using_directory(path)
-}
-
 fn prod_device_of(path: &Path) -> Option<u64> {
     #[cfg(unix)]
     {
@@ -1109,8 +1161,8 @@ pub fn production_probes(
         idle_window_secs,
         max_age_secs,
         ticket_finished: &prod_ticket_finished,
-        pid_alive: &prod_pid_alive,
-        processes_using: &prod_processes_using,
+        pid_alive: &process_activity::pid_alive,
+        directory_in_use: &process_activity::directory_in_use,
         device_of: &prod_device_of,
     }
 }
@@ -1123,6 +1175,7 @@ pub fn run_for(repo_root: &Path) -> ScratchRootReport {
         repo_root,
         &candidate_roots(repo_root),
         &prod_ticket_finished,
+        &process_activity::directory_in_use,
         &ProductionRecorder,
     )
 }
@@ -1133,6 +1186,7 @@ fn run_for_roots(
     repo_root: &Path,
     roots: &[PathBuf],
     ticket_finished: &dyn Fn(&Path, &str, u32) -> Option<bool>,
+    directory_in_use: &dyn Fn(&Path) -> Option<bool>,
     recorder: &dyn Recorder,
 ) -> ScratchRootReport {
     let config = crate::scratch_reclaim::read_scratch_reclaim_config(repo_root);
@@ -1183,6 +1237,7 @@ fn run_for_roots(
             .unwrap_or(i64::MAX);
     let probes = ScratchRootProbes {
         ticket_finished,
+        directory_in_use,
         ..production_probes(now, IDLE_WINDOW_SECS, max_age_secs)
     };
     let owner = unique_workspace_slug(repo_root);
@@ -1288,11 +1343,11 @@ mod tests {
     fn always_finished(_: &Path, _: &str, _: u32) -> Option<bool> {
         Some(true)
     }
-    fn never_alive(_: u32) -> bool {
-        false
+    fn never_alive(_: u32) -> Option<bool> {
+        Some(false)
     }
-    fn no_processes(_: &Path) -> Vec<u32> {
-        Vec::new()
+    fn no_processes(_: &Path) -> Option<bool> {
+        Some(false)
     }
     fn same_device(_: &Path) -> Option<u64> {
         Some(1)
@@ -1307,7 +1362,7 @@ mod tests {
                 max_age_secs: max_age,
                 ticket_finished: &always_finished,
                 pid_alive: &never_alive,
-                processes_using: &no_processes,
+                directory_in_use: &no_processes,
                 device_of: &same_device,
             },
             now,
@@ -1538,7 +1593,7 @@ mod tests {
         // HEAD (main) is published and the tree is clean; only the side branch is not.
         assert_eq!(
             worktree_safety(&work),
-            WorktreeSafety::NotSafe("clone has local branches no remote holds")
+            WorktreeSafety::NotSafe("clone has local refs not proven published")
         );
     }
 
@@ -1549,6 +1604,51 @@ mod tests {
         std::fs::write(work.join("f"), b"v2 stashed").unwrap();
         git(&work, &["stash", "push", "-q", "-m", "scratch-test-stash"]);
         assert_eq!(worktree_safety(&work), WorktreeSafety::NotSafe("clone has a stash"));
+    }
+
+    #[test]
+    fn preview_preserves_clone_backing_another_checkout_or_holding_a_local_tag() {
+        let tmp = tempfile::tempdir().unwrap();
+        let roots = [tmp.path().to_owned()];
+        let root = tmp.path().join("loom-201-builder.cafe");
+        let source = root.join("source");
+        init_main_with_origin(&source, &tmp.path().join("origin.git"));
+        git(
+            &source,
+            &[
+                "remote",
+                "set-url",
+                "origin",
+                "https://github.com/acme/widgets.git",
+            ],
+        );
+        let (probes, now) = probes_now(IDLE_WINDOW_SECS, IDLE_WINDOW_SECS);
+        let preview = || {
+            backdate(&root, now.timestamp() - 2 * IDLE_WINDOW_SECS);
+            let records = Mutex::new(Vec::new());
+            let report = sweep(tmp.path(), Some("acme/widgets"), &roots, &probes, true, &records);
+            assert_eq!(report.planned, records.into_inner().unwrap());
+            report
+        };
+        let sibling = tmp.path().join("loom-201-builder.cafe-sibling");
+        git(&source, &["worktree", "add", "--detach", sibling.to_str().unwrap()]);
+        assert!(preview().planned.is_empty(), "the sibling still needs the clone");
+        git(
+            &source,
+            &[
+                "worktree",
+                "move",
+                sibling.to_str().unwrap(),
+                root.join("linked").to_str().unwrap(),
+            ],
+        );
+        assert_eq!(preview().planned.len(), 1, "both clean checkouts are inside and checked");
+
+        git(&source, &["checkout", "--detach"]);
+        git(&source, &["commit", "--allow-empty", "-m", "tagged unpublished work"]);
+        git(&source, &["tag", "experiment"]);
+        git(&source, &["checkout", "main"]);
+        assert!(preview().planned.is_empty(), "only the local tag retains the commit");
     }
 
     #[test]
@@ -1691,7 +1791,7 @@ mod tests {
             max_age_secs: 24 * 3600,
             ticket_finished: probes.ticket_finished,
             pid_alive: probes.pid_alive,
-            processes_using: probes.processes_using,
+            directory_in_use: probes.directory_in_use,
             device_of: &mount_device,
         };
         assert_eq!(
@@ -1714,8 +1814,8 @@ mod tests {
             idle_window_secs: 24 * 3600,
             max_age_secs: 24 * 3600,
             ticket_finished: probes.ticket_finished,
-            pid_alive: &crate::daemon_install_state::pid_alive,
-            processes_using: probes.processes_using,
+            pid_alive: &process_activity::pid_alive,
+            directory_in_use: probes.directory_in_use,
             device_of: probes.device_of,
         };
         assert_eq!(
@@ -1741,6 +1841,54 @@ mod tests {
     }
 
     #[test]
+    fn incomplete_process_checks_never_emit_or_apply_a_removal() {
+        let tmp = tempfile::tempdir().unwrap();
+        let roots = [tmp.path().to_owned()];
+        let root = tmp.path().join("loom-202-builder.cafe");
+        let source = root.join("source");
+        init_main_with_origin(&source, &tmp.path().join("origin.git"));
+        git(
+            &source,
+            &[
+                "remote",
+                "set-url",
+                "origin",
+                "https://github.com/acme/widgets.git",
+            ],
+        );
+        let (probes, now) = probes_now(IDLE_WINDOW_SECS, IDLE_WINDOW_SECS);
+        let probes = ScratchRootProbes {
+            pid_alive: &|_| None,
+            directory_in_use: &|_| None,
+            ..probes
+        };
+        let assert_preserved = |reason| {
+            backdate(&root, now.timestamp() - 2 * IDLE_WINDOW_SECS);
+            let events = Mutex::new(Vec::new());
+            for dry_run in [true, false] {
+                let report =
+                    sweep(tmp.path(), Some("acme/widgets"), &roots, &probes, dry_run, &events);
+                assert_eq!(
+                    report.preserved,
+                    [PreservedRoot {
+                        path: root.clone(),
+                        reason
+                    }]
+                );
+                assert!(report.planned.is_empty() && report.removed.is_empty());
+                assert!(root.is_dir());
+            }
+            assert!(events.into_inner().unwrap().is_empty());
+        };
+        assert_preserved("process activity under the root could not be verified");
+        let marker = root.join("watch-pid");
+        std::fs::write(&marker, "42").unwrap();
+        assert_preserved("watch-pid liveness unknown");
+        // ENOTDIR looking up a marker below a regular file is not absence.
+        assert!(matches!(watch_pid_state(&marker, &never_alive), WatchPidState::Unreadable));
+    }
+
+    #[test]
     fn test_evaluate_root_open_and_unknown_ticket_preserved() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().join("loom-13-judge.ee55");
@@ -1755,7 +1903,7 @@ mod tests {
             max_age_secs: 24 * 3600,
             ticket_finished: &open_answer,
             pid_alive: probes.pid_alive,
-            processes_using: probes.processes_using,
+            directory_in_use: probes.directory_in_use,
             device_of: probes.device_of,
         };
         let unknown_probes = ScratchRootProbes {
@@ -1796,8 +1944,8 @@ mod tests {
 
     #[test]
     fn test_evaluate_root_processes_preserved() {
-        fn holder_processes(_: &Path) -> Vec<u32> {
-            vec![4242]
+        fn holder_processes(_: &Path) -> Option<bool> {
+            Some(true)
         }
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().join("loom-14-builder.ff66");
@@ -1810,7 +1958,7 @@ mod tests {
             max_age_secs: 24 * 3600,
             ticket_finished: probes.ticket_finished,
             pid_alive: probes.pid_alive,
-            processes_using: &holder_processes,
+            directory_in_use: &holder_processes,
             device_of: probes.device_of,
         };
         assert_eq!(
@@ -2032,14 +2180,8 @@ mod tests {
             }
         };
         // Root 103 "has" a live holder.
-        let open_file_root = base.join("loom-103-builder.dddd");
-        let process_probe = |p: &Path| {
-            if p == open_file_root {
-                vec![4242]
-            } else {
-                Vec::new()
-            }
-        };
+        let open_file_root = base.join("loom-103-builder.dddd").canonicalize().unwrap();
+        let process_probe = |p: &Path| Some(p == open_file_root);
         // Root 110 sits on another device.
         let device_probe = |p: &Path| if p == mount_root { Some(2) } else { Some(1) };
         let probes = ScratchRootProbes {
@@ -2047,8 +2189,8 @@ mod tests {
             idle_window_secs: 24 * 3600,
             max_age_secs: 24 * 3600,
             ticket_finished: &ticket_probe,
-            pid_alive: &crate::daemon_install_state::pid_alive,
-            processes_using: &process_probe,
+            pid_alive: &process_activity::pid_alive,
+            directory_in_use: &process_probe,
             device_of: &device_probe,
         };
 
@@ -2163,7 +2305,7 @@ mod tests {
             max_age_secs: 24 * 3600,
             ticket_finished: &always_finished,
             pid_alive: &never_alive,
-            processes_using: &no_processes,
+            directory_in_use: &no_processes,
             device_of: &same_device,
         };
         let recorder = Mutex::new(Vec::new());
@@ -2280,7 +2422,7 @@ mod tests {
         configure(&a, true, false);
         configure(&b, true, true);
         let records = Mutex::new(Vec::new());
-        let run = |ws: &Path| run_for_roots(ws, &roots, &always_finished, &records);
+        let run = |ws: &Path| run_for_roots(ws, &roots, &always_finished, &no_processes, &records);
         let single = run(&b);
         assert_eq!(single.planned.len(), 1);
         assert_eq!(single.planned[0].path, candidate);
@@ -2342,15 +2484,18 @@ mod tests {
         let roots = [tmp.path().to_path_buf()];
 
         std::env::set_var(crate::scratch_reclaim::SCRATCH_RECLAIM_ENABLE_ENV, "0");
-        let report = run_for_roots(tmp.path(), &roots, &always_finished, &ProductionRecorder);
+        let report =
+            run_for_roots(tmp.path(), &roots, &always_finished, &no_processes, &ProductionRecorder);
         std::env::remove_var(crate::scratch_reclaim::SCRATCH_RECLAIM_ENABLE_ENV);
         assert!(!report.enabled);
 
         // Enabled: first pass runs (nothing to find), second is deferred.
-        let first = run_for_roots(tmp.path(), &roots, &always_finished, &ProductionRecorder);
+        let first =
+            run_for_roots(tmp.path(), &roots, &always_finished, &no_processes, &ProductionRecorder);
         assert!(first.enabled);
         assert!(first.deferred.is_none());
-        let second = run_for_roots(tmp.path(), &roots, &always_finished, &ProductionRecorder);
+        let second =
+            run_for_roots(tmp.path(), &roots, &always_finished, &no_processes, &ProductionRecorder);
         assert!(second.deferred.is_some(), "cooldown defers the second pass");
     }
 
@@ -2363,10 +2508,22 @@ mod tests {
         let _env = crate::env_test_support::EnvGuard::clear(&[
             crate::scratch_reclaim::SCRATCH_RECLAIM_DRY_RUN_ENV,
         ]);
-        assert!(run_for_roots(tmp.path(), &roots, &always_finished, &ProductionRecorder).dry_run);
+        assert!(
+            run_for_roots(tmp.path(), &roots, &always_finished, &no_processes, &ProductionRecorder)
+                .dry_run
+        );
 
         std::env::set_var(crate::scratch_reclaim::SCRATCH_RECLAIM_DRY_RUN_ENV, "0");
         reset_state_for_test();
-        assert!(!run_for_roots(tmp.path(), &roots, &always_finished, &ProductionRecorder).dry_run);
+        assert!(
+            !run_for_roots(
+                tmp.path(),
+                &roots,
+                &always_finished,
+                &no_processes,
+                &ProductionRecorder
+            )
+            .dry_run
+        );
     }
 }
