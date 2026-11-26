@@ -1402,6 +1402,7 @@ fn remote_hold(name: &str, reason: &str, until: u64) -> CodexAccountHold {
         name: name.to_string(),
         reason: reason.to_string(),
         cooldown_until: until,
+        learned_at: None,
     }
 }
 
@@ -1471,6 +1472,49 @@ fn a_remote_hold_blocks_selection_until_its_deadline() {
 
 /// The merge never narrows: a remote deadline beats the local one only when
 /// strictly later; equal and earlier remotes change nothing (#15091 AC2).
+#[test]
+fn a_local_release_outranks_an_older_remote_hold() {
+    let tmp = tempfile::tempdir().unwrap();
+    let id = AccountId {
+        provider: AccountProvider::Codex,
+        name: "a".to_string(),
+    };
+    local_exhaustion(tmp.path(), "a", 5000);
+    // A measured release on newer evidence (observed 150 > updated 100).
+    let effect = record_availability_at(
+        tmp.path(),
+        &id,
+        AvailabilityOutcome::Available { observed_at: 150 },
+        "probe",
+        160,
+    )
+    .unwrap();
+    assert_eq!(effect, AvailabilityEffect::ClearedExhaustionHold);
+
+    // A hold learned *before* the release is not re-imposed.
+    let mut stale = remote_hold("a", "plan_exhausted", 9000);
+    stale.learned_at = Some(120);
+    assert_eq!(merge_codex_holds(tmp.path(), &[stale], 200), 0);
+    assert_eq!(held_entry(tmp.path(), "a").unwrap().cooldown_until, None, "still released");
+
+    // A hold learned after the release applies, stamped with its learned-at
+    // time (not the merge time), so a later reading can still release it.
+    let mut fresh = remote_hold("a", "plan_exhausted", 9000);
+    fresh.learned_at = Some(170);
+    assert_eq!(merge_codex_holds(tmp.path(), &[fresh], 200), 1);
+    let entry = held_entry(tmp.path(), "a").unwrap();
+    assert_eq!(entry.updated_at, 170);
+    let effect = record_availability_at(
+        tmp.path(),
+        &id,
+        AvailabilityOutcome::Available { observed_at: 180 },
+        "probe",
+        210,
+    )
+    .unwrap();
+    assert_eq!(effect, AvailabilityEffect::ClearedExhaustionHold);
+}
+
 #[test]
 fn the_merge_never_shortens_a_local_hold() {
     let tmp = tempfile::tempdir().unwrap();
@@ -1621,7 +1665,10 @@ fn live_codex_holds_publishes_only_live_timed_codex_holds() {
     .unwrap();
     assert_eq!(
         live_codex_holds(tmp.path(), 101),
-        Some(vec![remote_hold("a", "plan_exhausted", 5000)])
+        Some(vec![CodexAccountHold {
+            learned_at: Some(100),
+            ..remote_hold("a", "plan_exhausted", 5000)
+        }])
     );
     assert_eq!(
         live_codex_holds(tmp.path(), 5000),

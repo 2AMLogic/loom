@@ -631,6 +631,7 @@ mod tests {
                     name: "agent-9".into(),
                     reason: "plan_exhausted".into(),
                     cooldown_until: 1_800_000_000,
+                    learned_at: None,
                 }][..]
             )
         );

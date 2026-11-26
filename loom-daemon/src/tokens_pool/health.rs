@@ -1059,6 +1059,13 @@ pub struct CodexAccountHold {
     pub reason: String,
     /// When the hold ends, Unix epoch seconds.
     pub cooldown_until: u64,
+    /// When the originating host *learned* this hold (its record's
+    /// `updated_at`), Unix epoch seconds. A merge stamps this — not "now" —
+    /// into `updated_at` so `record_availability_at`'s "release requires
+    /// strictly newer evidence" guardrail still compares like quantities.
+    /// Absent from an old peer ⇒ the receiver falls back to `now`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub learned_at: Option<u64>,
 }
 
 /// The wire text of a reason a heartbeat may carry: the **timed,
@@ -1134,6 +1141,7 @@ pub fn live_codex_holds(workspace: &Path, now: u64) -> Option<Vec<CodexAccountHo
                 name: entry.name,
                 reason: reason.to_string(),
                 cooldown_until,
+                learned_at: Some(entry.updated_at),
             })
         })
         .collect();
@@ -1196,6 +1204,9 @@ pub fn merge_codex_holds_across(roots: &[PathBuf], holds: &[CodexAccountHold], n
 ///   `last_success`, transient-failure counters and cursors are untouched.
 /// * A `ReauthRequired` entry is never touched — a remote timed hold never
 ///   converts it, and reauth never rides the wire to be merged back.
+/// * A hold is stamped with when it was *learned* (`learned_at`, else
+///   `now`), and is not re-imposed over a local non-held record newer than
+///   that, so a local release on strictly newer evidence stays released.
 /// * A hold that is expired, implausibly far out, or names an unknown
 ///   reason is ignored, never an error.
 ///
@@ -1217,13 +1228,15 @@ pub fn merge_codex_holds(workspace: &Path, holds: &[CodexAccountHold], now: u64)
                 provider: AccountProvider::Codex,
                 name: hold.name.clone(),
             };
+            // When the fact was learned, never in the future.
+            let learned = hold.learned_at.map_or(now, |at| at.min(now));
             match state.accounts.iter().position(|entry| entry.id() == id) {
                 None => {
                     state.accounts.push(AccountHealth {
                         provider: AccountProvider::Codex,
                         name: hold.name.clone(),
                         reason,
-                        updated_at: now,
+                        updated_at: learned,
                         signal_provenance: FLEET_HOLD_PROVENANCE.to_string(),
                         cooldown_until: Some(hold.cooldown_until),
                         consecutive_transient_failures: 0,
@@ -1244,9 +1257,16 @@ pub fn merge_codex_holds(workspace: &Path, holds: &[CodexAccountHold], now: u64)
                     {
                         continue;
                     }
+                    // A local record (e.g. a measured release) newer than
+                    // this fact outranks it: never re-impose an older hold
+                    // over strictly newer local evidence.
+                    let locally_held = entry.cooldown_until.is_some_and(|held| held > now);
+                    if !locally_held && entry.updated_at > learned {
+                        continue;
+                    }
                     entry.reason = reason;
                     entry.cooldown_until = Some(hold.cooldown_until);
-                    entry.updated_at = now;
+                    entry.updated_at = entry.updated_at.max(learned);
                     entry.signal_provenance = FLEET_HOLD_PROVENANCE.to_string();
                     applied += 1;
                 }
