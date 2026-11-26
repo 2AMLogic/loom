@@ -590,7 +590,10 @@ fn ranking_uses_only_account_local_rollouts_for_reports_and_holds() {
         health::record_availability_at(
             workspace.path(),
             &alpha,
-            AvailabilityOutcome::Exhausted { until },
+            AvailabilityOutcome::Exhausted {
+                until,
+                observed_at: now_epoch - 600,
+            },
             AVAILABILITY_PROVENANCE,
             now_epoch - 600,
         )
@@ -663,6 +666,50 @@ fn selection_lands_on_the_healthy_account_after_the_probe_marks_the_other() {
 
 #[test]
 #[serial]
+fn rereading_an_exhausted_rollout_preserves_its_observation_time() {
+    let (workspace, profiles) = two_account_workspace();
+    let _profile_root = crate::tokens_pool::profile_root_env::ProfileRootEnv::set(profiles.path());
+    let timestamp = "2026-09-21T10:00:00Z";
+    let observed = timestamp.parse::<DateTime<Utc>>().unwrap();
+    write_rollout(
+        &profiles.path().join("alpha"),
+        "rollout-a.jsonl",
+        &[rollout_line(timestamp, 100.0, 100.0)],
+    );
+    let options = CheckOptions {
+        write_ranking: true,
+        live: false,
+    };
+    let epoch = u64::try_from(observed.timestamp()).unwrap();
+    for elapsed in [1, 120] {
+        run_check(workspace.path(), options, observed + chrono::Duration::seconds(elapsed))
+            .unwrap();
+        let holds = health::live_codex_holds(workspace.path(), epoch + 120).unwrap();
+        assert_eq!(holds.len(), 1);
+        assert_eq!(holds[0].learned_at, Some(epoch));
+        assert_eq!(holds[0].cooldown_until, epoch + 86400);
+    }
+
+    let id = AccountId {
+        provider: AccountProvider::Codex,
+        name: "alpha".into(),
+    };
+    health::record_availability_at(
+        workspace.path(),
+        &id,
+        AvailabilityOutcome::Available {
+            observed_at: epoch + 60,
+        },
+        "quota",
+        epoch + 121,
+    )
+    .unwrap();
+    run_check(workspace.path(), options, observed + chrono::Duration::seconds(122)).unwrap();
+    assert!(health::live_codex_holds(workspace.path(), epoch + 122).is_none());
+}
+
+#[test]
+#[serial]
 fn both_accounts_exhausted_produces_the_codex_scoped_refusal() {
     let (workspace, profiles) = two_account_workspace();
     for name in ["alpha", "beta"] {
@@ -729,7 +776,10 @@ fn a_newer_headroom_reading_releases_a_probe_written_hold() {
     health::record_availability_at(
         workspace.path(),
         &id,
-        AvailabilityOutcome::Exhausted { until: 5_000 },
+        AvailabilityOutcome::Exhausted {
+            until: 5_000,
+            observed_at: 1_000,
+        },
         AVAILABILITY_PROVENANCE,
         1_000,
     )
@@ -789,7 +839,10 @@ fn an_availability_reading_never_shortens_an_existing_hold_or_clears_a_reauth_on
     health::record_availability_at(
         workspace.path(),
         &id,
-        AvailabilityOutcome::Exhausted { until: 9_000 },
+        AvailabilityOutcome::Exhausted {
+            until: 9_000,
+            observed_at: 1_000,
+        },
         AVAILABILITY_PROVENANCE,
         1_000,
     )
@@ -797,7 +850,10 @@ fn an_availability_reading_never_shortens_an_existing_hold_or_clears_a_reauth_on
     health::record_availability_at(
         workspace.path(),
         &id,
-        AvailabilityOutcome::Exhausted { until: 3_000 },
+        AvailabilityOutcome::Exhausted {
+            until: 3_000,
+            observed_at: 1_100,
+        },
         AVAILABILITY_PROVENANCE,
         1_100,
     )

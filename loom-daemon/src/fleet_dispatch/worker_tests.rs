@@ -611,7 +611,7 @@ fn a_snapshot_on_the_heartbeat_answer_becomes_the_fleet_sidecar() {
     on_reaper_tick(root.path(), &[]);
     server.wait_for(proto::HEARTBEAT_PATH, 1);
 
-    // The answer is applied on the client's runtime thread; the sidecar
+    // The answer is applied asynchronously; the sidecar
     // appears within one heartbeat round-trip.
     let sidecar = root
         .path()
@@ -843,24 +843,70 @@ fn holds_fan_out_over_registered_roots_not_the_host_root() {
     // Downward: the answer's hold lands in every registered root.
     let server = hold_answering();
     enable(host.path(), &server.url(), true);
+    let lock = crate::tokens_pool::locking::MkdirLock::acquire(
+        &ws_b.path().join(".loom/account-health.lock"),
+    )
+    .unwrap();
     note_capacity(1, &roles_ok(&BTreeSet::new()));
     on_reaper_tick(host.path(), &[]);
     let beats = server.wait_for(proto::HEARTBEAT_PATH, 1);
     assert_eq!(beats[0]["codex_holds"][0]["name"], "agent-3");
 
-    let mut landed = false;
-    for _ in 0..50 {
-        if held_record(ws_a.path(), "agent-9").is_some()
-            && held_record(ws_b.path(), "agent-9").is_some()
-        {
-            landed = true;
-            break;
+    let wait_for_hold = |root: &Path| {
+        for _ in 0..100 {
+            if held_record(root, "agent-9").is_some() {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(20));
         }
-        std::thread::sleep(Duration::from_millis(20));
-    }
-    assert!(landed, "the hold must reach every registered workspace");
+        panic!("fleet hold did not reach {}", root.display());
+    };
+    wait_for_hold(ws_a.path());
+    assert!(held_record(ws_b.path(), "agent-9").is_none());
+    let ack: AckResponse =
+        client::post_blocking(&server.url(), proto::RELEASE_PATH, &json!({})).unwrap();
+    assert_eq!(ack.server_epoch, "e1", "RPCs complete while the second workspace is locked");
+    drop(lock);
+    wait_for_hold(ws_b.path());
     assert!(
         held_record(host.path(), "agent-9").is_none(),
         "the unregistered host root is not a root any draw reads"
     );
+}
+
+#[test]
+#[serial]
+fn a_moved_registered_workspace_stays_missing_after_a_heartbeat_merge() {
+    use crate::tokens_pool::health::{
+        codex_health_roots, merge_codex_holds_across, CodexAccountHold,
+    };
+    use crate::workspace_registry::{filter_missing_roots, WorkspaceRegistry};
+
+    let host = tempdir().unwrap();
+    let old = host.path().join("registered");
+    std::fs::create_dir(&old).unwrap();
+    let mut registry = WorkspaceRegistry::default();
+    registry.add(&old, None).unwrap();
+    let file = host.path().join("workspaces.json");
+    registry.save(&file).unwrap();
+    let _env = RegistryEnv::set(&file);
+
+    let before_move = codex_health_roots(host.path());
+    std::fs::rename(&old, host.path().join("moved")).unwrap();
+    let after_move = codex_health_roots(host.path());
+    assert!(after_move.is_empty());
+    let holds = [CodexAccountHold {
+        name: "agent-9".into(),
+        reason: "plan_exhausted".into(),
+        cooldown_until: 1000,
+        learned_at: Some(100),
+    }];
+    // Even a tick which enumerated roots just before the move cannot recreate it.
+    assert_eq!(merge_codex_holds_across(&before_move, &holds, 101), 0);
+    assert!(!old.exists());
+    assert!(
+        filter_missing_roots(registry.effective_roots(host.path()), &mut Default::default())
+            .is_empty()
+    );
+    assert!(held_record(host.path(), "agent-9").is_none());
 }

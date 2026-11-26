@@ -1538,6 +1538,88 @@ fn a_login_probe_does_not_suppress_a_fleet_hold() {
     assert_eq!(held_entry(tmp.path(), "a").unwrap().cooldown_until, Some(1000));
 }
 
+#[test]
+fn relaying_a_released_hold_preserves_its_original_observation() {
+    let a = tempfile::tempdir().unwrap();
+    let b = tempfile::tempdir().unwrap();
+    let id = codex_id("a");
+    local_exhaustion(a.path(), "a", 1000);
+    let original = live_codex_holds(a.path(), 101).unwrap();
+    record_availability_at(
+        a.path(),
+        &id,
+        AvailabilityOutcome::Available { observed_at: 150 },
+        "quota",
+        151,
+    )
+    .unwrap();
+
+    record_probe_at(b.path(), &id, ProbeOutcome::LoggedIn, "login", 200).unwrap();
+    assert_eq!(merge_codex_holds(b.path(), &original, 201), 1);
+    // An independent model-class failure also leaves the plan evidence alone.
+    record_terminal_for_class_at(
+        b.path(),
+        &id,
+        TerminalClassification::ModelCreditsExhausted,
+        Some("gpt"),
+        "dispatch",
+        202,
+    )
+    .unwrap();
+    let echo = live_codex_holds(b.path(), 203).unwrap();
+    assert_eq!(echo, original);
+    assert_eq!(merge_codex_holds(a.path(), &echo, 204), 0);
+    assert!(held_entry(a.path(), "a").unwrap().is_eligible_at(204));
+}
+
+#[test]
+fn successful_dispatch_supersedes_older_timed_holds() {
+    let root = tempfile::tempdir().unwrap();
+    let id = codex_id("a");
+    local_exhaustion(root.path(), "a", 1000);
+    record_terminal_at(root.path(), &id, TerminalClassification::Success, "dispatch", 180).unwrap();
+
+    assert_eq!(merge_codex_holds(root.path(), &[learned_hold("a", 1000, 100)], 201), 0);
+    assert!(held_entry(root.path(), "a").unwrap().is_eligible_at(201));
+    assert_eq!(merge_codex_holds(root.path(), &[learned_hold("a", 1000, 190)], 201), 1);
+    assert!(!held_entry(root.path(), "a").unwrap().is_eligible_at(201));
+}
+
+#[test]
+fn plan_recovery_does_not_release_an_independent_session_limit() {
+    let root = tempfile::tempdir().unwrap();
+    let id = codex_id("a");
+    local_exhaustion(root.path(), "a", 1000);
+    let available = AvailabilityOutcome::Available { observed_at: 150 };
+    record_availability_at(root.path(), &id, available, "quota", 150).unwrap();
+    let session = CodexAccountHold {
+        reason: "session_limit".into(),
+        ..learned_hold("a", 170, 140)
+    };
+    assert_eq!(merge_codex_holds(root.path(), &[session], 151), 1);
+    // Neither a replay of the old longer plan hold nor another headroom
+    // reading can erase the independent session limit.
+    assert_eq!(merge_codex_holds(root.path(), &[learned_hold("a", 1000, 100)], 152), 0);
+    record_availability_at(root.path(), &id, available, "quota", 153).unwrap();
+    let entry = held_entry(root.path(), "a").unwrap();
+    assert_eq!(entry.reason, HealthReason::SessionLimit);
+    assert!(!entry.is_eligible_at(153));
+    assert!(entry.is_eligible_at(170));
+}
+
+#[test]
+fn replaying_an_identical_hold_preserves_the_health_file() {
+    let root = tempfile::tempdir().unwrap();
+    let holds = [learned_hold("a", 1000, 100)];
+    assert_eq!(merge_codex_holds(root.path(), &holds, 101), 1);
+    let path = state_path(root.path());
+    let file = fs::File::options().write(true).open(&path).unwrap();
+    file.set_modified(std::time::UNIX_EPOCH).unwrap();
+    let modified = file.metadata().unwrap().modified().unwrap();
+    assert_eq!(merge_codex_holds(root.path(), &holds, 102), 0);
+    assert_eq!(fs::metadata(path).unwrap().modified().unwrap(), modified);
+}
+
 /// A headroom reading observed *before* the hold was learned, however late
 /// it was processed, establishes nothing about the hold.
 #[test]
@@ -1594,6 +1676,14 @@ fn relayed_holds_keep_the_freshest_evidence_on_equal_deadlines() {
     let longer = learned_hold("a", 2000, 100);
     let merged = newer.relayed(longer);
     assert_eq!((merged.cooldown_until, merged.learned_at), (2000, Some(300)));
+    // A different kind of failure cannot confirm plan exhaustion.
+    let session = CodexAccountHold {
+        reason: "session_limit".into(),
+        ..learned_hold("a", 1000, 400)
+    };
+    let plan = learned_hold("a", 2000, 100);
+    assert_eq!(plan.clone().relayed(session.clone()), plan);
+    assert_eq!(session.relayed(plan.clone()), plan);
     // A peer without `learned_at` never erases one that has it.
     assert_eq!(
         older
