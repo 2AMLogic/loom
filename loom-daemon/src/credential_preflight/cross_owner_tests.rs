@@ -346,6 +346,59 @@ fn an_unmanaged_owner_dir_is_reaped_but_an_empty_managed_list_reaps_nothing() {
     assert_eq!(minter.calls.get(), 0, "no cross owner, no mint");
 }
 
+/// #14548: reaping an owner's by-owner directory also evicts the registrations
+/// naming it, so no `gh_config_dir_for_owner_slug` caller is pointed at a
+/// directory with no `hosts.yml`; an owner registered against another
+/// directory is untouched, and an owner that comes back is re-minted rather
+/// than short-circuited on the stale registration.
+#[test]
+#[serial_test::serial]
+fn reaping_an_owner_dir_evicts_its_registry_entries_so_the_owner_re_mints() {
+    crate::credential_preflight::clear_owner_root_registry();
+    let env = Env::new(&[]);
+    let _cache = ScratchCache::new(env.tmp.path());
+    let (home, gone, kept) = (unique("home-"), unique("gone-"), unique("kept-"));
+    let (home_repo, gone_repo) = (format!("{home}/loom"), format!("{gone}/app"));
+    let workspace = env.repo("ws", &[("origin", &format!("https://github.com/{home_repo}.git"))]);
+    let minter = ScriptedMinter::new(vec![minted()]);
+
+    let gone_dir = publish_owner_dir(&workspace, &gone);
+    register_owner_gh_config_dir(&gone, &gone_dir);
+    register_owner_refresh_source(&gone_repo, &gone_dir);
+    // Registered against a directory the reap does not remove.
+    let elsewhere = env.tmp.path().join("elsewhere");
+    register_owner_gh_config_dir(&kept, &elsewhere);
+
+    let managed = vec![(workspace.clone(), home_repo.clone())];
+    establish_cross_owner_credentials(&workspace, &home, &managed, &minter);
+
+    assert!(!gone_dir.exists(), "stale owner dir reaped");
+    assert_eq!(gh_config_dir_for_owner_slug(&gone_repo), None, "slug registration evicted");
+    assert!(
+        !crate::credential_preflight::owner_refresh_sources()
+            .iter()
+            .any(|(_, d)| d == &gone_dir),
+        "refresh source evicted"
+    );
+    assert_eq!(
+        gh_config_dir_for_owner_slug(&format!("{kept}/x")),
+        Some(elsewhere),
+        "a registration naming another directory is kept"
+    );
+    assert_eq!(minter.calls.get(), 0);
+
+    // The owner returns: it is minted again instead of reusing the registration.
+    let back = vec![
+        (workspace.clone(), home_repo),
+        (workspace.clone(), gone_repo.clone()),
+    ];
+    let pass = establish_cross_owner_credentials(&workspace, &home, &back, &minter);
+    assert_eq!(pass.established, vec![gone.clone()]);
+    assert_eq!(minter.calls.get(), 1, "re-minted after eviction");
+    assert!(gone_dir.join("hosts.yml").is_file());
+    crate::credential_preflight::clear_owner_root_registry();
+}
+
 /// A failed registry read leaves `managed` as only the root fallback: the
 /// no-plan arm must reap nothing, while the root-owner directory (independent
 /// of `managed`) is still reaped (#14450).

@@ -730,6 +730,8 @@ pub(crate) fn reset_forge_credential_streaks() {
     *forge_credential_streaks()
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner) = CredentialStreaks::default();
+    primary_token::reset(); // #15327
+    loom_ui::reset_expired_for_tests();
 }
 
 /// Resolve the stale-credential grace window: **env >
@@ -791,10 +793,13 @@ pub fn record_forge_credential_success(source: &str) {
 #[must_use]
 pub fn forge_credential_stale() -> bool {
     let grace = resolve_forge_credential_stale_grace();
-    forge_credential_streaks()
+    let streak_stale = forge_credential_streaks()
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .is_stale_at(Instant::now(), grace)
+        .is_stale_at(Instant::now(), grace);
+    // #15327: a published primary token past its `expires_at` is stale whether
+    // or not any refresh tick is still running to record a failure.
+    streak_stale || primary_token::stale_hold(grace)
 }
 
 /// A short, non-secret human-readable summary of the current stale window, or
@@ -803,10 +808,17 @@ pub fn forge_credential_stale() -> bool {
 #[must_use]
 pub fn forge_credential_stale_summary() -> Option<String> {
     let grace = resolve_forge_credential_stale_grace();
-    forge_credential_streaks()
+    let streaks = forge_credential_streaks()
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .summary_at(Instant::now(), grace)
+        .summary_at(Instant::now(), grace);
+    // #15327: expiry of the published primary token, when no streak explains it.
+    streaks.or_else(|| {
+        primary_token::stale_hold(grace)
+            .then(primary_token::expiry_reason)
+            .flatten()
+            .map(|reason| format!("{CREDENTIAL_SOURCE_PRIMARY}: {reason}"))
+    })
 }
 
 /// Resolve the `github-app-token.sh` path: prefer the installed
@@ -1369,6 +1381,28 @@ pub fn register_owner_gh_config_dir(owner: &str, config_dir: &Path) {
     }
 }
 
+/// Drop every owner registration — the slug-keyed map (#5431) and the
+/// refresh-source map (#6171) — whose `GH_CONFIG_DIR` is exactly `config_dir`,
+/// and return how many owners were dropped. Matching on the directory rather
+/// than the owner key means a registration pointing anywhere else (another
+/// root's live credential) is never touched. The reap of a stale by-owner
+/// directory calls this so the registry and the disk never disagree: without
+/// it every [`gh_config_dir_for_owner_slug`] caller keeps being pointed at a
+/// directory with no `hosts.yml`, and the "already established" short-circuits
+/// (`write_scope`, `cross_owner`) never re-mint (#14548).
+pub fn unregister_owner_gh_config_dir(config_dir: &Path) -> usize {
+    let mut dropped = 0;
+    if let Ok(mut map) = owner_slug_config_registry().lock() {
+        let before = map.len();
+        map.retain(|_, dir| dir.as_path() != config_dir);
+        dropped += before - map.len();
+    }
+    if let Ok(mut map) = owner_refresh_registry().lock() {
+        map.retain(|_, (_, dir)| dir.as_path() != config_dir);
+    }
+    dropped
+}
+
 /// The `GH_CONFIG_DIR` registered for the owner segment of `owner_repo`, or
 /// `None` when that owner is not a registered cross-owner managed owner (the
 /// common single-owner case, or the root owner's own repos) — the slug-keyed
@@ -1719,6 +1753,7 @@ pub mod owner_drift;
 pub mod pool;
 pub use pool::attach as attach_pool;
 mod minted;
+pub mod primary_token;
 pub use minted::{publish_minted, publish_outcome, Minted, ScopedIssuance};
 
 #[cfg(test)]

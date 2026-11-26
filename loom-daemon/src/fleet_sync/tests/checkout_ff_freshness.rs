@@ -155,6 +155,30 @@ fn a_checkout_the_budget_did_not_reach_still_says_so() {
     assert_eq!(records[0].pass_skipped_reason.as_deref(), Some("budget"));
     assert_eq!(records[0].repo.as_deref(), Some("o/r"));
     assert!(records[0].prompt.is_none());
+    assert_eq!(records[0].checkout_state, None, "a deferred checkout was not judged");
+}
+
+#[test]
+fn a_reached_checkout_carries_the_state_the_pass_left_it_in() {
+    // Dirty and behind: declined.
+    let fx = Fixture::new();
+    fx.push("src/a.rs", "fn a() {}\n");
+    write(&fx.host.join("README.md"), "edited here\n");
+    let (_, captured) = capture(|| pass(&fx, &Knobs::default()));
+    let records = freshness(&captured);
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].checkout_state.as_deref(), Some("dirty"));
+
+    // Already current.
+    let fx = Fixture::new();
+    let (_, captured) = capture(|| pass(&fx, &Knobs::default()));
+    assert_eq!(freshness(&captured)[0].checkout_state.as_deref(), Some("current"));
+
+    // Behind and clean: fast-forwarded.
+    let fx = Fixture::new();
+    fx.push("src/a.rs", "fn a() {}\n");
+    let (_, captured) = capture(|| pass(&fx, &Knobs::default()));
+    assert_eq!(freshness(&captured)[0].checkout_state.as_deref(), Some("fast-forwarded"));
 }
 
 /// Seed the daemon's head cache for the fixture's checkout, `minutes` ago.

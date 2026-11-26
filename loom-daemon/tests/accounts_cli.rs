@@ -1,3 +1,11 @@
+/// Opt-in (#15086): when set (any value), the fallback-docker test below
+/// refuses its host-docker skip — the skip becomes a failure, so a CI runner
+/// image that grows `/usr/local/bin/docker` surfaces as a red test instead of
+/// a silent pass. Set in the `Rust Unit Tests (N/5)` job in
+/// `.github/workflows/ci.yml`; unset everywhere a host docker legitimately
+/// precedes the fixture (a Docker Desktop mac).
+const REQUIRE_FALLBACK_DOCKER: &str = "LOOM_TEST_REQUIRE_FALLBACK_DOCKER";
+
 #[cfg(unix)]
 #[test]
 fn login_child_exit_status_is_preserved_by_cli() {
@@ -191,14 +199,27 @@ fn session_start_and_shell_parse_mount_workspace_without_panicking() {
 /// `/usr/bin`. A docker in `/usr/local/bin` or `/opt/homebrew/bin` (a Docker
 /// Desktop mac) would precede the fake in the order, so those hosts skip
 /// rather than probe their real engine.
+///
+/// That skip reads as PASS to nextest (whose captured stderr is not printed
+/// for a passing test), so a host where the body never ran was
+/// indistinguishable from one where it did. Setting
+/// [`REQUIRE_FALLBACK_DOCKER`] (CI's Rust unit-test job does) turns the skip
+/// into a failure instead (#15086).
 #[cfg(unix)]
 #[test]
 fn accounts_check_live_measures_sessions_through_a_fallback_docker() {
     use std::os::unix::fs::PermissionsExt;
     use std::process::Command;
 
+    let required = std::env::var_os(REQUIRE_FALLBACK_DOCKER).is_some();
     for precedes in ["/usr/local/bin/docker", "/opt/homebrew/bin/docker"] {
         if std::path::Path::new(precedes).exists() {
+            assert!(
+                !required,
+                "{REQUIRE_FALLBACK_DOCKER} is set, but a host docker at {precedes} \
+                 precedes the fake in the fallback order, so this test would pass \
+                 without executing its body"
+            );
             eprintln!(
                 "skipping: host docker at {precedes} precedes the fake in the fallback order"
             );
