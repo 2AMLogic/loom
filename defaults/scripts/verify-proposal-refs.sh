@@ -101,7 +101,7 @@ fi
 # shellcheck source=lib/locate-daemon-bin.sh
 source "$(dirname "${BASH_SOURCE[0]}")/lib/locate-daemon-bin.sh"
 # requires-daemon: git-blob-lines >= 0.19.307   #8656 — the symlink-aware line-range check; a resolved binary predating this subcommand fails clap's own "unrecognized subcommand" per citation (visible on stderr) and every line range is SKIPPED, never silently passed as in-range, because the alternative is the symlink-blind `git show | wc -l` this replaced
-# requires-daemon: verify-output-decl >= 0.20.37   #15387 — the generated-output declaration check, same shape as the git-blob-lines branch above: a resolved binary predating the subcommand fails clap's own "unrecognized subcommand" per declaration (visible on stderr) and the declaration is SKIPPED, never silently passed — a binary without the verb cannot prove a citation, and this script records a miss only on a positive disproof
+# requires-daemon: verify-output-decl optional   Older daemons report an unknown subcommand (exit 2), leaving the declaration inconclusive.
 DAEMON_BIN="$(loom_resolve_self_daemon_bin)"
 [[ -n "$DAEMON_BIN" ]] || echo "WARNING: no loom-daemon binary resolved — line ranges will NOT be checked (inconclusive, never a miss); path existence and tracked-file claims are unaffected" >&2
 
