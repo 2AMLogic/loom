@@ -944,6 +944,7 @@ fn step_run(
         outcome: crate::step_dispatch::outcome_ledger::StepOutcome::new(class, reason),
         ran_for: Duration::from_secs(300),
         failure_class: None,
+        attempt: None,
     }
 }
 

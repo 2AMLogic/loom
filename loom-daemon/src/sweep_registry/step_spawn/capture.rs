@@ -663,6 +663,17 @@ impl SweepRegistry {
                     timed_out: end == StepEnd::TimedOut,
                     provider_exhausted,
                     launch_rejection,
+                    attempt: super::ended::AttemptEvidence {
+                        termination: end.into(),
+                        host: crate::host_identity::host_identity(),
+                        log: log_path
+                            .strip_prefix(&self.config.workspace_root)
+                            .unwrap_or(&log_path)
+                            .display()
+                            .to_string(),
+                        launch_rejected: never_started
+                            == Some(crate::pr_lease_reap::REASON_LAUNCH_REJECTED),
+                    },
                 },
             );
         }
