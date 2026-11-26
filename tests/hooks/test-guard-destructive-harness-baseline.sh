@@ -13,7 +13,7 @@
 # nonempty sentinel for every expected name, sources the real harness, and
 # reports each name that is still set. Exit 0 = all tests pass, 1 = failures.
 
-set -uo pipefail
+set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 HARNESS="$SCRIPT_DIR/lib/guard-destructive-harness.sh"
@@ -116,7 +116,8 @@ print_summary
 PROBE
 
 probe_rc=0
-probe_out="$(env -i PATH="$PATH" HOME="${HOME:-/tmp}" TMPDIR="${TMPDIR:-/tmp}" \
+# The parent's EXIT trap also removes the test repo if harness setup aborts.
+probe_out="$(env -i PATH="$PATH" HOME="${HOME:-/tmp}" TMPDIR="$WORK" \
     "$BASH" "$WORK/probe.sh" "$HARNESS" "$GUARD_FIXTURE" "${BASELINE_NAMES[@]}" 2>&1)" \
     || probe_rc=$?
 
