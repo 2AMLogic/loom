@@ -18,6 +18,14 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 ### 2026-11-26
 
+- **Issue #15414** (closed): Remove the second config-tier scan from configure_terminal
+- **PR #15425**: Remove the second config-tier scan from configure_terminal (#15414)
+- **Issue #15435** (closed): daemon tests: LOOM_GH_BIN is mutated under #[serial(loom_config_env)] in forge_verdict_cmd vs bare #[serial] in two claim_reconciliation test files
+- **PR #15448**: test: hold loom_config_env around LOOM_GH_BIN writes in verdict tests
+- **Issue #15440** (closed): telemetry-kind-pick-decision.md: the pick-skip wire-name mapping is 3 names behind the code (and its count says 24, not 27)
+- **PR #15444**: docs: add backstop_held and operator_link_unverified to the pick-skip mapping
+- **Issue #15408** (closed): Update the troubleshooting guide’s reference to the Builder quarantine procedure
+- **PR #15449**: docs: link troubleshooting step 4 to the quarantine replay section
 - **Issue #15258** (closed): merge-pr.sh: --no-cleanup-primary joins --no-cleanup-worktree as a silently-ignored opt-out after the #14905 cutover
 - **PR #15443**: docs: mark merge-pr --no-cleanup-* flags no-op on GitHub default path
 - **Issue #15406** (closed): Update token-attribution docs after the Safehouse completion envelope is retired
