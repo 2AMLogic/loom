@@ -1364,6 +1364,19 @@ mod tests {
             Some("acme/widgets")
         );
         assert_eq!(parse_nwo_from_remote_url("not-a-remote"), None);
+        // #15372: the unique URL cases `dep_classify`'s local copy of this
+        // parser used to pin — now covered once, beside the shared parser.
+        // A self-hosted remote with a port still yields the last two
+        // segments.
+        assert_eq!(
+            parse_nwo_from_remote_url("https://git.example.com/acme/widgets.git").as_deref(),
+            Some("acme/widgets")
+        );
+        // A URL that cannot name both halves is `None`, not a guess — the
+        // caller falls through to `gh repo view` rather than inventing an
+        // owner.
+        assert_eq!(parse_nwo_from_remote_url(""), None);
+        assert_eq!(parse_nwo_from_remote_url("https://github.com/"), None);
     }
 
     // ===== #5589: is_head_mismatch_response() classifier =====

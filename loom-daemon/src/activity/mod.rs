@@ -160,6 +160,10 @@ pub use weekly_point_calibration::{
 // Daily weekly-limit-point history (Issue #8347, part of #8063) — the sampling
 // side is written best-effort by `loom-daemon tokens check --ranking`; the read
 // side is the daily series #8063 joins against `usage-report --by day`.
+// `default_activity_db_path` is the one shared resolution of the activity
+// database location (#15372): `LOOM_ACTIVITY_DB`, else `~/.loom/activity.db` —
+// `limit_calibration` re-exports it to keep its historical import path alive.
 pub use weekly_point_history::{
-    record_daily_sample_best_effort, sum_account_points, WeeklyPointSample,
+    default_activity_db_path, record_daily_sample_best_effort, sum_account_points,
+    WeeklyPointSample,
 };

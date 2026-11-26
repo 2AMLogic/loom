@@ -283,12 +283,14 @@ fn discarded(root: &Path, from: &str) -> Option<DiscardedCommits> {
 }
 
 /// `owner/repo` from `origin`'s URL, when it has that shape.
+///
+/// Fleet-specific normalization first — the recorded URL may carry trailing
+/// slashes and repeated `.git` suffixes, which the checkout pass must keep
+/// accepting — then the one shared parser (issue #15372).
 fn repo_slug(root: &Path) -> Option<String> {
     let url = git(root, &["remote", "get-url", "origin"])?;
     let url = url.trim_end_matches('/').trim_end_matches(".git");
-    let mut parts = url.rsplit(['/', ':']);
-    let (repo, owner) = (parts.next()?, parts.next()?);
-    (!repo.is_empty() && !owner.is_empty()).then(|| format!("{owner}/{repo}"))
+    crate::forge_cmd::parse_nwo_from_remote_url(url)
 }
 
 // ============================================================================

@@ -56,27 +56,14 @@ fn resolve_monitor_dir(
 ) -> PathBuf {
     for raw in [llm_override, claude_override].into_iter().flatten() {
         if !raw.trim().is_empty() {
-            return expand_tilde(raw, home);
+            return crate::fs_util::expand_tilde_with_home(raw, home);
         }
     }
-    let new_default = expand_tilde(DEFAULT_LLM_MONITOR_DIR, home);
+    let new_default = crate::fs_util::expand_tilde_with_home(DEFAULT_LLM_MONITOR_DIR, home);
     if new_default.is_dir() {
         return new_default;
     }
-    expand_tilde(DEFAULT_CLAUDE_MONITOR_DIR, home)
-}
-
-fn expand_tilde(raw: &str, home: Option<&Path>) -> PathBuf {
-    if let Some(rest) = raw.strip_prefix("~/") {
-        if let Some(home) = home {
-            return home.join(rest);
-        }
-    } else if raw == "~" {
-        if let Some(home) = home {
-            return home.to_path_buf();
-        }
-    }
-    PathBuf::from(raw)
+    crate::fs_util::expand_tilde_with_home(DEFAULT_CLAUDE_MONITOR_DIR, home)
 }
 
 /// Test-only environment isolation for the two override variables.
