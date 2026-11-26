@@ -18,6 +18,12 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 ### 2026-11-26
 
+- **Issue #15258** (closed): merge-pr.sh: --no-cleanup-primary joins --no-cleanup-worktree as a silently-ignored opt-out after the #14905 cutover
+- **PR #15443**: docs: mark merge-pr --no-cleanup-* flags no-op on GitHub default path
+- **Issue #15406** (closed): Update token-attribution docs after the Safehouse completion envelope is retired
+- **PR #15447**: docs: point token-attribution guides at the sweep and role telemetry records
+- **Issue #15259** (closed): Clarify when daemon reconciliation handles post-merge follow-up in merge-pr.sh
+- **PR #15445**: fix(merge-pr): explain when post-merge reconciliation runs
 - **Issue #15416** (closed): Skip Champion merge dispatch for PRs already in GitHub’s merge queue
 - **PR #15436**: fix: check GitHub queue membership before dispatching Champion merges
 - **Issue #15052** (closed): workflow-lint: detect duplicate on keys and preserve boolean-like step IDs
