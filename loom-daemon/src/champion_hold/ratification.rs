@@ -179,11 +179,27 @@ pub fn declares_ratification(content: &str, cfg: &Config) -> bool {
     if !compile(STATUS).is_match(&text) {
         return false;
     }
-    // CLAUSE cannot cross a period. Keep every other boundary intact: a
-    // comma, semicolon or soft line wrap can introduce a qualification.
     let clause = compile(CLAUSE);
-    text.split('.')
-        .any(|passage| clause.is_match(passage) && !EXPLICIT_DEFERRAL.is_match(passage.trim()))
+    let holds =
+        |passage: &str| clause.is_match(passage) && !EXPLICIT_DEFERRAL.is_match(passage.trim());
+    let mut start = 0;
+    for (dot, _) in text.match_indices('.') {
+        let before = &text[start..dot];
+        let after = &text[dot + 1..];
+        // Keep ellipses (including spaced ones) and dots inside tokens such
+        // as item 5.1 in the passage, so a condition on either side survives.
+        if before.trim_end().ends_with('.')
+            || after.trim_start().starts_with('.')
+            || !(after.is_empty() || after.starts_with(char::is_whitespace))
+        {
+            continue;
+        }
+        if holds(before) {
+            return true;
+        }
+        start = dot + 1;
+    }
+    holds(&text[start..])
 }
 
 /// Scan a PR's change list. Only files the PR adds, modifies or renames count:

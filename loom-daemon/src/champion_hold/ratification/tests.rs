@@ -184,6 +184,23 @@ fn a_denial_cannot_clear_an_independent_or_ambiguous_declaration() {
 }
 
 #[test]
+fn ambiguous_periods_keep_conditions_attached_to_the_denial() {
+    for wording in [
+        "This PR does not ratify on merge... unless the operator approves it.".to_owned(),
+        format!("{DR_DENIAL}.1 without operator approval."),
+        "Only if the operator rejects it... this PR does not ratify on merge.".to_owned(),
+        "This PR does not ratify on merge . . . unless the operator approves it.".to_owned(),
+    ] {
+        let body = format!("Status: Proposed. {wording}");
+        assert_eq!(
+            scan(&[file(DR_PATH, "modified", Some(&body))], &Config::default()),
+            Verdict::Hold(vec![DR_PATH.into()]),
+            "{body}"
+        );
+    }
+}
+
+#[test]
 fn explicit_phrases_still_hold_a_deferred_record() {
     let cfg = Config {
         phrases: vec!["sign-off is merge".into()],
