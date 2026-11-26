@@ -130,10 +130,13 @@ pub(super) fn run_reconciliation_pass_over_roots(
         // #14902: observe confirmed merges regardless of who made them and
         // finish the issue bookkeeping they skipped — the partial-increment
         // reset, Champion's close check, the branch-derived close and the
-        // closed-issue strip. It makes no merge-mode check, so it runs on
-        // direct-mode workspaces too (the merge-queue hook above returns
-        // early there). The merged-stack pass below reads only the merge
-        // records this wrote, not any state it mutated.
+        // closed-issue strip — plus, since #14904, the post-merge worktree
+        // cleanup: eligible worktrees are removed (reclaiming a redirected
+        // cargo target dir; ledger mechanism `merge_observation`) and the
+        // landed local branches deleted. It makes no merge-mode check, so it
+        // runs on direct-mode workspaces too (the merge-queue hook above
+        // returns early there). The merged-stack pass below reads only the
+        // merge records this wrote, not any state it mutated.
         merge_observation::reconcile(gh_bin, root);
         // #14903: stacked children of a parent that merged outside
         // merge-pr.sh — still based on the merged parent's branch, or

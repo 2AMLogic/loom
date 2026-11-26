@@ -200,6 +200,16 @@ commit object that matches both forge reads and sets tracking only after a
 successful fast-forward. The `+` refreshes only the named remote-tracking ref when its
 cache is stale. The local branch advances by fast-forward after verification.
 
+For a dirty worktree, the refusal is the disposition: the snapshot (when one was
+taken) preserved the WIP as a patch under
+`<worktree-root>/.snapshots/issue-<N>-<UTC-timestamp>.patch`. In the PR comment
+name only the relative `.snapshots/issue-<N>-<UTC-timestamp>.patch` under the
+managed worktree root; keep the absolute path (the helper's `patchPath` output
+carries the workstation username and directory layout) and the patch contents
+local, never pasted into the PR. Then stop, release the PR lease
+and `loom:treating`, and park the PR instead (same shape as the
+detached-`pr-<N>` read-only rule, #14403).
+
 For a fork or a nonstandard head, use the existing `pr-worktree.sh` route and
 check the exact head and clean state there. The named `origin` recovery
 applies only to the matching same-repository issue branch. If the dedicated
@@ -1084,8 +1094,9 @@ loom-daemon forge doctor-handback $N --expected-head-sha "$(git rev-parse HEAD)"
 ```
 
 It re-reads labels and head, adds `loom:review-requested` *before* removing
-`loom:changes-requested`/`loom:treating` (never an unlabelled PR), re-reads,
-and withdraws its add if a verdict landed meanwhile. Act on the exit:
+`loom:changes-requested`, `loom:ci-failure` and `loom:treating` (never an
+unlabelled PR), re-reads, and withdraws its add if a verdict landed
+meanwhile. Act on the exit:
 
 | Exit | Line | Action |
 |------|------|--------|
@@ -1554,7 +1565,7 @@ states Doctor exists to clear:
 | Label | Meaning | Doctor's action |
 |-------|---------|-----------------|
 | `loom:merge-conflict` | PR has merge conflicts requiring resolution | **Remove it once you have rebased and the conflicts are resolved** (the PR is no longer conflicting). Apply it if you triage a conflicted PR you cannot immediately fix. |
-| `loom:ci-failure` | PR has failing CI checks | **Remove it once CI is green again** after your fix. Apply it if you are flagging a PR whose CI is red and leaving it for a follow-up. |
+| `loom:ci-failure` | PR has failing CI checks | **Cleared by `forge doctor-handback` on every hand-back, green or not.** Apply it by hand only when flagging a PR whose CI is red and leaving it for a follow-up. |
 
 These are informational flags, not queue gates (the queues are `loom:pr` for conflicts and
 `loom:changes-requested` for feedback). Keep them current: clear each the moment its

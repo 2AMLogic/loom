@@ -43,7 +43,7 @@ pass() { TESTS_RUN=$((TESTS_RUN + 1)); echo -e "  ${GREEN}PASS${NC}: $1"; }
 fail() { TESTS_RUN=$((TESTS_RUN + 1)); TESTS_FAILED=$((TESTS_FAILED + 1)); echo -e "  ${RED}FAIL${NC}: $1"; }
 
 # Always create worktrees inside the fixture, including on fleet hosts.
-unset LOOM_WORKTREE_ROOT
+unset LOOM_WORKTREE_ROOT LOOM_SWEEP_CLAIM_OWNED LOOM_BUILDER_CLAIM
 export LOOM_CONFIG_DEFAULTS_FILE=""
 TMP=$(mktemp -d "${TMPDIR:-/tmp}/loom-refused-lease.XXXXXX")
 trap 'rm -rf "$TMP"; cd "$SCRIPTS_DIR" 2>/dev/null || true' EXIT
@@ -76,7 +76,7 @@ case "$1" in
     lease)
         if [[ "$2" == "ensure" ]]; then
             case " $* " in
-                *" --require-ownership "*) echo "${STUB_OWNERSHIP_TOKEN:-OWNED}"; exit "${STUB_OWNERSHIP_RC:-0}" ;;
+                *" --require-ownership "*) printf '%s\n' "${STUB_OWNERSHIP_TOKEN-OWNED}"; exit "${STUB_OWNERSHIP_RC:-0}" ;;
             esac
             exit 0
         fi ;;
@@ -107,7 +107,9 @@ chmod +x "$TMP/shim/git"
 
 run_wt() { # <args...> -> sets RC, resets log
     : > "$LOG"; RC=0
-    LOOM_BUILDER_CLAIM="${LOOM_BUILDER_CLAIM-1}" ./.loom/scripts/worktree.sh "$@" >"$TMP/out.log" 2>&1 || RC=$?
+    local flags=()
+    [[ "${STUB_STANDALONE:-}" == 1 ]] || flags+=(--require-ownership)
+    ./.loom/scripts/worktree.sh "$@" ${flags[@]+"${flags[@]}"} >"$TMP/out.log" 2>&1 || RC=$?
 }
 lease_calls() { grep -c '^lease ensure' "$LOG" || true; }
 expect_refused_no_lease() { # <issue> <label>
@@ -244,26 +246,23 @@ if [[ "$RC" -eq 0 ]] && grep -q '^forge check-claim 518 --force-claim$' "$LOG"; 
 
 echo "Test 19: daemon predating --require-ownership (exit 2) -> ownership unverified, refused"
 rm -f "$STUB_HOOK_MARK"
-STUB_OWNERSHIP_RC=2 STUB_OWNERSHIP_TOKEN='' run_wt 519
+STUB_VERSION=99.0.0 STUB_OWNERSHIP_RC=2 STUB_OWNERSHIP_TOKEN='' run_wt --json 519
 if [[ "$RC" -ne 0 ]]; then pass "old daemon cannot prove ownership: refused (rc=$RC)"; else fail "unverified ownership admitted"; cat "$TMP/out.log"; fi
 no_peer_side_effects 519
-if grep -q "could not be positively verified" "$TMP/out.log"; then pass "refusal says ownership unverified"; else fail "refusal not explained"; cat "$TMP/out.log"; fi
-if grep -q 'requires loom-daemon >= 0.20.29' "$TMP/out.log" && grep -q 'loom-daemon-update.sh --fetch' "$TMP/out.log"; then pass "unknown-version refusal names the floor and roll command"; else fail "no actionable roll advice"; cat "$TMP/out.log"; fi
+if grep -q '"error": "DAEMON_INCOMPATIBLE"' "$TMP/out.log" && grep -q 'loom-daemon-update.sh --fetch' "$TMP/out.log"; then pass "unsupported strict argument reports an actionable refusal despite a high version"; else fail "unsupported argument diagnosis missing"; cat "$TMP/out.log"; fi
 
-echo "Test 25: released daemon before strict ownership -> distinct refusal before lease publication"
-rm -f "$STUB_HOOK_MARK"
-STUB_VERSION=0.20.16 run_wt --json 525
-expect_refused_no_lease 525 "below-floor daemon"
+echo "Test 25: a CLI silently ignoring the strict argument cannot admit a Builder"
+STUB_OWNERSHIP_TOKEN='' run_wt --json 525
 no_peer_side_effects 525
-if grep -q '"error": "DAEMON_INCOMPATIBLE"' "$TMP/out.log" && grep -q 'Required:  >= 0.20.29' "$TMP/out.log" && grep -q 'loom-daemon-update.sh --fetch' "$TMP/out.log"; then pass "old daemon refusal is actionable and distinct from a peer"; else fail "old daemon diagnosis missing"; cat "$TMP/out.log"; fi
+if [[ "$RC" -ne 0 ]] && grep -q '"error": "OWNERSHIP_UNVERIFIED"' "$TMP/out.log"; then pass "empty success refused"; else fail "empty success admitted"; cat "$TMP/out.log"; fi
 
-echo "Test 26: daemon at the strict-ownership floor still must establish ownership"
-STUB_VERSION=0.20.29 run_wt 526
-if [[ "$RC" -eq 0 && -f .loom/worktrees/issue-526/.loom-managed ]] && grep -q '^lease ensure 526 --require-ownership ' "$LOG"; then pass "floor boundary admits exact OWNED"; else fail "at-floor admission failed"; cat "$LOG" "$TMP/out.log"; fi
+echo "Test 26: a backported strict capability admits only a positive ownership result"
+STUB_VERSION=0.1.0 run_wt 526
+if [[ "$RC" -eq 0 && -f .loom/worktrees/issue-526/.loom-managed ]] && grep -q '^lease ensure 526 --require-ownership ' "$LOG"; then pass "backported capability admits exact OWNED"; else fail "backported admission failed"; cat "$LOG" "$TMP/out.log"; fi
 rm -f "$STUB_HOOK_MARK"
-STUB_VERSION=0.20.29 STUB_OWNERSHIP_TOKEN=INDETERMINATE STUB_OWNERSHIP_RC=2 run_wt --json 527
+STUB_VERSION=0.1.0 STUB_OWNERSHIP_TOKEN=INDETERMINATE STUB_OWNERSHIP_RC=2 run_wt --json 527
 no_peer_side_effects 527
-if [[ "$RC" -ne 0 ]] && grep -q '"error": "OWNERSHIP_UNVERIFIED"' "$TMP/out.log"; then pass "sufficient version never substitutes for positive ownership"; else fail "at-floor unverifiable ownership admitted or mislabeled"; cat "$TMP/out.log"; fi
+if [[ "$RC" -ne 0 ]] && grep -q '"error": "OWNERSHIP_UNVERIFIED"' "$TMP/out.log"; then pass "recognized argument without positive ownership refused"; else fail "unverifiable ownership admitted or mislabeled"; cat "$TMP/out.log"; fi
 
 echo "Test 21: INDETERMINATE ownership (exit 0) -> refused, nothing created"
 rm -f "$STUB_HOOK_MARK"
@@ -288,7 +287,7 @@ STUB_OWNERSHIP_RC=4 run_wt 520
 if [[ "$RC" -eq 0 ]] && grep -q '^lease ensure 520 --watch-pid' "$LOG" && ! grep -q -- '--require-ownership' "$LOG"; then pass "authorized branch reuse unaffected"; else fail "rc=$RC"; cat "$LOG" "$TMP/out.log"; fi
 
 echo "Test 23: standalone (non-Builder) fresh creation keeps the fail-open lease even when ownership is unverifiable"
-STUB_CHECK_CLAIM_RC=1 STUB_OWNERSHIP_RC=2 STUB_OWNERSHIP_TOKEN='' LOOM_BUILDER_CLAIM="" run_wt 523
+STUB_CHECK_CLAIM_RC=1 STUB_OWNERSHIP_RC=2 STUB_OWNERSHIP_TOKEN='' STUB_STANDALONE=1 run_wt 523
 if [[ "$RC" -eq 0 && -e ".loom/worktrees/issue-523/.git" ]] && ! grep -q -- '--require-ownership' "$LOG"; then pass "standalone not refused"; else fail "rc=$RC"; cat "$LOG" "$TMP/out.log"; fi
 
 echo "Test 24: another creator's partial directory cannot be reused by a Builder"

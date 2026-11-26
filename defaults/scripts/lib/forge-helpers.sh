@@ -303,6 +303,45 @@ gitea_api() {
   fi
 }
 
+# --- Gitea lease-record reads (#14941) ---
+#
+# The Builder lease (`sweep-lease-publish.sh` / `sweep-lease-renew.sh`) lists
+# an issue's comments, reads its state and PATCHes its own comment. Gitea's
+# REST paths for these are GitHub-shaped (`repos/{o}/{r}/issues/{n}/comments`,
+# `repos/{o}/{r}/issues/comments/{id}`), so the lease scripts reuse their
+# GitHub request shapes through `gitea_api` on a Gitea checkout and never
+# reach for `gh`. Callers must have run `forge_detect` (FORGE_TYPE=gitea).
+
+# forge_gitea_issue_comments NWO ISSUE -> one JSON array holding EVERY comment
+# of the issue, oldest first, in Gitea's REST shape. Gitea's issue-comment list
+# takes `since`/`before` only and is not paginated, so one GET is the whole
+# listing. Returns 1 when it cannot be read or is not an array, so an error
+# document is never mistaken for "no comments".
+forge_gitea_issue_comments() {
+  local chunk
+  chunk="$(gitea_api GET "repos/$1/issues/$2/comments")" || return 1
+  jq -ec 'if type == "array" then . else empty end' <<< "$chunk"
+}
+
+# forge_gitea_issue_state NWO ISSUE -> `open` / `closed` (empty + exit 1 when
+# the state cannot be read).
+forge_gitea_issue_state() {
+  local body
+  body="$(gitea_api GET "repos/$1/issues/$2")" || return 1
+  jq -er '.state // empty' <<< "$body"
+}
+
+# forge_gitea_self_login -> the login the configured Gitea credential
+# authenticates as (`GET /user`). Gitea reports no `author_association`, so
+# this is the identity a lease record written with this host's own credential
+# is attributed to: the Gitea reading of comment-trust's "this daemon's own
+# identity" rule (`loom-daemon forge trusted-comments --self-login`).
+forge_gitea_self_login() {
+  local body
+  body="$(gitea_api GET user)" || return 1
+  jq -er '.login // empty' <<< "$body"
+}
+
 # --- Owner/Repo Helpers ---
 
 # Extract owner and repo from NWO (name-with-owner) string.
@@ -1880,6 +1919,158 @@ forge_get_pr_reviews() {
   fi
   echo "forge_get_pr_reviews: REST review read failed (rc $rc) — falling back to the GraphQL transport (#15009)" >&2
   _forge_get_pr_reviews_github_graphql "$nwo" "$pr_number" "$gh_cmd"
+  return $?
+}
+
+# GraphQL fallback for forge_get_pr_conversation_comments (#15025): a paginated
+# pullRequest.comments read, the sibling of the #15009 reviews fallback above.
+# Called ONLY after a FAILED REST read — never after a 124 (#13927).
+#
+# Output shape: ONE JSON array of REST-shaped comment objects
+# ({id, user:{login,type}, author_association, body, created_at}). The only
+# consumer is `loom-daemon forge trusted-comments`, which authenticates on the
+# author, and the gate's verdict jq reads `.id` / `.user.login`. GraphQL says
+# "this author is an App" with `author.__typename == "Bot"` where REST says
+# `user.type == "Bot"`; the mapping carries that signal into `user.type` so the
+# trust verdict is the same on either transport. A deleted (null) author maps
+# to `user:null`, which no trust rule accepts.
+#
+# Fails closed exactly like the reviews fallback: any gh failure, a GraphQL
+# `errors` payload, a page missing the comments connection / pageInfo / nodes,
+# a non-boolean hasNextPage, or a hasNextPage without a cursor is a non-zero
+# return with NO output. A genuinely empty list is `[]` (rc 0), which is how a
+# complete zero-comment read is told apart from a read that never happened.
+_forge_get_pr_conversation_comments_github_graphql() {
+  local nwo="$1"
+  local pr_number="$2"
+  local gh_cmd="${3:-gh}"
+
+  forge_split_nwo "$nwo"
+
+  local query='query($owner:String!,$repo:String!,$pr:Int!,$cursor:String){
+    repository(owner:$owner,name:$repo){
+      pullRequest(number:$pr){
+        comments(first:100,after:$cursor){
+          pageInfo{hasNextPage endCursor}
+          nodes{
+            databaseId
+            author{login __typename}
+            authorAssociation
+            body
+            createdAt
+          }
+        }
+      }
+    }
+  }'
+
+  local cursor="" page=0 response rc records="" page_records has_next
+  while :; do
+    page=$((page + 1))
+    if [[ $page -gt 50 ]]; then
+      echo "forge_get_pr_conversation_comments: exceeded 50 GraphQL pages — refusing to report a truncated comment list" >&2
+      return 1
+    fi
+
+    if [[ -z "$cursor" ]]; then
+      response=$(_forge_review_read_run "$gh_cmd" api graphql -f query="$query" \
+        -F owner="$FORGE_OWNER" -F repo="$FORGE_REPO" -F pr="$pr_number")
+    else
+      response=$(_forge_review_read_run "$gh_cmd" api graphql -f query="$query" \
+        -F owner="$FORGE_OWNER" -F repo="$FORGE_REPO" -F pr="$pr_number" \
+        -F cursor="$cursor")
+    fi
+    rc=$?
+    if [[ "$rc" -eq 124 ]]; then
+      echo "forge_get_pr_conversation_comments: the GraphQL comment read timed out (#13927)" >&2
+      return 124
+    fi
+    [[ "$rc" -ne 0 ]] && return 1
+
+    if printf '%s' "$response" | jq -e '.errors' > /dev/null 2>&1; then
+      echo "forge_get_pr_conversation_comments: GraphQL response carried errors — comment read failed" >&2
+      return 1
+    fi
+
+    if ! printf '%s' "$response" \
+      | jq -e '.data.repository.pullRequest.comments
+               | type == "object" and has("pageInfo") and (.nodes | type == "array")' > /dev/null 2>&1; then
+      echo "forge_get_pr_conversation_comments: GraphQL page lacked the comments/pageInfo shape — treating the read as incomplete" >&2
+      return 1
+    fi
+
+    page_records=$(printf '%s' "$response" \
+      | jq -c '.data.repository.pullRequest.comments.nodes[]
+          | select(. != null)
+          | {
+              id: (.databaseId // 0),
+              user: (if .author == null then null
+                     else {login: (.author.login // ""),
+                           type: (if .author.__typename == "Bot" then "Bot" else "User" end)}
+                     end),
+              author_association: (.authorAssociation // "NONE"),
+              body: (.body // ""),
+              created_at: (.createdAt // "")
+            }') || return 1
+    # Buffered, not streamed: a page-2 failure must not leave page 1's records
+    # looking like an answer.
+    [[ -n "$page_records" ]] && records+="$page_records"$'\n'
+
+    has_next=$(printf '%s' "$response" \
+      | jq -r '.data.repository.pullRequest.comments.pageInfo.hasNextPage') || return 1
+    if [[ "$has_next" == "false" ]]; then
+      break
+    fi
+    if [[ "$has_next" != "true" ]]; then
+      echo "forge_get_pr_conversation_comments: hasNextPage was not a boolean — treating the read as incomplete" >&2
+      return 1
+    fi
+    cursor=$(printf '%s' "$response" \
+      | jq -r '.data.repository.pullRequest.comments.pageInfo.endCursor') || return 1
+    if [[ -z "$cursor" || "$cursor" == "null" ]]; then
+      echo "forge_get_pr_conversation_comments: hasNextPage without a usable endCursor — treating the read as incomplete" >&2
+      return 1
+    fi
+  done
+
+  if [[ -n "$records" ]]; then
+    printf '%s' "$records" | jq -s -c '.' || return 1
+  else
+    printf '[]\n'
+  fi
+  return 0
+}
+
+# Get a PR's conversation (issue) comments, fully paginated, for the verdict
+# trust filter (#12475, #15025).
+#
+# Usage: forge_get_pr_conversation_comments NWO PR_NUMBER [GH_CMD]
+# Output: the comment listing as JSON — on the REST path exactly what
+#   `gh api --paginate` streams (one array per page, concatenated); on the
+#   GraphQL fallback ONE array of REST-shaped objects (see the fallback above).
+#   `forge trusted-comments` accepts both.
+# Exit: 0 on a complete read (including a genuinely empty list), non-zero on
+#       ANY read/pagination failure (fail closed), 124 when the read exceeded
+#       LOOM_FORGE_REVIEW_READ_TIMEOUT (#13927) — a timeout is never retried
+#       through the fallback.
+# Always plain `gh` (never a cache wrapper): this read gates a verdict.
+forge_get_pr_conversation_comments() {
+  local nwo="$1"
+  local pr_number="$2"
+  local gh_cmd="${3:-gh}"
+
+  local out rc
+  out=$(_forge_review_read_run "$gh_cmd" api "repos/$nwo/issues/$pr_number/comments?per_page=100" --paginate 2> /dev/null)
+  rc=$?
+  if [[ "$rc" -eq 0 ]]; then
+    printf '%s\n' "$out"
+    return 0
+  fi
+  if [[ "$rc" -eq 124 ]]; then
+    return 124
+  fi
+  echo "forge_get_pr_conversation_comments: REST comment read failed (rc $rc) — falling back to the GraphQL transport (#15025)" >&2
+  _forge_get_pr_conversation_comments_github_graphql "$nwo" "$pr_number" "$gh_cmd"
   return $?
 }
 

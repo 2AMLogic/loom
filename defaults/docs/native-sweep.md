@@ -79,12 +79,27 @@ transcript archival.
 
 A Claude-orchestrated sweep can run only its Builder and Doctor phases on
 another runtime (e.g. `opencode:zai-flash`) via `runtimes.rolePreference`.
+
+**Scope (#15299).** This applies only to a sweep that was *dispatched* to a
+native-runtime lane: a daemon-dispatched child, marked by `LOOM_SWEEP_CLAIM_OWNED`
+or `--claim-owned N` (`sweep-backend-detection.md` Stage -1 rule 3, the same marker
+`forge_check_claim.rs` reads). An **attended in-session sweep** (neither present)
+never calls `loom-daemon worker run`: Builder and Doctor are dispatched as Claude
+Task subagents directly, like Curator and Judge, so a host's `roleDraw` /
+`rolePreference` cannot route the operator's session to another runtime. A
+hand-run `claude -p "/loom:sweep N"` has no marker either and likewise stays on
+Claude. For a marker-bearing sweep nothing below changes, including exits 75/78.
+
 Before each such phase the orchestrator calls
 `LOOM_SWEEP_RUN_ID="$RUN_ID" loom-daemon worker run --role builder --issue N --json` (Doctor:
 `--role doctor --pr N`; a stacked Builder adds `--base feature/issue-<parent>`).
 For Builder, `RUN_ID` must be the exact successful preflight lease identity;
 never invent one or continue after preflight refused. Fresh setup requires
-positive ownership before the worker receives its checkout.
+positive ownership before the worker receives its checkout. Issue sweep and
+Builder step dispatch check that the installed worktree helper advertises
+strict ownership. Builder setup passes `--require-ownership` to that helper,
+which requires exit 0 and `OWNED` from the running daemon's strict lease call.
+A host can use a backport that implements the same contract.
 The command resolves the role's runtime (an inherited
 daemon-dispatch `LOOM_RUNTIME` pin is ignored; `LOOM_RUNTIME_<ROLE>` still wins); when that is
 `claude` it prints `outcome=delegate-to-claude` and exits 0 without launching

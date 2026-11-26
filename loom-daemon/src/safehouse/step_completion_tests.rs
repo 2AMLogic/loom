@@ -709,8 +709,9 @@ fn a_step_dispatched_merge_attributes_an_opencode_builder_and_a_claude_judge() {
             .unwrap();
         }
     }
-    let _db_env =
-        crate::env_test_support::EnvGuard::set(crate::opencode_usage::OPENCODE_DB_ENV, &db);
+    // Crate-wide `LOOM_OPENCODE_DB` lock (#15204): held for the whole pin so a
+    // default-keyed writer elsewhere cannot clobber it mid-run.
+    let _db_env = crate::tokens_pool::opencode_db_env::OpencodeDbEnv::set(&db);
 
     let gh = FakeGh::new(dir.path());
     gh.serve_view(&pr_row(700, 14018, Some(1)));
@@ -857,14 +858,13 @@ fn a_step_dispatched_merge_attributes_an_opencode_builder_and_a_codex_judge_body
         )
         .unwrap();
     }
-    let _db_env =
-        crate::env_test_support::EnvGuard::set(crate::opencode_usage::OPENCODE_DB_ENV, &db);
-
     let gh = FakeGh::new(dir.path());
     gh.serve_view(&pr_row(701, 14883, Some(1)));
-    // Crate-wide `LOOM_CODEX_HOME` lock (#15174), taken before the profile-root
-    // redirect below (its documented lock order).
+    // Crate-wide `LOOM_CODEX_HOME` lock (#15174), taken before the
+    // `LOOM_OPENCODE_DB` pin (#15204) and the profile-root redirect below
+    // (the documented lock order: codex-home, opencode-db, profile-root).
     let _codex_home_lock = crate::tokens_pool::codex_home_env::lock();
+    let _db_env = crate::tokens_pool::opencode_db_env::OpencodeDbEnv::set(&db);
     let _home_env = crate::env_test_support::EnvGuard::clear(&[
         crate::codex_usage::CODEX_HOME_ENV,
         crate::codex_usage::CODEX_NATIVE_HOME_ENV,
@@ -977,14 +977,15 @@ fn a_codex_banner_naming_no_rollout_leaves_the_envelope_byte_identical_body() {
             )
             .unwrap();
         }
-        let _db_env =
-            crate::env_test_support::EnvGuard::set(crate::opencode_usage::OPENCODE_DB_ENV, &db);
         // An empty Codex home: the banner names a rollout nothing holds. The
         // crate-wide `LOOM_CODEX_HOME` lock (#15174) makes the pin race-free
-        // against the isolation helpers clearing the variable.
+        // against the isolation helpers clearing the variable; it is taken
+        // before the `LOOM_OPENCODE_DB` pin (#15204), per the documented
+        // lock order.
         let empty_home = dir.path().join("empty-codex");
         std::fs::create_dir_all(empty_home.join("sessions")).unwrap();
         let _codex_home_lock = crate::tokens_pool::codex_home_env::lock();
+        let _db_env = crate::tokens_pool::opencode_db_env::OpencodeDbEnv::set(&db);
         let _home_env =
             crate::env_test_support::EnvGuard::set(crate::codex_usage::CODEX_HOME_ENV, &empty_home);
 

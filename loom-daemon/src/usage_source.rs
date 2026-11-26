@@ -534,7 +534,7 @@ fn combine_model_totals(
 }
 
 /// The flat token total of `rows`: every counter summed, the same figure
-/// [`crate::transcript_tokens::sum_sweep_tokens`] reports for the same
+/// [`crate::transcript_tokens::sum_item_tokens`] reports for the same
 /// transcripts. `None` for a zero total, so an absent figure omits the key
 /// rather than publishing `0`.
 #[must_use]
@@ -853,8 +853,8 @@ mod tests {
             opencode: vec![id.to_string()],
             codex: Vec::new(),
         };
-        let _db =
-            crate::env_test_support::EnvGuard::set(crate::opencode_usage::OPENCODE_DB_ENV, &db);
+        // Crate-wide `LOOM_OPENCODE_DB` lock (#15204), held for the whole pin.
+        let _db = crate::tokens_pool::opencode_db_env::OpencodeDbEnv::set(&db);
         let close = |runtime, ids: &NativeSessionIds| {
             native_close_usage(Some(runtime), tmp.path(), Some((42, false)), &db, None, ids)
         };

@@ -19,7 +19,7 @@ fn waits(logs: &[(log::Level, String)]) -> Vec<&(log::Level, String)> {
 fn an_offline_pass_warns_for_every_stale_workspace_each_pass_and_resynces_when_back() {
     let fx = Fixture::new(STALE);
     let host = Host::new(&fx, "host-a");
-    let floor = Some("1.0.850");
+    let floor = Some("0.19.850");
     // Three remotes that do not answer end the pass's asking mid-classify;
     // the stale workspace behind them is classified from its clone and never
     // offered the attempt — the shape of the four held repos.
@@ -109,7 +109,7 @@ fn a_host_gate_refusal_warns_per_stale_workspace_on_each_write_pass() {
     for gate in [NotCurrent::Draining, NotCurrent::ReleaseUnverified] {
         for _ in 0..2 {
             let (logs, pass) = capture_logs_pass(|| {
-                host.pass_over(&roots, Mode::Write, &|| Err(gate), Some("1.0.850"))
+                host.pass_over(&roots, Mode::Write, &|| Err(gate), Some("0.19.850"))
             });
             assert_eq!(network(&pass), (0, 0, 0));
             assert_eq!(pass.workspaces.len(), roots.len());
@@ -139,7 +139,7 @@ fn a_pass_past_its_deadline_names_it_for_each_stale_workspace() {
 
     host.overdue.set(true);
     let (logs, pass) =
-        capture_logs_pass(|| host.pass_with(Mode::Write, &|| Ok(()), Some("1.0.850")));
+        capture_logs_pass(|| host.pass_with(Mode::Write, &|| Ok(()), Some("0.19.850")));
     let lines = waits(&logs);
     assert_eq!(lines.len(), 1, "{logs:?}");
     assert!(lines[0].1.contains("the pass was past its deadline"), "{logs:?}");
@@ -152,7 +152,7 @@ fn a_pass_past_its_deadline_names_it_for_each_stale_workspace() {
     // The next pass is within the deadline and resyncs it.
     host.overdue.set(false);
     let (logs, pass) =
-        capture_logs_pass(|| host.pass_with(Mode::Write, &|| Ok(()), Some("1.0.850")));
+        capture_logs_pass(|| host.pass_with(Mode::Write, &|| Ok(()), Some("0.19.850")));
     assert!(waits(&logs).is_empty(), "nothing left stale: {logs:?}");
     assert_eq!(only(&pass).state, WState::W0, "{pass:?}");
     assert_eq!(fx.origin_commits(), commits + 1);
@@ -332,7 +332,7 @@ fn w3_refusal_recovery(
     });
     refuse_main_only(&fx);
     let host = Host::new(&fx, "host-a");
-    let floor = Some("1.0.850");
+    let floor = Some("0.19.850");
     let branch = format!("chore/loom-resync-v{RUNNING}");
     let before = fx.origin_head();
 
@@ -341,7 +341,7 @@ fn w3_refusal_recovery(
     let (logs, pass) = capture_logs_pass(|| host.pass_with(Mode::Write, refused_pass, floor));
     let report = only(&pass);
     assert_eq!(report.state, WState::W3, "{report:?}");
-    assert_eq!(report.installed.as_deref(), Some("1.0.800"), "{report:?}");
+    assert_eq!(report.installed.as_deref(), Some("0.19.800"), "{report:?}");
     assert_eq!(reason(report), refusal, "{report:?}");
     let lines = waits(&logs);
     assert_eq!(lines.len(), 1, "{logs:?}");

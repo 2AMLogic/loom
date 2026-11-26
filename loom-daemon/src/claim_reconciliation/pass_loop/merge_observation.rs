@@ -1826,3 +1826,7 @@ impl Forge for GhForge<'_> {
 #[cfg(test)]
 #[path = "merge_observation_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "merge_observation_git_tests.rs"]
+mod git_tests;

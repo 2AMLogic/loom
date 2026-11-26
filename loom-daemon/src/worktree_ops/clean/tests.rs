@@ -481,7 +481,7 @@ fn cleanup_worktree_removes_untracked_orphan_directory() {
     std::fs::write(orphan.join("some-build-artifact"), "junk").unwrap();
     assert!(orphan.is_dir());
 
-    let result = cleanup_worktree(&repo_root, &orphan, 999, false, "test");
+    let result = cleanup_worktree(&repo_root, &orphan, 999, &CleanOptions::default(), "test");
     assert_eq!(
         result,
         Ok(CleanupOutcome::Removed),
@@ -575,7 +575,7 @@ fn cleanup_worktree_reclaims_a_redirected_cargo_target_dir() {
         return;
     }
 
-    let result = cleanup_worktree(&repo_root, &worktree, 7239, false, "test");
+    let result = cleanup_worktree(&repo_root, &worktree, 7239, &CleanOptions::default(), "test");
     assert_eq!(result, Ok(CleanupOutcome::Removed), "{result:?}");
     assert!(!worktree.exists(), "worktree should be gone");
     assert!(
@@ -665,7 +665,7 @@ fn cleanup_worktree_keeps_a_target_dir_a_live_worktree_still_shares() {
         return;
     }
 
-    let result = cleanup_worktree(&repo_root, &made[0], 7239, false, "test");
+    let result = cleanup_worktree(&repo_root, &made[0], 7239, &CleanOptions::default(), "test");
     assert_eq!(result, Ok(CleanupOutcome::Removed), "{result:?}");
     assert!(!made[0].exists(), "the removed worktree should be gone");
     assert!(
@@ -697,7 +697,7 @@ fn cleanup_worktree_treats_missing_directory_as_already_gone() {
     let gone = crate::worktree_root::worktree_root(&repo_root).join("issue-4525");
     assert!(!gone.exists(), "fixture must not exist on disk");
 
-    let result = cleanup_worktree(&repo_root, &gone, 4525, false, "test");
+    let result = cleanup_worktree(&repo_root, &gone, 4525, &CleanOptions::default(), "test");
     assert_eq!(
         result,
         Ok(CleanupOutcome::AlreadyGone),
@@ -827,7 +827,7 @@ fn cleanup_worktree_does_not_force_remove_on_other_errors() {
     std::fs::create_dir_all(&managed).unwrap();
     std::fs::write(managed.join(".loom-managed"), "test").unwrap();
 
-    let result = cleanup_worktree(&repo_root, &managed, 1000, false, "test");
+    let result = cleanup_worktree(&repo_root, &managed, 1000, &CleanOptions::default(), "test");
     assert!(result.is_err(), "non-orphan failure must propagate");
     assert!(managed.exists(), "directory must be left in place on a non-orphan failure");
 }
@@ -1428,7 +1428,7 @@ fn cleanup_worktree_recovers_a_stale_initializing_locked_worktree() {
     std::fs::write(wt_path.join(".loom-managed"), "test").unwrap();
     set_worktree_lock(&wt_path, "initializing", Some(Duration::from_secs(48 * 60 * 60)));
 
-    let result = cleanup_worktree(&repo_root, &wt_path, 14878, false, "test");
+    let result = cleanup_worktree(&repo_root, &wt_path, 14878, &CleanOptions::default(), "test");
     assert_eq!(result, Ok(CleanupOutcome::Removed), "{result:?}");
     assert!(!wt_path.exists(), "worktree directory should be gone");
     let list = git(&repo_root, &["worktree", "list", "--porcelain"]);
@@ -1457,7 +1457,7 @@ fn cleanup_worktree_recovers_a_lock_registered_under_a_different_id() {
     std::fs::write(wt_path.join(".git"), format!("gitdir: {}\n", renamed.display())).unwrap();
     set_worktree_lock(&wt_path, "initializing", Some(Duration::from_secs(48 * 60 * 60)));
 
-    let result = cleanup_worktree(&repo_root, &wt_path, 14880, false, "test");
+    let result = cleanup_worktree(&repo_root, &wt_path, 14880, &CleanOptions::default(), "test");
     assert_eq!(result, Ok(CleanupOutcome::Removed), "{result:?}");
     assert!(!wt_path.exists(), "worktree directory should be gone");
     assert!(!renamed.exists(), "renamed git registration should be gone");
@@ -1494,7 +1494,7 @@ fn cleanup_worktree_preserves_a_fresh_initializing_lock() {
     std::fs::write(wt_path.join(".loom-managed"), "test").unwrap();
     let lock_file = set_worktree_lock(&wt_path, "initializing", None);
 
-    let result = cleanup_worktree(&repo_root, &wt_path, 14881, false, "test");
+    let result = cleanup_worktree(&repo_root, &wt_path, 14881, &CleanOptions::default(), "test");
     let cause = result.expect_err("a fresh lock must still refuse removal");
     assert!(
         cause.contains("cannot remove a locked working tree"),
@@ -1522,7 +1522,7 @@ fn cleanup_worktree_preserves_a_future_dated_initializing_lock() {
         .set_modified(SystemTime::now() + Duration::from_secs(60 * 60))
         .unwrap();
 
-    let result = cleanup_worktree(&repo_root, &wt_path, 14885, false, "test");
+    let result = cleanup_worktree(&repo_root, &wt_path, 14885, &CleanOptions::default(), "test");
     assert!(
         result
             .expect_err("a future-dated lock must refuse removal")
@@ -1546,7 +1546,7 @@ fn cleanup_worktree_preserves_an_operator_lock_regardless_of_age() {
     let lock_file =
         set_worktree_lock(&wt_path, "operator hold\n", Some(Duration::from_secs(72 * 60 * 60)));
 
-    let result = cleanup_worktree(&repo_root, &wt_path, 14882, false, "test");
+    let result = cleanup_worktree(&repo_root, &wt_path, 14882, &CleanOptions::default(), "test");
     let cause = result.expect_err("an operator lock must refuse removal");
     assert!(
         cause.contains("cannot remove a locked working tree"),
@@ -1571,7 +1571,16 @@ fn cleanup_worktree_dry_run_leaves_a_stale_initializing_lock_intact() {
     let lock_file =
         set_worktree_lock(&wt_path, "initializing", Some(Duration::from_secs(48 * 60 * 60)));
 
-    let result = cleanup_worktree(&repo_root, &wt_path, 14883, true, "test");
+    let result = cleanup_worktree(
+        &repo_root,
+        &wt_path,
+        14883,
+        &CleanOptions {
+            dry_run: true,
+            ..CleanOptions::default()
+        },
+        "test",
+    );
     assert_eq!(result, Ok(CleanupOutcome::Removed), "{result:?}");
     assert!(wt_path.exists(), "dry-run must not remove anything");
     assert!(

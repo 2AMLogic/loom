@@ -1244,7 +1244,12 @@ at all.
 
 **Do not disable a guard, and do not reach for `python3`/another interpreter to
 write the file.** Get a managed worktree — the same thing every Builder works
-in — and write there:
+in — and write there. Inside that worktree, the file writes this phase cannot
+perform inline (`WORK_PLAN.md`'s receipt file and marker-region splice, whose
+`rm`/redirect/`mktemp` shapes on the variable-built `$DOCS_WT` path are denied
+before execution, #15219) are owned by `loom-daemon guide` verbs the code
+blocks below call with the literal `--docs-worktree "$DOCS_WT"` path: call the
+verb, never re-inline the write.
 
 ```bash
 # Run this AFTER Step 1's open-docs-PR check has decided not to return early,
@@ -1512,7 +1517,7 @@ write immediately regardless of the window (see "WORK_LOG debounce" in
 
 **First creation (#14009).** If `$DOCS_WT/WORK_LOG.md` does not exist (the
 repo has never tracked it — presence, not recency), this pass **creates it
-without asking**: write the standard preamble and `## Archives` index shape
+without asking**: write the standard preamble, `## Archives` index and `## Entries` heading shape
 (mirror the WORK_LOG.md template in `defaults/.claude/commands/loom/imagine.md`)
 followed by this tick's entries. Creation itself bypasses the debounce and
 min-entries gates below — a first creation with nothing to record yet is
@@ -2163,7 +2168,9 @@ update_work_log() {
   fi
 
   # Group entries by date and prepend them to "$DOCS_WT/WORK_LOG.md" (below the
-  # header/comment block, above the newest existing `### ` section).
+  # header/comment block and `## Archives` index, under the `## Entries`
+  # heading, above the newest existing `### ` section; when a file has no
+  # `## Entries` heading, add one after the index first (#15271)).
   # Format: ### YYYY-MM-DD
   #         - **PR #N**: Title
   #         - **Issue #N** (closed): Title
@@ -2683,6 +2690,33 @@ render_plan_body() {
   epics=$("$GH_READ" issue list --label "loom:epic" --state open --limit 200 --json number,title,labels \
     --jq 'sort_by(.number) | .[] | select(any(.labels[]?.name; . == "loom:frozen") | not) | "- **#\(.number)**: \(.title)"'"$held_sfx")
 
+  # #15201: an issue whose only stage label is a hold renders nowhere — every
+  # hold is excluded from Ready, and the *(held)* suffix above can only
+  # annotate a bullet that already exists — so a parked issue vanished from
+  # the roadmap. Backlog Balance says how many it is not listing: held on any
+  # registry hold except `loom:frozen`, carrying none of the six labels
+  # that render a bullet above, and not already under In Progress (that query
+  # is `loom:building` minus the operator gates, so `loom:blocked`+
+  # `loom:building` is listed there and `loom:operator`+`loom:building` is
+  # not). One cached listing per hold label — `--label` cannot say "any
+  # hold" (gh ANDs labels) — unioned by number. A count, never a
+  # listing: a `## Blocked` section stays rejected (#13908).
+  local bucket_names op_names held_unbucketed_json held_unbucketed
+  bucket_names='["loom:very-important","loom:important","loom:curated","loom:architect","loom:hermit","loom:epic"]'
+  op_names=$(printf '%s' "$op_q" | jq -Rsc 'split("\n") | map(select(length > 0))')
+  held_unbucketed_json="$(
+    printf '%s\n' "$hold_q" | sed '/^loom:frozen$/d' | while IFS= read -r h; do
+      # loom:frozen is excluded: sed above drops it from the hold list (#11743).
+      "$GH_READ" issue list --label "$h" --state open --limit 200 --json number,labels \
+        --jq 'sort_by(.number)'
+    done | jq -s 'add // [] | unique_by(.number)')"
+  held_unbucketed=$(printf '%s' "$held_unbucketed_json" | jq --argjson hold "$hold_names" \
+    --argjson bucket "$bucket_names" --argjson op "$op_names" '[.[] | select(
+      (any(.labels[]?.name; . == "loom:frozen") | not) and
+      any(.labels[]?.name; . as $n | $hold | index($n)) and
+      (any(.labels[]?.name; . as $n | $bucket | index($n)) | not) and
+      ((any(.labels[]?.name; . == "loom:building") | not) or any(.labels[]?.name; . as $n | $op | index($n))))] | length')
+
   section "Operator Attention: Merge-Risk-Hold Pileup" \
     "Judge-approved PRs under a hold (\`loom:blocked\` or \`loom:operator\`) — only a human merge decision is missing." \
     "$held"
@@ -2719,6 +2753,7 @@ render_plan_body() {
     "| Important | $(count "$imp") |" \
     "| Ready (\`loom:issue\`, net of holds/building/open-linked-PRs) | $(count "$ready") |" \
     "| In Progress (\`loom:building\`) | $(count "$building") |" \
+    "| Held, no other bucket | ${held_unbucketed:-0} |" \
     "| PRs awaiting review | $(count "$review") |" \
     "| Approved PRs awaiting merge | $(count "$approved") |" \
     "| Curated | $(count "$curated") |" \
@@ -2755,20 +2790,27 @@ strip_plan_stamp() {
 # per line) so Step 5 can recover them. The file is never staged:
 # stage_docs_paths() / the archive loop add by EXACT path, and
 # docs-worktree.sh's `clean -fd` removes it on the next reset.
-WORK_PLAN_RECEIPT_FILE_NAME=".loom-work-plan-receipt"
+#
+# #15219: every write to and read of that file goes through
+# `loom-daemon guide work-plan-receipt` — never an inline `rm` or `>`
+# redirect. This block is pasted into a Bash tool call verbatim, and a write
+# whose target is built from `$DOCS_WT` (a command-substitution value the
+# guard cannot resolve) is denied before anything executes. The verb owns the
+# file; do not inline the writes back.
 
-# Record outcome $1 (the classification) in the global AND the file. The render
-# hash is read from the global update_work_plan() set earlier in the same call.
+# Record outcome $1 (the classification) in the global AND, through the verb,
+# the receipt file. The render hash is read from the global update_work_plan()
+# set earlier in the same call.
 record_work_plan_receipt() {
   WORK_PLAN_RECEIPT="$1"
-  printf 'receipt=%s\nrender_hash=%s\n' "$WORK_PLAN_RECEIPT" "${WORK_PLAN_RENDER_HASH:-}" \
-    > "$DOCS_WT/$WORK_PLAN_RECEIPT_FILE_NAME" 2>/dev/null || true
+  loom-daemon guide work-plan-receipt record --docs-worktree "$DOCS_WT" \
+    --outcome "$WORK_PLAN_RECEIPT" --render-hash "${WORK_PLAN_RENDER_HASH:-}" 2>/dev/null || true
 }
 
 # Read one key from the receipt file; prints nothing when the file or key is
 # absent. Never `source`d: the file is data, not code.
 read_work_plan_receipt_field() {
-  sed -n "s/^$1=//p" "$DOCS_WT/$WORK_PLAN_RECEIPT_FILE_NAME" 2>/dev/null | head -n1
+  loom-daemon guide work-plan-receipt read --docs-worktree "$DOCS_WT" --field "$1" 2>/dev/null
 }
 
 update_work_plan() {
@@ -2778,14 +2820,16 @@ update_work_plan() {
   if docs_maintenance_skipped WORK_PLAN.md; then
     # #14259: even this early return must not leave a previous tick's receipt
     # file behind to be read as this tick's outcome.
-    rm -f "$DOCS_WT/$WORK_PLAN_RECEIPT_FILE_NAME"
+    loom-daemon guide work-plan-receipt reset --docs-worktree "$DOCS_WT" 2>/dev/null || true
     echo "WORK_PLAN.md is listed in guide.docsMaintenance.skipDocs — skipping (no create, no update)."
     return 1
   fi
 
   # #14259: drop any receipt left by a previous tick before this tick's gates
   # run, so every path below either records a fresh receipt or leaves none.
-  rm -f "$DOCS_WT/$WORK_PLAN_RECEIPT_FILE_NAME"
+  # (#15219: the reset lives in the verb — an inline `rm` on the
+  # variable-built `$DOCS_WT` path is denied by the default guard.)
+  loom-daemon guide work-plan-receipt reset --docs-worktree "$DOCS_WT" 2>/dev/null || true
 
   # Change detection: compare the freshly-rendered body against the body already
   # committed between the markers. No gitignored side-car (which resets to "" on
@@ -2892,11 +2936,15 @@ update_work_plan() {
   # either — a hand-written timestamp freezes at typing time and then asserts
   # a specific wrong time; it appears only on the next genuine generation.
   #
-  # #13923 SCRATCH DISCIPLINE: splice via `splice_plan_body`, which
-  # uses a per-tick `mktemp -d` dir. NEVER stage the body or the spliced file at
-  # a literal repo-independent path (`/tmp/body.md`, `/tmp/plan.new`): sibling
-  # repos' ticks share /tmp, and a tick whose own write was denied then consumes
-  # another repo's stale file. Never read a scratch file this tick did not write.
+  # #13923 SCRATCH DISCIPLINE: splice via `splice_plan_body`, which hands the
+  # body to `loom-daemon guide work-plan-splice` — the verb stages its scratch
+  # inside the docs worktree and replaces the region atomically. NEVER stage
+  # the body or the spliced file at a literal repo-independent path
+  # (`/tmp/body.md`, `/tmp/plan.new`): sibling repos' ticks share /tmp, and a
+  # tick whose own write was denied then consumes another repo's stale file.
+  # Never read a scratch file this tick did not write. (#15219: the splice
+  # lives in the verb precisely because the inline mktemp/rm/redirect shapes
+  # were denied by the default guard before they could execute.)
   # A failed splice must not leave a stale receipt implying a write happened;
   # classify it too (#14204).
   stamp="$(plan_stamp_line)"
@@ -2989,22 +3037,16 @@ verify_plan_provenance() {
 }
 
 # #13923: write $1 between the plan-body markers of "$DOCS_WT/WORK_PLAN.md"
-# through a per-tick scratch dir that is removed before returning (explicitly,
-# not via `trap ... RETURN`, which is bash-only and leaks the dir under zsh).
-# Fails (file untouched) if the markers are missing.
+# through `loom-daemon guide work-plan-splice` (body on stdin). The verb owns
+# the scratch file and the atomic replace, refuses with the file untouched
+# when either marker is missing, and leaves nothing behind on success or
+# failure. A thin wrapper so the call site in update_work_plan() is unchanged;
+# the awk splice semantics it replaces live in the verb
+# (loom-daemon/src/cli/guide_work_plan.rs) — #15219 moved it out of the pasted
+# block because its inline mktemp/rm/redirect shapes were denied by the
+# default guard before execution.
 splice_plan_body() {
-  local plan="$DOCS_WT/WORK_PLAN.md" scratch rc=0
-  grep -q '<!-- guide:plan-body:start -->' "$plan" 2>/dev/null \
-    && grep -q '<!-- guide:plan-body:end -->' "$plan" 2>/dev/null || return 1
-  scratch="$(mktemp -d "${TMPDIR:-/tmp}/guide-plan.XXXXXX")" || return 1
-  printf '%s\n' "$1" > "$scratch/body.md" \
-    && awk -v body="$scratch/body.md" '
-      /<!-- guide:plan-body:start -->/ { print; while ((getline l < body) > 0) print l; skip=1; next }
-      /<!-- guide:plan-body:end -->/   { skip=0 }
-      !skip { print }' "$plan" > "$scratch/plan.new" \
-    && cat "$scratch/plan.new" > "$plan" || rc=1
-  rm -rf "$scratch"
-  return "$rc"
+  printf '%s\n' "$1" | loom-daemon guide work-plan-splice --docs-worktree "$DOCS_WT"
 }
 ```
 
@@ -3019,7 +3061,12 @@ outcome for Step 5 in two globals — machine-recorded state, never prose — an
 mirrors both into `$DOCS_WT/.loom-work-plan-receipt` (`receipt=` and
 `render_hash=` lines) through `record_work_plan_receipt`, because shell globals
 do not survive when Step 3 and Step 5 run as separate shell invocations (the
-usual shape for an LLM-driven multi-step bash phase). `WORK_PLAN_RECEIPT` is the
+usual shape for an LLM-driven multi-step bash phase). The file itself is owned
+by `loom-daemon guide work-plan-receipt` (#15219): the wrapper functions call
+the verb's `record` / `read` / `reset` subcommands with the literal
+`--docs-worktree` path, because the inline `rm` and `>` shapes on the
+variable-built `$DOCS_WT` path are denied by the default guard before they
+execute. `WORK_PLAN_RECEIPT` is the
 outcome classification: `written`, `current`, `debounced (elapsed <X>s <
 window <Y>s)`, `provenance-refused`, `inventory-unreadable` (#14785: the
 open-PR inventory read failed, so the render's Ready filter is
@@ -3028,7 +3075,7 @@ splice that failed —
 leaving a stale value there would read as a write that never happened).
 `WORK_PLAN_RENDER_HASH` is the first 12 hex of the rendered body's sha256, so
 the PR body can identify *which* render an outcome refers to. The function
-deletes the file on entry, before any early return (the `skipDocs` one
+resets the file on entry, before any early return (the `skipDocs` one
 included), so a previous tick's file can never be read as this tick's outcome;
 the file is never staged (staging is by exact path, and the docs worktree reset
 removes it). Initialize `WORK_PLAN_RECEIPT="NOT RUN"` before calling the

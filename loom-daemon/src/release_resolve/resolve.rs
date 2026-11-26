@@ -909,43 +909,18 @@ fn fetch_published_at(tag: &str, repo: &str, root: &Path) -> Result<String, Read
     .map(|p| p.published_at)
 }
 
-/// The `gh release download` of the checksum asset (`release.checksum`).
+/// A checksum read (`release.checksum` / `release.checksum_lookup`).
 ///
-/// Gateway-exempt (#15134): releases never use the forge gateway, so this read
-/// goes straight to the reader pool. Offered to the gateway, the relay refuses
-/// it, the refusal classifies as `Failure::Credential`, and that withdraws the
-/// gateway for the whole owner for `CREDENTIAL_WITHDRAWAL` — every
-/// gateway-eligible read of the owner then falls back to a reader App for about
-/// five minutes of each 15-minute auto-update cycle.
-fn checksum_invocation(
-    tag: &str,
-    repo: &str,
-    sha_name: &str,
-    root: &Path,
-    dir: &str,
-) -> GhInvocation {
-    GhInvocation::new(
-        Operation::new("release.checksum"),
-        AccessIntent::Read,
-        GhTarget::repo(repo).unwrap_or(GhTarget::None),
-        GH_TIMEOUT,
-    )
-    .program(crate::gh_invocation::gh_bin())
-    .current_dir(root)
-    .args([
-        "release",
-        "download",
-        tag,
-        "-R",
-        repo,
-        "-p",
-        sha_name,
-        "-D",
-        dir,
-        "--clobber",
-    ])
-    .reader_only()
-    .gateway_exempt()
+/// Gateway-exempt (#15134): releases never use the forge gateway, so these
+/// reads go straight to the reader pool. Offered to the gateway, the relay
+/// refuses them, the refusal classifies as `Failure::Credential`, and that
+/// withdraws the gateway for the whole owner for `CREDENTIAL_WITHDRAWAL`.
+fn checksum_read(op: &'static str, target: GhTarget, root: &Path) -> GhInvocation {
+    GhInvocation::new(Operation::new(op), AccessIntent::Read, target, GH_TIMEOUT)
+        .program(crate::gh_invocation::gh_bin())
+        .current_dir(root)
+        .reader_only()
+        .gateway_exempt()
 }
 
 /// The published sha256 for this platform's binary, read from the release's own
@@ -956,34 +931,78 @@ fn checksum_invocation(
 /// detect "same version, different bytes": a host that built this version from
 /// source before the release existed.
 fn fetch_asset_sha256(tag: &str, repo: &str, sha_name: &str, root: &Path) -> Option<String> {
-    // A scratch directory of our own, removed before returning on every path —
-    // the shell's `mktemp -d` plus its `_cleanup_fetch_tmpdirs` trap. Resolution
-    // runs on every tick, so a leaked directory per tick is a real leak.
-    let dir = std::env::temp_dir().join(format!(
-        "loom-daemon-resolve-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0)
-    ));
-    std::fs::create_dir_all(&dir).ok()?;
-    let digest = (|| {
-        let dir_str = dir.to_str()?;
-        let out = checksum_invocation(tag, repo, sha_name, root, dir_str).run();
-        if !out.succeeded() {
-            return None;
-        }
-        let text = std::fs::read_to_string(dir.join(sha_name)).ok()?;
-        // `awk 'NR==1{print $1}'` — first field of the first line.
-        text.lines()
-            .next()?
-            .split_whitespace()
-            .next()
-            .map(str::to_string)
-    })();
-    let _ = std::fs::remove_dir_all(&dir);
-    digest
+    #[derive(Deserialize)]
+    struct ChecksumAsset {
+        id: u64,
+        name: String,
+    }
+    #[derive(Deserialize)]
+    struct Release {
+        assets: Vec<ChecksumAsset>,
+    }
+
+    // Look up the asset's numeric ID and fetch it with `gh api --include`
+    // rather than `gh release download`. The asset request is redirected to
+    // asset storage on another host, where `gh` drops the `Authorization`
+    // header. `--include` exposes the final response's status and headers,
+    // which `gh release download` hides. `checksum_retry::is_asset_refusal` uses
+    // them to tell a refusal from storage (no `x-github-request-id`) apart
+    // from a GitHub API refusal (which carries one). The relative path does
+    // not change which API host the reader credential reaches.
+    let target = GhTarget::repo(repo).ok()?;
+    let GhTarget::Repo { owner, repo: name } = &target else {
+        return None;
+    };
+    let (releases, tag_lookup) = checksum_paths(owner, name, tag)?;
+    let Query::Populated(release) = decode_json::<Release, _>(
+        checksum_read("release.checksum_lookup", target.clone(), root)
+            .args(["api", &tag_lookup])
+            .run(),
+        |_| false,
+    ) else {
+        return None;
+    };
+    let id = release
+        .assets
+        .into_iter()
+        .find(|asset| asset.name == sha_name && asset.id > 0)?
+        .id;
+    let asset_path = format!("{releases}/assets/{id}");
+    let out = checksum_read("release.checksum", target, root)
+        .args([
+            "api",
+            &asset_path,
+            "--include",
+            "-H",
+            "Accept: application/octet-stream",
+        ])
+        .run();
+    let parsed = crate::forge_listing::parse_http_response(&String::from_utf8_lossy(
+        &out.ok_output()?.stdout,
+    ))?;
+    checksum_digest(&parsed.body).map(str::to_string)
+}
+
+fn checksum_paths(owner: &str, repo: &str, tag: &str) -> Option<(String, String)> {
+    if [owner, repo, tag]
+        .iter()
+        .any(|part| matches!(*part, "." | ".."))
+    {
+        return None;
+    }
+    let mut url = reqwest::Url::parse("https://api.github.com/").ok()?;
+    url.path_segments_mut()
+        .ok()?
+        .pop_if_empty()
+        .extend(["repos", owner, repo, "releases"]);
+    let releases = url.path().strip_prefix('/')?.to_string();
+    url.path_segments_mut().ok()?.extend(["tags", tag]);
+    Some((releases, url.path().strip_prefix('/')?.to_string()))
+}
+
+fn checksum_digest(body: &str) -> Option<&str> {
+    let digest = body.lines().next()?.split_whitespace().next()?;
+    (digest.len() == 64 && digest.bytes().all(|b| b.is_ascii_hexdigit())).then_some(digest)
 }
 
 /// The installed binary's version and commit, from its own `--version`.

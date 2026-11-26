@@ -379,6 +379,21 @@ impl SweepRegistryConfig {
             .exists()
     }
 
+    /// An old installed prompt may never pass the strict worktree argument.
+    /// Refuse the Builder dispatch before its claim in such a workspace.
+    fn check_builder_worktree(
+        &self,
+    ) -> Result<(), crate::workspace_hold::WorkspaceHeldDispatchError> {
+        crate::install_compat::require_builder_worktree(
+            &self.workspace_root.join(".loom/scripts/worktree.sh"),
+        )
+        .map_err(|detail| crate::workspace_hold::WorkspaceHeldDispatchError {
+            workspace: self.workspace_root.clone(),
+            kind: crate::workspace_hold::HoldKind::InstallIncompatible,
+            detail,
+        })
+    }
+
     /// The workspace file holding `role`'s slash command (`/loom:<role>`).
     #[must_use]
     pub fn role_command_path(&self, role: crate::step_role::StepRole) -> PathBuf {

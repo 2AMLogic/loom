@@ -29,7 +29,10 @@
 //! exit 64 before any handler runs.
 //!
 //! `champion-hold`, `curation-complete` and `notify-cleared-blockers` (#14465, §13.9)
-//! apply the same mode gate. Workflow writes require the local route and scoped forge access.
+//! apply the same mode gate. On the local route the workflow writes run on the
+//! caller's scoped `gh` credential; on the fleet route they go to the scoped
+//! curation-write broker (`complete_curation`, `notify_cleared_blocker`),
+//! never an ambient credential, with no local fallback on broker failure.
 //!
 //! `gateway refresh|status|clean` (#14884) is the session-mode gateway
 //! publisher: a daemon-free pass of the same profile publisher the daemon's
@@ -386,14 +389,17 @@ fn mode_gate() -> Result<()> {
     tools_mode::configure_forge_reads(&cwd).map_err(anyhow::Error::msg)
 }
 
-/// The fleet broker's role profile has no label or comment operations.
-/// Never run these mutations on an ambient gh credential in fleet mode.
-fn workflow_gate(root: &std::path::Path, writes: bool) -> Result<()> {
+/// Resolve mode and adopt the read routing for a workflow command. `writes`
+/// names whether the invocation mutates: only then is a conflicting mode
+/// tier a refusal. Returns whether the fleet route was chosen — the caller
+/// then routes its writes to the scoped curation broker (#14465) instead of
+/// an ambient `gh` credential.
+fn workflow_gate(root: &std::path::Path, writes: bool) -> Result<bool> {
     let checkout = loom_daemon::repo_root::find_repo_root(root);
     check_workflow_route(checkout.as_deref().unwrap_or(root), writes)
 }
 
-fn check_workflow_route(root: &std::path::Path, writes: bool) -> Result<()> {
+fn check_workflow_route(root: &std::path::Path, writes: bool) -> Result<bool> {
     if writes
         && loom_daemon::config_resolver::tier_conflicts(root)
             .iter()
@@ -406,13 +412,20 @@ fn check_workflow_route(root: &std::path::Path, writes: bool) -> Result<()> {
     if tools_mode::configure_forge_reads_with_route(root).map_err(anyhow::Error::msg)?
         == Route::Fleet
     {
-        anyhow::ensure!(!writes, "the scoped fleet write broker does not authorize workflow label edits or blocker comments");
         anyhow::ensure!(
             loom_daemon::forge_gateway::cli_reads_reader_only(),
             "no usable fleet read route"
         );
+        return Ok(true);
     }
-    Ok(())
+    Ok(false)
+}
+
+/// The fleet curation-write broker handle (#14465): resolved before any
+/// forge read, so a missing caller key is the actionable error and nothing
+/// else runs.
+fn curation_broker() -> Result<loom_daemon::fleet_curation_broker::Broker> {
+    loom_daemon::fleet_curation_broker::Broker::resolve_from_env().map_err(anyhow::Error::msg)
 }
 
 /// `apply --new` files through `create-issue.sh`, which calls `$LOOM_DAEMON_BIN
@@ -455,15 +468,25 @@ fn run() -> Result<()> {
             handle_forge_read_command(cli)
         }
         ToolsCommands::ChampionHold(cmd) => {
-            cmd.run_with_gate(|root| check_workflow_route(root, false))
+            cmd.run_with_gate(|root| check_workflow_route(root, false).map(|_| ()))
         }
         ToolsCommands::CurationComplete(args) => {
-            workflow_gate(&args.workspace_root, true)?;
-            args.run()
+            if workflow_gate(&args.workspace_root, true)? {
+                args.run_fleet(&curation_broker()?)
+            } else {
+                args.run()
+            }
         }
         ToolsCommands::NotifyClearedBlockers(args) => {
-            workflow_gate(args.repo_root.as_deref().unwrap_or(&cwd), !args.dry_run)?;
-            args.run()
+            let root = args.repo_root.clone().unwrap_or_else(|| cwd.clone());
+            // One gate call: its notes and env side effects happen once. A
+            // dry run evaluates it with `writes = false`, so a preview is
+            // never refused, and never takes the broker route (#15260).
+            if workflow_gate(&root, !args.dry_run)? && !args.dry_run {
+                args.run_fleet(&curation_broker()?)
+            } else {
+                args.run()
+            }
         }
         ToolsCommands::ParkRecord(cli) => handle_park_record_command(cli),
         ToolsCommands::OperatorDecision(cli) => {

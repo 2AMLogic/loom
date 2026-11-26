@@ -272,6 +272,14 @@ impl SessionEnv {
         use super::lease_co_occupancy::read_rows;
         let gh_bin = PathBuf::from(std::env::var("LOOM_GH_BIN").unwrap_or_else(|_| "gh".into()));
         let root = PathBuf::from(&args.workspace);
+        // #14941: this read is `gh`-backed, and `gh` cannot reach a Gitea
+        // forge. Leaving `lease_rows` unset is the documented fail-open answer
+        // (publish decides as before): `sweep-lease-publish.sh` lists the
+        // comments through the Gitea API itself and reuses its own fresh lease,
+        // so no `gh` call is made on a Gitea checkout.
+        if crate::forge_cmd::detect_forge(Some(&root)) == crate::forge_cmd::ForgeType::Gitea {
+            return self;
+        }
         let policy = crate::comment_trust::TrustPolicy::for_root(&root);
         self.lease_rows =
             read_rows(&gh_bin, &root, args.issue, std::time::Duration::from_secs(10), &policy);

@@ -27,15 +27,15 @@ use std::process::Command;
 /// The oldest installed Loom (`install-metadata.json` `loom_version`) this
 /// daemon works with.
 ///
-/// 0.20.29 is the next-patch floor for #14376: native Builder prelaunch
-/// requires installed worktree/publisher scripts that enforce strict ownership.
-/// Older scripts ignore the Builder admission marker and fail open.
+/// 0.19.175 is the first release whose installed watchdog delegates to
+/// `loom-daemon daemon-watchdog`. The 0.19.174 watchdog still calls the
+/// retired `peer-claims` subcommand.
 ///
-/// `ci-daily.yml` (`Compatibility Floor`) tests the oldest numeric release tag
-/// at or above this floor and at or below VERSION. Only a prospective next-patch
-/// floor may use current installed files until its release exists; a missing
-/// tag for an already-reached floor fails closed. See `release-cadence.md`.
-pub const SUPPORTS_INSTALLED: &str = "0.20.29";
+/// It must name a release tag. `ci-daily.yml` (`Compatibility Floor`) runs
+/// that release's installed files against today's daemon every day (#10868).
+/// If that fails, raise this to the oldest release that passes, or restore
+/// what the old files need (`defaults/docs/release-cadence.md`).
+pub const SUPPORTS_INSTALLED: &str = "0.19.175";
 
 /// The oldest daemon the installed files this release ships work with. The
 /// install-metadata writers record it as `requires_daemon`.
@@ -51,16 +51,33 @@ pub const SUPPORTS_INSTALLED: &str = "0.20.29";
 /// 0.19.1312 is the first release with the `resolve-role-model` subcommand
 /// (#13956; 0.19.1311 was cut before the merge and lacks it), called by the
 /// `resolve-role-model.sh` script-helper, whose hard
-/// floor is the same release.
-/// 0.20.29 is the next-patch floor for strict `lease ensure --require-ownership`
-/// (#14376), required by fresh Builder worktree admission. 0.20.20 was
-/// assigned before this flag. The daemon and installed scripts therefore
-/// declare the next patch while they await their first release together.
+/// floor is the same release. 0.20.5 is the first release after this change
+/// merges (#14371; `v0.20.4` was published from a `main` without it): the first
+/// with `session-exec claude-seat`, called by `spawn-claude.sh` for an adopted
+/// Claude seat, whose hard floor is the same.
 ///
 /// Keep this on one line in exactly this shape: the installer
 /// (`scripts/install/loom-source-path.sh`) reads it from this file with
 /// `sed`, because the tree it installs can be newer than any binary it has.
-pub const REQUIRES_DAEMON: &str = "0.20.29";
+pub const REQUIRES_DAEMON: &str = "0.20.5";
+
+/// Installed scripts advertise this contract so a daemon can reject an old
+/// Builder recipe and helper before dispatch, without executing workspace code.
+pub(crate) const STRICT_BUILDER_CAPABILITY: &str = "# loom:capability strict-builder-ownership";
+
+pub(crate) fn require_builder_worktree(script: &Path) -> Result<(), String> {
+    let source = std::fs::read_to_string(script).map_err(|err| {
+        format!("cannot read Builder worktree helper {}: {err}", script.display())
+    })?;
+    if source.lines().any(|line| line == STRICT_BUILDER_CAPABILITY) {
+        Ok(())
+    } else {
+        Err(format!(
+            "{} lacks strict Builder ownership support; resync the installed Loom scripts before dispatch",
+            script.display()
+        ))
+    }
+}
 
 // compat:invoked-files:begin
 /// The installed files this daemon executes in a workspace. An installed tree
@@ -438,6 +455,7 @@ pub const TOOLS_COMMANDS: &[&str] = &[
     "forge verdict-stale-notice",
     "forge verdict-body-check",
     "forge workflow-write-all-check",
+    "forge workflow-secrets-check",
     "forge verdict-gate",
     "forge may-write",
     "forge calls",

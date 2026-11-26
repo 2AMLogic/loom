@@ -13,10 +13,6 @@
 //!   Otherwise every `loom-daemon <sub>` its installed shell calls must exist
 //!   in the new daemon, and every file the new daemon executes must exist in
 //!   its installed tree.
-//!   `--oldest-installed` instead tests the oldest numeric release tag at or
-//!   above `SUPPORTS_INSTALLED` and at or below `VERSION`. With no eligible tag,
-//!   only a next-patch floor may check current files as a prospective stand-in;
-//!   an already-reached floor with no tag is an error, never a skipped proof.
 //! * **B: the new installed files against the oldest daemon `REQUIRES_DAEMON`
 //!   claims.** Same two checks the other way round, against a release binary.
 //!   That binary is the OLDEST PUBLISHED release at or above `REQUIRES_DAEMON`,
@@ -78,17 +74,12 @@ pub struct CheckOptions {
     /// The checkout whose `defaults/` are the new installed files and whose
     /// tags name the releases.
     pub repo_root: PathBuf,
-    /// Base branch tip for checking a new strict Builder contract before merge.
-    pub base_ref: Option<String>,
     /// The new daemon (built from `repo_root`).
     pub new_daemon: PathBuf,
     /// Where direction B's old daemon comes from.
     pub old_daemon: OldDaemon,
     /// The previous release, as a git ref. `None` resolves it from the tags.
     pub prev_ref: Option<String>,
-    /// Test the oldest eligible installed release rather than the adjacent one.
-    /// Mutually exclusive with `prev_ref`.
-    pub oldest_installed: bool,
     /// The new daemon's `SUPPORTS_INSTALLED` claim.
     pub supports_installed: Version,
     /// The new installed files' `REQUIRES_DAEMON` claim.
@@ -240,10 +231,6 @@ pub fn run(opts: &CheckOptions) -> Result<Report> {
         opts.supports_installed, opts.requires_daemon
     ));
 
-    if let Some(base) = &opts.base_ref {
-        check_builder_release_boundary(opts, base, &mut report)?;
-    }
-
     let new_tree = opts.repo_root.join("defaults");
     let new_scripts = installed_shell_files(&new_tree)?;
     check_claims(opts, ships_as, &new_tree, &new_scripts, &mut report);
@@ -252,61 +239,6 @@ pub fn run(opts: &CheckOptions) -> Result<Report> {
     direction_a(opts, version, &mut probe, &mut report)?;
     direction_b(opts, &new_tree, &new_scripts, &mut probe, &mut report)?;
     Ok(report)
-}
-
-/// A floor that was prospective at review can name an incompatible release by
-/// merge time. Compare with the event's actual base, even if it has no tag yet.
-fn check_builder_release_boundary(
-    opts: &CheckOptions,
-    base: &str,
-    report: &mut Report,
-) -> Result<()> {
-    const WORKTREE: &str = "defaults/scripts/worktree.sh";
-    let base_file = |path: &str| -> Result<String> {
-        let spec = format!("{base}:{path}");
-        let out = crate::git_utils::git_run(&opts.repo_root, &["cat-file", "blob", &spec])?;
-        anyhow::ensure!(
-            out.status.success(),
-            "could not read {spec}: {}",
-            String::from_utf8_lossy(&out.stderr)
-        );
-        Ok(String::from_utf8(out.stdout)?)
-    };
-
-    // Once strict admission is on the base, later release bumps leave its
-    // introduction floor alone. Read the capability independently of its marker.
-    if base_file(WORKTREE)?.lines().any(|line| {
-        !line.trim_start().starts_with('#')
-            && line.contains("lease ensure")
-            && line.contains("--require-ownership")
-    }) {
-        return Ok(());
-    }
-    let version = Version::parse(&base_file("VERSION")?).context("invalid base VERSION")?;
-    let expected = version.next_patch();
-    // Git refuses a concurrent release's edit to this adjacent version line,
-    // including when green PR checks were recorded before the release.
-    let manifest = std::fs::read_to_string(opts.repo_root.join("Cargo.toml"))?;
-    let boundary = format!(
-        "\n# First release with strict Builder ownership: {expected}\nversion = \"{version}\"\n"
-    );
-    if !manifest.contains(&boundary) {
-        report.violations.push(format!("keep the strict Builder release boundary for {expected} directly above workspace.package.version {version} in Cargo.toml"));
-    }
-    let script = std::fs::read_to_string(opts.repo_root.join(WORKTREE))?;
-    let lease_floors: Vec<_> = hard_floors(&script)
-        .into_iter()
-        .filter_map(|(sub, floor)| (sub == "lease").then_some(floor))
-        .collect();
-    if opts.supports_installed != expected
-        || opts.requires_daemon != expected
-        || lease_floors != [expected]
-    {
-        report.violations.push(format!(
-            "strict Builder ownership first ships after base VERSION {version}: set SUPPORTS_INSTALLED, REQUIRES_DAEMON and {WORKTREE}'s lease floor to {expected}"
-        ));
-    }
-    Ok(())
 }
 
 fn check_claims(
@@ -366,42 +298,9 @@ fn direction_a(
     probe: &mut Probe,
     report: &mut Report,
 ) -> Result<()> {
-    let prev_ref = if opts.oldest_installed {
-        anyhow::ensure!(opts.prev_ref.is_none(), "--oldest-installed conflicts with --prev-ref");
-        match tags_at_or_above(&release_tags(&opts.repo_root)?, opts.supports_installed)
-            .into_iter()
-            .find(|(v, _)| *v <= version)
-        {
-            Some((_, tag)) => tag,
-            None => {
-                anyhow::ensure!(
-                    opts.supports_installed == version.next_patch(),
-                    "no eligible installed release tag at or above SUPPORTS_INSTALLED {} and \
-                     at or below VERSION {version}; fetch the release tags. A prospective \
-                     current-files stand-in is permitted only for next patch {}",
-                    opts.supports_installed,
-                    version.next_patch()
-                );
-                report.notes.push(format!(
-                    "A: prospective SUPPORTS_INSTALLED {}; no eligible release tag through \
-                     VERSION {version}. Current installed files stand in; this does not prove \
-                     compatibility with an absent release",
-                    opts.supports_installed
-                ));
-                return check_installed_tree(
-                    opts,
-                    &opts.repo_root.join("defaults"),
-                    "A (prospective current installed files vs new daemon)",
-                    probe,
-                    report,
-                );
-            }
-        }
-    } else {
-        match &opts.prev_ref {
-            Some(r) => r.clone(),
-            None => newest_tag_at_or_below(&opts.repo_root, version)?,
-        }
+    let prev_ref = match &opts.prev_ref {
+        Some(r) => r.clone(),
+        None => newest_tag_at_or_below(&opts.repo_root, version)?,
     };
     let prev = Version::parse(&prev_ref)
         .ok_or_else(|| anyhow!("previous release ref {prev_ref} is not a version tag"))?;
@@ -417,22 +316,12 @@ fn direction_a(
         .tempdir()?;
     extract_defaults(&opts.repo_root, &prev_ref, scratch.path())?;
     let prev_tree = scratch.path().join("defaults");
+    let scripts = installed_shell_files(&prev_tree)?;
     let label = format!("A ({prev_ref} installed files vs new daemon)");
-    check_installed_tree(opts, &prev_tree, &label, probe, report)
-}
-
-fn check_installed_tree(
-    opts: &CheckOptions,
-    tree: &Path,
-    label: &str,
-    probe: &mut Probe,
-    report: &mut Report,
-) -> Result<()> {
-    let scripts = installed_shell_files(tree)?;
     let gaps = probe.missing_subcommands(&opts.repo_root, &opts.new_daemon, &scripts)?;
-    record_gaps(label, &opts.new_daemon, &gaps, tree, report);
-    record_absent_files(label, &opts.invoked_files, tree, report);
-    report.notes.push(gaps.summary(label, scripts.len()));
+    record_gaps(&label, &opts.new_daemon, &gaps, &prev_tree, report);
+    record_absent_files(&label, &opts.invoked_files, &prev_tree, report);
+    report.notes.push(gaps.summary(&label, scripts.len()));
     Ok(())
 }
 

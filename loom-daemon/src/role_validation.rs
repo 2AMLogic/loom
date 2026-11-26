@@ -28,10 +28,11 @@
 //! # Usage
 //!
 //! ```ignore
-//! use loom_daemon::role_validation::{validate_role_completeness, ValidationMode};
+//! use loom_daemon::role_validation::{validate_from_config, ValidationMode};
 //!
-//! let config_json = r#"{"terminals": [...]}"#;
-//! let result = validate_role_completeness(config_json, ValidationMode::Warn);
+//! // `config` is the effective config resolved through the tier chain
+//! // (`config_resolver::resolve_effective_config`), a `serde_json::Value`.
+//! let result = validate_from_config(&config, ValidationMode::Warn);
 //!
 //! for warning in &result.warnings {
 //!     println!("Warning: {} -> {}: {}",
@@ -152,23 +153,12 @@ struct RoleConfig {
     role_file: Option<String>,
 }
 
-/// Extract role names from a config JSON string
-///
-/// Parses the config and extracts role names from terminal configurations.
-/// Role names are derived from roleFile values (e.g., "judge.md" -> "judge").
-pub fn extract_roles_from_config(config_json: &str) -> Result<Vec<String>, String> {
-    let config: serde_json::Value =
-        serde_json::from_str(config_json).map_err(|e| format!("Failed to parse config: {e}"))?;
-    extract_roles_from_value(&config)
-}
-
 /// Extract role names from an already-resolved config `Value` (#4059).
 ///
-/// The `Value`-based sibling of [`extract_roles_from_config`]: the validate
-/// command now resolves the effective config through the tier chain
+/// The validate command resolves the effective config through the tier chain
 /// (`config_resolver::resolve_effective_config`) and hands the resulting
-/// `serde_json::Value` here directly, rather than round-tripping through a file
-/// read + string parse.
+/// `serde_json::Value` here directly. Role names are derived from `roleFile`
+/// values (e.g., "judge.md" -> "judge").
 pub fn extract_roles_from_value(config: &serde_json::Value) -> Result<Vec<String>, String> {
     let config: LoomConfig = serde_json::from_value(config.clone())
         .map_err(|e| format!("Failed to parse config: {e}"))?;
@@ -227,43 +217,11 @@ pub fn resolve_role_file_for_terminal_id(
     (!role_name.is_empty()).then_some(role_name)
 }
 
-/// Validate that all role dependencies are satisfied
-///
-/// # Arguments
-///
-/// * `config_json` - JSON string containing the Loom config
-/// * `mode` - Validation mode (Ignore, Warn, or Strict)
-///
-/// # Returns
-///
-/// Validation result with any warnings or errors found
-pub fn validate_role_completeness(config_json: &str, mode: ValidationMode) -> ValidationResult {
-    if mode == ValidationMode::Ignore {
-        return ValidationResult {
-            valid: true,
-            configured_roles: Vec::new(),
-            warnings: Vec::new(),
-            errors: Vec::new(),
-        };
-    }
-
-    match extract_roles_from_config(config_json) {
-        Ok(roles) => check_role_dependencies(roles),
-        Err(e) => ValidationResult {
-            valid: false,
-            configured_roles: Vec::new(),
-            warnings: Vec::new(),
-            errors: vec![e],
-        },
-    }
-}
-
 /// Validate role completeness from an already-resolved config `Value` (#4059).
 ///
-/// The `Value`-based entry point used by `handle_validate_command` after it
-/// resolves the effective config through the tier chain. Behaviorally identical
-/// to [`validate_role_completeness`]; it just skips the file-read + string-parse
-/// round-trip.
+/// The entry point used by `handle_validate_command` after it resolves the
+/// effective config through the tier chain. Checks that every configured
+/// role's dependencies are satisfied (see the module docs).
 ///
 /// Also proactively checks the config's `runtimes.roles` map (#5006) using the
 /// same fail-closed rules `runtime_admission::config_runtime` already enforces
@@ -313,6 +271,15 @@ pub fn validate_from_config(config: &serde_json::Value, mode: ValidationMode) ->
     if !excluded_errors.is_empty() {
         result.valid = false;
         result.errors.extend(excluded_errors);
+    }
+
+    // #15252: `runtimes.modelProfileOverrides` may only overlay bundled
+    // profiles with model/effort/allowedEfforts/excludedRolesAdd.
+    let override_errors =
+        crate::worker_spawn::profiles::check_model_profile_overrides_config(config);
+    if !override_errors.is_empty() {
+        result.valid = false;
+        result.errors.extend(override_errors);
     }
 
     let escalation_errors = crate::doctor_escalation::check_config(config);
@@ -389,8 +356,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_extract_roles_from_config() {
-        let config = r#"{
+    fn test_extract_roles_from_value() {
+        let config = serde_json::json!({
             "terminals": [
                 {
                     "id": "terminal-1",
@@ -407,10 +374,17 @@ mod tests {
                     }
                 }
             ]
-        }"#;
+        });
 
-        let roles = extract_roles_from_config(config).unwrap();
+        let roles = extract_roles_from_value(&config).unwrap();
         assert_eq!(roles, vec!["builder", "judge"]);
+    }
+
+    #[test]
+    fn test_extract_roles_from_value_malformed_terminals_errors() {
+        let config = serde_json::json!({"terminals": "not-an-array"});
+        let err = extract_roles_from_value(&config).unwrap_err();
+        assert!(err.starts_with("Failed to parse config:"), "{err}");
     }
 
     // ===== resolve_role_file_for_terminal_id (#6128) =====
@@ -494,7 +468,7 @@ mod tests {
 
     #[test]
     fn test_validate_missing_doctor() {
-        let config = r#"{
+        let config = serde_json::json!({
             "terminals": [
                 {
                     "id": "terminal-1",
@@ -511,9 +485,9 @@ mod tests {
                     }
                 }
             ]
-        }"#;
+        });
 
-        let result = validate_role_completeness(config, ValidationMode::Warn);
+        let result = validate_from_config(&config, ValidationMode::Warn);
 
         assert!(result.valid);
         assert!(!result.warnings.is_empty());
@@ -529,7 +503,7 @@ mod tests {
 
     #[test]
     fn test_validate_all_dependencies_satisfied() {
-        let config = r#"{
+        let config = serde_json::json!({
             "terminals": [
                 {"roleConfig": {"roleFile": "judge.md"}},
                 {"roleConfig": {"roleFile": "champion.md"}},
@@ -537,9 +511,9 @@ mod tests {
                 {"roleConfig": {"roleFile": "builder.md"}},
                 {"roleConfig": {"roleFile": "curator.md"}}
             ]
-        }"#;
+        });
 
-        let result = validate_role_completeness(config, ValidationMode::Warn);
+        let result = validate_from_config(&config, ValidationMode::Warn);
 
         assert!(result.valid);
         assert!(result.warnings.is_empty());
@@ -547,29 +521,13 @@ mod tests {
 
     #[test]
     fn test_validate_ignore_mode() {
-        let config = r#"{"terminals": []}"#;
+        let config = serde_json::json!({"terminals": []});
 
-        let result = validate_role_completeness(config, ValidationMode::Ignore);
+        let result = validate_from_config(&config, ValidationMode::Ignore);
 
         assert!(result.valid);
         assert!(result.configured_roles.is_empty());
         assert!(result.warnings.is_empty());
-    }
-
-    /// #4059: `validate_from_config` accepts an already-resolved `Value` and is
-    /// behaviorally identical to the string-based path.
-    #[test]
-    fn test_validate_from_config_value() {
-        let config = serde_json::json!({
-            "terminals": [
-                {"roleConfig": {"roleFile": "judge.md"}},
-                {"roleConfig": {"roleFile": "champion.md"}},
-            ]
-        });
-        let result = validate_from_config(&config, ValidationMode::Warn);
-        assert!(result.valid);
-        // judge and champion both depend on doctor, which is absent.
-        assert!(!result.warnings.is_empty());
     }
 
     /// #4059 end-to-end (minus `process::exit`): a repo whose terminals come
@@ -686,5 +644,32 @@ mod tests {
         assert!(output.contains("ROLE CONFIGURATION WARNINGS"));
         assert!(output.contains("CHAMPION"));
         assert!(output.contains("DOCTOR"));
+    }
+
+    /// #15252: `loom-daemon validate` surfaces every bad modelProfileOverrides entry.
+    #[test]
+    fn validate_flags_bad_model_profile_overrides() {
+        let bad = serde_json::json!({"terminals": [], "runtimes": {"modelProfileOverrides": {
+            "zai-full": {"model": "glm-5.4", "excludedRoles": [], "billing": "api"},
+            "nope": {"model": "x"}
+        }}});
+        let result = validate_from_config(&bad, ValidationMode::Warn);
+        assert!(!result.valid);
+        let text = result.errors.join("\n");
+        assert!(text.contains("zai-full.excludedRoles cannot be set"), "{text}");
+        assert!(text.contains("zai-full.billing: unknown override key"), "{text}");
+        assert!(text.contains("nope: `nope` is not a bundled model profile"), "{text}");
+
+        let good = serde_json::json!({"terminals": [], "runtimes": {"modelProfileOverrides": {
+            "zai-full": {"model": "glm-5.4", "excludedRolesAdd": ["doctor"]}
+        }}});
+        let ok = validate_from_config(&good, ValidationMode::Warn);
+        assert!(
+            !ok.errors
+                .iter()
+                .any(|e| e.contains("modelProfileOverrides")),
+            "{:?}",
+            ok.errors
+        );
     }
 }

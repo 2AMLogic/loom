@@ -346,6 +346,13 @@ pub fn trust_state(profile: &Path) -> &'static str {
     super::super::codex_hooks::trust_state(profile, &bundle::registration())
 }
 
+/// [`trust_state`] for the telemetry sampler (#15292): `None` when the profile
+/// could not be assessed, so a read failure never reports as `missing`.
+#[must_use]
+pub fn assessed_trust_state(profile: &Path) -> Option<&'static str> {
+    super::super::codex_hooks::assessed_trust_state(profile, &bundle::registration())
+}
+
 // ---------------------------------------------------------------------------
 // Host side.
 // ---------------------------------------------------------------------------
@@ -407,7 +414,7 @@ pub fn admit_new(
     if !rejection.containment_eligible() {
         return Err(rejection);
     }
-    let selection = dispatch::Selection::prepare_contained(root, model, kind, issue, owner);
+    let selection = dispatch::Selection::prepare_contained(root, model, kind, issue, owner, role);
     admit_selection(root, role, explicit, rejection, selection)
 }
 
@@ -581,6 +588,7 @@ impl crate::runtime_preference::ContainmentPreparer for Preparer<'_> {
             self.kind,
             self.issue,
             &self.owner,
+            role,
         );
         self.note_seat_availability(&selection);
         let (admitted, selection, proof) =
@@ -605,7 +613,7 @@ impl crate::runtime_preference::ContainmentPreparer for Preparer<'_> {
             self.kind,
             self.issue,
             &self.owner,
-            crate::runtime_preference::codex_guard::guarded(&admitted.role),
+            &admitted.role,
         );
         self.note_seat_availability(&selection);
         let selection = selection.map_err(|error| RuntimeRejection {
@@ -713,7 +721,7 @@ fn in_bound_container(revision: &str, repository: &str, clone: &str) -> Result<S
     if repo.canonicalize()? != repo || !std::fs::symlink_metadata(repo.join(".git"))?.is_dir() {
         bail!("{NOT_OWNED_CLONE}");
     }
-    repository::verify_alternates(repo, repository, mirror_alternate(repository).as_deref())?;
+    repository::verify_alternates(repo, mirror_alternate(repository).as_deref())?;
     // With an alternate present, prove it is the read-only mirror bind it
     // claims to be — from inside the worker, where the proof counts (#14680).
     if let Ok(content) = std::fs::read_to_string(repo.join(".git/objects/info/alternates")) {

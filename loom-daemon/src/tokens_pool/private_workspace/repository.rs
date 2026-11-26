@@ -442,7 +442,7 @@ fn prepare_revision(
     {
         bail!("workspace must own a real clone and private Git objects, without symlinks");
     }
-    verify_alternates(&repo, &args.repository, args.mirror_objects.as_deref())?;
+    verify_alternates(&repo, args.mirror_objects.as_deref())?;
     private_metadata(&repo.join(".git"))?;
     if Path::new(git(&repo, &["rev-parse", "--show-toplevel"])?.trim()).canonicalize()? != repo {
         bail!("workspace clone is not its own independent Git root");
@@ -581,7 +581,7 @@ fn clone_args<'a>(
     Ok(args)
 }
 
-/// The one alternate shape a clone of `repository` may carry (#14680): no
+/// The one alternate shape a clone may carry (#14680): no
 /// alternate at all (a private clone, always supported), or exactly the
 /// mirror objects path the caller authorized for THIS repository. Anything
 /// else — a second entry, a wrong path, an alternate with no authorized
@@ -589,11 +589,7 @@ fn clone_args<'a>(
 /// what is authorized: preparation passes the mirror the host bound (or
 /// `None`, refusing every alternate), admission passes the repository's
 /// canonical mirror path.
-pub(super) fn verify_alternates(
-    repo: &Path,
-    _repository: &str,
-    mirror: Option<&str>,
-) -> Result<()> {
+pub(super) fn verify_alternates(repo: &Path, mirror: Option<&str>) -> Result<()> {
     let file = repo.join(".git/objects/info/alternates");
     let content = match std::fs::read_to_string(&file) {
         Ok(content) => content,
@@ -689,8 +685,8 @@ pub(super) fn borrow_published(repo: &Path, objects: &str, fresh: bool) -> Resul
 pub(super) fn stranded_heads(repo: &Path) -> Result<Vec<DetachedWork>> {
     let mut stranded = Vec::new();
     for worktree in worktrees(repo)? {
-        // `rev-parse --abbrev-ref HEAD` answers `HEAD` only when detached.
-        if git(&worktree, &["rev-parse", "--abbrev-ref", "HEAD"])?.trim() != "HEAD" {
+        // `current_branch` answers `None` only when detached.
+        if current_branch(&worktree)?.is_some() {
             continue;
         }
         let ahead = ahead_of_origin(&worktree, "HEAD")?;
@@ -715,7 +711,7 @@ pub(super) fn holding_worktree(repo: &Path, branch: &str) -> Result<Option<PathB
         if worktree.canonicalize()? == main {
             continue;
         }
-        if git(&worktree, &["rev-parse", "--abbrev-ref", "HEAD"])?.trim() == branch {
+        if current_branch(&worktree)?.as_deref() == Some(branch) {
             return Ok(Some(worktree));
         }
     }
@@ -763,16 +759,41 @@ pub(super) fn held_branch_refusal(
     Ok(message)
 }
 
+/// Every local branch of `repo` as `(full ref, branch name)`, enumerated by
+/// full refname with the single `refs/heads/` prefix stripped once: PR-fetch
+/// residue (`refs/<name>`, `refs/remotes/<name>`) cannot shorten
+/// `refs/heads/<name>` into the non-name `heads/<name>` the way
+/// `%(refname:short)` does (#15027).
+fn local_branch_refs(repo: &Path) -> Result<Vec<(String, String)>> {
+    let refs = git(repo, &["for-each-ref", "--format=%(refname)", "refs/heads/"])?;
+    Ok(refs
+        .lines()
+        .map(str::trim)
+        .filter(|r| !r.is_empty())
+        .filter_map(|r| {
+            r.strip_prefix("refs/heads/")
+                .map(|name| (r.to_owned(), name.to_owned()))
+        })
+        .collect())
+}
+
+/// The branch checked out at `path`, or `None` when detached. `git branch
+/// --show-current` prints the true name where `rev-parse --abbrev-ref HEAD`
+/// shortens a residue-shadowed branch to `heads/<name>` (#15027).
+pub(super) fn current_branch(path: &Path) -> Result<Option<String>> {
+    let name = git(path, &["branch", "--show-current"])?.trim().to_owned();
+    Ok((!name.is_empty()).then_some(name))
+}
+
 /// Every local branch with commits no remote-tracking ref of `origin`
 /// reaches, with its ahead count.
 pub(super) fn unpublished_branches(repo: &Path) -> Result<Vec<UnpublishedBranch>> {
-    let names = git(repo, &["for-each-ref", "--format=%(refname:short)", "refs/heads"])?;
     let mut unpublished = Vec::new();
-    for name in names.lines().map(str::trim).filter(|name| !name.is_empty()) {
-        let ahead = ahead_of_origin(repo, &format!("refs/heads/{name}"))?;
+    for (full_ref, name) in local_branch_refs(repo)? {
+        let ahead = ahead_of_origin(repo, &full_ref)?;
         if ahead > 0 {
             unpublished.push(UnpublishedBranch {
-                branch: name.to_owned(),
+                branch: name,
                 ahead,
             });
         }
@@ -896,9 +917,9 @@ pub(super) fn recover(root: &Path, args: &RecoverArgs) -> Result<RecoverOutcome>
         bail!("discard requires an explicit scope (--branch BRANCH, --issue N or --worktree PATH)");
     }
     if !scope.is_empty() {
-        let local = git(&repo, &["for-each-ref", "--format=%(refname:short)", "refs/heads"])?;
+        let local = local_branch_refs(&repo)?;
         for name in &scope {
-            if !local.lines().any(|line| line.trim() == name) {
+            if !local.iter().any(|(_, local)| local == name) {
                 outcome.ignored.push(name.clone());
             }
         }
@@ -1194,7 +1215,7 @@ fn holds_of(repo: &Path, branches: &[String]) -> Result<Holds> {
     };
     for name in branches {
         for worktree in worktrees(repo)? {
-            if git(&worktree, &["rev-parse", "--abbrev-ref", "HEAD"])?.trim() != name {
+            if current_branch(&worktree)?.as_deref() != Some(name.as_str()) {
                 continue;
             }
             let is_main = worktree.canonicalize()? == main;
@@ -1438,14 +1459,12 @@ fn dirty_worktrees(root: &Path, repo: &Path) -> Result<Vec<DirtyWorktree>> {
             continue;
         }
         let untracked = status.iter().filter(|line| line.starts_with("?? ")).count();
-        let branch = git(&path, &["rev-parse", "--abbrev-ref", "HEAD"])?
-            .trim()
-            .to_owned();
+        let branch = current_branch(&path)?;
         let canonical = path.canonicalize()?;
         let unpublished = ahead_of_origin(&path, "HEAD")?;
         dirty.push(DirtyWorktree {
             path: path.display().to_string(),
-            branch: (branch != "HEAD").then_some(branch),
+            branch,
             tracked: status.len() - untracked,
             untracked,
             unpublished,
@@ -1556,13 +1575,14 @@ fn reap_finished_worktrees(
         if locked || canonical == repo || !canonical.starts_with(root) {
             continue;
         }
-        let branch = git(&path, &["rev-parse", "--abbrev-ref", "HEAD"])?;
-        let branch = branch.trim();
-        if branch == "HEAD" || ahead_of_origin(&path, "HEAD")? > 0 {
+        let Some(branch) = current_branch(&path)? else {
+            continue;
+        };
+        if ahead_of_origin(&path, "HEAD")? > 0 {
             continue;
         }
         let tip = git(&path, &["rev-parse", "HEAD"])?;
-        if has_finished_pr(repo, repository, branch, tip.trim()) {
+        if has_finished_pr(repo, repository, &branch, tip.trim()) {
             let display_path = path.display().to_string();
             git(repo, &["worktree", "remove", "--force", &display_path])?;
             reaped.push(display_path);

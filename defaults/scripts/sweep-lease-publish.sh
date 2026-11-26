@@ -179,6 +179,54 @@ gh_repo_path() {
     printf '%s' "${LOOM_REPO:-$placeholder}"
 }
 
+# --- Gitea checkouts (#14941) ------------------------------------------------
+# On a Gitea checkout `gh` cannot reach the forge, so the lease's reads go
+# through `gitea_api` (forge-helpers.sh) and its one POST through the shared
+# `loom-daemon forge comment` writer (#14940, which vets the write and carries
+# the vetted Gitea connection). forge-helpers.sh is sourced in a SUBSHELL per
+# call so its function names never shadow this script's own helpers.
+lease_forge_lib() {
+    printf '%s' "$(dirname "${BASH_SOURCE[0]}")/lib/forge-helpers.sh"
+}
+
+# lease_forge_is_gitea -- 0 on a Gitea checkout (forge_detect's own answer:
+# LOOM_FORGE_TYPE, then config, then the origin host), 1 otherwise or when
+# forge-helpers.sh is unavailable (the GitHub path is then unchanged).
+lease_forge_is_gitea() {
+    [[ -r "$(lease_forge_lib)" ]] || return 1
+    (
+        # shellcheck source=lib/forge-helpers.sh
+        source "$(lease_forge_lib)" && forge_detect && [[ "$FORGE_TYPE" == gitea ]]
+    ) > /dev/null 2>&1
+}
+
+# lease_gitea_repo_path -- the owner/repo Gitea reads name (LOOM_REPO, else the
+# origin remote; never the GitHub `{owner}/{repo}` placeholder).
+lease_gitea_repo_path() {
+    (
+        # shellcheck source=lib/forge-helpers.sh
+        source "$(lease_forge_lib)" && echo "${LOOM_REPO:-$(_forge_nwo_from_remote)}"
+    )
+}
+
+# lease_gitea_comments <issue> -- the issue's comments as one JSON array.
+lease_gitea_comments() {
+    local issue="$1" repo
+    repo="$(lease_gitea_repo_path)" && [[ -n "$repo" ]] || return 1
+    (
+        # shellcheck source=lib/forge-helpers.sh
+        source "$(lease_forge_lib)" && forge_detect && forge_gitea_issue_comments "$repo" "$issue"
+    )
+}
+
+# lease_gitea_self_login -- the login this host's Gitea credential acts as.
+lease_gitea_self_login() {
+    (
+        # shellcheck source=lib/forge-helpers.sh
+        source "$(lease_forge_lib)" && forge_detect && forge_gitea_self_login
+    ) 2> /dev/null
+}
+
 # --- sha256 hex digest of stdin, tolerating either common tool -------------
 sha256_hex_stdin() {
     if command -v shasum >/dev/null 2>&1; then
@@ -394,17 +442,43 @@ cmd_publish() {
     # mirrors sweep-lease-fence.sh's #6485 fix -- see the yield-exclusion
     # scan below for why a publish-side peer check needs the yield records
     # too (Issue #5331).
-    local comments_ndjson read_ok=1
-    if ! comments_ndjson="$("${LEASE_READ_API[@]}" "repos/${repo_path}/issues/${issue}/comments" \
-        --paginate --jq \
-        ".[] | select(.body != null and ((.body | startswith(\"${LEASE_MARKER_PREFIX}\")) or (.body | startswith(\"${YIELD_MARKER_PREFIX}\")))) | {updated_at: .updated_at, body: .body, user: {login: .user.login, type: .user.type}, author_association: .author_association}")"; then
+    local comments_ndjson read_ok=1 gitea=0 lease_jq
+    lease_forge_is_gitea && gitea=1
+    lease_jq=".[] | select(.body != null and ((.body | startswith(\"${LEASE_MARKER_PREFIX}\")) or (.body | startswith(\"${YIELD_MARKER_PREFIX}\")))) | {updated_at: .updated_at, body: .body, user: {login: .user.login, type: .user.type}, author_association: .author_association}"
+    if ((gitea == 1)); then
+        # Gitea has no `gh api --jq`: list the comments, project them with the
+        # same filter. Handle listing failures below for both forges.
+        local gitea_listing
+        if gitea_listing="$(lease_gitea_comments "$issue")" \
+            && comments_ndjson="$(jq -c "$lease_jq" <<< "$gitea_listing")"; then
+            :
+        else
+            echo "WARN: could not read existing lease comments for issue #${issue} from Gitea" >&2
+            read_ok=0
+            comments_ndjson=""
+        fi
+    elif ! comments_ndjson="$("${LEASE_READ_API[@]}" "repos/${repo_path}/issues/${issue}/comments" \
+        --paginate --jq "$lease_jq")"; then
         echo "WARN: could not read existing lease comments for issue #${issue}" >&2
         read_ok=0
         comments_ndjson=""
     fi
     # #9548: only a TRUSTED author's lease/yield marker is a peer or a record.
-    # requires-daemon: forge optional   Without the `trusted-comments` verb the markers are unverifiable: treated like an unreadable listing (publish anyway), the existing direction.
-    ((read_ok == 1)) && ! comments_ndjson="$(jq -s -c '.' <<< "$comments_ndjson" | "${LOOM_DAEMON_BIN:-loom-daemon}" forge trusted-comments 2> /dev/null | jq -c '.[]')" \
+    # On Gitea (#14941) comments carry no `author_association`, so the
+    # credential's own login is the self identity the trust filter believes.
+    local -a trust_args=()
+    if ((gitea == 1)) && ((read_ok == 1)); then
+        local self_login
+        self_login="$(lease_gitea_self_login || true)"
+        if [[ -n "$self_login" ]]; then
+            trust_args=(--self-login "$self_login")
+        elif ((require_ownership == 1)); then
+            echo "WARN: could not authenticate the Gitea lease identity for issue #${issue}" >&2
+            read_ok=0
+        fi
+    fi
+    # requires-daemon: forge optional   Without the `trusted-comments` verb the markers are unverifiable and treated like an unreadable listing.
+    ((read_ok == 1)) && ! comments_ndjson="$(jq -s -c '.' <<< "$comments_ndjson" | "${LOOM_DAEMON_BIN:-loom-daemon}" forge trusted-comments ${trust_args[@]+"${trust_args[@]}"} 2> /dev/null | jq -c '.[]')" \
         && { echo "WARN: lease comments on issue #${issue} could not be authenticated" >&2; read_ok=0; comments_ndjson=""; }
 
     if ((read_ok == 0)); then
@@ -560,10 +634,20 @@ cmd_publish() {
     # named explicitly (loom_write_repo, forge-helpers.sh, sourced in the
     # subshell since it turns on `set -e`), never via `{owner}/{repo}`, which
     # gh expands from an `upstream` remote in preference to `origin`.
-    local post_out write_repo
+    local post_out write_repo post_rc=0
     write_repo="$(source "$(dirname "${BASH_SOURCE[0]}")/lib/forge-helpers.sh" && loom_write_repo "${LOOM_REPO:-}")" || { echo "ERROR: not publishing a lease on issue #${issue}: loom-daemon forge may-write refused the repo (#9548)" >&2; exit 2; }
-    if ! post_out="$(printf '%s' "$lease_body" \
-        | gh api --method POST "repos/${write_repo}/issues/${issue}/comments" -F body=@- 2>&1)"; then
+    if ((gitea == 1)); then
+        # #14941: the shared comment writer (#14940) posts through the Gitea
+        # API with the connection the write-scope check approved; `gh` is never
+        # run. It appends the dashboard footer BELOW the body, so the marker
+        # stays the literal first line.
+        post_out="$(printf '%s' "$lease_body" \
+            | "${LOOM_DAEMON_BIN:-loom-daemon}" forge comment "$issue" --repo "$write_repo" --body-file - 2>&1)" || post_rc=$?
+    else
+        post_out="$(printf '%s' "$lease_body" \
+            | gh api --method POST "repos/${write_repo}/issues/${issue}/comments" -F body=@- 2>&1)" || post_rc=$?
+    fi
+    if ((post_rc != 0)); then
         echo "ERROR: failed to publish lease comment on issue #${issue}: ${post_out}" >&2
         if ((require_ownership == 1)); then
             echo "Ownership is indeterminate; Builder admission must stop." >&2
@@ -574,7 +658,13 @@ cmd_publish() {
     fi
 
     local comment_id
-    comment_id="$(jq -r '.id // empty' <<< "$post_out" 2>/dev/null || true)"
+    if ((gitea == 1)); then
+        # `forge comment` prints the new comment's html_url (`…#issuecomment-<id>`).
+        comment_id="${post_out##*#issuecomment-}"
+        [[ "$comment_id" =~ ^[0-9]+$ ]] || comment_id=""
+    else
+        comment_id="$(jq -r '.id // empty' <<< "$post_out" 2>/dev/null || true)"
+    fi
     echo "OK: published lease record for issue #${issue} (host=${host} sweep=${sweep_id}${comment_id:+ comment_id=${comment_id}}) at ${now_iso}" >&2
     printf '%s %s\n' "$host" "$sweep_id"
 }

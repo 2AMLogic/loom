@@ -229,7 +229,7 @@ Check for an argument passed via the slash command:
 
 If a number is provided (e.g., `/builder 42`):
 1. Treat that number as the target **issue** to work on; **skip** "Finding Work"
-2. **Guard before any write** (#11863): `loom-daemon forge check-claim <number>`. Exit `1`: claim (the guard itself passes your invoker's own claim when `LOOM_SWEEP_CLAIM_OWNED` names the number, and says so; never refuse on exit `1`). Exit `0` prints a token: `TARGET_IS_PR` (an issue role, #9929), `CLOSED`, `FROZEN`, `OPERATOR`, `OPEN_PR`, `MERGED_PR` (#12615) or `TRIAGE` (#12713) → refuse, writing nothing, and end with `LOOM_STEP_OUTCOME role=builder target=<n> class=refused reason=<token lowercased, e.g. merged_pr|triage>` so the step-outcome ledger can back off a repeated refusal. `BUILDING` / `LEASE_ALREADY_HELD` / `BRANCH_EXISTS` → refuse unless your invoker holds this claim (`LOOM_SWEEP_CLAIM_OWNED` names the number, or your brief says `This /loom:sweep pre-flighted #<number>`) or the operator told you to resume or force it: that overrides these three, never the seven above. Any other exit: stop. A hard-excluded label (Label Workflow) refuses too. **Split-parent refusal (#13635)**, before claiming: `loom-daemon forge parent split-state --parent <number>`; exit `0` (`SPLIT_ALL_CLOSED`: children exist and all are closed) → refuse, claim nothing, end with `class=refused reason=split_parent_children_closed`. Exit `1` proceeds; another exit is unanswered, not an all-clear
+2. **Guard before any write** (#11863): `loom-daemon forge check-claim <number>`. Exit `1`: claim (the guard itself passes your invoker's own claim when `LOOM_SWEEP_CLAIM_OWNED` names the number, and says so; never refuse on exit `1`). Exit `0` prints a token: `TARGET_IS_PR` (an issue role, #9929), `CLOSED`, `FROZEN`, `OPERATOR`, `OPEN_PR`, `MERGED_PR` (#12615) or `TRIAGE` (#12713) → refuse, writing nothing, and end with `LOOM_STEP_OUTCOME role=builder target=<n> class=refused reason=<token lowercased, e.g. merged_pr|triage>` so the step-outcome ledger can back off a repeated refusal. `BUILDING` / `LEASE_ALREADY_HELD` / `BRANCH_EXISTS` → refuse unless your invoker holds this claim (`LOOM_SWEEP_CLAIM_OWNED` names the number, or your brief says `This /loom:sweep pre-flighted #<number>`) or the operator told you to resume or force it: that overrides these three, never the seven above. Any other exit: stop. A hard-excluded label (Label Workflow) refuses too. **Split-parent refusal (#13635)**, before claiming: `loom-daemon forge parent split-state --parent <number>`; exit `0` (`SPLIT_ALL_CLOSED`: children exist and all are closed) → refuse, claim nothing, end with `class=refused reason=split_parent_children_closed`. Exit `1` proceeds (a parent whose body carries `<!-- loom:split-rescoped -->` alone on a line, written by the reviser when a post-split revision added work the children do not cover, #15242, reports `NOT_SPLIT` and is buildable); another exit is unanswered, not an all-clear
 3. Claim the issue: `gh issue edit <number> --remove-label "loom:issue" --add-label "loom:building"` (`worktree.sh` leases it)
 4. Proceed directly to implementation
 5. End with the outcome line from `.loom/docs/targeted-role-invocation.md`: `LOOM_STEP_OUTCOME role=builder target=<n> class=<verdict|noop|refused|failed> reason=<token>`
@@ -352,7 +352,7 @@ workflow) that require maintainer approval before being worked on.
 
 1. **Gate first**: the guard above. The instruction approves the stage (e.g. `loom:curated`) and overrides only its three claim tokens, never the seven refusals
 2. **Claim**: add `loom:building` and comment "Starting work on this issue per user request"
-3. **Work and finish normally**: `LOOM_BUILDER_CLAIM=1 ./.loom/scripts/worktree.sh 592`, implement, then a PR with `loom:review-requested` (builder-pr.md § "Creating the PR")
+3. **Work and finish normally**: `./.loom/scripts/worktree.sh 592 --require-ownership`, implement, then a PR with `loom:review-requested` (builder-pr.md § "Creating the PR")
 
 Not an override: "find work" / "look for issues", no issue number, or an autonomous run. Use the label-based workflow.
 
@@ -361,7 +361,7 @@ Not an override: "find work" / "look for issues", no issue number, or an autonom
 For detailed worktree workflows, see **builder-worktree.md**.
 
 **Quick reference:**
-- Use `LOOM_BUILDER_CLAIM=1 ./.loom/scripts/worktree.sh <issue-number>` to create worktrees
+- Use `./.loom/scripts/worktree.sh <issue-number> --require-ownership` to create worktrees
 - Work in `.loom/worktrees/issue-N` directories
 
 ### Never use bare `git stash` for ad-hoc WIP (#4821)
@@ -429,14 +429,14 @@ target too: `./.loom/scripts/worktree.sh stash-push main` …
 ### Pre-Work Validation
 
 A refused or indeterminate Builder setup ends this attempt. Do not enter or edit
-the checkout, retry without `LOOM_BUILDER_CLAIM=1`, or add `--force-claim` to
+the checkout, retry without `--require-ownership`, or add `--force-claim` to
 bypass the refusal. An explicit operator override is a separate decision.
 
 After claiming an issue, **before writing any code**, verify you are in the correct worktree:
 
 ```bash
 # 1. Create the worktree (if not already created)
-LOOM_BUILDER_CLAIM=1 ./.loom/scripts/worktree.sh <issue-number> || exit 1 # strict native ownership for a Builder (#14376)
+./.loom/scripts/worktree.sh <issue-number> --require-ownership || exit 1 # strict native ownership for a Builder (#14376)
 
 # 2. Capture the worktree's ABSOLUTE path ONCE — do not rely on cwd persisting
 WORKTREE_ABS="$(cd .loom/worktrees/issue-<issue-number> && pwd)"
@@ -507,7 +507,7 @@ git -C "<MAIN_ROOT>" stash show -p stash@{0}                           # nothing
 
 **If your working directory does NOT contain `.loom/worktrees/issue-`:**
 1. **STOP** - do not write any code
-2. Create the worktree: `LOOM_BUILDER_CLAIM=1 ./.loom/scripts/worktree.sh <issue-number>`
+2. Create the worktree: `./.loom/scripts/worktree.sh <issue-number> --require-ownership`
 3. Change to the worktree: `cd .loom/worktrees/issue-<issue-number>`
 4. THEN start implementation
 

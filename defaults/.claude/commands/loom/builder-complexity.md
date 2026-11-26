@@ -67,7 +67,10 @@ When you claim an issue and realize mid-work it requires >6 hours or touches >8 
 
 # 2. Park the parent on its children: one body park record per child, then
 #    building -> blocked. NEVER close a parent yourself; humans close it once
-#    children are filed, and loom:blocked is the terminal state.
+#    children are filed, and loom:blocked is the terminal state. If the parent
+#    body carries <!-- loom:split-rescoped --> alone on a line, remove that line
+#    in the same edit (#15256): a stale marker makes split-state print NOT_SPLIT
+#    once these children close, re-opening the #13635 re-dispatch loop.
 loom-daemon park-record apply --issue 812 --blocked-by XXX,YYY,ZZZ --by builder --remove-label loom:building
 
 # Then exit and let the Curator/sweep pipeline pick up each sub-issue.
@@ -301,7 +304,7 @@ Before claiming an issue, estimate the work required:
 
 **If Simple or Medium (< 6 hours, clear path)**:
 1. Claim immediately: `gh issue edit <number> --remove-label "loom:issue" --add-label "loom:building"`
-2. Create worktree: `LOOM_BUILDER_CLAIM=1 ./.loom/scripts/worktree.sh <number> || exit 1`
+2. Create worktree: `./.loom/scripts/worktree.sh <number> --require-ownership || exit 1`
 3. Implement -> Test -> PR
 4. Be ambitious - complete the full issue in one PR
 
@@ -374,6 +377,10 @@ children are filed and curated. This is the decomposition-parent exception, not 
 blanket rule: for a **non-parent** issue you verify is already implemented, close it
 with a rationale per `builder.md` → "Issues Are Suggestions" (or the `.no-changes-needed`
 marker under `/loom:sweep`).
+
+If the parent body carries `<!-- loom:split-rescoped -->` alone on a line, remove that line in the same edit that files the
+children or parks the parent (#15256): the marker describes a revision these children supersede, and a stale one makes
+`forge parent split-state` print `NOT_SPLIT` after they close, re-opening the #13635 re-dispatch loop.
 
 ```bash
 loom-daemon park-record apply --issue <parent-number> --blocked-by <phase1>,<phase2>,<phase3> --by builder --remove-label loom:building

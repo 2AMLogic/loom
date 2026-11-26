@@ -1417,6 +1417,43 @@ Only native runtimes (`pi`, `opencode`, `kimi`) are checked, and only when the
 profile declares a provider for that harness. `loom-daemon validate` rejects an
 `excludedRoles` entry that is not a known role name.
 
+**Changing a bundled profile's model without a release (`runtimes.modelProfileOverrides`, #15252).**
+`runtimes.modelProfiles.<name>` *replaces* a bundled profile wholesale, so a copy
+that omits `excludedRoles` silently admits GLM to Judge and Curator (#11450).
+To change only what a bundled profile runs, overlay it instead:
+
+```jsonc
+"runtimes": { "modelProfileOverrides": { "zai-full": { "model": "glm-5.4" } } }
+```
+
+- The override is merged **onto** the bundled profile inside `profiles::lookup`,
+  so every launch, admission, billing and inspection path sees it. Providers,
+  credentials, `credentialProxy`, `providerOptions`/`providerDefinition`,
+  `billing` and `excludedRoles` always come from the bundled definition.
+- Allowed keys: `model`, `effort`, `allowedEfforts` (each replaces the bundled
+  value) and `excludedRolesAdd` (a list of known role names, **unioned** onto the
+  bundled `excludedRoles`, deduplicated by canonical role). `excludedRoles` itself
+  can never be replaced or reduced. `{}` is a valid no-op.
+- Rejected by `loom-daemon validate` **and** at launch (exit 78, so a bad store
+  config cannot half-apply): an unknown key (including `excludedRoles`), a name
+  that is not bundled, a name also defined under `runtimes.modelProfiles`, a
+  blank/non-string `model`/`effort`/`allowedEfforts` entry, and an unknown or
+  non-array `excludedRolesAdd`. Explicit `null` (a profile or a field) is "absent".
+- Works at every config tier and layers by `deep_merge`, so a host-tier override
+  (`fleet/hosts/<host>/defaults.json`, `.loom-local/local.json`) beats the fleet
+  default key by key, and a higher tier's `null` clears a lower tier's value. A
+  per-host override is therefore a canary: put the new model on one host, compare,
+  then promote it to the fleet defaults.
+- `loom-daemon worker profile-check <name>` prints the effective model and the
+  tier that decided it: `model: glm-5.4 (source: defaults)`. The source is
+  `local`, `fleet-repo`, `project`, `committed`, `defaults` (the rendered machine
+  tier) or `bundled` (no override). A `runtimes.modelProfiles` replacement reports
+  the tier it came from the same way.
+
+This is the sanctioned way to change a fleet-wide model: the fleet store must not
+define its own GLM profile under `runtimes.modelProfiles` (that is the #11450
+loophole), and uses this overlay instead.
+
 **Prompt modifier for a single-step run (`LOOM_PROMPT_MODIFIER`, #15017).** A caller
 that runs exactly one step can name a registered modifier, next to the
 `LOOM_RUNTIME` / `LOOM_MODEL_PROFILE` / `LOOM_EFFORT` pins above, so the run is
@@ -1585,7 +1622,8 @@ so the launch record shows the real runtime and model profile. A `claude`
 resolution prints `outcome=delegate-to-claude` and exits 0 without launching.
 Exit codes: 0 artifact, 1 no artifact, 2 usage (Judge/Curator refused),
 75 no eligible runtime/seat, 78 config, 124 timeout. The `/loom:sweep`
-orchestrator calls it before Builder/Doctor Task dispatch; see
+orchestrator calls it before Builder/Doctor Task dispatch only when it is a daemon-dispatched child
+(`LOOM_SWEEP_CLAIM_OWNED` / `--claim-owned`); an attended in-session sweep skips it (#15299); see
 `native-sweep.md` and `sweep-execution-model.md`.
 
 Because a phase can outlast the Bash tool cap (120s default / 600s max), the
@@ -1851,8 +1889,10 @@ unknown to known did not weaken this guard for other names.)
 
 Containers as a session-persistence and containment boundary for worker
 runtimes — per-account persistent session containers for runtimes with
-mutable interactive auth (Codex), per-sweep ephemeral containers for
-stateless-auth runtimes (Claude, Pi/OpenCode) — are specified in
+mutable interactive auth (Codex) and, opt-in per account, for Claude
+([below](#claude-per-seat-session-containers-issue-14371)); per-sweep
+ephemeral containers for stateless-auth runtimes (Claude by default,
+Pi/OpenCode) — are specified in
 [ADR-0017: Session-Container Architecture](https://github.com/2AMLogic/loom/blob/main/docs/adr/0017-session-container-architecture.md)
 (epic #6896). Both container lifetimes dispatch through the existing
 `spawn-worker.sh` → `spawn-<runtime>.sh` seam described above with **no new
@@ -1862,8 +1902,82 @@ This is a pointer only — no contract-point changes ship with it.
 | Runtime | Lifetime | Image | Enable with | Telemetry `containment=` |
 |---|---|---|---|---|
 | Claude | per-sweep **ephemeral** | `ghcr.io/2amlogic/loom-worker` | `runtimes.containment.enabled: true` (#7429) | `claude-ephemeral` |
+| Claude | per-seat **persistent session** (opt-in per account) | `ghcr.io/2amlogic/loom-worker-session` (or the `accounts.session.image` override, #14019) | `loom-daemon accounts session start <name> --provider claude` (#14371) | `claude-session` |
 | Codex | per-account **persistent session** | `ghcr.io/2amlogic/loom-worker-session` | ADR-0017 Phase 2 | — |
 | Pi, OpenCode | per-sweep **ephemeral** | `ghcr.io/2amlogic/loom-worker-native` | `runtimes.containment.native: "ephemeral"` (#8403) | `native-ephemeral` |
+
+#### Claude per-seat session containers (issue #14371)
+
+The operator ruled that every runtime's steps may run in one
+operator-built session image with **one login per container**. For Claude that
+is a *seat*: a Claude token-pool account whose persistent container
+`loom-claude-session-<name>` is managed like Codex's `loom-codex-session-<name>`
+and started from the same session image. It is a second **opt-in** shape beside
+`claude-ephemeral`, not a replacement, and it adds no dispatch path.
+
+**How a step reaches a seat.** `spawn-claude.sh` runs the existing token
+selector first (bad-token skipping, `.ranking`, `.allowlist`, then random). Only
+if the *selected* account is a registered seat does it `exec`
+`loom-daemon session-exec claude-seat`, which runs `spawn-claude.sh` inside that
+seat's container through the same supervised `docker exec` transport Codex uses.
+So seat selection is the pool selector's choice of account; there is no second
+selector and no in-container pool read. An exhausted or dead account is skipped
+exactly as on the host, and an empty or fully-excluded pool still exits `78`
+(`EX_CONFIG`) before any container is touched. A selected seat that is stopped,
+missing the workspace mount, or on an incompatible `session-exec` protocol
+**refuses the step** (named reason, no silent fall back to host dispatch). A
+credential-proxied dispatch is also refused for a seat, because the token must
+travel in the exec's process environment.
+
+**What lives where.**
+
+| | Per-sweep ephemeral (`claude-ephemeral`) | Per-seat session (`claude-session`) |
+|---|---|---|
+| Lifetime | one sweep, then removed | persistent; survives steps, daemon restarts, host reboots |
+| Token | process env, pool re-read inside the container | process env of the `docker exec` only; the pool is never mounted and the token is on no container path |
+| Claude state (config, sessions, transcripts) | clean filesystem per sweep | the seat's own `<seat root>/<name>/home`, mounted at `/home/loom/.claude`; two seats share no directory |
+| Resource limits | per-sweep CPU / memory cgroup payload | none per seat today (a seat is shared by that account's steps) |
+| Operator surface | none (config flag) | `accounts session start`, `stop`, `status` with `--provider claude`; `accounts list --provider claude` |
+
+What each shape costs: ephemeral pays a container create and teardown per sweep
+and gives up cross-step state; a seat pays an idle persistent container per
+enrolled account plus lifecycle operations (start, stop, recreate when the
+image rolls — #14112 will automate that), and its filesystem is **not** clean
+between steps. Which one starts a step sooner is measured, not assumed: a seat
+step's stderr log carries `# LOOM_SEAT_DISPATCH dispatched_at=<RFC 3339>` (the
+instant before `docker exec` is spawned) and `# LOOM_SEAT_FIRST_ACTIVITY
+dispatched_at=<..> first_activity_at=<..> elapsed_ms=<n>` (the first byte the
+worker writes to stderr; `first_activity_at=none` if it never wrote one).
+Stdout is not observable by the supervisor, so first activity is a stderr
+signal, not a first-model-token signal.
+
+**Telemetry.** The `# LOOM_DISPATCH_MODE` marker for a seat step reads
+`containment=claude-session` and adds `container_id=` and `image_digest=`
+(`sha256:…`) of the container instance the step was bound to, so a run record
+names the exact container and image. `accounts list --provider claude` and
+`accounts session status <name> --provider claude` show each seat's runtime,
+containment, container and image.
+
+**The Claude CLI in the image.** The session image does not install Claude
+itself: it is `FROM` the `loom-worker` image at the same release tag, which
+installs the CLI with `claude.ai/install.sh`. The CLI version is therefore the
+one that install served when that base image was built, and the image tag pins
+the pair together; it is **not** separately version-pinned. That follows
+`.github/workflows/harness-pins.yml`, which keeps Claude Code out of the pinned
+harnesses on purpose (the fleet tracks latest). Whether the in-container CLI
+self-updates past the built version is not asserted here.
+
+**Relation to the #7767 soak.** #7767 gates flipping the *fleet default* of
+`runtimes.containment.enabled` (the `claude-ephemeral` shape) on soak evidence.
+Per-seat sessions are opt-in per account, flip no default, and neither consume
+nor count toward those criteria; because the `containment=` value differs,
+soak data for one shape cannot be mistaken for the other. #7767 stays blocked
+on its own evidence.
+
+**Status.** Registration, supervised dispatch, selection, isolation and the
+fake-Docker/image-smoke tests are merged (#14499, #14596). A provider-backed
+Builder step inside a real seat on a fleet host has not been run as part of this
+documentation change.
 
 #### Why native harnesses do NOT reuse Codex's session container
 

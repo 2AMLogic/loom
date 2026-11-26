@@ -89,9 +89,9 @@ impl TokenUsage {
     /// #9443): every input-side counter summed — uncached input, cache reads and
     /// cache writes — against `output` alone.
     ///
-    /// Mirrors [`crate::transcript_tokens::sum_sweep_tokens_split`] exactly, so
-    /// a per-phase split derived from per-model rows reconciles against the
-    /// sweep total that function produces. Negative counters (impossible from a
+    /// Mirrors [`crate::sweep_usage::flatten`] exactly, so a per-phase split
+    /// derived from per-model rows reconciles against the sweep total that
+    /// function produces. Negative counters (impossible from a
     /// real reader) clamp to `0` rather than wrapping.
     #[must_use]
     pub fn split(&self) -> (u64, u64) {

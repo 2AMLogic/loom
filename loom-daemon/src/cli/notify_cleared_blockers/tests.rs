@@ -260,3 +260,47 @@ fn unrepresentable_dependent_number_cannot_write() {
     assert!(!post_comment(Artifact::Pr, -1, "body", "acme/repo", Path::new(".")));
     assert!(!unpark(i64::MAX, "acme/repo", Path::new(".")));
 }
+
+/// #14465: a fleet resweep may only hand the broker numbers the evidence
+/// shows resolved (the broker re-verifies closure server-side).
+#[test]
+fn resolved_cited_keeps_resolved_local_numbers_only() {
+    let mut evidence = ev(&[(10, "MERGED"), (11, "OPEN")]);
+    evidence.named = vec![
+        crate::dep_recheck::named::Dep {
+            number: 12,
+            repo: None,
+            checked: false,
+            state: Some("MERGED".to_owned()),
+        },
+        crate::dep_recheck::named::Dep {
+            number: 13,
+            repo: None,
+            checked: false,
+            state: Some("OPEN".to_owned()),
+        },
+        // A ticked `## Dependencies` entry is never state-looked-up: unknown,
+        // not closed, so a fleet resweep leaves it to a later close event.
+        crate::dep_recheck::named::Dep {
+            number: 14,
+            repo: None,
+            checked: true,
+            state: None,
+        },
+        // A cross-repo citation is not a local closed number.
+        crate::dep_recheck::named::Dep {
+            number: 15,
+            repo: Some("other/repo".to_owned()),
+            checked: false,
+            state: Some("MERGED".to_owned()),
+        },
+    ];
+    // 10 is cited twice (prose and named); the result is deduplicated.
+    evidence.named.push(crate::dep_recheck::named::Dep {
+        number: 10,
+        repo: None,
+        checked: false,
+        state: Some("MERGED".to_owned()),
+    });
+    assert_eq!(resolved_cited(&evidence), vec![10, 12]);
+}
