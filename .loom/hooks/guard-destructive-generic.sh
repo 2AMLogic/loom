@@ -8836,6 +8836,101 @@ rm_scope_literal_same_command_resolve() {
 # measurement, and it is the one that can change.
 # =============================================================================
 
+# Resolve a bounded loop's quoted stdout operand before qsplit can split its
+# embedded pipe (#15417). Consume a contiguous grammar from the start of the
+# command. An unrelated loop, quoted example or intervening assignment cannot
+# supply evidence about this redirect. No command text is evaluated.
+resolve_loop_label_redirect() {
+    local rest="$COMMAND" blank='[[:blank:]]+' space='[[:space:]]*'
+    local name='[a-z][a-z0-9_]*' re item file_var label_var label prefix suffix
+    local -a labels=()
+    # The reported loop can follow a quoted scratch-file heredoc and path
+    # setup. Consume only complete, literal setup statements in the raw input.
+    local nl=$'\n' delimiter
+    re="^${space}cat${blank}>[[:blank:]]*/tmp/[A-Za-z0-9_./-]+${blank}<<'([A-Za-z_][A-Za-z0-9_]*)'[[:blank:]]*${nl}"
+    if [[ "$rest" =~ $re ]]; then
+        delimiter="${nl}${BASH_REMATCH[1]}${nl}"
+        rest=${rest#"${BASH_REMATCH[0]}"}
+        rest="$nl$rest"
+        [[ "$rest" == *"$delimiter"* ]] || return 1
+        rest=${rest#*"$delimiter"}
+    fi
+    re="^${space}export${blank}"'PATH=/[A-Za-z0-9_./-]+:\$PATH[[:blank:]]*'"$nl"
+    if [[ "$rest" =~ $re ]]; then
+        rest=${rest#"${BASH_REMATCH[0]}"}
+    fi
+    re="^${space}([A-Z][A-Za-z0-9_]*)=/[A-Za-z0-9_./-]+[[:blank:]]*${nl}"
+    if [[ "$rest" =~ $re ]]; then
+        [[ "${BASH_REMATCH[1]}" != IFS ]] || return 1
+        rest=${rest#"${BASH_REMATCH[0]}"}
+    fi
+
+    # Redactions elsewhere in the guard cannot stand in for a loop binding.
+    [[ "$1" == *"$rest" ]] || return 1
+    re="^${space}for${blank}($name)${blank}in${blank}"
+    [[ "$rest" =~ $re ]] || return 1
+    item=${BASH_REMATCH[1]}
+    rest=${rest#"${BASH_REMATCH[0]}"}
+
+    # Each quoted word has a final literal colon and a glob-free, slash-free
+    # suffix. The optional variable in the path cannot change that last colon.
+    re='^"(\$[A-Za-z_][A-Za-z0-9_]*)?[/A-Za-z0-9._-]+:([A-Za-z0-9][A-Za-z0-9()_-]*( [A-Za-z0-9()_-]+)*)"'
+    while [[ "$rest" =~ $re ]]; do
+        labels+=("${BASH_REMATCH[2]}")
+        rest=${rest#"${BASH_REMATCH[0]}"}
+        [[ "$rest" =~ ^$blank ]] || break
+        rest=${rest#"${BASH_REMATCH[0]}"}
+    done
+    [[ ${#labels[@]} -gt 0 ]] || return 1
+
+    # Match the two projections and their separator. Require separate
+    # variables so the first projection cannot overwrite the loop word.
+    local file_projection='"\$\{'"$item"'%%:\*\}"'
+    local label_projection='"\$\{'"$item"'##\*:\}"'
+    re="^${space};${space}do[[:space:]]+($name)=${file_projection}${space};${space}($name)=${label_projection}"
+    [[ "$rest" =~ $re ]] || return 1
+    file_var=${BASH_REMATCH[1]}
+    label_var=${BASH_REMATCH[2]}
+    rest=${rest#"${BASH_REMATCH[0]}"}
+    [[ "$file_var" != "$item" ]] || return 1
+
+    # Only ordinary command words may intervene before stdout. Leave every
+    # other redirect and all following commands in the normal write scan.
+    local args='([[:blank:]]+([A-Za-z0-9_./-]+|"\$[A-Za-z_][A-Za-z0-9_]*"))*'
+    re="^[[:blank:]]*[;$nl]${space}([A-Za-z0-9_./-]+)${args}[[:blank:]]+>[[:blank:]]*"
+    [[ "$rest" =~ $re ]] || return 1
+    rest=${rest#"${BASH_REMATCH[0]}"}
+    # Shell builtins and functions can change the next iteration's bindings.
+    case $(type -t -- "${BASH_REMATCH[1]}") in
+        builtin|function|keyword|alias) return 1 ;;
+    esac
+    local before=${1%"$rest"}
+    re='^"(/tmp/([A-Za-z0-9_-][A-Za-z0-9_.-]*/)*[A-Za-z0-9_-][A-Za-z0-9_.-]*)'
+    [[ "$rest" =~ $re ]] || return 1
+    prefix=${BASH_REMATCH[1]}
+    rest=${rest#"${BASH_REMATCH[0]}"}
+    local transform='$(echo $'"${label_var}|tr -d '()')"
+    [[ "$rest" == "$transform"* ]] || return 1
+    rest=${rest#"$transform"}
+    re='^([A-Za-z0-9._-]*)"'
+    [[ "$rest" =~ $re ]] || return 1
+    suffix=${BASH_REMATCH[1]}
+    rest=${rest#"${BASH_REMATCH[0]}"}
+
+    # No concatenation onto the operand, and no loop-body command that could
+    # change bindings or shell semantics before the next iteration.
+    local stderr_re='([[:blank:]]+2>[A-Za-z0-9_./-]+)?'
+    local recover_re='([[:blank:]]*\|\|[[:blank:]]*true)?'
+    re="^${stderr_re}${recover_re}[[:blank:]]*[;$nl]${space}done([[:space:];]|$)"
+    [[ "$rest" =~ $re ]] || return 1
+
+    for label in "${labels[@]}"; do
+        label=${label//[()]/}
+        loop_targets+=("$prefix$label$suffix")
+    done
+    write_scan="$before\"${loop_targets[0]}\"$rest"
+}
+
 # =============================================================================
 # extract_write_targets() — Bash-tool write-idiom target extraction (#4178).
 #
@@ -9018,9 +9113,23 @@ rm_scope_literal_same_command_resolve() {
 # shape), pays nothing at all.
 # =============================================================================
 extract_write_targets() {
-    _extract_write_targets_scan "$1" "$2"
-    heredoc_subst_span_text "$1"
-    [[ -n "$_HD_SPAN_TEXT" ]] && _extract_write_targets_scan "$_HD_SPAN_TEXT" "$2"
+    local write_scan="$1" path
+    local -a loop_targets=()
+    if [[ "$1" == *'$(echo $'* && "$1" == *'|tr -d '* && "$1" == *'for '* ]]; then
+        resolve_loop_label_redirect "$1" || :
+    fi
+    {
+        _extract_write_targets_scan "$write_scan" "$2"
+        heredoc_subst_span_text "$1"
+        [[ -n "$_HD_SPAN_TEXT" ]] && _extract_write_targets_scan "$_HD_SPAN_TEXT" "$2"
+    } | head -20
+
+    # The first concrete operand went through the ordinary scan. Check the
+    # remaining iterations as well, without displacing a stderr or later write
+    # from that scan's target limit.
+    for path in "${loop_targets[@]:1}"; do
+        printf '%s\037%s\n' "$2" "$path"
+    done
     return 0
 }
 
@@ -9034,6 +9143,12 @@ _extract_write_targets_scan() {
     # when it lands in the main checkout). Fail-closed by construction: this
     # function can only ever REPLACE a token with a value it actually proved,
     # never make one disappear.
+    # Keep the opening quote on substitution-bearing redirect operands,
+    # even if qsplit returned only the fragment before a pipe (#15417).
+    function redirect_target(tok) {
+        if (substr(tok, 1, 1) == DQ && tok ~ /\$\([^(]/) return tok
+        return resolve_var_q(tok)
+    }
     BEGIN {
         SEP = sprintf("%c", 31)
         curcwd = startcwd
@@ -9666,7 +9781,7 @@ _extract_write_targets_scan() {
                     # Bare operator token. Dup-to-fd (`> &1`) is recognized by
                     # the NEXT token starting with `&` and excluded.
                     if (j + 1 <= m && toks[j+1] != "" && mtoks[j+1] !~ /^&/) {
-                        print curcwd SEP resolve_var_q(toks[j+1])
+                        print curcwd SEP redirect_target(toks[j+1])
                     }
                     continue
                 }
@@ -9689,7 +9804,7 @@ _extract_write_targets_scan() {
                     # process substitution, not an attached target (#13814).
                     op = toks[j]
                     sub(/^[0-9]*>>?/, "", op)
-                    if (op != "") print curcwd SEP resolve_var_q(op)
+                    if (op != "") print curcwd SEP redirect_target(op)
                 }
             }
         }
@@ -10600,7 +10715,7 @@ if worktree_isolation_guard_enabled && \
         fi
     }
 
-    WRITE_TARGETS=$(extract_write_targets "$COMMAND_ASK_SCAN" "$CWD" | head -20)
+    WRITE_TARGETS=$(extract_write_targets "$COMMAND_ASK_SCAN" "$CWD")
     while IFS=$'\037' read -r _wcwd _wtarget; do
         [[ -z "$_wtarget" ]] && continue
 
@@ -10686,6 +10801,12 @@ if worktree_isolation_guard_enabled && \
         if [[ "$_wtarget" == *'$'* || "$_wcwd" == *'$'* ]]; then
             mark_expandable_dollars "$_wtarget"
             _wmarked="$_MARKED_TOKEN"
+            # A live command substitution may produce directory separators
+            # even after a literal filename prefix. A fragmented quote is
+            # insufficient evidence to resolve that operand against cwd.
+            if [[ "$_wtarget" == '"'* && "$_wmarked" == *$'\001('* ]] && _wt_isolation_in_play; then
+                deny "BLOCKED: Bash write target '${_wtarget}' contains an unresolved command substitution. Use a literal redirect destination so the guard can verify where the write lands." "worktree-write-confinement-unresolved-var"  # scan-reads: COMMAND_ASK_SCAN
+            fi
             # The cwd itself can carry the unexpanded `$` instead of the
             # target (`cd $A && echo x > f.sh` — extract_write_targets threads
             # the unresolved `cd` argument into curcwd), so mark it too and

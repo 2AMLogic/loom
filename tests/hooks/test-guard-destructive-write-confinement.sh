@@ -80,6 +80,55 @@ assert_allow "write-confinement: echo > target in /tmp allows" \
 assert_allow "write-confinement: cd <worktree> && echo > relative target allows" \
     "cd $WT_DIR && echo x > f.sh" "$WT_REPO"
 
+# The colon suffix of each quoted loop word fixes the label used by tr (#15417).
+# Keep the command as shell source. The fixture only asks the hook for a verdict.
+label_loop=$(cat <<'CMD'
+for g in "$W/layout/utmi_stub.gds:OLD(committed)" "$W/flow/build/trial/.klt/place-and-route/utmi_stub.gds:NEW(with PDN)"; do
+  f="${g%%:*}"; label="${g##*:}"
+  klt erc "$f" /tmp/issue59-erc-spec.json --top utmi_stub --pdk sky130 --format json > "/tmp/erc-$(echo $label|tr -d '()').json" 2>/tmp/erc.err || true
+done
+CMD
+)
+assert_allow "write-confinement (#15417): fixed loop labels name scratch files" "$label_loop" "$WT_REPO"
+label_setup=$(cat <<'CMD'
+cat > /tmp/issue59-erc-spec.json <<'JSON'
+{}
+JSON
+export PATH=/opt/klayout/bin:$PATH
+W=/tmp/issue-59
+CMD
+)
+assert_allow "write-confinement (#15417): reported scratch setup followed by loop" \
+    "$label_setup
+$label_loop" "$WT_REPO"
+assert_deny "write-confinement (#15417): relative stdout stays in checkout" \
+    "${label_loop/\/tmp\/erc-/erc-}" "$WT_REPO"
+assert_deny "write-confinement (#15417): absolute checkout stdout" \
+    "${label_loop/\/tmp\/erc-/$WT_REPO/erc-}" "$WT_REPO"
+assert_deny_reason_matches "write-confinement (#15417): stderr checked separately" \
+    "${label_loop/2>\/tmp\/erc.err/2>$WT_REPO/checkout.err}" 'checkout\.err' "$WT_REPO"
+assert_deny_reason_matches "write-confinement (#15417): later checkout write" \
+    "$label_loop
+echo x > $WT_REPO/after.txt" 'after\.txt' "$WT_REPO"
+# Only the second concrete destination resolves into the primary checkout.
+label_scratch=$(mktemp -d /tmp/loom-loop-XXXXXXXX)
+ln -s "$WT_REPO" "$label_scratch/erc-NEWwith PDN.json"
+assert_deny_reason_matches "write-confinement (#15417): second destination checked" \
+    "${label_loop/\/tmp\/erc-/$label_scratch/erc-}" 'erc-NEWwith PDN\.json' "$WT_REPO"
+rm -rf "$label_scratch"
+for label_cwd in "$WT_REPO" "$WT_DIR"; do
+    assert_deny "write-confinement (#15417): unresolved loop label" \
+        "${label_loop/OLD(committed)/\$unknown}" "$label_cwd"
+    assert_deny "write-confinement (#15417): every loop word needs a literal label" \
+        "${label_loop/NEW(with PDN)/\$unknown}" "$label_cwd"
+    assert_deny "write-confinement (#15417): standalone redirect has no loop binding" \
+        "$(printf '%s\n' "$label_loop" | sed -n '/klt erc/p')" "$label_cwd"
+    assert_deny "write-confinement (#15417): dynamic directory" \
+        "${label_loop/\/tmp\/erc-/\/tmp\/\$dir\/erc-}" "$label_cwd"
+    assert_deny "write-confinement (#15417): modified substitution is still live" \
+        "${label_loop/echo \$label/echo \$label > $WT_REPO/inner}" "$label_cwd"
+done
+
 # --- #7415: a git worktree NESTED under the main checkout, created by a plain
 # `git worktree add` (so carrying no `.loom-managed` sentinel), was
 # indistinguishable from the main checkout: the sentinel walk-up found nothing
