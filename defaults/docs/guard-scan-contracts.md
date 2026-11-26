@@ -133,7 +133,7 @@ list.
 | `rm-protected-path` (×2) | `COMMAND_ASK_SCAN`, `COMMAND_RM_MKTEMP_SCAN` |
 | `rm-scope-unresolved-var` | `COMMAND_ASK_SCAN`, `COMMAND_RM_MKTEMP_SCAN` |
 | `rm-scope-outside-repo` | `COMMAND_ASK_SCAN`, `COMMAND_RM_MKTEMP_SCAN` |
-| `worktree-write-confinement-unresolved-var` (×3) | `COMMAND_ASK_SCAN`, `COMMAND_WT_MKTEMP_SCAN` |
+| `worktree-write-confinement-unresolved-var` (×4) | `COMMAND_ASK_SCAN`, `COMMAND_WT_MKTEMP_SCAN` |
 | `worktree-write-confinement` | `COMMAND_ASK_SCAN`, `COMMAND_WT_MKTEMP_SCAN` |
 | `stash-scope:create-redirect` | `COMMAND_STASH_SCAN` |
 

@@ -8896,7 +8896,7 @@ resolve_loop_label_redirect() {
 
     # Only ordinary command words may intervene before stdout. Leave every
     # other redirect and all following commands in the normal write scan.
-    local args='([[:blank:]]+([A-Za-z0-9_./-]+|"\$[A-Za-z_][A-Za-z0-9_]*"))*'
+    local args='([[:blank:]]+([A-Za-z0-9_./=:,-]+|"\$[A-Za-z_][A-Za-z0-9_]*"))*'
     re="^[[:blank:]]*[;$nl]${space}([A-Za-z0-9_./-]+)${args}[[:blank:]]+>[[:blank:]]*"
     [[ "$rest" =~ $re ]] || return 1
     rest=${rest#"${BASH_REMATCH[0]}"}
@@ -8929,6 +8929,19 @@ resolve_loop_label_redirect() {
         loop_targets+=("$prefix$label$suffix")
     done
     write_scan="$before\"${loop_targets[0]}\"$rest"
+}
+
+# A complete double-quoted redirect can have a known directory even when
+# the basename contains a timestamp, hostname or login name (#15417).
+# Match the raw operand so a qsplit fragment or additional expansion cannot
+# stand in for a complete filename. Never run a command to obtain its value.
+wt_write_filename_subst_only() {
+    local path_text='[^"$`\\]*' leaf_text='[^/"$`\\]*'
+    # Only literal separators and numeric date conversions within the filename.
+    local stamp='date[[:blank:]]+(-u[[:blank:]]+)?\+([0-9._:+-]|%[YmdHMSsjFTN])+'
+    local subst='\$\(('"$stamp"'|hostname|id[[:blank:]]+-un)\)'
+    local operand_re="^\"(${path_text}/)?${leaf_text}(${subst}${leaf_text})+\"$"
+    [[ "$1" =~ $operand_re ]]
 }
 
 # =============================================================================
@@ -10801,11 +10814,14 @@ if worktree_isolation_guard_enabled && \
         if [[ "$_wtarget" == *'$'* || "$_wcwd" == *'$'* ]]; then
             mark_expandable_dollars "$_wtarget"
             _wmarked="$_MARKED_TOKEN"
-            # A live command substitution may produce directory separators
-            # even after a literal filename prefix. A fragmented quote is
-            # insufficient evidence to resolve that operand against cwd.
-            if [[ "$_wtarget" == '"'* && "$_wmarked" == *$'\001('* ]] && _wt_isolation_in_play; then
-                deny "BLOCKED: Bash write target '${_wtarget}' contains an unresolved command substitution. Use a literal redirect destination so the guard can verify where the write lands." "worktree-write-confinement-unresolved-var"  # scan-reads: COMMAND_ASK_SCAN
+            if [[ "$_wtarget" == '"'* && "$_wmarked" == *$'\001('* ]]; then
+                if wt_write_filename_subst_only "$_wtarget"; then
+                    # Only the basename varies. Keep the original operand for
+                    # containment and still check any unresolved dollars in cwd.
+                    _wmarked=${_wmarked//$'\001'/'$'}
+                elif _wt_isolation_in_play; then
+                    deny "BLOCKED: Bash write target '${_wtarget}' contains an unresolved command substitution. Use a literal redirect destination so the guard can verify where the write lands." "worktree-write-confinement-unresolved-var"  # scan-reads: COMMAND_ASK_SCAN
+                fi
             fi
             # The cwd itself can carry the unexpanded `$` instead of the
             # target (`cd $A && echo x > f.sh` — extract_write_targets threads

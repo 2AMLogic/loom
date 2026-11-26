@@ -1115,6 +1115,21 @@ mirroring the quoted-tilde rule of #4382. As always, the deny only fires when a
 managed worktree actually exists for the repo, and the category toggle below
 switches it off with the rest of the check.
 
+**Double-quoted redirect filenames (#15417).** For `>`, `>>`, and numbered
+redirects such as `2>`, the guard checks the literal parent directory of a
+filename containing `$(hostname)`, `$(id -un)`, or a numeric timestamp such as
+`$(date +%s)` or `$(date -u +%Y%m%d)`. For example,
+`> "/tmp/x-$(date +%s).log"` allows. A relative `> "out-$(date +%s).log"`
+allows after `cd` into a managed worktree and denies in the primary checkout.
+An unresolved directory, a fragmented operand, or a substitution whose output
+could contain a path separator denies. The guard inspects the command text
+without running the substitution.
+
+For the loop that extracts a label with `${g##*:}` and removes parentheses
+with `tr -d '()'`, literal label suffixes in every loop word establish the
+possible scratch filenames. The guard checks each destination, the separate
+stderr redirect, and any subsequent writes.
+
 The workaround when an agent legitimately needs a variable-derived target is to
 spell the path out literally — inside its own issue worktree for repo files, or
 as an explicit `/tmp/...` path for scratch. This deliberately also denies a
@@ -1332,10 +1347,11 @@ because each `PreToolUse` hook invocation only sees the current command's
 text, never prior shell state. Re-declare the literal value in the same
 command as the write.
 
-This workaround applies to the three `worktree-write-confinement-unresolved-var`
-deny sites in `guard-destructive-generic.sh`'s Bash-tool write-confinement
-check (the ones fed by `extract_write_targets()`, which runs the resolver
-above before reaching these deny paths).
+The Bash-tool write-confinement check has four
+`worktree-write-confinement-unresolved-var` deny sites. Three cover variable
+paths as described above. The fourth covers unresolved command substitutions
+in quoted redirect operands. For that case, spell out the destination or use
+one of the filename forms described above.
 
 The `rm-scope-unresolved-var` deny (`guards.rmScope=repo`) reaches the same
 outcome by a **separate, narrower** route: `extract_rm_targets()` still never

@@ -90,6 +90,8 @@ done
 CMD
 )
 assert_allow "write-confinement (#15417): fixed loop labels name scratch files" "$label_loop" "$WT_REPO"
+assert_allow "write-confinement (#15417): fixed labels with --flag=value arguments" \
+    "${label_loop/--pdk sky130/--pdk=sky130 --format-map=a:b,c}" "$WT_REPO"
 label_setup=$(cat <<'CMD'
 cat > /tmp/issue59-erc-spec.json <<'JSON'
 {}
@@ -128,6 +130,31 @@ for label_cwd in "$WT_REPO" "$WT_DIR"; do
     assert_deny "write-confinement (#15417): modified substitution is still live" \
         "${label_loop/echo \$label/echo \$label > $WT_REPO/inner}" "$label_cwd"
 done
+
+# Keep ordinary filename substitutions subject to the destination's usual
+# confinement check, including the cwd established by a preceding cd.
+assert_allow "write-confinement (#15417): timestamped scratch redirect" \
+    'echo x > "/tmp/x-$(date +%s).log"' "$WT_REPO"
+assert_allow "write-confinement (#15417): timestamped append in the managed worktree" \
+    "echo x >> \"$WT_DIR/out-\$(date +%s).log\"" "$WT_REPO"
+assert_allow "write-confinement (#15417): timestamped relative redirect after cd" \
+    "cd \"$WT_DIR\" && echo x > \"out-\$(date +%s).log\"" "$WT_REPO"
+assert_allow "write-confinement (#15417): numeric UTC date as relative basename" \
+    'echo x > "$(date -u +%Y%m%d).log"' "$WT_DIR"
+assert_allow "write-confinement (#15417): hostname and user in attached stderr filename" \
+    'echo x > /tmp/a.log 2>"/tmp/$(hostname)-$(id -un).err"' "$WT_REPO"
+assert_deny "write-confinement (#15417): timestamped checkout filename" \
+    "echo x > \"$WT_REPO/out-\$(date +%s).log\"" "$WT_DIR"
+assert_deny_reason_matches "write-confinement (#15417): timestamped stdout still checks stderr" \
+    "echo x > \"/tmp/x-\$(date +%s).log\" 2>$WT_REPO/checkout.err" 'checkout\.err' "$WT_DIR"
+assert_deny "write-confinement (#15417): timestamp in an unresolved directory" \
+    'echo x > "/tmp/$dir/x-$(date +%s).log"' "$WT_DIR"
+assert_deny "write-confinement (#15417): command substitution in a directory component" \
+    'echo x > "/tmp/x-$(date +%s)/out.log"' "$WT_DIR"
+assert_deny "write-confinement (#15417): date conversion can produce separators" \
+    'echo x > "/tmp/x-$(date +%D).log"' "$WT_DIR"
+assert_deny "write-confinement (#15417): complete substitution with unknown filename output" \
+    'echo x > "/tmp/x-$(cat labels.txt).log"' "$WT_DIR"
 
 # --- #7415: a git worktree NESTED under the main checkout, created by a plain
 # `git worktree add` (so carrying no `.loom-managed` sentinel), was
