@@ -1979,7 +1979,7 @@ function has_live_subst(str,    i, c, bs) {
 # and k+1. Callers that ignore it are unaffected; parse_force_ops() reads it.
 # =============================================================================
 _QSPLIT_AWK="$_HASLIVESUBST_AWK"'
-function qsplit(s,   out, n, i, c, j, qc, ci, inner, SQ, DQ, k, ch, scanfrom, bs, bk) {
+function qsplit(s, join_lines_only,   out, n, i, c, j, qc, ci, inner, SQ, DQ, k, ch, scanfrom, bs, bk) {
     SQ = sprintf("%c", 39)   # single quote
     DQ = sprintf("%c", 34)   # double quote
     out = ""
@@ -2060,8 +2060,9 @@ function qsplit(s,   out, n, i, c, j, qc, ci, inner, SQ, DQ, k, ch, scanfrom, bs
                 continue
             }
             inner = substr(s, i + 1, ci - i - 1)
-            if (!has_live_subst(inner)) {
-                # Inert quoted span: copy verbatim, separators inside are literal.
+            if (join_lines_only || !has_live_subst(inner)) {
+                # Joining lines preserves the entire span. During segmentation,
+                # only an inert span keeps its separators literal.
                 out = out substr(s, i, ci - i + 1)
                 i = ci + 1
                 continue
@@ -2180,6 +2181,9 @@ function qsplit(s,   out, n, i, c, j, qc, ci, inner, SQ, DQ, k, ch, scanfrom, bs
             i += 2
             continue
         }
+        # The rm scanner first joins continued physical lines, then uses the
+        # operators from a separate qsplit call for each logical line.
+        if (join_lines_only) { out = out c; i++; continue }
         if (c == ";") { out = out "\n"; qsplit_op[++qsplit_nops] = ";"; i++; continue }
         if (c == "&") {
             if (i < n && substr(s, i + 1, 1) == "&") { out = out "\n"; qsplit_op[++qsplit_nops] = "&&"; i += 2; continue }
@@ -7795,12 +7799,16 @@ _extract_rm_targets_scan() {
         }
         curcwd = curcwd "/" cls
     }
-    {
-        # A new input record is a newline boundary, i.e. a `;`: an earlier cd
-        # does not reliably move this record (#15169 review).
+    { buf = buf (NR > 1 ? "\n" : "") $0 }
+    END {
+        if (index(buf, BS "\n")) buf = qsplit(buf, 1)
+        nlines = split(buf, lines, "\n")
+        for (ln = 1; ln <= nlines; ln++) scan_rm_line(lines[ln])
+    }
+    function scan_rm_line(line) {
+        # An uncontinued newline breaks the link to an earlier cd (#15169).
         if (startunres != 1) cdlink = 0
-        $0 = qsplit($0)   # quote-aware segmentation (#3755)
-        n = split($0, segs, "\n")
+        n = split(qsplit(line), segs, "\n")
         # qsplit_op[k] is the operator between segments k and k+1, but a literal
         # newline records none: when the counts disagree the operators cannot be
         # trusted, so every cd below fails closed.
@@ -7860,11 +7868,11 @@ _extract_rm_targets_scan() {
             # Grouping: `{ ` runs in the current shell (stripped); `(` and `$(`
             # open a subshell whose cd never leaks out, so save the state on
             # each open paren and restore it on each close (#12082 analogue).
-            # Quoted spans are blanked before counting.
+            # Consume quoted spans and escaped bytes together so literal parens
+            # cannot change the directory stack. A backslash pair is one literal.
             while (seg ~ /^\{[ \t]/) sub(/^\{[ \t]+/, "", seg)
             pq = segs[i]
-            gsub(/"[^"]*"/, "", pq)
-            gsub(/\047[^\047]*\047/, "", pq)
+            gsub(/\\.|"([^"\\]|\\.)*"|\047[^\047]*\047/, "", pq)
             popen = gsub(/\(/, "", pq)
             pclose = gsub(/\)/, "", pq)
             # A leading `(` encloses this segment, so the state is saved before

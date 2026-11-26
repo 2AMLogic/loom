@@ -298,6 +298,18 @@ assert_allow "rmScope default (#15221): nested subshell closes after a proven mk
     'D=$(mktemp -d); function finish { ( ( rm -rf "$D") ); }; finish' "$REPO_ROOT"
 assert_allow "rmScope default (#15221): redirection on the subshell body follows the rm operands" \
     'cd /usr && finish() ( rm -f /tmp/x/foo ) >/dev/null; finish' "$REPO_ROOT"
+assert_allow "#15221: continued redirection follows the subshell close" \
+    'cd /usr && finish() ( rm -f /tmp/x/foo ) \
+        2>/dev/null; finish' "$REPO_ROOT"
+assert_allow "#15221: continued AND-list follows the subshell close" \
+    'cd /usr && finish() ( rm -f /tmp/x/foo ) \
+        && finish' "$REPO_ROOT"
+assert_deny_reason_matches "#15221: continued AND-list keeps the outer directory for the next rm" \
+    'cd /usr && finish() ( rm -f /tmp/x/foo ) \
+        && rm -f local-note' '/usr/local-note$' "$REPO_ROOT"
+assert_deny_reason_matches "#15221: a literal backslash at line end keeps the next rm separate" \
+    'printf %s \\
+rm -f /opt/loom-fixture' '/opt/loom-fixture$' "$REPO_ROOT"
 for fd_redirect in '{logfd}>/dev/null' '{logfd}>>/dev/null' '{logfd}</dev/null'; do
     assert_allow "rmScope default (#15221): group redirection $fd_redirect follows the rm operands" \
         "cd /usr && finish() ( rm -f /tmp/x/foo ) $fd_redirect; finish" "$REPO_ROOT"
@@ -1419,6 +1431,10 @@ assert_allow "#15221 merge: name() ( cd ... ) body opener keeps the cd contained
     'probe() ( cd /tmp ) && rm -rf data' "$REPO_ROOT"
 assert_allow "#15221: inner cd in a subshell function body leaves the cleanup in the repo" \
     'finish() ( ( cd /usr ) && rm -f local-note ); finish' "$REPO_ROOT"
+assert_allow "#15221: escaped literal opener in the inner command leaves the cleanup in the repo" \
+    'finish() ( ( cd /usr && printf %s report\(draft ) && rm -f local-note ); finish' "$REPO_ROOT"
+assert_allow "#15221: escaped literal closer leaves the inner cwd active until the real close" \
+    'cd /usr && ( cd /tmp && printf %s report\)draft && rm -f local-note )' "$REPO_ROOT"
 assert_allow "#15221: inner cd in a function-keyword subshell body leaves the cleanup in the repo" \
     'function finish ( ( cd /usr ) && rm -f local-note ); finish' "$REPO_ROOT"
 assert_allow "#15221: two nested groups in a brace body each restore the repo cwd" \
