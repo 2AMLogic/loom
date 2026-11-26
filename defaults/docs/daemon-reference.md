@@ -10044,9 +10044,13 @@ removed only when **every** gate proves eligibility; any unreadable answer
 preserves (fail closed):
 
 1. the linked ticket is `CLOSED`/`MERGED` on the repo identified by a
-   worktree's `origin` remote. The search covers the root and six directory
-   levels below it. A missing worktree, a non-GitHub origin or a failed
-   ticket lookup preserves the root.
+   worktree's `origin` remote. Every discovered origin must match the same
+   registered workspace (or the daemon workspace when the registry is empty).
+   A mixed or ambiguous origin preserves the root. Only its owning workspace
+   can apply its `scratchReclaim` settings, including when workspaces share
+   a volume, home or temporary directory. The search covers the root and
+   six directory levels below it. A missing worktree, a non-GitHub origin
+   or a failed ticket lookup preserves the root.
 2. a `watch-pid` file at the root's top level names a dead process (absent
    passes; unreadable/unparseable counts as alive);
 3. no process has its cwd or an open file under the root;
@@ -10082,9 +10086,12 @@ selects preview for all other values. Live removal events have
 telemetry before enabling deletion in a separate change. The shared
 `scratchReclaim.enabled` switch controls both scratch passes.
 
-**Where it runs.** The scheduled `worktreeReaper` tick and the eager tier-1
-pass, sharing the `scratchReclaim` block above (`enabled`, `maxAgeHours`, the
-30-minute `minIntervalSecs` cooldown, and this pass's `dryRun`).
+**Where it runs.** The scheduled `worktreeReaper` tick and eager tier 1 queue
+the same background scan. Requests for a workspace with a queued or running
+scan coalesce. Workspaces are scanned sequentially, each with its own
+`minIntervalSecs` cooldown (30 minutes by default). Dispatch continues while
+the scan runs. The eager report shows the pending scan. The worker publishes
+each eligible-root event and logs a summary when the scan finishes.
 
 See `loom-daemon/src/scratch_root_reaper.rs`.
 

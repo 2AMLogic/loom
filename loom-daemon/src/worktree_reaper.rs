@@ -869,7 +869,7 @@ pub fn reap_repo(repo_root: &Path, config: &WorktreeReaperConfig) -> ReapReport 
     // `$HOME`, `~/.cache` and `$TMPDIR`. Fail-closed gates (closed ticket,
     // dead watch-pid, no open fds, 24h idle, clean+published worktrees),
     // own 30-minute cooldown shared with the eager tier's call.
-    let _ = crate::scratch_root_reaper::run_for(repo_root);
+    let _ = crate::scratch_root_reaper::schedule(repo_root);
 
     // #5919: the primary checkout's OWN build artifacts — the one thing
     // neither pass above can reach, and the leak that took hosts to 1.9 GiB

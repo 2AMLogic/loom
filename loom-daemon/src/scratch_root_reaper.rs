@@ -71,7 +71,7 @@
 //! the scheduled `worktree_reaper` tick and the eager tier-1 pass, gated by
 //! its own 30-minute per-repo cooldown.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Arc, Mutex, OnceLock};
@@ -536,6 +536,31 @@ fn gh_host() -> String {
     std::env::var("GH_HOST").unwrap_or_else(|_| "github.com".to_string())
 }
 
+/// A scratch root's origin can identify a workspace only if exactly one
+/// registered checkout has that origin. Include disabled checkouts in this
+/// test: their configuration is just as authoritative as an enabled one's.
+fn unique_workspace_slug(workspace: &Path) -> Option<String> {
+    let host = gh_host();
+    let slug_for = |path: &Path| {
+        if !path.join(".git").exists() {
+            return None;
+        }
+        github_slug_from_url(&origin_url(path)?, &host)
+    };
+    let workspace = workspace.canonicalize().ok()?;
+    let slug = slug_for(&workspace)?;
+    let registry = crate::workspace_registry::WorkspaceRegistry::load_default().ok()?;
+    let roots = registry.effective_roots(&workspace);
+    if !roots.contains(&workspace)
+        || roots.iter().any(|other| {
+            other != &workspace && slug_for(other).is_some_and(|s| s.eq_ignore_ascii_case(&slug))
+        })
+    {
+        return None;
+    }
+    Some(slug)
+}
+
 /// Gate 2's watch-pid reading. Fails closed: an existing `watch-pid` file
 /// that cannot be read or parsed counts as **alive** — only a dead pid or
 /// no file at all passes the gate.
@@ -601,7 +626,7 @@ pub struct ScratchRootProbes<'a> {
 /// Apply every removal gate, cheapest first, to one candidate root. Pure
 /// decision logic: removes nothing.
 #[must_use]
-pub fn evaluate_root(root: &Path, probes: &ScratchRootProbes<'_>) -> RootVerdict {
+pub fn evaluate_root(root: &Path, owner: &str, probes: &ScratchRootProbes<'_>) -> RootVerdict {
     let Some(name) = root
         .file_name()
         .and_then(|n| n.to_str())
@@ -629,6 +654,22 @@ pub fn evaluate_root(root: &Path, probes: &ScratchRootProbes<'_>) -> RootVerdict
     if !crate::scratch_reclaim::is_reclaimable_age(root_age, probes.max_age_secs) {
         return RootVerdict::Preserve("root younger than scratchReclaim.maxAgeHours");
     }
+    let Some(worktrees) = find_git_worktrees(root) else {
+        return RootVerdict::Preserve("worktree search could not answer (unreadable subtree)");
+    };
+    let Some(probe_cwd) = worktrees.first() else {
+        return RootVerdict::Preserve("no git worktree inside the root");
+    };
+    let host = gh_host();
+    for worktree in &worktrees {
+        let Some(slug) = origin_url(worktree).and_then(|url| github_slug_from_url(&url, &host))
+        else {
+            return RootVerdict::Preserve("no resolvable GitHub origin repository");
+        };
+        if !slug.eq_ignore_ascii_case(owner) {
+            return RootVerdict::Preserve("worktree belongs to another repository");
+        }
+    }
     match probe_idle(root, probes.idle_window_secs, probes.now) {
         IdleProbe::Recent(_) => {
             return RootVerdict::Preserve("files changed within the 24h idle window");
@@ -637,12 +678,6 @@ pub fn evaluate_root(root: &Path, probes: &ScratchRootProbes<'_>) -> RootVerdict
             return RootVerdict::Preserve("idle walk could not answer (unreadable subtree)");
         }
         IdleProbe::Idle => {}
-    }
-    let Some(worktrees) = find_git_worktrees(root) else {
-        return RootVerdict::Preserve("worktree search could not answer (unreadable subtree)");
-    };
-    if worktrees.is_empty() {
-        return RootVerdict::Preserve("no git worktree inside the root");
     }
     let mut prune = BTreeSet::new();
     for worktree in &worktrees {
@@ -655,23 +690,13 @@ pub fn evaluate_root(root: &Path, probes: &ScratchRootProbes<'_>) -> RootVerdict
             WorktreeSafety::NotSafe(reason) => return RootVerdict::Preserve(reason),
         }
     }
-    // Ticket → repo: the first worktree whose `origin` names a GitHub repo.
-    // The resolving worktree is also the cwd the ticket probe runs `gh` in.
-    let host = gh_host();
-    let Some((probe_cwd, slug)) = worktrees.iter().find_map(|worktree| {
-        let url = origin_url(worktree)?;
-        let slug = github_slug_from_url(&url, &host)?;
-        Some((worktree.clone(), slug))
-    }) else {
-        return RootVerdict::Preserve("no resolvable GitHub origin repository");
-    };
     match watch_pid_state(root, probes.pid_alive) {
         WatchPidState::Alive | WatchPidState::Unreadable => {
             return RootVerdict::Preserve("watch-pid file names a live process");
         }
         WatchPidState::Dead | WatchPidState::Absent => {}
     }
-    match (probes.ticket_finished)(&probe_cwd, &slug, name.ticket) {
+    match (probes.ticket_finished)(probe_cwd, owner, name.ticket) {
         Some(true) => {}
         Some(false) => return RootVerdict::Preserve("linked ticket is open"),
         None => return RootVerdict::Preserve("linked ticket state unknown (probe failed)"),
@@ -681,7 +706,7 @@ pub fn evaluate_root(root: &Path, probes: &ScratchRootProbes<'_>) -> RootVerdict
     }
     RootVerdict::Remove {
         ticket: name.ticket,
-        repo: slug,
+        repo: owner.to_owned(),
         bytes: dir_size_bytes(root),
         prune,
     }
@@ -887,9 +912,10 @@ impl ScratchRootReport {
 
 /// Evaluate every candidate under `roots` and remove (or plan, under
 /// `dry_run`) the eligible ones, recording each removal via `recorder`.
-/// `repo_root` is only reporting provenance.
+/// Only the workspace uniquely identified by the candidate origins may act.
 fn sweep(
     repo_root: &Path,
+    owner: Option<&str>,
     roots: &[PathBuf],
     probes: &ScratchRootProbes<'_>,
     dry_run: bool,
@@ -908,7 +934,11 @@ fn sweep(
     };
     for candidate in discover_candidates(roots) {
         report.candidates += 1;
-        match evaluate_root(&candidate, probes) {
+        let verdict = owner.map_or(
+            RootVerdict::Preserve("workspace has no unique registered GitHub origin"),
+            |slug| evaluate_root(&candidate, slug, probes),
+        );
+        match verdict {
             RootVerdict::Remove {
                 ticket,
                 repo,
@@ -1082,12 +1112,22 @@ pub fn production_probes(
 /// `scratchReclaim` config surface and its own cooldown, and log the result.
 #[must_use]
 pub fn run_for(repo_root: &Path) -> ScratchRootReport {
-    run_for_roots(repo_root, &candidate_roots(repo_root))
+    run_for_roots(
+        repo_root,
+        &candidate_roots(repo_root),
+        &prod_ticket_finished,
+        &ProductionRecorder,
+    )
 }
 
 /// [`run_for`] over an explicit root list — the seam tests use so they never
 /// scan (or remove from) the real `$HOME` / `$TMPDIR` / worktree volume.
-fn run_for_roots(repo_root: &Path, roots: &[PathBuf]) -> ScratchRootReport {
+fn run_for_roots(
+    repo_root: &Path,
+    roots: &[PathBuf],
+    ticket_finished: &dyn Fn(&Path, &str, u32) -> Option<bool>,
+    recorder: &dyn Recorder,
+) -> ScratchRootReport {
     let config = crate::scratch_reclaim::read_scratch_reclaim_config(repo_root);
     let enabled = crate::scratch_reclaim::resolve_enabled(&config);
     let dry_run = crate::scratch_reclaim::resolve_dry_run(&config);
@@ -1134,11 +1174,56 @@ fn run_for_roots(repo_root: &Path, roots: &[PathBuf]) -> ScratchRootReport {
     let max_age_secs =
         i64::try_from(crate::scratch_reclaim::resolve_max_age_hours(&config).saturating_mul(3600))
             .unwrap_or(i64::MAX);
-    let probes = production_probes(now, IDLE_WINDOW_SECS, max_age_secs);
-    let report = sweep(repo_root, roots, &probes, dry_run, &ProductionRecorder);
+    let probes = ScratchRootProbes {
+        ticket_finished,
+        ..production_probes(now, IDLE_WINDOW_SECS, max_age_secs)
+    };
+    let owner = unique_workspace_slug(repo_root);
+    let report = sweep(repo_root, owner.as_deref(), roots, &probes, dry_run, recorder);
     record_run(repo_root, now);
     log_report(&report);
     report
+}
+
+/// Scheduled and eager ticks share one queued or running job per workspace.
+static SCANS: Mutex<BTreeMap<PathBuf, tokio::task::JoinHandle<()>>> = Mutex::new(BTreeMap::new());
+/// Shared directories are walked by at most one worker at a time.
+static WALK_SLOT: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(1);
+
+/// Queue a scan and return immediately. The worker reports actual removals
+/// and previews separately when it completes.
+pub fn schedule(repo_root: &Path) -> bool {
+    schedule_with(repo_root, |root| {
+        let _ = run_for(root);
+    })
+}
+
+pub(crate) fn schedule_with(repo_root: &Path, scan: impl FnOnce(&Path) + Send + 'static) -> bool {
+    let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+        log::warn!("scratch_root_reaper: cannot schedule a scan outside the daemon runtime");
+        return false;
+    };
+    let root = crate::workspace_registry::normalize_path(repo_root);
+    let mut scans = SCANS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    scans.retain(|_, task| !task.is_finished());
+    scans.entry(root.clone()).or_insert_with(|| {
+        runtime.spawn(async move {
+            let Ok(permit) = WALK_SLOT.acquire().await else {
+                return;
+            };
+            if let Err(err) = tokio::task::spawn_blocking(move || {
+                let _permit = permit;
+                scan(&root);
+            })
+            .await
+            {
+                log::error!("scratch_root_reaper: scan worker failed: {err}");
+            }
+        })
+    });
+    true
 }
 
 #[cfg(test)]
@@ -1532,7 +1617,10 @@ mod tests {
         let file = tmp.path().join("loom-9987-src.patch");
         std::fs::write(&file, b"x").unwrap();
         let (probes, _) = probes_now(24 * 3600, 24 * 3600);
-        assert_eq!(evaluate_root(&file, &probes), RootVerdict::Preserve("not a directory"));
+        assert_eq!(
+            evaluate_root(&file, "acme/widgets", &probes),
+            RootVerdict::Preserve("not a directory")
+        );
     }
 
     #[test]
@@ -1544,7 +1632,7 @@ mod tests {
         // Fresh mtime: fails both the age floor and the idle window; the age
         // floor is checked first.
         assert_eq!(
-            evaluate_root(&root, &probes),
+            evaluate_root(&root, "acme/widgets", &probes),
             RootVerdict::Preserve("root younger than scratchReclaim.maxAgeHours")
         );
     }
@@ -1558,7 +1646,7 @@ mod tests {
         let (probes, now) = probes_now(24 * 3600, 24 * 3600);
         backdate(&root, now.timestamp() - 48 * 3600);
         assert_eq!(
-            evaluate_root(&root, &probes),
+            evaluate_root(&root, "acme/widgets", &probes),
             RootVerdict::Preserve("no git worktree inside the root")
         );
     }
@@ -1573,7 +1661,7 @@ mod tests {
 
         let (probes, _) = probes_now(24 * 3600, 24 * 3600);
         assert_eq!(
-            evaluate_root(&link, &probes),
+            evaluate_root(&link, "acme/widgets", &probes),
             RootVerdict::Preserve("root is a symlink (never followed)")
         );
 
@@ -1591,7 +1679,7 @@ mod tests {
             device_of: &mount_device,
         };
         assert_eq!(
-            evaluate_root(&mount, &probing),
+            evaluate_root(&mount, "acme/widgets", &probing),
             RootVerdict::Preserve("root is a mount point (device differs from parent)")
         );
     }
@@ -1615,7 +1703,7 @@ mod tests {
             device_of: probes.device_of,
         };
         assert_eq!(
-            evaluate_root(&root, &probing),
+            evaluate_root(&root, "acme/widgets", &probing),
             RootVerdict::Preserve("no git worktree inside the root")
         );
 
@@ -1623,7 +1711,7 @@ mod tests {
         std::fs::write(root.join("watch-pid"), "999999997").unwrap();
         backdate(&root, now.timestamp() - 48 * 3600);
         assert_eq!(
-            evaluate_root(&root, &probing),
+            evaluate_root(&root, "acme/widgets", &probing),
             RootVerdict::Preserve("no git worktree inside the root")
         );
 
@@ -1648,7 +1736,7 @@ mod tests {
         std::fs::write(root.join("watch-pid"), "not-a-pid").unwrap();
         backdate(&root, now.timestamp() - 48 * 3600);
         assert_eq!(
-            evaluate_root(&root, &probing),
+            evaluate_root(&root, "acme/widgets", &probing),
             RootVerdict::Preserve("watch-pid file names a live process")
         );
     }
@@ -1676,7 +1764,7 @@ mod tests {
             ..open_probes
         };
         assert_eq!(
-            evaluate_root(&root, &open_probes),
+            evaluate_root(&root, "acme/widgets", &open_probes),
             RootVerdict::Preserve("no git worktree inside the root")
         );
         // With a resolvable worktree, the ticket gate decides.
@@ -1698,11 +1786,11 @@ mod tests {
         git(&with_wt, &["update-ref", "refs/remotes/origin/main", "HEAD"]);
         backdate(&root, now.timestamp() - 48 * 3600);
         assert_eq!(
-            evaluate_root(&root, &open_probes),
+            evaluate_root(&root, "acme/widgets", &open_probes),
             RootVerdict::Preserve("linked ticket is open")
         );
         assert_eq!(
-            evaluate_root(&root, &unknown_probes),
+            evaluate_root(&root, "acme/widgets", &unknown_probes),
             RootVerdict::Preserve("linked ticket state unknown (probe failed)")
         );
     }
@@ -1727,7 +1815,7 @@ mod tests {
             device_of: probes.device_of,
         };
         assert_eq!(
-            evaluate_root(&root, &probing),
+            evaluate_root(&root, "acme/widgets", &probing),
             RootVerdict::Preserve("no git worktree inside the root")
         );
     }
@@ -1966,8 +2054,14 @@ mod tests {
         };
 
         let recorder = Mutex::new(Vec::new());
-        let report =
-            sweep(base, &[base.to_path_buf()], &probes, /* dry_run = */ false, &recorder);
+        let report = sweep(
+            base,
+            Some("acme/widgets"),
+            &[base.to_path_buf()],
+            &probes,
+            /* dry_run = */ false,
+            &recorder,
+        );
 
         assert!(!eligible.exists(), "eligible root is removed");
         assert_eq!(report.removed.len(), 1, "exactly one removal: {report:?}");
@@ -2006,7 +2100,7 @@ mod tests {
         assert_eq!(reason_for("loom-104-builder.eeee"), "files changed within the 24h idle window");
         assert_eq!(reason_for("loom-105-builder.ffff"), "worktree has tracked changes");
         assert_eq!(reason_for("loom-106-judge.1111"), "worktree HEAD has commits no remote holds");
-        assert_eq!(reason_for("loom-107-judge.2222"), "git status failed");
+        assert_eq!(reason_for("loom-107-judge.2222"), "no resolvable GitHub origin repository");
         assert_eq!(reason_for("loom-108-judge.3333"), "no resolvable GitHub origin repository");
         assert_eq!(reason_for("loom-109-judge.4444"), "root is a symlink (never followed)");
         assert_eq!(
@@ -2078,8 +2172,14 @@ mod tests {
         assert_eq!(config.dry_run, None);
         let bytes = dir_size_bytes(&root);
         assert!(bytes > 0);
-        let report =
-            sweep(base, &[base.to_path_buf()], &probes, resolve_dry_run(&config), &recorder);
+        let report = sweep(
+            base,
+            Some("acme/widgets"),
+            &[base.to_path_buf()],
+            &probes,
+            resolve_dry_run(&config),
+            &recorder,
+        );
         assert!(root.exists(), "dry-run removes nothing");
         assert!(report.removed.is_empty());
         assert_eq!(report.planned.len(), 1);
@@ -2103,8 +2203,14 @@ mod tests {
         let root = tmp.path().join("loom-9-builder.aa11");
         std::fs::create_dir(&root).unwrap();
         let (probes, _) = probes_now(IDLE_WINDOW_SECS, 24 * 3600);
-        let report =
-            sweep(tmp.path(), &[tmp.path().to_owned()], &probes, true, &Mutex::new(Vec::new()));
+        let report = sweep(
+            tmp.path(),
+            Some("acme/widgets"),
+            &[tmp.path().to_owned()],
+            &probes,
+            true,
+            &Mutex::new(Vec::new()),
+        );
         let logs = crate::test_log_capture::capture_logs(|| log_report(&report));
 
         assert!(
@@ -2122,6 +2228,79 @@ mod tests {
 
     #[test]
     #[serial]
+    fn shared_root_uses_only_its_owners_policy() {
+        use crate::env_test_support::EnvGuard;
+        use crate::scratch_reclaim::{
+            SCRATCH_RECLAIM_DRY_RUN_ENV, SCRATCH_RECLAIM_ENABLE_ENV,
+            SCRATCH_RECLAIM_MAX_AGE_HOURS_ENV,
+        };
+        use crate::workspace_registry::{WorkspaceRegistry, REGISTRY_PATH_ENV};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let registry_file = tmp.path().join("workspaces.json");
+        let _env = EnvGuard::clear(&[
+            SCRATCH_RECLAIM_DRY_RUN_ENV,
+            SCRATCH_RECLAIM_ENABLE_ENV,
+            SCRATCH_RECLAIM_MAX_AGE_HOURS_ENV,
+            "GH_HOST",
+        ])
+        .and_set(REGISTRY_PATH_ENV, Some(registry_file.as_os_str()));
+        let roots = [tmp.path().join("shared")];
+        let candidate = roots[0].join("loom-200-builder.cafe");
+        let source = candidate.join("source");
+        init_main_with_origin(&source, &tmp.path().join("origin.git"));
+        let url_b = "https://github.com/acme/b.git";
+        git(&source, &["remote", "set-url", "origin", url_b]);
+        backdate(&candidate, Utc::now().timestamp() - 48 * 3600);
+
+        let mut registry = WorkspaceRegistry::default();
+        let configure = |ws: &Path, enabled: bool, dry_run: bool| {
+            let config = serde_json::json!({"autonomous":{"worktreeReaper":{"scratchReclaim":{
+                "enabled": enabled, "dryRun": dry_run
+            }}}});
+            std::fs::write(ws.join(".loom/config.json"), config.to_string()).unwrap();
+        };
+        let a = tmp.path().join("a");
+        let b = tmp.path().join("b");
+        for (ws, url) in [(&a, "https://github.com/acme/a.git"), (&b, url_b)] {
+            std::fs::create_dir_all(ws.join(".loom")).unwrap();
+            git(ws, &["init", "-q"]);
+            git(ws, &["remote", "add", "origin", url]);
+            registry.add(ws, None).unwrap();
+        }
+        registry.save(&registry_file).unwrap();
+        configure(&a, true, false);
+        configure(&b, true, true);
+        let records = Mutex::new(Vec::new());
+        let run = |ws: &Path| run_for_roots(ws, &roots, &always_finished, &records);
+        for _ in 0..2 {
+            assert!(run(&a).removed.is_empty());
+            run(&b);
+        }
+        let events = records.lock().unwrap().clone();
+        assert_eq!(events.len(), 1);
+        assert!(events[0].dry_run);
+        assert_eq!(events[0].path, candidate);
+        assert_eq!(events[0].repo, "acme/b");
+        assert!(candidate.is_dir());
+
+        configure(&b, false, false);
+        reset_state_for_test();
+        assert!(run(&a).removed.is_empty());
+        assert!(!run(&b).enabled);
+        assert_eq!(records.lock().unwrap().len(), 1);
+        assert!(candidate.is_dir());
+
+        // A second registered checkout of B cannot inherit authority over it.
+        git(&a, &["remote", "set-url", "origin", url_b]);
+        reset_state_for_test();
+        assert!(run(&a).removed.is_empty());
+        assert_eq!(records.lock().unwrap().len(), 1);
+        assert!(candidate.is_dir());
+    }
+
+    #[test]
+    #[serial]
     fn test_run_for_respects_cooldown_and_disabled() {
         reset_state_for_test();
         let tmp = tempfile::tempdir().unwrap();
@@ -2131,15 +2310,15 @@ mod tests {
         let roots = [tmp.path().to_path_buf()];
 
         std::env::set_var(crate::scratch_reclaim::SCRATCH_RECLAIM_ENABLE_ENV, "0");
-        let report = run_for_roots(tmp.path(), &roots);
+        let report = run_for_roots(tmp.path(), &roots, &always_finished, &ProductionRecorder);
         std::env::remove_var(crate::scratch_reclaim::SCRATCH_RECLAIM_ENABLE_ENV);
         assert!(!report.enabled);
 
         // Enabled: first pass runs (nothing to find), second is deferred.
-        let first = run_for_roots(tmp.path(), &roots);
+        let first = run_for_roots(tmp.path(), &roots, &always_finished, &ProductionRecorder);
         assert!(first.enabled);
         assert!(first.deferred.is_none());
-        let second = run_for_roots(tmp.path(), &roots);
+        let second = run_for_roots(tmp.path(), &roots, &always_finished, &ProductionRecorder);
         assert!(second.deferred.is_some(), "cooldown defers the second pass");
     }
 
@@ -2152,10 +2331,10 @@ mod tests {
         let _env = crate::env_test_support::EnvGuard::clear(&[
             crate::scratch_reclaim::SCRATCH_RECLAIM_DRY_RUN_ENV,
         ]);
-        assert!(run_for_roots(tmp.path(), &roots).dry_run);
+        assert!(run_for_roots(tmp.path(), &roots, &always_finished, &ProductionRecorder).dry_run);
 
         std::env::set_var(crate::scratch_reclaim::SCRATCH_RECLAIM_DRY_RUN_ENV, "0");
         reset_state_for_test();
-        assert!(!run_for_roots(tmp.path(), &roots).dry_run);
+        assert!(!run_for_roots(tmp.path(), &roots, &always_finished, &ProductionRecorder).dry_run);
     }
 }

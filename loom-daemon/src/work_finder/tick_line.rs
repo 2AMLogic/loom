@@ -237,7 +237,7 @@ mod tests {
             deep_clean: None,
             docker: None,
             scratch: None,
-            scratch_roots: None,
+            scratch_roots_pending: false,
             seats: None,
             seats_pending: false,
             target_orphans: None,

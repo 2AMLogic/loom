@@ -68,20 +68,6 @@ fn scratch_report(root: &Path, now: DateTime<Utc>, removed: usize) -> ScratchRec
     }
 }
 
-fn scratch_root_report(root: &Path, now: DateTime<Utc>) -> ScratchRootReport {
-    ScratchRootReport {
-        repo_root: root.to_path_buf(),
-        enabled: true,
-        dry_run: false,
-        candidates: 0,
-        removed: Vec::new(),
-        planned: Vec::new(),
-        preserved: Vec::new(),
-        deferred: None,
-        at: now,
-    }
-}
-
 fn git_tmp_report(root: &Path, now: DateTime<Utc>) -> GitTmpReclaimReport {
     GitTmpReclaimReport {
         repo_root: root.to_path_buf(),
@@ -160,7 +146,7 @@ impl Sim {
                     "stub: seats not under test".into(),
                 )
             };
-            let stub_scratch_roots = |root: &Path| scratch_root_report(root, now);
+            let stub_scratch_roots = |_: &Path| false;
             let passes = SubPasses {
                 reap_worktrees: &reap,
                 deep_clean: &deep,
@@ -226,6 +212,13 @@ fn test_pinned_below_floor_runs_at_most_one_pass_per_cooldown_window() {
 /// after tier 1, after tier 2, …; the last value repeats), returning the
 /// sub-passes it called in order.
 fn run_tiered(probes: &[Option<u64>]) -> (EagerReclaimReport, Vec<&'static str>) {
+    run_tiered_with_scratch(probes, &|_| false)
+}
+
+fn run_tiered_with_scratch(
+    probes: &[Option<u64>],
+    schedule: &dyn Fn(&Path) -> bool,
+) -> (EagerReclaimReport, Vec<&'static str>) {
     let order = RefCell::new(Vec::new());
     let queue = RefCell::new(probes.iter().copied().collect::<VecDeque<_>>());
     let now = t(0);
@@ -271,13 +264,12 @@ fn run_tiered(probes: &[Option<u64>]) -> (EagerReclaimReport, Vec<&'static str>)
         order.borrow_mut().push("docker");
         docker_report(now)
     };
-    let stub_scratch_roots = |root: &Path| scratch_root_report(root, now);
     let passes = SubPasses {
         reap_worktrees: &reap,
         deep_clean: &deep,
         docker: &docker,
         scratch: &scratch,
-        scratch_roots: &stub_scratch_roots,
+        scratch_roots: schedule,
         seats: &seats,
         target_orphans: &orphans,
         free_gb: &free_gb,
@@ -472,25 +464,49 @@ fn test_backoff_resets_once_a_pass_reclaims_something() {
     assert!(worktree_reap_due(&ledger, t(1), COOLDOWN));
 }
 
-#[test]
-fn test_planned_scratch_root_alerts_and_advances_empty_streak() {
-    let (mut report, _) = run_tiered(&[Some(15)]);
-    let roots = report.scratch_roots.as_mut().unwrap();
-    roots.dry_run = true;
-    roots.candidates = 1;
-    roots
-        .planned
-        .push(crate::scratch_root_reaper::RemovalRecord {
-            path: "/tmp/loom-200-builder.cafe".into(),
-            ticket: 200,
-            repo: "acme/widgets".into(),
-            bytes: 4096,
-            dry_run: true,
-        });
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn eager_pass_returns_while_the_shared_scratch_scan_is_pending() {
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    let workspace = tempfile::tempdir().unwrap();
+    let (started, running) = mpsc::channel();
+    let (release, hold) = mpsc::channel();
+    let (done, finished) = mpsc::channel();
+    let root = workspace.path().to_owned();
+    // Run the same tiered pass that the dispatch tick awaits. The worker
+    // signals entry and cannot complete until after the eager report returns.
+    let report = tokio::task::spawn_blocking(move || {
+        let channels = RefCell::new(Some((started, hold, done)));
+        run_tiered_with_scratch(&[Some(15)], &|_| {
+            let (started, hold, done) = channels.take().unwrap();
+            crate::scratch_root_reaper::schedule_with(&root, move |_| {
+                started.send(()).unwrap();
+                hold.recv_timeout(Duration::from_secs(10)).unwrap();
+                done.send(()).unwrap();
+            })
+        })
+        .0
+    });
+    let report = tokio::time::timeout(Duration::from_secs(5), report)
+        .await
+        .unwrap()
+        .unwrap();
+    running.recv_timeout(Duration::from_secs(5)).unwrap();
+    assert!(report.scratch_roots_pending);
+    assert!(!report.reclaimed_anything());
     let mut ledger = PassLedger::default();
     ledger.record(&report);
     assert_eq!(ledger.empty_streak, 1);
     assert!(report.empty_pass_alert(ledger.empty_streak).is_some());
+    // A scheduled tick for the same workspace joins the running scan.
+    let (duplicate, duplicate_run) = mpsc::channel();
+    assert!(crate::scratch_root_reaper::schedule_with(workspace.path(), move |_| {
+        duplicate.send(()).unwrap();
+    }));
+    assert_eq!(duplicate_run.try_recv(), Err(mpsc::TryRecvError::Disconnected));
+    release.send(()).unwrap();
+    finished.recv_timeout(Duration::from_secs(5)).unwrap();
 }
 
 #[test]
