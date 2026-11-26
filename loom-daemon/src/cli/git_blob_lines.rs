@@ -92,6 +92,58 @@ pub(crate) enum Resolution {
     Unreadable { resolved_path: String },
 }
 
+/// A resolved tree entry with its CONTENT, for callers that need the bytes
+/// rather than the line count (#15387's output-declaration check reads the
+/// producer's cited line). Three-way, not binary: "absent" is its own answer,
+/// because the two callers that share this reader disagree on what it means —
+/// `resolve()` (the range check) folds it into [`Resolution::Unreadable`]
+/// (inconclusive), while `verify-output-decl` treats a producer with NO tree
+/// entry at the cited path as a disproof and only a dangling/unresolvable
+/// entry as inconclusive.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ResolvedBlob {
+    /// Resolved to a regular blob; its full content.
+    Content {
+        resolved_path: String,
+        bytes: Vec<u8>,
+    },
+    /// An entry exists at the cited path but resolves to nothing readable
+    /// (dangling symlink, unresolved cycle, non-blob entry).
+    Unreadable { resolved_path: String },
+    /// No tree entry exists at the cited path at all.
+    Absent { resolved_path: String },
+}
+
+/// Resolve `path` against `rev` in `workspace` and return the entry's
+/// content. The entry at the CITED path is checked before any symlink hop, so
+/// "no entry at all" (Absent) stays distinguishable from "an entry whose
+/// target is unreadable" (Unreadable).
+///
+/// # Errors
+/// When `git` cannot be run, or a `git` invocation itself fails (e.g. `rev`
+/// does not resolve).
+pub(crate) fn resolved_blob(workspace: &Path, rev: &str, path: &str) -> Result<ResolvedBlob> {
+    if tree_entry_mode(workspace, rev, path)?.is_none() {
+        return Ok(ResolvedBlob::Absent {
+            resolved_path: normalize_lexically(path),
+        });
+    }
+    let resolved = resolve_symlink_path(workspace, rev, path)?;
+    let mode = tree_entry_mode(workspace, rev, &resolved)?;
+    match mode.as_deref() {
+        Some("100644") | Some("100755") => {
+            let bytes = read_blob(workspace, rev, &resolved)?;
+            Ok(ResolvedBlob::Content {
+                resolved_path: resolved,
+                bytes,
+            })
+        }
+        _ => Ok(ResolvedBlob::Unreadable {
+            resolved_path: resolved,
+        }),
+    }
+}
+
 fn git(workspace: &Path, args: &[&str]) -> Result<std::process::Output> {
     Command::new("git")
         .arg("-C")
@@ -185,25 +237,25 @@ fn resolve_symlink_path(workspace: &Path, rev: &str, path: &str) -> Result<Strin
 }
 
 /// Resolve `path` against `rev` in `workspace`, then classify the result.
+/// "Absent" folds into [`Resolution::Unreadable`] — the range check's
+/// question ("does this span fit?") cannot be asked of a path that is not
+/// there, which is inconclusive, not a disproof.
 ///
 /// # Errors
 /// When `git` cannot be run, or a `git` invocation itself fails (e.g. `rev`
 /// does not resolve).
 pub(crate) fn resolve(workspace: &Path, rev: &str, path: &str) -> Result<Resolution> {
-    let resolved = resolve_symlink_path(workspace, rev, path)?;
-    let mode = tree_entry_mode(workspace, rev, &resolved)?;
-    match mode.as_deref() {
-        Some("100644") | Some("100755") => {
-            let content = read_blob(workspace, rev, &resolved)?;
-            let count = content.iter().filter(|&&b| b == b'\n').count() as u64;
-            Ok(Resolution::Lines {
-                resolved_path: resolved,
-                count,
-            })
-        }
-        _ => Ok(Resolution::Unreadable {
-            resolved_path: resolved,
+    match resolved_blob(workspace, rev, path)? {
+        ResolvedBlob::Content {
+            resolved_path,
+            bytes,
+        } => Ok(Resolution::Lines {
+            resolved_path,
+            count: bytes.iter().filter(|&&b| b == b'\n').count() as u64,
         }),
+        ResolvedBlob::Unreadable { resolved_path } | ResolvedBlob::Absent { resolved_path } => {
+            Ok(Resolution::Unreadable { resolved_path })
+        }
     }
 }
 
@@ -566,5 +618,47 @@ mod tests {
         assert_eq!(normalize_lexically("docs/../regular.md"), "regular.md");
         assert_eq!(normalize_lexically("./docs/./link.md"), "docs/link.md");
         assert_eq!(normalize_lexically("a/b/../../c"), "c");
+    }
+
+    // --- resolved_blob (#15387): absent / unreadable / content stay
+    // distinguishable, because verify-output-decl needs "the producer has no
+    // tree entry" as a disproof while "its target is unreadable" stays
+    // inconclusive.
+
+    #[test]
+    fn resolved_blob_content_carries_the_bytes() {
+        let dir = build_fixture();
+        let r = resolved_blob(dir.path(), "HEAD", "docs/link.md").unwrap();
+        assert_eq!(
+            r,
+            ResolvedBlob::Content {
+                resolved_path: "regular.md".to_string(),
+                bytes: b"one\ntwo\nthree\n".to_vec(),
+            }
+        );
+    }
+
+    #[test]
+    fn resolved_blob_absent_is_absent_not_unreadable() {
+        let dir = build_fixture();
+        let r = resolved_blob(dir.path(), "HEAD", "does/not/exist.md").unwrap();
+        assert_eq!(
+            r,
+            ResolvedBlob::Absent {
+                resolved_path: "does/not/exist.md".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn resolved_blob_dangling_stays_unreadable() {
+        let dir = build_fixture();
+        let r = resolved_blob(dir.path(), "HEAD", "docs/dangling.md").unwrap();
+        assert_eq!(
+            r,
+            ResolvedBlob::Unreadable {
+                resolved_path: "missing.md".to_string(),
+            }
+        );
     }
 }
