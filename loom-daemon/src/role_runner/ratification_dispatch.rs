@@ -15,11 +15,23 @@
 //!
 //! # Independence
 //!
-//! Each session's prompt is built only from (a) that key's pinned instructions
-//! and (b) the PR reference. Nothing else crosses: no shared file, env var or
-//! prior-output argument, and a session never sees the other's outcome. All
-//! selected sessions run before any marker is posted (step 3 is a separate
-//! pass), so a newly posted result is never context for the other key.
+//! Each session's prompt is built only from (a) that key's pinned instructions,
+//! (b) the PR reference, (c) for a public target repo's market session, the
+//! public-sources line, and (d) last, Loom's own output contract for that key
+//! ([`lane_contract`], #15315), generated from the parser's vocabulary. Nothing
+//! else crosses: no shared file, env var or prior-output argument, and a
+//! session never sees the other's outcome. All selected sessions run before
+//! any marker is posted (step 3 is a separate pass), so a newly posted result
+//! is never context for the other key.
+//!
+//! # Echoed prompt
+//!
+//! A runtime that writes the prompt it was given to its log (Codex prints its
+//! `user` block on stderr, which the role log captures) would otherwise put
+//! the template's own heading and `<…>` verdict line into the captured output.
+//! Every verbatim occurrence of the prompt is cut out of the output before it
+//! is parsed ([`strip_prompt_echo`]); text before or after it is kept, so an
+//! echo landing on either side of the review never hides it.
 //!
 //! # Fail closed
 //!
@@ -55,6 +67,28 @@ pub enum KeyOutcome {
     FailedClosed(String),
 }
 
+/// How a key's attempt failed, as the lane's attempt accounting reads it
+/// (#15315). Captured per key before the next key reuses the runner, beside
+/// the evidence [`KeyOutcome`] is classified from; telemetry classification
+/// is unchanged by it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AttemptFailure {
+    /// The pinned instructions could not be read: no session was launched.
+    Pin,
+    /// The runner, or the launcher child, refused the session before its CLI
+    /// ran ([`KeyOutcome::FailedClosed`] after an invocation).
+    PreLaunch,
+    /// A planned version roll stopped the launched session
+    /// ([`crate::observability::lifecycle::ROLL_INTERRUPTED`]).
+    Rolled,
+    /// The role timeout fired while the host was saturated
+    /// ([`RoleTickOutcome::LoadSkipped`]): the host's load, not the PR.
+    HostLoad,
+    /// The session ran and did not succeed; its `loom.failure_class` when the
+    /// runner recorded one.
+    Launched(Option<String>),
+}
+
 /// Per-key results for one PR. `None` means the key was **not attempted**
 /// this pass: its pin was already complete (a trusted current-head marker
 /// exists, #14797), so no instruction was read, no session launched and
@@ -63,9 +97,13 @@ pub enum KeyOutcome {
 pub struct Dispatched {
     pub ee: Option<KeyOutcome>,
     pub market: Option<KeyOutcome>,
-    /// The EE session's output, when it ran and the runner exposes it (#13502).
+    /// The EE session's output, when it ran and the runner exposes it
+    /// (#13502), with any verbatim echo of its prompt cut out (#15315).
     pub ee_output: Option<String>,
     pub market_output: Option<String>,
+    /// Why the EE attempt failed, when it did (#15315).
+    pub ee_failure: Option<AttemptFailure>,
+    pub market_failure: Option<AttemptFailure>,
 }
 
 impl Dispatched {
@@ -75,6 +113,22 @@ impl Dispatched {
             Key::Ee => self.ee.as_ref(),
             Key::Market => self.market.as_ref(),
         }
+    }
+
+    /// Why `key`'s attempt failed, when it was attempted and failed.
+    #[must_use]
+    pub fn failure(&self, key: Key) -> Option<&AttemptFailure> {
+        match key {
+            Key::Ee => self.ee_failure.as_ref(),
+            Key::Market => self.market_failure.as_ref(),
+        }
+    }
+
+    /// Whether a version roll stopped `key`'s launched session (#15315):
+    /// still counted as `invocation_failed`, never as a review attempt.
+    #[must_use]
+    pub fn rolled(&self, key: Key) -> bool {
+        self.failure(key) == Some(&AttemptFailure::Rolled)
     }
 }
 
@@ -113,14 +167,64 @@ fn fetch_pinned(src: &dyn InstructionSource, pin: &Pin) -> Result<String, String
     Ok(body)
 }
 
-fn build_prompt(instructions: &str, pr_ref: &str, public_only: bool) -> String {
+/// One key session's prompt: the pinned instructions, the PR reference, the
+/// public-sources line when `public_only`, and **last** Loom's own output
+/// contract for `key` ([`lane_contract`]), so it is the final thing read.
+#[must_use]
+pub fn build_prompt(key: Key, instructions: &str, pr_ref: &str, public_only: bool) -> String {
     let mut p = format!("{}\n\nPR: {pr_ref}\n", instructions.trim_end());
     if public_only {
         p.push('\n');
         p.push_str(PUBLIC_SOURCES_ONLY);
         p.push('\n');
     }
+    p.push('\n');
+    p.push_str(&lane_contract(key));
+    p.push('\n');
     p
+}
+
+/// Loom's output contract for `key`'s lane session (#15315). The pinned
+/// instructions tell the reviewer to post with `scripts/ratify-key.sh` and
+/// show a template whose `<…>` parts are easy to copy; inside the lane Loom
+/// posts the final message, and only a filled review with a bare token parses.
+///
+/// Generated from [`Key::allowed_tokens`], so the vocabulary cannot drift from
+/// the parser. It names the heading in prose and **never** contains
+/// [`Key::review_heading`] or a verdict-label line (critique A4): an echoed
+/// prompt must not be able to supply a review block or a verdict of its own.
+#[must_use]
+pub fn lane_contract(key: Key) -> String {
+    let name = match key {
+        Key::Ee => "EE-key",
+        Key::Market => "Market-key",
+    };
+    let tokens = key.allowed_tokens().join(", ");
+    format!(
+        "Lane output contract (from Loom; where it differs from the instruction file, it \
+wins). You are running inside Loom's ratification lane. Do not post a comment and do not \
+run scripts/ratify-key.sh: Loom posts your final message. Your final message must be the \
+completed review, beginning with the {name} review heading the instructions give, followed \
+by the real block name. The angle-bracket parts of the template are placeholders to \
+replace, never to copy. On the bold Overall verdict line write exactly one of these words, \
+bare: {tokens}. No angle brackets, no `|` list, no bold or backticks around the word, no \
+full stop after it; follow it with a comma and one sentence. If you cannot reach a verdict, \
+leave that line out and say why."
+    )
+}
+
+/// `output` with every verbatim occurrence of `prompt` (trailing whitespace
+/// ignored) cut out, each replaced by a line break (#15315). Text on either
+/// side is kept, so a review written before or after an echoed prompt still
+/// parses, and the template inside the echo never does. An output that does
+/// not contain the prompt is returned unchanged.
+#[must_use]
+pub fn strip_prompt_echo(output: &str, prompt: &str) -> String {
+    let needle = prompt.trim_end();
+    if needle.is_empty() || !output.contains(needle) {
+        return output.to_string();
+    }
+    output.replace(needle, "\n")
 }
 
 /// Launch the selected key sessions for one candidate PR (#14797): a `None`
@@ -140,43 +244,96 @@ pub fn dispatch(
     src: &dyn InstructionSource,
     runner: &mut dyn RoleInvocationRunner,
 ) -> Dispatched {
-    let mut run_key = |key: Key, pin: &Pin| -> (KeyOutcome, Option<String>) {
+    type KeyRun = (KeyOutcome, Option<String>, Option<AttemptFailure>);
+    let mut run_key = |key: Key, pin: &Pin| -> KeyRun {
         match fetch_pinned(src, pin) {
-            Err(reason) => (KeyOutcome::FailedClosed(reason), None),
+            Err(reason) => (KeyOutcome::FailedClosed(reason), None, Some(AttemptFailure::Pin)),
             Ok(text) => {
                 // Visibility decides the market constraint only, so it is
                 // read only when a market session actually runs (#14797).
                 let public_only =
                     key == Key::Market && src.repo_is_private(target_repo) != Some(true);
-                let prompt = build_prompt(&text, pr_ref, public_only);
+                let prompt = build_prompt(key, &text, pr_ref, public_only);
                 let outcome = runner.invoke(role_name(key), &prompt);
                 // Read the evidence now: the next key reuses the same runner.
-                let result = if failed_before_launch(&outcome, runner) {
-                    KeyOutcome::FailedClosed(format!("session did not succeed: {outcome:?}"))
+                let raw = runner.last_output();
+                let (result, failure) = if failed_before_launch(&outcome, runner, raw.as_deref()) {
+                    (
+                        KeyOutcome::FailedClosed(format!("session did not succeed: {outcome:?}")),
+                        Some(AttemptFailure::PreLaunch),
+                    )
                 } else {
-                    KeyOutcome::Ran(outcome)
+                    let failure = launched_failure(&outcome, runner);
+                    (KeyOutcome::Ran(outcome), failure)
                 };
-                (result, runner.last_output())
+                let output = raw.map(|out| strip_prompt_echo(&out, &prompt));
+                (result, output, failure)
             }
         }
     };
-    let (ee, ee_output) = ee.map_or((None, None), |pin| {
-        let (o, out) = run_key(Key::Ee, pin);
-        (Some(o), out)
+    let (ee, ee_output, ee_failure) = ee.map_or((None, None, None), |pin| {
+        let (o, out, failure) = run_key(Key::Ee, pin);
+        (Some(o), out, failure)
     });
-    let (market, market_output) = market.map_or((None, None), |pin| {
-        let (o, out) = run_key(Key::Market, pin);
-        (Some(o), out)
+    let (market, market_output, market_failure) = market.map_or((None, None, None), |pin| {
+        let (o, out, failure) = run_key(Key::Market, pin);
+        (Some(o), out, failure)
     });
     Dispatched {
         ee,
         market,
         ee_output,
         market_output,
+        ee_failure,
+        market_failure,
     }
 }
 
-fn failed_before_launch(outcome: &RoleTickOutcome, runner: &dyn RoleInvocationRunner) -> bool {
+/// The `loom.failure_class` values [`super::launch`]'s classifier gives a
+/// launched child that died **before its CLI ran** (#15315): the wrapper's
+/// auth pre-flight, a `session-exec` refusal, and the sweep pre-flight
+/// classifier's labels. Bare `exit-78` is deliberately absent:
+/// `claude-wrapper` can exit 78 after its CLI started.
+pub const LAUNCH_REFUSAL_CLASSES: &[&str] = &[
+    "preflight-no-cli-start",
+    "preflight-token-selection-failed",
+    "preflight-auth-failed",
+    "preflight-mcp-failed",
+    "session-down",
+    "session-mount-stale",
+];
+
+/// Whether a session's captured output is the launcher's own refusal: it
+/// carries the launcher's `# LOOM_LAUNCH_REJECTED ` marker
+/// ([`crate::worker_spawn::LAUNCH_REJECTED_MARKER`], written the moment a
+/// preflight rejection reaches the launcher's exit) and no CLI-start marker
+/// at all — positive evidence that the CLI never ran (critique A3).
+#[must_use]
+pub fn launch_rejected_before_cli(output: &str) -> bool {
+    use crate::sweep_registry::crash_signals::{CLAUDE_CLI_START_MARKER, CLI_START_MARKER};
+    output.contains(crate::worker_spawn::LAUNCH_REJECTED_MARKER)
+        && !output.contains(CLI_START_MARKER)
+        && !output.contains(CLAUDE_CLI_START_MARKER)
+}
+
+/// Whether the invocation was refused before the session's CLI ran, so the
+/// key fails closed as `pre_launch_failed` and is never charged to the PR.
+///
+/// A [`RoleTickOutcome::Failure`] qualifies only on positive evidence: a
+/// pre-launch site the runner noted ([`pre_launch::ALL`]), a launched
+/// child's failure class in [`LAUNCH_REFUSAL_CLASSES`] (the trace's own
+/// class, which the production runner reports for a child the launcher
+/// refused with exit 78, #15315), or the launcher's rejection marker in the
+/// session's own output with no CLI start ([`launch_rejected_before_cli`]).
+/// A launched version-roll stop (its trace carries no failure) and an
+/// unclassified failure stay `invocation_failed`.
+///
+/// [`pre_launch::ALL`]: crate::observability::lifecycle::pre_launch::ALL
+fn failed_before_launch(
+    outcome: &RoleTickOutcome,
+    runner: &dyn RoleInvocationRunner,
+    output: Option<&str>,
+) -> bool {
     use crate::observability::lifecycle::pre_launch;
     match outcome {
         RoleTickOutcome::RuntimeRejected(_)
@@ -187,12 +344,46 @@ fn failed_before_launch(outcome: &RoleTickOutcome, runner: &dyn RoleInvocationRu
         // The runner also uses this channel for a launched version-roll stop
         // and for an unclassified failure without a launch span. Neither is
         // positive evidence that the invocation was refused before launch.
-        RoleTickOutcome::Failure(_) => runner.unlaunched_failure().is_some_and(|failure| {
-            pre_launch::ALL
-                .iter()
-                .any(|site| site.class == failure.class())
-        }),
+        RoleTickOutcome::Failure(_) => {
+            runner.unlaunched_failure().is_some_and(|failure| {
+                pre_launch::ALL
+                    .iter()
+                    .any(|site| site.class == failure.class())
+            }) || runner
+                .trace_context()
+                .and_then(|t| t.failure)
+                .is_some_and(|f| LAUNCH_REFUSAL_CLASSES.contains(&f.class()))
+                || output.is_some_and(launch_rejected_before_cli)
+        }
         RoleTickOutcome::Success | RoleTickOutcome::LoadSkipped { .. } => false,
+    }
+}
+
+/// How a session that ran (was not refused before launch) failed, if it did.
+fn launched_failure(
+    outcome: &RoleTickOutcome,
+    runner: &dyn RoleInvocationRunner,
+) -> Option<AttemptFailure> {
+    use crate::observability::lifecycle::ROLL_INTERRUPTED;
+    match outcome {
+        RoleTickOutcome::Success => None,
+        RoleTickOutcome::Failure(_) => {
+            let unlaunched = runner.unlaunched_failure();
+            if unlaunched
+                .as_ref()
+                .is_some_and(|f| f.class() == ROLL_INTERRUPTED)
+            {
+                return Some(AttemptFailure::Rolled);
+            }
+            let class = runner
+                .trace_context()
+                .and_then(|t| t.failure)
+                .or(unlaunched)
+                .map(|f| f.class().to_string());
+            Some(AttemptFailure::Launched(class))
+        }
+        RoleTickOutcome::LoadSkipped { .. } => Some(AttemptFailure::HostLoad),
+        _ => Some(AttemptFailure::Launched(None)),
     }
 }
 

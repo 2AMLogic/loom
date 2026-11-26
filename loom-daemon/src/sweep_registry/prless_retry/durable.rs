@@ -138,13 +138,8 @@ fn write_marks<K: serde::Serialize, V: serde::Serialize>(
     path: &Path,
     marks: &HashMap<K, V>,
 ) -> std::io::Result<()> {
-    let tmp = path.with_extension("json.tmp");
     let bytes = serde_json::to_vec(marks).map_err(std::io::Error::other)?;
-    if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir)?;
-    }
-    std::fs::write(&tmp, bytes)?;
-    std::fs::rename(&tmp, path)
+    crate::fs_util::write_atomic(path, &bytes, crate::fs_util::AtomicOpts::default())
 }
 
 /// The durable count for one outcome, and the cause its record carries.

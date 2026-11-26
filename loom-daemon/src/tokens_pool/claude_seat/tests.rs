@@ -220,6 +220,21 @@ fn two_seats_get_two_containers_with_disjoint_homes() {
 }
 
 #[test]
+fn list_reports_every_pool_account_and_which_are_registered_seats() {
+    let (workspace, root) = fixture(&["alice", "bob"]);
+    let lifecycle = lifecycle(workspace.path(), root.path(), None);
+    lifecycle.start("alice", None).unwrap();
+    let listed = lifecycle.list().unwrap();
+    let by_name = |name: &str| listed.iter().find(|seat| seat.name == name).unwrap();
+    assert_eq!(listed.len(), 2);
+    assert!(by_name("alice").seat_registered && by_name("alice").running);
+    assert!(by_name("alice").image.is_some());
+    assert!(!by_name("bob").seat_registered && by_name("bob").container_id.is_none());
+    // Listing is read-only: it must not have created or started anything.
+    assert_eq!(lifecycle.runner.creates.lock().unwrap().len(), 1);
+}
+
+#[test]
 fn start_rejects_an_account_that_is_not_in_the_pool() {
     let (workspace, root) = fixture(&["alice"]);
     let lifecycle = lifecycle(workspace.path(), root.path(), None);

@@ -173,6 +173,7 @@ fn ratification_counts_reconcile_on_the_otlp_wire_without_exporting_detail() {
                 "invocation_failed",
                 "output_missing",
                 "verdict_invalid",
+                "verdict_placeholder",
                 "post_failed",
             ] {
                 let count = count(&format!("loom.ratification.{key}.{class}"));
@@ -188,6 +189,9 @@ fn ratification_counts_reconcile_on_the_otlp_wire_without_exporting_detail() {
         }
         assert_eq!(posted, count("loom.ratification.posted"));
         assert_eq!(withheld, count("loom.ratification.withheld"));
+        // The attempt bound's counts travel the wire too (#15315).
+        assert_eq!(count("loom.ratification.capped"), 0);
+        assert_eq!(count("loom.ratification.deferred"), 0);
     }
     assert_eq!(
         nonzero,

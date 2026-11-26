@@ -162,7 +162,9 @@ pub struct StepRefusal {
     /// facts the spawn records as a route hold. `None` for every other
     /// refusal.
     pub writer_limit: Option<Box<crate::writer_limit::WriterLimited>>,
-    seat_unavailable: bool,
+    /// The runtime reported no usable seat. The captain and the local draw
+    /// both use this signal to back off after a launch refusal.
+    pub(crate) seat_unavailable: bool,
 }
 
 impl StepRefusal {
