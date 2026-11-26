@@ -131,6 +131,16 @@ pub(crate) fn handle_accounts_command(action: AccountsAction, workspace: &str) -
         Ok(())
     }
 
+    // `accounts list --provider claude` reads the Claude pool and its seats; it
+    // never touches the Codex registry below (#14371).
+    if let AccountsAction::List { provider, json } = &action {
+        if super::accounts_session_claude::is_claude(provider)? {
+            // Same workspace resolution as `accounts session status --provider claude`.
+            let registry = resolve_registry(workspace)?;
+            return super::accounts_session_claude::list(registry.workspace.clone(), *json);
+        }
+    }
+
     let registry = match &action {
         AccountsAction::Disable { shared: true, .. }
         | AccountsAction::Enable { shared: true, .. } => resolve_shared_registry()?,

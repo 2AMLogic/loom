@@ -301,12 +301,22 @@ reading `.ranking` directly:
   measurement view: its `probed` field says whether a request was sent in *this*
   run, and a failed round's `status`/`error` show what this round saw even when
   `.ranking` kept the older `exhausted` row.
-- **A carried row is re-measured only by a round that gets evidence.** It stays
-  until a probe of that account returns a real answer, so while a probe keeps
-  failing the `exhausted` row (with its recorded reset) persists, and the
-  selector's `exhausted` hard exclusion keeps applying to it. Carrying never
-  widens the selectable set: `error` and `blocked` are excluded or ranked after
-  every selectable status anyway.
+- **What releases a carried row depends on why it was carried.** For `error` /
+  `blocked`, the row stays until a round gets evidence for that account, so
+  while a probe keeps failing the `exhausted` row (with its recorded reset)
+  persists. For a codex `unknown` or a header-less `available`, a later probe
+  that answers the same way does **not** release it — a header-less 2xx is a
+  real answer but carries no 5h-utilization evidence — so the release is the
+  carried reset elapsing (or being missing, unparseable or beyond the eight-day
+  horizon), not the next answered probe. A round that measures (`available`
+  with a 5h utilization, `rate_limited`, a fresh `exhausted`) overwrites at
+  any time.
+  Throughout, the selector's `exhausted` hard exclusion keeps applying to the
+  carried row. Carrying never widens the selectable set, for all four carried
+  statuses: `error` and `blocked` are excluded or ranked after every selectable
+  status anyway, and for `unknown` / header-less `available` the fresh row
+  would have been selectable, so carrying the `exhausted` row can only narrow
+  the set.
 
 The carry-forward does **not** apply to an account with a standing `auth` or
 `malformed-timestamp` mark: that account's `blocked` row comes from the mark,
