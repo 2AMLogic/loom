@@ -30,12 +30,9 @@
 //! symlink-aware reader the line-range check uses — and never executed and
 //! never read from the working tree, so a local edit or a locally generated
 //! report cannot satisfy the declaration. The cited line must contain the
-//! output path **as a complete argument**: an occurrence whose neighbouring
-//! bytes are not path-constituent characters (letters, digits, `_`, `.`,
-//! `/`, `-`, or any non-ASCII byte), so a misspelling that is a prefix of
-//! the real filename (`verify-fast.jso`) or a substring of a longer token
-//! (`verify-fast.json.bak`) fails, while the downstream Makefile's
-//! whitespace-delimited `--json <path>` argument passes.
+//! output path as a literal argument or the value of an option such as
+//! `--json="build/report.json"`. Quotes may delimit the path. Punctuation
+//! and Make expansions appended to a filename stay part of the word.
 //!
 //! # Exit-code contract
 //!
@@ -115,44 +112,56 @@ pub(crate) fn parse_producer_spec(spec: &str) -> Option<(&str, u64)> {
     Some((path, line_no))
 }
 
-/// A byte that, adjacent to a needle occurrence, means the needle is part of
-/// a LONGER token rather than a complete argument. ASCII path constituents
-/// plus any non-ASCII byte: a needle is pure ASCII, so a non-ASCII neighbour
-/// is always part of a longer word (`pré` + `build/…`), never a delimiter.
-fn is_token_byte(b: u8) -> bool {
-    b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b'/' | b'-') || !b.is_ascii()
+/// A literal shell word may be enclosed in a matching pair of quotes.
+fn unquote(word: &str) -> &str {
+    for quote in ['\'', '"'] {
+        if let Some(inner) = word.strip_prefix(quote).and_then(|w| w.strip_suffix(quote)) {
+            return inner;
+        }
+    }
+    word
 }
 
-/// Does `line` contain `needle` as a complete argument — an occurrence with
-/// no token byte immediately before or after it? The downstream producer
-/// line `` @$(RUN) --json build/verification/verify-fast.json \ `` qualifies
-/// (whitespace on both sides); `verify-fast.jso` against
-/// `…verify-fast.json…` does not (`n` follows), and `verify-fast.json`
-/// against `…verify-fast.json.bak…` does not either (`.` follows).
+/// Compare whole recipe words without interpreting Make or running the shell.
+/// Only unquoted whitespace and shell operators separate words. In particular,
+/// `+` and `$(SUFFIX)` after the path are part of the same argument.
 pub(crate) fn line_contains_complete_arg(line: &str, needle: &str) -> bool {
     if needle.is_empty() {
         return false;
     }
-    let hay = line.as_bytes();
-    let nd = needle.as_bytes();
-    let mut start = 0;
-    while start + nd.len() <= hay.len() {
-        let Some(offset) = hay[start..]
-            .windows(nd.len())
-            .position(|w| w == nd)
-            .map(|p| start + p)
-        else {
-            break;
-        };
-        let end = offset + nd.len();
-        let before_ok = offset == 0 || !is_token_byte(hay[offset - 1]);
-        let after_ok = end == hay.len() || !is_token_byte(hay[end]);
-        if before_ok && after_ok {
+
+    let mut quote = None;
+    let mut escaped = false;
+    let words = line.split(|ch: char| {
+        if std::mem::take(&mut escaped) {
+            return false;
+        }
+        if ch == '\\' && quote != Some('\'') {
+            escaped = true;
+        } else if let Some(open) = quote {
+            if ch == open {
+                quote = None;
+            }
+        } else if matches!(ch, '\'' | '"') {
+            quote = Some(ch);
+        } else {
+            return ch.is_ascii_whitespace() || matches!(ch, ';' | '&' | '|' | '<' | '>');
+        }
+        false
+    });
+
+    words.take_while(|word| !word.starts_with('#')).any(|word| {
+        let arg = unquote(word);
+        if arg == needle {
             return true;
         }
-        start = offset + 1;
-    }
-    false
+        let Some((option, value)) = arg.split_once('=') else {
+            return false;
+        };
+        // Inside a quoted whole option, any quotes around its value are literal.
+        let value = if arg == word { unquote(value) } else { value };
+        option.starts_with('-') && value == needle
+    })
 }
 
 /// 1-based line `line_no` of the content, or `None` when it does not exist.
@@ -285,6 +294,24 @@ mod tests {
     fn a_token_continuing_past_the_needle_is_not_a_complete_argument() {
         let line = "\t@$(RUN) --json build/verification/verify-fast.json.bak \\";
         assert!(!line_contains_complete_arg(line, "build/verification/verify-fast.json"));
+    }
+
+    #[test]
+    fn punctuation_and_make_expansions_can_extend_the_same_argument() {
+        for argument in [
+            "build/report.json+debug",
+            "build/report.json$(SUFFIX)",
+            "'build/report.json'+debug",
+            "--json=\"build/report.json\"$(SUFFIX)",
+            "\"a single argument containing build/report.json inside\"",
+            "\"--json='build/report.json'\"",
+            "tool # build/report.json",
+            r"build/report.json\ suffix",
+        ] {
+            assert!(!line_contains_complete_arg(argument, "build/report.json"), "{argument}");
+        }
+        assert!(line_contains_complete_arg("--json='build/report.json'", "build/report.json"));
+        assert!(line_contains_complete_arg("\"--json=build/report.json\";", "build/report.json"));
     }
 
     #[test]
