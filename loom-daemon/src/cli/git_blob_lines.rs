@@ -92,6 +92,81 @@ pub(crate) enum Resolution {
     Unreadable { resolved_path: String },
 }
 
+/// A resolved tree entry with its CONTENT, for callers that need the bytes
+/// rather than the line count (#15387's output-declaration check reads the
+/// producer's cited line). Three-way, not binary: "absent" is its own answer,
+/// because the two callers that share this reader disagree on what it means —
+/// `resolve()` (the range check) folds it into [`Resolution::Unreadable`]
+/// (inconclusive), while `verify-output-decl` treats a producer with NO tree
+/// entry at the cited path as a disproof and only a dangling/unresolvable
+/// entry as inconclusive.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ResolvedBlob {
+    /// Resolved to a regular blob; its full content.
+    Content {
+        resolved_path: String,
+        bytes: Vec<u8>,
+    },
+    /// An entry exists at the cited path but resolves to nothing readable
+    /// (dangling symlink, unresolved cycle, non-blob entry).
+    Unreadable { resolved_path: String },
+    /// No tree entry exists at the cited path at all.
+    Absent { resolved_path: String },
+}
+
+/// Resolve `path` against `rev` in `workspace` and return the entry's
+/// content. The entry at the CITED path is checked before any symlink hop, so
+/// "no entry at all" (Absent) stays distinguishable from "an entry whose
+/// target is unreadable" (Unreadable).
+///
+/// # Errors
+/// When `git` cannot be run, or a `git` invocation itself fails (e.g. `rev`
+/// does not resolve).
+pub(crate) fn resolved_blob(workspace: &Path, rev: &str, path: &str) -> Result<ResolvedBlob> {
+    // ls-tree normalizes pathspecs (even "missing/../Makefile"). Only real
+    // tree-entry names may make up a citation. Resolve relative link targets
+    // after finding the link itself in the pinned tree.
+    let relative = path.trim_start_matches("./");
+    if relative
+        .split('/')
+        .any(|part| matches!(part, "" | "." | ".."))
+    {
+        return Ok(ResolvedBlob::Absent {
+            resolved_path: path.to_owned(),
+        });
+    }
+    let mut current = relative.to_owned();
+    for hop in 0..=MAX_HOPS {
+        match tree_entry_mode(workspace, rev, &current)?.as_deref() {
+            None if hop == 0 => {
+                return Ok(ResolvedBlob::Absent {
+                    resolved_path: current,
+                })
+            }
+            Some("100644" | "100755") => {
+                let bytes = read_blob(workspace, rev, &current)?;
+                return Ok(ResolvedBlob::Content {
+                    resolved_path: current,
+                    bytes,
+                });
+            }
+            Some("120000") if hop < MAX_HOPS => {
+                let bytes = read_blob(workspace, rev, &current)?;
+                let dir = current.rsplit_once('/').map_or("", |(dir, _)| dir);
+                let next = std::str::from_utf8(&bytes)
+                    .ok()
+                    .and_then(|target| normalize_lexically(dir, target));
+                let Some(next) = next else { break };
+                current = next;
+            }
+            _ => break,
+        }
+    }
+    Ok(ResolvedBlob::Unreadable {
+        resolved_path: current,
+    })
+}
+
 fn git(workspace: &Path, args: &[&str]) -> Result<std::process::Output> {
     Command::new("git")
         .arg("-C")
@@ -104,7 +179,7 @@ fn git(workspace: &Path, args: &[&str]) -> Result<std::process::Output> {
 /// `git ls-tree <rev> -- <path>` mode column, or `None` when the path does
 /// not exist in the tree at that rev at all.
 fn tree_entry_mode(workspace: &Path, rev: &str, path: &str) -> Result<Option<String>> {
-    let out = git(workspace, &["ls-tree", rev, "--", path])?;
+    let out = git(workspace, &["--literal-pathspecs", "ls-tree", rev, "--", path])?;
     if !out.status.success() {
         anyhow::bail!(
             "git ls-tree {rev} -- {path} failed: {}",
@@ -132,78 +207,54 @@ fn read_blob(workspace: &Path, rev: &str, path: &str) -> Result<Vec<u8>> {
     Ok(out.stdout)
 }
 
-/// Collapse `.` / `..` segments **lexically**. See the module doc for why
-/// this must not touch the filesystem.
-fn normalize_lexically(path: &str) -> String {
-    let mut stack: Vec<&str> = Vec::new();
-    for seg in path.split('/') {
-        match seg {
+/// Resolve a relative path from a directory in the pinned tree. An absolute
+/// path or a parent hop above the root has no referent in this tree.
+fn normalize_lexically(dir: &str, path: &str) -> Option<String> {
+    if path.starts_with('/') {
+        return None;
+    }
+    let mut stack = Vec::new();
+    for segment in dir.split('/').chain(path.split('/')) {
+        match segment {
             "" | "." => continue,
             ".." => {
-                stack.pop();
+                stack.pop()?;
             }
             other => stack.push(other),
         }
     }
-    stack.join("/")
-}
-
-/// The directory component of a repo-relative path, or `""` for a top-level
-/// path.
-fn parent_dir(path: &str) -> String {
-    match path.rsplit_once('/') {
-        Some((dir, _)) => dir.to_string(),
-        None => String::new(),
+    if stack.is_empty() {
+        return None;
     }
-}
-
-/// Follow `path` through up to [`MAX_HOPS`] `120000` tree entries at `rev`,
-/// resolving each target relative to the **link's own directory**. Returns
-/// once the current path stops being a symlink tree entry — which may still
-/// not exist (a dangling target) or may still be `120000` if the hop bound
-/// was hit (an unresolved cycle); the caller classifies that via a final
-/// [`tree_entry_mode`] check.
-fn resolve_symlink_path(workspace: &Path, rev: &str, path: &str) -> Result<String> {
-    let mut current = normalize_lexically(path);
-    for _ in 0..MAX_HOPS {
-        let mode = tree_entry_mode(workspace, rev, &current)?;
-        if mode.as_deref() != Some("120000") {
-            break;
-        }
-        let target_bytes = read_blob(workspace, rev, &current)?;
-        let target = String::from_utf8_lossy(&target_bytes);
-        let target = target.trim_end_matches('\n');
-        let dir = parent_dir(&current);
-        let joined = if dir.is_empty() {
-            target.to_string()
-        } else {
-            format!("{dir}/{target}")
-        };
-        current = normalize_lexically(&joined);
-    }
-    Ok(current)
+    Some(stack.join("/"))
 }
 
 /// Resolve `path` against `rev` in `workspace`, then classify the result.
+/// "Absent" folds into [`Resolution::Unreadable`] — the range check's
+/// question ("does this span fit?") cannot be asked of a path that is not
+/// there, which is inconclusive, not a disproof.
 ///
 /// # Errors
 /// When `git` cannot be run, or a `git` invocation itself fails (e.g. `rev`
 /// does not resolve).
 pub(crate) fn resolve(workspace: &Path, rev: &str, path: &str) -> Result<Resolution> {
-    let resolved = resolve_symlink_path(workspace, rev, path)?;
-    let mode = tree_entry_mode(workspace, rev, &resolved)?;
-    match mode.as_deref() {
-        Some("100644") | Some("100755") => {
-            let content = read_blob(workspace, rev, &resolved)?;
-            let count = content.iter().filter(|&&b| b == b'\n').count() as u64;
-            Ok(Resolution::Lines {
-                resolved_path: resolved,
-                count,
-            })
-        }
-        _ => Ok(Resolution::Unreadable {
-            resolved_path: resolved,
+    // The line-count command historically accepts lexical paths.
+    let Some(normalized) = normalize_lexically("", path) else {
+        return Ok(Resolution::Unreadable {
+            resolved_path: path.to_owned(),
+        });
+    };
+    match resolved_blob(workspace, rev, &normalized)? {
+        ResolvedBlob::Content {
+            resolved_path,
+            bytes,
+        } => Ok(Resolution::Lines {
+            resolved_path,
+            count: bytes.iter().filter(|&&b| b == b'\n').count() as u64,
         }),
+        ResolvedBlob::Unreadable { resolved_path } | ResolvedBlob::Absent { resolved_path } => {
+            Ok(Resolution::Unreadable { resolved_path })
+        }
     }
 }
 
@@ -563,8 +614,50 @@ mod tests {
 
     #[test]
     fn lexical_normalize_collapses_dot_and_dotdot() {
-        assert_eq!(normalize_lexically("docs/../regular.md"), "regular.md");
-        assert_eq!(normalize_lexically("./docs/./link.md"), "docs/link.md");
-        assert_eq!(normalize_lexically("a/b/../../c"), "c");
+        assert_eq!(normalize_lexically("docs", "../regular.md").as_deref(), Some("regular.md"));
+        assert_eq!(normalize_lexically("", "./docs/./link.md").as_deref(), Some("docs/link.md"));
+        assert_eq!(normalize_lexically("a/b", "../../c").as_deref(), Some("c"));
+    }
+
+    // --- resolved_blob (#15387): absent / unreadable / content stay
+    // distinguishable, because verify-output-decl needs "the producer has no
+    // tree entry" as a disproof while "its target is unreadable" stays
+    // inconclusive.
+
+    #[test]
+    fn resolved_blob_content_carries_the_bytes() {
+        let dir = build_fixture();
+        let r = resolved_blob(dir.path(), "HEAD", "docs/link.md").unwrap();
+        assert_eq!(
+            r,
+            ResolvedBlob::Content {
+                resolved_path: "regular.md".to_string(),
+                bytes: b"one\ntwo\nthree\n".to_vec(),
+            }
+        );
+    }
+
+    #[test]
+    fn resolved_blob_absent_is_absent_not_unreadable() {
+        let dir = build_fixture();
+        let r = resolved_blob(dir.path(), "HEAD", "does/not/exist.md").unwrap();
+        assert_eq!(
+            r,
+            ResolvedBlob::Absent {
+                resolved_path: "does/not/exist.md".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn resolved_blob_dangling_stays_unreadable() {
+        let dir = build_fixture();
+        let r = resolved_blob(dir.path(), "HEAD", "docs/dangling.md").unwrap();
+        assert_eq!(
+            r,
+            ResolvedBlob::Unreadable {
+                resolved_path: "missing.md".to_string(),
+            }
+        );
     }
 }
