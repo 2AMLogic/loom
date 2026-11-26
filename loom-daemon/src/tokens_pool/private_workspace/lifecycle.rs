@@ -516,6 +516,7 @@ pub fn recover(
         }
         check_hold()
     };
+    image_roll::recover_interrupted(&config, &held)?;
     let state = docker::inspect(&config.container)?;
     if let Some(state) = &state {
         docker::validate(&config, state)?;
@@ -701,6 +702,7 @@ pub fn roll(
         }
         check_hold()
     };
+    image_roll::recover_interrupted(&config, &held)?;
     let state = docker::inspect(&config.container)?;
     let Some(state) = state.filter(|state| reports_running(Some(state))) else {
         // Stopped, restarting or missing: `recover` brings it back in place,

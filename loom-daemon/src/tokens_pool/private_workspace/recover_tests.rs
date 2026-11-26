@@ -2831,6 +2831,101 @@ fn a_roll_can_only_share_mounts_with_its_exact_stopped_original() {
     create(Some(CONTAINER_ID)).unwrap();
 }
 
+/// Leave the seat as a roll that died after renaming its stopped original
+/// (`replacement: false`), or after its replacement started (`true`).
+fn interrupt_roll(env: &Env, replacement: bool) -> String {
+    let backup = format!("{}-previous-{CONTAINER_ID}", env.config.container);
+    docker::command(&["stop", CONTAINER_ID]).unwrap();
+    docker::command(&["rename", CONTAINER_ID, &backup]).unwrap();
+    if replacement {
+        docker::provision_controls(&env.config, &release()).unwrap();
+        docker::create_replacing(&env.config, &release(), Some(CONTAINER_ID)).unwrap();
+    }
+    backup
+}
+
+/// Exactly one container owns the volume and profile, and it is usable.
+fn assert_sole_usable_owner(env: &Env) -> Value {
+    let engine = env.engine();
+    assert_eq!(engine.containers.len(), 1, "{:?}", engine.names());
+    let state = engine.containers[&env.config.container].clone();
+    assert_eq!(state["State"]["Running"], true);
+    docker::validate_settings(&env.config, &state).unwrap();
+    state
+}
+
+#[test]
+#[serial]
+fn a_fresh_reconciler_restores_the_original_when_a_roll_died_before_its_replacement() {
+    let env = setup();
+    env.seed_volume();
+    env.seed_container_on(CONTAINER_ID, true, LEGACY_LATEST);
+    interrupt_roll(&env, false);
+    assert!(env.engine().find(&env.config.container).is_none());
+    // The reconcile pass reaches a stopped or missing seat through `recover`.
+    assert!(env.recover(None).unwrap().running);
+    let state = assert_sole_usable_owner(&env);
+    assert_eq!(state["Id"], CONTAINER_ID, "the original, by its immutable identity");
+    // And an unattended roll behaves the same from the same wreckage.
+    let env = setup();
+    env.seed_volume();
+    env.seed_container_on(CONTAINER_ID, true, LEGACY_LATEST);
+    interrupt_roll(&env, false);
+    env.roll_to(&release()).unwrap();
+    assert_sole_usable_owner(&env);
+}
+
+#[test]
+#[serial]
+fn a_fresh_reconciler_finishes_a_verified_replacement_and_removes_the_original() {
+    let env = setup();
+    env.seed_volume();
+    env.seed_container_on(CONTAINER_ID, true, LEGACY_LATEST);
+    interrupt_roll(&env, true);
+    // The ownership check still refuses the stopped original as a peer.
+    let named = env.engine().containers[&env.config.container].clone();
+    assert!(docker::validate(&env.config, &named).is_err());
+    assert_eq!(env.roll_to(&release()).unwrap(), Rolled::Unchanged);
+    let state = assert_sole_usable_owner(&env);
+    assert_ne!(state["Id"], CONTAINER_ID);
+    assert_eq!(state["Config"]["Image"], release().as_str());
+    assert!(env
+        .engine()
+        .find(&format!("{}-previous-{CONTAINER_ID}", env.config.container))
+        .is_none());
+}
+
+#[test]
+#[serial]
+fn an_unverified_replacement_is_discarded_and_the_original_restored() {
+    let env = setup();
+    env.seed_volume();
+    env.seed_container_on(CONTAINER_ID, true, LEGACY_LATEST);
+    interrupt_roll(&env, true);
+    env.with(|e| {
+        let key = env.config.container.clone();
+        e.containers.get_mut(&key).unwrap()["State"]["Running"] = json!(false);
+    });
+    env.recover(None).unwrap();
+    let state = assert_sole_usable_owner(&env);
+    assert_eq!(state["Id"], CONTAINER_ID);
+}
+
+#[test]
+#[serial]
+fn an_unrelated_occupant_of_the_session_name_keeps_the_ownership_refusal() {
+    let env = setup();
+    env.seed_volume();
+    env.seed_container_on(CONTAINER_ID, true, LEGACY_LATEST);
+    let backup = interrupt_roll(&env, false);
+    env.seed_container_on(OTHER_ID, true, release().as_str());
+    let before = env.mutations().len();
+    assert!(env.roll_to(&release()).is_err());
+    assert_eq!(env.mutations().len(), before, "nothing was touched");
+    assert!(env.engine().find(&backup).is_some());
+    assert_eq!(env.engine().containers[&env.config.container]["Id"], OTHER_ID);
+}
+
 #[test]
 #[serial]
 fn the_locked_roll_keeps_a_newer_stock_release() {

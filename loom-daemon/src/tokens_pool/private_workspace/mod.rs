@@ -33,6 +33,7 @@ pub mod transport;
 mod volume_usage;
 mod worker_setup;
 
+pub(crate) use docker::REPLACES_LABEL;
 pub(crate) use image_roll::RollAttempted;
 pub use lease::AccountBusy;
 pub(crate) use lifecycle::ConfiguredSeatMissing;

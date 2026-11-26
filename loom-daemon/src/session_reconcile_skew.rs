@@ -52,7 +52,9 @@ use serde_json::Value;
 use super::drift::DeferReason;
 use super::{recreate_container, AccountMemory, Outcome, PassInputs};
 use crate::tokens_pool::account_registry::AccountDescriptor;
-use crate::tokens_pool::private_workspace::{AccountBusy, ImageUnavailable, RollAttempted, Rolled};
+use crate::tokens_pool::private_workspace::{
+    AccountBusy, ImageUnavailable, RollAttempted, Rolled, REPLACES_LABEL,
+};
 use crate::tokens_pool::session_dispatch_lock::{self, Exclusive};
 use crate::tokens_pool::session_hold::OperatorHeld;
 use crate::tokens_pool::session_lifecycle::{
@@ -560,6 +562,21 @@ fn reconcile_private_image(
     let mem = &mut account_mem.skew;
     if running == release {
         mem.private = PrivateImageMemory::default();
+        // A replacement a roll created still has the original under a backup
+        // name if the roll was interrupted before its commit. `roll` first
+        // finishes or undoes such a roll under the account lease, then finds
+        // nothing to do; a seat that never rolled never pays for the call.
+        if inspect["Config"]["Labels"][REPLACES_LABEL].is_string() {
+            let is_held = || inputs.index.is_held(name);
+            if let Err(error) = (inputs.roll_private)(account, &release, &is_held) {
+                if error.downcast_ref::<AccountBusy>().is_none() {
+                    log::warn!(
+                        "session_reconcile: {container}: could not settle a possibly interrupted \
+                         image roll: {error:#}"
+                    );
+                }
+            }
+        }
         return Ok(None);
     }
     let pair = (running.to_owned(), release.clone());

@@ -760,7 +760,7 @@ pub(super) fn create(config: &Config, image: &str) -> Result<()> {
     create_replacing(config, image, None)
 }
 
-pub(super) const REPLACES_LABEL: &str = "loom.roll-replaces";
+pub(crate) const REPLACES_LABEL: &str = "loom.roll-replaces";
 
 pub(super) fn create_replacing(config: &Config, image: &str, retained: Option<&str>) -> Result<()> {
     let volumes = command(&["volume", "ls", "--format", "{{.Name}}"])?;
