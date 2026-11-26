@@ -230,7 +230,13 @@ pub(super) fn execute(command: Vec<String>) -> Result<()> {
         // put a bogus transient hold on the account and re-draw this same
         // unusable seat after every backoff window.
         if let Err(cause) = admit_role(&role) {
-            refuse_hooks_untrusted(&cause);
+            // Only a failed containment proof is a hook-trust refusal; a
+            // static rejection (missing adapter, bad manifest, unknown role)
+            // keeps its ordinary error so the clone or adapter gets repaired.
+            if is_hooks_untrusted(&cause) {
+                refuse_hooks_untrusted(&cause);
+            }
+            return Err(cause);
         }
     }
     let (bin, args) = command.split_first().context("private command missing")?;
@@ -272,6 +278,27 @@ pub(super) fn execute(command: Vec<String>) -> Result<()> {
 /// contract `SESSION_DOWN` and `SESSION_MOUNT_STALE` already ride. The cause
 /// text is printed first: these refusals are fixed, secret-free obligation
 /// strings by construction.
+/// Marks an admission error as a containment-proof / hook-trust failure, as
+/// opposed to a static admission rejection.
+#[derive(Debug)]
+struct HooksUntrustedCause(String);
+
+impl std::fmt::Display for HooksUntrustedCause {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for HooksUntrustedCause {}
+
+fn hooks_untrusted(message: String) -> anyhow::Error {
+    anyhow::Error::new(HooksUntrustedCause(message))
+}
+
+fn is_hooks_untrusted(cause: &anyhow::Error) -> bool {
+    cause.is::<HooksUntrustedCause>()
+}
+
 fn refuse_hooks_untrusted(cause: &anyhow::Error) -> ! {
     eprintln!("private-workspace execute: {cause:#}");
     crate::session_exec::refusal::announce(
@@ -307,10 +334,10 @@ fn admit_role(role: &str) -> Result<()> {
             let account = std::env::var("LOOM_ACCOUNT_NAME").unwrap_or_default();
             containment::in_container(&account, &bound, &revision, &repository, &clone_text)
                 .map_err(|error| {
-                    anyhow::anyhow!(
+                    hooks_untrusted(format!(
                         "role {role} requires Loom's guard hook, but it is not \
                          proven for this private session: {error}"
-                    )
+                    ))
                 })?;
             return Ok(());
         }
@@ -327,12 +354,11 @@ fn admit_role(role: &str) -> Result<()> {
     let account = std::env::var("LOOM_ACCOUNT_NAME").unwrap_or_default();
     let proof = containment::in_container(&account, &bound, &revision, &repository, &clone_text)
         .map_err(|error| {
-            anyhow::anyhow!(
-                "{}",
+            hooks_untrusted(
                 rejection
                     .clone()
                     .with_containment_failure(&error.to_string())
-                    .diagnostic()
+                    .diagnostic(),
             )
         })?;
     let admitted = containment::admit_with(&clone, role, Some("codex"), &proof)
@@ -381,4 +407,26 @@ pub(super) fn check_host_job() -> Result<()> {
         bail!("run-job host/SSH/Docker executors are unsupported in private-clone v1; run supported build commands directly in the owned clone");
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod hooks_untrusted_tests {
+    use super::*;
+
+    #[test]
+    fn a_containment_failure_is_marked_hooks_untrusted() {
+        assert!(is_hooks_untrusted(&hooks_untrusted("proof missing".into())));
+    }
+
+    #[test]
+    fn a_static_admission_rejection_is_not_marked() {
+        // Same shape `admit_role` returns for a static rejection.
+        assert!(!is_hooks_untrusted(&anyhow::anyhow!("adapter spawn-codex.sh is missing")));
+    }
+
+    #[test]
+    fn an_unknown_role_at_worker_entry_is_not_hooks_untrusted() {
+        let cause = admit_role("no-such-role-15397").expect_err("unknown role is refused");
+        assert!(!is_hooks_untrusted(&cause), "{cause:#}");
+    }
 }
