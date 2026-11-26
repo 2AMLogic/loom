@@ -244,9 +244,10 @@ only. A missing, unreadable, disabled, exhausted or at-cap pool refuses the
 launch at 78 **before the CLI runs — including when an ambient
 `GEMINI_API_KEY` or a cached Google login exists**: an ambient key never
 reaches the child (the pool's selection replaces it), and the adapter's
-per-launch isolated `HOME` (a fresh `mktemp -d` holding the
-`{"modelProvider": "gemini"}` settings file) keeps the CLI away from any
-stored session. The `# LOOM_LAUNCH` record names the account, never the key.
+per-launch isolated `HOME` (a fresh `mktemp -d` holding the settings file
+that selects the gemini provider and pins the permission policy described
+below) keeps the CLI away from any stored session. The `# LOOM_LAUNCH`
+record names the account, never the key.
 At draw time the availability walk composes the binary gate with the shared
 pool check and reports `api_keys:gemini` — the same source a native tap on
 the namespace reports — so `hold_pool_slot` reserves either route against
@@ -264,7 +265,7 @@ the one cap.
   latest-only: the installer takes only `--dir` and installs whatever the
   unversioned manifest names, the release bucket refuses anonymous listing,
   and nothing vendor-published names a version for `agy update`. Recorded
-  and verified on linux-x64 (#15059, 2026-11-26):
+  and verified on linux-x64 with adapter `d83809d46` (#15059, 2026-11-26):
   `agy --version` → `1.5.18`, archive
   `https://storage.googleapis.com/antigravity-public/antigravity-cli/1.5.18-6386224290725888/linux-x64/cli_linux_x64.tar.gz`,
   manifest `sha512`
@@ -273,50 +274,73 @@ the one cap.
   vendor-published way to fetch it, so it is **not a reproducible pin**, and
   nothing below was verified on it. Record a build's URL and `sha512` when
   you pin it; the adapter never updates or re-downloads the CLI itself.
-- **Background self-update**: the CLI starts a background updater on launch
-  (its log: `Spawned background update process`; the child re-execs the
-  binary with `--bg-updater`). The updater writes `update.lock` and
-  `update_status.json` under `~/.gemini/antigravity-cli/updater/`, writes
-  the debounce marker `~/.gemini/antigravity-cli/last_check.timestamp` (the
-  vendor doc places it inside `updater/`), and contacts
-  `antigravity-cli-auto-updater-974169037036.us-central1.run.app`.
-  `AGY_CLI_DISABLE_AUTO_UPDATE=true` in the CLI's environment disables it.
-  Verified on `1.5.18` without a model call (#15059) as a matched set on
-  disposable HOMEs, read from the CLI's log — the exit code is identical in
-  every arm. A fresh-HOME control spawns the updater and leaves the files
-  and the connection. With the variable the log reads `Auto-update disabled
-  via environment variable AGY_CLI_DISABLE_AUTO_UPDATE` and none of them
-  appears. Absent files alone prove nothing: the same control re-run on
-  that HOME inside the 15-minute debounce makes no new file changes (the
-  first run's files stay unchanged), logging
-  `Last check was less than 15 minutes ago, skipping update (fast path)`.
-  **The adapter does not set it** — the variable reaches the CLI only by
-  inheritance from the worker environment, so a launch from a clean
-  environment leaves the updater enabled (#15474). Until the adapter sets
-  it, export it in the environment `loom-daemon spawn-worker` is dispatched
-  from, and treat an updater without it as enabled.
-- **Flag surface** (`1.5.18`, #15059): `--settings <file>` is accepted and
-  honored as a file path or an inline JSON object, as `agy --help` documents
-  ("a JSON object of settings.json keys, inline or as a file path"); the
-  vendor's flag tables do not list it. A settings file that only the flag
-  names took effect through the shipped chain (the adapter's per-launch
-  file, which is not at the documented default path), as did one outside
-  `HOME` when passed directly.
-  `--sandbox` is terminal containment, **not** a permission mode; the
-  auto-approve flag is `--dangerously-skip-permissions`. The vendor
-  documents that headless `-p` runs in `auto` mode since v1.5.7 wherever
-  that mode is available, in which workspace file edits and sandboxed
-  commands run without asking — and that `auto` requires the terminal
-  sandbox. Where that sandbox is unavailable the vendor says `--sandbox`
-  has no effect and the run falls back to `default` mode. The verification
-  host is such a host (the CLI logged `Terminal sandbox unavailable:
-  AppArmor restricts unprivileged user namespaces`); which mode a pooled
-  run actually takes there is not verified live. The adapter's argv
-  therefore does not by itself make a run read-only: the guarded read and
-  both denied-write checks are still open (#15059), and until they pass
-  treat `agy` as write-capable (#15474). An on-disk
-  `.loom/runtimes/agy.json` or an operator-pinned
-  `LOOM_GENERIC_EXTRA_ARGS` overrides either without recompiling.
+- **Background self-update (#15474)** — `spawn-agy.sh` exports
+  `AGY_CLI_DISABLE_AUTO_UPDATE=true` for the child when the variable is
+  unset or empty. A non-empty value from the worker environment wins.
+  At the tested revision (`d83809d46`) the adapter only inherited the
+  variable, and a launch from a clean environment started the updater.
+
+  Three keyless runs of `1.5.18` distinguished updater suppression from its
+  15-minute debounce. Each exited 1. The CLI log identified what happened:
+
+  | Environment | CLI log | Observed effect |
+  |---|---|---|
+  | Fresh HOME, variable unset | `Spawned background update process` | A `--bg-updater` child wrote `updater/update.lock`, `updater/update_status.json` and `last_check.timestamp` under `~/.gemini/antigravity-cli/` and made one TLS connection to the vendor updater. |
+  | Same HOME 61 seconds later, variable unset | `Last check was less than 15 minutes ago, skipping update (fast path)` | The earlier files stayed unchanged. No updater child or updater connection appeared. |
+  | Fresh HOME, variable set to `true` | `Auto-update disabled via environment variable AGY_CLI_DISABLE_AUTO_UPDATE` | No updater child, updater files or updater connection appeared. |
+
+  The TLS connection went to
+  `antigravity-cli-auto-updater-974169037036.us-central1.run.app`. Treat the
+  `1.5.14` canary's updater as enabled until a run establishes otherwise.
+  [Recorded observations on #15059](https://github.com/2AMLogic/loom/issues/15059#issuecomment-7198012068)
+- **CLI flags** — On `1.5.18`, `--settings` honored both an inline JSON
+  object and a file path outside HOME. At `d83809d46` the adapter's settings
+  file was reachable only through the flag. In each case, selecting the Gemini
+  provider produced the expected missing-key diagnostic. The verification
+  host also logged `Terminal sandbox unavailable: AppArmor restricts
+  unprivileged user namespaces`. The vendor documents a fallback to the
+  default mode when the terminal sandbox is unavailable. The effective
+  mode on that host still needs a pooled run.
+- **Permission policy (#15474)** — `--sandbox` is terminal containment, not a
+  permission policy. Since v1.5.7 a headless run starts in `auto` mode
+  wherever that mode is available, where workspace file edits and sandboxed
+  commands run without approval, and an approval that headless mode cannot
+  give is a soft denial that still exits 0. The adapter therefore pins the
+  policy in the per-launch settings file and launches with
+  `--settings <that file> --sandbox`:
+
+  ```json
+  {
+    "modelProvider": "gemini",
+    "agentMode": "",
+    "toolPermission": "request-review",
+    "permissions": {
+      "allow": ["read_file(<workspace>)"],
+      "deny": ["write_file(*)", "command(*)", "mcp(*)"]
+    }
+  }
+  ```
+
+  The default execution mode and `request-review` are set explicitly, and
+  the vendor documents explicit rules as taking precedence over the mode,
+  with deny over ask over allow. The adapter writes the file to both the
+  `--settings` path and the CLI's documented default location under the isolated HOME
+  (`~/.gemini/antigravity-cli/settings.json`), so both paths supply the same
+  policy. The adapter screens `LOOM_GENERIC_EXTRA_ARGS` and the worker's own
+  arguments. A `--settings`, `--mode`,
+  `--dangerously-skip-permissions` (other than the bare form the tier-3
+  template consumes from the worker's argv) or `--sandbox` with any value but
+  `true` refuses the launch at 78 before anything is created or run. Every
+  other token follows the guarded argv, ahead of the model and the prompt; a
+  bare `--sandbox` in an override is dropped as a duplicate.
+- **Offline policy checks** — The `agy` tests in
+  `loom-daemon/tests/worker_spawn_api_keys.rs` check the argv, both settings
+  files and refusals against a fake CLI. The adapter leaves
+  `trustedWorkspaces` empty because a trusted workspace can supply hooks,
+  plugins and MCP configuration. A guarded read in an untrusted workspace
+  and both write denials still need live verification on the pinned build.
+- An on-disk `.loom/runtimes/agy.json` overrides the manifest without
+  recompiling.
 - **Effort is not mapped** — `agy models` lists `-low/medium/high/xhigh`
   model variants an operator can pass through explicitly (the canary's
   listing; key-less on `1.5.18` the subcommand refuses without a sign-in).
@@ -330,8 +354,9 @@ the one cap.
   bad-marked exhausted, so no `agy` process ran. Still open: everything on
   `1.5.14`, `gemini-4-neon` resolving through the pool (key-less the CLI
   logged `Model ID gemini-4-neon not in local config`), a guarded read, the
-  file-edit and shell-write denials, and updater suppression inside a
-  pooled `spawn-worker` launch.
+  file-edit and shell-write denials with before/after fixture digests, and
+  updater suppression inside a pooled `spawn-worker` launch. Run those checks
+  with the policy shipped for #15474. Until then, treat `agy` as write-capable.
 
 ## The seven contract points
 

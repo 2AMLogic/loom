@@ -114,8 +114,8 @@ ALLOWED_HOST_SUFFIXES=(
 
 # Hosts allowed by EXACT match only — no subdomains. `storage.googleapis.com`
 # is Google's public object-storage host, which serves the Antigravity CLI
-# (`agy`) release archive and manifest that `defaults/docs/runtime-adapters.md`
-# records as the version pin (#15059). Bucket-style hostnames under it
+# (`agy`) release archive pinned in `defaults/docs/runtime-adapters.md`
+# (#15059). The manifest comes from the updater host. Bucket-style hostnames
 # (`<bucket>.storage.googleapis.com`) can identify an operator's deployment, so
 # it must NOT be a suffix entry.
 ALLOWED_HOSTS_EXACT=(
