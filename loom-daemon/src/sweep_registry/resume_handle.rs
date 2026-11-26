@@ -201,7 +201,9 @@ impl DispatchSession {
             // A daemon-dispatched fresh launch is never a resume, whatever the
             // daemon's own environment holds.
             cmd.env_remove(resume::RESUME_SESSION_ENV)
-                .env_remove(resume::RESUME_PROMPT_ENV);
+                .env_remove(resume::RESUME_PROMPT_ENV)
+                .env_remove(resume::RESUME_ACCOUNT_ENV)
+                .env_remove(resume::RESUME_STORE_ENV);
             return;
         };
         cmd.env(resume::RESUME_SESSION_ENV, &launch.session_id)
@@ -223,6 +225,20 @@ impl DispatchSession {
             match launch.requested_sandbox() {
                 Some(mode) => cmd.env("LOOM_CODEX_SANDBOX", mode),
                 None => cmd.env_remove("LOOM_CODEX_SANDBOX"),
+            };
+        } else {
+            // A Claude transcript lives in the config dir of the account that
+            // wrote it (a persistent seat's private home), so the resume pins
+            // that account and store (#14981). `spawn-claude.sh` fails the
+            // launch rather than land anywhere else. Always set or cleared, so
+            // an inherited value never pins a different session.
+            match launch.account.as_deref().filter(|a| !a.is_empty()) {
+                Some(account) => cmd.env(resume::RESUME_ACCOUNT_ENV, account),
+                None => cmd.env_remove(resume::RESUME_ACCOUNT_ENV),
+            };
+            match launch.session_store.as_deref().filter(|s| !s.is_empty()) {
+                Some(store) => cmd.env(resume::RESUME_STORE_ENV, store),
+                None => cmd.env_remove(resume::RESUME_STORE_ENV),
             };
         }
     }

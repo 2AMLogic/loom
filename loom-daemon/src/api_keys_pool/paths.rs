@@ -45,7 +45,7 @@ pub fn shared_api_keys_dir() -> Option<PathBuf> {
             if trimmed.is_empty() {
                 None
             } else {
-                Some(expand_tilde(trimmed))
+                Some(crate::fs_util::expand_tilde(trimmed))
             }
         }
         #[cfg(test)]
@@ -53,19 +53,6 @@ pub fn shared_api_keys_dir() -> Option<PathBuf> {
         #[cfg(not(test))]
         Err(_) => dirs::home_dir().map(|home| home.join(".loom").join("api-keys")),
     }
-}
-
-fn expand_tilde(raw: &str) -> PathBuf {
-    if let Some(rest) = raw.strip_prefix("~/") {
-        if let Some(home) = dirs::home_dir() {
-            return home.join(rest);
-        }
-    } else if raw == "~" {
-        if let Some(home) = dirs::home_dir() {
-            return home;
-        }
-    }
-    PathBuf::from(raw)
 }
 
 /// A pool directory that **exists but could not be read**.

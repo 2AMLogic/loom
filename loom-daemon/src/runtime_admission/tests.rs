@@ -965,3 +965,78 @@ fn cargo_env_clears_every_role_runtime_pin() {
         assert!(forced(&var), "{var} not forced empty in {}", cfg_path.display());
     }
 }
+
+// ---- #14945: the bundled `agy` manifest admits read-only roles only ----
+
+/// A consumer-layout workspace (`.loom/roles` + `.loom/scripts`, NO
+/// `.loom/runtimes/`) with an `agy` adapter stub: the pilot's manifest —
+/// capabilities and the credential-pool declaration — comes from the
+/// daemon binary's bundled fallback.
+fn agy_consumer_layout() -> tempfile::TempDir {
+    let d = tempfile::tempdir().unwrap();
+    let roles = d.path().join(".loom/roles");
+    fs::create_dir_all(&roles).unwrap();
+    fs::write(roles.join("curator.json"), "{}").unwrap();
+    fs::write(roles.join("guide.json"), "{}").unwrap();
+    fs::write(roles.join("judge.json"), r#"{"runtimeRequirements":["loomControl"]}"#).unwrap();
+    fs::write(
+        roles.join("builder.json"),
+        r#"{"runtimeRequirements":["worktreeIsolation","loomControl"]}"#,
+    )
+    .unwrap();
+    fs::write(
+        roles.join("doctor.json"),
+        r#"{"runtimeRequirements":["worktreeIsolation","loomControl"]}"#,
+    )
+    .unwrap();
+    let scripts = d.path().join(".loom/scripts");
+    fs::create_dir_all(&scripts).unwrap();
+    let adapter = scripts.join("spawn-agy.sh");
+    fs::write(&adapter, "#!/bin/sh\n").unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&adapter, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    d
+}
+
+/// The bundled `agy` manifest is registered in the fallback table and
+/// declares every capability "no", so a role with no `runtimeRequirements`
+/// (Curator, Guide) admits on it — the pilot's read-only audience — exactly
+/// as it would against an on-disk manifest.
+#[test]
+fn bundled_agy_manifest_admits_requirement_free_roles() {
+    let d = agy_consumer_layout();
+    for role in ["curator", "guide"] {
+        let admitted = resolve_and_admit(d.path(), role, Some("agy")).unwrap();
+        assert_eq!(admitted.runtime, "agy");
+        // No on-disk `.loom/runtimes/` exists to read, so the manifest came
+        // from the bundled table; the recorded path is the `roots()`
+        // fallback location that missed.
+        assert!(
+            admitted.runtime_manifest.ends_with("agy.json"),
+            "{}",
+            admitted.runtime_manifest.display()
+        );
+    }
+}
+
+/// Builder, Doctor (worktreeIsolation + loomControl) and Judge (loomControl)
+/// are refused on the bundled `agy` capabilities — the same
+/// fail-closed-mechanism that keeps every other tier-3 runtime out of
+/// worktree-mutating and Loom-controlled roles (#14945 criterion 4).
+#[test]
+fn bundled_agy_manifest_refuses_worktree_mutating_and_loom_controlled_roles() {
+    let d = agy_consumer_layout();
+    for (role, expected) in [
+        ("builder", vec!["loomControl", "worktreeIsolation"]),
+        ("doctor", vec!["loomControl", "worktreeIsolation"]),
+        ("judge", vec!["loomControl"]),
+    ] {
+        let rejection = resolve_and_admit(d.path(), role, Some("agy")).unwrap_err();
+        let mut unmet = rejection.unmet_capabilities.clone();
+        unmet.sort();
+        assert_eq!(unmet, expected, "{role}: {}", rejection.reason);
+    }
+}

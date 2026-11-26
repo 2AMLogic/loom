@@ -1,6 +1,8 @@
-//! Small filesystem/formatting helpers shared by the reclaim and GC modules
-//! (`target_dir_gc`, `tmpfs_reclaim`, `scratch_reclaim`, `git_tmp_reclaim`,
-//! `docker_image_clean`, `target_orphan_reclaim`).
+//! Small filesystem/formatting helpers shared across the crate: the reclaim
+//! and GC modules (`target_dir_gc`, `tmpfs_reclaim`, `scratch_reclaim`,
+//! `git_tmp_reclaim`, `docker_image_clean`, `target_orphan_reclaim`) and, since
+//! issue #15372, the one `~`-expansion convention every pool and forge path
+//! resolver delegates to ([`expand_tilde_with_home`]).
 
 use std::ffi::OsStr;
 use std::fs;
@@ -193,6 +195,41 @@ pub fn truncate_tail(s: &str, max: usize) -> String {
     s[start..].trim().to_string()
 }
 
+/// Expand a leading tilde in `raw` against an explicit, optional home.
+///
+/// `~` resolves to the home itself and `~/rest` to `home/rest`; any other
+/// input — `~other/key`, a plain relative, an absolute path — and every input
+/// when no home is available is returned verbatim, so the caller's own
+/// validation still sees exactly what was configured (issue #15372: this is
+/// the one shared implementation the credential pools, fleet roster and
+/// forge identity used to carry as per-module copies).
+///
+/// The home *source* stays the caller's decision: `dirs::home_dir()`
+/// ([`expand_tilde`]), an env var read, or a value injected by a test — sites
+/// that must not fall back to OS account discovery pass their own lookup's
+/// result and get `None`-preserving behavior for free.
+#[must_use]
+pub(crate) fn expand_tilde_with_home(raw: &str, home: Option<&Path>) -> PathBuf {
+    if let Some(rest) = raw.strip_prefix("~/") {
+        if let Some(home) = home {
+            return home.join(rest);
+        }
+    } else if raw == "~" {
+        if let Some(home) = home {
+            return home.to_path_buf();
+        }
+    }
+    PathBuf::from(raw)
+}
+
+/// [`expand_tilde_with_home`] with the home from `dirs::home_dir()`: the
+/// form the credential pools use, where a discoverable account home is an
+/// acceptable substitute for `$HOME`.
+#[must_use]
+pub(crate) fn expand_tilde(raw: &str) -> PathBuf {
+    expand_tilde_with_home(raw, dirs::home_dir().as_deref())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -323,5 +360,46 @@ mod tests {
         let q = td.path().join("public");
         write_atomic(&q, b"x", AtomicOpts::default()).unwrap();
         assert_eq!(fs::metadata(&q).unwrap().permissions().mode() & 0o777, 0o644);
+    }
+
+    #[test]
+    fn expand_tilde_with_home_covers_the_tilde_forms() {
+        // The full-form callers (pools, monitor dir, roster root): a bare `~`
+        // is the home, `~/rest` joins under it, anything else passes through.
+        let home = Path::new("/home/tester");
+        let cases: &[(&str, &str)] = &[
+            ("~", "/home/tester"),
+            ("~/key", "/home/tester/key"),
+            ("~other/key", "~other/key"),
+            ("plain", "plain"),
+            ("./rel", "./rel"),
+            ("/abs/key", "/abs/key"),
+        ];
+        for (raw, want) in cases {
+            assert_eq!(
+                expand_tilde_with_home(raw, Some(home)),
+                PathBuf::from(*want),
+                "raw = {raw}"
+            );
+        }
+    }
+
+    #[test]
+    fn expand_tilde_without_a_home_returns_the_input_verbatim() {
+        for raw in ["~", "~/key", "~other/key", "plain", "/abs"] {
+            assert_eq!(expand_tilde_with_home(raw, None), PathBuf::from(raw));
+        }
+    }
+
+    #[test]
+    fn expand_tilde_delegates_to_dirs_home_dir() {
+        // Only the pass-through arm is host-independent enough to pin here;
+        // the tilde arms are [`expand_tilde_with_home`]'s table above.
+        assert_eq!(expand_tilde("plain"), PathBuf::from("plain"));
+        assert_eq!(
+            expand_tilde("/abs/key"),
+            PathBuf::from("/abs/key"),
+            "an absolute path must never be rewritten"
+        );
     }
 }

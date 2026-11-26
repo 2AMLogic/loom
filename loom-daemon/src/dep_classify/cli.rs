@@ -31,7 +31,6 @@
 //! order. A proposal with no dependency findings still costs exactly one read.
 
 use super::{apply, consts, cycle, defer, fact, forge, park, state, subset, unescalate};
-use crate::script_helpers::run_git;
 use std::path::{Path, PathBuf};
 
 /// The directory forge calls are made from.
@@ -104,10 +103,10 @@ fn warn(msg: &str) {
 
 /// Resolve `owner/repo`, git remote first.
 ///
-/// Order matters and is the shell's: `git remote get-url origin` is answered
-/// locally, so it keeps working offline and under GraphQL exhaustion — which
-/// is exactly when a Champion pass most needs to keep running. `gh repo view`
-/// is the fallback for a checkout with no origin.
+/// Thin delegate to the one shared resolver
+/// ([`crate::script_helpers::resolve_repo`], issue #15372) under this
+/// module's `dep.repo_view` operation tag — see that function's doc for the
+/// order and its offline rationale.
 ///
 /// `pub(crate)` for `dep_recheck`'s `dep-states` (#14710): a bare `#N`
 /// dependency means the invoking repo, and the invoking repo's NWO is also
@@ -115,47 +114,7 @@ fn warn(msg: &str) {
 /// copy that could disagree with this one.
 #[must_use]
 pub(crate) fn resolve_repo(cwd: &Path) -> Option<String> {
-    if let Some(nwo) = run_git(cwd, &["remote", "get-url", "origin"])
-        .ok_stdout_trimmed()
-        .as_deref()
-        .and_then(nwo_from_remote_url)
-    {
-        return Some(nwo);
-    }
-
-    #[derive(serde::Deserialize)]
-    struct NameWithOwner {
-        #[serde(rename = "nameWithOwner")]
-        name_with_owner: String,
-    }
-    let q: crate::cmd_out::Query<NameWithOwner> = crate::script_helpers::gh_read_json(
-        "dep.repo_view",
-        &["repo", "view", "--json", "nameWithOwner"],
-        cwd,
-        false,
-        |n: &NameWithOwner| n.name_with_owner.is_empty(),
-    );
-    match q {
-        crate::cmd_out::Query::Populated(n) => Some(n.name_with_owner),
-        _ => None,
-    }
-}
-
-/// `owner/repo` from a git remote URL, in either the SSH
-/// (`git@host:owner/repo.git`) or HTTPS (`https://host/owner/repo`) form.
-///
-/// `None` when the URL cannot yield both halves — the shell's
-/// `[[ "$url" == */* ]]` guard, which falls through to `gh` rather than
-/// guessing.
-#[must_use]
-fn nwo_from_remote_url(url: &str) -> Option<String> {
-    let trimmed = url.strip_suffix(".git").unwrap_or(url);
-    let mut parts: Vec<&str> = trimmed.rsplit(['/', ':']).take(2).collect();
-    if parts.len() != 2 || parts.iter().any(|p| p.is_empty()) {
-        return None;
-    }
-    parts.reverse();
-    Some(parts.join("/"))
+    crate::script_helpers::resolve_repo(cwd, "dep.repo_view")
 }
 
 /// Resolve the repo from `--repo` or the checkout, or exit 2 with the shell's

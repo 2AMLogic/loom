@@ -18,6 +18,43 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 ### 2026-11-26
 
+- **Issue #15372** (closed): Consolidate duplicated expand_tilde, default_activity_db_path, and git-origin resolve_repo helpers in loom-daemon
+- **PR #15389**: refactor: consolidate duplicated tilde, activity-db, and git-origin resolver helpers in loom-daemon
+- **Issue #14110** (closed): Contained roles: select only private-clone accounts registering the repository; clear refusal, status and docs
+- **PR #14260**: fix(daemon): contained launches draw only private-clone accounts registering the workspace repository
+- **PR #15339**: chore(deps): Bump the github-actions group across 1 directory with 4 updates
+- **Issue #15159** (closed): Cross-owner reap and plan disagree on owner-name case, costing a re-mint per pass
+- **PR #15349**: fix(credential_preflight): compare the root owner case-insensitively in the plan (#15159)
+- **Issue #15387** (closed): verify-proposal-refs reports generated outputs named in acceptance tests as missing source files
+- **PR #15393**: feat(daemon): verify generated-output declarations in proposal refs
+- **Issue #15452** (closed): Ignore config tiers containing multiple top-level JSON values
+- **PR #15462**: fix(config-resolver): ignore config tiers holding several JSON values
+- **Issue #15414** (closed): Remove the second config-tier scan from configure_terminal
+- **PR #15425**: Remove the second config-tier scan from configure_terminal (#15414)
+- **Issue #15435** (closed): daemon tests: LOOM_GH_BIN is mutated under #[serial(loom_config_env)] in forge_verdict_cmd vs bare #[serial] in two claim_reconciliation test files
+- **PR #15448**: test: hold loom_config_env around LOOM_GH_BIN writes in verdict tests
+- **Issue #15440** (closed): telemetry-kind-pick-decision.md: the pick-skip wire-name mapping is 3 names behind the code (and its count says 24, not 27)
+- **PR #15444**: docs: add backstop_held and operator_link_unverified to the pick-skip mapping
+- **Issue #15408** (closed): Update the troubleshooting guide’s reference to the Builder quarantine procedure
+- **PR #15449**: docs: link troubleshooting step 4 to the quarantine replay section
+- **Issue #15258** (closed): merge-pr.sh: --no-cleanup-primary joins --no-cleanup-worktree as a silently-ignored opt-out after the #14905 cutover
+- **PR #15443**: docs: mark merge-pr --no-cleanup-* flags no-op on GitHub default path
+- **Issue #15406** (closed): Update token-attribution docs after the Safehouse completion envelope is retired
+- **PR #15447**: docs: point token-attribution guides at the sweep and role telemetry records
+- **Issue #15259** (closed): Clarify when daemon reconciliation handles post-merge follow-up in merge-pr.sh
+- **PR #15445**: fix(merge-pr): explain when post-merge reconciliation runs
+- **Issue #15416** (closed): Skip Champion merge dispatch for PRs already in GitHub’s merge queue
+- **PR #15436**: fix: check GitHub queue membership before dispatching Champion merges
+- **Issue #15052** (closed): workflow-lint: detect duplicate on keys and preserve boolean-like step IDs
+- **PR #15426**: fix(workflow-lint): detect duplicate on keys and preserve boolean-like step IDs
+- **Issue #15438** (closed): docs/mcp/loom-terminals.md shows a legacy Error frame with a bare-string payload
+- **PR #15442**: docs: correct the Error frame payload shape in loom-terminals.md
+- **Issue #15413** (closed): Builder step that exits within a minute is recorded as unclassified with no cause before quarantine
+- **PR #15427**: feat(daemon): show exit status, runtime and log pointer on failed Builder steps
+- **Issue #15431** (closed): mcp-loom terminals.ts drops the daemon's legacy Error message (reads top-level `message`, wire shape is `payload.message`)
+- **PR #15439**: fix: surface legacy daemon Error messages in mcp-loom terminal tools
+- **Issue #15415** (closed): create-pr.sh: quoted-evidence filter misses fenced code blocks and single-quoted citations
+- **PR #15424**: fix: ignore fenced examples and single-quoted citations in PR guard lookups
 - **Issue #15385** (closed): operator-decision resolve --from: batch recorded 3 of 5 items with no visible failure
 - **PR #15388**: feat: print per-item batch summary and retry block in resolve --from
 - **Issue #15423** (closed): Remove the synthetic empty registry fallback from MCP list_terminals
