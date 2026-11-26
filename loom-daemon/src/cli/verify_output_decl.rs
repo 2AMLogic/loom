@@ -29,21 +29,37 @@
 //! `origin/main`) via [`super::git_blob_lines::resolved_blob`] — the same
 //! symlink-aware reader the line-range check uses — and never executed and
 //! never read from the working tree, so a local edit or a locally generated
-//! report cannot satisfy the declaration. The cited line must contain the
-//! output path as a literal argument or the value of an option such as
-//! `--json="build/report.json"`. Quotes may delimit the path. Punctuation
+//! report cannot satisfy the declaration. The cited line must either contain
+//! the output path as a literal argument or the value of an option such as
+//! `--json="build/report.json"` (a recipe or command line), or name it as an
+//! exact target on a Make rule line. Quotes may delimit the path. Punctuation
 //! and Make expansions appended to a filename stay part of the word.
+//!
+//! A rule line (`build/report.json: dep`, also a `::` rule or an inline
+//! `targets: dep; @cmd` recipe) matches when the output is one whitespace-
+//! separated target before the line's first unquoted colon — the line an
+//! idiomatic Makefile names its output on, its recipe referring to it only as
+//! `$@`. A comment, `=` or shell operator before that colon makes the colon
+//! part of an ordinary word instead (`# build/report.json: dep` is a
+//! comment, not a rule). Scripts and physical lines continuing a recipe use
+//! the command argument check, even when the cited line has no leading tab.
+//! Target recognition does not require a Makefile name or a .mk suffix. A target
+//! is compared as written, quotes included: `'build/report.json': dep` names
+//! a target with quotes in its name. Storing the path in a variable still
+//! matches as an argument (`REPORT = build/report.json`), but an assignment
+//! to a variable NAMED like the output declares nothing
+//! (`build/report.json := val`).
 //!
 //! # Exit-code contract
 //!
 //! | Exit | Meaning | Output |
 //! |---|---|---|
-//! | `0` | The cited producer line contains the output as a complete argument | (none) |
-//! | [`EX_DECL_FAILED`] (1) | Disproof: the producer has no tree entry at the cited path, the cited line does not exist, or it does not pass the output as a complete argument | stdout: `BAD OUTPUT DECL: …` — the caller appends it to its own miss list |
+//! | `0` | The cited producer line contains the output as a complete argument or names it as a Make rule target | (none) |
+//! | [`EX_DECL_FAILED`] (1) | Disproof: the producer has no tree entry at the cited path, the cited line does not exist, or it neither passes the output as a complete argument nor names it as a Make rule target | stdout: `BAD OUTPUT DECL: …` — the caller appends it to its own miss list |
 //! | [`EX_USAGE`] (2) | Malformed `--producer` spec, `git` could not be run, or the rev does not resolve | stderr |
 //! | [`EX_UNREADABLE`] (10) | The producer entry exists but is unreadable (dangling symlink, unresolved cycle, non-blob) — the declaration could NOT be checked | stderr: `UNREADABLE PRODUCER: …`. **Not a miss**: an unreadable producer is an inconclusive check, not a disproof (#8593's distinction, applied here) |
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 
@@ -73,7 +89,7 @@ pub(crate) struct VerifyOutputDeclArgs {
 
     /// The declared producer citation: `PATH:L`, where line `L` of the
     /// tracked `PATH` at `--rev` must contain the output path as a complete
-    /// argument.
+    /// argument or name it as a Make rule target.
     #[arg(long, value_name = "PATH:L")]
     producer: String,
 
@@ -174,17 +190,96 @@ fn inline_flagged_recipe(line: &str) -> Option<&str> {
     None
 }
 
-/// Compare whole recipe words without interpreting Make or running the shell.
-/// Only unquoted whitespace and shell operators separate words. In particular,
-/// `+` and `$(SUFFIX)` after the path are part of the same argument.
-pub(crate) fn line_contains_complete_arg(line: &str, needle: &str) -> bool {
-    if needle.is_empty() {
-        return false;
+/// What precedes the first unquoted colon of a line that is not a recipe.
+enum BeforeColon<'a> {
+    /// The target list of a rule: `targets:` or `targets::`.
+    Rule { targets: &'a str },
+    /// The variable name of an assignment: `name :=`, `name ::=` or `name :::=`.
+    Assignment { name: &'a str },
+    /// The colon belongs to an ordinary word: a comment, `=` or shell
+    /// operator precedes it, or there is no colon at all.
+    Word,
+}
+
+/// Find the colon that ends a Make rule's target list, without interpreting
+/// Make: the first colon outside quotes, escapes and expansions. Only return
+/// the portion of the header on the cited physical line.
+fn before_rule_colon(line: &str, cited_start: usize) -> BeforeColon<'_> {
+    let mut unquoted = unquoted();
+    for (index, ch) in line.char_indices().filter(|&(_, ch)| unquoted(ch)) {
+        match ch {
+            '#' | '=' | ';' | '&' | '|' | '<' | '>' | '(' | ')' => break,
+            ':' => {
+                // `:=`, `::=` and `:::=` assign to a variable; `:` and `::` open a rule.
+                let Some(before) = line.get(cited_start..index) else {
+                    // The colon ended the header on a previous physical line.
+                    return BeforeColon::Word;
+                };
+                let after_first = &line[index + 1..];
+                // `:::=` is the third assignment spelling; `:::` alone is a rule.
+                let extra = after_first
+                    .bytes()
+                    .take(2)
+                    .take_while(|&b| b == b':')
+                    .count();
+                return if after_first[extra..].starts_with('=') {
+                    BeforeColon::Assignment { name: before }
+                } else {
+                    BeforeColon::Rule { targets: before }
+                };
+            }
+            _ => {}
+        }
+    }
+    BeforeColon::Word
+}
+
+/// Whether `needle` is one of the words of a rule's target list or an
+/// assignment's left side. Only unquoted whitespace separates words, and a
+/// word is compared as written: quotes, escapes and Make expansions belong
+/// to it.
+fn has_exact_word(text: &str, needle: &str) -> bool {
+    let mut unquoted = unquoted();
+    text.split(|ch| unquoted(ch) && ch.is_ascii_whitespace())
+        .any(|word| word == needle)
+}
+
+/// Whether `needle` is the last unquoted-whitespace-separated word of `text`.
+fn is_last_word(text: &str, needle: &str) -> bool {
+    let mut unquoted = unquoted();
+    text.split(|ch| unquoted(ch) && ch.is_ascii_whitespace())
+        .rfind(|word| !word.is_empty())
+        == Some(needle)
+}
+
+/// Inspect the Make logical line through the end of the citation. Its first
+/// rule colon ends the target list. Only names on the cited physical line
+/// can vouch for the output.
+fn make_line_matches(logical: &str, cited_start: usize, needle: &str) -> bool {
+    if !logical.starts_with('\t') && !needle.is_empty() {
+        match before_rule_colon(logical, cited_start) {
+            // Only the final word names the variable. Earlier words may be
+            // modifiers or command arguments, as in make out MODE:=x.
+            BeforeColon::Assignment { name } if is_last_word(name, needle) => return false,
+            BeforeColon::Rule { targets } if has_exact_word(targets, needle) => return true,
+            _ => {}
+        }
+    }
+    let line = &logical[cited_start..];
+    if cited_start != 0 {
+        return command_contains_complete_arg(line, needle);
     }
     let recipe = line
         .strip_prefix('\t')
         .or_else(|| inline_flagged_recipe(line));
     let line = recipe.map_or(line, |body| body.trim_start_matches([' ', '\t', '@', '-', '+']));
+    command_contains_complete_arg(line, needle)
+}
+
+fn command_contains_complete_arg(line: &str, needle: &str) -> bool {
+    if needle.is_empty() {
+        return false;
+    }
     let mut unquoted = unquoted();
     let words = line.split(|ch: char| {
         unquoted(ch)
@@ -205,21 +300,65 @@ pub(crate) fn line_contains_complete_arg(line: &str, needle: &str) -> bool {
     })
 }
 
-/// 1-based line `line_no` of the content, or `None` when it does not exist.
-/// A trailing `\n` produces a final empty segment that is not a line.
-pub(crate) fn line_at(content: &[u8], line_no: u64) -> Option<String> {
-    if line_no == 0 {
-        return None;
+/// A shebang identifies a script even when its filename has no extension.
+/// An executable Makefile names make as its interpreter. For sourced shell
+/// files without a shebang, use the resolved producer's shell suffix, ASCII
+/// case-insensitively (`copy.SH` is as much a shell script as `copy.sh`,
+/// #15500).
+///
+/// A producer with neither signal — no shebang and no shell suffix, such as a
+/// `Dockerfile` or an extensionless command file — is read as Make. The cited
+/// line alone cannot choose between the two: `build/report.json:backup` is a
+/// command argument in a script and a rule for `build/report.json` in a
+/// Makefile. Only the file type can, and listing more file types (`Dockerfile`,
+/// `justfile`) would trade this heuristic for a longer one, so a colon-extended
+/// argument in such a producer is a known false accept (#15500).
+fn is_command_script(path: &str, content: &str) -> bool {
+    if let Some(shebang) = content
+        .lines()
+        .next()
+        .and_then(|line| line.strip_prefix("#!"))
+    {
+        let mut words = shebang.split_ascii_whitespace();
+        let mut interpreter = words.next();
+        if interpreter.is_some_and(|word| Path::new(word).ends_with("env")) {
+            interpreter = words.find(|word| !word.starts_with('-') && !word.contains('='));
+        }
+        return !interpreter.is_some_and(|word| {
+            let path = Path::new(word);
+            path.ends_with("make") || path.ends_with("gmake")
+        });
     }
-    let text = String::from_utf8_lossy(content);
-    let segments: Vec<&str> = text.split('\n').collect();
-    let real = if content.last() == Some(&b'\n') {
-        segments.len().saturating_sub(1)
-    } else {
-        segments.len()
-    };
-    let idx = line_no as usize - 1;
-    (idx < real).then(|| segments[idx].to_string())
+    Path::new(path)
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| {
+            ["sh", "bash", "dash", "ksh", "zsh", "fish", "csh", "tcsh"]
+                .iter()
+                .any(|suffix| ext.eq_ignore_ascii_case(suffix))
+        })
+}
+
+/// Locate the cited physical line and its enclosing logical line in the
+/// pinned producer. A fresh target can follow a continued recipe immediately.
+fn producer_line_matches(path: &str, content: &str, line_no: u64, needle: &str) -> Option<bool> {
+    let index = usize::try_from(line_no.checked_sub(1)?).ok()?;
+    if is_command_script(path, content) {
+        return Some(command_contains_complete_arg(content.lines().nth(index)?, needle));
+    }
+
+    let mut logical_start = 0;
+    let mut cited_start = 0;
+    let mut lines = content.split_inclusive('\n');
+    for line in lines.by_ref().take(index) {
+        cited_start += line.len();
+        if !line.trim_end_matches(['\r', '\n']).ends_with('\\') {
+            logical_start = cited_start;
+        }
+    }
+    let line = lines.next()?.trim_end_matches(['\r', '\n']);
+    let logical = &content[logical_start..cited_start + line.len()];
+    Some(make_line_matches(logical, cited_start - logical_start, needle))
 }
 
 /// `wc -l` line count of the content, matching [`resolved_blob`]'s line
@@ -294,7 +433,9 @@ fn handle(
             resolved_path,
             bytes,
         }) => {
-            let Some(producer_line) = line_at(&bytes, line_no) else {
+            let content = String::from_utf8_lossy(&bytes);
+            let Some(matches) = producer_line_matches(&resolved_path, &content, line_no, output)
+            else {
                 println!(
                     "BAD OUTPUT DECL: `{cite}` — {rev}:{resolved_path} has only {} lines, no \
                      line {line_no}",
@@ -302,12 +443,12 @@ fn handle(
                 );
                 std::process::exit(EX_DECL_FAILED);
             };
-            if line_contains_complete_arg(&producer_line, output) {
+            if matches {
                 std::process::exit(0);
             }
             println!(
-                "BAD OUTPUT DECL: `{cite}` — {rev}:{resolved_path}:{line_no} does not pass \
-                 `{output}` as a complete argument"
+                "BAD OUTPUT DECL: `{cite}` — {rev}:{resolved_path}:{line_no} does not name \
+                 `{output}` as a complete argument or a Make rule target"
             );
             std::process::exit(EX_DECL_FAILED);
         }
@@ -318,6 +459,10 @@ fn handle(
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+
+    fn line_contains_complete_arg(line: &str, needle: &str) -> bool {
+        producer_line_matches("Makefile", line, 1, needle) == Some(true)
+    }
 
     #[test]
     fn complete_argument_matches_the_downstream_recipe_line() {
@@ -413,6 +558,76 @@ mod tests {
     }
 
     #[test]
+    fn a_make_rule_target_line_declares_the_output() {
+        let output = "build/report.json";
+        for line in [
+            "build/report.json: dep",
+            "build/report.json : dep",
+            "a.out build/report.json: dep",
+            "build/report.json:: dep",
+            "build/report.json: dep; @tool $@",
+        ] {
+            assert!(line_contains_complete_arg(line, output), "{line}");
+        }
+        assert!(!line_contains_complete_arg("build/report.json: dep", "build/report.jso"));
+    }
+
+    #[test]
+    fn only_an_exact_literal_rule_target_declares_the_output() {
+        let output = "build/report.json";
+        for line in [
+            "build/report.json.bak: dep",
+            "build/report.json$(SUFFIX): dep",
+            "# build/report.json: dep",
+            "\tbuild/report.json: dep",
+            "'build/report.json': dep",
+            "a\\ build/report.json: dep",
+            "\"a build/report.json b\": dep",
+        ] {
+            assert!(!line_contains_complete_arg(line, output), "{line}");
+        }
+    }
+
+    #[test]
+    fn an_assignment_named_like_the_output_is_not_an_argument_for_it() {
+        let output = "build/report.json";
+        for line in [
+            "build/report.json := val",
+            "build/report.json ::= val",
+            "export build/report.json := val",
+            "build/report.json:::=value",
+            "build/report.json :::= val",
+        ] {
+            assert!(!line_contains_complete_arg(line, output), "{line}");
+        }
+        assert!(line_contains_complete_arg("REPORT = build/report.json", output));
+    }
+
+    #[test]
+    fn a_command_argument_before_a_make_assignment_is_still_an_argument() {
+        let output = "build/report.json";
+        for line in [
+            "make build/report.json MODE:=release",
+            "make build/report.json MODE::=release",
+            "make MODE:=release build/report.json",
+        ] {
+            assert!(line_contains_complete_arg(line, output), "{line}");
+        }
+    }
+
+    #[test]
+    fn a_colon_inside_a_recipe_argument_does_not_separate_words() {
+        let output = "build/report.json";
+        for line in [
+            "\t@env PATH=foo:build/report.json tool",
+            "\t@tool build/report.json:extra",
+            "\t@tool host:build/report.json",
+        ] {
+            assert!(!line_contains_complete_arg(line, output), "{line}");
+        }
+    }
+
+    #[test]
     fn producer_spec_parsing() {
         assert_eq!(parse_producer_spec("Makefile:270"), Some(("Makefile", 270)));
         assert_eq!(parse_producer_spec("tools/Makefile:12"), Some(("tools/Makefile", 12)));
@@ -423,13 +638,79 @@ mod tests {
     }
 
     #[test]
-    fn line_at_is_one_based_and_ignores_the_trailing_newline_segment() {
-        assert_eq!(line_at(b"one\ntwo\n", 1).as_deref(), Some("one"));
-        assert_eq!(line_at(b"one\ntwo\n", 2).as_deref(), Some("two"));
-        assert_eq!(line_at(b"one\ntwo\n", 3), None);
-        // No trailing newline: the last segment is still a real line.
-        assert_eq!(line_at(b"one\ntwo", 2).as_deref(), Some("two"));
-        assert_eq!(line_at(b"one\ntwo", 3), None);
-        assert_eq!(line_at(b"one\ntwo", 0), None);
+    fn producer_lines_are_one_based_and_ignore_the_trailing_newline_segment() {
+        for content in ["one\ntwo", "one\ntwo\n"] {
+            let matches = |n, word| producer_line_matches("Makefile", content, n, word);
+            assert_eq!(matches(0, "one"), None);
+            assert_eq!(matches(1, "one"), Some(true));
+            assert_eq!(matches(2, "two"), Some(true));
+            assert_eq!(matches(2, "one"), Some(false));
+            assert_eq!(matches(3, "two"), None);
+        }
+    }
+
+    #[test]
+    fn script_arguments_and_make_targets_use_the_pinned_interpreter() {
+        let output = "build/report.json";
+        for interpreter in ["/bin/sh", "/usr/bin/env -S bash -eu"] {
+            let content =
+                format!("#!{interpreter}\ncp seed {output}:backup\nmake {output} MODE:=release");
+            assert_eq!(producer_line_matches("copy", &content, 2, output), Some(false));
+            assert_eq!(producer_line_matches("copy", &content, 3, output), Some(true));
+        }
+        for interpreter in ["/usr/bin/make -f", "/usr/bin/env -S gmake -f"] {
+            let content = format!("#!{interpreter}\nfirst \\\n {output}: dep");
+            assert_eq!(producer_line_matches("rules", &content, 3, output), Some(true));
+            assert_eq!(producer_line_matches("rules", &content, 3, "first"), Some(false));
+        }
+    }
+
+    #[test]
+    fn a_shell_suffix_is_recognized_in_any_ascii_case() {
+        let output = "build/report.json";
+        let content = format!("cp seed {output}:backup\ncp seed {output}\n");
+        for path in [
+            "tools/copy.sh",
+            "tools/copy.SH",
+            "tools/copy.Bash",
+            "tools/copy.Sh",
+        ] {
+            let matches = |line| producer_line_matches(path, &content, line, output);
+            assert_eq!(matches(1), Some(false), "{path}: a colon-extended argument");
+            assert_eq!(matches(2), Some(true), "{path}: a complete argument");
+        }
+        // The shebang is read first: Make behind a shell-looking suffix is still Make.
+        let make = format!("#!/usr/bin/make -f\n{output}: dep");
+        assert_eq!(producer_line_matches("rules.SH", &make, 2, output), Some(true));
+    }
+
+    #[test]
+    fn a_make_producer_without_a_shell_suffix_still_declares_a_rule_target() {
+        let output = "build/report.json";
+        for path in ["Makefile", "MAKEFILE", "tools/report.rules"] {
+            assert_eq!(
+                producer_line_matches(path, "build/report.json: dep", 1, output),
+                Some(true),
+                "{path}"
+            );
+        }
+    }
+
+    #[test]
+    fn continued_recipes_match_only_whole_arguments_on_the_cited_line() {
+        let output = "build/report.json";
+        for start in [
+            "copy:\n\t@cp \\",
+            "copy: ; cp \\",
+            "copy: dep \\\n  ; cp \\",
+        ] {
+            let content = format!("{start}\r\n    seed \\\r\n    {output}:backup\n{output}: seed");
+            let last = content.lines().count() as u64;
+            let matches = |line, word| producer_line_matches("build.rules", &content, line, word);
+            assert_eq!(matches(last - 1, output), Some(false));
+            assert_eq!(matches(last - 1, "build/report.json:backup"), Some(true));
+            assert_eq!(matches(last - 1, "seed"), Some(false));
+            assert_eq!(matches(last, output), Some(true));
+        }
     }
 }

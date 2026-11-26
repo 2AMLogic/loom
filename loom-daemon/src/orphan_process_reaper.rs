@@ -2370,9 +2370,15 @@ mod tests {
                 wait_for(|| !alive(fixture.driver_pid), 10),
                 "the orphaned driver survived the production pass"
             );
-            std::thread::sleep(Duration::from_millis(2500));
-            let survivors = live_in_worktree(&wt);
-            assert!(survivors.is_empty(), "leftovers after the pass: {survivors:?}");
+            // Poll rather than sleep a fixed window: the escaped descendants
+            // are signalled in staged steps and may still be dying on a
+            // loaded runner (#15337). A real survivor still fails — the poll
+            // times out and the assert reports the pids.
+            assert!(
+                wait_for(|| live_in_worktree(&wt).is_empty(), 15),
+                "leftovers after the pass: {:?}",
+                live_in_worktree(&wt)
+            );
         }
 
         #[test]

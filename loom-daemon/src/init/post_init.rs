@@ -532,6 +532,35 @@ pub fn is_credential_path(path: &str) -> bool {
         .any(|p| path.starts_with(p.strip_suffix('/').unwrap_or(p)))
 }
 
+/// The daemon-written subset of [`EPHEMERAL_PATTERNS`] (#15479): runtime files
+/// the daemon writes into every workspace, which must ALSO be in both
+/// `LOOM_OWNED_PREFIXES` lists — the bash one in
+/// `defaults/scripts/check-main-clean.sh` and its Rust mirror in
+/// `loom-daemon/src/main_health_gate/owned_paths.rs`.
+///
+/// Those lists are the backstop that holds BEFORE a consumer repo's managed
+/// `.gitignore` block is resynced: until then a new ignore rule never reaches
+/// the repo, so the file the daemon already writes there is untracked dirt.
+/// Unlisted, that dirt makes `check-main-clean.sh` exit 3 as builder
+/// contamination — and its `--quarantine` moves the daemon's file into the
+/// stash stack — and wedges the daemon's dirty-tree gate "dirty" every tick.
+/// That was #8075 for `.loom-local/` and #15479 for
+/// `.loom/account-ranking.codex`.
+///
+/// A `.gitignore` entry alone is therefore not enough for a path the daemon
+/// writes at runtime: add it here too, and the parity test in `owned_paths.rs`
+/// fails CI until both owned lists carry it. Same shape as
+/// [`CREDENTIAL_PATTERNS`] and `credential_class_tests`. Deliberately bounded
+/// to the paths #15479 proved — not an audit of every daemon-written entry in
+/// [`EPHEMERAL_PATTERNS`].
+///
+/// Exact paths (no trailing `/`), so both owned lists match them exactly.
+pub const DAEMON_RUNTIME_PATTERNS: &[&str] = &[
+    ".loom/account-health.json",
+    ".loom/account-health.lock",
+    ".loom/account-ranking.codex",
+];
+
 /// Build the Loom-managed `.gitignore` block (marker lines + header + patterns),
 /// with no leading or trailing newline. Callers add surrounding newlines.
 ///

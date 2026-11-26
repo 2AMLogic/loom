@@ -728,14 +728,16 @@ If no downstream cap is documented, ask in the PR description rather than assumi
 **Before drawing any conclusion from a failing test suite** (especially one where the failures don't match what the issue/PR under investigation would plausibly cause), check your own environment first:
 
 ```bash
-env | grep -E '^LOOM_(FORCE_SCOPE|GUARD_DECISION_LOG)='
+env | grep -E '^LOOM_(FORCE_SCOPE|GUARD_DECISION_LOG|SWEEP_ID|WORKTREE_PATH|WORKSPACE)='
 ```
 
-If either is set and the suite exercises guard-hook / force-push / reset-hard behavior, re-run it with the ambient overrides stripped before trusting the result:
+If any is set and the suite exercises guard-hook / force-push / reset-hard behavior, re-run the suite with them all stripped before trusting the result:
 
 ```bash
-env -u LOOM_FORCE_SCOPE -u LOOM_GUARD_DECISION_LOG <test-suite-command>
+env -u LOOM_FORCE_SCOPE -u LOOM_GUARD_DECISION_LOG -u LOOM_SWEEP_ID -u LOOM_WORKTREE_PATH -u LOOM_WORKSPACE <test-suite-command>
 ```
+
+The last three are read by the primary-checkout mutation guard, not as behaviour overrides: `LOOM_SWEEP_ID` and `LOOM_WORKTREE_PATH` mark an agent step, `LOOM_WORKSPACE` names the workspace (#15483). With a marker ambient the guard denies `git commit` in a primary checkout — which is what a guard suite's fixture repository typically is — so a suite's `git commit -m <prose>` allow-assertions there are denied instead (#15496).
 
 Full background: `.loom/docs/guard-hooks.md` → "Known consequence".
 
