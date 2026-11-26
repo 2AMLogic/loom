@@ -338,7 +338,15 @@ _cpr_body_ref_issue() {
   # #15404: strip quoted evidence (inline code + double-quoted citations)
   # before extracting, so the selection rules below only ever see genuine
   # references. See the comment block above for the rationale.
-  body="$(sed -e 's/`[^`]*`//g' -e 's/"[^"]*"//g' <<< "$BODY")"
+  # Backtick runs pair with a run of the SAME length (longest first), so
+  # ``Closes #396`` is one span, not two empty ones. Each span becomes " ; ",
+  # a boundary that a keyword-to-number match cannot cross (`closes `x` #396`
+  # must not collapse into `closes #396`).
+  body="$(sed -E \
+    -e 's/```([^`]|`[^`]|``[^`])*```/ ; /g' \
+    -e 's/``([^`]|`[^`])*``/ ; /g' \
+    -e 's/`[^`]*`/ ; /g' \
+    -e 's/"[^"]*"/ ; /g' <<< "$BODY")"
   # One number per match: each match ends in `#<digits>`, so the trailing
   # digit run is the reference itself (never an earlier digit-token prefix).
   refs="$(grep -ioE "((^[[:space:]]*)|((^|[[:space:]])[^#[:space:]]*[0-9][[:space:]]+)|([^#0-9][[:space:]]+)|([^[:alnum:]_#[:space:]]))($1)[[:space:]]+#[0-9]+" <<< "$body" \

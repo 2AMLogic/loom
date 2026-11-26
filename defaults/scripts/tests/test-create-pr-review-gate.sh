@@ -435,6 +435,28 @@ run_create_pr --title "fix: something" --body '| Evidence | PR #414 body says "C
 assert_eq "0" "$EXIT_CODE" "Double-quoted citation alone -> exits 0"
 assert_eq "" "$(cat "$STUB_DIR/daemon-forge-calls.log" 2>/dev/null || true)" "Double-quoted citation alone -> guard never consulted"
 
+# T25 (#15404, judge round 1): a double-backtick span is one span (matching
+# run lengths), so the cited #396 never reaches the guard.
+reset_fixtures
+run_create_pr --title "feat: slice" --body '| Evidence | PR #414 says ``Closes #396``. |
+
+Part of #1378' --head "feature/issue-1378"
+assert_eq "0" "$EXIT_CODE" "Double-backtick citation + Part of #1378 -> exits 0"
+assert_contains "$(cat "$STUB_DIR/daemon-forge-calls.log")" "check-open-pr 1378" "Guard consulted the partial #1378 (double-backtick)"
+assert_not_contains "$(cat "$STUB_DIR/daemon-forge-calls.log")" "396" "Guard never consulted the cited #396 (double-backtick)"
+
+# T26 (#15404, judge round 1): a removed span must not splice a keyword onto a
+# number across the gap, for backtick and double-quote spans.
+for shape in 'The worker closes `socket` #396 after each request.' 'The worker closes "socket" #396 after each request.'; do
+  reset_fixtures
+  run_create_pr --title "feat: slice" --body "$shape
+
+Part of #1378" --head "feature/issue-1378"
+  assert_eq "0" "$EXIT_CODE" "Span between keyword and number ($shape) -> exits 0"
+  assert_contains "$(cat "$STUB_DIR/daemon-forge-calls.log")" "check-open-pr 1378" "Guard consulted the partial #1378 (span gap)"
+  assert_not_contains "$(cat "$STUB_DIR/daemon-forge-calls.log")" "396" "Guard never consulted #396 across a span gap"
+done
+
 # --- Summary ---
 echo ""
 echo "────────────────────────────────"

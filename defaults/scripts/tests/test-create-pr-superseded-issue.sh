@@ -510,6 +510,37 @@ assert_eq "0" "$EXIT_CODE" "Double-quoted citation alone -> exits 0"
 assert_eq "1" "$(created_count)" "Double-quoted citation alone -> PR is created"
 assert_not_contains "$(cat "$STUB_DIR/gh-calls.log")" "issue view 396" "Double-quoted citation -> no issue lookup"
 
+# T32 (#15404, judge round 1): a double-backtick span (``Closes #396``) is one
+# span -- matching backtick runs of the same length -- so the cited #396 is
+# never exposed, with a partial footer.
+reset_fixtures
+echo "CLOSED" > "$STUB_DIR/issue-396-state.txt"
+echo "414" > "$STUB_DIR/issue-396-number.txt"
+echo "https://github.com/owner/repo/pull/414" > "$STUB_DIR/issue-396-url.txt"
+echo "feature/issue-999" > "$STUB_DIR/pr-414-head.txt"
+run_create_pr --title "feat: slice" --body '| Evidence | PR #414 says ``Closes #396``. |
+
+Part of #1378' --head "feature/issue-1378"
+assert_eq "0" "$EXIT_CODE" "Double-backtick citation + Part of #1378 -> exits 0"
+assert_eq "1" "$(created_count)" "Double-backtick citation -> PR is created"
+assert_not_contains "$(cat "$STUB_DIR/gh-calls.log")" "issue view 396" "Double-backtick citation -> #396 never looked up"
+
+# T33 (#15404, judge round 1): deleting a span must not splice a keyword onto
+# a number across the gap (`closes `socket` #396`), for backtick and quote spans.
+for shape in 'The worker closes `socket` #396 after each request.' 'The worker closes "socket" #396 after each request.'; do
+reset_fixtures
+echo "CLOSED" > "$STUB_DIR/issue-396-state.txt"
+echo "414" > "$STUB_DIR/issue-396-number.txt"
+echo "https://github.com/owner/repo/pull/414" > "$STUB_DIR/issue-396-url.txt"
+echo "feature/issue-999" > "$STUB_DIR/pr-414-head.txt"
+  run_create_pr --title "feat: slice" --body "$shape
+
+Part of #1378" --head "feature/issue-1378"
+  assert_eq "0" "$EXIT_CODE" "Span between keyword and number ($shape) -> exits 0"
+  assert_eq "1" "$(created_count)" "Span between keyword and number -> PR is created"
+  assert_not_contains "$(cat "$STUB_DIR/gh-calls.log")" "issue view 396" "Span between keyword and number -> #396 never looked up"
+done
+
 # --- Summary ---
 echo ""
 echo "────────────────────────────────"
