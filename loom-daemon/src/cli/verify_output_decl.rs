@@ -129,9 +129,17 @@ pub(crate) fn line_contains_complete_arg(line: &str, needle: &str) -> bool {
         return false;
     }
 
+    // Make consumes recipe flags before handing a tab-prefixed line to the shell.
+    let line = match line.strip_prefix('\t') {
+        Some(recipe) => recipe.trim_start_matches([' ', '\t', '@', '-', '+']),
+        None => line,
+    };
     let mut quote = None;
     let mut escaped = false;
+    let mut dollar = false;
+    let mut expansion_depth = 0;
     let words = line.split(|ch: char| {
+        let after_dollar = std::mem::take(&mut dollar);
         if std::mem::take(&mut escaped) {
             return false;
         }
@@ -144,7 +152,18 @@ pub(crate) fn line_contains_complete_arg(line: &str, needle: &str) -> bool {
         } else if matches!(ch, '\'' | '"') {
             quote = Some(ch);
         } else {
-            return ch.is_ascii_whitespace() || matches!(ch, ';' | '&' | '|' | '<' | '>');
+            // Keep $(...) in its word, including nested parentheses and spaces.
+            // Other unquoted parentheses are shell grouping operators.
+            match ch {
+                '(' if after_dollar || expansion_depth > 0 => expansion_depth += 1,
+                ')' if expansion_depth > 0 => expansion_depth -= 1,
+                '$' => dollar = true,
+                _ if expansion_depth == 0 => {
+                    return ch.is_ascii_whitespace()
+                        || matches!(ch, ';' | '&' | '|' | '<' | '>' | '(' | ')');
+                }
+                _ => {}
+            }
         }
         false
     });
@@ -311,6 +330,27 @@ mod tests {
         }
         assert!(line_contains_complete_arg("--json='build/report.json'", "build/report.json"));
         assert!(line_contains_complete_arg("\"--json=build/report.json\";", "build/report.json"));
+    }
+
+    #[test]
+    fn recipe_flags_only_introduce_comments_at_the_start_of_the_recipe() {
+        let output = "build/report.json";
+        assert!(!line_contains_complete_arg("\t-@+ # tool --json build/report.json", output));
+        assert!(line_contains_complete_arg("\t@tool @# --json build/report.json", output));
+    }
+
+    #[test]
+    fn grouping_delimiters_respect_quotes_escapes_and_make_expansions() {
+        let output = "build/report.json";
+        assert!(line_contains_complete_arg("\t@(tool --json='build/report.json')", output));
+        for line in [
+            "\t@(tool --json build/report.json$(SUFFIX))",
+            "\t@(tool $(call f,$(x) build/report.json ))",
+            "\t@(tool --json 'build/report.json)')",
+            "\t@(tool --json build/report.json\\))",
+        ] {
+            assert!(!line_contains_complete_arg(line, output), "{line}");
+        }
     }
 
     #[test]
