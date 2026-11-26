@@ -137,8 +137,8 @@ below).
 Cleanup is restricted to Loom-managed worktrees (those under
 .loom/worktrees/issue-N that contain a .loom-managed sentinel file written
 by worktree.sh). User-provisioned worktrees at other paths are never
-removed by the default code path. Set LOOM_PRESERVE_WORKTREE=1 to disable
-cleanup unconditionally for a session.
+removed by the default code path. Set LOOM_PRESERVE_WORKTREE=1 in the
+script's environment to skip its inline cleanup.
 
 Cleanup ownership on GitHub (#14905): unless --worktree-path or
 --remove-ignored is passed, this script runs no cleanup itself. The daemon's

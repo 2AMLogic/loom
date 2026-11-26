@@ -118,7 +118,7 @@
 # Cleanup is restricted to Loom-managed worktrees (those containing the
 # .loom-managed sentinel written by worktree.sh). Worktrees lacking the
 # sentinel are treated as user-owned and never removed. Set
-# LOOM_PRESERVE_WORKTREE=1 to disable cleanup unconditionally for a session.
+# LOOM_PRESERVE_WORKTREE=1 in the script's environment to skip its inline cleanup.
 #
 # Cleanup ownership on GitHub (#14905): unless --worktree-path or
 # --remove-ignored is passed, this script runs no cleanup itself. The
@@ -1442,7 +1442,7 @@ fi
 # .loom/worktrees/ (marked with a .loom-managed sentinel file by worktree.sh
 # or pr-worktree.sh). Any worktree lacking the sentinel is treated as
 # user-owned and is never removed by this script. Operators can also set
-# LOOM_PRESERVE_WORKTREE=1 to skip cleanup unconditionally.
+# LOOM_PRESERVE_WORKTREE=1 in the script's environment to skip its inline cleanup.
 #
 # Two worktree-path conventions are recognized:
 #   - .loom/worktrees/issue-<N>/  (Loom-issue branches: feature/issue-<N>;
