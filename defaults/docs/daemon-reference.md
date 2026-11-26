@@ -13789,11 +13789,16 @@ loom-daemon restart --abort-drain                 # cancel an in-progress drain,
   only a one-shot note: `status --json`'s `drain.roll` object (`null` when no
   drain is active) carries `roll_pending`, `started_at`, `paused_secs`,
   `budget_secs`, `refusals`, `in_flight`, `target`, `then_exit`, `origin`,
-  `timed_out`, `startup_hold` and `pause`. **Since #10831** `roll_pending` is
-  always `false` and `refusals` always `0` (no roll is retained across a
-  deadline; both stay in the object so older readers still parse it),
+  `timed_out`, `startup_hold`, `fleet_hold` and `pause`. **Since #10831**
+  `roll_pending` is always `false` and `refusals` always `0` (no roll is
+  retained across a deadline; both stay in the object so older readers still
+  parse it),
   `budget_secs` is the pause budget for a `pause-roll` drain and `0` otherwise,
-  and `origin` reads `operator` or `pause-roll`. `pause` is `null` except during
+  and `origin` reads `operator` or `pause-roll`. **Since #15300** `fleet_hold`
+  is `true` when the hold came from the fleet store's `paused` state (#9598)
+  rather than a local operator stop (#9588) or a drain; always accompanied by
+  `startup_hold`. It is `#[serde(default)]`, so a current reader defaults the
+  field to `false` when an older daemon omits it. `pause` is `null` except during
   a pause roll, when it carries the H4 `step` (1-10), `stopped` (whether an
   abort is still possible), `budget_secs`, `min_resumable_age_secs`,
   `manifest_id`, `target_source`, `to_version`, `items`, `paused`, `exited`,
