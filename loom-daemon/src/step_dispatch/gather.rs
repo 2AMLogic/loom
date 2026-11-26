@@ -9,7 +9,7 @@
 //!
 //! - **the items, and the PRs' head and author**: the tick's one discovery
 //!   snapshot ([`crate::discovery`], #12306); the gather lists nothing itself.
-//!   The Direct backend lists per repo ([`super::listing::list_all_open`]
+//!   The Direct backend lists per repo ([`super::listing::list_all_open_on`]
 //!   and the ETag-cached open-PR listing), the Mirror backend reads one
 //!   worklist for every repo. The last good copy of either stands in on a
 //!   failure (#12074), so the Builder branch links as it does in the open-PR

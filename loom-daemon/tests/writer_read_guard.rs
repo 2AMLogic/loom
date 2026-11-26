@@ -58,6 +58,11 @@ const LOCAL_TOKEN: &str = "local `gh auth token` read of the chosen credential; 
 /// to the writer. Only ever remove entries.
 const READ_ON_WRITER: &[(&str, &str)] = &[
     ("branch_update.rs", MERGE),
+    // #15068: the operator send-back walk's collaborator-permission probe —
+    // the endpoint needs push access to answer at all (a reader App is 403'd,
+    // which would make every operator unverifiable and clear their
+    // rejections). The walk's comments and timeline reads stay on readers.
+    ("claim_reconciliation/verdict_send_back.rs", ASKER),
     // Promotion's collaborator-permission endpoint depends on which
     // credential asks. Timeline and body-edit reads still use readers.
     ("cli/forge_identity_cmd.rs", ASKER),
