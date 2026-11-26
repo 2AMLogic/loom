@@ -533,20 +533,27 @@ work reaching the public feed", read `loom.feed.completions` (#12152), whose
 
 #### Per-model token usage (Issue #6384)
 
+**Which records carry it.** This record (`sweep.completed`) and its paired
+[`sweep.outcome`](#sweepoutcome) are the per-sweep records to query for token
+usage: both carry the same `tokens_by_model`, and missing usage stays absent
+on both. Safehouse is not a source for it — the `completion-v1` envelope is
+historical (see the note at the end of this section).
+
 `tokens_by_model` is an **additive, optional** array — omitted entirely
-(never an empty array, never a fabricated `0`) when no attributable
-transcript was found for this sweep. Each row is a
+(never an empty array, never a fabricated `0`) on both records when no
+attributable transcript was found for this sweep. Each row is a
 `(model, speed, service_tier)` bucket with raw, **not cost-weighted** input
 (`input` = `input_tokens` + `cache_read_input_tokens` +
 `cache_creation_input_tokens`; `cache_read`/`cache_write_5m`/
-`cache_write_1h` further split the cache portion) and output token counts —
-the same shape and same underlying aggregation
-(`crate::transcript_tokens::sum_sweep_tokens_by_model`) the safehouse
-`completion-v1` envelope's own `tokens_by_model` field already carries, so
-the two paths report identical per-sweep token data. This closes the gap
-where a dashboard-sourced backfill (reconstructing completions from
-`sweep.completed` + GitHub when the safehouse→egress path is down) had no
-token data to fall back on.
+`cache_write_1h` further split the cache portion) and output token counts.
+The two records share the shape and the underlying aggregation
+(`crate::transcript_tokens::sum_sweep_tokens_by_model`) and are populated
+together (as below), so they report identical per-sweep token data.
+Historically this closed the gap where a dashboard-sourced backfill —
+reconstructing completions from `sweep.completed` + GitHub while the
+safehouse→egress path was down — had no token data to fall back on. That
+egress path was retired with the envelope (#13946); for a new run, query the
+two records above.
 
 Populated on the backfill/local-journal export path
 (`observability::backfill::synthesize_completed`, copied verbatim from the
@@ -564,6 +571,19 @@ This field is purely additive — a `schema_version` bump is unnecessary (see
 `tokens_out`, it is workload detail about a private repo and is not added to
 the public (unauthenticated, private-repo) redaction allowlist
 (`loom-ui:src/redaction.ts`) by this change.
+
+**Historical: the Safehouse `completion-v1` envelope (#13946).** Until
+#13946 retired the narration sink, a merged PR also reached the fleet feed
+as a Safehouse `completion-v1` envelope whose own `tokens_by_model` field
+carried the same shape and same underlying aggregation, so the two paths
+reported identical per-sweep token data. An older fleet-feed completion may
+therefore still show a `completion-v1` object with `runtime` / `provider` /
+`profile` and `tokens_by_model`; nothing writes that envelope now. A merge
+reaches the room only as a `chat` line,
+`merged ✓ owner/repo#N · <title> · <url>`, which names the merged PR by
+repository, number, optional title (dropped when the PR has none) and URL
+and carries no token usage
+([`safehouse.md` → What gets reported](safehouse.md#what-gets-reported)).
 
 ### `sweep.outcome`
 
