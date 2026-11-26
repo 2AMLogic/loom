@@ -18,6 +18,19 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 ### 2026-11-26
 
+- **Issue #15337** (closed): test flake: orphan_process_reaper::tests::live::test_production_pass_reaps_a_genuinely_orphaned_tree fails on Rust Unit Tests (4/5) — leftovers after the pass
+- **PR #15351**: fix(test): poll for survivors in orphan reaper production-pass test (#15337)
+- **Issue #15466** (closed): verify-output-decl rejects a Make target line as a generated-output producer citation
+- **PR #15482**: fix: accept a Make rule target line as an output producer citation
+- **Issue #15354** (closed): [ci-daily] Flake Detection (shell suites, macos-latest, parallelism 1)
+- **Issue #15355** (closed): [ci-daily] Flake Detection (shell suites, ubuntu-latest, parallelism 1)
+- **Issue #13865** (closed): [ci-daily] Supply Chain
+- **PR #15484**: fix: pin read-only policy and updater kill switch in agy adapter
+- **Issue #15467** (closed): Accept source citations to an unterminated final line in verify-proposal-refs
+- **PR #15472**: fix: count an unterminated final line in git-blob-lines range checks
+- **Issue #15477** (closed): Champion promotion reconciliation reports OK when its trusted-comment input cannot be read
+- **Issue #15461** (closed): loom-start.sh malformed-tier guard accepts several top-level JSON values, so a two-object config reports "no terminals" instead of "Invalid JSON"
+- **PR #15469**: fix: fail loom start on config tiers holding several JSON values
 - **Issue #15455** (closed): Export the native session PID to OpenCode tools so self-claim leases survive tool exit
 - **PR #15465**: fix: export LOOM_AGENT_SESSION_PID from the native launcher
 - **Issue #15450** (closed): Document queue_membership_unknown under backoff in the pick-decision guide
