@@ -219,6 +219,14 @@ pub struct AccountHealth {
     /// the new reader.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub class_cooldowns: HashMap<String, u64>,
+    /// The **observation time** of the headroom reading that last released a
+    /// plan-exhaustion hold (#15091) — the only evidence that establishes
+    /// quota recovery. Distinct from `updated_at`, which a login probe, a
+    /// first-seen record or the *processing* time of an old reading also
+    /// moves; a fleet hold learned before this instant is not re-imposed,
+    /// one learned after it is. Additive and optional, like `last_probe`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quota_released_at: Option<u64>,
 }
 
 impl AccountHealth {
@@ -675,6 +683,7 @@ pub fn record_terminal_for_class_with_reset_at(
                 last_success: None,
                 last_probe: None,
                 class_cooldowns: HashMap::new(),
+                quota_released_at: None,
             },
             |index| state.accounts.remove(index),
         );
@@ -841,6 +850,7 @@ pub fn record_probe_at(
                 last_success: None,
                 last_probe: None,
                 class_cooldowns: HashMap::new(),
+                quota_released_at: None,
             },
             |index| state.accounts.remove(index),
         );
@@ -955,6 +965,7 @@ pub fn record_availability_at(
                 last_success: None,
                 last_probe: None,
                 class_cooldowns: HashMap::new(),
+                quota_released_at: None,
             },
             |index| state.accounts.remove(index),
         );
@@ -985,6 +996,7 @@ pub fn record_availability_at(
                         entry.reason = HealthReason::Healthy;
                         entry.cooldown_until = None;
                         entry.updated_at = now;
+                        entry.quota_released_at = Some(observed_at);
                         entry.signal_provenance = provenance.to_string();
                         AvailabilityEffect::ClearedExhaustionHold
                     } else {
@@ -1094,6 +1106,26 @@ fn timed_reason_of(wire: &str) -> Option<HealthReason> {
 }
 
 impl CodexAccountHold {
+    /// The one relay rule for two reports of the same account (#15091): the
+    /// later deadline wins wholesale (an earlier report never shortens a
+    /// later one); on an equal deadline the freshly learned report wins; and
+    /// either way the result carries the **freshest** `learned_at` of the
+    /// two, so a headroom reading older than the newest exhaustion evidence
+    /// can never release the hold downstream.
+    #[must_use]
+    pub fn relayed(self, other: Self) -> Self {
+        let learned_at = self.learned_at.max(other.learned_at);
+        let mut winner = if other.cooldown_until > self.cooldown_until
+            || (other.cooldown_until == self.cooldown_until && other.learned_at > self.learned_at)
+        {
+            other
+        } else {
+            self
+        };
+        winner.learned_at = learned_at;
+        winner
+    }
+
     /// Whether this hold is one the wire may carry and a merge may apply at
     /// `now`: a sane name, a timed reason, a deadline that is strictly in the
     /// future and no further out than [`MAX_EXHAUSTION_RESET_HORIZON_SECS`].
@@ -1172,12 +1204,11 @@ pub fn live_codex_holds_across(roots: &[PathBuf], now: u64) -> Option<Vec<CodexA
         std::collections::BTreeMap::new();
     for root in roots {
         for hold in live_codex_holds(root, now).into_iter().flatten() {
-            match merged.get(&hold.name) {
-                Some(current) if current.cooldown_until >= hold.cooldown_until => {}
-                _ => {
-                    merged.insert(hold.name.clone(), hold);
-                }
-            }
+            let next = match merged.remove(&hold.name) {
+                Some(current) => current.relayed(hold),
+                None => hold,
+            };
+            merged.insert(next.name.clone(), next);
         }
     }
     (!merged.is_empty()).then(|| merged.into_values().collect())
@@ -1243,6 +1274,7 @@ pub fn merge_codex_holds(workspace: &Path, holds: &[CodexAccountHold], now: u64)
                         last_success: None,
                         last_probe: None,
                         class_cooldowns: HashMap::new(),
+                        quota_released_at: None,
                     });
                     applied += 1;
                 }
@@ -1250,18 +1282,36 @@ pub fn merge_codex_holds(workspace: &Path, holds: &[CodexAccountHold], now: u64)
                     let entry = &mut state.accounts[index];
                     // Sticky reauth outranks a remote timed fact; a local
                     // deadline the remote does not beat stands as it is.
-                    if entry.reason == HealthReason::ReauthRequired
-                        || entry
-                            .cooldown_until
-                            .is_some_and(|held| held >= hold.cooldown_until)
-                    {
+                    if entry.reason == HealthReason::ReauthRequired {
                         continue;
                     }
-                    // A local record (e.g. a measured release) newer than
-                    // this fact outranks it: never re-impose an older hold
-                    // over strictly newer local evidence.
+                    if entry
+                        .cooldown_until
+                        .is_some_and(|held| held >= hold.cooldown_until)
+                    {
+                        // The deadline stands, but exhaustion evidence the
+                        // remote learned *later* than ours still counts: a
+                        // headroom reading between the two must not release
+                        // it. Only an explicit `learned_at` (an old peer's
+                        // `now` fallback would keep postponing a release).
+                        let live = entry.cooldown_until.is_some_and(|held| held > now);
+                        let fresher = hold
+                            .learned_at
+                            .map(|at| at.min(now))
+                            .filter(|at| *at > entry.updated_at);
+                        if let (true, Some(at)) = (live, fresher) {
+                            entry.updated_at = at;
+                            applied += 1;
+                        }
+                        continue;
+                    }
+                    // A measured release (a headroom reading *observed* after
+                    // this fact was learned) outranks it: never re-impose an
+                    // older hold over strictly newer quota evidence. A login
+                    // probe, a first-seen record or the processing time of an
+                    // old reading is not quota evidence.
                     let locally_held = entry.cooldown_until.is_some_and(|held| held > now);
-                    if !locally_held && entry.updated_at > learned {
+                    if !locally_held && entry.quota_released_at.is_some_and(|at| at > learned) {
                         continue;
                     }
                     entry.reason = reason;

@@ -1515,6 +1515,112 @@ fn a_local_release_outranks_an_older_remote_hold() {
     assert_eq!(effect, AvailabilityEffect::ClearedExhaustionHold);
 }
 
+fn codex_id(name: &str) -> AccountId {
+    AccountId {
+        provider: AccountProvider::Codex,
+        name: name.to_string(),
+    }
+}
+
+fn learned_hold(name: &str, until: u64, learned: u64) -> CodexAccountHold {
+    let mut hold = remote_hold(name, "plan_exhausted", until);
+    hold.learned_at = Some(learned);
+    hold
+}
+
+/// A login probe is not quota evidence: it must not suppress a fleet hold
+/// learned before it (#15091 review).
+#[test]
+fn a_login_probe_does_not_suppress_a_fleet_hold() {
+    let tmp = tempfile::tempdir().unwrap();
+    record_probe_at(tmp.path(), &codex_id("a"), ProbeOutcome::LoggedIn, "probe", 200).unwrap();
+    assert_eq!(merge_codex_holds(tmp.path(), &[learned_hold("a", 1000, 100)], 201), 1);
+    assert_eq!(held_entry(tmp.path(), "a").unwrap().cooldown_until, Some(1000));
+}
+
+/// A headroom reading observed *before* the hold was learned, however late
+/// it was processed, establishes nothing about the hold.
+#[test]
+fn a_late_processed_old_reading_does_not_suppress_a_fleet_hold() {
+    let tmp = tempfile::tempdir().unwrap();
+    let effect = record_availability_at(
+        tmp.path(),
+        &codex_id("a"),
+        AvailabilityOutcome::Available { observed_at: 50 },
+        "probe",
+        200,
+    )
+    .unwrap();
+    assert_eq!(effect, AvailabilityEffect::Unchanged);
+    assert_eq!(merge_codex_holds(tmp.path(), &[learned_hold("a", 1000, 100)], 201), 1);
+    assert_eq!(held_entry(tmp.path(), "a").unwrap().cooldown_until, Some(1000));
+}
+
+/// Reports with the same deadline keep the freshest exhaustion evidence, so
+/// a reading between the two learn times cannot release the hold.
+#[test]
+fn equal_deadline_reports_keep_the_freshest_evidence() {
+    let tmp = tempfile::tempdir().unwrap();
+    merge_codex_holds(tmp.path(), &[learned_hold("a", 1000, 100)], 150);
+    assert_eq!(merge_codex_holds(tmp.path(), &[learned_hold("a", 1000, 300)], 350), 1);
+    let entry = held_entry(tmp.path(), "a").unwrap();
+    assert_eq!((entry.cooldown_until, entry.updated_at), (Some(1000), 300));
+    // An older equal report changes nothing.
+    assert_eq!(merge_codex_holds(tmp.path(), &[learned_hold("a", 1000, 200)], 350), 0);
+    let effect = record_availability_at(
+        tmp.path(),
+        &codex_id("a"),
+        AvailabilityOutcome::Available { observed_at: 200 },
+        "probe",
+        360,
+    )
+    .unwrap();
+    assert_eq!(
+        effect,
+        AvailabilityEffect::Unchanged,
+        "a reading from 200 cannot release a hold confirmed at 300"
+    );
+    assert_eq!(held_entry(tmp.path(), "a").unwrap().cooldown_until, Some(1000));
+}
+
+/// The relay rule: later deadline wins, equal deadline keeps the freshest
+/// `learned_at`, and the winner always carries the freshest of both.
+#[test]
+fn relayed_holds_keep_the_freshest_evidence_on_equal_deadlines() {
+    let older = learned_hold("a", 1000, 100);
+    let newer = learned_hold("a", 1000, 300);
+    assert_eq!(older.clone().relayed(newer.clone()).learned_at, Some(300));
+    assert_eq!(newer.clone().relayed(older.clone()).learned_at, Some(300));
+    let longer = learned_hold("a", 2000, 100);
+    let merged = newer.relayed(longer);
+    assert_eq!((merged.cooldown_until, merged.learned_at), (2000, Some(300)));
+    // A peer without `learned_at` never erases one that has it.
+    assert_eq!(
+        older
+            .relayed(remote_hold("a", "plan_exhausted", 1000))
+            .learned_at,
+        Some(100)
+    );
+}
+
+/// Two registered roots learning the same deadline at different times: the
+/// union publishes the later `learned_at` whichever root is read first.
+#[test]
+fn the_root_union_publishes_the_freshest_learned_at() {
+    let old_root = tempfile::tempdir().unwrap();
+    let new_root = tempfile::tempdir().unwrap();
+    for (root, learned) in [(&old_root, 100), (&new_root, 300)] {
+        merge_codex_holds(root.path(), &[learned_hold("a", 1000, learned)], 400);
+    }
+    for roots in [
+        [old_root.path().to_path_buf(), new_root.path().to_path_buf()],
+        [new_root.path().to_path_buf(), old_root.path().to_path_buf()],
+    ] {
+        let holds = live_codex_holds_across(&roots, 400).unwrap();
+        assert_eq!((holds[0].cooldown_until, holds[0].learned_at), (1000, Some(300)));
+    }
+}
+
 #[test]
 fn the_merge_never_shortens_a_local_hold() {
     let tmp = tempfile::tempdir().unwrap();

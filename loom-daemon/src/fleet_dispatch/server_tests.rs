@@ -1301,6 +1301,13 @@ fn ahead(secs: i64) -> u64 {
     u64::try_from(chrono::Utc::now().timestamp() + secs).unwrap()
 }
 
+/// A deadline `secs` past `base`, a wall instant a test samples **once**: a
+/// test that re-reads the clock for its expected value races the second
+/// boundary (flaked at invocation 239 of a loop).
+fn at(base: u64, secs: i64) -> u64 {
+    u64::try_from(i64::try_from(base).unwrap() + secs).unwrap()
+}
+
 fn hb_with_holds(host: &str, holds: Value) -> Value {
     let mut body = hb_body(host, json!([]), 1);
     body["codex_holds"] = holds;
@@ -1317,13 +1324,14 @@ fn beat(s: &Arc<Server<StaticIdentity>>, host: &str, body: &Value) -> Value {
 /// heartbeat (#15091 AC1) — the captain relays without any wiring of its own.
 #[test]
 fn worker_reported_codex_holds_ride_the_next_answer() {
+    let base = ahead(0); // sampled once: every deadline derives from it
     let s = open_server("node-a");
     let answer = beat(
         &s,
         A,
         &hb_with_holds(
             A,
-            json!([{"name": "agent-7", "reason": "plan_exhausted", "cooldown_until": ahead(3600)}]),
+            json!([{"name": "agent-7", "reason": "plan_exhausted", "cooldown_until": at(base, 3600)}]),
         ),
     );
     let holds = answer["codex_holds"]
@@ -1336,20 +1344,21 @@ fn worker_reported_codex_holds_ride_the_next_answer() {
     assert_eq!(holds.len(), 1);
     assert_eq!(holds[0]["name"], "agent-7");
     assert_eq!(holds[0]["reason"], "plan_exhausted");
-    assert_eq!(holds[0]["cooldown_until"], json!(ahead(3600)));
+    assert_eq!(holds[0]["cooldown_until"], json!(at(base, 3600)));
 }
 
 /// The aggregate keeps the later deadline: an earlier report never shortens
 /// what a later one established (#15091 AC2, upward side).
 #[test]
 fn an_earlier_report_never_shortens_the_aggregate() {
+    let base = ahead(0); // sampled once: every deadline derives from it
     let s = open_server("node-a");
     beat(
         &s,
         A,
         &hb_with_holds(
             A,
-            json!([{"name": "agent-7", "reason": "plan_exhausted", "cooldown_until": ahead(7200)}]),
+            json!([{"name": "agent-7", "reason": "plan_exhausted", "cooldown_until": at(base, 7200)}]),
         ),
     );
     beat(
@@ -1357,12 +1366,12 @@ fn an_earlier_report_never_shortens_the_aggregate() {
         A,
         &hb_with_holds(
             A,
-            json!([{"name": "agent-7", "reason": "transient_failure", "cooldown_until": ahead(60)}]),
+            json!([{"name": "agent-7", "reason": "transient_failure", "cooldown_until": at(base, 60)}]),
         ),
     );
     let answer = beat(&s, B, &hb_body(B, json!([]), 1));
     let holds = answer["codex_holds"].as_array().unwrap();
-    assert_eq!(holds[0]["cooldown_until"], json!(ahead(7200)));
+    assert_eq!(holds[0]["cooldown_until"], json!(at(base, 7200)));
     assert_eq!(holds[0]["reason"], "plan_exhausted", "the later record wins wholesale");
 
     // A later report still extends.
@@ -1371,17 +1380,18 @@ fn an_earlier_report_never_shortens_the_aggregate() {
         A,
         &hb_with_holds(
             A,
-            json!([{"name": "agent-7", "reason": "plan_exhausted", "cooldown_until": ahead(9000)}]),
+            json!([{"name": "agent-7", "reason": "plan_exhausted", "cooldown_until": at(base, 9000)}]),
         ),
     );
     let answer = beat(&s, B, &hb_body(B, json!([]), 1));
-    assert_eq!(answer["codex_holds"][0]["cooldown_until"], json!(ahead(9000)));
+    assert_eq!(answer["codex_holds"][0]["cooldown_until"], json!(at(base, 9000)));
 }
 
 /// Expired and invalid holds do not ride, and a quiet fleet's answer omits
 /// the field — the exact body an old captain sent (#15091 AC2/AC3).
 #[test]
 fn expired_and_invalid_holds_do_not_ride() {
+    let base = ahead(0); // sampled once: every deadline derives from it
     let s = open_server("node-a");
     let answer = beat(
         &s,
@@ -1389,11 +1399,11 @@ fn expired_and_invalid_holds_do_not_ride() {
         &hb_with_holds(
             A,
             json!([
-                {"name": "gone", "reason": "plan_exhausted", "cooldown_until": ahead(-10)},
+                {"name": "gone", "reason": "plan_exhausted", "cooldown_until": at(base, -10)},
                 {"name": "far", "reason": "plan_exhausted",
-                 "cooldown_until": ahead(35 * 24 * 3600 + 60)},
-                {"name": "odd", "reason": "quota_nuked", "cooldown_until": ahead(60)},
-                {"name": "", "reason": "plan_exhausted", "cooldown_until": ahead(60)}
+                 "cooldown_until": at(base, 35 * 24 * 3600 + 60)},
+                {"name": "odd", "reason": "quota_nuked", "cooldown_until": at(base, 60)},
+                {"name": "", "reason": "plan_exhausted", "cooldown_until": at(base, 60)}
             ]),
         ),
     );
@@ -1402,12 +1412,39 @@ fn expired_and_invalid_holds_do_not_ride() {
     assert!(answer.get("codex_holds").is_none(), "and nothing is republished");
 }
 
+/// Reports sharing a deadline keep the freshest `learned_at` in the aggregate
+/// whichever arrives first, so a downstream reading between the two learn
+/// times cannot release the hold (#15091 review).
+#[test]
+fn equal_deadline_reports_keep_the_freshest_learned_at() {
+    let base = ahead(0);
+    let until = at(base, 3600);
+    for order in [[100_u64, 300], [300, 100]] {
+        let s = open_server("node-a");
+        for learned in order {
+            beat(
+                &s,
+                A,
+                &hb_with_holds(
+                    A,
+                    json!([{"name": "agent-7", "reason": "plan_exhausted",
+                            "cooldown_until": until, "learned_at": learned}]),
+                ),
+            );
+        }
+        let answer = beat(&s, B, &hb_body(B, json!([]), 1));
+        assert_eq!(answer["codex_holds"][0]["cooldown_until"], json!(until));
+        assert_eq!(answer["codex_holds"][0]["learned_at"], json!(300));
+    }
+}
+
 /// The captain's own locally learned holds publish beside the aggregate
 /// (#15091): `with_codex_health` names the workspace whose health file the
 /// captain reads fresh on every heartbeat, like `with_token_probe`.
 #[test]
 #[serial_test::serial]
 fn the_captains_own_holds_publish_beside_the_aggregate() {
+    let base = ahead(0); // sampled once: every deadline derives from it
     let workspace = tempfile::tempdir().unwrap();
     let _registry = super::super::test_server::RegistryEnv::empty(workspace.path());
     crate::tokens_pool::health::record_terminal_for_class_with_reset_at(
@@ -1418,9 +1455,9 @@ fn the_captains_own_holds_publish_beside_the_aggregate() {
         },
         crate::tokens_pool::health::TerminalClassification::TokenExhausted,
         None,
-        Some(ahead(5400)),
+        Some(at(base, 5400)),
         "adapter_v1",
-        ahead(-60),
+        at(base, -60),
     )
     .unwrap();
     let clock = Arc::new(ManualClock::default());
@@ -1440,7 +1477,7 @@ fn the_captains_own_holds_publish_beside_the_aggregate() {
         .as_array()
         .expect("the captain's own hold rides");
     assert_eq!(holds[0]["name"], "captain-seat");
-    assert_eq!(holds[0]["cooldown_until"], json!(ahead(5400)));
+    assert_eq!(holds[0]["cooldown_until"], json!(at(base, 5400)));
 
     // A worker's later report for the same account wins over the captain's
     // own earlier one — one never-narrows rule, both sources.
@@ -1449,11 +1486,11 @@ fn the_captains_own_holds_publish_beside_the_aggregate() {
         A,
         &hb_with_holds(
             A,
-            json!([{"name": "captain-seat", "reason": "plan_exhausted", "cooldown_until": ahead(9000)}]),
+            json!([{"name": "captain-seat", "reason": "plan_exhausted", "cooldown_until": at(base, 9000)}]),
         ),
     );
     let answer = beat(&s, B, &hb_body(B, json!([]), 1));
-    assert_eq!(answer["codex_holds"][0]["cooldown_until"], json!(ahead(9000)));
+    assert_eq!(answer["codex_holds"][0]["cooldown_until"], json!(at(base, 9000)));
 }
 
 // -----------------------------------------------------------------

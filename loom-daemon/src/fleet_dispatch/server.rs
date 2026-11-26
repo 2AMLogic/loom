@@ -268,15 +268,10 @@ impl<I: Identity> Server<I> {
             if !hold.is_carriable(now) {
                 continue;
             }
-            match holds.get(&hold.name) {
-                Some(current) if current.cooldown_until >= hold.cooldown_until => {}
-                Some(_) => {
-                    holds.insert(hold.name.clone(), hold.clone());
-                }
-                None if holds.len() < crate::tokens_pool::health::MAX_FLEET_HOLDS => {
-                    holds.insert(hold.name.clone(), hold.clone());
-                }
-                None => {}
+            if let Some(current) = holds.remove(&hold.name) {
+                holds.insert(hold.name.clone(), current.relayed(hold.clone()));
+            } else if holds.len() < crate::tokens_pool::health::MAX_FLEET_HOLDS {
+                holds.insert(hold.name.clone(), hold.clone());
             }
         }
     }
@@ -305,12 +300,11 @@ impl<I: Identity> Server<I> {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         fleet.retain(|_, hold| hold.cooldown_until > now);
         for (name, hold) in fleet.iter() {
-            if merged
-                .get(name)
-                .is_none_or(|current| current.cooldown_until < hold.cooldown_until)
-            {
-                merged.insert(name.clone(), hold.clone());
-            }
+            let next = match merged.remove(name) {
+                Some(current) => current.relayed(hold.clone()),
+                None => hold.clone(),
+            };
+            merged.insert(name.clone(), next);
         }
         (!merged.is_empty()).then(|| merged.into_values().collect())
     }
