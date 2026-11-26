@@ -13,12 +13,8 @@
 import { readFile } from "node:fs/promises";
 import type { Tool } from "@modelcontextprotocol/sdk/types.js";
 import stripAnsi from "strip-ansi";
-import { getWorkspacePath, readConfigFile, writeConfigFile } from "../shared/config.js";
-import {
-  LOCAL_CONFIG_REL,
-  PROJECT_CONFIG_REL,
-  hasNonLegacyTier,
-} from "../shared/config-resolver.js";
+import { readConfigFileWithTiers, writeConfigFile } from "../shared/config.js";
+import { LOCAL_CONFIG_REL, PROJECT_CONFIG_REL } from "../shared/config-resolver.js";
 import { sendDaemonRequest } from "../shared/daemon.js";
 import { formatTerminalOutput } from "../shared/formatting.js";
 import type {
@@ -335,7 +331,7 @@ async function configureTerminal(
       };
     }
 
-    const config = await readConfigFile();
+    const { config, hasNonLegacyTier } = await readConfigFileWithTiers();
     if (!config) {
       return {
         success: false,
@@ -350,7 +346,7 @@ async function configureTerminal(
     // its source of truth. Since this resolver family is read-only (there is no
     // tier-aware write path), refuse the edit and direct the operator to the
     // tier file instead.
-    if (await hasNonLegacyTier(getWorkspacePath())) {
+    if (hasNonLegacyTier) {
       return {
         success: false,
         error:

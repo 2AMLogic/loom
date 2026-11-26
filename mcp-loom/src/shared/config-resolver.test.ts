@@ -14,19 +14,32 @@ import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { handleTerminalTool } from "../tools/terminals.js";
+
+// Count readFile attempts per path (#15414) while delegating to the real fs.
+const readAttempts = vi.hoisted(() => ({ paths: [] as string[] }));
+vi.mock("node:fs/promises", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("node:fs/promises")>();
+  return {
+    ...actual,
+    readFile: ((path: unknown, ...rest: unknown[]) => {
+      readAttempts.paths.push(String(path));
+      return (actual.readFile as (...a: unknown[]) => Promise<unknown>)(path, ...rest);
+    }) as typeof actual.readFile,
+  };
+});
 import {
   deepMerge,
   FLEET_REPO_CONFIG_REL,
   getPath,
-  hasNonLegacyTier,
   LEGACY_CONFIG_REL,
   LOCAL_CONFIG_REL,
   privateDefaultsPath,
   PRIVATE_DEFAULTS_ENV,
   PROJECT_CONFIG_REL,
   resolveEffectiveConfig,
+  resolveEffectiveConfigWithTiers,
   softReadJsonObject,
 } from "./config-resolver.js";
 
@@ -333,18 +346,112 @@ describe("configure_terminal write policy", () => {
     expect(legacyAfter).not.toContain("perTokenConcurrency");
   });
 
-  it("hasNonLegacyTier is true with a per-repo fleet tier (#11738)", async () => {
+  it("resolveEffectiveConfigWithTiers flags a per-repo fleet tier (#11738)", async () => {
     disableDefaultsTier();
     const withFleetRepo = await makeRepo({ legacy: "{}", fleetRepo: '{"a": 1}' });
-    expect(await hasNonLegacyTier(withFleetRepo)).toBe(true);
+    const { config, hasNonLegacyTier } = await resolveEffectiveConfigWithTiers(withFleetRepo);
+    expect(hasNonLegacyTier).toBe(true);
+    expect(config).toEqual({ a: 1 });
   });
 
-  it("hasNonLegacyTier is true with a project tier and false without", async () => {
+  it("resolveEffectiveConfigWithTiers flags a project tier and not a legacy-only repo", async () => {
     disableDefaultsTier();
     const withProject = await makeRepo({ legacy: "{}", project: '{"a": 1}' });
     const legacyOnly = await makeRepo({ legacy: '{"a": 1}' });
-    expect(await hasNonLegacyTier(withProject)).toBe(true);
-    expect(await hasNonLegacyTier(legacyOnly)).toBe(false);
+    expect((await resolveEffectiveConfigWithTiers(withProject)).hasNonLegacyTier).toBe(true);
+    const legacyResult = await resolveEffectiveConfigWithTiers(legacyOnly);
+    expect(legacyResult.hasNonLegacyTier).toBe(false);
+    expect(legacyResult.config).toEqual({ a: 1 });
+  });
+
+  it("empty, malformed and non-object non-legacy tiers do not set the flag", async () => {
+    disableDefaultsTier();
+    const root = await makeRepo({
+      legacy: '{"a": 1}',
+      project: "{}",
+      fleetRepo: "not json",
+      local: "[1, 2]",
+    });
+    const result = await resolveEffectiveConfigWithTiers(root);
+    expect(result.hasNonLegacyTier).toBe(false);
+    expect(result.config).toEqual({ a: 1 });
+  });
+
+  it("resolveEffectiveConfig returns the same config as the tiered variant", async () => {
+    disableDefaultsTier();
+    const root = await makeRepo({ legacy: '{"a": 1}', local: '{"b": 2}' });
+    expect(await resolveEffectiveConfig(root)).toEqual(
+      (await resolveEffectiveConfigWithTiers(root)).config
+    );
+  });
+
+  it("flags a nonempty private defaults tier", async () => {
+    const root = await makeRepo({ legacy: '{"a": 1}' });
+    const defaultsRoot = await makeRepo({});
+    const defaultsFile = join(defaultsRoot, "defaults.json");
+    await writeFile(defaultsFile, '{"d": 1}');
+    process.env[PRIVATE_DEFAULTS_ENV] = defaultsFile;
+    expect((await resolveEffectiveConfigWithTiers(root)).hasNonLegacyTier).toBe(true);
+  });
+
+  const nonLegacyTiers = [
+    { label: "project", key: "project", rel: PROJECT_CONFIG_REL },
+    { label: "fleet-repo", key: "fleetRepo", rel: FLEET_REPO_CONFIG_REL },
+    { label: "local", key: "local", rel: LOCAL_CONFIG_REL },
+  ] as const;
+
+  for (const tier of nonLegacyTiers) {
+    it(`refuses the edit when the ${tier.label} tier is nonempty and leaves legacy intact`, async () => {
+      disableDefaultsTier();
+      const legacy = JSON.stringify(
+        { version: "1.0", terminals: [{ id: "terminal-1", name: "Old" }] },
+        null,
+        2
+      );
+      const root = await makeRepo({ legacy, [tier.key]: '{"x": 1}' });
+      process.env.LOOM_WORKSPACE = root;
+
+      const result = await handleTerminalTool("configure_terminal", {
+        terminal_id: "terminal-1",
+        name: "New",
+      });
+      expect(result[0]?.text ?? "").toContain("non-legacy config tier");
+      expect(await readFile(join(root, LEGACY_CONFIG_REL), "utf-8")).toBe(legacy);
+      expect(await readFile(join(root, tier.rel), "utf-8")).toBe('{"x": 1}');
+    });
+  }
+
+  it("reads each tier at most once per configure_terminal call (#15414)", async () => {
+    // Point the private defaults tier at an absent fixture so it is probed.
+    const absentDefaults = join(tmpdir(), "loom-cfg-absent-defaults.json");
+    process.env[PRIVATE_DEFAULTS_ENV] = absentDefaults;
+    const legacy = JSON.stringify(
+      { version: "1.0", terminals: [{ id: "terminal-1", name: "Old" }] },
+      null,
+      2
+    );
+    const root = await makeRepo({ legacy });
+    process.env.LOOM_WORKSPACE = root;
+    const tierPaths = [
+      absentDefaults,
+      join(root, LEGACY_CONFIG_REL),
+      join(root, PROJECT_CONFIG_REL),
+      join(root, FLEET_REPO_CONFIG_REL),
+      join(root, LOCAL_CONFIG_REL),
+    ];
+
+    readAttempts.paths.length = 0;
+    const result = await handleTerminalTool("configure_terminal", {
+      terminal_id: "terminal-1",
+      name: "New",
+    });
+    expect(result[0]?.text ?? "").toContain("Success");
+
+    // Guard against a vacuous pass: the counter must actually observe reads.
+    expect(readAttempts.paths.filter((p) => p === tierPaths[1]).length).toBe(1);
+    for (const path of tierPaths) {
+      expect(readAttempts.paths.filter((p) => p === path).length).toBeLessThanOrEqual(1);
+    }
   });
 
   it("still edits the legacy file when it is the only tier present", async () => {
