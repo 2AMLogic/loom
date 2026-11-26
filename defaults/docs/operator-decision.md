@@ -194,11 +194,11 @@ After a confirmed batch, `resolve --from` prints `BATCH_RECORDED=` (items with
 a verified receipt, including matching prior receipts), `BATCH_FAILED=` (items
 with an incomplete operation), and a `BATCH_SUMMARY` table in input order with
 one row per input — including any item refused at review, and separating a
-verified receipt from a failed hold release (#15385). When any item fails, it
-exits non-zero (preserving the first non-zero item code) and prints a delimited
-block containing only the incomplete lines, ready to save directly as a
-`--from` file (all comment and delimiter lines start with `#` so `resolve --from`
-reads it verbatim; the block is omitted when every item succeeds):
+verified receipt from a failed hold release (#15385). The first failed attempt
+sets the exit code, even if an identical later input succeeds. That later success
+clears the earlier attempt from the retry file. If any inputs still need a
+retry, the command prints them in input order in a delimited block. All comment
+and delimiter lines start with `#`, so `resolve --from` reads the block verbatim.
 
 ```text
 BATCH_RECORDED=4

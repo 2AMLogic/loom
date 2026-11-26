@@ -27,6 +27,7 @@ use super::resolution::{
 };
 use super::DECISION_LABEL;
 use crate::comment_trust::TrustPolicy;
+use std::collections::HashSet;
 use std::io::Write;
 
 /// Not run from an attended session.
@@ -656,11 +657,17 @@ fn write_retry_block(
     release: bool,
     out: &mut dyn Write,
 ) {
-    let retry: Vec<&str> = outcomes
-        .iter()
-        .filter(|o| o.code != exit::OK)
-        .map(|o| o.target.as_str())
-        .collect();
+    // A later success satisfies earlier failures of the same repo, issue and option.
+    let mut completed = HashSet::new();
+    let mut retry = Vec::new();
+    for outcome in outcomes.iter().rev() {
+        let target = outcome.target.as_str();
+        if outcome.code == exit::OK {
+            completed.insert(target);
+        } else if !completed.contains(target) {
+            retry.push(target);
+        }
+    }
     if retry.is_empty() {
         return;
     }
@@ -672,7 +679,7 @@ fn write_retry_block(
         "#   loom-daemon operator-decision resolve --from retry.txt --effect {}{release_flag}",
         effect.as_str()
     );
-    for line in retry {
+    for line in retry.into_iter().rev() {
         let _ = writeln!(out, "{line}");
     }
     let _ = writeln!(out, "{RETRY_END}");
@@ -684,8 +691,8 @@ fn write_retry_block(
 /// (`resolve <N>`), then run the same record/re-read/verify/release steps per
 /// item. After a confirmed batch, prints a per-item summary table in input
 /// order (including items refused at review and separating verified receipts
-/// from failed hold releases) and, on any failure, a ready-to-save `--from`
-/// retry block containing only the incomplete items. A refused or failed item
+/// from failed hold releases) and, if any requests still need a retry, a
+/// ready-to-save `--from` block containing those items. A refused or failed item
 /// does not stop the others; the exit code is `0` only when every item
 /// completed, otherwise the first non-zero item code wins — review-phase codes
 /// before record-phase ones. `forge_for` builds the forge for one item's

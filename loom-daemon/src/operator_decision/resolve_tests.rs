@@ -492,7 +492,7 @@ fn parse_items_reads_lines_comments_and_blank_lines() {
 struct MultiRepoState {
     views: HashMap<(String, u64), IssueView>,
     comments: HashMap<(String, u64), Vec<Value>>,
-    post_errors: HashMap<(String, u64), String>,
+    next_post_errors: HashMap<(String, u64), String>,
     remove_label_errors: HashMap<(String, u64), String>,
     poster: Value,
     log: Vec<String>,
@@ -569,8 +569,8 @@ impl ResolveForge for MultiRepoFake {
         let key = (self.repo.to_ascii_lowercase(), issue);
         let mut s = self.state.borrow_mut();
         s.log.push(format!("post:{}#{issue}", key.0));
-        if let Some(msg) = s.post_errors.get(&key) {
-            return Err(msg.clone());
+        if let Some(msg) = s.next_post_errors.remove(&key) {
+            return Err(msg);
         }
         let mut c = s.poster.clone();
         c["body"] = json!(b);
@@ -662,9 +662,9 @@ fn a_partial_post_confirmation_batch_reports_every_row_and_emits_a_parseable_ret
     let s = MultiRepoState::with_issues(&issues, operator());
     {
         let mut st = s.borrow_mut();
-        st.post_errors
+        st.next_post_errors
             .insert(("acme/gamma".into(), 101), "HTTP 403 secondary rate limit on #101".into());
-        st.post_errors
+        st.next_post_errors
             .insert(("acme/gamma".into(), 98), "HTTP 403 secondary rate limit on #98".into());
     }
 
@@ -739,8 +739,7 @@ fn a_partial_post_confirmation_batch_reports_every_row_and_emits_a_parseable_ret
         multi_items(&[("acme/gamma", 101, "keep"), ("acme/gamma", 98, "keep")])
     );
 
-    // Clear the injected failure and rerun with the same options.
-    s.borrow_mut().post_errors.clear();
+    // Rerun with the same options after the transient post failures.
     let retry_req = BatchRequest {
         items: retry_items,
         effect: req.effect,
@@ -769,6 +768,44 @@ fn a_partial_post_confirmation_batch_reports_every_row_and_emits_a_parseable_ret
         assert_eq!(st.comment_count(repo, *issue), 1, "{repo}#{issue}");
         assert!(!st.is_held(repo, *issue), "{repo}#{issue} still held");
     }
+}
+
+#[test]
+fn retry_omits_a_failed_request_completed_by_a_later_duplicate() {
+    let s = MultiRepoState::with_issues(&[("acme/r", 7), ("acme/r", 8)], operator());
+    for issue in [7, 8] {
+        s.borrow_mut()
+            .next_post_errors
+            .insert(("acme/r".into(), issue), "first post failed".into());
+    }
+    let req = BatchRequest {
+        items: parse_items("acme/r#7=keep\nacme/r#8=keep\nacme/r#7=keep").unwrap(),
+        effect: Effect::Proceed,
+        release: true,
+        dry_run: false,
+    };
+    let result = run_multi_batch(&s, &req, &mut yes);
+    assert_eq!(result.code, exit::FORGE);
+    let rows: Vec<_> = summary_rows(&result.out)
+        .into_iter()
+        .map(|row| row.split_whitespace().take(4).collect::<Vec<_>>())
+        .collect();
+    assert_eq!(
+        rows,
+        [
+            ["acme/r#7=keep", "failed", "unverified", "skipped"],
+            ["acme/r#8=keep", "failed", "unverified", "skipped"],
+            ["acme/r#7=keep", "ok", "verified", "released"],
+        ]
+    );
+    let state = s.borrow();
+    assert_eq!(state.comment_count("acme/r", 7), 1);
+    assert!(!state.is_held("acme/r", 7));
+    assert_eq!(state.comment_count("acme/r", 8), 0);
+    assert!(state.is_held("acme/r", 8));
+
+    let block = retry_block(&result.out).expect("issue 8 still needs a retry");
+    assert_eq!(parse_items(&block).unwrap(), multi_items(&[("acme/r", 8, "keep")]));
 }
 
 #[test]
@@ -914,7 +951,7 @@ fn a_batch_preserves_first_nonzero_exit_code_across_review_and_record_failures()
         operator(),
     );
     s.borrow_mut()
-        .post_errors
+        .next_post_errors
         .insert(("acme/beta".into(), 8), "HTTP 502 bad gateway".into());
 
     let req = BatchRequest {
