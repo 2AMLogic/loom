@@ -302,7 +302,17 @@ fn command_contains_complete_arg(line: &str, needle: &str) -> bool {
 
 /// A shebang identifies a script even when its filename has no extension.
 /// An executable Makefile names make as its interpreter. For sourced shell
-/// files without a shebang, use the resolved producer's shell suffix.
+/// files without a shebang, use the resolved producer's shell suffix, ASCII
+/// case-insensitively (`copy.SH` is as much a shell script as `copy.sh`,
+/// #15500).
+///
+/// A producer with neither signal — no shebang and no shell suffix, such as a
+/// `Dockerfile` or an extensionless command file — is read as Make. The cited
+/// line alone cannot choose between the two: `build/report.json:backup` is a
+/// command argument in a script and a rule for `build/report.json` in a
+/// Makefile. Only the file type can, and listing more file types (`Dockerfile`,
+/// `justfile`) would trade this heuristic for a longer one, so a colon-extended
+/// argument in such a producer is a known false accept (#15500).
 fn is_command_script(path: &str, content: &str) -> bool {
     if let Some(shebang) = content
         .lines()
@@ -319,10 +329,14 @@ fn is_command_script(path: &str, content: &str) -> bool {
             path.ends_with("make") || path.ends_with("gmake")
         });
     }
-    matches!(
-        Path::new(path).extension().and_then(|ext| ext.to_str()),
-        Some("sh" | "bash" | "dash" | "ksh" | "zsh" | "fish" | "csh" | "tcsh")
-    )
+    Path::new(path)
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| {
+            ["sh", "bash", "dash", "ksh", "zsh", "fish", "csh", "tcsh"]
+                .iter()
+                .any(|suffix| ext.eq_ignore_ascii_case(suffix))
+        })
 }
 
 /// Locate the cited physical line and its enclosing logical line in the
@@ -648,6 +662,37 @@ mod tests {
             let content = format!("#!{interpreter}\nfirst \\\n {output}: dep");
             assert_eq!(producer_line_matches("rules", &content, 3, output), Some(true));
             assert_eq!(producer_line_matches("rules", &content, 3, "first"), Some(false));
+        }
+    }
+
+    #[test]
+    fn a_shell_suffix_is_recognized_in_any_ascii_case() {
+        let output = "build/report.json";
+        let content = format!("cp seed {output}:backup\ncp seed {output}\n");
+        for path in [
+            "tools/copy.sh",
+            "tools/copy.SH",
+            "tools/copy.Bash",
+            "tools/copy.Sh",
+        ] {
+            let matches = |line| producer_line_matches(path, &content, line, output);
+            assert_eq!(matches(1), Some(false), "{path}: a colon-extended argument");
+            assert_eq!(matches(2), Some(true), "{path}: a complete argument");
+        }
+        // The shebang is read first: Make behind a shell-looking suffix is still Make.
+        let make = format!("#!/usr/bin/make -f\n{output}: dep");
+        assert_eq!(producer_line_matches("rules.SH", &make, 2, output), Some(true));
+    }
+
+    #[test]
+    fn a_make_producer_without_a_shell_suffix_still_declares_a_rule_target() {
+        let output = "build/report.json";
+        for path in ["Makefile", "MAKEFILE", "tools/report.rules"] {
+            assert_eq!(
+                producer_line_matches(path, "build/report.json: dep", 1, output),
+                Some(true),
+                "{path}"
+            );
         }
     }
 
