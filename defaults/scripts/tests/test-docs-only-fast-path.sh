@@ -284,9 +284,21 @@ assert_doc_contains "$JUDGE_MD" \
     'DOCS_FAST_PATH_ALLOWLIST=("WORK_LOG.md" "WORK_PLAN.md" "README.md")' \
     "judge.md defines the exact 3-file allowlist"
 
-assert_doc_contains "$JUDGE_MD" \
-    'FILES=$(gh api "repos/{owner}/{repo}/pulls/$PR_NUMBER/files" --paginate --jq '"'"'.[].filename'"'"')' \
-    "judge.md fetches the changed-file list via the paginated REST endpoint (not the truncating gh pr view --json files)"
+FILES_READ='FILES=$(gh api "repos/{owner}/{repo}/pulls/$PR_NUMBER/files" --paginate --jq '"'"'.[].filename'"'"')'
+assert_doc_contains "$JUDGE_PROMPT_MD" "$FILES_READ" \
+    "judge.md (always-loaded) reads the changed-file list via the paginated REST endpoint (not the truncating gh pr view --json files)"
+assert_doc_contains "$JUDGE_PROMPT_MD" '|| FILES=""' \
+    "judge.md: a failed file-list read leaves FILES empty (full review)"
+assert_doc_lacks "$JUDGE_MD" "$FILES_READ" \
+    "judge sibling does not fetch the file list itself; it reuses the parent's read"
+FILES_LN=$(grep -nF -- "$FILES_READ" "$JUDGE_PROMPT_MD" | head -1 | cut -d: -f1)
+GATE_LN=$(grep -nF -- '[`judge-docs-only-fast-path.md`](judge-docs-only-fast-path.md) |' "$JUDGE_PROMPT_MD" | head -1 | cut -d: -f1)
+STEP4B_LN=$(grep -n '^4b\. \*\*Check docs-only' "$JUDGE_PROMPT_MD" | head -1 | cut -d: -f1)
+if [ -n "$FILES_LN" ] && [ -n "$STEP4B_LN" ] && [ "$FILES_LN" -gt "$STEP4B_LN" ] && [ "$FILES_LN" -lt "${GATE_LN:-0}" ]; then
+    pass "judge.md: file-list read sits in step 4b, before the load gate row"
+else
+    fail "judge.md: file-list read sits in step 4b, before the load gate row (4b=$STEP4B_LN read=$FILES_LN gate=$GATE_LN)"
+fi
 
 assert_doc_contains "$JUDGE_MD" \
     'docs_only_fast_path_check() {' \

@@ -448,6 +448,12 @@ Full policy, TTL/invalidation semantics, and the manual verification steps:
    ```
 4. **Understand context** (first capture `REVIEW_STARTED=$(date -u +%Y-%m-%dT%H:%M:%SZ)`, before reading anything — and for each linked issue `N` the hash of the body you read: `ISSUE_HASH_N=$(printf %s "$(gh api repos/<owner>/<repo>/issues/N --jq .body)" | sha256sum | cut -d' ' -f1)` (a hash that keeps jq's trailing newline is accepted too, as is the raw body's own hash with or without that newline); see "Stale-Read Gate" under Verdict SHA Marker): Read PR description and linked issues, and run the "Spec Reconciliation" step below on each `Closes`/`Fixes`/`Resolves`/`Part of`/`Contributes to` reference (current body + trusted comments, not the PR's account of them)
 4b. **Check docs-only fast-path eligibility** (load `judge-docs-only-fast-path.md` per "Docs-Only Fast Path (WORK_LOG / WORK_PLAN / README, #6134)" below, only when the changed-file list is confined to the allowlist) — if the changed-file list is an exact match against the fast-path allowlist **and the PR has no closing-issue reference** (Step 3 of the sibling, #14182 — both conditions are required, and a failed closing-reference read counts as a reference) **and every WORK_LOG record the diff adds verifies against the base repository** (Step 4 of the sibling, #13760 — number, kind and title; a failed diff or target read is not eligible) **and any change to WORK_PLAN.md's `guide:plan-body` region carries the machine-rendered `written` receipt with a matching render-hash** (Step 5 of the sibling, #15220 — a stamp-only region edit, free prose in place of the receipt line, or a missing/mismatched hash is not eligible), skip steps 5-7b and the "Evaluation Focus Areas" review entirely; go straight to CI Status Check (step 8), the formal-review reconciliation gate (step 8b — **not** skipped: a docs-only diff can still carry an unresolved formal review, #7647) and the fast-path approval write. Otherwise continue normally.
+   Read the changed-file list **here, always, before the load decision** (the paginated REST endpoint, never `gh pr view --json files`, which truncates at 100 files, #4613). The sibling reuses this `$FILES` rather than fetching its own:
+   ```bash
+   PR_NUMBER=<number>
+   FILES=$(gh api "repos/{owner}/{repo}/pulls/$PR_NUMBER/files" --paginate --jq '.[].filename') || FILES=""
+   # A failed or empty read is not eligible: skip the sibling and continue with steps 5-7b.
+   ```
 5. **Check out code**: Use the existing builder worktree, else `./.loom/scripts/pr-worktree.sh <number>` — never a bare `gh pr checkout` in the main checkout (see "PR Branch Isolation" and Worktree-Aware Code Access below). Capture `REVIEW_HEAD_SHA=$(gh pr view <number> --json headRefOid --jq '.headRefOid')` here — step 11's recheck compares against it, and your verdict marker records it.
 6. **Rebase check**: Verify PR has no merge conflicts with main (see Rebase Check section below)
 7. **Targeted checks only**: read the diff and trust the green CI from step 2b. At most run scoped tests for a specific doubt (Scoped Test Execution below); never the full suite or `buildGate.command`. If the *environment* cannot run a command you need for a verdict, see "Environment Gap: Cannot Verify Here" below
@@ -1741,7 +1747,7 @@ write live in a gated sibling (#15236):
 
 | File | Load when |
 |---|---|
-| [`judge-docs-only-fast-path.md`](judge-docs-only-fast-path.md) | Step 4b and the PR's changed-file list (the paginated files read you already hold) is an exact match against `WORK_LOG.md`, `WORK_PLAN.md`, `README.md` at the repo root plus `work_log/WORK_LOG_YYYY-MM.md` / `work_plan/WORK_PLAN_YYYY-MM.md`. Any other file in the list: do not load it. |
+| [`judge-docs-only-fast-path.md`](judge-docs-only-fast-path.md) | Step 4b and the PR's changed-file list (the `$FILES` read in step 4b, taken before this decision) is an exact match against `WORK_LOG.md`, `WORK_PLAN.md`, `README.md` at the repo root plus `work_log/WORK_LOG_YYYY-MM.md` / `work_plan/WORK_PLAN_YYYY-MM.md`. Any other file in the list: do not load it. |
 
 **Fails closed.** The fast path exists only inside that file. If it is not
 loaded and run in this pass, there is no fast path: continue with steps 5-7b

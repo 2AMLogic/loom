@@ -37,14 +37,16 @@ only").
 
 ## Detecting Eligibility
 
-**Step 1: Fetch the full changed-file list — the paginated REST endpoint,
-never `gh pr view --json files`** (that field silently truncates at 100
-files with no error, the same #4613 truncation bug Champion's critical-file
-check guards against):
+**Step 1: Use the changed-file list from Primary Queue step 4b** — the
+paginated REST read (never `gh pr view --json files`, which truncates at 100
+files, the same #4613 bug Champion's critical-file check guards against) is
+taken in `judge.md` *before* the decision to load this file, so it is already
+in `$FILES`. If `$FILES` is empty or unset (a failed read), there is no fast
+path: stop here and continue with steps 5-7b.
 
 ```bash
 PR_NUMBER=<number>
-FILES=$(gh api "repos/{owner}/{repo}/pulls/$PR_NUMBER/files" --paginate --jq '.[].filename')
+[ -n "$FILES" ] || { echo "NOT ELIGIBLE: changed-file list unavailable"; }
 ```
 
 **Step 2: Check every file against the exact-match allowlist** — three
