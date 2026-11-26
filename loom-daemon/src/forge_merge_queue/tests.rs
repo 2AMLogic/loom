@@ -635,3 +635,29 @@ fn cli_status_with_fake_forge() {
     assert_eq!(r.code, 0, "{r:?}");
     assert!(r.stdout[0].contains("queued state=QUEUED position=1"), "{r:?}");
 }
+
+#[test]
+fn a_failed_membership_batch_keeps_only_verified_answers() {
+    let dir = tempdir().unwrap();
+    let response = serde_json::json!({"data": {"repository": {
+        "pr1": {"number": 1, "state": "OPEN", "mergeQueueEntry": null},
+        "pr2": {"number": 2, "state": "OPEN", "mergeQueueEntry": {"position": 1}},
+        "pr3": {"number": 3, "state": "OPEN"},
+        "pr4": {"number": 4, "state": "OPEN", "mergeQueueEntry": {}},
+        "pr5": {"number": 5, "state": "CLOSED", "mergeQueueEntry": null},
+        "pr6": {"number": 7, "state": "OPEN", "mergeQueueEntry": null}
+    }}})
+    .to_string();
+    let partial = r#"{"errors":[{"message":"unavailable"}],"data":{"repository":{"pr101":{"number":101,"state":"OPEN","mergeQueueEntry":null}}}}"#;
+    let gh = fake_gh(
+        dir.path(),
+        &[
+            ("pr101: pullRequest", 0, partial, ""),
+            ("pr1: pullRequest", 0, &response, ""),
+        ],
+    );
+    let api = GhQueueApi::new(&gh, "acme/widgets").unwrap();
+    let prs: Vec<_> = (1..=101).collect();
+    assert_eq!(api.membership(&prs), [(1, false), (2, true)].into());
+    assert_eq!(calls_log(dir.path()).lines().count(), 2);
+}

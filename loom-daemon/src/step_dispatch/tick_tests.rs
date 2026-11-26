@@ -1980,3 +1980,139 @@ fn a_one_slot_tick_draws_only_the_inherited_red_row() {
     assert_eq!(tick.report.dispatched, 1);
     assert_eq!(tick.stop, TickStop::Filled);
 }
+
+#[test]
+#[serial_test::serial]
+fn live_queue_entries_gate_the_listing_to_spawn_path() {
+    use crate::discovery::{Chain, Discovery};
+    use crate::step_dispatch::{gather, stage_entry::StageEntryProvider};
+    use crate::sweep_registry::test_support::{forge_probing_registry, write_config};
+    use serde_json::json;
+    use std::fs;
+    use std::sync::{Arc, Mutex};
+
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    let slug = format!("acme/queue-{}", root.file_name().unwrap().to_string_lossy());
+    let _env = crate::env_test_support::EnvGuard::set("LOOM_REPO", &slug)
+        .and_set("LOOM_GH_BIN", None)
+        .and_set("LOOM_MERGE_MODE", None);
+    write_config(root, r#"{"champion":{"mergeMode":"queue"}}"#);
+    let prs = [7935, 7900, 7948].map(|n| json!({
+        "number": n, "state": "open", "labels": [{"name":"loom:pr"}], "pull_request": {},
+        "body":format!("Closes #{}", n - 100), "head": {"ref":"feature", "sha":"abc"}, "base": {"ref":"main"}
+    }));
+    let mut rows = prs.to_vec();
+    // Only the full pull identifies 7935 as approved. Falling back for
+    // every row would send it to Champion triage and fail this test.
+    rows[0]["labels"] = json!([]);
+    rows.extend(
+        [7835, 7800, 7848]
+            .map(|n| json!({"number":n,"state":"open","labels":[{"name":"loom:building"}]})),
+    );
+    rows.push(json!({"number":1,"state":"open","labels":[{"name":"loom:triage"}]}));
+    fs::write(root.join("issues"), json!(rows).to_string()).unwrap();
+    // PR 7900 deliberately has only an issues-listing row.
+    fs::write(root.join("pulls"), json!([prs[0], prs[2]]).to_string()).unwrap();
+    let registry = Arc::new(Mutex::new(forge_probing_registry(
+        root,
+        r#"#!/bin/sh
+cd "$(dirname "$0")" || exit 1
+case "$*" in
+  *'/issues?state=open'*) printf 'HTTP/2.0 200 OK\r\n\r\n'; cat issues ;;
+  *'/pulls?state=open'*) printf 'HTTP/2.0 200 OK\r\n\r\n'; cat pulls ;;
+  *'mergeQueueEntry'*) echo read >> queue-reads; cat queue ;;
+  *) exit 1 ;;
+esac
+"#,
+    )));
+    let dispatch =
+        |response: Option<&serde_json::Value>, queued: &[u32], unknown: &[u32], merges: &[u32]| {
+            if let Some(response) = response {
+                fs::write(root.join("queue"), response.to_string()).unwrap();
+            } else {
+                fs::remove_file(root.join("queue")).unwrap();
+            }
+            let snapshot = Discovery::default().begin_tick(Chain::standalone(), now());
+            let gathered = gather::gather(
+                root,
+                &registry,
+                &snapshot,
+                |_| false,
+                &BTreeSet::new(),
+                &mut StageEntryProvider::load(None, 0),
+                now(),
+            )
+            .unwrap()
+            .unwrap();
+            let mut ws = workspace(0, &slug, &[]);
+            ws.merge_slots = prs.len();
+            ws.weighing = weigh(
+                &gathered.inputs,
+                &WeighContext {
+                    now: now(),
+                    workspace_idx: 0,
+                    build_backoff_engaged: false,
+                    pool_exhausted_roles: BTreeSet::new(),
+                    cooldowns: Default::default(),
+                },
+                &ItemWeights::default(),
+            );
+            let mut spawner = FakeSpawner::default();
+            run_with(vec![ws], limits(rows.len()), &mut spawner);
+            let asked: BTreeSet<_> = spawner.asked.iter().map(|a| (a.1, a.2)).collect();
+            let expected = merges
+                .iter()
+                .map(|&n| (n, StepRole::ChampionMerge))
+                .chain([(1, StepRole::Curator)])
+                .collect();
+            assert_eq!(asked, expected);
+            for (numbers, reason) in [(queued, "queued"), (unknown, "queue_membership_unknown")] {
+                for &n in numbers {
+                    let item = &gathered
+                        .inputs
+                        .iter()
+                        .find(|i| i.item.pr == Some(n))
+                        .unwrap()
+                        .item;
+                    assert!(
+                        matches!(item.verdict, step_item::Verdict::Pass(p) if p.as_str() == reason),
+                        "#{n}: {:?}",
+                        item.verdict
+                    );
+                }
+            }
+        };
+
+    // GitHub response captured from 2AMLogic/klayout-tools on 2026-11-26.
+    let mut entries = json!({"data":{"repository":{
+        "pr7935":{"number":7935,"state":"OPEN","mergeQueueEntry":{"position":1,"headCommit":{"oid":"7d6a95a00ccbb3c4388c4ed402fe4ad8e50cab39"}}},
+        "pr7900":{"number":7900,"state":"OPEN","mergeQueueEntry":{"position":2,"headCommit":null}},
+        "pr7948":{"number":7948,"state":"OPEN","mergeQueueEntry":null}
+    }}});
+    dispatch(Some(&entries), &[7935, 7900], &[], &[7948]);
+    let reads = || {
+        fs::read_to_string(root.join("queue-reads"))
+            .unwrap()
+            .lines()
+            .count()
+    };
+    assert_eq!(reads(), 1);
+    entries["data"]["repository"]
+        .as_object_mut()
+        .unwrap()
+        .remove("pr7948");
+    dispatch(Some(&entries), &[7935, 7900], &[7948], &[]);
+    dispatch(None, &[], &[7935, 7900, 7948], &[]);
+
+    // The next complete response vouches for the removals.
+    for n in [7935, 7900, 7948] {
+        entries["data"]["repository"][format!("pr{n}")] =
+            json!({"number":n,"state":"OPEN","mergeQueueEntry":null});
+    }
+    dispatch(Some(&entries), &[], &[], &[7935, 7900, 7948]);
+    assert_eq!(reads(), 4);
+    write_config(root, r#"{"champion":{"mergeMode":"direct"}}"#);
+    dispatch(None, &[], &[], &[7935, 7900, 7948]);
+    assert_eq!(reads(), 4, "direct mode must skip queue discovery");
+}
