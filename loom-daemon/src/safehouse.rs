@@ -447,6 +447,21 @@ pub struct RecentMessages {
     pub bodies: Vec<String>,
     /// Every possible report in the returned window was readable.
     pub complete: bool,
+    /// Matrix origin time of the first returned message, in milliseconds.
+    oldest_ts: Option<i64>,
+}
+
+impl RecentMessages {
+    /// Safehoused filters non-message events after limiting the timeline, so
+    /// even a short nonempty reply can be a truncated slice. Require a row
+    /// strictly before the instant in question (timestamps can tie). An empty
+    /// readable room retains the best-effort first-post behavior.
+    fn covers(&self, since: chrono::DateTime<chrono::Utc>) -> bool {
+        self.complete
+            && self
+                .oldest_ts
+                .is_none_or(|ts| ts < since.timestamp_millis())
+    }
 }
 
 /// Set `cell` to [`SafehouseState::NotConfigured`] (#4345).
@@ -663,7 +678,16 @@ impl SafehouseClient {
                 complete = false;
             }
         }
-        Ok(RecentMessages { bodies, complete })
+        let oldest_ts = rows
+            .first()
+            .and_then(|row| row["ts"].as_i64())
+            .filter(|ts| *ts >= 0);
+        complete &= rows.is_empty() || oldest_ts.is_some();
+        Ok(RecentMessages {
+            bodies,
+            complete,
+            oldest_ts,
+        })
     }
 
     /// Shared reply gate: `ok:false` is a [`SendError::Rejected`]; a reply `id`

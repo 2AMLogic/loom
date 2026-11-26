@@ -457,12 +457,12 @@ queued) produces no line.
 
 - **The host that ran the merge.** A completed sweep merge phase or a Champion
   `merged` verdict identifies the PR by number. The host confirms that PR's
-  `mergedAt` with `gh pr view` and sends if it falls inside the catch-up
-  window. An issue-only exit, including cancellation on a reused branch,
+  `mergedAt` with `gh pr view` against the event workspace's origin and
+  sends if it falls inside the catch-up window. An issue-only exit, including cancellation on a reused branch,
   leaves reporting to the captain.
 - **The fleet captain, for merges no host reported.** Where
   the [fleet captain setting](daemon-reference.md#fleet-captain-8848) selects this host,
-  a timer scans each workspace for PRs merged inside a **bounded catch-up
+  a timer queries each workspace's origin for PRs merged inside a **bounded catch-up
   window**, reads the room once, and posts exactly the merges whose line is
   absent. It leaves a merge younger than the grace period to the host that made
   it, so the two normally never race. This is what covers a hosted/manual merge,
@@ -473,7 +473,11 @@ queued) produces no line.
 the reply is **lost or times out**, the outcome is unknown: **read the recent
 room messages with the `read` op and re-send only if that PR's line is
 absent.** A visible match settles the report. If the room read fails or has
-unreadable events, an absent match is inconclusive. Later host events must
+unreadable events, an absent match is inconclusive. For a nonempty reply,
+the oldest visible message must predate the send attempt for a retry, or
+the merge for a captain backfill. Safehoused filters non-message events
+after limiting the timeline. Even a short reply can omit an older report.
+An empty readable reply allows a best-effort post. Later host events must
 read again before sending, including after a lost reply to the second send. A protocol refusal
 (`ok:false`, e.g. `'room' required`) or an unreachable socket means the line was
 certainly not sent and is not retried by the reporter; the captain's next scan
@@ -486,9 +490,12 @@ are tolerated by design.
 **The captain's scan is retryable.** Each workspace keeps an in-memory
 watermark that advances only after a *complete* pass: the forge answered, every
 interval was fully searched, the room was readable, and every due post succeeded.
-A full result splits the merge-time interval in half. Both halves must complete
-within the query budget. A saturated single second, an exhausted query budget,
-a failed read or send, or a cooling rate-limit breaker keeps the window open.
+A full result splits the merge-time interval in half. Each tick searches up
+to five ranges per workspace. The next tick resumes unfinished ranges and
+retries failed queries. The captain collects the results for the window
+before posting so its own sends cannot displace history needed by later pages.
+A saturated single second, inconclusive room read, failed send, or cooling
+rate-limit breaker keeps the window open.
 The room read-back is what stops a retried scan from posting a line twice.
 
 | Env var | Default | Meaning |

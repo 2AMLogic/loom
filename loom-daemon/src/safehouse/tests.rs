@@ -33,7 +33,7 @@ use crate::rate_limit_breaker::{BudgetSnapshot, RateLimitBreakerConfig, SharedRa
 #[derive(Default)]
 struct Room {
     /// Bodies of messages that landed, oldest first.
-    messages: Mutex<Vec<String>>,
+    messages: Mutex<Vec<(i64, String)>>,
     /// Number of `send` requests received (landed or not).
     sends: AtomicUsize,
     /// Next N sends: the connection closes before the message lands.
@@ -53,7 +53,12 @@ struct Room {
 
 impl Room {
     fn lines(&self) -> Vec<String> {
-        self.messages.lock().unwrap().clone()
+        self.messages
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(_, body)| body.clone())
+            .collect()
     }
 
     fn count_containing(&self, needle: &str) -> usize {
@@ -83,10 +88,10 @@ async fn serve(stream: tokio::net::UnixStream, room: Arc<Room>) {
                 } else if take(&room.close_before_store) {
                     return;
                 } else {
-                    room.messages
-                        .lock()
-                        .unwrap()
-                        .push(req["body"].as_str().unwrap().to_owned());
+                    room.messages.lock().unwrap().push((
+                        Utc::now().timestamp_millis(),
+                        req["body"].as_str().unwrap().to_owned(),
+                    ));
                     if take(&room.close_after_store) {
                         return;
                     }
@@ -106,14 +111,14 @@ async fn serve(stream: tokio::net::UnixStream, room: Arc<Room>) {
                     json!({"ok": false, "error": "read refused", "id": id})
                 } else {
                     let limit = req["limit"].as_u64().unwrap_or(20) as usize;
-                    let all = room.lines();
+                    let all = room.messages.lock().unwrap();
                     let start = all.len().saturating_sub(limit);
                     let rows: Vec<Value> = all[start..]
                         .iter()
-                        .map(|body| {
+                        .map(|(ts, body)| {
                             json!({
                                 "event_id": "$x", "sender": "@someone:example.org",
-                                "own": false, "ts": 1, "envelope": {"body": body},
+                                "own": false, "ts": ts, "envelope": {"body": body},
                             })
                         })
                         .collect();
@@ -743,6 +748,26 @@ async fn a_later_host_event_reads_before_resending_an_uncertain_report() {
 }
 
 #[tokio::test]
+async fn an_ambiguous_host_send_hidden_by_newer_messages_is_not_repeated() {
+    let dir = tempfile::tempdir().unwrap();
+    let (socket, room) = start_room(dir.path());
+    let host = reporter(&socket, dir.path());
+    let pr = merged(9, "a/b", minutes(1));
+    room.close_after_store.store(1, Ordering::SeqCst);
+    room.fail_reads.store(true, Ordering::SeqCst);
+    host.report_host_merge(&pr, Trigger::Step).await;
+    room.fail_reads.store(false, Ordering::SeqCst);
+    let ts = Utc::now().timestamp_millis();
+    room.messages
+        .lock()
+        .unwrap()
+        .extend((0..merge_report::READ_BACK_LIMIT).map(|_| (ts, "later message".to_owned())));
+    host.report_host_merge(&pr, Trigger::Step).await;
+    assert_eq!(room.sends.load(Ordering::SeqCst), 1);
+    assert_eq!(room.reads.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
 async fn a_lost_acknowledgement_on_the_second_send_still_requires_a_fresh_read() {
     let dir = tempfile::tempdir().unwrap();
     let (socket, room) = start_room(dir.path());
@@ -799,18 +824,24 @@ if [[ -f "$dir/fail" ]]; then exit 1; fi
 if [[ -f "$dir/fail-call" && $(wc -l < "$dir/calls.log") -eq $(cat "$dir/fail-call") ]]; then
     exit 1
 fi
-if [[ "$1 $2" == "pr view" ]]; then
-    exec jq --argjson number "$3" 'first(.[] | select(.number == $number))' "$dir/rows.json"
-fi
+verb=$2
+number=$3
+repo=${GH_REPO:-unset}
 while [[ $# -gt 0 ]]; do
     case "$1" in
+        --repo) repo=${2#github.com/}; shift ;;
         --search) window=${2#merged:}; shift ;;
         --limit) limit=$2; shift ;;
     esac
     shift
 done
-exec jq --arg lo "${window%..*}" --arg hi "${window#*..}" --argjson limit "$limit" \
-    '[.[] | select(.mergedAt >= $lo and .mergedAt <= $hi)][: $limit]' "$dir/rows.json"
+prefix="https://github.com/$repo/pull/"
+if [[ "$verb" == view ]]; then
+    exec jq --arg prefix "$prefix" --argjson number "$number" \
+        'first(.[] | select((.url | startswith($prefix)) and .number == $number))' "$dir/rows.json"
+fi
+exec jq --arg prefix "$prefix" --arg lo "${window%..*}" --arg hi "${window#*..}" --argjson limit "$limit" \
+    '[.[] | select((.url | startswith($prefix)) and .mergedAt >= $lo and .mergedAt <= $hi)][: $limit]' "$dir/rows.json"
 "#;
         std::fs::write(&script, body).unwrap();
         let mut perms = std::fs::metadata(&script).unwrap().permissions();
@@ -857,6 +888,7 @@ fn row(number: u32, slug: &str, age: chrono::Duration) -> Value {
 
 /// A workspace whose config names `captain`, plus the env/fake-gh scaffolding.
 struct Captain {
+    repos: crate::forge_repo_facts::test_support::Env,
     _env: CaptainEnv,
     root: PathBuf,
     gh: FakeGh,
@@ -865,7 +897,8 @@ struct Captain {
 }
 
 fn captain_fixture(dir: &Path, captain: &str) -> Captain {
-    let root = dir.join("workspace");
+    let repos = crate::forge_repo_facts::test_support::Env::new(&[]);
+    let root = repos.repo("workspace", &[("origin", "https://github.com/a/b.git")]);
     std::fs::create_dir_all(root.join(".loom")).unwrap();
     std::fs::write(
         root.join(".loom/config.json"),
@@ -876,6 +909,7 @@ fn captain_fixture(dir: &Path, captain: &str) -> Captain {
     let env = CaptainEnv::set(&gh.bin(), &dir.join("workspaces.json"));
     let (socket, room) = start_room(dir);
     Captain {
+        repos,
         _env: env,
         root,
         gh,
@@ -938,7 +972,7 @@ async fn host_looks_up_the_numbered_merge_on_a_reused_branch() {
     let calls = std::fs::read_to_string(c.gh.dir.join("calls.log")).unwrap();
     assert_eq!(
         calls.lines().collect::<Vec<_>>(),
-        ["pr view 50 --json number,url,mergedAt,title"]
+        ["pr view 50 --json number,url,mergedAt,title --repo github.com/a/b"]
     );
     assert_eq!(c.room.count_containing("a/b#50 ·"), 1);
     assert_eq!(c.room.count_containing("a/b#36 ·"), 0);
@@ -988,21 +1022,43 @@ async fn the_captain_leaves_a_fresh_merge_to_the_host_that_made_it() {
 
 #[tokio::test]
 #[serial]
-async fn the_captain_reports_the_same_number_in_two_repos_and_skips_unmerged_prs() {
+async fn host_and_captain_select_each_workspaces_origin_over_the_ambient_repo() {
+    let _ambient = crate::env_test_support::EnvGuard::set("GH_REPO", "ambient/repo")
+        .and_set("LOOM_REPO", Some("ambient/repo".as_ref()));
     let dir = tempfile::tempdir().unwrap();
     let c = captain_fixture(dir.path(), &this_host());
-    let mut closed_unmerged = row(8, "a/one", minutes(60));
-    closed_unmerged["mergedAt"] = Value::Null;
+    let second = c
+        .repos
+        .repo("second", &[("origin", "git@github.com:a/two.git")]);
+    let mut registry = crate::workspace_registry::WorkspaceRegistry::default();
+    registry.add(&second, None).unwrap();
+    registry.save_default().unwrap();
+    let mut unmerged = row(8, "a/b", minutes(60));
+    unmerged["mergedAt"] = Value::Null;
     c.gh.rows(&[
-        row(7, "a/one", minutes(60)),
+        row(7, "ambient/repo", minutes(60)),
+        row(7, "a/b", minutes(60)),
         row(7, "a/two", minutes(50)),
-        closed_unmerged,
+        unmerged,
     ]);
+    for (root, slug) in [(&c.root, "a/b"), (&second, "a/two")] {
+        let pr = merge_source::merged_pr_by_number(root, 7).await.unwrap();
+        assert_eq!(pr.repo_slug().as_deref(), Some(slug));
+    }
+    let calls = c.gh.calls();
+    assert!(merge_source::merged_pr_by_number(dir.path(), 7)
+        .await
+        .is_none());
+    assert_eq!(c.gh.calls(), calls, "a missing origin must never query the ambient repo");
+
     let captain = reporter(&c.socket, &c.root);
     assert_eq!(captain.captain_pass().await, 2);
-    assert_eq!(c.room.count_containing("a/one#7"), 1);
+    assert_eq!(c.room.count_containing("a/b#7"), 1);
     assert_eq!(c.room.count_containing("a/two#7"), 1);
-    assert_eq!(c.room.count_containing("a/one#8"), 0, "a PR that never merged is not reported");
+    assert!(captain.watermark(&c.root).is_some());
+    assert!(captain.watermark(&second).is_some());
+    assert_eq!(c.room.count_containing("ambient/repo"), 0);
+    assert_eq!(c.room.count_containing("a/b#8"), 0);
 }
 
 #[tokio::test]
@@ -1068,6 +1124,77 @@ async fn an_incomplete_room_read_preserves_the_captain_window() {
 
 #[tokio::test]
 #[serial]
+async fn a_fresh_captain_checks_how_far_back_the_room_read_reaches() {
+    let dir = tempfile::tempdir().unwrap();
+    let c = captain_fixture(dir.path(), &this_host());
+    let mut rows = Vec::new();
+    let old = Utc::now() - hours(2);
+    let boundary = Utc::now() - hours(1);
+    {
+        let mut messages = c.room.messages.lock().unwrap();
+        for n in 1..=20 {
+            let pr = merged(n, "a/b", hours(2));
+            rows.push(row(n, "a/b", hours(2)));
+            messages.push((old.timestamp_millis(), report_for(&pr).body()));
+        }
+        for _ in 0..merge_report::READ_BACK_LIMIT {
+            messages.push((boundary.timestamp_millis(), "ordinary message".into()));
+        }
+    }
+    // This genuinely missing merge is inside the visible history.
+    rows.push(row(21, "a/b", minutes(30)));
+    c.gh.rows(&rows);
+    let captain = reporter(&c.socket, &c.root);
+    assert_eq!(captain.captain_pass().await, 1);
+    assert_eq!(c.room.count_containing("merged ✓"), 21);
+    assert_eq!(c.room.count_containing("a/b#21 ·"), 1);
+    assert!(captain.watermark(&c.root).is_none());
+    // Safehoused can filter out a non-message event after applying the limit.
+    *c.room.read_reply.lock().unwrap() = Some(json!({
+        "ok":true,"undecryptable":0,
+        "messages":[{"ts":boundary.timestamp_millis(),"envelope":{"body":"ordinary message"}}]
+    }));
+    assert_eq!(captain.captain_pass().await, 0);
+    assert_eq!(c.room.sends.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+#[serial]
+async fn a_dense_burst_resumes_across_ticks_within_the_query_budget() {
+    let dir = tempfile::tempdir().unwrap();
+    let c = captain_fixture(dir.path(), &this_host());
+    let now = Utc::now();
+    // Creation order puts #1 last. All merges fall in a two-minute interval
+    // whose split takes more than a single tick's budget to reach.
+    let rows: Vec<_> = (1..=101)
+        .rev()
+        .map(|n| {
+            let mut pr = row(n, "a/b", minutes(15));
+            pr["mergedAt"] = json!((now - minutes(15) + chrono::Duration::seconds(i64::from(n)))
+                .to_rfc3339_opts(chrono::SecondsFormat::Secs, true));
+            pr
+        })
+        .collect();
+    c.gh.rows(&rows);
+    let captain = reporter(&c.socket, &c.root);
+    for tick in 0..10 {
+        let calls = c.gh.calls();
+        captain.captain_pass_at(now + minutes(5 * tick)).await;
+        assert!(c.gh.calls() - calls <= 5);
+        if tick == 0 {
+            assert!(captain.watermark(&c.root).is_none());
+        }
+        if captain.watermark(&c.root).is_some() {
+            break;
+        }
+    }
+    assert!(captain.watermark(&c.root).is_some());
+    assert_eq!(c.room.lines().len(), 101);
+    assert_eq!(c.room.count_containing("a/b#1 ·"), 1);
+}
+
+#[tokio::test]
+#[serial]
 async fn a_saturated_creation_order_page_does_not_hide_a_late_merge() {
     let dir = tempfile::tempdir().unwrap();
     let c = captain_fixture(dir.path(), &this_host());
@@ -1080,14 +1207,14 @@ async fn a_saturated_creation_order_page_does_not_hide_a_late_merge() {
     c.gh.rows(&rows);
     let captain = reporter(&c.socket, &c.root);
     std::fs::write(c.gh.dir.join("fail-call"), "3").unwrap();
-    assert_eq!(captain.captain_pass().await, rows.len() - 1);
+    assert_eq!(captain.captain_pass().await, 0, "discovery has not finished");
     assert!(captain.watermark(&c.root).is_none(), "the second half failed");
     assert_eq!(c.room.count_containing("a/b#1 ·"), 0);
 
-    assert_eq!(captain.captain_pass().await, 1);
+    assert_eq!(captain.captain_pass().await, rows.len());
     assert_eq!(c.room.count_containing("a/b#1 ·"), 1);
     assert_eq!(c.room.lines().len(), rows.len());
-    assert_eq!(c.gh.calls(), 6, "each attempt searched the parent and both halves");
+    assert_eq!(c.gh.calls(), 4, "only the failed half needed a second query");
     assert!(captain.watermark(&c.root).is_some());
 }
 
@@ -1126,7 +1253,13 @@ async fn a_full_page_that_cannot_be_walked_back_is_not_marked_done() {
         .collect();
     c.gh.rows(&rows);
     let captain = reporter(&c.socket, &c.root);
-    assert_eq!(captain.captain_pass().await, rows.len());
+    for _ in 0..10 {
+        if captain.captain_pass().await > 0 {
+            break;
+        }
+        assert!(captain.watermark(&c.root).is_none());
+    }
+    assert_eq!(c.room.lines().len(), rows.len());
     assert!(captain.watermark(&c.root).is_none(), "incomplete scan holds the watermark");
     // Re-running posts nothing new: the room read-back already holds every line.
     assert_eq!(captain.captain_pass().await, 0);

@@ -16,12 +16,10 @@
 //!   normally never race. A merge made by a hosted/manual action, or by a host
 //!   that died before posting, is caught here.
 //!
-//! The scan is stateless apart from an in-memory per-workspace watermark that is
-//! advanced **only** after a fully answered, fully read, fully posted pass. A
-//! failed forge read, a failed room read, a failed post or a page the forge
-//! filled leaves the window as it was, so the unseen range is retried on the next
-//! tick (and is bounded below by the catch-up window). The room read-back is what
-//! keeps a retried scan from posting a line twice.
+//! The captain keeps a watermark and any unfinished search in memory for each
+//! workspace. The watermark advances after all ranges have been searched and
+//! every merge has been accounted for. A search may span several ticks, but
+//! only merges still inside the catch-up window are eligible for delivery.
 
 use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::path::{Path, PathBuf};
@@ -33,7 +31,9 @@ use chrono::{DateTime, SubsecRound, Utc};
 
 use super::merge_report::{self, Outcome, PrReport, ReportTarget};
 use super::merge_source::{self, MergedPr};
-use super::{forge_gate, resolve_socket, set_state, SafehouseConfig, SafehouseState};
+use super::{
+    forge_gate, resolve_socket, set_state, RecentMessages, SafehouseConfig, SafehouseState,
+};
 use crate::event_bus::{EventBus, RecvError, Subscription};
 use crate::observability::ops::feed::{self, PassOutcome, Trigger};
 use crate::types::Event;
@@ -145,6 +145,8 @@ pub(super) struct Reporter {
     known_workspaces: Mutex<BTreeSet<String>>,
     /// Per-workspace scan watermarks (see the module docs).
     watermarks: Mutex<HashMap<String, DateTime<Utc>>>,
+    /// Unfinished searches resume at the next tick, with their original end time.
+    pending: Mutex<HashMap<PathBuf, ScanWindow>>,
     /// A scan is running; the next tick skips instead of overlapping it.
     scan_in_flight: AtomicBool,
     catchup: chrono::Duration,
@@ -161,6 +163,7 @@ impl Reporter {
             reported: Mutex::new(HashMap::new()),
             known_workspaces: Mutex::new(BTreeSet::new()),
             watermarks: Mutex::new(HashMap::new()),
+            pending: Mutex::new(HashMap::new()),
             scan_in_flight: AtomicBool::new(false),
             catchup: secs(env_secs(CATCHUP_ENV, DEFAULT_CATCHUP)),
             grace: secs(env_secs(GRACE_ENV, DEFAULT_GRACE)),
@@ -191,14 +194,19 @@ impl Reporter {
 
     /// Reserve the key across awaits. A second worker cannot send while the
     /// first worker is deciding whether an earlier send landed.
-    async fn deliver(&self, report: &PrReport, visible_in_room: bool) -> Outcome {
+    async fn deliver(&self, report: &PrReport, recent: Option<&RecentMessages>) -> Outcome {
         let key = report.key();
+        let visible_in_room = recent.is_some_and(|room| report.is_reported_in(&room.bodies));
+        let started = Utc::now();
         let previous = {
             let mut states = self.reported.lock().unwrap_or_else(PoisonError::into_inner);
             match states.get(&key) {
                 Some(ReportState::Reported) => return Outcome::AlreadyReported,
                 Some(ReportState::InFlight) => return Outcome::Failed("report in flight".into()),
                 _ => {}
+            }
+            if !visible_in_room && recent.is_some_and(|room| !room.covers(report.merged_at)) {
+                return Outcome::Failed("room history does not reach the merge".into());
             }
             if states.len() >= REPORTED_CAP {
                 let cutoff = Utc::now() - self.catchup;
@@ -213,10 +221,14 @@ impl Reporter {
             }
             states.insert(key.clone(), ReportState::InFlight)
         };
+        let since = match previous {
+            Some(ReportState::Uncertain(at)) => at,
+            _ => started,
+        };
         let outcome = if visible_in_room {
             Outcome::AlreadyReported
         } else if matches!(previous, Some(ReportState::Uncertain(_))) {
-            merge_report::post_after_read(&self.target, report).await
+            merge_report::post_after_read(&self.target, report, since).await
         } else {
             merge_report::post(&self.target, report).await
         };
@@ -226,7 +238,7 @@ impl Reporter {
                 states.insert(key, ReportState::Reported);
             }
             Outcome::Uncertain(_) => {
-                states.insert(key, ReportState::Uncertain(Utc::now()));
+                states.insert(key, ReportState::Uncertain(since));
             }
             Outcome::Failed(_) => {
                 states.remove(&key);
@@ -276,7 +288,7 @@ impl Reporter {
             return;
         };
         let key = report.key();
-        match self.deliver(&report, false).await {
+        match self.deliver(&report, None).await {
             Outcome::Posted => {
                 feed::record_completions(trigger, false, 1);
                 log::info!("safehouse: reported merged PR {key}");
@@ -293,14 +305,18 @@ impl Reporter {
     /// One captain catch-up pass over every scan target. A no-op unless this
     /// host is the armed fleet captain. Returns the number of lines posted.
     pub(super) async fn captain_pass(&self) -> usize {
+        self.captain_pass_at(Utc::now()).await
+    }
+
+    pub(super) async fn captain_pass_at(&self, now: DateTime<Utc>) -> usize {
         let host = crate::sweep_registry::host_identity();
         let gate = crate::fleet_captain::resolve_gate_for_root(&self.default_root, &host);
         if !gate.is_armed() {
             log::trace!("safehouse: {}", gate.message("safehouse merged-PR catch-up"));
             return 0;
         }
-        let mut bodies = match merge_report::read_room(&self.target).await {
-            Ok(recent) if recent.complete => recent.bodies,
+        let mut recent = match merge_report::read_room(&self.target).await {
+            Ok(recent) if recent.complete => recent,
             Ok(_) => {
                 log::warn!("safehouse: incomplete fleet room read; deferring captain catch-up");
                 feed::record_reconcile_pass(PassOutcome::Failed);
@@ -317,20 +333,27 @@ impl Reporter {
         };
         let mut posted = 0;
         for root in self.scan_targets() {
-            posted += self.scan_workspace(Path::new(&root), &mut bodies).await;
+            posted += self
+                .scan_workspace(Path::new(&root), &mut recent, now)
+                .await;
         }
         posted
     }
 
     /// Scan one workspace and post the merges the room lacks. Advances the
     /// workspace's watermark only when the pass was complete (see module docs).
-    async fn scan_workspace(&self, root: &Path, bodies: &mut Vec<String>) -> usize {
+    async fn scan_workspace(
+        &self,
+        root: &Path,
+        recent: &mut RecentMessages,
+        now: DateTime<Utc>,
+    ) -> usize {
         let root_key = root.to_string_lossy().into_owned();
         if forge_gate::suppressed("pr list (scan)", root) {
             feed::record_reconcile_pass(PassOutcome::Deferred);
             return 0;
         }
-        let now = Utc::now();
+        let cutoff = now - self.catchup;
         let horizon = now - self.grace;
         let since = {
             let marks = self
@@ -340,32 +363,44 @@ impl Reporter {
             marks
                 .get(&root_key)
                 .copied()
-                .map_or(now - self.catchup, |mark| mark.max(now - self.catchup))
+                .map_or(cutoff, |mark| mark.max(cutoff))
         };
 
-        let (mut rows, complete) = scan_window(root, since, horizon).await;
-        // A saturated parent can repeat rows returned by its children.
+        let mut window = self
+            .pending
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(root)
+            .filter(|window| window.until >= cutoff)
+            .unwrap_or_else(|| ScanWindow::new(since, horizon));
+        if !window.search(root, cutoff).await {
+            self.pending
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .insert(root.to_owned(), window);
+            feed::record_reconcile_pass(PassOutcome::Deferred);
+            return 0;
+        }
+        let mut rows = window.rows;
         rows.sort_by(|a, b| (a.merged_at, a.number, &a.url).cmp(&(b.merged_at, b.number, &b.url)));
         rows.dedup_by(|a, b| a.url == b.url);
         let mut posted = 0;
         let mut failures = Vec::new();
-        for pr in rows.iter().filter(|pr| pr.merged_at <= horizon) {
+        for pr in rows
+            .iter()
+            .filter(|pr| (cutoff..=window.until).contains(&pr.merged_at))
+        {
             let Some(report) = PrReport::from_merged(pr) else {
                 continue;
             };
             let key = report.key();
-            let visible = report.is_reported_in(bodies);
-            match self.deliver(&report, visible).await {
+            match self.deliver(&report, Some(recent)).await {
                 Outcome::Posted => {
-                    bodies.push(report.body());
+                    recent.bodies.push(report.body());
                     posted += 1;
                     log::info!("safehouse: captain reported merged PR {key} that no host reported");
                 }
-                Outcome::AlreadyReported => {
-                    if !visible {
-                        bodies.push(report.body());
-                    }
-                }
+                Outcome::AlreadyReported => {}
                 Outcome::Failed(why) | Outcome::Uncertain(why) => {
                     failures.push(format!("{key}: {why}"));
                 }
@@ -374,11 +409,11 @@ impl Reporter {
         if posted > 0 {
             feed::record_completions(Trigger::Reconcile, false, posted);
         }
-        if complete && failures.is_empty() {
+        if window.complete && failures.is_empty() {
             self.watermarks
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
-                .insert(root_key, horizon - WATERMARK_SLACK);
+                .insert(root_key, window.until - WATERMARK_SLACK);
             feed::record_reconcile_pass(PassOutcome::Ran);
         } else {
             if !failures.is_empty() {
@@ -396,39 +431,55 @@ impl Reporter {
     }
 }
 
-/// Search both halves of a saturated interval. The forge can return rows in
-/// creation order, so the oldest visible merge says nothing about unseen rows.
-async fn scan_window(
-    root: &Path,
-    since: DateTime<Utc>,
+/// Keep the exact remaining ranges across ticks. Deliver the discovered rows
+/// together: posting the first full page early could evict the room history
+/// that a later page needs to decide whether a hidden PR was reported.
+struct ScanWindow {
     until: DateTime<Utc>,
-) -> (Vec<MergedPr>, bool) {
-    let mut intervals = VecDeque::new();
-    if since <= until {
-        intervals.push_back((since.trunc_subsecs(0), until.trunc_subsecs(0)));
-    }
-    let mut rows = Vec::new();
-    let mut complete = true;
-    for _ in 0..MAX_PAGES {
-        let Some((start, end)) = intervals.pop_front() else {
-            break;
-        };
-        let Some(page) = merge_source::merged_prs_between(root, start, end).await else {
-            complete = false;
-            break;
-        };
-        rows.extend(page.rows);
-        if page.saturated {
-            if start == end {
-                complete = false;
-                continue;
-            }
-            let midpoint = start + chrono::Duration::seconds((end - start).num_seconds() / 2);
-            intervals.push_back((start, midpoint));
-            intervals.push_back((midpoint + chrono::Duration::seconds(1), end));
+    intervals: VecDeque<(DateTime<Utc>, DateTime<Utc>)>,
+    rows: Vec<MergedPr>,
+    complete: bool,
+}
+
+impl ScanWindow {
+    fn new(since: DateTime<Utc>, until: DateTime<Utc>) -> Self {
+        Self {
+            until,
+            intervals: VecDeque::from([(since.trunc_subsecs(0), until.trunc_subsecs(0))]),
+            rows: Vec::new(),
+            complete: true,
         }
     }
-    (rows, complete && intervals.is_empty())
+
+    /// Search at most MAX_PAGES this tick. Retry a failed query on a later
+    /// tick. An unsplittable full page keeps the completed pass's watermark open.
+    async fn search(&mut self, root: &Path, cutoff: DateTime<Utc>) -> bool {
+        for _ in 0..MAX_PAGES {
+            let Some((start, end)) = self.intervals.pop_front() else {
+                break;
+            };
+            let start = start.max(cutoff.trunc_subsecs(0));
+            if start > end {
+                continue;
+            }
+            let Some(page) = merge_source::merged_prs_between(root, start, end).await else {
+                self.intervals.push_back((start, end));
+                break;
+            };
+            if page.saturated && start < end {
+                let midpoint = start + chrono::Duration::seconds((end - start).num_seconds() / 2);
+                self.intervals.push_back((start, midpoint));
+                self.intervals
+                    .push_back((midpoint + chrono::Duration::seconds(1), end));
+            } else {
+                // Leaf ranges are disjoint. A full single second can only
+                // contribute its visible rows and must hold the watermark.
+                self.rows.extend(page.rows);
+                self.complete &= !page.saturated;
+            }
+        }
+        self.intervals.is_empty()
+    }
 }
 
 /// Only a completed merge naming a PR authorizes the host lookup. An issue

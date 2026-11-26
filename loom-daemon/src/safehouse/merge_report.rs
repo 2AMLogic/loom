@@ -23,6 +23,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use anyhow::Result;
+use chrono::{DateTime, Utc};
 
 use super::merge_source::MergedPr;
 use super::{
@@ -31,8 +32,7 @@ use super::{
 };
 
 /// How many recent room messages the read-back inspects (safehoused caps
-/// `read` at 100). A line older than this is not seen, and the report may be
-/// duplicated; that is tolerated.
+/// `read` at 100). Older lines can fall outside the returned history.
 pub(super) const READ_BACK_LIMIT: u32 = 100;
 
 /// Bound on one safehoused round trip (connect + `hello`, `send`, or `read`).
@@ -106,6 +106,7 @@ impl ReportTarget {
 pub(super) struct PrReport {
     /// Forge `owner/repo`.
     slug: String,
+    pub(super) merged_at: DateTime<Utc>,
     number: u32,
     url: String,
     title: Option<String>,
@@ -120,6 +121,7 @@ impl PrReport {
     pub(super) fn from_merged(pr: &MergedPr) -> Option<Self> {
         Some(Self {
             slug: pr.repo_slug()?,
+            merged_at: pr.merged_at,
             number: pr.number,
             url: pr.url.clone(),
             title: pr.title.as_deref().map(one_line).filter(|t| !t.is_empty()),
@@ -241,18 +243,23 @@ pub(super) async fn read_room(
 /// See the module docs for the rule. At most two `send`s are made.
 pub(super) async fn post(target: &ReportTarget, report: &PrReport) -> Outcome {
     let envelope = report.envelope();
+    let started = Utc::now();
     match attempt_send(target, &envelope).await {
-        Outcome::Uncertain(_) => post_after_read(target, report).await,
+        Outcome::Uncertain(_) => post_after_read(target, report, started).await,
         outcome => outcome,
     }
 }
 
 /// Resolve a previous ambiguous send. One fresh, complete negative read
 /// authorizes exactly one send, even if this attempt also loses its reply.
-pub(super) async fn post_after_read(target: &ReportTarget, report: &PrReport) -> Outcome {
+pub(super) async fn post_after_read(
+    target: &ReportTarget,
+    report: &PrReport,
+    started: DateTime<Utc>,
+) -> Outcome {
     match read_room(target).await {
         Ok(recent) if report.is_reported_in(&recent.bodies) => Outcome::AlreadyReported,
-        Ok(recent) if recent.complete => attempt_send(target, &report.envelope()).await,
+        Ok(recent) if recent.covers(started) => attempt_send(target, &report.envelope()).await,
         Ok(_) => Outcome::Uncertain("read-back incomplete".to_owned()),
         Err(why) => Outcome::Uncertain(format!("read-back failed: {why}")),
     }

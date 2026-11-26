@@ -58,7 +58,7 @@ Sweep 1 is noisy: `hyper` matches `hyperparams` (about 80 lines), and
 `UnixListener`/`TcpListener` matches inside `#[cfg(test)]` modules that live in
 non-`*tests*` files (`serve.rs` below roughly line 1220, `exporter.rs`,
 `jev_merge_risk.rs`, `cli/dispatch.rs`, `cli/status.rs`, `cli/cancel.rs`,
-`cli/fleet_send.rs`, `safehouse/envelopes.rs`, `serve/api_keys.rs`). These
+`cli/fleet_send.rs`, `serve/api_keys.rs`). These
 tighter forms isolate the production hits and are what the tables below were
 built from:
 

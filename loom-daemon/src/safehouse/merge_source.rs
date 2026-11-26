@@ -169,8 +169,15 @@ async fn run_json(
     if forge_gate::suppressed(call, workspace_root) {
         return None;
     }
+    let Some((host, slug)) = crate::forge_etag_store::remote_identity(workspace_root) else {
+        log_gh_failure_once(call, workspace_root, "cannot resolve workspace origin");
+        return None;
+    };
+    let repo = format!("{host}/{slug}");
+    let mut args = args.to_vec();
+    args.extend(["--repo", &repo]);
     let gh_bin = super::env_nonempty(GH_BIN_ENV).unwrap_or_else(|| "gh".to_owned());
-    let output = match gh_read_async(op, args, workspace_root, &gh_bin, LOOKUP_TIMEOUT).await {
+    let output = match gh_read_async(op, &args, workspace_root, &gh_bin, LOOKUP_TIMEOUT).await {
         CmdOutcome::Ran(output) => output,
         CmdOutcome::Unavailable(u) => {
             // Every failure is counted (#13156); the log below stays one-shot.
