@@ -908,9 +908,10 @@ pub fn select_codex_account_where(
     keep: impl Fn(&AccountDescriptor) -> bool,
 ) -> Result<SelectedAccount> {
     let provider = AccountProvider::Codex;
+    use super::session_lifecycle::liveness;
     let inventory: Vec<AccountDescriptor> = account_inventory(workspace, provider)?
         .into_iter()
-        .filter(|account| keep(account))
+        .filter(|account| keep(account) && !liveness::bare_sandbox_blocked(account))
         .collect();
     let now = now_epoch_secs();
     // Proactive in-container auth probe (issue #6927): a session-managed
@@ -926,7 +927,7 @@ pub fn select_codex_account_where(
     // containers cannot be observed (fail open). #10660: the read is the
     // shared session snapshot — the daemon's published one in-process, one
     // bounded snapshot in `tokens select` (see `liveness`'s module doc).
-    let live = super::session_lifecycle::liveness::live_preferred(&inventory).and_then(|live| {
+    let live = liveness::live_preferred(&inventory).and_then(|live| {
         super::health::select_healthy_for_model_at(workspace, provider, &live, model, now).ok()
     });
     let descriptor = match live {

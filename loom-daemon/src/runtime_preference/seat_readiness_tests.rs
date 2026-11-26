@@ -1,5 +1,5 @@
 //! #14455: the ordered resolver draws a Codex pool only through seats that can
-//! run a command — a bare-metal profile on a host of session containers is
+//! run a command — a bare-metal profile with a blocked host sandbox is
 //! passed over before the claim, and a seat whose sandbox ran nothing is held
 //! on its own, leaving the rest of the pool drawable.
 
@@ -7,6 +7,7 @@ use super::{fixture, provision_claude_pool, write_config, ClearedRuntimeEnv};
 use crate::runtime_preference::{resolve_runtime, Decision};
 use crate::tokens_pool::account_registry::{AccountId, AccountProvider};
 use crate::tokens_pool::sandbox_seat_hold::hold_seat;
+use crate::tokens_pool::session_lifecycle::liveness::host_sandbox::test_support::block;
 use std::fs;
 use std::path::Path;
 
@@ -61,15 +62,13 @@ fn workspace() -> tempfile::TempDir {
     dir
 }
 
-/// The report: seats 1-2 run in containers, seat 3 is a bare-metal profile
-/// that was never provisioned. The unprovisioned seat is never what makes the
-/// pool spawnable, so a pool whose only live seat is down falls through, and
-/// naming the seat the way the write-role `not-admitted(...)` line does.
+/// On a host that refuses sandboxed commands, only running containers count.
 #[test]
 #[serial_test::serial]
-fn an_unprovisioned_bare_seat_beside_container_seats_is_not_admitted() {
+fn a_blocked_host_sandbox_excludes_only_the_bare_seat() {
     use crate::tokens_pool::session_lifecycle::liveness::test_support::{running, set};
     let _env = ClearedRuntimeEnv::new();
+    let _blocked = block();
     let dir = workspace();
     provision_codex_account("agent-1", true);
     provision_codex_account("agent-2", true);
@@ -85,7 +84,8 @@ fn an_unprovisioned_bare_seat_beside_container_seats_is_not_admitted() {
         let (chosen, skipped) = curator_walk(dir.path());
         assert_eq!(chosen, "claude", "the bare seat must not keep codex alive");
         assert!(
-            skipped[0].contains("1/3 not-admitted(sessionSeat") && skipped[0].contains("#14455"),
+            skipped[0].contains("1/3 not-admitted(sessionSeat")
+                && skipped[0].contains("the host Codex sandbox cannot run a command"),
             "{skipped:?}"
         );
         assert!(skipped[0].contains("SessionDown"), "{skipped:?}");
@@ -96,11 +96,10 @@ fn an_unprovisioned_bare_seat_beside_container_seats_is_not_admitted() {
     }
 }
 
-/// A host with no container seat at all is a bare-metal host: nothing is
-/// passed over, so a plain `CODEX_HOME` setup is unaffected.
+/// The first draw on a bare-only host uses the same sandbox evidence.
 #[test]
 #[serial_test::serial]
-fn a_host_with_only_bare_metal_seats_is_not_gated() {
+fn a_bare_only_pool_depends_on_its_host_sandbox() {
     use crate::tokens_pool::session_lifecycle::liveness::test_support::{running, set};
     let _env = ClearedRuntimeEnv::new();
     let dir = workspace();
@@ -108,6 +107,10 @@ fn a_host_with_only_bare_metal_seats_is_not_gated() {
     provision_codex_account("bare-2", false);
     let _down = set(running(&[]));
     assert_eq!(curator_walk(dir.path()), ("codex".to_string(), vec![]));
+    let _blocked = block();
+    let (chosen, skipped) = curator_walk(dir.path());
+    assert_eq!(chosen, "claude");
+    assert!(skipped[0].contains("2/2 not-admitted(sessionSeat"), "{skipped:?}");
 }
 
 /// A seat held for its own `SANDBOX_UNAVAILABLE` leaves the other seat

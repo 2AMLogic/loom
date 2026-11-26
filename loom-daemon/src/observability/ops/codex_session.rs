@@ -712,6 +712,7 @@ impl Drop for InFlight {
 /// One watch pass (blocking): snapshot, then fold it under the tracker lock,
 /// WARN, and keep the observations.
 fn watch_pass(root: &Path) {
+    crate::tokens_pool::session_lifecycle::liveness::host_sandbox::refresh_if_used();
     let seats = session_seats::seats(root);
     publish_seats(seats.clone());
     let accounts: Vec<(String, String)> = seats

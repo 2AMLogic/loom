@@ -42,12 +42,9 @@
 //!   account is marked down. A running container with stale mounts is not
 //!   down. An account the operator stopped (`accounts session stop`) is
 //!   reported as held, with no hint to start it.
-//! - **A bare-metal profile beside container seats** (#14455) is NOT counted
-//!   spawnable: on a host whose other enabled seats are session containers, a
-//!   profile never `accounts session start`ed runs on the host's own sandbox,
-//!   which refuses every command (`SANDBOX_UNAVAILABLE`). Unlike `SessionDown`
-//!   this needs no snapshot, so it does not fail open; a host with no
-//!   container seat is never gated. A seat held by its own
+//! - **A host-direct seat** (#14455) needs a working host sandbox. A confirmed
+//!   Linux sandbox failure excludes that seat from both preflight and selection.
+//!   A seat held by its own
 //!   `SANDBOX_UNAVAILABLE` step (`tokens_pool::sandbox_seat_hold`) is a
 //!   cooldown like any other and is named in the skip text.
 //!
@@ -364,11 +361,8 @@ pub(crate) struct CodexPoolState {
     /// How many of `session_down` the operator holds down (`accounts session
     /// stop`, #10453). Only changes the skip text (#10660).
     pub session_held: usize,
-    /// Enabled bare-metal profiles on a host whose other seats run in session
-    /// containers: never provisioned as one, so never counted spawnable
-    /// (#14455; `liveness::is_unprovisioned_bare_seat`). Needs no snapshot,
-    /// so unlike `session_down` it does not fail open.
-    pub unprovisioned: usize,
+    /// Enabled host-direct seats excluded because the host sandbox refused a command.
+    pub bare_sandbox_blocked: usize,
     /// Enabled seats held by a `SANDBOX_UNAVAILABLE` tick of their own
     /// (`sandbox_seat_hold`, #14455), a subset of the seats in cooldown.
     pub sandbox_held: usize,
@@ -382,8 +376,8 @@ pub(crate) struct CodexPoolState {
     pub read_error: Option<(PoolStateFile, String)>,
 }
 
-/// Read the codex account pool for `root` at `now` (epoch seconds). Pure file
-/// reads — no selection cursor is advanced and no probe is run.
+/// Read the codex account pool for `root` at `now` (epoch seconds). The read leaves
+/// the selection cursor untouched.
 ///
 /// `account-health.json` is read and parsed **once** per call (#8444). The
 /// per-account read this replaced re-parsed the file for every enabled
@@ -407,7 +401,7 @@ pub(crate) fn codex_pool_state_for(
         untrusted: Vec::new(),
         session_down: 0,
         session_held: 0,
-        unprovisioned: 0,
+        bare_sandbox_blocked: 0,
         sandbox_held: 0,
         earliest_clear: None,
         read_error: None,
@@ -458,12 +452,8 @@ pub(crate) fn codex_pool_state_for(
             state.untrusted.push(account.id.name.clone());
             continue;
         }
-        // #14455: a bare-metal profile beside container seats never ran
-        // `accounts session start`; the sandbox on it refuses every command.
-        if crate::tokens_pool::session_lifecycle::liveness::is_unprovisioned_bare_seat(
-            account, &inventory,
-        ) {
-            state.unprovisioned += 1;
+        if crate::tokens_pool::session_lifecycle::liveness::bare_sandbox_blocked(account) {
+            state.bare_sandbox_blocked += 1;
             continue;
         }
         let Some(health) = health_state.get(&account.id) else {
@@ -517,10 +507,10 @@ fn codex_health_exhausted_reason(state: &CodexPoolState) -> String {
     // skip line says why, in the form the write-role `not-admitted(...)` line
     // has.
     let mut named = Vec::new();
-    if state.unprovisioned > 0 {
+    if state.bare_sandbox_blocked > 0 {
         named.push(format!(
-            "{}/{} not-admitted(sessionSeat: bare-metal profile on a host whose other seats run in session containers; never `loom-daemon accounts session start`ed, so its sandbox is unprovisioned; #14455)",
-            state.unprovisioned, state.enabled
+            "{}/{} not-admitted(sessionSeat: the host Codex sandbox cannot run a command for bare-metal seats; #14455)",
+            state.bare_sandbox_blocked, state.enabled
         ));
     }
     if state.sandbox_held > 0 {

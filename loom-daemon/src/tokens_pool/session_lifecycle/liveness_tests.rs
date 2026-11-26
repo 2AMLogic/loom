@@ -32,40 +32,20 @@ fn account(profiles: &Path, name: &str, session_managed: bool) -> AccountDescrip
     }
 }
 
-/// #14455: a bare-metal profile is unprovisioned only beside container seats.
-/// A bare-metal host, a private-clone seat, a disabled profile and a disabled
-/// container seat's neighbours are each judged on their own state.
 #[test]
-fn a_bare_seat_is_unprovisioned_only_beside_an_enabled_container_seat() {
+fn container_boundaries_do_not_depend_on_the_host_sandbox() {
     let profiles = tempfile::tempdir().unwrap();
-    let bare = account(profiles.path(), "bare", false);
-    let other_bare = account(profiles.path(), "other-bare", false);
-    let seat = account(profiles.path(), "seat", true);
+    let session = account(profiles.path(), "session", true);
     let private = account(profiles.path(), "private", false);
-    let hold = profiles.path().join(".private-sessions").join("private");
-    fs::create_dir_all(&hold).unwrap();
-    fs::write(hold.join("workspace.json"), "{}").unwrap();
-
-    let bare_host = [bare.clone(), other_bare.clone()];
-    assert!(!is_unprovisioned_bare_seat(&bare, &bare_host), "a bare-metal host is not gated");
-
-    let mixed = [bare.clone(), other_bare, seat.clone()];
-    assert!(is_unprovisioned_bare_seat(&bare, &mixed));
-    assert!(!is_unprovisioned_bare_seat(&seat, &mixed), "a container seat is provisioned");
-
-    let with_private = [bare.clone(), private.clone()];
-    assert!(is_unprovisioned_bare_seat(&bare, &with_private), "a private clone is a seat");
-    assert!(!is_unprovisioned_bare_seat(&private, &with_private));
-
-    let mut disabled_seat = seat;
-    disabled_seat.enabled = false;
-    assert!(
-        !is_unprovisioned_bare_seat(&bare, &[bare.clone(), disabled_seat]),
-        "a disabled seat does not make the host a container host"
-    );
-    let mut disabled_bare = bare;
-    disabled_bare.enabled = false;
-    assert!(!is_unprovisioned_bare_seat(&disabled_bare, &mixed), "disabled is out already");
+    let held = profiles.path().join(".private-sessions/private");
+    fs::create_dir_all(&held).unwrap();
+    fs::write(held.join("workspace.json"), "{}").unwrap();
+    let bare = account(profiles.path(), "bare", false);
+    assert!(!bare_sandbox_blocked(&bare));
+    let _blocked = host_sandbox::test_support::block();
+    assert!(bare_sandbox_blocked(&bare));
+    assert!(!bare_sandbox_blocked(&session));
+    assert!(!bare_sandbox_blocked(&private));
 }
 
 /// The mapping from the shared snapshot's states: stopped, restarting and
@@ -168,6 +148,23 @@ fn selection_prefers_a_live_session_account() {
     let unobservable: std::collections::HashSet<_> = (0..4).map(|_| pick()).collect();
     assert_eq!(unobservable.len(), 2, "fail open keeps both accounts in rotation");
 
+    account(profiles.path(), "bare", false);
+    let _live = set(running(&["agent-2"]));
+    let drawable: std::collections::HashSet<_> = (0..4).map(|_| pick()).collect();
+    assert_eq!(drawable, ["agent-2".to_string(), "bare".to_string()].into());
+    let _blocked = host_sandbox::test_support::block();
+    for _ in 0..4 {
+        assert_eq!(pick(), "agent-2");
+    }
+    // A workspace filter may remove every container (e.g. a private clone
+    // bound elsewhere). Even the selector's fallback must reject this seat.
+    let bare_only = crate::tokens_pool::account_registry::select_codex_account_where(
+        workspace.path(),
+        None,
+        |account| account.id.name == "bare",
+    );
+    assert!(bare_only.is_err());
+
     match prior_probe {
         Some(value) => std::env::set_var("LOOM_CODEX_SESSION_PROBE", value),
         None => std::env::remove_var("LOOM_CODEX_SESSION_PROBE"),
@@ -195,19 +192,12 @@ fn live_preferred_follows_the_snapshot_state_and_ignores_the_hold() {
         .into_iter()
         .map(|a| a.id.name)
         .collect();
-    // #14455: the bare-metal profile beside container seats is not preferred.
-    assert_eq!(names, ["stale"]);
+    assert_eq!(names, ["stale", "bare-metal"]);
     drop(live);
-    // A hold alone marks nothing down: with no snapshot no container is
-    // passed over, exactly as for any other unobservable container; only the
-    // unprovisioned bare-metal profile still is.
+    // A hold alone marks nothing down: with no snapshot there is nothing to
+    // prefer, exactly as for any other unobservable container.
     let _blind = set(unavailable());
-    let names: Vec<_> = live_preferred(&inventory)
-        .unwrap()
-        .into_iter()
-        .map(|a| a.id.name)
-        .collect();
-    assert_eq!(names, ["looping", "stale", "held"]);
+    assert_eq!(live_preferred(&inventory), None);
 }
 
 /// The out-of-process selector (`tokens select`): one bounded snapshot from
