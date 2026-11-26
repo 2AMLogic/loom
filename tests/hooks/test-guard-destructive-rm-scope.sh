@@ -298,6 +298,10 @@ assert_allow "rmScope default (#15221): nested subshell closes after a proven mk
     'D=$(mktemp -d); function finish { ( ( rm -rf "$D") ); }; finish' "$REPO_ROOT"
 assert_allow "rmScope default (#15221): redirection on the subshell body follows the rm operands" \
     'cd /usr && finish() ( rm -f /tmp/x/foo ) >/dev/null; finish' "$REPO_ROOT"
+assert_allow "rmScope default (#15221): quoted \$(...) filename plus redirected subshell close" \
+    "cd /usr && finish() ( rm -f '/tmp/loom-judge-15224-\$(template)' ) 2>/dev/null; finish" "$REPO_ROOT"
+assert_allow "rmScope default (#15221): quoted \${VAR:-x} filename plus redirected subshell close" \
+    'cd /usr && finish() ( rm -f "/tmp/loom-judge-15224-${USER:-unknown}" ) 2>/dev/null; finish' "$REPO_ROOT"
 assert_deny_reason_matches "rmScope default (#15221): quoted closing paren belongs to the filename" \
     'finish() ( rm -f "/opt/loom-fixture)"); finish' '/opt/loom-fixture\)$' "$REPO_ROOT"
 assert_deny_reason_matches "rmScope default (#15221): escaped closing paren belongs to the filename" \

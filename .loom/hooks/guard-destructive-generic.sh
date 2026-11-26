@@ -7909,14 +7909,19 @@ _extract_rm_targets_scan() {
     }
     # The grouping openers have already been removed from s. Keep parens
     # inside quoted/escaped filenames and balanced operand expressions.
-    function rm_command_text(s,   pos, c, quote, depth, args, tail, plain) {
+    function rm_command_text(s,   pos, c, quote, depth, args, tail, bdepth, prev, p) {
         for (pos = 1; pos <= length(s); pos++) {
             c = substr(s, pos, 1)
-            if (c == BS && quote != SQ) { pos++; continue }
+            p = prev; prev = c
+            if (c == BS && quote != SQ) { pos++; prev = ""; continue }
             if (quote != "") {
                 if (c == quote) quote = ""
             } else if (c == SQ || c == DQ || c == "`") {
                 quote = c
+            } else if (c == "{" && p == "$") {
+                bdepth++
+            } else if (c == "}" && bdepth > 0) {
+                bdepth--
             } else if (c == "(") {
                 depth++
             } else if (c == ")") {
@@ -7925,12 +7930,11 @@ _extract_rm_targets_scan() {
                 tail = substr(s, pos)
                 if (tail ~ /^[) \t]+$/) return args
                 # A redirection or comment can follow the subshell. Only
-                # discard that trailer when the preceding words contain no
-                # complex expansion whose own syntax might contain this paren.
+                # discard that trailer when no unquoted ${...} is still open.
                 if (tail !~ /^[) \t]+([0-9]*[<>]|#)/) continue
-                plain = args
-                gsub(/\$\{[A-Za-z_][A-Za-z0-9_]*\}/, "", plain)
-                if (plain !~ /\$[({\047]|`/) return args
+                # Only an unquoted, still-open ${...} could hide this paren;
+                # quoted text was skipped by the scan above.
+                if (bdepth == 0) return args
             }
         }
         return s
