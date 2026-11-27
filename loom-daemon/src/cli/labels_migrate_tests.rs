@@ -320,6 +320,104 @@ fn a_full_last_page_is_followed_by_an_empty_one() {
     assert_eq!(r.summary.relabeled, 100);
 }
 
+/// A listing that never ends: every page asked for comes back full.
+struct Endless {
+    pages: RefCell<Vec<u32>>,
+}
+
+impl MigrateForge for Endless {
+    fn live_labels(&self) -> Result<Vec<String>, ForgeError> {
+        Ok(vec![STAR.into(), IMPORTANT.into()])
+    }
+
+    fn open_page(&self, label: &str, page: u32) -> Result<Vec<Item>, ForgeError> {
+        self.pages.borrow_mut().push(page);
+        Ok((0..PER_PAGE)
+            .map(|i| Item {
+                number: u64::from(page) * PER_PAGE as u64 + i as u64,
+                labels: vec![label.into()],
+            })
+            .collect())
+    }
+
+    fn item_labels(&self, _: u64) -> Result<Vec<String>, ForgeError> {
+        unreachable!("a truncated listing keeps the label before any re-check")
+    }
+
+    fn add_label(&self, _: u64, _: &str) -> Result<(), ForgeError> {
+        unreachable!("a truncated listing is never acted on")
+    }
+
+    fn remove_label(&self, _: u64, _: &str) -> Result<(), ForgeError> {
+        unreachable!("a truncated listing is never acted on")
+    }
+
+    fn delete_label(&self, _: &str) -> Result<(), ForgeError> {
+        unreachable!("a truncated listing keeps the label")
+    }
+}
+
+#[test]
+fn a_truncated_listing_keeps_the_label_and_never_writes() {
+    // "Is it in use?" got no answer after 100 full pages: fail closed.
+    let endless = Endless {
+        pages: RefCell::new(Vec::new()),
+    };
+    let r = run(&endless, "o/r", &[retired(STAR, Some(IMPORTANT), true)], true);
+    assert_eq!(*endless.pages.borrow(), (1..=100).collect::<Vec<_>>());
+    assert_eq!(
+        r.events,
+        vec![Event::Kept {
+            label: STAR.into(),
+            why: "usage lookup failed: more than 10000 open items; listing truncated".into(),
+        }]
+    );
+    assert_eq!((r.summary.kept, r.summary.remaining, r.summary.writes), (1, 1, 0));
+    assert_eq!(r.exit, 3);
+}
+
+#[test]
+fn pages_are_read_until_the_first_short_one() {
+    // Two full pages, then a short one: every item in page order, and no
+    // page asked for after it.
+    let asked = RefCell::new(Vec::new());
+    let rows = paginate_open(
+        |p| {
+            asked.borrow_mut().push(p);
+            Ok(match p {
+                1 => 0..PER_PAGE,
+                2 => PER_PAGE..PER_PAGE * 2,
+                3 => PER_PAGE * 2..PER_PAGE * 2 + 2,
+                _ => unreachable!("no page is asked for after a short one"),
+            }
+            .collect())
+        },
+        |_| unreachable!("a listing that ends is not truncated"),
+    )
+    .unwrap();
+    assert_eq!(*asked.borrow(), [1, 2, 3]);
+    assert_eq!(rows, (0..PER_PAGE * 2 + 2).collect::<Vec<_>>());
+}
+
+#[test]
+fn a_failed_page_ends_the_listing_with_its_error() {
+    let asked = RefCell::new(Vec::new());
+    let err = paginate_open(
+        |p| {
+            asked.borrow_mut().push(p);
+            match p {
+                1 => Ok((0..PER_PAGE).collect()),
+                2 => Err(ForgeError::RateLimited("HTTP 429".into())),
+                _ => unreachable!("no page is asked for after a failure"),
+            }
+        },
+        |_| unreachable!("a failed page is not a truncation"),
+    )
+    .unwrap_err();
+    assert_eq!(*asked.borrow(), [1, 2]);
+    assert_eq!(err, ForgeError::RateLimited("HTTP 429".into()));
+}
+
 #[test]
 fn an_unowned_label_is_add_only_in_every_mode() {
     for apply in [false, true] {
