@@ -35,7 +35,6 @@
 use super::{LeaseEnsureArgs, Outcome, SessionEnv, DEFAULT_MAX_AGE_SECS};
 use crate::worktree_ops::gh::{probe_open_linked_pr_for_lease, OpenPrProbe};
 use std::io::Write as _;
-use std::os::unix::io::AsRawFd as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
@@ -334,17 +333,10 @@ fn sleep_while(total: Duration, poll: Duration, alive: impl Fn() -> bool) {
     }
 }
 
-pub(super) fn try_lock(path: &Path) -> Option<std::fs::File> {
-    std::fs::create_dir_all(path.parent()?).ok()?;
-    let f = std::fs::OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .write(true)
-        .open(path)
-        .ok()?;
-    // SAFETY: flock only takes an advisory lock on an fd this function owns.
-    let rc = unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
-    (rc == 0).then_some(f)
+pub(super) fn try_lock(path: &Path) -> Option<crate::fs_util::FileLock> {
+    crate::fs_util::FileLock::try_lock_exclusive(path)
+        .ok()
+        .flatten()
 }
 
 /// The retry decision, with time, sleep and liveness injected so it is

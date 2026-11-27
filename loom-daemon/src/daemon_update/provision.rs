@@ -330,7 +330,7 @@ pub fn publish(staged: &Path, dest: &Path) -> Result<Published, InstallError> {
 /// when the holder exits, so a killed holder cannot leave it stuck. The lock
 /// file is never deleted (deleting it would let two holders lock different
 /// inodes); a leftover one is harmless.
-pub(super) struct DestLock(#[allow(dead_code)] std::fs::File);
+pub(super) struct DestLock(#[allow(dead_code)] crate::fs_util::FileLock);
 
 impl DestLock {
     pub(super) fn acquire(dest: &Path) -> std::io::Result<Self> {
@@ -338,27 +338,10 @@ impl DestLock {
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_else(|| "loom-daemon".to_string());
-        let file = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(staging_dir(dest).join(format!(".{base}.install.lock")))?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::io::AsRawFd;
-            loop {
-                // SAFETY: `file` owns a valid open descriptor for this call.
-                if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } == 0 {
-                    break;
-                }
-                let error = std::io::Error::last_os_error();
-                if error.kind() != std::io::ErrorKind::Interrupted {
-                    return Err(error);
-                }
-            }
-        }
-        Ok(Self(file))
+        crate::fs_util::FileLock::lock_exclusive(
+            &staging_dir(dest).join(format!(".{base}.install.lock")),
+        )
+        .map(Self)
     }
 }
 

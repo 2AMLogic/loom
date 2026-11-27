@@ -53,7 +53,6 @@
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
-use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -227,23 +226,10 @@ impl Store {
 
     /// An exclusive `flock` on the directory's lock file, held until dropped
     /// (or the process exits, so a crashed holder never wedges the next one).
-    fn lock(&self) -> Result<File> {
-        std::fs::create_dir_all(&self.dir)
-            .with_context(|| format!("creating {}", self.dir.display()))?;
-        let file = std::fs::OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .write(true)
-            .open(self.dir.join(".lock"))?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::io::AsRawFd as _;
-            // SAFETY: `flock` on a descriptor this function owns.
-            if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } != 0 {
-                return Err(std::io::Error::last_os_error()).context("flock");
-            }
-        }
-        Ok(file)
+    fn lock(&self) -> Result<crate::fs_util::FileLock> {
+        let path = self.dir.join(".lock");
+        crate::fs_util::FileLock::lock_exclusive(&path)
+            .with_context(|| format!("locking {}", path.display()))
     }
 
     /// `Ok(None)` for a missing or unparseable record.

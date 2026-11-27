@@ -71,7 +71,7 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
-use crate::fs_util::{human_size, newest_mtime_and_size};
+use crate::fs_util::{human_size, newest_mtime_and_size, FileLock};
 use chrono::{DateTime, Utc};
 
 // ============================================================================
@@ -239,61 +239,12 @@ pub fn cargo_lock_is_held(target_dir: &Path) -> bool {
         Err(e) if e.kind() == io::ErrorKind::NotFound => return false,
         Err(_) => return true,
     };
-    match try_lock_exclusive(&file) {
-        Ok(true) => {
-            // We took the lock ourselves — release it immediately and report
-            // "not held".
-            let _ = unlock(&file);
-            false
-        }
-        Ok(false) => true,
-        Err(_) => true,
+    match FileLock::try_lock_exclusive_file(file) {
+        // We took the lock ourselves; dropping the guard releases it
+        // immediately and reports "not held".
+        Ok(Some(_guard)) => false,
+        Ok(None) | Err(_) => true,
     }
-}
-
-#[cfg(unix)]
-fn try_lock_exclusive(file: &fs::File) -> io::Result<bool> {
-    use std::os::unix::io::AsRawFd;
-    let fd = file.as_raw_fd();
-    // SAFETY: `fd` is a valid, open file descriptor for the lifetime of this
-    // call (borrowed from `file`, which outlives it).
-    let rc = unsafe { libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) };
-    if rc == 0 {
-        Ok(true)
-    } else {
-        let err = io::Error::last_os_error();
-        if err.kind() == io::ErrorKind::WouldBlock {
-            Ok(false)
-        } else {
-            Err(err)
-        }
-    }
-}
-
-#[cfg(unix)]
-fn unlock(file: &fs::File) -> io::Result<()> {
-    use std::os::unix::io::AsRawFd;
-    let fd = file.as_raw_fd();
-    // SAFETY: see `try_lock_exclusive`.
-    let rc = unsafe { libc::flock(fd, libc::LOCK_UN) };
-    if rc == 0 {
-        Ok(())
-    } else {
-        Err(io::Error::last_os_error())
-    }
-}
-
-#[cfg(not(unix))]
-fn try_lock_exclusive(_file: &fs::File) -> io::Result<bool> {
-    // No portable non-blocking advisory lock on this platform; treat the file
-    // as unlocked (relies entirely on the mtime-freshness gate). Not exercised
-    // by the daemon's supported (Unix) hosts today.
-    Ok(true)
-}
-
-#[cfg(not(unix))]
-fn unlock(_file: &fs::File) -> io::Result<()> {
-    Ok(())
 }
 
 // ============================================================================
@@ -745,14 +696,16 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let lock_path = tmp.path().join(".cargo-lock");
         let file = File::create(&lock_path).unwrap();
-        assert!(try_lock_exclusive(&file).unwrap(), "must acquire cleanly first");
+        let guard = FileLock::try_lock_exclusive_file(file)
+            .unwrap()
+            .expect("must acquire cleanly first");
 
         // Held by `file` (in this same process, a distinct fd) — flock is
         // per-open-file-description, so a second independent open+lock
         // attempt correctly contends with it.
         assert!(cargo_lock_is_held(tmp.path()));
 
-        unlock(&file).unwrap();
+        drop(guard);
         assert!(!cargo_lock_is_held(tmp.path()));
     }
 
@@ -809,7 +762,9 @@ mod tests {
 
         let lock_path = root.join(".cargo-lock");
         let lock_file = File::create(&lock_path).unwrap();
-        assert!(try_lock_exclusive(&lock_file).unwrap());
+        let guard = FileLock::try_lock_exclusive_file(lock_file)
+            .unwrap()
+            .expect("free");
 
         let report = run(root, 7, false, t(0));
         assert!(report.build_in_progress);
@@ -818,7 +773,7 @@ mod tests {
         assert!(root.join("debug/deps/libfoo.rlib").exists());
         assert!(report.reason().contains("deferring"));
 
-        unlock(&lock_file).unwrap();
+        drop(guard);
     }
 
     #[test]
@@ -829,13 +784,15 @@ mod tests {
         let root = tmp.path();
         touch_with_mtime(&root.join("debug/incremental/c-abc/s-old-working/x.bin"), -30 * 86_400);
         let lock_file = File::create(root.join(".cargo-lock")).unwrap();
-        assert!(try_lock_exclusive(&lock_file).unwrap());
+        let guard = FileLock::try_lock_exclusive_file(lock_file)
+            .unwrap()
+            .expect("free");
 
         let report = run(root, 7, true, t(0));
         assert!(report.build_in_progress);
         assert!(report.removed.is_empty());
 
-        unlock(&lock_file).unwrap();
+        drop(guard);
     }
 
     #[test]
