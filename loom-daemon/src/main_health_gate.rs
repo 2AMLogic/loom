@@ -102,8 +102,8 @@ use crate::workspace_registry::WorkspaceRegistry;
 // with the repo does not belong in this file (#8243).
 mod owned_paths;
 use owned_paths::{
-    BUILD_ARTIFACT_LOCKFILE_BASENAMES, INSTALLED_SURFACE_PREFIXES, INSTALL_METADATA_PATH,
-    LOOM_OWNED_PREFIXES,
+    BUILD_ARTIFACT_LOCKFILE_BASENAMES, INSTALLED_SURFACE_FILES, INSTALLED_SURFACE_PREFIXES,
+    INSTALL_METADATA_PATH, LOOM_OWNED_PREFIXES,
 };
 
 // `WorkspaceHealthStates::find` (#11565) lives in its own sibling module.
@@ -2193,13 +2193,21 @@ pub(crate) fn run_gate_tick_with_fns(
     Some(outcome)
 }
 
-/// If `path` falls under one of [`INSTALLED_SURFACE_PREFIXES`], return its
-/// `defaults/`-relative source counterpart path. `defaults/` source paths
-/// themselves are deliberately **not** in the mapping's domain — this only
-/// ever maps *installed* copies to their source, never the reverse, so a
-/// dirty `defaults/docs/x.md` (an operator editing the source directly)
-/// never matches here and stays non-ignorable.
+/// If `path` is one of [`INSTALLED_SURFACE_FILES`], or falls under one of
+/// [`INSTALLED_SURFACE_PREFIXES`], return its `defaults/`-relative source
+/// counterpart path. An exact entry is answered before the prefixes are
+/// tried. `defaults/` source paths themselves are deliberately **not** in
+/// the mapping's domain — this only ever maps *installed* copies to their
+/// source, never the reverse, so a dirty `defaults/docs/x.md` (an operator
+/// editing the source directly) never matches here and stays
+/// non-ignorable.
 fn installed_surface_defaults_counterpart(path: &str) -> Option<String> {
+    if let Some((_, defaults)) = INSTALLED_SURFACE_FILES
+        .iter()
+        .find(|(installed, _)| path == *installed)
+    {
+        return Some((*defaults).to_string());
+    }
     INSTALLED_SURFACE_PREFIXES
         .iter()
         .find_map(|(installed, defaults)| {

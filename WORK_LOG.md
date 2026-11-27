@@ -18,6 +18,16 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 ### 2026-11-27
 
+- **PR #15565**: test: scope IPC daemon-status env overrides with EnvGuard
+- **PR #15562**: docs: replace the step usage fallback with per-runtime cases
+- **PR #15555**: fix: treat .loom/signals/ as Loom-owned so quarantine never stashes a stop request
+- **PR #15552**: Route contained OpenCode Z.ai launches through the credential proxy (#15527)
+- **PR #15547**: docs(guide): use parsed issue dependencies for dependency-based unblocks
+- **Issue #15558** (closed): Use EnvGuard to restore registry and token overrides in seven IPC status tests
+- **Issue #15557** (closed): Correct the attribution guide for steps with missing session IDs or logs
+- **Issue #15545** (closed): Protect operator stop signals from quarantine and remove the stale #11284 comment
+- **Issue #15528** (closed): Unblock sweep lifted #8698's blocker-less park twice (2026-11-19 and 2026-11-26), naming closed #8674 as the resolved dependency
+- **Issue #15527** (closed): Contained OpenCode launch of the bundled Z.ai profiles cannot be routed through the credential egress proxy (prerequisite for #8698)
 - **PR #15540**: fix: type effort and model refusals inside profile selection
 - **PR #15549**: fix: read Loom resync waiver tags and blobs from 2AMLogic/loom
 - **PR #15530**: fix: make resync's printed recipe stage its retirements and rate card

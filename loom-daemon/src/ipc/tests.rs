@@ -3436,15 +3436,16 @@ fn a_host_short_of_disk_ram_and_cpu_still_gets_the_configured_cap() {
 #[test]
 #[serial_test::serial]
 fn test_build_daemon_status_capacity_bound_tracks_occupancy() {
+    use crate::env_test_support::EnvGuard;
     use crate::main_health_gate::WorkspaceHealthStates;
     use crate::workspace_registry::REGISTRY_PATH_ENV;
+    use std::ffi::OsStr;
 
     let (sr, dir, _rec) = setup_sweep_registry_in_tempdir();
     let root = dir.path().to_path_buf();
     let empty_reg = dir.path().join("no-such-workspaces.json");
-    std::env::set_var(REGISTRY_PATH_ENV, &empty_reg);
-    let prev_shared = std::env::var("LOOM_SHARED_TOKENS_DIR").ok();
-    std::env::set_var("LOOM_SHARED_TOKENS_DIR", "");
+    let _env = EnvGuard::set(REGISTRY_PATH_ENV, &empty_reg)
+        .and_set("LOOM_SHARED_TOKENS_DIR", Some(OsStr::new("")));
 
     // Provision a two-token pool so the dynamic cap is > 0 (a real ceiling).
     let tokens_dir = root.join(".loom").join("tokens");
@@ -3481,12 +3482,6 @@ fn test_build_daemon_status_capacity_bound_tracks_occupancy() {
         report.capacity_bound,
         "{cap} in-flight against cap {cap} must be capacity-bound",
     );
-
-    if let Some(v) = prev_shared {
-        std::env::set_var("LOOM_SHARED_TOKENS_DIR", v);
-    } else {
-        std::env::remove_var("LOOM_SHARED_TOKENS_DIR");
-    }
 }
 
 /// #5305: `capacity.token_bound` must be reachable again — it was
@@ -3497,15 +3492,16 @@ fn test_build_daemon_status_capacity_bound_tracks_occupancy() {
 #[test]
 #[serial_test::serial]
 fn test_build_daemon_status_token_bound_reflects_zero_healthy_accounts() {
+    use crate::env_test_support::EnvGuard;
     use crate::main_health_gate::WorkspaceHealthStates;
     use crate::workspace_registry::REGISTRY_PATH_ENV;
+    use std::ffi::OsStr;
 
     let (sr, dir, _rec) = setup_sweep_registry_in_tempdir();
     let root = dir.path().to_path_buf();
     let empty_reg = dir.path().join("no-such-workspaces.json");
-    std::env::set_var(REGISTRY_PATH_ENV, &empty_reg);
-    let prev_shared = std::env::var("LOOM_SHARED_TOKENS_DIR").ok();
-    std::env::set_var("LOOM_SHARED_TOKENS_DIR", "");
+    let _env = EnvGuard::set(REGISTRY_PATH_ENV, &empty_reg)
+        .and_set("LOOM_SHARED_TOKENS_DIR", Some(OsStr::new("")));
 
     let tokens_dir = root.join(".loom").join("tokens");
     std::fs::create_dir_all(&tokens_dir).unwrap();
@@ -3547,12 +3543,6 @@ fn test_build_daemon_status_token_bound_reflects_zero_healthy_accounts() {
         report.capacity.token_bound,
         "zero healthy accounts ⇒ genuinely starved, guidance branch must be reachable"
     );
-
-    if let Some(v) = prev_shared {
-        std::env::set_var("LOOM_SHARED_TOKENS_DIR", v);
-    } else {
-        std::env::remove_var("LOOM_SHARED_TOKENS_DIR");
-    }
 }
 
 /// `build_daemon_status` reflects the per-repo main-health halt flag and
@@ -3562,8 +3552,10 @@ fn test_build_daemon_status_token_bound_reflects_zero_healthy_accounts() {
 #[test]
 #[serial_test::serial]
 fn test_build_daemon_status_reports_halt_and_in_flight() {
+    use crate::env_test_support::EnvGuard;
     use crate::main_health_gate::WorkspaceHealthStates;
     use crate::workspace_registry::REGISTRY_PATH_ENV;
+    use std::ffi::OsStr;
 
     let (sr, dir, _rec) = setup_sweep_registry_in_tempdir();
     let root = dir.path().to_path_buf();
@@ -3571,13 +3563,12 @@ fn test_build_daemon_status_reports_halt_and_in_flight() {
     // Point the workspace registry at a nonexistent file so effective_roots
     // falls back to [root] (single-workspace equivalence).
     let empty_reg = dir.path().join("no-such-workspaces.json");
-    std::env::set_var(REGISTRY_PATH_ENV, &empty_reg);
 
     // Disable the shared machine-level pool fallback (#3940) so the
     // token-pool assertions see only the tempdir workspace, not the
     // host's real ~/.loom/tokens (empty value = operator opt-out).
-    let prev_shared = std::env::var("LOOM_SHARED_TOKENS_DIR").ok();
-    std::env::set_var("LOOM_SHARED_TOKENS_DIR", "");
+    let _env = EnvGuard::set(REGISTRY_PATH_ENV, &empty_reg)
+        .and_set("LOOM_SHARED_TOKENS_DIR", Some(OsStr::new("")));
 
     // Seed the pool with the default registry keyed at `root`.
     let pool = Arc::new(WorkspacePool::new(Arc::new(EventBus::new()), test_runtime_handle()));
@@ -3631,7 +3622,7 @@ fn test_build_daemon_status_reports_halt_and_in_flight() {
     // This is the exact ambiguity the issue is about: `pending` and
     // `disabled` both still allow dispatch, but they must not be
     // confused with `clear` (verified green).
-    std::env::remove_var(crate::main_health_gate::MAIN_HEALTH_GATE_ENABLE_ENV);
+    let _health_gate = EnvGuard::clear(&[crate::main_health_gate::MAIN_HEALTH_GATE_ENABLE_ENV]);
     std::fs::write(
             root.join(".loom").join("config.json"),
             r#"{"autonomous": {"mainHealthGate": {"enabled": true}}, "buildGate": {"enabled": true, "command": "true"}}"#,
@@ -3699,12 +3690,6 @@ fn test_build_daemon_status_reports_halt_and_in_flight() {
             .as_deref(),
         Some(reason)
     );
-
-    match prev_shared {
-        Some(v) => std::env::set_var("LOOM_SHARED_TOKENS_DIR", v),
-        None => std::env::remove_var("LOOM_SHARED_TOKENS_DIR"),
-    }
-    std::env::remove_var(REGISTRY_PATH_ENV);
 }
 
 /// Regression test for Issue #4279 (the silent-EOF `status` incident): once
@@ -3718,15 +3703,16 @@ fn test_build_daemon_status_reports_halt_and_in_flight() {
 #[test]
 #[serial_test::serial]
 fn test_build_daemon_status_recovers_from_poisoned_registry() {
+    use crate::env_test_support::EnvGuard;
     use crate::main_health_gate::WorkspaceHealthStates;
     use crate::workspace_registry::REGISTRY_PATH_ENV;
+    use std::ffi::OsStr;
 
     let (sr, dir, _rec) = setup_sweep_registry_in_tempdir();
     let root = dir.path().to_path_buf();
     let empty_reg = dir.path().join("no-such-workspaces.json");
-    std::env::set_var(REGISTRY_PATH_ENV, &empty_reg);
-    let prev_shared = std::env::var("LOOM_SHARED_TOKENS_DIR").ok();
-    std::env::set_var("LOOM_SHARED_TOKENS_DIR", "");
+    let _env = EnvGuard::set(REGISTRY_PATH_ENV, &empty_reg)
+        .and_set("LOOM_SHARED_TOKENS_DIR", Some(OsStr::new("")));
 
     let pool = Arc::new(WorkspacePool::new(Arc::new(EventBus::new()), test_runtime_handle()));
     pool.seed(root.clone(), sr.clone());
@@ -3749,12 +3735,6 @@ fn test_build_daemon_status_recovers_from_poisoned_registry() {
     let report = build_daemon_status(&pool, &health, &root, &test_credential_preflight());
     assert_eq!(report.per_repo.len(), 1, "single-workspace report still built");
     assert_eq!(report.per_repo[0].root, root);
-
-    match prev_shared {
-        Some(v) => std::env::set_var("LOOM_SHARED_TOKENS_DIR", v),
-        None => std::env::remove_var("LOOM_SHARED_TOKENS_DIR"),
-    }
-    std::env::remove_var(REGISTRY_PATH_ENV);
 }
 
 /// Regression test for Issue #4214 (the "vanish window" incident): a sweep
@@ -3768,15 +3748,16 @@ fn test_build_daemon_status_recovers_from_poisoned_registry() {
 #[test]
 #[serial_test::serial]
 fn test_build_daemon_status_surfaces_unregistered_locked_sweep() {
+    use crate::env_test_support::EnvGuard;
     use crate::main_health_gate::WorkspaceHealthStates;
     use crate::workspace_registry::REGISTRY_PATH_ENV;
+    use std::ffi::OsStr;
 
     let (sr, dir, _rec) = setup_sweep_registry_in_tempdir();
     let root = dir.path().to_path_buf();
     let empty_reg = dir.path().join("no-such-workspaces.json");
-    std::env::set_var(REGISTRY_PATH_ENV, &empty_reg);
-    let prev_shared = std::env::var("LOOM_SHARED_TOKENS_DIR").ok();
-    std::env::set_var("LOOM_SHARED_TOKENS_DIR", "");
+    let _env = EnvGuard::set(REGISTRY_PATH_ENV, &empty_reg)
+        .and_set("LOOM_SHARED_TOKENS_DIR", Some(OsStr::new("")));
 
     let pool = Arc::new(WorkspacePool::new(Arc::new(EventBus::new()), test_runtime_handle()));
     pool.seed(root.clone(), sr.clone());
@@ -3838,12 +3819,6 @@ fn test_build_daemon_status_surfaces_unregistered_locked_sweep() {
     assert_eq!(back.unregistered_locked.len(), 1);
     assert_eq!(back.unregistered_locked[0].issue, 4201);
     assert_eq!(back.unregistered_locked[0].owner_pid, std::process::id());
-
-    match prev_shared {
-        Some(v) => std::env::set_var("LOOM_SHARED_TOKENS_DIR", v),
-        None => std::env::remove_var("LOOM_SHARED_TOKENS_DIR"),
-    }
-    std::env::remove_var(REGISTRY_PATH_ENV);
 }
 
 /// `build_daemon_status` with two registered workspaces returns one `per_repo`
@@ -3931,21 +3906,15 @@ fn test_build_daemon_status_multi_workspace_per_repo_breakdown() {
 #[test]
 #[serial_test::serial]
 fn test_build_daemon_status_per_repo_ranking_reflects_each_repos_own_pool() {
+    use crate::env_test_support::EnvGuard;
     use crate::main_health_gate::WorkspaceHealthStates;
     use crate::workspace_registry::{normalize_path, WorkspaceRegistry, REGISTRY_PATH_ENV};
+    use std::ffi::OsStr;
 
     let (sr_a, dir_a, _rec_a) = setup_sweep_registry_in_tempdir();
     let (sr_b, dir_b, _rec_b) = setup_sweep_registry_in_tempdir();
     let root_a = dir_a.path().to_path_buf();
     let root_b = dir_b.path().to_path_buf();
-
-    // Disable the shared machine-level pool fallback so each repo's own
-    // per-repo `.loom/tokens/` is the only pool `resolve_tokens_dir` can
-    // find for it — otherwise a repo with no per-repo pool would silently
-    // fall through to the host's real `~/.loom/tokens` (or a stale value
-    // left by another `#[serial]` test) instead of reporting "absent".
-    let prev_shared = std::env::var("LOOM_SHARED_TOKENS_DIR").ok();
-    std::env::set_var("LOOM_SHARED_TOKENS_DIR", "");
 
     // A registry listing BOTH managed repos, exactly like the sibling
     // multi-workspace test above.
@@ -3954,7 +3923,14 @@ fn test_build_daemon_status_per_repo_ranking_reflects_each_repos_own_pool() {
     reg.add(&root_a, None).unwrap();
     reg.add(&root_b, None).unwrap();
     reg.save(&reg_path).unwrap();
-    std::env::set_var(REGISTRY_PATH_ENV, &reg_path);
+
+    // Disable the shared machine-level pool fallback so each repo's own
+    // per-repo `.loom/tokens/` is the only pool `resolve_tokens_dir` can
+    // find for it — otherwise a repo with no per-repo pool would silently
+    // fall through to the host's real `~/.loom/tokens` (or a stale value
+    // left by another `#[serial]` test) instead of reporting "absent".
+    let _env = EnvGuard::set(REGISTRY_PATH_ENV, &reg_path)
+        .and_set("LOOM_SHARED_TOKENS_DIR", Some(OsStr::new("")));
 
     let canon_a = normalize_path(&root_a);
     let canon_b = normalize_path(&root_b);
@@ -4024,12 +4000,6 @@ fn test_build_daemon_status_per_repo_ranking_reflects_each_repos_own_pool() {
         "repo B's own ranking must read as fresh, got {:?}",
         b.ranking_age_secs
     );
-
-    match prev_shared {
-        Some(v) => std::env::set_var("LOOM_SHARED_TOKENS_DIR", v),
-        None => std::env::remove_var("LOOM_SHARED_TOKENS_DIR"),
-    }
-    std::env::remove_var(REGISTRY_PATH_ENV);
 }
 
 /// Issue #4326: a registry entry whose root directory has been deleted
@@ -4634,12 +4604,14 @@ fn test_daemon_status_backward_compat_missing_drain_fields() {
 #[test]
 #[serial_test::serial]
 fn test_build_daemon_status_with_drain_overlays_state() {
+    use crate::env_test_support::EnvGuard;
+    use std::ffi::OsStr;
+
     let (sr, dir, _rec) = setup_sweep_registry_in_tempdir();
     let root = dir.path().to_path_buf();
     let empty_reg = dir.path().join("no-such-workspaces.json");
-    std::env::set_var(crate::workspace_registry::REGISTRY_PATH_ENV, &empty_reg);
-    let prev_shared = std::env::var("LOOM_SHARED_TOKENS_DIR").ok();
-    std::env::set_var("LOOM_SHARED_TOKENS_DIR", "");
+    let _env = EnvGuard::set(crate::workspace_registry::REGISTRY_PATH_ENV, &empty_reg)
+        .and_set("LOOM_SHARED_TOKENS_DIR", Some(OsStr::new("")));
 
     let pool = Arc::new(WorkspacePool::new(Arc::new(EventBus::new()), test_runtime_handle()));
     pool.seed(root.clone(), sr);
@@ -4679,12 +4651,6 @@ fn test_build_daemon_status_with_drain_overlays_state() {
     let back: DaemonStatusReport = serde_json::from_str(&json).unwrap();
     assert!(back.draining);
     assert_eq!(back.drain_deadline, Some(deadline));
-
-    match prev_shared {
-        Some(v) => std::env::set_var("LOOM_SHARED_TOKENS_DIR", v),
-        None => std::env::remove_var("LOOM_SHARED_TOKENS_DIR"),
-    }
-    std::env::remove_var(crate::workspace_registry::REGISTRY_PATH_ENV);
 }
 
 /// Wire-compat (Finding 3): the new `DrainAndRestartDaemon` variant
