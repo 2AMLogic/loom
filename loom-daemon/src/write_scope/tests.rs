@@ -642,16 +642,17 @@ fn daemon_write_paths_are_scoped() {
             "claim_reconciliation/orphan_stack.rs",
             Via(
                 PASS,
-                "orphan-stack pass (#12760): base retarget PATCH, conflict label, flag \
-                 comment; its scratch-worktree push (orphan_stack_git.rs) rides the same gate",
+                "orphan-stack pass (#12760): conflict label add/remove; its scratch-worktree \
+                 push (orphan_stack_git.rs) rides the same gate",
             ),
         ),
         (
-            "claim_reconciliation/merged_stack.rs",
+            "claim_reconciliation/stack_reconcile.rs",
             Via(
                 PASS,
-                "merged-stack pass (#14903): base retarget PATCH and reconcile comments; its \
-                 scratch-worktree push (orphan_stack_git.rs) rides the same gate",
+                "stack passes (#12760, #14903): the base retarget PATCH and comment POST both \
+                 orphan_stack and merged_stack share; their scratch-worktree pushes \
+                 (orphan_stack_git.rs) ride the same gate",
             ),
         ),
         (

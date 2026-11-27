@@ -2,10 +2,15 @@
 //! ([`super`], #15597).
 
 use std::collections::BTreeSet;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use super::*;
+use crate::comment_trust::records::TEST_FLEET_AUTHOR;
+use crate::forge_call_stats;
+use crate::gh_invocation::test_support::{calls, stub};
+use crate::merge_pr::reconcile::LeaseState;
 use crate::test_git_helpers::{run, StackFixture as GitFixture};
+use crate::types::{ForgeCallCounts, ForgeOperationCounts};
 
 const REPO: &str = "acme/widgets";
 
@@ -315,4 +320,238 @@ fn cascade_enforces_hold_inflight_nohead_default_branch_lease_and_transient_rule
         },
     );
     assert_eq!(unknown_flags, vec![(209, CascadeFlag::NotLoomBranch)]);
+}
+
+// --- live forge adapters -----------------------------------------------------
+
+/// A stub `gh` that appends its argv to `log` and answers by endpoint: one
+/// closed PR whose head is `feature/issue-7`, `lease_reply` for the lease
+/// read of issue 7's comments, an empty comment listing for every other read
+/// of them, one label on issue 7, and `[]` for anything else.
+fn logging_stub(dir: &Path, log: &Path, lease_reply: &str) -> PathBuf {
+    const CLOSED: &str = r#"[{"number":12,"state":"closed","head":{"ref":"feature/issue-7","sha":"abc123"},"merged_at":null}]"#;
+    const LABELED: &str = r#"{"labels":[{"name":"loom:issue"}]}"#;
+    let script = format!(
+        "printf '%s\\n' \"$*\" >> '{log}'\n\
+         case \"$2\" in\n\
+         \t*pulls?head=*) printf '%s' '{CLOSED}' ;;\n\
+         \t*issues/7/comments*)\n\
+         \t\tif [ \"$4\" = --jq ]; then printf '%s\\n' '{lease_reply}'\n\
+         \t\telse printf '%s' '[]'; fi ;;\n\
+         \t*issues/7) printf '%s' '{LABELED}' ;;\n\
+         \t*) printf '%s' '[]' ;;\n\
+         esac",
+        log = log.display()
+    );
+    stub(dir, "gh-log", &script)
+}
+
+/// Run `body` with this thread's call-stats sink at a fresh dir: the
+/// per-call-site rows and the per-operation rows it produced.
+fn report_after(body: impl FnOnce()) -> (Vec<ForgeCallCounts>, Vec<ForgeOperationCounts>) {
+    let sink = tempfile::tempdir().unwrap();
+    forge_call_stats::set_test_sink_dir(Some(sink.path().to_path_buf()));
+    body();
+    let report = forge_call_stats::status_report(chrono::Utc::now(), None);
+    forge_call_stats::set_test_sink_dir(None);
+    (report.host_window.unwrap_or_default(), report.operations.unwrap_or_default())
+}
+
+fn op_calls(rows: &[ForgeOperationCounts], operation: &str) -> u64 {
+    rows.iter()
+        .filter(|r| r.operation == operation)
+        .map(|r| r.ok + r.error)
+        .sum()
+}
+
+fn logged_argv(log: &Path) -> Vec<String> {
+    std::fs::read_to_string(log)
+        .unwrap()
+        .lines()
+        .map(str::to_string)
+        .collect()
+}
+
+/// A trusted author's lease-record comment, as the lease read's `--jq`
+/// projection hands it to the policy.
+fn lease_record(updated_at: &str) -> String {
+    format!("{{\"updated_at\":\"{updated_at}\",{TEST_FLEET_AUTHOR}}}")
+}
+
+const PARENT_LOOKUP: &str =
+    "api repos/{owner}/{repo}/pulls?head={owner}:feature/issue-7&state=closed&per_page=100";
+const TRUSTED_COMMENTS: &str = "api repos/{owner}/{repo}/issues/7/comments?per_page=100 --paginate";
+const LEASE_READ: &str = "api repos/{owner}/{repo}/issues/7/comments?per_page=100 --paginate --jq ";
+
+fn closed_parent() -> Option<orphan::ParentPr> {
+    Some(orphan::ParentPr {
+        number: 12,
+        merged: false,
+        head_sha: Some("abc123".to_string()),
+    })
+}
+
+#[test]
+#[serial_test::serial]
+fn orphan_forge_issues_its_calls_under_the_orphan_stack_op_names() {
+    use orphan::{GhOrphanForge, OrphanForge};
+
+    let tmp = tempfile::tempdir().unwrap();
+    let log = tmp.path().join("argv.log");
+    let gh = logging_stub(tmp.path(), &log, &lease_record(&chrono::Utc::now().to_rfc3339()));
+    let forge = GhOrphanForge {
+        gh_bin: &gh,
+        root: tmp.path(),
+    };
+    let (rows, operations) = report_after(|| {
+        assert_eq!(forge.newest_closed_pr_for_head("feature/issue-7").unwrap(), closed_parent());
+        assert_eq!(forge.trusted_comments(7), Some(vec![]));
+        assert_eq!(forge.issue_lease_fresh(7), Some(true));
+        forge.retarget(12, "main").unwrap();
+        forge.add_label(12, "loom:merge-conflict").unwrap();
+        forge.remove_label(12, "loom:merge-conflict").unwrap();
+        forge.comment(12, "flagged").unwrap();
+    });
+
+    let argv = logged_argv(&log);
+    assert_eq!(argv.len(), 7, "{argv:?}");
+    assert_eq!(argv[0], PARENT_LOOKUP);
+    assert_eq!(argv[1], TRUSTED_COMMENTS);
+    assert!(argv[2].starts_with(LEASE_READ), "{}", argv[2]);
+    assert_eq!(
+        argv[3..],
+        [
+            "api -X PATCH repos/{owner}/{repo}/pulls/12 -f base=main",
+            "api -X POST repos/{owner}/{repo}/issues/12/labels -f labels[]=loom:merge-conflict",
+            "api -X DELETE repos/{owner}/{repo}/issues/12/labels/loom%3Amerge-conflict",
+            "api -X POST repos/{owner}/{repo}/issues/12/comments -f body=flagged",
+        ]
+    );
+
+    for name in [
+        "orphan_stack.parent_lookup",
+        "orphan_stack.comments",
+        "orphan_stack.retarget",
+        "orphan_stack.comment",
+    ] {
+        assert_eq!(calls(&rows, name), 1, "{name}: {rows:?}");
+    }
+    assert_eq!(calls(&rows, "orphan_stack.label"), 2, "{rows:?}");
+    assert!(rows.iter().all(|r| !r.caller.starts_with("merged_stack.")), "{rows:?}");
+    // The lease read (`claim.lease_comments`) books `comment.list` too.
+    for (operation, n) in [
+        ("pr.list-by-head", 1),
+        ("comment.list", 2),
+        ("issue.edit-labels", 2),
+        ("pr.edit-base", 1),
+        ("comment.create", 1),
+    ] {
+        assert_eq!(op_calls(&operations, operation), n, "{operation}: {operations:?}");
+    }
+}
+
+#[test]
+#[serial_test::serial]
+fn merged_forge_issues_its_calls_under_the_merged_stack_op_names() {
+    use super::super::merged_stack::{GhMergedForge, MergedForge};
+
+    let tmp = tempfile::tempdir().unwrap();
+    let log = tmp.path().join("argv.log");
+    let gh = logging_stub(tmp.path(), &log, &lease_record(&chrono::Utc::now().to_rfc3339()));
+    let forge = GhMergedForge {
+        gh_bin: &gh,
+        root: tmp.path(),
+    };
+    let (rows, _) = report_after(|| {
+        assert_eq!(forge.newest_closed_pr_for_head("feature/issue-7").unwrap(), closed_parent());
+        assert_eq!(forge.trusted_comments(7), Some(vec![]));
+        assert_eq!(forge.issue_labels(7), "loom:issue");
+        assert_eq!(forge.lease(7), LeaseState::Held);
+        forge.retarget(12, "main").unwrap();
+        forge.comment(12, "restacked").unwrap();
+    });
+
+    let argv = logged_argv(&log);
+    assert_eq!(argv.len(), 6, "{argv:?}");
+    assert_eq!(argv[0], PARENT_LOOKUP);
+    assert_eq!(argv[1], TRUSTED_COMMENTS);
+    assert_eq!(argv[2], "api repos/{owner}/{repo}/issues/7");
+    assert!(argv[3].starts_with(LEASE_READ), "{}", argv[3]);
+    assert_eq!(
+        argv[4..],
+        [
+            "api -X PATCH repos/{owner}/{repo}/pulls/12 -f base=main",
+            "api -X POST repos/{owner}/{repo}/issues/12/comments -f body=restacked",
+        ]
+    );
+
+    for name in [
+        "merged_stack.parent_lookup",
+        "merged_stack.comments",
+        "merged_stack.issue_labels",
+        "merged_stack.retarget",
+        "merged_stack.comment",
+    ] {
+        assert_eq!(calls(&rows, name), 1, "{name}: {rows:?}");
+    }
+    assert!(rows.iter().all(|r| !r.caller.starts_with("orphan_stack.")), "{rows:?}");
+}
+
+#[test]
+#[serial_test::serial]
+fn both_forges_read_the_lease_through_one_probe_and_project_it_their_own_way() {
+    use super::super::merged_stack::{GhMergedForge, MergedForge};
+    use orphan::{GhOrphanForge, OrphanForge};
+
+    let tmp = tempfile::tempdir().unwrap();
+    let stale = logging_stub(
+        tmp.path(),
+        &tmp.path().join("stale.log"),
+        &lease_record("2020-01-01T00:00:00Z"),
+    );
+    let absent = logging_stub(tmp.path(), &tmp.path().join("absent.log"), "[]");
+    let failing = stub(tmp.path(), "gh-fail", "exit 1");
+    for (gh, fresh, state) in [
+        (&stale, Some(false), LeaseState::NoneFresh),
+        (&absent, Some(false), LeaseState::NoneFresh),
+        (&failing, None, LeaseState::Unknown),
+    ] {
+        let root = tmp.path();
+        assert_eq!(GhOrphanForge { gh_bin: gh, root }.issue_lease_fresh(7), fresh, "{gh:?}");
+        assert_eq!(GhMergedForge { gh_bin: gh, root }.lease(7), state, "{gh:?}");
+    }
+}
+
+#[test]
+#[serial_test::serial]
+fn prepare_reconcile_reuses_a_handed_down_listing_and_skips_an_unknown_branch() {
+    let tmp = tempfile::tempdir().unwrap();
+    let log = tmp.path().join("argv.log");
+    let gh = logging_stub(tmp.path(), &log, "[]");
+    let rows = vec![open_pr(7, "feature/issue-7", &"a".repeat(40), "main")];
+
+    let saved = std::env::var("LOOM_DEFAULT_BRANCH").ok();
+    std::env::set_var("LOOM_DEFAULT_BRANCH", "main");
+    let handed_down = prepare_reconcile("test stack", &gh, tmp.path(), Some(&rows));
+    std::env::remove_var("LOOM_DEFAULT_BRANCH");
+    let unknown_branch = prepare_reconcile("test stack", &gh, tmp.path(), Some(&rows));
+    if let Some(v) = saved {
+        std::env::set_var("LOOM_DEFAULT_BRANCH", v);
+    }
+
+    match handed_down {
+        Some((branch, open)) => {
+            assert_eq!(branch, "main");
+            assert!(
+                matches!(open, Cow::Borrowed(r) if std::ptr::eq(r, rows.as_slice())),
+                "the handed-down rows must be reused, not copied: {open:?}"
+            );
+        }
+        None => panic!("a known default branch and a handed-down listing must proceed"),
+    }
+    assert!(
+        unknown_branch.is_none(),
+        "an unknown default branch skips the pass: {unknown_branch:?}"
+    );
+    assert!(!log.exists(), "neither path may call gh");
 }

@@ -94,11 +94,7 @@ kind = "rust"
 path = "loom-daemon/src/forge_pull_listing.rs"
 [[operation.callers]]
 kind = "rust"
-path = "loom-daemon/src/claim_reconciliation/orphan_stack.rs"
-
-[[operation.callers]]
-kind = "rust"
-path = "loom-daemon/src/claim_reconciliation/merged_stack.rs"
+path = "loom-daemon/src/claim_reconciliation/stack_reconcile.rs"
 
 [[operation]]
 id = "pr.edit-base"
@@ -138,10 +134,7 @@ kind = "rust"
 path = "loom-daemon/src/merge_pr/retarget_children.rs"
 [[operation.callers]]
 kind = "rust"
-path = "loom-daemon/src/claim_reconciliation/orphan_stack.rs"
-[[operation.callers]]
-kind = "rust"
-path = "loom-daemon/src/claim_reconciliation/merged_stack.rs"
+path = "loom-daemon/src/claim_reconciliation/stack_reconcile.rs"
 
 [[operation]]
 id = "pr.list-open"
