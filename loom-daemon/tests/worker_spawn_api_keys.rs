@@ -532,6 +532,7 @@ printf 'ARG %s\n' "$@" >"$AGY_CAPTURE"
 printf 'HOME=%s\n' "$HOME" >>"$AGY_CAPTURE"
 printf 'KEY=%s\n' "${GEMINI_API_KEY:-<unset>}" >>"$AGY_CAPTURE"
 printf 'UPDATER=%s\n' "${AGY_CLI_DISABLE_AUTO_UPDATE:-<unset>}" >>"$AGY_CAPTURE"
+printf 'HANDOFF=%s\n' "${LOOM_SPAWN_WORKER_DAEMON_BIN-<unset>}" >>"$AGY_CAPTURE"
 printf 'SETTINGS=%s\n' "$(flat "$HOME/settings.json")" >>"$AGY_CAPTURE"
 printf 'DEFAULT_SETTINGS=%s\n' "$(flat "$HOME/.gemini/antigravity-cli/settings.json")" >>"$AGY_CAPTURE"
 "#,
@@ -1006,5 +1007,50 @@ printf 'DEFAULT_SETTINGS=%s\n' "$(flat "$HOME/.gemini/antigravity-cli/settings.j
             .output()
             .unwrap();
         assert_refused(&out, scratch.path(), &["spawn-agy", "workspace", "control character"]);
+    }
+
+    /// Direct native `loom-daemon spawn-worker` (without `spawn-worker.sh`)
+    /// supplies its own executable identity to `spawn-agy.sh` — overwriting
+    /// any stale inherited `LOOM_SPAWN_WORKER_DAEMON_BIN` — and `spawn-agy.sh`
+    /// unsets the private handoff before exec'ing `agy` (#15532).
+    #[test]
+    fn direct_native_worker_supplies_its_own_identity_and_unsets_handoff_before_cli() {
+        let w = AgyWorkspace::new();
+        w.register_pool("alpha");
+        let out = w
+            .worker()
+            .env("LOOM_SPAWN_WORKER_DAEMON_BIN", "/nonexistent/stale-loom-daemon")
+            .args(["-p", "hello"])
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(out.status.success(), "{stderr}");
+        assert_eq!(w.fact("KEY="), POOL_KEY);
+        assert_eq!(w.fact("HANDOFF="), "<unset>");
+    }
+
+    /// Non-`agy` launches scrub `LOOM_SPAWN_WORKER_DAEMON_BIN` so a worker
+    /// spawned via `spawn-worker.sh` never leaks an ambient handoff into a
+    /// session shell where a bare `spawn-agy.sh` could later read it (#15532).
+    #[test]
+    fn non_agy_worker_scrubs_inherited_agy_daemon_handoff() {
+        let d = tempfile::tempdir().unwrap();
+        super::pooled_profile(d.path());
+        super::register(d.path(), "alpha", super::ALPHA_KEY);
+        let out = super::worker(d.path(), "opencode")
+            .env("LOOM_SPAWN_WORKER_DAEMON_BIN", "/leaked/from/outer/spawn-worker")
+            .env("FIXTURE_PRINT_ENV", "LOOM_SPAWN_WORKER_DAEMON_BIN")
+            .args(["-p", "hello"])
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(out.status.success(), "{stderr}");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            stdout
+                .lines()
+                .any(|l| l == "child_env LOOM_SPAWN_WORKER_DAEMON_BIN="),
+            "{stdout}"
+        );
     }
 }

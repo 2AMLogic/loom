@@ -253,6 +253,25 @@ pool check and reports `api_keys:gemini` — the same source a native tap on
 the namespace reports — so `hold_pool_slot` reserves either route against
 the one cap.
 
+**Daemon version floor (`loom-daemon >= 0.20.41`, #15532).** Mandatory
+`credentialPool` enforcement landed in `0918138e9` (`runtime_launch::pooled_tier3`),
+first released in **`v0.20.41`**; a `loom-daemon` older than `0.20.41` ignores
+the manifest's `credentialPool` and lets an ambient `GEMINI_API_KEY` reach
+`agy`. Before creating the isolated `HOME` or invoking `agy`, `spawn-agy.sh`
+checks **only** the worker executable handed off for this launch
+(`LOOM_SPAWN_WORKER_DAEMON_BIN`, set as an absolute path by `spawn-worker.sh`
+from its `LOOM_DAEMON_SELF_BIN` / `loom_locate_daemon_bin` selection, or by
+`loom-daemon spawn-worker` from its own `current_exe()` on direct native
+dispatch). A missing handoff, missing or non-executable path, non-zero
+`--version` exit, unrecognized version line, or version `< 0.20.41` refuses at
+exit **78** (`LOOM_SKIP_DAEMON_VERSION_PREFLIGHT` does not bypass this spend
+control). Historical `v0.20.41`–`v0.20.43` binaries already enforce the pool
+and are supported through `.loom/scripts/spawn-worker.sh`, which supplies the
+handoff; invoking `loom-daemon spawn-worker` directly without that wrapper
+requires a worker build that supplies its own identity (`>= 0.20.44`), and a
+bare `.loom/scripts/spawn-agy.sh` invocation always refuses because it cannot
+establish which worker selected a pool account.
+
 - **Supported roles**: read-only roles with no `runtimeRequirements`
   (Curator, Guide, Auditor). Builder and Doctor (worktreeIsolation +
   loomControl) and Judge (loomControl) are refused by the manifest's
