@@ -203,6 +203,33 @@ fn no_origin_ref_skips_the_forge_entirely() {
     assert!(!asked.get(), "no resolvable tip => nothing to match => no query");
 }
 
+/// The tools arm with no resolvable mode (#15650): the probe could not even
+/// be *asked*, which is not an undecidable probe (those are 0). The error
+/// reaches the caller untouched for the CLI adapter to exit 2 on, so it can
+/// be mistaken for — or folded into — neither decision code.
+#[test]
+fn a_probe_that_cannot_be_asked_is_an_error_not_a_decision() {
+    let repo = crate::worktree_cli::test_support::tmpdir("loom-closed-pr-probe", "mode-error");
+    crate::worktree_cli::test_support::git(&repo, &["init", "-q", "-b", "main"]);
+    crate::worktree_cli::test_support::git(&repo, &["commit", "-q", "--allow-empty", "-m", "base"]);
+    crate::worktree_cli::test_support::git(
+        &repo,
+        &[
+            "update-ref",
+            "refs/remotes/origin/feature/issue-8195",
+            "HEAD",
+        ],
+    );
+    let asked = std::cell::Cell::new(false);
+    let error = try_run_with(&opts(&repo), &|_| {
+        asked.set(true);
+        Err::<Probe, _>("`mode` is unset".to_string())
+    })
+    .unwrap_err();
+    assert_eq!(error, "`mode` is unset");
+    assert!(asked.get(), "a resolvable tip is what makes the probe worth asking");
+}
+
 #[test]
 fn json_number_never_changes_the_field_type() {
     assert_eq!(json_number("8275"), "8275");

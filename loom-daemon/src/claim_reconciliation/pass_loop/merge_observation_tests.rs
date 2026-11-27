@@ -1985,3 +1985,67 @@ fn the_ladder_answer_maps_onto_the_cleanup_fact() {
     assert!(!landed_from_answer(mk(Verdict::NotLanded, Evidence::MergedHeadMismatch)).landed);
     assert!(!landed_from_answer(mk(Verdict::Unknown, Evidence::Inconclusive)).landed);
 }
+
+/// `GhForge` runs its bookkeeping I/O on the shared `SystemHost` (#15641)
+/// and keeps its own per-PR commit-message memo: one fetch per PR, however
+/// many passes ask, every call from the workspace root.
+#[test]
+#[serial_test::serial]
+fn ghforge_shares_the_bookkeeping_host_and_memos_commit_messages_per_pr() {
+    use crate::gh_invocation::test_support::{calls, rows_after, stub};
+
+    let dir = tempfile::tempdir().unwrap();
+    let log = dir.path().join("gh.log");
+    let gh = stub(
+        dir.path(),
+        "gh-forge",
+        r#"printf '%s\n' "$PWD $*" >> "@LOG@"
+case "$1 $2" in
+  "api repos/o/r/pulls/9/commits") echo '[{"commit":{"message":"a"}}]' ;;
+  "api repos/o/r/pulls/10/commits") echo '[{"commit":{"message":"b"}}]' ;;
+  "api repos/o/r/issues/5/timeline?per_page=100") echo '[{"event":"labeled"}]' ;;
+esac"#
+            .replace("@LOG@", &log.display().to_string())
+            .as_str(),
+    );
+    let forge = GhForge::new(&gh, dir.path());
+    let rows = rows_after(|| {
+        assert_eq!(forge.commit_messages("o/r", "9"), "a");
+        assert_eq!(forge.commit_messages("o/r", "9"), "a");
+        assert_eq!(forge.commit_messages("o/r", "10"), "b");
+        assert_eq!(
+            forge.label_events("o/r", "5").as_deref().map(str::trim),
+            Some(r#"[{"event":"labeled"}]"#)
+        );
+        assert_eq!(forge.read_issue("o/r", "5"), "");
+        assert_eq!(forge.issue_kind("o/r", "5"), "");
+        assert!(forge.close_issue("o/r", "5", "closed by the merge"));
+    });
+    let lines: Vec<String> = std::fs::read_to_string(&log)
+        .unwrap()
+        .lines()
+        .map(str::to_string)
+        .collect();
+    assert_eq!(
+        lines.iter().filter(|l| l.contains("/commits")).count(),
+        2,
+        "one fetch per PR: {lines:?}"
+    );
+    let root = dir.path().canonicalize().unwrap();
+    assert!(
+        lines
+            .iter()
+            .all(|l| l.starts_with(&root.display().to_string())),
+        "{lines:?}"
+    );
+    for (op, n) in [
+        ("merged_obs.commits", 2),
+        ("merged_obs.timeline", 1),
+        ("merged_obs.issue_read", 1),
+        ("merged_obs.issue_kind", 1),
+        ("merged_obs.issue_close", 1),
+    ] {
+        assert_eq!(calls(&rows, op), n, "{op}: {rows:?}");
+    }
+    assert_eq!(calls(&rows, "post_merge.issue_close"), 0, "{rows:?}");
+}
