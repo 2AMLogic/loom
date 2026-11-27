@@ -61,7 +61,7 @@
 //! supplies no `merged_at`, so it never gates and never defers.
 
 use std::io::Write as _;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 use regex::bytes::Regex;
@@ -466,41 +466,117 @@ fn strip_pass(inputs: &Inputs, facts: &Facts, host: &dyn Host) -> Outcome {
 // The real host
 // ---------------------------------------------------------------------------
 
+/// The telemetry operation names a [`SystemHost`] books its forge calls
+/// under. One host serves both callers of these passes (#15641) — the
+/// `merge-pr post-merge-bookkeeping` verb and the daemon's merge-observation
+/// pass — and each keeps the names its `forge_call_stats` rows always had.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BookkeepingOps {
+    issue_read: &'static str,
+    commits: &'static str,
+    issue_kind: &'static str,
+    timeline: &'static str,
+    issue_close: &'static str,
+}
+
+impl BookkeepingOps {
+    /// `merge-pr post-merge-bookkeeping`, the shell verb.
+    pub const POST_MERGE: Self = Self {
+        issue_read: "post_merge.issue_read",
+        commits: "post_merge.commits",
+        issue_kind: "post_merge.issue_kind",
+        timeline: "post_merge.timeline",
+        issue_close: "post_merge.issue_close",
+    };
+    /// The daemon's merge-observation pass (#14902).
+    pub const MERGED_OBS: Self = Self {
+        issue_read: "merged_obs.issue_read",
+        commits: "merged_obs.commits",
+        issue_kind: "merged_obs.issue_kind",
+        timeline: "merged_obs.timeline",
+        issue_close: "merged_obs.issue_close",
+    };
+}
+
 /// The live forge and the shell helper library.
+///
+/// Both callers of these passes use this one host (#15641), each bound to
+/// its own invocation context by its constructor — the way the worktree
+/// cleanup shares `post_merge_cleanup::SystemHost` (#14904).
 pub struct SystemHost {
     /// Path to `lib/forge-helpers.sh`.
-    pub forge_helpers: String,
+    forge_helpers: PathBuf,
+    ops: BookkeepingOps,
+    /// The `gh` program the facade runs.
+    gh_bin: PathBuf,
+    /// The working directory of the forge calls.
+    gh_cwd: PathBuf,
+    /// Whether a read names its repository ([`GhInvocation::reader_repo`]).
+    reader_repo: bool,
+    /// The working directory of the helper calls; `None` inherits the
+    /// caller's.
+    helper_cwd: Option<PathBuf>,
 }
 
-/// Run `gh <args…>` through the facade (#10089), booked under `op`.
-///
-/// The working directory is not a checkout of `repo`, so a read names it
-/// (`reader_repo`) or the facade cannot route it to a reader and sheds it.
-pub(crate) fn gh_inv(
-    op: &'static str,
-    intent: AccessIntent,
-    repo: &str,
-    args: &[&str],
-) -> GhInvocation {
-    let gh = crate::gh_invocation::gh_bin();
-    let inv = gh_call::inv(op, intent, Path::new(&gh), Path::new(".")).args(args);
-    if intent == AccessIntent::Read {
-        inv.reader_repo(repo)
-    } else {
-        inv
+impl SystemHost {
+    /// The `merge-pr post-merge-bookkeeping` verb: `gh` as the facade
+    /// resolves it, run from the caller's working directory.
+    ///
+    /// That directory is not a checkout of `repo`, so a read names it
+    /// (`reader_repo`) or the facade cannot route it to a reader and sheds
+    /// it.
+    pub fn for_merge_pr(forge_helpers: String) -> Self {
+        Self {
+            forge_helpers: PathBuf::from(forge_helpers),
+            ops: BookkeepingOps::POST_MERGE,
+            gh_bin: PathBuf::from(crate::gh_invocation::gh_bin()),
+            gh_cwd: PathBuf::from("."),
+            reader_repo: true,
+            helper_cwd: None,
+        }
     }
-}
 
-pub(crate) fn gh_stdout(op: &'static str, repo: &str, args: &[&str]) -> Option<String> {
-    gh_call::ok_stdout(gh_inv(op, AccessIntent::Read, repo, args))
-        .map(|b| String::from_utf8_lossy(&b).into_owned())
+    /// The daemon's merge-observation pass: its `gh_bin` and the workspace
+    /// `root`, the checkout whose route serves the reads. The helper runs
+    /// from `root` and sources the `forge-helpers.sh` installed under it.
+    pub fn for_merge_observation(gh_bin: &Path, root: &Path) -> Self {
+        Self {
+            forge_helpers: root.join(".loom/scripts/lib/forge-helpers.sh"),
+            ops: BookkeepingOps::MERGED_OBS,
+            gh_bin: gh_bin.to_path_buf(),
+            gh_cwd: root.to_path_buf(),
+            reader_repo: false,
+            helper_cwd: Some(root.to_path_buf()),
+        }
+    }
+
+    /// Run `gh <args…>` through the facade (#10089), booked under `op`.
+    fn gh_inv(
+        &self,
+        op: &'static str,
+        intent: AccessIntent,
+        repo: &str,
+        args: &[&str],
+    ) -> GhInvocation {
+        let inv = gh_call::inv(op, intent, &self.gh_bin, &self.gh_cwd).args(args);
+        if intent == AccessIntent::Read && self.reader_repo {
+            inv.reader_repo(repo)
+        } else {
+            inv
+        }
+    }
+
+    fn gh_stdout(&self, op: &'static str, repo: &str, args: &[&str]) -> Option<String> {
+        gh_call::ok_stdout(self.gh_inv(op, AccessIntent::Read, repo, args))
+            .map(|b| String::from_utf8_lossy(&b).into_owned())
+    }
 }
 
 impl Host for SystemHost {
     fn read_issue(&self, repo: &str, issue: &str) -> String {
         let path = format!("repos/{repo}/issues/{issue}");
-        let o = gh_call::output(gh_inv(
-            "post_merge.issue_read",
+        let o = gh_call::output(self.gh_inv(
+            self.ops.issue_read,
             AccessIntent::Read,
             repo,
             &["api", &path],
@@ -519,7 +595,8 @@ impl Host for SystemHost {
 
     fn commit_messages(&self, repo: &str, pr: &str) -> String {
         let path = format!("repos/{repo}/pulls/{pr}/commits");
-        let Some(raw) = gh_stdout("post_merge.commits", repo, &["api", &path, "--paginate"]) else {
+        let Some(raw) = self.gh_stdout(self.ops.commits, repo, &["api", &path, "--paginate"])
+        else {
             return String::new();
         };
         // `--paginate` concatenates one JSON array per page.
@@ -537,7 +614,7 @@ impl Host for SystemHost {
 
     fn issue_kind(&self, repo: &str, issue: &str) -> String {
         let path = format!("repos/{repo}/issues/{issue}");
-        let Some(raw) = gh_stdout("post_merge.issue_kind", repo, &["api", &path]) else {
+        let Some(raw) = self.gh_stdout(self.ops.issue_kind, repo, &["api", &path]) else {
             return String::new();
         };
         match serde_json::from_str::<Value>(&raw) {
@@ -554,18 +631,21 @@ impl Host for SystemHost {
     fn label_events(&self, repo: &str, issue: &str) -> Option<String> {
         let path = format!("repos/{repo}/issues/{issue}/timeline?per_page=100");
         let args = ["api", path.as_str(), "--paginate"];
-        gh_stdout("post_merge.timeline", repo, &args)
+        self.gh_stdout(self.ops.timeline, repo, &args)
     }
 
     fn helper(&self, func: &str, args: &[&str]) -> bool {
-        Command::new("bash")
-            .arg("-c")
+        let mut cmd = Command::new("bash");
+        cmd.arg("-c")
             .arg(r#"source "$1" || exit 127; shift; "$@""#)
             .arg("_")
             .arg(&self.forge_helpers)
             .arg(func)
-            .args(args)
-            .stdin(Stdio::null())
+            .args(args);
+        if let Some(cwd) = &self.helper_cwd {
+            cmd.current_dir(cwd);
+        }
+        cmd.stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .status()
@@ -573,8 +653,8 @@ impl Host for SystemHost {
     }
 
     fn close_issue(&self, repo: &str, issue: &str, comment: &str) -> bool {
-        gh_call::output(gh_inv(
-            "post_merge.issue_close",
+        gh_call::output(self.gh_inv(
+            self.ops.issue_close,
             AccessIntent::Write,
             repo,
             &[

@@ -148,6 +148,9 @@ path = "loom-daemon/src/intake_reconcile/demote.rs"
 [[operation.callers]]
 kind = "rust"
 path = "loom-daemon/src/claim_reconciliation/pass_loop/merge_observation.rs"
+[[operation.callers]]
+kind = "rust"
+path = "loom-daemon/src/merge_pr/post_merge_bookkeeping.rs"
 
 [[operation]]
 id = "issue.search"
@@ -353,7 +356,7 @@ kind = "rust"
 path = "loom-daemon/src/work_finder/main_red_autofile.rs"
 [[operation.callers]]
 kind = "rust"
-path = "loom-daemon/src/claim_reconciliation/pass_loop/merge_observation.rs"
+path = "loom-daemon/src/merge_pr/post_merge_bookkeeping.rs"
 
 # --- label-catalogue-transitions ---------------------------------------------
 
@@ -605,7 +608,7 @@ kind = "rust"
 path = "loom-daemon/src/intake_reconcile/demote.rs"
 [[operation.callers]]
 kind = "rust"
-path = "loom-daemon/src/claim_reconciliation/pass_loop/merge_observation.rs"
+path = "loom-daemon/src/merge_pr/post_merge_bookkeeping.rs"
 
 # --- epics-relationships -----------------------------------------------------
 
