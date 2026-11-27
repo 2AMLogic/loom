@@ -39,9 +39,9 @@ use super::account_registry::{
 };
 use super::session_image::{self, ExtraMount, SessionImageConfig};
 use super::session_lifecycle::{
-    gh_credential_dirs, gh_credential_owners, is_session_managed, mark_session_managed,
-    ContainerRunner, ContainerState, DEFAULT_SESSION_IMAGE, EXTRA_MOUNTS_LABEL, SESSION_POSTURE,
-    SESSION_POSTURE_LABEL, STOP_GRACE, WORKSPACE_LABEL,
+    hardened_session_run_args, is_session_managed, mark_session_managed,
+    resolve_host_session_mounts, ContainerRunner, ContainerState, ProcessContainerRunner,
+    SessionRuntimeSpec, DEFAULT_SESSION_IMAGE, STOP_GRACE,
 };
 
 /// Container-name prefix of a Claude seat: `loom-claude-session-<name>`,
@@ -137,59 +137,24 @@ pub fn claude_seat_run_args(
     credentials: &[PathBuf],
     extra_mounts: &[ExtraMount],
 ) -> Vec<String> {
-    let mut args: Vec<String> = vec![
-        "run".into(),
-        "-d".into(),
-        "--name".into(),
-        container.into(),
-        "--restart".into(),
-        "unless-stopped".into(),
-        "--cap-drop".into(),
-        "ALL".into(),
-        "--security-opt".into(),
-        "no-new-privileges".into(),
+    let runtime_args = [
         "-v".into(),
         format!("{}:{CONTAINER_CLAUDE_HOME}", claude_home.display()),
         "-e".into(),
         format!("CLAUDE_CONFIG_DIR={CONTAINER_CLAUDE_HOME}"),
     ];
-    for root in roots {
-        let root = root.display().to_string();
-        args.push("-v".into());
-        args.push(format!("{root}:{root}"));
-    }
-    for dir in credentials {
-        let dir = dir.display().to_string();
-        args.push("-v".into());
-        args.push(format!("{dir}:{dir}:ro"));
-    }
-    for mount in extra_mounts {
-        args.push("--mount".into());
-        args.push(format!(
-            "type=bind,src={},dst={},readonly",
-            mount.host.display(),
-            mount.container.display()
-        ));
-    }
-    args.extend([
-        "--label".into(),
-        format!("{WORKSPACE_LABEL}={}", workspace.display()),
-        "--label".into(),
-        format!("{SESSION_POSTURE_LABEL}={SESSION_POSTURE}"),
-        "--label".into(),
-        format!("{RUNTIME_LABEL}={RUNTIME}"),
-        "--label".into(),
-        format!("{CONTAINMENT_LABEL}={CONTAINMENT}"),
-    ]);
-    if !extra_mounts.is_empty() {
-        args.push("--label".into());
-        args.push(format!(
-            "{EXTRA_MOUNTS_LABEL}={}",
-            session_image::extra_mounts_label_json(extra_mounts)
-        ));
-    }
-    args.push(image.into());
-    args
+    hardened_session_run_args(
+        container,
+        image,
+        SessionRuntimeSpec {
+            args: &runtime_args,
+            labels: &[(RUNTIME_LABEL, RUNTIME), (CONTAINMENT_LABEL, CONTAINMENT)],
+        },
+        workspace,
+        roots,
+        credentials,
+        extra_mounts,
+    )
 }
 
 /// Workspace, credential and operator-supplied mounts cannot expose the
@@ -246,18 +211,14 @@ pub fn docker_create_seat(
     daemon_root: &Path,
     extra_mounts: &[ExtraMount],
 ) -> Result<()> {
-    let roots = super::session_mount_gate::create_roots(workspace)?;
-    let loom_workspace = std::env::var_os("LOOM_WORKSPACE").map(PathBuf::from);
-    let owners = gh_credential_owners(workspace, daemon_root, loom_workspace.as_deref());
-    let env_gh = std::env::var_os("GH_CONFIG_DIR").map(PathBuf::from);
-    let credentials = gh_credential_dirs(&owners, env_gh.as_deref());
-    super::session_mount_gate::check_extra_mounts(extra_mounts, workspace, &roots, &credentials)?;
+    let mounts = resolve_host_session_mounts(workspace, daemon_root, extra_mounts)?;
     check_mount_sources(
         claude_home,
         workspace,
-        roots
+        mounts
+            .roots
             .iter()
-            .chain(&credentials)
+            .chain(&mounts.credentials)
             .map(PathBuf::as_path)
             .chain(extra_mounts.iter().map(|mount| mount.host.as_path())),
     )?;
@@ -266,21 +227,11 @@ pub fn docker_create_seat(
         image,
         claude_home,
         workspace,
-        &roots,
-        &credentials,
+        &mounts.roots,
+        &mounts.credentials,
         extra_mounts,
     );
-    let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
-    let program = super::docker_cli::docker_program()?;
-    let (success, _stdout, stderr) = super::docker_cli::run_bounded(
-        &program,
-        &arg_refs,
-        super::docker_cli::timeout_for(&arg_refs),
-    )?;
-    if !success {
-        bail!("docker run {image} failed: {}", stderr.trim());
-    }
-    Ok(())
+    ProcessContainerRunner::run_create(image, &args)
 }
 
 /// What `accounts session status --provider claude` reports. Secret-free.
@@ -355,31 +306,6 @@ impl<R: ContainerRunner> ClaudeSeatLifecycle<R> {
         self
     }
 
-    fn extra_mounts(&self) -> Vec<ExtraMount> {
-        self.session_config
-            .as_ref()
-            .map(|config| config.extra_mounts.clone())
-            .unwrap_or_default()
-    }
-
-    /// Same rule as the Codex lifecycle: the bundle check fires only when the
-    /// effective image *is* the configured override (an explicit `--image`
-    /// keeps its historical behaviour).
-    fn verify_session_config_image(&self) -> Result<()> {
-        let Some(configured) = self
-            .session_config
-            .as_ref()
-            .and_then(|config| config.image.as_deref())
-        else {
-            return Ok(());
-        };
-        if configured != self.image.as_str() {
-            return Ok(());
-        }
-        session_image::verify_override_bundle(&self.image, &self.runner)
-            .context("refusing to create a session container from the configured override image")
-    }
-
     /// Register `name` as a seat and launch (or reuse, or resume) its
     /// container from the configured session image. One login per container:
     /// the container is named for, and mounts only, this account's state.
@@ -408,7 +334,11 @@ impl<R: ContainerRunner> ClaudeSeatLifecycle<R> {
                 self.runner.start_existing(&container)?;
             }
             None => {
-                self.verify_session_config_image()?;
+                session_image::verify_configured_image(
+                    self.session_config.as_ref(),
+                    &self.image,
+                    &self.runner,
+                )?;
                 let home = ensure_seat_dirs(&self.seat_root, name)?;
                 self.runner.create_claude_seat(
                     &container,
@@ -416,7 +346,7 @@ impl<R: ContainerRunner> ClaudeSeatLifecycle<R> {
                     &home,
                     &requested,
                     &self.workspace,
-                    &self.extra_mounts(),
+                    session_image::configured_extra_mounts(self.session_config.as_ref()),
                 )?;
             }
         }
@@ -452,6 +382,20 @@ impl<R: ContainerRunner> ClaudeSeatLifecycle<R> {
             seat_registered: is_seat(&self.seat_root, name),
             workspace: state.and_then(|s| s.workspace),
         })
+    }
+
+    /// Every Claude pool account with its seat state: which are registered
+    /// seats, and the runtime and image each seat's container runs (#14371
+    /// AC8). Unregistered accounts are listed too (`seat_registered: false`),
+    /// since they dispatch on the host or per-sweep.
+    ///
+    /// # Errors
+    /// The Claude token pool cannot be read, or Docker cannot be asked.
+    pub fn list(&self) -> Result<Vec<SeatStatus>> {
+        account_inventory(&self.workspace, AccountProvider::Claude)?
+            .iter()
+            .map(|account| self.status(&account.id.name))
+            .collect()
     }
 
     /// Tear the container down cleanly (`docker stop` then `rm`). Refuses an

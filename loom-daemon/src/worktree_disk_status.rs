@@ -86,49 +86,9 @@ pub fn classify_worktree_names<S: AsRef<str>>(names: &[S]) -> (usize, usize, usi
     (issue, pr, other)
 }
 
-/// Total apparent size, in bytes, of everything under `path`.
-///
-/// Symlinks are counted at their own (tiny) size via `symlink_metadata` and
-/// never followed — a worktree containing a symlink to a large tree outside it
-/// must not be charged for that tree, and following one could otherwise loop.
-///
-/// Best-effort: an unreadable subdirectory or file contributes nothing rather
-/// than failing the whole measurement (a permissions hiccup in one worktree
-/// must not blank out a repo's census). Returns `None` only when `path`
-/// itself cannot be read at all.
-#[must_use]
-pub fn dir_size_bytes(path: &Path) -> Option<u64> {
-    fn walk(path: &Path, total: &mut u64) {
-        let Ok(entries) = std::fs::read_dir(path) else {
-            return;
-        };
-        for entry in entries.flatten() {
-            // `DirEntry::file_type` does NOT follow symlinks (it is
-            // `symlink_metadata`-backed), so a symlinked directory lands in
-            // the non-dir branch and is never recursed into.
-            //
-            // The size there must come from `symlink_metadata` too (#5939
-            // review): `DirEntry::metadata()` *follows* the link, which would
-            // charge a symlink the size of its target — exactly the
-            // double-count this walk is trying to avoid.
-            match entry.file_type() {
-                Ok(ft) if ft.is_dir() => walk(&entry.path(), total),
-                Ok(_) => {
-                    if let Ok(meta) = std::fs::symlink_metadata(entry.path()) {
-                        *total = total.saturating_add(meta.len());
-                    }
-                }
-                Err(_) => {}
-            }
-        }
-    }
-    if std::fs::read_dir(path).is_err() {
-        return None;
-    }
-    let mut total = 0u64;
-    walk(path, &mut total);
-    Some(total)
-}
+/// Total apparent size of everything under `path` — the shared walker in
+/// [`crate::fs_util`], re-exported so existing callers keep this path.
+pub use crate::fs_util::dir_size_bytes;
 
 /// Collect `root`'s worktree census (Issue #5939).
 ///

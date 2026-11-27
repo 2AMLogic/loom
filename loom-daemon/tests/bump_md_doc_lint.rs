@@ -59,8 +59,8 @@
 //! `bump_version()`, `set_version()`, `do_tag()`,
 //! `bump <major|minor|patch>`, `set <version>`, `--tag`) lived EXCLUSIVELY
 //! inside a markdown code fence (verified by a fence-position scan of the
-//! whole doc). That test is now `extract_fenced_block_after` + a real `bash
-//! -n` syntax check + end-to-end execution (`show`/`check`/`bump
+//! whole doc). That test is now `doc_lint_support::first_fenced_block_after` + a
+//! real `bash -n` syntax check + end-to-end execution (`show`/`check`/`bump
 //! patch`/`set <version> --tag` against a real git fixture) of the fenced
 //! `scripts/version.sh` template — see its doc comment below. There are no
 //! table/structure assertions in this file (bump.md has no markdown tables).
@@ -77,6 +77,9 @@
 
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
+#[allow(dead_code)]
+mod doc_lint_support;
+
 use std::fs;
 use std::path::PathBuf;
 use std::process::Command;
@@ -92,36 +95,6 @@ fn read_bump_md() -> String {
             BUMP_MD_RELATIVE,
         );
     })
-}
-
-/// Extracts the body of the first fenced code block (```` ```lang\n...\n``` ````)
-/// that appears at or after the given `anchor` substring in `content`.
-///
-/// This is the extract-and-execute primitive (#7979/#7993 precedent,
-/// `doc_lint_support::first_fenced_block_after`): rather than pinning the
-/// fence's literal contents as a `contains()` string, the caller extracts the
-/// fence body and RUNS it, so a behavior-preserving reword/relocation of the
-/// surrounding prose (or the fence's own comments) does not break the build —
-/// only an actual functional change does. Panics naming `anchor` if no fence
-/// is found or it is never closed — exactly the "someone deleted/broke the
-/// example" case this lint exists to catch.
-fn extract_fenced_block_after<'a>(content: &'a str, anchor: &str) -> &'a str {
-    let from = content
-        .find(anchor)
-        .unwrap_or_else(|| panic!("expected to find anchor `{anchor}` in bump.md"));
-    let rest = &content[from..];
-    let open = rest
-        .find("```")
-        .unwrap_or_else(|| panic!("expected a fenced code block after `{anchor}`, found none"));
-    let after_open = &rest[open + 3..];
-    let nl = after_open.find('\n').unwrap_or_else(|| {
-        panic!("malformed fence after `{anchor}`: no newline following the opening ```")
-    });
-    let body = &after_open[nl + 1..];
-    let close = body.find("```").unwrap_or_else(|| {
-        panic!("unterminated fence after `{anchor}` — the code block never closes")
-    });
-    &body[..close]
 }
 
 /// AC: skill file exists with the expected title.
@@ -275,7 +248,10 @@ fn bump_md_includes_version_sh_template() {
          scripts/version.sh template"
     );
 
-    let fence = extract_fenced_block_after(&content, anchor);
+    let from = content
+        .find(anchor)
+        .expect("anchor presence is asserted just above");
+    let (fence, _) = doc_lint_support::first_fenced_block_after(&content, from, anchor);
 
     // Syntax check: the WHOLE template (including its commented-out
     // per-shape placeholder sections) must parse as valid bash.

@@ -12,7 +12,6 @@
 //! token. It never holds a token.
 
 use std::path::Path;
-use std::sync::atomic::{AtomicU64, Ordering};
 
 use serde::{Deserialize, Serialize};
 
@@ -71,22 +70,18 @@ pub fn read_sidecar(dir: &Path) -> Option<Sidecar> {
 }
 
 /// Write `side` into `dir` atomically (write-then-rename). The temporary
-/// name is unique per process and call, so two publishers racing on one
-/// directory never interleave one file.
+/// name is unique per call ([`crate::fs_util::write_atomic`]), so two
+/// publishers racing on one directory never interleave one file.
 ///
 /// # Errors
 ///
 /// When the write or the rename fails.
 pub fn write_sidecar(dir: &Path, side: &Sidecar) -> std::io::Result<()> {
-    static SEQ: AtomicU64 = AtomicU64::new(0);
-    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
-    let tmp = dir.join(format!(".{SIDECAR}.{}.{seq}.tmp", std::process::id()));
-    let written = std::fs::write(&tmp, serde_json::to_vec(side).unwrap_or_default())
-        .and_then(|()| std::fs::rename(&tmp, dir.join(SIDECAR)));
-    if written.is_err() {
-        let _ = std::fs::remove_file(&tmp);
-    }
-    written
+    crate::fs_util::write_atomic(
+        &dir.join(SIDECAR),
+        &serde_json::to_vec(side).unwrap_or_default(),
+        crate::fs_util::AtomicOpts::default(),
+    )
 }
 
 /// Remove `dir`'s sidecar (a token-less profile describes no identity).

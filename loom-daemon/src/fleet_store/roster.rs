@@ -205,13 +205,9 @@ fn from_map(top: &serde_json::Map<String, Value>, home: &Path, source: &str) -> 
 }
 
 fn expand_root(root: &str, home: &Path, source: &str) -> Result<PathBuf> {
-    let p = if root == "~" {
-        home.to_path_buf()
-    } else if let Some(rest) = root.strip_prefix("~/") {
-        home.join(rest)
-    } else {
-        PathBuf::from(root)
-    };
+    // The roster's home is mandatory, so a bare `~` or `~/…` root always
+    // expands (issue #15372: shared [`crate::fs_util::expand_tilde_with_home`]).
+    let p = crate::fs_util::expand_tilde_with_home(root, Some(home));
     if !p.is_absolute() {
         bail!("{source}: `root` must be absolute or start with `~/` (got `{root}`)");
     }

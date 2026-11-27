@@ -20,8 +20,8 @@ use anyhow::Result;
 use clap::Args;
 
 use super::forge_action::{handle_forge_command, ForgeAction};
-use super::forge_merge_queue_cmd::MergeQueueAction;
 use crate::forge_merge_queue::mode::{resolve_merge_mode, MergeModeError, ResolvedMergeMode};
+use crate::forge_merge_queue::MergeQueueCmd;
 
 /// Exit status for a `forge` verb `loom-tools` does not serve (BSD
 /// `EX_USAGE`). Not `1`: `check-claim`, `check-open-pr` and friends use `1` as
@@ -182,17 +182,17 @@ impl ForgeAction {
             // the in-handler `may_write_from` (reconcile's queue branch,
             // group-check; `step` runs reconcile first) run on this path too.
             Self::MergeQueue { action } => match action.0 {
-                MergeQueueAction::Mode
-                | MergeQueueAction::Preflight { .. }
-                | MergeQueueAction::Status { .. }
-                | MergeQueueAction::Enqueue { .. }
-                | MergeQueueAction::Dequeue { .. }
-                | MergeQueueAction::Reconcile { .. }
-                | MergeQueueAction::Handoff { .. }
-                | MergeQueueAction::Step { .. }
-                | MergeQueueAction::Revoke { .. }
-                | MergeQueueAction::GroupCheck { .. }
-                | MergeQueueAction::AuthorizeCheck { .. } => true,
+                MergeQueueCmd::Mode
+                | MergeQueueCmd::Preflight { .. }
+                | MergeQueueCmd::Status { .. }
+                | MergeQueueCmd::Enqueue { .. }
+                | MergeQueueCmd::Dequeue { .. }
+                | MergeQueueCmd::Reconcile { .. }
+                | MergeQueueCmd::Handoff { .. }
+                | MergeQueueCmd::Step { .. }
+                | MergeQueueCmd::Revoke { .. }
+                | MergeQueueCmd::GroupCheck { .. }
+                | MergeQueueCmd::AuthorizeCheck { .. } => true,
             },
         }
     }

@@ -1,6 +1,8 @@
-//! Small filesystem/formatting helpers shared by the reclaim and GC modules
-//! (`target_dir_gc`, `tmpfs_reclaim`, `scratch_reclaim`, `git_tmp_reclaim`,
-//! `docker_image_clean`, `target_orphan_reclaim`).
+//! Small filesystem/formatting helpers shared across the crate: the reclaim
+//! and GC modules (`target_dir_gc`, `tmpfs_reclaim`, `scratch_reclaim`,
+//! `git_tmp_reclaim`, `docker_image_clean`, `target_orphan_reclaim`) and, since
+//! issue #15372, the one `~`-expansion convention every pool and forge path
+//! resolver delegates to ([`expand_tilde_with_home`]).
 
 use std::ffi::OsStr;
 use std::fs;
@@ -81,6 +83,134 @@ pub fn write_atomic(path: &Path, bytes: &[u8], opts: AtomicOpts) -> io::Result<(
     Ok(())
 }
 
+/// A held advisory `flock` on a lock file, released when dropped.
+///
+/// The one place the crate calls `libc::flock` for ordinary lock files
+/// (consolidated from eight hand-rolled copies, #15620). Every constructor
+/// retries `EINTR`, and [`Drop`] unlocks explicitly rather than relying on
+/// `close` (#11066, #11544): an `flock` lock belongs to the open file
+/// description, and a child that any thread forks shares that description
+/// until it execs. Closing only our copy would leave the lock held for as long
+/// as such a child lingers between fork and exec, so the next taker would read
+/// a lock held by a holder that has already finished. `LOCK_UN` releases the
+/// description itself, whoever else still has a copy. The kernel also releases
+/// the lock when the holder exits, so a killed holder cannot wedge the next.
+///
+/// Locks that must open their file differently (`O_NOFOLLOW`, an inherited
+/// descriptor, `openat`) stay local to their module.
+///
+/// On non-unix targets there is no portable advisory lock: acquisition always
+/// succeeds and nothing is held.
+#[derive(Debug)]
+pub struct FileLock(
+    // Held only so the descriptor (and so the lock) lives as long as `self`.
+    #[cfg_attr(not(unix), allow(dead_code))] fs::File,
+);
+
+impl FileLock {
+    /// Open `path` for locking, creating it (and its parent directory when the
+    /// path has one) if absent. The file is never truncated.
+    fn open(path: &Path) -> io::Result<fs::File> {
+        if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
+            fs::create_dir_all(dir)?;
+        }
+        fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(path)
+    }
+
+    /// Take the lock on `path`, blocking until it is free.
+    ///
+    /// # Errors
+    /// Creating the parent directory, opening the file, or `flock` failing.
+    pub fn lock_exclusive(path: &Path) -> io::Result<Self> {
+        let file = Self::open(path)?;
+        flock(&file, Operation::Exclusive, true)?;
+        Ok(Self(file))
+    }
+
+    /// Take the lock on `path` without blocking. `Ok(None)` means another
+    /// open file description holds it.
+    ///
+    /// # Errors
+    /// Anything other than contention: opening the file or `flock` failing.
+    pub fn try_lock_exclusive(path: &Path) -> io::Result<Option<Self>> {
+        Self::try_lock_exclusive_file(Self::open(path)?)
+    }
+
+    /// Take a shared lock on `path` without blocking. `Ok(None)` means an
+    /// exclusive holder has it.
+    ///
+    /// # Errors
+    /// Anything other than contention: opening the file or `flock` failing.
+    pub fn try_lock_shared(path: &Path) -> io::Result<Option<Self>> {
+        let file = Self::open(path)?;
+        Ok(flock(&file, Operation::Shared, false)?.then_some(Self(file)))
+    }
+
+    /// [`Self::try_lock_exclusive`] on a file the caller already opened, for a
+    /// lock whose file must not be created (`.create(false)`). The file is
+    /// closed again when the lock is refused.
+    ///
+    /// # Errors
+    /// Anything other than contention: `flock` failing.
+    pub fn try_lock_exclusive_file(file: fs::File) -> io::Result<Option<Self>> {
+        Ok(flock(&file, Operation::Exclusive, false)?.then_some(Self(file)))
+    }
+}
+
+#[derive(Clone, Copy)]
+enum Operation {
+    Shared,
+    Exclusive,
+}
+
+/// `flock(2)` with `EINTR` retried. `Ok(true)` once held; with `blocking`
+/// false, `Ok(false)` when another description holds it (`EWOULDBLOCK`).
+#[cfg(unix)]
+fn flock(file: &fs::File, op: Operation, blocking: bool) -> io::Result<bool> {
+    use std::os::unix::io::AsRawFd as _;
+    let mut flags = match op {
+        Operation::Shared => libc::LOCK_SH,
+        Operation::Exclusive => libc::LOCK_EX,
+    };
+    if !blocking {
+        flags |= libc::LOCK_NB;
+    }
+    loop {
+        // SAFETY: `file` owns a valid open descriptor for the duration of the
+        // call; no memory is shared with the kernel.
+        if unsafe { libc::flock(file.as_raw_fd(), flags) } == 0 {
+            return Ok(true);
+        }
+        let error = io::Error::last_os_error();
+        match error.kind() {
+            io::ErrorKind::Interrupted => {}
+            io::ErrorKind::WouldBlock if !blocking => return Ok(false),
+            _ => return Err(error),
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn flock(_file: &fs::File, _op: Operation, _blocking: bool) -> io::Result<bool> {
+    Ok(true)
+}
+
+#[cfg(unix)]
+impl Drop for FileLock {
+    fn drop(&mut self) {
+        use std::os::unix::io::AsRawFd as _;
+        // SAFETY: `flock` on a descriptor we still own; no memory is shared
+        // with the kernel. Failure is ignored: closing the descriptor next
+        // releases the lock anyway.
+        unsafe { libc::flock(self.0.as_raw_fd(), libc::LOCK_UN) };
+    }
+}
+
 /// Format a byte count as `B` / `K` / `M` / `G` with one decimal place.
 pub fn human_size(bytes: u64) -> String {
     let b = bytes as f64;
@@ -93,6 +223,64 @@ pub fn human_size(bytes: u64) -> String {
     } else {
         format!("{bytes}B")
     }
+}
+
+/// Total apparent size, in bytes, of everything under the directory `path`.
+///
+/// Symlinks are counted at their own (tiny) size via `symlink_metadata` and
+/// never followed — a tree containing a symlink to a large tree outside it
+/// must not be charged for that tree, and following one could otherwise loop.
+/// Directory inodes themselves contribute nothing; only non-directory entries
+/// are summed, with `saturating_add` so a pathological tree cannot overflow.
+///
+/// Best-effort: an unreadable subdirectory or file contributes nothing rather
+/// than failing the whole measurement (a permissions hiccup in one subtree
+/// must not abort a pass whose purpose is to free space). Returns `None` only
+/// when `path` itself cannot be read as a directory.
+#[must_use]
+pub fn dir_size_bytes(path: &Path) -> Option<u64> {
+    fs::read_dir(path).ok().map(sum_entries)
+}
+
+/// Best-effort byte size of `path`, which may be a file or a directory tree:
+/// a non-directory (including a symlink, never followed) is its own length, a
+/// directory is [`dir_size_bytes`], and anything unreadable is `0`. The
+/// size-only counterpart of [`newest_mtime_and_size`] for callers that discard
+/// the timestamp.
+#[must_use]
+pub fn tree_size_bytes(path: &Path) -> u64 {
+    match fs::symlink_metadata(path) {
+        Ok(meta) if meta.is_dir() => dir_size_bytes(path).unwrap_or(0),
+        Ok(meta) => meta.len(),
+        Err(_) => 0,
+    }
+}
+
+fn sum_entries(entries: fs::ReadDir) -> u64 {
+    let mut total = 0u64;
+    for entry in entries.flatten() {
+        // `DirEntry::file_type` does NOT follow symlinks, so a symlinked
+        // directory lands in the non-dir branch and is never recursed into.
+        // Accounting rule: a symlink contributes its own length, and a
+        // symlink to a directory is never traversed. The size is read with
+        // `symlink_metadata` so the non-following stat is explicit and
+        // platform-independent; `DirEntry::metadata()` would also report the
+        // link's own metadata rather than its target's.
+        match entry.file_type() {
+            Ok(ft) if ft.is_dir() => {
+                if let Ok(children) = fs::read_dir(entry.path()) {
+                    total = total.saturating_add(sum_entries(children));
+                }
+            }
+            Ok(_) => {
+                if let Ok(meta) = fs::symlink_metadata(entry.path()) {
+                    total = total.saturating_add(meta.len());
+                }
+            }
+            Err(_) => {}
+        }
+    }
+    total
 }
 
 /// Recursively find the newest mtime and cumulative size under `path`,
@@ -191,6 +379,41 @@ pub fn truncate_tail(s: &str, max: usize) -> String {
         .find(|&i| s.is_char_boundary(i))
         .unwrap_or(s.len());
     s[start..].trim().to_string()
+}
+
+/// Expand a leading tilde in `raw` against an explicit, optional home.
+///
+/// `~` resolves to the home itself and `~/rest` to `home/rest`; any other
+/// input — `~other/key`, a plain relative, an absolute path — and every input
+/// when no home is available is returned verbatim, so the caller's own
+/// validation still sees exactly what was configured (issue #15372: this is
+/// the one shared implementation the credential pools, fleet roster and
+/// forge identity used to carry as per-module copies).
+///
+/// The home *source* stays the caller's decision: `dirs::home_dir()`
+/// ([`expand_tilde`]), an env var read, or a value injected by a test — sites
+/// that must not fall back to OS account discovery pass their own lookup's
+/// result and get `None`-preserving behavior for free.
+#[must_use]
+pub(crate) fn expand_tilde_with_home(raw: &str, home: Option<&Path>) -> PathBuf {
+    if let Some(rest) = raw.strip_prefix("~/") {
+        if let Some(home) = home {
+            return home.join(rest);
+        }
+    } else if raw == "~" {
+        if let Some(home) = home {
+            return home.to_path_buf();
+        }
+    }
+    PathBuf::from(raw)
+}
+
+/// [`expand_tilde_with_home`] with the home from `dirs::home_dir()`: the
+/// form the credential pools use, where a discoverable account home is an
+/// acceptable substitute for `$HOME`.
+#[must_use]
+pub(crate) fn expand_tilde(raw: &str) -> PathBuf {
+    expand_tilde_with_home(raw, dirs::home_dir().as_deref())
 }
 
 #[cfg(test)]
@@ -323,5 +546,188 @@ mod tests {
         let q = td.path().join("public");
         write_atomic(&q, b"x", AtomicOpts::default()).unwrap();
         assert_eq!(fs::metadata(&q).unwrap().permissions().mode() & 0o777, 0o644);
+    }
+
+    #[test]
+    fn expand_tilde_with_home_covers_the_tilde_forms() {
+        // The full-form callers (pools, monitor dir, roster root): a bare `~`
+        // is the home, `~/rest` joins under it, anything else passes through.
+        let home = Path::new("/home/tester");
+        let cases: &[(&str, &str)] = &[
+            ("~", "/home/tester"),
+            ("~/key", "/home/tester/key"),
+            ("~other/key", "~other/key"),
+            ("plain", "plain"),
+            ("./rel", "./rel"),
+            ("/abs/key", "/abs/key"),
+        ];
+        for (raw, want) in cases {
+            assert_eq!(
+                expand_tilde_with_home(raw, Some(home)),
+                PathBuf::from(*want),
+                "raw = {raw}"
+            );
+        }
+    }
+
+    #[test]
+    fn expand_tilde_without_a_home_returns_the_input_verbatim() {
+        for raw in ["~", "~/key", "~other/key", "plain", "/abs"] {
+            assert_eq!(expand_tilde_with_home(raw, None), PathBuf::from(raw));
+        }
+    }
+
+    #[test]
+    fn expand_tilde_delegates_to_dirs_home_dir() {
+        // Only the pass-through arm is host-independent enough to pin here;
+        // the tilde arms are [`expand_tilde_with_home`]'s table above.
+        assert_eq!(expand_tilde("plain"), PathBuf::from("plain"));
+        assert_eq!(
+            expand_tilde("/abs/key"),
+            PathBuf::from("/abs/key"),
+            "an absolute path must never be rewritten"
+        );
+    }
+
+    #[test]
+    fn dir_size_bytes_sums_nested_files_and_skips_directory_inodes() {
+        let td = tempfile::tempdir().unwrap();
+        fs::create_dir_all(td.path().join("a/b")).unwrap();
+        fs::write(td.path().join("top"), [0u8; 100]).unwrap();
+        fs::write(td.path().join("a/mid"), [0u8; 200]).unwrap();
+        fs::write(td.path().join("a/b/leaf"), [0u8; 51]).unwrap();
+        assert_eq!(dir_size_bytes(td.path()), Some(351));
+    }
+
+    #[test]
+    fn dir_size_bytes_is_none_for_missing_or_file_and_zero_for_empty() {
+        let td = tempfile::tempdir().unwrap();
+        assert_eq!(dir_size_bytes(&td.path().join("nope")), None);
+        assert_eq!(dir_size_bytes(td.path()), Some(0));
+        let file = td.path().join("f");
+        fs::write(&file, [0u8; 7]).unwrap();
+        assert_eq!(dir_size_bytes(&file), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dir_size_bytes_does_not_follow_symlinked_directories() {
+        let outside = tempfile::tempdir().unwrap();
+        fs::write(outside.path().join("big"), vec![0u8; 10_000]).unwrap();
+        let td = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink(outside.path(), td.path().join("link")).unwrap();
+        let measured = dir_size_bytes(td.path()).unwrap();
+        assert!(measured < 10_000, "symlinked tree was charged (got {measured})");
+    }
+
+    #[test]
+    fn tree_size_bytes_handles_file_directory_and_missing_path() {
+        let td = tempfile::tempdir().unwrap();
+        fs::create_dir(td.path().join("d")).unwrap();
+        fs::write(td.path().join("d/x"), [0u8; 40]).unwrap();
+        fs::write(td.path().join("f"), [0u8; 9]).unwrap();
+        assert_eq!(tree_size_bytes(&td.path().join("d")), 40);
+        assert_eq!(tree_size_bytes(&td.path().join("f")), 9);
+        assert_eq!(tree_size_bytes(&td.path().join("nope")), 0);
+        // Agrees with the size half of `newest_mtime_and_size`.
+        assert_eq!(tree_size_bytes(td.path()), newest_mtime_and_size(td.path()).unwrap().1);
+    }
+    #[cfg(unix)]
+    #[test]
+    fn file_lock_exclusive_contends_across_separate_opens() {
+        let td = tempfile::tempdir().unwrap();
+        let path = td.path().join("nested/dir/a.lock");
+        let held = FileLock::try_lock_exclusive(&path)
+            .unwrap()
+            .expect("first taker wins");
+        assert!(FileLock::try_lock_exclusive(&path).unwrap().is_none());
+        assert!(FileLock::try_lock_shared(&path).unwrap().is_none());
+        drop(held);
+        assert!(FileLock::try_lock_exclusive(&path).unwrap().is_some());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn file_lock_shared_holders_coexist_but_exclude_exclusive() {
+        let td = tempfile::tempdir().unwrap();
+        let path = td.path().join("s.lock");
+        let a = FileLock::try_lock_shared(&path)
+            .unwrap()
+            .expect("first shared");
+        let b = FileLock::try_lock_shared(&path)
+            .unwrap()
+            .expect("second shared");
+        assert!(FileLock::try_lock_exclusive(&path).unwrap().is_none());
+        drop(a);
+        assert!(FileLock::try_lock_exclusive(&path).unwrap().is_none(), "one shared holder left");
+        drop(b);
+        assert!(FileLock::try_lock_exclusive(&path).unwrap().is_some());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn file_lock_drop_releases_even_while_a_duplicate_descriptor_lives() {
+        // The #11066/#11544 shape: a forked child shares the open file
+        // description. `try_clone` is the same sharing (`dup`); closing only
+        // our fd would leave the lock held through the clone.
+        let td = tempfile::tempdir().unwrap();
+        let path = td.path().join("fork.lock");
+        let held = FileLock::try_lock_exclusive(&path).unwrap().unwrap();
+        let _inherited = held.0.try_clone().unwrap();
+        drop(held);
+        assert!(
+            FileLock::try_lock_exclusive(&path).unwrap().is_some(),
+            "lock must be released on drop, not on the last close"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn file_lock_blocking_acquire_waits_for_the_holder() {
+        let td = tempfile::tempdir().unwrap();
+        let path = td.path().join("b.lock");
+        let held = FileLock::lock_exclusive(&path).unwrap();
+        let waiter = {
+            let path = path.clone();
+            std::thread::spawn(move || FileLock::lock_exclusive(&path).map(drop))
+        };
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        assert!(!waiter.is_finished(), "waiter must block while the lock is held");
+        drop(held);
+        waiter.join().unwrap().unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn file_lock_on_an_opened_file_never_creates_it() {
+        let td = tempfile::tempdir().unwrap();
+        let path = td.path().join("pre.lock");
+        assert!(fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .is_err());
+        fs::write(&path, b"").unwrap();
+        let open = || {
+            fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&path)
+                .unwrap()
+        };
+        let held = FileLock::try_lock_exclusive_file(open())
+            .unwrap()
+            .expect("free");
+        assert!(FileLock::try_lock_exclusive_file(open()).unwrap().is_none());
+        drop(held);
+        assert!(FileLock::try_lock_exclusive_file(open()).unwrap().is_some());
+    }
+
+    #[test]
+    fn file_lock_creates_the_lock_file_and_leaves_it_after_release() {
+        let td = tempfile::tempdir().unwrap();
+        let path = td.path().join("bare.lock");
+        drop(FileLock::lock_exclusive(&path).unwrap());
+        assert!(path.is_file(), "lock file must not be deleted on drop");
     }
 }

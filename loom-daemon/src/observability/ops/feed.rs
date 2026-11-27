@@ -25,8 +25,8 @@ use crate::telemetry::ops::{MetricName, MetricPoint};
 /// What found the merge a completion narrates.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Trigger {
-    /// An issue sweep's `sweep.issue.{N}.exited` (#4426).
-    SweepExit,
+    /// The sweep's numbered merge phase. Keep the historical `sweep_exit` metric label.
+    SweepMerge,
     /// A Champion merge step's `step.item.{N}.ended` (#12152).
     Step,
     /// The periodic merge-reconciliation pass (#4583).
@@ -37,7 +37,7 @@ impl Trigger {
     #[must_use]
     pub fn as_str(self) -> &'static str {
         match self {
-            Self::SweepExit => "sweep_exit",
+            Self::SweepMerge => "sweep_exit",
             Self::Step => "step",
             Self::Reconcile => "reconcile",
         }
@@ -134,7 +134,7 @@ mod tests {
             record_completions(Trigger::Step, false, 1);
             record_completions(Trigger::Step, false, 1);
             record_completions(Trigger::Reconcile, true, 3);
-            record_completions(Trigger::SweepExit, false, 0);
+            record_completions(Trigger::SweepMerge, false, 0);
             record_reconcile_pass(PassOutcome::Deferred);
             record_reconcile_pass(PassOutcome::Deferred);
             record_reconcile_pass(PassOutcome::Ran);

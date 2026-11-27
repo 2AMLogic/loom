@@ -42,9 +42,7 @@
 //! than directory+window — and #14048 delivers exactly that for the consumers
 //! that have the stream: a step's log holds its launch's whole event output,
 //! so [`crate::usage_source::native_session_ids`] parses the ids out of it,
-//! [`tokens_by_model_for_ids`] selects the rows by identity for the step-close
-//! telemetry record, and [`tokens_by_session_ids`] does the same for a
-//! step-dispatched completion (#14018). This matters
+//! and [`tokens_by_model_for_ids`] selects the rows by identity. This matters
 //! most where directory+window provably cannot separate work: two concurrent
 //! same-role steps dispatched in one workspace overlap in time by
 //! construction. Directory+window remains the key for consumers without a
@@ -100,66 +98,7 @@ pub const OPENCODE_DB_ENV: &str = "LOOM_OPENCODE_DB";
 const SESSION_QUERY: &str = "SELECT id, model, tokens_input, tokens_output, tokens_reasoning, \
      tokens_cache_read, tokens_cache_write, directory, time_created FROM session";
 
-/// How `session` rows are attributed: an exact id set when the caller has one
-/// (#14048), else the directory set every consumer used before it — the
-/// OpenCode counterpart of [`crate::codex_usage::SessionFilter`].
-///
-/// An entirely-empty filter (no directories, no ids) matches NOTHING: a
-/// caller with no key at all must not silently attribute every session on the
-/// host.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct SessionFilter {
-    /// Working directories to attribute, matched exactly against
-    /// `session.directory`. Empty ⇒ no directory constraint (only meaningful
-    /// together with [`Self::ids`], which is then the whole key).
-    pub directories: Vec<PathBuf>,
-    /// Exact `session.id` values to attribute — the `sessionID`s a launch's
-    /// own `--format json` event stream names. Empty ⇒ no id constraint.
-    pub ids: Vec<String>,
-}
-
-impl SessionFilter {
-    /// The directory+window key every consumer in the daemon used before
-    /// #14048, unchanged.
-    #[must_use]
-    pub fn directories(directories: &[PathBuf]) -> Self {
-        Self {
-            directories: directories.to_vec(),
-            ids: Vec::new(),
-        }
-    }
-
-    /// The exact-id key (#14048): the session ids a launch's own log names.
-    #[must_use]
-    pub fn ids(ids: &[String]) -> Self {
-        Self {
-            directories: Vec::new(),
-            ids: ids.to_vec(),
-        }
-    }
-
-    /// Whether a row's `id` / `directory` pass this filter — the reading-side
-    /// rule [`Self`]'s doc states: both constraints apply when both are set,
-    /// and an empty filter matches nothing.
-    #[must_use]
-    fn passes(&self, id: Option<&str>, directory: &str) -> bool {
-        if self.directories.is_empty() && self.ids.is_empty() {
-            return false;
-        }
-        if !self.directories.is_empty()
-            && !self
-                .directories
-                .iter()
-                .any(|d| d.to_str().is_some_and(|d| d == directory))
-        {
-            return false;
-        }
-        if !self.ids.is_empty() && !id.is_some_and(|id| self.ids.iter().any(|want| want == id)) {
-            return false;
-        }
-        true
-    }
-}
+pub use crate::session_filter::SessionFilter;
 
 /// Bounded wait for a lock held by a live OpenCode process, mirroring
 /// `crate::tokens_pool::monitor_db`'s own budget for the same reason: a held
@@ -543,7 +482,7 @@ impl RawSessionRow {
         window: Option<(DateTime<Utc>, DateTime<Utc>)>,
     ) -> Option<OpencodeSessionUsage> {
         let directory = self.directory?;
-        if !filter.passes(self.id.as_deref(), &directory) {
+        if !filter.matches(&directory, self.id.as_deref()) {
             return None;
         }
         // An id-keyed filter (#14048) selects the row by identity: the window
@@ -709,23 +648,6 @@ pub fn tokens_by_model_for_ids(
     home: Option<&Path>,
 ) -> Option<Vec<ModelUsageTotals>> {
     fold_sessions(sessions_for_ids(ids, home))
-}
-
-/// Per-model token totals for exactly the sessions named in `ids`, across every
-/// installed OpenCode version's store (#14018) — [`tokens_by_model`] keyed on
-/// session id. The attribution a step-dispatched completion needs: a step's
-/// log names the sessions it ran, and the session store's `directory` is the
-/// workspace root shared by every session in the repo, so directory + window
-/// would fold in whichever neighbour overlapped. `None` — never
-/// `Some(vec![])` — when `ids` is empty, no store was found, or no named
-/// session recorded usage.
-#[must_use]
-pub fn tokens_by_session_ids(ids: &[String], home: Option<&Path>) -> Option<Vec<ModelUsageTotals>> {
-    // An empty id set is the empty filter: [`sessions_selected`] returns for it
-    // before any store discovery, so this is `None` without a separate guard,
-    // and shares that function's cross-store dedupe with
-    // [`tokens_by_model_for_ids`].
-    tokens_by_model_for_ids(ids, home)
 }
 
 /// The usage rows or the reason a by-id read could not produce them.

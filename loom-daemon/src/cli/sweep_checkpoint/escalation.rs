@@ -153,7 +153,7 @@ pub(super) fn run(
             // PR merged or parked for good: drop its history everywhere.
             if let Some(obj) = record.as_object_mut().filter(|_| target != pr_target) {
                 if obj.remove(KEY).is_some() {
-                    persist(dir, &target, &record)?;
+                    persist(&target, &record)?;
                 }
             }
             return match std::fs::remove_file(&pr_target) {
@@ -198,7 +198,7 @@ pub(super) fn run(
     // Identity and count are one record, one atomic write.
     if changed {
         record[KEY] = json!(state);
-        persist(dir, &target, &record)?;
+        persist(&target, &record)?;
     }
     writeln!(out, "{line}").map_err(io_error)
 }

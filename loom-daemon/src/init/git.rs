@@ -6,7 +6,6 @@
 use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 use super::ValidationReport;
 
@@ -22,39 +21,14 @@ use super::ValidationReport;
 /// // SSH: git@github.com:owner/repo.git -> Some(("owner", "repo"))
 /// ```
 pub fn extract_repo_info(workspace_path: &Path) -> Option<(String, String)> {
-    // Get git remote URL
-    let output = Command::new("git")
-        .args(["remote", "get-url", "origin"])
-        .current_dir(workspace_path)
-        .output()
-        .ok()?;
-
-    if !output.status.success() {
+    // Bounded read (#9715) + shared parser (#15624).
+    let remote_url = crate::forge_cmd::get_remote_url(workspace_path)?;
+    let (host, nwo) = crate::forge_cmd::parse_remote_url(&remote_url)?;
+    if host != "github.com" {
         return None;
     }
-
-    let remote_url = String::from_utf8(output.stdout).ok()?;
-    let remote_url = remote_url.trim();
-
-    // Parse HTTPS URL: https://github.com/owner/repo.git
-    if let Some(https_path) = remote_url.strip_prefix("https://github.com/") {
-        let path = https_path.strip_suffix(".git").unwrap_or(https_path);
-        let parts: Vec<&str> = path.split('/').collect();
-        if parts.len() >= 2 {
-            return Some((parts[0].to_string(), parts[1].to_string()));
-        }
-    }
-
-    // Parse SSH URL: git@github.com:owner/repo.git
-    if let Some(ssh_path) = remote_url.strip_prefix("git@github.com:") {
-        let path = ssh_path.strip_suffix(".git").unwrap_or(ssh_path);
-        let parts: Vec<&str> = path.split('/').collect();
-        if parts.len() >= 2 {
-            return Some((parts[0].to_string(), parts[1].to_string()));
-        }
-    }
-
-    None
+    let (owner, repo) = nwo.split_once('/')?;
+    Some((owner.to_string(), repo.to_string()))
 }
 
 /// Check if the workspace is the Loom source repository itself

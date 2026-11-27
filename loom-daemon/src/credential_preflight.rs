@@ -730,6 +730,8 @@ pub(crate) fn reset_forge_credential_streaks() {
     *forge_credential_streaks()
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner) = CredentialStreaks::default();
+    primary_token::reset(); // #15327
+    loom_ui::reset_expired_for_tests();
 }
 
 /// Resolve the stale-credential grace window: **env >
@@ -791,10 +793,13 @@ pub fn record_forge_credential_success(source: &str) {
 #[must_use]
 pub fn forge_credential_stale() -> bool {
     let grace = resolve_forge_credential_stale_grace();
-    forge_credential_streaks()
+    let streak_stale = forge_credential_streaks()
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .is_stale_at(Instant::now(), grace)
+        .is_stale_at(Instant::now(), grace);
+    // #15327: a published primary token past its `expires_at` is stale whether
+    // or not any refresh tick is still running to record a failure.
+    streak_stale || primary_token::stale_hold(grace)
 }
 
 /// A short, non-secret human-readable summary of the current stale window, or
@@ -803,10 +808,17 @@ pub fn forge_credential_stale() -> bool {
 #[must_use]
 pub fn forge_credential_stale_summary() -> Option<String> {
     let grace = resolve_forge_credential_stale_grace();
-    forge_credential_streaks()
+    let streaks = forge_credential_streaks()
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .summary_at(Instant::now(), grace)
+        .summary_at(Instant::now(), grace);
+    // #15327: expiry of the published primary token, when no streak explains it.
+    streaks.or_else(|| {
+        primary_token::stale_hold(grace)
+            .then(primary_token::expiry_reason)
+            .flatten()
+            .map(|reason| format!("{CREDENTIAL_SOURCE_PRIMARY}: {reason}"))
+    })
 }
 
 /// Resolve the `github-app-token.sh` path: prefer the installed
@@ -838,28 +850,7 @@ pub fn resolve_github_app_script(root: &Path) -> Option<PathBuf> {
 pub fn nwo_from_git_remote(cwd: &Path) -> Option<String> {
     // Bounded (#9715): a hung `git` must not stall the caller.
     let url = crate::forge_cmd::get_remote_url(cwd)?;
-    let stripped = url.strip_suffix(".git").unwrap_or(url.as_str());
-
-    let path = if let Some(rest) = stripped.strip_prefix("git@") {
-        // SSH: git@host:owner/repo
-        let (_host, p) = rest.split_once(':')?;
-        p
-    } else if let Some(rest) = stripped.strip_prefix("https://") {
-        // HTTPS: https://host/owner/repo
-        let (_host, p) = rest.split_once('/')?;
-        p
-    } else {
-        let rest = stripped.strip_prefix("http://")?;
-        let (_host, p) = rest.split_once('/')?;
-        p
-    };
-
-    let trimmed = path.trim_matches('/');
-    let (owner, repo) = trimmed.split_once('/')?;
-    if owner.is_empty() || repo.is_empty() {
-        return None;
-    }
-    Some(format!("{owner}/{repo}"))
+    crate::forge_cmd::parse_remote_url(&url).map(|(_, nwo)| nwo)
 }
 
 /// The owner segment of a `"owner/repo"` string (everything before the first
@@ -888,7 +879,7 @@ pub fn detect_cross_owner_repos(
     let root_owner = owner_of(root_owner_repo);
     managed_owner_repos
         .iter()
-        .filter(|nwo| owner_of(nwo) != root_owner)
+        .filter(|nwo| !owner_of(nwo).eq_ignore_ascii_case(root_owner))
         .cloned()
         .collect()
 }
@@ -1283,7 +1274,7 @@ pub(crate) fn apply_gh_config_for_root_with_recovery_using(
         {
             let root_owner = owner_of(root_owner_repo);
             let primary_owner = owner_of(primary_owner_repo);
-            if !root_owner.is_empty() && root_owner != primary_owner {
+            if !root_owner.is_empty() && !root_owner.eq_ignore_ascii_case(primary_owner) {
                 // Ignore the "retry me" signal deliberately: unlike
                 // `forge_listing.rs`'s caller (which retries a specific
                 // already-failed `gh` call), there is nothing to retry here
@@ -1367,6 +1358,28 @@ pub fn register_owner_gh_config_dir(owner: &str, config_dir: &Path) {
     if let Ok(mut map) = owner_slug_config_registry().lock() {
         map.insert(owner.to_string(), config_dir.to_path_buf());
     }
+}
+
+/// Drop every owner registration — the slug-keyed map (#5431) and the
+/// refresh-source map (#6171) — whose `GH_CONFIG_DIR` is exactly `config_dir`,
+/// and return how many owners were dropped. Matching on the directory rather
+/// than the owner key means a registration pointing anywhere else (another
+/// root's live credential) is never touched. The reap of a stale by-owner
+/// directory calls this so the registry and the disk never disagree: without
+/// it every [`gh_config_dir_for_owner_slug`] caller keeps being pointed at a
+/// directory with no `hosts.yml`, and the "already established" short-circuits
+/// (`write_scope`, `cross_owner`) never re-mint (#14548).
+pub fn unregister_owner_gh_config_dir(config_dir: &Path) -> usize {
+    let mut dropped = 0;
+    if let Ok(mut map) = owner_slug_config_registry().lock() {
+        let before = map.len();
+        map.retain(|_, dir| dir.as_path() != config_dir);
+        dropped += before - map.len();
+    }
+    if let Ok(mut map) = owner_refresh_registry().lock() {
+        map.retain(|_, (_, dir)| dir.as_path() != config_dir);
+    }
+    dropped
 }
 
 /// The `GH_CONFIG_DIR` registered for the owner segment of `owner_repo`, or
@@ -1468,7 +1481,9 @@ pub fn plan_cross_owner_credentials(
             continue;
         }
         let owner = owner_of(owner_repo);
-        if owner.is_empty() || owner == root_owner {
+        // GitHub owner names are case-insensitive: `2amlogic` is the root owner
+        // `2AMLogic`, matching `reap_stale_owner_credentials` (#15159).
+        if owner.is_empty() || owner.eq_ignore_ascii_case(root_owner) {
             continue;
         }
         match by_owner.get_mut(owner) {
@@ -1717,6 +1732,7 @@ pub mod owner_drift;
 pub mod pool;
 pub use pool::attach as attach_pool;
 mod minted;
+pub mod primary_token;
 pub use minted::{publish_minted, publish_outcome, Minted, ScopedIssuance};
 
 #[cfg(test)]
@@ -2023,6 +2039,20 @@ mod tests {
         assert!(set_url.success());
 
         assert_eq!(nwo_from_git_remote(path), Some("2AMLogic/klayout-tools".to_string()));
+
+        // #15624: ssh:// and userinfo remotes resolve through the shared parser.
+        for url in [
+            "ssh://git@github.com/o/r.git",
+            "https://token@github.com/o/r",
+        ] {
+            let set_url = Command::new("git")
+                .args(["remote", "set-url", "origin", url])
+                .current_dir(path)
+                .status()
+                .unwrap();
+            assert!(set_url.success());
+            assert_eq!(nwo_from_git_remote(path), Some("o/r".to_string()), "{url}");
+        }
     }
 
     #[test]
@@ -2107,6 +2137,26 @@ mod tests {
         // First-seen repo of that owner is the representative mint key.
         assert_eq!(plans[0].representative_owner_repo, "2AMLogic/marketing");
         assert_eq!(plans[0].roots, vec![PathBuf::from("/ws/marketing"), PathBuf::from("/ws/2am")]);
+    }
+
+    /// #15159: owner names are case-insensitive, so a managed root whose origin
+    /// spells the root owner in a different case is not a cross-owner.
+    #[test]
+    fn plan_cross_owner_credentials_skips_root_owner_in_any_ascii_case() {
+        let managed = vec![
+            (PathBuf::from("/ws/loom"), "2AMLogic/loom".to_string()),
+            (PathBuf::from("/ws/app"), "2amlogic/app".to_string()),
+            (PathBuf::from("/ws/other"), "rjwalters/other".to_string()),
+        ];
+        let plans = plan_cross_owner_credentials("2AMLogic", &managed);
+        assert_eq!(plans.len(), 1, "{plans:?}");
+        assert_eq!(plans[0].owner, "rjwalters");
+        assert!(detect_cross_owner_repos(
+            "2AMLogic/loom",
+            &["2amlogic/app".to_string(), "rjwalters/other".to_string()]
+        )
+        .iter()
+        .all(|nwo| nwo == "rjwalters/other"));
     }
 
     #[test]

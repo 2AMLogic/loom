@@ -708,12 +708,12 @@ fn a_failed_removal_keeps_the_merge_record_and_writes_no_false_ledger_line() {
         assert!(after.done.contains(pass), "{pass} was lost from {:?}", after.done);
     }
     assert!(after.complete());
-    assert!(
-        !root
-            .join(".loom/state/merge-bookkeeping/.pr-9.json.tmp")
-            .exists(),
-        "a temp record was left behind"
-    );
+    let stray: Vec<_> = std::fs::read_dir(root.join(".loom/state/merge-bookkeeping"))
+        .unwrap()
+        .filter_map(|e| e.ok().map(|e| e.file_name().to_string_lossy().into_owned()))
+        .filter(|name| crate::fs_util::is_staging_name(name))
+        .collect();
+    assert!(stray.is_empty(), "a temp record was left behind: {stray:?}");
     // The branch is still checked out in the locked worktree, so it stays.
     assert_eq!(git(&root, &["rev-parse", BRANCH]), fx.head);
 }

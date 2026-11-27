@@ -316,10 +316,6 @@ fn mtime_secs(path: &Path) -> Option<u64> {
 
 /// Write the record atomically (tmp + rename), so a reader never sees half.
 pub fn write_state(path: &Path, s: &State) -> std::io::Result<()> {
-    if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir)?;
-    }
-    let tmp = path.with_extension(format!("tmp.{}", std::process::id()));
     let body = format!(
         "# loom-daemon watchdog hang-recovery record (#7855). Delete to re-arm.\n\
          last_attempt_at={}\nlast_attempt_pid={}\nunhealed={}\nlast_result={}\n",
@@ -328,8 +324,7 @@ pub fn write_state(path: &Path, s: &State) -> std::io::Result<()> {
         s.unhealed,
         s.last_result.replace('\n', " ")
     );
-    std::fs::write(&tmp, body)?;
-    std::fs::rename(&tmp, path)
+    crate::fs_util::write_atomic(path, body.as_bytes(), crate::fs_util::AtomicOpts::default())
 }
 
 fn lock_path(state_path: &Path) -> PathBuf {

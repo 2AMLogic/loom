@@ -3302,19 +3302,22 @@ fn capacity_advisory_event_topic() {
 // ===================================================================
 
 #[test]
-fn test_dispatch_held_per_root_gate_in_flight_holds_only_its_own_root() {
+fn test_gate_in_flight_holds_only_its_own_root() {
     // A root whose gate run is in flight is held; a sibling with no gate in
     // flight is NOT — the #3930 per-repo isolation contract must survive.
     let states = WorkspaceHealthStates::new();
     let root_a = std::path::PathBuf::from("/tmp/repo-a");
     let root_b = std::path::PathBuf::from("/tmp/repo-b");
     states.get_or_create(&root_a).set_gate_in_flight(true);
-    let held = dispatch_held_per_root(&states, &[root_a, root_b], true);
+    let held: Vec<_> = halt_cause::causes_per_root(&states, &[root_a, root_b], true, &[], false)
+        .iter()
+        .map(Option::is_some)
+        .collect();
     assert_eq!(held, vec![true, false], "only the in-flight root is held");
 }
 
 #[test]
-fn test_dispatch_held_per_root_suppressor_disabled_is_is_halted_only() {
+fn test_disabled_gate_suppressor_holds_only_halted_roots() {
     // With the suppressor off, the in-flight term drops out entirely — the
     // result is byte-for-byte the pre-#4084 `is_halted`-only vector, even
     // for a root with a gate run in flight.
@@ -3323,14 +3326,21 @@ fn test_dispatch_held_per_root_suppressor_disabled_is_is_halted_only() {
     let root_b = std::path::PathBuf::from("/tmp/repo-b");
     states.get_or_create(&root_a).set_gate_in_flight(true);
     states.get_or_create(&root_b).set_halted(true);
-    let held = dispatch_held_per_root(&states, &[root_a.clone(), root_b.clone()], false);
+    let roots = [root_a, root_b];
+    let held: Vec<_> = halt_cause::causes_per_root(&states, &roots, false, &[], false)
+        .iter()
+        .map(Option::is_some)
+        .collect();
     assert_eq!(
         held,
         vec![false, true],
         "suppressor off ⇒ gate-in-flight is ignored; only verified-red holds"
     );
     // Sanity: with the suppressor on, root_a is additionally held.
-    let held_on = dispatch_held_per_root(&states, &[root_a, root_b], true);
+    let held_on: Vec<_> = halt_cause::causes_per_root(&states, &roots, true, &[], false)
+        .iter()
+        .map(Option::is_some)
+        .collect();
     assert_eq!(held_on, vec![true, true]);
 }
 
@@ -3374,14 +3384,16 @@ fn test_admission_stays_held_for_a_pause_roll_and_resumes_when_it_ends_without_a
 
 #[test]
 fn test_gate_in_flight_root_dispatches_zero_new_sweeps() {
-    // End-to-end through `tick_multi`: a root marked held (as
-    // `dispatch_held_per_root` would for a gate in flight) dispatches
-    // nothing, while its healthy sibling gets the shared slot.
+    // A gate in flight holds its root through `tick_multi`, while its
+    // healthy sibling gets the shared slot.
     let states = WorkspaceHealthStates::new();
     let root_a = std::path::PathBuf::from("/tmp/repo-a");
     let root_b = std::path::PathBuf::from("/tmp/repo-b");
     states.get_or_create(&root_a).set_gate_in_flight(true);
-    let halted = dispatch_held_per_root(&states, &[root_a, root_b], true);
+    let halted: Vec<_> = halt_cause::causes_per_root(&states, &[root_a, root_b], true, &[], false)
+        .iter()
+        .map(Option::is_some)
+        .collect();
 
     let mut multi = vec![
         (FakeSource::once(vec![issue(1)]), RecordingDispatcher::default()),

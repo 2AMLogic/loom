@@ -805,13 +805,12 @@ impl RecordStore {
     /// The record could not be persisted; the caller leaves the merge for a
     /// later tick rather than act on an unpinned identity.
     pub fn store(&self, r: &MergeRecord) -> std::io::Result<()> {
-        std::fs::create_dir_all(&self.dir)?;
         let text =
             serde_json::to_string_pretty(r).map_err(|e| std::io::Error::other(e.to_string()))?;
-        std::fs::write(self.dir.join(format!(".pr-{}.json.tmp", r.pr)), text)?;
-        std::fs::rename(
-            self.dir.join(format!(".pr-{}.json.tmp", r.pr)),
-            self.dir.join(format!("pr-{}.json", r.pr)),
+        crate::fs_util::write_atomic(
+            &self.dir.join(format!("pr-{}.json", r.pr)),
+            text.as_bytes(),
+            crate::fs_util::AtomicOpts::default(),
         )
     }
 
@@ -1371,9 +1370,9 @@ fn close_check(
 
 /// The out-of-band AC hold (#6883): reopen if the merge already closed the
 /// issue, post the marker-idempotent notice, and add `loom:operator`. The
-/// marker is byte-identical to Champion's own
-/// (`champion-pr-merge.md` → `hold_issue_on_unverified_ac`), so a hold
-/// posted by either side is recognized by both.
+/// marker is byte-identical to the one
+/// (Champion's former `hold_issue_on_unverified_ac`, retired by #14905), so a
+/// hold posted before the cutover is still recognized and never re-posted.
 fn hold_for_unverified_ac(
     f: &impl Forge,
     rec: &MergeRecord,

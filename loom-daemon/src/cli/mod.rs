@@ -110,6 +110,7 @@ pub(crate) mod host;
 mod host_id_cmd;
 pub(crate) mod inflight;
 mod install_binary;
+mod verify_output_decl;
 pub use install_binary::InstallBinaryCommand;
 pub(crate) mod install_compat_cli;
 mod label_duplicates;

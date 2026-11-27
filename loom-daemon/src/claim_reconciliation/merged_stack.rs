@@ -53,9 +53,9 @@
 //! so the operator's `reconcile-stack.sh` fallback keeps working — the pin is
 //! *preserved* when the shell wrote it and *positively recovered* when only
 //! the forge's PR ref remains. A pin that disagrees with the recorded head
-//! loses: the recorded head is what actually merged, and [`restack`]'s
-//! ancestry check is what makes a wrong boundary refuse rather than replay
-//! the wrong range.
+//! loses: the recorded head is what actually merged, and the guarded replay's
+//! ancestry check ([`super::orphan_stack_git::guarded_replay`]) is what makes
+//! a wrong boundary refuse rather than replay the wrong range.
 //!
 //! # Defer vs retarget-before-delete — the distinction is kept
 //!
@@ -94,17 +94,17 @@
 //! role-runner shard the orphan pass takes (#10634).
 
 use std::collections::BTreeSet;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use super::open_pr_listing::RestPull;
 use super::orphan_stack as orphan;
 use super::orphan_stack_git as git;
+use super::stack_reconcile;
 use crate::branch_update::Strategy;
 use crate::merge_pr::reconcile::{
     child_route, issue_from_branch, route_with_lease, LeaseState, Route,
 };
 use crate::merge_pr::stacked_children::{is_stackable_parent_branch, pin_ref, try_establish_pin};
-use crate::rebase_guard::Verdict as GuardVerdict;
 
 /// Kill switch for this pass (`0`/`false`/`no`/`off` disables). Defaults ON.
 pub const MERGED_STACK_ENABLED_ENV: &str = "LOOM_MERGED_STACK_RECONCILE";
@@ -129,7 +129,7 @@ pub const PUSHED_MARKER_PREFIX: &str = "<!-- loom:merged-stack pushed";
 pub const FLAGGED_MARKER_PREFIX: &str = "<!-- loom:merged-stack flagged";
 
 /// How many stack levels above a restacked child are replayed in one pass.
-pub const MAX_CASCADE_DEPTH: usize = 8;
+pub const MAX_CASCADE_DEPTH: usize = stack_reconcile::MAX_CASCADE_DEPTH;
 
 /// Is this pass enabled? See [`MERGED_STACK_ENABLED_ENV`].
 #[must_use]
@@ -215,35 +215,26 @@ pub fn deferred_marker(parent: u32, branch: &str) -> String {
 /// it names it as the pushed head.
 #[must_use]
 pub fn pushed_marker(parent: u32, old_head: &str, new_head: &str) -> String {
-    format!("{PUSHED_MARKER_PREFIX} parent={parent} old={old_head} new={new_head} -->")
+    stack_reconcile::pushed_marker(PUSHED_MARKER_PREFIX, parent, old_head, new_head)
 }
 
 /// If an earlier pass already pushed this child's replay and only its retarget
 /// failed, the head it had before that push.
 #[must_use]
 pub fn pushed_earlier(bodies: &[String], parent: u32, head: &str) -> Option<String> {
-    let suffix = format!(" new={head} -->");
-    let prefix = format!("{PUSHED_MARKER_PREFIX} parent={parent} old=");
-    bodies.iter().find_map(|b| {
-        b.lines().find_map(|l| {
-            let old = l.trim().strip_prefix(&prefix)?.strip_suffix(&suffix)?;
-            (!old.is_empty() && !old.contains(' ')).then(|| old.to_string())
-        })
-    })
+    stack_reconcile::pushed_earlier(PUSHED_MARKER_PREFIX, bodies, parent, head)
 }
 
 /// The marker line for a flag on `head` caused by parent PR `parent`.
 #[must_use]
 pub fn flagged_marker(parent: u32, head: &str) -> String {
-    format!("{FLAGGED_MARKER_PREFIX} parent={parent} head={head} -->")
+    stack_reconcile::flagged_marker(FLAGGED_MARKER_PREFIX, parent, head)
 }
 
 /// Has this pass already flagged the child at `head` for `parent`?
 #[must_use]
 pub fn already_flagged(bodies: &[String], parent: u32, head: &str) -> bool {
-    bodies
-        .iter()
-        .any(|b| b.contains(&flagged_marker(parent, head)))
+    stack_reconcile::already_flagged(FLAGGED_MARKER_PREFIX, bodies, parent, head)
 }
 
 /// Was this child already deferred for `parent_branch` — by this pass OR by
@@ -273,6 +264,17 @@ pub enum FlagReason {
     NotLoomBranch,
     /// The replay could not run or its result was refused.
     Refused(String),
+}
+
+impl From<stack_reconcile::CascadeFlag> for FlagReason {
+    fn from(flag: stack_reconcile::CascadeFlag) -> Self {
+        match flag {
+            stack_reconcile::CascadeFlag::Conflict(paths) => Self::Conflict(paths),
+            stack_reconcile::CascadeFlag::ParentRewritten => Self::ParentRewritten,
+            stack_reconcile::CascadeFlag::NotLoomBranch => Self::NotLoomBranch,
+            stack_reconcile::CascadeFlag::Refused(why) => Self::Refused(why),
+        }
+    }
 }
 
 /// Everything a flag comment interpolates.
@@ -572,16 +574,6 @@ pub struct MergedStats {
     pub flagged: usize,
     /// Children left for a later tick (a gate, an unknown, a transient failure).
     pub skipped: usize,
-}
-
-/// What one restack attempt produced.
-enum Restack {
-    /// Published; the new head.
-    Done(String),
-    /// Must be flagged.
-    Flag(FlagReason),
-    /// Nothing published; worth retrying on a later tick.
-    Transient(String),
 }
 
 /// One pass over `open` for the repository checked out at `repo`. `records`
@@ -990,31 +982,42 @@ fn process_child(
     // A branch pushed by an earlier pass whose retarget then failed is
     // already replayed: only the retarget is retried (#12769 shape), and the
     // cascade must not re-run against an already-published head.
-    let (old_head, attempt, replayed_now) = match pushed_earlier(&bodies, parent.pr, head) {
-        Some(old) => (old, Restack::Done(head.to_string()), false),
+    let (old_head, outcome, replayed_now) = match pushed_earlier(&bodies, parent.pr, head) {
+        Some(old) => (old, git::ReplayOutcome::Pushed(head.to_string()), false),
         None => (
             head.to_string(),
-            restack(repo, child.number, branch, head, &onto, &parent.head),
+            git::guarded_replay(
+                repo,
+                &git::ReplayRequest {
+                    pr: child.number,
+                    branch,
+                    head,
+                    onto: &onto,
+                    upstream: &parent.head,
+                    scratch: &scratch_path(repo, child.number),
+                    pass: "merged stack",
+                },
+            ),
             true,
         ),
     };
     let head = old_head.as_str();
-    match attempt {
-        Restack::Done(new_head) => {
+    match outcome {
+        git::ReplayOutcome::Pushed(new_head) => {
             if replayed_now {
                 stats.restacked += 1;
                 // The grandchildren follow the push even when the retarget
                 // below fails — the branch is already published.
-                cascade(
+                let this_repo = repo_identity.as_ref().and_then(Option::as_deref);
+                cascade_children(
                     forge,
                     repo,
                     open,
-                    &repo_identity.clone().flatten(),
+                    this_repo,
                     default_branch,
                     child,
                     head,
                     &new_head,
-                    1,
                     stats,
                 );
             }
@@ -1076,10 +1079,13 @@ fn process_child(
                 );
             }
         }
-        Restack::Flag(reason) => {
-            flag(forge, &flag_ctx(child, parent, default_branch, &parent.head), &reason, stats);
-        }
-        Restack::Transient(e) => {
+        git::ReplayOutcome::Refused(r) => flag(
+            forge,
+            &flag_ctx(child, parent, default_branch, &parent.head),
+            &FlagReason::from(stack_reconcile::CascadeFlag::from(r)),
+            stats,
+        ),
+        git::ReplayOutcome::Transient(e) => {
             log::info!(
                 "claim_reconciliation (merged stack): PR #{} not restacked this tick: {e}",
                 child.number
@@ -1116,204 +1122,70 @@ fn flag_ctx<'a>(
     }
 }
 
-/// Replay `upstream..head` of `branch` onto `onto`, guard it, and publish it.
-fn restack(repo: &Path, pr: u32, branch: &str, head: &str, onto: &str, upstream: &str) -> Restack {
-    match git::ensure_pr_head(repo, pr, head) {
-        git::HeadFetch::Present => {}
-        git::HeadFetch::FetchFailed(e) => {
-            return Restack::Transient(format!("its head {head} could not be fetched: {e}"))
-        }
-        git::HeadFetch::Missing => {
-            return Restack::Transient(format!("its head {head} is not in refs/pull/{pr}/head"))
-        }
-    }
-    match git::live_tip(repo, branch) {
-        Ok(Some(live)) if live == head => {}
-        Ok(Some(live)) => {
-            return Restack::Transient(format!(
-                "the remote branch is at {live}, not the listed head {head}"
-            ))
-        }
-        Ok(None) => return Restack::Transient(format!("the remote has no branch '{branch}'")),
-        Err(e) => return Restack::Transient(e),
-    }
-    // `rebase --onto <onto> <upstream>` with a non-ancestor upstream does not
-    // fail: it replays the wrong range (`reconcile_stack`'s
-    // `Prerequisite::ParentAncestry`). Refuse.
-    match git::is_ancestor(repo, upstream, head) {
-        Ok(true) => {}
-        Ok(false) => return Restack::Flag(FlagReason::ParentRewritten),
-        Err(e) => return Restack::Transient(e),
-    }
-    let scratch = repo.join(format!(".loom/worktrees/merged-restack-pr-{pr}"));
-    let new_head = match git::replay(repo, &scratch, head, onto, upstream) {
-        Ok(h) => h,
-        Err(git::ReplayError::Conflict(paths)) => {
-            return Restack::Flag(FlagReason::Conflict(paths))
-        }
-        Err(git::ReplayError::Failed(e)) => return Restack::Transient(e),
-    };
-    match crate::rebase_guard::assess(repo, onto, head, &new_head) {
-        GuardVerdict::Clean(_) => {}
-        GuardVerdict::Emptied { .. } => {
-            return Restack::Flag(FlagReason::Refused(
-                "replaying it would leave no change of its own (the rebase guard reported \
-                 EMPTIED, #9282)"
-                    .to_string(),
-            ))
-        }
-        GuardVerdict::ResolutionDiscarded { merge, .. } => {
-            return Restack::Flag(FlagReason::Refused(format!(
-                "replaying it would drop the hand resolution in merge {merge} (the rebase guard \
-                 reported RESOLUTION_DISCARDED, #9282)"
-            )))
-        }
-        GuardVerdict::Unanswered(why) => log::warn!(
-            "claim_reconciliation (merged stack): PR #{pr}: rebase guard gave no answer ({why}); \
-             pushing unchecked, as reconcile-stack.sh does (#9282)"
-        ),
-    }
-    match git::push_leased(repo, branch, &new_head, head) {
-        Ok(()) => Restack::Done(new_head),
-        Err(e) => Restack::Transient(e),
-    }
+fn scratch_path(repo: &Path, pr: u32) -> PathBuf {
+    repo.join(format!(".loom/worktrees/merged-restack-pr-{pr}"))
 }
 
-/// Replay every open PR stacked on `child` from `old_head` onto `new_head`
-/// (base unchanged), under the same ownership, lease and ancestry rules.
-/// `this_repo` is this repository's resolved `owner/name`.
 #[allow(clippy::too_many_arguments)]
-fn cascade(
+fn cascade_children(
     forge: &impl MergedForge,
     repo: &Path,
     open: &[RestPull],
-    this_repo: &Option<String>,
+    this_repo: Option<&str>,
     default_branch: &str,
     child: &RestPull,
     old_head: &str,
     new_head: &str,
-    depth: usize,
     stats: &mut MergedStats,
 ) {
-    let Some(child_branch) = child.head_ref.as_deref() else {
-        return;
-    };
-    for g in open
-        .iter()
-        .filter(|p| p.state == "open" && p.number != child.number)
-        .filter(|p| p.base_ref.as_deref() == Some(child_branch))
-    {
-        let head = g.head_sha.as_deref().unwrap_or_default();
-        let branch = g.head_ref.as_deref().unwrap_or_default();
-        let ctx = FlagContext {
-            pr: g.number,
-            branch,
-            head,
-            parent_pr: child.number,
-            parent_branch: child_branch,
-            upstream: old_head,
+    let counts = stack_reconcile::cascade(
+        child,
+        old_head,
+        new_head,
+        &mut stack_reconcile::Cascade {
+            repo,
+            open,
+            this_repo,
             default_branch,
-            retarget_to: None,
-            cascade_onto: Some(new_head),
-        };
-        let reason = if depth > MAX_CASCADE_DEPTH {
-            Some(FlagReason::Refused(format!(
-                "the stack above #{} is deeper than {MAX_CASCADE_DEPTH} levels",
-                child.number
-            )))
-        } else {
-            match orphan::gate(g) {
-                Some(orphan::Skip::Held) => {
-                    log::warn!(
-                        "claim_reconciliation (merged stack): PR #{} is stacked on rewritten #{} \
-                         but carries a hold label — not touched",
-                        g.number,
-                        child.number
-                    );
-                    stats.skipped += 1;
-                    continue;
-                }
-                Some(orphan::Skip::NoHead) => Some(FlagReason::Refused(
-                    "its head branch or head commit is not usable".to_string(),
-                )),
-                Some(orphan::Skip::InFlight) => Some(FlagReason::Refused(
-                    "an agent is working on it (loom:reviewing / loom:treating)".to_string(),
-                )),
-                None => match orphan::head_owner(g, default_branch, this_repo.as_deref()) {
-                    // A sync PR from the default branch into the rewritten
-                    // child: nothing of its own to replay.
-                    orphan::HeadOwner::DefaultBranch => {
-                        log::debug!(
-                            "claim_reconciliation (merged stack): PR #{}'s head is \
-                             '{default_branch}' — not a stacked child, skipped",
-                            g.number
-                        );
-                        continue;
-                    }
-                    orphan::HeadOwner::Foreign | orphan::HeadOwner::Unknown => {
-                        Some(FlagReason::NotLoomBranch)
-                    }
-                    orphan::HeadOwner::Loom => None,
-                },
-            }
-        };
-        // A live (or unreadable) lease on the grandchild's issue means a
-        // Builder may be pushing to its branch: never race it.
-        let reason = match reason {
-            None if lease_blocks(forge, branch) => Some(FlagReason::Refused(
-                "its issue lease is held, so a Builder may be pushing to it".to_string(),
-            )),
-            other => other,
-        };
-        if let Some(reason) = reason {
-            flag(forge, &ctx, &reason, stats);
-            continue;
-        }
-        match restack(repo, g.number, branch, head, new_head, old_head) {
-            Restack::Done(g_new) => {
-                stats.cascaded += 1;
-                log::info!(
-                    "claim_reconciliation (merged stack): PR #{} (stacked on #{}) replayed onto \
-                     {new_head}, pushed {g_new} leased to {head} (#14903)",
-                    g.number,
-                    child.number
+            pass: "merged stack",
+            issue_tag: "#14903",
+            scratch_path,
+            issue_lease_blocks: &|i| {
+                matches!(forge.lease(i), LeaseState::Held | LeaseState::Unknown)
+            },
+            on_cascaded: &mut |s, g_new| {
+                let body = cascaded_comment_body(
+                    s.parent_pr,
+                    s.parent_branch,
+                    s.head,
+                    g_new,
+                    s.new_parent_head,
                 );
-                if let Err(e) = forge.comment(
-                    g.number,
-                    &cascaded_comment_body(child.number, child_branch, head, &g_new, new_head),
-                ) {
+                if let Err(e) = forge.comment(s.pr, &body) {
                     log::warn!(
                         "claim_reconciliation (merged stack): PR #{}: cascade comment failed: {e}",
-                        g.number
+                        s.pr
                     );
                 }
-                cascade(
-                    forge,
-                    repo,
-                    open,
-                    this_repo,
+            },
+            on_flag: &mut |s, r| {
+                let ctx = FlagContext {
+                    pr: s.pr,
+                    branch: s.branch,
+                    head: s.head,
+                    parent_pr: s.parent_pr,
+                    parent_branch: s.parent_branch,
+                    upstream: s.old_parent_head,
                     default_branch,
-                    g,
-                    head,
-                    &g_new,
-                    depth + 1,
-                    stats,
-                );
-            }
-            // The discovery query will not see this PR again once the child
-            // reconciled, so a transient failure here is flagged, not retried.
-            Restack::Flag(r) => flag(forge, &ctx, &r, stats),
-            Restack::Transient(e) => flag(forge, &ctx, &FlagReason::Refused(e), stats),
-        }
-    }
-}
-
-/// Does the issue behind `branch` have a held or unreadable lease?
-fn lease_blocks(forge: &impl MergedForge, branch: &str) -> bool {
-    let Some(issue) = issue_from_branch(branch).and_then(|n| n.parse::<u32>().ok()) else {
-        return false;
-    };
-    matches!(forge.lease(issue), LeaseState::Held | LeaseState::Unknown)
+                    retarget_to: None,
+                    cascade_onto: Some(s.new_parent_head),
+                };
+                flag(forge, &ctx, &r.into(), stats);
+            },
+        },
+    );
+    stats.cascaded += counts.cascaded;
+    stats.skipped += counts.skipped;
 }
 
 /// Comment first (so a failed post is retried next tick: no marker yet), and

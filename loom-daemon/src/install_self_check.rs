@@ -68,7 +68,7 @@ use crate::fs_util::{find_executable_in, is_executable, truncate_tail};
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, SystemTime};
 
 use crate::gh_invocation::{AccessIntent, GhInvocation, GhTarget, Operation};
 use crate::workspace_registry::WorkspaceRegistry;
@@ -111,9 +111,6 @@ pub const DEFAULT_RANKING_MAX_AGE_SECS: u64 = 3600;
 /// --ranking`). Generous headroom for a slow install without letting a hung
 /// repair wedge the loop.
 const DEFAULT_REPAIR_TIMEOUT: Duration = Duration::from_secs(300);
-
-/// Poll granularity while waiting for a repair subprocess to finish.
-const PROBE_POLL_INTERVAL: Duration = Duration::from_millis(200);
 
 /// Max bytes of captured subprocess output retained in a failure log line.
 const MAX_OUTPUT_TAIL_BYTES: usize = 2048;
@@ -732,9 +729,10 @@ fn resolve_tool_path_in(tool: &str, search_path: Option<&std::ffi::OsStr>) -> Op
 }
 
 /// Run `bin arg… [maybe_workspace]` with `cwd` as the working directory,
-/// capturing combined output to a temp file (never a pipe — avoids the
-/// pipe-buffer deadlock) and killing it after `timeout`. `Ok(())` on a zero
-/// exit; `Err(reason)` (with an output tail) otherwise.
+/// through [`crate::proc_exec`] (concurrent pipe draining, and a deadline after
+/// `timeout` that kills the child's whole process group, the `node` an `npm`
+/// run forked included). `Ok(())` on a zero exit; `Err(reason)` (with an output
+/// tail) otherwise.
 fn run_with_timeout(
     bin: &Path,
     args: &[&str],
@@ -743,74 +741,37 @@ fn run_with_timeout(
     timeout: Duration,
     self_spawn_site: Option<&'static str>,
 ) -> Result<(), String> {
-    let log_path =
-        std::env::temp_dir().join(format!("loom-install-self-check-{}.log", uuid::Uuid::new_v4()));
-    let out_file = std::fs::File::create(&log_path)
-        .map_err(|e| format!("could not create output file: {e}"))?;
-    let stderr_file = match out_file.try_clone() {
-        Ok(f) => f,
-        Err(e) => {
-            let _ = std::fs::remove_file(&log_path);
-            return Err(format!("could not clone output handle: {e}"));
-        }
-    };
+    use crate::proc_exec::{Completion, ExecError};
 
     let mut command = Command::new(bin);
     command.args(args);
     if let Some(ws) = trailing_workspace {
         command.arg(ws);
     }
-    let mut child = match command
-        .current_dir(cwd)
-        .stdin(Stdio::null())
-        .stdout(Stdio::from(out_file))
-        .stderr(Stdio::from(stderr_file))
-        .spawn()
-    {
-        Ok(c) => c,
-        Err(e) => {
-            let _ = std::fs::remove_file(&log_path);
-            return Err(format!("could not spawn `{}`: {e}", bin.display()));
-        }
-    };
+    command.current_dir(cwd).stdin(Stdio::null());
     // #14100: when `bin` is the daemon's own binary, attribute its pid.
-    let mut tracked =
-        self_spawn_site.map(|site| crate::self_spawn_log::track(site, &command, child.id()));
-
-    let start = Instant::now();
-    let result = loop {
-        match child.try_wait() {
-            Ok(Some(status)) if status.success() => {
-                tracked.take().map(|t| t.finish(status));
-                break Ok(());
-            }
-            Ok(Some(status)) => {
-                tracked.take().map(|t| t.finish(status));
-                let tail = std::fs::read_to_string(&log_path).unwrap_or_default();
-                break Err(format!(
-                    "`{}` exited with {status}: {}",
-                    bin.display(),
-                    truncate_tail(&tail, MAX_OUTPUT_TAIL_BYTES)
-                ));
-            }
-            Ok(None) => {
-                if start.elapsed() >= timeout {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    tracked.take().map(|t| t.finish("timed out"));
-                    break Err(format!(
-                        "`{}` timed out after {}s",
-                        bin.display(),
-                        timeout.as_secs()
-                    ));
-                }
-                std::thread::sleep(PROBE_POLL_INTERVAL);
-            }
-            Err(e) => break Err(format!("could not poll `{}`: {e}", bin.display())),
-        }
+    let result = match self_spawn_site {
+        Some(site) => crate::self_spawn_log::run_bounded_tracked(site, command, timeout),
+        None => crate::proc_exec::run_bounded(command, timeout),
     };
-    let _ = std::fs::remove_file(&log_path);
-    result
+    match result {
+        Ok(Completion::Exited(out)) if out.status.success() => Ok(()),
+        Ok(Completion::Exited(out)) => {
+            let mut combined = String::from_utf8_lossy(&out.stdout).into_owned();
+            combined.push_str(&String::from_utf8_lossy(&out.stderr));
+            Err(format!(
+                "`{}` exited with {}: {}",
+                bin.display(),
+                out.status,
+                truncate_tail(&combined, MAX_OUTPUT_TAIL_BYTES)
+            ))
+        }
+        Ok(Completion::TimedOut { .. }) => {
+            Err(format!("`{}` timed out after {}s", bin.display(), timeout.as_secs()))
+        }
+        Err(ExecError::Spawn(e)) => Err(format!("could not spawn `{}`: {e}", bin.display())),
+        Err(ExecError::Collect(e)) => Err(format!("could not poll `{}`: {e}", bin.display())),
+    }
 }
 
 // ============================================================================

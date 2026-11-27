@@ -178,6 +178,127 @@ fn annotated_tag_is_peeled_to_commit() {
 }
 
 #[test]
+fn a_no_answer_from_gh_api_names_a_shed_and_a_timeout_and_nothing_from_the_child() {
+    use crate::cmd_out::{CmdOutcome, Unavailable};
+    use std::os::unix::process::ExitStatusExt;
+    use std::time::{Duration, SystemTime};
+
+    const RAW: &str = "gh: RAW-CHILD-OUTPUT";
+    let unavailable = |why| api_answer(CmdOutcome::Unavailable(why)).unwrap_err();
+    let shed = unavailable(Unavailable::Shed {
+        until: SystemTime::UNIX_EPOCH + Duration::from_secs(1_800_000_000),
+        graphql_budget_exhausted: false,
+    });
+    assert!(shed.contains("shed"), "{shed}");
+    assert!(shed.contains(SHED_MARKER), "{shed}");
+    assert!(shed.contains("2027-01-15T08:00:00Z"), "{shed}");
+    assert!(!shed.contains("timed out"), "{shed}");
+
+    let timeout = unavailable(Unavailable::TimedOut {
+        after: Duration::from_secs(60),
+        partial_stdout: RAW.as_bytes().to_vec(),
+    });
+    assert_eq!(timeout, "`gh api` timed out after 60s");
+    assert!(!timeout.contains("shed"), "{timeout}");
+
+    let reasons = [
+        shed,
+        timeout,
+        unavailable(Unavailable::Spawn(RAW.into())),
+        unavailable(Unavailable::Collect(RAW.into())),
+        unavailable(Unavailable::RoutingBlocked(RAW.into())),
+        unavailable(Unavailable::AdapterUnavailable(RAW.into())),
+        unavailable(Unavailable::DeadlineReached),
+    ];
+    assert!(reasons.iter().all(|r| !r.contains("RAW-CHILD-OUTPUT")), "{reasons:?}");
+
+    let ran = |wait_status: i32| {
+        api_answer(CmdOutcome::Ran(std::process::Output {
+            status: ExitStatusExt::from_raw(wait_status),
+            stdout: b"{\"ref\":\"refs/tags/x\"}".to_vec(),
+            stderr: RAW.as_bytes().to_vec(),
+        }))
+    };
+    assert_eq!(ran(0).unwrap(), "{\"ref\":\"refs/tags/x\"}");
+    assert_eq!(ran(1 << 8).unwrap_err(), "`gh api` exited 1");
+    assert_eq!(ran(9).unwrap_err(), "`gh api` exited by signal");
+}
+
+#[test]
+fn the_shed_and_timeout_reasons_survive_tag_resolution_wrapping() {
+    use crate::cmd_out::{CmdOutcome, Unavailable};
+    use std::time::{Duration, SystemTime};
+
+    let shed = api_answer(CmdOutcome::Unavailable(Unavailable::Shed {
+        until: SystemTime::UNIX_EPOCH + Duration::from_secs(1_800_000_000),
+        graphql_budget_exhausted: false,
+    }))
+    .unwrap_err();
+    let timeout = api_answer(CmdOutcome::Unavailable(Unavailable::TimedOut {
+        after: Duration::from_secs(60),
+        partial_stdout: Vec::new(),
+    }))
+    .unwrap_err();
+    let resolving = |reason: &str| {
+        resolve_tag_commit(&|_| Err(reason.to_string()), SLUG, "v1.0.0").unwrap_err()
+    };
+    assert_eq!(resolving(&shed), format!("resolving tag v1.0.0: {shed}"));
+    assert_eq!(resolving(&timeout), format!("resolving tag v1.0.0: {timeout}"));
+    assert_ne!(resolving(&shed), resolving(&timeout));
+
+    let annotated =
+        HashMap::from([(format!("repos/{SLUG}/git/ref/tags/v1.0.0"), ref_body("tag", T))]);
+    let peeling = |reason: &str| {
+        resolve_tag_commit(
+            &|path: &str| {
+                annotated
+                    .get(path)
+                    .cloned()
+                    .ok_or_else(|| reason.to_string())
+            },
+            SLUG,
+            "v1.0.0",
+        )
+        .unwrap_err()
+    };
+    assert_eq!(peeling(&shed), format!("peeling annotated tag v1.0.0: {shed}"));
+    assert_eq!(peeling(&timeout), format!("peeling annotated tag v1.0.0: {timeout}"));
+
+    let anchor = AnchorSetting::Anchor(A.to_string());
+    let refusal = gate(&|_| Err(shed.clone()), &inputs(&anchor, None, "x")).unwrap_err();
+    assert_eq!(refusal.class, RefusalClass::Unavailable);
+    let line = &refusal.lines[0];
+    assert!(line.contains(&shed), "{line}");
+    assert!(line.contains("NOT evidence of tampering"), "{line}");
+}
+
+#[test]
+fn a_shed_read_reaches_tag_resolution_named_as_a_shed() {
+    use crate::forge_identity::{ExhaustCause, RouteDecision};
+    use crate::gh_invocation::cwd_route::{CwdAnswer, DeriveEnv};
+    use crate::gh_invocation::test_routing::{install, seen, sheds, TestRouting};
+    use std::time::{Duration, SystemTime};
+
+    let root = tempdir();
+    let _routing = install(TestRouting {
+        decision: RouteDecision::Exhausted {
+            until: SystemTime::now() + Duration::from_secs(300),
+            cause: ExhaustCause::Unavailable,
+        },
+        env: DeriveEnv::default(),
+        checkout: CwdAnswer::Sole("someone-else/consumer".to_string()),
+    });
+    let err = resolve_tag_commit(&|path| gh_api(&root, path), SLUG, "v1.0.0").unwrap_err();
+    let reason = err.strip_prefix("resolving tag v1.0.0: ").unwrap_or(&err);
+    assert!(reason.contains("shed") && reason.contains(SHED_MARKER), "{err}");
+    assert!(!reason.contains("timed out"), "{err}");
+    let attempts = seen();
+    assert_eq!(attempts.len(), 1);
+    assert_eq!(attempts[0].route_slug.as_deref(), Some(SLUG));
+    assert_eq!(sheds(), 1);
+}
+
+#[test]
 fn source_adoption_record_detects_movement_and_replacement() {
     let dir = tempdir();
     let rec = dir.join("sub").join("adoption.json");
@@ -538,12 +659,11 @@ exit 1
 #[serial]
 fn required_mode_refuses_when_adoption_record_is_unwritable() {
     let fx = Fx::new();
-    // The record is absent (reads as empty) but its temp-file path is a
+    // The record is absent (reads as empty) but its lock-file path is a
     // directory, so the write fails deterministically, even when running as root.
-    let tmp = fx
-        .record
-        .with_extension(format!("json.tmp.{}", std::process::id()));
-    std::fs::create_dir_all(&tmp).unwrap();
+    let mut lock = fx.record.as_os_str().to_owned();
+    lock.push(".lock");
+    std::fs::create_dir_all(&lock).unwrap();
     let policy = fx.policy(Some(A));
     fx.set_tag("v1.0.0", B, "ahead");
     let all = fx.refused("v1.0.0", &policy);
@@ -715,10 +835,9 @@ fn refusal_evidence_keeps_the_source_facts_established_before_it() {
 #[serial]
 fn refusal_evidence_reports_adoption_write_failure() {
     let fx = Fx::new();
-    let tmp = fx
-        .record
-        .with_extension(format!("json.tmp.{}", std::process::id()));
-    std::fs::create_dir_all(&tmp).unwrap();
+    let mut lock = fx.record.as_os_str().to_owned();
+    lock.push(".lock");
+    std::fs::create_dir_all(&lock).unwrap();
     fx.set_tag("v1.0.0", B, "ahead");
     let ev = fx.refused_record("v1.0.0", &fx.policy(Some(A)));
     assert_eq!(ev["adoption_record"], "write_failed", "{ev}");

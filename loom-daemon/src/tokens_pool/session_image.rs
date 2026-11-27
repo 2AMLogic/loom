@@ -78,6 +78,31 @@ impl SessionImageConfig {
     }
 }
 
+/// Configured extra read-only mounts (`accounts.session.extraMounts`), or empty
+/// when no session config is present.
+#[must_use]
+pub(super) fn configured_extra_mounts(config: Option<&SessionImageConfig>) -> &[ExtraMount] {
+    config.map_or(&[], |config| config.extra_mounts.as_slice())
+}
+
+/// Verify the configured override image carries the sealed control bundle this
+/// daemon enforces (#14019) — a no-op unless `effective_image` **is** the
+/// configured override (an explicit `--image` keeps its historical behaviour).
+pub(super) fn verify_configured_image(
+    config: Option<&SessionImageConfig>,
+    effective_image: &str,
+    probe: &dyn BundleProbe,
+) -> Result<()> {
+    let Some(configured) = config.and_then(|config| config.image.as_deref()) else {
+        return Ok(());
+    };
+    if configured != effective_image {
+        return Ok(());
+    }
+    verify_override_bundle(effective_image, probe)
+        .context("refusing to create a session container from the configured override image")
+}
+
 /// Read `.loom/config.json → accounts.session` (every tier,
 /// [`config_resolver::resolve_effective_config`]) and validate it. A missing
 /// block is today's behaviour; a malformed one is an **error**, never a
@@ -403,4 +428,4 @@ fn assert_sealed_assets_intact(image: &str, manifest: &Manifest, digests_text: &
 
 #[cfg(test)]
 #[path = "session_image_tests.rs"]
-mod tests;
+pub(super) mod tests;

@@ -36,6 +36,51 @@ fn stdin_kind() -> &'static str {
     "unknown"
 }
 
+/// Milliseconds since the Unix epoch: the timeline a test reads back.
+fn now_millis() -> u128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|passed| passed.as_millis())
+        .unwrap_or_default()
+}
+
+/// Whether `pid` names a process this harness can signal.
+fn pid_alive(pid: &str) -> bool {
+    !pid.is_empty()
+        && std::process::Command::new("kill")
+            .args(["-0", pid])
+            .stderr(std::process::Stdio::null())
+            .status()
+            .is_ok_and(|status| status.success())
+}
+
+/// One tool process of a guarded launch (#15455). The real harness runs each
+/// tool call as a short-lived process of its own, so the sequence is this
+/// runner and then the `bash` running its script, whose `$PPID` is the
+/// runner. Reports the two session markers it inherited and whether the
+/// process each names is alive, then runs `script` when the launch named one.
+fn tool(previous: &str, script: Option<&std::ffi::OsStr>) -> ! {
+    let marker = |key: &str| {
+        let pid = std::env::var(key).unwrap_or_default();
+        format!("{key}={pid}:{}", pid_alive(&pid))
+    };
+    println!("tool_runner pid={}", std::process::id());
+    println!(
+        "tool_markers {} {}",
+        marker("LOOM_NATIVE_WORKER_PID"),
+        marker("LOOM_AGENT_SESSION_PID")
+    );
+    println!("tool_prev_alive={}", pid_alive(previous));
+    if let Some(script) = script {
+        let status = std::process::Command::new("bash")
+            .arg(script)
+            .stdin(std::process::Stdio::null())
+            .status();
+        println!("tool_exit={}", status.map_or(-1, |status| status.code().unwrap_or(-1)));
+    }
+    std::process::exit(0)
+}
+
 fn main() {
     // A versioned CLI: answer the adapter's probe and nothing else. This must
     // stay ahead of the FIXTURE_SIGNAL self-kill, which would otherwise take
@@ -50,6 +95,16 @@ fn main() {
                 .ok()
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(0),
+        );
+    }
+    let mut args = std::env::args_os().skip(1);
+    if args.next().as_deref() == Some(std::ffi::OsStr::new("--fixture-tool")) {
+        tool(
+            args.next()
+                .as_deref()
+                .and_then(|value| value.to_str())
+                .unwrap_or(""),
+            args.next().as_deref(),
         );
     }
     if std::env::var("FIXTURE_SIGNAL").is_ok() {
@@ -127,6 +182,48 @@ fn main() {
             "native_worker_pid_matches={}",
             std::env::var("LOOM_NATIVE_WORKER_PID").unwrap() == std::process::id().to_string()
         );
+        println!(
+            "native_session_pid={}",
+            std::env::var("LOOM_AGENT_SESSION_PID").unwrap_or_default()
+        );
+    }
+    // #15455: `FIXTURE_TOOL_CALLS=n` runs n successive tool processes under
+    // this one launch, `FIXTURE_TOOL_GAP` seconds apart, each running
+    // `FIXTURE_TOOL_DIR/<i>.sh` when that file exists. One has exited before
+    // the next starts, like two tool calls of one session.
+    if let Some(calls) = std::env::var("FIXTURE_TOOL_CALLS")
+        .ok()
+        .and_then(|calls| calls.parse::<u32>().ok())
+    {
+        let gap = std::env::var("FIXTURE_TOOL_GAP")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(0);
+        let dir = std::env::var_os("FIXTURE_TOOL_DIR").map(std::path::PathBuf::from);
+        let exe = std::env::current_exe().unwrap();
+        let mut previous = String::new();
+        for call in 1..=calls {
+            let script = dir.as_ref().and_then(|dir| {
+                let script = dir.join(format!("{call}.sh"));
+                script.is_file().then_some(script)
+            });
+            println!("tool_begin={call} at={}", now_millis());
+            let mut command = std::process::Command::new(&exe);
+            command
+                .args(["--fixture-tool", &previous])
+                .stdin(std::process::Stdio::null());
+            if let Some(script) = &script {
+                command.arg(script);
+            }
+            let mut child = command.spawn().unwrap();
+            let runner = child.id().to_string();
+            let status = child.wait().unwrap();
+            println!("tool_end={call} at={} runner={runner} status={status}", now_millis());
+            previous = runner;
+            if call < calls {
+                std::thread::sleep(std::time::Duration::from_secs(gap));
+            }
+        }
     }
     // Simulates a native `--format json` event stream (#8448), so a test can
     // capture the guarded launch's full output through the real `spawn-worker`

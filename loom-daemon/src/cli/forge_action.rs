@@ -1211,7 +1211,7 @@ pub(crate) fn handle_forge_command(action: ForgeAction) -> Result<()> {
             access,
             force,
         } => return super::forge_identity_cmd::token(&repo, &access, force),
-        ForgeAction::MergeQueue { action } => super::forge_merge_queue_cmd::run(action.0),
+        ForgeAction::MergeQueue { action } => crate::forge_merge_queue::handle(&action.0),
         ForgeAction::CreateIssue(a) => return handle_create_issue(a),
         ForgeAction::Parent { action } => return super::forge_parent_cmd::handle(action),
         ForgeAction::IsFleet { login } => return super::forge_identity_cmd::is_fleet(&login),
@@ -1562,13 +1562,13 @@ fn write_target(action: &ForgeAction) -> Option<Option<String>> {
         // by #11104).
         // #10255: the queue mutations write (dormant today, vetted anyway).
         ForgeAction::MergeQueue { action } => match &action.0 {
-            super::forge_merge_queue_cmd::MergeQueueAction::Enqueue { repo, .. }
-            | super::forge_merge_queue_cmd::MergeQueueAction::Dequeue { repo, .. }
+            crate::forge_merge_queue::MergeQueueCmd::Enqueue { repo, .. }
+            | crate::forge_merge_queue::MergeQueueCmd::Dequeue { repo, .. }
             // #10256: these comment, relabel, enqueue or dequeue.
             // `reconcile` is vetted inside its queue-mode branch instead:
             // in direct mode (every `merge-pr.sh` run) it writes nothing.
-            | super::forge_merge_queue_cmd::MergeQueueAction::Handoff { repo, .. }
-            | super::forge_merge_queue_cmd::MergeQueueAction::Revoke { repo, .. } => {
+            | crate::forge_merge_queue::MergeQueueCmd::Handoff { repo, .. }
+            | crate::forge_merge_queue::MergeQueueCmd::Revoke { repo, .. } => {
                 Some(repo.clone())
             }
             _ => None,
@@ -1645,7 +1645,7 @@ mod write_target_tests {
 
     #[test]
     fn deferred_merge_queue_writes_are_still_vetted() {
-        use super::super::forge_merge_queue_cmd::MergeQueueAction as Mq;
+        use crate::forge_merge_queue::MergeQueueCmd as Mq;
         let mq = |action: Mq| ForgeAction::MergeQueue {
             action: super::super::forge_merge_queue_cmd::DeferredMergeQueue(action),
         };
@@ -1668,7 +1668,7 @@ mod write_target_tests {
     /// (what `--help` walks) still registers them.
     #[test]
     fn merge_queue_verbs_parse_through_the_deferred_slot() {
-        use super::super::forge_merge_queue_cmd::MergeQueueAction as Mq;
+        use crate::forge_merge_queue::MergeQueueCmd as Mq;
         use clap::CommandFactory;
         let sha = "a".repeat(40);
         let argv = [

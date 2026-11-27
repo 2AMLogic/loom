@@ -56,6 +56,7 @@
 //! [`gh_read`]: `reader_only()` ignores a writer pin by construction.
 
 use std::path::Path;
+use std::time::Duration;
 
 use crate::cmd_out::{decode_json, CmdOutcome, Query, Unavailable, DEFAULT_TIMEOUT};
 use crate::gh_invocation::{AccessIntent, GhInvocation, GhTarget, Operation};
@@ -206,6 +207,7 @@ fn guarded(
     repo_root: &Path,
     use_cache: bool,
     read_repo: Option<&str>,
+    timeout: Duration,
 ) -> Result<GhInvocation, CmdOutcome> {
     match (intent, argv_access(args)) {
         (AccessIntent::Write, ArgvAccess::Read) => {
@@ -221,7 +223,7 @@ fn guarded(
             .map_err(|detail| CmdOutcome::Unavailable(Unavailable::Spawn(detail)))?,
         None => target_of(args),
     };
-    let mut inv = GhInvocation::new(Operation::new(op), intent, target, DEFAULT_TIMEOUT)
+    let mut inv = GhInvocation::new(Operation::new(op), intent, target, timeout)
         .current_dir(repo_root)
         .args(args);
     if use_cache {
@@ -247,8 +249,22 @@ fn guarded(
 /// [`Query::Unavailable`] / a non-zero exit stays [`CmdOutcome::Ran`],
 /// exactly as the raw helper classified them.
 pub fn gh_read(op: &'static str, args: &[&str], repo_root: &Path, use_cache: bool) -> CmdOutcome {
-    match guarded(op, AccessIntent::Read, args, repo_root, use_cache, None) {
+    match guarded(op, AccessIntent::Read, args, repo_root, use_cache, None, DEFAULT_TIMEOUT) {
         Ok(inv) => inv.run(),
+        Err(out) => out,
+    }
+}
+
+/// A routed read for async callers with a subsystem-specific deadline and executable.
+pub(crate) async fn gh_read_async(
+    op: &'static str,
+    args: &[&str],
+    repo_root: &Path,
+    program: &str,
+    timeout: Duration,
+) -> CmdOutcome {
+    match guarded(op, AccessIntent::Read, args, repo_root, false, None, timeout) {
+        Ok(inv) => inv.program(program).run_async().await,
         Err(out) => out,
     }
 }
@@ -261,7 +277,7 @@ pub(crate) fn gh_read_for_repo(
     repo_root: &Path,
     repo: &str,
 ) -> CmdOutcome {
-    match guarded(op, AccessIntent::Read, args, repo_root, false, Some(repo)) {
+    match guarded(op, AccessIntent::Read, args, repo_root, false, Some(repo), DEFAULT_TIMEOUT) {
         Ok(inv) => inv.run(),
         Err(out) => out,
     }
@@ -285,7 +301,7 @@ where
 
 /// A write: the writer credential, through the facade's write sequencing.
 pub fn gh_write(op: &'static str, args: &[&str], repo_root: &Path, use_cache: bool) -> CmdOutcome {
-    match guarded(op, AccessIntent::Write, args, repo_root, use_cache, None) {
+    match guarded(op, AccessIntent::Write, args, repo_root, use_cache, None, DEFAULT_TIMEOUT) {
         Ok(inv) => inv.run(),
         Err(out) => out,
     }
@@ -346,7 +362,7 @@ pub(crate) fn test_read_invocation(
     args: &[&str],
     repo_root: &Path,
 ) -> GhInvocation {
-    match guarded(op, AccessIntent::Read, args, repo_root, false, None) {
+    match guarded(op, AccessIntent::Read, args, repo_root, false, None, DEFAULT_TIMEOUT) {
         Ok(inv) => inv,
         Err(out) => panic!("a correctly labelled read does not refuse: {out:?}"),
     }
@@ -359,7 +375,7 @@ pub(crate) fn test_write_invocation(
     args: &[&str],
     repo_root: &Path,
 ) -> GhInvocation {
-    match guarded(op, AccessIntent::Write, args, repo_root, false, None) {
+    match guarded(op, AccessIntent::Write, args, repo_root, false, None, DEFAULT_TIMEOUT) {
         Ok(inv) => inv,
         Err(out) => panic!("a correctly labelled write does not refuse: {out:?}"),
     }

@@ -388,11 +388,14 @@ fn check_key_chars(key: &str) -> Result<String, String> {
     Ok(key.to_owned())
 }
 
+/// Prefix-only `~/` expansion for the default key file: a bare `~` stays
+/// literal (issue #15372 — delegates to the shared
+/// [`crate::fs_util::expand_tilde_with_home`] for the `~/` form only).
 fn expand_home(path: &str) -> PathBuf {
-    let Some(rest) = path.strip_prefix("~/") else {
+    if !path.starts_with("~/") {
         return PathBuf::from(path);
-    };
-    dirs::home_dir().map_or_else(|| PathBuf::from(path), |home| home.join(rest))
+    }
+    crate::fs_util::expand_tilde_with_home(path, dirs::home_dir().as_deref())
 }
 
 #[cfg(test)]

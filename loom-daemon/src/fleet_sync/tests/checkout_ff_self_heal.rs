@@ -1024,6 +1024,94 @@ fn a_still_held_line_names_why_the_rehome_was_refused() {
 }
 
 // ----------------------------------------------------------------------------
+// #15301: every standing declined hold is said again, not only wrong-branch
+// ----------------------------------------------------------------------------
+
+/// The `still-held` transitions of a pass.
+fn still_held(pass: &CheckoutPass) -> Vec<&Transition> {
+    pass.transitions
+        .iter()
+        .filter(|t| t.kind == "still-held")
+        .collect()
+}
+
+#[test]
+fn a_standing_dirty_hold_is_said_again_with_its_lag_and_paths() {
+    let fx = Fixture::new();
+    fx.push("src/a.rs", "fn a() {}\n");
+    write(&fx.host.join("README.md"), "edited here\n");
+    let mut memory = Memory::default();
+    let knobs = Knobs::default();
+    let t0 = Utc::now();
+    let at = |mins: i64| t0 + chrono::Duration::minutes(mins);
+
+    let first = pass_at(&fx, &knobs, &mut memory, at(0));
+    assert!(still_held(&first).is_empty(), "the first sight is the transition");
+    assert!(still_held(&pass_at(&fx, &knobs, &mut memory, at(30))).is_empty());
+    let hourly = pass_at(&fx, &knobs, &mut memory, at(61));
+    let said = still_held(&hourly);
+    assert_eq!(said.len(), 1, "{:?}", kinds(&hourly));
+    assert_eq!(said[0].level, Level::Warn);
+    let line = &said[0].line;
+    assert!(line.contains("still `dirty` after 61 min"), "{line}");
+    assert!(line.contains(", 1 behind"), "{line}");
+    assert!(line.contains("README.md"), "{line}");
+    assert!(still_held(&pass_at(&fx, &knobs, &mut memory, at(90))).is_empty());
+    assert_eq!(still_held(&pass_at(&fx, &knobs, &mut memory, at(125))).len(), 1);
+}
+
+#[test]
+fn a_standing_hold_on_installed_files_is_said_again_as_an_error() {
+    let fx = Fixture::new();
+    fx.push(".loom/scripts/spawn.sh", "#!/bin/sh\necho new\n");
+    write(&fx.host.join("README.md"), "edited here\n");
+    let mut memory = Memory::default();
+    let knobs = Knobs::default();
+    let t0 = Utc::now();
+    pass_at(&fx, &knobs, &mut memory, t0);
+    let hourly = pass_at(&fx, &knobs, &mut memory, t0 + chrono::Duration::minutes(61));
+    let said = still_held(&hourly);
+    assert_eq!(said.len(), 1, "{:?}", kinds(&hourly));
+    assert_eq!(said[0].level, Level::Error);
+    assert!(said[0].line.contains("installed Loom files are behind"), "{}", said[0].line);
+}
+
+#[test]
+fn a_standing_diverged_hold_is_said_again_with_both_counts() {
+    let fx = Fixture::new();
+    fx.commit_locally("local.rs");
+    fx.push("src/a.rs", "fn a() {}\n");
+    let mut memory = Memory::default();
+    let knobs = Knobs::default();
+    let t0 = Utc::now();
+    let at = |mins: i64| t0 + chrono::Duration::minutes(mins);
+
+    pass_at(&fx, &knobs, &mut memory, at(0));
+    let hourly = pass_at(&fx, &knobs, &mut memory, at(61));
+    let said = still_held(&hourly);
+    assert_eq!(said.len(), 1, "{:?}", kinds(&hourly));
+    assert!(said[0].line.contains("still `diverged`"), "{}", said[0].line);
+    assert!(said[0].line.contains(", 1 behind, 1 ahead"), "{}", said[0].line);
+}
+
+#[test]
+fn a_standing_fetch_failure_is_said_again() {
+    let fx = Fixture::new();
+    let gone = fx.base().join("nowhere.git");
+    git(&fx.host, &["remote", "set-url", "origin", gone.to_str().unwrap()]);
+    let mut memory = Memory::default();
+    let knobs = Knobs::default();
+    let t0 = Utc::now();
+    for n in 0..3 {
+        pass_at(&fx, &knobs, &mut memory, t0 + chrono::Duration::minutes(n));
+    }
+    let hourly = pass_at(&fx, &knobs, &mut memory, t0 + chrono::Duration::minutes(61));
+    let said = still_held(&hourly);
+    assert_eq!(said.len(), 1, "{:?}", kinds(&hourly));
+    assert!(said[0].line.contains("still `fetch-failed`"), "{}", said[0].line);
+}
+
+// ----------------------------------------------------------------------------
 // #13835: the forge lookup runs last, and a rescue ref is reused
 // ----------------------------------------------------------------------------
 

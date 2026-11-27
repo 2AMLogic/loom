@@ -1481,12 +1481,13 @@ source "$RETIRED_HELPER"
 RETIRED_LAST_SHIPPED_BLOB="b1dac86f43dbe159b1a617b31010cdaab7b88bc5"
 RETIRED_RELEASE_PATH=".claude/commands/loom/release.md"
 
-# Run the production cleanup non-interactively against repo $1 from a cwd that
-# is NOT the repo (the routine must not depend on the caller's cwd). Sets
-# RETIRED_OUT / RETIRED_RC.
+# Run the production cleanup non-interactively with read_root=$1 and
+# git_root=${2:-$1} (default: the same repo) from a cwd that is NOT the repo
+# (the routine must not depend on the caller's cwd). Pass a distinct $2 to
+# exercise the read_root/git_root split (Test 44e). Sets RETIRED_OUT / RETIRED_RC.
 run_retired_cleanup() {
   RETIRED_RC=0
-  RETIRED_OUT="$(cd "$TEST_DIR" && loom_remove_retired_files "$1" "$1" yes 2>&1)" || RETIRED_RC=$?
+  RETIRED_OUT="$(cd "$TEST_DIR" && loom_remove_retired_files "$1" "${2:-$1}" yes 2>&1)" || RETIRED_RC=$?
 }
 
 echo "--- Section 5b: Retired-File Cleanup (#3572, #14846) ---"
@@ -1586,6 +1587,52 @@ if [[ "$RETIRED_RC" -eq 0 && -z "$RETIRED_OUT" ]] \
   pass "Absent release.md yields no cleanup action"
 else
   fail "Absent release.md did not yield a clean no-op (rc=$RETIRED_RC out=$RETIRED_OUT)"
+fi
+echo ""
+
+# Test 44e: read_root and git_root are distinct (as in production, where the
+# installer hashes under $TARGET_PATH but runs git in the install worktree).
+# read_root (a plain directory, not a repo) holds the shipped blob, so the hash
+# gate passes only if it reads there. git_root tracks the same relative path with
+# DIFFERENT content, so hashing under git_root would preserve instead of remove,
+# and running `git rm` against read_root would fail. Swapping either use of the
+# two roots in retired-files.sh therefore fails this fixture.
+echo "Test 44e: Distinct read_root/git_root -- hash read_root, git rm in git_root"
+if git -C "$LOOM_ROOT" cat-file -e "$RETIRED_LAST_SHIPPED_BLOB" 2>/dev/null; then
+  RETIRED_SPLIT_READ="$TEST_DIR/retired-split-read"
+  RETIRED_SPLIT_GIT="$TEST_DIR/retired-split-git"
+  mkdir -p "$RETIRED_SPLIT_READ/$(dirname "$RETIRED_RELEASE_PATH")"
+  git -C "$LOOM_ROOT" cat-file blob "$RETIRED_LAST_SHIPPED_BLOB" \
+    > "$RETIRED_SPLIT_READ/$RETIRED_RELEASE_PATH"
+  git -C "$LOOM_ROOT" cat-file blob "$RETIRED_LAST_SHIPPED_BLOB" \
+    > "$TEST_DIR/retired-split-expected"
+  create_temp_repo "$RETIRED_SPLIT_GIT"
+  mkdir -p "$RETIRED_SPLIT_GIT/$(dirname "$RETIRED_RELEASE_PATH")"
+  printf '# tracked copy, content differs from the shipped blob\n' \
+    > "$RETIRED_SPLIT_GIT/$RETIRED_RELEASE_PATH"
+  git -C "$RETIRED_SPLIT_GIT" add "$RETIRED_RELEASE_PATH"
+  git -C "$RETIRED_SPLIT_GIT" commit -m "Track release.md" --quiet
+
+  run_retired_cleanup "$RETIRED_SPLIT_READ" "$RETIRED_SPLIT_GIT"
+  if [[ "$RETIRED_RC" -eq 0 ]]; then
+    pass "Split-root cleanup returned 0"
+  else
+    fail "Split-root cleanup returned $RETIRED_RC: $RETIRED_OUT"
+  fi
+  if ! git -C "$RETIRED_SPLIT_GIT" ls-files --error-unmatch "$RETIRED_RELEASE_PATH" >/dev/null 2>&1 \
+    && [[ ! -f "$RETIRED_SPLIT_GIT/$RETIRED_RELEASE_PATH" ]] \
+    && [[ "$(git -C "$RETIRED_SPLIT_GIT" status --porcelain)" == "D  $RETIRED_RELEASE_PATH" ]]; then
+    pass "Deletion staged in git_root (hash gated on read_root content)"
+  else
+    fail "Deletion not staged in git_root (out=$RETIRED_OUT status=$(git -C "$RETIRED_SPLIT_GIT" status --porcelain))"
+  fi
+  if cmp -s "$TEST_DIR/retired-split-expected" "$RETIRED_SPLIT_READ/$RETIRED_RELEASE_PATH"; then
+    pass "read_root copy of release.md untouched"
+  else
+    fail "read_root copy of release.md was removed or altered"
+  fi
+else
+  warn "Skipping Test 44e: shipped release.md blob $RETIRED_LAST_SHIPPED_BLOB unreachable (shallow clone?)"
 fi
 echo ""
 

@@ -656,6 +656,7 @@ pub(crate) fn handle_tokens_command(action: TokensAction) -> Result<()> {
             auto_unpin,
             model,
             role,
+            pin_account,
         } => select_cmd::handle_select(select_cmd::SelectArgs {
             workspace,
             provider,
@@ -664,6 +665,7 @@ pub(crate) fn handle_tokens_command(action: TokensAction) -> Result<()> {
             auto_unpin,
             model,
             role,
+            pin_account,
         }),
 
         TokensAction::Bootstrap {
