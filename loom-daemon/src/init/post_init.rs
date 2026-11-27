@@ -573,7 +573,17 @@ pub fn is_credential_path(path: &str) -> bool {
 /// - `.loom/activity.db`: opened in the daemon's own state directory —
 ///   `~/.loom`, else the `LOOM_SOCKET_PATH` / `LOOM_ACTIVITY_DB` override
 ///   (`autonomy_marker::resolve_loom_dir`,
-///   `activity::default_activity_db_path`) — never relative to a workspace.
+///   `activity::default_activity_db_path`) — not under a workspace in any
+///   working configuration. One degraded path exists: when home-directory
+///   lookup fails (a UID with no passwd entry, `HOME` and `LOOM_ACTIVITY_DB`
+///   unset), `default_activity_db_path` falls back to `.`, and the ranking
+///   refresh (`token_ranking_refresh`, cwd = repo root) then creates
+///   `<workspace>/.loom/activity.db` via `tokens check --ranking`. That file
+///   is deliberately left unprotected: it only appears when the host's
+///   home/state-dir resolution is broken, and surfacing it as dirt (and
+///   letting `--quarantine` move it aside) is the right signal to fix that
+///   misconfiguration, not state worth shielding. Protecting it would hide
+///   the fault and keep a stray database in the checkout every tick.
 /// - `.loom/signals/`: written by `defaults/scripts/signal.sh stop` when an
 ///   operator requests a stop; the daemon only checks whether a signal exists
 ///   (`agent_session::spawn::check_stop_signals`).
