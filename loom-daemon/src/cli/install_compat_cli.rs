@@ -15,7 +15,7 @@ use crate::install_compat::{
     self, classify, DaemonCompat, Version, DAEMON_INVOKED_INSTALLED_FILES, REQUIRES_DAEMON,
     SUPPORTS_INSTALLED,
 };
-use crate::install_compat_harness as harness;
+use crate::install_compat_harness::{self as harness, CommandTree};
 use crate::release_resolve::host;
 use anyhow::Result;
 use std::path::PathBuf;
@@ -169,6 +169,7 @@ impl CheckArgs {
                 .iter()
                 .map(|s| (*s).to_string())
                 .collect(),
+            command_tree: CommandTree::loom_daemon(),
         };
         let report = match harness::run(&opts) {
             Ok(r) => r,
