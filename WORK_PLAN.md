@@ -7,7 +7,7 @@ The body below is a snapshot of GitHub label state as of the last merged docs-ma
 <!-- Maintained automatically by the Guide triage agent. Manual edits are fine but may be overwritten. -->
 
 <!-- guide:plan-body:start -->
-_Generated: 2026-11-27T11:53:43Z (snapshot; compare against live labels)_
+_Generated: 2026-11-27T14:52:53Z (snapshot; compare against live labels)_
 ## Operator Attention: Merge-Risk-Hold Pileup
 
 Judge-approved PRs under a hold (`loom:blocked` or `loom:operator`) — a human merge decision, or the prerequisite shown, is missing.
@@ -123,8 +123,6 @@ Issues currently being built (`loom:building`).
 - **#15581**: Add proc_exec::run_bounded_to_file and consolidate the 4 combined-log temp-file try_wait runners
 - **#15583**: Consolidate duplicate gh argv and gh api parsers in gh_invocation onto route::split_with and api_request
 - **#15588**: Make pr-worktree.sh stop when worktree root config resolution fails
-- **#15602**: Share the Git fixture used by the three stack reconciliation test suites
-- **#15603**: Share hardened docker run argv, mount setup, and override-image verification between Codex and Claude session containers
 - **#15605**: Consolidate duplicated PR file-list pagination and head-content plumbing across the four forge PR-diff verbs
 
 ## PRs Awaiting Review
@@ -134,6 +132,7 @@ PRs waiting on Judge (`loom:review-requested`).
 - **#12969**: feat: age-bound Codex rollout history in live profiles *(held)*
 - **#14612**: fix: launch eager reclaim detached so it cannot hold back a work-finder tick *(held)*
 - **#15047**: refactor: drop superseded zero-caller pub helpers from loom-daemon *(held)*
+- **#15616**: refactor: share PR-diff file-list transport across Champion carve-out verbs
 
 ## Approved (Awaiting Merge)
 
@@ -175,7 +174,6 @@ PRs that passed review (`loom:pr`); unmarked PRs are queued for Champion auto-me
 - **#15577**: fix: spool --list output of the lib test binary when stdout is a pipe — closes #15553 *(held: champion merge-risk hold)*
 - **#15584**: refactor: add proc_exec::run_bounded_to_file for combined-log runners — closes #15581 *(held: champion merge-risk hold)*
 - **#15589**: fix(worktree-root): propagate config lookup failure status — closes #15588 *(held: champion merge-risk hold)*
-- **#15606**: test: extract shared StackFixture into test_git_helpers — closes #15602
 
 ## Proposed
 
@@ -294,8 +292,6 @@ Issues carrying `loom:curated`.
 - **#15532**: agy pilot: an installed loom-daemon older than v0.20.41 skips the manifest's mandatory pool, so an ambient GEMINI_API_KEY reaches the child *(curated)*
 - **#15553**: test flake: nextest discovery stalls inside the Run tests step (lib binary --list) on Rust Unit Tests (5/5) — sixth occurrence, first after #15378 *(curated)*
 - **#15588**: Make pr-worktree.sh stop when worktree root config resolution fails *(curated)*
-- **#15602**: Share the Git fixture used by the three stack reconciliation test suites *(curated)*
-- **#15603**: Share hardened docker run argv, mount setup, and override-image verification between Codex and Claude session containers *(curated)*
 - **#15605**: Consolidate duplicated PR file-list pagination and head-content plumbing across the four forge PR-diff verbs *(curated)*
 
 ## Proposed (Architect / Hermit)
@@ -307,8 +303,7 @@ Issues carrying `loom:curated`.
 - **#15410**: Remove the senderless SQLite issue_claims registry and its nine IPC requests (~1,200 LOC) *(hermit)* *(held)*
 - **#15568**: Remove three remaining senderless terminal IPC requests (GetTerminalOutput, GetTerminalActivity, GetCurrentCommit) and their unreachable output-scraping chain (~2,800 LOC) *(hermit)* *(held)*
 - **#15601**: Reuse the reaper’s send_group_signal in role timeouts *(hermit)* *(held)*
-- **#15603**: Share hardened docker run argv, mount setup, and override-image verification between Codex and Claude session containers *(hermit)*
-- **#15607**: Consolidate 10 remaining durable state atomic-write sites onto fs_util::write_atomic *(hermit)*
+- **#15617**: Retire sweep_registry::reaper::output_with_timeout and route its 13 remaining callers onto proc_exec::run_bounded *(hermit)*
 
 ## Epics
 
@@ -328,11 +323,11 @@ Issues carrying `loom:curated`.
 | Very important | 0 |
 | Important | 9 |
 | Ready (`loom:issue`, net of holds/building/open-linked-PRs) | 0 |
-| In Progress (`loom:building`) | 37 |
+| In Progress (`loom:building`) | 35 |
 | Held, no other bucket | 80 |
-| PRs awaiting review | 3 |
-| Approved PRs awaiting merge | 37 |
-| Curated | 116 |
-| Architect / Hermit proposals | 9 |
+| PRs awaiting review | 4 |
+| Approved PRs awaiting merge | 36 |
+| Curated | 114 |
+| Architect / Hermit proposals | 8 |
 | Active epics | 7 |
 <!-- guide:plan-body:end -->
