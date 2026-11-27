@@ -65,7 +65,8 @@ pub mod status_route;
 use std::path::PathBuf;
 
 use crate::forge_cmd::{detect_forge, gh_bin, repo_nwo, ForgeType};
-use mode::{resolve_merge_mode, ResolvedMergeMode};
+use clap::Subcommand;
+use mode::{resolve_merge_mode, MergeMode, MergeModeError, ResolvedMergeMode};
 use ops::{DequeueOutcome, EnqueueOutcome, QueueError};
 use preflight::CapabilityError;
 
@@ -75,63 +76,163 @@ pub const QUEUE_EXECUTION_ENABLED: bool = true;
 
 const PREFIX: &str = "merge-queue:";
 
-/// One `forge merge-queue` verb.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// One `forge merge-queue` verb (also its clap surface, #15626). `mode`,
+/// `preflight` and `status` are read-only; `enqueue`/`dequeue` refuse (exit 4)
+/// under `champion.mergeMode=direct` (the default). Exit codes: 0 ok, 1 failed
+/// / not capable, 2 invalid config or usage, 3 could not determine, 4 refused
+/// before any forge call.
+#[derive(Debug, Clone, PartialEq, Eq, Subcommand)]
 pub enum MergeQueueCmd {
+    /// Print the resolved `champion.mergeMode` (env `LOOM_MERGE_MODE` >
+    /// config > default `direct`), its source, and the execution gate.
     Mode,
+    /// Capability preflight: is there an active `merge_queue` rule with
+    /// required status checks on the branch? Never writes; never falls back.
     Preflight {
+        /// Repository, `owner/repo`. Default: the repository of the CWD.
+        #[arg(long, value_name = "NWO")]
         repo: Option<String>,
+        /// Branch to check. Default: the repository's default branch.
+        #[arg(long, value_name = "BRANCH")]
         branch: Option<String>,
     },
+    /// Read a PR's head and merge-queue entry.
     Status {
+        #[arg(value_name = "PR")]
         pr: u32,
+        #[arg(long, value_name = "NWO")]
         repo: Option<String>,
     },
+    /// Enqueue a PR pinned to the approved head (`expectedHeadOid`).
+    /// Idempotent.
     Enqueue {
+        #[arg(value_name = "PR")]
         pr: u32,
+        /// The full 40-character head SHA the Judge approved.
+        #[arg(long, value_name = "SHA")]
         approved_sha: String,
+        #[arg(long, value_name = "NWO")]
         repo: Option<String>,
     },
+    /// Remove a PR from the merge queue. Idempotent.
     Dequeue {
+        #[arg(value_name = "PR")]
         pr: u32,
+        #[arg(long, value_name = "NWO")]
         repo: Option<String>,
     },
-    /// #10256: reconcile one PR (`merge-pr.sh`) or every pending one.
+    /// #10256: reconcile a PR with the queue (`merge-pr.sh` calls this with
+    /// `--pr`), or every pending queued PR (no `--pr`). Confirms merges,
+    /// comments and routes drops with GitHub's verified reason, revokes and
+    /// dequeues a queued PR that lost its authorization. Prints
+    /// `LOOM-MERGE-QUEUE-DIRECT` and exits 0 in direct mode without any forge
+    /// call. Exit 7 = queued/dropped (not merged, nothing wrong), 3 = could
+    /// not determine (do not merge).
     Reconcile {
+        #[arg(long, value_name = "PR")]
         pr: Option<u32>,
+        #[arg(long, value_name = "NWO")]
         repo: Option<String>,
+        /// Only report the mode; read and write nothing (dry runs).
+        #[arg(long)]
         mode_only: bool,
     },
-    /// #10256: authorize and enqueue after every direct guard passed.
+    /// #10256: authorize and enqueue an approved PR after every direct merge
+    /// guard passed. Refuses (exit 4) in direct mode;
+    /// refuses unless the ruleset requires `loom/merge-authorization`. Exit 7
+    /// = handed off (NOT merged). Never falls back to a direct merge.
     Handoff {
+        #[arg(value_name = "PR")]
         pr: u32,
+        #[arg(long, value_name = "SHA")]
         approved_sha: String,
+        #[arg(long, value_name = "NWO")]
         repo: Option<String>,
     },
-    /// #10256: the Champion's single call: reconcile, then hand off.
+    /// #10256: the Champion's one call at the merge point: `reconcile`, then
+    /// `handoff` only when reconcile says continue. Direct mode prints
+    /// `LOOM-MERGE-QUEUE-DIRECT` and exits 0 (run `merge-pr.sh` as before);
+    /// any other first line means do NOT run `merge-pr.sh`.
     Step {
+        #[arg(value_name = "PR")]
         pr: u32,
+        #[arg(long, value_name = "SHA")]
         approved_sha: String,
+        #[arg(long, value_name = "NWO")]
         repo: Option<String>,
     },
-    /// #10256: revoke + dequeue before a Loom-owned transition.
+    /// #10256: revoke the queue authorization and dequeue BEFORE a Loom-owned
+    /// transition (verdict invalidation, review claim, operator hold). Exit 0
+    /// when the transition may proceed (and always in direct mode).
     Revoke {
+        #[arg(value_name = "PR")]
         pr: u32,
+        /// Short token recorded in the revoke marker, e.g. `stale-verdict`.
+        #[arg(long, default_value = "transition")]
         reason: String,
+        #[arg(long, value_name = "NWO")]
         repo: Option<String>,
     },
     /// #10256: evaluate and post `loom/merge-authorization` for the merge
-    /// group built at `commit` (every member, concluded last).
+    /// group commit (run from the `merge_group` workflow or the daemon).
+    /// Exit 0 = success posted; 1 = failure posted; 6 = pending posted;
+    /// 3 = nothing confirmed posted. Every non-zero exit blocks the merge.
     GroupCheck {
+        #[arg(long, value_name = "SHA")]
         commit: String,
+        #[arg(long, value_name = "NWO")]
         repo: Option<String>,
     },
-    /// #10256: body of the required `loom/merge-authorization` check.
+    /// #10256: the required `loom/merge-authorization` check body for the PR
+    /// head a merge group was built from. Exit 0 = success, 1 = failure
+    /// (any unknown fact, outage or forge error fails).
     AuthorizeCheck {
+        #[arg(value_name = "PR")]
         pr: u32,
+        #[arg(long, value_name = "SHA")]
         pr_head: String,
+        #[arg(long, value_name = "NWO")]
         repo: Option<String>,
     },
+}
+
+impl MergeQueueCmd {
+    /// Whether this verb can reach the forge, given the resolved
+    /// `champion.mergeMode`, and so must pass `loom-tools`' mode gate (design
+    /// §10.3, #14520). Mirrors [`run`]'s own
+    /// short circuits, by effect:
+    ///
+    /// - an invalid mode is answered (exit 2) before anything else runs, for
+    ///   every verb;
+    /// - `reconcile --mode-only` reads and writes nothing in any mode;
+    /// - in `direct` mode `reconcile` and `step` print their
+    ///   `LOOM-MERGE-QUEUE-DIRECT` sentinel before the forge is identified;
+    /// - `enqueue`, `dequeue`, `handoff` and `revoke` are vetted by
+    ///   `write_target` (a credential probe against the target) *before* the
+    ///   handler's direct-mode refusal, so they reach the forge in every mode;
+    /// - `mode`, `preflight`, `status`, `group-check` and `authorize-check` are
+    ///   mode-independent and always may.
+    #[must_use]
+    pub(crate) fn reaches_forge(&self, mode: &Result<ResolvedMergeMode, MergeModeError>) -> bool {
+        let Ok(resolved) = mode else {
+            return false;
+        };
+        match self {
+            Self::Reconcile {
+                mode_only: true, ..
+            } => false,
+            Self::Reconcile { .. } | Self::Step { .. } => resolved.mode == MergeMode::Queue,
+            Self::Mode
+            | Self::Preflight { .. }
+            | Self::Status { .. }
+            | Self::Enqueue { .. }
+            | Self::Dequeue { .. }
+            | Self::Handoff { .. }
+            | Self::Revoke { .. }
+            | Self::GroupCheck { .. }
+            | Self::AuthorizeCheck { .. } => true,
+        }
+    }
 }
 
 /// Exit code for a [`QueueError`].
