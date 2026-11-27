@@ -485,26 +485,9 @@ fn run_fetch_with(
 // Cache key: resolved repo + host + credential identity
 // ============================================================================
 
-/// `(host, owner/repo)` parsed from a git remote URL (`git@host:o/r(.git)`,
-/// `ssh://git@host/o/r`, `https://host/o/r`, `http://host/o/r`).
-pub(crate) fn parse_remote_url(url: &str) -> Option<(String, String)> {
-    let url = url.trim();
-    let stripped = url.strip_suffix(".git").unwrap_or(url);
-    let (host, path) = if let Some(rest) = stripped.strip_prefix("git@") {
-        rest.split_once(':')?
-    } else {
-        let rest = ["ssh://", "https://", "http://"]
-            .iter()
-            .find_map(|p| stripped.strip_prefix(p))?;
-        let (authority, path) = rest.split_once('/')?;
-        (authority.rsplit('@').next().unwrap_or(authority), path)
-    };
-    let (owner, repo) = path.trim_matches('/').split_once('/')?;
-    if host.is_empty() || owner.is_empty() || repo.is_empty() {
-        return None;
-    }
-    Some((host.to_ascii_lowercase(), format!("{owner}/{repo}")))
-}
+/// `(host, owner/repo)` parsed from a git remote URL — the shared parser in
+/// [`crate::forge_cmd`] (#15624), so `:port` never reaches `gh api --hostname`.
+pub(crate) use crate::forge_cmd::parse_remote_url;
 
 /// `cwd`'s `origin` remote as `(host, owner/repo)`, memoised per root: the
 /// daemon's loops hit ~58 roots × several labels every tick, and forking
