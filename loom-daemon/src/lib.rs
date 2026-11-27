@@ -406,6 +406,7 @@ pub mod secret_scan;
 pub mod self_spawn_log;
 pub mod self_update;
 pub mod serve;
+pub mod session_filter;
 pub mod session_reconcile;
 pub mod session_status;
 pub mod shell_quote;

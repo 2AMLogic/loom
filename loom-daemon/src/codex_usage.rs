@@ -428,60 +428,7 @@ fn numeric_children(
     (out, incomplete)
 }
 
-/// Which sessions a caller wants attributed.
-///
-/// `directories` + the caller's window is the default key (see the module
-/// doc); `ids` narrows to an exact `session_meta.session_id` set when the
-/// caller has one, and is the strictly-more-precise attribution #8507's design
-/// note asked for.
-#[derive(Debug, Clone, Default)]
-pub struct SessionFilter {
-    /// Working directories to attribute, matched exactly against
-    /// `session_meta.cwd`. Empty ⇒ no directory constraint (only meaningful
-    /// together with [`Self::ids`], which is then the whole key).
-    pub directories: Vec<PathBuf>,
-    /// Exact `session_meta.session_id` values to attribute. Empty ⇒ no id
-    /// constraint.
-    pub ids: Vec<String>,
-}
-
-impl SessionFilter {
-    /// The directory+window key every consumer in the daemon uses today.
-    #[must_use]
-    pub fn directories(directories: &[PathBuf]) -> Self {
-        Self {
-            directories: directories.to_vec(),
-            ids: Vec::new(),
-        }
-    }
-
-    /// Whether a rollout's `cwd` / `session_id` pass this filter.
-    ///
-    /// An EMPTY filter (no directories, no ids) matches nothing: "attribute
-    /// every session on this host" is never what a caller means, and silently
-    /// treating it as such would fold an unrelated sweep's spend into a
-    /// completion.
-    #[must_use]
-    fn matches(&self, cwd: &str, session_id: Option<&str>) -> bool {
-        if self.directories.is_empty() && self.ids.is_empty() {
-            return false;
-        }
-        if !self.directories.is_empty()
-            && !self
-                .directories
-                .iter()
-                .any(|d| d.to_str().is_some_and(|d| d == cwd))
-        {
-            return false;
-        }
-        if !self.ids.is_empty()
-            && !session_id.is_some_and(|id| self.ids.iter().any(|want| want == id))
-        {
-            return false;
-        }
-        true
-    }
-}
+pub use crate::session_filter::SessionFilter;
 
 /// One attributable Codex session, already decoded and folded — the shape both
 /// [`tokens_by_model`] and [`sessions`] produce.
@@ -928,10 +875,7 @@ pub fn lookup_ids(
     if ids.is_empty() {
         return IdLookup::NotFound;
     }
-    let filter = SessionFilter {
-        directories: Vec::new(),
-        ids: ids.to_vec(),
-    };
+    let filter = SessionFilter::ids(ids);
     let mut rows: Vec<CodexSessionUsage> = Vec::new();
     let mut selected = false;
     let mut read_any = false;
