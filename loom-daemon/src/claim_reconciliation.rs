@@ -2057,8 +2057,9 @@ pub mod merge_sequence;
 /// file, run on the same tick right after [`forge::reconcile_pr_verdicts`].
 pub mod review_conflict;
 
-/// Retarget open PRs stacked on a parent closed unmerged (#12760) — and its
-/// scratch-worktree git mechanics — sibling files.
+/// Retarget open PRs stacked on a parent closed unmerged (#12760) — and the
+/// scratch-worktree git mechanics it shares with [`merged_stack`] — sibling
+/// files.
 pub mod orphan_stack;
 pub(crate) mod orphan_stack_git;
 

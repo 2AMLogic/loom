@@ -878,3 +878,116 @@ fn a_parent_head_absent_from_its_record_or_its_fetched_ref_is_flagged() {
     assert!(posted[0].contains("names no head commit"), "{}", posted[0]);
     assert_eq!(fx.origin_rev(B), b);
 }
+
+// --- #9282: the rebase guard's refusals ---------------------------------------
+
+/// `install-metadata.json` as a Loom repository's base commit holds it.
+fn metadata(commit: &str) -> String {
+    format!("{{\n  \"loom_version\": \"1\",\n  \"loom_commit\": \"{commit}\"\n}}\n")
+}
+
+/// A stack whose child's only change is to a `merge=ours` path that the
+/// default branch changed too. Replayed, the change is discarded, so the
+/// replayed head has the default branch's exact tree: the rebase guard's
+/// `EMPTIED` (#8298, #9001). Returns the parent's and the child's heads.
+fn merge_ours_stack(fx: &Fixture) -> (String, String) {
+    std::fs::write(fx.author.join(".gitattributes"), "install-metadata.json merge=ours\n").unwrap();
+    commit_file(&fx.author, "install-metadata.json", &metadata("aaaa"), "base: metadata");
+    run(&fx.author, &["push", "-q", "origin", "main"]);
+    let a = fx.branch(A, "main", 1, "a.txt", "parent\n");
+    let b = fx.branch(B, A, 2, "install-metadata.json", &metadata("bbbb"));
+    fx.advance_main(
+        "install-metadata.json",
+        "{\n  \"loom_version\": \"2\",\n  \"loom_commit\": \"aaaa\"\n}\n",
+    );
+    fx.clone_repo();
+    // The driver the attribute names, as a Loom repository configures it.
+    run(&fx.repo, &["config", "merge.ours.driver", "true"]);
+    (a, b)
+}
+
+/// The rebase guard's `EMPTIED`: a replay that leaves the child no change of
+/// its own is flagged with the guard's reason and nothing is pushed.
+#[test]
+fn a_replay_the_rebase_guard_empties_is_flagged_and_nothing_is_pushed() {
+    let fx = Fixture::new();
+    let (a, b) = merge_ours_stack(&fx);
+    let forge = FakeForge {
+        parents: parents_a(&a),
+        ..FakeForge::default()
+    };
+    let open = vec![open_pr(2, B, &b, A)];
+    let stats = reconcile_with(&forge, &fx.repo, "main", &open);
+
+    assert_eq!((stats.flagged, stats.retargeted), (1, 0), "{stats:?}");
+    assert_eq!(fx.origin_rev(B), b, "nothing pushed");
+    assert_eq!(*forge.added.borrow(), vec![(2, MERGE_CONFLICT.to_string())]);
+    assert!(forge.retargets.borrow().is_empty());
+    let posted = forge.comments.borrow().get(&2).cloned().unwrap_or_default();
+    assert_eq!(posted.len(), 1);
+    assert!(posted[0].starts_with(&flagged_marker(1, &b)));
+    assert!(
+        posted[0].contains(
+            "replaying it would leave no change of its own (the rebase guard reported \
+             EMPTIED, #9282)"
+        ),
+        "{}",
+        posted[0]
+    );
+    assert_eq!(worktree_count(&fx.repo), 1, "the scratch worktree is removed");
+
+    // Flagged once per head: the same state posts nothing again.
+    let again = reconcile_with(&forge, &fx.repo, "main", &open);
+    assert_eq!(again.flagged, 0);
+    assert_eq!(forge.added.borrow().len(), 1);
+    assert_eq!(forge.comments.borrow().get(&2).map(Vec::len), Some(1));
+}
+
+/// The rebase guard's `RESOLUTION_DISCARDED`: a child holding a hand-made
+/// merge resolution, which the replay flattens away, is flagged naming that
+/// merge and nothing is pushed.
+#[test]
+fn a_replay_that_drops_a_hand_resolution_is_flagged_and_nothing_is_pushed() {
+    let fx = Fixture::new();
+    let a = fx.branch(A, "main", 1, "a.txt", "parent\n");
+    fx.branch(B, A, 2, "fix_b.txt", "coord=5\n");
+    fx.advance_main("fix_a.txt", "coord=5\n");
+    // The child merges the default branch cleanly and, in that merge commit,
+    // moves its own fixture off the colliding coordinate by hand.
+    run(&fx.author, &["checkout", "-q", B]);
+    run(&fx.author, &["merge", "--no-commit", "main"]);
+    let b =
+        commit_file(&fx.author, "fix_b.txt", "coord=6\n", "B: merge main, keep the fixtures apart");
+    run(&fx.author, &["push", "-q", "-f", "origin", &format!("{B}:{B}")]);
+    run(
+        &fx.author,
+        &[
+            "push",
+            "-q",
+            "-f",
+            "origin",
+            &format!("{B}:refs/pull/2/head"),
+        ],
+    );
+    fx.clone_repo();
+    let forge = FakeForge {
+        parents: parents_a(&a),
+        ..FakeForge::default()
+    };
+    let stats = reconcile_with(&forge, &fx.repo, "main", &[open_pr(2, B, &b, A)]);
+
+    assert_eq!((stats.flagged, stats.retargeted), (1, 0), "{stats:?}");
+    assert_eq!(fx.origin_rev(B), b, "nothing pushed");
+    assert!(forge.retargets.borrow().is_empty());
+    let posted = forge.comments.borrow().get(&2).cloned().unwrap_or_default();
+    assert_eq!(posted.len(), 1);
+    assert!(posted[0].starts_with(&flagged_marker(1, &b)));
+    assert!(
+        posted[0].contains(&format!(
+            "replaying it would drop the hand resolution in merge {b} (the rebase guard \
+             reported RESOLUTION_DISCARDED, #9282)"
+        )),
+        "{}",
+        posted[0]
+    );
+}
