@@ -229,7 +229,7 @@ pub(crate) fn parse_host(url: &str) -> Option<String> {
 }
 
 mod remote_url;
-pub(crate) use remote_url::get_remote_url;
+pub(crate) use remote_url::{get_remote_url, parse_remote_url};
 
 /// Determine forge type from a hostname, consulting the configured Gitea URL.
 fn detect_from_host(host: &str, forge_config: &Value) -> ForgeType {
@@ -677,17 +677,11 @@ pub(crate) fn repo_nwo_in(gh: &str, cwd: Option<&Path>) -> Option<String> {
     parse_nwo_from_remote_url(&remote_url)
 }
 
-/// Extract `owner/repo` from a git remote URL (SSH `git@host:owner/repo.git`
-/// or HTTPS `https://host/owner/repo(.git)` form), mirroring the shell sed in
-/// `forge_get_repo_nwo` (`defaults/scripts/lib/forge-helpers.sh`).
+/// Extract `owner/repo` from a git remote URL (any form
+/// [`parse_remote_url`] accepts). A single-segment, 3+-segment or local-path
+/// remote is `None` rather than an invented owner (#15624).
 pub(crate) fn parse_nwo_from_remote_url(url: &str) -> Option<String> {
-    let trimmed = url.strip_suffix(".git").unwrap_or(url);
-    let mut parts: Vec<&str> = trimmed.rsplit(['/', ':']).take(2).collect();
-    if parts.len() != 2 || parts.iter().any(|p| p.is_empty()) {
-        return None;
-    }
-    parts.reverse();
-    Some(parts.join("/"))
+    parse_remote_url(url).map(|(_, nwo)| nwo)
 }
 
 /// Handle `loom-daemon forge auto-merge` (operator-only since #8410/#8427 —
@@ -1377,6 +1371,13 @@ mod tests {
         // owner.
         assert_eq!(parse_nwo_from_remote_url(""), None);
         assert_eq!(parse_nwo_from_remote_url("https://github.com/"), None);
+        // #15624: no invented owner from the hostname or a local path.
+        assert_eq!(parse_nwo_from_remote_url("https://github.com/only-owner"), None);
+        assert_eq!(parse_nwo_from_remote_url("/srv/git/widgets.git"), None);
+        assert_eq!(
+            parse_nwo_from_remote_url("ssh://git@github.com:22/acme/widgets.git").as_deref(),
+            Some("acme/widgets")
+        );
     }
 
     // ===== #5589: is_head_mismatch_response() classifier =====
