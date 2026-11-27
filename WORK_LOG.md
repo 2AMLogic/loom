@@ -18,6 +18,10 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 ### 2026-11-27
 
+- **PR #15625**: Share parse_remote_url across git-remote URL parsers; bound init::git::extract_repo_info
+- **Issue #15624** (closed): Share parse_remote_url across 6 git-remote URL parsers and bound init::git::extract_repo_info
+- **PR #15622**: refactor: route eight hand-rolled flock lock files through fs_util::FileLock
+- **Issue #15620** (closed): Consolidate 8 hand-rolled libc::flock file-lock wrappers in loom-daemon onto a shared fs_util::FileLock
 - **PR #15614**: refactor: delegate private_workspace::save to fs_util::write_atomic
 - **Issue #15611** (closed): write_atomic consolidation: private_workspace::save is a residual durable-state writer #15607 did not enumerate
 - **PR #15612**: refactor: extract shared Codex and Claude container setup helpers
