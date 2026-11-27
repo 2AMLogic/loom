@@ -51,7 +51,7 @@ use chrono::{DateTime, Utc};
 pub type TagLookup<'a> = dyn Fn(&str, &str) -> Result<String, String> + 'a;
 
 /// The repository whose tags are releases.
-pub const RELEASE_REPO: &str = "rjwalters/loom";
+pub const RELEASE_REPO: &str = "2AMLogic/loom";
 
 /// The marker text the stamp is embedded in, so `release.yml` can check a
 /// built artifact (including a cross-compiled one it cannot run) with
