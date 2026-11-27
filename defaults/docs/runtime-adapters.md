@@ -253,13 +253,35 @@ pool check and reports `api_keys:gemini` — the same source a native tap on
 the namespace reports — so `hold_pool_slot` reserves either route against
 the one cap.
 
-- **Supported roles**: read-only roles with no `runtimeRequirements`
-  (Curator, Guide, Auditor). Builder and Doctor (worktreeIsolation +
-  loomControl) and Judge (loomControl) are refused by the manifest's
-  all-`"no"` capabilities, by the same mechanism as every other tier-3
-  runtime.
-- **Pilot invocation**: `LOOM_RUNTIME=agy .loom/scripts/spawn-worker.sh -p
-  "<prompt>"`, or a `runtimes.preference` / role-draw entry naming `agy`.
+- **Supported roles**: none for dispatch; the pilot is **verification-only**.
+  Its one task is a one-shot read-only prompt: read a disposable workspace
+  fixture and return the value in the response. The capability check does not
+  confine it to that. A role that declares no `runtimeRequirements` is
+  admitted without the manifest's capabilities being read:
+  `check-runtime-capabilities.sh` admits it with `role '<role>' declares no
+  runtimeRequirements`, and `runtime_admission` does the same. The
+  all-`"no"` capabilities therefore refuse only Builder and Doctor
+  (worktreeIsolation + loomControl) and Judge (loomControl), as in every
+  other tier-3 runtime. Admission is not completion. Curator, Guide and
+  Auditor each finish by executing a command: Curator through
+  `loom-daemon curation-complete`, Guide through `gh`, Auditor through its
+  checks and `./.loom/scripts/create-issue.sh`. The empty
+  `runtimeRequirements` list is not unique to them (Architect, Champion,
+  Driver, Hermit and `loom` declare none either), and the same applies to
+  any role that needs a command to finish. The pinned policy denies
+  `command(*)` and `mcp(*)`, and the manifest declares `mcp: "no"`, so a
+  role drawn onto `agy` can produce text and nothing else. On build
+  `1.5.18-6386224290725888` a shell write (`run_command`) was refused with
+  `Matches user-configured deny rule` (#15474; see "Permission policy"
+  below). Do not name `agy` in `runtimes.preference`,
+  `runtimes.rolePreference` or `runtimes.roleDraw`. Narrowing `command(*)`
+  would change the containment policy approved in #15474 and needs its own
+  decision.
+- **Pilot invocation**: an explicit
+  `LOOM_RUNTIME=agy .loom/scripts/spawn-worker.sh -p "<prompt>"` carrying a
+  one-shot read-only prompt or a fixture check. Never a
+  `runtimes.preference`, `runtimes.rolePreference` or `runtimes.roleDraw`
+  entry naming `agy`.
 - **Version pin**: a pin is a **recorded build** — the archive URL and the
   release manifest's `sha512` for one build — because the vendor channel is
   latest-only: the installer takes only `--dir` and installs whatever the
