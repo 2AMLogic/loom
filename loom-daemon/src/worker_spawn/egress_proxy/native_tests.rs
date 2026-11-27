@@ -97,26 +97,6 @@ fn prepare_native_refuses_legacy_runtimes_and_non_opencode_config_overrides() {
     assert!(opencode.unwrap().is_some());
 }
 
-#[test]
-#[serial_test::serial]
-fn prepare_refuses_a_config_only_override_on_a_contained_launch() {
-    let _g = env_lock();
-    let tmp = tempfile::tempdir().unwrap();
-    std::env::remove_var("LOOM_NATIVE_CREDENTIAL_PROXY");
-    std::env::set_var("LOOM_TEST_PROXY_KEY_8674", "sk-fake-real-credential");
-    let on = json!({"runtimes":{"containment":{"credentialProxy":true}}});
-    let error =
-        prepare(tmp.path(), &selection_with(Some(zai_flash_proxy())), &on, "opencode").unwrap_err();
-    std::env::remove_var("LOOM_TEST_PROXY_KEY_8674");
-    assert!(
-        error
-            .message
-            .contains("baseUrlConfig is only supported on uncontained"),
-        "{}",
-        error.message
-    );
-}
-
 /// #11714: a profile may DECLARE config-side redirection for its opencode
 /// binding while it also binds `pi`. With the flag OFF, a contained launch of
 /// that profile is plain env-passthrough — the declaration alone must not

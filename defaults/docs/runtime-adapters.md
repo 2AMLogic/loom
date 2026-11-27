@@ -2306,10 +2306,12 @@ stays env-passthrough even with the flag on.
   the only harness with a config contract this writes, so the field is
   **inert on any other runtime** — dropped from the selection at resolution,
   so a profile may declare it for its OpenCode binding while its other
-  bindings keep launching. It is also refused on an armed **contained**
-  launch: that config is provisioned inside the container, where the
-  host-side launcher cannot patch it, so a contained OpenCode launch is
-  re-pointed with `baseUrlEnv`.
+  bindings keep launching. On an armed **contained** OpenCode launch the
+  config is provisioned inside the container, where the host-side launcher
+  cannot patch it, so the host hands the proxy's container-reachable base
+  URL to the in-container copy as a *required* internal worker argument
+  (`--egress-proxy-base-url`, issue #15527) and that copy applies the same
+  patch after provisioning (see "Contained OpenCode launches" below).
 
 The bundled `zai-flash` profile proxies Z.ai's coding-plan endpoint through
 the OpenCode harness this way (`upstream: https://api.z.ai/api/coding/paas/v4`,
@@ -2319,6 +2321,37 @@ operator turns `credentialProxy` on (issue #11300). That profile also binds
 no `baseUrlEnv`, so with the flag on a `pi` launch of it fails closed —
 arming a proxy the harness would not follow would send the placeholder to
 the real upstream — and with the flag off it launches unchanged.
+
+**Contained OpenCode launches (issue #15527).** With both switches on
+(`runtimes.containment.native = "ephemeral"` and `credentialProxy = true`),
+a contained OpenCode launch of a `baseUrlConfig` profile — the bundled
+`zai-flash` and `zai-full` — is armed on the host like any other proxied
+launch: the real credential is resolved on the host, `docker run` carries
+the same per-launch placeholder under every credential name
+(`ZAI_API_KEY` and `ZHIPU_API_KEY`) and forwards neither by name, and the
+listener stays host-side. The launcher then appends
+`--egress-proxy-base-url <http://host:port>` to the worker argv of the
+contained re-exec. Inside the container, before any prompt expansion or
+harness provisioning, the worker validates the handoff and, once the OpenCode
+config is provisioned (guarded role or free-form launch, with or without a
+provider block in the profile), sets
+`provider.<id>.options.<baseUrlConfig>` on the selected provider to that URL;
+the rest of `OPENCODE_CONFIG_CONTENT` is left alone.
+
+The handoff fails closed (exit 78, before the harness starts) when it is:
+given anywhere but the contained re-exec; given for a runtime other than
+`opencode`, a profile with no `baseUrlConfig`, or a gateway-routed launch;
+not exactly `http://<host>:<port>`; or paired with a credential that is not
+the host's placeholder. **Mixed versions:** the argument is required, not
+advisory. A `loom-daemon` inside the image that predates it rejects the
+unknown option (`unsupported worker option`, exit 78) before it reads a
+credential or builds a harness command, so an old image yields an explicit
+configuration error and never a launch that looks proxied but is not. Rebuild
+or republish the worker image alongside the host when enabling this path.
+Unproxied launches, uncontained proxied launches (loopback-bound, patched by
+the launcher itself) and a `pi` selection of the same profiles behave as
+before; `pi` with the proxy on still refuses, because the bundled profiles
+declare no `baseUrlEnv` for it.
 
 **Uncontained native launches.** The same substitution is available without
 containment, on the same switch and the same per-profile opt-in: a native

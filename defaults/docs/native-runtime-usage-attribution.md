@@ -88,9 +88,32 @@ caller-supplied set) plus the caller's wall-clock window:
   (`codex_usage::lookup_ids`) keys on id + window with no directory (#14540 —
   deliberately no directory retry, which could fold a sibling launch's spend
   into this one). Session IDs distinguish concurrent same-role steps
-  dispatched in one workspace. When the log yields no IDs (a Claude step,
-  an unreadable log, a Kimi launch), the reader falls back to the role-tick
-  key of workspace root and time window.
+  dispatched in one workspace. When no session id is available
+  there is no single fallback — which files and stores are consulted depends
+  on the runtime, and on whether the step log could be read at all:
+  - **Unreadable log, native runtime.** The step's log is missing or
+    unreadable, or has no `sweep_id=` header for this dispatch, and the
+    runtime the registry selected at step launch is a native store (OpenCode,
+    Kimi, Codex, Pi): the session ids are unknown, so the daemon reports
+    `no_step_log` (#14566) without opening that store. The token is the
+    `loom.usage.missing_reason` of a `loom.runtime.usage_missing` span
+    ([`telemetry-schema.md`](telemetry-schema.md)).
+  - **Readable log, no session id.** The directory-based readers (OpenCode,
+    Codex, Kimi — a Kimi launch always lands here, because no id is parsed
+    from its log) search within the step's time window. An issue-keyed step
+    (Curator, Builder, `champion_promote`) covers the workspace root *and*
+    that issue's own worktree; a PR-keyed step (Judge, Doctor,
+    `champion_merge`) covers the workspace root alone. An OpenCode or Codex
+    step that finds nothing there reports `no_session_id`.
+  - **Claude step.** The token match consults neither the step log nor a
+    directory: the daemon scans the workspace's Claude project transcripts in
+    the step's window and keeps a session only when its head names the role
+    command *and* the step's own item (`/loom:builder N`, `/loom:curator N`,
+    `/loom:champion --issue N`; `/loom:judge N`, `/loom:doctor N`,
+    `/loom:champion --pr N`), so a concurrent transcript for another item
+    does not qualify.
+  - **Pi step.** The step's own log is the only source: the daemon reads the
+    event stream captured there, within the step's window.
 
 A session row whose five counters are all zero is skipped: OpenCode writes the
 row at creation, so a launch that produced no turns would otherwise publish a

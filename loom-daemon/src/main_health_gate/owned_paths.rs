@@ -56,6 +56,15 @@ pub(super) const LOOM_OWNED_PREFIXES: &[&str] = &[
     // to prevent. Safe to ignore here: the gate's remediation is `git reset
     // --hard <remote>` and never `git clean`, so the overlay survives.
     ".loom-local/",
+    // Operator stop requests (#15545): `signal.sh stop` writes
+    // `.loom/signals/stop-<name>` and the daemon only tests its existence
+    // (`check_stop_signals`), so it is operator-written control state, not
+    // daemon-written, and stays out of `DAEMON_RUNTIME_PATTERNS`. In a repo
+    // whose managed .gitignore block predates the `.loom/signals/` rule it is
+    // untracked dirt; the bash mirror's `--quarantine` would stash the stop
+    // request away mid-sweep. The trailing slash matches the directory git
+    // reports as well as any child path; `.loom/signals-old/` is not matched.
+    ".loom/signals/",
     // Daemon-written token-pool runtime files (#15479): the per-repo health
     // cache and its sibling lock (#5014), and the ranking the refresh tick
     // rewrites every cycle (#14584). Written into every workspace now, while

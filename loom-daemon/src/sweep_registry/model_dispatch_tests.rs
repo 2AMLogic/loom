@@ -5,7 +5,7 @@ use crate::sweep_registry::test_support::*;
 use crate::sweep_registry::{DispatchModel, SweepRegistry};
 use crate::types::SweepKind;
 use crate::work_finder::{RegistryDispatcher, WorkDispatcher};
-use crate::worker_spawn::{profiles, Options};
+use crate::worker_spawn::{profiles, LaunchStage, Options};
 use serde_json::{json, Value};
 // #9548: gate-reaching tests hold the default serial key; see `crate::write_scope_test_support`.
 use std::{
@@ -611,6 +611,89 @@ fn an_allowed_bare_effort_and_a_qualified_pin_are_forwarded_verbatim() {
         Some("medium"),
         "a runtime-qualified pin is never silently dropped"
     );
+}
+
+// ---- #14634: the observed Builder refusal, judged by the launcher's select ----
+
+/// `#14634` fixture at the incident's values: a bare `opencode` draw whose
+/// launch selects the `zai-full` model profile (the bundled vocabulary —
+/// `allowedEfforts` low/high/max, own effort `max`), with the role-effort
+/// config `efforts`. No credential is declared, so the walk's availability
+/// mirror does not gate the tap (as in the #14963 fixture).
+fn zai_full_effort_config(efforts: Value) -> Value {
+    let mut config = fallback_config();
+    config["runtimes"]["default"] = json!("opencode");
+    config["runtimes"]["preference"] = json!(["opencode"]);
+    config["runtimes"]["defaultModelProfile"] = json!("zai-full");
+    config["runtimes"]["modelProfiles"]["zai-full"] = json!({
+        "model": "glm-5.4",
+        "providers": {"opencode": "zai-coding-plan"},
+        "effort": "max",
+        "allowedEfforts": ["low", "high", "max"]
+    });
+    config["autonomous"]["roleRunner"]["roleEfforts"] = efforts;
+    config
+}
+
+/// The launcher's own verdict on the launch the step site forwards: the
+/// `--effort` it passes and the tap's `modelProfile` the child reads.
+fn launcher_verdict(
+    launch: &crate::sweep_registry::step_spawn::StepLaunch,
+    config: &Value,
+) -> std::result::Result<profiles::Selection, crate::worker_spawn::LaunchError> {
+    let admitted = launch.admission.admitted.as_ref().unwrap();
+    profiles::select(
+        &admitted.runtime,
+        &Options {
+            effort: launch.effort.clone(),
+            profile: admitted
+                .preference
+                .as_ref()
+                .and_then(|p| p.model_profile.clone()),
+            ..Options::default()
+        },
+        config,
+    )
+}
+
+/// The incident: the unqualified `xhigh` is dropped, so the launch the step
+/// forwards is one `select` accepts — the profile's own effort reaches the
+/// harness, the `(zai-full, max)` launch these repos now show.
+#[test]
+#[serial_test::serial(loom_shared_tokens_dir_env)]
+fn a_bare_xhigh_builder_effort_launches_at_the_profiles_own_effort() {
+    let dir = tempfile::tempdir().unwrap();
+    let _env = Environment::isolated(dir.path());
+    let config = zai_full_effort_config(json!({"builder": "xhigh"}));
+    let launch = builder_launch(dir.path(), &config).unwrap();
+    assert_eq!(
+        launch
+            .admission
+            .admitted
+            .as_ref()
+            .map(|admitted| admitted.runtime.as_str()),
+        Some("opencode"),
+        "the test must exercise a native pick"
+    );
+    let selection = launcher_verdict(&launch, &config).unwrap();
+    assert_eq!(selection.profile.as_deref(), Some("zai-full"));
+    assert_eq!(selection.effort.as_deref(), Some("max"));
+}
+
+/// An explicit pin keeps its fail-closed refusal: a runtime-qualified `xhigh`
+/// is forwarded verbatim and `select` refuses it, typed with the refused
+/// argument.
+#[test]
+#[serial_test::serial(loom_shared_tokens_dir_env)]
+fn a_qualified_xhigh_pin_is_forwarded_and_refused_with_its_typed_boundary() {
+    let dir = tempfile::tempdir().unwrap();
+    let _env = Environment::isolated(dir.path());
+    let config = zai_full_effort_config(json!({"builder@opencode": "xhigh"}));
+    let launch = builder_launch(dir.path(), &config).unwrap();
+    assert_eq!(launch.effort.as_deref(), Some("xhigh"));
+    let error = launcher_verdict(&launch, &config).expect_err("select refuses a disallowed pin");
+    assert_eq!(error.code, 78);
+    assert_eq!(error.stage, Some(LaunchStage::ProfileSelectionEffort));
 }
 
 // ---- #14962: a configured role-tier model vs a native profile pick ----

@@ -52,6 +52,17 @@ fn a_launch_rejected_notice_names_the_preflight_boundary() {
     let coarse =
         outcome_notice_body(&run(OutcomeClass::Failed, "preflight_rejected", "s"), None).unwrap();
     assert!(coarse.contains("`preflight_rejected`"), "{coarse}");
+    // A profile-selection sub-boundary reaches the receipt as its own token —
+    // never the launcher's free-form diagnostic.
+    for reason in [
+        "preflight_profile_selection_effort",
+        "preflight_profile_selection_model",
+    ] {
+        let body = outcome_notice_body(&run(OutcomeClass::Failed, reason, "s"), None).unwrap();
+        assert!(body.contains(&format!("`{reason}`")), "{body}");
+        assert!(!body.contains("reasoning effort is unsupported"), "{body}");
+        assert!(!body.contains("bare model differs"), "{body}");
+    }
 }
 
 #[test]
