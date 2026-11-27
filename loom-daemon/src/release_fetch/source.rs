@@ -50,6 +50,9 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
+use crate::cmd_out::{CmdOutcome, Unavailable};
+use crate::gh_invocation::SHED_MARKER;
+
 /// Env: the approved source anchor (a full 40-hex commit SHA).
 pub const APPROVED_SOURCE_ANCHOR_ENV: &str = "LOOM_DAEMON_UPDATE_APPROVED_SOURCE_ANCHOR";
 
@@ -131,7 +134,6 @@ pub type ApiFn<'a> = dyn Fn(&str) -> Result<String, String> + 'a;
 
 /// The real runner, through the counted/bounded `gh` facade.
 pub fn gh_api(repo_root: &Path, path: &str) -> Result<String, String> {
-    use crate::cmd_out::CmdOutcome;
     use crate::gh_invocation::{AccessIntent, GhInvocation, GhTarget, Operation};
     let outcome = GhInvocation::new(
         Operation::new("api.rest"),
@@ -143,6 +145,10 @@ pub fn gh_api(repo_root: &Path, path: &str) -> Result<String, String> {
     .current_dir(repo_root)
     .args(["api", path])
     .run();
+    api_answer(outcome)
+}
+
+fn api_answer(outcome: CmdOutcome) -> Result<String, String> {
     match outcome {
         CmdOutcome::Ran(o) if o.status.success() => Ok(String::from_utf8_lossy(&o.stdout).into()),
         CmdOutcome::Ran(o) => Err(format!(
@@ -151,7 +157,15 @@ pub fn gh_api(repo_root: &Path, path: &str) -> Result<String, String> {
                 .code()
                 .map_or_else(|| "by signal".to_string(), |c| c.to_string())
         )),
-        CmdOutcome::Unavailable(_) => Err("`gh api` could not be run or timed out".to_string()),
+        CmdOutcome::Unavailable(Unavailable::Shed { until, .. }) => Err(format!(
+            "`gh api` was not run: shed, no reader can serve this read until {} {SHED_MARKER}",
+            chrono::DateTime::<chrono::Utc>::from(until)
+                .to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+        )),
+        CmdOutcome::Unavailable(Unavailable::TimedOut { after, .. }) => {
+            Err(format!("`gh api` timed out after {after:?}"))
+        }
+        CmdOutcome::Unavailable(_) => Err("`gh api` could not be run".to_string()),
     }
 }
 
