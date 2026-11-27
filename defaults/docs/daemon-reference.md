@@ -2984,7 +2984,7 @@ deciding the workspace needs a `Skip`:
 | Loom-owned transient paths (#3778/#3950) | `.loom/sweep-checkpoint/`, `.loom/tokens/`, `.loom/logs/`, `.loom/worktrees/`, … — the daemon's own runtime bookkeeping |
 | Regenerable lockfiles (#3950) | `package-lock.json`, `Cargo.lock`, `pnpm-lock.yaml`, `yarn.lock`, `uv.lock` (matched by basename anywhere in the tree) |
 | Re-stamped install manifest (#4239, #4332) | `.loom/install-metadata.json` exactly — generated + re-stamped by every `resync-installed.sh` run, no `defaults/` source to byte-match against |
-| Installed-surface byte-match (#4332) | `.loom/hooks/`, `.loom/scripts/`, `.loom/roles/`, `.loom/docs/`, `.loom/bin/`, `.claude/commands/loom/` — ignorable **iff** the dirty file's content byte-matches its tracked `defaults/` counterpart in the same worktree (loom-repo-scoped; a consumer repo has no local `defaults/` tree, so this class never applies there) |
+| Installed-surface byte-match (#4332) | `.loom/hooks/`, `.loom/scripts/`, `.loom/roles/`, `.loom/docs/`, `.loom/bin/`, `.claude/commands/loom/` by directory prefix, plus the single-file rate card `.loom/pricing.json` ← `defaults/pricing.json` by exact path (#15554) — ignorable **iff** the dirty file's content byte-matches its tracked `defaults/` counterpart in the same worktree (loom-repo-scoped; a consumer repo has no local `defaults/` tree, so this class never applies there) |
 
 The installed-surface class exists because this repo dogfoods its own install:
 `resync-installed.sh` (`.loom/docs/troubleshooting.md` → *Overnight / long-running

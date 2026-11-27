@@ -1690,6 +1690,97 @@ fn test_non_ignorable_dirt_untracked_installed_surface_byte_match() {
     assert!(non_ignorable_dirt(status, repo_root).is_empty());
 }
 
+// ===================================================================
+// Single-file installed surface (#15554) — `.loom/pricing.json` is one
+// `sync_one` copy of `defaults/pricing.json`, so no directory prefix
+// describes it. It is ignorable IFF it byte-matches that source: the
+// same rule as the directory surfaces above.
+// ===================================================================
+
+/// AC1 (#15554): a rate card left modified by a resync, byte-identical to
+/// `defaults/pricing.json`, is ignorable.
+#[test]
+fn test_is_ignorable_dirt_pricing_card_byte_match() {
+    let repo = tempfile::tempdir().unwrap();
+    let repo_root = repo.path();
+    write_rel(repo_root, "defaults/pricing.json", "{\"model\": 1}\n");
+    write_rel(repo_root, ".loom/pricing.json", "{\"model\": 1}\n");
+    assert!(
+        is_ignorable_dirt(".loom/pricing.json", repo_root),
+        "byte-identical installed rate card is provably resync output"
+    );
+}
+
+/// AC2 (#15554): a rate card that differs from `defaults/pricing.json` is
+/// an operator's hand-edit or a pinned fork, never assumed to be resync
+/// output.
+#[test]
+fn test_is_ignorable_dirt_pricing_card_content_mismatch_stays_non_ignorable() {
+    let repo = tempfile::tempdir().unwrap();
+    let repo_root = repo.path();
+    write_rel(repo_root, "defaults/pricing.json", "source rates\n");
+    write_rel(repo_root, ".loom/pricing.json", "operator's rates\n");
+    assert!(
+        !is_ignorable_dirt(".loom/pricing.json", repo_root),
+        "content that diverges from defaults/pricing.json must not be assumed to be resync output"
+    );
+}
+
+/// AC2 (#15554): with no `defaults/pricing.json` in the worktree (a
+/// consumer repo, or a checkout predating #8177) there is nothing to
+/// byte-match against, so the rate card stays non-ignorable.
+#[test]
+fn test_is_ignorable_dirt_pricing_card_without_source_stays_non_ignorable() {
+    let repo = tempfile::tempdir().unwrap();
+    let repo_root = repo.path();
+    write_rel(repo_root, ".loom/pricing.json", "some content\n");
+    // Deliberately no defaults/pricing.json.
+    assert!(!is_ignorable_dirt(".loom/pricing.json", repo_root));
+}
+
+/// The entry is an exact path: a file whose name merely extends the rate
+/// card's is not covered, even when a byte-identical file sits where a
+/// prefix rewrite would have looked for its source.
+#[test]
+fn test_is_ignorable_dirt_pricing_card_entry_does_not_match_by_prefix() {
+    for path in [".loom/pricing.json.bak", ".loom/pricing.json/old"] {
+        let repo = tempfile::tempdir().unwrap();
+        let repo_root = repo.path();
+        let source = format!("defaults/{}", &path[".loom/".len()..]);
+        write_rel(repo_root, &source, "same bytes\n");
+        write_rel(repo_root, path, "same bytes\n");
+        assert!(
+            !is_ignorable_dirt(path, repo_root),
+            "{path} must not match the .loom/pricing.json entry by prefix"
+        );
+    }
+}
+
+/// Edge cases (#15554): the status code is irrelevant — a modified (` M`),
+/// an untracked (`??`) and a renamed-in (`R  … ->`) rate card are all keyed
+/// on the path and classified by content.
+#[test]
+fn test_non_ignorable_dirt_pricing_card_status_line_variants() {
+    let status =
+        " M .loom/pricing.json\n?? .loom/pricing.json\nR  rate-card.json -> .loom/pricing.json\n";
+    let repo = tempfile::tempdir().unwrap();
+    let repo_root = repo.path();
+    write_rel(repo_root, "defaults/pricing.json", "resynced rates\n");
+    write_rel(repo_root, ".loom/pricing.json", "resynced rates\n");
+    assert!(non_ignorable_dirt(status, repo_root).is_empty());
+
+    std::fs::write(repo_root.join(".loom/pricing.json"), "operator's rates\n").unwrap();
+    assert_eq!(
+        non_ignorable_dirt(status, repo_root),
+        vec![
+            " M .loom/pricing.json",
+            "?? .loom/pricing.json",
+            "R  rate-card.json -> .loom/pricing.json",
+        ],
+        "a diverged rate card must stay dirt on every status line"
+    );
+}
+
 /// AC1(a): a workspace with ONLY Loom-owned transient paths dirty must NOT
 /// block the gate (prep proceeds to sync/reset, not Skip).
 #[test]
