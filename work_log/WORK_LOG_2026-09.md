@@ -2,6 +2,84 @@
 
 Sections moved byte-for-byte from [WORK_LOG.md](../WORK_LOG.md) by `loom-daemon work-docs archive`.
 
+### 2026-09-27
+
+- **PR #9246**: feat(merge-pr): port the pre-merge partial-increment close-conflict decision to Rust (#8191 slice)
+- **Issue #9016** (closed): Champion critical-file hold deadlocks with merge-pr.sh's #8112 guard: the documented human merge path is refused and the hold re-arms after release
+- **PR #9242**: fix(champion): make the critical-file hold's human-merge path actually work (#9016)
+- **PR #9240**: feat(merge-pr): port the async-close-race cleanup gate to Rust (#8191 slice)
+- **Issue #8953** (closed): Shared App installation rate limit exhausted on all 4 dispatchers (~11k warnings/3d, 92 work_finder ticks skipped) — recurrence after #7606/#4429
+- **PR #9237**: fix(loom-daemon): stop reconciliation fan-out and quarantine-release retries from burning an exhausted shared rate limit
+- **PR #9234**: feat(merge-pr): port the post-merge stacked-child reconcile decision to Rust (#8191 slice)
+- **Issue #8995** (closed): forge_events Phase 2 follow-ups: queueHeadWake naming, per-loop wake amplification, and wake-counter visibility
+- **PR #9235**: fix(forge_events): name the claim-reconcile wake for its loop, and make the wake counters visible
+- **Issue #9222** (closed): observability: per-issue dispatch disposition spans (loom.dispatch.disposition) so SigNoz can answer "why hasn't repo#N started"
+- **PR #9227**: feat(observability): per-issue dispatch disposition spans (loom.dispatch.disposition) (#9222)
+- **Issue #9013** (closed): Telemetry mega PR A follow-ups: OpenCode open-row pruning, trace-join edge cases, role-tick usage join
+- **PR #9232**: fix(telemetry): opencode open-row pruning, trace-join edge cases, codex mark over-count
+- **Issue #9224** (closed): Guard destructive-generic: catastrophic-tier substring guard false-positives on read-only jq/report commands quoting a pattern as data
+- **Issue #9005** (closed): Observability: export per-account subscription quota utilization (5h / weekly % of limit) to SigNoz — the saturation half of #8857
+- **PR #9230**: feat(telemetry): export per-account weekly quota utilization to SigNoz (#9005)
+- **PR #9228**: feat(merge-pr): port the merge-retry response classifier to Rust (#8191 slice)
+- **Issue #9010** (closed): auto_update: bound the unsatisfiable-roll suppression with a cooldown retry, instead of waiting for a 900s-sampled in_flight == 0
+- **PR #9229**: auto_update: bound the roll-stall suppression with a cooldown retry (#9010)
+- **Issue #9056** (closed): feat(telemetry): estimate story points and record actual token burn, CI minutes, and cycle time on completed issues
+- **PR #9216**: feat(telemetry): loom:points estimate marker + opt-in sweep-outcome write-back
+- **Issue #9215** (closed): feat(observability): export standard TRACEPARENT + opt-in Claude Code OTel env to spawned workers (LLM vs tool sub-spans)
+- **PR #9221**: feat(observability): export TRACEPARENT + opt-in Claude Code OTel env to spawned workers
+- **Issue #9122** (closed): feat(experiments): generalize sweep model-cost experiment to N configurable arms with a budget-fraction cap (Phase 1 of multi-model framework)
+- **PR #9220**: feat(experiments): N configurable arms + budget-fraction cap for the sweep model-cost experiment (#9122 Phase 1)
+- **PR #9219**: feat(merge-pr): port the closed-issue loom:building cleanup to Rust (#8191 slice)
+- **Issue #9034** (closed): feat(dispatch): enforce strict host-class routing to prevent heavy sweeps on developer laptops
+- **PR #9214**: feat(dispatch): gate loom:heavy sweeps off local-dev host_class
+- **PR #9213**: feat(merge-pr): port the partial-increment label-reset decision to Rust (#8191 slice)
+- **Issue #8987** (closed): check-runs reads outside forge_get_check_runs can still truncate (Gitea branch, daemon stale-checks guard)
+- **PR #9212**: fix(check-runs): paginate the Gitea statuses read and the daemon's check-runs read
+- **Issue #9029** (closed): feat(dashboard): visual timeline dashboard for Loom lifecycle and token usage over time
+- **PR #9211**: feat(dashboard): add token-pool burn-rate chart to token analytics
+- **Issue #9032** (closed): feat(dashboard): expose dedicated org-wide ranked ready dispatch queue view (/dashboard/queue)
+- **PR #9210**: feat(dashboard): rank column + repo/tier filters on the #/queue view
+- **Issue #8992** (closed): ci-telemetry: a never-completing workflow run pins a repo's watermark indefinitely
+- **PR #9209**: fix(ci-telemetry): bound the incomplete-run watermark hold
+- **Issue #9167** (closed): Guard catastrophic-tier scan hard-denies a bare jq filter-script literal quoting a dangerous phrase (no invocation occurs)
+- **Issue #9094** (closed): Dashboard live view: stable per-issue rows that show label changes in place
+- **Issue #9197** (closed): ci-telemetry owners follow-ups: keep status --json .org alias, prune page-2+ cache entries, kind on failed discovery
+- **PR #9205**: fix(ci-telemetry): owners follow-ups from #9195 Judge review
+- **PR #9099**: feat(dashboard): Live board cards never move, and show label transitions (#9094)
+- **Issue #8981** (closed): check-vendored-private-refs: dotted config-key paths ending in a TLD-shaped segment false-positive as hostnames
+- **PR #9203**: fix(check-vendored-private-refs): allowlist config-key paths ending in a TLD-shaped segment
+- **PR #9200**: feat(merge-pr): port the stale-mergeable recheck decision to Rust (#8191 slice)
+- **Issue #9188** (closed): ci-telemetry: poll several owners (orgs AND user accounts) so rjwalters/loom CI runs join story traces
+- **PR #9195**: ci-telemetry: poll several owners (orgs AND user accounts) (#9188)
+- **Issue #9185** (closed): main is red on Native Port Suites: test-loom-daemon-update-fetch-refusal.sh scenario 3 hits the min-version refusal instead of the flat reason
+- **Issue #9183** (closed): main is red on cargo fmt --check: loom-daemon/src/daemon_update/artifact.rs:181 (from #8680)
+- **PR #9196**: fix(ci): make main green — fmt artifact.rs (#9183) + stale old-binary fixture (#9185)
+- **Issue #9180** (closed): role-tick story targets: harden transcript parsing (quoted heredocs, cat<<EOF, GH_REPO/cd) and bound the resolution step
+- **PR #9181**: fix(tracing): harden role-tick story targets and bound the story step (#9180)
+- **PR #9182**: feat(merge-pr): port the worktree porcelain parsers to Rust (#8191 slice)
+- **Issue #8976** (closed): ci_telemetry tests: env_overrides_config races config_defaults_are_flags_off_and_config_values_resolve
+- **PR #9184**: test(ci_telemetry): serialize every env-reading config test (#8976)
+- **Issue #8088** (closed): Port loom-daemon-update.sh to a daemon subcommand (1,733 lines; the binary must replace itself)
+- **PR #8680**: feat(daemon-update): port loom-daemon-update.sh to a daemon subcommand
+- **Issue #8974** (closed): dashboard: harden queue.snapshot public redaction (record-level visibility bypass, private-row reason passthrough)
+- **Issue #9168** (closed): tracing: role-runner ticks (Judge/Curator/Champion/Doctor) join the D32 story trace of each issue/PR they acted on
+- **PR #9179**: feat(tracing): role-runner ticks join the story trace of each issue/PR they wrote to (#9168)
+- **PR #9176**: feat(merge-pr): port the #3747 merge-ordering guard to Rust (#8191 slice)
+- **PR #9058**: feat(tracing): deterministic span ids + Loom provenance on every span (policy)
+- **Issue #9171** (closed): main CI red: tests/install/test-lint-ignore-configs.sh 'loom-daemon init copies .loom/biome.jsonc' fails since #9130
+- **PR #9172**: test(install): assert init's defaults/.loom walk instead of a removed literal (#9171)
+- **Issue #8287** (closed): worktree.sh reset a stale local feature/issue-N to main although origin/feature/issue-N carried the PR's commits (Doctor on #8190)
+- **Issue #9028** (closed): feat(telemetry): populate service.version and prompt template hash on all SigNoz OTLP spans
+- **PR #9169**: feat(telemetry): always emit service.version on OTLP resources (traces, logs, metrics)
+- **Issue #9123** (closed): install.sh --full fails its own completeness check: .loom/credentials.md.example is recorded in install-metadata.json but never copied (--quick hides it)
+- **PR #9130**: init: walk defaults/.loom/ instead of naming its members (#9123)
+- **Issue #8968** (closed): cleanup-branches.sh: drop the dead extract-and-eval of merge-pr.sh's _maybe_delete_local_branch helpers; call loom-daemon merge-pr delete-branch directly
+- **PR #9164**: refactor(cleanup-branches): call `loom-daemon merge-pr delete-branch` directly instead of extracting/evaling merge-pr.sh's helpers
+- **PR #9162**: feat(merge-pr): port pre-merge version-policy guard to Rust (#8191 slice)
+- **Issue #8838** (closed): rework #8486 (issue #8458): bring the per-worktree CARGO_TARGET_DIR portable-shell delta to <= 0 (declaration commit ineffective - portable pool has no declare-exit)
+- **Issue #8458** (closed): cargo: per-worktree CARGO_TARGET_DIR wired to worktree lifecycle, preserving the #6013/#6014 binary-reuse fast path (#8453 item 2)
+- **PR #8486**: feat(cargo): opt-in per-worktree CARGO_TARGET_DIR wired to the worktree lifecycle
+
 ### 2026-09-26
 
 - **Issue #8925** (closed): Blocked PRs have no unblock path: the unblock sweep lists issues only, and a park recorded in a comment leaves no parseable dependency
