@@ -11205,7 +11205,7 @@ naming a runtime that never launches is simply never matched.
   `allowedEfforts` list that does not contain the value, the daemon drops
   the override and the child launches with the profile's own `effort`
   instead of the launch being refused before the CLI starts
-  (`profile_selection`, exit 78). The drop is logged, and the per-tick
+  (`profile_selection_effort`, exit 78). The drop is logged, and the per-tick
   header's source names it, e.g.
   `effort=<runtime CLI default> (source=autonomous.roleRunner.roleEfforts.builder (profile default for opencode:zai-flash))`.
   A runtime-qualified `roleEfforts.<role>@<runtime>` entry is an explicit
@@ -11269,7 +11269,7 @@ default, so it may name a model the native pick the draw landed on does not
 run: an `opencode:<profile>` candidate pins a *profile*, and
 `worker_spawn::profiles::select` refuses a launch whose `--model` differs
 from that profile's own `model` (`bare model differs from the selected
-profile`, `profile_selection`, exit 78) — before #14962 this lost whole
+profile`, `profile_selection_model`, exit 78) — before #14962 this lost whole
 Judge/Guide steps whose `roleModels.<role>` was aimed at the Claude picks.
 Both launch sites (the sweep step spawn and the role runner's invocation) now
 resolve the model through `resolve_role_runner_model_for_launch`: when the
