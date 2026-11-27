@@ -97,6 +97,62 @@ pub fn human_size(bytes: u64) -> String {
     }
 }
 
+/// Total apparent size, in bytes, of everything under the directory `path`.
+///
+/// Symlinks are counted at their own (tiny) size via `symlink_metadata` and
+/// never followed — a tree containing a symlink to a large tree outside it
+/// must not be charged for that tree, and following one could otherwise loop.
+/// Directory inodes themselves contribute nothing; only non-directory entries
+/// are summed, with `saturating_add` so a pathological tree cannot overflow.
+///
+/// Best-effort: an unreadable subdirectory or file contributes nothing rather
+/// than failing the whole measurement (a permissions hiccup in one subtree
+/// must not abort a pass whose purpose is to free space). Returns `None` only
+/// when `path` itself cannot be read as a directory.
+#[must_use]
+pub fn dir_size_bytes(path: &Path) -> Option<u64> {
+    fs::read_dir(path).ok().map(sum_entries)
+}
+
+/// Best-effort byte size of `path`, which may be a file or a directory tree:
+/// a non-directory (including a symlink, never followed) is its own length, a
+/// directory is [`dir_size_bytes`], and anything unreadable is `0`. The
+/// size-only counterpart of [`newest_mtime_and_size`] for callers that discard
+/// the timestamp.
+#[must_use]
+pub fn tree_size_bytes(path: &Path) -> u64 {
+    match fs::symlink_metadata(path) {
+        Ok(meta) if meta.is_dir() => dir_size_bytes(path).unwrap_or(0),
+        Ok(meta) => meta.len(),
+        Err(_) => 0,
+    }
+}
+
+fn sum_entries(entries: fs::ReadDir) -> u64 {
+    let mut total = 0u64;
+    for entry in entries.flatten() {
+        // `DirEntry::file_type` does NOT follow symlinks, so a symlinked
+        // directory lands in the non-dir branch and is never recursed into.
+        // The size there must come from `symlink_metadata` too:
+        // `DirEntry::metadata()` follows the link and would charge a symlink
+        // the size of its target (#5939 review).
+        match entry.file_type() {
+            Ok(ft) if ft.is_dir() => {
+                if let Ok(children) = fs::read_dir(entry.path()) {
+                    total = total.saturating_add(sum_entries(children));
+                }
+            }
+            Ok(_) => {
+                if let Ok(meta) = fs::symlink_metadata(entry.path()) {
+                    total = total.saturating_add(meta.len());
+                }
+            }
+            Err(_) => {}
+        }
+    }
+    total
+}
+
 /// Recursively find the newest mtime and cumulative size under `path`,
 /// without following symlinks. Best-effort: an unreadable child is skipped
 /// rather than failing the whole walk (a permissions hiccup on one nested
@@ -401,5 +457,49 @@ mod tests {
             PathBuf::from("/abs/key"),
             "an absolute path must never be rewritten"
         );
+    }
+
+    #[test]
+    fn dir_size_bytes_sums_nested_files_and_skips_directory_inodes() {
+        let td = tempfile::tempdir().unwrap();
+        fs::create_dir_all(td.path().join("a/b")).unwrap();
+        fs::write(td.path().join("top"), [0u8; 100]).unwrap();
+        fs::write(td.path().join("a/mid"), [0u8; 200]).unwrap();
+        fs::write(td.path().join("a/b/leaf"), [0u8; 51]).unwrap();
+        assert_eq!(dir_size_bytes(td.path()), Some(351));
+    }
+
+    #[test]
+    fn dir_size_bytes_is_none_for_missing_or_file_and_zero_for_empty() {
+        let td = tempfile::tempdir().unwrap();
+        assert_eq!(dir_size_bytes(&td.path().join("nope")), None);
+        assert_eq!(dir_size_bytes(td.path()), Some(0));
+        let file = td.path().join("f");
+        fs::write(&file, [0u8; 7]).unwrap();
+        assert_eq!(dir_size_bytes(&file), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dir_size_bytes_does_not_follow_symlinked_directories() {
+        let outside = tempfile::tempdir().unwrap();
+        fs::write(outside.path().join("big"), vec![0u8; 10_000]).unwrap();
+        let td = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink(outside.path(), td.path().join("link")).unwrap();
+        let measured = dir_size_bytes(td.path()).unwrap();
+        assert!(measured < 10_000, "symlinked tree was charged (got {measured})");
+    }
+
+    #[test]
+    fn tree_size_bytes_handles_file_directory_and_missing_path() {
+        let td = tempfile::tempdir().unwrap();
+        fs::create_dir(td.path().join("d")).unwrap();
+        fs::write(td.path().join("d/x"), [0u8; 40]).unwrap();
+        fs::write(td.path().join("f"), [0u8; 9]).unwrap();
+        assert_eq!(tree_size_bytes(&td.path().join("d")), 40);
+        assert_eq!(tree_size_bytes(&td.path().join("f")), 9);
+        assert_eq!(tree_size_bytes(&td.path().join("nope")), 0);
+        // Agrees with the size half of `newest_mtime_and_size`.
+        assert_eq!(tree_size_bytes(td.path()), newest_mtime_and_size(td.path()).unwrap().1);
     }
 }

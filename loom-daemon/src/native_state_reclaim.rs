@@ -325,30 +325,6 @@ pub fn shared_sccache_tmp() -> PathBuf {
     pinned_tmp_base().join(SHARED_SCCACHE_LEAF)
 }
 
-/// Bytes held by everything under `path`. Best effort — an unreadable entry
-/// contributes zero rather than aborting a pass whose purpose is to free
-/// space.
-fn dir_size(path: &Path) -> u64 {
-    let Ok(entries) = std::fs::read_dir(path) else {
-        return 0;
-    };
-    let mut total = 0u64;
-    for entry in entries.flatten() {
-        let Ok(meta) = entry.metadata() else {
-            continue;
-        };
-        if meta.is_symlink() {
-            continue;
-        }
-        total += if meta.is_dir() {
-            dir_size(&entry.path())
-        } else {
-            meta.len()
-        };
-    }
-    total
-}
-
 /// Whether a launch's session directory (named `uuid`) still exists under any
 /// workspace-hash directory beneath `session_base`. `reap::reap_base`'s own
 /// pid-liveness check is what actually decides whether a session directory
@@ -434,7 +410,7 @@ pub fn sweep_pinned_tmp(pinned_tmp_base: &Path, session_bases: &[PathBuf]) -> (u
             continue; // the launch's session directory is still present
         }
         let path = entry.path();
-        let bytes = dir_size(&path);
+        let bytes = crate::fs_util::dir_size_bytes(&path).unwrap_or(0);
         match std::fs::remove_dir_all(&path) {
             Ok(()) => {
                 removed_count += 1;
