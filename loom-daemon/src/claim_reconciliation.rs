@@ -2058,14 +2058,15 @@ pub mod merge_sequence;
 pub mod review_conflict;
 
 /// Retarget open PRs stacked on a parent closed unmerged (#12760) — and the
-/// scratch-worktree git mechanics it shares with [`merged_stack`] — sibling
-/// files.
+/// scratch-worktree git mechanics and descendant-cascade/marker helpers it
+/// shares with [`merged_stack`] — sibling files.
 pub mod orphan_stack;
 pub(crate) mod orphan_stack_git;
+mod stack_reconcile;
 
 /// Retarget the stacked children of a parent that merged outside
 /// `merge-pr.sh` — including the ones GitHub already retargeted (#14903) —
-/// a sibling of [`orphan_stack`] reusing its git mechanics.
+/// a sibling of [`orphan_stack`] reusing its git mechanics and cascade walk.
 pub mod merged_stack;
 
 /// The per-repo loop of one reconciliation pass, plus the #8953 mid-pass
