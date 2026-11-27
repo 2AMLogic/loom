@@ -299,6 +299,16 @@
 # creates (and then auto-removes) the staging worktree, so a preview never
 # leaves any residue.
 #
+# Staging mode skips Loom's user-scope (host) provisioning steps too (#15518):
+# the two steps a real run ends with -- the #10238 dispatcher + skill/agent
+# link (re)provisioning (from whatever checkout the run synced from) and the
+# #12121 retired presence-wiring strip, which write ~/.local/bin,
+# ~/.local/share and ~/.claude -- are skipped under --output. Neither would
+# land in the staging worktree: both write the HOST, and --dry-run never
+# previewed them. This covers only those Loom steps, not every byte under
+# $HOME (tools the run invokes may create their own state). A non-staging
+# real run still does both.
+#
 # Local-override convention: list a relative path (e.g. `hooks/guard-destructive.sh`,
 # `scripts/foo.sh`, `roles/custom-role.md`, `docs/notes.md`, `bin/loom`,
 # `commands/loom/mine.md`, `package.json` to pin the #4285 stub version edit,
@@ -467,6 +477,13 @@
 #   LOOM_RESYNC_SYNC_LABELS=1     - same as --sync-labels (for non-interactive
 #                                   callers; the daemon's post-roll resync passes
 #                                   the flag so fleet label auto-heal, #6716, stays).
+#   LOOM_RESYNC_SKIP_USER_SCOPE=1 - skip the #10238 user-scope step of a real
+#                                   run: the (re)provisioning of ~/.local/bin/loom
+#                                   and of the ~/.claude/commands/loom +
+#                                   ~/.claude/agents/loom-*.md links from the
+#                                   source checkout (host-level paths every
+#                                   session on the machine shares). Already
+#                                   implied by --dry-run and by --output (#15518).
 #
 # Exit codes:
 #   0 - Success. Sync applied (or already in sync); or --dry-run found no drift.
@@ -4348,7 +4365,14 @@ clear_resync_marker
 # not change this script's exit status. Skipped under --dry-run, when the
 # source is not a plain git checkout (e.g. a staging worktree), or with
 # LOOM_RESYNC_SKIP_USER_SCOPE=1.
-if [[ "$DRY_RUN" -eq 0 && "${LOOM_RESYNC_SKIP_USER_SCOPE:-0}" != "1" \
+# #15518: also skipped in --output staging mode. Everything this step writes
+# is user-scope (~/.local/bin/loom, ~/.local/share/loom, the
+# ~/.claude/commands/loom and ~/.claude/agents/loom-* links) -- the staging
+# worktree has no surface for it, so a real staging run used to write the HOST
+# instead, from whatever checkout --source named, and --dry-run (which skips
+# the step) never previewed it. A staging run makes no Loom user-scope write
+# at all: the #12121 strip below is skipped there for the same reason.
+if [[ "$DRY_RUN" -eq 0 && -z "$OUTPUT_DIR" && "${LOOM_RESYNC_SKIP_USER_SCOPE:-0}" != "1" \
       && -d "$SOURCE_ROOT/.git" && -r "$SOURCE_ROOT/scripts/install/provision-skills.sh" \
       && -r "$SOURCE_ROOT/scripts/install/provision-dispatcher.sh" ]]; then
     (
@@ -4385,10 +4409,11 @@ fi
 # #12121: operator presence is derived by the daemon, so resync only STRIPS the
 # retired user-scope presence-beat.sh hook entries and LOOM_OPERATOR_PRESENCE=1
 # env entry from ~/.claude/settings.json. A no-op when the machine checkout
-# lacks provision-hooks.sh and in --dry-run. Best-effort: resync never fails
-# on it.
+# lacks provision-hooks.sh and in --dry-run. Skipped in --output staging mode
+# too (#15518): a staged resync never writes user-scope paths; the next
+# non-staging run strips the wiring. Best-effort: resync never fails on it.
 _PRESENCE_LIB="${LOOM_HOME:-$HOME/.local/share/loom}/scripts/install/provision-hooks.sh"
-if [[ "${DRY_RUN:-0}" != "1" && -r "$_PRESENCE_LIB" ]]; then
+if [[ "${DRY_RUN:-0}" != "1" && -z "$OUTPUT_DIR" && -r "$_PRESENCE_LIB" ]]; then
     # shellcheck source=/dev/null
     ( source "$_PRESENCE_LIB" && provision_operator_presence ) \
         || warn "stripping the retired operator presence wiring was not fully applied (see messages above); resync itself completed."
