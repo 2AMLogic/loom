@@ -1164,7 +1164,15 @@ _forge_nwo_from_url() {
 # fail for unrelated reasons in the middle of the very recovery path that
 # exists because a `gh` call just failed (#4659's lesson, applied here).
 _forge_nwo_from_remote() {
-  local remote_url
+  # Prefer the CONFIGURED url: `git remote get-url` applies url.<base>.insteadOf
+  # transport rewrites (e.g. a local bare repo), which is not forge identity and
+  # would parse as "unknown repository". Fall back to get-url if it fails to parse.
+  local remote_url nwo
+  remote_url=$(git config --get remote.origin.url 2>/dev/null || echo "")
+  if [[ -n "$remote_url" ]] && nwo=$(_forge_nwo_from_url "$remote_url"); then
+    printf '%s' "$nwo"
+    return 0
+  fi
   remote_url=$(git remote get-url origin 2>/dev/null || echo "")
   [[ -n "$remote_url" ]] || return 1
   _forge_nwo_from_url "$remote_url"
