@@ -18,6 +18,10 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 ### 2026-11-27
 
+- **PR #15600**: refactor: share stack cascade walk and marker helpers
+- **PR #15598**: refactor: share one SessionFilter between Codex and OpenCode usage readers
+- **Issue #15597** (closed): Share the descendant cascade walk and marker helpers between orphan_stack and merged_stack
+- **Issue #15594** (closed): Share the Codex and OpenCode session attribution filter
 - **PR #15585**: fix: mark weekly/monthly API-key exhaustion account-wide
 - **Issue #15572** (closed): API-key pool: a weekly/monthly exhaustion mark under one model class does not stop another class from re-selecting the account
 - **Issue #15596** (closed): config-resolver.sh: a defaults.json over 128 KiB makes every sourcing script exit 126 (jq --argjson exceeds MAX_ARG_STRLEN)
