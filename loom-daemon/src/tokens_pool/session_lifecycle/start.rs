@@ -118,7 +118,11 @@ impl<R: ContainerRunner> SessionLifecycle<R> {
                 // The configured override image is bundle-verified before
                 // anything is created from it (issue #14019); a refusal
                 // leaves any existing state untouched.
-                self.verify_session_config_image()?;
+                super::session_image::verify_configured_image(
+                    self.session_config.as_ref(),
+                    &self.image,
+                    &self.runner,
+                )?;
                 ensure_profile_controls(&profile)?;
                 self.runner.create(
                     &container,
@@ -126,7 +130,7 @@ impl<R: ContainerRunner> SessionLifecycle<R> {
                     &profile,
                     &requested_workspace,
                     &self.workspace,
-                    &self.extra_mounts(),
+                    super::session_image::configured_extra_mounts(self.session_config.as_ref()),
                 )?;
                 self.recheck_hold_after_start(name, &container, held)?;
             }
