@@ -73,17 +73,17 @@
 //!    region is a whole run's transcript, and the exhaustion needles are
 //!    ordinary English an agent emits routinely (`judge.md`'s own rate-limit
 //!    signature table quotes three of them verbatim). So this path classifies
-//!    through [`classify_launch_region`], whose prose table sees only the
-//!    lines the provider/harness wrote — never the model's own event
-//!    payloads. Guards 1-4 all held while the matched text came from the
+//!    only the [`provider_lines`] following the selected launch record.
+//!    Guards 1-4 all held while the matched text came from the
 //!    agent, which is why this one had to be its own guard rather than a
 //!    tightening of another.
 //!
-//! # Marks are class-scoped when the record names a model
+//! # Model-class and account-wide marks
 //!
 //! The launch record carries the resolved model, so an automatic mark is
-//! scoped to that model class (#8424 item 3) and an account-wide mark is used
-//! only when there is no usable model. That direction is chosen on purpose:
+//! scoped to that model class (#8424 item 3) unless the provider reports
+//! weekly/monthly exhaustion or the record lacks a usable model. In those
+//! cases the mark is account-wide. That direction is chosen on purpose:
 //! under-marking self-corrects (the next spawn on a genuinely dry account
 //! fails once more and marks the second class too), while over-marking idles
 //! an allowance that was never exhausted.
@@ -93,7 +93,7 @@ use std::path::Path;
 use serde_json::Value;
 
 use super::bad_marks::{self, BadMark};
-use super::classify::{classify_launch_region, mark_scope_class, provider_lines, Classification};
+use super::classify::{classify, mark_scope_class, provider_lines, Classification};
 use super::reset;
 
 /// Prefix of the line `worker_spawn::run` writes before handing off to a
@@ -183,12 +183,19 @@ pub fn region_after<'a>(contents: &'a str, anchor: &str) -> Option<&'a str> {
 ///   `credential_source`), never as a fallback to an earlier record.
 #[must_use]
 pub fn last_launch_record_body(region: &str) -> Option<&str> {
-    region.lines().rev().find_map(|line| {
+    last_launch_record_and_output(region).map(|(body, _)| body)
+}
+
+/// Pair the last valid record with the output following its line. A retry
+/// under the same sweep anchor must never inherit an earlier launch's refusal.
+fn last_launch_record_and_output(region: &str) -> Option<(&str, &str)> {
+    let mut end = region.len();
+    region.split_inclusive('\n').rev().find_map(|line| {
+        let output = &region[end..];
+        end -= line.len();
         let json = line.trim().strip_prefix(LAUNCH_RECORD_PREFIX)?;
-        // Parsed only to decide "is this a usable record?" — the body is
-        // handed back as text so each caller can read its own keys off it.
         serde_json::from_str::<Value>(json).ok()?;
-        Some(json)
+        Some((json, output))
     })
 }
 
@@ -199,7 +206,11 @@ pub fn last_launch_record_body(region: &str) -> Option<&str> {
 /// [`last_launch_record_body`]'s.
 #[must_use]
 pub fn parse_launch_record(region: &str) -> Option<LaunchRecord> {
-    let value: Value = serde_json::from_str(last_launch_record_body(region)?).ok()?;
+    credential_fields(last_launch_record_body(region)?)
+}
+
+fn credential_fields(body: &str) -> Option<LaunchRecord> {
+    let value: Value = serde_json::from_str(body).ok()?;
     let string = |key: &str| {
         value
             .get(key)
@@ -229,20 +240,30 @@ pub fn classify_launch_log(
     anchor: &str,
     exit_code: Option<i32>,
 ) -> Option<(LaunchRecord, Classification)> {
+    classify_launch_with_evidence(contents, anchor, exit_code)
+        .map(|(record, classification, _)| (record, classification))
+}
+
+fn classify_launch_with_evidence(
+    contents: &str,
+    anchor: &str,
+    exit_code: Option<i32>,
+) -> Option<(LaunchRecord, Classification, String)> {
     // Guard 3: a completed run is not evidence about an allowance.
     if exit_code == Some(0) {
         return None;
     }
     let region = region_after(contents, anchor)?;
     // Guard 2 + 1: Loom's own record, and only a pool-selected credential.
-    let record = parse_launch_record(region)?;
+    let (body, output) = last_launch_record_and_output(region)?;
+    let record = credential_fields(body)?;
     if !record.is_pool_selected() || record.provider.is_none() || record.account.is_none() {
         return None;
     }
-    // Guard 5: the region is a whole transcript, so the prose table is shown
-    // only the lines the provider/harness wrote — never the agent's own.
-    let classification = classify_launch_region(region, exit_code.unwrap_or(1))?;
-    Some((record, classification))
+    // Guard 5: classification, reset and scope all use this launch's provider lines.
+    let provider_text = provider_lines(output);
+    let classification = classify(&provider_text, exit_code.unwrap_or(1))?;
+    Some((record, classification, provider_text))
 }
 
 /// The hook: classify `contents` and, when it names a pool account that ran
@@ -280,10 +301,8 @@ pub fn ingest_launch_log_since(
     exit_code: Option<i32>,
     evidence_at: Option<u64>,
 ) -> Option<LaunchFeedback> {
-    let (record, classification) = classify_launch_log(contents, anchor, exit_code)?;
-    // The reset horizon (#11286) is read from the same provider-only lines
-    // the classifier saw — never the agent's transcript.
-    let provider_text = provider_lines(region_after(contents, anchor)?);
+    let (record, classification, provider_text) =
+        classify_launch_with_evidence(contents, anchor, exit_code)?;
     let evidence_at = evidence_at.unwrap_or_else(bad_marks::epoch_now);
     apply_mark_at(workspace, record, classification, &provider_text, "the launch log", evidence_at)
 }

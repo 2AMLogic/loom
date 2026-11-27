@@ -587,6 +587,40 @@ fn the_last_launch_record_in_the_region_wins() {
     assert!(active(tmp.path(), "beta", None).is_some());
 }
 
+#[test]
+fn a_retry_uses_only_its_own_refusal_and_reset() {
+    use crate::api_keys_pool::classify::{
+        CAPTURED_ZAI_FIVE_HOUR_LIMIT_EVENT, CAPTURED_ZAI_RATE_LIMIT_EVENT,
+        CAPTURED_ZAI_WEEKLY_LIMIT_EVENT,
+    };
+
+    let _clock = bad_marks::test_clock::pin(ZAI_FIVE_HOUR_SEEN);
+    let class = "glm-5.3-flash";
+    let retry = format!(
+        "{}\n{}\n",
+        log("pool", Some("alpha"), class, CAPTURED_ZAI_WEEKLY_LIMIT_EVENT),
+        launch_line("pool", Some("beta"), class),
+    );
+    assert!(classify_launch_log(&retry, ANCHOR, Some(1)).is_none());
+
+    // The five-hour capture resets after 171s. The rate limit names no
+    // reset, so beta gets its default 60s even though alpha named a reset.
+    for (event, classification, cooldown) in [
+        (CAPTURED_ZAI_FIVE_HOUR_LIMIT_EVENT, Classification::Exhausted, 171),
+        (CAPTURED_ZAI_RATE_LIMIT_EVENT, Classification::RateLimited, 60),
+    ] {
+        let tmp = workspace(&["alpha", "beta"]);
+        let contents = format!("{retry}{event}\n");
+        let feedback = ingest_launch_log(tmp.path(), &contents, ANCHOR, Some(1)).unwrap();
+        assert_eq!(feedback.account, "beta");
+        assert_eq!(feedback.classification, classification);
+        let mark = active(tmp.path(), "beta", Some(class)).expect("class mark for beta");
+        assert_eq!(mark.model_class.as_deref(), Some(class));
+        assert_eq!(mark.resets_at, Some(ZAI_FIVE_HOUR_SEEN + cooldown));
+        assert!(active(tmp.path(), "beta", Some("glm-5.4")).is_none());
+    }
+}
+
 /// Marking an account that is no longer registered fails the write, and that
 /// failure is reported rather than panicking or changing the outcome.
 #[test]

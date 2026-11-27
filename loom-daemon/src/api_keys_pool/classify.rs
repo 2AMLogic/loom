@@ -653,10 +653,8 @@ pub fn provider_lines(region: &str) -> String {
 /// # Why this is not just [`classify`] (#8521)
 ///
 /// `classify` assumes its input is the provider's/harness's own words — true
-/// when an operator hands it captured error output, false for the region
-/// [`super::ingest::classify_launch_log`] holds. That region is everything
-/// after a sweep's `sweep_id=` anchor (or a role tick's header), i.e. the
-/// **agent's entire transcript**, and both native harnesses are launched in a
+/// when an operator hands it captured error output. A retained launch log
+/// also contains the **agent's entire transcript**. Both native harnesses run in a
 /// JSON event mode — `pi --print --mode json`, `opencode run --format json`
 /// (`super::super::worker_spawn::harness`) — so the model's prose arrives
 /// inside event payloads that the substring table happily matched, because it
