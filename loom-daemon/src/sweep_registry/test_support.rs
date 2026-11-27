@@ -86,6 +86,10 @@ pub(crate) fn touch_sweep_command(workspace: &Path) {
     let dir = workspace.join(".claude").join("commands").join("loom");
     std::fs::create_dir_all(&dir).unwrap();
     std::fs::write(dir.join("sweep.md"), "# /loom:sweep (test fixture)\n").unwrap();
+    let scripts = workspace.join(".loom/scripts");
+    std::fs::create_dir_all(&scripts).unwrap();
+    std::fs::write(scripts.join("worktree.sh"), crate::install_compat::STRICT_BUILDER_CAPABILITY)
+        .unwrap();
     install_runtime_admission_fixture(workspace);
 }
 

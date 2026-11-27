@@ -501,20 +501,8 @@ fn run() -> Result<()> {
             // actions, and an `ensure` the environment settles by itself, never
             // resolve `mode`. PR leases resolve it for their own workspace.
             if cli.needs_issue_mode_gate() {
-                if let Err(err) = mode_gate() {
-                    // `ensure` always exits 0 and `co-occupancy` fails open with
-                    // 0 (its exit 1 means "refuse the shared worktree"): a mode
-                    // error must not alias either, so it is reported and the
-                    // verb ends as it does on any other unreadable forge.
-                    if cli.fails_open_on_mode_error() {
-                        eprintln!(
-                            "lease {}: {err:#} -- failing open (a lease is evidence, never a \
-                             precondition)",
-                            cli.verb()
-                        );
-                        return Ok(());
-                    }
-                    return Err(err);
+                if let Err(error) = mode_gate() {
+                    return cli.handle_issue_mode_error(error);
                 }
             }
             handle_lease_command(cli)

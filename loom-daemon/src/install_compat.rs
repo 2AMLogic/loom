@@ -67,6 +67,24 @@ pub const SUPPORTS_INSTALLED: &str = "0.19.175";
 /// `sed`, because the tree it installs can be newer than any binary it has.
 pub const REQUIRES_DAEMON: &str = "0.20.34";
 
+/// Installed scripts advertise this contract so a daemon can reject an old
+/// Builder recipe and helper before dispatch, without executing workspace code.
+pub(crate) const STRICT_BUILDER_CAPABILITY: &str = "# loom:capability strict-builder-ownership";
+
+pub(crate) fn require_builder_worktree(script: &Path) -> Result<(), String> {
+    let source = std::fs::read_to_string(script).map_err(|err| {
+        format!("cannot read Builder worktree helper {}: {err}", script.display())
+    })?;
+    if source.lines().any(|line| line == STRICT_BUILDER_CAPABILITY) {
+        Ok(())
+    } else {
+        Err(format!(
+            "{} lacks strict Builder ownership support; resync the installed Loom scripts before dispatch",
+            script.display()
+        ))
+    }
+}
+
 // compat:invoked-files:begin
 /// The installed files this daemon executes in a workspace. An installed tree
 /// missing one of them cannot be dispatched into, whatever its version says.

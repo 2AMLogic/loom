@@ -259,6 +259,9 @@ impl SweepRegistry {
         //      work with this daemon (W3/W4). Structural like 2.4, so `force`
         //      does not bypass it; before any lock, label flip or forge call.
         crate::workspace_hold::guard(&sr.config.workspace_root)?;
+        if !skip_label_flip {
+            sr.config.check_builder_worktree()?;
+        }
 
         // 2.5 Closed-issue guard (Issue #4088, widened in #4504). All three
         //     watchdogs (startup #3887, mid-build-death #3895, review-stall

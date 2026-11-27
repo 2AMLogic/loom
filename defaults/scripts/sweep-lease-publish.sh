@@ -98,11 +98,13 @@
 # lease, exactly as it did before this script existed. This mirrors
 # `write_lease_comment`'s fail-open contract (#6179) -- the `loom:building`
 # label remains the authoritative claim; a lease only improves the evidence.
+# Fresh Builder admission opts into --require-ownership: an unreadable or
+# unauthenticated prestate refuses publication (exit 2), never claims success.
 #
 # ## Commands
 #
 #   sweep-lease-publish.sh publish <issue> [--host HOST] [--sweep-id ID]
-#                                          [--ttl-minutes N]
+#                                          [--ttl-minutes N] [--require-ownership]
 #     Publish a lease record for <issue>. --host defaults to the PUBLISHED
 #     form of this host's own identity (Issue #6322): the opaque id
 #     (`opaque_host_id`, mirroring `sweep_registry::opaque_host_id` byte for
@@ -125,8 +127,8 @@
 #       0  Published, or a live lease for this host+sweep-id already exists.
 #          Proceed.
 #       1  Usage error (bad issue number, unknown flag, bad --ttl-minutes).
-#       2  The publish call failed (`gh`, or the Gitea comment writer on a Gitea
-#          checkout, #14941). Proceed WITHOUT a lease (best-effort).
+#       2  Publication failed, or strict ownership prestate was unreadable.
+#          Strict Builder admission stops; ordinary callers remain best-effort.
 #       4  A different host holds a fresh lease, or this identity yielded.
 #          Nothing published. Skip this claim; a yielded ID needs a new run.
 #
@@ -379,6 +381,87 @@ gen_sweep_id() {
     printf 'sweep-insession-%s-%s' "$(date -u +%Y%m%dT%H%M%SZ)" "$$"
 }
 
+# Read this issue's trusted lease + lease-yield comments as NDJSON (with the
+# comment `id`) on stdout. Exit 1 = unreadable or unauthenticated (#14376: the
+# strict publish and its post-publication claim-order check share this read).
+lease_read_trusted() {
+    local issue="$1" require_ownership="$2"
+    local comments_ndjson read_ok=1 gitea=0 lease_jq repo_path
+    repo_path="$(gh_repo_path)"
+    lease_forge_is_gitea && gitea=1
+    lease_jq=".[] | select(.body != null and ((.body | startswith(\"${LEASE_MARKER_PREFIX}\")) or (.body | startswith(\"${YIELD_MARKER_PREFIX}\")))) | {id: .id, updated_at: .updated_at, body: .body, user: {login: .user.login, type: .user.type}, author_association: .author_association}"
+    if ((gitea == 1)); then
+        # Gitea has no `gh api --jq`: list the comments, project them with the
+        # same filter. Handle listing failures below for both forges.
+        local gitea_listing
+        if gitea_listing="$(lease_gitea_comments "$issue")" \
+            && comments_ndjson="$(jq -c "$lease_jq" <<< "$gitea_listing")"; then
+            :
+        else
+            echo "WARN: could not read existing lease comments for issue #${issue} from Gitea" >&2
+            read_ok=0
+            comments_ndjson=""
+        fi
+    elif ! comments_ndjson="$("${LEASE_READ_API[@]}" "repos/${repo_path}/issues/${issue}/comments" \
+        --paginate --jq "$lease_jq")"; then
+        echo "WARN: could not read existing lease comments for issue #${issue}" >&2
+        read_ok=0
+        comments_ndjson=""
+    fi
+    # #9548: only a TRUSTED author's lease/yield marker is a peer or a record.
+    # On Gitea (#14941) comments carry no `author_association`, so the
+    # credential's own login is the self identity the trust filter believes.
+    local -a trust_args=()
+    if ((gitea == 1)) && ((read_ok == 1)); then
+        local self_login
+        self_login="$(lease_gitea_self_login || true)"
+        if [[ -n "$self_login" ]]; then
+            trust_args=(--self-login "$self_login")
+        elif ((require_ownership == 1)); then
+            echo "WARN: could not authenticate the Gitea lease identity for issue #${issue}" >&2
+            read_ok=0
+        fi
+    fi
+    # requires-daemon: forge optional   Without the `trusted-comments` verb the markers are unverifiable and treated like an unreadable listing.
+    ((read_ok == 1)) && ! comments_ndjson="$(jq -s -c '.' <<< "$comments_ndjson" | "${LOOM_DAEMON_BIN:-loom-daemon}" forge trusted-comments ${trust_args[@]+"${trust_args[@]}"} 2> /dev/null | jq -c '.[]')" \
+        && { echo "WARN: lease comments on issue #${issue} could not be authenticated" >&2; read_ok=0; comments_ndjson=""; }
+    ((read_ok == 1)) || return 1
+    printf '%s\n' "$comments_ndjson"
+}
+
+# lease_earlier_peer <ndjson> <my-comment-id> <host> <sweep> <now-epoch> <ttl-seconds>
+# Prints "host=<H> sweep=<S>" for the first live, non-yielded lease from ANOTHER
+# (host, sweep) whose comment id is lower than ours; prints nothing when ours is
+# the earliest.
+lease_earlier_peer() {
+    local ndjson="$1" my_id="$2" host="$3" sweep_id="$4" now_epoch="$5" ttl_seconds="$6"
+    local yield_lines line c_id c_updated c_body c_parsed c_host c_sweep y y_parsed c_epoch
+    yield_lines="$(jq -r --arg p "$YIELD_MARKER_PREFIX" 'select(.body != null and (.body | startswith($p))) | .body | split("\n")[0]' <<< "$ndjson" 2>/dev/null || true)"
+    while IFS= read -r line; do
+        [[ -z "$line" ]] && continue
+        c_id="$(jq -r '.id // empty' <<< "$line" 2>/dev/null || true)"
+        c_updated="$(jq -r '.updated_at // empty' <<< "$line" 2>/dev/null || true)"
+        c_body="$(jq -r '.body // empty' <<< "$line" 2>/dev/null || true)"
+        [[ "$c_id" =~ ^[0-9]+$ && -n "$c_updated" && -n "$c_body" ]] || continue
+        ((c_id < my_id)) || continue
+        c_parsed="$(parse_lease_marker_line "${c_body%%$'\n'*}" || true)"
+        [[ -n "$c_parsed" ]] || continue
+        c_host="${c_parsed%%$'\t'*}"
+        c_sweep="${c_parsed#*$'\t'}"
+        [[ "$c_host" == "$host" && "$c_sweep" == "$sweep_id" ]] && continue
+        while IFS= read -r y; do
+            [[ -z "$y" ]] && continue
+            y_parsed="$(parse_lease_yield_marker_line "$y" || true)"
+            [[ "$y_parsed" == "$c_host"$'\t'"$c_sweep" ]] && continue 2
+        done <<< "$yield_lines"
+        c_epoch="$(iso_to_epoch "$c_updated")" || continue
+        ((now_epoch - c_epoch <= ttl_seconds)) || continue
+        printf 'host=%s sweep=%s' "$c_host" "$c_sweep"
+        return 0
+    done <<< "$ndjson"
+    return 0
+}
+
 cmd_publish() {
     local issue="${1:-}"
     shift || true
@@ -387,7 +470,7 @@ cmd_publish() {
         exit 1
     }
 
-    local host="" sweep_id="" ttl_minutes="$DEFAULT_TTL_MINUTES"
+    local host="" sweep_id="" ttl_minutes="$DEFAULT_TTL_MINUTES" require_ownership=0
     while [[ $# -gt 0 ]]; do
         case "$1" in
             --host)
@@ -401,6 +484,10 @@ cmd_publish() {
             --ttl-minutes)
                 ttl_minutes="${2:-}"
                 shift 2
+                ;;
+            --require-ownership)
+                require_ownership=1
+                shift
                 ;;
             *)
                 echo "ERROR: publish: unknown flag '$1'" >&2
@@ -427,48 +514,26 @@ cmd_publish() {
         exit 1
     fi
 
-    local repo_path
-    repo_path="$(gh_repo_path)"
-
     # --- Read existing lease AND lease-yield comments in ONE round trip
     # (NDJSON; see sweep-lease-fence.sh on why this is deliberately NOT an
     # array literal under `--paginate`). Fetching both marker shapes together
     # mirrors sweep-lease-fence.sh's #6485 fix -- see the yield-exclusion
     # scan below for why a publish-side peer check needs the yield records
     # too (Issue #5331).
-    local comments_ndjson read_ok=1 gitea=0 lease_jq
+    local comments_ndjson read_ok=1 gitea=0
     lease_forge_is_gitea && gitea=1
-    lease_jq=".[] | select(.body != null and ((.body | startswith(\"${LEASE_MARKER_PREFIX}\")) or (.body | startswith(\"${YIELD_MARKER_PREFIX}\")))) | {updated_at: .updated_at, body: .body, user: {login: .user.login, type: .user.type}, author_association: .author_association}"
-    if ((gitea == 1)); then
-        # Gitea has no `gh api --jq`: list the comments, project them with the
-        # same filter. A listing that cannot be read fails open, as below.
-        local gitea_listing
-        if gitea_listing="$(lease_gitea_comments "$issue")" \
-            && comments_ndjson="$(jq -c "$lease_jq" <<< "$gitea_listing")"; then
-            :
-        else
-            echo "WARN: could not read existing lease comments for issue #${issue} from Gitea -- publishing anyway (absence of evidence is not evidence of a peer)" >&2
-            read_ok=0
-            comments_ndjson=""
-        fi
-    elif ! comments_ndjson="$("${LEASE_READ_API[@]}" "repos/${repo_path}/issues/${issue}/comments" \
-        --paginate --jq "$lease_jq")"; then
-        echo "WARN: could not read existing lease comments for issue #${issue} -- publishing anyway (absence of evidence is not evidence of a peer)" >&2
+    if ! comments_ndjson="$(lease_read_trusted "$issue" "$require_ownership")"; then
         read_ok=0
         comments_ndjson=""
     fi
-    # #9548: only a TRUSTED author's lease/yield marker is a peer or a record.
-    # On Gitea (#14941) comments carry no `author_association`, so the
-    # credential's own login is the self identity the trust filter believes.
-    local -a trust_args=()
-    if ((gitea == 1)) && ((read_ok == 1)); then
-        local self_login
-        self_login="$(lease_gitea_self_login || true)"
-        [[ -z "$self_login" ]] || trust_args=(--self-login "$self_login")
+
+    if ((read_ok == 0)); then
+        if ((require_ownership == 1)); then
+            echo "SKIP: issue #${issue}: ownership indeterminate; nothing published." >&2
+            exit 2
+        fi
+        echo "WARN: publishing anyway (absence of evidence is not evidence of a peer)" >&2
     fi
-    # requires-daemon: forge optional   Without the `trusted-comments` verb the markers are unverifiable: treated like an unreadable listing (publish anyway), the existing direction.
-    ((read_ok == 1)) && ! comments_ndjson="$(jq -s -c '.' <<< "$comments_ndjson" | "${LOOM_DAEMON_BIN:-loom-daemon}" forge trusted-comments ${trust_args[@]+"${trust_args[@]}"} 2> /dev/null | jq -c '.[]')" \
-        && { echo "WARN: lease comments on issue #${issue} could not be authenticated -- publishing anyway" >&2; read_ok=0; comments_ndjson=""; }
 
     if ((read_ok == 1)) && [[ -n "$(printf '%s' "$comments_ndjson" | tr -d '[:space:]')" ]]; then
         # Scan EVERY fresh, NON-YIELDED lease comment for a foreign host --
@@ -615,23 +680,26 @@ cmd_publish() {
     # named explicitly (loom_write_repo, forge-helpers.sh, sourced in the
     # subshell since it turns on `set -e`), never via `{owner}/{repo}`, which
     # gh expands from an `upstream` remote in preference to `origin`.
-    local post_out write_repo
+    local post_out write_repo post_rc=0
     write_repo="$(source "$(dirname "${BASH_SOURCE[0]}")/lib/forge-helpers.sh" && loom_write_repo "${LOOM_REPO:-}")" || { echo "ERROR: not publishing a lease on issue #${issue}: loom-daemon forge may-write refused the repo (#9548)" >&2; exit 2; }
     if ((gitea == 1)); then
         # #14941: the shared comment writer (#14940) posts through the Gitea
         # API with the connection the write-scope check approved; `gh` is never
         # run. It appends the dashboard footer BELOW the body, so the marker
         # stays the literal first line.
-        if ! post_out="$(printf '%s' "$lease_body" \
-            | "${LOOM_DAEMON_BIN:-loom-daemon}" forge comment "$issue" --repo "$write_repo" --body-file - 2>&1)"; then
-            echo "ERROR: failed to publish lease comment on issue #${issue}: ${post_out}" >&2
-            echo "Proceeding without a lease is safe but degrades reclaim evidence (best-effort, mirrors #6179's fail-open dispatch write)." >&2
-            exit 2
-        fi
-    elif ! post_out="$(printf '%s' "$lease_body" \
-        | gh api --method POST "repos/${write_repo}/issues/${issue}/comments" -F body=@- 2>&1)"; then
+        post_out="$(printf '%s' "$lease_body" \
+            | "${LOOM_DAEMON_BIN:-loom-daemon}" forge comment "$issue" --repo "$write_repo" --body-file - 2>&1)" || post_rc=$?
+    else
+        post_out="$(printf '%s' "$lease_body" \
+            | gh api --method POST "repos/${write_repo}/issues/${issue}/comments" -F body=@- 2>&1)" || post_rc=$?
+    fi
+    if ((post_rc != 0)); then
         echo "ERROR: failed to publish lease comment on issue #${issue}: ${post_out}" >&2
-        echo "Proceeding without a lease is safe but degrades reclaim evidence (best-effort, mirrors #6179's fail-open dispatch write)." >&2
+        if ((require_ownership == 1)); then
+            echo "Ownership is indeterminate; Builder admission must stop." >&2
+        else
+            echo "Proceeding without a lease is safe but degrades reclaim evidence (best-effort, mirrors #6179's fail-open dispatch write)." >&2
+        fi
         exit 2
     fi
 
@@ -642,6 +710,33 @@ cmd_publish() {
         [[ "$comment_id" =~ ^[0-9]+$ ]] || comment_id=""
     else
         comment_id="$(jq -r '.id // empty' <<< "$post_out" 2>/dev/null || true)"
+    fi
+    # --- Claim-then-verify-order (#14376; the dispatcher's #6287 tie-break) ---
+    # The scan above ran BEFORE the POST, so two Builders that both read an empty
+    # list both publish. Re-read after publishing: a live lease from another
+    # sweep with an EARLIER forge comment id won, and this caller must not report
+    # ownership (the caller would start renewal on a claim it lost). The loser
+    # removes its own comment (best effort) so it cannot shadow the winner.
+    if ((require_ownership == 1)); then
+        if [[ ! "$comment_id" =~ ^[0-9]+$ ]]; then
+            echo "SKIP: issue #${issue}: published lease has no readable comment id; claim order unverifiable. Ownership is indeterminate." >&2
+            exit 2
+        fi
+        local after_ndjson earlier order_ttl_seconds
+        order_ttl_seconds="$(awk -v m="$ttl_minutes" 'BEGIN { printf "%d", m * 60 }')"
+        if ! after_ndjson="$(lease_read_trusted "$issue" "$require_ownership")"; then
+            echo "SKIP: issue #${issue}: could not re-read lease comments to verify claim order. Ownership is indeterminate." >&2
+            exit 2
+        fi
+        earlier="$(lease_earlier_peer "$after_ndjson" "$comment_id" "$host" "$sweep_id" "${LOOM_LEASE_PUBLISH_NOW:-$(date -u +%s)}" "$order_ttl_seconds")" || earlier=""
+        if [[ -n "$earlier" ]]; then
+            if ((gitea == 0)); then
+                gh api --method DELETE "repos/${write_repo}/issues/comments/${comment_id}" > /dev/null 2>&1 \
+                    || echo "WARN: could not remove the losing lease comment ${comment_id}" >&2
+            fi
+            echo "SKIP: issue #${issue}: lost the claim order to an earlier live lease (${earlier}). Not reporting ownership." >&2
+            exit 4
+        fi
     fi
     echo "OK: published lease record for issue #${issue} (host=${host} sweep=${sweep_id}${comment_id:+ comment_id=${comment_id}}) at ${now_iso}" >&2
     printf '%s %s\n' "$host" "$sweep_id"

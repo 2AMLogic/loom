@@ -349,17 +349,36 @@ fn ensure_worktree(
     let dir = crate::worktree_root::worktree_root_readable(root);
     let issue_wt = dir.join(format!("issue-{issue}"));
     if issue_wt.is_dir() {
+        if role == Role::Builder
+            && (!issue_wt.join(".loom-managed").is_file()
+                || issue_wt.join(".loom-unclaimed").exists())
+        {
+            return Err(LaunchError::config(
+                "Builder worktree ownership is not ready; refusing reuse",
+            ));
+        }
         return Ok(issue_wt);
     }
     let (script, arg, wt) = match (role, pr) {
         (Role::Doctor, Some(pr)) => ("pr-worktree.sh", pr, dir.join(format!("pr-{pr}"))),
         _ => ("worktree.sh", issue, issue_wt),
     };
-    if wt.is_dir() {
+    if role == Role::Doctor && wt.is_dir() {
         return Ok(wt);
     }
-    let mut cmd = Command::new(super::scripts_dir(root).join(script));
+    let script_path = super::scripts_dir(root).join(script);
+    if role == Role::Builder {
+        crate::install_compat::require_builder_worktree(&script_path)
+            .map_err(LaunchError::config)?;
+    }
+    let mut cmd = Command::new(script_path);
     cmd.current_dir(root).arg(arg.to_string());
+    // An older installed worktree.sh rejects this unknown argument before
+    // creating anything. An environment variable alone is silently ignored.
+    if role == Role::Builder {
+        cmd.arg("--require-ownership");
+    }
+    super::claim_owned::apply(&mut cmd, role, issue);
     if let (Role::Builder, Some(base)) = (role, base) {
         cmd.arg("--base").arg(base);
     }
@@ -484,6 +503,12 @@ fn run(args: &RunArgs, role: Role) -> Result<i32, LaunchError> {
         escalation_reason: None,
     };
     if delegates_to_claude(&admitted.runtime) {
+        if role == Role::Builder {
+            crate::install_compat::require_builder_worktree(
+                &super::scripts_dir(&root).join("worktree.sh"),
+            )
+            .map_err(LaunchError::config)?;
+        }
         emit(args, &report);
         return Ok(0);
     }
@@ -810,10 +835,67 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         write_executable(
             &dir.path().join(".loom/scripts/worktree.sh"),
-            "#!/bin/sh\nmkdir -p \"$(dirname \"$0\")/../worktrees/issue-$1\"\n",
+            "#!/bin/sh\n# loom:capability strict-builder-ownership\nmkdir -p \"$(dirname \"$0\")/../worktrees/issue-$1\"\n",
         );
         let wt = ensure_worktree(dir.path(), Role::Builder, 42, None, None).unwrap();
         assert!(wt.ends_with("issue-42") && wt.is_dir());
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn builder_prelaunch_requires_ownership_before_delivering_a_worktree() {
+        let _env = EnvGuard::clear(GUARDED_ENV);
+        let dir = tempfile::tempdir().unwrap();
+        write_executable(
+            &dir.path().join(".loom/scripts/worktree.sh"),
+            r#"#!/bin/sh
+# loom:capability strict-builder-ownership
+if [ "$2" = --require-ownership ] && [ "$LOOM_SWEEP_CLAIM_OWNED" = "$1" ]; then
+    echo 'ownership refused' >&2
+    exit 4
+fi
+mkdir -p ".loom/worktrees/issue-$1"
+"#,
+        );
+        for base in [None, Some("feature/issue-41")] {
+            let err = ensure_worktree(dir.path(), Role::Builder, 42, None, base).unwrap_err();
+            assert!(err.message.contains("ownership refused"));
+            assert!(!dir.path().join(".loom/worktrees/issue-42").exists());
+        }
+        // Doctor keeps the generic script contract, with neither Builder marker.
+        let wt = ensure_worktree(dir.path(), Role::Doctor, 42, None, None).unwrap();
+        assert!(wt.is_dir());
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn builder_refuses_an_old_installed_worktree_helper_before_running_it() {
+        let _env = EnvGuard::clear(GUARDED_ENV);
+        let dir = tempfile::tempdir().unwrap();
+        write_executable(
+            &dir.path().join(".loom/scripts/worktree.sh"),
+            "#!/bin/sh\ntouch ran\nmkdir -p .loom/worktrees/issue-$1\n",
+        );
+        let err = ensure_worktree(dir.path(), Role::Builder, 42, None, None).unwrap_err();
+        assert!(err.message.contains("lacks strict Builder ownership"));
+        assert!(!dir.path().join("ran").exists());
+        assert!(!dir.path().join(".loom/worktrees/issue-42").exists());
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn builder_cannot_reuse_a_partial_or_unclaimed_checkout() {
+        let _env = EnvGuard::clear(GUARDED_ENV);
+        let dir = tempfile::tempdir().unwrap();
+        let wt = dir.path().join(".loom/worktrees/issue-42");
+        std::fs::create_dir_all(&wt).unwrap();
+        assert!(ensure_worktree(dir.path(), Role::Builder, 42, None, None).is_err());
+        std::fs::write(wt.join(".loom-managed"), "").unwrap();
+        std::fs::write(wt.join(".loom-unclaimed"), "").unwrap();
+        assert!(ensure_worktree(dir.path(), Role::Builder, 42, None, None).is_err());
+        assert_eq!(ensure_worktree(dir.path(), Role::Doctor, 42, None, None).unwrap(), wt);
+        std::fs::remove_file(wt.join(".loom-unclaimed")).unwrap();
+        assert_eq!(ensure_worktree(dir.path(), Role::Builder, 42, None, None).unwrap(), wt);
     }
 
     use crate::env_test_support::EnvGuard;
@@ -829,6 +911,7 @@ mod tests {
         "LOOM_RUNTIME_DOCTOR",
         "LOOM_WORKTREE_ROOT",
         "LOOM_SWEEP_CLAIM_OWNED",
+        "LOOM_BUILDER_CLAIM",
         // #11400: the zai-flash tap needs a seat from the fixture.
         "ZAI_API_KEY",
         "LOOM_NATIVE_AUTH_FILE",
@@ -917,13 +1000,14 @@ mod tests {
             let eff = over.join(root.file_name().unwrap());
             for (script, prefix) in [("worktree.sh", "issue"), ("pr-worktree.sh", "pr")] {
                 let body = format!(
-                    "#!/bin/sh\necho \"{script} $*\" >> calls.txt\nmkdir -p '{}/{prefix}-'\"$1\"\n",
+                    "#!/bin/sh\n# loom:capability strict-builder-ownership\necho \"{script} $*\" >> calls.txt\nmkdir -p '{}/{prefix}-'\"$1\"\n",
                     eff.display()
                 );
                 write_executable(&root.join(".loom/scripts").join(script), &body);
             }
             let b = ensure_worktree(root, Role::Builder, 42, None, Some("feature/issue-41"));
             assert_eq!(b.unwrap(), eff.join("issue-42"), "via_env={via_env}");
+            std::fs::write(eff.join("issue-42/.loom-managed"), "").unwrap();
             let d = ensure_worktree(root, Role::Doctor, 50, Some(77), None).unwrap();
             assert_eq!(d, eff.join("pr-77"));
             // Reuse: existing worktrees under the external root, no new calls.
@@ -937,7 +1021,10 @@ mod tests {
             );
             ensure_worktree(root, Role::Doctor, 50, Some(77), None).unwrap();
             let calls = std::fs::read_to_string(root.join("calls.txt")).unwrap();
-            assert_eq!(calls, "worktree.sh 42 --base feature/issue-41\npr-worktree.sh 77\n");
+            assert_eq!(
+                calls,
+                "worktree.sh 42 --require-ownership --base feature/issue-41\npr-worktree.sh 77\n"
+            );
         }
     }
 

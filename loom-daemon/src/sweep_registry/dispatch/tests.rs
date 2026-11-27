@@ -4029,6 +4029,35 @@ fn dispatch_refuses_workspace_missing_sweep_command() {
     assert_eq!(typed.workspace, ws);
 }
 
+#[test]
+#[serial]
+fn old_builder_worktree_helper_refuses_sweep_and_builder_step_before_claim() {
+    let tmp = tempdir().unwrap();
+    let ws = tmp.path();
+    let (mut reg, gh_log) = closed_guard_registry(ws, &state_probe_json("open", false), 0);
+    let commands = ws.join(".claude/commands/loom");
+    std::fs::write(commands.join("builder.md"), "# builder").unwrap();
+    let script = ws.join(".loom/scripts/worktree.sh");
+    std::fs::write(&script, "#!/bin/sh\nexit 0\n").unwrap();
+
+    let err = reg
+        .dispatch(&SweepKind::Issue(42), None, None, None, None)
+        .unwrap_err();
+    assert!(err.to_string().contains("lacks strict Builder ownership"));
+    let step = crate::step_role::StepRole::Builder;
+    let err = reg
+        .begin_step_spawn(&crate::sweep_registry::step_spawn::StepSpawnRequest::new(42, step))
+        .err()
+        .expect("refuse Builder step");
+    assert!(err.to_string().contains("install_incompatible"));
+    assert!(std::fs::read_to_string(gh_log)
+        .unwrap_or_default()
+        .is_empty());
+
+    std::fs::write(script, include_str!("../../../../defaults/scripts/worktree.sh")).unwrap();
+    reg.config.check_builder_worktree().unwrap();
+}
+
 /// Regression guard: a workspace WITH the marker installed dispatches
 /// exactly as before — the #4027 guard is a pure no-op for a properly
 /// initialized workspace.

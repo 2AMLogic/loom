@@ -432,6 +432,11 @@ impl SweepRegistry {
         let name = role.role_name();
         if !self.config.role_command_missing(role) {
             self.missing_command_warned.remove(name);
+            if role == StepRole::Builder {
+                self.config
+                    .check_builder_worktree()
+                    .map_err(|err| StepRefusal::new("install_incompatible", err.to_string()))?;
+            }
             return Ok(());
         }
         let path = self.config.role_command_path(role);

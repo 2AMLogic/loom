@@ -424,6 +424,13 @@ impl SweepRegistry {
             // Hermetic fixtures install no runtime manifests.
             crate::runtime_preference::DispatchAdmission::none()
         } else {
+            if spec.worktree.is_none()
+                && matches!(spec.step, None | Some(crate::step_role::StepRole::Builder))
+            {
+                self.config.check_builder_worktree().map_err(|err| {
+                    RollResumeRefusal::guard("install-incompatible", err.to_string())
+                })?;
+            }
             match crate::runtime_admission::resolve_and_admit(
                 &self.config.workspace_root,
                 "sweep-lifecycle",

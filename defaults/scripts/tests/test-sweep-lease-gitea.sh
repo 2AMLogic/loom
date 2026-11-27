@@ -173,6 +173,14 @@ assert_eq "4" "$RC" "(c) a second host is refused while the first lease is fresh
 assert_eq "1" "$(comment_count)" "(c) no competing lease was written"
 assert_contains "$ERR" "FRESH lease" "(c) the existing peer refusal is reported"
 
+# A strict Builder must recognize Gitea's authenticated lease owner.
+run_publish --host other-host --sweep-id sweep-b --require-ownership
+assert_eq "4" "$RC" "strict publication recognizes the trusted Gitea peer"
+: > "$STATE/user"
+run_publish --host other-host --sweep-id sweep-b --require-ownership
+assert_eq "2" "$RC" "strict publication refuses an unreadable Gitea identity"
+assert_eq "1" "$(comment_count)" "an unauthenticated Builder leaves the peer lease alone"
+
 # (d1) stale peer does not block
 reset_state
 seed 7 loomtest "<!-- loom:lease host=peer-host sweep=old -->

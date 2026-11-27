@@ -83,6 +83,7 @@ fn args(dir: &TempDir) -> LeaseEnsureArgs {
         watch_pid: NO_SUCH_PID,
         max_age: DEFAULT_MAX_AGE_SECS,
         force: false,
+        require_ownership: false,
         workspace: dir.path().to_string_lossy().into_owned(),
         deferred: false,
         retry_interval: 60,
@@ -416,6 +417,30 @@ const PUBLISH_GH_FAILS: &str = r#"#!/usr/bin/env bash
 n=$(cat publish-attempts 2>/dev/null || echo 0); echo "$((n + 1))" > publish-attempts
 exit 2
 "#;
+
+/// #14376: `--require-ownership` tells a definitive peer refusal (publish exit
+/// 4) from an admitted claim and from an availability failure (publish exit 2).
+#[test]
+fn ownership_verdict_separates_owned_peer_and_indeterminate() {
+    let owned = args(&checkout(PUBLISH_OK, RENEW_OK)).ensure(&in_session());
+    assert_eq!(owned.ownership(), Ownership::Owned);
+
+    let peer = args(&checkout(PUBLISH_PEER_HOLDS, RENEW_OK)).ensure(&in_session());
+    assert_eq!(peer.ownership(), Ownership::PeerOwned);
+
+    let down = args(&checkout(PUBLISH_GH_FAILS, RENEW_OK)).ensure(&in_session());
+    assert_eq!(down.ownership(), Ownership::Indeterminate);
+
+    let no_session = args(&checkout(PUBLISH_OK, RENEW_OK)).ensure(&SessionEnv::default());
+    assert_eq!(no_session.ownership(), Ownership::Indeterminate);
+
+    let dispatched = SessionEnv {
+        dispatched_issue: Some("8193".into()),
+        ..Default::default()
+    };
+    let d = args(&checkout(PUBLISH_OK, RENEW_OK)).ensure(&dispatched);
+    assert_eq!(d.ownership(), Ownership::Owned);
+}
 
 fn attempts(dir: &TempDir) -> u32 {
     argv(dir, "publish-attempts").map_or(0, |s| s.trim().parse().unwrap())
@@ -1040,6 +1065,23 @@ fn ensure_with_a_live_orchestrator_lease_publishes_and_renews_nothing() {
 }
 
 #[test]
+fn strict_admission_does_not_reuse_a_different_same_host_session() {
+    let dir = checkout(PUBLISH_PEER_HOLDS, RENEW_OK);
+    let mut a = args(&dir);
+    a.require_ownership = true;
+    let host = crate::cli::lease_release::my_host_ids().remove(0);
+    let env = SessionEnv {
+        lease_rows: Some(vec![lease_row(&host, "another-session", 30)]),
+        ..in_session()
+    };
+    assert_eq!(a.ensure(&env), Outcome::PublishDeclined(Some(4)));
+    assert!(argv(&dir, "publish-argv")
+        .unwrap()
+        .contains("--require-ownership"));
+    assert!(argv(&dir, "renew-argv").is_none());
+}
+
+#[test]
 #[serial_test::serial(loom_auto_update_env)]
 fn the_reuse_decision_follows_the_lease_ttl_env() {
     let env_var = crate::claim_reconciliation::LEASE_TTL_MINUTES_ENV;
@@ -1088,4 +1130,69 @@ fn spawning_the_deferred_publisher_logs_a_self_spawn_start_line_only() {
     );
     assert!(!starts[0].1.contains("hunter2"), "{}", starts[0].1);
     assert!(!logs.iter().any(|(_, m)| m.starts_with("self_spawn exit")), "{logs:?}");
+}
+
+// --- Strict admission of a dispatched claim (#14376) ---------------------------
+
+fn dispatched_outcome(rows: &[crate::cli::lease_co_occupancy::LeaseRow]) -> Outcome {
+    dispatched_claimant_outcome(rows, chrono::Utc::now(), ttl(), &mine(), "original-session")
+}
+
+#[test]
+fn a_dispatcher_that_still_owns_the_lease_is_admitted() {
+    let rows = [lease_row("h-me", "original-session", 30)];
+    assert_eq!(dispatched_outcome(&rows), Outcome::AlreadyDispatched);
+}
+
+#[test]
+fn a_displaced_dispatcher_is_a_peer_owned_refusal() {
+    // The original lease lapsed and a same-host sibling acquired the claim.
+    let rows = [
+        lease_row("h-me", "original-session", 3600),
+        lease_row("h-me", "peer-session", 30),
+    ];
+    let outcome = dispatched_outcome(&rows);
+    assert_eq!(
+        outcome,
+        Outcome::DispatchedDisplaced {
+            host: "h-me".to_string(),
+            sweep_id: "peer-session".to_string()
+        }
+    );
+    assert_eq!(outcome.ownership(), Ownership::PeerOwned);
+    // A live peer beside a live original is still a refusal.
+    let both = [
+        lease_row("h-me", "original-session", 30),
+        lease_row("h-other", "peer-session", 30),
+    ];
+    assert_eq!(dispatched_outcome(&both).ownership(), Ownership::PeerOwned);
+}
+
+#[test]
+fn a_dispatched_claim_with_no_live_own_lease_is_indeterminate() {
+    assert_eq!(dispatched_outcome(&[]).ownership(), Ownership::Indeterminate);
+    let expired = [lease_row("h-me", "original-session", 3600)];
+    assert_eq!(dispatched_outcome(&expired).ownership(), Ownership::Indeterminate);
+    // Same sweep id from another host is not the dispatched claimant.
+    let other_host = [lease_row("h-other", "original-session", 30)];
+    assert_eq!(dispatched_outcome(&other_host).ownership(), Ownership::PeerOwned);
+}
+
+#[test]
+fn strict_dispatched_admission_without_evidence_is_indeterminate_but_plain_ensure_is_unchanged() {
+    let dir = checkout(PUBLISH_OK, RENEW_OK);
+    let env = SessionEnv {
+        dispatched_issue: Some("8193".to_string()),
+        session_present: true,
+        ..Default::default()
+    };
+    let mut strict = args(&dir);
+    strict.require_ownership = true;
+    assert_eq!(strict.ensure(&env).ownership(), Ownership::Indeterminate);
+    // Forge without `gh` rows (Gitea) keeps the daemon-publish trust.
+    let gitea = SessionEnv {
+        lease_rows_unsupported: true,
+        ..env
+    };
+    assert_eq!(strict.ensure(&gitea), Outcome::AlreadyDispatched);
 }

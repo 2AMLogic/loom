@@ -189,7 +189,18 @@ if [[ "$1" == "api" ]]; then
     echo "$n" > "$D/post-count"
     resolve_body > "$D/post-$n.body"
     echo "$path" >> "$D/post-calls.log"
+    # Race fixture: a competitor's comment landed between this caller's read
+    # and its POST, so the listing it re-reads holds the competitor's row too.
+    if [[ -f "$D/race-inject.json" ]]; then
+      jq --slurpfile body <(jq -Rs . "$D/post-$n.body") --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --argjson id $((9000 + n)) \
+        '. + [{id: $id, updated_at: $ts, body: $body[0], user: {login: "bot", type: "Bot"}, author_association: "OWNER"}]' \
+        "$D/race-inject.json" > "$D/comments.json"
+    fi
     echo "{\"id\": $((9000 + n))}"
+    exit 0
+  fi
+  if [[ "$method" == "DELETE" && "$path" == repos/*/issues/comments/* ]]; then
+    echo "${path##*/}" >> "$D/delete-ids.log"
     exit 0
   fi
   if [[ "$method" == "PATCH" && "$path" == repos/*/issues/comments/* ]]; then
@@ -233,7 +244,7 @@ OPAQUE_HOST="host-471642b3"
 reset_state() {
     rm -f "$STUB_DIR"/comments.json "$STUB_DIR"/comments-fail "$STUB_DIR"/post-fail
     rm -f "$STUB_DIR"/post-*.body "$STUB_DIR"/post-count "$STUB_DIR"/post-calls.log
-    rm -f "$STUB_DIR"/post-flags.log
+    rm -f "$STUB_DIR"/post-flags.log "$STUB_DIR"/race-inject.json "$STUB_DIR"/delete-ids.log
     unset LOOM_LEASE_PUBLISH_NOW LOOM_LEASE_HOST_ID
 }
 
@@ -428,6 +439,40 @@ assert_eq "0" "$RC" "(f) a comments-read failure fails OPEN (exit 0)"
 assert_eq "1" "$(post_count)" "(f) the lease is published despite unreadable evidence"
 assert_contains "$ERR" "publishing anyway" "(f) stderr explains the fail-open"
 rm -f "$STUB_DIR/comments-fail"
+
+# Fresh Builder admission must not publish against an unreadable prestate.
+reset_state
+touch "$STUB_DIR/comments-fail"
+run_script publish 6320 --sweep-id sweep-run-A --require-ownership
+assert_eq "2" "$RC" "strict unreadable comments refuse ownership"
+assert_eq "0" "$(post_count)" "strict unreadable comments post nothing"
+assert_contains "$ERR" "ownership indeterminate" "strict failure explains refusal"
+rm -f "$STUB_DIR/comments-fail"
+
+reset_state
+export LOOM_TEST_NO_TRUST_VERB=1
+run_script publish 6320 --sweep-id sweep-run-A --require-ownership
+unset LOOM_TEST_NO_TRUST_VERB
+assert_eq "2" "$RC" "strict unauthenticated comments refuse ownership"
+assert_eq "0" "$(post_count)" "strict unauthenticated comments post nothing"
+
+# #14376: two strict publishers both read an empty list; the competitor's comment
+# (earlier id, fresh, different host/sweep) lands before ours. Only the earliest
+# claim reports ownership; the loser removes its own comment.
+reset_state
+jq -n --arg ts "$FRESH_ISO" '[{id: 5, updated_at: $ts, body: "<!-- loom:lease host=peer-host sweep=sweep-peer-1 -->\nprose", user: {login: "bot", type: "Bot"}, author_association: "OWNER"}]' > "$STUB_DIR/race-inject.json"
+run_script publish 6320 --sweep-id sweep-run-A --require-ownership
+assert_eq "4" "$RC" "strict publish that lost the claim order exits 4"
+assert_eq "" "$OUT" "the loser prints no identity (no renewal is started)"
+assert_contains "$ERR" "lost the claim order" "loser explains the refusal"
+assert_eq "9001" "$(cat "$STUB_DIR/delete-ids.log" 2>/dev/null || echo NONE)" "the loser removes only its own comment"
+
+# The same interleaving where OUR comment is earliest keeps ownership.
+reset_state
+jq -n --arg ts "$FRESH_ISO" '[{id: 99999, updated_at: $ts, body: "<!-- loom:lease host=peer-host sweep=sweep-peer-1 -->\nprose", user: {login: "bot", type: "Bot"}, author_association: "OWNER"}]' > "$STUB_DIR/race-inject.json"
+run_script publish 6320 --sweep-id sweep-run-A --require-ownership
+assert_eq "0" "$RC" "strict publish with the earliest claim keeps ownership"
+assert_eq "$OPAQUE_HOST sweep-run-A" "$OUT" "the winner prints its identity"
 
 # --- (g) a `gh` WRITE failure -> exit 2 ----------------------------------
 reset_state

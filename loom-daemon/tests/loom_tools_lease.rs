@@ -27,3 +27,39 @@ fn the_issue_lease_chain_runs_on_a_tools_only_host() {
     );
     assert!(stdout.contains("ALL PASSED"), "{stdout}");
 }
+
+#[test]
+fn strict_ensure_reports_indeterminate_when_mode_resolution_fails() {
+    let root = tempfile::tempdir().expect("isolated mode fixture");
+    // (strict, dispatched, resolves mode, exit, stdout). A non-strict dispatched
+    // call is settled from the marker alone and never touches mode. A strict
+    // dispatched call (#14376) must prove the live lease is the dispatcher's own
+    // (LOOM_SWEEP_ID + lease rows), so it reaches the forge, resolves mode, and
+    // with neither available here reports INDETERMINATE rather than OWNED.
+    for (strict, dispatched, resolves_mode, exit, stdout) in [
+        (false, false, true, 0, ""),
+        (false, true, false, 0, ""),
+        (true, false, true, 2, "INDETERMINATE"),
+        (true, true, true, 2, "INDETERMINATE"),
+    ] {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_loom-tools"));
+        command
+            .env_clear()
+            .env("LOOM_MODE", "invalid-fixture-mode")
+            .current_dir(root.path())
+            .args(["lease", "ensure", "42", "--watch-pid", "1", "--force"]);
+        if strict {
+            command.arg("--require-ownership");
+        }
+        if dispatched {
+            command.env("LOOM_SWEEP_LEASE_RENEW_DISPATCHED", "42");
+        }
+        let out = command
+            .output()
+            .expect("run lease ensure with invalid mode");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(stderr.contains("invalid mode"), resolves_mode, "{stderr}");
+        assert_eq!(out.status.code(), Some(exit), "{stderr}");
+        assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), stdout);
+    }
+}
