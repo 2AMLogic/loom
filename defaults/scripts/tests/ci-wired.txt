@@ -228,6 +228,7 @@ test-resync-installed-output-staging.sh
 test-resync-installed-source.sh
 test-resync-installed.sh
 test-resync-installed-payload-fallback.sh
+test-resync-installed-user-scope.sh
 test-review-feedback-reconciliation.sh
 test-run-ci-suites-daemon-guard.sh
 test-run-ci-suites-failure-excerpt.sh

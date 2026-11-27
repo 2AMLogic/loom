@@ -78,6 +78,14 @@ pub(super) const LOOM_OWNED_PREFIXES: &[&str] = &[
     ".loom/account-health.json",
     ".loom/account-health.lock",
     ".loom/account-ranking.codex",
+    // The other two daemon-written entries of the audit (#15488), both
+    // directories: `.loom/claims/` (`loom-daemon claim` writes
+    // `issue-<N>.lock/claim.json`) and `.loom/metrics/` (`validate-phase`'s
+    // recovery path writes `recovery-events.json`). Same stale-block hazard
+    // as the three above; listed with their trailing `/` so the subtree
+    // match above covers every file either writer produces.
+    ".loom/claims/",
+    ".loom/metrics/",
 ];
 
 /// Common regenerable lockfile basenames (#3950): a package manager can
@@ -256,6 +264,33 @@ mod tests {
             ".loom/account-ranking.codex",
         ] {
             assert!(loom_owned(p), "{p} must stay in LOOM_OWNED_PREFIXES (#15479)");
+        }
+    }
+
+    #[test]
+    fn the_daemon_written_runtime_directories_are_loom_owned() {
+        // #15488: the audit of the remaining EPHEMERAL_PATTERNS candidates
+        // found two more daemon-written entries, both directories —
+        // `loom-daemon claim` writes `.loom/claims/issue-<N>.lock/claim.json`
+        // and `validate-phase`'s recovery path writes
+        // `.loom/metrics/recovery-events.json`. Both are listed with a
+        // trailing `/`, so what the lists must get right is the subtree match
+        // on a child path; the entries themselves are pinned by the parity
+        // test below.
+        for p in [
+            ".loom/claims/issue-42.lock/claim.json",
+            ".loom/metrics/recovery-events.json",
+        ] {
+            assert!(loom_owned(p), "{p} must be Loom-owned (#15488)");
+        }
+        // A sibling that merely extends the directory's name is not Loom
+        // state: the trailing `/` ends the prefix, so a stray there stays
+        // visible as contamination.
+        for p in [
+            ".loom/claims-old/issue-42.lock/claim.json",
+            ".loom/metrics-old/recovery-events.json",
+        ] {
+            assert!(!loom_owned(p), "{p} must not match a directory entry by its name prefix");
         }
     }
 

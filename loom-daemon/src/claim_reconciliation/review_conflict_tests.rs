@@ -158,8 +158,8 @@ fn prs_with_an_agent_in_flight_are_left_to_it() {
 /// `loom:pr` from the approved-PR suite) followed by those of `mc_json` (the
 /// `loom:merge-conflict` PRs), written in the old `gh pr list` shape and
 /// converted here — each PR's `GET pulls/<n>` answers its `mergeable`, and the
-/// comments walk returns `comments`. Any GraphQL `gh pr
-/// list` fails, so a regression back to it fails every end-to-end test here.
+/// comments walk returns `comments`. The fake rejects GraphQL `gh pr list`
+/// with exit 97. Even tests that expect no writes check the candidate count.
 fn fake_gh(dir: &Path, log: &Path, rr_json: &str, mc_json: &str, comments: &str) -> PathBuf {
     let bin = dir.join("fake-gh-conflict.sh");
     let mut open: Vec<serde_json::Value> = serde_json::from_str(rr_json).unwrap();
@@ -257,6 +257,7 @@ fn end_to_end_unknown_writes_nothing() {
         r#"[{{"number":8911,"headRefOid":"{SHA}","mergeable":"UNKNOWN","labels":[{{"name":"loom:merge-conflict"}},{{"name":"loom:changes-requested"}}]}}]"#
     );
     let (stats, calls) = run(&rr, &mc, "[]");
+    assert_eq!(stats.checked, 2, "{calls}");
     assert_eq!((stats.flagged, stats.cleared), (0, 0));
     assert!(!calls.contains("pr edit") && !calls.contains("pr comment"), "{calls}");
 }
@@ -291,6 +292,7 @@ fn end_to_end_held_pr_is_untouched() {
         r#"[{{"number":8909,"headRefOid":"{SHA}","mergeable":"CONFLICTING","labels":[{{"name":"loom:review-requested"}},{{"name":"loom:operator"}}]}}]"#
     );
     let (stats, calls) = run(&rr, "[]", "[]");
+    assert_eq!(stats.checked, 1, "{calls}");
     assert_eq!(stats.flagged, 0);
     assert!(!calls.contains("pr edit") && !calls.contains("pr comment"), "{calls}");
 }
@@ -311,6 +313,7 @@ fn end_to_end_an_untrusted_flag_marker_is_not_ours() {
     ] {
         let listing = format!(r#"[{{{author},"body":"<!-- loom:base-conflict flagged -->\nx"}}]"#);
         let (stats, calls) = run("[]", &mc, &listing);
+        assert_eq!(stats.checked, 1, "{author}: {calls}");
         assert_eq!(stats.cleared, 0, "{author}: {calls}");
         assert!(!calls.contains("pr edit"), "{author}: {calls}");
     }

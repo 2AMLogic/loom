@@ -531,8 +531,8 @@ pub fn is_credential_path(path: &str) -> bool {
         .any(|p| path.starts_with(p.strip_suffix('/').unwrap_or(p)))
 }
 
-/// The daemon-written subset of [`EPHEMERAL_PATTERNS`] (#15479): runtime files
-/// the daemon writes into every workspace, which must ALSO be in both
+/// The daemon-written subset of [`EPHEMERAL_PATTERNS`] (#15479): runtime paths
+/// the daemon writes into a workspace, which must ALSO be in both
 /// `LOOM_OWNED_PREFIXES` lists — the bash one in
 /// `defaults/scripts/check-main-clean.sh` and its Rust mirror in
 /// `loom-daemon/src/main_health_gate/owned_paths.rs`.
@@ -549,15 +549,55 @@ pub fn is_credential_path(path: &str) -> bool {
 /// A `.gitignore` entry alone is therefore not enough for a path the daemon
 /// writes at runtime: add it here too, and the parity test in `owned_paths.rs`
 /// fails CI until both owned lists carry it. Same shape as
-/// [`CREDENTIAL_PATTERNS`] and `credential_class_tests`. Deliberately bounded
-/// to the paths #15479 proved — not an audit of every daemon-written entry in
-/// [`EPHEMERAL_PATTERNS`].
+/// [`CREDENTIAL_PATTERNS`] and `credential_class_tests`.
 ///
-/// Exact paths (no trailing `/`), so both owned lists match them exactly.
+/// Matching: an entry without a trailing `/` is an exact path. An entry with
+/// one is a directory, and both owned lists match its whole subtree under the
+/// rule they already apply to every entry — no special handling for a
+/// directory, only the trailing `/`, which also keeps a sibling that extends
+/// the name (`.loom/claims-old/`) visible as dirt.
+///
+/// #15488 audited the remaining [`EPHEMERAL_PATTERNS`] candidates for
+/// daemon-written entries. Two are included:
+///
+/// - `.loom/claims/`: `claim_issue` (`script_helpers/claim.rs`) creates
+///   `.loom/claims/issue-<N>.lock/` and writes its `claim.json`.
+/// - `.loom/metrics/`: `log_recovery_event`
+///   (`script_helpers/validate_phase.rs`) creates the directory and appends
+///   to `recovery-events.json`.
+///
+/// The rest are deliberately excluded, since none is written by the daemon
+/// under a workspace:
+///
+/// - `.loom/activity.db`: opened in the daemon's own state directory —
+///   `~/.loom`, else the `LOOM_SOCKET_PATH` / `LOOM_ACTIVITY_DB` override
+///   (`autonomy_marker::resolve_loom_dir`,
+///   `activity::default_activity_db_path`) — not under a workspace in any
+///   working configuration. One degraded path exists: when home-directory
+///   lookup fails (a UID with no passwd entry, `HOME` and `LOOM_ACTIVITY_DB`
+///   unset), `default_activity_db_path` falls back to `.`, and the ranking
+///   refresh (`token_ranking_refresh`, cwd = repo root) then creates
+///   `<workspace>/.loom/activity.db` via `tokens check --ranking`. That file
+///   is deliberately left unprotected: it only appears when the host's
+///   home/state-dir resolution is broken, and surfacing it as dirt (and
+///   letting `--quarantine` move it aside) is the right signal to fix that
+///   misconfiguration, not state worth shielding. Protecting it would hide
+///   the fault and keep a stray database in the checkout every tick.
+/// - `.loom/signals/`: written by `defaults/scripts/signal.sh stop` when an
+///   operator requests a stop; the daemon only checks whether a signal exists
+///   (`agent_session::spawn::check_stop_signals`).
+/// - `.loom/state.json`: no writer. The terminal snapshot belonged to the
+///   desktop app removed in #3353.
+/// - `.loom/status/`: no writer since `a32259f2a` removed `status.sh` and
+///   `37dbc3eb8` the stale-blocked release status file.
+/// - `.loom/diagnostics/`: no writer since `b811fca8d` removed the shepherd
+///   diagnostic writer; only installer tests populate the directory.
 pub const DAEMON_RUNTIME_PATTERNS: &[&str] = &[
     ".loom/account-health.json",
     ".loom/account-health.lock",
     ".loom/account-ranking.codex",
+    ".loom/claims/",
+    ".loom/metrics/",
 ];
 
 /// Build the Loom-managed `.gitignore` block (marker lines + header + patterns),
