@@ -155,16 +155,16 @@ const PROBE_TIMEOUT: Duration = Duration::from_secs(PROBE_TIMEOUT_SECS);
 /// time.
 ///
 /// `stdin` is explicitly nulled to preserve `Command::output()`'s contract:
-/// `output()` nulls stdin, while [`output_with_timeout`]'s `spawn()` would
+/// `output()` nulls stdin, while [`run_bounded`]'s `spawn()` would
 /// otherwise *inherit* the daemon's stdin. None of these probes read stdin, but
 /// inheriting it is a behavior change this wrap must not smuggle in.
 ///
-/// [`output_with_timeout`]: crate::sweep_registry::output_with_timeout
+/// [`run_bounded`]: crate::proc_exec::run_bounded
 fn probe_output(mut cmd: Command, timeout: Duration) -> Option<std::process::Output> {
     cmd.stdin(std::process::Stdio::null());
-    crate::sweep_registry::output_with_timeout(cmd, timeout)
+    crate::proc_exec::run_bounded(cmd, timeout)
         .ok()
-        .flatten()
+        .and_then(crate::proc_exec::Completion::output)
 }
 
 // ============================================================================

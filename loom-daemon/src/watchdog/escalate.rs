@@ -234,9 +234,9 @@ pub fn file_issue(
         .arg("loom:triage")
         .arg("--force");
 
-    let filed = crate::sweep_registry::output_with_timeout(cmd, std::time::Duration::from_secs(60))
+    let filed = crate::proc_exec::run_bounded(cmd, std::time::Duration::from_secs(60))
         .ok()
-        .flatten()
+        .and_then(crate::proc_exec::Completion::output)
         .is_some_and(|o| o.status.success());
 
     if filed {

@@ -1471,7 +1471,7 @@ rm -rf "$PS_STUB_DIR" "$STUB21"
 # ---- 22. RETIRED (#8086): #4832's missing-lib/bounded-run.sh case.
 #          Its MECHANISM was `mv`-ing defaults/scripts/lib/bounded-run.sh out
 #          of the way. The port sources no lib: the bound is
-#          crate::sweep_registry::output_with_timeout, a compiled-in call.
+#          crate::proc_exec::run_bounded, a compiled-in call.
 #          There is nothing to move, so the case cannot run -- and note its
 #          third assertion ("no raw 'command not found' surfaced") would now
 #          pass VACUOUSLY, which is the #7834 failure one step earlier.

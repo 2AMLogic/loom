@@ -283,9 +283,9 @@ impl AlertSink for IssueSink<'_> {
             info.owner,
             info.run_url()
         );
-        crate::sweep_registry::output_with_timeout(cmd, StdDuration::from_secs(60))
+        crate::proc_exec::run_bounded(cmd, StdDuration::from_secs(60))
             .ok()
-            .flatten()
+            .and_then(crate::proc_exec::Completion::output)
             .is_some_and(|o| o.status.success() || o.status.code() == Some(3))
     }
 }

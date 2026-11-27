@@ -376,9 +376,9 @@ fn outage(
             std::time::Duration::from_secs(env::num("LOOM_WATCHDOG_RECOVER_TIMEOUT_SECS", 120));
         let mut cmd = std::process::Command::new(&argv[0]);
         cmd.args(&argv[1..]);
-        let recover_rc = crate::sweep_registry::output_with_timeout(cmd, timeout)
+        let recover_rc = crate::proc_exec::run_bounded(cmd, timeout)
             .ok()
-            .flatten()
+            .and_then(crate::proc_exec::Completion::output)
             .and_then(|o| o.status.code());
 
         // Confirm with the SAME liveness question the outage was declared on.

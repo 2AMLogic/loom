@@ -602,7 +602,9 @@ pub(crate) struct RollItemFacts {
 pub(super) fn git_line(worktree: &Path, args: &[&str]) -> Option<String> {
     let mut cmd = Command::new("git");
     cmd.arg("-C").arg(worktree).args(args);
-    let out = reaper::output_with_timeout(cmd, reaper::reap_gh_timeout()).ok()??;
+    let out = crate::proc_exec::run_bounded(cmd, reaper::reap_gh_timeout())
+        .ok()?
+        .output()?;
     let line = String::from_utf8_lossy(&out.stdout).trim().to_string();
     (out.status.success() && !line.is_empty()).then_some(line)
 }
@@ -717,14 +719,16 @@ pub(crate) fn refresh_lease_once(
     // refused by the write-scope probe. The recovery variant covers a roll that
     // runs soon after a daemon start, before the root is registered (#6722).
     crate::credential_preflight::apply_gh_config_for_root_with_recovery(&mut cmd, workspace_root);
-    match reaper::output_with_timeout(cmd, timeout) {
-        Ok(Some(out)) if out.status.success() => Ok(()),
-        Ok(Some(out)) => Err(format!(
+    match crate::proc_exec::run_bounded(cmd, timeout) {
+        Ok(crate::proc_exec::Completion::Exited(out)) if out.status.success() => Ok(()),
+        Ok(crate::proc_exec::Completion::Exited(out)) => Err(format!(
             "renew-once exited {:?}: {}",
             out.status.code(),
             String::from_utf8_lossy(&out.stderr).trim()
         )),
-        Ok(None) => Err(format!("renew-once exceeded {}s", timeout.as_secs())),
+        Ok(crate::proc_exec::Completion::TimedOut { .. }) => {
+            Err(format!("renew-once exceeded {}s", timeout.as_secs()))
+        }
         Err(e) => Err(format!("renew-once could not run: {e}")),
     }
 }

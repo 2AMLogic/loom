@@ -324,9 +324,9 @@ fn run_launchctl(args: &[&str]) -> Option<std::process::Output> {
     let mut cmd = Command::new("launchctl");
     cmd.args(args);
     cmd.stdin(std::process::Stdio::null());
-    crate::sweep_registry::output_with_timeout(cmd, PROBE_TIMEOUT)
+    crate::proc_exec::run_bounded(cmd, PROBE_TIMEOUT)
         .ok()
-        .flatten()
+        .and_then(crate::proc_exec::Completion::output)
 }
 
 /// Real `launchctl bootout <domain>/<label>` — best-effort, failure ignored

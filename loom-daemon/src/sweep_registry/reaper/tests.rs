@@ -2239,31 +2239,6 @@ fn read_path_reaps_exited_child_out_of_running_promptly() {
 // These tests pin the bounded-subprocess fix.
 
 #[test]
-fn output_with_timeout_returns_output_for_a_fast_command() {
-    let mut cmd = Command::new("/bin/echo");
-    cmd.arg("hi");
-    let out = output_with_timeout(cmd, Duration::from_secs(5))
-        .expect("spawn should succeed")
-        .expect("a fast command must complete inside the window");
-    assert!(out.status.success());
-    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "hi");
-}
-
-#[test]
-fn output_with_timeout_kills_a_hung_command() {
-    let mut cmd = Command::new("/bin/sleep");
-    cmd.arg("30");
-    let start = Instant::now();
-    let out = output_with_timeout(cmd, Duration::from_millis(300)).expect("spawn should succeed");
-    let elapsed = start.elapsed();
-    assert!(out.is_none(), "a command exceeding the timeout must be killed and yield None");
-    assert!(
-        elapsed < Duration::from_secs(5),
-        "kill-on-timeout should be prompt, took {elapsed:?}"
-    );
-}
-
-#[test]
 #[serial]
 fn reap_gh_timeout_honors_env_override() {
     std::env::set_var(REAP_GH_TIMEOUT_ENV, "3");
