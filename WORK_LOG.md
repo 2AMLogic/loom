@@ -18,6 +18,8 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 ### 2026-11-27
 
+- **PR #15614**: refactor: delegate private_workspace::save to fs_util::write_atomic
+- **Issue #15611** (closed): write_atomic consolidation: private_workspace::save is a residual durable-state writer #15607 did not enumerate
 - **PR #15612**: refactor: extract shared Codex and Claude container setup helpers
 - **PR #15610**: refactor: route remaining durable state writers through fs_util::write_atomic
 - **PR #15606**: test: extract shared StackFixture into test_git_helpers
