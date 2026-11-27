@@ -138,6 +138,7 @@ for copy in "defaults/.claude/commands/loom/guide.md" "defaults/.agents/skills/l
     STUB_PARK_OUT=''
 
     # No `loom:park` text at all: the daemon is not consulted.
+    assert_eq "$(parse_dependencies 'Depends on #962')" "962" "ordinary Depends on declaration is parsed"
     assert_eq "$(parse_dependencies "$AC")" "100" "no park record: checkbox dep still parsed"
     assert_eq "$(parse_dependencies $'- [ ] example-org/tool-repo#55: x')" "example-org/tool-repo#55" "cross-repo ref keeps owner prefix"
 
@@ -298,16 +299,23 @@ RESOLVED='#8674'"
         else
             pass "#15528: #8698-shaped body: no Unblocked comment"
         fi
-        [[ "$state" == CLOSED ]] && { [[ ! -s "$CALLS" ]] && pass "#15528: no gh/comment call at all" || fail "#15528: unexpected calls: $(cat "$CALLS")"; }
+        if [[ "$state" == CLOSED ]]; then
+            if [[ -s "$CALLS" ]]; then
+                fail "#15528: unexpected calls: $(cat "$CALLS")"
+            else
+                pass "#15528: no gh/comment call at all"
+            fi
+        fi
     done
     STUB_PARK_OUT=''; STUB_PARK_RC=2
 
     # The prompt itself must state the rule (the by-hand Guide path, #15528).
-    if grep -q 'A lift needs a dependency `parse_dependencies` printed (#15528)' "$f" \
-        && grep -q 'An empty `parse_dependencies`' "$f"; then
-        pass "#15528: $copy states the parse_dependencies-only lift rule"
+    # shellcheck disable=SC2016  # Match the literal command in the prompt.
+    if grep -Fq 'run `parse_dependencies "$body"`' "$f" \
+        && grep -Fq 'skip the dependency-based label edit' "$f"; then
+        pass "#15528: $copy states the issue dependency rule for a manual sweep"
     else
-        fail "#15528: $copy lacks the parse_dependencies-only lift rule"
+        fail "#15528: $copy lacks the issue dependency rule for a manual sweep"
     fi
 done
 echo "Tests run: $TESTS_RUN"

@@ -684,22 +684,19 @@ a later pass to sort out.
 
 ### Unblocking Logic
 
-**A lift needs a dependency `parse_dependencies` printed (#15528).** Whatever
-runs this section — the function below, or you running the role by hand —
-removes `loom:blocked`, restores `loom:issue` and posts "Unblocked" **only for a
-dependency that `parse_dependencies` (or its daemon equivalent,
-`loom-daemon park-record parse`) printed**, and only when
-`resolve_dep_states` + `deps_fully_resolved` clear every one. These are never a
-reason to lift, however closed the referenced issue is: a ticked
-`## Dependencies` checkbox, a `#N` inside a park record's `reason="..."` text,
-a `#N` in the issue's prose, or any ad hoc scan of the body ("every checklist
-entry is ticked", "the cited issue is closed"). **An empty `parse_dependencies`
-result means no label write and no comment** — a reason-only park (`Blocked by:
-(unstated)`) is a hold a person or Champion set on purpose, and it stays until
-they release it. (#8698 was lifted twice, 2026-11-19 and 2026-11-26, naming
-closed #8674 from a ticked box and park `reason=` text; no park record declared
-a blocker.) Do not hand-roll a replacement for the empty-`$deps` skip in
-`check_and_unblock` below.
+For the **issue dependency check** (#15528), run `parse_dependencies "$body"`
+even when working by hand. It reads ordinary declarations such as
+`Depends on #962` and unchecked dependency boxes. For park records it uses
+`loom-daemon park-record parse`. Pass only the printed dependencies to
+`resolve_dep_states`. Proceed through the remaining gates only when the resolver
+reports all dependencies resolved and `deps_fully_resolved` confirms every ref.
+
+If `parse_dependencies` prints nothing, skip the dependency-based label edit
+and “Unblocked” comment for that issue. On #8698, a checked box and two park
+reasons cited closed issue #8674, but neither park declared it as a blocker.
+Never fill an empty result from a checked box, `reason="..."` or other prose.
+Continue the PR evidence check, awaiting-revision conversion and due transient
+park release under their own rules below.
 
 Permanent block (#8742): `<!-- loom:permanent-block -->` (own line; quoted prose
 doesn't count) counts from a trusted comment, or the body **only if its author is trusted** (`--with-body`). Champion
@@ -967,12 +964,13 @@ convert_awaiting_revision_parks() {
 ### Example Unblocking Flow
 
 ```bash
-# 1. Issue #963 has loom:blocked, body contains "Depends on #962"
-gh issue view 963 --json labels,body
+# 1. Blocked issue #963 has an ordinary dependency declaration, "Depends on #962".
+body=$(gh issue view 963 --json body --jq .body)
+deps=$(parse_dependencies "$body")  # deps is 962
 
-# 2. Check if #962 is closed
-gh issue view 962 --json state
-# → state: CLOSED ✓
+# 2. The dependency check in check_and_unblock verifies that all parsed refs resolved.
+resolve_dep_states "$deps"
+# → true on line 1, #962 on line 2
 
 # 3. Superseding-block gate (#4634): any linked PR still open and blocked?
 has_superseding_block 963
@@ -1016,9 +1014,8 @@ pr_state=$(gh pr view "$pr_number" --json state,mergedAt --jq '.state')
 
 ### When NOT to Unblock
 
-- If no parseable dependencies found → Skip (may need manual review): no label
-  write, no comment. A checked `## Dependencies` box, `reason="..."` text and
-  body prose are not dependencies (#15528)
+- If `parse_dependencies` prints nothing for an issue, skip only its
+  dependency-based unblock (#15528). Continue the other sweep checks above.
 - If any dependency is still OPEN → Keep blocked
 - **If a linked implementation PR is still OPEN with `loom:changes-requested`,
   `loom:blocked`, or `loom:operator` → Keep blocked, even if every
