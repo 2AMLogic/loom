@@ -348,3 +348,194 @@ fn strip_failed_removal_warns_with_the_manual_command() {
         .1
         .contains("gh issue edit 1 --repo o/r --remove-label loom:building"));
 }
+
+// ---------------------------------------------------------------------------
+// SystemHost: one host, two callers (#15641)
+// ---------------------------------------------------------------------------
+
+/// A `gh` stand-in that logs its working directory and argv and answers the
+/// reads the bookkeeping makes. Issue `5` fails with an error body — the
+/// shell capture's `|| echo '{}'` case.
+fn logging_gh(dir: &std::path::Path, name: &str) -> (std::path::PathBuf, std::path::PathBuf) {
+    let log = dir.join(format!("{name}.log"));
+    let gh = crate::gh_invocation::test_support::stub(
+        dir,
+        name,
+        r#"printf '%s\n' "$PWD $*" >> "@LOG@"
+case "$1 $2" in
+  "api repos/o/r/issues/5") echo '{"message":"Not Found"}'; exit 1 ;;
+  "api repos/o/r/issues/6") echo '{"state":"open","pull_request":{}}' ;;
+  "api repos/o/r/pulls/9/commits") printf '%s\n' '[{"commit":{"message":"a"}}]' '[{"commit":{"message":"b"}}]' ;;
+  "api repos/o/r/issues/6/timeline?per_page=100") echo '[{"event":"labeled"}]' ;;
+esac"#
+            .replace("@LOG@", &log.display().to_string())
+            .as_str(),
+    );
+    (gh, log)
+}
+
+/// Everything the passes ask of the forge through the shared host.
+fn exercise(host: &SystemHost) {
+    // A failed read is the shell capture: the error body, then `{}`.
+    assert_eq!(host.read_issue("o/r", "5"), "{\"message\":\"Not Found\"}\n{}");
+    assert_eq!(host.issue_kind("o/r", "5"), "");
+    assert_eq!(host.issue_kind("o/r", "6"), "pr");
+    assert_eq!(host.commit_messages("o/r", "9"), "a\nb");
+    assert_eq!(
+        host.label_events("o/r", "6").as_deref().map(str::trim),
+        Some(r#"[{"event":"labeled"}]"#)
+    );
+    assert!(host.close_issue("o/r", "6", "closed by the merge"));
+}
+
+fn logged(log: &std::path::Path) -> Vec<String> {
+    std::fs::read_to_string(log)
+        .unwrap()
+        .lines()
+        .map(str::to_string)
+        .collect()
+}
+
+/// A logged call without the `$PWD` the stub prefixed.
+fn argv(line: &str) -> &str {
+    line.split_once(' ').map_or(line, |(_, rest)| rest)
+}
+
+/// Both bindings run the same shared code, and each books it under its own
+/// caller's operation names — the shell verb's `post_merge.*` rows and the
+/// observation pass's `merged_obs.*` rows are the attribution each always
+/// had (#15641).
+#[test]
+#[serial_test::serial]
+fn system_host_books_each_binding_under_its_own_operation_names() {
+    use crate::gh_invocation::resolver::test_stub::GhBinGuard;
+    use crate::gh_invocation::test_support::{calls, rows_after};
+
+    let tmp = tempfile::tempdir().unwrap();
+    let (shell_gh, shell_log) = logging_gh(tmp.path(), "gh-shell-verb");
+    let (obs_gh, obs_log) = logging_gh(tmp.path(), "gh-observation");
+    let rows = {
+        let _shell_gh_bin = GhBinGuard::set(&shell_gh);
+        rows_after(|| {
+            exercise(&SystemHost::for_merge_pr(String::new()));
+            exercise(&SystemHost::for_merge_observation(&obs_gh, tmp.path()));
+        })
+    };
+    for (op, n) in [
+        ("post_merge.issue_read", 1),
+        ("post_merge.issue_kind", 2),
+        ("post_merge.commits", 1),
+        ("post_merge.timeline", 1),
+        ("post_merge.issue_close", 1),
+        ("merged_obs.issue_read", 1),
+        ("merged_obs.issue_kind", 2),
+        ("merged_obs.commits", 1),
+        ("merged_obs.timeline", 1),
+        ("merged_obs.issue_close", 1),
+    ] {
+        assert_eq!(calls(&rows, op), n, "{op}: {rows:?}");
+    }
+
+    // The same argv from both bindings, each from its own working
+    // directory: the shell verb's caller, never a workspace root.
+    let (shell, obs) = (logged(&shell_log), logged(&obs_log));
+    let expected = [
+        "api repos/o/r/issues/5",
+        "api repos/o/r/issues/5",
+        "api repos/o/r/issues/6",
+        "api repos/o/r/pulls/9/commits --paginate",
+        "api repos/o/r/issues/6/timeline?per_page=100 --paginate",
+        "issue close 6 --repo o/r --reason completed --comment closed by the merge",
+    ];
+    assert_eq!(shell.iter().map(|l| argv(l)).collect::<Vec<_>>(), expected);
+    assert_eq!(obs.iter().map(|l| argv(l)).collect::<Vec<_>>(), expected);
+    let cwd = std::env::current_dir().unwrap();
+    let root = tmp.path().canonicalize().unwrap();
+    assert!(
+        shell
+            .iter()
+            .all(|l| l.starts_with(&cwd.display().to_string())),
+        "{shell:?}"
+    );
+    assert!(
+        obs.iter()
+            .all(|l| l.starts_with(&root.display().to_string())),
+        "{obs:?}"
+    );
+}
+
+/// The two bindings carry their caller's invocation context (#15641): the
+/// shell verb resolves `gh` through the facade, runs from the caller's
+/// working directory and names the repository on its reads, because that
+/// directory is not a checkout of it; the observation pass binds the
+/// daemon's `gh` and the workspace root, whose checkout routes its reads.
+#[test]
+#[serial_test::serial]
+fn the_bindings_carry_their_callers_invocation_context() {
+    use crate::gh_invocation::resolver::test_stub::GhBinGuard;
+    use std::path::{Path, PathBuf};
+
+    let gh = PathBuf::from("/stub/gh");
+    let _gh_bin = GhBinGuard::set(&gh);
+    let shell_verb = SystemHost::for_merge_pr("/x/lib/forge-helpers.sh".into());
+    assert_eq!(shell_verb.gh_bin, gh);
+    assert_eq!(shell_verb.gh_cwd, PathBuf::from("."));
+    assert_eq!(shell_verb.forge_helpers, PathBuf::from("/x/lib/forge-helpers.sh"));
+    assert_eq!(shell_verb.ops, BookkeepingOps::POST_MERGE);
+    assert!(shell_verb.reader_repo);
+    assert_eq!(shell_verb.helper_cwd, None);
+
+    let root = Path::new("/w/repo");
+    let observation = SystemHost::for_merge_observation(Path::new("gh"), root);
+    assert_eq!(observation.gh_bin, PathBuf::from("gh"));
+    assert_eq!(observation.gh_cwd, root);
+    assert_eq!(
+        observation.forge_helpers,
+        Path::new("/w/repo/.loom/scripts/lib/forge-helpers.sh")
+    );
+    assert_eq!(observation.ops, BookkeepingOps::MERGED_OBS);
+    assert!(!observation.reader_repo);
+    assert_eq!(observation.helper_cwd, Some(root.to_path_buf()));
+}
+
+/// `helper` sources the binding's `forge-helpers.sh` and exits with the
+/// function's status; only the observation pass runs it from the workspace
+/// root — the shell verb's helper inherits its caller's working directory
+/// (#15641).
+#[test]
+fn helper_runs_from_the_workspace_only_for_the_observation_binding() {
+    let tmp = tempfile::tempdir().unwrap();
+    let log = tmp.path().join("helper.log");
+    let script = |lib: &str| {
+        format!(
+            "forge_fn() {{\n  printf '%s\\n' \"{lib} arg=$1 PWD=$PWD\" >> '{}'\n{}\n}}",
+            log.display(),
+            "  [ \"$1\" != fail ]"
+        )
+    };
+    let shell_lib = tmp.path().join("shell-forge-helpers.sh");
+    std::fs::write(&shell_lib, script("shell")).unwrap();
+    let obs_lib = tmp.path().join(".loom/scripts/lib/forge-helpers.sh");
+    std::fs::create_dir_all(obs_lib.parent().unwrap()).unwrap();
+    std::fs::write(&obs_lib, script("observation")).unwrap();
+
+    let shell_verb = SystemHost::for_merge_pr(shell_lib.display().to_string());
+    assert!(shell_verb.helper("forge_fn", &["a"]));
+    assert!(!shell_verb.helper("forge_fn", &["fail"]));
+    let observation = SystemHost::for_merge_observation(std::path::Path::new("gh"), tmp.path());
+    assert!(observation.helper("forge_fn", &["a"]));
+    assert!(!observation.helper("forge_fn", &["fail"]));
+
+    let cwd = std::env::current_dir().unwrap();
+    let root = tmp.path().canonicalize().unwrap();
+    let (cwd, root) = (cwd.display().to_string(), root.display().to_string());
+    assert_eq!(
+        logged(&log),
+        [
+            format!("shell arg=a PWD={cwd}"),
+            format!("shell arg=fail PWD={cwd}"),
+            format!("observation arg=a PWD={root}"),
+            format!("observation arg=fail PWD={root}"),
+        ]
+    );
+}

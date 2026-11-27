@@ -104,6 +104,10 @@ fn every_mapped_claim_name_is_an_inventoried_op() {
         "orphan_stack.label",
         "orphan_stack.comment",
         "orphan_stack.retarget",
+        "post_merge.issue_read",
+        "post_merge.issue_kind",
+        "post_merge.timeline",
+        "post_merge.issue_close",
     ];
     for name in mapped {
         let op = gh_call::forge_op_for(name).unwrap_or_else(|| panic!("{name} is unmapped"));
@@ -246,5 +250,26 @@ fn comment_post_books_comment_create() {
     });
     assert_eq!(calls(&rows, "comment.post"), 1, "{rows:?}");
     assert_eq!(op_calls(&operations, "comment.create"), 1, "{operations:?}");
+    assert_eq!(op_calls(&operations, forge_call_stats::UNKNOWN_OPERATION), 0, "{operations:?}");
+}
+
+/// #15641: the shell verb's bookkeeping reads book their inventoried
+/// operation, not `unknown` — `forge_op_for` carries the `post_merge.*`
+/// names.
+#[test]
+#[serial_test::serial]
+fn a_post_merge_timeline_read_records_timeline_read_not_unknown() {
+    use crate::gh_invocation::resolver::test_stub::GhBinGuard;
+    use crate::merge_pr::post_merge_bookkeeping::{Host, SystemHost};
+
+    let tmp = tempfile::tempdir().unwrap();
+    let gh = stub(tmp.path(), "gh-ok", "echo '[]'");
+    let _gh_bin = GhBinGuard::set(&gh);
+    let (rows, operations) = report_after(|| {
+        let host = SystemHost::for_merge_pr(String::new());
+        assert_eq!(host.label_events("o/r", "5").as_deref().map(str::trim), Some("[]"));
+    });
+    assert_eq!(calls(&rows, "post_merge.timeline"), 1, "{rows:?}");
+    assert_eq!(op_calls(&operations, "timeline.read"), 1, "{operations:?}");
     assert_eq!(op_calls(&operations, forge_call_stats::UNKNOWN_OPERATION), 0, "{operations:?}");
 }
