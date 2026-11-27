@@ -11,10 +11,7 @@
 //! on the public fleet feed, which is what #8507 reported for the GLM-5.3
 //! trial's 46 merged PRs.
 //!
-//! Three call sites need the same decision — the sweep outcome journal, the
-//! role-tick journal, and safehouse's `completion-v1` narration — so the
-//! decision lives here once rather than as three copies of a
-//! `runtime == "opencode"` test that could drift apart.
+//! Sweep and role-tick outcomes share this mapping from launch runtime to usage store.
 //!
 //! # The contract every source keeps
 //!
@@ -333,9 +330,8 @@ pub(crate) fn role_tick_codex_session_id(output: &str) -> Option<String> {
 /// quoted mid-line — an agent's text, a runner's echo, an event string — is
 /// data about a launch, not evidence of one. The one anchoring rule every
 /// Codex banner reader shares ([`native_session_ids`],
-/// [`role_tick_codex_session_id`], `launch_record`'s step-log pair, and the
-/// roll-pause capture), so it cannot drift between readers the way the token
-/// shape cannot; `spawn-codex.sh`'s transcript join greps for the same
+/// [`role_tick_codex_session_id`], and the roll-pause capture).
+/// `spawn-codex.sh`'s transcript join greps for the same
 /// `^[[:space:]]*session id:` line.
 pub(crate) fn codex_session_banner(line: &str) -> Option<String> {
     line.trim_start()
@@ -414,141 +410,6 @@ pub fn sweep_tokens_by_model(
             )
         }
     }
-}
-
-/// Whether a merged PR's work ran as dispatched **steps** on this host
-/// (#14018): at least one of its [`crate::launch_record::merge_step_logs`]
-/// exists. `false` means a legacy `/loom:sweep` (or a step that ran only on
-/// other hosts), which the sweep-keyed readers above already serve.
-#[must_use]
-pub fn has_merge_step_logs(workspace_root: &Path, issue: u32, pr: u32) -> bool {
-    !crate::launch_record::merge_step_logs(workspace_root, issue, pr).is_empty()
-}
-
-/// Per-`(model, speed, service_tier)` token totals for a **step-dispatched**
-/// merge of `pr` (closing `issue`), on this host only (#14018).
-///
-/// Three sources, summed, because the steps of one PR can run on different
-/// runtimes (an OpenCode Builder, a Claude Judge, a Codex Doctor):
-///
-/// - **Claude transcripts** whose first message names the issue-keyed Builder
-///   or the PR-keyed Judge/Doctor/`champion --pr` command
-///   ([`crate::transcript_tokens::sum_item_tokens_by_model`]); `window` narrows
-///   these by file mtime, as for a sweep.
-/// - **OpenCode sessions** named by the `sessionID`s in the step logs
-///   ([`crate::opencode_usage::tokens_by_session_ids`]) — never directory +
-///   window, since the store's `directory` is shared repo-wide. No window
-///   applies: a session id already names exactly one session. The Builder
-///   log (issue-keyed) is read from its last dispatch only, so an abandoned
-///   retry is not charged to the PR; the PR-keyed Doctor/Judge/`champion_merge`
-///   logs are read whole, as each dispatch there is a completed round (#14210).
-/// - **Codex sessions** named by the `session id:` banners in the same step
-///   logs, with the same last-dispatch (Builder) vs whole-log (PR-keyed) split
-///   (#14883), resolved through
-///   [`crate::codex_usage::tokens_by_session_ids`] by exact id with no
-///   directory and no window: a private-clone seat's rollout reports a
-///   container-local `cwd` (#14540), and a Builder rollout can start before
-///   the PR's `createdAt`, so the merge `window` must not bound it.
-///
-/// A step that ran on another host left no log or transcript here, so its usage
-/// is absent and the total stays partial. `None` — never `Some(vec![])` — when
-/// no source found anything.
-#[must_use]
-pub fn merge_step_tokens_by_model(
-    workspace_root: &Path,
-    issue: u32,
-    pr: u32,
-    window: Option<(DateTime<Utc>, DateTime<Utc>)>,
-) -> Option<Vec<ModelUsageTotals>> {
-    let claude = crate::transcript_tokens::claude_projects_dir().and_then(|projects| {
-        crate::transcript_tokens::sum_item_tokens_by_model(
-            &projects,
-            workspace_root,
-            issue,
-            Some(pr),
-            window,
-        )
-    });
-    let mut session_ids: Vec<String> = Vec::new();
-    let mut codex_ids: Vec<String> = Vec::new();
-    for (role, contents) in crate::launch_record::merge_step_logs(workspace_root, issue, pr)
-        .into_iter()
-        .filter_map(|(role, path)| Some((role, std::fs::read_to_string(path).ok()?)))
-    {
-        use crate::step_role::StepRole;
-        // Spelled out, no catch-all: a role added to `merge_step_logs`
-        // must be filed under its keying here before this compiles.
-        match role {
-            // Issue-keyed: an earlier dispatch is an abandoned retry.
-            StepRole::Builder | StepRole::Curator | StepRole::ChampionPromote => {
-                session_ids
-                    .extend(crate::launch_record::opencode_session_ids_last_dispatch(&contents));
-                codex_ids.extend(crate::launch_record::codex_session_ids_last_dispatch(&contents));
-            }
-            // PR-keyed: an earlier dispatch is a completed round on this PR.
-            StepRole::Doctor | StepRole::Judge | StepRole::ChampionMerge => {
-                session_ids.extend(crate::launch_record::opencode_session_ids(&contents));
-                codex_ids.extend(crate::launch_record::codex_session_ids(&contents));
-            }
-        }
-    }
-    // One launch's banner can land in two logs (a resume named by both the
-    // Builder's and a round's); first-seen order, de-duplicated across the
-    // selected regions.
-    let mut seen = std::collections::HashSet::new();
-    codex_ids.retain(|id| seen.insert(id.clone()));
-    let opencode = crate::opencode_usage::tokens_by_session_ids(&session_ids, None);
-    let codex = crate::codex_usage::tokens_by_session_ids(&codex_ids, None);
-    combine_model_totals(
-        claude
-            .into_iter()
-            .flatten()
-            .chain(opencode.into_iter().flatten())
-            .chain(codex.into_iter().flatten()),
-    )
-}
-
-/// Merge rows by `(model, speed, service_tier)`, summing every counter, sorted
-/// by that key. `None` when there are no rows.
-fn combine_model_totals(
-    rows: impl IntoIterator<Item = ModelUsageTotals>,
-) -> Option<Vec<ModelUsageTotals>> {
-    let mut merged: std::collections::BTreeMap<(String, String, String), ModelUsageTotals> =
-        std::collections::BTreeMap::new();
-    for row in rows {
-        let entry = merged
-            .entry((row.model.clone(), row.speed.clone(), row.service_tier.clone()))
-            .or_insert_with(|| ModelUsageTotals {
-                model: row.model.clone(),
-                speed: row.speed.clone(),
-                service_tier: row.service_tier.clone(),
-                ..ModelUsageTotals::default()
-            });
-        entry.input = entry.input.saturating_add(row.input);
-        entry.cache_read = entry.cache_read.saturating_add(row.cache_read);
-        entry.cache_write_5m = entry.cache_write_5m.saturating_add(row.cache_write_5m);
-        entry.cache_write_1h = entry.cache_write_1h.saturating_add(row.cache_write_1h);
-        entry.output = entry.output.saturating_add(row.output);
-    }
-    (!merged.is_empty()).then(|| merged.into_values().collect())
-}
-
-/// The flat token total of `rows`: every counter summed, the same figure
-/// [`crate::transcript_tokens::sum_item_tokens`] reports for the same
-/// transcripts. `None` for a zero total, so an absent figure omits the key
-/// rather than publishing `0`.
-#[must_use]
-pub fn total_tokens(rows: &[ModelUsageTotals]) -> Option<u64> {
-    let total = rows.iter().fold(0_u64, |acc, row| {
-        let sum = row
-            .input
-            .saturating_add(row.cache_read)
-            .saturating_add(row.cache_write_5m)
-            .saturating_add(row.cache_write_1h)
-            .saturating_add(row.output);
-        acc.saturating_add(u64::try_from(sum).unwrap_or(0))
-    });
-    (total > 0).then_some(total)
 }
 
 /// Per-`(model, speed, service_tier)` token totals for one sweep, split across
@@ -1081,149 +942,6 @@ mod tests {
         );
     }
 
-    /// #14883: a step-dispatched merge joins Codex usage by the exact session
-    /// ids its selected regions name — the Builder's LAST dispatch plus every
-    /// PR-keyed round — with no window bounding the read (a Builder rollout
-    /// can start before the PR's creation). An abandoned attempt, an unrelated
-    /// rollout in the same home, a repeated id and a named-but-missing rollout
-    /// each contribute exactly what they must: nothing, or once.
-    #[test]
-    #[serial_test::serial(codex_home_env)]
-    fn a_merge_attributes_exactly_the_final_codex_builder_and_every_round() {
-        let tmp = tempfile::tempdir().unwrap();
-        let ws = tmp.path().join("ws");
-        let logs = ws.join(".loom").join("logs");
-        std::fs::create_dir_all(&logs).unwrap();
-        const ABANDONED: &str = "00000000-0000-0000-0000-000000000001";
-        const FINAL: &str = "11111111-1111-1111-1111-111111111111";
-        const ROUND1: &str = "22222222-2222-2222-2222-222222222222";
-        const ROUND2: &str = "33333333-3333-3333-3333-333333333333";
-        const MISSING: &str = "44444444-4444-4444-4444-444444444444";
-        // Issue-keyed Builder log: an abandoned attempt, then the final one —
-        // whose banner repeats (a resume re-echo) and must count once.
-        std::fs::write(
-            logs.join("step-builder-14883.log"),
-            [
-                "==== loom-daemon dispatch: 2026-11-20T09:00:00+00:00 sweep_id=a item=14883 ===="
-                    .to_string(),
-                format!("session id: {ABANDONED}"),
-                "==== loom-daemon dispatch: 2026-11-20T11:00:00+00:00 sweep_id=b item=14883 ===="
-                    .to_string(),
-                format!("session id: {FINAL}"),
-                format!("session id: {FINAL}"),
-            ]
-            .join("\n"),
-        )
-        .unwrap();
-        // PR-keyed Judge log: two dispatch regions — two completed rounds. The
-        // final Builder's id repeated in round 2 must not double-count it, and
-        // MISSING names no rollout at all.
-        std::fs::write(
-            logs.join("step-judge-701.log"),
-            [
-                "==== loom-daemon dispatch: 2026-11-21T01:00:00+00:00 sweep_id=c item=701 ===="
-                    .to_string(),
-                format!("session id: {ROUND1}"),
-                "==== loom-daemon dispatch: 2026-11-21T03:00:00+00:00 sweep_id=d item=701 ===="
-                    .to_string(),
-                format!("session id: {ROUND2}"),
-                format!("session id: {FINAL}"),
-                format!("session id: {MISSING}"),
-            ]
-            .join("\n"),
-        )
-        .unwrap();
-
-        let home = tmp.path().join(".codex");
-        let cwd = "/workspace/work/repo-clone";
-        // The final Builder's rollout is created BEFORE the PR window opens —
-        // a `createdAt` lower bound would lose exactly this usage.
-        seed_rollout(
-            &home,
-            "2026/11/20",
-            &format!("rollout-2026-11-20T10-00-00-{FINAL}.jsonl"),
-            &codex_rollout(cwd, "2026-11-20T10:00:31Z", FINAL, "gpt-5-final", &[(1_000, 400, 100)]),
-        );
-        seed_rollout(
-            &home,
-            "2026/11/20",
-            &format!("rollout-2026-11-20T09-30-00-{ABANDONED}.jsonl"),
-            &codex_rollout(
-                cwd,
-                "2026-11-20T09:30:31Z",
-                ABANDONED,
-                "abandoned-model",
-                &[(9_000_000, 0, 900_000)],
-            ),
-        );
-        seed_rollout(
-            &home,
-            "2026/11/21",
-            &format!("rollout-2026-11-21T01-30-00-{ROUND1}.jsonl"),
-            &codex_rollout(cwd, "2026-11-21T01:30:31Z", ROUND1, "gpt-5-round1", &[(500, 0, 50)]),
-        );
-        seed_rollout(
-            &home,
-            "2026/11/21",
-            &format!("rollout-2026-11-21T03-30-00-{ROUND2}.jsonl"),
-            &codex_rollout(
-                cwd,
-                "2026-11-21T03:30:31Z",
-                ROUND2,
-                "gpt-5-round2",
-                &[(2_000, 100, 200)],
-            ),
-        );
-        // An unrelated rollout in the same home: never named by a log.
-        seed_rollout(
-            &home,
-            "2026/11/21",
-            "rollout-2026-11-21T02-00-00-55555555-6666-7777-8888-999999999999.jsonl",
-            &codex_rollout(
-                cwd,
-                "2026-11-21T02:00:31Z",
-                "55555555-6666-7777-8888-999999999999",
-                "unrelated-model",
-                &[(8_000_000, 0, 800_000)],
-            ),
-        );
-        let _codex_home_lock = crate::tokens_pool::codex_home_env::lock();
-        let _guard =
-            crate::env_test_support::EnvGuard::set(crate::codex_usage::CODEX_HOME_ENV, &home);
-
-        let window = Some((at("2026-11-20T10:30:00Z"), at("2026-11-21T04:00:00Z")));
-        let rows = merge_step_tokens_by_model(&ws, 14883, 701, window).expect("three codex rows");
-        assert_eq!(
-            rows.iter().map(|r| r.model.as_str()).collect::<Vec<_>>(),
-            vec!["gpt-5-final", "gpt-5-round1", "gpt-5-round2"],
-            "{rows:?}"
-        );
-        let by_input = |model: &str| rows.iter().find(|r| r.model == model).unwrap();
-        let final_row = by_input("gpt-5-final");
-        assert_eq!(
-            (final_row.input, final_row.cache_read, final_row.output),
-            (600, 400, 100),
-            "cached input stays disjoint from input"
-        );
-        let round1 = by_input("gpt-5-round1");
-        assert_eq!((round1.input, round1.cache_read, round1.output), (500, 0, 50));
-        let round2 = by_input("gpt-5-round2");
-        assert_eq!((round2.input, round2.cache_read, round2.output), (1900, 100, 200));
-
-        // A merge nothing measured — a step log with no banners, no named
-        // rollout — omits the breakdown entirely: unknown, never zero rows.
-        let bare = tmp.path().join("ws-bare");
-        let bare_logs = bare.join(".loom").join("logs");
-        std::fs::create_dir_all(&bare_logs).unwrap();
-        std::fs::write(
-            bare_logs.join("step-builder-14884.log"),
-            "==== loom-daemon dispatch: 2026-11-21T01:00:00+00:00 sweep_id=e item=14884 ====\nno \
-             banners, no sessions\n",
-        )
-        .unwrap();
-        assert_eq!(merge_step_tokens_by_model(&bare, 14884, 702, window), None);
-    }
-
     #[test]
     fn each_mapped_runtime_selects_its_own_store_and_everything_else_stays_on_transcripts() {
         assert_eq!(UsageSource::for_runtime(Some("opencode")), UsageSource::OpenCodeSessionDb);
@@ -1459,8 +1177,7 @@ mod tests {
         assert_eq!(attribution.runtime, "kimi");
         assert_eq!(attribution.provider.as_deref(), Some("moonshot"));
         assert_eq!(attribution.profile.as_deref(), Some("example-kimi-subscription"));
-        // …and the SAME `runtime` string is what selects the store, so a
-        // completion's labels and its numbers can never describe two runtimes.
+        // The outcome's runtime label also selects its token store.
         assert_eq!(
             UsageSource::for_runtime(Some(attribution.runtime.as_str())),
             UsageSource::KimiSessionStore
