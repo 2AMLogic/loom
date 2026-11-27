@@ -88,15 +88,57 @@ fn shell_write_and_protected_branch_are_denied_without_effects() {
     assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stdout));
 }
 #[test]
-fn unknown_tool_and_ambiguous_edit_fail_closed() {
+fn unknown_tool_fails_closed() {
     let d = fixture();
     assert_eq!(call(d.path(), "task", json!({})).status.code(), Some(78));
+}
+
+#[test]
+fn edit_reports_why_old_text_cannot_be_replaced() {
+    let d = fixture();
     let path = ".loom/worktrees/issue-1/repeated.txt";
-    fs::write(d.path().join(path), "same same").unwrap();
-    assert!(!call(d.path(), "edit", json!({"path":path,"oldText":"same","newText":"BAD"}))
-        .status
-        .success());
-    assert_eq!(fs::read_to_string(d.path().join(path)).unwrap(), "same same");
+    let original = b"same same\r\n";
+    fs::write(d.path().join(path), original).unwrap();
+    for (old, diagnostic) in [
+        ("", "oldText is empty"),
+        ("missing", "oldText has no exact match"),
+        ("same", "oldText has 2 exact matches"),
+    ] {
+        let out = call(d.path(), "edit", json!({"path": path, "oldText": old, "newText": "BAD"}));
+        assert_eq!(out.status.code(), Some(78));
+        let response: Value = serde_json::from_slice(&out.stdout).unwrap();
+        let error = response["error"].as_str().unwrap();
+        assert!(error.contains(diagnostic), "{error}");
+        assert_eq!(fs::read(d.path().join(path)).unwrap(), original);
+    }
+}
+
+#[test]
+fn edit_replaces_one_multiline_match_after_paged_and_full_reads() {
+    let d = fixture();
+    let path = ".loom/worktrees/issue-1/score.py";
+    let prefix = "# Synthetic score data preceding the edited expression.\n".repeat(498);
+    let suffix = "\n# one\n# two\n# three\n# end";
+    let old = format!("score = (first\n{}+ second)", " ".repeat(31));
+    let new = "score = total";
+    fs::write(d.path().join(path), format!("{prefix}{old}{suffix}")).unwrap();
+
+    for (offset, limit) in [(1, 200), (200, 200), (399, 200), (456, 200), (1, 520)] {
+        let out = call(d.path(), "read", json!({"path": path, "offset": offset, "limit": limit}));
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stdout));
+        let response: Value = serde_json::from_slice(&out.stdout).unwrap();
+        let text = response["text"].as_str().unwrap();
+        assert!(text.starts_with(&format!("{offset}: ")));
+        if limit == 520 {
+            assert!(text.ends_with("504: # end\n"));
+        }
+    }
+    let out = call(d.path(), "edit", json!({"path": path, "oldText": old, "newText": new}));
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stdout));
+    assert_eq!(
+        fs::read(d.path().join(path)).unwrap(),
+        format!("{prefix}{new}{suffix}").as_bytes()
+    );
 }
 
 #[test]

@@ -1,5 +1,5 @@
 //! Model/provider choices are data; harness adapters only translate the launch protocol.
-use super::{LaunchError, Options};
+use super::{LaunchError, LaunchStage, Options};
 use serde::Deserialize;
 use serde_json::{Map, Value};
 use std::collections::BTreeMap;
@@ -303,8 +303,9 @@ fn is_qualified_model(model: &str) -> bool {
 /// Issue #14963: the model profile a native launch of `runtime` would resolve,
 /// when that profile declares a non-empty `allowedEfforts` that does not
 /// include `effort` — the exact predicate [`select`] refuses the launch on
-/// (`stage=profile_selection`, exit 78), factored out so the daemon's launch
-/// sites can drop an *unqualified* effort override instead of losing the step.
+/// (`stage=profile_selection_effort`, exit 78), factored out so the daemon's
+/// launch sites can drop an *unqualified* effort override instead of losing
+/// the step.
 ///
 /// Shares [`excluded_role`]'s lookup path verbatim — `profile` is the
 /// explicitly chosen profile (a preference tap's `modelProfile`); `None` falls
@@ -364,9 +365,10 @@ fn effort_outside_allowed(effort: &str, allowed: &[String]) -> bool {
 
 /// Issue #14962: the model profile a native launch of `runtime` would
 /// resolve, when that profile's model differs from `model` — the
-/// predicate [`select`] refuses the launch on (see the qualified-pin carve-out below) (`stage=profile_selection`,
-/// exit 78), factored out so the daemon's launch sites can drop a
-/// *configured-tier* model override instead of losing the step.
+/// predicate [`select`] refuses the launch on (see the qualified-pin carve-out
+/// below) (`stage=profile_selection_model`, exit 78), factored out so the
+/// daemon's launch sites can drop a *configured-tier* model override instead
+/// of losing the step.
 ///
 /// Shares [`excluded_role`]'s lookup path verbatim — `profile` is the
 /// explicitly chosen profile (a preference tap's `modelProfile`); `None`
@@ -855,7 +857,10 @@ pub fn select(runtime: &str, options: &Options, config: &Value) -> Result<Select
     }
     if let Some(model) = options.model.clone() {
         if model != profile.model {
-            return Err(LaunchError::config("bare model differs from the selected profile; use provider/model or define a model profile"));
+            return Err(LaunchError::config(
+                "bare model differs from the selected profile; use provider/model or define a model profile",
+            )
+            .with_stage(LaunchStage::ProfileSelectionModel));
         }
     }
     if let Some(effort) = options.effort.clone() {
@@ -865,7 +870,8 @@ pub fn select(runtime: &str, options: &Options, config: &Value) -> Result<Select
         if effort_outside_allowed(e, &profile.allowed_efforts) {
             return Err(LaunchError::config(
                 "reasoning effort is unsupported by the selected model profile",
-            ));
+            )
+            .with_stage(LaunchStage::ProfileSelectionEffort));
         }
     }
     Ok(selection)
@@ -1229,6 +1235,70 @@ mod tests {
             profile_rejects_effort("opencode", None, None, "medium", &config),
             Some("zai-full".to_string()),
             "runtimes.defaultModelProfile names the profile a bare tap is judged against"
+        );
+
+        if let Some(v) = saved {
+            std::env::set_var("LOOM_MODEL_PROFILE", v);
+        }
+    }
+
+    /// #14634: `select` types the two launch-argument refusals — an effort
+    /// outside the profile's `allowedEfforts`, a bare model that differs from
+    /// the profile's own — so the launcher's marker and the step receipt name
+    /// the refused argument; every other selection failure keeps the coarse
+    /// boundary.
+    #[test]
+    fn select_types_the_launch_argument_a_profile_refuses() {
+        let _g = env_lock();
+        let saved = std::env::var_os("LOOM_MODEL_PROFILE");
+        std::env::remove_var("LOOM_MODEL_PROFILE");
+        let config = serde_json::json!({"runtimes":{"modelProfiles":{
+            "strict": {"model": "glm-5.3", "providers": {"opencode": "zai-coding-plan"},
+                       "allowedEfforts": ["low", "high", "max"]}
+        }}});
+        // Typed the way the launcher's call site types them: the coarse
+        // boundary fills in only what the refusal left untyped.
+        let stage_of = |options: &Options| {
+            select("opencode", options, &config)
+                .map_err(|error| error.or_stage(LaunchStage::ProfileSelection))
+                .err()
+                .and_then(|error| error.stage)
+        };
+        let strict = Some("strict".to_string());
+        assert_eq!(
+            stage_of(&Options {
+                profile: strict.clone(),
+                effort: Some("xhigh".to_string()),
+                ..Options::default()
+            }),
+            Some(LaunchStage::ProfileSelectionEffort)
+        );
+        assert_eq!(
+            stage_of(&Options {
+                profile: strict.clone(),
+                model: Some("opus".to_string()),
+                ..Options::default()
+            }),
+            Some(LaunchStage::ProfileSelectionModel)
+        );
+        // The profile's own effort and model are accepted.
+        assert!(select(
+            "opencode",
+            &Options {
+                profile: strict,
+                effort: Some("high".to_string()),
+                ..Options::default()
+            },
+            &config
+        )
+        .is_ok());
+        // Everything else about selection keeps the coarse boundary.
+        assert_eq!(
+            stage_of(&Options {
+                profile: Some("nope".to_string()),
+                ..Options::default()
+            }),
+            Some(LaunchStage::ProfileSelection)
         );
 
         if let Some(v) = saved {

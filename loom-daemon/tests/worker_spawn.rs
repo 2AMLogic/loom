@@ -1305,6 +1305,58 @@ fn an_unqualified_opencode_cli_refuses_at_the_cli_qualification_stage() {
     assert!(out.stdout.is_empty());
 }
 
+/// #14634: the two launch arguments a native model profile can refuse — a
+/// reasoning effort outside its `allowedEfforts`, and a bare model that
+/// differs from its own — are typed preflight boundaries of their own, so a
+/// recurrence's receipt names the refused argument instead of the coarse
+/// `profile_selection` (every Builder refusal the issue tracked carried the
+/// effort one). Every other selection failure — here an unknown profile name
+/// — keeps the coarse token. The harness never runs, and the marker is the
+/// typed token alone: the free-form diagnostic stays on its own stderr line.
+#[test]
+fn an_effort_or_model_a_profile_refuses_is_a_typed_preflight_boundary() {
+    let d = tempfile::tempdir().unwrap();
+    let cases = [
+        (
+            vec!["--effort", "xhigh"],
+            "profile_selection_effort",
+            "reasoning effort is unsupported by the selected model profile",
+        ),
+        (
+            vec!["--model", "sonnet"],
+            "profile_selection_model",
+            "bare model differs from the selected profile",
+        ),
+        (
+            vec!["--profile", "no-such-profile"],
+            "profile_selection",
+            "unknown model profile `no-such-profile`",
+        ),
+    ];
+    for (args, stage, diagnostic) in cases {
+        let out = worker(d.path(), "opencode")
+            .args(args)
+            .args(["-p", "hello"])
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(78), "{stage}: {stderr}");
+        let marker = format!("# LOOM_LAUNCH_REJECTED code=78 stage={stage}");
+        let line = stderr
+            .lines()
+            .find(|l| l.contains("# LOOM_LAUNCH_REJECTED"))
+            .unwrap_or_else(|| panic!("no rejection marker: {stderr}"));
+        assert_eq!(line, marker, "the marker is the typed token, nothing else");
+        assert!(stderr.contains(diagnostic), "{stage}: the diagnostic stays on stderr");
+        assert!(stderr.contains("# LOOM_RUNTIME_RESOLVED runtime=opencode"), "{stage}: {stderr}");
+        assert!(
+            out.stdout.is_empty(),
+            "{stage}: the harness never ran: {:?}",
+            String::from_utf8_lossy(&out.stdout)
+        );
+    }
+}
+
 #[path = "worker_spawn/cargo_debuginfo.rs"]
 mod cargo_debuginfo;
 #[path = "worker_spawn/excluded_roles.rs"]

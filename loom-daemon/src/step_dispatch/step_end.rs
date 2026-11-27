@@ -806,6 +806,25 @@ mod tests {
                 outcome_ledger::Effect::FastFailLadder
             );
         }
+        // A profile-selection sub-boundary (the refused launch argument) is a
+        // typed reason of the same family: same class, same ladder.
+        for reason in [
+            "preflight_profile_selection_effort",
+            "preflight_profile_selection_model",
+        ] {
+            let split = run_of(&step(Some(reason)), None, Some(post));
+            assert_eq!(split.outcome.class, OutcomeClass::Failed);
+            assert_eq!(split.outcome.reason, reason);
+            assert_eq!(
+                outcome_ledger::effect_of(
+                    StepRole::Builder,
+                    &split.outcome,
+                    split.ran_for,
+                    &outcome_ledger::LedgerConfig::default(),
+                ),
+                outcome_ledger::Effect::FastFailLadder
+            );
+        }
     }
 
     /// #15413: an untyped fast exit 78 with no outcome line reports the coarse

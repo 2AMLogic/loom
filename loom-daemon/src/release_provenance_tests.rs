@@ -1,7 +1,7 @@
 //! Tests for the release-build check (#10718). No network: the tag lookup is
 //! a closure.
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::time::Duration;
 
 use chrono::{DateTime, Duration as ChronoDuration, TimeZone, Utc};
@@ -53,14 +53,25 @@ fn a_stamped_build_is_verified_once_the_tag_names_its_commit() {
     let before = checker.current();
     assert!(matches!(before, Provenance::Unverified { .. }) && !before.refuted());
     let asked = Cell::new(0);
+    let requested = RefCell::new((String::new(), String::new()));
     let api = |repo: &str, tag: &str| -> Result<String, String> {
         asked.set(asked.get() + 1);
-        assert_eq!((repo, tag), ("rjwalters/loom", "v0.19.925"));
-        Ok(COMMIT.to_string())
+        *requested.borrow_mut() = (repo.to_string(), tag.to_string());
+        match (repo, tag) {
+            ("2AMLogic/loom", "v0.19.925") => Ok(COMMIT.to_string()),
+            _ => Err("no reader can serve this read".to_string()),
+        }
     };
-    assert_eq!(checker.ensure(t0(), INTERVAL, &api), Provenance::Verified);
+    let found = checker.ensure(t0(), INTERVAL, &api);
+    assert_eq!(
+        requested.take(),
+        ("2AMLogic/loom".to_string(), "v0.19.925".to_string()),
+        "the tag is asked of the repository that publishes Loom"
+    );
+    assert_eq!(found, Provenance::Verified);
     // Cached: no second lookup.
     assert_eq!(checker.ensure(t0(), INTERVAL, &api), Provenance::Verified);
+    assert_eq!(checker.ensure_with_attempt(t0(), INTERVAL, &api), (Provenance::Verified, None));
     assert_eq!(asked.get(), 1);
 }
 
