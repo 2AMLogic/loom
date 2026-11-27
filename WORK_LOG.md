@@ -18,6 +18,13 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 ### 2026-11-27
 
+- **PR #15612**: refactor: extract shared Codex and Claude container setup helpers
+- **PR #15610**: refactor: route remaining durable state writers through fs_util::write_atomic
+- **PR #15606**: test: extract shared StackFixture into test_git_helpers
+- **Issue #15603** (closed): Share hardened docker run argv, mount setup, and override-image verification between Codex and Claude session containers
+- **Issue #15607** (closed): Consolidate 10 remaining durable state atomic-write sites onto fs_util::write_atomic
+- **Issue #15609** (closed): create-issue.sh exits 0 having created nothing when config-resolver.sh's jq call fails with 'Argument list too long'
+- **Issue #15602** (closed): Share the Git fixture used by the three stack reconciliation test suites
 - **PR #15593**: docs: correct sum_entries comment on symlink size accounting
 - **Issue #15592** (closed): fs_util::sum_entries comment misstates DirEntry::metadata() symlink behavior
 - **PR #15600**: refactor: share stack cascade walk and marker helpers
