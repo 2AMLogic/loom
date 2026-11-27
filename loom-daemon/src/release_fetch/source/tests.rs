@@ -659,12 +659,11 @@ exit 1
 #[serial]
 fn required_mode_refuses_when_adoption_record_is_unwritable() {
     let fx = Fx::new();
-    // The record is absent (reads as empty) but its temp-file path is a
+    // The record is absent (reads as empty) but its lock-file path is a
     // directory, so the write fails deterministically, even when running as root.
-    let tmp = fx
-        .record
-        .with_extension(format!("json.tmp.{}", std::process::id()));
-    std::fs::create_dir_all(&tmp).unwrap();
+    let mut lock = fx.record.as_os_str().to_owned();
+    lock.push(".lock");
+    std::fs::create_dir_all(&lock).unwrap();
     let policy = fx.policy(Some(A));
     fx.set_tag("v1.0.0", B, "ahead");
     let all = fx.refused("v1.0.0", &policy);
@@ -836,10 +835,9 @@ fn refusal_evidence_keeps_the_source_facts_established_before_it() {
 #[serial]
 fn refusal_evidence_reports_adoption_write_failure() {
     let fx = Fx::new();
-    let tmp = fx
-        .record
-        .with_extension(format!("json.tmp.{}", std::process::id()));
-    std::fs::create_dir_all(&tmp).unwrap();
+    let mut lock = fx.record.as_os_str().to_owned();
+    lock.push(".lock");
+    std::fs::create_dir_all(&lock).unwrap();
     fx.set_tag("v1.0.0", B, "ahead");
     let ev = fx.refused_record("v1.0.0", &fx.policy(Some(A)));
     assert_eq!(ev["adoption_record"], "write_failed", "{ev}");

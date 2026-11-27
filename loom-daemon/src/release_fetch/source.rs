@@ -403,14 +403,10 @@ fn write_entry_waiting(
         }
     }
     record.entries.insert(key, entry);
-    let tmp = path.with_extension(format!("json.tmp.{}", std::process::id()));
     let text =
         serde_json::to_string_pretty(&record).map_err(|e| PersistError::Storage(e.to_string()))?;
-    std::fs::write(&tmp, text).map_err(storage)?;
-    std::fs::rename(&tmp, path).map_err(|e| {
-        let _ = std::fs::remove_file(&tmp);
-        PersistError::Storage(e.to_string())
-    })
+    crate::fs_util::write_atomic(path, text.as_bytes(), crate::fs_util::AtomicOpts::default())
+        .map_err(storage)
 }
 
 // ---------------------------------------------------------------------------

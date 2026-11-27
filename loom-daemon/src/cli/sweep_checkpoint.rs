@@ -138,7 +138,7 @@ fn execute(root: &Path, args: &[String], out: &mut impl Write) -> Result<()> {
     if command == "write" {
         let mut record = parse_write(&args[2..])?;
         escalation::carry_forward(&target, &mut record)?;
-        persist(&dir, &target, &record)?;
+        persist(&target, &record)?;
         // Telemetry remains best effort, and only follows a successful durable write.
         crate::observability::lifecycle::checkpoint_completed(
             root,
@@ -275,19 +275,13 @@ fn parse_begin(args: &[String]) -> Result<(&str, Option<u32>, Option<&str>)> {
     Ok((role, attempt, model))
 }
 
-fn persist(dir: &Path, target: &Path, record: &Value) -> Result<()> {
+fn persist(target: &Path, record: &Value) -> Result<()> {
     let mut bytes = serde_json::to_vec_pretty(record).map_err(io_error)?;
     bytes.push(b'\n');
     if bytes.len() > 65536 {
         return Err(invalid("checkpoint exceeds 64 KiB"));
     }
-    std::fs::create_dir_all(dir).map_err(io_error)?;
-    let mut temp = tempfile::NamedTempFile::new_in(dir).map_err(io_error)?;
-    temp.write_all(&bytes).map_err(io_error)?;
-    temp.as_file().sync_all().map_err(io_error)?;
-    temp.persist(target).map_err(io_error)?;
-    std::fs::File::open(dir)
-        .and_then(|file| file.sync_all())
+    crate::fs_util::write_atomic(target, &bytes, crate::fs_util::AtomicOpts::default())
         .map_err(io_error)
 }
 

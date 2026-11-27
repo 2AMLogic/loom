@@ -211,36 +211,15 @@ pub fn log_success(message: &str) {
 // JSON state files (port of `loom_tools.common.state`)
 // --------------------------------------------------------------------------
 
-/// Atomic JSON write: temp file in the same directory + rename.
+/// Atomic JSON write via [`crate::fs_util::write_atomic`].
 ///
 /// Mirrors `loom_tools.common.state.write_json_file` — two-space indent plus a
 /// trailing newline, parent directories created on demand.
 pub fn write_json_file(path: &Path, value: &serde_json::Value) -> std::io::Result<()> {
-    let dir = path.parent().filter(|p| !p.as_os_str().is_empty());
-    if let Some(d) = dir {
-        std::fs::create_dir_all(d)?;
-    }
     let mut body = serde_json::to_string_pretty(value)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
     body.push('\n');
-
-    // A pid-suffixed sibling keeps the rename atomic (same filesystem) while
-    // staying collision-free across concurrent agents.
-    let file_name = path
-        .file_name()
-        .map_or_else(|| std::ffi::OsString::from("state.json"), std::ffi::OsStr::to_os_string);
-    let tmp_name = format!(".{}.loom-tmp-{}", file_name.to_string_lossy(), std::process::id());
-    let tmp = match dir {
-        Some(d) => d.join(tmp_name),
-        None => PathBuf::from(tmp_name),
-    };
-    match std::fs::write(&tmp, body).and_then(|()| std::fs::rename(&tmp, path)) {
-        Ok(()) => Ok(()),
-        Err(e) => {
-            let _ = std::fs::remove_file(&tmp);
-            Err(e)
-        }
-    }
+    crate::fs_util::write_atomic(path, body.as_bytes(), crate::fs_util::AtomicOpts::default())
 }
 
 /// Read and parse a JSON file, soft-failing to `None` on any error.

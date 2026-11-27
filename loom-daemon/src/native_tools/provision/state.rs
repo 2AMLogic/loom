@@ -442,11 +442,15 @@ impl State {
             } else {
                 self.directory.join("data/opencode/auth.json")
             };
-            let mut file = tempfile::NamedTempFile::new_in(
-                path.parent().context("auth destination has no parent")?,
+            path.parent().context("auth destination has no parent")?;
+            crate::fs_util::write_atomic(
+                &path,
+                auth,
+                crate::fs_util::AtomicOpts {
+                    private: true,
+                    sync_dir: true,
+                },
             )?;
-            std::io::Write::write_all(&mut file, auth)?;
-            file.persist(path).map_err(|error| error.error)?;
         }
         Ok(())
     }

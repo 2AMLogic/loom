@@ -257,10 +257,11 @@ impl Store {
 
     /// Write-then-rename, so a concurrent `check` never reads half a record.
     fn write(&self, key: &Key, rec: &OwnerRecord) -> Result<()> {
-        let path = self.path(key);
-        let tmp = path.with_extension(format!("tmp.{}", std::process::id()));
-        std::fs::write(&tmp, serde_json::to_vec(rec)?)?;
-        std::fs::rename(&tmp, &path)?;
+        crate::fs_util::write_atomic(
+            &self.path(key),
+            &serde_json::to_vec(rec)?,
+            crate::fs_util::AtomicOpts::default(),
+        )?;
         Ok(())
     }
 
@@ -425,9 +426,11 @@ pub(crate) fn end_owners_detail(
             signal(rec.pid);
         }
         rec.released = true;
-        let tmp = path.with_extension(format!("tmp.{}", std::process::id()));
-        std::fs::write(&tmp, serde_json::to_vec(&rec)?)?;
-        std::fs::rename(&tmp, &path)?;
+        crate::fs_util::write_atomic(
+            &path,
+            &serde_json::to_vec(&rec)?,
+            crate::fs_util::AtomicOpts::default(),
+        )?;
     }
     Ok(n)
 }
