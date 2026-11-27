@@ -154,10 +154,11 @@ fn prs_with_an_agent_in_flight_are_left_to_it() {
 // ---- end to end through a fake `gh` ----
 
 /// Fake `gh` (#10349: REST). The ETag'd open-PR listing returns every open PR
-/// — the rows of `rr_json` (the `loom:review-requested` PRs) followed by those
-/// of `mc_json` (the `loom:merge-conflict` PRs), written in the old `gh pr
-/// list` shape and converted here — each PR's `GET pulls/<n>` answers its
-/// `mergeable`, and the comments walk returns `comments`. Any GraphQL `gh pr
+/// — the rows of `rr_json` (the review-queue PRs: `loom:review-requested`, or
+/// `loom:pr` from the approved-PR suite) followed by those of `mc_json` (the
+/// `loom:merge-conflict` PRs), written in the old `gh pr list` shape and
+/// converted here — each PR's `GET pulls/<n>` answers its `mergeable`, and the
+/// comments walk returns `comments`. Any GraphQL `gh pr
 /// list` fails, so a regression back to it fails every end-to-end test here.
 fn fake_gh(dir: &Path, log: &Path, rr_json: &str, mc_json: &str, comments: &str) -> PathBuf {
     let bin = dir.join("fake-gh-conflict.sh");
@@ -213,7 +214,7 @@ exit 0
 
 use std::path::PathBuf;
 
-fn run(rr_json: &str, mc_json: &str, comments: &str) -> (ReviewConflictStats, String) {
+pub(super) fn run(rr_json: &str, mc_json: &str, comments: &str) -> (ReviewConflictStats, String) {
     let dir = tempdir().unwrap();
     let root = dir.path().join("repo");
     std::fs::create_dir_all(&root).unwrap();
