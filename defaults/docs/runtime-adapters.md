@@ -343,7 +343,11 @@ the one cap.
   other token follows the guarded argv, ahead of the model and the prompt; a
   bare `--sandbox` in an override is dropped as a duplicate.
 
-  Build `1.5.18-6386224290725888` honours the policy (#15474, 2026-11-27).
+  On build `1.5.18-6386224290725888` the policy was observed denying
+  `edit_file`, `write_file` and `run_command` (#15474, 2026-11-27), on the
+  adapter, `loom-daemon` and host configuration recorded under "Live
+  verification status" (terminal sandbox unavailable). MCP enforcement was
+  not exercised.
   The CLI log shows the rules as written (`CLI settings initialized:
   permissions=&{Allow:[read_file(<workspace>)] Deny:[write_file(*) command(*)
   mcp(*)] Ask:[]}, toolPermission=request-review`). The rule names are the
@@ -393,10 +397,12 @@ the one cap.
 
   [Recorded observations on #15474](https://github.com/2AMLogic/loom/issues/15474#issuecomment-7206255449).
   Still open: everything on `1.5.14`; write denial on a host where the
-  terminal sandbox is available; and an operator-exported
+  terminal sandbox is available; MCP tool enforcement (the run exercised four
+  of the 60 advertised tools); and an operator-exported
   `AGY_CLI_DISABLE_AUTO_UPDATE=false` inside a pooled launch. Until a host
-  runs the same checks against the build it has installed, treat any build
-  other than `1.5.18-6386224290725888` as write-capable.
+  runs the same checks against the build and configuration it has installed,
+  treat that installation as write-capable. This includes
+  `1.5.18-6386224290725888` on any configuration other than the recorded one.
 
 ## The seven contract points
 
