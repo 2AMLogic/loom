@@ -56,6 +56,11 @@ pub struct Options {
     pub effort: Option<String>,
     pub log: Option<PathBuf>,
     pub skip_permissions: bool,
+    /// Internal (#15527): the host proxy's container-reachable base URL, set
+    /// only by the host launcher on a contained OpenCode re-exec. Validated
+    /// by [`egress_proxy::ContainedRedirect::resolve`]; an older worker
+    /// rejects it as an unsupported option, which is the compatibility check.
+    pub egress_proxy_base_url: Option<String>,
 }
 impl Options {
     fn parse(args: &[std::ffi::OsString]) -> Result<Self, LaunchError> {
@@ -82,6 +87,7 @@ impl Options {
                 "--profile",
                 "--effort",
                 "--log",
+                egress_proxy::BASE_URL_ARG,
             ]
             .contains(&flag)
             {
@@ -100,6 +106,11 @@ impl Options {
                 "--profile" => out.profile = Some(value.into()),
                 "--effort" => out.effort = Some(value.into()),
                 "--log" => out.log = Some(value.into()),
+                egress_proxy::BASE_URL_ARG => {
+                    if out.egress_proxy_base_url.replace(value.into()).is_some() {
+                        return Err(LaunchError::config(format!("{flag} may be given only once")));
+                    }
+                }
                 _ => unreachable!(),
             }
         }
@@ -175,6 +186,9 @@ impl LaunchError {
 /// reaches span attributes, the step log's rejection marker, and — prefixed
 /// with `preflight_` — the step ledger's outcome reason. Never carries
 /// free-form diagnostic text: the message stays on local stderr only.
+/// A detail of a boundary keeps the boundary's token as its prefix
+/// (`profile_selection_effort`), so a search for the boundary still finds
+/// every detail.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LaunchStage {
     /// The runtime name could not be resolved or validated (workspace
@@ -185,8 +199,18 @@ pub enum LaunchStage {
     WorkerOptions,
     /// Role admission refused this runtime/profile/role pairing.
     RoleAdmission,
-    /// Model-profile selection failed for this launch.
+    /// Model-profile selection failed for this launch: everything that is
+    /// wrong with the profile itself or with the request's shape (an unknown
+    /// or malformed profile, no provider binding for this harness, an invalid
+    /// credential mapping). The two launch-argument conflicts have their own
+    /// variants below.
     ProfileSelection,
+    /// Model-profile selection failed because the launch's reasoning effort
+    /// is outside the selected profile's `allowedEfforts`.
+    ProfileSelectionEffort,
+    /// Model-profile selection failed because the launch's bare model differs
+    /// from the selected profile's own model.
+    ProfileSelectionModel,
     /// The selected model profile excludes this role (`excludedRoles`).
     ProfileRoleExcluded,
     /// The LLM gateway refused, or could not plan, this launch.
@@ -228,6 +252,8 @@ impl LaunchStage {
             Self::WorkerOptions => "worker_options",
             Self::RoleAdmission => "role_admission",
             Self::ProfileSelection => "profile_selection",
+            Self::ProfileSelectionEffort => "profile_selection_effort",
+            Self::ProfileSelectionModel => "profile_selection_model",
             Self::ProfileRoleExcluded => "profile_role_excluded",
             Self::GatewayPlan => "gateway_plan",
             Self::Containment => "containment",
@@ -253,6 +279,8 @@ impl LaunchStage {
             "worker_options" => Self::WorkerOptions,
             "role_admission" => Self::RoleAdmission,
             "profile_selection" => Self::ProfileSelection,
+            "profile_selection_effort" => Self::ProfileSelectionEffort,
+            "profile_selection_model" => Self::ProfileSelectionModel,
             "profile_role_excluded" => Self::ProfileRoleExcluded,
             "gateway_plan" => Self::GatewayPlan,
             "containment" => Self::Containment,
@@ -294,6 +322,8 @@ fn stage_reason(stage: LaunchStage) -> &'static str {
         LaunchStage::WorkerOptions => "preflight_worker_options",
         LaunchStage::RoleAdmission => "preflight_role_admission",
         LaunchStage::ProfileSelection => "preflight_profile_selection",
+        LaunchStage::ProfileSelectionEffort => "preflight_profile_selection_effort",
+        LaunchStage::ProfileSelectionModel => "preflight_profile_selection_model",
         LaunchStage::ProfileRoleExcluded => "preflight_profile_role_excluded",
         LaunchStage::GatewayPlan => "preflight_gateway_plan",
         LaunchStage::Containment => "preflight_containment",
@@ -867,6 +897,19 @@ fn run_preflight(
         }
         let mut selection = profiles::select(&runtime, &options, &config)
             .map_err(|e| e.or_stage(LaunchStage::ProfileSelection))?;
+        // #15527: the proxy handoff is the host launcher's own argument to the
+        // contained re-exec. Anything else supplying it (a hand-built argv, a
+        // stale wrapper) is refused before any listener, container or harness.
+        if options.egress_proxy_base_url.is_some()
+            && nonempty_env("LOOM_SPAWN_CONTAINERIZED").is_none()
+        {
+            return Err(LaunchError::config(format!(
+                "{} is an internal argument of the contained re-exec and is not accepted on the \
+                 host",
+                egress_proxy::BASE_URL_ARG
+            ))
+            .with_stage(LaunchStage::WorkerOptions));
+        }
         // #11400: the profile actually selected (an explicit `--profile` may
         // differ from the one admission judged) must not exclude this role.
         if let Some(name) = selection.profile.as_deref() {
@@ -944,12 +987,20 @@ fn run_preflight(
             // feature is off or the profile opts out.
             let prepared = egress_proxy::prepare(root, &selection, &config, &runtime)
                 .map_err(|e| e.or_stage(LaunchStage::EgressProxy))?;
+            // #15527: a config-side redirect (`baseUrlConfig`) is applied by the
+            // in-container copy, which provisions the OpenCode config; it gets
+            // the proxy URL as a REQUIRED argument (see
+            // `Prepared::contained_worker_args`).
+            let worker_args = match &prepared {
+                Some(prepared) => prepared.contained_worker_args(&selection, &runtime, &args.args),
+                None => args.args.clone(),
+            };
             let mut command = containment::docker_command(
                 &profile,
                 root,
                 &std::env::current_dir().map_err(|e| LaunchError::config(e.to_string()))?,
                 options.log.as_deref(),
-                &args.args,
+                &worker_args,
                 &credentials,
                 prepared.as_ref().map(|p| &p.injection),
             )
@@ -1001,6 +1052,24 @@ fn run_preflight(
             (None, None) => credential::resolve(root, &selection)
                 .map_err(|e| e.or_stage(LaunchStage::Credential))?,
         };
+        // #15527: the contained OpenCode proxy handoff, validated before the
+        // prompt is expanded or the harness provisioned. Any invalid or
+        // conflicting handoff stops the launch here.
+        let contained_redirect = options
+            .egress_proxy_base_url
+            .as_deref()
+            .map(|raw| {
+                egress_proxy::ContainedRedirect::resolve(
+                    raw,
+                    &selection,
+                    &runtime,
+                    nonempty_env("LOOM_SPAWN_CONTAINERIZED").is_some(),
+                    gateway.is_some(),
+                    &credential,
+                )
+            })
+            .transpose()
+            .map_err(|e| e.or_stage(LaunchStage::EgressProxy))?;
         // #10749: how this launch is billed, from the profile's declared class
         // and the credential source actually resolved. Enumerated vocabulary
         // plus the profile name only; never a key, account or path.
@@ -1053,6 +1122,14 @@ fn run_preflight(
                 .and_then(|proxy| proxy.base_url_config.as_deref());
             prepared
                 .apply_native_env(&mut command, &selection.provider, config_option)
+                .map_err(|e| e.or_stage(LaunchStage::EgressProxy))?;
+        }
+        // After provisioning, so the patch lands on the config the harness
+        // will read — guarded role or free-form, with or without a provider
+        // block in the profile.
+        if let Some(redirect) = &contained_redirect {
+            redirect
+                .apply(&mut command, &selection.provider)
                 .map_err(|e| e.or_stage(LaunchStage::EgressProxy))?;
         }
         log = attach_log(&mut command, options.log.as_deref())
@@ -1534,6 +1611,8 @@ mod launch_rejection_tests {
             LaunchStage::WorkerOptions,
             LaunchStage::RoleAdmission,
             LaunchStage::ProfileSelection,
+            LaunchStage::ProfileSelectionEffort,
+            LaunchStage::ProfileSelectionModel,
             LaunchStage::ProfileRoleExcluded,
             LaunchStage::GatewayPlan,
             LaunchStage::Containment,
@@ -1556,6 +1635,14 @@ mod launch_rejection_tests {
             let reason = stage_reason(stage);
             assert!(reason.starts_with("preflight_"));
             assert_eq!(reason.strip_prefix("preflight_"), Some(stage.as_str()));
+            // One token reaches the ledger whole through the per-spawn report
+            // socket: a longer name would be truncated on the datagram and
+            // read back as no typed reason.
+            assert!(
+                stage.as_str().len() <= super::rejection::REPORT_BYTES,
+                "{} is too long for the report socket",
+                stage.as_str()
+            );
         }
         assert_eq!(LaunchStage::parse("credential "), None, "exact tokens only");
         assert_eq!(LaunchStage::parse("Credential"), None);

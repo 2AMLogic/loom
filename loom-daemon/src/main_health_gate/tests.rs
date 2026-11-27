@@ -1558,6 +1558,21 @@ fn test_is_ignorable_dirt_loom_owned_prefixes() {
 }
 
 #[test]
+fn test_is_ignorable_dirt_operator_stop_signals() {
+    // #15545: an operator's `signal.sh stop` is Loom-owned control state. Git
+    // reports the bare directory in a repo with tracked files under `.loom/`,
+    // and a child path when the directory is already tracked or listed.
+    let repo_root = tempfile::tempdir().unwrap();
+    let repo_root = repo_root.path();
+    assert!(is_ignorable_dirt(".loom/signals/", repo_root));
+    assert!(is_ignorable_dirt(".loom/signals/stop-terminal-1", repo_root));
+    // A lookalike sibling is still dirt.
+    assert!(!is_ignorable_dirt(".loom/signals-old/stray", repo_root));
+    let status = "?? .loom/signals/\n?? .loom/signals-old/stray\n";
+    assert_eq!(non_ignorable_dirt(status, repo_root), vec!["?? .loom/signals-old/stray"]);
+}
+
+#[test]
 fn test_is_ignorable_dirt_lockfile_basenames() {
     let repo_root = tempfile::tempdir().unwrap();
     let repo_root = repo_root.path();
