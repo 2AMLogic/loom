@@ -693,7 +693,7 @@ pub fn reanchor_body(
 /// one-shot CLI path calls this, before any `gh` runs. `None` changes nothing.
 fn pin_repo(repo: Option<&str>) -> Result<(), String> {
     let Some(repo) = repo else { return Ok(()) };
-    if !crate::forge_version_only_diff::valid_repo(repo) {
+    if !crate::forge_pr_diff::valid_repo(repo) {
         return Err("--repo is not a plain OWNER/REPO".to_string());
     }
     std::env::set_var("LOOM_REPO", repo);

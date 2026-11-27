@@ -31,15 +31,11 @@ use std::path::Path;
 
 use anyhow::Result;
 use regex::Regex;
-use serde::Deserialize;
 
-use crate::forge_additive_migrations::{decode_contents, gh_head_sha, safe_path};
+use crate::forge_pr_diff::{self, FileEntry, ListError, PrHeadReader, RepoError};
 
-/// `per_page` for the file-list read (GitHub's maximum).
-const PAGE_SIZE: usize = 100;
-
-/// GitHub's `pulls/<n>/files` stops at 3000 files, i.e. 30 full pages.
-const MAX_PAGES: u32 = 30;
+/// The `forge_call_stats` operation label of this verb's forge reads.
+const OP: &str = "forge.locked_deps_only";
 
 /// Why a PR is NOT cleared. Every variant exits 1.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -95,14 +91,13 @@ impl std::fmt::Display for Reason {
     }
 }
 
-/// One entry of a `pulls/<n>/files` page.
-#[derive(Deserialize)]
-struct FileEntry {
-    filename: String,
-    #[serde(default)]
-    status: String,
-    #[serde(default)]
-    patch: Option<String>,
+impl From<ListError> for Reason {
+    fn from(e: ListError) -> Self {
+        match e {
+            ListError::Fetch(why) => Self::FetchFailed(why),
+            ListError::Truncated => Self::ListTruncated,
+        }
+    }
 }
 
 fn basename(path: &str) -> &str {
@@ -287,25 +282,6 @@ where
     Ok(())
 }
 
-/// Walk the file list page by page through `fetch_page` (1-based page to raw JSON body).
-fn list_files<F>(mut fetch_page: F) -> Result<Vec<FileEntry>, Reason>
-where
-    F: FnMut(u32) -> Result<Vec<u8>, String>,
-{
-    let mut all = Vec::new();
-    for page in 1..=MAX_PAGES {
-        let body = fetch_page(page).map_err(Reason::FetchFailed)?;
-        let entries: Vec<FileEntry> = serde_json::from_slice(&body)
-            .map_err(|e| Reason::FetchFailed(format!("page {page} did not parse: {e}")))?;
-        let full = entries.len() >= PAGE_SIZE;
-        all.extend(entries);
-        if !full {
-            return Ok(all);
-        }
-    }
-    Err(Reason::ListTruncated)
-}
-
 /// The whole verdict with the forge reads injected.
 ///
 /// # Errors
@@ -316,11 +292,7 @@ where
     F: FnMut(u32) -> Result<Vec<u8>, String>,
     R: FnMut(&str) -> Result<String, String>,
 {
-    decide_files(&list_files(fetch_page)?, head)
-}
-
-fn gh_read(gh_bin: &Path, path: &str) -> Result<Vec<u8>, String> {
-    crate::verdict_equivalence::gh_api_checked("forge.locked_deps_only", gh_bin, None, path)
+    decide_files(&forge_pr_diff::list_files(fetch_page)?, head)
 }
 
 /// Parsed `forge locked-deps-only` arguments.
@@ -336,36 +308,17 @@ pub struct Args {
 /// Never returns (exits): 0 with `LOCKED_DEPS_ONLY=1` when the PR adds no third-party package,
 /// otherwise 1 with the reason on stderr.
 pub fn handle(args: &Args) -> Result<()> {
-    use crate::forge_version_only_diff::{gh_fetch_page, resolve_repo, valid_repo};
     let pr = args.pr;
-    let verdict = match args.repo.as_deref() {
-        Some(r) if !valid_repo(r) => Err(Reason::InvalidRepo),
-        r => {
-            let gh = crate::forge_cmd::gh_bin();
-            match resolve_repo(r, &gh) {
-                Err(why) => Err(Reason::FetchFailed(why)),
-                Ok(repo) => {
-                    let repo = repo.as_str();
-                    let gh = Path::new(&gh);
-                    let mut sha: Option<String> = None;
-                    decide(
-                        |page| gh_fetch_page(gh, repo, pr, page),
-                        |file| {
-                            if !safe_path(file) {
-                                return Err("unsafe file path".into());
-                            }
-                            if sha.is_none() {
-                                sha = Some(gh_head_sha(gh, repo, pr)?);
-                            }
-                            let sha = sha.as_deref().unwrap_or_default();
-                            decode_contents(&gh_read(
-                                gh,
-                                &format!("repos/{repo}/contents/{file}?ref={sha}"),
-                            )?)
-                        },
-                    )
-                }
-            }
+    let verdict = match forge_pr_diff::resolve_gh_repo(args.repo.as_deref()) {
+        Err(RepoError::Invalid) => Err(Reason::InvalidRepo),
+        Err(RepoError::Unresolved(why)) => Err(Reason::FetchFailed(why)),
+        Ok((gh, repo)) => {
+            let gh = Path::new(&gh);
+            let mut head = PrHeadReader::new(OP, gh, &repo, pr);
+            decide(
+                |page| forge_pr_diff::gh_fetch_page(OP, gh, &repo, pr, page),
+                |file| head.read(file),
+            )
         }
     };
     match verdict {
@@ -389,6 +342,7 @@ mod tests {
         FileEntry {
             filename: name.into(),
             status: status.into(),
+            previous_filename: None,
             patch: patch.map(str::to_string),
         }
     }
@@ -571,7 +525,7 @@ mod tests {
 
     #[test]
     fn full_list_at_cap_holds() {
-        let page: Vec<String> = (0..PAGE_SIZE)
+        let page: Vec<String> = (0..crate::forge_pr_diff::PAGE_SIZE)
             .map(|i| format!(r#"{{"filename":"src/f{i}.rs","status":"modified"}}"#))
             .collect();
         let page = format!("[{}]", page.join(","));

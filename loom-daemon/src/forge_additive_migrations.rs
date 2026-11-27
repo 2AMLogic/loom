@@ -30,14 +30,11 @@
 use std::path::Path;
 
 use anyhow::Result;
-use serde::Deserialize;
 
-/// `per_page` for the file-list read (GitHub's maximum).
-const PAGE_SIZE: usize = 100;
+use crate::forge_pr_diff::{self, FileEntry, ListError, PrHeadReader, RepoError};
 
-/// GitHub's `pulls/<n>/files` stops at 3000 files, i.e. 30 full pages. A list that is still
-/// full at the cap may be truncated, so it holds.
-const MAX_PAGES: u32 = 30;
+/// The `forge_call_stats` operation label of this verb's forge reads.
+const OP: &str = "forge.additive_migrations";
 
 /// Why a PR is NOT cleared. Every variant exits 1.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -85,14 +82,13 @@ impl std::fmt::Display for Reason {
     }
 }
 
-/// One entry of a `pulls/<n>/files` page.
-#[derive(Deserialize)]
-struct FileEntry {
-    filename: String,
-    #[serde(default)]
-    status: String,
-    #[serde(default)]
-    previous_filename: Option<String>,
+impl From<ListError> for Reason {
+    fn from(e: ListError) -> Self {
+        match e {
+            ListError::Fetch(why) => Self::FetchFailed(why),
+            ListError::Truncated => Self::ListTruncated,
+        }
+    }
 }
 
 /// Does `path` fall under Champion's `*migrations/*` / `*_migration.py` kept-set patterns?
@@ -299,25 +295,6 @@ where
     }
 }
 
-/// Walk the file list page by page through `fetch_page` (1-based page to raw JSON body).
-fn list_files<F>(mut fetch_page: F) -> Result<Vec<FileEntry>, Reason>
-where
-    F: FnMut(u32) -> Result<Vec<u8>, String>,
-{
-    let mut all = Vec::new();
-    for page in 1..=MAX_PAGES {
-        let body = fetch_page(page).map_err(Reason::FetchFailed)?;
-        let entries: Vec<FileEntry> = serde_json::from_slice(&body)
-            .map_err(|e| Reason::FetchFailed(format!("page {page} did not parse: {e}")))?;
-        let full = entries.len() >= PAGE_SIZE;
-        all.extend(entries);
-        if !full {
-            return Ok(all);
-        }
-    }
-    Err(Reason::ListTruncated)
-}
-
 /// The whole verdict with the forge reads injected.
 ///
 /// # Errors
@@ -328,52 +305,7 @@ where
     F: FnMut(u32) -> Result<Vec<u8>, String>,
     R: FnMut(&str) -> Result<String, String>,
 {
-    decide_files(&list_files(fetch_page)?, read)
-}
-
-/// Reject file names that could address a different API endpoint.
-pub(crate) fn safe_path(file: &str) -> bool {
-    !file.is_empty()
-        && !file.starts_with('/')
-        && !file
-            .split('/')
-            .any(|p| p.is_empty() || p == "." || p == "..")
-        && file
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-' | b'/'))
-}
-
-/// Decode a `repos/<r>/contents/<f>?ref=<sha>` JSON body to text.
-pub(crate) fn decode_contents(body: &[u8]) -> Result<String, String> {
-    use base64::engine::general_purpose::STANDARD;
-    use base64::Engine as _;
-    let v: serde_json::Value = serde_json::from_slice(body).map_err(|e| e.to_string())?;
-    if v.get("encoding").and_then(|e| e.as_str()) != Some("base64") {
-        return Err("contents API returned no base64 body".into());
-    }
-    let raw: String = v
-        .get("content")
-        .and_then(|c| c.as_str())
-        .ok_or("contents API returned no content")?
-        .split_whitespace()
-        .collect();
-    let bytes = STANDARD.decode(raw).map_err(|e| e.to_string())?;
-    String::from_utf8(bytes).map_err(|e| e.to_string())
-}
-
-fn gh_read(gh_bin: &Path, path: &str) -> Result<Vec<u8>, String> {
-    crate::verdict_equivalence::gh_api_checked("forge.additive_migrations", gh_bin, None, path)
-}
-
-/// The PR head SHA.
-pub(crate) fn gh_head_sha(gh_bin: &Path, repo: &str, pr: u32) -> Result<String, String> {
-    let body = gh_read(gh_bin, &format!("repos/{repo}/pulls/{pr}"))?;
-    let v: serde_json::Value = serde_json::from_slice(&body).map_err(|e| e.to_string())?;
-    v.pointer("/head/sha")
-        .and_then(|s| s.as_str())
-        .filter(|s| s.len() >= 7 && s.bytes().all(|b| b.is_ascii_hexdigit()))
-        .map(str::to_string)
-        .ok_or_else(|| "PR head sha missing".into())
+    decide_files(&forge_pr_diff::list_files(fetch_page)?, read)
 }
 
 /// Parsed `forge additive-migrations` arguments.
@@ -389,36 +321,17 @@ pub struct Args {
 /// Never returns (exits): 0 with `ADDITIVE_MIGRATIONS=1` when every migration file is
 /// additive, otherwise 1 with the reason on stderr.
 pub fn handle(args: &Args) -> Result<()> {
-    use crate::forge_version_only_diff::{gh_fetch_page, resolve_repo, valid_repo};
     let pr = args.pr;
-    let verdict = match args.repo.as_deref() {
-        Some(r) if !valid_repo(r) => Err(Reason::InvalidRepo),
-        r => {
-            let gh = crate::forge_cmd::gh_bin();
-            match resolve_repo(r, &gh) {
-                Err(why) => Err(Reason::FetchFailed(why)),
-                Ok(repo) => {
-                    let repo = repo.as_str();
-                    let gh = Path::new(&gh);
-                    let mut head: Option<String> = None;
-                    decide(
-                        |page| gh_fetch_page(gh, repo, pr, page),
-                        |file| {
-                            if !safe_path(file) {
-                                return Err("unsafe file path".into());
-                            }
-                            if head.is_none() {
-                                head = Some(gh_head_sha(gh, repo, pr)?);
-                            }
-                            let sha = head.as_deref().unwrap_or_default();
-                            decode_contents(&gh_read(
-                                gh,
-                                &format!("repos/{repo}/contents/{file}?ref={sha}"),
-                            )?)
-                        },
-                    )
-                }
-            }
+    let verdict = match forge_pr_diff::resolve_gh_repo(args.repo.as_deref()) {
+        Err(RepoError::Invalid) => Err(Reason::InvalidRepo),
+        Err(RepoError::Unresolved(why)) => Err(Reason::FetchFailed(why)),
+        Ok((gh, repo)) => {
+            let gh = Path::new(&gh);
+            let mut head = PrHeadReader::new(OP, gh, &repo, pr);
+            decide(
+                |page| forge_pr_diff::gh_fetch_page(OP, gh, &repo, pr, page),
+                |file| head.read(file),
+            )
         }
     };
     match verdict {
@@ -525,6 +438,7 @@ mod tests {
             filename: name.into(),
             status: status.into(),
             previous_filename: prev.map(str::to_string),
+            patch: None,
         }
     }
 
@@ -604,33 +518,15 @@ mod tests {
         assert!(matches!(r, Err(Reason::FetchFailed(_))));
     }
 
-    #[test]
-    fn pagination_collects_every_page() {
-        let page1: Vec<String> = (0..PAGE_SIZE)
-            .map(|i| format!(r#"{{"filename":"src/f{i}.rs","status":"modified"}}"#))
-            .collect();
-        let page1 = format!("[{}]", page1.join(","));
-        let page2 = r#"[{"filename":"migrations/9.sql","status":"added"}]"#.to_string();
-        let r =
-            decide(|p| Ok(if p == 1 { page1.clone() } else { page2.clone() }.into_bytes()), good);
-        assert_eq!(r, Ok(()));
-    }
-
+    /// Pagination itself is covered in `forge_pr_diff`; this pins the verb's mapping of a
+    /// truncated list to a hold.
     #[test]
     fn full_list_at_cap_holds() {
-        let page: Vec<String> = (0..PAGE_SIZE)
+        let page: Vec<String> = (0..crate::forge_pr_diff::PAGE_SIZE)
             .map(|i| format!(r#"{{"filename":"src/f{i}.rs","status":"modified"}}"#))
             .collect();
         let page = format!("[{}]", page.join(","));
         let r = decide(|_| Ok(page.clone().into_bytes()), good);
         assert_eq!(r, Err(Reason::ListTruncated));
-    }
-
-    #[test]
-    fn safe_path_rejects_traversal() {
-        assert!(safe_path("migrations/0001_x.sql"));
-        assert!(!safe_path("migrations/../x.sql"));
-        assert!(!safe_path("/migrations/x.sql"));
-        assert!(!safe_path("migrations/x y.sql"));
     }
 }
