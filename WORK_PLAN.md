@@ -7,7 +7,7 @@ The body below is a snapshot of GitHub label state as of the last merged docs-ma
 <!-- Maintained automatically by the Guide triage agent. Manual edits are fine but may be overwritten. -->
 
 <!-- guide:plan-body:start -->
-_Generated: 2026-11-26T22:27:59Z (snapshot; compare against live labels)_
+_Generated: 2026-11-27T01:06:56Z (snapshot; compare against live labels)_
 ## Operator Attention: Merge-Risk-Hold Pileup
 
 Judge-approved PRs under a hold (`loom:blocked` or `loom:operator`) — a human merge decision, or the prerequisite shown, is missing.
@@ -16,7 +16,10 @@ Judge-approved PRs under a hold (`loom:blocked` or `loom:operator`) — a human 
 - **#14384**: fix: require native ownership before handing a fresh worktree to a Builder *(held: champion merge-risk hold)*
 - **#14498**: fix: pass over unprovisioned and sandbox-held Codex seats before a draw *(held: champion merge-risk hold)*
 - **#14696**: fix(dispatch): admit on the containment proof the walk already took *(held: champion merge-risk hold)*
+- **#14715**: fix: send verified Champion-held Doctor repairs back to Judge *(held: champion merge-risk hold)*
 - **#15066**: feat: reap agent per-ticket scratch roots on the worktree volume *(held: champion merge-risk hold)*
+- **#15071**: feat: relay private-seat preparation Git reads through the fleet gateway *(held: champion merge-risk hold)*
+- **#15099**: feat: share codex account holds across fleet hosts on the heartbeat *(held: champion merge-risk hold)*
 - **#15133**: feat: read Builder claim and split-parent evidence from Gitea *(held: champion merge-risk hold)*
 - **#15224**: fix: scan rm targets behind function-definition and group openers in rm-scope guard *(held: Local worktree pr-15224 holding feature/issue-15221 is dirty at b680d5547 behind PR head ccbf98811; preserved untouched per dirty-worktree refusal policy)*
 - **#15307**: refactor(prompts): load-gate the docs-only fast path bodies (#15236) *(held: champion merge-risk hold)*
@@ -28,6 +31,7 @@ Judge-approved PRs under a hold (`loom:blocked` or `loom:operator`) — a human 
 - **#15459**: fix: make the installer's same-version gate report held-back paths *(held: champion merge-risk hold)*
 - **#15480**: fix: prune stale manifest entries for commands, agents and skills *(held: champion merge-risk hold)*
 - **#15485**: fix: sweep abandoned agy per-launch HOMEs at the next launch *(held: champion critical-file hold)*
+- **#15489**: feat: move private session seats onto the daemon release image *(held: champion merge-risk hold)*
 - **#15494**: fix: make resync --dry-run name the prune for a file it would remove *(held: champion merge-risk hold)*
 - **#15497**: fix: scope primary-checkout mutation guard to the agent's workspace *(held: champion merge-risk hold)*
 - **#15501**: fix: allow quoted documentation in the primary-checkout guard *(held: champion merge-risk hold)*
@@ -49,13 +53,15 @@ _None._
 - **#14465**: Serve hold diagnostics, curation labels and blocker notifications from loom-tools *(held)*
 - **#14474**: Expose worktree operations through the shared Rust CLI
 - **#14566**: Telemetry: about 40% of OpenCode (GLM) runs on 0.19.1316 emit no loom.runtime.usage row *(held)*
-- **#15308**: main CI red since 11:10Z: install-compat (session-exec claude-seat vs requires_daemon 0.20.5) and E0308 in daemon tests *(held)*
+- **#15308**: main CI red since 11:10Z: install-compat (session-exec claude-seat vs requires_daemon 0.20.5) and E0308 in daemon tests
 
 ## Ready
 
 Human-approved issues (`loom:issue`) ready for implementation — excluding held (`loom:blocked`/`loom:operator`/`loom:frozen`), `loom:building`, and issues with an open linked PR (native admission `OPEN_PR`; listed under Issues with Open PRs).
 
-_None._
+- **#15522**: Remove orphaned Safehouse completion-envelope token and runtime readers (~950 LOC)
+- **#15529**: Share the guarded Git replay used by orphan-stack and merged-stack reconciliation
+- **#15537**: Zero-write review-conflict e2e tests pass when the open-PR listing fails
 
 ## Issues with Open PRs (Not Dispatchable)
 
@@ -67,7 +73,7 @@ _None._
 - **#14474**: Expose worktree operations through the shared Rust CLI — open PR #14514 (approved)
 - **#14626**: Private-clone admission contains the winning seat twice per admission — open PR #14696 (held)
 - **#14712**: resync: a no-op resync warns that it stamped the canonical loom_source_remote, but leaves the stale one — open PR #14769 (approved)
-- **#14714**: Held Doctor repairs leave stale approvals outside the Judge queue — open PR #14715 (approved)
+- **#14714**: Held Doctor repairs leave stale approvals outside the Judge queue — open PR #14715 (held)
 - **#14876**: clean: stale-branch pass deletes a mis-prefixed 'heads/<name>' branch and fails permanently on PR-fetch ref residue — open PR #14916 (unlabeled)
 
 ## In Progress
@@ -79,6 +85,7 @@ Issues currently being built (`loom:building`).
 - **#14376**: Refuse a peer-owned claim before handing a new worktree to a Builder
 - **#14460**: held_back residue: install-loom.sh's "already installed" gate still reads the stamp alone, and three install_compat doc comments are stale
 - **#14560**: Work-finder completion gaps leave the Fleet queue stale
+- **#14634**: Dashboard Builder repeatedly selects OpenCode and exits at preflight on loom-worker-3
 - **#14935**: Fetch private-seat clones through the configured fleet Git read relay
 - **#14936**: Diagnose writer renewal and refuse private-seat write jobs before leasing when credentials are missing
 - **#14938**: Gitea gap: forge check-claim and forge parent split-state are GitHub-only, blocking targeted Builder steps
@@ -90,6 +97,7 @@ Issues currently being built (`loom:building`).
 - **#15221**: rm-scope guard: an rm on an unresolved variable is admitted when it is the only statement in a function body (the same rm at top level is denied)
 - **#15236**: Load-gate the docs-only fast-path block out of judge.md and champion-pr-merge.md
 - **#15291**: Telemetry: Codex runs and refusals carry no seat, and seat state (held / container missing / quota) is log-only
+- **#15308**: main CI red since 11:10Z: install-compat (session-exec claude-seat vs requires_daemon 0.20.5) and E0308 in daemon tests
 - **#15356**: [ci-daily] Session and Private-Workspace Docker Fixtures (unfiltered)
 - **#15377**: Ratification detector holds a record that says merging does NOT ratify it (STATUS + CLAUSE ignore negation)
 - **#15397**: Codex private-clone steps keep drawing seats with no recorded hook trust ('sealed'); 21% of Codex runs fail in seconds
@@ -97,13 +105,20 @@ Issues currently being built (`loom:building`).
 - **#15421**: Share the live-sweep and checkpoint checks for issue and step logs
 - **#15430**: Ratification hold and reviewer dispatch miss a proposed record requiring both keys before merge
 - **#15471**: verify-output-decl says a producer with an unterminated final line has zero lines
+- **#15474**: agy adapter: default the self-update kill switch and pin an explicit permission mode (live findings #15059)
 - **#15475**: resync: manifest prune (#14012) skips surfaces outside .loom/, so a retired file under .claude/commands/loom leaves a stale installed_files entry
 - **#15478**: resync: --dry-run does not preview the manifest prune for a retired file the same run would remove
-- **#15481**: verify-output-decl accepts a plain =, +=, ?= or != assignment named like the output as its producer
 - **#15483**: guard: primary-checkout-mutation denies git commit in an independent disposable repository during an agent step (any standalone repository reads as a primary checkout)
 - **#15487**: Primary-checkout guard scans heredoc bodies as commands (#7923's inert-heredoc fix never reached it)
-- **#15500**: verify-output-decl reads a command line as a Make rule when the producer has no shebang and no shell extension
+- **#15488**: install/hygiene: decide the rest of the daemon-written EPHEMERAL_PATTERNS against both LOOM_OWNED_PREFIXES lists (left out of scope by #15479)
 - **#15505**: Primary-checkout guard: every command-substitution form bypasses it (pre-existing, unrelated to #15487)
+- **#15510**: Reuse the review-conflict fake gh in approved-PR tests
+- **#15514**: Hoist duplicated doc-lint fence helpers into doc_lint_support
+- **#15517**: Release-tag verification is shed on fleet workers: RELEASE_REPO still names rjwalters/loom, so resync-payload and the workspace resync never apply the payload
+- **#15518**: resync-installed.sh --output: the real run rewrites ~/.local/bin/loom via the user-scope #10238 step; --dry-run shows nothing
+- **#15519**: resync-installed.sh --output: the printed git add recipe omits the run's own retired-file deletions under .loom/scripts and the .loom/pricing.json update
+- **#15521**: native loom_edit refuses with "read the current file first" straight after a full read, oldText matching exactly once
+- **#15527**: Contained OpenCode launch of the bundled Z.ai profiles cannot be routed through the credential egress proxy (prerequisite for #8698)
 
 ## PRs Awaiting Review
 
@@ -112,7 +127,13 @@ PRs waiting on Judge (`loom:review-requested`).
 - **#12969**: feat: age-bound Codex rollout history in live profiles *(held)*
 - **#14612**: fix: launch eager reclaim detached so it cannot hold back a work-finder tick *(held)*
 - **#15047**: refactor: drop superseded zero-caller pub helpers from loom-daemon *(held)*
-- **#15511**: fix: match verify-output-decl shell suffix case-insensitively
+- **#15524**: fix: ignore daemon-written .loom/claims/ and .loom/metrics/ as dirt
+- **#15526**: fix: catch primary-checkout mutations inside command substitutions
+- **#15531**: fix: skip resync-installed user-scope steps in --output staging mode
+- **#15533**: fix: raise REQUIRES_DAEMON to 0.20.34 and hard-floor claude-seat
+- **#15534**: fix: explain why native edits cannot match oldText
+- **#15540**: fix: type effort and model refusals inside profile selection
+- **#15542**: fix: verify release tags against 2AMLogic/loom and name shed lookups
 
 ## Approved (Awaiting Merge)
 
@@ -125,10 +146,11 @@ PRs that passed review (`loom:pr`); unmarked PRs are queued for Champion auto-me
 - **#14498**: fix: pass over unprovisioned and sandbox-held Codex seats before a draw — closes #14455 *(held: champion merge-risk hold)*
 - **#14514**: feat(tools): share worktree CLI operations and read routing — closes #14474
 - **#14696**: fix(dispatch): admit on the containment proof the walk already took — closes #14626 *(held: champion merge-risk hold)*
-- **#14715**: fix: send verified Champion-held Doctor repairs back to Judge — closes #14714
+- **#14715**: fix: send verified Champion-held Doctor repairs back to Judge — closes #14714 *(held: champion merge-risk hold)*
 - **#14769**: fix: skip source-remote lookup on no-op resyncs — closes #14712
 - **#15066**: feat: reap agent per-ticket scratch roots on the worktree volume — closes #14952 *(held: champion merge-risk hold)*
-- **#15071**: feat: relay private-seat preparation Git reads through the fleet gateway — closes #14935
+- **#15071**: feat: relay private-seat preparation Git reads through the fleet gateway — closes #14935 *(held: champion merge-risk hold)*
+- **#15099**: feat: share codex account holds across fleet hosts on the heartbeat — closes #15091 *(held: champion merge-risk hold)*
 - **#15133**: feat: read Builder claim and split-parent evidence from Gitea — closes #14938 *(held: champion merge-risk hold)*
 - **#15224**: fix: scan rm targets behind function-definition and group openers in rm-scope guard — closes #15221 *(held: Local worktree pr-15224 holding feature/issue-15221 is dirty at b680d5547 behind PR head ccbf98811; preserved untouched per dirty-worktree refusal policy)*
 - **#15307**: refactor(prompts): load-gate the docs-only fast path bodies (#15236) — closes #15236 *(held: champion merge-risk hold)*
@@ -141,10 +163,12 @@ PRs that passed review (`loom:pr`); unmarked PRs are queued for Champion auto-me
 - **#15459**: fix: make the installer's same-version gate report held-back paths — closes #14460 *(held: champion merge-risk hold)*
 - **#15480**: fix: prune stale manifest entries for commands, agents and skills — closes #15475 *(held: champion merge-risk hold)*
 - **#15485**: fix: sweep abandoned agy per-launch HOMEs at the next launch — closes #15109 *(held: champion critical-file hold)*
+- **#15489**: feat: move private session seats onto the daemon release image — closes #14112 *(held: champion merge-risk hold)*
 - **#15494**: fix: make resync --dry-run name the prune for a file it would remove — closes #15478 *(held: champion merge-risk hold)*
 - **#15497**: fix: scope primary-checkout mutation guard to the agent's workspace — closes #15483 *(held: champion merge-risk hold)*
 - **#15501**: fix: allow quoted documentation in the primary-checkout guard — closes #15487 *(held: champion merge-risk hold)*
 - **#15502**: fix: verify-output-decl counts an unterminated final line (#15471) — closes #15471
+- **#15538**: test: share the review-conflict fake gh with approved-PR tests — closes #15510
 
 ## Proposed
 
@@ -195,7 +219,6 @@ Issues carrying `loom:curated`.
 - **#14112**: Private-clone session image follows the daemon release tag; recreate idle private sessions at a daemon roll *(curated)*
 - **#14218**: Verify the repaired publish paths actually fire after the org transfer (post-merge live check for #14158) *(curated)*
 - **#14232**: Spike: does regenerating CODEX_HOME/config.toml with inline hooks per launch avoid the private-clone hook-trust prompt? *(curated)* *(held)*
-- **#14235**: Design: let a roleDraw attempt table escalate on named outcome reasons, once #14233 has data *(curated)* *(held)*
 - **#14292**: test flake: test-docs-guide-lock.sh Test 4 (#5573 race) fails on Shell Test Suites (hermetic, 2/2) — two concurrent acquires both win *(curated)* *(held)*
 - **#14371**: Per-seat session container for Claude steps: launch in the configured session image, one login per container *(curated)* *(held)*
 - **#14376**: Refuse a peer-owned claim before handing a new worktree to a Builder *(curated)*
@@ -213,12 +236,11 @@ Issues carrying `loom:curated`.
 - **#14566**: Telemetry: about 40% of OpenCode (GLM) runs on 0.19.1316 emit no loom.runtime.usage row *(curated)* *(held)*
 - **#14583**: Keep quiet dispatch disposition rows inside the five-minute Fleet freshness target *(curated)* *(held)*
 - **#14626**: Private-clone admission contains the winning seat twice per admission *(curated)*
-- **#14634**: Dashboard Builder repeatedly selects OpenCode and exits at preflight on loom-worker-3 *(curated)* *(held)*
+- **#14634**: Dashboard Builder repeatedly selects OpenCode and exits at preflight on loom-worker-3 *(curated)*
 - **#14665**: Live verification: post-fix Codex usage-missing breakdown and the 17 unaccounted runs (#14664) *(curated)* *(held)*
 - **#14685**: Live-verify Docker retention per-evaluation summaries on a containerd-store worker (#14679 follow-up) *(curated)* *(held)*
 - **#14712**: resync: a no-op resync warns that it stamped the canonical loom_source_remote, but leaves the stale one *(curated)*
 - **#14714**: Held Doctor repairs leave stale approvals outside the Judge queue *(curated)*
-- **#14737**: Observed Loom step attempt spans omit the recorded failure class *(curated)* *(held)*
 - **#14741**: pricing: gpt-6.2-astra is not on the pricing card; every Codex step is costed at the Sonnet fallback *(curated)* *(held)*
 - **#14765**: Live verification: session_reconcile creates an App-only private-clone seat after #14744 *(curated)* *(held)*
 - **#14808**: A PR that says "Part of #<operator-held tracker>" inherits the hold and is never drawn by Judge or Doctor, with no visible reason (three chip PRs stalled 6 to 27 days; a fourth held with no visible reason) *(curated)* *(held)*
@@ -246,7 +268,7 @@ Issues carrying `loom:curated`.
 - **#15221**: rm-scope guard: an rm on an unresolved variable is admitted when it is the only statement in a function body (the same rm at top level is denied) *(curated)*
 - **#15236**: Load-gate the docs-only fast-path block out of judge.md and champion-pr-merge.md *(curated)*
 - **#15291**: Telemetry: Codex runs and refusals carry no seat, and seat state (held / container missing / quota) is log-only *(curated)*
-- **#15308**: main CI red since 11:10Z: install-compat (session-exec claude-seat vs requires_daemon 0.20.5) and E0308 in daemon tests *(curated)* *(held)*
+- **#15308**: main CI red since 11:10Z: install-compat (session-exec claude-seat vs requires_daemon 0.20.5) and E0308 in daemon tests *(curated)*
 - **#15356**: [ci-daily] Session and Private-Workspace Docker Fixtures (unfiltered) *(curated)*
 - **#15377**: Ratification detector holds a record that says merging does NOT ratify it (STATUS + CLAUSE ignore negation) *(curated)*
 - **#15397**: Codex private-clone steps keep drawing seats with no recorded hook trust ('sealed'); 21% of Codex runs fail in seconds *(curated)*
@@ -254,18 +276,24 @@ Issues carrying `loom:curated`.
 - **#15418**: Telemetry: report the seat/account for Claude and Z.ai runs too (provider-neutral, extends #15291) *(curated)* *(held)*
 - **#15430**: Ratification hold and reviewer dispatch miss a proposed record requiring both keys before merge *(curated)*
 - **#15471**: verify-output-decl says a producer with an unterminated final line has zero lines *(curated)*
-- **#15474**: agy adapter: default the self-update kill switch and pin an explicit permission mode (live findings #15059) *(curated)* *(held)*
+- **#15474**: agy adapter: default the self-update kill switch and pin an explicit permission mode (live findings #15059) *(curated)*
 - **#15475**: resync: manifest prune (#14012) skips surfaces outside .loom/, so a retired file under .claude/commands/loom leaves a stale installed_files entry *(curated)*
 - **#15478**: resync: --dry-run does not preview the manifest prune for a retired file the same run would remove *(curated)*
-- **#15481**: verify-output-decl accepts a plain =, +=, ?= or != assignment named like the output as its producer *(curated)*
 - **#15483**: guard: primary-checkout-mutation denies git commit in an independent disposable repository during an agent step (any standalone repository reads as a primary checkout) *(curated)*
 - **#15487**: Primary-checkout guard scans heredoc bodies as commands (#7923's inert-heredoc fix never reached it) *(curated)*
 - **#15488**: install/hygiene: decide the rest of the daemon-written EPHEMERAL_PATTERNS against both LOOM_OWNED_PREFIXES lists (left out of scope by #15479) *(curated)*
 - **#15493**: test-spawn-agy.sh resolves the shipped agy manifest one directory too high, so the fixture copy never runs *(curated)* *(held)*
-- **#15500**: verify-output-decl reads a command line as a Make rule when the producer has no shebang and no shell extension *(curated)*
 - **#15504**: Primary-checkout guard: inert-documentation allowlist misses the sanctioned issue-filing and verdict-posting forms (follow-up to #15487) *(curated)* *(held)*
 - **#15505**: Primary-checkout guard: every command-substitution form bypasses it (pre-existing, unrelated to #15487) *(curated)*
 - **#15506**: docs(guard-hooks): finish the Known-consequence update for agent-step markers *(curated)* *(held)*
+- **#15517**: Release-tag verification is shed on fleet workers: RELEASE_REPO still names rjwalters/loom, so resync-payload and the workspace resync never apply the payload *(curated)*
+- **#15518**: resync-installed.sh --output: the real run rewrites ~/.local/bin/loom via the user-scope #10238 step; --dry-run shows nothing *(curated)*
+- **#15519**: resync-installed.sh --output: the printed git add recipe omits the run's own retired-file deletions under .loom/scripts and the .loom/pricing.json update *(curated)*
+- **#15521**: native loom_edit refuses with "read the current file first" straight after a full read, oldText matching exactly once *(curated)*
+- **#15525**: Merge redirect misses executing commands with the daemon installed; run the full workflow-guard suite in native CI *(curated)*
+- **#15527**: Contained OpenCode launch of the bundled Z.ai profiles cannot be routed through the credential egress proxy (prerequisite for #8698) *(curated)*
+- **#15528**: Unblock sweep lifted #8698's blocker-less park twice (2026-11-19 and 2026-11-26), naming closed #8674 as the resolved dependency *(curated)*
+- **#15537**: Zero-write review-conflict e2e tests pass when the open-PR listing fails *(curated)*
 
 ## Proposed (Architect / Hermit)
 
@@ -274,7 +302,6 @@ Issues carrying `loom:curated`.
 - **#15212**: Remove superseded parse_queue_ref and members_for from group_authz.rs *(hermit)* *(held)*
 - **#15364**: Remove unused Autoprefixer from the desktop quickstart *(hermit)* *(held)*
 - **#15410**: Remove the senderless SQLite issue_claims registry and its nine IPC requests (~1,200 LOC) *(hermit)* *(held)*
-- **#15510**: Reuse the review-conflict fake gh in approved-PR tests *(hermit)*
 
 ## Epics
 
@@ -290,15 +317,15 @@ Issues carrying `loom:curated`.
 
 | Bucket | Count |
 |------|-------|
-| Operator merge-risk holds | 19 |
+| Operator merge-risk holds | 23 |
 | Very important | 0 |
 | Important | 8 |
-| Ready (`loom:issue`, net of holds/building/open-linked-PRs) | 0 |
-| In Progress (`loom:building`) | 30 |
-| Held, no other bucket | 76 |
-| PRs awaiting review | 4 |
-| Approved PRs awaiting merge | 27 |
-| Curated | 116 |
-| Architect / Hermit proposals | 6 |
+| Ready (`loom:issue`, net of holds/building/open-linked-PRs) | 3 |
+| In Progress (`loom:building`) | 39 |
+| Held, no other bucket | 77 |
+| PRs awaiting review | 10 |
+| Approved PRs awaiting merge | 30 |
+| Curated | 120 |
+| Architect / Hermit proposals | 5 |
 | Active epics | 7 |
 <!-- guide:plan-body:end -->
