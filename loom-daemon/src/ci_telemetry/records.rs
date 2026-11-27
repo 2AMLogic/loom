@@ -165,7 +165,14 @@ impl RunJson {
 
     #[must_use]
     pub fn workflow(&self) -> String {
-        self.name.clone().unwrap_or_else(|| "unnamed".to_string())
+        self.workflow_name().to_string()
+    }
+
+    /// [`Self::workflow`] borrowed from the row instead of cloned, for a
+    /// caller that holds the `RunJson` for as long as it needs the name.
+    #[must_use]
+    pub fn workflow_name(&self) -> &str {
+        self.name.as_deref().unwrap_or("unnamed")
     }
 
     /// The join-key PR/issue number for this run, when derivable (Issue
@@ -914,8 +921,86 @@ pub fn job_envelopes_with_reason(
         envelope(host_id, TelemetryRecord::CiDuration(duration_record), None),
         envelope(host_id, TelemetryRecord::Span(span), Some(ctx.clone())),
     ];
-    envelopes.extend(step_envelopes(repo, run, job, &shard, &ctx, host_id));
+    let target = JobSpanTarget {
+        repo: &repo.full_name,
+        visibility: repo.visibility(),
+        run_id: run.id,
+        attempt: job.run_attempt,
+        job_id: job.id,
+        job: &job.name,
+        workflow: run.workflow_name(),
+        shard,
+        job_context: ctx,
+        job_started: started_at,
+        job_ended: completed_at,
+    };
+    envelopes.extend(step_envelopes(&target, &job.steps, host_id));
     envelopes
+}
+
+/// Everything a job-child span — a step, a suite or a test — needs about its
+/// job, resolved once by the caller.
+///
+/// One type for all three families (#15654): they hang off the same job span
+/// and repeat the same job and shard attributes, so a change to either is made
+/// here and in [`JobSpanTarget::child_span_envelope`], not once per family.
+#[derive(Debug, Clone)]
+pub struct JobSpanTarget<'a> {
+    pub repo: &'a str,
+    pub visibility: RepoVisibility,
+    pub run_id: u64,
+    pub attempt: u32,
+    pub job_id: u64,
+    pub job: &'a str,
+    pub workflow: &'a str,
+    pub shard: ShardInfo,
+    pub job_context: TraceContext,
+    pub job_started: DateTime<Utc>,
+    pub job_ended: DateTime<Utc>,
+}
+
+impl JobSpanTarget<'_> {
+    /// One job-child span as its envelope: a child of the job's span, in
+    /// `ctx` (the calling family's own derived context), carrying the job and
+    /// shard attributes every child repeats around `attributes` — the
+    /// family's own — and stamped with the recorder's provenance.
+    pub(super) fn child_span_envelope(
+        &self,
+        name: SpanName,
+        ctx: TraceContext,
+        window: (DateTime<Utc>, DateTime<Utc>),
+        status: SpanStatus,
+        attributes: Vec<(&str, Option<String>)>,
+        host_id: &str,
+    ) -> TelemetryEnvelope {
+        let (started_at, ended_at) = window;
+        let mut pairs = vec![
+            ("loom.repo", Some(self.repo.to_string())),
+            ("loom.repo.visibility", Some(self.visibility.as_str().to_string())),
+            ("loom.ci.run_id", Some(self.run_id.to_string())),
+            ("loom.ci.job_id", Some(self.job_id.to_string())),
+            ("loom.ci.workflow", Some(self.workflow.to_string())),
+            ("loom.ci.job", Some(self.job.to_string())),
+        ];
+        pairs.extend(attributes);
+        pairs.extend([
+            ("loom.ci.shard.index", self.shard.index.map(|i| i.to_string())),
+            ("loom.ci.shard.total", self.shard.total.map(|t| t.to_string())),
+            ("loom.ci.shard.kind", Some(self.shard.kind.as_str().to_string())),
+        ]);
+        let span = SpanRecord {
+            context: ctx.clone(),
+            parent_span_id: Some(self.job_context.span_id.clone()),
+            name,
+            started_at,
+            ended_at,
+            status,
+            attributes: span_attributes(pairs),
+            events: Vec::new(),
+            links: Vec::new(),
+        };
+        envelope(host_id, TelemetryRecord::Span(span), Some(ctx))
+    }
 }
 
 /// The `loom.ci.step` spans of one job, each a child of that job's span
@@ -936,44 +1021,34 @@ pub fn job_envelopes_with_reason(
 /// the 30-day metric series count by the step count of every job.
 #[must_use]
 fn step_envelopes(
-    repo: &RepoJson,
-    run: &RunJson,
-    job: &JobJson,
-    shard: &ShardInfo,
-    job_ctx: &TraceContext,
+    target: &JobSpanTarget<'_>,
+    steps: &[StepJson],
     host_id: &str,
 ) -> Vec<TelemetryEnvelope> {
-    job.steps
+    steps
         .iter()
         .filter_map(|step| Some((step, step.window()?)))
         .take(MAX_STEP_SPANS_PER_JOB)
-        .map(|(step, (started_at, ended_at))| {
-            let ctx = step_context(&repo.full_name, run.id, job.run_attempt, job.id, step.number);
-            let span = SpanRecord {
-                context: ctx.clone(),
-                parent_span_id: Some(job_ctx.span_id.clone()),
-                name: SpanName::CiStep,
-                started_at,
-                ended_at,
-                status: span_status(step.conclusion.as_deref()),
-                attributes: span_attributes(vec![
-                    ("loom.repo", Some(repo.full_name.clone())),
-                    ("loom.repo.visibility", Some(repo.visibility().as_str().to_string())),
-                    ("loom.ci.run_id", Some(run.id.to_string())),
-                    ("loom.ci.job_id", Some(job.id.to_string())),
-                    ("loom.ci.workflow", Some(run.workflow())),
-                    ("loom.ci.job", Some(job.name.clone())),
+        .map(|(step, window)| {
+            let ctx = step_context(
+                target.repo,
+                target.run_id,
+                target.attempt,
+                target.job_id,
+                step.number,
+            );
+            target.child_span_envelope(
+                SpanName::CiStep,
+                ctx,
+                window,
+                span_status(step.conclusion.as_deref()),
+                vec![
                     ("loom.ci.step", Some(step_name(&step.name))),
                     ("loom.ci.step_number", Some(step.number.to_string())),
                     ("loom.ci.conclusion", step.conclusion.clone()),
-                    ("loom.ci.shard.index", shard.index.map(|i| i.to_string())),
-                    ("loom.ci.shard.total", shard.total.map(|t| t.to_string())),
-                    ("loom.ci.shard.kind", Some(shard.kind.as_str().to_string())),
-                ]),
-                events: Vec::new(),
-                links: Vec::new(),
-            };
-            envelope(host_id, TelemetryRecord::Span(span), Some(ctx))
+                ],
+                host_id,
+            )
         })
         .collect()
 }
