@@ -90,8 +90,18 @@ fn pi_event(kind: &str, role: &str) -> String {
 }
 
 // ============================================================================
-// accumulate_usage
+// line_usage — folded across a captured event stream
 // ============================================================================
+
+/// Sum [`line_usage`] over every line of a captured native event stream: any
+/// line that is not a usage-bearing JSON event contributes nothing.
+fn stream_usage(text: &str) -> TapUsage {
+    let mut total = TapUsage::default();
+    for usage in text.lines().filter_map(line_usage) {
+        total.absorb(&usage);
+    }
+    total
+}
 
 /// OpenCode's shape: usage on `step_finish`, counters under `tokens`, cache
 /// counters nested one level deeper, cost on the event itself.
@@ -102,7 +112,7 @@ fn opencode_step_finish_counters_are_summed_across_steps() {
         {\"type\":\"step_finish\",\"tokens\":{\"input\":100,\"output\":20,\"reasoning\":5,\"cache\":{\"read\":900,\"write\":10}},\"cost\":0.01}\n\
         {\"type\":\"step_finish\",\"tokens\":{\"input\":50,\"output\":7,\"reasoning\":1,\"cache\":{\"read\":100,\"write\":2}},\"cost\":0.02}\n\
     ";
-    let usage = accumulate_usage(stream);
+    let usage = stream_usage(stream);
     assert_eq!(usage.usage_events, 2);
     assert_eq!(usage.input, Some(150));
     assert_eq!(usage.output, Some(27));
@@ -130,7 +140,7 @@ fn pi_message_end_usage_is_counted_once_and_repeat_events_are_ignored() {
         pi_event("agent_end", "assistant"),
         pi_event("entry_appended", "assistant"),
     );
-    let usage = accumulate_usage(&stream);
+    let usage = stream_usage(&stream);
     assert_eq!(usage.usage_events, 1, "neither agent_end nor entry_appended may be folded in");
     assert_eq!(usage.input, Some(1000));
     assert_eq!(usage.output, Some(200));
@@ -159,7 +169,7 @@ fn pi_message_end_usage_is_counted_once_and_repeat_events_are_ignored() {
 /// is nothing to guess, and dropping it would be a knowable undercount.
 #[test]
 fn a_tool_results_nested_usage_is_charged_to_the_tap_that_paid_for_it() {
-    let usage = accumulate_usage(&format!("{}\n", pi_event("message_end", "toolResult")));
+    let usage = stream_usage(&format!("{}\n", pi_event("message_end", "toolResult")));
     assert_eq!(usage.usage_events, 1);
     assert_eq!(usage.input, Some(1000));
     assert_eq!(usage.output, Some(200));
@@ -170,16 +180,15 @@ fn a_tool_results_nested_usage_is_charged_to_the_tap_that_paid_for_it() {
 /// are read — and an object with no rollup total is unmeasured, never zero.
 #[test]
 fn a_cost_object_is_read_from_its_rollup_total_and_a_bare_number_still_works() {
-    let nested = accumulate_usage(
+    let nested = stream_usage(
         "{\"type\":\"message_end\",\"message\":{\"usage\":{\"input\":1,\"cost\":{\"input\":0.1,\"total\":0.4}}}}\n",
     );
     assert!((nested.cost_estimate.unwrap() - 0.4).abs() < 1e-9);
 
-    let flat =
-        accumulate_usage("{\"type\":\"step_finish\",\"tokens\":{\"input\":1},\"cost\":0.02}\n");
+    let flat = stream_usage("{\"type\":\"step_finish\",\"tokens\":{\"input\":1},\"cost\":0.02}\n");
     assert!((flat.cost_estimate.unwrap() - 0.02).abs() < 1e-9);
 
-    let no_total = accumulate_usage(
+    let no_total = stream_usage(
         "{\"type\":\"message_end\",\"message\":{\"usage\":{\"input\":1,\"cost\":{\"input\":0.1}}}}\n",
     );
     assert_eq!(no_total.cost_estimate, None);
@@ -191,7 +200,7 @@ fn a_cost_object_is_read_from_its_rollup_total_and_a_bare_number_still_works() {
 /// search rather than replacing it.
 #[test]
 fn a_flat_message_end_usage_object_is_still_read() {
-    let usage = accumulate_usage(
+    let usage = stream_usage(
         "{\"type\":\"message_end\",\"usage\":{\"input_tokens\":50,\"output_tokens\":7,\"reasoning_tokens\":3}}\n",
     );
     assert_eq!(usage.usage_events, 1);
@@ -209,7 +218,7 @@ fn a_flat_message_end_usage_object_is_still_read() {
 /// module claim the launch produced no output.
 #[test]
 fn a_missing_counter_stays_unmeasured_rather_than_becoming_zero() {
-    let usage = accumulate_usage("{\"type\":\"step_finish\",\"tokens\":{\"input\":10}}\n");
+    let usage = stream_usage("{\"type\":\"step_finish\",\"tokens\":{\"input\":10}}\n");
     assert_eq!(usage.input, Some(10));
     assert_eq!(usage.output, None);
     assert_eq!(usage.reasoning, None);
@@ -229,7 +238,7 @@ fn a_stream_with_no_usage_bearing_events_is_unmeasured_not_zero() {
         // A step_finish with no counters at all is not a reading of zero.
         "{\"type\":\"step_finish\"}\n{\"type\":\"tool_use\",\"tool\":\"loom_read\"}\n",
     ] {
-        let usage = accumulate_usage(stream);
+        let usage = stream_usage(stream);
         assert_eq!(usage, TapUsage::default(), "{stream:?}");
         assert!(!usage.is_measured(), "{stream:?}");
         assert_eq!(usage.total_tokens(), None, "{stream:?}");
@@ -242,7 +251,7 @@ fn alternate_field_and_event_spellings_are_recognized() {
         {\"type\":\"step-finish\",\"usage\":{\"promptTokens\":3,\"completionTokens\":4,\"cacheReadInputTokens\":5,\"cacheCreationInputTokens\":6,\"reasoningTokens\":7,\"costUsd\":0.5}}\n\
         {\"type\":\"message-end\",\"input\":1,\"output\":2}\n\
     ";
-    let usage = accumulate_usage(stream);
+    let usage = stream_usage(stream);
     assert_eq!(usage.usage_events, 2);
     assert_eq!(usage.input, Some(4));
     assert_eq!(usage.output, Some(6));
@@ -272,8 +281,14 @@ fn absorbing_an_unmeasured_row_never_turns_an_unmeasured_counter_into_zero() {
 }
 
 // ============================================================================
-// account_launch_log
+// account_region_by_tap — single-launch, anchoring and slicing
 // ============================================================================
+
+/// The row for the launch a region's outcome belongs to (its last record), with
+/// that tap's whole share of the region.
+fn outcome_row(contents: &str, anchor: &str) -> Option<TapAccounting> {
+    account_region_by_tap(contents, anchor).outcome().cloned()
+}
 
 #[test]
 fn a_logs_usage_is_attributed_to_the_tap_its_own_launch_record_names() {
@@ -285,7 +300,7 @@ fn a_logs_usage_is_attributed_to_the_tap_its_own_launch_record_names() {
             "{\"type\":\"step_finish\",\"tokens\":{\"input\":100,\"output\":20},\"cost\":0.25}"
         ),
     );
-    let row = account_launch_log(&log, "sweep_id=s1").unwrap();
+    let row = outcome_row(&log, "sweep_id=s1").unwrap();
     assert_eq!(row.key(), "opencode:zai-metered@api_keys:zai");
     assert_eq!(row.usage.input, Some(100));
     assert!((row.usage.cost_estimate.unwrap() - 0.25).abs() < 1e-9);
@@ -297,7 +312,7 @@ fn a_logs_usage_is_attributed_to_the_tap_its_own_launch_record_names() {
 #[test]
 fn an_attributable_launch_with_an_unreadable_stream_is_still_a_row() {
     let log = log_with("sweep_id=s1", &launch_line("pi", "env", None));
-    let row = account_launch_log(&log, "sweep_id=s1").unwrap();
+    let row = outcome_row(&log, "sweep_id=s1").unwrap();
     assert_eq!(row.key(), "pi@env");
     assert!(!row.usage.is_measured());
 }
@@ -317,7 +332,7 @@ fn a_real_pi_launchs_region_is_measured_and_attributed_to_the_pi_tap() {
             pi_event("agent_end", "assistant"),
         ),
     );
-    let row = account_launch_log(&log, "sweep_id=s1").unwrap();
+    let row = outcome_row(&log, "sweep_id=s1").unwrap();
     assert_eq!(row.key(), "pi@env");
     assert!(row.usage.is_measured(), "a real Pi launch is not unmeasured");
     assert_eq!(row.usage.usage_events, 1);
@@ -332,9 +347,9 @@ fn a_real_pi_launchs_region_is_measured_and_attributed_to_the_pi_tap() {
 #[test]
 fn a_log_with_no_launch_record_or_a_missing_anchor_yields_nothing() {
     let log = log_with("sweep_id=s1", "{\"type\":\"step_finish\",\"tokens\":{\"input\":9}}");
-    assert!(account_launch_log(&log, "sweep_id=s1").is_none());
+    assert!(outcome_row(&log, "sweep_id=s1").is_none());
     let log = log_with("sweep_id=other", &launch_line("pi", "env", None));
-    assert!(account_launch_log(&log, "sweep_id=s1").is_none());
+    assert!(outcome_row(&log, "sweep_id=s1").is_none());
 }
 
 /// A per-issue log is reused across dispatches, so a previous run's usage must
@@ -361,84 +376,9 @@ fn a_previous_dispatchs_usage_in_a_reused_log_is_not_attributed_to_this_one() {
             )
         ),
     );
-    let row = account_launch_log(&log, "sweep_id=new").unwrap();
+    let row = outcome_row(&log, "sweep_id=new").unwrap();
     assert_eq!(row.usage.input, Some(7));
     assert_eq!(row.usage.usage_events, 1);
-}
-
-/// Issue #8633: a region may hold more than one launch record (a re-dispatch
-/// inside one sweep, a containment re-exec, a phase pinned to its own tap by
-/// `rolePreference`/`LOOM_RUNTIME_<ROLE>`), and the last record's tap must not
-/// be handed the whole region's usage.
-///
-/// Here the metered launch is the **earlier** one, which is why folding a
-/// region onto its last tap is not safely conservative: the untouched
-/// behaviour charged 9007 input tokens of metered spend to a flat-rate
-/// subscription tap.
-#[test]
-fn a_multi_record_regions_usage_is_sliced_per_record_not_folded_onto_the_last() {
-    let log = log_with(
-        "sweep_id=s1",
-        &format!(
-            "{}\n{}\n{}\n{}",
-            launch_line("opencode:zai-metered", "pool", Some("zai")),
-            "{\"type\":\"step_finish\",\"tokens\":{\"input\":9000,\"output\":800},\"cost\":0.25}",
-            launch_line("codex", "env", None),
-            "{\"type\":\"message_end\",\"usage\":{\"input_tokens\":7}}"
-        ),
-    );
-
-    // The one-row contract still names the LAST launch — but with only its own
-    // usage.
-    let row = account_launch_log(&log, "sweep_id=s1").unwrap();
-    assert_eq!(row.key(), "codex@env");
-    assert_eq!(
-        row.usage.input,
-        Some(7),
-        "the earlier launch's 9000 input tokens belong to the metered tap, not to codex"
-    );
-    assert_eq!(row.usage.output, None);
-    assert_eq!(row.usage.cost_estimate, None, "a metered cost estimate must not follow the tap");
-    assert_eq!(row.usage.usage_events, 1);
-
-    // The lossless read: both launches, each with its own block's usage.
-    let rows = account_launch_logs(&log, "sweep_id=s1");
-    assert_eq!(
-        rows.iter().map(TapAccounting::key).collect::<Vec<_>>(),
-        vec![
-            "opencode:zai-metered@api_keys:zai".to_string(),
-            "codex@env".to_string()
-        ],
-        "rows come back in log order"
-    );
-    assert_eq!(rows[0].usage.input, Some(9000));
-    assert_eq!(rows[0].usage.output, Some(800));
-    assert!((rows[0].usage.cost_estimate.unwrap() - 0.25).abs() < 1e-9);
-
-    let folded = fold_by_tap(&rows);
-    assert_eq!(folded["opencode:zai-metered@api_keys:zai"].input, Some(9000));
-    assert_eq!(folded["codex@env"].input, Some(7));
-}
-
-/// A single-record region — the overwhelmingly common shape — is unchanged by
-/// the slicing: one row, all of the region's usage, and `account_launch_logs`
-/// agrees with `account_launch_log`.
-#[test]
-fn a_single_record_region_is_unaffected_by_per_record_slicing() {
-    let log = log_with(
-        "sweep_id=s1",
-        &format!(
-            "{}\n{}\n{}",
-            launch_line("opencode:zai-metered", "pool", Some("zai")),
-            "{\"type\":\"step_finish\",\"tokens\":{\"input\":100,\"output\":20},\"cost\":0.25}",
-            "{\"type\":\"step_finish\",\"tokens\":{\"input\":50}}"
-        ),
-    );
-    let row = account_launch_log(&log, "sweep_id=s1").unwrap();
-    assert_eq!(row.usage.input, Some(150));
-    assert_eq!(row.usage.output, Some(20));
-    assert_eq!(row.usage.usage_events, 2);
-    assert_eq!(account_launch_logs(&log, "sweep_id=s1"), vec![row]);
 }
 
 /// Usage ahead of a region's first launch record had no tap announced yet, so
@@ -454,10 +394,10 @@ fn usage_before_the_first_launch_record_is_charged_to_nobody() {
             "{\"type\":\"message_end\",\"usage\":{\"input_tokens\":7}}"
         ),
     );
-    let row = account_launch_log(&log, "sweep_id=s1").unwrap();
+    let row = outcome_row(&log, "sweep_id=s1").unwrap();
     assert_eq!(row.key(), "pi@env");
     assert_eq!(row.usage.input, Some(7));
-    assert_eq!(account_launch_logs(&log, "sweep_id=s1").len(), 1);
+    assert_eq!(account_region_by_tap(&log, "sweep_id=s1").per_tap.len(), 1);
 }
 
 /// The marker is matched line-anchored, exactly as
@@ -475,37 +415,10 @@ fn a_mid_line_mention_of_the_marker_opens_no_block() {
             "{\"type\":\"message_end\",\"usage\":{\"input_tokens\":7}}"
         ),
     );
-    let rows = account_launch_logs(&log, "sweep_id=s1");
+    let rows = account_region_by_tap(&log, "sweep_id=s1").per_tap;
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].key(), "pi@env");
     assert_eq!(rows[0].usage.input, Some(7));
-}
-
-/// An unattributable record (no runtime to key a tap on) contributes no row,
-/// and its usage is dropped rather than charged to a neighbouring tap.
-#[test]
-fn an_unattributable_record_absorbs_its_own_usage_and_yields_no_row() {
-    let log = log_with(
-        "sweep_id=s1",
-        &format!(
-            "{}\n{}\n{}\n{}",
-            launch_line("pi", "env", None),
-            "{\"type\":\"message_end\",\"usage\":{\"input_tokens\":7}}",
-            r#"# LOOM_LAUNCH {"schema":1,"credentialSource":"env"}"#,
-            "{\"type\":\"step_finish\",\"tokens\":{\"input\":9000}}"
-        ),
-    );
-    // The last record is unattributable, so the one-row read declines — the
-    // same "no opinion" it has always returned for that record.
-    assert!(account_launch_log(&log, "sweep_id=s1").is_none());
-    let rows = account_launch_logs(&log, "sweep_id=s1");
-    assert_eq!(rows.len(), 1);
-    assert_eq!(rows[0].key(), "pi@env");
-    assert_eq!(
-        rows[0].usage.input,
-        Some(7),
-        "the unattributable record's 9000 tokens must not land on the pi launch"
-    );
 }
 
 // ============================================================================
@@ -576,8 +489,7 @@ fn a_multi_tap_region_reports_every_taps_share_with_the_outcomes_tap_first() {
     );
     let region = account_region_by_tap(&log, "sweep_id=s1");
 
-    // The outcome's own row is still the LAST record — unchanged from
-    // `account_launch_log`, and with only its own tap's usage.
+    // The outcome's own row is the LAST record, with only its own tap's usage.
     let outcome = region.outcome().expect("the last record is attributable");
     assert_eq!(outcome.key(), "codex@env");
     assert_eq!(outcome.usage.input, Some(7));
@@ -647,17 +559,13 @@ fn a_single_record_region_has_an_outcome_row_and_an_empty_breakdown() {
         ),
     );
     let region = account_region_by_tap(&log, "sweep_id=s1");
-    assert_eq!(
-        region.outcome().map(TapAccounting::key),
-        account_launch_log(&log, "sweep_id=s1").map(|row| row.key()),
-        "the one-row contract is unchanged for a single-record region"
-    );
+    assert_eq!(region.outcome().map(TapAccounting::key), Some("pi@env".to_string()));
     assert_eq!(region.outcome().unwrap().usage.input, Some(7));
     assert!(region.breakdown().is_empty());
 }
 
 /// An unattributable **last** record has no tap to name, so the outcome row
-/// declines exactly as `account_launch_log` does — an earlier launch is never
+/// declines — an earlier launch is never
 /// promoted into "which tap did this sweep run on". Its measured usage is not
 /// lost either: the breakdown carries it, which is the whole point of #8659.
 #[test]
@@ -673,7 +581,6 @@ fn an_unattributable_last_record_declines_the_outcome_row_but_keeps_the_breakdow
         ),
     );
     let region = account_region_by_tap(&log, "sweep_id=s1");
-    assert!(account_launch_log(&log, "sweep_id=s1").is_none());
     assert!(
         region.outcome().is_none(),
         "no attributable last record ⇒ no opinion about the outcome's tap"
@@ -772,11 +679,11 @@ fn a_mixed_sweep_charges_each_phase_to_the_tap_that_actually_ran_it() {
     mixed::assert_glm_total(&totals[GLM_KEY]);
     assert_eq!(totals[CODEX_KEY].input, Some(3000));
 
-    // The independent oracle: fold every region's per-record slices directly.
-    let mut every_launch = account_launch_logs(&parent, &format!("sweep_id={SWEEP}"));
+    // The independent oracle: fold every region's per-tap rows directly.
+    let mut every_launch = account_region_by_tap(&parent, &format!("sweep_id={SWEEP}")).per_tap;
     let anchor = crate::launch_record::phase_log_anchor(SWEEP).unwrap();
-    every_launch.extend(account_launch_logs(&builder, &anchor));
-    every_launch.extend(account_launch_logs(&doctor, &anchor));
+    every_launch.extend(account_region_by_tap(&builder, &anchor).per_tap);
+    every_launch.extend(account_region_by_tap(&doctor, &anchor).per_tap);
     assert_eq!(totals, fold_by_tap(&every_launch));
 }
 
@@ -1023,10 +930,6 @@ fn a_quoted_phase_log_header_does_not_move_the_parents_anchor() {
     assert_eq!(outcome.key(), CODEX_KEY);
     assert_eq!(outcome.usage.input, Some(3000));
     assert_eq!(outcome.usage.usage_events, 2);
-    assert_eq!(
-        account_launch_logs(&with_header, &anchor),
-        account_launch_logs(&without_header, &anchor)
-    );
 
     // Joining phase logs leaves the parent's rows untouched.
     let builder = mixed::builder_log(SWEEP);
