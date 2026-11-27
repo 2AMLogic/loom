@@ -9,6 +9,9 @@ struct FakeRunner {
     busy: Mutex<bool>,
     /// `(container, image, claude_home, workspace)` per create.
     creates: Mutex<Vec<(String, String, PathBuf, PathBuf)>>,
+    extra_mounts: Mutex<Vec<Vec<ExtraMount>>>,
+    probe_output: Mutex<Option<String>>,
+    probed_images: Mutex<Vec<String>>,
     starts: Mutex<Vec<String>>,
     stops: Mutex<Vec<String>>,
 }
@@ -30,7 +33,16 @@ impl FakeRunner {
     }
 }
 
-impl session_image::BundleProbe for FakeRunner {}
+impl session_image::BundleProbe for FakeRunner {
+    fn run_image_script(&self, image: &str, _script: &str) -> Result<String> {
+        self.probed_images.lock().unwrap().push(image.to_string());
+        self.probe_output
+            .lock()
+            .unwrap()
+            .clone()
+            .ok_or_else(|| anyhow!("this container runner cannot probe images"))
+    }
+}
 
 impl ContainerRunner for FakeRunner {
     fn inspect(&self, container: &str) -> Result<Option<ContainerState>> {
@@ -54,8 +66,12 @@ impl ContainerRunner for FakeRunner {
         claude_home: &Path,
         workspace: &Path,
         _daemon_root: &Path,
-        _extra_mounts: &[ExtraMount],
+        extra_mounts: &[ExtraMount],
     ) -> Result<()> {
+        self.extra_mounts
+            .lock()
+            .unwrap()
+            .push(extra_mounts.to_vec());
         self.creates.lock().unwrap().push((
             container.into(),
             image.into(),
@@ -71,7 +87,7 @@ impl ContainerRunner for FakeRunner {
                 started_at: None,
                 image: Some(image.to_string()),
                 workspace: Some(workspace.to_path_buf()),
-                extra_mounts: Vec::new(),
+                extra_mounts: extra_mounts.to_vec(),
             },
         );
         Ok(())
@@ -220,6 +236,21 @@ fn two_seats_get_two_containers_with_disjoint_homes() {
 }
 
 #[test]
+fn list_reports_every_pool_account_and_which_are_registered_seats() {
+    let (workspace, root) = fixture(&["alice", "bob"]);
+    let lifecycle = lifecycle(workspace.path(), root.path(), None);
+    lifecycle.start("alice", None).unwrap();
+    let listed = lifecycle.list().unwrap();
+    let by_name = |name: &str| listed.iter().find(|seat| seat.name == name).unwrap();
+    assert_eq!(listed.len(), 2);
+    assert!(by_name("alice").seat_registered && by_name("alice").running);
+    assert!(by_name("alice").image.is_some());
+    assert!(!by_name("bob").seat_registered && by_name("bob").container_id.is_none());
+    // Listing is read-only: it must not have created or started anything.
+    assert_eq!(lifecycle.runner.creates.lock().unwrap().len(), 1);
+}
+
+#[test]
 fn start_rejects_an_account_that_is_not_in_the_pool() {
     let (workspace, root) = fixture(&["alice"]);
     let lifecycle = lifecycle(workspace.path(), root.path(), None);
@@ -348,4 +379,224 @@ fn a_mount_over_the_effective_legacy_pool_is_refused() {
     assert!(err.to_string().contains("token pool"), "{err}");
     let inner = ws.join(".loom");
     assert!(check_mount_sources(&home, ws, [inner.as_path()].into_iter()).is_err());
+}
+
+#[test]
+fn claude_seat_run_args_preserve_exact_order_and_extra_mounts() {
+    let without_extra = claude_seat_run_args(
+        "loom-claude-session-alice",
+        "img:1",
+        Path::new("/seats/alice/home"),
+        Path::new("/ws"),
+        &[PathBuf::from("/ws/repo"), PathBuf::from("/ws/other")],
+        &[PathBuf::from("/ws/repo/.loom/gh-config")],
+        &[],
+    );
+    assert_eq!(
+        without_extra,
+        vec![
+            "run",
+            "-d",
+            "--name",
+            "loom-claude-session-alice",
+            "--restart",
+            "unless-stopped",
+            "--cap-drop",
+            "ALL",
+            "--security-opt",
+            "no-new-privileges",
+            "-v",
+            "/seats/alice/home:/home/loom/.claude",
+            "-e",
+            "CLAUDE_CONFIG_DIR=/home/loom/.claude",
+            "-v",
+            "/ws/repo:/ws/repo",
+            "-v",
+            "/ws/other:/ws/other",
+            "-v",
+            "/ws/repo/.loom/gh-config:/ws/repo/.loom/gh-config:ro",
+            "--label",
+            "loom.workspace=/ws",
+            "--label",
+            "loom.session-posture=container-boundary-v1",
+            "--label",
+            "loom.session-runtime=claude",
+            "--label",
+            "loom.containment=claude-session",
+            "img:1",
+        ]
+    );
+
+    let extra = vec![
+        ExtraMount {
+            host: PathBuf::from("/opt/pdk"),
+            container: PathBuf::from("/opt/pdk"),
+        },
+        ExtraMount {
+            host: PathBuf::from("/data/models"),
+            container: PathBuf::from("/srv/models"),
+        },
+    ];
+    let with_extra = claude_seat_run_args(
+        "loom-claude-session-alice",
+        "img:1",
+        Path::new("/seats/alice/home"),
+        Path::new("/ws"),
+        &[PathBuf::from("/ws/repo")],
+        &[PathBuf::from("/ws/repo/.loom/gh-config")],
+        &extra,
+    );
+    let expected_extra_label =
+        format!("loom.extra-mounts={}", session_image::extra_mounts_label_json(&extra));
+    assert_eq!(
+        with_extra,
+        vec![
+            "run",
+            "-d",
+            "--name",
+            "loom-claude-session-alice",
+            "--restart",
+            "unless-stopped",
+            "--cap-drop",
+            "ALL",
+            "--security-opt",
+            "no-new-privileges",
+            "-v",
+            "/seats/alice/home:/home/loom/.claude",
+            "-e",
+            "CLAUDE_CONFIG_DIR=/home/loom/.claude",
+            "-v",
+            "/ws/repo:/ws/repo",
+            "-v",
+            "/ws/repo/.loom/gh-config:/ws/repo/.loom/gh-config:ro",
+            "--mount",
+            "type=bind,src=/opt/pdk,dst=/opt/pdk,readonly",
+            "--mount",
+            "type=bind,src=/data/models,dst=/srv/models,readonly",
+            "--label",
+            "loom.workspace=/ws",
+            "--label",
+            "loom.session-posture=container-boundary-v1",
+            "--label",
+            "loom.session-runtime=claude",
+            "--label",
+            "loom.containment=claude-session",
+            "--label",
+            expected_extra_label.as_str(),
+            "img:1",
+        ]
+    );
+}
+
+#[test]
+#[serial_test::serial]
+fn docker_create_seat_checks_mount_sources_before_launching_docker() {
+    let (workspace_with_pool, seats) = fixture(&["alpha"]);
+    std::fs::create_dir_all(workspace_with_pool.path().join(".git")).unwrap();
+    let home = home_dir(seats.path(), "alpha");
+    std::fs::create_dir_all(&home).unwrap();
+
+    // Workspace root overlapping the populated legacy pool is refused before
+    // `docker` is resolved or executed.
+    let err = docker_create_seat(
+        "loom-claude-session-alpha",
+        "img:1",
+        &home,
+        workspace_with_pool.path(),
+        workspace_with_pool.path(),
+        &[],
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(err.contains("token pool"), "{err}");
+
+    // Resolved credential directory overlapping seat state is also refused
+    // before `docker` is resolved or executed.
+    let clean_repo = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(clean_repo.path().join(".git")).unwrap();
+    let daemon_in_seats = seats.path().join("daemon");
+    std::fs::create_dir_all(daemon_in_seats.join(".loom/gh-config")).unwrap();
+    let err = docker_create_seat(
+        "loom-claude-session-alpha",
+        "img:1",
+        &home,
+        clean_repo.path(),
+        &daemon_in_seats,
+        &[],
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(err.contains("seat state"), "{err}");
+}
+
+#[test]
+fn start_verifies_configured_override_image_before_creating_and_skips_mismatch() {
+    let override_image = format!("ghcr.io/example/session@sha256:{}", "a".repeat(64));
+    let extra = vec![ExtraMount {
+        host: PathBuf::from("/opt/pdk"),
+        container: PathBuf::from("/opt/pdk"),
+    }];
+    let config = SessionImageConfig {
+        image: Some(override_image.clone()),
+        extra_mounts: extra.clone(),
+        object_mirrors: false,
+    };
+
+    // 1. Matching configured override with a failing bundle probe prevents
+    //    container creation and leaves the seat unregistered.
+    let (workspace, root) = fixture(&["alice"]);
+    let failing = ClaudeSeatLifecycle::new(
+        workspace.path(),
+        root.path(),
+        FakeRunner::default(),
+        Some(override_image.clone()),
+    )
+    .with_session_config(Some(config.clone()));
+    let err = failing.start("alice", None).unwrap_err();
+    assert!(err.to_string().contains("configured override image"), "{err:#}");
+    assert_eq!(*failing.runner.probed_images.lock().unwrap(), vec![override_image.clone()]);
+    assert!(failing.runner.creates.lock().unwrap().is_empty());
+    assert!(!is_seat(root.path(), "alice"));
+
+    // 2. Matching configured override with an intact bundle verifies and creates
+    //    with the configured extra mounts.
+    let (workspace, root) = fixture(&["alice"]);
+    let runner = FakeRunner::default();
+    *runner.probe_output.lock().unwrap() =
+        Some(super::super::session_image::tests::intact_probe_output());
+    let verified = ClaudeSeatLifecycle::new(
+        workspace.path(),
+        root.path(),
+        runner,
+        Some(override_image.clone()),
+    )
+    .with_session_config(Some(config.clone()));
+    verified.start("alice", None).unwrap();
+    assert_eq!(*verified.runner.probed_images.lock().unwrap(), vec![override_image]);
+    assert_eq!(verified.runner.creates.lock().unwrap().len(), 1);
+    assert_eq!(*verified.runner.extra_mounts.lock().unwrap(), vec![extra.clone()]);
+
+    // 3. Explicit `--image` differing from the configured override skips the
+    //    bundle check while still carrying `extra_mounts`.
+    let (workspace, root) = fixture(&["alice"]);
+    let explicit = ClaudeSeatLifecycle::new(
+        workspace.path(),
+        root.path(),
+        FakeRunner::default(),
+        Some("img:explicit".into()),
+    )
+    .with_session_config(Some(config));
+    explicit.start("alice", None).unwrap();
+    assert!(explicit.runner.probed_images.lock().unwrap().is_empty());
+    assert_eq!(explicit.runner.creates.lock().unwrap()[0].1, "img:explicit");
+    assert_eq!(*explicit.runner.extra_mounts.lock().unwrap(), vec![extra]);
+
+    // 4. Absent configured image skips the bundle check.
+    let (workspace, root) = fixture(&["alice"]);
+    let unconfigured =
+        ClaudeSeatLifecycle::new(workspace.path(), root.path(), FakeRunner::default(), None)
+            .with_session_config(Some(SessionImageConfig::default()));
+    unconfigured.start("alice", None).unwrap();
+    assert!(unconfigured.runner.probed_images.lock().unwrap().is_empty());
+    assert_eq!(unconfigured.runner.creates.lock().unwrap().len(), 1);
 }

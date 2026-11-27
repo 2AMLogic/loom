@@ -1112,7 +1112,7 @@ merge helpers stay #14463; wrapper cutover stays #14398.
 ### 16.1 Mechanism
 
 Admission is `ForgeAction::is_served` (`cli/forge_read.rs`): the `MergeQueue` arm
-is an exhaustive `match` over `MergeQueueAction` that names every verb, so a
+is an exhaustive `match` over `MergeQueueCmd` that names every verb, so a
 twelfth verb does not compile until its author classifies it. The handler call
 is unchanged: `handle_forge_command` -> `forge_merge_queue_cmd::run` ->
 `forge_merge_queue::handle`. Both binaries therefore share arguments, output
@@ -1146,7 +1146,7 @@ head status), and only the posting paths are vetted.
 ### 16.3 Mode gate, classified by effect
 
 `loom-tools` resolves its `mode` (§10.3) only for a verb that can reach the
-forge. `MergeQueueAction::reaches_forge(&resolved_merge_mode)` mirrors the
+forge. `MergeQueueCmd::reaches_forge(&resolved_merge_mode)` mirrors the
 handler's own short circuits, so the forge-free answers work with `mode` unset:
 
 - an invalid `champion.mergeMode` is answered (exit 2) before anything else;

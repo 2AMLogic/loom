@@ -8,7 +8,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use anyhow::{anyhow, Result};
 
 use super::batch::{
-    closing_refs_query, gather_all, gather_pr_resweep, parse_closing_refs, parse_comments,
+    closing_refs_query, gather_all, gather_pr_resweep, parse_closing_refs, parse_comments_with,
     parse_pr_merge_state, parse_pr_resweep_state, parse_rate_limit, parse_ref_state, ClosingRef,
     Gathered, Options, RefState, StaleBlockedForge, CLOSING_BATCH,
 };
@@ -544,7 +544,8 @@ fn verdicts_match_the_existing_fixtures() {
     fake.rows
         .push(row(183, "Nothing cited.", 1, false, &["loom:blocked"]));
     let bot_page = r#"[{"user":{"login":"loom-fleet-dispatch[bot]","type":"Bot"},"body":"Blocked by #7, per the last pass."}]"#;
-    fake.comments.insert(183, parse_comments(bot_page).unwrap());
+    fake.comments
+        .insert(183, parse_comments_with(bot_page, None).unwrap());
     // Prose-only park on a live blocker (T3i).
     fake.rows
         .push(issue(202, "Blocked by #9 — noted here, never declared."));
@@ -623,7 +624,7 @@ fn rest_bot_logins_are_normalised_to_the_graphql_spelling() {
         {"user":{"login":"a-human","type":"User"},"body":"b"},
         {"user":null,"body":null}
     ]"#;
-    let c = parse_comments(page).unwrap();
+    let c = parse_comments_with(page, None).unwrap();
     let logins: Vec<&str> = c.iter().map(|c| c.author.login.as_str()).collect();
     assert_eq!(logins, vec!["github-actions", "a-human", ""]);
     assert_eq!(c[2].body, "");

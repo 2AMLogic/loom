@@ -754,7 +754,10 @@ async fn bad_mark_at_proxy(record: Record, classification: Classification, reset
     }
     let provider = record.provider.clone();
     let launch_id = record.launch_id.clone();
-    let model_class = record.model_class().map(str::to_string);
+    // #15572: a weekly/monthly exhaustion is the account's, not this launch's
+    // class — mark it account-wide (`None`). Same decision as the log ingest.
+    let model_class = classify::mark_scope_class(classification, &reset_text, record.model_class())
+        .map(str::to_string);
     let outcome = tokio::task::spawn_blocking(move || {
         let provider_root = crate::api_keys_pool::paths::resolve_provider_root(&root, &provider)
             .map_err(|e| e.to_string())?;

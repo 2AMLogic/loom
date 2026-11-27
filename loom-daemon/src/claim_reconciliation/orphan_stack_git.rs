@@ -27,12 +27,25 @@
 //! exactly `<old>` (asked of the remote, never read from a remote-tracking ref)
 //! before anything is rewritten. A sibling that pushed in between makes the
 //! lease fail, and the pass retries on a later tick from the new head.
+//!
+//! # The guarded replay
+//!
+//! [`guarded_replay`] is the whole sequence both stack reconcilers run — the
+//! orphaned-stacked-child pass ([`super::orphan_stack`]) and the merged-parent
+//! one ([`super::merged_stack`]) — for a child and again for each descendant:
+//! fetch the listed head, confirm the remote still has it, refuse a rewritten
+//! parent, replay, ask the #9282 rebase guard, push leased. The callers bring
+//! only what differs between them, the scratch worktree's path and the name
+//! their diagnostics go under, and map [`ReplayOutcome`] onto their own flag
+//! and retry handling. Discovery, retargeting, cascade decisions and forge
+//! comments stay with the callers.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
 
 use crate::cmd_out::{run_command, CmdOutcome};
+use crate::rebase_guard::Verdict as GuardVerdict;
 
 /// The remote every replay fetches from and pushes to, as in
 /// `reconcile-stack.sh`.
@@ -294,6 +307,163 @@ pub fn push_leased(
     }
 }
 
+/// Why the #9282 rebase guard refused a replayed head.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GuardRefusal {
+    /// The replayed head has the base's exact tree although the branch had a
+    /// change of its own (`EMPTIED`).
+    Emptied,
+    /// The replay flattened `merge`, which held a hand-made conflict
+    /// resolution the replayed head does not carry (`RESOLUTION_DISCARDED`).
+    ResolutionDiscarded { merge: String },
+}
+
+impl GuardRefusal {
+    /// The clause each reconciler's flag comment gives for this refusal.
+    #[must_use]
+    pub fn reason(&self) -> String {
+        match self {
+            Self::Emptied => "replaying it would leave no change of its own (the rebase guard \
+                              reported EMPTIED, #9282)"
+                .to_string(),
+            Self::ResolutionDiscarded { merge } => format!(
+                "replaying it would drop the hand resolution in merge {merge} (the rebase \
+                 guard reported RESOLUTION_DISCARDED, #9282)"
+            ),
+        }
+    }
+}
+
+/// Why a guarded replay refused to publish anything.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReplayRefusal {
+    /// `upstream` is not an ancestor of `head`: the parent was rewritten after
+    /// this branch was cut, so `upstream..head` is not "this branch's own
+    /// commits".
+    ParentRewritten,
+    /// The replay stopped on conflicts in these paths.
+    Conflict(Vec<String>),
+    /// The rebase guard refused the replayed head.
+    Guard(GuardRefusal),
+}
+
+/// What one guarded replay produced.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReplayOutcome {
+    /// Published under a lease on `head`; the new head.
+    Pushed(String),
+    /// Nothing was published: the replay was refused before any push, and the
+    /// caller flags it.
+    Refused(ReplayRefusal),
+    /// Nothing was published; worth retrying on a later tick.
+    Transient(String),
+}
+
+/// The inputs of one [`guarded_replay`]: a PR branch's replay, and the two
+/// things that differ between the reconcilers that run it.
+#[derive(Debug, Clone, Copy)]
+pub struct ReplayRequest<'a> {
+    /// The PR whose head branch is replayed: `refs/pull/<pr>/head` is where
+    /// `head` is fetched from, and the number its diagnostics name.
+    pub pr: u32,
+    /// The PR's head branch on the remote.
+    pub branch: &'a str,
+    /// The head the listing reported for `branch`.
+    pub head: &'a str,
+    /// What `upstream..head` is replayed onto.
+    pub onto: &'a str,
+    /// The last commit that is NOT replayed: the parent's head.
+    pub upstream: &'a str,
+    /// The detached scratch worktree the replay runs in, removed afterwards.
+    pub scratch: &'a Path,
+    /// The calling pass, as its other log lines name it.
+    pub pass: &'static str,
+}
+
+/// Replay `upstream..head` of `branch` onto `onto`, check the result with the
+/// #9282 rebase guard, and publish it with a lease on `head`.
+///
+/// Nothing is published unless every step holds. `head` is fetched through
+/// `refs/pull/<pr>/head`, and the remote must still be at exactly `head`
+/// ([`live_tip`]) when the replay starts; a sibling that pushed in between
+/// makes the attempt [`ReplayOutcome::Transient`], retried from the new head
+/// on a later tick. `upstream` must be readable in `repo` (the caller fetched
+/// it) and must be an ancestor of `head` ([`is_ancestor`]), or the replayed
+/// range is not "this branch's own commits" and the attempt is refused. A
+/// replay conflict and a guard refusal ([`GuardVerdict::Emptied`],
+/// [`GuardVerdict::ResolutionDiscarded`]) are refused too. A guard that gives
+/// no answer does not block — `reconcile-stack.sh` pushes unchecked in that
+/// case as well — so it is warned about under `pass`, and the push goes on.
+pub fn guarded_replay(repo: &Path, req: &ReplayRequest<'_>) -> ReplayOutcome {
+    let ReplayRequest {
+        pr,
+        branch,
+        head,
+        onto,
+        upstream,
+        scratch,
+        pass,
+    } = *req;
+    match ensure_pr_head(repo, pr, head) {
+        HeadFetch::Present => {}
+        HeadFetch::FetchFailed(e) => {
+            return ReplayOutcome::Transient(format!("its head {head} could not be fetched: {e}"))
+        }
+        HeadFetch::Missing => {
+            return ReplayOutcome::Transient(format!(
+                "its head {head} is not in refs/pull/{pr}/head"
+            ))
+        }
+    }
+    match live_tip(repo, branch) {
+        Ok(Some(live)) if live == head => {}
+        Ok(Some(live)) => {
+            return ReplayOutcome::Transient(format!(
+                "the remote branch is at {live}, not the listed head {head}"
+            ))
+        }
+        Ok(None) => {
+            return ReplayOutcome::Transient(format!("the remote has no branch '{branch}'"))
+        }
+        Err(e) => return ReplayOutcome::Transient(e),
+    }
+    // `rebase --onto <onto> <upstream>` with a non-ancestor upstream does not
+    // fail: it replays every commit `upstream` cannot reach, which for a
+    // parent rewritten after this branch was cut includes the parent's OLD
+    // commits (reconcile_stack's `Prerequisite::ParentAncestry`). Refuse.
+    match is_ancestor(repo, upstream, head) {
+        Ok(true) => {}
+        Ok(false) => return ReplayOutcome::Refused(ReplayRefusal::ParentRewritten),
+        Err(e) => return ReplayOutcome::Transient(e),
+    }
+    let new_head = match replay(repo, scratch, head, onto, upstream) {
+        Ok(h) => h,
+        Err(ReplayError::Conflict(paths)) => {
+            return ReplayOutcome::Refused(ReplayRefusal::Conflict(paths))
+        }
+        Err(ReplayError::Failed(e)) => return ReplayOutcome::Transient(e),
+    };
+    match crate::rebase_guard::assess(repo, onto, head, &new_head) {
+        GuardVerdict::Clean(_) => {}
+        GuardVerdict::Emptied { .. } => {
+            return ReplayOutcome::Refused(ReplayRefusal::Guard(GuardRefusal::Emptied))
+        }
+        GuardVerdict::ResolutionDiscarded { merge, .. } => {
+            return ReplayOutcome::Refused(ReplayRefusal::Guard(
+                GuardRefusal::ResolutionDiscarded { merge },
+            ))
+        }
+        GuardVerdict::Unanswered(why) => log::warn!(
+            "claim_reconciliation ({pass}): PR #{pr}: rebase guard gave no answer ({why}); \
+             pushing unchecked, as reconcile-stack.sh does (#9282)"
+        ),
+    }
+    match push_leased(repo, branch, &new_head, head) {
+        Ok(()) => ReplayOutcome::Pushed(new_head),
+        Err(e) => ReplayOutcome::Transient(e),
+    }
+}
+
 /// The commits in `upstream..head`, oldest first, as full shas, with a flag
 /// for whether any of them is a merge commit.
 ///
@@ -369,3 +539,7 @@ pub fn fetch_branch(repo: &Path, branch: &str, tip: &str) -> Result<(), String> 
         Err(format!("fetched {refname} but {tip} is not in it"))
     }
 }
+
+#[cfg(test)]
+#[path = "orphan_stack_git_tests.rs"]
+mod tests;

@@ -323,7 +323,7 @@ enum Kind {
 
 /// Record `path` under `kind`, adding its size, and remove it unless `dry_run`.
 fn remove(path: &Path, dry_run: bool, kind: Kind, report: &mut Report) {
-    let bytes = tree_size(path);
+    let bytes = crate::fs_util::tree_size_bytes(path);
     if !dry_run {
         if let Err(error) = fs::remove_dir_all(path) {
             report
@@ -337,24 +337,6 @@ fn remove(path: &Path, dry_run: bool, kind: Kind, report: &mut Report) {
         Kind::Binding => report.bindings.push(path.to_path_buf()),
     }
     report.bytes += bytes;
-}
-
-/// Bytes held by a tree. Best effort — an unreadable entry contributes zero
-/// rather than aborting a pass whose purpose is to free space.
-fn tree_size(path: &Path) -> u64 {
-    let Ok(metadata) = fs::symlink_metadata(path) else {
-        return 0;
-    };
-    if !metadata.is_dir() {
-        return metadata.len();
-    }
-    fs::read_dir(path)
-        .into_iter()
-        .flatten()
-        .flatten()
-        .map(|entry| tree_size(&entry.path()))
-        .sum::<u64>()
-        + metadata.len()
 }
 
 /// Render a report as the one-line summary `clean` and the launch path print.

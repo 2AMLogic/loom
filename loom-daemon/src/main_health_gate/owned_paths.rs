@@ -18,11 +18,13 @@
 /// Loom-owned transient state path prefixes the gate's dirty-tree check
 /// ignores when deciding whether the workspace is safe to sync/reset before a
 /// run (#3950). Mirrors `.loom/scripts/check-main-clean.sh`'s
-/// `LOOM_OWNED_PREFIXES` — kept in sync manually since one lives in bash and
-/// the other in Rust, but both exist to solve the same #3778 problem: Loom's
-/// own runtime bookkeeping showing up as "dirty" and false-positiving a check
-/// that exists to protect *real* operator edits. A prefix ending in `/`
-/// matches a directory subtree; the others match an exact path.
+/// `LOOM_OWNED_PREFIXES` — kept in sync by hand since one lives in bash and
+/// the other in Rust, except for the daemon-written subset that
+/// `DAEMON_RUNTIME_PATTERNS` machine-checks (#15479); both exist to solve the
+/// same #3778 problem: Loom's own runtime bookkeeping showing up as "dirty"
+/// and false-positiving a check that exists to protect *real* operator edits.
+/// A prefix ending in `/` matches a directory subtree; the others match an
+/// exact path.
 pub(super) const LOOM_OWNED_PREFIXES: &[&str] = &[
     ".loom/sweep-checkpoint/",
     ".loom/sweep-run/",
@@ -54,6 +56,36 @@ pub(super) const LOOM_OWNED_PREFIXES: &[&str] = &[
     // to prevent. Safe to ignore here: the gate's remediation is `git reset
     // --hard <remote>` and never `git clean`, so the overlay survives.
     ".loom-local/",
+    // Operator stop requests (#15545): `signal.sh stop` writes
+    // `.loom/signals/stop-<name>` and the daemon only tests its existence
+    // (`check_stop_signals`), so it is operator-written control state, not
+    // daemon-written, and stays out of `DAEMON_RUNTIME_PATTERNS`. In a repo
+    // whose managed .gitignore block predates the `.loom/signals/` rule it is
+    // untracked dirt; the bash mirror's `--quarantine` would stash the stop
+    // request away mid-sweep. The trailing slash matches the directory git
+    // reports as well as any child path; `.loom/signals-old/` is not matched.
+    ".loom/signals/",
+    // Daemon-written token-pool runtime files (#15479): the per-repo health
+    // cache and its sibling lock (#5014), and the ranking the refresh tick
+    // rewrites every cycle (#14584). Written into every workspace now, while
+    // their ignore rules only reach a consumer repo's managed .gitignore block
+    // after a resync — until then each is untracked dirt that would wedge this
+    // gate "dirty" every tick, the `.loom-local/` failure mode above (#8075).
+    // The lock is an empty `mkdir` directory, which `git status` never
+    // reports; it is listed so the three travel together. Machine-checked
+    // against `DAEMON_RUNTIME_PATTERNS` (`init/post_init.rs`) by the parity
+    // test below.
+    ".loom/account-health.json",
+    ".loom/account-health.lock",
+    ".loom/account-ranking.codex",
+    // The other two daemon-written entries of the audit (#15488), both
+    // directories: `.loom/claims/` (`loom-daemon claim` writes
+    // `issue-<N>.lock/claim.json`) and `.loom/metrics/` (`validate-phase`'s
+    // recovery path writes `recovery-events.json`). Same stale-block hazard
+    // as the three above; listed with their trailing `/` so the subtree
+    // match above covers every file either writer produces.
+    ".loom/claims/",
+    ".loom/metrics/",
 ];
 
 /// Common regenerable lockfile basenames (#3950): a package manager can
@@ -85,9 +117,10 @@ pub(super) const INSTALL_METADATA_PATH: &str = ".loom/install-metadata.json";
 /// counterpart lives under `defaults/`. Mirrors the exact surface table
 /// `resync-installed.sh` walks (`defaults/scripts/resync-installed.sh`,
 /// search `widened pure-copy surfaces`) — **not** a uniform prefix rewrite:
-/// `.loom/bin/` and `.claude/commands/loom/` map into
-/// `defaults/.loom/bin/` and `defaults/.claude/commands/loom/`
-/// respectively, while the others map straight into `defaults/<name>/`.
+/// `.loom/bin/`, `.claude/commands/loom/` and `.agents/skills/` map into
+/// `defaults/.loom/bin/`, `defaults/.claude/commands/loom/` and
+/// `defaults/.agents/skills/` respectively, while the others map straight
+/// into `defaults/<name>/`.
 /// Only meaningful in a repo that carries a local `defaults/` tree (the loom
 /// repo itself); a consumer install has no `defaults/` dir so the byte-match
 /// lookup below always misses and classification is unchanged (#4332 is
@@ -105,13 +138,84 @@ pub(super) const INSTALLED_SURFACE_PREFIXES: &[(&str, &str)] = &[
     (".loom/scripts/", "defaults/scripts/"),
     (".loom/roles/", "defaults/roles/"),
     (".loom/docs/", "defaults/docs/"),
+    (".loom/runtimes/", "defaults/runtimes/"),
     (".loom/bin/", "defaults/.loom/bin/"),
     (".claude/commands/loom/", "defaults/.claude/commands/loom/"),
+    (".agents/skills/", "defaults/.agents/skills/"),
+];
+
+/// Single-file surfaces of the same installed↔source mapping (#15554):
+/// files `resync-installed.sh` copies one at a time with `sync_one`, which
+/// no directory prefix can describe. Matched by exact path, so
+/// `.loom/pricing.json.bak` is not covered, and classified by the same
+/// byte-match rule as [`INSTALLED_SURFACE_PREFIXES`].
+///
+/// - `.loom/pricing.json` ← `defaults/pricing.json`: the model rate card
+///   (#8177), which a vendor price change reaches on a resync. It was
+///   missing from this mapping the way it was missing from both shell
+///   classifiers at once (#15519), so a resync that refreshed it left the
+///   opt-in gate skipping every tick as `dirty-tree` (#4332's stall).
+/// - `.claude/README.md`, `.github/CONFIGURATION.md`, `.loom/biome.jsonc`
+///   and `.claude/biome.jsonc` ← their `defaults/` counterparts (#15566):
+///   the remaining `sync_one` copies of the resync surface table, missing
+///   from this mapping the same way the rate card was.
+pub(super) const INSTALLED_SURFACE_FILES: &[(&str, &str)] = &[
+    (".loom/pricing.json", "defaults/pricing.json"),
+    (".claude/README.md", "defaults/.claude/README.md"),
+    (".github/CONFIGURATION.md", "defaults/.github/CONFIGURATION.md"),
+    (".loom/biome.jsonc", "defaults/.loom/biome.jsonc"),
+    (".claude/biome.jsonc", "defaults/.claude/biome.jsonc"),
 ];
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::init::{DAEMON_RUNTIME_PATTERNS, EPHEMERAL_PATTERNS};
+    use std::collections::BTreeSet;
+
+    const CHECK_MAIN_CLEAN: &str = include_str!("../../../defaults/scripts/check-main-clean.sh");
+
+    /// The bare paths in a line of the bash array: entries are quoted there,
+    /// while this table stores them unquoted.
+    fn unquoted(tokens: &str) -> impl Iterator<Item = String> + '_ {
+        tokens
+            .split_whitespace()
+            .map(|t| t.trim_matches(['"', '\'']).to_string())
+    }
+
+    /// The entries of `LOOM_OWNED_PREFIXES=( ... )` in
+    /// `defaults/scripts/check-main-clean.sh`, the bash mirror of this table.
+    fn bash_owned_prefixes() -> BTreeSet<String> {
+        let needle = "\nLOOM_OWNED_PREFIXES=(";
+        let start = CHECK_MAIN_CLEAN
+            .find(needle)
+            .expect("check-main-clean.sh must declare LOOM_OWNED_PREFIXES=( ... )");
+        let mut entries = BTreeSet::new();
+        let mut closed = false;
+        for line in CHECK_MAIN_CLEAN[start + needle.len()..].lines() {
+            // The array's comments cite issues in parentheses, so the closing
+            // `)` is looked for in each line's code only, before any `#`.
+            let code = match line.split_once('#') {
+                Some((code, _)) => code,
+                None => line,
+            };
+            if let Some(idx) = code.find(')') {
+                entries.extend(unquoted(&code[..idx]));
+                closed = true;
+                break;
+            }
+            entries.extend(unquoted(code));
+        }
+        assert!(closed, "LOOM_OWNED_PREFIXES array must be closed with `)`");
+        // Carried by the array since #8075. Without it either the parse lost
+        // the array or that entry was removed, and both are wrong.
+        assert!(
+            entries.contains(".loom-local/"),
+            "check-main-clean.sh's LOOM_OWNED_PREFIXES does not yield .loom-local/: parsed \
+             {entries:?}"
+        );
+        entries
+    }
 
     /// The table's matching rule, as `is_ignorable_dirt_with_readers` applies
     /// it: a trailing `/` matches a subtree, anything else is an exact path.
@@ -169,6 +273,80 @@ mod tests {
             "README.md",
         ] {
             assert!(!loom_owned(p), "{p} must remain non-ignorable");
+        }
+    }
+
+    #[test]
+    fn the_daemon_written_runtime_files_are_loom_owned() {
+        // #15479: the token pool writes these into every workspace, and
+        // neither owned list carried them. In a consumer repo whose managed
+        // .gitignore block predates #14594 the file is untracked dirt that
+        // wedges this gate "dirty" — the `.loom-local/` failure mode of #8075,
+        // repeated. Pinned literally so deleting an entry from
+        // `DAEMON_RUNTIME_PATTERNS` cannot retire the coverage with it.
+        for p in [
+            ".loom/account-health.json",
+            ".loom/account-health.lock",
+            ".loom/account-ranking.codex",
+        ] {
+            assert!(loom_owned(p), "{p} must stay in LOOM_OWNED_PREFIXES (#15479)");
+        }
+    }
+
+    #[test]
+    fn the_daemon_written_runtime_directories_are_loom_owned() {
+        // #15488: the audit of the remaining EPHEMERAL_PATTERNS candidates
+        // found two more daemon-written entries, both directories —
+        // `loom-daemon claim` writes `.loom/claims/issue-<N>.lock/claim.json`
+        // and `validate-phase`'s recovery path writes
+        // `.loom/metrics/recovery-events.json`. Both are listed with a
+        // trailing `/`, so what the lists must get right is the subtree match
+        // on a child path; the entries themselves are pinned by the parity
+        // test below.
+        for p in [
+            ".loom/claims/issue-42.lock/claim.json",
+            ".loom/metrics/recovery-events.json",
+        ] {
+            assert!(loom_owned(p), "{p} must be Loom-owned (#15488)");
+        }
+        // A sibling that merely extends the directory's name is not Loom
+        // state: the trailing `/` ends the prefix, so a stray there stays
+        // visible as contamination.
+        for p in [
+            ".loom/claims-old/issue-42.lock/claim.json",
+            ".loom/metrics-old/recovery-events.json",
+        ] {
+            assert!(!loom_owned(p), "{p} must not match a directory entry by its name prefix");
+        }
+    }
+
+    #[test]
+    fn every_daemon_runtime_pattern_is_in_both_owned_path_lists() {
+        // The parity test behind `DAEMON_RUNTIME_PATTERNS` (#15479): a runtime
+        // path the managed block ignores is still dirt in every consumer repo
+        // until a resync delivers the rule, so both backstops must carry it
+        // from the day it ships — this table for the daemon's dirty-tree gate,
+        // the bash array for `check-main-clean.sh`. A path added to the const
+        // without both lists fails here instead of in a consumer's sweep.
+        let bash = bash_owned_prefixes();
+        for p in DAEMON_RUNTIME_PATTERNS {
+            assert!(
+                EPHEMERAL_PATTERNS.contains(p),
+                "DAEMON_RUNTIME_PATTERNS entry {p:?} is missing from EPHEMERAL_PATTERNS — the \
+                 managed .gitignore block must ignore it too (#15479)"
+            );
+            assert!(
+                LOOM_OWNED_PREFIXES.contains(p),
+                "DAEMON_RUNTIME_PATTERNS entry {p:?} is missing from this table — the daemon's \
+                 dirty-tree gate counts the file as dirt in a consumer repo whose managed \
+                 .gitignore block is stale (#15479)"
+            );
+            assert!(
+                bash.contains(*p),
+                "DAEMON_RUNTIME_PATTERNS entry {p:?} is missing from defaults/scripts/check-main-clean.sh's \
+                 LOOM_OWNED_PREFIXES — the backstop exits 3 on the file and --quarantine stashes \
+                 it (#15479)"
+            );
         }
     }
 }

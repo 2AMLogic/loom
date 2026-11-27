@@ -1,6 +1,6 @@
 //! The Direct backend: today's per-repo listings, behind the discovery
 //! interface unchanged. The item listing is
-//! [`crate::step_dispatch::listing::list_all_open`] and the PRs' facts are the
+//! [`crate::step_dispatch::listing::list_all_open_on`] and the PRs' facts are the
 //! ETag-cached open-PR listing; an idle repo costs free `304`s.
 
 use std::collections::BTreeMap;

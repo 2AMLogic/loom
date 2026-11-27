@@ -8,7 +8,6 @@ use serde::Serialize;
 
 use crate::comment_trust::TrustPolicy;
 use crate::fleet_store::{compiled, roster};
-use crate::forge_cmd::{parse_host, parse_nwo_from_remote_url};
 use crate::forge_listing::list_issues_cached_all_as;
 use crate::forge_pull_listing::list_open_pulls_cached_as;
 use crate::work_finder::step_item::{
@@ -59,11 +58,10 @@ pub(crate) fn run(args: Args) -> Result<()> {
     let results: Vec<_> = targets
         .into_iter()
         .map(|record| {
-            let slug = record.remote.as_deref().and_then(|remote| {
-                (parse_host(remote).as_deref() == Some("github.com"))
-                    .then(|| parse_nwo_from_remote_url(remote))
-                    .flatten()
-            });
+            let slug = record
+                .remote
+                .as_deref()
+                .and_then(crate::release_resolve::host::slug_from_remote_url);
             let Some(slug) = slug else {
                 return RepoResult {
                     repo: record.name.clone(),

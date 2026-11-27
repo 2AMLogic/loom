@@ -10,6 +10,9 @@ struct FakeRunner {
     containers: Mutex<HashMap<String, ContainerState>>,
     busy: Mutex<HashMap<String, bool>>,
     creates: Mutex<Vec<(String, String, PathBuf, PathBuf)>>,
+    extra_mounts: Mutex<Vec<Vec<ExtraMount>>>,
+    probe_output: Mutex<Option<String>>,
+    probed_images: Mutex<Vec<String>>,
     /// The `daemon_root` each `create` received (issue #10103).
     daemon_roots: Mutex<Vec<PathBuf>>,
     stops: Mutex<Vec<String>>,
@@ -75,7 +78,16 @@ impl FakeRunner {
     }
 }
 
-impl session_image::BundleProbe for FakeRunner {}
+impl session_image::BundleProbe for FakeRunner {
+    fn run_image_script(&self, image: &str, _script: &str) -> Result<String> {
+        self.probed_images.lock().unwrap().push(image.to_string());
+        self.probe_output
+            .lock()
+            .unwrap()
+            .clone()
+            .ok_or_else(|| anyhow!("this container runner cannot probe images"))
+    }
+}
 
 impl ContainerRunner for FakeRunner {
     fn inspect(&self, container: &str) -> Result<Option<ContainerState>> {
@@ -89,10 +101,14 @@ impl ContainerRunner for FakeRunner {
         codex_home: &Path,
         workspace: &Path,
         daemon_root: &Path,
-        _extra_mounts: &[ExtraMount],
+        extra_mounts: &[ExtraMount],
     ) -> Result<()> {
         let mut roots = self.daemon_roots.lock().unwrap();
         roots.push(daemon_root.to_path_buf());
+        self.extra_mounts
+            .lock()
+            .unwrap()
+            .push(extra_mounts.to_vec());
         self.creates.lock().unwrap().push((
             container.to_string(),
             image.to_string(),
@@ -1517,6 +1533,142 @@ fn extra_mount_targets_may_not_be_relative_and_may_not_overlap_each_other() {
     .unwrap_err()
     .to_string();
     assert!(err.contains("overlapping"), "{err}");
+}
+
+#[test]
+fn host_session_run_args_preserve_exact_argument_order() {
+    let extra = vec![ExtraMount {
+        host: PathBuf::from("/opt/pdk"),
+        container: PathBuf::from("/opt/pdk"),
+    }];
+    let args = host_session_run_args(
+        "loom-codex-session-alice",
+        "img:tag",
+        Path::new("/profiles/alice"),
+        Path::new("/home/u/GitHub"),
+        &[PathBuf::from("/home/u/GitHub/loom")],
+        &[PathBuf::from("/home/u/loom-daemon/.loom/gh-config")],
+        &extra,
+    );
+    let expected_extra_label = format!(
+        "loom.extra-mounts={}",
+        crate::tokens_pool::session_image::extra_mounts_label_json(&extra)
+    );
+    assert_eq!(
+        args,
+        vec![
+            "run",
+            "-d",
+            "--name",
+            "loom-codex-session-alice",
+            "--restart",
+            "unless-stopped",
+            "--cap-drop",
+            "ALL",
+            "--security-opt",
+            "no-new-privileges",
+            "-v",
+            "/profiles/alice:/home/loom/.codex-profile",
+            "--mount",
+            "type=bind,src=/profiles/alice/hooks.json,dst=/home/loom/.codex-profile/hooks.json,readonly",
+            "--mount",
+            "type=bind,src=/profiles/alice/config.toml,dst=/home/loom/.codex-profile/config.toml,readonly",
+            "--mount",
+            "type=bind,src=/profiles/alice/loom-codex-hooks.json,dst=/home/loom/.codex-profile/loom-codex-hooks.json,readonly",
+            "-v",
+            "/home/u/GitHub/loom:/home/u/GitHub/loom",
+            "-v",
+            "/home/u/loom-daemon/.loom/gh-config:/home/u/loom-daemon/.loom/gh-config:ro",
+            "--mount",
+            "type=bind,src=/opt/pdk,dst=/opt/pdk,readonly",
+            "--label",
+            "loom.workspace=/home/u/GitHub",
+            "--label",
+            "loom.session-posture=container-boundary-v1",
+            "--label",
+            expected_extra_label.as_str(),
+            "img:tag",
+        ]
+    );
+}
+
+#[test]
+#[serial]
+fn start_verifies_configured_override_image_before_creating_and_skips_mismatch() {
+    let override_image = format!("ghcr.io/example/session@sha256:{}", "b".repeat(64));
+    let extra = vec![ExtraMount {
+        host: PathBuf::from("/opt/pdk"),
+        container: PathBuf::from("/opt/pdk"),
+    }];
+    let config = SessionImageConfig {
+        image: Some(override_image.clone()),
+        extra_mounts: extra.clone(),
+        object_mirrors: false,
+    };
+
+    // 1. Matching configured override with a failing bundle probe prevents
+    //    creation and leaves the profile unadopted.
+    {
+        let (workspace, root, _env) = setup();
+        import_account(workspace.path(), root.path(), "alice");
+        let failing = SessionLifecycle::new(
+            workspace.path(),
+            FakeRunner::default(),
+            Some(override_image.clone()),
+        )
+        .with_session_config(Some(config.clone()));
+        let err = failing.start("alice").unwrap_err();
+        assert!(err.to_string().contains("configured override image"), "{err:#}");
+        assert_eq!(*failing.runner.probed_images.lock().unwrap(), vec![override_image.clone()]);
+        assert!(failing.runner.creates.lock().unwrap().is_empty());
+        assert!(!is_session_managed(&root.path().join("alice")));
+    }
+
+    // 2. Matching configured override with an intact bundle verifies and creates
+    //    with the configured extra mounts.
+    {
+        let (workspace, root, _env) = setup();
+        import_account(workspace.path(), root.path(), "alice");
+        let runner = FakeRunner::default();
+        *runner.probe_output.lock().unwrap() =
+            Some(super::session_image::tests::intact_probe_output());
+        let verified =
+            SessionLifecycle::new(workspace.path(), runner, Some(override_image.clone()))
+                .with_session_config(Some(config.clone()));
+        verified.start("alice").unwrap();
+        assert_eq!(*verified.runner.probed_images.lock().unwrap(), vec![override_image]);
+        assert_eq!(verified.runner.creates.lock().unwrap().len(), 1);
+        assert_eq!(*verified.runner.extra_mounts.lock().unwrap(), vec![extra.clone()]);
+        assert!(is_session_managed(&root.path().join("alice")));
+    }
+
+    // 3. Explicit `--image` differing from the configured override skips the
+    //    bundle check while still carrying `extra_mounts`.
+    {
+        let (workspace, root, _env) = setup();
+        import_account(workspace.path(), root.path(), "alice");
+        let explicit = SessionLifecycle::new(
+            workspace.path(),
+            FakeRunner::default(),
+            Some("img:explicit".into()),
+        )
+        .with_session_config(Some(config));
+        explicit.start("alice").unwrap();
+        assert!(explicit.runner.probed_images.lock().unwrap().is_empty());
+        assert_eq!(explicit.runner.creates.lock().unwrap()[0].1, "img:explicit");
+        assert_eq!(*explicit.runner.extra_mounts.lock().unwrap(), vec![extra]);
+    }
+
+    // 4. Absent configured image skips the bundle check.
+    {
+        let (workspace, root, _env) = setup();
+        import_account(workspace.path(), root.path(), "alice");
+        let unconfigured = SessionLifecycle::new(workspace.path(), FakeRunner::default(), None)
+            .with_session_config(Some(SessionImageConfig::default()));
+        unconfigured.start("alice").unwrap();
+        assert!(unconfigured.runner.probed_images.lock().unwrap().is_empty());
+        assert_eq!(unconfigured.runner.creates.lock().unwrap().len(), 1);
+    }
 }
 
 #[path = "session_lifecycle_controls_tests.rs"]

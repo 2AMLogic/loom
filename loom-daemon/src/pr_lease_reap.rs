@@ -40,7 +40,7 @@
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 /// The child's env var naming the file its won PR leases are listed in.
 pub const LEASE_FILE_ENV: &str = "LOOM_ROLE_PR_LEASE_FILE";
@@ -78,8 +78,6 @@ pub fn reason_never_reviewed(reason: &str) -> bool {
 /// The deadline for one `lease pr reap` child: a bounded lease read (three
 /// attempts), one PR read and one PATCH, each with its own `gh` deadline.
 pub const REAP_TIMEOUT: Duration = Duration::from_secs(150);
-
-const POLL: Duration = Duration::from_millis(200);
 
 /// One PR lease a role run won: the identity its lease comment names.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -288,7 +286,7 @@ impl Reaper {
                 .stdout(Stdio::null())
                 .stderr(Stdio::null());
             prepare(&mut cmd);
-            if run_bounded(&mut cmd, REAP_TIMEOUT) {
+            if run_bounded(cmd, REAP_TIMEOUT) {
                 ok += 1;
             } else {
                 log::warn!(
@@ -344,31 +342,17 @@ pub(crate) fn reap_for_roll(root: &Path, held: &Held, gh: &Path) -> bool {
         .stderr(Stdio::null())
         .env("LOOM_GH_BIN", gh);
     crate::credential_preflight::apply_gh_config_for_root(&mut cmd, root);
-    run_bounded(&mut cmd, REAP_TIMEOUT)
+    run_bounded(cmd, REAP_TIMEOUT)
 }
 
-fn run_bounded(cmd: &mut Command, limit: Duration) -> bool {
-    let Ok(mut child) = cmd.spawn() else {
-        return false;
-    };
+/// Whether the reap child exited zero within `limit`. Past it, the child's
+/// whole process group is killed, so the `gh` it forked does not outlive it.
+fn run_bounded(cmd: Command, limit: Duration) -> bool {
     // #14100: the reap child is the daemon's own binary; attribute its pid.
-    let tracked = crate::self_spawn_log::track("pr_lease_reap", cmd, child.id());
-    let start = Instant::now();
-    loop {
-        match child.try_wait() {
-            Ok(Some(status)) => {
-                tracked.finish(status);
-                return status.success();
-            }
-            Ok(None) if start.elapsed() < limit => std::thread::sleep(POLL),
-            _ => {
-                let _ = child.kill();
-                let _ = child.wait();
-                tracked.finish("timed out");
-                return false;
-            }
-        }
-    }
+    matches!(
+        crate::self_spawn_log::run_bounded_tracked("pr_lease_reap", cmd, limit),
+        Ok(done) if done.succeeded()
+    )
 }
 
 #[cfg(test)]

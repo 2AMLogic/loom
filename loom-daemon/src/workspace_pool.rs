@@ -53,22 +53,8 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use crate::event_bus::EventBus;
-use crate::safehouse::{self, CompletedAd, CompletionSink, CompletionView, InboundEventSink};
-use crate::sweep_registry::{self, host_identity, SweepRegistry, SweepRegistryConfig};
-
-/// The daemon-wide safehouse completion-dedup context (Issue #6352): one shared
-/// inbound view + one outbound publisher + the single task that bridges them to
-/// the room. Created lazily by [`WorkspacePool::start_completion_dedup`] when
-/// `safehouse.enabled` is true; the narration sink reads both to dedup
-/// public-feed completions fleet-wide. `None` ⇒ per-host-only dedup.
-struct CompletionDedup {
-    /// Bounded, non-blocking outbound channel to the coordination task.
-    publisher: tokio::sync::mpsc::Sender<CompletedAd>,
-    /// The shared inbound view the coordination task feeds.
-    view: Arc<Mutex<CompletionView>>,
-    /// The coordination task handle, kept alive for the daemon's lifetime.
-    _task: Option<tokio::task::JoinHandle<()>>,
-}
+use crate::safehouse;
+use crate::sweep_registry::{self, SweepRegistry, SweepRegistryConfig};
 
 /// One cached per-workspace registry plus the background tasks keeping it
 /// reconciled and self-healing.
@@ -97,15 +83,11 @@ pub struct WorkspacePool {
     /// dedicated OS thread.
     runtime: tokio::runtime::Handle,
     inner: Mutex<HashMap<PathBuf, PooledRegistry>>,
-    /// The daemon-wide completion-dedup context (Issue #6352), or `None` when
-    /// `safehouse.enabled` is false. Set once by
-    /// [`start_completion_dedup`](Self::start_completion_dedup).
-    completion_dedup: Mutex<Option<CompletionDedup>>,
     /// The daemon-wide live safehouse connection-state cell (Issue #4345),
-    /// updated by both [`start_safehouse_narration`](Self::start_safehouse_narration)'s
-    /// sink and [`start_completion_dedup`](Self::start_completion_dedup)'s
-    /// coordination task. Read back by [`safehouse_status`](Self::safehouse_status)
-    /// for `loom-daemon status` — see `crate::safehouse::SafehouseState`.
+    /// updated by the merged-PR reporter
+    /// ([`start_merge_reporter`](Self::start_merge_reporter)). Read back by
+    /// [`safehouse_status`](Self::safehouse_status) for `loom-daemon status` —
+    /// see `crate::safehouse::SafehouseState`.
     safehouse_state: safehouse::SharedSafehouseState,
 }
 
@@ -118,47 +100,24 @@ impl WorkspacePool {
             event_bus,
             runtime,
             inner: Mutex::new(HashMap::new()),
-            completion_dedup: Mutex::new(None),
             safehouse_state: safehouse::new_shared_state(),
         }
     }
 
-    /// Start the optional safehouse fleet-comms narration sink (#3997) for
-    /// `repo_root`. The sink subscribes the pool's shared [`Arc<EventBus>`] —
-    /// the single place the bus is owned — and spawns on the daemon runtime, so
-    /// every daemon-dispatched sweep's lifecycle transitions narrate into the
-    /// safehouse room with no per-role changes. **Byte-for-byte no-op** when
-    /// `safehouse.enabled` is false/absent: [`crate::safehouse::spawn_sink`]
-    /// returns without subscribing or touching a socket. Best-effort by
-    /// contract — a missing/refused peer degrades to a `warn`, never a sweep
-    /// failure. The handle is detached (daemon-lifetime).
+    /// Start the merged-PR reporter (#13946) for `repo_root`: the one thing Loom
+    /// still says in the safehouse fleet room. The reporter subscribes the
+    /// pool's shared [`Arc<EventBus>`]; the host that ran a merge posts it, and on
+    /// the fleet captain a bounded catch-up scan posts the merges no host
+    /// reported (see [`crate::safehouse::spawn_merge_reporter`]). **Byte-for-byte
+    /// no-op** when `safehouse.enabled` is false/absent: nothing subscribes and
+    /// no socket is touched. Best-effort by contract — a missing/refused peer
+    /// degrades to a `warn`, never a sweep failure. The handle is detached
+    /// (daemon-lifetime).
     ///
-    /// `activity_db` (#4497) is threaded to the completion emit point purely so
-    /// its public-feed `meta` can carry a best-effort per-issue `tokens` total;
-    /// `None` omits that field and changes nothing else.
-    ///
-    /// **Per-repo room routing (#4225) needs nothing threaded through here.** The
-    /// sink is a single subscriber on the pool's *shared* bus, and every narrated
-    /// event already carries its owning workspace root (`repo`, #3929/#4201) —
-    /// which is exactly the key `safehouse::RoomRouter` routes firehose traffic
-    /// by. So one sink resolving `safehouse.rooms` once (from `repo_root`, the
-    /// daemon's default workspace, the same layer that already owns socket /
-    /// persona) routes **every** managed repo correctly, and no
-    /// per-workspace sink or per-repo config resolution is introduced.
-    ///
-    /// **Fleet-wide completion dedup (Issue #6352).** If
-    /// [`start_completion_dedup`](Self::start_completion_dedup) has already
-    /// established the dedup connection for this pool (it MUST be called first —
-    /// `daemon_service::run` does so), its publisher + view are used to build a
-    /// [`crate::safehouse::PeerCompletionHandle`] so the narration sink can
-    /// consult/announce completions fleet-wide. Called before it is established
-    /// (or with `safehouse.enabled` false), this is `None` — the narration sink
-    /// then falls back to per-host-only dedup.
-    pub fn start_safehouse_narration(
-        &self,
-        repo_root: &Path,
-        activity_db: Option<Arc<Mutex<crate::activity::ActivityDb>>>,
-    ) {
+    /// `repo_root` is the daemon's default workspace: it is where `safehouse`
+    /// config (and `.loom-local/local.json`) is resolved, and where the captain
+    /// gate reads `fleet.captain`.
+    pub fn start_merge_reporter(&self, repo_root: &Path) {
         // #5822: `resolve_config` (and therefore `.loom-local/local.json`) is
         // read relative to *this* `repo_root`, which for the daemon's default
         // workspace is `LOOM_WORKSPACE`/`current_dir()` at process startup, not
@@ -166,29 +125,16 @@ impl WorkspacePool {
         // supervisor unit that does not pin `WorkingDirectory`). Logging it once
         // here lets an operator confirm it matches before chasing the resolver.
         log::info!(
-            "workspace_pool: safehouse narration resolving config against repo_root={}",
+            "workspace_pool: safehouse merged-PR report resolving config against repo_root={}",
             repo_root.display()
         );
-        let config = crate::safehouse::resolve_config(repo_root);
-        let peer_completions = {
-            let slot = self
-                .completion_dedup
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            slot.as_ref().map(|coord| {
-                crate::safehouse::PeerCompletionHandle::new(
-                    coord.publisher.clone(),
-                    coord.view.clone(),
-                )
-            })
-        };
-        let _ = crate::safehouse::spawn_sink(
-            config,
+        let config = safehouse::resolve_config(repo_root);
+        let _ = safehouse::spawn_merge_reporter(
+            &config,
             &self.event_bus,
             &self.runtime,
             self.safehouse_state.clone(),
-            activity_db,
-            peer_completions,
+            repo_root.to_path_buf(),
         );
     }
 
@@ -199,65 +145,6 @@ impl WorkspacePool {
     #[must_use]
     pub fn safehouse_status(&self) -> crate::types::SafehouseStatus {
         safehouse::snapshot_state(&self.safehouse_state).to_status()
-    }
-
-    /// Start the daemon-wide safehouse **completion dedup** (Issue #6352) keyed
-    /// off `repo_root`'s config: creates the shared inbound [`CompletionView`],
-    /// the bounded outbound channel, and the single task that bridges them to the
-    /// room, then stores them for [`start_safehouse_narration`](Self::start_safehouse_narration).
-    ///
-    /// **No-op** when `safehouse.enabled` is false/absent: no view, no channel,
-    /// no task, no socket. Idempotent — a second call is a no-op once the dedup
-    /// is established.
-    pub fn start_completion_dedup(&self, repo_root: &Path) {
-        // #5822: same repo_root-mismatch caveat as `start_safehouse_narration`
-        // above — this resolves `.loom-local/local.json` against `repo_root` as
-        // received, not against wherever an operator happens to have edited it.
-        log::info!(
-            "workspace_pool: completion dedup resolving config against repo_root={}",
-            repo_root.display()
-        );
-        let config = safehouse::resolve_config(repo_root);
-        if !config.enabled {
-            // Mirrors spawn_sink's own disabled handling — set here too since
-            // this early return means spawn_completion_dedup (which would
-            // otherwise set it) is never reached (#4345).
-            safehouse::set_not_configured(&self.safehouse_state);
-            return; // disabled ⇒ byte-for-byte no-op
-        }
-        let mut slot = self
-            .completion_dedup
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if slot.is_some() {
-            return; // already established
-        }
-        let completion_ttl = safehouse::resolve_completion_ttl(repo_root);
-        let view = Arc::new(Mutex::new(CompletionView::new(host_identity(), completion_ttl)));
-        let (tx, rx) = tokio::sync::mpsc::channel::<CompletedAd>(safehouse::COMPLETION_CHANNEL_CAP);
-        let sink: Arc<dyn InboundEventSink> = Arc::new(CompletionSink::new(view.clone()));
-        let task = safehouse::spawn_completion_dedup(
-            config,
-            sink,
-            rx,
-            &self.runtime,
-            self.safehouse_state.clone(),
-        );
-        if task.is_none() {
-            // Enabled but no socket resolved: leave it unestablished (the
-            // outbound sender would have no consumer). spawn_completion_dedup
-            // already logged the reason.
-            return;
-        }
-        log::info!(
-            "workspace_pool: safehouse completion dedup started (completion_ttl={}s)",
-            completion_ttl.as_secs()
-        );
-        *slot = Some(CompletionDedup {
-            publisher: tx,
-            view,
-            _task: task,
-        });
     }
 
     /// Seed the pool with a pre-built registry for `root` — used for the default
@@ -739,7 +626,7 @@ mod tests {
 
     #[tokio::test]
     #[serial_test::serial]
-    async fn start_safehouse_narration_surfaces_unreachable_for_enabled_unresolved_socket() {
+    async fn start_merge_reporter_surfaces_unreachable_for_enabled_unresolved_socket() {
         clear_safehouse_env();
         let dir = tempdir().unwrap();
         let root = dir.path().to_path_buf();
@@ -753,8 +640,8 @@ mod tests {
         );
         let pool = pool();
 
-        pool.start_safehouse_narration(&root, None);
-        // The sink reports "configured, not yet connected" immediately on
+        pool.start_merge_reporter(&root);
+        // The reporter reports "configured, not yet connected" immediately on
         // spawn (before any connect attempt) — poll briefly rather than
         // assuming the spawned task has already run once.
         let mut status = pool.safehouse_status();
@@ -771,7 +658,7 @@ mod tests {
 
     #[tokio::test]
     #[serial_test::serial]
-    async fn start_completion_dedup_disabled_reports_not_configured_even_after_prior_state() {
+    async fn start_merge_reporter_disabled_reports_not_configured_even_after_prior_state() {
         clear_safehouse_env();
         let dir = tempdir().unwrap();
         let root = dir.path().to_path_buf();
@@ -785,8 +672,8 @@ mod tests {
         );
         let pool = pool();
 
-        // Drive the cell to a non-default state first via the narration sink.
-        pool.start_safehouse_narration(&root, None);
+        // Drive the cell to a non-default state first via an enabled config.
+        pool.start_merge_reporter(&root);
         let mut status = pool.safehouse_status();
         for _ in 0..50 {
             if status.state != "not_configured" {
@@ -797,12 +684,10 @@ mod tests {
         }
         assert_eq!(status.state, "unreachable", "precondition: cell must be non-default");
 
-        // Now disable and re-resolve via the completion-dedup entry point's
-        // own disabled fast path (which returns before ever calling
-        // spawn_completion_dedup — the code path #4345 had to patch
-        // explicitly).
+        // Now disable and re-resolve: the reporter's disabled path must reset
+        // the cell rather than leave the stale `unreachable` (#4345).
         write_config(&root, r#"{"safehouse": {"enabled": false}}"#);
-        pool.start_completion_dedup(&root);
+        pool.start_merge_reporter(&root);
         assert_eq!(pool.safehouse_status().state, "not_configured");
     }
 

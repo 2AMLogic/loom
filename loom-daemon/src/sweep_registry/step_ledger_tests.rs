@@ -53,6 +53,7 @@ fn run(item: u32, step: StepRole, class: OutcomeClass, reason: &str, secs: u64) 
         outcome: StepOutcome::new(class, reason),
         ran_for: Duration::from_secs(secs),
         failure_class: None,
+        attempt: None,
     }
 }
 

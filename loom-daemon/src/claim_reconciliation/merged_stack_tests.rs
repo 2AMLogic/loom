@@ -7,7 +7,7 @@
 
 use std::cell::RefCell;
 use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use super::*;
 
@@ -105,110 +105,11 @@ fn flag_marker_is_keyed_by_parent_and_head() {
 
 // --- the pass, on real repositories -----------------------------------------
 
-use crate::test_git_helpers::{commit_file, configure, run};
+use crate::test_git_helpers::{commit_file, run, StackFixture as Fixture};
 
 const A: &str = "feature/issue-901";
 const B: &str = "feature/issue-902";
 const C: &str = "feature/issue-903";
-
-/// origin + an "author" clone that builds the stack + the clone the pass
-/// runs in (which never checked out any of the stack's branches).
-struct Fixture {
-    _tmp: tempfile::TempDir,
-    origin: PathBuf,
-    author: PathBuf,
-    repo: PathBuf,
-}
-
-impl Fixture {
-    fn new() -> Self {
-        let tmp = tempfile::tempdir().unwrap();
-        let origin = tmp.path().join("origin.git");
-        let author = tmp.path().join("author");
-        let repo = tmp.path().join("repo");
-        run(
-            tmp.path(),
-            &[
-                "init",
-                "-q",
-                "--bare",
-                "--initial-branch=main",
-                origin.to_str().unwrap(),
-            ],
-        );
-        std::fs::create_dir_all(&author).unwrap();
-        run(&author, &["init", "-q", "--initial-branch=main"]);
-        configure(&author);
-        commit_file(&author, "base.txt", "base\n", "base");
-        run(&author, &["remote", "add", "origin", origin.to_str().unwrap()]);
-        run(&author, &["push", "-q", "origin", "main"]);
-        Self {
-            _tmp: tmp,
-            origin,
-            author,
-            repo,
-        }
-    }
-
-    /// Commit `file` on a new branch `name` off `from` in the author clone,
-    /// push it, and record it as PR `pr`'s head (`refs/pull/<pr>/head`).
-    fn branch(&self, name: &str, from: &str, pr: u32, file: &str, body: &str) -> String {
-        run(&self.author, &["checkout", "-q", "-B", name, from]);
-        let sha = commit_file(&self.author, file, body, &format!("{name}: {file}"));
-        run(&self.author, &["push", "-q", "-f", "origin", &format!("{name}:{name}")]);
-        run(
-            &self.author,
-            &[
-                "push",
-                "-q",
-                "-f",
-                "origin",
-                &format!("{name}:refs/pull/{pr}/head"),
-            ],
-        );
-        sha
-    }
-
-    /// Move origin's main forward with `file` — the squash merge, whose SHA
-    /// differs from the parent's pre-merge tip by construction.
-    fn advance_main(&self, file: &str, body: &str) -> String {
-        run(&self.author, &["checkout", "-q", "main"]);
-        let sha = commit_file(&self.author, file, body, &format!("main: {file}"));
-        run(&self.author, &["push", "-q", "origin", "main"]);
-        sha
-    }
-
-    /// The clone the pass runs in, made after the stack exists.
-    fn clone_repo(&self) {
-        run(
-            self.origin.parent().unwrap(),
-            &[
-                "clone",
-                "-q",
-                self.origin.to_str().unwrap(),
-                self.repo.to_str().unwrap(),
-            ],
-        );
-        configure(&self.repo);
-    }
-
-    fn origin_rev(&self, rev: &str) -> String {
-        run(&self.origin, &["rev-parse", rev])
-    }
-
-    fn origin_files(&self, rev: &str) -> Vec<String> {
-        run(&self.origin, &["ls-tree", "--name-only", rev])
-            .lines()
-            .map(str::to_string)
-            .collect()
-    }
-
-    fn origin_count(&self, range: &str) -> usize {
-        run(&self.origin, &["rev-list", "--count", range])
-            .parse()
-            .unwrap()
-    }
-}
 
 /// The repository the fake forge says it is; [`open_pr`] heads live in it.
 const REPO: &str = "acme/widgets";
@@ -1042,6 +943,58 @@ fn a_conflicting_replay_is_flagged_once_and_nothing_is_pushed() {
             ..MergedStats::default()
         }
     );
+}
+
+/// The rebase guard's `EMPTIED` (#8298, #9001): a replay that leaves the child
+/// no change of its own — here a `merge=ours` path that the default branch
+/// changed too — is flagged with the guard's reason, and nothing is pushed.
+#[test]
+fn a_replay_the_rebase_guard_empties_is_flagged_and_nothing_is_pushed() {
+    let fx = Fixture::new();
+    std::fs::write(fx.author.join(".gitattributes"), "install-metadata.json merge=ours\n").unwrap();
+    let metadata = |commit: &str| {
+        format!("{{\n  \"loom_version\": \"1\",\n  \"loom_commit\": \"{commit}\"\n}}\n")
+    };
+    commit_file(&fx.author, "install-metadata.json", &metadata("aaaa"), "base: metadata");
+    run(&fx.author, &["push", "-q", "origin", "main"]);
+    let a = fx.branch(A, "main", 1, "a.txt", "parent\n");
+    let b = fx.branch(B, A, 2, "install-metadata.json", &metadata("bbbb"));
+    fx.advance_main(
+        "install-metadata.json",
+        "{\n  \"loom_version\": \"2\",\n  \"loom_commit\": \"aaaa\"\n}\n",
+    );
+    run(&fx.author, &["push", "-q", "origin", "--delete", A]);
+    fx.clone_repo();
+    // The driver the attribute names, as a Loom repository configures it.
+    run(&fx.repo, &["config", "merge.ours.driver", "true"]);
+
+    let forge = FakeForge {
+        parents: [(A.to_string(), FakeForge::merged_parent(1, &a))]
+            .into_iter()
+            .collect(),
+        ..FakeForge::default()
+    };
+    let stats = reconcile_with(&forge, &fx.repo, "main", &[open_pr(2, B, &b, A)], &[]);
+
+    assert_eq!(
+        (stats.children, stats.flagged, stats.restacked, stats.retargeted),
+        (1, 1, 0, 0),
+        "{stats:?}"
+    );
+    assert_eq!(fx.origin_rev(B), b, "nothing pushed");
+    assert!(forge.retargets.borrow().is_empty());
+    let posted = forge.comments.borrow().get(&2).cloned().unwrap_or_default();
+    assert_eq!(posted.len(), 1);
+    assert!(posted[0].starts_with(&flagged_marker(1, &b)));
+    assert!(
+        posted[0].contains(
+            "replaying it would leave no change of its own (the rebase guard reported \
+             EMPTIED, #9282)"
+        ),
+        "{}",
+        posted[0]
+    );
+    assert_eq!(worktree_count(&fx.repo), 1, "the scratch worktree is removed");
 }
 
 /// An already-reconciled child (rebased by the shell or by hand after the

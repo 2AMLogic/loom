@@ -30,38 +30,9 @@ pub(crate) struct Remote {
     pub(crate) gh_resolved: Option<String>,
 }
 
-/// Parse a git remote URL into `(host, owner/repo)`.
-///
-/// Accepts scp-style (`git@host:owner/repo.git`), `ssh://[user@]host[:port]/
-/// owner/repo`, `https://[user@]host/owner/repo` (also `http`, `git`). The
-/// first two path segments are the repository; anything else is `None`.
-pub(crate) fn parse_remote_url(url: &str) -> Option<(String, String)> {
-    let url = url.trim();
-    let (host, path) = if let Some((scheme, rest)) = url.split_once("://") {
-        if !matches!(scheme, "https" | "http" | "ssh" | "git" | "git+ssh") {
-            return None;
-        }
-        let (authority, path) = rest.split_once('/')?;
-        let host = authority.rsplit('@').next()?;
-        let host = host.split(':').next()?;
-        (host, path)
-    } else {
-        // scp-like: [user@]host:path — but never a local path.
-        let (authority, path) = url.split_once(':')?;
-        if authority.contains('/') || path.starts_with("//") {
-            return None;
-        }
-        (authority.rsplit('@').next()?, path)
-    };
-    let path = path.trim_matches('/');
-    let path = path.strip_suffix(".git").unwrap_or(path);
-    let mut segs = path.split('/').filter(|s| !s.is_empty());
-    let (owner, repo) = (segs.next()?, segs.next()?);
-    if host.is_empty() || segs.next().is_some() {
-        return None;
-    }
-    Some((host.to_ascii_lowercase(), format!("{owner}/{repo}")))
-}
+/// Parse a git remote URL into `(host, owner/repo)` — the shared parser in
+/// [`crate::forge_cmd`] (#15624).
+pub(crate) use crate::forge_cmd::parse_remote_url;
 
 /// Parse `git config --get-regexp '^remote\.'` output into remotes, in
 /// config order. Remotes without a parseable URL are dropped (gh ignores them

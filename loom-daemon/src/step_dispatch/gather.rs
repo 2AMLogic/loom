@@ -9,7 +9,7 @@
 //!
 //! - **the items, and the PRs' head and author**: the tick's one discovery
 //!   snapshot ([`crate::discovery`], #12306); the gather lists nothing itself.
-//!   The Direct backend lists per repo ([`super::listing::list_all_open`]
+//!   The Direct backend lists per repo ([`super::listing::list_all_open_on`]
 //!   and the ETag-cached open-PR listing), the Mirror backend reads one
 //!   worklist for every repo. The last good copy of either stands in on a
 //!   failure (#12074), so the Builder branch links as it does in the open-PR
@@ -56,6 +56,10 @@ use super::item_draw::DrawInput;
 use super::stage_entry::{GhEventsReader, StageEntry, StageEntryProvider};
 use crate::discovery::{Target, TickSnapshot};
 use crate::forge_listing::RestIssue;
+use crate::forge_merge_queue::{
+    github::GhQueueApi,
+    mode::{resolve_merge_mode, MergeMode, MergeModeError},
+};
 use crate::forge_pull_listing::RestPull;
 use crate::step_role::StepRole;
 use crate::sweep_registry::SweepRegistry;
@@ -92,6 +96,8 @@ pub struct IssueFacts {
 /// One workspace's draw inputs, and what else the tick reads from it.
 #[derive(Debug, Clone, Default)]
 pub struct Gathered {
+    /// The merge mode used to gather this tick, also used to size the merge lane.
+    pub queue_mode: bool,
     /// The forge slug.
     pub slug: String,
     pub inputs: Vec<DrawInput>,
@@ -771,12 +777,58 @@ pub fn gather(
         .map(|l| finish(l, root, provider, now)))
 }
 
+/// Update the approved PRs from one tick's live queue entries, after the
+/// full-pull / issue-row join so both sources use the same lookup. Return
+/// the PRs still unknown: only a Champion merge needs to wait for proof of
+/// absence. Other work (including revocation) can proceed.
+fn read_queue_membership(
+    mode: Result<MergeMode, MergeModeError>,
+    gh: &Path,
+    slug: &str,
+    pulls: &mut [PullInput],
+) -> HashSet<u32> {
+    if matches!(mode, Ok(MergeMode::Direct)) {
+        return HashSet::new();
+    }
+    let approved_labels = crate::label_registry::embedded_aliases("loom:pr");
+    let approved: Vec<_> = pulls
+        .iter_mut()
+        .filter(|p| {
+            p.labels
+                .iter()
+                .any(|l| approved_labels.contains(&l.as_str()))
+        })
+        .collect();
+    if approved.is_empty() {
+        return HashSet::new();
+    }
+    let numbers: Vec<_> = approved.iter().map(|p| p.number).collect();
+    let known = mode
+        .map_err(|e| e.to_string())
+        .and_then(|_| GhQueueApi::new(&gh.to_string_lossy(), slug).map_err(|e| e.to_string()))
+        .map(|api| api.membership(&numbers))
+        .unwrap_or_else(|e| {
+            log::warn!("work_finder: {slug}: cannot read merge queue membership: {e}");
+            HashMap::new()
+        });
+    let mut unknown = HashSet::new();
+    for p in approved {
+        if let Some(&queued) = known.get(&p.number) {
+            p.queued = queued;
+        } else {
+            unknown.insert(p.number);
+        }
+    }
+    unknown
+}
+
 /// One workspace's forge half of [`gather`] (#12256): the listings, the
 /// facts and the classification, everything but the stage-entry lookups.
 /// It touches no state shared across repos but the process caches (each
 /// behind its own lock), so the driver runs it for several repos at once.
 #[derive(Debug, Clone)]
 pub struct Listed {
+    queue_mode: bool,
     pub slug: String,
     rows: Vec<RestIssue>,
     items: Vec<Item>,
@@ -833,7 +885,7 @@ pub fn list(
     let (pulls, pulls_complete) = pulls_or_last_good(&slug, pull_listing);
     let full: HashMap<u32, RestPull> = pulls.into_iter().map(|p| (p.number, p)).collect();
     let (markers, marker_reads) = pull_markers(&slug, root, &rows);
-    let pulls: Vec<PullInput> = rows
+    let mut pulls: Vec<PullInput> = rows
         .iter()
         .filter(|r| r.is_pull_request)
         .map(|r| {
@@ -848,6 +900,9 @@ pub fn list(
             }
         })
         .collect();
+    let mode = resolve_merge_mode(root).map(|m| m.mode);
+    let queue_mode = matches!(mode, Ok(MergeMode::Queue));
+    let queue_unknown = read_queue_membership(mode, &gh_bin, &slug, &mut pulls);
     let hold_heads: HashMap<u32, String> = pulls
         .iter()
         .filter_map(|p| p.markers.hold_head.clone().map(|h| (p.number, h)))
@@ -912,6 +967,13 @@ pub fn list(
         },
     );
     let mut items = step_item::classify(&inputs);
+    for item in &mut items {
+        if item.step() == Some(Step::ChampionMerge)
+            && item.pr.is_some_and(|pr| queue_unknown.contains(&pr))
+        {
+            item.verdict = Verdict::Pass(PassReason::QueueMembershipUnknown);
+        }
+    }
     let heads: HashMap<u32, String> = full
         .iter()
         .filter_map(|(n, p)| p.head_sha.clone().map(|sha| (*n, sha)))
@@ -1030,6 +1092,7 @@ pub fn list(
         }
     }
     Ok(Some(Listed {
+        queue_mode,
         slug,
         rows,
         items,
@@ -1049,6 +1112,7 @@ pub fn finish(
     now: DateTime<Utc>,
 ) -> Gathered {
     let Listed {
+        queue_mode,
         slug,
         rows,
         items,
@@ -1063,6 +1127,7 @@ pub fn finish(
         provider.retain_present(&slug, &rows);
     }
     Gathered {
+        queue_mode,
         ladder: ladder_due(&rows, now),
         reevals: ladder_state(&rows, now),
         created_at: rows

@@ -693,10 +693,10 @@ fn the_deferred_lock_admits_a_single_owner() {
     let held = deferred::try_lock(&lock).expect("first owner takes it");
     assert!(deferred::try_lock(&lock).is_none(), "second owner refused");
     drop(held);
-    // A flock belongs to the open file description. A concurrent fork from
-    // another test thread can briefly hold a duplicate until it execs, so
-    // poll rather than assert once (#11544).
-    assert!(eventually(10, || deferred::try_lock(&lock).is_some()), "released on drop");
+    // `FileLock`'s `Drop` issues `LOCK_UN` on the open file description, so a
+    // duplicate held by a concurrently forked child cannot delay the release
+    // (#11544, #15620). Assert once; no retry.
+    assert!(deferred::try_lock(&lock).is_some(), "released on drop");
 }
 
 /// Exit 4 (a peer's lease is fresh) until the test drops `peer-expired`, then

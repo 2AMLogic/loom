@@ -900,6 +900,87 @@ async fn a_429_bad_marks_the_pool_account_at_the_proxy_exactly_once() {
     assert_eq!(mark, mark_again, "a second 429 on the same launch must not re-mark");
 }
 
+/// Drive one upstream refusal `body` through the proxy for a pool launch that
+/// ran model class `glm-5.3-flash`, and return that account's mark for the
+/// launch's own class and for a different one (#15572).
+async fn proxy_mark_scopes_for(body: &'static str) -> (crate::api_keys_pool::BadMark, bool) {
+    let tmp = tempfile::tempdir().unwrap();
+    let (upstream_addr, _seen) = fake_upstream_with(429, &[], body).await;
+    let registry = Registry::new();
+    let placeholder = Placeholder::generate();
+    // Called for its side effect of registering `acct-1` in the pool; its
+    // record is class-less, so the classed record is rebuilt below.
+    drop(pool_attributed_record(tmp.path(), &format!("http://{upstream_addr}"), "acct-1"));
+    let record = Record::new(
+        "launch-429",
+        "anthropic",
+        Upstream::parse(&format!("http://{upstream_addr}")).unwrap(),
+        HeaderStyle::AuthorizationBearer,
+        "sk-fake-real-credential",
+    )
+    .with_pool_account(tmp.path().to_path_buf(), "acct-1", Some("glm-5.3-flash".to_string()));
+    registry.insert(&placeholder, record);
+    let bound = server::Bound::bind(std::net::Ipv4Addr::LOCALHOST.into()).unwrap();
+    let addr = bound.addr();
+    let listener = bound.into_tokio().unwrap();
+    tokio::spawn(server::serve(listener, registry.clone()));
+
+    let response = raw_request(addr, &post(Some(placeholder.as_str()), &addr.to_string())).await;
+    assert!(response.starts_with("HTTP/1.1 429"), "{response}");
+
+    let root = tmp.path().join(".loom/api-keys");
+    let now = crate::api_keys_pool::bad_marks::epoch_now();
+    let mut own = None;
+    for _ in 0..100 {
+        own = crate::api_keys_pool::bad_marks::active_mark_for_class(
+            &root,
+            "anthropic",
+            "acct-1",
+            Some("glm-5.3-flash"),
+            now,
+        )
+        .unwrap();
+        if own.is_some() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    let own = own.expect("the refusal must bad-mark the pool account");
+    let covers_other_class = crate::api_keys_pool::bad_marks::active_mark_for_class(
+        &root,
+        "anthropic",
+        "acct-1",
+        Some("glm-5.4"),
+        now,
+    )
+    .unwrap()
+    .is_some();
+    (own, covers_other_class)
+}
+
+/// #15572: a weekly/monthly refusal is the account's, so the proxy marks it
+/// account-wide even though the launch ran one model class — another class
+/// must not re-select the account and burn a request on the same refusal.
+#[tokio::test]
+async fn a_weekly_refusal_at_the_proxy_marks_the_account_wide() {
+    let (mark, covers_other_class) =
+        proxy_mark_scopes_for(crate::api_keys_pool::classify::CAPTURED_ZAI_WEEKLY_LIMIT_EVENT)
+            .await;
+    assert_eq!(mark.model_class, None, "{mark:?}");
+    assert!(covers_other_class, "a weekly mark must cover every class");
+}
+
+/// #15572, pinning existing behaviour: the 5-hour refusal stays scoped to the
+/// launch's model class at the proxy.
+#[tokio::test]
+async fn a_five_hour_refusal_at_the_proxy_stays_class_scoped() {
+    let (mark, covers_other_class) =
+        proxy_mark_scopes_for(crate::api_keys_pool::classify::CAPTURED_ZAI_FIVE_HOUR_LIMIT_EVENT)
+            .await;
+    assert_eq!(mark.model_class.as_deref(), Some("glm-5.3-flash"), "{mark:?}");
+    assert!(!covers_other_class, "a 5-hour mark must not cover another class");
+}
+
 /// AC2's flip side: a launch whose credential was NOT pool-selected (no
 /// [`Record::with_pool_account`] call, exactly `exec::build`'s Claude path)
 /// never bad-marks anything, however many 429s it sees.

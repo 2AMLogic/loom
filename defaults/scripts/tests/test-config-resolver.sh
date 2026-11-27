@@ -299,6 +299,112 @@ else
     pass "config-resolver.sh does not use --argjson"
 fi
 
+echo "Test 17: loom_config_get propagates a resolver failure (#15321)"
+repo=$(new_repo)
+errf="$repo/stderr.txt"
+# Subshell-scoped stub: the override never leaks into the other tests.
+rc=0
+out=$(
+    # shellcheck disable=SC2317  # invoked indirectly by loom_config_get
+    loom_resolve_config() { echo "stub resolver: boom" >&2; return 37; }
+    loom_config_get "$repo" sample.key fallback 2>"$errf"
+) || rc=$?
+assert_eq "$rc" "37" "getter returns the resolver's status"
+assert_eq "$out" "" "getter emits nothing on stdout (no fallback)"
+assert_eq "$(cat "$errf")" "stub resolver: boom" "resolver diagnostic reaches stderr"
+
+# Same failure, but with the getter tested in an `if` condition.
+cond=$(
+    # shellcheck disable=SC2317  # invoked indirectly by loom_config_get
+    loom_resolve_config() { echo "stub resolver: boom" >&2; return 37; }
+    if got=$(loom_config_get "$repo" sample.key fallback 2>/dev/null); then
+        echo "treated-as-success:$got"
+    else
+        echo "failed:$?"
+    fi
+)
+assert_eq "$cond" "failed:37" "failure is visible when the getter is an if condition"
+
+# Successful resolution still yields value / default with status 0.
+mkdir -p "$repo/.loom" "$repo/.loom-local"
+echo '{"present": "configured", "scalar": 1}' > "$repo/.loom/config.json"
+rc=0
+assert_eq "$(loom_config_get "$repo" present fallback)" "configured" "configured value returned"
+loom_config_get "$repo" present fallback >/dev/null || rc=$?
+assert_eq "$rc" "0" "configured value returns status 0"
+rc=0
+out=$(loom_config_get "$repo" absent fallback) || rc=$?
+assert_eq "$out/$rc" "fallback/0" "absent key returns default with status 0"
+rc=0
+out=$(loom_config_get "$repo" scalar.child fallback) || rc=$?
+assert_eq "$out/$rc" "fallback/0" "path through a scalar returns default with status 0"
+rm -rf "$repo"
+
+# --- Tests 18-20: a tier must hold exactly one JSON object (#15452) ---
+# jq evaluates a plain filter once per top-level value, so a file holding two
+# objects yielded two values for a single tier and the merge took both. A
+# tier that is not exactly one object now contributes {}, as the Rust
+# resolver already does (serde_json rejects the trailing value).
+
+# Tier file contents that are not exactly one JSON object.
+declare -A BAD_TIER_CONTENT=(
+    [two-objects]=$'{"first": 1}\n{"forge": {"type": "gitea"}}'
+    [empty]=''
+    [array]='[1, 2]'
+    [string]='"text"'
+    [number]='42'
+    [null]='null'
+    [malformed]='{not json'
+)
+
+echo "Test 18: a multi-value tier contributes {} from each working-copy tier; a valid neighbour survives"
+for tier in defaults legacy project fleet local; do
+    repo=$(new_repo)
+    mkdir -p "$repo/.loom" "$repo/.loom-project" "$repo/.loom-local"
+    neighbour="$LOOM_CONFIG_LEGACY_REL"
+    if [[ "$tier" == "legacy" ]]; then
+        neighbour="$LOOM_CONFIG_LOCAL_REL"
+    fi
+    printf '%s\n' "${BAD_TIER_CONTENT[two-objects]}" > "$repo/${TIER_PATH[$tier]}"
+    echo '{"neighbour": true}' > "$repo/$neighbour"
+    if [[ "$tier" == "defaults" ]]; then
+        export LOOM_CONFIG_DEFAULTS_FILE="$repo/${TIER_PATH[$tier]}"
+    fi
+    actual=$(loom_resolve_config "$repo")
+    export LOOM_CONFIG_DEFAULTS_FILE=""
+    assert_eq "$actual" '{"neighbour":true}' "$tier tier holding two top-level values contributes {}; valid neighbour survives"
+    rm -rf "$repo"
+done
+
+echo "Test 19: strictly-behind clean checkout -- a tracked tier on origin/HEAD that is not exactly one object contributes {}"
+for shape in two-objects empty array string number null malformed; do
+    repo=$(mktemp -d)
+    g init -q -b main
+    mkdir -p "$repo/.loom" "$repo/.loom-project"
+    echo '{"a": 1}' > "$repo/.loom/config.json"
+    echo '{"tracked": "before"}' > "$repo/.loom-project/project.json"
+    g add -A; g commit -q -m one
+    printf '%s' "${BAD_TIER_CONTENT[$shape]}" > "$repo/.loom/config.json"
+    echo '{"tracked": "from-origin"}' > "$repo/.loom-project/project.json"
+    g commit -q -am two
+    g update-ref refs/remotes/origin/main HEAD
+    g symbolic-ref refs/remotes/origin/HEAD refs/remotes/origin/main
+    g reset -q --hard HEAD~1
+    # `a` lives only in the stale working copy: its absence proves the tier
+    # was read from origin/HEAD -- and ignored there.
+    assert_eq "$(loom_resolve_config "$repo" | jq -S -c .)" '{"tracked":"from-origin"}' "$shape .loom/config.json on origin/HEAD contributes {}; valid neighbour survives"
+    rm -rf "$repo"
+done
+
+echo "Test 20: an empty, non-object or malformed tier contributes {} (working-copy reader)"
+for shape in empty array string number null malformed; do
+    repo=$(new_repo)
+    mkdir -p "$repo/.loom"
+    printf '%s' "${BAD_TIER_CONTENT[$shape]}" > "$repo/.loom/config.json"
+    assert_eq "$(loom_resolve_config "$repo")" "{}" "$shape tier contributes {}"
+    rm -rf "$repo"
+done
+
 # --- Summary ---
 echo ""
 echo "────────────────────────────────"

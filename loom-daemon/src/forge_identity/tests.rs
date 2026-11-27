@@ -1,5 +1,6 @@
 use super::*;
 use serde_json::json;
+use serial_test::serial;
 
 fn ident(app: &str, slug: Option<&str>) -> Identity {
     Identity {
@@ -88,6 +89,7 @@ fn a_reader_that_is_also_the_writer_is_dropped() {
 }
 
 #[test]
+#[serial]
 fn a_tilde_key_path_is_expanded() {
     let home = std::env::var("HOME").unwrap_or_default();
     let cfg = json!({"forge": {"githubApp": {"appId": "100", "privateKeyPath": "~/.loom/github-app/w.pem"}}});
@@ -96,6 +98,24 @@ fn a_tilde_key_path_is_expanded() {
         r.writer.unwrap().private_key_path,
         PathBuf::from(home).join(".loom/github-app/w.pem")
     );
+}
+
+#[test]
+#[serial]
+fn a_tilde_key_path_stays_literal_when_home_is_unset() {
+    // #15372 compatibility pin: the private key's home source is the `HOME`
+    // variable alone. `dirs::home_dir()` would still resolve this account's
+    // home through OS discovery with `HOME` removed, silently changing which
+    // key file is read — this test is what makes that drift detectable.
+    let cfg = json!({"forge": {"githubApp": {"appId": "100", "privateKeyPath": "~/.loom/github-app/w.pem"}}});
+    let prev = std::env::var_os("HOME");
+    std::env::remove_var("HOME");
+    let r = from_config(&cfg, None, &[]);
+    match prev {
+        Some(v) => std::env::set_var("HOME", v),
+        None => std::env::remove_var("HOME"),
+    }
+    assert_eq!(r.writer.unwrap().private_key_path, PathBuf::from("~/.loom/github-app/w.pem"));
 }
 
 // ---- "is this login ours?" -------------------------------------------------

@@ -5,8 +5,6 @@
 
 use super::*;
 use serial_test::serial;
-use std::os::unix::fs::PermissionsExt;
-use tempfile::tempdir;
 
 const SHA: &str = "4444444444444444444444444444444444444444";
 
@@ -190,55 +188,7 @@ fn approved_flag_comment_says_the_approval_is_set_aside() {
 // ---- end to end through a fake `gh` ----
 
 fn run(open_json: &str, comments: &str) -> (ReviewConflictStats, String) {
-    let dir = tempdir().unwrap();
-    let root = dir.path().join("repo");
-    std::fs::create_dir_all(&root).unwrap();
-    let log = dir.path().join("gh.log");
-    std::fs::write(&log, "").unwrap();
-    let rows: Vec<serde_json::Value> = serde_json::from_str(open_json).unwrap();
-    let mut arms = String::new();
-    let rest: Vec<serde_json::Value> = rows
-        .iter()
-        .map(|r| {
-            let number = r["number"].as_u64().unwrap();
-            let m = match r["mergeable"].as_str() {
-                Some("MERGEABLE") => "true",
-                Some("CONFLICTING") => "false",
-                _ => "null",
-            };
-            arms.push_str(&format!(
-                "case \"$*\" in api*'/pulls/{number}') printf 'HTTP/2.0 200 OK\\r\\n\\r\\n'; \
-                 echo '{{\"mergeable\":{m},\"head\":{{\"sha\":\"{SHA}\"}}}}'; exit 0 ;; esac\n"
-            ));
-            serde_json::json!({
-                "number": number,
-                "labels": r["labels"],
-                "head": {"ref": "feature/x", "sha": SHA},
-            })
-        })
-        .collect();
-    let pulls = super::open_pr_listing::test_support::pulls_arm_cmd(&format!(
-        "echo '{}'",
-        serde_json::Value::Array(rest)
-    ));
-    let gh = dir.path().join("fake-gh.sh");
-    std::fs::write(
-        &gh,
-        format!(
-            "#!/usr/bin/env bash\nprintf '%s\\n' \"$*\" >> \"{}\"\n{pulls}{arms}\
-             if [ \"$1\" = \"api\" ]; then echo '{comments}'; exit 0; fi\nexit 0\n",
-            log.display()
-        ),
-    )
-    .unwrap();
-    std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o755)).unwrap();
-    let prev = std::env::var(REVIEW_CONFLICT_ENABLED_ENV).ok();
-    std::env::remove_var(REVIEW_CONFLICT_ENABLED_ENV);
-    let stats = reconcile_review_conflicts(&gh, &root);
-    if let Some(v) = prev {
-        std::env::set_var(REVIEW_CONFLICT_ENABLED_ENV, v);
-    }
-    (stats, std::fs::read_to_string(&log).unwrap())
+    super::tests::run(open_json, "[]", comments)
 }
 
 fn open(number: u32, mergeable: &str, labels: &[&str]) -> String {
@@ -247,7 +197,7 @@ fn open(number: u32, mergeable: &str, labels: &[&str]) -> String {
         .map(|l| format!(r#"{{"name":"{l}"}}"#))
         .collect();
     format!(
-        r#"[{{"number":{number},"mergeable":"{mergeable}","labels":[{}]}}]"#,
+        r#"[{{"number":{number},"headRefOid":"{SHA}","mergeable":"{mergeable}","labels":[{}]}}]"#,
         labels.join(",")
     )
 }
@@ -309,6 +259,7 @@ fn end_to_end_frozen_unknown_and_in_flight_approved_prs_write_nothing() {
         ("UNKNOWN", "loom:merge-conflict"),
     ] {
         let (stats, calls) = run(&open(12041, m, &["loom:pr", label]), "[]");
+        assert_eq!(stats.checked, 1, "{label}: {calls}");
         assert_eq!((stats.flagged, stats.labeled, stats.cleared), (0, 0, 0), "{label}");
         assert!(!calls.contains("pr edit") && !calls.contains("pr comment"), "{label}: {calls}");
     }
@@ -351,6 +302,7 @@ fn end_to_end_already_flagged_approved_pr_is_not_reflagged() {
         &open(12041, "CONFLICTING", &["loom:pr", "loom:operator", "loom:merge-conflict"]),
         "[]",
     );
+    assert_eq!(stats.checked, 1, "{calls}");
     assert_eq!((stats.flagged, stats.labeled), (0, 0));
     assert!(!calls.contains("pr edit"), "{calls}");
 }
@@ -387,6 +339,7 @@ fn end_to_end_unknown_mergeable_held_pr_keeps_the_label() {
         &open(12041, "UNKNOWN", &["loom:pr", "loom:operator", "loom:merge-conflict"]),
         "[]",
     );
+    assert_eq!(stats.checked, 1, "{calls}");
     assert_eq!(stats.label_cleared, 0);
     assert!(!calls.contains("pr edit"), "{calls}");
 }

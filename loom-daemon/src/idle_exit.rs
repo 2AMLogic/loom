@@ -355,17 +355,14 @@ pub fn marker_path(socket: &Path) -> PathBuf {
 }
 
 pub fn write_marker(path: &Path, marker: &IdleExitMarker) -> Result<(), String> {
-    let parent = path
-        .parent()
+    path.parent()
         .ok_or_else(|| "marker has no parent".to_string())?;
-    fs::create_dir_all(parent).map_err(|error| error.to_string())?;
-    let temporary = path.with_extension(format!("json.tmp-{}", std::process::id()));
-    fs::write(
-        &temporary,
-        serde_json::to_vec_pretty(marker).map_err(|error| error.to_string())?,
+    crate::fs_util::write_atomic(
+        path,
+        &serde_json::to_vec_pretty(marker).map_err(|error| error.to_string())?,
+        crate::fs_util::AtomicOpts::default(),
     )
-    .map_err(|error| error.to_string())?;
-    fs::rename(temporary, path).map_err(|error| error.to_string())
+    .map_err(|error| error.to_string())
 }
 
 fn token_counts(root: &Path) -> (usize, usize) {

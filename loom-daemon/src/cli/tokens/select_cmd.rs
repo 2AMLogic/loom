@@ -27,6 +27,9 @@ pub(crate) struct SelectArgs {
     /// Used for Codex guard readiness and Claude prompt-cache affinity; `None` —
     /// the default, and every pre-#8146 caller — selects exactly as before.
     pub role: Option<String>,
+    /// `--pin-account` (issue #14981): the one Claude account a session
+    /// resume may run in. `None` selects as before.
+    pub pin_account: Option<String>,
 }
 
 /// Handle `loom-daemon tokens select`.
@@ -47,6 +50,7 @@ pub(crate) fn handle_select(args: SelectArgs) -> Result<()> {
         auto_unpin,
         model,
         role,
+        pin_account,
     } = args;
     // #5609 (design D8/D9): parsed through `AccountProvider`'s
     // `FromStr` rather than compared against two hardcoded string
@@ -130,7 +134,20 @@ pub(crate) fn handle_select(args: SelectArgs) -> Result<()> {
     //   only ever *reorders* accounts the tiers already found eligible.
     // Both `None` is bit-for-bit the pre-#8058/#8146 `select_token` path, as
     // is any role on a pool with affinity unconfigured.
-    match select::select_token_for_model_and_role(&ws, None, model.as_deref(), role.as_deref()) {
+    // `--pin-account` (#14981) replaces the draw with one named account and
+    // fails closed (no fallback to another account) when it cannot be used.
+    let selection = match pin_account.as_deref() {
+        Some(pin) => {
+            let class = model
+                .as_deref()
+                .and_then(|m| bad_tokens::model_class_of(m.trim()));
+            select::select_pinned_token(&ws, pin, class.as_deref())
+        }
+        None => {
+            select::select_token_for_model_and_role(&ws, None, model.as_deref(), role.as_deref())
+        }
+    };
+    match selection {
         Ok(sel) => {
             if export {
                 if no_key {

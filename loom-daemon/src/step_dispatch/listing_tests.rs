@@ -1,6 +1,7 @@
 //! Tests for the step engine's all-open listing: the shared REST walk.
 
 use super::*;
+use crate::forge_cmd::ForgeType;
 
 /// The entry point is the shared ETag walk: the unfiltered, oldest-first REST listing, accounted as
 /// `step_engine`.
@@ -27,7 +28,7 @@ printf '[{{"number": 4, "state": "open", "labels": []}}, {{"number": 5, "state":
         std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o755)).unwrap();
     }
     let repo = format!("acme/step-listing-{}", std::process::id());
-    let items = list_all_open(&gh, Some(d), Some(&repo)).unwrap();
+    let items = list_all_open_on(ForgeType::GitHub, &gh, Some(d), Some(&repo)).unwrap();
     assert_eq!(items.iter().map(|r| r.number).collect::<Vec<_>>(), [4, 5]);
     assert!(items[1].is_pull_request, "pull requests are items too");
     let calls = std::fs::read_to_string(d.join("calls.log")).unwrap();
@@ -78,7 +79,7 @@ fi
     }
     let repo = format!("acme/step-idle-{}", std::process::id());
     let gather = || {
-        let items = list_all_open(&gh, Some(d), Some(&repo)).unwrap();
+        let items = list_all_open_on(ForgeType::GitHub, &gh, Some(d), Some(&repo)).unwrap();
         let pulls = crate::forge_pull_listing::list_open_pulls_cached_as(
             CALLER,
             &gh,

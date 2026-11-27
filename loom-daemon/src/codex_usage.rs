@@ -428,60 +428,7 @@ fn numeric_children(
     (out, incomplete)
 }
 
-/// Which sessions a caller wants attributed.
-///
-/// `directories` + the caller's window is the default key (see the module
-/// doc); `ids` narrows to an exact `session_meta.session_id` set when the
-/// caller has one, and is the strictly-more-precise attribution #8507's design
-/// note asked for.
-#[derive(Debug, Clone, Default)]
-pub struct SessionFilter {
-    /// Working directories to attribute, matched exactly against
-    /// `session_meta.cwd`. Empty ⇒ no directory constraint (only meaningful
-    /// together with [`Self::ids`], which is then the whole key).
-    pub directories: Vec<PathBuf>,
-    /// Exact `session_meta.session_id` values to attribute. Empty ⇒ no id
-    /// constraint.
-    pub ids: Vec<String>,
-}
-
-impl SessionFilter {
-    /// The directory+window key every consumer in the daemon uses today.
-    #[must_use]
-    pub fn directories(directories: &[PathBuf]) -> Self {
-        Self {
-            directories: directories.to_vec(),
-            ids: Vec::new(),
-        }
-    }
-
-    /// Whether a rollout's `cwd` / `session_id` pass this filter.
-    ///
-    /// An EMPTY filter (no directories, no ids) matches nothing: "attribute
-    /// every session on this host" is never what a caller means, and silently
-    /// treating it as such would fold an unrelated sweep's spend into a
-    /// completion.
-    #[must_use]
-    fn matches(&self, cwd: &str, session_id: Option<&str>) -> bool {
-        if self.directories.is_empty() && self.ids.is_empty() {
-            return false;
-        }
-        if !self.directories.is_empty()
-            && !self
-                .directories
-                .iter()
-                .any(|d| d.to_str().is_some_and(|d| d == cwd))
-        {
-            return false;
-        }
-        if !self.ids.is_empty()
-            && !session_id.is_some_and(|id| self.ids.iter().any(|want| want == id))
-        {
-            return false;
-        }
-        true
-    }
-}
+pub use crate::session_filter::SessionFilter;
 
 /// One attributable Codex session, already decoded and folded — the shape both
 /// [`tokens_by_model`] and [`sessions`] produce.
@@ -884,52 +831,6 @@ pub fn tokens_by_model(
     fold_sessions(sessions(filter, window, home))
 }
 
-/// Per-`(model, speed, service_tier)` token totals for exactly the sessions
-/// named in `ids`, across every [`codex_homes`] store — the merge reader's key
-/// (#14883), the Codex counterpart of
-/// [`crate::opencode_usage::tokens_by_session_ids`].
-///
-/// The key is the id alone: no directory constraint (a private-clone seat's
-/// rollout reports its container path as `cwd`, #14540) and **no window** — a
-/// Builder rollout can start before the PR's creation, so a `createdAt`-anchored
-/// lower bound would drop the very session the merge is paying for. The id
-/// already names exactly one session; a window would only lose usage, never
-/// sharpen the key.
-///
-/// Economical by filename: the date-partitioned walk enumerates rollout
-/// *names* only, and only a file whose own name carries one of the exact ids
-/// is opened — then the id is checked again against `session_meta.session_id`
-/// by [`SessionFilter::matches`] and folded by the existing counter folding
-/// ([`fold_rollout`] + [`fold_sessions`]). An id no rollout holds (absent, or
-/// a filename coincidence the metadata rejects) contributes no row. `None` —
-/// never `Some(vec![])` — for an empty `ids` set or when no named rollout
-/// recorded usage: unknown is not zero.
-#[must_use]
-pub fn tokens_by_session_ids(ids: &[String], home: Option<&Path>) -> Option<Vec<ModelUsageTotals>> {
-    if ids.is_empty() {
-        return None;
-    }
-    let filter = SessionFilter {
-        directories: Vec::new(),
-        ids: ids.to_vec(),
-    };
-    let mut rows: Vec<CodexSessionUsage> = Vec::new();
-    for (root, path) in discover_home_rollouts(home, None).0 {
-        let name = path.file_name().and_then(|n| n.to_str());
-        // Select by exact session id in the FILENAME before any content read:
-        // the rollout's own uuid is part of its name
-        // (`rollout-<ts>-<session-id>.jsonl`).
-        if !name.is_some_and(|name| ids.iter().any(|id| name.contains(id))) {
-            continue;
-        }
-        let Some(read) = read_rollout(&root, &path, u64::MAX) else {
-            continue;
-        };
-        rows.extend(fold_rollout(&read.lines, &filter, None));
-    }
-    fold_sessions(rows)
-}
-
 /// The usage rows or the reason a by-id Codex read could not produce them —
 /// the rollout-store counterpart of [`crate::opencode_usage::IdLookup`], so
 /// `usage_source::native_close_usage` can say WHY a Codex run closed without
@@ -974,10 +875,7 @@ pub fn lookup_ids(
     if ids.is_empty() {
         return IdLookup::NotFound;
     }
-    let filter = SessionFilter {
-        directories: Vec::new(),
-        ids: ids.to_vec(),
-    };
+    let filter = SessionFilter::ids(ids);
     let mut rows: Vec<CodexSessionUsage> = Vec::new();
     let mut selected = false;
     let mut read_any = false;

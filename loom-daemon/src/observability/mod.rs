@@ -58,7 +58,7 @@
 //! subscription, no queue file, no HTTP client construction, zero syscalls —
 //! whenever the resolved config is disabled or under-configured (no OTLP
 //! exporter, no endpoint, no credential). This is the same "disabled means
-//! truly inert" contract [`crate::safehouse::spawn_sink`] and
+//! truly inert" contract [`crate::safehouse::spawn_merge_reporter`] and
 //! [`crate::idle_exit::spawn_task`]'s callers already rely on.
 //!
 //! # Read-only invariant

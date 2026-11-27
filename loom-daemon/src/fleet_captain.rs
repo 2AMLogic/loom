@@ -385,23 +385,12 @@ fn load_shell_arm_registry(root: &Path) -> ShellArmRegistry {
         .unwrap_or_default()
 }
 
-/// Atomic JSON write: temp file (pid-suffixed, so two concurrent writers on
-/// the same host never collide on the temp name) + fsync + rename — same
-/// pattern as `ci_telemetry::state`'s `save_json`.
+/// Atomic JSON write via [`crate::fs_util::write_atomic`] (uniquely named temp
+/// file, fsync, rename, parent-dir sync).
 fn save_shell_arm_registry(root: &Path, registry: &ShellArmRegistry) -> io::Result<()> {
     let path = shell_arm_registry_path(root);
-    if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir)?;
-    }
     let text = serde_json::to_string_pretty(registry).map_err(io::Error::other)?;
-    let temp = path.with_extension(format!("tmp-{}", std::process::id()));
-    {
-        use std::io::Write;
-        let mut file = std::fs::File::create(&temp)?;
-        file.write_all(text.as_bytes())?;
-        file.sync_all()?;
-    }
-    std::fs::rename(&temp, &path)
+    crate::fs_util::write_atomic(&path, text.as_bytes(), crate::fs_util::AtomicOpts::default())
 }
 
 /// A held, exclusive, blocking `flock` on `armed.lock` beside the registry
@@ -412,30 +401,13 @@ fn save_shell_arm_registry(root: &Path, registry: &ShellArmRegistry) -> io::Resu
 /// Reads stay lock-free: the save is an atomic rename, so a reader always
 /// sees one complete version.
 struct ShellArmLock {
-    _file: std::fs::File,
+    _lock: crate::fs_util::FileLock,
 }
 
 impl ShellArmLock {
     fn acquire(root: &Path) -> io::Result<Self> {
         let path = shell_arm_registry_path(root).with_extension("lock");
-        if let Some(dir) = path.parent() {
-            std::fs::create_dir_all(dir)?;
-        }
-        let file = std::fs::OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .write(true)
-            .open(path)?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::io::AsRawFd;
-            // SAFETY: `flock` on a descriptor we own for the duration of the
-            // call; no memory is shared with the kernel.
-            if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } != 0 {
-                return Err(io::Error::last_os_error());
-            }
-        }
-        Ok(Self { _file: file })
+        crate::fs_util::FileLock::lock_exclusive(&path).map(|_lock| Self { _lock })
     }
 }
 

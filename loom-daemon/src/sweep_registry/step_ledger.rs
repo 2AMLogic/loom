@@ -64,6 +64,9 @@ pub struct StepRun {
     /// The reaper's failure class, when it has one; the outcome's reason
     /// otherwise.
     pub failure_class: Option<String>,
+    /// How the attempt ended and where its output is (#15413); `None` for a
+    /// run the daemon has no process evidence for (a spawn-time refusal).
+    pub attempt: Option<super::step_spawn::ended::AttemptEvidence>,
 }
 
 impl SweepRegistry {
@@ -260,10 +263,11 @@ impl SweepRegistry {
             return;
         }
         let path = self.step_ledger_path();
-        let tmp = path.with_extension("json.tmp");
-        let written = std::fs::create_dir_all(self.config.logs_dir())
-            .and_then(|()| std::fs::write(&tmp, &json))
-            .and_then(|()| std::fs::rename(&tmp, &path));
+        let written = crate::fs_util::write_atomic(
+            &path,
+            json.as_bytes(),
+            crate::fs_util::AtomicOpts::default(),
+        );
         match written {
             Ok(()) => self.step_ledger_persisted = json,
             Err(e) => log::debug!("step_ledger: could not persist {}: {e}", path.display()),
@@ -273,8 +277,8 @@ impl SweepRegistry {
     /// Publish `step.item.{N}.ended` for a finished step (#12152): the
     /// step's terminal event on the bus, carrying the ledger's
     /// classification. A step emits no `sweep.issue.{N}.exited`, so this is
-    /// what the narration sink reads to narrate a merged PR's public-feed
-    /// `completion` (`safehouse::step_narrates_completion` decides which ends
+    /// what the safehouse merged-PR reporter reads to report a merged PR
+    /// (`safehouse::reporter::host_merge_hint` decides which ends
     /// qualify). Called once per ended step by the settle pass, never for a
     /// spawn-time refusal (`record_refusal`: no session ran). A no-op without
     /// a bus.
