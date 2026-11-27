@@ -43,10 +43,17 @@ pub(super) fn execute(cwd: &Path, request: &Request) -> Result<String> {
             let old = field(&request.input, "oldText")?;
             let new = field(&request.input, "newText")?;
             let original = fs::read_to_string(&path)?;
-            if old.is_empty() || original.matches(old).count() != 1 {
-                bail!(
-                    "edit requires exactly one nonempty oldText match; read the current file first"
-                );
+            if old.is_empty() {
+                bail!("oldText is empty. Supply the exact text to replace.");
+            }
+            match original.matches(old).count() {
+                0 => bail!(
+                    "oldText has no exact match. Check the file text, whitespace and line endings."
+                ),
+                1 => {}
+                count => {
+                    bail!("oldText has {count} exact matches. Include surrounding text in oldText.")
+                }
             }
             fs::write(&path, original.replacen(old, new, 1))?;
             Ok(format!("Edited {}", path.display()))
