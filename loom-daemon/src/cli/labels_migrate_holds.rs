@@ -54,19 +54,19 @@
 use std::collections::BTreeMap;
 use std::fmt;
 use std::path::PathBuf;
-use std::time::Duration;
 
 use crate::champion_hold::{capped_hold_routed, standing_hold, HoldKind, HOLD_BY};
 use crate::dep_classify::cli::EscalationMigration;
-use crate::gh_invocation::{AccessIntent, GhInvocation, GhTarget, Operation};
+use crate::gh_invocation::AccessIntent;
 use crate::sweep_registry::park_hold::{DAEMON_HOLD_BY, NOOP_HOLD_REASON};
 use crate::sweep_registry::standing_noop_hold_fingerprint;
 use serde::Serialize;
 
-use super::labels_migrate::{classify, enc, pace_write, ForgeError, Target, PER_PAGE};
-
-/// Pages read per label before a listing is treated as unanswerable.
-const MAX_PAGES: u32 = 100;
+use super::labels_migrate::{
+    classify, delete_issue_label, dry_run_hint, gh_api, max_exit, mode_banner, open_issues_page,
+    pace_write, paginate_open, parse_json_lines, push_fleet_header, run_targets_with, ForgeError,
+    Target,
+};
 
 /// The proposal and curated labels Pass 0 scanned for escalations.
 pub(crate) const ESCALATION_LABELS: [&str; 4] = [
@@ -199,11 +199,7 @@ pub(crate) struct Report {
 
 impl Report {
     fn render(&self, out: &mut String) {
-        let mode = if self.apply {
-            "apply"
-        } else {
-            "dry-run (no forge writes; pass --apply to migrate)"
-        };
+        let mode = mode_banner(self.apply);
         out.push_str(&format!("MODE holds {mode}\n"));
         for e in &self.events {
             out.push_str(&format!("{e}\n"));
@@ -233,23 +229,12 @@ fn stop_on_limit(r: &mut Report, e: &ForgeError) -> Result<(), Stop> {
 fn operator_held(forge: &dyn HoldsForge) -> Result<Vec<HoldItem>, ForgeError> {
     let mut all: BTreeMap<u64, HoldItem> = BTreeMap::new();
     for name in crate::work_finder::OPERATOR_HOLD_NAMES.iter() {
-        let mut done = false;
-        for page in 1..=MAX_PAGES {
-            let batch = forge.open_page(name, page)?;
-            let full = batch.len() >= PER_PAGE;
-            for it in batch {
-                all.entry(it.number).or_insert(it);
-            }
-            if !full {
-                done = true;
-                break;
-            }
-        }
-        if !done {
-            return Err(ForgeError::Other(format!(
-                "more than {} open items carry {name}; listing truncated",
-                MAX_PAGES as usize * PER_PAGE
-            )));
+        let listed = paginate_open(
+            |page| forge.open_page(name, page),
+            |limit| format!("more than {limit} open items carry {name}; listing truncated"),
+        )?;
+        for it in listed {
+            all.entry(it.number).or_insert(it);
         }
     }
     Ok(all.into_values().collect())
@@ -500,67 +485,36 @@ pub(crate) struct GhHoldsForge {
     pub root: PathBuf,
 }
 
-const GH_TIMEOUT: Duration = Duration::from_secs(60);
+/// Every `gh api` call of this pass is accounted under this operation.
+const OP: &str = "labels.migrate_holds";
 
 /// Forge writes one escalation step may make (body, label add, label
 /// removals, comment): paced up front so the step stays under the shared
 /// write rate.
 const ESCALATION_WRITES: usize = 4;
 
-impl GhHoldsForge {
-    fn gh(&self, intent: AccessIntent, args: &[&str]) -> Result<Vec<u8>, ForgeError> {
-        let target = GhTarget::repo(&self.repo).map_err(ForgeError::Other)?;
-        let what = format!("gh {}", args.get(..3).unwrap_or(args).join(" "));
-        let r =
-            GhInvocation::new(Operation::new("labels.migrate_holds"), intent, target, GH_TIMEOUT)
-                .args(args)
-                .run();
-        if let Some(o) = r.ok_output() {
-            return Ok(o.stdout.clone());
-        }
-        if let crate::cmd_out::CmdOutcome::Unavailable(crate::cmd_out::Unavailable::Shed {
-            ..
-        }) = r
-        {
-            return Err(ForgeError::RateLimited(r.failure_reason(&what)));
-        }
-        Err(classify(r.failure_reason(&what)))
-    }
-}
-
 /// One `[number, [label, ...], is_pr]` JSON line per item.
 pub(crate) fn parse_hold_items(stdout: &str) -> Result<Vec<HoldItem>, ForgeError> {
-    stdout
-        .lines()
-        .map(str::trim)
-        .filter(|l| !l.is_empty())
-        .map(|l| {
-            serde_json::from_str::<(u64, Vec<String>, bool)>(l)
-                .map(|(number, labels, is_pr)| HoldItem {
-                    number,
-                    labels,
-                    is_pr,
-                })
-                .map_err(|e| ForgeError::Other(format!("bad item line {l:?}: {e}")))
-        })
-        .collect()
+    parse_json_lines::<(u64, Vec<String>, bool)>(stdout).map(|rows| {
+        rows.into_iter()
+            .map(|(number, labels, is_pr)| HoldItem {
+                number,
+                labels,
+                is_pr,
+            })
+            .collect()
+    })
 }
 
 impl HoldsForge for GhHoldsForge {
     fn open_page(&self, label: &str, page: u32) -> Result<Vec<HoldItem>, ForgeError> {
-        let path = format!(
-            "repos/{}/issues?state=open&labels={}&per_page={PER_PAGE}&page={page}",
-            self.repo,
-            enc(label)
-        );
         let jq = ".[] | [.number, [.labels[].name], (.pull_request != null)] | @json";
-        let out = self.gh(AccessIntent::Read, &["api", &path, "--jq", jq])?;
-        parse_hold_items(&String::from_utf8_lossy(&out))
+        parse_hold_items(&open_issues_page(&self.repo, OP, label, page, jq)?)
     }
 
     fn trusted_comments(&self, number: u64) -> Result<Vec<String>, ForgeError> {
         let path = format!("repos/{}/issues/{number}/comments?per_page=100", self.repo);
-        let out = self.gh(AccessIntent::Read, &["api", "--paginate", &path])?;
+        let out = gh_api(&self.repo, OP, AccessIntent::Read, &["api", "--paginate", &path])?;
         crate::comment_trust::TrustPolicy::for_root(&self.root)
             .trusted_bodies(&out)
             .ok_or_else(|| ForgeError::Other("comment listing did not parse".to_string()))
@@ -575,10 +529,7 @@ impl HoldsForge for GhHoldsForge {
     }
 
     fn remove_label(&self, number: u64, label: &str) -> Result<(), ForgeError> {
-        pace_write();
-        let path = format!("repos/{}/issues/{number}/labels/{}", self.repo, enc(label));
-        self.gh(AccessIntent::Write, &["api", "-X", "DELETE", &path, "--silent"])
-            .map(|_| ())
+        delete_issue_label(&self.repo, OP, number, label)
     }
 
     fn migrate_escalation(&self, number: u64, apply: bool) -> EscalationMigration {
@@ -633,36 +584,26 @@ pub(crate) fn run_targets(
     forge_for: &dyn Fn(&Target) -> Box<dyn HoldsForge>,
     gate: &dyn Fn(&Target) -> Result<(), String>,
 ) -> Vec<Report> {
-    let mut reports = Vec::new();
-    for t in targets {
-        if apply {
-            if let Err(why) = gate(t) {
-                reports.push(Report {
-                    repo: t.repo.clone(),
-                    apply,
-                    events: vec![Event::Stopped {
-                        why: format!("refusing --apply (#9548): {why}"),
-                    }],
-                    summary: Summary::default(),
-                    exit: 2,
-                    rate_limited: false,
-                });
-                continue;
-            }
-        }
-        let r = run(forge_for(t).as_ref(), &t.repo, apply);
-        let stop = r.rate_limited;
-        reports.push(r);
-        if stop {
-            break;
-        }
-    }
-    reports
+    run_targets_with(
+        targets,
+        apply,
+        gate,
+        |t, why| Report {
+            repo: t.repo.clone(),
+            apply,
+            events: vec![Event::Stopped { why }],
+            summary: Summary::default(),
+            exit: 2,
+            rate_limited: false,
+        },
+        |t| run(forge_for(t).as_ref(), &t.repo, apply),
+        |r| r.rate_limited,
+    )
 }
 
 /// Render the reports; returns the exit code.
 pub(crate) fn finish(reports: &[Report], apply: bool, fleet: bool, json: bool) -> i32 {
-    let exit = reports.iter().map(|r| r.exit).max().unwrap_or(0);
+    let exit = max_exit(reports.iter().map(|r| &r.exit));
     if json {
         let v =
             serde_json::json!({ "apply": apply, "holds": true, "repos": reports, "exit": exit });
@@ -672,14 +613,12 @@ pub(crate) fn finish(reports: &[Report], apply: bool, fleet: bool, json: bool) -
     let mut out = String::new();
     for r in reports {
         if fleet {
-            out.push_str(&format!("== {} ==\n", r.repo));
+            push_fleet_header(&mut out, &r.repo);
         }
         r.render(&mut out);
     }
     print!("{out}");
-    if exit == 3 && !apply {
-        eprintln!("labels migrate --holds: dry run only; rerun with --apply to migrate");
-    }
+    dry_run_hint("labels migrate --holds", exit, apply);
     exit
 }
 
