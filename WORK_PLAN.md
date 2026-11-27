@@ -7,12 +7,13 @@ The body below is a snapshot of GitHub label state as of the last merged docs-ma
 <!-- Maintained automatically by the Guide triage agent. Manual edits are fine but may be overwritten. -->
 
 <!-- guide:plan-body:start -->
-_Generated: 2026-11-27T10:14:27Z (snapshot; compare against live labels)_
+_Generated: 2026-11-27T11:53:43Z (snapshot; compare against live labels)_
 ## Operator Attention: Merge-Risk-Hold Pileup
 
 Judge-approved PRs under a hold (`loom:blocked` or `loom:operator`) — a human merge decision, or the prerequisite shown, is missing.
 
 - **#13997**: docs(judge): split judge.md into always-read core + on-demand judge-* sub-skills *(held: champion merge-risk hold)*
+- **#14046**: refactor: remove the loom-api crate from the workspace *(held: champion critical-file hold)*
 - **#14108**: fix(private_workspace): forward the freshest owner token, not a fixed primary-first one *(held: champion merge-risk hold)*
 - **#14384**: fix: require native ownership before handing a fresh worktree to a Builder *(held: champion merge-risk hold)*
 - **#14498**: fix: pass over unprovisioned and sandbox-held Codex seats before a draw *(held: champion merge-risk hold)*
@@ -75,7 +76,7 @@ _None._
 
 `loom:issue` issues an open linked PR already holds — native admission would refuse them (`OPEN_PR`); listed with the PR and its stage, not counted above.
 
-- **#13820**: Remove the loom-api crate: reads a database the daemon does not write, 3 of 5 endpoints query tables nothing creates — open PR #14046 (unlabeled)
+- **#13820**: Remove the loom-api crate: reads a database the daemon does not write, 3 of 5 endpoints query tables nothing creates — open PR #14046 (held)
 - **#13957**: Shrink always-read core of judge.md (173 KB) into on-demand sub-skills — open PR #13997 (held)
 - **#14455**: Codex Curator steps are dispatched to stopped, unprovisioned seats and end SANDBOX_UNAVAILABLE every time — open PR #14498 (held)
 - **#14474**: Expose worktree operations through the shared Rust CLI — open PR #14514 (approved)
@@ -122,9 +123,9 @@ Issues currently being built (`loom:building`).
 - **#15581**: Add proc_exec::run_bounded_to_file and consolidate the 4 combined-log temp-file try_wait runners
 - **#15583**: Consolidate duplicate gh argv and gh api parsers in gh_invocation onto route::split_with and api_request
 - **#15588**: Make pr-worktree.sh stop when worktree root config resolution fails
-- **#15592**: fs_util::sum_entries comment misstates DirEntry::metadata() symlink behavior
-- **#15594**: Share the Codex and OpenCode session attribution filter
-- **#15597**: Share the descendant cascade walk and marker helpers between orphan_stack and merged_stack
+- **#15602**: Share the Git fixture used by the three stack reconciliation test suites
+- **#15603**: Share hardened docker run argv, mount setup, and override-image verification between Codex and Claude session containers
+- **#15605**: Consolidate duplicated PR file-list pagination and head-content plumbing across the four forge PR-diff verbs
 
 ## PRs Awaiting Review
 
@@ -139,6 +140,7 @@ PRs waiting on Judge (`loom:review-requested`).
 PRs that passed review (`loom:pr`); unmarked PRs are queued for Champion auto-merge, PRs marked `*(held …)*` are not (the hold decides).
 
 - **#13997**: docs(judge): split judge.md into always-read core + on-demand judge-* sub-skills — closes #13957 *(held: champion merge-risk hold)*
+- **#14046**: refactor: remove the loom-api crate from the workspace — closes #13820 *(held: champion critical-file hold)*
 - **#14108**: fix(private_workspace): forward the freshest owner token, not a fixed primary-first one — closes #13933 *(held: champion merge-risk hold)*
 - **#14384**: fix: require native ownership before handing a fresh worktree to a Builder — closes #14376 *(held: champion merge-risk hold)*
 - **#14498**: fix: pass over unprovisioned and sandbox-held Codex seats before a draw — closes #14455 *(held: champion merge-risk hold)*
@@ -173,8 +175,7 @@ PRs that passed review (`loom:pr`); unmarked PRs are queued for Champion auto-me
 - **#15577**: fix: spool --list output of the lib test binary when stdout is a pipe — closes #15553 *(held: champion merge-risk hold)*
 - **#15584**: refactor: add proc_exec::run_bounded_to_file for combined-log runners — closes #15581 *(held: champion merge-risk hold)*
 - **#15589**: fix(worktree-root): propagate config lookup failure status — closes #15588 *(held: champion merge-risk hold)*
-- **#15593**: docs: correct sum_entries comment on symlink size accounting — closes #15592
-- **#15598**: refactor: share one SessionFilter between Codex and OpenCode usage readers — closes #15594
+- **#15606**: test: extract shared StackFixture into test_git_helpers — closes #15602
 
 ## Proposed
 
@@ -293,7 +294,9 @@ Issues carrying `loom:curated`.
 - **#15532**: agy pilot: an installed loom-daemon older than v0.20.41 skips the manifest's mandatory pool, so an ambient GEMINI_API_KEY reaches the child *(curated)*
 - **#15553**: test flake: nextest discovery stalls inside the Run tests step (lib binary --list) on Rust Unit Tests (5/5) — sixth occurrence, first after #15378 *(curated)*
 - **#15588**: Make pr-worktree.sh stop when worktree root config resolution fails *(curated)*
-- **#15592**: fs_util::sum_entries comment misstates DirEntry::metadata() symlink behavior *(curated)*
+- **#15602**: Share the Git fixture used by the three stack reconciliation test suites *(curated)*
+- **#15603**: Share hardened docker run argv, mount setup, and override-image verification between Codex and Claude session containers *(curated)*
+- **#15605**: Consolidate duplicated PR file-list pagination and head-content plumbing across the four forge PR-diff verbs *(curated)*
 
 ## Proposed (Architect / Hermit)
 
@@ -303,6 +306,9 @@ Issues carrying `loom:curated`.
 - **#15364**: Remove unused Autoprefixer from the desktop quickstart *(hermit)* *(held)*
 - **#15410**: Remove the senderless SQLite issue_claims registry and its nine IPC requests (~1,200 LOC) *(hermit)* *(held)*
 - **#15568**: Remove three remaining senderless terminal IPC requests (GetTerminalOutput, GetTerminalActivity, GetCurrentCommit) and their unreachable output-scraping chain (~2,800 LOC) *(hermit)* *(held)*
+- **#15601**: Reuse the reaper’s send_group_signal in role timeouts *(hermit)* *(held)*
+- **#15603**: Share hardened docker run argv, mount setup, and override-image verification between Codex and Claude session containers *(hermit)*
+- **#15607**: Consolidate 10 remaining durable state atomic-write sites onto fs_util::write_atomic *(hermit)*
 
 ## Epics
 
@@ -318,7 +324,7 @@ Issues carrying `loom:curated`.
 
 | Bucket | Count |
 |------|-------|
-| Operator merge-risk holds | 32 |
+| Operator merge-risk holds | 33 |
 | Very important | 0 |
 | Important | 9 |
 | Ready (`loom:issue`, net of holds/building/open-linked-PRs) | 0 |
@@ -326,7 +332,7 @@ Issues carrying `loom:curated`.
 | Held, no other bucket | 80 |
 | PRs awaiting review | 3 |
 | Approved PRs awaiting merge | 37 |
-| Curated | 114 |
-| Architect / Hermit proposals | 6 |
+| Curated | 116 |
+| Architect / Hermit proposals | 9 |
 | Active epics | 7 |
 <!-- guide:plan-body:end -->
