@@ -2,10 +2,10 @@
 //! ([`super`], #15597).
 
 use std::collections::BTreeSet;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use super::*;
-use crate::test_git_helpers::{commit_file, configure, run};
+use crate::test_git_helpers::{run, StackFixture as GitFixture};
 
 const REPO: &str = "acme/widgets";
 
@@ -81,78 +81,6 @@ fn branch_lease_blocks_checks_only_loom_issue_branches() {
     assert!(!branch_lease_blocks("main", |_| {
         panic!("default branch must not query issue leases")
     }));
-}
-
-struct GitFixture {
-    _tmp: tempfile::TempDir,
-    origin: PathBuf,
-    author: PathBuf,
-    repo: PathBuf,
-}
-
-impl GitFixture {
-    fn new() -> Self {
-        let tmp = tempfile::tempdir().unwrap();
-        let origin = tmp.path().join("origin.git");
-        let author = tmp.path().join("author");
-        let repo = tmp.path().join("repo");
-        run(
-            tmp.path(),
-            &[
-                "init",
-                "-q",
-                "--bare",
-                "--initial-branch=main",
-                origin.to_str().unwrap(),
-            ],
-        );
-        std::fs::create_dir_all(&author).unwrap();
-        run(&author, &["init", "-q", "--initial-branch=main"]);
-        configure(&author);
-        commit_file(&author, "base.txt", "base\n", "base");
-        run(&author, &["remote", "add", "origin", origin.to_str().unwrap()]);
-        run(&author, &["push", "-q", "origin", "main"]);
-        Self {
-            _tmp: tmp,
-            origin,
-            author,
-            repo,
-        }
-    }
-
-    fn branch(&self, name: &str, from: &str, pr: u32, file: &str, body: &str) -> String {
-        run(&self.author, &["checkout", "-q", "-B", name, from]);
-        let sha = commit_file(&self.author, file, body, &format!("{name}: {file}"));
-        run(&self.author, &["push", "-q", "-f", "origin", &format!("{name}:{name}")]);
-        run(
-            &self.author,
-            &[
-                "push",
-                "-q",
-                "-f",
-                "origin",
-                &format!("{name}:refs/pull/{pr}/head"),
-            ],
-        );
-        sha
-    }
-
-    fn clone_repo(&self) {
-        run(
-            self.origin.parent().unwrap(),
-            &[
-                "clone",
-                "-q",
-                self.origin.to_str().unwrap(),
-                self.repo.to_str().unwrap(),
-            ],
-        );
-        configure(&self.repo);
-    }
-
-    fn origin_rev(&self, rev: &str) -> String {
-        run(&self.origin, &["rev-parse", rev])
-    }
 }
 
 #[test]

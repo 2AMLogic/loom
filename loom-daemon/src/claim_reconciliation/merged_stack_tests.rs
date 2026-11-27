@@ -7,7 +7,7 @@
 
 use std::cell::RefCell;
 use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use super::*;
 
@@ -105,110 +105,11 @@ fn flag_marker_is_keyed_by_parent_and_head() {
 
 // --- the pass, on real repositories -----------------------------------------
 
-use crate::test_git_helpers::{commit_file, configure, run};
+use crate::test_git_helpers::{commit_file, run, StackFixture as Fixture};
 
 const A: &str = "feature/issue-901";
 const B: &str = "feature/issue-902";
 const C: &str = "feature/issue-903";
-
-/// origin + an "author" clone that builds the stack + the clone the pass
-/// runs in (which never checked out any of the stack's branches).
-struct Fixture {
-    _tmp: tempfile::TempDir,
-    origin: PathBuf,
-    author: PathBuf,
-    repo: PathBuf,
-}
-
-impl Fixture {
-    fn new() -> Self {
-        let tmp = tempfile::tempdir().unwrap();
-        let origin = tmp.path().join("origin.git");
-        let author = tmp.path().join("author");
-        let repo = tmp.path().join("repo");
-        run(
-            tmp.path(),
-            &[
-                "init",
-                "-q",
-                "--bare",
-                "--initial-branch=main",
-                origin.to_str().unwrap(),
-            ],
-        );
-        std::fs::create_dir_all(&author).unwrap();
-        run(&author, &["init", "-q", "--initial-branch=main"]);
-        configure(&author);
-        commit_file(&author, "base.txt", "base\n", "base");
-        run(&author, &["remote", "add", "origin", origin.to_str().unwrap()]);
-        run(&author, &["push", "-q", "origin", "main"]);
-        Self {
-            _tmp: tmp,
-            origin,
-            author,
-            repo,
-        }
-    }
-
-    /// Commit `file` on a new branch `name` off `from` in the author clone,
-    /// push it, and record it as PR `pr`'s head (`refs/pull/<pr>/head`).
-    fn branch(&self, name: &str, from: &str, pr: u32, file: &str, body: &str) -> String {
-        run(&self.author, &["checkout", "-q", "-B", name, from]);
-        let sha = commit_file(&self.author, file, body, &format!("{name}: {file}"));
-        run(&self.author, &["push", "-q", "-f", "origin", &format!("{name}:{name}")]);
-        run(
-            &self.author,
-            &[
-                "push",
-                "-q",
-                "-f",
-                "origin",
-                &format!("{name}:refs/pull/{pr}/head"),
-            ],
-        );
-        sha
-    }
-
-    /// Move origin's main forward with `file` — the squash merge, whose SHA
-    /// differs from the parent's pre-merge tip by construction.
-    fn advance_main(&self, file: &str, body: &str) -> String {
-        run(&self.author, &["checkout", "-q", "main"]);
-        let sha = commit_file(&self.author, file, body, &format!("main: {file}"));
-        run(&self.author, &["push", "-q", "origin", "main"]);
-        sha
-    }
-
-    /// The clone the pass runs in, made after the stack exists.
-    fn clone_repo(&self) {
-        run(
-            self.origin.parent().unwrap(),
-            &[
-                "clone",
-                "-q",
-                self.origin.to_str().unwrap(),
-                self.repo.to_str().unwrap(),
-            ],
-        );
-        configure(&self.repo);
-    }
-
-    fn origin_rev(&self, rev: &str) -> String {
-        run(&self.origin, &["rev-parse", rev])
-    }
-
-    fn origin_files(&self, rev: &str) -> Vec<String> {
-        run(&self.origin, &["ls-tree", "--name-only", rev])
-            .lines()
-            .map(str::to_string)
-            .collect()
-    }
-
-    fn origin_count(&self, range: &str) -> usize {
-        run(&self.origin, &["rev-list", "--count", range])
-            .parse()
-            .unwrap()
-    }
-}
 
 /// The repository the fake forge says it is; [`open_pr`] heads live in it.
 const REPO: &str = "acme/widgets";

@@ -1,8 +1,10 @@
 //! Hermetic git helpers shared by the in-crate tests that drive real
 //! repositories (orphan-stack replacement and the orphaned-stacked-child pass).
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
+
+use tempfile::TempDir;
 
 pub fn git_out(dir: &Path, args: &[&str]) -> std::process::Output {
     Command::new("git")
@@ -43,4 +45,102 @@ pub fn configure(dir: &Path) {
     run(dir, &["config", "user.email", "loom@example.com"]);
     run(dir, &["config", "user.name", "Loom Test"]);
     run(dir, &["config", "commit.gpgsign", "false"]);
+}
+
+/// Bare `origin` + an `author` clone that builds the stack + the `repo` clone
+/// the pass runs in (which never checked out any of the stack's branches).
+pub struct StackFixture {
+    pub _tmp: TempDir,
+    pub origin: PathBuf,
+    pub author: PathBuf,
+    pub repo: PathBuf,
+}
+
+impl StackFixture {
+    pub fn new() -> Self {
+        let tmp = tempfile::tempdir().unwrap();
+        let origin = tmp.path().join("origin.git");
+        let author = tmp.path().join("author");
+        let repo = tmp.path().join("repo");
+        run(
+            tmp.path(),
+            &[
+                "init",
+                "-q",
+                "--bare",
+                "--initial-branch=main",
+                origin.to_str().unwrap(),
+            ],
+        );
+        std::fs::create_dir_all(&author).unwrap();
+        run(&author, &["init", "-q", "--initial-branch=main"]);
+        configure(&author);
+        commit_file(&author, "base.txt", "base\n", "base");
+        run(&author, &["remote", "add", "origin", origin.to_str().unwrap()]);
+        run(&author, &["push", "-q", "origin", "main"]);
+        Self {
+            _tmp: tmp,
+            origin,
+            author,
+            repo,
+        }
+    }
+
+    /// Commit `file` on a new branch `name` off `from` in the author clone,
+    /// push it, and record it as PR `pr`'s head (`refs/pull/<pr>/head`).
+    pub fn branch(&self, name: &str, from: &str, pr: u32, file: &str, body: &str) -> String {
+        run(&self.author, &["checkout", "-q", "-B", name, from]);
+        let sha = commit_file(&self.author, file, body, &format!("{name}: {file}"));
+        run(&self.author, &["push", "-q", "-f", "origin", &format!("{name}:{name}")]);
+        run(
+            &self.author,
+            &[
+                "push",
+                "-q",
+                "-f",
+                "origin",
+                &format!("{name}:refs/pull/{pr}/head"),
+            ],
+        );
+        sha
+    }
+
+    /// Move origin's main forward with `file`.
+    pub fn advance_main(&self, file: &str, body: &str) -> String {
+        run(&self.author, &["checkout", "-q", "main"]);
+        let sha = commit_file(&self.author, file, body, &format!("main: {file}"));
+        run(&self.author, &["push", "-q", "origin", "main"]);
+        sha
+    }
+
+    /// The clone the pass runs in, made after the stack exists.
+    pub fn clone_repo(&self) {
+        run(
+            self.origin.parent().unwrap(),
+            &[
+                "clone",
+                "-q",
+                self.origin.to_str().unwrap(),
+                self.repo.to_str().unwrap(),
+            ],
+        );
+        configure(&self.repo);
+    }
+
+    pub fn origin_rev(&self, rev: &str) -> String {
+        run(&self.origin, &["rev-parse", rev])
+    }
+
+    pub fn origin_files(&self, rev: &str) -> Vec<String> {
+        run(&self.origin, &["ls-tree", "--name-only", rev])
+            .lines()
+            .map(str::to_string)
+            .collect()
+    }
+
+    pub fn origin_count(&self, range: &str) -> usize {
+        run(&self.origin, &["rev-list", "--count", range])
+            .parse()
+            .unwrap()
+    }
 }
