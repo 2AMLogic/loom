@@ -175,6 +175,9 @@ impl LaunchError {
 /// reaches span attributes, the step log's rejection marker, and — prefixed
 /// with `preflight_` — the step ledger's outcome reason. Never carries
 /// free-form diagnostic text: the message stays on local stderr only.
+/// A detail of a boundary keeps the boundary's token as its prefix
+/// (`profile_selection_effort`), so a search for the boundary still finds
+/// every detail.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LaunchStage {
     /// The runtime name could not be resolved or validated (workspace
@@ -185,8 +188,18 @@ pub enum LaunchStage {
     WorkerOptions,
     /// Role admission refused this runtime/profile/role pairing.
     RoleAdmission,
-    /// Model-profile selection failed for this launch.
+    /// Model-profile selection failed for this launch: everything that is
+    /// wrong with the profile itself or with the request's shape (an unknown
+    /// or malformed profile, no provider binding for this harness, an invalid
+    /// credential mapping). The two launch-argument conflicts have their own
+    /// variants below.
     ProfileSelection,
+    /// Model-profile selection failed because the launch's reasoning effort
+    /// is outside the selected profile's `allowedEfforts`.
+    ProfileSelectionEffort,
+    /// Model-profile selection failed because the launch's bare model differs
+    /// from the selected profile's own model.
+    ProfileSelectionModel,
     /// The selected model profile excludes this role (`excludedRoles`).
     ProfileRoleExcluded,
     /// The LLM gateway refused, or could not plan, this launch.
@@ -228,6 +241,8 @@ impl LaunchStage {
             Self::WorkerOptions => "worker_options",
             Self::RoleAdmission => "role_admission",
             Self::ProfileSelection => "profile_selection",
+            Self::ProfileSelectionEffort => "profile_selection_effort",
+            Self::ProfileSelectionModel => "profile_selection_model",
             Self::ProfileRoleExcluded => "profile_role_excluded",
             Self::GatewayPlan => "gateway_plan",
             Self::Containment => "containment",
@@ -253,6 +268,8 @@ impl LaunchStage {
             "worker_options" => Self::WorkerOptions,
             "role_admission" => Self::RoleAdmission,
             "profile_selection" => Self::ProfileSelection,
+            "profile_selection_effort" => Self::ProfileSelectionEffort,
+            "profile_selection_model" => Self::ProfileSelectionModel,
             "profile_role_excluded" => Self::ProfileRoleExcluded,
             "gateway_plan" => Self::GatewayPlan,
             "containment" => Self::Containment,
@@ -294,6 +311,8 @@ fn stage_reason(stage: LaunchStage) -> &'static str {
         LaunchStage::WorkerOptions => "preflight_worker_options",
         LaunchStage::RoleAdmission => "preflight_role_admission",
         LaunchStage::ProfileSelection => "preflight_profile_selection",
+        LaunchStage::ProfileSelectionEffort => "preflight_profile_selection_effort",
+        LaunchStage::ProfileSelectionModel => "preflight_profile_selection_model",
         LaunchStage::ProfileRoleExcluded => "preflight_profile_role_excluded",
         LaunchStage::GatewayPlan => "preflight_gateway_plan",
         LaunchStage::Containment => "preflight_containment",
@@ -1534,6 +1553,8 @@ mod launch_rejection_tests {
             LaunchStage::WorkerOptions,
             LaunchStage::RoleAdmission,
             LaunchStage::ProfileSelection,
+            LaunchStage::ProfileSelectionEffort,
+            LaunchStage::ProfileSelectionModel,
             LaunchStage::ProfileRoleExcluded,
             LaunchStage::GatewayPlan,
             LaunchStage::Containment,
@@ -1556,6 +1577,14 @@ mod launch_rejection_tests {
             let reason = stage_reason(stage);
             assert!(reason.starts_with("preflight_"));
             assert_eq!(reason.strip_prefix("preflight_"), Some(stage.as_str()));
+            // One token reaches the ledger whole through the per-spawn report
+            // socket: a longer name would be truncated on the datagram and
+            // read back as no typed reason.
+            assert!(
+                stage.as_str().len() <= super::rejection::REPORT_BYTES,
+                "{} is too long for the report socket",
+                stage.as_str()
+            );
         }
         assert_eq!(LaunchStage::parse("credential "), None, "exact tokens only");
         assert_eq!(LaunchStage::parse("Credential"), None);
