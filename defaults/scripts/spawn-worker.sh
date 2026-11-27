@@ -12,4 +12,11 @@ if [[ -z "$DAEMON_BIN" ]]; then
     echo "[ERROR] loom-daemon binary not found. Build it or set LOOM_DAEMON_BIN." >&2
     exit 1
 fi
+if [[ "$DAEMON_BIN" != /* ]]; then
+    DAEMON_BIN="$(cd "$(dirname "$DAEMON_BIN")" && pwd)/$(basename "$DAEMON_BIN")"
+fi
+# Hand the exact worker executable selected for this launch to child adapters
+# (spawn-agy.sh's v0.20.41 mandatory-pool floor, #15532), overwriting any
+# inherited value on every invocation.
+export LOOM_SPAWN_WORKER_DAEMON_BIN="$DAEMON_BIN"
 exec "$DAEMON_BIN" spawn-worker --scripts-dir "$SCRIPT_DIR" -- "$@"

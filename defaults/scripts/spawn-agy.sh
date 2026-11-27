@@ -45,12 +45,16 @@
 # object stays free of per-launch paths.
 #
 # The GEMINI_API_KEY itself is NOT handled here: `loom-daemon spawn-worker`
-# selects the gemini pool account and injects the key into this process's
-# environment before exec'ing the runner, so the lease is counted against
-# the worker PID that becomes the run.
+# (>= 0.20.41, `0918138e9`) selects the gemini pool account and injects the key
+# into this process's environment before exec'ing the runner, so the lease is
+# counted against the worker PID that becomes the run. An older worker binary
+# skips the manifest's `credentialPool` and lets an ambient GEMINI_API_KEY
+# reach the child (#15532), so this adapter checks the selected worker
+# executable (`LOOM_SPAWN_WORKER_DAEMON_BIN`, supplied by `spawn-worker.sh` or
+# direct native `spawn-worker`) against >= 0.20.41 before creating HOME or
+# running `agy`. Bare adapter calls lack that identity and refuse at 78.
 #
 # Usage:
-#   .loom/scripts/spawn-agy.sh -p "your prompt"
 #   LOOM_RUNTIME=agy .loom/scripts/spawn-worker.sh -p "your prompt"
 set -euo pipefail
 
@@ -67,6 +71,66 @@ _agy_refuse() {
 # Background self-update kill switch, ahead of everything else: nothing this
 # script runs may inherit an updater-enabled environment.
 export AGY_CLI_DISABLE_AUTO_UPDATE="${AGY_CLI_DISABLE_AUTO_UPDATE:-true}"
+
+# Mandatory-pool daemon floor (#15532): v0.20.41 (`0918138e9`) is the first
+# release where `loom-daemon spawn-worker` enforces `agy`'s manifest
+# `credentialPool`. Check ONLY the worker executable handed off for this
+# launch, fail closed on any missing/unreadable/below-floor binary before
+# creating the isolated HOME, and consume the private handoff variable so the
+# CLI child never inherits it. Advisory preflight skip switches do not apply.
+_AGY_DAEMON_FLOOR="0.20.41"
+_AGY_WORKER_BIN="${LOOM_SPAWN_WORKER_DAEMON_BIN:-}"
+unset LOOM_SPAWN_WORKER_DAEMON_BIN
+
+_agy_version_ge() {
+    local have="$1" floor="$2"
+    local hm hn hp fm fn fp
+    [[ "$have" =~ ^([0-9]+)\.([0-9]+)\.([0-9]+)$ ]] || return 1
+    hm="${BASH_REMATCH[1]}"; hn="${BASH_REMATCH[2]}"; hp="${BASH_REMATCH[3]}"
+    [[ "$floor" =~ ^([0-9]+)\.([0-9]+)\.([0-9]+)$ ]] || return 1
+    fm="${BASH_REMATCH[1]}"; fn="${BASH_REMATCH[2]}"; fp="${BASH_REMATCH[3]}"
+    if (( 10#$hm != 10#$fm )); then (( 10#$hm > 10#$fm )); return $?; fi
+    if (( 10#$hn != 10#$fn )); then (( 10#$hn > 10#$fn )); return $?; fi
+    (( 10#$hp >= 10#$fp ))
+}
+
+_agy_check_worker_floor() {
+    local ver_out="" ver_rc=0 ver_line="" have_ver=""
+    if [[ -z "$_AGY_WORKER_BIN" ]]; then
+        _agy_refuse "daemon floor" "LOOM_SPAWN_WORKER_DAEMON_BIN is unset" \
+            "because agy requires loom-daemon >= $_AGY_DAEMON_FLOOR to enforce its mandatory gemini credentialPool and a bare spawn-agy.sh invocation cannot establish which worker ran" \
+            "launch via 'LOOM_RUNTIME=agy .loom/scripts/spawn-worker.sh -p ...', or update loom-daemon (>= $_AGY_DAEMON_FLOOR; .loom/scripts/cli/loom-daemon-update.sh --fetch) when invoking 'loom-daemon spawn-worker' directly"
+    fi
+    if [[ "$_AGY_WORKER_BIN" != /* || ! -f "$_AGY_WORKER_BIN" || ! -x "$_AGY_WORKER_BIN" ]]; then
+        _agy_refuse "daemon floor" "'$_AGY_WORKER_BIN'" \
+            "is not an executable absolute loom-daemon path (agy requires loom-daemon >= $_AGY_DAEMON_FLOOR)" \
+            "launch via 'LOOM_RUNTIME=agy .loom/scripts/spawn-worker.sh -p ...' or roll this host (.loom/scripts/cli/loom-daemon-update.sh --fetch) to loom-daemon >= $_AGY_DAEMON_FLOOR"
+    fi
+    set +e
+    ver_out="$("$_AGY_WORKER_BIN" --version 2>/dev/null </dev/null)"
+    ver_rc=$?
+    set -e
+    if [[ "$ver_rc" -ne 0 ]]; then
+        _agy_refuse "daemon floor" "'$_AGY_WORKER_BIN --version'" \
+            "exited $ver_rc instead of reporting a usable loom-daemon >= $_AGY_DAEMON_FLOOR" \
+            "roll this host (.loom/scripts/cli/loom-daemon-update.sh --fetch) or set LOOM_DAEMON_BIN to a working loom-daemon >= $_AGY_DAEMON_FLOOR, and launch via .loom/scripts/spawn-worker.sh"
+    fi
+    ver_line="${ver_out%%$'\n'*}"
+    ver_line="${ver_line%$'\r'}"
+    if [[ ! "$ver_line" =~ ^loom-daemon[[:space:]]+([0-9]+\.[0-9]+\.[0-9]+)([[:space:]]|$) ]]; then
+        _agy_refuse "daemon floor" "'$_AGY_WORKER_BIN --version'" \
+            "returned an unrecognized version string (expected 'loom-daemon <major.minor.patch>' >= $_AGY_DAEMON_FLOOR)" \
+            "roll this host (.loom/scripts/cli/loom-daemon-update.sh --fetch) or set LOOM_DAEMON_BIN to loom-daemon >= $_AGY_DAEMON_FLOOR, and launch via .loom/scripts/spawn-worker.sh"
+    fi
+    have_ver="${BASH_REMATCH[1]}"
+    if ! _agy_version_ge "$have_ver" "$_AGY_DAEMON_FLOOR"; then
+        _agy_refuse "daemon floor" "'$_AGY_WORKER_BIN' (loom-daemon $have_ver)" \
+            "predates loom-daemon >= $_AGY_DAEMON_FLOOR, the first release that enforces agy's mandatory gemini credentialPool" \
+            "roll this host (.loom/scripts/cli/loom-daemon-update.sh --fetch) or build/pin LOOM_DAEMON_BIN to loom-daemon >= $_AGY_DAEMON_FLOOR before launching via .loom/scripts/spawn-worker.sh"
+    fi
+}
+
+_agy_check_worker_floor
 
 # Screen one source of CLI-bound tokens against the pinned policy and collect
 # what survives in _agy_kept (space-prefixed). `tag` is `extra-args` for an

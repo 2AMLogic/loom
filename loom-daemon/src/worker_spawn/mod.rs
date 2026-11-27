@@ -279,6 +279,12 @@ impl LaunchStage {
 /// diagnostics stay on local stderr and out of receipts and telemetry.
 pub const LAUNCH_REJECTED_MARKER: &str = "# LOOM_LAUNCH_REJECTED ";
 
+/// Private worker-to-adapter handoff naming the `loom-daemon` executable that
+/// selected this launch (#15532). `spawn-worker.sh` sets it for historical
+/// `0.20.41`–`0.20.43` workers; direct `loom-daemon spawn-worker` sets its own
+/// `current_exe()` for `agy` and scrubs the variable from every other runtime.
+const AGY_WORKER_DAEMON_BIN_ENV: &str = "LOOM_SPAWN_WORKER_DAEMON_BIN";
+
 /// The ledger outcome reason for a rejected preflight whose boundary is
 /// proven (the marker exists) but untyped (no stage, or a stage this build
 /// does not know).
@@ -955,6 +961,7 @@ fn run_preflight(
             )
             .map_err(|e| e.or_stage(LaunchStage::Containment))?;
             llm_gateway::scrub(&mut command);
+            command.env_remove(AGY_WORKER_DAEMON_BIN_ENV);
             let mut log = attach_log(&mut command, options.log.as_deref())
                 .map_err(|e| e.or_stage(LaunchStage::LogWrite))?;
             writeln!(log, "{}", profile.dispatch_marker())
@@ -1126,6 +1133,15 @@ fn run_preflight(
         }
         let mut command = Command::new(runner);
         command.args(&adapter_args);
+        if runtime == "agy" {
+            let worker_exe = std::env::current_exe().map_err(|e| {
+                LaunchError::config(format!(
+                    "cannot resolve running loom-daemon executable for agy floor check: {e}"
+                ))
+                .with_stage(LaunchStage::LaunchPrep)
+            })?;
+            command.env(AGY_WORKER_DAEMON_BIN_ENV, worker_exe);
+        }
         // #14945: a tier-3 runtime whose manifest declares `credentialPool`
         // (the Antigravity `agy` pilot) draws its key from the API-key pool
         // HERE, in the worker process that exec's the runner — the process
@@ -1204,6 +1220,9 @@ fn run_preflight(
     // and not a native harness either, which holds a routed key only under
     // its own provider-key variable (`llm_gateway::Route::credential`).
     llm_gateway::scrub(&mut command);
+    if runtime != "agy" {
+        command.env_remove(AGY_WORKER_DAEMON_BIN_ENV);
+    }
     let private_selection = if runtime == "codex"
         && std::env::var_os("LOOM_PRIVATE_LEASE_FD").is_none()
         && nonempty_env("LOOM_CODEX_NO_EXEC").is_none()

@@ -397,3 +397,7 @@ test-guide-transient-first-at.sh
 # passthrough, the 0.19.1312 version floor, and the resync-keeps-the-setting
 # recheck (agents stay unpinned, config survives). Hermetic: mocks only.
 test-resolve-role-model.sh
+# #15532: spawn-agy.sh's v0.20.41 mandatory-pool daemon floor via
+# spawn-worker.sh handoff, self-pin precedence, malformed/failing --version, and
+# skip-switch immunity. Hermetic: controlled daemon/CLI stubs only.
+test-spawn-agy-daemon-floor.sh
