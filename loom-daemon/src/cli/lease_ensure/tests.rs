@@ -293,12 +293,26 @@ fn starting_renewal_returns_before_the_detached_loop_exits() {
     );
 }
 
-/// A renew fake that records which fds above 2 it was handed. It probes each
-/// number with `-e /dev/fd/N` rather than globbing `/dev/fd`, because the glob
-/// opens a directory fd of its own (typically 3) and would report it.
+/// A renew fake that reports exactly the fds above 2 it was handed, one number
+/// per line in `renew-fds`. It probes each number with `-e /dev/fd/N` rather
+/// than globbing `/dev/fd`, because the glob opens a directory fd of its own
+/// and would report it.
+///
+/// Nothing here may be an fd the shell opens for itself, because the test
+/// compares bare numbers against the report: a script-reading bash keeps its
+/// script open on fd 255, and a redirected compound command makes it save
+/// stdout on fd 10. With the report written by `for ...; done > renew-fds`, a
+/// test process whose pipe happened to be allocated on fd 10 failed on bash's
+/// own saved stdout, not on an inherited fd (#15635: in all three captured
+/// failures the two pipes' `/proc/<pid>/fd/N` inodes differed). Hence `exec
+/// bash -c` (no script fd) and `exec > renew-fds` before the loop (no saved
+/// stdout).
 const RENEW_RECORDS_FDS: &str = r#"#!/usr/bin/env bash
-for ((f = 3; f < 1024; f++)); do [[ -e /dev/fd/$f ]] && echo "$f"; done > renew-fds
-echo 424242
+exec bash -c '
+    exec > renew-fds
+    for ((f = 3; f < 1024; f++)); do [[ -e /dev/fd/$f ]] && echo "$f"; done
+    exit 0
+'
 "#;
 
 /// #10203: `worktree.sh` calls `lease ensure` with its caller's stdout on fd 3,
@@ -313,7 +327,7 @@ fn the_renewal_script_inherits_no_fd_from_the_caller() {
     let dir = checkout(PUBLISH_OK, RENEW_RECORDS_FDS);
 
     let outcome = args(&dir).ensure(&in_session());
-    assert!(matches!(outcome, Outcome::Renewing { .. }));
+    assert!(matches!(outcome, Outcome::Renewing { .. }), "{outcome:?}");
 
     let seen = argv(&dir, "renew-fds").expect("the fake renew script ran");
     for fd in pipe_fds {
@@ -891,9 +905,17 @@ fn a_live_session_publishes_under_the_same_identity_every_time() {
     let mut a = args(&dir);
     a.watch_pid = std::process::id();
 
-    a.ensure(&in_session());
+    let first_outcome = a.ensure(&in_session());
+    assert!(
+        matches!(first_outcome, Outcome::Renewing { .. }),
+        "first ensure: {first_outcome:?}"
+    );
     let first = argv(&dir, "publish-argv").unwrap();
-    a.ensure(&in_session());
+    let second_outcome = a.ensure(&in_session());
+    assert!(
+        matches!(second_outcome, Outcome::Renewing { .. }),
+        "second ensure: {second_outcome:?}"
+    );
     let second = argv(&dir, "publish-argv").unwrap();
 
     assert!(first.contains("--sweep-id sweep-insession-s"), "{first}");
@@ -911,8 +933,44 @@ fn a_sweep_run_id_keeps_publish_on_its_own_identity() {
         ..in_session()
     };
 
-    a.ensure(&env);
+    let outcome = a.ensure(&env);
+    assert!(matches!(outcome, Outcome::Renewing { .. }), "{outcome:?}");
     assert_eq!(argv(&dir, "publish-argv").unwrap().trim(), "publish 8193");
+}
+
+/// #15013's window at `lease ensure`'s own spawn. Under plain `cargo test` a
+/// sibling test thread's `fork` briefly holds a copy of the write fd
+/// `write_executable` opened, and the kernel refuses to exec the publish
+/// script with `ETXTBSY` until that copy's `execve` closes it — which surfaced
+/// as a missing `publish-argv` (#15635: `PublishUnavailable("Text file busy")`
+/// in both captured failures). Holding the script open for writing stands in
+/// for that copy; `ensure()` must wait it out, not report the lease lost.
+#[test]
+fn a_publish_script_a_sibling_is_still_writing_is_waited_for() {
+    let dir = checkout(PUBLISH_OK, RENEW_OK);
+    let writer = fs::OpenOptions::new()
+        .write(true)
+        .open(dir.path().join(".loom/scripts/sweep-lease-publish.sh"))
+        .unwrap();
+    let releaser = std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(30));
+        drop(writer);
+    });
+
+    let started = Instant::now();
+    let outcome = args(&dir).ensure(&in_session());
+    releaser.join().unwrap();
+
+    assert!(
+        started.elapsed() >= std::time::Duration::from_millis(30),
+        "the script ran before its writer closed: {:?}",
+        started.elapsed()
+    );
+    assert!(
+        matches!(&outcome, Outcome::Renewing { loop_pid: Some(pid), .. } if pid == "424242"),
+        "the waited-for script must run exactly once: {outcome:?}"
+    );
+    assert_eq!(argv(&dir, "publish-argv").unwrap(), "publish 8193\n");
 }
 
 fn lease_row(host: &str, sweep: &str, age_secs: i64) -> crate::cli::lease_co_occupancy::LeaseRow {
