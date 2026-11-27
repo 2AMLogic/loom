@@ -2984,7 +2984,7 @@ deciding the workspace needs a `Skip`:
 | Loom-owned transient paths (#3778/#3950) | `.loom/sweep-checkpoint/`, `.loom/tokens/`, `.loom/logs/`, `.loom/worktrees/`, … — the daemon's own runtime bookkeeping |
 | Regenerable lockfiles (#3950) | `package-lock.json`, `Cargo.lock`, `pnpm-lock.yaml`, `yarn.lock`, `uv.lock` (matched by basename anywhere in the tree) |
 | Re-stamped install manifest (#4239, #4332) | `.loom/install-metadata.json` exactly — generated + re-stamped by every `resync-installed.sh` run, no `defaults/` source to byte-match against |
-| Installed-surface byte-match (#4332) | `.loom/hooks/`, `.loom/scripts/`, `.loom/roles/`, `.loom/docs/`, `.loom/bin/`, `.claude/commands/loom/` by directory prefix, plus the single-file rate card `.loom/pricing.json` ← `defaults/pricing.json` by exact path (#15554) — ignorable **iff** the dirty file's content byte-matches its tracked `defaults/` counterpart in the same worktree (loom-repo-scoped; a consumer repo has no local `defaults/` tree, so this class never applies there) |
+| Installed-surface byte-match (#4332) | `.loom/hooks/`, `.loom/scripts/`, `.loom/roles/`, `.loom/docs/`, `.loom/runtimes/`, `.loom/bin/`, `.claude/commands/loom/` and `.agents/skills/` by directory prefix, plus the single files `.loom/pricing.json` ← `defaults/pricing.json` (#15554), `.claude/README.md` ← `defaults/.claude/README.md`, `.github/CONFIGURATION.md` ← `defaults/.github/CONFIGURATION.md`, `.loom/biome.jsonc` ← `defaults/.loom/biome.jsonc` and `.claude/biome.jsonc` ← `defaults/.claude/biome.jsonc` by exact path (#15566) — ignorable **iff** the dirty file's content byte-matches its tracked `defaults/` counterpart in the same worktree (loom-repo-scoped; a consumer repo has no local `defaults/` tree, so this class never applies there) |
 
 The installed-surface class exists because this repo dogfoods its own install:
 `resync-installed.sh` (`.loom/docs/troubleshooting.md` → *Overnight / long-running
@@ -2998,7 +2998,12 @@ copy cannot byte-match content it was never copied from, so it still reports
 `dirty-tree` as before; only provable resync output is ignored. A `defaults/…`
 SOURCE-side edit is never in this class's domain either way (only the *installed*
 copy maps to its source, not the reverse), so editing `defaults/docs/x.md`
-directly and then resyncing still correctly skips the gate on that edit.
+directly and then resyncing still correctly skips the gate on that edit. The
+marker-gated `.agents/skills/` surface follows the same rule: a skill that was
+hand-edited, or detached from generation by stripping its marker, no longer
+byte-matches its source and stays `dirty-tree`. This repo tracks
+`.agents/skills` as a symlink, so only a checkout carrying a real directory
+there can leave dirt under that prefix.
 
 `resync-installed.sh` also recommends `./.loom/scripts/land-resync-commit.sh`
 in its summary when a run leaves the tree dirty with nothing but this kind of

@@ -1796,6 +1796,176 @@ fn test_non_ignorable_dirt_pricing_card_status_line_variants() {
     );
 }
 
+const OTHER_SINGLE_FILE_SURFACES: [(&str, &str); 4] = [
+    (".claude/README.md", "defaults/.claude/README.md"),
+    (".github/CONFIGURATION.md", "defaults/.github/CONFIGURATION.md"),
+    (".loom/biome.jsonc", "defaults/.loom/biome.jsonc"),
+    (".claude/biome.jsonc", "defaults/.claude/biome.jsonc"),
+];
+
+const OTHER_DIRECTORY_SURFACES: [(&str, &str, &str); 2] = [
+    (".agents/skills/", "defaults/.agents/skills/", "loom-builder/SKILL.md"),
+    (".loom/runtimes/", "defaults/runtimes/", "claude.json"),
+];
+
+#[test]
+fn test_is_ignorable_dirt_other_single_file_surface_byte_match() {
+    for (installed, source) in OTHER_SINGLE_FILE_SURFACES {
+        let repo = tempfile::tempdir().unwrap();
+        let repo_root = repo.path();
+        write_rel(repo_root, source, "resynced content\n");
+        write_rel(repo_root, installed, "resynced content\n");
+        assert!(
+            is_ignorable_dirt(installed, repo_root),
+            "{installed}: a byte-identical copy of {source} is provably resync output"
+        );
+    }
+}
+
+#[test]
+fn test_is_ignorable_dirt_other_single_file_surface_content_mismatch_stays_non_ignorable() {
+    for (installed, source) in OTHER_SINGLE_FILE_SURFACES {
+        let repo = tempfile::tempdir().unwrap();
+        let repo_root = repo.path();
+        write_rel(repo_root, source, "source content\n");
+        write_rel(repo_root, installed, "operator edit\n");
+        assert!(
+            !is_ignorable_dirt(installed, repo_root),
+            "{installed}: content that diverges from {source} must not be assumed to be resync output"
+        );
+    }
+}
+
+#[test]
+fn test_is_ignorable_dirt_other_single_file_surface_without_source_stays_non_ignorable() {
+    for (installed, source) in OTHER_SINGLE_FILE_SURFACES {
+        let repo = tempfile::tempdir().unwrap();
+        let repo_root = repo.path();
+        write_rel(repo_root, installed, "some content\n");
+        assert!(
+            !is_ignorable_dirt(installed, repo_root),
+            "{installed}: with no {source} to byte-match against, the file stays dirt"
+        );
+    }
+}
+
+#[test]
+fn test_non_ignorable_dirt_other_single_file_surface_status_line_variants() {
+    for (installed, source) in OTHER_SINGLE_FILE_SURFACES {
+        let repo = tempfile::tempdir().unwrap();
+        let repo_root = repo.path();
+        write_rel(repo_root, source, "resynced content\n");
+        write_rel(repo_root, installed, "resynced content\n");
+        let status = format!(" M {installed}\n?? {installed}\nR  old.md -> {installed}\n");
+        assert!(
+            non_ignorable_dirt(&status, repo_root).is_empty(),
+            "{installed}: a byte-identical copy must be ignored on every status line"
+        );
+
+        std::fs::write(repo_root.join(installed), "operator edit\n").unwrap();
+        assert_eq!(
+            non_ignorable_dirt(&status, repo_root),
+            status.lines().collect::<Vec<_>>(),
+            "{installed}: a diverged copy must stay dirt on every status line"
+        );
+    }
+}
+
+#[test]
+fn test_is_ignorable_dirt_other_directory_surface_byte_match() {
+    for (installed_prefix, source_prefix, child) in OTHER_DIRECTORY_SURFACES {
+        let repo = tempfile::tempdir().unwrap();
+        let repo_root = repo.path();
+        let installed = format!("{installed_prefix}{child}");
+        let source = format!("{source_prefix}{child}");
+        write_rel(repo_root, &source, "resynced content\n");
+        write_rel(repo_root, &installed, "resynced content\n");
+        assert!(
+            is_ignorable_dirt(&installed, repo_root),
+            "{installed}: a byte-identical copy of {source} is provably resync output"
+        );
+    }
+}
+
+#[test]
+fn test_is_ignorable_dirt_other_directory_surface_content_mismatch_stays_non_ignorable() {
+    for (installed_prefix, source_prefix, child) in OTHER_DIRECTORY_SURFACES {
+        let repo = tempfile::tempdir().unwrap();
+        let repo_root = repo.path();
+        let installed = format!("{installed_prefix}{child}");
+        let source = format!("{source_prefix}{child}");
+        write_rel(repo_root, &source, "source content\n");
+        write_rel(repo_root, &installed, "operator edit\n");
+        assert!(
+            !is_ignorable_dirt(&installed, repo_root),
+            "{installed}: content that diverges from {source} must not be assumed to be resync output"
+        );
+    }
+}
+
+#[test]
+fn test_is_ignorable_dirt_other_directory_surface_without_source_stays_non_ignorable() {
+    for path in [
+        ".agents/skills/loom-custom/SKILL.md",
+        ".loom/runtimes/local-runtime.json",
+    ] {
+        let repo = tempfile::tempdir().unwrap();
+        let repo_root = repo.path();
+        write_rel(repo_root, path, "some content\n");
+        assert!(
+            !is_ignorable_dirt(path, repo_root),
+            "{path}: with no defaults/ counterpart to byte-match against, the file stays dirt"
+        );
+    }
+}
+
+#[test]
+fn test_is_ignorable_dirt_agent_skills_locally_edited_stays_non_ignorable() {
+    const SKILL: &str = ".agents/skills/loom-builder/SKILL.md";
+    const MARKER: &str = "<!-- loom-managed-skill -->\n";
+    let source = format!("---\nname: loom-builder\n---\n{MARKER}generated body\n");
+    let repo = tempfile::tempdir().unwrap();
+    let repo_root = repo.path();
+    write_rel(repo_root, "defaults/.agents/skills/loom-builder/SKILL.md", &source);
+
+    write_rel(repo_root, SKILL, &source.replace("generated body", "locally edited body"));
+    assert!(
+        !is_ignorable_dirt(SKILL, repo_root),
+        "a locally edited skill diverges from its source and must stay dirt"
+    );
+
+    std::fs::write(repo_root.join(SKILL), source.replace(MARKER, "")).unwrap();
+    assert!(
+        !is_ignorable_dirt(SKILL, repo_root),
+        "a skill detached from generation by stripping its marker must stay dirt"
+    );
+}
+
+#[test]
+fn test_is_ignorable_dirt_agent_skills_symlink_itself_stays_non_ignorable() {
+    let repo = tempfile::tempdir().unwrap();
+    let repo_root = repo.path();
+    write_rel(repo_root, "defaults/.agents/skills", "same bytes\n");
+    write_rel(repo_root, ".agents/skills", "same bytes\n");
+    assert!(
+        !is_ignorable_dirt(".agents/skills", repo_root),
+        "the .agents/skills link itself is an operator edit, not a file under the prefix"
+    );
+}
+
+#[test]
+fn test_non_ignorable_dirt_loom_runtimes_backfilled_file_byte_match() {
+    let repo = tempfile::tempdir().unwrap();
+    let repo_root = repo.path();
+    write_rel(repo_root, "defaults/runtimes/new-runtime.json", "{}\n");
+    write_rel(repo_root, ".loom/runtimes/new-runtime.json", "{}\n");
+    let status = "?? .loom/runtimes/new-runtime.json\n";
+    assert!(
+        non_ignorable_dirt(status, repo_root).is_empty(),
+        "a backfilled runtime identical to its source is resync output"
+    );
+}
+
 /// AC1(a): a workspace with ONLY Loom-owned transient paths dirty must NOT
 /// block the gate (prep proceeds to sync/reset, not Skip).
 #[test]
