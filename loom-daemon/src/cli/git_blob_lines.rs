@@ -253,7 +253,7 @@ fn newline_count(bytes: &[u8]) -> u64 {
 /// when the content is nonempty and its last byte is not `\n` — that final
 /// segment is a real line. A trailing `\n` adds none, and an empty blob has
 /// none.
-fn citable_lines(bytes: &[u8]) -> u64 {
+pub(crate) fn citable_lines(bytes: &[u8]) -> u64 {
     newline_count(bytes) + u64::from(!bytes.is_empty() && bytes.last() != Some(&b'\n'))
 }
 
