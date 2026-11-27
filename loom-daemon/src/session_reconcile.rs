@@ -983,11 +983,17 @@ fn reconcile_one<R: ContainerRunner>(
             None => Outcome::Running,
         },
         Decision::Restarting => {
+            if let Some(inspect) = inspect {
+                skew::settle_interrupted_roll(account, inspect, ctx)?;
+            }
             mem.restarting_streak += 1;
             log::debug!("session_reconcile: {container}: restarting (Docker is retrying it)");
             Outcome::Restarting
         }
         Decision::CrashLoop => {
+            if let Some(inspect) = inspect {
+                skew::settle_interrupted_roll(account, inspect, ctx)?;
+            }
             mem.restarting_streak += 1;
             if mem.crash_loop_reported {
                 log::debug!(

@@ -493,3 +493,108 @@ fn a_timed_out_roll_ends_the_pass_as_docker_unavailable() {
     assert!(matches!(out.as_slice(), [Outcome::PrivateImageRecreated { .. }]), "{out:?}");
     assert_eq!(asked.get(), 1);
 }
+
+/// A roll that settles the interrupted roll (restores the original under the
+/// account lease) and counts how often the pass asked.
+fn settling<'a>(
+    fake: Fake,
+    asked: &'a Cell<usize>,
+) -> impl Fn(&AccountDescriptor, &str, &dyn Fn() -> bool) -> Result<Rolled> + 'a {
+    move |_: &AccountDescriptor, _: &str, _: &dyn Fn() -> bool| {
+        asked.set(asked.get() + 1);
+        let mut containers = fake.containers.lock().unwrap();
+        let seat = containers.get_mut(&container_name("alice")).unwrap();
+        seat.restarting = false;
+        seat.running = true;
+        fake.replaces.lock().unwrap().clear();
+        Ok(Rolled::Unchanged)
+    }
+}
+
+#[test]
+#[serial]
+fn a_restarting_roll_replacement_is_settled_before_the_pass_reads_a_crash_loop() {
+    for passes in [1, 6] {
+        let env = setup(&["alice"], &["alice"]);
+        let mut lifecycle = SessionLifecycle::new(env.workspace.path(), Fake::default(), None);
+        seed_stale(&lifecycle, "0.20.41", &release("0.20.41"));
+        {
+            let fake = lifecycle.runner();
+            fake.containers
+                .lock()
+                .unwrap()
+                .get_mut(&container_name("alice"))
+                .unwrap()
+                .restarting = true;
+            fake.replaces
+                .lock()
+                .unwrap()
+                .insert(container_name("alice"), "a".repeat(64));
+        }
+        let asked = Cell::new(0);
+        let roll = settling(lifecycle.runner().clone(), &asked);
+        let mut state = ReconcileState::default();
+        for now in 0..passes {
+            roll_pass(&mut lifecycle, &env, &private(), &roll, &mut state, now * 60);
+        }
+        // The recovery ran on the first pass, before the restart streak could
+        // reach a crash-loop verdict, and left one running owner.
+        assert_eq!(asked.get(), 1, "settled once, then the label is gone");
+        let seat = lifecycle.runner().containers.lock().unwrap()[&container_name("alice")].clone();
+        assert!(seat.running && !seat.restarting);
+    }
+}
+
+#[test]
+#[serial]
+fn a_replacement_on_a_newer_image_still_settles_the_interrupted_roll() {
+    let env = setup(&["alice"], &["alice"]);
+    let mut lifecycle = SessionLifecycle::new(env.workspace.path(), Fake::default(), None);
+    let newer = "ghcr.io/2amlogic/loom-worker-session:0.20.44";
+    seed_stale(&lifecycle, "0.20.43", newer);
+    lifecycle
+        .runner()
+        .replaces
+        .lock()
+        .unwrap()
+        .insert(container_name("alice"), "b".repeat(64));
+    let asked = Cell::new(0);
+    let roll = settling(lifecycle.runner().clone(), &asked);
+    let mut state = ReconcileState::default();
+    assert_eq!(
+        roll_pass(&mut lifecycle, &env, &private(), &roll, &mut state, 0),
+        vec![Outcome::Running]
+    );
+    assert_eq!(asked.get(), 1, "settled before the no-downgrade decision");
+    assert_eq!(running_image(&lifecycle), newer, "and the newer seat is not downgraded");
+}
+
+#[test]
+#[serial]
+fn a_failed_recovery_is_a_failed_pass_not_a_running_one() {
+    let env = setup(&["alice"], &["alice"]);
+    let mut lifecycle = SessionLifecycle::new(env.workspace.path(), Fake::default(), None);
+    seed_stale(&lifecycle, "0.20.41", &release("0.20.41"));
+    lifecycle
+        .runner()
+        .replaces
+        .lock()
+        .unwrap()
+        .insert(container_name("alice"), "c".repeat(64));
+    let refused = |_: &AccountDescriptor, _: &str, _: &dyn Fn() -> bool| -> Result<Rolled> {
+        bail!("docker refused rollback removal")
+    };
+    let mut state = ReconcileState::default();
+    let out = roll_pass(&mut lifecycle, &env, &private(), &refused, &mut state, 0);
+    assert!(
+        matches!(&out[..], [Outcome::Failed { error, .. }] if error.contains("refused rollback")),
+        "{out:?}"
+    );
+    assert!(
+        matches!(
+            roll_pass(&mut lifecycle, &env, &private(), &refused, &mut state, 1)[..],
+            [Outcome::BackingOff { .. }]
+        ),
+        "the failure backs off instead of clearing the account's failure state"
+    );
+}

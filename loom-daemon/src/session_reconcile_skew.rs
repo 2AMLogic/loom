@@ -340,6 +340,36 @@ fn image_deferred(reason: DeferReason) -> Outcome {
     Outcome::PrivateImageDeferred { reason }
 }
 
+/// Finish or undo an interrupted image roll (#14112) for a seat whose current
+/// container is labelled as a roll's replacement. `roll` settles it under the
+/// account lease before anything else and then, for a seat that is not
+/// running, on an explicit image, or newer than this daemon, changes nothing.
+/// A busy account is retried next pass; every other failure is returned so the
+/// caller's failure accounting sees it instead of reading the seat as healthy.
+pub(super) fn settle_interrupted_roll(
+    account: &AccountDescriptor,
+    inspect: &Value,
+    inputs: &PassInputs<'_>,
+) -> anyhow::Result<()> {
+    if !inspect["Config"]["Labels"][REPLACES_LABEL].is_string() {
+        return Ok(());
+    }
+    let Some(host) = inputs.host_version.as_ref() else {
+        return Ok(());
+    };
+    if !matches!((inputs.is_private_clone)(account), Ok(true)) {
+        return Ok(());
+    }
+    let name = account.id.name.as_str();
+    let release = release_session_image(&host.to_string());
+    let is_held = || inputs.index.is_held(name);
+    match (inputs.roll_private)(account, &release, &is_held) {
+        Ok(_) => Ok(()),
+        Err(error) if error.downcast_ref::<AccountBusy>().is_some() => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
 /// The version-skew step for a healthy running container. `None`: nothing to
 /// do (no positive finding, or nothing may be decided this pass).
 #[allow(clippy::too_many_lines)]
@@ -559,24 +589,14 @@ fn reconcile_private_image(
         return Ok(None);
     };
     let release = release_session_image(&host.to_string());
+    // Before any image decision: a replacement a roll created may still have
+    // the original under a backup name. Settling it is not an image upgrade,
+    // so it precedes the no-downgrade and already-attempted checks, and a
+    // failure surfaces as this pass's error (failure and backoff accounting).
+    settle_interrupted_roll(account, inspect, inputs)?;
     let mem = &mut account_mem.skew;
     if running == release {
         mem.private = PrivateImageMemory::default();
-        // A replacement a roll created still has the original under a backup
-        // name if the roll was interrupted before its commit. `roll` first
-        // finishes or undoes such a roll under the account lease, then finds
-        // nothing to do; a seat that never rolled never pays for the call.
-        if inspect["Config"]["Labels"][REPLACES_LABEL].is_string() {
-            let is_held = || inputs.index.is_held(name);
-            if let Err(error) = (inputs.roll_private)(account, &release, &is_held) {
-                if error.downcast_ref::<AccountBusy>().is_none() {
-                    log::warn!(
-                        "session_reconcile: {container}: could not settle a possibly interrupted \
-                         image roll: {error:#}"
-                    );
-                }
-            }
-        }
         return Ok(None);
     }
     let pair = (running.to_owned(), release.clone());
