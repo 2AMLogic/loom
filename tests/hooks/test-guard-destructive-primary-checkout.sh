@@ -108,7 +108,7 @@ assert_deny_env "substitution as an if-condition in primary is denied" "$AGENT" 
 assert_deny_env "nested substitution in primary is denied" "$AGENT" \
     'echo "$(echo "$(git commit -m z)")"' "$PC_REPO"
 assert_deny_env "a substitution earlier on the line survives an arithmetic expansion later on it" "$AGENT" \
-    'x=$(git checkout other); y=$(( $(git commit -m z) + 1 ))' "$PC_REPO"
+    'x=$(git checkout other); y=$(( $(printf 1) + 1 ))' "$PC_REPO"
 assert_deny_env "single quotes inside double quotes are literal, so the substitution is live" "$AGENT" \
     "echo \"note '\$(git commit -m z)'\"" "$PC_REPO"
 assert_deny_env "substitution with git -C <primary> commit from a worktree cwd is denied" "$AGENT" \
@@ -165,6 +165,30 @@ assert_allow_env "substitution in a dash-form quoted-delimiter heredoc body is i
     "cat <<-'EOF'${PC_NL}${PC_TAB}x=\$(git commit -m z)${PC_NL}${PC_TAB}EOF" "$PC_REPO"
 assert_allow_env "body-comment heredoc idiom with inert text, then nothing chained, is allowed" "$AGENT" \
     "gh pr comment 7 --body \"\$(cat <<'EOF'${PC_NL}x=\$(git commit -m z)${PC_NL}EOF${PC_NL})\"" "$PC_REPO"
+assert_allow_env "multi-line single-quoted example text is inert" "$AGENT" \
+    "printf '%s\\n' 'Example:${PC_NL}x=\$(git commit -m z)'" "$PC_REPO"
+assert_allow_env "an escaped apostrophe inside an ANSI-C string does not end it" "$AGENT" \
+    "printf '%s\\n' \$'can\\'t run \$(git commit -m z)'" "$PC_REPO"
+assert_allow_env "a here-string operator is not a heredoc opener" "$AGENT" \
+    "cat <<<word${PC_NL}printf '%s\\n' '\$(git commit -m z)'" "$PC_REPO"
+assert_allow_env "a backslash-quoted heredoc delimiter makes a quoted heredoc" "$AGENT" \
+    "cat <<\\EOF${PC_NL}x=\$(git commit -m z)${PC_NL}EOF" "$PC_REPO"
+assert_allow_env "a partly quoted heredoc delimiter makes a quoted heredoc" "$AGENT" \
+    "cat <<E'OF'${PC_NL}x=\$(git commit -m z)${PC_NL}EOF" "$PC_REPO"
+assert_allow_env "a quoted heredoc delimiter containing a dash is read whole" "$AGENT" \
+    "cat <<'END-DOC'${PC_NL}x=\$(git commit -m z)${PC_NL}END-DOC" "$PC_REPO"
+assert_allow_env "a heredoc data line with a trailing blank is not the terminator" "$AGENT" \
+    "cat <<'EOF'${PC_NL}EOF ${PC_NL}x=\$(git commit -m z)${PC_NL}EOF" "$PC_REPO"
+assert_allow_env "two quoted heredocs on one command: example in the second body" "$AGENT" \
+    "cat <<'A' <<'B'${PC_NL}one${PC_NL}A${PC_NL}x=\$(git commit -m z)${PC_NL}B" "$PC_REPO"
+assert_deny_env "live substitution after a multi-line single-quoted argument is still denied" "$AGENT" \
+    "printf '%s\\n' 'a${PC_NL}b'${PC_NL}x=\$(git commit -m z)" "$PC_REPO"
+assert_deny_env "live substitution after a closed ANSI-C string is still denied" "$AGENT" \
+    "printf '%s\\n' \$'a\\'b'; x=\$(git commit -m z)" "$PC_REPO"
+assert_deny_env "unquoted heredoc after a here-string keeps its live substitution" "$AGENT" \
+    "cat <<<word <<EOF${PC_NL}x=\$(git commit -m z)${PC_NL}EOF" "$PC_REPO"
+assert_deny_env "second heredoc is unquoted: its live substitution is denied" "$AGENT" \
+    "cat <<'A' <<B${PC_NL}one${PC_NL}A${PC_NL}x=\$(git commit -m z)${PC_NL}B" "$PC_REPO"
 assert_allow_env "operator session substitution (no agent env) is untouched" "" \
     'x=$(git commit -m z)' "$PC_REPO"
 

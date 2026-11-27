@@ -5229,17 +5229,45 @@ resolve_primary_mutations() {
         return 0
     }
 
-    # Remember, for the lines that follow, the heredoc whose opener starts at
-    # the head of t. Only the first one on a line is followed.
-    function pcm_heredoc(t,    d) {
-        if (PCM_HDF || match(t, PCM_HDRE) == 0) return
-        d = substr(t, RSTART, RLENGTH)
-        PCM_HDF = 1
-        PCM_HDD = (substr(d, 3, 1) == "-")
-        sub(/^<<-?[ \t]*/, "", d)
-        PCM_HDQ = (substr(d, 1, 1) == SQ || substr(d, 1, 1) == DQ)
-        if (PCM_HDQ) d = substr(d, 2, length(d) - 2)
-        PCM_HD = d
+    # Queue, for the lines that follow, the heredoc whose opener starts at the
+    # head of t (`<<` or `<<-`). The delimiter is the whole shell word: any
+    # run of bare characters and single-quoted, double-quoted and backslash parts up to an unquoted
+    # blank or metacharacter; the heredoc is QUOTED (no expansion in its body)
+    # when any part of the word was quoted. A bare word must start like an
+    # identifier (so `(( 1<<2 ))` is not taken for an opener). Several
+    # openers on one line queue in order: their bodies follow in that order.
+    function pcm_heredoc(t,    n, i, c, d, w, q, dash, j) {
+        n = length(t); i = 3; dash = 0
+        if (substr(t, i, 1) == "-") { dash = 1; i++ }
+        while (substr(t, i, 1) == " " || substr(t, i, 1) == "\t") i++
+        c = substr(t, i, 1)
+        if (!(c == SQ || c == DQ || c == "\\" || c ~ /[A-Za-z_]/)) return
+        w = ""; q = 0
+        while (i <= n) {
+            c = substr(t, i, 1)
+            if (c == SQ) {
+                j = index(substr(t, i + 1), SQ); q = 1
+                if (j == 0) { w = w substr(t, i + 1); break }
+                w = w substr(t, i + 1, j - 1); i += j + 1
+                continue
+            }
+            if (c == DQ) {
+                q = 1; i++
+                while (i <= n && (c = substr(t, i, 1)) != DQ) {
+                    if (c == "\\" && substr(t, i + 1, 1) ~ /[$`"\\]/) { i++; c = substr(t, i, 1) }
+                    w = w c; i++
+                }
+                i++
+                continue
+            }
+            if (c == "\\") { w = w substr(t, i + 1, 1); i += 2; q = 1; continue }
+            if (c ~ /[ \t;&|<>()]/) break
+            w = w c; i++
+        }
+        PCM_HDN++
+        PCM_HDW[PCM_HDN] = w
+        PCM_HDD[PCM_HDN] = dash
+        PCM_HDQ[PCM_HDN] = q
     }
 
     # Every LIVE substitution body of s at the top level of s, in TEXT order,
@@ -5251,16 +5279,28 @@ resolve_primary_mutations() {
     # pcm_close finds each end. Entries are appended from index base (a
     # recursive call for an arithmetic expansion must not overwrite the
     # entries already found). Returns the number of entries.
-    function pcm_bodies(s, mode, B, base,    n, i, c, st, j, pfrom, kind, ne, k0, ac) {
-        n = length(s); i = 1; st = ""; ne = base
+    function pcm_bodies(s, mode, B, base, top,    n, i, c, st, j, pfrom, kind, ne, k0, ac) {
+        n = length(s); i = 1; ne = base
+        # Quote state carries across physical lines at the top level (a
+        # multi-line single-quoted argument); a nested scan starts clean.
+        st = (top ? PCM_ST : "")
         while (i <= n) {
             c = substr(s, i, 1)
             if (mode == 1 && st == SQ) { if (c == SQ) st = ""; i++; continue }
+            if (mode == 1 && st == "A") {
+                # ANSI-C quoting: a backslash escapes the next character, even a quote.
+                if (c == "\\") { i += 2; continue }
+                if (c == SQ) st = ""
+                i++
+                continue
+            }
             if (c == "\\") { i += 2; continue }
             if (mode == 1) {
+                if (st == "" && c == "$" && substr(s, i + 1, 1) == SQ) { st = "A"; i += 2; continue }
                 if (st == "" && c == SQ) { st = SQ; i++; continue }
                 if (c == DQ) { st = (st == DQ) ? "" : DQ; i++; continue }
-                if (st == "" && c == "<" && substr(s, i, 2) == "<<" && substr(s, i + 2, 1) != "<") {
+                if (st == "" && c == "<" && substr(s, i, 3) == "<<<") { i += 3; continue }
+                if (st == "" && c == "<" && substr(s, i, 2) == "<<") {
                     ne++
                     B[ne, "k"] = "h"; B[ne, "o"] = i
                     i += 2
@@ -5287,6 +5327,7 @@ resolve_primary_mutations() {
             B[ne, "t"] = (j == 0) ? substr(s, pfrom) : substr(s, pfrom, j - pfrom)
             i = (j == 0) ? n + 1 : j + 1
         }
+        if (top) PCM_ST = st
         return ne
     }
 
@@ -5366,7 +5407,7 @@ resolve_primary_mutations() {
             off = so[i] + length(segs[i])
         }
         ne = 0
-        if (mode != 0 && depth < PCM_MAXD) ne = pcm_bodies(s, mode, B, 0)
+        if (mode != 0 && depth < PCM_MAXD) ne = pcm_bodies(s, mode, B, 0, depth == 0 && mode == 1)
         k = 1
         for (i = 1; i <= n; i++) {
             hi = (i < n) ? so[i + 1] : length(s) + 1
@@ -5383,30 +5424,26 @@ resolve_primary_mutations() {
     BEGIN {
         SQ = sprintf("%c", 39)
         DQ = sprintf("%c", 34)
-        PCM_HDRE = "<<-?[ \t]*(" SQ "[A-Za-z_][A-Za-z0-9_]*" SQ "|" DQ "[A-Za-z_][A-Za-z0-9_]*" DQ "|[A-Za-z_][A-Za-z0-9_]*)"
         PCM_MAXD = 8
         curcwd = startcwd
-        PCM_HD = ""     # delimiter of the heredoc whose body the next lines are
-        PCM_HDD = 0     # its `<<-` form
-        PCM_HDQ = 0     # its delimiter is quoted
-        PCM_HDF = 0     # an opener was already found on this line
+        PCM_HDN = 0     # heredocs queued by the openers seen so far
+        PCM_HDI = 1     # the queued heredoc whose body the next lines are
+        PCM_ST = ""     # quote state at the end of the previous line
     }
     {
-        if (PCM_HD != "") {
+        if (PCM_HDI <= PCM_HDN) {
             # A heredoc body line. Body mode gates ONLY the substitution scan:
             # the segments are scanned as they always were.
             hdline = $0
-            if (PCM_HDD) sub(/^\t+/, "", hdline)
-            sub(/[ \t]+$/, "", hdline)
-            if (hdline == PCM_HD) {
-                PCM_HD = ""
+            if (PCM_HDD[PCM_HDI]) sub(/^\t+/, "", hdline)
+            if (hdline == PCM_HDW[PCM_HDI]) {
+                if (++PCM_HDI > PCM_HDN) { PCM_HDN = 0; PCM_HDI = 1 }
                 curcwd = pcm_text($0, curcwd, 0, 0)
                 next
             }
-            curcwd = pcm_text($0, curcwd, 0, (PCM_HDQ ? 0 : 2))
+            curcwd = pcm_text($0, curcwd, 0, (PCM_HDQ[PCM_HDI] ? 0 : 2))
             next
         }
-        PCM_HDF = 0
         curcwd = pcm_text($0, curcwd, 0, 1)
     }'
 }
