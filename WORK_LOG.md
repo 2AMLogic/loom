@@ -18,6 +18,23 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 ### 2026-11-27
 
+- **PR #15585**: fix: mark weekly/monthly API-key exhaustion account-wide
+- **Issue #15572** (closed): API-key pool: a weekly/monthly exhaustion mark under one model class does not stop another class from re-selecting the account
+- **Issue #15596** (closed): config-resolver.sh: a defaults.json over 128 KiB makes every sourcing script exit 126 (jq --argjson exceeds MAX_ARG_STRLEN)
+- **PR #15590**: refactor: consolidate directory-size walkers into fs_util::dir_size_bytes/tree_size_bytes
+- **PR #15587**: refactor: route the four self_spawn_log::track timeout runners through proc_exec (#15580)
+- **PR #15579**: refactor: share the guarded stack replay between both reconcilers
+- **PR #15578**: fix: treat six more resynced surfaces as ignorable gate dirt
+- **PR #15576**: docs: make the agy pilot verification-only in the adapter guide
+- **PR #15573**: refactor: dedupe doc-lint fence helpers into doc_lint_support
+- **Issue #15586** (closed): Consolidate 6 duplicate directory-size walkers and clean.rs's duplicate human_size into fs_util
+- **Issue #15582** (closed): config-resolver.sh: loom_resolve_config passes each tier as one jq --argjson argv string; a defaults.json over 128 KiB fails with 'Argument list too long' and takes create-issue.sh down
+- **Issue #15580** (closed): Add self_spawn_log::run_bounded_tracked and route the 4 tracked try_wait runners onto proc_exec::run_bounded_observed
+- **Issue #15575** (closed): config-resolver: jq --argjson per tier fails with "Argument list too long" once defaults.json exceeds 128 KiB (create-pr.sh exits 126)
+- **Issue #15566** (closed): main_health_gate: six other pure-copy resync surfaces stay non-ignorable dirt (same gap as the rate card)
+- **Issue #15529** (closed): Share the guarded Git replay used by orphan-stack and merged-stack reconciliation
+- **Issue #15514** (closed): Hoist duplicated doc-lint fence helpers into doc_lint_support
+- **Issue #15492** (closed): agy pilot: the pinned read-only policy denies command(*), which the pilot's own read-only roles need to finish
 - **PR #15571**: refactor: dedupe re-entrant env locks into env_test_support
 - **PR #15567**: fix: treat a resynced .loom/pricing.json as ignorable gate dirt
 - **PR #15563**: fix: stream duplicate-scan candidates and report incomplete pools

@@ -1044,6 +1044,58 @@ fn a_conflicting_replay_is_flagged_once_and_nothing_is_pushed() {
     );
 }
 
+/// The rebase guard's `EMPTIED` (#8298, #9001): a replay that leaves the child
+/// no change of its own — here a `merge=ours` path that the default branch
+/// changed too — is flagged with the guard's reason, and nothing is pushed.
+#[test]
+fn a_replay_the_rebase_guard_empties_is_flagged_and_nothing_is_pushed() {
+    let fx = Fixture::new();
+    std::fs::write(fx.author.join(".gitattributes"), "install-metadata.json merge=ours\n").unwrap();
+    let metadata = |commit: &str| {
+        format!("{{\n  \"loom_version\": \"1\",\n  \"loom_commit\": \"{commit}\"\n}}\n")
+    };
+    commit_file(&fx.author, "install-metadata.json", &metadata("aaaa"), "base: metadata");
+    run(&fx.author, &["push", "-q", "origin", "main"]);
+    let a = fx.branch(A, "main", 1, "a.txt", "parent\n");
+    let b = fx.branch(B, A, 2, "install-metadata.json", &metadata("bbbb"));
+    fx.advance_main(
+        "install-metadata.json",
+        "{\n  \"loom_version\": \"2\",\n  \"loom_commit\": \"aaaa\"\n}\n",
+    );
+    run(&fx.author, &["push", "-q", "origin", "--delete", A]);
+    fx.clone_repo();
+    // The driver the attribute names, as a Loom repository configures it.
+    run(&fx.repo, &["config", "merge.ours.driver", "true"]);
+
+    let forge = FakeForge {
+        parents: [(A.to_string(), FakeForge::merged_parent(1, &a))]
+            .into_iter()
+            .collect(),
+        ..FakeForge::default()
+    };
+    let stats = reconcile_with(&forge, &fx.repo, "main", &[open_pr(2, B, &b, A)], &[]);
+
+    assert_eq!(
+        (stats.children, stats.flagged, stats.restacked, stats.retargeted),
+        (1, 1, 0, 0),
+        "{stats:?}"
+    );
+    assert_eq!(fx.origin_rev(B), b, "nothing pushed");
+    assert!(forge.retargets.borrow().is_empty());
+    let posted = forge.comments.borrow().get(&2).cloned().unwrap_or_default();
+    assert_eq!(posted.len(), 1);
+    assert!(posted[0].starts_with(&flagged_marker(1, &b)));
+    assert!(
+        posted[0].contains(
+            "replaying it would leave no change of its own (the rebase guard reported \
+             EMPTIED, #9282)"
+        ),
+        "{}",
+        posted[0]
+    );
+    assert_eq!(worktree_count(&fx.repo), 1, "the scratch worktree is removed");
+}
+
 /// An already-reconciled child (rebased by the shell or by hand after the
 /// merge) contains the merge commit and is left entirely alone.
 #[test]

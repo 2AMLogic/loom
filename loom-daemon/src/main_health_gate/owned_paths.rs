@@ -117,9 +117,10 @@ pub(super) const INSTALL_METADATA_PATH: &str = ".loom/install-metadata.json";
 /// counterpart lives under `defaults/`. Mirrors the exact surface table
 /// `resync-installed.sh` walks (`defaults/scripts/resync-installed.sh`,
 /// search `widened pure-copy surfaces`) — **not** a uniform prefix rewrite:
-/// `.loom/bin/` and `.claude/commands/loom/` map into
-/// `defaults/.loom/bin/` and `defaults/.claude/commands/loom/`
-/// respectively, while the others map straight into `defaults/<name>/`.
+/// `.loom/bin/`, `.claude/commands/loom/` and `.agents/skills/` map into
+/// `defaults/.loom/bin/`, `defaults/.claude/commands/loom/` and
+/// `defaults/.agents/skills/` respectively, while the others map straight
+/// into `defaults/<name>/`.
 /// Only meaningful in a repo that carries a local `defaults/` tree (the loom
 /// repo itself); a consumer install has no `defaults/` dir so the byte-match
 /// lookup below always misses and classification is unchanged (#4332 is
@@ -137,8 +138,10 @@ pub(super) const INSTALLED_SURFACE_PREFIXES: &[(&str, &str)] = &[
     (".loom/scripts/", "defaults/scripts/"),
     (".loom/roles/", "defaults/roles/"),
     (".loom/docs/", "defaults/docs/"),
+    (".loom/runtimes/", "defaults/runtimes/"),
     (".loom/bin/", "defaults/.loom/bin/"),
     (".claude/commands/loom/", "defaults/.claude/commands/loom/"),
+    (".agents/skills/", "defaults/.agents/skills/"),
 ];
 
 /// Single-file surfaces of the same installed↔source mapping (#15554):
@@ -152,8 +155,17 @@ pub(super) const INSTALLED_SURFACE_PREFIXES: &[(&str, &str)] = &[
 ///   missing from this mapping the way it was missing from both shell
 ///   classifiers at once (#15519), so a resync that refreshed it left the
 ///   opt-in gate skipping every tick as `dirty-tree` (#4332's stall).
-pub(super) const INSTALLED_SURFACE_FILES: &[(&str, &str)] =
-    &[(".loom/pricing.json", "defaults/pricing.json")];
+/// - `.claude/README.md`, `.github/CONFIGURATION.md`, `.loom/biome.jsonc`
+///   and `.claude/biome.jsonc` ← their `defaults/` counterparts (#15566):
+///   the remaining `sync_one` copies of the resync surface table, missing
+///   from this mapping the same way the rate card was.
+pub(super) const INSTALLED_SURFACE_FILES: &[(&str, &str)] = &[
+    (".loom/pricing.json", "defaults/pricing.json"),
+    (".claude/README.md", "defaults/.claude/README.md"),
+    (".github/CONFIGURATION.md", "defaults/.github/CONFIGURATION.md"),
+    (".loom/biome.jsonc", "defaults/.loom/biome.jsonc"),
+    (".claude/biome.jsonc", "defaults/.claude/biome.jsonc"),
+];
 
 #[cfg(test)]
 mod tests {

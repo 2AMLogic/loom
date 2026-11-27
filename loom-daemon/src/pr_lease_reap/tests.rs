@@ -125,3 +125,23 @@ fn a_failing_reap_is_not_counted() {
     assert_eq!(reaper.reap(Path::new("/bin/false"), REASON_TIMEOUT, |_| {}), 0);
     assert_eq!(reaper.reap(&dir.path().join("missing"), REASON_TIMEOUT, |_| {}), 0);
 }
+
+/// The deadline takes the reap child's whole process group, so a `gh` it
+/// forked does not outlive it (#15580).
+#[cfg(unix)]
+#[test]
+fn a_reap_past_its_deadline_takes_its_grandchild_with_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let pidfile = dir.path().join("grandchild.pid");
+    let mut cmd = Command::new("/bin/sh");
+    cmd.args([
+        "-c",
+        &crate::exec_test_support::hung_with_grandchild(&pidfile),
+    ])
+    .stdin(Stdio::null());
+    assert!(!run_bounded(cmd, Duration::from_millis(600)));
+    assert!(
+        !crate::exec_test_support::grandchild_outlived(&pidfile),
+        "the reap child's grandchild outlived the deadline"
+    );
+}

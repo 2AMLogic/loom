@@ -53,9 +53,9 @@
 //! so the operator's `reconcile-stack.sh` fallback keeps working — the pin is
 //! *preserved* when the shell wrote it and *positively recovered* when only
 //! the forge's PR ref remains. A pin that disagrees with the recorded head
-//! loses: the recorded head is what actually merged, and [`restack`]'s
-//! ancestry check is what makes a wrong boundary refuse rather than replay
-//! the wrong range.
+//! loses: the recorded head is what actually merged, and the guarded replay's
+//! ancestry check ([`super::orphan_stack_git::guarded_replay`]) is what makes
+//! a wrong boundary refuse rather than replay the wrong range.
 //!
 //! # Defer vs retarget-before-delete — the distinction is kept
 //!
@@ -104,7 +104,6 @@ use crate::merge_pr::reconcile::{
     child_route, issue_from_branch, route_with_lease, LeaseState, Route,
 };
 use crate::merge_pr::stacked_children::{is_stackable_parent_branch, pin_ref, try_establish_pin};
-use crate::rebase_guard::Verdict as GuardVerdict;
 
 /// Kill switch for this pass (`0`/`false`/`no`/`off` disables). Defaults ON.
 pub const MERGED_STACK_ENABLED_ENV: &str = "LOOM_MERGED_STACK_RECONCILE";
@@ -1116,66 +1115,34 @@ fn flag_ctx<'a>(
     }
 }
 
-/// Replay `upstream..head` of `branch` onto `onto`, guard it, and publish it.
+/// Replay `upstream..head` of `branch` onto `onto`, guard it, and publish it
+/// ([`git::guarded_replay`]) in this pass's scratch worktree, in terms of
+/// this pass's flag and retry handling.
 fn restack(repo: &Path, pr: u32, branch: &str, head: &str, onto: &str, upstream: &str) -> Restack {
-    match git::ensure_pr_head(repo, pr, head) {
-        git::HeadFetch::Present => {}
-        git::HeadFetch::FetchFailed(e) => {
-            return Restack::Transient(format!("its head {head} could not be fetched: {e}"))
-        }
-        git::HeadFetch::Missing => {
-            return Restack::Transient(format!("its head {head} is not in refs/pull/{pr}/head"))
-        }
-    }
-    match git::live_tip(repo, branch) {
-        Ok(Some(live)) if live == head => {}
-        Ok(Some(live)) => {
-            return Restack::Transient(format!(
-                "the remote branch is at {live}, not the listed head {head}"
-            ))
-        }
-        Ok(None) => return Restack::Transient(format!("the remote has no branch '{branch}'")),
-        Err(e) => return Restack::Transient(e),
-    }
-    // `rebase --onto <onto> <upstream>` with a non-ancestor upstream does not
-    // fail: it replays the wrong range (`reconcile_stack`'s
-    // `Prerequisite::ParentAncestry`). Refuse.
-    match git::is_ancestor(repo, upstream, head) {
-        Ok(true) => {}
-        Ok(false) => return Restack::Flag(FlagReason::ParentRewritten),
-        Err(e) => return Restack::Transient(e),
-    }
     let scratch = repo.join(format!(".loom/worktrees/merged-restack-pr-{pr}"));
-    let new_head = match git::replay(repo, &scratch, head, onto, upstream) {
-        Ok(h) => h,
-        Err(git::ReplayError::Conflict(paths)) => {
-            return Restack::Flag(FlagReason::Conflict(paths))
+    match git::guarded_replay(
+        repo,
+        &git::ReplayRequest {
+            pr,
+            branch,
+            head,
+            onto,
+            upstream,
+            scratch: &scratch,
+            pass: "merged stack",
+        },
+    ) {
+        git::ReplayOutcome::Pushed(new_head) => Restack::Done(new_head),
+        git::ReplayOutcome::Transient(e) => Restack::Transient(e),
+        git::ReplayOutcome::Refused(git::ReplayRefusal::ParentRewritten) => {
+            Restack::Flag(FlagReason::ParentRewritten)
         }
-        Err(git::ReplayError::Failed(e)) => return Restack::Transient(e),
-    };
-    match crate::rebase_guard::assess(repo, onto, head, &new_head) {
-        GuardVerdict::Clean(_) => {}
-        GuardVerdict::Emptied { .. } => {
-            return Restack::Flag(FlagReason::Refused(
-                "replaying it would leave no change of its own (the rebase guard reported \
-                 EMPTIED, #9282)"
-                    .to_string(),
-            ))
+        git::ReplayOutcome::Refused(git::ReplayRefusal::Conflict(paths)) => {
+            Restack::Flag(FlagReason::Conflict(paths))
         }
-        GuardVerdict::ResolutionDiscarded { merge, .. } => {
-            return Restack::Flag(FlagReason::Refused(format!(
-                "replaying it would drop the hand resolution in merge {merge} (the rebase guard \
-                 reported RESOLUTION_DISCARDED, #9282)"
-            )))
+        git::ReplayOutcome::Refused(git::ReplayRefusal::Guard(g)) => {
+            Restack::Flag(FlagReason::Refused(g.reason()))
         }
-        GuardVerdict::Unanswered(why) => log::warn!(
-            "claim_reconciliation (merged stack): PR #{pr}: rebase guard gave no answer ({why}); \
-             pushing unchecked, as reconcile-stack.sh does (#9282)"
-        ),
-    }
-    match git::push_leased(repo, branch, &new_head, head) {
-        Ok(()) => Restack::Done(new_head),
-        Err(e) => Restack::Transient(e),
     }
 }
 
