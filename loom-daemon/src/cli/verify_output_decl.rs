@@ -63,7 +63,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 
-use super::git_blob_lines::{resolved_blob, ResolvedBlob};
+use super::git_blob_lines::{citable_lines, resolved_blob, ResolvedBlob};
 
 /// Disproof: the declaration failed — a miss. Mirrors
 /// [`super::git_blob_lines`]'s `EX_OUT_OF_RANGE`.
@@ -415,13 +415,6 @@ fn producer_line_matches(path: &str, content: &str, line_no: u64, needle: &str) 
     Some(make_line_matches(logical, cited_start - logical_start, needle))
 }
 
-/// `wc -l` line count of the content, matching [`resolved_blob`]'s line
-/// counting so the diagnostic agrees with `git-blob-lines`' "has only N
-/// lines".
-fn line_count(content: &[u8]) -> u64 {
-    content.iter().filter(|&&b| b == b'\n').count() as u64
-}
-
 /// Handle `loom-daemon verify-output-decl …`. Never returns (exits the
 /// process with the code documented on the module).
 fn handle(
@@ -493,7 +486,7 @@ fn handle(
                 println!(
                     "BAD OUTPUT DECL: `{cite}` — {rev}:{resolved_path} has only {} lines, no \
                      line {line_no}",
-                    line_count(&bytes)
+                    citable_lines(&bytes)
                 );
                 std::process::exit(EX_DECL_FAILED);
             };
@@ -516,6 +509,34 @@ mod tests {
 
     fn line_contains_complete_arg(line: &str, needle: &str) -> bool {
         producer_line_matches("Makefile", line, 1, needle) == Some(true)
+    }
+
+    #[test]
+    fn the_diagnostic_count_agrees_with_the_lines_the_producer_check_can_address() {
+        // `has only N lines` reports `citable_lines`, so for every blob the
+        // last line the producer check resolves is line N and line N + 1 is absent.
+        for (blob, want) in [
+            (&b""[..], 0),
+            (b"last", 1),
+            (b"first\nlast", 2),
+            (b"first\nlast\n", 2),
+        ] {
+            assert_eq!(citable_lines(blob), want, "{blob:?}");
+            let content = String::from_utf8_lossy(blob);
+            for path in ["run.sh", "Makefile"] {
+                assert_eq!(
+                    producer_line_matches(path, &content, want + 1, "x"),
+                    None,
+                    "{path} {blob:?}"
+                );
+                if want > 0 {
+                    assert!(
+                        producer_line_matches(path, &content, want, "x").is_some(),
+                        "{path} {blob:?}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]
