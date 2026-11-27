@@ -491,3 +491,108 @@ fn a_normal_exit_whose_pipe_outlives_the_budget_is_a_collect_error_not_empty_suc
         );
     }
 }
+
+// ---- #15581: file-backed combined-stream bounded runner -------------------
+
+#[test]
+fn run_bounded_to_file_captures_combined_stdout_and_stderr_and_unlinks_on_drop() {
+    let mut cmd = Command::new("/bin/sh");
+    cmd.args(["-c", "echo out-line; echo err-line >&2; exit 7"]);
+
+    let out = run_bounded_to_file(cmd, GENEROUS, "loom-proc-exec-test-").expect("sh should spawn");
+    match out.completion() {
+        FileCompletion::Exited(status) => {
+            assert_eq!(status.code(), Some(7), "exact exit code must survive");
+        }
+        FileCompletion::TimedOut => panic!("fast command must not time out"),
+    }
+
+    let path = out.path().to_path_buf();
+    let file_name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .expect("temp file must have a UTF-8 file name");
+    assert!(
+        file_name.starts_with("loom-proc-exec-test-") && file_name.ends_with(".log"),
+        "temp file name must honor prefix and .log suffix, got {file_name}"
+    );
+    assert!(path.exists(), "temp file must exist while BoundedFileOutput is alive");
+
+    let text = std::fs::read_to_string(&path).expect("log file must be readable");
+    assert!(text.contains("out-line"), "stdout must be captured, got: {text:?}");
+    assert!(text.contains("err-line"), "stderr must be captured, got: {text:?}");
+
+    drop(out);
+    assert!(!path.exists(), "temp file must be unlinked on drop");
+}
+
+#[test]
+fn run_bounded_to_file_missing_executable_is_spawn_error() {
+    let cmd = Command::new("/nonexistent/loom/definitely-not-here");
+    match run_bounded_to_file(cmd, GENEROUS, "loom-proc-exec-spawn-err-") {
+        Err(ExecError::Spawn(e)) => {
+            assert_eq!(e.kind(), io::ErrorKind::NotFound);
+        }
+        Err(ExecError::Collect(e)) => panic!("a missing binary never started: {e}"),
+        Ok(out) => panic!("a missing binary cannot produce a completion: {out:?}"),
+    }
+}
+
+#[test]
+#[cfg(unix)]
+fn run_bounded_to_file_timeout_terminates_descendants_and_preserves_partial_output() {
+    let dir = tempfile::tempdir().unwrap();
+    let pidfile = dir.path().join("grandchild.pid");
+
+    let mut cmd = Command::new("/bin/sh");
+    cmd.args([
+        "-c",
+        &format!(
+            "echo before-hang; echo err-before-hang >&2; /bin/sleep 120 & echo $! > '{}'; exec /bin/sleep 120",
+            pidfile.display()
+        ),
+    ]);
+    let out = run_bounded_to_file(cmd, Duration::from_millis(600), "loom-proc-exec-timeout-")
+        .expect("sh should spawn");
+    assert_eq!(out.completion(), FileCompletion::TimedOut);
+
+    let text = std::fs::read_to_string(out.path()).expect("partial log file must be readable");
+    assert!(
+        text.contains("before-hang"),
+        "stdout before timeout must survive, got: {text:?}"
+    );
+    assert!(
+        text.contains("err-before-hang"),
+        "stderr before timeout must survive, got: {text:?}"
+    );
+
+    let pid: i32 = std::fs::read_to_string(&pidfile)
+        .expect("grandchild must have recorded its pid")
+        .trim()
+        .parse()
+        .expect("pid must parse");
+    assert!(pid > 0, "fixture must capture a real pid");
+
+    let mut alive = true;
+    let reap_deadline = Instant::now() + Duration::from_secs(1);
+    while Instant::now() < reap_deadline {
+        // SAFETY: signal 0 performs error checking only; it never delivers a signal.
+        if unsafe { libc::kill(pid as libc::pid_t, 0) } != 0 {
+            alive = false;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    if alive {
+        // Do not leak the process if the assertion is about to fail.
+        unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) };
+    }
+    assert!(
+        !alive,
+        "grandchild pid {pid} outlived the deadline — timeout killed only the immediate child"
+    );
+
+    let path = out.path().to_path_buf();
+    drop(out);
+    assert!(!path.exists(), "temp file must be unlinked on drop after timeout");
+}

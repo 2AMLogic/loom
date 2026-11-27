@@ -70,9 +70,38 @@ fn run_checks_passes_and_stops_at_first_failure_in_order() {
 #[test]
 fn run_checks_timeout_is_a_failure_and_env_is_scrubbed() {
     let d = tempfile::tempdir().unwrap();
-    match run_checks(d.path(), &cfg(&["sleep 30"], 1)) {
+    let pidfile = d.path().join("grandchild.pid");
+    let script = format!("/bin/sleep 120 & echo $! > '{}'; exec /bin/sleep 120", pidfile.display());
+    match run_checks(d.path(), &cfg(&[&script], 1)) {
         Outcome::Failed { output, .. } => assert!(output.contains("timed out")),
         o => panic!("{o:?}"),
+    }
+    #[cfg(unix)]
+    {
+        let pid: i32 = std::fs::read_to_string(&pidfile)
+            .expect("grandchild must have recorded its pid")
+            .trim()
+            .parse()
+            .expect("pid must parse");
+        assert!(pid > 0, "fixture must capture a real pid");
+        let mut alive = true;
+        let reap_deadline = std::time::Instant::now() + Duration::from_secs(1);
+        while std::time::Instant::now() < reap_deadline {
+            // SAFETY: signal 0 performs error checking only; it never delivers a signal.
+            if unsafe { libc::kill(pid as libc::pid_t, 0) } != 0 {
+                alive = false;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        if alive {
+            // Do not leak the process if the assertion is about to fail.
+            unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) };
+        }
+        assert!(
+            !alive,
+            "grandchild pid {pid} outlived the deadline — timeout killed only the immediate child"
+        );
     }
     std::env::set_var("LOOM_TREE_CHECKS_TEST_SECRET", "x");
     assert_eq!(
