@@ -684,6 +684,23 @@ a later pass to sort out.
 
 ### Unblocking Logic
 
+**A lift needs a dependency `parse_dependencies` printed (#15528).** Whatever
+runs this section — the function below, or you running the role by hand —
+removes `loom:blocked`, restores `loom:issue` and posts "Unblocked" **only for a
+dependency that `parse_dependencies` (or its daemon equivalent,
+`loom-daemon park-record parse`) printed**, and only when
+`resolve_dep_states` + `deps_fully_resolved` clear every one. These are never a
+reason to lift, however closed the referenced issue is: a ticked
+`## Dependencies` checkbox, a `#N` inside a park record's `reason="..."` text,
+a `#N` in the issue's prose, or any ad hoc scan of the body ("every checklist
+entry is ticked", "the cited issue is closed"). **An empty `parse_dependencies`
+result means no label write and no comment** — a reason-only park (`Blocked by:
+(unstated)`) is a hold a person or Champion set on purpose, and it stays until
+they release it. (#8698 was lifted twice, 2026-11-19 and 2026-11-26, naming
+closed #8674 from a ticked box and park `reason=` text; no park record declared
+a blocker.) Do not hand-roll a replacement for the empty-`$deps` skip in
+`check_and_unblock` below.
+
 Permanent block (#8742): `<!-- loom:permanent-block -->` (own line; quoted prose
 doesn't count) counts from a trusted comment, or the body **only if its author is trusted** (`--with-body`). Champion
 and `check_and_unblock_prs` check the same. Removing `loom:blocked` ⇒ audit comment.
@@ -999,7 +1016,9 @@ pr_state=$(gh pr view "$pr_number" --json state,mergedAt --jq '.state')
 
 ### When NOT to Unblock
 
-- If no parseable dependencies found → Skip (may need manual review)
+- If no parseable dependencies found → Skip (may need manual review): no label
+  write, no comment. A checked `## Dependencies` box, `reason="..."` text and
+  body prose are not dependencies (#15528)
 - If any dependency is still OPEN → Keep blocked
 - **If a linked implementation PR is still OPEN with `loom:changes-requested`,
   `loom:blocked`, or `loom:operator` → Keep blocked, even if every
