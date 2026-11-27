@@ -401,30 +401,13 @@ fn save_shell_arm_registry(root: &Path, registry: &ShellArmRegistry) -> io::Resu
 /// Reads stay lock-free: the save is an atomic rename, so a reader always
 /// sees one complete version.
 struct ShellArmLock {
-    _file: std::fs::File,
+    _lock: crate::fs_util::FileLock,
 }
 
 impl ShellArmLock {
     fn acquire(root: &Path) -> io::Result<Self> {
         let path = shell_arm_registry_path(root).with_extension("lock");
-        if let Some(dir) = path.parent() {
-            std::fs::create_dir_all(dir)?;
-        }
-        let file = std::fs::OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .write(true)
-            .open(path)?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::io::AsRawFd;
-            // SAFETY: `flock` on a descriptor we own for the duration of the
-            // call; no memory is shared with the kernel.
-            if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } != 0 {
-                return Err(io::Error::last_os_error());
-            }
-        }
-        Ok(Self { _file: file })
+        crate::fs_util::FileLock::lock_exclusive(&path).map(|_lock| Self { _lock })
     }
 }
 

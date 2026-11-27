@@ -33,10 +33,10 @@
 //! teardown gets [`Exclusive::Unknown`], which the reconciler treats as
 //! busy: it never stops a container when the lock state is unknown.
 
-use std::fs::File;
-use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
+
+use crate::fs_util::FileLock;
 
 /// Overrides the lock directory (tests; a host whose dispatches and daemon
 /// do not share a home directory).
@@ -58,7 +58,7 @@ pub fn lock_dir() -> Option<PathBuf> {
 
 /// A held lock; released on drop (and by the kernel if the holder dies).
 #[derive(Debug)]
-pub struct DispatchLock(#[allow(dead_code)] File);
+pub struct DispatchLock(#[allow(dead_code)] FileLock);
 
 /// The result of one non-blocking exclusive attempt.
 #[derive(Debug)]
@@ -71,22 +71,8 @@ pub enum Exclusive {
     Unknown(String),
 }
 
-fn open(dir: &Path, container: &str) -> std::io::Result<File> {
-    std::fs::create_dir_all(dir)?;
-    File::options()
-        .create(true)
-        .truncate(false)
-        .write(true)
-        .open(dir.join(format!("{container}.lock")))
-}
-
-fn flock(file: &File, operation: libc::c_int) -> std::io::Result<()> {
-    // SAFETY: `flock` on a descriptor this function's caller owns.
-    if unsafe { libc::flock(file.as_raw_fd(), operation | libc::LOCK_NB) } == 0 {
-        Ok(())
-    } else {
-        Err(std::io::Error::last_os_error())
-    }
+fn lock_path(dir: &Path, container: &str) -> PathBuf {
+    dir.join(format!("{container}.lock"))
 }
 
 /// Take `container`'s lock shared, waiting up to `wait` for an exclusive
@@ -95,12 +81,12 @@ fn flock(file: &File, operation: libc::c_int) -> std::io::Result<()> {
 /// this lock existed.
 #[must_use]
 pub fn shared(dir: &Path, container: &str, wait: Duration) -> Option<DispatchLock> {
-    let file = open(dir, container).ok()?;
+    let path = lock_path(dir, container);
     let deadline = Instant::now() + wait;
     loop {
-        match flock(&file, libc::LOCK_SH) {
-            Ok(()) => return Some(DispatchLock(file)),
-            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+        match FileLock::try_lock_shared(&path) {
+            Ok(Some(lock)) => return Some(DispatchLock(lock)),
+            Ok(None) => {
                 if Instant::now() >= deadline {
                     return None;
                 }
@@ -124,14 +110,11 @@ pub fn try_exclusive(dir: Option<&Path>, container: &str) -> Exclusive {
     let Some(dir) = dir else {
         return Exclusive::Unknown("no session lock directory".into());
     };
-    let file = match open(dir, container) {
-        Ok(file) => file,
-        Err(error) => return Exclusive::Unknown(format!("{}: {error}", dir.display())),
-    };
-    match flock(&file, libc::LOCK_EX) {
-        Ok(()) => Exclusive::Acquired(DispatchLock(file)),
-        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => Exclusive::Busy,
-        Err(error) => Exclusive::Unknown(format!("flock: {error}")),
+    let path = lock_path(dir, container);
+    match FileLock::try_lock_exclusive(&path) {
+        Ok(Some(lock)) => Exclusive::Acquired(DispatchLock(lock)),
+        Ok(None) => Exclusive::Busy,
+        Err(error) => Exclusive::Unknown(format!("{}: {error}", path.display())),
     }
 }
 

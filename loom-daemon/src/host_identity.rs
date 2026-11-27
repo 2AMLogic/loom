@@ -433,31 +433,12 @@ pub(crate) fn load_or_create_with(
 /// held only while replacing an empty id file. Separate opens contend even
 /// within one process; the kernel releases it on drop, so a crashed holder
 /// cannot leave it stuck.
-struct RecoveryLock(#[allow(dead_code)] std::fs::File);
+struct RecoveryLock(#[allow(dead_code)] crate::fs_util::FileLock);
 
 impl RecoveryLock {
     fn acquire(dir: &Path) -> std::io::Result<Self> {
-        let file = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(dir.join(format!(".{HOST_ID_FILENAME}.lock")))?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::io::AsRawFd;
-            loop {
-                // SAFETY: `file` owns a valid open descriptor for this call.
-                if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } == 0 {
-                    break;
-                }
-                let error = std::io::Error::last_os_error();
-                if error.kind() != std::io::ErrorKind::Interrupted {
-                    return Err(error);
-                }
-            }
-        }
-        Ok(Self(file))
+        crate::fs_util::FileLock::lock_exclusive(&dir.join(format!(".{HOST_ID_FILENAME}.lock")))
+            .map(Self)
     }
 }
 

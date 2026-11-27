@@ -3,7 +3,7 @@
 //! (`discovery-cache.json`), and the per-host cycle lock (`poll.lock`).
 
 use std::collections::BTreeMap;
-use std::fs::{File, OpenOptions};
+use std::fs::File;
 use std::io;
 use std::path::{Path, PathBuf};
 
@@ -319,54 +319,19 @@ pub fn save_discovery_cache(dir: &Path, cache: &DiscoveryCache) -> io::Result<()
 /// A held, exclusive, per-host cycle lock (`flock` on `poll.lock`),
 /// released when dropped. Serialises the CLI `--once` and the daemon poller
 /// on one host so two writers never race the ledger.
+///
+/// The lock itself is [`crate::fs_util::FileLock`], which unlocks explicitly on
+/// drop rather than relying on `close` (#11066).
 #[derive(Debug)]
 pub struct CycleLock {
-    file: File,
+    _lock: crate::fs_util::FileLock,
 }
 
 impl CycleLock {
     /// Try to take the lock without blocking. `Ok(None)` means another cycle
     /// on this host holds it.
     pub fn try_acquire(dir: &Path) -> io::Result<Option<Self>> {
-        std::fs::create_dir_all(dir)?;
-        let file = OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .write(true)
-            .open(dir.join("poll.lock"))?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::io::AsRawFd;
-            // SAFETY: `flock` on a descriptor we own for the duration of the
-            // call; no memory is shared with the kernel.
-            let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
-            if rc != 0 {
-                let error = io::Error::last_os_error();
-                if error.kind() == io::ErrorKind::WouldBlock {
-                    return Ok(None);
-                }
-                return Err(error);
-            }
-        }
-        Ok(Some(CycleLock { file }))
-    }
-}
-
-/// Unlock explicitly rather than relying on `close` (#11066). An `flock`
-/// lock belongs to the open file description, and a child that any thread
-/// forks shares that description until it execs. Closing only our copy
-/// would leave the lock held for as long as such a child lingers between
-/// fork and exec, so the next cycle, export pass, or status note would
-/// read a lock held by a holder that has already finished. `LOCK_UN`
-/// releases the description itself, whoever else still has a copy.
-impl Drop for CycleLock {
-    fn drop(&mut self) {
-        #[cfg(unix)]
-        {
-            use std::os::unix::io::AsRawFd;
-            // SAFETY: `flock` on a descriptor we still own; no memory is
-            // shared with the kernel.
-            unsafe { libc::flock(self.file.as_raw_fd(), libc::LOCK_UN) };
-        }
+        Ok(crate::fs_util::FileLock::try_lock_exclusive(&dir.join("poll.lock"))?
+            .map(|lock| CycleLock { _lock: lock }))
     }
 }

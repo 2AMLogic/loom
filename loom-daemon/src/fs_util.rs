@@ -83,6 +83,134 @@ pub fn write_atomic(path: &Path, bytes: &[u8], opts: AtomicOpts) -> io::Result<(
     Ok(())
 }
 
+/// A held advisory `flock` on a lock file, released when dropped.
+///
+/// The one place the crate calls `libc::flock` for ordinary lock files
+/// (consolidated from eight hand-rolled copies, #15620). Every constructor
+/// retries `EINTR`, and [`Drop`] unlocks explicitly rather than relying on
+/// `close` (#11066, #11544): an `flock` lock belongs to the open file
+/// description, and a child that any thread forks shares that description
+/// until it execs. Closing only our copy would leave the lock held for as long
+/// as such a child lingers between fork and exec, so the next taker would read
+/// a lock held by a holder that has already finished. `LOCK_UN` releases the
+/// description itself, whoever else still has a copy. The kernel also releases
+/// the lock when the holder exits, so a killed holder cannot wedge the next.
+///
+/// Locks that must open their file differently (`O_NOFOLLOW`, an inherited
+/// descriptor, `openat`) stay local to their module.
+///
+/// On non-unix targets there is no portable advisory lock: acquisition always
+/// succeeds and nothing is held.
+#[derive(Debug)]
+pub struct FileLock(
+    // Held only so the descriptor (and so the lock) lives as long as `self`.
+    #[cfg_attr(not(unix), allow(dead_code))] fs::File,
+);
+
+impl FileLock {
+    /// Open `path` for locking, creating it (and its parent directory when the
+    /// path has one) if absent. The file is never truncated.
+    fn open(path: &Path) -> io::Result<fs::File> {
+        if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
+            fs::create_dir_all(dir)?;
+        }
+        fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(path)
+    }
+
+    /// Take the lock on `path`, blocking until it is free.
+    ///
+    /// # Errors
+    /// Creating the parent directory, opening the file, or `flock` failing.
+    pub fn lock_exclusive(path: &Path) -> io::Result<Self> {
+        let file = Self::open(path)?;
+        flock(&file, Operation::Exclusive, true)?;
+        Ok(Self(file))
+    }
+
+    /// Take the lock on `path` without blocking. `Ok(None)` means another
+    /// open file description holds it.
+    ///
+    /// # Errors
+    /// Anything other than contention: opening the file or `flock` failing.
+    pub fn try_lock_exclusive(path: &Path) -> io::Result<Option<Self>> {
+        Self::try_lock_exclusive_file(Self::open(path)?)
+    }
+
+    /// Take a shared lock on `path` without blocking. `Ok(None)` means an
+    /// exclusive holder has it.
+    ///
+    /// # Errors
+    /// Anything other than contention: opening the file or `flock` failing.
+    pub fn try_lock_shared(path: &Path) -> io::Result<Option<Self>> {
+        let file = Self::open(path)?;
+        Ok(flock(&file, Operation::Shared, false)?.then_some(Self(file)))
+    }
+
+    /// [`Self::try_lock_exclusive`] on a file the caller already opened, for a
+    /// lock whose file must not be created (`.create(false)`). The file is
+    /// closed again when the lock is refused.
+    ///
+    /// # Errors
+    /// Anything other than contention: `flock` failing.
+    pub fn try_lock_exclusive_file(file: fs::File) -> io::Result<Option<Self>> {
+        Ok(flock(&file, Operation::Exclusive, false)?.then_some(Self(file)))
+    }
+}
+
+#[derive(Clone, Copy)]
+enum Operation {
+    Shared,
+    Exclusive,
+}
+
+/// `flock(2)` with `EINTR` retried. `Ok(true)` once held; with `blocking`
+/// false, `Ok(false)` when another description holds it (`EWOULDBLOCK`).
+#[cfg(unix)]
+fn flock(file: &fs::File, op: Operation, blocking: bool) -> io::Result<bool> {
+    use std::os::unix::io::AsRawFd as _;
+    let mut flags = match op {
+        Operation::Shared => libc::LOCK_SH,
+        Operation::Exclusive => libc::LOCK_EX,
+    };
+    if !blocking {
+        flags |= libc::LOCK_NB;
+    }
+    loop {
+        // SAFETY: `file` owns a valid open descriptor for the duration of the
+        // call; no memory is shared with the kernel.
+        if unsafe { libc::flock(file.as_raw_fd(), flags) } == 0 {
+            return Ok(true);
+        }
+        let error = io::Error::last_os_error();
+        match error.kind() {
+            io::ErrorKind::Interrupted => {}
+            io::ErrorKind::WouldBlock if !blocking => return Ok(false),
+            _ => return Err(error),
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn flock(_file: &fs::File, _op: Operation, _blocking: bool) -> io::Result<bool> {
+    Ok(true)
+}
+
+#[cfg(unix)]
+impl Drop for FileLock {
+    fn drop(&mut self) {
+        use std::os::unix::io::AsRawFd as _;
+        // SAFETY: `flock` on a descriptor we still own; no memory is shared
+        // with the kernel. Failure is ignored: closing the descriptor next
+        // releases the lock anyway.
+        unsafe { libc::flock(self.0.as_raw_fd(), libc::LOCK_UN) };
+    }
+}
+
 /// Format a byte count as `B` / `K` / `M` / `G` with one decimal place.
 pub fn human_size(bytes: u64) -> String {
     let b = bytes as f64;
@@ -503,5 +631,103 @@ mod tests {
         assert_eq!(tree_size_bytes(&td.path().join("nope")), 0);
         // Agrees with the size half of `newest_mtime_and_size`.
         assert_eq!(tree_size_bytes(td.path()), newest_mtime_and_size(td.path()).unwrap().1);
+    }
+    #[cfg(unix)]
+    #[test]
+    fn file_lock_exclusive_contends_across_separate_opens() {
+        let td = tempfile::tempdir().unwrap();
+        let path = td.path().join("nested/dir/a.lock");
+        let held = FileLock::try_lock_exclusive(&path)
+            .unwrap()
+            .expect("first taker wins");
+        assert!(FileLock::try_lock_exclusive(&path).unwrap().is_none());
+        assert!(FileLock::try_lock_shared(&path).unwrap().is_none());
+        drop(held);
+        assert!(FileLock::try_lock_exclusive(&path).unwrap().is_some());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn file_lock_shared_holders_coexist_but_exclude_exclusive() {
+        let td = tempfile::tempdir().unwrap();
+        let path = td.path().join("s.lock");
+        let a = FileLock::try_lock_shared(&path)
+            .unwrap()
+            .expect("first shared");
+        let b = FileLock::try_lock_shared(&path)
+            .unwrap()
+            .expect("second shared");
+        assert!(FileLock::try_lock_exclusive(&path).unwrap().is_none());
+        drop(a);
+        assert!(FileLock::try_lock_exclusive(&path).unwrap().is_none(), "one shared holder left");
+        drop(b);
+        assert!(FileLock::try_lock_exclusive(&path).unwrap().is_some());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn file_lock_drop_releases_even_while_a_duplicate_descriptor_lives() {
+        // The #11066/#11544 shape: a forked child shares the open file
+        // description. `try_clone` is the same sharing (`dup`); closing only
+        // our fd would leave the lock held through the clone.
+        let td = tempfile::tempdir().unwrap();
+        let path = td.path().join("fork.lock");
+        let held = FileLock::try_lock_exclusive(&path).unwrap().unwrap();
+        let _inherited = held.0.try_clone().unwrap();
+        drop(held);
+        assert!(
+            FileLock::try_lock_exclusive(&path).unwrap().is_some(),
+            "lock must be released on drop, not on the last close"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn file_lock_blocking_acquire_waits_for_the_holder() {
+        let td = tempfile::tempdir().unwrap();
+        let path = td.path().join("b.lock");
+        let held = FileLock::lock_exclusive(&path).unwrap();
+        let waiter = {
+            let path = path.clone();
+            std::thread::spawn(move || FileLock::lock_exclusive(&path).map(drop))
+        };
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        assert!(!waiter.is_finished(), "waiter must block while the lock is held");
+        drop(held);
+        waiter.join().unwrap().unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn file_lock_on_an_opened_file_never_creates_it() {
+        let td = tempfile::tempdir().unwrap();
+        let path = td.path().join("pre.lock");
+        assert!(fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .is_err());
+        fs::write(&path, b"").unwrap();
+        let open = || {
+            fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&path)
+                .unwrap()
+        };
+        let held = FileLock::try_lock_exclusive_file(open())
+            .unwrap()
+            .expect("free");
+        assert!(FileLock::try_lock_exclusive_file(open()).unwrap().is_none());
+        drop(held);
+        assert!(FileLock::try_lock_exclusive_file(open()).unwrap().is_some());
+    }
+
+    #[test]
+    fn file_lock_creates_the_lock_file_and_leaves_it_after_release() {
+        let td = tempfile::tempdir().unwrap();
+        let path = td.path().join("bare.lock");
+        drop(FileLock::lock_exclusive(&path).unwrap());
+        assert!(path.is_file(), "lock file must not be deleted on drop");
     }
 }
