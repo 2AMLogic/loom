@@ -18,6 +18,14 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 ### 2026-11-27
 
+- **Issue #15521** (closed): native loom_edit refuses with "read the current file first" straight after a full read, oldText matching exactly once
+- **PR #15534**: fix: explain why native edits cannot match oldText
+- **Issue #15517** (closed): Release-tag verification is shed on fleet workers: RELEASE_REPO still names rjwalters/loom, so resync-payload and the workspace resync never apply the payload
+- **PR #15542**: fix: verify release tags against 2AMLogic/loom and name shed lookups
+- **Issue #15471** (closed): verify-output-decl says a producer with an unterminated final line has zero lines
+- **PR #15502**: fix: verify-output-decl counts an unterminated final line (#15471)
+- **Issue #15510** (closed): Reuse the review-conflict fake gh in approved-PR tests
+- **PR #15538**: test: share the review-conflict fake gh with approved-PR tests
 - **Issue #15539** (closed): config-resolver.sh: a config tier over 128 KiB fails with `jq: Argument list too long` (exit 126) and aborts create-pr.sh
 - **Issue #15536** (closed): config-resolver.sh: loom_resolve_config passes each tier as one jq --argjson and dies with "Argument list too long" above 128 KiB
 - **Issue #15512** (closed): tests/hooks: verify the destructive guard harness clears inherited environment variables in CI
