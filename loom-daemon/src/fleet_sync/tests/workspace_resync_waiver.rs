@@ -101,6 +101,12 @@ fn why(v: &Verdict) -> &str {
 }
 
 #[test]
+fn kind_upstream_names_the_canonical_owner_of_each_repo() {
+    assert_eq!(Kind::Loom.upstream(), "2AMLogic/loom");
+    assert_eq!(Kind::RepoSkills.upstream(), "rjwalters/repo");
+}
+
+#[test]
 fn a_byte_identical_resync_is_eligible_and_records_the_kept_set_file() {
     let v = evaluate(&Fake::ok(), 1);
     assert_eq!(
