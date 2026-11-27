@@ -786,3 +786,347 @@ fn gh_pr_merge_detection_is_not_a_role_capability() {
     assert!(!executes_gh_pr_merge("gh pr view 1"));
     assert_clean("gh pr merge 1");
 }
+
+// ---------------------------------------------------------------------------
+// gh pr merge assembled at run time (#15525)
+// ---------------------------------------------------------------------------
+//
+// The merge-redirect guard trusts `executes_gh_pr_merge` == false as "would
+// not run it". These commands ASSEMBLE the line an interpreter then runs, so no
+// command word of theirs is `gh`; each is a real execution of the merge.
+
+/// The rows of the #15525 table, then the other shapes the workflow-guard suite
+/// (`tests/hooks/test-guard-loom-workflow.sh`) requires denied.
+const ASSEMBLED_MERGES: &[(&str, &str)] = &[
+    // --- the table ---
+    (
+        "eval of a heredoc captured by $( )",
+        "eval \"$(cat <<'EOF'\ngh pr merge 123\nEOF\n)\"",
+    ),
+    ("echo piped into bash", "echo \"gh pr merge 123\" | bash"),
+    ("eval of $(echo …)", "eval \"$(echo \"gh pr merge 123\")\""),
+    ("jq literal piped into bash", "jq -n -r '\"gh pr merge 123\"' | bash"),
+    (
+        "heredoc-assigned variable run as the command word",
+        "X=\"$(cat <<'EOF'\ngh pr merge 123\nEOF\n)\"; $X",
+    ),
+    (
+        "for-loop item eval'd",
+        "for q in \"gh pr merge 123\"; do eval \"$q\"; done",
+    ),
+    (
+        "unquoted heredoc inside a $( ) argument expands a live $( )",
+        "gh pr comment 5 --body \"$(cat <<EOF\nsee $(gh pr merge 999)\nEOF\n)\"",
+    ),
+    ("the control", "gh pr merge 123"),
+    // --- pipes into a shell that reads stdin ---
+    ("printf piped into sh", "printf '%s\\n' \"gh pr merge 1\" | sh"),
+    ("bash -s", "echo 'gh pr merge 1' | bash -s"),
+    ("bash -s with arguments", "echo 'gh pr merge 1' | bash -s -- a b"),
+    ("zsh", "echo 'gh pr merge 1' | zsh"),
+    ("bash reading /dev/stdin", "echo 'gh pr merge 1' | bash /dev/stdin"),
+    ("bash reading -", "echo 'gh pr merge 1' | bash -"),
+    ("stderr pipe", "echo 'gh pr merge 1' |& bash"),
+    ("sudo-wrapped shell", "echo 'gh pr merge 1' | sudo bash"),
+    ("env-wrapped shell", "echo 'gh pr merge 1' | env X=1 bash"),
+    ("middle of a longer pipeline", "echo 'gh pr merge 1' | cat | tr -d '\\r' | bash"),
+    ("after an earlier command", "ls; echo 'gh pr merge 1' | bash"),
+    (
+        "heredoc piped into a shell, substitution live",
+        "cat <<E | bash\n$( echo \"gh pr merge 1\" )\nE",
+    ),
+    // --- eval / -c of a substitution's output ---
+    ("backtick substitution", "eval \"` echo \"gh pr merge 1\" `\""),
+    ("second statement of the substitution", "eval \"$(echo setup; echo \"gh pr merge 1\")\""),
+    ("bash -c of printf", "bash -c \"$(  printf %s \"gh pr merge 1\" )\""),
+    ("here-string of a substitution", "bash <<< \"$(echo gh pr merge 1)\""),
+    ("jq literal under eval", "eval \"$(jq -n -r '\"gh pr merge 1\"')\""),
+    // --- a `)` that is not a closer inside the substitution ---
+    ("bare-paren sibling", "eval \"$( (true); echo \"gh pr merge 1\" )\""),
+    ("nested bare parens", "eval \"$( ( (true) ); echo \"gh pr merge 1\" )\""),
+    ("arithmetic sibling", "eval \"$( n=$((1+2)); echo \"gh pr merge 1\" )\""),
+    ("quoted paren", "eval \"$( echo \"a)b\" ; echo \"gh pr merge 1\" )\""),
+    ("single-quoted paren", "eval \"$( echo 'a)b'; echo \"gh pr merge 1\" )\""),
+    ("case pattern", "eval \"$( case x in x) :;; esac; echo \"gh pr merge 1\" )\""),
+    (
+        "nested case patterns",
+        "eval \"$( case x in a) case y in b) :;; esac;; esac; echo \"gh pr merge 1\" )\"",
+    ),
+    (
+        "case inside a group",
+        "eval \"$( ( case x in x) :;; esac ); echo \"gh pr merge 1\" )\"",
+    ),
+    (
+        "case body with its own substitution",
+        "eval \"$( case x in x) d=$(date);; esac; echo \"gh pr merge 1\" )\"",
+    ),
+    (
+        "case with a leading paren and a fallthrough arm",
+        "eval \"$( case x in (a) :;& (x) :;;& *) :;; esac; echo \"gh pr merge 1\" )\"",
+    ),
+    ("paren in a ${ } expansion", "eval \"$( x=${y//)/}; echo \"gh pr merge 1\" )\""),
+    (
+        "two ${ } expansions hiding parens",
+        "eval \"$( x=${y//)/}; z=${w//)/}; echo \"gh pr merge 1\" )\"",
+    ),
+    (
+        "paren in a heredoc body",
+        "eval \"$( cat <<'E'\n)\nE\necho \"gh pr merge 1\" )\"",
+    ),
+    (
+        "paren in a <<- heredoc body",
+        "eval \"$( cat <<-'E'\n\t)\n\tE\necho \"gh pr merge 1\" )\"",
+    ),
+    (
+        "paren in an unquoted heredoc body",
+        "eval \"$( cat <<E\n)\nE\necho \"gh pr merge 1\" )\"",
+    ),
+    (
+        "comment with an apostrophe before it",
+        "# it's fine\neval \"$(echo \"gh pr merge 1\")\"",
+    ),
+    // --- variables ---
+    (
+        "heredoc-assigned variable eval'd",
+        "C=\"$(cat <<'E'\ngh pr merge 1\nE\n)\"\neval \"$C\"",
+    ),
+    (
+        "one safe and one unsafe reference",
+        "X=\"$(cat <<'E'\ngh pr merge 1\nE\n)\"\ngh api repos/o/r -f body=\"$X\"\necho \"$X\" | bash",
+    ),
+    (
+        "substring expansion",
+        "B=\"$(cat <<'E'\ngh pr merge 1\nE\n)\"\neval \"${B:0:100}\"",
+    ),
+    (
+        "prefix-removal expansion",
+        "B=\"$(cat <<'E'\ngh pr merge 1\nE\n)\"\neval \"${B#}\"",
+    ),
+    (
+        "default-value expansion",
+        "B=\"$(cat <<'E'\ngh pr merge 1\nE\n)\"\neval \"${B:-}\"",
+    ),
+    (
+        "indirect expansion",
+        "B=\"$(cat <<'E'\ngh pr merge 1\nE\n)\"\nREF=B; eval \"${!REF}\"",
+    ),
+    ("plain assignment run as the command", "X=\"gh pr merge 1\"; $X"),
+    ("an earlier value survives a reassignment", "X=\"gh pr merge 1\"; X=\"ls\"; $X"),
+    (
+        "for-loop item run as the command",
+        "for q in \"alpha\" \"gh pr merge 1\"; do\n  $q\ndone",
+    ),
+    (
+        "for-loop item among safe references",
+        "for q in \"alpha\" \"gh pr merge 1\"; do\n  echo \"$q\"\n  gh issue list --search \"$q\"\n  eval \"$q\"\ndone",
+    ),
+    (
+        "for-loop item echoed into bash",
+        "for q in \"alpha\" \"gh pr merge 1\"; do\n  echo \"$q\" | bash\ndone",
+    ),
+    (
+        "for-loop item through $(echo …) under eval",
+        "for q in \"alpha\" \"gh pr merge 1\"; do\n  eval \"$(echo \"$q\")\"\ndone",
+    ),
+    (
+        "nested loops",
+        "for o in \"x\" \"y\"; do\n  for i in \"alpha\" \"gh pr merge 1\"; do\n    eval \"$i\"\n  done\ndone",
+    ),
+    (
+        "same name reused by a later safe loop",
+        "for q in \"gh pr merge 1\"; do\n  eval \"$q\"\ndone\nfor q in \"alpha\"; do\n  echo \"$q\"\ndone",
+    ),
+    // --- expanding heredocs ---
+    (
+        "live $( ) in an unquoted heredoc captured into --body",
+        "gh pr comment 5 --body \"$(cat <<EOF\nPlease avoid: $(gh pr merge 999)\nEOF\n)\"",
+    ),
+    (
+        "live backticks in an unquoted heredoc captured into --body",
+        "gh pr comment 5 --body \"$(cat <<EOF\nPlease avoid: `gh pr merge 999`\nEOF\n)\"",
+    ),
+    (
+        "outer expanding heredoc around an inner quoted one",
+        "bash <<OUTER\ngit commit -F - <<'EOF'\n$(gh pr merge 887 --admin)\nEOF\nOUTER",
+    ),
+    // --- an incomplete construct cannot establish confinement ---
+    (
+        "unterminated commit-message heredoc",
+        "git commit -F - <<'EOF'\ngh pr merge 123 mentioned but the heredoc never closes",
+    ),
+    ("unterminated heredoc to cat", "cat <<'EOF'\ngh pr merge 1"),
+];
+
+/// Commands that only MENTION the merge, or carry it as data to something that
+/// does not run it: the lexer must keep allowing every one.
+const INERT_MENTIONS: &[(&str, &str)] = &[
+    (
+        "heredoc parked in a file used only as a message body",
+        "cat > /tmp/m.md <<'DELIM'\nSome prose that quotes 'gh pr merge 123' as documentation.\nDELIM\ngh issue edit 1234 --body-file /tmp/m.md",
+    ),
+    (
+        "unquoted commit-message heredoc with no substitution",
+        "git commit -F - <<EOF\ngh pr merge 123\nEOF",
+    ),
+    (
+        "quoted-prefix commit-message heredoc",
+        "echo \"staged\" ; git commit -F - <<'EOF'\nnever run `gh pr merge 1` directly\nEOF",
+    ),
+    (
+        "stdin ignored by echo",
+        "echo git commit -F - <<'EOF'\ngh pr merge 887 --admin\nEOF",
+    ),
+    (
+        "quoted phrase after an unrelated substitution",
+        "./.loom/scripts/check-duplicate.sh \"Title\" \"see $(x) then 'gh pr merge 123'\"",
+    ),
+    (
+        "quoted phrase after a backtick",
+        "./.loom/scripts/check-duplicate.sh \"Title\" \"see `x` then 'gh pr merge 123'\"",
+    ),
+    (
+        "loop item never referenced",
+        "for q in \"alpha\" \"gh pr merge redirect\"; do\n  echo \"no reference to the loop variable here\"\ndone",
+    ),
+    (
+        "loop item used only as a search query",
+        "for q in alpha \"gh pr merge redirect\"; do\n  gh issue list --search \"$q\"\ndone",
+    ),
+    ("variable echoed", "X=\"gh pr merge 1\"; echo \"$X\""),
+    (
+        "variable passed as a body",
+        "X=\"gh pr merge 1\"; gh issue comment 5 --body \"$X\"",
+    ),
+    ("echo into cat", "echo \"gh pr merge 123\" | cat"),
+    ("echo into grep", "echo \"gh pr merge 123\" | grep bash"),
+    ("echo into a script file", "echo \"gh pr merge 123\" | bash ./run.sh"),
+    ("echo into bash -c", "echo \"gh pr merge 123\" | bash -c 'cat'"),
+    ("echo into a pager", "echo \"gh pr merge 123\" | less"),
+    ("only an or-list ahead of the shell", "echo \"gh pr merge 123\" || bash"),
+    ("a shell on its own line", "echo \"gh pr merge 123\"\nbash"),
+    ("a substitution that prints a date", "eval \"$(date)\""),
+    ("a heredoc to cat", "cat <<'EOF'\nnever run gh pr merge 12 by hand\nEOF"),
+    (
+        "an unquoted heredoc to cat with a harmless substitution",
+        "cat <<EOF\nstamp $(date) gh pr merge 12 is blocked\nEOF",
+    ),
+    (
+        "an escaped substitution in an unquoted heredoc",
+        "cat <<EOF\nwrite \\$(gh pr merge 12) literally\nEOF",
+    ),
+    (
+        "commit message heredoc",
+        "git commit -m \"$(cat <<'EOF'\nfix: document gh pr merge redirect\nEOF\n)\"",
+    ),
+    (
+        "a case statement before an echoed mention",
+        "case x in x) :;; esac; echo \"note about gh pr merge\"",
+    ),
+    (
+        "case as an argument inside $( )",
+        "X=$(grep case /etc/hosts); echo \"note about gh pr merge\"",
+    ),
+];
+
+#[test]
+fn gh_pr_merge_assembled_text_is_executed() {
+    for (name, cmd) in ASSEMBLED_MERGES {
+        assert!(executes_gh_pr_merge(cmd), "{name}: must be a live merge: {cmd:?}");
+    }
+}
+
+#[test]
+fn gh_pr_merge_mentions_stay_data() {
+    for (name, cmd) in INERT_MENTIONS {
+        assert!(!executes_gh_pr_merge(cmd), "{name}: a mention must stay data: {cmd:?}");
+    }
+}
+
+#[test]
+fn generated_text_scan_speaks_only_to_gh_pr_merge() {
+    // The role-capability matcher keeps its documented limit: a command line
+    // assembled at run time, or text piped into a shell, is not matched.
+    for cmd in [
+        "echo 'ssh host' | bash",
+        "eval \"$(echo 'ssh host')\"",
+        "X='ssh host'; $X",
+        "for h in 'ssh host'; do eval \"$h\"; done",
+        "cat <<E | bash\n$( echo 'ssh host' )\nE",
+        "git commit -F - <<'EOF'\nssh host mentioned but never closed",
+    ] {
+        assert_clean(cmd);
+    }
+}
+
+#[test]
+fn unquoted_heredoc_substitutions_are_commands_for_every_capability() {
+    // Bash runs a `$( )` in an expanding heredoc body whoever reads the text.
+    assert!(hits_cap("cat <<EOF\nnote $(ssh host)\nEOF", "remote-shell"));
+    assert!(hits_cap("cat <<EOF\nnote `ssh host`\nEOF", "remote-shell"));
+    assert!(hits_cap("cat <<EOF\n${x:-$(ssh host)}\nEOF", "remote-shell"));
+    // A quoted delimiter keeps the body literal; an escaped `$(` is text.
+    assert_clean("cat <<'EOF'\nnote $(ssh host)\nEOF");
+    assert_clean("cat <<\\EOF\nnote $(ssh host)\nEOF");
+    assert_clean("cat <<EOF\nnote \\$(ssh host)\nEOF");
+}
+
+#[test]
+fn substitution_bodies_survive_a_paren_that_is_not_a_closer() {
+    // A `)` in a case pattern, a heredoc body, a `${ }` or a comment must not end
+    // the `$( )`: the command after it is still inside, and still analyzed.
+    for cmd in [
+        "echo $( case x in x) :;; esac; ssh host )",
+        "echo $( case x in (x) :;; esac; ssh host )",
+        "echo $( cat <<'E'\n)\nE\nssh host )",
+        "echo $( x=${y//)/}; ssh host )",
+        "echo $( # a ) in a comment\nssh host )",
+        "echo $( echo ')' ; ssh host )",
+    ] {
+        assert!(hits_cap(cmd, "remote-shell"), "{cmd:?}");
+    }
+    // `case` as a plain argument opens nothing; the first `)` closes the `$( )`.
+    assert!(!hits_cap("X=$(grep case /etc/hosts); echo ssh", "remote-shell"));
+    assert!(hits_cap("X=$(grep case /etc/hosts); ssh host", "remote-shell"));
+    // A here-string is not a heredoc: the text after it is not a body.
+    assert!(hits_cap("echo $( cat <<< 'x'\nssh host )", "remote-shell"));
+}
+
+#[test]
+fn generated_text_scan_is_bounded_and_fails_closed() {
+    // Fifty thousand distinct loop items eval'd one by one: the scan runs out of
+    // budget rather than time, and an answer it cannot finish is a live merge.
+    let items: Vec<String> = (0..50_000).map(|n| format!("w{n}")).collect();
+    let cmd = format!("for q in {}; do eval \"$q\"; done", items.join(" "));
+    let started = std::time::Instant::now();
+    assert!(executes_gh_pr_merge(&cmd));
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(20),
+        "{:?}",
+        started.elapsed()
+    );
+    // The budget is per query: later commands are answered on their merits.
+    assert!(!executes_gh_pr_merge("ls -la"));
+    assert!(executes_gh_pr_merge("echo 'gh pr merge 1' | bash"));
+    assert!(!executes_gh_pr_merge("for q in a b c; do eval \"$q\"; done"));
+}
+
+#[test]
+fn variables_expanding_each_other_do_not_multiply_the_scan() {
+    // Twenty variables that each expand the next three: 3^16 expansion paths, but
+    // only twenty distinct texts. No merge anywhere, so the answer is no, quickly.
+    let mut cmd = String::new();
+    for k in 0..20 {
+        cmd.push_str(&format!("v{k}=\"$v{}$v{}$v{}\"\n", k + 1, k + 2, k + 3));
+    }
+    cmd.push_str("eval \"$v0\"");
+    assert!(!executes_gh_pr_merge(&cmd));
+    cmd.push_str("; v19='gh pr merge 1'");
+    assert!(executes_gh_pr_merge(&cmd));
+}
+
+#[test]
+fn a_self_referencing_variable_terminates() {
+    assert!(!executes_gh_pr_merge("X='$X'; eval \"$X\""));
+    assert!(executes_gh_pr_merge("X='$X; gh pr merge 1'; eval \"$X\""));
+    assert!(!executes_gh_pr_merge("A='$B'; B='$A'; eval \"$A\""));
+}
