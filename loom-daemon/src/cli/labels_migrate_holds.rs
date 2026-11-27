@@ -57,13 +57,12 @@ use std::path::PathBuf;
 
 use crate::champion_hold::{capped_hold_routed, standing_hold, HoldKind, HOLD_BY};
 use crate::dep_classify::cli::EscalationMigration;
-use crate::gh_invocation::AccessIntent;
 use crate::sweep_registry::park_hold::{DAEMON_HOLD_BY, NOOP_HOLD_REASON};
 use crate::sweep_registry::standing_noop_hold_fingerprint;
 use serde::Serialize;
 
 use super::labels_migrate::{
-    classify, delete_issue_label, dry_run_hint, gh_api, max_exit, mode_banner, open_issues_page,
+    classify, delete_issue_label, dry_run_hint, gh_read, max_exit, mode_banner, open_issues_page,
     pace_write, paginate_open, parse_json_lines, push_fleet_header, run_targets_with, ForgeError,
     Target,
 };
@@ -514,7 +513,7 @@ impl HoldsForge for GhHoldsForge {
 
     fn trusted_comments(&self, number: u64) -> Result<Vec<String>, ForgeError> {
         let path = format!("repos/{}/issues/{number}/comments?per_page=100", self.repo);
-        let out = gh_api(&self.repo, OP, AccessIntent::Read, &["api", "--paginate", &path])?;
+        let out = gh_read(&self.repo, OP, &["api", "--paginate", &path])?;
         crate::comment_trust::TrustPolicy::for_root(&self.root)
             .trusted_bodies(&out)
             .ok_or_else(|| ForgeError::Other("comment listing did not parse".to_string()))

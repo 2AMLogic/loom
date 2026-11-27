@@ -747,7 +747,7 @@ pub(crate) fn classify(why: String) -> ForgeError {
 /// forge credential, the shared breaker and the call accounting, all under
 /// the telemetry operation `op`. The call's stdout, or the failure
 /// classified.
-pub(crate) fn gh_api(
+fn gh_api(
     repo: &str,
     op: &'static str,
     intent: AccessIntent,
@@ -765,6 +765,11 @@ pub(crate) fn gh_api(
         return Err(ForgeError::RateLimited(r.failure_reason(&what)));
     }
     Err(classify(r.failure_reason(&what)))
+}
+
+/// One read-only `gh api` call on `repo`, through [`GhInvocation`].
+pub(crate) fn gh_read(repo: &str, op: &'static str, args: &[&str]) -> Result<Vec<u8>, ForgeError> {
+    gh_api(repo, op, AccessIntent::Read, args)
 }
 
 /// A forge write: [`pace_write`], then the call with write intent.
@@ -797,7 +802,7 @@ pub(crate) fn open_issues_page(
         "repos/{repo}/issues?state=open&labels={}&per_page={PER_PAGE}&page={page}",
         enc(label)
     );
-    let out = gh_api(repo, op, AccessIntent::Read, &["api", &path, "--jq", jq])?;
+    let out = gh_read(repo, op, &["api", &path, "--jq", jq])?;
     Ok(String::from_utf8_lossy(&out).into_owned())
 }
 
@@ -829,12 +834,7 @@ pub(crate) fn parse_items(stdout: &str) -> Result<Vec<Item>, ForgeError> {
 impl MigrateForge for GhMigrateForge {
     fn live_labels(&self) -> Result<Vec<String>, ForgeError> {
         let path = format!("repos/{}/labels?per_page=100", self.repo);
-        let out = gh_api(
-            &self.repo,
-            OP,
-            AccessIntent::Read,
-            &["api", "--paginate", &path, "--jq", ".[].name"],
-        )?;
+        let out = gh_read(&self.repo, OP, &["api", "--paginate", &path, "--jq", ".[].name"])?;
         Ok(String::from_utf8_lossy(&out)
             .lines()
             .map(str::trim)
@@ -850,7 +850,7 @@ impl MigrateForge for GhMigrateForge {
 
     fn item_labels(&self, number: u64) -> Result<Vec<String>, ForgeError> {
         let path = format!("repos/{}/issues/{number}/labels?per_page=100", self.repo);
-        let out = gh_api(&self.repo, OP, AccessIntent::Read, &["api", &path, "--jq", ".[].name"])?;
+        let out = gh_read(&self.repo, OP, &["api", &path, "--jq", ".[].name"])?;
         Ok(String::from_utf8_lossy(&out)
             .lines()
             .map(str::trim)
