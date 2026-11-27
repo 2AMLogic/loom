@@ -564,6 +564,27 @@ pub(super) const VERBS: &[&str] = &[
     "workflow view",
 ];
 
+/// `gh api` flags that take a value (so the value is not the endpoint).
+pub(super) const API_VALUE_FLAGS: &[&str] = &[
+    "-H",
+    "--header",
+    "-f",
+    "--raw-field",
+    "-F",
+    "--field",
+    "-q",
+    "--jq",
+    "-t",
+    "--template",
+    "-X",
+    "--method",
+    "--hostname",
+    "--input",
+    "--cache",
+    "-p",
+    "--preview",
+];
+
 /// Flags whose value is the next token (gh-shim's `valueFlags` plus its
 /// app-read additions), so a value is never read as a positional.
 pub(super) const VALUE_FLAGS: &[&str] = &[

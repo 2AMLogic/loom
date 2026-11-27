@@ -55,6 +55,7 @@ use super::billing::{self, Billing};
 use super::telemetry::Outcome as InvokeOutcome;
 use super::GhInvocation;
 use crate::forge_call_stats::{self, CallIdentity, Outcome, Pool};
+use std::borrow::Cow;
 use std::ffi::OsString;
 
 #[path = "attribution.rs"]
@@ -71,12 +72,10 @@ pub use attribution::{
 /// or the free `rate_limit` endpoint; `gh search …` spends the search pool.
 #[must_use]
 pub fn static_pool(args: &[OsString]) -> Pool {
-    let words: Vec<String> = args
-        .iter()
-        .map(|a| a.to_string_lossy().into_owned())
-        .collect();
-    match words.first().map(String::as_str) {
-        Some("api") => api_pool(&words[1..]),
+    if let Some(rest) = api_args(args) {
+        return api_pool(&rest);
+    }
+    match args.first().and_then(|a| a.to_str()) {
         Some("issue" | "pr" | "repo" | "project") => Pool::Graphql,
         Some("search") => Pool::Search,
         Some("release" | "run" | "workflow" | "label" | "secret" | "variable" | "cache") => {
@@ -86,13 +85,18 @@ pub fn static_pool(args: &[OsString]) -> Pool {
     }
 }
 
-/// The endpoint is the first `gh api` argument that is not a flag or a flag's
-/// value. Flags taking a value are skipped with it.
-fn api_pool(rest: &[String]) -> Pool {
-    let Some(path) = api_path(rest) else {
+/// The arguments after `gh api`, in the string form the shared parser takes.
+fn api_args(args: &[OsString]) -> Option<Vec<Cow<'_, str>>> {
+    let (cmd, rest) = args.split_first()?;
+    (cmd == "api").then(|| rest.iter().map(|arg| arg.to_string_lossy()).collect())
+}
+
+fn api_pool(rest: &[impl AsRef<str>]) -> Pool {
+    let request = super::route::api_request(rest);
+    let Some(path) = request.endpoint.map(|p| p.trim_start_matches('/')) else {
         return Pool::Other;
     };
-    if path == "graphql" {
+    if request.graphql {
         Pool::Graphql
     } else if path == "rate_limit" {
         Pool::Other
@@ -107,52 +111,9 @@ fn api_pool(rest: &[String]) -> Pool {
 /// dropped; `None` for any other command.
 #[must_use]
 pub(crate) fn api_endpoint(args: &[OsString]) -> Option<String> {
-    let words: Vec<String> = args
-        .iter()
-        .map(|a| a.to_string_lossy().into_owned())
-        .collect();
-    if words.first().map(String::as_str) != Some("api") {
-        return None;
-    }
-    api_path(&words[1..]).map(str::to_string)
-}
-
-/// The first `gh api` argument (after `api`) that is not a flag or a flag's
-/// value, leading `/` dropped.
-fn api_path(rest: &[String]) -> Option<&str> {
-    const VALUED: &[&str] = &[
-        "-H",
-        "--header",
-        "-f",
-        "--raw-field",
-        "-F",
-        "--field",
-        "-q",
-        "--jq",
-        "-t",
-        "--template",
-        "-X",
-        "--method",
-        "--hostname",
-        "--input",
-        "--cache",
-        "-p",
-        "--preview",
-    ];
-    let mut i = 0;
-    while i < rest.len() {
-        let a = rest[i].as_str();
-        if VALUED.contains(&a) {
-            i += 2;
-            continue;
-        }
-        if a.starts_with('-') {
-            i += 1;
-            continue;
-        }
-        return Some(a.trim_start_matches('/'));
-    }
-    None
+    super::route::api_request(&api_args(args)?)
+        .endpoint
+        .map(|p| p.trim_start_matches('/').to_owned())
 }
 
 /// Whether the invocation asked `gh api` to print the response headers.
@@ -162,9 +123,9 @@ fn wants_headers(args: &[OsString]) -> bool {
 
 /// The value of `--hostname` in a `gh api` argv, if any.
 fn hostname_arg(args: &[OsString]) -> Option<String> {
-    args.windows(2)
-        .find(|w| w[0] == "--hostname")
-        .map(|w| w[1].to_string_lossy().into_owned())
+    super::route::api_request(&api_args(args)?)
+        .hostname
+        .map(str::to_owned)
 }
 
 /// The identity a completed invocation is accounted under: what the site

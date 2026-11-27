@@ -19,9 +19,8 @@
 //! The vocabulary and the matching rules are gh-shim's (2AMLogic/2am
 //! `infra/ops/internal/ghquota/args.go`, runbook `github-quota.md`
 //! §"Route, resource and target"), so the two sources join on `route`. The
-//! content boundary is also gh-shim's: every value is one of this file's
-//! constants. No path segment, query string, body, header or flag value is
-//! ever returned.
+//! content boundary is also gh-shim's: every span attribute is one of this
+//! file's constants. Raw endpoints and flag values stay inside the process.
 
 use std::sync::OnceLock;
 
@@ -43,7 +42,7 @@ pub const COMMAND_OTHER: &str = "other";
 
 #[path = "route_table.rs"]
 mod table;
-use table::{GROUPS, LEAVES, METHODS, ROUTE_TABLE, VALUE_FLAGS, VERBS};
+use table::{API_VALUE_FLAGS, GROUPS, LEAVES, METHODS, ROUTE_TABLE, VALUE_FLAGS, VERBS};
 
 /// What a span records about the endpoint (see the module docs).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -69,15 +68,23 @@ impl RouteFacts {
     }
 }
 
-struct Flag<'a> {
-    name: &'a str,
-    value: Option<&'a str>,
+pub(super) struct Flag<'a> {
+    pub(super) name: &'a str,
+    pub(super) value: Option<&'a str>,
 }
 
 const API_FIELD_FLAGS: &[&str] = &["-f", "--raw-field", "-F", "--field"];
 
 /// gh's argv as positionals and named flags (gh-shim's `splitArgs`).
 fn split(args: &[impl AsRef<str>]) -> (Vec<&str>, Vec<Flag<'_>>) {
+    split_with(args, VALUE_FLAGS)
+}
+
+/// Split argv using the valued flags for the command being parsed.
+pub(super) fn split_with<'a>(
+    args: &'a [impl AsRef<str>],
+    value_flags: &[&str],
+) -> (Vec<&'a str>, Vec<Flag<'a>>) {
     let mut pos = Vec::new();
     let mut flags = Vec::new();
     let mut i = 0;
@@ -99,7 +106,7 @@ fn split(args: &[impl AsRef<str>]) -> (Vec<&str>, Vec<Flag<'_>>) {
             tok.get(..2).unwrap_or(tok)
         };
         let mut value = None;
-        if VALUE_FLAGS.contains(&name) {
+        if value_flags.contains(&name) {
             if long && tok.contains('=') {
                 value = tok.split_once('=').map(|(_, v)| v);
             } else if !long && tok.len() > 2 {
@@ -173,19 +180,29 @@ fn api_method(flags: &[Flag<'_>]) -> &'static str {
     }
 }
 
-/// The parts of `gh api` argv needed to check its declared access intent.
+/// Request details for routing, call accounting and checking declared access intent.
 pub(crate) struct ApiRequest<'a> {
+    pub(super) endpoint: Option<&'a str>,
+    pub(super) hostname: Option<&'a str>,
+    /// Reader credentials are for github.com. A missing host is ambiguous too.
+    pub(super) has_foreign_hostname: bool,
     pub(crate) method: &'static str,
     pub(crate) graphql: bool,
     pub(crate) query: Option<&'a str>,
 }
 
 /// Parse the same option forms as the facade's route and method telemetry.
-pub(crate) fn api_request<'a>(args: &'a [&'a str]) -> ApiRequest<'a> {
-    let (pos, flags) = split(args);
-    let graphql = pos
-        .first()
-        .and_then(|endpoint| endpoint_segments(endpoint))
+pub(crate) fn api_request(args: &[impl AsRef<str>]) -> ApiRequest<'_> {
+    let (pos, flags) = split_with(args, API_VALUE_FLAGS);
+    let endpoint = pos.first().copied();
+    let mut hosts = flags.iter().filter(|f| f.name == "--hostname");
+    let hostname = hosts.clone().next_back().and_then(|f| f.value);
+    let has_foreign_hostname = hosts.any(|f| {
+        f.value
+            .is_none_or(|h| !h.eq_ignore_ascii_case("github.com"))
+    });
+    let graphql = endpoint
+        .and_then(endpoint_segments)
         .is_some_and(|segments| segments == ["graphql"]);
     let query = flags
         .iter()
@@ -193,6 +210,9 @@ pub(crate) fn api_request<'a>(args: &'a [&'a str]) -> ApiRequest<'a> {
         .filter_map(|flag| flag.value?.strip_prefix("query="))
         .next_back();
     ApiRequest {
+        endpoint,
+        hostname,
+        has_foreign_hostname,
         method: api_method(&flags),
         graphql,
         query,

@@ -894,16 +894,8 @@ fn daemon_write_paths_are_scoped() {
             NotAWrite("reads the forge and runs local git; only its test names git's `-X theirs`"),
         ),
         (
-            "gh_invocation/accounting.rs",
-            NotAWrite("classifies an invocation's argv for call accounting, runs none"),
-        ),
-        (
             "gh_invocation/affinity.rs",
             NotAWrite("derives a read's routing key from argv; only its tests name `--method`"),
-        ),
-        (
-            "gh_invocation/cwd_route.rs",
-            NotAWrite("classifies an invocation's argv to refuse mutations a reader route, runs none"),
         ),
         (
             "gh_invocation/api_kind.rs",

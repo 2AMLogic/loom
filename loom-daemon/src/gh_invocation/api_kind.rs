@@ -50,60 +50,32 @@ const VALUE_FLAGS: &[&str] = &[
     "-t",
     "--template",
     "--json",
-    "-X",
-    "--method",
-    "-H",
-    "--header",
-    "-f",
-    "--raw-field",
-    "-F",
-    "--field",
-    "--input",
-    "--hostname",
-    "--cache",
-    "-p",
-    "--preview",
     "-D",
     "--dir",
     "-O",
     "--output",
+    "-p",
     "--pattern",
     "-A",
     "--archive",
 ];
 
-/// The positional (non-flag) arguments of `args`, in order.
-fn positionals(args: &[String]) -> Vec<&str> {
-    let mut out = Vec::new();
-    let mut iter = args.iter();
-    while let Some(a) = iter.next() {
-        if a == "--" {
-            out.extend(iter.by_ref().map(String::as_str));
-            break;
-        }
-        if a.starts_with('-') && a.len() > 1 {
-            if !a.contains('=') && VALUE_FLAGS.contains(&a.as_str()) {
-                iter.next();
-            }
-            continue;
-        }
-        out.push(a.as_str());
-    }
-    out
-}
-
 /// Classify a `gh` argument vector (without the `gh` program itself).
 #[must_use]
 pub fn classify(args: &[String]) -> ApiKind {
-    let pos = positionals(args);
+    if args.first().is_some_and(|cmd| cmd == "api") {
+        let request = super::route::api_request(&args[1..]);
+        return if request.graphql {
+            ApiKind::Graphql
+        } else if request.endpoint.is_some() {
+            ApiKind::Rest
+        } else {
+            ApiKind::Unknown
+        };
+    }
+    let (pos, _) = super::route::split_with(args, VALUE_FLAGS);
     let sub = pos.get(1).copied();
     match pos.first().copied() {
-        // `gh api graphql` is GraphQL; any other endpoint path is REST.
-        Some("api") => match sub {
-            Some("graphql") => ApiKind::Graphql,
-            Some(_) => ApiKind::Rest,
-            None => ApiKind::Unknown,
-        },
         // Actions, settings and search families are REST-only in `gh`.
         Some(
             "run" | "workflow" | "cache" | "secret" | "variable" | "search" | "ssh-key" | "gpg-key",
@@ -155,7 +127,9 @@ mod tests {
     fn api_endpoint_decides_rest_vs_graphql() {
         assert_eq!(kind(&["api", "repos/acme/widgets/issues"]), "rest");
         assert_eq!(kind(&["api", "-X", "POST", "repos/acme/widgets/labels"]), "rest");
-        assert_eq!(kind(&["api", "graphql", "-f", "query=x"]), "graphql");
+        for endpoint in ["graphql", "/graphql", "https://api.github.com/graphql"] {
+            assert_eq!(kind(&["api", endpoint, "-f", "query=x"]), "graphql", "{endpoint}");
+        }
         // A flag value equal to "graphql" is not the endpoint.
         assert_eq!(kind(&["api", "-H", "graphql", "repos/acme/w"]), "rest");
         assert_eq!(kind(&["api"]), "unknown");
