@@ -526,9 +526,8 @@ impl LeaseEnsureArgs {
         {
             command.arg("--sweep-id").arg(id);
         }
-        let output = command
-            .current_dir(root)
-            .output()
+        command.current_dir(root);
+        let output = crate::proc_exec::output(&mut command)
             .map_err(|e| Outcome::PublishUnavailable(e.to_string()))?;
 
         if !output.status.success() {
@@ -568,7 +567,7 @@ impl LeaseEnsureArgs {
         mark_inherited_fds_cloexec();
         let mut command = Command::new(renew_script);
         pin_running_binary(&mut command);
-        let result = command
+        command
             .arg("start")
             .arg(self.issue.to_string())
             .arg("--watch-pid")
@@ -582,8 +581,8 @@ impl LeaseEnsureArgs {
             .current_dir(root)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .output();
+            .stderr(Stdio::null());
+        let result = crate::proc_exec::output(&mut command);
 
         match result {
             Ok(o) if o.status.success() => {
