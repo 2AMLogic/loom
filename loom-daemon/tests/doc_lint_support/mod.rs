@@ -1,5 +1,8 @@
 //! Extract-and-execute support for `../sweep_md_doc_lint.rs` (#7993, split
-//! from #7979).
+//! from #7979). The fence/stub helpers (`first_fenced_block_after`,
+//! `nth_fenced_block_after`, `write_executable_stub`) are shared with the
+//! sibling `sweep_md_stage_minus_one_doc_lint.rs` and `bump_md_doc_lint.rs`
+//! test crates (#15514).
 //!
 //! These functions hold the bodies of the doc-lint checks that EXECUTE
 //! extracted content (a fenced shell snippet run against stub scripts, or a
@@ -50,6 +53,53 @@ pub fn first_fenced_block_after<'a>(
         panic!("unterminated fence after `{label}` — the code block never closes")
     });
     (&body[..close], from + open + 3 + nl + 1 + close + 3)
+}
+
+/// Returns the `n`-th (0-based) fenced block tagged ```` ```<lang> ```` that
+/// starts **after** `anchor` in `content`, with the fence delimiters stripped.
+///
+/// This is the "locate" half of locate → extract → execute. It deliberately
+/// anchors on a *heading* (structure) rather than on the block's contents, so
+/// the block's own text is free to change.
+#[allow(dead_code)]
+pub fn nth_fenced_block_after(content: &str, anchor: &str, lang: &str, n: usize) -> String {
+    let anchor_at = content.find(anchor).unwrap_or_else(|| {
+        panic!(
+            "sweep skill docs are missing the `{anchor}` anchor — the Stage -1 \
+             doc-lint cannot locate the fenced block it extracts. If the section \
+             was intentionally renamed, update the anchor in this test."
+        )
+    });
+    let open = format!("```{lang}");
+    let mut blocks = Vec::new();
+    let mut current: Option<Vec<&str>> = None;
+    for line in content[anchor_at..].lines() {
+        match current.as_mut() {
+            None => {
+                if line.trim_end() == open {
+                    current = Some(Vec::new());
+                }
+            }
+            Some(buf) => {
+                if line.trim_end() == "```" {
+                    blocks.push(buf.join("\n"));
+                    current = None;
+                } else {
+                    buf.push(line);
+                }
+            }
+        }
+        if blocks.len() > n {
+            break;
+        }
+    }
+    blocks.into_iter().nth(n).unwrap_or_else(|| {
+        panic!(
+            "sweep skill docs have no ```{lang} block #{n} after the `{anchor}` \
+             anchor — #7994 requires this block stay extractable so its behaviour \
+             (not its wording) can be asserted"
+        )
+    })
 }
 
 /// Writes `body` as an executable bash script at `path`, with a `#!/usr/bin/env
