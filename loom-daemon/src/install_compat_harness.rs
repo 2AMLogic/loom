@@ -645,11 +645,11 @@ impl Probe {
         if let Some(known) = self.seen.get(&key) {
             return known.clone();
         }
-        let outcome = Command::new(daemon)
-            .args(sub.split_whitespace())
+        let mut cmd = Command::new(daemon);
+        cmd.args(sub.split_whitespace())
             .arg("--help")
-            .stdin(Stdio::null())
-            .output();
+            .stdin(Stdio::null());
+        let outcome = crate::proc_exec::output(&mut cmd);
         let result = classify_probe(&outcome);
         match (&outcome, &result) {
             (Err(_), Probed::Broken(why)) => {
@@ -886,11 +886,9 @@ fn newest_tag_at_or_below(repo_root: &Path, version: Version) -> Result<String> 
 
 /// The version a daemon binary reports: `loom-daemon <version>…` on stdout.
 fn binary_version(bin: &Path) -> Option<Version> {
-    let out = Command::new(bin)
-        .arg("--version")
-        .stdin(Stdio::null())
-        .output()
-        .ok()?;
+    let mut cmd = Command::new(bin);
+    cmd.arg("--version").stdin(Stdio::null());
+    let out = crate::proc_exec::output(&mut cmd).ok()?;
     String::from_utf8_lossy(&out.stdout)
         .split_whitespace()
         .find_map(Version::parse)
