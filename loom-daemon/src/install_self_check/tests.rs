@@ -344,6 +344,46 @@ fn test_repair_token_ranking_failure_via_fake_bin() {
     assert!(matches!(outcome, RepairOutcome::Failed(_)), "{outcome:?}");
 }
 
+#[test]
+fn test_run_without_a_site_reports_the_exit_and_its_output() {
+    let tmp = tempfile::tempdir().unwrap();
+    let ok = write_fake_bin(tmp.path(), "ok.sh", "exit 0");
+    assert_eq!(
+        run_with_timeout(&ok, &[], None, tmp.path(), Duration::from_secs(5), None),
+        Ok(())
+    );
+    let boom = write_fake_bin(tmp.path(), "boom.sh", "echo boom >&2; exit 1");
+    let err =
+        run_with_timeout(&boom, &[], None, tmp.path(), Duration::from_secs(5), None).unwrap_err();
+    assert!(err.contains("exited with exit status: 1") && err.contains("boom"), "{err}");
+}
+
+/// A repair past its deadline takes the child's whole process group, so the
+/// `node` an `npm` run forked does not outlive it (#15580).
+#[test]
+fn test_run_with_timeout_takes_the_grandchild_with_it() {
+    let tmp = tempfile::tempdir().unwrap();
+    #[cfg(unix)]
+    let pidfile = tmp.path().join("grandchild.pid");
+    #[cfg(unix)]
+    let body = crate::exec_test_support::hung_with_grandchild(&pidfile);
+    #[cfg(not(unix))]
+    let body = "sleep 30".to_string();
+    let bin = write_fake_bin(tmp.path(), "hang.sh", &body);
+    for site in [Some("install_self_check"), None] {
+        let err = run_with_timeout(&bin, &[], None, tmp.path(), Duration::from_millis(600), site)
+            .unwrap_err();
+        assert!(err.contains(" timed out after "), "{err}");
+        #[cfg(unix)]
+        assert!(
+            !crate::exec_test_support::grandchild_outlived(&pidfile),
+            "the {site:?} child's grandchild outlived the deadline"
+        );
+        #[cfg(unix)]
+        let _ = fs::remove_file(&pidfile);
+    }
+}
+
 // ===================================================================
 // Repair — MCP live-sweep guard
 // ===================================================================
