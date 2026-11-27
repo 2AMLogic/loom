@@ -23,6 +23,7 @@ use std::process::{Command, Output, Stdio};
 use std::time::{Duration, Instant};
 
 use crate::fleet_sync::git_spawn_log::{argv_of, Sampler};
+use crate::proc_exec::{run_bounded_observed, Completion, ExecError};
 
 /// How a tracked child ended.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -74,7 +75,13 @@ pub struct Tracked {
 /// start line (argv only, no environment) and begins sampling peak RSS.
 #[must_use]
 pub fn track(site: &'static str, cmd: &Command, child_pid: u32) -> Tracked {
-    log::info!("{}", start_line(site, child_pid, &argv_of(cmd)));
+    track_argv(site, &argv_of(cmd), child_pid)
+}
+
+/// [`track`] from an argv captured earlier, for a caller that has already
+/// handed the `Command` away (see [`run_bounded_tracked`]).
+fn track_argv(site: &'static str, argv: &[String], child_pid: u32) -> Tracked {
+    log::info!("{}", start_line(site, child_pid, argv));
     let sampler = Sampler::for_self_spawn();
     sampler.start(child_pid);
     Tracked {
@@ -97,6 +104,35 @@ pub(crate) fn output_tracked(site: &'static str, cmd: &mut Command) -> std::io::
     let out = child.wait_with_output()?;
     tracked.finish(out.status);
     Ok(out)
+}
+
+/// Run a self-spawn under `timeout` through [`crate::proc_exec`]: its pipes are
+/// drained concurrently and a deadline terminates the child's whole process
+/// group, so a `gh` or `npm` it forked does not outlive it. Logs the start and
+/// exit lines [`track`] does (`timed out` for a deadline); a command that could
+/// not be spawned logs nothing, as nothing ran.
+///
+/// # Errors
+///
+/// As [`crate::proc_exec::run_bounded_observed`].
+pub(crate) fn run_bounded_tracked(
+    site: &'static str,
+    cmd: Command,
+    timeout: Duration,
+) -> Result<Completion, ExecError> {
+    let argv = argv_of(&cmd);
+    let mut tracked = None;
+    let result = run_bounded_observed(cmd, timeout, |pid| {
+        tracked = Some(track_argv(site, &argv, pid));
+    });
+    if let Some(tracked) = tracked {
+        match &result {
+            Ok(Completion::Exited(out)) => drop(tracked.finish(out.status)),
+            Ok(Completion::TimedOut { .. }) => drop(tracked.finish("timed out")),
+            Err(e) => drop(tracked.finish(e)),
+        }
+    }
+    result
 }
 
 impl Tracked {
@@ -167,6 +203,76 @@ mod tests {
                     && line.contains(" site=test_capture status=exit status: 3 ")),
             "{records:?}"
         );
+    }
+
+    fn lines_for(records: &[(log::Level, String)], site: &str) -> Vec<String> {
+        records
+            .iter()
+            .map(|(_, line)| line.clone())
+            .filter(|line| line.contains(&format!(" site={site} ")))
+            .collect()
+    }
+
+    #[test]
+    fn run_bounded_tracked_logs_start_and_exit_of_a_completed_child() {
+        let records = crate::test_log_capture::capture_logs(|| {
+            let out = run_bounded_tracked(
+                "test_bounded",
+                sh("printf out; printf err >&2; exit 3"),
+                Duration::from_secs(5),
+            )
+            .unwrap()
+            .output()
+            .unwrap();
+            assert_eq!(out.stdout, b"out");
+            assert_eq!(out.stderr, b"err");
+            assert_eq!(out.status.code(), Some(3));
+        });
+        let lines = lines_for(&records, "test_bounded");
+        assert!(lines.iter().any(|l| l.starts_with("self_spawn start pid=")), "{lines:?}");
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.starts_with("self_spawn exit pid=")
+                    && l.contains("status=exit status: 3 ")),
+            "{lines:?}"
+        );
+    }
+
+    #[test]
+    fn run_bounded_tracked_logs_a_deadline_as_timed_out_and_ends_the_group() {
+        let dir = tempfile::tempdir().unwrap();
+        let pidfile = dir.path().join("grandchild.pid");
+        let records = crate::test_log_capture::capture_logs(|| {
+            let done = run_bounded_tracked(
+                "test_bounded",
+                sh(&crate::exec_test_support::hung_with_grandchild(&pidfile)),
+                Duration::from_millis(600),
+            )
+            .unwrap();
+            assert!(matches!(done, Completion::TimedOut { .. }), "{done:?}");
+        });
+        let lines = lines_for(&records, "test_bounded");
+        assert!(lines.iter().any(|l| l.contains("status=timed out ")), "{lines:?}");
+        assert!(!lines.iter().any(|l| l.contains("abandoned")), "{lines:?}");
+        assert!(
+            !crate::exec_test_support::grandchild_outlived(&pidfile),
+            "the grandchild outlived the deadline"
+        );
+    }
+
+    #[test]
+    fn run_bounded_tracked_logs_nothing_for_a_spawn_failure() {
+        let records = crate::test_log_capture::capture_logs(|| {
+            let err = run_bounded_tracked(
+                "test_bounded",
+                Command::new("/nonexistent/loom-daemon"),
+                Duration::from_secs(1),
+            )
+            .unwrap_err();
+            assert!(matches!(err, ExecError::Spawn(_)), "{err:?}");
+        });
+        assert!(lines_for(&records, "test_bounded").is_empty(), "{records:?}");
     }
 
     #[test]

@@ -75,9 +75,8 @@ pub(crate) fn claim_args(
 
 /// The longest stderr tail a claim's span carries, in bytes.
 const STDERR_TAIL_MAX: usize = 256;
-/// How long to wait for the stderr reader after the claim ended: a
-/// grandchild may still hold the pipe open.
-const STDERR_GRACE: Duration = Duration::from_millis(500);
+/// The most of each output stream [`run_bounded`] keeps, in bytes.
+const OUTPUT_MAX: usize = 65_536;
 
 /// How one bounded command ended.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -172,53 +171,39 @@ fn stderr_tail(raw: &str) -> Option<String> {
 }
 
 /// Run `cmd` to completion within `limit`; how it ended, how long it took,
-/// and the tail of its stderr plus its (bounded) stdout when `cmd` pipes
-/// them. The stdout is the claim child's typed channel
-/// (`writer_limit::parse_handoff`): vendor output never reaches it.
+/// and the tail of its stderr plus its (bounded) stdout. The stdout is the
+/// claim child's typed channel (`writer_limit::parse_handoff`): vendor output
+/// never reaches it. Past `limit` the child's whole process group is killed,
+/// so the `gh` it forked does not outlive it.
 fn run_bounded(
-    cmd: &mut Command,
+    cmd: Command,
     limit: Duration,
 ) -> (ClaimRun, Duration, Option<String>, Option<String>) {
+    use crate::proc_exec::{Completion, ExecError};
     let start = Instant::now();
-    let Ok(mut child) = cmd.spawn() else {
-        return (ClaimRun::SpawnFailed, start.elapsed(), None, None);
-    };
     // #14100: a `lease pr` child is the daemon's own binary; attribute its pid.
-    let tracked = crate::self_spawn_log::track("step_lease", cmd, child.id());
-    // Drained on threads, so a chatty child cannot fill a pipe and stall.
-    fn drain<R: std::io::Read + Send + 'static>(
-        stream: R,
-    ) -> Option<std::sync::mpsc::Receiver<String>> {
-        let (tx, rx) = std::sync::mpsc::channel();
-        std::thread::spawn(move || {
-            let mut buf = Vec::new();
-            let _ = std::io::Read::read_to_end(&mut std::io::Read::take(stream, 65_536), &mut buf);
-            let _ = tx.send(String::from_utf8_lossy(&buf).into_owned());
-        });
-        Some(rx)
-    }
-    let stderr_reader = child.stderr.take().and_then(drain);
-    let stdout_reader = child.stdout.take().and_then(drain);
-    let run = loop {
-        match child.try_wait() {
-            Ok(Some(status)) => {
-                tracked.finish(status);
-                break status.code().map_or(ClaimRun::Signaled, ClaimRun::Exited);
-            }
-            Ok(None) if start.elapsed() < limit => std::thread::sleep(Duration::from_millis(200)),
-            _ => {
-                let _ = child.kill();
-                let _ = child.wait();
-                tracked.finish("timed out");
-                break ClaimRun::TimedOut;
-            }
-        }
-    };
+    let result = crate::self_spawn_log::run_bounded_tracked("step_lease", cmd, limit);
     let elapsed = start.elapsed();
-    let tail = stderr_reader
-        .and_then(|rx| rx.recv_timeout(STDERR_GRACE).ok())
-        .and_then(|raw| stderr_tail(&raw));
-    let stdout = stdout_reader.and_then(|rx| rx.recv_timeout(STDERR_GRACE).ok());
+    let capped =
+        |raw: &[u8]| String::from_utf8_lossy(&raw[..raw.len().min(OUTPUT_MAX)]).into_owned();
+    let (run, stderr, stdout) = match result {
+        Ok(Completion::Exited(out)) => (
+            out.status
+                .code()
+                .map_or(ClaimRun::Signaled, ClaimRun::Exited),
+            Some(capped(&out.stderr)),
+            Some(capped(&out.stdout)),
+        ),
+        Ok(Completion::TimedOut { stdout, stderr }) => {
+            (ClaimRun::TimedOut, Some(capped(&stderr)), Some(capped(&stdout)))
+        }
+        Err(ExecError::Spawn(_)) => (ClaimRun::SpawnFailed, None, None),
+        // Started, but its result could not be collected. The closed token set
+        // has no such outcome; as before (a failed `try_wait` took the
+        // deadline's arm) it is the unverified `timed_out`, never a spawn failure.
+        Err(ExecError::Collect(_)) => (ClaimRun::TimedOut, None, None),
+    };
+    let tail = stderr.and_then(|raw| stderr_tail(&raw));
     (run, elapsed, tail, stdout)
 }
 
@@ -299,13 +284,13 @@ impl SweepRegistry {
             return;
         }
         let args = claim_args(&self.config.workspace_root, item, role, sweep_id, Some(pid));
-        let Some(mut cmd) = self.lease_command(sweep_id, &args, false) else {
+        let Some(cmd) = self.lease_command(sweep_id, &args, false) else {
             return;
         };
         let id = sweep_id.to_string();
         let spawned = std::thread::Builder::new()
             .name(format!("step-lease-renew-{item}"))
-            .spawn(move || match run_bounded(&mut cmd, CLAIM_TIMEOUT).0 {
+            .spawn(move || match run_bounded(cmd, CLAIM_TIMEOUT).0 {
                 ClaimRun::Exited(EXIT_HELD) => {}
                 run => log::warn!(
                     "sweep_registry: {id}: lease renewal did not start ({run:?}); the lease \
@@ -346,7 +331,7 @@ impl SweepRegistry {
 /// `writer_rate_limited` refusal (#13746); every other way the claim fails
 /// stays `claim_unverified`.
 pub(super) fn run_step_claim(cmd: Option<Command>) -> std::result::Result<ClaimFacts, StepRefusal> {
-    let Some(mut cmd) = cmd else {
+    let Some(cmd) = cmd else {
         let mut refusal = StepRefusal::new("claim_unverified", "no loom-daemon binary");
         refusal.claim = Some(Box::new(ClaimFacts {
             outcome: "no_binary",
@@ -357,7 +342,7 @@ pub(super) fn run_step_claim(cmd: Option<Command>) -> std::result::Result<ClaimF
         }));
         return Err(refusal);
     };
-    let (run, elapsed, tail, stdout) = run_bounded(&mut cmd, CLAIM_TIMEOUT);
+    let (run, elapsed, tail, stdout) = run_bounded(cmd, CLAIM_TIMEOUT);
     let facts = ClaimFacts {
         outcome: run.token(),
         exit_code: run.code(),
@@ -417,7 +402,7 @@ mod facts_tests {
             cmd.args(["-c", script])
                 .stderr(Stdio::piped())
                 .stdout(Stdio::piped());
-            run_bounded(&mut cmd, Duration::from_secs(5))
+            run_bounded(cmd, Duration::from_secs(5))
         };
         let (run, _, tail, stdout) = sh("echo cause >&2; exit 5");
         assert_eq!((run.token(), run.code()), ("exited", Some(5)));
@@ -425,14 +410,34 @@ mod facts_tests {
         assert_eq!(stdout.as_deref(), Some(""));
         let (run, _, _, _) = sh("kill -9 $$");
         assert_eq!((run.token(), run.code()), ("signaled", None));
-        let (run, _, _, _) =
-            run_bounded(&mut Command::new("/nonexistent/loom-claim"), CLAIM_TIMEOUT);
+        let (run, _, _, _) = run_bounded(Command::new("/nonexistent/loom-claim"), CLAIM_TIMEOUT);
         assert_eq!(run.token(), "spawn_failed");
         let mut slow = Command::new("sh");
         slow.args(["-c", "sleep 5"]);
-        let (run, elapsed, _, _) = run_bounded(&mut slow, Duration::from_millis(300));
+        let (run, elapsed, _, _) = run_bounded(slow, Duration::from_millis(300));
         assert_eq!(run.token(), "timed_out");
         assert!(elapsed < Duration::from_secs(3));
+    }
+
+    /// The deadline takes the claim child's whole process group, so a `gh` it
+    /// forked does not outlive it (#15580).
+    #[cfg(unix)]
+    #[test]
+    fn a_timed_out_claim_takes_its_grandchild_with_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let pidfile = dir.path().join("grandchild.pid");
+        let mut cmd = Command::new("/bin/sh");
+        cmd.args([
+            "-c",
+            &crate::exec_test_support::hung_with_grandchild(&pidfile),
+        ])
+        .stdin(Stdio::null());
+        let (run, _, _, _) = run_bounded(cmd, Duration::from_millis(600));
+        assert_eq!(run.token(), "timed_out");
+        assert!(
+            !crate::exec_test_support::grandchild_outlived(&pidfile),
+            "the claim child's grandchild outlived the deadline"
+        );
     }
 
     /// A confirmed writer rate limit the child handed over on stdout is the
