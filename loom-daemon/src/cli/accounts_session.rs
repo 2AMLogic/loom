@@ -15,8 +15,10 @@ pub(crate) enum SessionAction {
         /// (issue #7389 -- see `accounts add --email`).
         #[arg(value_name = "NAME")]
         name: String,
-        /// Override the session image (default:
-        /// `ghcr.io/2amlogic/loom-worker-session:latest`).
+        /// Override the session image (default for a host-mounted session:
+        /// `ghcr.io/2amlogic/loom-worker-session:latest`; for a private-clone
+        /// session: the running daemon's release tag, unless
+        /// `accounts.session.image` is configured).
         #[arg(long, value_name = "IMAGE")]
         image: Option<String>,
         /// Directory to bind-mount read-write at the identical absolute
@@ -328,6 +330,13 @@ pub(crate) fn handle_session_command(
                 trust
             );
             println!("{}: image={}", status.config.account, status.image.as_deref().unwrap_or("-"));
+            if let Some((running, expected)) = status.image_difference() {
+                println!(
+                    "{}: image differs from the expected one: running {running}, expected {expected}. \
+                     The reconciler updates idle stock seats and keeps configured overrides and newer releases.",
+                    status.config.account
+                );
+            }
             if !status.extra_mounts.is_empty() {
                 let mounts: Vec<String> = status
                     .extra_mounts

@@ -256,6 +256,8 @@ esac
 mod drift_tests;
 #[path = "session_reconcile_hold_tests.rs"]
 mod hold_tests;
+#[path = "session_reconcile_private_image_tests.rs"]
+mod private_image_tests;
 #[path = "session_reconcile_removal_tests.rs"]
 mod removal_tests;
 #[path = "session_reconcile_safety_tests.rs"]
@@ -277,6 +279,9 @@ impl Deref for Fake {
 #[derive(Default)]
 struct FakeState {
     containers: Mutex<HashMap<String, ContainerState>>,
+    /// Containers a private image roll created, with the original they replace
+    /// (the `loom.roll-replaces` label).
+    replaces: Mutex<HashMap<String, String>>,
     /// Workspace bind destinations per container (path parity).
     mounts: Mutex<HashMap<String, Vec<PathBuf>>>,
     /// The workspace registry the pass and `create` see.
@@ -424,8 +429,11 @@ impl FakeState {
         let map: BTreeMap<String, Observed> = containers
             .iter()
             .map(|(name, state)| {
-                let inspect =
+                let mut inspect =
                     inspect_json(name, state, mounts.get(name).map_or(&[], Vec::as_slice));
+                if let Some(original) = self.replaces.lock().unwrap().get(name) {
+                    inspect["Config"]["Labels"]["loom.roll-replaces"] = original.clone().into();
+                }
                 let observed = Observed::of(inspect, &DriftInputs::registry(registered));
                 (name.clone(), observed)
             })
@@ -675,6 +683,7 @@ fn fake_inputs<'a>(
         index,
         is_private_clone: private,
         recover_private: &|_, _, _| Ok(()),
+        roll_private: &|_, _, _| Ok(private_workspace::Rolled::Unchanged),
         fallback_workspace: fallback,
         registered: Some(registered),
         denials_for: &|_| Ok(drift::Denials::default()),

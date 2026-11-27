@@ -464,6 +464,31 @@ Local-path/SSH remotes and URL credentials are unsupported and fail before
 creation. The account's existing persistent authentication profile remains its
 single refresh owner.
 
+**The seat image follows the daemon's release (#14112).** A private-clone
+seat started without `--image` is created from
+`ghcr.io/2amlogic/loom-worker-session:<daemon version>` — the tag this
+release publishes, never the mutable `:latest` (which a seat created from an
+older daemon still runs). `accounts.session.image` wins when it is
+configured, and an explicit `--image` wins over both. The daemon's session
+reconcile pass keeps a seat on the stock image in step with the daemon: when
+a running seat's image is not the running daemon's release image, an **idle**
+seat moves to the release image using its existing volume, clones and profile.
+A busy seat waits. The reconciler obtains the image, checks mounts and rechecks
+the seat and holds under the account lease. It keeps the original container
+stopped while it provisions and verifies the replacement. If the replacement
+fails, it restores the original container's name, controls and running state
+before returning the error. If Docker also refuses restoration, the error
+identifies the original container for recovery. Failed pulls back off because
+the session image follows a release by about 25 minutes.
+`accounts session status` reports the running and expected images when they differ.
+
+An explicit `--image` selects the starting image. A tag or digest in the
+current or legacy stock repository still follows the daemon's release once
+idle, unless the seat is already on a newer release. The reconciler keeps
+images from other repositories and any recorded `accounts.session.image`
+digest pin. To move a derived image to a new release, rebuild it `FROM` the
+new base, update its configured digest, then stop and start the seat.
+
 **Several repositories per account (#10795).** The first `--private-clone`
 repository stays at `/workspace/repo` (an existing single-repository volume,
 container and unfinished work are untouched). Repeating `session start

@@ -10600,7 +10600,9 @@ session status` (text and `--json`) reports them.
 
 **Private-clone sessions (#14451)** take the same two keys. An operator
 `session start` resolves them once, when it creates the container, in the
-order explicit `--image` > `accounts.session.image` > stock, and records the
+order explicit `--image` > `accounts.session.image` > the daemon's release
+image (`ghcr.io/2amlogic/loom-worker-session:<daemon version>`, #14112 —
+never the mutable `:latest`), and records the
 configured image and the mounts in the seat's `workspace.json`
 (`session_image`, `extra_mounts`; absent state reads as unset). The **host
 tier** decides for a seat that serves several repositories: the keys are read
@@ -10618,7 +10620,32 @@ never the config as edited since and never the stock image, re-running the
 bundle verification: a daemon roll that leaves the derived image not yet
 rebuilt refuses with a WARN. A configuration edit applies to a seat after
 `accounts session stop` and a new `start`. `accounts session status` reports
-the image and the extra mounts of a private-clone seat.
+the image and the extra mounts of a private-clone seat, and `expected_image`
+beside `image` when the two differ.
+
+**A private seat's image follows the daemon's release (#14112).** The
+reconcile pass compares each running private-clone seat's image with the
+running daemon's release image. A seat on the stock image that is not on it —
+a `:latest` seat an older daemon created, or one on the previous release — is
+recreated from the release image once it is idle. The reconciler pulls the
+image, checks the mounts and mirror binds, then rechecks the running seat
+and any operator hold under the account lease. A surviving worker defers the
+roll until an idle pass. A failed pull backs off, and a Docker timeout retries
+when the engine backoff expires.
+
+The reconciler stops the original container and retains it by ID while it
+provisions controls and verifies the replacement against the same volume and
+profile. Only one session runs on those mounts at a time. It removes the
+original after the replacement passes its mount, setup and control checks.
+If replacement fails, it removes its candidate, restores the original name
+and controls, and restarts and verifies the original container. If Docker also
+refuses rollback, the error includes the original ID for operator recovery.
+A replacement that reached the stop is attempted once per image pair.
+
+An explicit `--image` selects the starting image. Tags and digests in the
+current or legacy stock repository follow the daemon's release even when
+selected explicitly. The reconciler keeps newer releases, images from other
+repositories, and any recorded `accounts.session.image` digest pin.
 
 The pass makes no extra Docker call for an unset config, and a malformed
 `accounts.session` block refuses an operator `start` outright (the
@@ -10650,6 +10677,7 @@ across the registered roots:
 |---|---|
 | held (operator stop) | none, and no `docker` call |
 | running | none |
+| running, private-clone, on a stock image other than the daemon's release image | recreated from the release image against its own volume and profile once idle (#14112); deferred while a job uses the seat. The pass keeps recorded overrides, images outside the stock repositories and newer releases |
 | restarting, first pass | none (Docker's `unless-stopped` policy is retrying) |
 | restarting, 2+ consecutive passes | one WARN `crash loop`; never reused or stopped |
 | stopped, host-mounted | `docker start`, via the `accounts session start` path |

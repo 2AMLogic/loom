@@ -237,6 +237,18 @@ fn first_line(text: &str) -> String {
     out
 }
 
+/// Why a deferral deferred, for `action_of`'s record.
+fn defer_detail(reason: &DeferReason) -> &'static str {
+    match reason {
+        DeferReason::Busy => "in-flight",
+        DeferReason::LockUnknown => "dispatch lock unknown",
+        DeferReason::Changed => "container changed",
+        DeferReason::NothingIntended => "registry lists nothing under its workspace",
+        DeferReason::RootUnavailable => "a registered root is unavailable",
+        DeferReason::InputsUnreadable => "registry or roster unreadable",
+    }
+}
+
 /// The action an outcome records; `None` when the pass did nothing worth
 /// remembering (a healthy or held container keeps the previous action).
 #[must_use]
@@ -250,22 +262,18 @@ pub fn action_of(outcome: &Outcome) -> Option<String> {
         Outcome::PrivateCloneSkipped => "skipped (private-clone)".into(),
         Outcome::PrivateRecovered => "recovered (private-clone)".into(),
         Outcome::DriftRecreated { .. } => "recreated (mount drift)".into(),
-        Outcome::DriftDeferred { reason } => format!(
-            "deferred ({})",
-            match reason {
-                DeferReason::Busy => "in-flight",
-                DeferReason::LockUnknown => "dispatch lock unknown",
-                DeferReason::Changed => "container changed",
-                DeferReason::NothingIntended => "registry lists nothing under its workspace",
-                DeferReason::RootUnavailable => "a registered root is unavailable",
-                DeferReason::InputsUnreadable => "registry or roster unreadable",
-            }
-        ),
+        Outcome::DriftDeferred { reason } => format!("deferred ({})", defer_detail(reason)),
         Outcome::DriftUnachievable => "drift not actionable (see the daemon log)".into(),
         Outcome::DriftRemoved { .. } => "removed (denied mount)".into(),
         Outcome::DriftRemovalStands => "kept down (removal stands)".into(),
         Outcome::SkewDeferred { .. } => "deferred (daemon older than the host's)".into(),
         Outcome::SkewRecreated { .. } => "recreated (daemon older than the host's)".into(),
+        Outcome::PrivateImageDeferred { reason } => {
+            format!("deferred (image roll: {})", defer_detail(reason))
+        }
+        Outcome::PrivateImageRecreated { .. } => {
+            "recreated (image follows the daemon release)".into()
+        }
         Outcome::BackingOff { retry_at } => format!("backoff until {}", utc(*retry_at)),
         Outcome::DockerUnavailable { retry_at, .. } => {
             format!("docker unavailable; backoff until {}", utc(*retry_at))

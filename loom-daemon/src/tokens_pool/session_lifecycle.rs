@@ -88,10 +88,61 @@ mod start;
 mod stop;
 pub use start::UndoLock;
 
-/// Default image this lifecycle launches session containers from
-/// (`docker/session/README.md`). Overridable per-invocation (`--image`) for
-/// tests and for an operator pinning a specific published tag.
+/// The repository `.github/workflows/release.yml` publishes the session image
+/// to, at one tag per release (`docker/session/README.md` § "Versioning and
+/// publishing").
+pub const SESSION_IMAGE_REPOSITORY: &str = "ghcr.io/2amlogic/loom-worker-session";
+
+/// The same image under its pre-transfer path (#14419): a session created
+/// before the repository moved still runs it, so it follows the release too.
+pub const LEGACY_SESSION_IMAGE_REPOSITORY: &str = "ghcr.io/rjwalters/loom-worker-session";
+
+/// Default image a host-mode `accounts session start` launches session
+/// containers from (`docker/session/README.md`). Overridable per-invocation
+/// (`--image`) for tests and for an operator pinning a specific published tag.
+/// Mutable: a container keeps whichever build `:latest` named when it was
+/// created, so the reconciler moves it onto the release tag at a daemon roll
+/// (#11727). A private-clone session starts from [`release_session_image`]
+/// instead (#14112).
 pub const DEFAULT_SESSION_IMAGE: &str = "ghcr.io/2amlogic/loom-worker-session:latest";
+
+/// The release tag of the **running** daemon: its crate version, which is the
+/// tag the session image of this exact release is published under
+/// (`scripts/version.sh` keeps every version-bearing file in sync).
+pub const DAEMON_RELEASE_TAG: &str = env!("CARGO_PKG_VERSION");
+
+/// The stock session image of the release `version` names: the session image
+/// repository at that tag. What a daemon of `version` creates a container
+/// from, and what a stock seat is expected to run — never `:latest`, which
+/// moves without the daemon (#14112).
+#[must_use]
+pub fn release_session_image(version: &str) -> String {
+    format!("{SESSION_IMAGE_REPOSITORY}:{version}")
+}
+
+/// An image reference without its digest (`repo:tag` for `repo:tag@sha256:…`,
+/// which `docker inspect` records for an image pulled by tag, #13479): the
+/// reference used when comparing against an expected release tag.
+#[must_use]
+pub fn image_reference(image: &str) -> &str {
+    image.split('@').next().unwrap_or(image)
+}
+
+/// Whether `image` names the stock session image — this release's repository
+/// or the legacy one — at any tag or digest. In the absence of a recorded
+/// override these images follow the daemon's release ([`release_session_image`]).
+#[must_use]
+pub fn is_release_image(image: &str) -> bool {
+    let name = image_reference(image);
+    [SESSION_IMAGE_REPOSITORY, LEGACY_SESSION_IMAGE_REPOSITORY]
+        .iter()
+        .any(|repo| {
+            name == *repo
+                || name
+                    .strip_prefix(repo)
+                    .is_some_and(|rest| rest.starts_with(':'))
+        })
+}
 
 /// The session image's fixed `CODEX_HOME` mount point
 /// (`docker/session/README.md` § "`CODEX_HOME` mount contract").

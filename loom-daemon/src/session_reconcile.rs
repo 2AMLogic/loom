@@ -16,6 +16,7 @@
 //! |-----------|--------|
 //! | held (operator `stop`) | nothing — skipped before any `docker` call |
 //! | running, mounts match the registry | nothing |
+//! | running, private-clone, on a stock image other than the daemon's release image | recreated from the release image against its own volume and profile once idle, deferred while a job uses it; the pass keeps recorded overrides and images outside the stock repositories ([`skew`], #14112) |
 //! | running, mount drift, idle | stop + rm, then recreate ([`recreate_container`]) with the current registry roots (#10364; see [`drift`]) |
 //! | running, mount drift, in-flight exec | defer and re-check next pass — never killed |
 //! | running, mounts a positively denied path, idle, and no start would be accepted | stop + rm, not recreated, recorded on disk; never repeated (fails closed) |
@@ -36,9 +37,11 @@
 //!
 //! * **Never interrupts work.** The `docker` mutations are `docker start` of
 //!   a *stopped* container, `docker run` of a *missing* one, and, for mount
-//!   drift only, a graceful `docker stop` + `rm` + `run` of a *running*
-//!   container that `docker top` shows idle and whose dispatch lock no
-//!   dispatch holds ([`drift`], [`session_dispatch_lock`]). A container with
+//!   drift, the version-skew recreate and a private seat's image roll only, a
+//!   graceful `docker stop` + `rm` + `run` of a *running* container that
+//!   `docker top` shows idle and whose dispatch lock no dispatch holds
+//!   ([`drift`], [`session_dispatch_lock`]) — and, for a private seat, that
+//!   no job holds the account lease of. A container with
 //!   an in-flight `docker exec` (the #5119 contract), or a dispatch that is
 //!   only starting, is never stopped. A restarting container is not touched either: `stop` without
 //!   `--force` cannot judge one (its `docker top` in-flight check fails while
@@ -133,7 +136,7 @@ use crate::tokens_pool::account_registry::{
     codex_inventory_observed, AccountDescriptor, AccountProvider,
 };
 use crate::tokens_pool::docker_cli::DockerTimedOut;
-use crate::tokens_pool::private_workspace::{self, BindingReadiness};
+use crate::tokens_pool::private_workspace::{self, BindingReadiness, Rolled};
 use crate::tokens_pool::session_hold::{self, LastStart, OperatorHeld};
 use crate::tokens_pool::session_image::SessionImageConfig;
 use crate::tokens_pool::session_lifecycle::{
@@ -375,6 +378,19 @@ pub enum Outcome {
         from: skew::DaemonVersion,
         to: skew::DaemonVersion,
     },
+    /// Running, private-clone, on a stock image other than the daemon's
+    /// release image, but not rolled this pass (busy, changed); re-checked on
+    /// the next one (#14112).
+    PrivateImageDeferred {
+        reason: DeferReason,
+    },
+    /// Running, private-clone, idle, on a stock image other than the daemon's
+    /// release image: recreated from the release image against its existing
+    /// volume and profile (#14112).
+    PrivateImageRecreated {
+        from: String,
+        to: String,
+    },
     /// Skipped without any `docker` call until `retry_at` (unix secs).
     BackingOff {
         retry_at: u64,
@@ -402,6 +418,7 @@ impl Outcome {
                 | Self::Recreated { .. }
                 | Self::DriftRecreated { .. }
                 | Self::SkewRecreated { .. }
+                | Self::PrivateImageRecreated { .. }
         )
     }
 }
@@ -544,6 +561,14 @@ impl AccountIndex {
 pub type PrivateRecovery<'a> =
     dyn Fn(&AccountDescriptor, Option<&str>, &dyn Fn() -> bool) -> anyhow::Result<()> + 'a;
 
+/// Move a running private session onto the image the daemon's release
+/// expects (#14112): given the account, that image, and the same hold probe
+/// [`PrivateRecovery`] takes; what it did comes back as
+/// [`private_workspace::Rolled`]. Typed errors the pass acts on: busy
+/// (deferred), held, image not obtainable (the pull is retried on a backoff).
+pub type PrivateRoll<'a> =
+    dyn Fn(&AccountDescriptor, &str, &dyn Fn() -> bool) -> anyhow::Result<Rolled> + 'a;
+
 pub struct PassInputs<'a> {
     /// Holds and `enabled=false` across every registered root.
     pub index: &'a AccountIndex,
@@ -554,6 +579,10 @@ pub struct PassInputs<'a> {
     /// account, the last recorded image (`None`: unknown) and a hold probe it
     /// must call at the mutation boundary. Never provisions or resets work.
     pub recover_private: &'a PrivateRecovery<'a>,
+    /// Roll a running configured private session onto the daemon's release
+    /// image (#14112): [`private_workspace::roll`], given the account, the
+    /// expected image and a hold probe it must call at the mutation boundary.
+    pub roll_private: &'a PrivateRoll<'a>,
     /// The guessed workspace for a missing container with no recorded start.
     pub fallback_workspace: &'a Path,
     /// The workspace registry's roots **now**: what a drifted container's
@@ -954,11 +983,17 @@ fn reconcile_one<R: ContainerRunner>(
             None => Outcome::Running,
         },
         Decision::Restarting => {
+            if let Some(inspect) = inspect {
+                skew::settle_interrupted_roll(account, inspect, ctx)?;
+            }
             mem.restarting_streak += 1;
             log::debug!("session_reconcile: {container}: restarting (Docker is retrying it)");
             Outcome::Restarting
         }
         Decision::CrashLoop => {
+            if let Some(inspect) = inspect {
+                skew::settle_interrupted_roll(account, inspect, ctx)?;
+            }
             mem.restarting_streak += 1;
             if mem.crash_loop_reported {
                 log::debug!(
@@ -1210,10 +1245,20 @@ pub fn run_tick(fallback_root: &Path, state: &mut ReconcileState, now: u64) -> V
                     })
                     .map(drop)
                 };
+            let roll_private = |a: &AccountDescriptor, image: &str, held: &dyn Fn() -> bool| {
+                private_workspace::roll(root, &a.id.name, image, &|| {
+                    if held() {
+                        Err(OperatorHeld.into())
+                    } else {
+                        Ok(())
+                    }
+                })
+            };
             let inputs = PassInputs {
                 index: &index,
                 is_private_clone: &is_private_clone,
                 recover_private: &recover_private,
+                roll_private: &roll_private,
                 fallback_workspace: &fallback_workspace,
                 registered: readable.then_some(registered.as_slice()),
                 denials_for: &drift::Denials::load,
