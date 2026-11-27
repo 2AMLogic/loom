@@ -18,6 +18,23 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 ### 2026-11-27
 
+- **Issue #15639** (closed): Resync payload: install-metadata requires_daemon (0.20.5) is below the verbs the Guide calls; two tests use declare -A (Bash 3.2)
+- **PR #15646**: fix: raise REQUIRES_DAEMON to 0.20.34; make two suites Bash 3.2-safe
+- **Issue #14474** (closed): Expose worktree operations through the shared Rust CLI
+- **PR #14514**: feat(tools): share worktree CLI operations and read routing
+- **Issue #15635** (closed): Flaky lease_ensure tests disclosed during PR #15632 review: renewal-script fd inheritance and live-session identity
+- **PR #15643**: fix: de-flake lease_ensure tests (bash's own fds, ETXTBSY spawns)
+- **Issue #15627** (closed): Remove superseded accumulate_usage, account_launch_log, and account_launch_logs from tap_usage
+- **PR #15634**: refactor: remove superseded accumulate_usage and account_launch_log(s) from tap_usage
+- **Issue #15637** (closed): config-resolver.sh: loom_resolve_config passes config tiers as jq argv, fails E2BIG once private defaults exceed 128 KB
+- **Issue #15628** (closed): Shell forge-helpers remote-URL sed still invents owners where the Rust parser now returns None
+- **PR #15629**: fix: parse shell remote URLs with the strict two-segment contract
+- **Issue #15626** (closed): Consolidate duplicate MergeQueueAction mirror enum onto MergeQueueCmd (~110 LOC)
+- **PR #15633**: refactor: derive clap on MergeQueueCmd and drop the MergeQueueAction mirror enum
+- **Issue #15636** (closed): config-resolver.sh: a config tier over MAX_ARG_STRLEN fails the bash consumers with exit 126 (jq: Argument list too long)
+- **Issue #15623** (closed): Drop the eventually(10, ..) flock-release workaround in lease_ensure tests now that FileLock unlocks on drop
+- **PR #15632**: test: drop flock-release retry in deferred lock test now that FileLock unlocks on drop
+- **Issue #15631** (closed): config-resolver.sh: jq --argjson breaks (E2BIG) once the private defaults config exceeds 128 KiB, and create-issue.sh then silently creates nothing
 - **PR #15625**: Share parse_remote_url across git-remote URL parsers; bound init::git::extract_repo_info
 - **Issue #15624** (closed): Share parse_remote_url across 6 git-remote URL parsers and bound init::git::extract_repo_info
 - **PR #15622**: refactor: route eight hand-rolled flock lock files through fs_util::FileLock

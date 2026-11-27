@@ -3,6 +3,7 @@
 
 use super::*;
 use crate::champion_hold::{CRITICAL_FILE_HOLD_MARKER, MERGE_RISK_HOLD_MARKER};
+use crate::cli::labels_migrate::PER_PAGE;
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -267,6 +268,68 @@ fn a_refused_write_scope_makes_no_call() {
     let forge_for = |_: &Target| -> Box<dyn HoldsForge> { panic!("no forge call when refused") };
     let reports = run_targets(&[t], true, &forge_for, &|_| Err("not this repo".into()));
     assert_eq!(reports[0].exit, 2);
+}
+
+/// A listing that never ends: every page asked for, under every hold name,
+/// comes back full.
+struct Endless(RefCell<Vec<(String, u32)>>);
+
+impl HoldsForge for Endless {
+    fn open_page(&self, label: &str, page: u32) -> Result<Vec<HoldItem>, ForgeError> {
+        self.0.borrow_mut().push((label.into(), page));
+        Ok((0..PER_PAGE)
+            .map(|i| HoldItem {
+                number: u64::from(page) * PER_PAGE as u64 + i as u64,
+                labels: vec![label.into()],
+                is_pr: false,
+            })
+            .collect())
+    }
+
+    fn trusted_comments(&self, _: u64) -> Result<Vec<String>, ForgeError> {
+        unreachable!("a truncated listing is never acted on")
+    }
+
+    fn park_hold(&self, _: u64, _: HoldKind) -> Result<(), ForgeError> {
+        unreachable!("a truncated listing is never acted on")
+    }
+
+    fn park_noop_hold(&self, _: u64) -> Result<(), ForgeError> {
+        unreachable!("a truncated listing is never acted on")
+    }
+
+    fn remove_label(&self, _: u64, _: &str) -> Result<(), ForgeError> {
+        unreachable!("a truncated listing is never acted on")
+    }
+
+    fn migrate_escalation(&self, _: u64, _: bool) -> EscalationMigration {
+        unreachable!("a truncated listing is never acted on")
+    }
+}
+
+#[test]
+fn a_truncated_listing_stops_the_run_at_exit_four() {
+    // "Who is held?" got no answer after 100 full pages of a hold name: the
+    // pass stops there, and nothing is moved.
+    let endless = Endless(RefCell::new(Vec::new()));
+    let r = run(&endless, "o/r", true);
+    let first = crate::work_finder::OPERATOR_HOLD_NAMES
+        .iter()
+        .next()
+        .unwrap();
+    let asked = endless.0.borrow();
+    assert_eq!(asked.iter().map(|(_, p)| *p).collect::<Vec<_>>(), (1..=100).collect::<Vec<_>>());
+    assert!(asked.iter().all(|(l, _)| l.as_str() == *first), "{asked:?}");
+    assert_eq!(
+        r.events,
+        vec![Event::Stopped {
+            why: format!(
+                "could not list operator-held items: more than 10000 open items carry {first}; \
+                 listing truncated"
+            ),
+        }]
+    );
+    assert_eq!((r.exit, r.rate_limited), (4, false));
 }
 
 #[test]

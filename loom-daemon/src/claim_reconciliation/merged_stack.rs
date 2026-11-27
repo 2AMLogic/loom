@@ -99,7 +99,7 @@ use std::path::{Path, PathBuf};
 use super::open_pr_listing::RestPull;
 use super::orphan_stack as orphan;
 use super::orphan_stack_git as git;
-use super::stack_reconcile;
+use super::stack_reconcile::{self, GhStackForge, StackForgeOps};
 use crate::branch_update::Strategy;
 use crate::merge_pr::reconcile::{
     child_route, issue_from_branch, route_with_lease, LeaseState, Route,
@@ -1207,6 +1207,14 @@ fn flag(
     );
 }
 
+/// The telemetry names the merged pass's shared forge calls are booked under.
+static STACK_FORGE_OPS: StackForgeOps = StackForgeOps {
+    parent_lookup: "merged_stack.parent_lookup",
+    comments: "merged_stack.comments",
+    retarget: "merged_stack.retarget",
+    comment: "merged_stack.comment",
+};
+
 /// The live forge, through the claim-reconciliation `gh` facade.
 pub struct GhMergedForge<'a> {
     pub gh_bin: &'a Path,
@@ -1214,45 +1222,18 @@ pub struct GhMergedForge<'a> {
 }
 
 impl GhMergedForge<'_> {
-    fn api_write(&self, op: &'static str, args: &[&str]) -> Result<(), String> {
-        let out = super::gh_call::output(
-            super::gh_call::write(op, self.gh_bin, self.root)
-                .args(["api"])
-                .args(args),
-        )
-        .map_err(|e| e.to_string())?;
-        if out.status.success() {
-            Ok(())
-        } else {
-            Err(super::gh_call::stderr(&out))
-        }
+    fn shared(&self) -> GhStackForge<'_> {
+        GhStackForge::new(self.gh_bin, self.root, &STACK_FORGE_OPS)
     }
 }
 
 impl MergedForge for GhMergedForge<'_> {
     fn newest_closed_pr_for_head(&self, branch: &str) -> Result<Option<orphan::ParentPr>, String> {
-        let path = format!(
-            "repos/{{owner}}/{{repo}}/pulls?head={{owner}}:{branch}&state=closed&per_page=100"
-        );
-        let out = super::gh_call::output(
-            super::gh_call::read("merged_stack.parent_lookup", self.gh_bin, self.root)
-                .args(["api", &path]),
-        )
-        .map_err(|e| e.to_string())?;
-        if !out.status.success() {
-            return Err(super::gh_call::stderr(&out));
-        }
-        orphan::parse_newest_closed(&out.stdout, branch)
+        self.shared().newest_closed_pr_for_head(branch)
     }
 
     fn trusted_comments(&self, pr: u32) -> Option<Vec<String>> {
-        crate::merge_pr::sequence::fetch_trusted_bodies_as(
-            "merged_stack.comments",
-            &self.gh_bin.to_string_lossy(),
-            self.root,
-            "{owner}/{repo}",
-            pr,
-        )
+        self.shared().trusted_comments(pr)
     }
 
     fn issue_labels(&self, issue: u32) -> String {
@@ -1281,40 +1262,27 @@ impl MergedForge for GhMergedForge<'_> {
     }
 
     fn lease(&self, issue: u32) -> LeaseState {
-        use super::forge::LeaseProbe;
-        match super::forge::fetch_freshest_lease_updated_at(self.gh_bin, self.root, issue) {
-            LeaseProbe::Found(at) => {
-                if super::lease_is_fresh(at, chrono::Utc::now(), super::resolve_lease_ttl_minutes())
-                {
-                    LeaseState::Held
-                } else {
-                    LeaseState::NoneFresh
-                }
-            }
-            LeaseProbe::NotFound => LeaseState::NoneFresh,
-            LeaseProbe::ReadFailed => LeaseState::Unknown,
+        match self.shared().issue_lease_fresh(issue) {
+            Some(true) => LeaseState::Held,
+            Some(false) => LeaseState::NoneFresh,
+            None => LeaseState::Unknown,
         }
     }
 
     fn strategy(&self) -> Strategy {
-        let nwo = std::env::var("LOOM_REPO").ok();
-        crate::branch_update::resolve(Some(self.root), nwo.as_deref(), true).strategy
+        self.shared().strategy()
     }
 
     fn repository(&self) -> Option<String> {
-        crate::worktree_ops::gh::resolve_owner_repo(self.root).map(|(o, r)| format!("{o}/{r}"))
+        self.shared().repository()
     }
 
     fn retarget(&self, pr: u32, base: &str) -> Result<(), String> {
-        let path = format!("repos/{{owner}}/{{repo}}/pulls/{pr}");
-        let field = format!("base={base}");
-        self.api_write("merged_stack.retarget", &["-X", "PATCH", &path, "-f", &field])
+        self.shared().retarget(pr, base)
     }
 
     fn comment(&self, pr: u32, body: &str) -> Result<(), String> {
-        let path = format!("repos/{{owner}}/{{repo}}/issues/{pr}/comments");
-        let field = format!("body={body}");
-        self.api_write("merged_stack.comment", &["-X", "POST", &path, "-f", &field])
+        self.shared().comment(pr, body)
     }
 }
 
@@ -1328,32 +1296,10 @@ pub(super) fn reconcile(
     if !merged_stack_enabled() {
         return MergedStats::default();
     }
-    // One host per workspace writes (#10634's shard, as the orphan pass
-    // uses): two daemons racing the same child would both read, and the
-    // loser's lease would fail, but both would comment.
-    if !crate::role_shard::decide(root).admits_role_tick() {
+    let Some((default_branch, open)) =
+        stack_reconcile::prepare_reconcile("merged stack", gh_bin, root, prefetched)
+    else {
         return MergedStats::default();
-    }
-    let Some(default_branch) = crate::worktree_cli::default_branch::resolve(root) else {
-        log::debug!(
-            "claim_reconciliation (merged stack): {}: default branch unknown — pass skipped",
-            root.display()
-        );
-        return MergedStats::default();
-    };
-    let listed;
-    let open = match prefetched {
-        Some(rows) => rows,
-        None => match super::open_pr_listing::list_open_prs(gh_bin, root) {
-            Ok(rows) => {
-                listed = rows;
-                &listed[..]
-            }
-            Err(e) => {
-                log::warn!("claim_reconciliation (merged stack): {}: {e}", root.display());
-                return MergedStats::default();
-            }
-        },
     };
     let store = super::pass_loop::merge_observation::RecordStore::for_root(root);
     let records: Vec<merge_observation_record::Record> = store
@@ -1369,7 +1315,7 @@ pub(super) fn reconcile(
         .collect();
     let parents = parents_from_records(&records);
     let stats =
-        reconcile_with(&GhMergedForge { gh_bin, root }, root, &default_branch, open, &parents);
+        reconcile_with(&GhMergedForge { gh_bin, root }, root, &default_branch, &open, &parents);
     if stats != MergedStats::default() {
         log::info!(
             "claim_reconciliation (merged stack): {}: {} child(ren) of merged parents, {} \

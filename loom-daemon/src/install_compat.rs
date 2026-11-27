@@ -55,11 +55,17 @@ pub const SUPPORTS_INSTALLED: &str = "0.19.175";
 /// merges (#14371; `v0.20.4` was published from a `main` without it): the first
 /// with `session-exec claude-seat`, called by `spawn-claude.sh` for an adopted
 /// Claude seat, whose hard floor is the same.
+/// No hard floor covers a verb a shipped role prompt calls directly
+/// (`defaults/.claude/commands/loom/*.md`), so those are dated here instead:
+/// 0.20.30 is the first release with `guide work-plan-splice` and
+/// `guide work-plan-receipt`, which the Guide role runs (#14204, #14259), and
+/// 0.20.34 the first with `forge workflow-secrets-check`, which the Champion
+/// merge gate fails closed on (#14915, #15639).
 ///
 /// Keep this on one line in exactly this shape: the installer
 /// (`scripts/install/loom-source-path.sh`) reads it from this file with
 /// `sed`, because the tree it installs can be newer than any binary it has.
-pub const REQUIRES_DAEMON: &str = "0.20.5";
+pub const REQUIRES_DAEMON: &str = "0.20.34";
 
 // compat:invoked-files:begin
 /// The installed files this daemon executes in a workspace. An installed tree
