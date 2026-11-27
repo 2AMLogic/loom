@@ -798,7 +798,9 @@ specific reads is not cheap: `ForgeType::Gitea` appears in 23 library files
 No wrapper or locator changed. `loom_tools_serves` in
 `lib/locate-daemon-bin.sh` still lists the four slice commands; making the
 `forge-helpers.sh` stubs tools-first is part of the switch-over (#14398),
-which can now read the served list from `capabilities --json`.
+which can now read the served list from `capabilities --json`. The one addition
+to the locator since is the worktree wrapper's daemon-first backstop (§13.11);
+the tools-first list is unchanged.
 
 ### 13.6 Role-keyed PR leases (#14489)
 
@@ -981,6 +983,89 @@ same branch decision logic, including its handling of unavailable answers.
 The optional per-worktree Cargo target provisioning remains a separate
 helper. Claim and lease migration is #14475. Installed-wrapper selection and
 end-to-end switching are #14476.
+
+### 13.11 The installed worktree wrapper (#14476)
+
+`worktree.sh` is the normal entry point and stays a delegate: it keeps its
+verbs, flags, messages, `--json` documents and exit codes, and runs the
+commands of §13.10 and §15 on whichever binary resolves.
+
+**Resolution — daemon first, `loom-tools` as the backstop.** The create path's
+one `_WT_DAEMON_BIN` and the `remove` / `--check` delegate in
+`lib/script-helper.sh` resolve the daemon exactly as before
+(`loom_resolve_self_daemon_bin`, then `loom_locate_daemon_bin`), and take a
+`loom-tools` only when that comes back empty (`loom_tools_backstops`,
+`loom_tools_backstop_bin` in `lib/locate-daemon-bin.sh`: `LOOM_TOOLS_BIN`,
+`PATH`, the machine install, a repo build, probed with `--help`). This is
+`loom_select_lease_bin`'s rule (#14488): a host with a `loom-daemon` resolves
+what it always did, and preferring the tools binary is the switch-over
+(#14398). An explicit pin (`LOOM_DAEMON_SELF_BIN`, `LOOM_DAEMON_BIN`) still
+wins. Before the backstop an empty resolution meant "skip" at each call site:
+`worktree.sh <N>` reported success with its claim probe, crash cleanup, branch
+reuse and lease silently skipped, and `remove` refused with exit 2.
+
+| Call site | Command on the resolved binary |
+| --- | --- |
+| Create and reuse | `worktree-check`, `worktree-cleanup`, `worktree-lock` (`acquire`, `release`, `check-issue`), `worktree-base`, `worktree-existing`, `worktree-sparse`, `worktree-branch-reuse`, `worktree-open-pr`, `worktree-closed-pr-branch`, `worktree-branch-conflict`, `worktree-submodules`, `worktree-link` |
+| Claim and lease | `forge check-claim <N> --force-claim` (fresh branch only), `lease ensure`, `lease co-occupancy` |
+| Verbs | `worktree-remove` (`remove` / `--remove`), `worktree-check` (`--check`) |
+
+Still on the daemon, unchanged: `worktree-wip` (`snapshot`, `stash-push`,
+`stash-pop`) refuses with exit 2 without one; `cargo-target-dir provision` is
+a separate, best-effort helper that is skipped; the standalone
+`lib/worktree-race-rescue.sh` adapter is not reached by `worktree.sh`.
+
+**Mode.** A command that can reach the forge resolves `mode` first (§7.3), so
+a tools-only host sets it — `session` for a checkout worked on its own
+credential — in `.loom-local/local.json` or `LOOM_MODE`. With `mode` unset a
+forge-shaped origin is refused by the fresh-branch probe
+(`forge-check-unavailable`), never created unguarded; a local-only origin has
+no forge read to make and creates as before. A refusal is not a "clear":
+
+| `forge check-claim` exits | Meaning | `worktree.sh` | The Builder's pre-claim guard |
+| --- | --- | --- | --- |
+| `0` | blocked; the reason token on stdout | refuses the create | hard-abort |
+| `1` | verified clear | creates | claim |
+| `5` | no verdict — an unreadable leg, or a mode the gate cannot resolve | continues, as on a forge outage | stop |
+
+The third row is the distinction #14476 closes: a mode refusal used to leave
+the tools binary through its generic error exit, which is `1`, the code the
+wrapper reads as clear. `ForgeReadCli::no_verdict_exit` sends it out as the
+verb's own `EX_PROBE_FAILED` for `check-claim`, `check-open-pr` and
+`check-branch`, the three verbs whose exit codes are data. The wrapper's
+fresh-branch probe (`worktree-open-pr`) is a separate guard with its own
+policy: `not_found` and `no_forge_remote` create, a cross-repository PR is
+refused, and `unavailable` is refused rather than guessed.
+
+**Enter.** `worktree.sh --json N` prints one JSON object; `worktreePath` is
+absolute and may contain spaces, so it is read quoted
+(`cd "$(… | jq -r .worktreePath)"`). The branch is `feature/issue-N` (or the
+custom name), `.loom-managed` names the issue, and git registers the path once.
+Re-running against an existing worktree returns the same path and registers
+nothing more. An interrupted create leaves the add lock owned by a dead pid;
+the next run recovers it and leaves exactly one managed checkout. A live
+competing lock refuses the create and keeps its owner's lock and token.
+
+**Remove.** `worktree.sh remove N [--keep-branch] [--force] [--dry-run]
+[--json]` keeps the removal policy: only a sentinel-bearing worktree is
+removed, uncommitted work is refused (and listed) unless `--force`, and an
+absent worktree is the exit-0 no-op. The "has this branch landed?" read that
+precedes deleting the local branch needs the forge only for a branch with
+commits of its own (a never-pushed branch off the base resolves locally). With
+`mode` unset that read stops after the worktree is removed: the local branch is
+kept and the verb exits 1 naming the mode. With `mode` set and the forge
+unreachable the read is unanswered and the branch is kept conservatively.
+
+**Evidence.** `defaults/scripts/tests/test-loom-tools-worktree.sh` (run by
+`loom-daemon/tests/loom_tools_worktree.rs` against the built binary) installs
+the binary and the shipped scripts in an isolated checkout whose path contains
+a space and shows that every daemon lookup — the create path's, the cargo
+target helper's, a pin, `PATH`, a repo build — resolves nothing. The two
+nested fallbacks that reach for a bare `loom-daemon` (`lib/branch-landed.sh`,
+`lib/worktree-forge-pr-check.sh`) run only when no resolved binary answered,
+so a tools-only host sends them to `gh`. The same test re-runs
+`test-worktree-remove.sh`, `test-worktree-json-purity.sh` and
+`test-worktree-issue-lock.sh` unchanged against the tools binary.
 
 ## 14. Phase 3b: park records and operator decisions (#14464)
 
