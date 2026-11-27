@@ -259,6 +259,7 @@ fn end_to_end_frozen_unknown_and_in_flight_approved_prs_write_nothing() {
         ("UNKNOWN", "loom:merge-conflict"),
     ] {
         let (stats, calls) = run(&open(12041, m, &["loom:pr", label]), "[]");
+        assert_eq!(stats.checked, 1, "{label}: {calls}");
         assert_eq!((stats.flagged, stats.labeled, stats.cleared), (0, 0, 0), "{label}");
         assert!(!calls.contains("pr edit") && !calls.contains("pr comment"), "{label}: {calls}");
     }
@@ -301,6 +302,7 @@ fn end_to_end_already_flagged_approved_pr_is_not_reflagged() {
         &open(12041, "CONFLICTING", &["loom:pr", "loom:operator", "loom:merge-conflict"]),
         "[]",
     );
+    assert_eq!(stats.checked, 1, "{calls}");
     assert_eq!((stats.flagged, stats.labeled), (0, 0));
     assert!(!calls.contains("pr edit"), "{calls}");
 }
@@ -337,6 +339,7 @@ fn end_to_end_unknown_mergeable_held_pr_keeps_the_label() {
         &open(12041, "UNKNOWN", &["loom:pr", "loom:operator", "loom:merge-conflict"]),
         "[]",
     );
+    assert_eq!(stats.checked, 1, "{calls}");
     assert_eq!(stats.label_cleared, 0);
     assert!(!calls.contains("pr edit"), "{calls}");
 }
