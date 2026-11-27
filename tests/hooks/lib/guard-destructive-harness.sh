@@ -32,6 +32,13 @@
 
 set -euo pipefail
 
+# An agent-step marker leaks the way an override does (#15496): a dispatched
+# session exports LOOM_SWEEP_ID, the primary-checkout mutation guard (#13589)
+# then takes TEST_REPO — a primary checkout — for a workspace clone and denies
+# `git commit`, and every "commit -m <prose> is allowed" assertion fails.
+# LOOM_WORKTREE_PATH is the other marker; LOOM_WORKSPACE is unset for #15483,
+# which scopes that guard to the workspace it names.
+
 # Hermetic baseline: ambient guard-behavior overrides must not leak into tests
 # (#4325). Tests that exercise env-driven behavior deliberately inject their
 # vars explicitly per invocation (run_guard_env / assert_ask_env / assert_allow_env),
@@ -39,8 +46,10 @@ set -euo pipefail
 unset LOOM_FORCE_SCOPE LOOM_DEFAULT_BRANCH LOOM_GUARD_SQL LOOM_GUARD_CLOUD \
       LOOM_GUARD_REVERSIBLE_GH LOOM_RM_SCOPE LOOM_GUARD_READONLY_FASTPATH \
       LOOM_GUARD_WORKTREE_ISOLATION LOOM_WORKTREE_PATH LOOM_WORKTREE_ROOT \
+      LOOM_WORKSPACE \
       LOOM_GUARD_DECISION_LOG LOOM_GUARD_DECISION_LOG_FILE LOOM_GUARD_STASH_SCOPE \
-      LOOM_ROLE LOOM_GUARD_CARGO_CLEAN CARGO_TARGET_DIR LOOM_GUARD_SCRATCH_ROOT
+      LOOM_ROLE LOOM_GUARD_CARGO_CLEAN CARGO_TARGET_DIR LOOM_GUARD_SCRATCH_ROOT \
+      LOOM_SWEEP_ID
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../../.." && pwd)"
