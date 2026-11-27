@@ -1319,7 +1319,10 @@ if [[ "$_has_seats" == true ]]; then
         case "${LOOM_SWEEP_CREDENTIAL_PROXY:-$(_containment_cfg claudeCredentialProxy)}" in
             1|true|yes) log_error "Claude seats require process-environment OAuth; refusing a credential-proxied dispatch"; exit 78 ;;
         esac
-        # requires-daemon: session-exec optional   #14371 — only an adopted seat uses `session-exec claude-seat`, and only a daemon with that verb can adopt one. It is probed with --help first; a missing verb refuses the step (exit 78) with a named error, never a silent fallback.
+        # Only an adopted seat reaches this call, but a daemon as old as 0.20.33 can
+        # adopt one (`accounts session start --provider claude`), and a missing verb
+        # refuses the step (exit 78) rather than degrading, so it is a floor (#15308).
+        # requires-daemon: session-exec >= 0.20.34   #14371 — `session-exec claude-seat` first ships in 0.20.34; v0.20.33 lacks it.
         _seat_bin="$(loom_resolve_self_daemon_bin)"
         if [[ -z "$_seat_bin" ]] || ! "$_seat_bin" session-exec claude-seat --help >/dev/null 2>&1; then
             log_error "The selected Claude seat requires an updated loom-daemon with session-exec claude-seat"
