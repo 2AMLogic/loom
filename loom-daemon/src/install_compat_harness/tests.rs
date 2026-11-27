@@ -11,6 +11,7 @@
 use super::prompt_calls::{self, CommandTree};
 use super::*;
 use crate::test_git_helpers::run as git;
+use std::time::Instant;
 
 fn v(s: &str) -> Version {
     Version::parse(s).unwrap()
@@ -206,12 +207,7 @@ fn fake_daemon(dir: &Path, version: &str) -> PathBuf {
 /// An executable `sh` script named `name` in `dir`.
 fn script(dir: &Path, name: &str, body: &str) -> PathBuf {
     let bin = dir.join(name);
-    std::fs::write(&bin, format!("#!/bin/sh\n{body}\n")).unwrap();
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
-    }
+    crate::exec_test_support::write_executable(&bin, format!("#!/bin/sh\n{body}\n"));
     bin
 }
 
@@ -421,6 +417,66 @@ fn a_daemon_that_cannot_be_executed_is_broken_and_reported_once() {
             .broken
             .is_empty());
     }
+}
+
+/// Hold `path` open for writing, so the kernel refuses to exec it (`ETXTBSY`),
+/// until a helper thread drops the descriptor `hold` from now. Returns when
+/// the hold began, to assert on afterwards.
+fn held_writer(path: &Path, hold: Duration) -> (Instant, std::thread::JoinHandle<()>) {
+    let writer = std::fs::OpenOptions::new().write(true).open(path).unwrap();
+    // Clock first: it must precede the releaser's `sleep` by construction, or
+    // a late-scheduled parent could see less than `hold` elapse (#15074).
+    let started = Instant::now();
+    let releaser = std::thread::spawn(move || {
+        std::thread::sleep(hold);
+        drop(writer);
+    });
+    (started, releaser)
+}
+
+#[test]
+fn a_daemon_still_open_for_writing_is_waited_for_not_broken_or_unknown() {
+    // #15013: a sibling test thread's `fork` can hold a copy of the write fd
+    // `script()` just closed, and an exec of the fixture in that window is
+    // refused with ETXTBSY. Holding the fixture open for writing stands in
+    // for that child; every site that execs a daemon must wait it out.
+    let repo = checkout("0.19.897", &["v0.19.891", "v0.19.895"]);
+    let daemon = fake_daemon(repo.path(), "0.19.895");
+
+    let (started, releaser) = held_writer(&daemon, Duration::from_millis(30));
+    assert_eq!(
+        Probe::default().probe(&daemon, "forge"),
+        Probed::Present,
+        "a busy daemon is waited for, not broken"
+    );
+    releaser.join().unwrap();
+    assert!(
+        started.elapsed() >= Duration::from_millis(30),
+        "the probe ran before its writer closed: {:?}",
+        started.elapsed()
+    );
+
+    // `run` execs `git` before direction B reaches the given daemon, so this
+    // hold outlasts that preamble.
+    let hold = Duration::from_millis(300);
+    let (started, releaser) = held_writer(&daemon, hold);
+    let report = run(&opts(repo.path(), "0.19.893", OldDaemon::Given(daemon))).unwrap();
+    releaser.join().unwrap();
+    assert!(
+        started.elapsed() >= hold,
+        "the daemon ran before its writer closed: {:?}",
+        started.elapsed()
+    );
+    assert!(report.violations.is_empty(), "{:?}", report.violations);
+    assert!(
+        report
+            .notes
+            .iter()
+            .any(|n| n
+                .contains("daemon 0.19.895, the oldest published release at or above 0.19.893")),
+        "direction B ran against the given daemon: {:?}",
+        report.notes
+    );
 }
 
 #[test]

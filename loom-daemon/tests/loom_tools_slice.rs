@@ -205,46 +205,37 @@ printf '%s\n' "$FIXTURE_RESPONSE"
     std::fs::write(&marker, gh.canonicalize().unwrap().to_str().unwrap()).unwrap();
     std::fs::set_permissions(&marker, std::fs::Permissions::from_mode(0o600)).unwrap();
 
-    let decision = |binary, mode, fail, branch| {
+    let decision = |binary, mode, fail, response, branch| {
         let mut command = base(binary, tmp.path(), &repo);
         command
             .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
             .env("LOOM_MODE", mode)
             .env("FIXTURE_LOG", &log)
             .env("FIXTURE_FAIL", fail)
-            .env("FIXTURE_RESPONSE", payload.to_string());
+            .env("FIXTURE_RESPONSE", response);
         if binary == TOOLS {
             command.env("LOOM_GH_GATEWAY_DIR", &gateway);
         }
-        command
-            .args([
-                "worktree-closed-pr-branch",
-                "--branch",
-                branch,
-                "--issue",
-                "42",
-                "--base-display",
-                "main",
-                "--json-output",
-                "true",
-            ])
-            .arg("--repo-root")
-            .arg(&repo);
+        worktree_closed_pr_args(&mut command, &repo, branch);
         run(command, None)
     };
-    let legacy = decision(DAEMON, "invalid", "0", "feature/example");
+    let closed_at_tip = payload.to_string();
+    let closed_at_tip: &str = &closed_at_tip;
+    let legacy = decision(DAEMON, "invalid", "0", closed_at_tip, "feature/example");
     assert_eq!(legacy.status.code(), Some(1), "{legacy:?}");
     for mode in ["session", "fleet"] {
-        let tools = decision(TOOLS, mode, "0", "feature/example");
+        let tools = decision(TOOLS, mode, "0", closed_at_tip, "feature/example");
         assert_eq!(tools.status.code(), Some(1), "{tools:?}");
         assert_eq!(tools.stdout, legacy.stdout);
     }
-    let failure = decision(TOOLS, "fleet", "1", "feature/example");
+    let failure = decision(TOOLS, "fleet", "1", closed_at_tip, "feature/example");
     assert_eq!(failure.status.code(), Some(0), "{failure:?}");
     assert!(failure.stdout.is_empty());
-    let invalid = decision(TOOLS, "invalid", "0", "feature/example");
-    assert_invalid_worktree_mode(&invalid);
-    let absent_tip = decision(TOOLS, "invalid", "0", "feature/absent");
+    // Answered, and nothing closed at the tip: 0, with no document on fd 3.
+    let not_closed = decision(TOOLS, "session", "0", "[]", "feature/example");
+    assert_eq!(not_closed.status.code(), Some(0), "{not_closed:?}");
+    assert!(not_closed.stdout.is_empty(), "{not_closed:?}");
+    let absent_tip = decision(TOOLS, "invalid", "0", closed_at_tip, "feature/absent");
     assert!(absent_tip.status.success(), "{absent_tip:?}");
     assert!(absent_tip.stdout.is_empty(), "{absent_tip:?}");
     assert_eq!(
@@ -256,9 +247,43 @@ printf '%s\n' "$FIXTURE_RESPONSE"
             "session",
             "session",
             profile.to_str().unwrap(),
-            profile.to_str().unwrap()
+            profile.to_str().unwrap(),
+            "session"
         ]
     );
+
+    // #15650: a mode the tools binary cannot resolve is neither a refusal (1)
+    // nor a decision (0). `worktree.sh` refuses on 1 alone, so a mode error
+    // must not answer 1: it is "could not run", the complaint on stderr,
+    // nothing on the fd-3 channel, and no forge read attempted.
+    let unresolved = |mode: Option<&str>, gateway_dir: Option<&Path>| {
+        let mut command = base(TOOLS, tmp.path(), &repo);
+        command.env("PATH", format!("{}:/usr/bin:/bin", bin.display()));
+        match mode {
+            Some(mode) => command.env("LOOM_MODE", mode),
+            None => command.env_remove("LOOM_MODE"),
+        };
+        match gateway_dir {
+            Some(dir) => command.env("LOOM_GH_GATEWAY_DIR", dir),
+            None => command.env_remove("LOOM_GH_GATEWAY_DIR"),
+        };
+        worktree_closed_pr_args(&mut command, &repo, "feature/example");
+        run(command, None)
+    };
+    let reads_before = std::fs::read(&log).unwrap();
+    let missing_gateway = tmp.path().join("no-such-gateway");
+    for (output, complaint) in [
+        (unresolved(None, None), "`mode` is unset"),
+        (unresolved(Some("invalid"), Some(&gateway)), "invalid mode"),
+        (unresolved(Some("fleet"), None), "no fleet route is configured"),
+        (
+            unresolved(Some("fleet"), Some(&missing_gateway)),
+            "is not an existing absolute directory",
+        ),
+    ] {
+        assert_worktree_mode_could_not_run(&output, complaint);
+    }
+    assert_eq!(std::fs::read(&log).unwrap(), reads_before);
 
     let open_pr = |binary, mode| {
         let mut command = base(binary, tmp.path(), &repo);
@@ -279,6 +304,37 @@ printf '%s\n' "$FIXTURE_RESPONSE"
     let reads_before = std::fs::read(&log).unwrap();
     assert_invalid_worktree_mode(&open_pr(TOOLS, "invalid"));
     assert_eq!(std::fs::read(log).unwrap(), reads_before);
+}
+
+/// The `worktree-closed-pr-branch` argv shared by the test's two closures.
+#[cfg(unix)]
+fn worktree_closed_pr_args(command: &mut Command, repo: &Path, branch: &str) {
+    command
+        .args([
+            "worktree-closed-pr-branch",
+            "--branch",
+            branch,
+            "--issue",
+            "42",
+            "--base-display",
+            "main",
+            "--json-output",
+            "true",
+        ])
+        .arg("--repo-root")
+        .arg(repo);
+}
+
+/// #15650: a mode the tools binary cannot resolve is "could not run" (2),
+/// never the refusal 1 stands for. Its complaint is on stderr and the fd-3
+/// channel stays empty — there is no refusal to report.
+#[cfg(unix)]
+fn assert_worktree_mode_could_not_run(output: &Output, complaint: &str) {
+    assert_eq!(output.status.code(), Some(2), "{output:?}");
+    assert!(output.stdout.is_empty(), "{output:?}");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains(complaint), "{stderr}");
+    assert!(stderr.contains("did not run"), "{stderr}");
 }
 
 #[cfg(unix)]
