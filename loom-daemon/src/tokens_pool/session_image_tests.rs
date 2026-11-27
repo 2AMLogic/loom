@@ -48,6 +48,10 @@ fn verify_with(output: Option<String>) -> Result<()> {
     verify_override_bundle("ghcr.io/example/session-mine@sha256:deadbeef", &probe)
 }
 
+pub(in crate::tokens_pool) fn intact_probe_output() -> String {
+    good_probe_output(&good_manifest())
+}
+
 #[test]
 fn digest_pin_is_required() {
     assert!(validate_digest_pin("ghcr.io/example/img@sha256:0000").is_err());

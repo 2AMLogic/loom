@@ -425,6 +425,81 @@ pub fn ensure_profile_controls(profile: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Runtime-specific additions to the shared [`hardened_session_run_args`]
+/// container posture.
+pub(super) struct SessionRuntimeSpec<'a> {
+    /// Runtime-specific mount/env arguments placed immediately after the
+    /// hardened `docker run` preamble and before workspace/credential mounts.
+    pub(super) args: &'a [String],
+    /// Additional `(key, value)` container labels placed immediately after the
+    /// shared workspace and session-posture labels.
+    pub(super) labels: &'a [(&'a str, &'a str)],
+}
+
+/// Shared `docker run` argv builder enforcing the `container-boundary-v1`
+/// posture across Codex and Claude host-mode session containers.
+#[must_use]
+pub(super) fn hardened_session_run_args(
+    container: &str,
+    image: &str,
+    runtime: SessionRuntimeSpec<'_>,
+    workspace: &Path,
+    roots: &[PathBuf],
+    credentials: &[PathBuf],
+    extra_mounts: &[ExtraMount],
+) -> Vec<String> {
+    let mut args: Vec<String> = vec![
+        "run".into(),
+        "-d".into(),
+        "--name".into(),
+        container.into(),
+        "--restart".into(),
+        "unless-stopped".into(),
+        "--cap-drop".into(),
+        "ALL".into(),
+        "--security-opt".into(),
+        "no-new-privileges".into(),
+    ];
+    args.extend_from_slice(runtime.args);
+    for root in roots {
+        let root = root.display().to_string();
+        args.push("-v".into());
+        args.push(format!("{root}:{root}"));
+    }
+    for dir in credentials {
+        let dir = dir.display().to_string();
+        args.push("-v".into());
+        args.push(format!("{dir}:{dir}:ro"));
+    }
+    for mount in extra_mounts {
+        args.push("--mount".into());
+        args.push(format!(
+            "type=bind,src={},dst={},readonly",
+            mount.host.display(),
+            mount.container.display()
+        ));
+    }
+    args.extend([
+        "--label".into(),
+        format!("{WORKSPACE_LABEL}={}", workspace.display()),
+        "--label".into(),
+        format!("{SESSION_POSTURE_LABEL}={SESSION_POSTURE}"),
+    ]);
+    for (key, value) in runtime.labels {
+        args.push("--label".into());
+        args.push(format!("{key}={value}"));
+    }
+    if !extra_mounts.is_empty() {
+        args.push("--label".into());
+        args.push(format!(
+            "{EXTRA_MOUNTS_LABEL}={}",
+            session_image::extra_mounts_label_json(extra_mounts)
+        ));
+    }
+    args.push(image.into());
+    args
+}
+
 /// The full `docker run` argv for a host-mode session container (issue
 /// #9979). Pure, so the posture is unit-testable without Docker.
 ///
@@ -478,61 +553,30 @@ pub fn host_session_run_args(
     credentials: &[PathBuf],
     extra_mounts: &[ExtraMount],
 ) -> Vec<String> {
-    let mut args: Vec<String> = vec![
-        "run".into(),
-        "-d".into(),
-        "--name".into(),
-        container.into(),
-        "--restart".into(),
-        "unless-stopped".into(),
-        "--cap-drop".into(),
-        "ALL".into(),
-        "--security-opt".into(),
-        "no-new-privileges".into(),
+    let mut runtime_args = vec![
         "-v".into(),
         format!("{}:{CONTAINER_CODEX_HOME}", codex_home.display()),
     ];
     for name in PROFILE_CONTROLS {
-        args.push("--mount".into());
-        args.push(format!(
+        runtime_args.push("--mount".into());
+        runtime_args.push(format!(
             "type=bind,src={},dst={},readonly",
             codex_home.join(name).display(),
             profile_control_destination(name)
         ));
     }
-    for root in roots {
-        let root = root.display().to_string();
-        args.push("-v".into());
-        args.push(format!("{root}:{root}"));
-    }
-    for dir in credentials {
-        let dir = dir.display().to_string();
-        args.push("-v".into());
-        args.push(format!("{dir}:{dir}:ro"));
-    }
-    for mount in extra_mounts {
-        args.push("--mount".into());
-        args.push(format!(
-            "type=bind,src={},dst={},readonly",
-            mount.host.display(),
-            mount.container.display()
-        ));
-    }
-    args.extend([
-        "--label".into(),
-        format!("{WORKSPACE_LABEL}={}", workspace.display()),
-        "--label".into(),
-        format!("{SESSION_POSTURE_LABEL}={SESSION_POSTURE}"),
-    ]);
-    if !extra_mounts.is_empty() {
-        args.push("--label".into());
-        args.push(format!(
-            "{EXTRA_MOUNTS_LABEL}={}",
-            session_image::extra_mounts_label_json(extra_mounts)
-        ));
-    }
-    args.push(image.into());
-    args
+    hardened_session_run_args(
+        container,
+        image,
+        SessionRuntimeSpec {
+            args: &runtime_args,
+            labels: &[],
+        },
+        workspace,
+        roots,
+        credentials,
+        extra_mounts,
+    )
 }
 
 /// Grace period `stop` (and the reconciler's mount-drift recreate of an idle
@@ -773,6 +817,41 @@ pub trait ContainerRunner: session_image::BundleProbe {
     fn select_window(&self, container: &str, tmux_session: &str, window: &str) -> Result<()>;
 }
 
+/// Validated host-mode workspace roots and daemon-owned `gh` credential
+/// directories prepared before launching a session container.
+pub(super) struct HostSessionMounts {
+    pub(super) roots: Vec<PathBuf>,
+    pub(super) credentials: Vec<PathBuf>,
+}
+
+/// Resolve narrowed workspace mount roots and daemon-owned `gh` credential
+/// directories, and validate `extra_mounts` against them.
+pub(super) fn resolve_host_session_mounts(
+    workspace: &Path,
+    daemon_root: &Path,
+    extra_mounts: &[ExtraMount],
+) -> Result<HostSessionMounts> {
+    // The daemon's own workspace registry is the allow-list of what the
+    // container may see (issue #9979), minus the home directory and the
+    // firewalled repositories. The session reconciler asks the same
+    // function before it tears a drifted container down (#10364).
+    let roots = super::session_mount_gate::create_roots(workspace)?;
+    // Daemon-owned App-token dirs for `gh` (see `gh_credential_dirs`):
+    // the session workspace, the accounts registry's daemon root (#10103),
+    // the daemon's own `LOOM_WORKSPACE`, and the owner of a daemon-shaped
+    // `GH_CONFIG_DIR` in this process's env.
+    let loom_workspace = std::env::var_os("LOOM_WORKSPACE").map(PathBuf::from);
+    let owners = gh_credential_owners(workspace, daemon_root, loom_workspace.as_deref());
+    let env_gh = std::env::var_os("GH_CONFIG_DIR").map(PathBuf::from);
+    let credentials = gh_credential_dirs(&owners, env_gh.as_deref());
+    // The configured extra read-only mounts are refused when a target
+    // shadows the workspace, the profile, the bundle or a credential
+    // path (issue #14019), and their host sources pass the same denials
+    // the workspace roots do.
+    super::session_mount_gate::check_extra_mounts(extra_mounts, workspace, &roots, &credentials)?;
+    Ok(HostSessionMounts { roots, credentials })
+}
+
 /// Real [`ContainerRunner`] shelling out to the `docker` CLI, exactly the way
 /// [`super::account_lifecycle::ProcessCodexRunner`] shells out to `codex`.
 pub struct ProcessContainerRunner;
@@ -786,6 +865,15 @@ impl ProcessContainerRunner {
             args,
             super::docker_cli::timeout_for(args),
         )
+    }
+
+    pub(super) fn run_create(image: &str, args: &[String]) -> Result<()> {
+        let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
+        let (success, _stdout, stderr) = Self::run_capture(&arg_refs)?;
+        if !success {
+            bail!("docker run {image} failed: {}", stderr.trim());
+        }
+        Ok(())
     }
 
     /// The baseline process set the session image's entrypoint establishes:
@@ -910,44 +998,17 @@ impl ContainerRunner for ProcessContainerRunner {
         daemon_root: &Path,
         extra_mounts: &[ExtraMount],
     ) -> Result<()> {
-        // The daemon's own workspace registry is the allow-list of what the
-        // container may see (issue #9979), minus the home directory and the
-        // firewalled repositories. The session reconciler asks the same
-        // function before it tears a drifted container down (#10364).
-        let roots = super::session_mount_gate::create_roots(workspace)?;
-        // Daemon-owned App-token dirs for `gh` (see `gh_credential_dirs`):
-        // the session workspace, the accounts registry's daemon root (#10103),
-        // the daemon's own `LOOM_WORKSPACE`, and the owner of a daemon-shaped
-        // `GH_CONFIG_DIR` in this process's env.
-        let loom_workspace = std::env::var_os("LOOM_WORKSPACE").map(PathBuf::from);
-        let owners = gh_credential_owners(workspace, daemon_root, loom_workspace.as_deref());
-        let env_gh = std::env::var_os("GH_CONFIG_DIR").map(PathBuf::from);
-        let credentials = gh_credential_dirs(&owners, env_gh.as_deref());
-        // The configured extra read-only mounts are refused when a target
-        // shadows the workspace, the profile, the bundle or a credential
-        // path (issue #14019), and their host sources pass the same denials
-        // the workspace roots do.
-        super::session_mount_gate::check_extra_mounts(
-            extra_mounts,
-            workspace,
-            &roots,
-            &credentials,
-        )?;
+        let mounts = resolve_host_session_mounts(workspace, daemon_root, extra_mounts)?;
         let args = host_session_run_args(
             container,
             image,
             codex_home,
             workspace,
-            &roots,
-            &credentials,
+            &mounts.roots,
+            &mounts.credentials,
             extra_mounts,
         );
-        let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
-        let (success, _stdout, stderr) = Self::run_capture(&arg_refs)?;
-        if !success {
-            bail!("docker run {image} failed: {}", stderr.trim());
-        }
-        Ok(())
+        Self::run_create(image, &args)
     }
 
     fn create_claude_seat(
@@ -1343,37 +1404,6 @@ impl<R: ContainerRunner> SessionLifecycle<R> {
     /// container state through it, issue #10453).
     pub fn runner(&self) -> &R {
         &self.runner
-    }
-
-    /// The configured extra read-only mounts (issue #14019) — empty without
-    /// the setting.
-    pub(super) fn extra_mounts(&self) -> Vec<ExtraMount> {
-        self.session_config
-            .as_ref()
-            .map(|config| config.extra_mounts.clone())
-            .unwrap_or_default()
-    }
-
-    /// Verify the configured override image carries the sealed control
-    /// bundle this daemon enforces (issue #14019) — a no-op unless the
-    /// effective image **is** the configured one (an operator's explicit
-    /// `--image` keeps its historical behaviour), and a refusal that names
-    /// the missing or altered asset otherwise. Called before any create.
-    ///
-    /// # Errors
-    /// The configured image fails its bundle verification.
-    pub(super) fn verify_session_config_image(&self) -> Result<()> {
-        let Some(config) = &self.session_config else {
-            return Ok(());
-        };
-        let Some(configured) = config.image.as_deref() else {
-            return Ok(());
-        };
-        if configured != self.image.as_str() {
-            return Ok(());
-        }
-        session_image::verify_override_bundle(&self.image, &self.runner)
-            .context("refusing to create a session container from the configured override image")
     }
 
     /// Image a later `create` launches from; `None` restores the default.
