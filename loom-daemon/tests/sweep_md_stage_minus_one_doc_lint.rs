@@ -39,20 +39,16 @@
 //!
 //! **No assertion in this file pins a literal whose only occurrence in the
 //! skill docs is inside a markdown code fence** (#7994 AC #6). If you add one,
-//! convert it to an EXECUTABLE check instead — the helpers below
-//! (`first_fenced_block_after`, `nth_fenced_block_after`, `run_bash_in`,
-//! `write_executable_stub`, the `DECIDE` interpreter) exist for exactly that.
-//!
-//! Helper-shape note (#7994 / #7993): these helpers intentionally use the same
-//! names and shapes as the ones PR #8024 introduces for `sweep_md_doc_lint.rs`
-//! (`first_fenced_block_after`, `write_executable_stub`). They are duplicated
-//! here on purpose — #7994 explicitly permits duplicate-then-de-duplicate so
-//! the two migrations can land independently — and are trivially hoistable into
-//! one shared `tests/doc_lint_support/` module once both have merged.
+//! convert it to an EXECUTABLE check instead — the shared `doc_lint_support`
+//! helpers (`nth_fenced_block_after`, `write_executable_stub`) and the local
+//! `run_bash_in` + `DECIDE` interpreter exist for exactly that.
 //!
 //! Companion test: `sweep_md_doc_lint.rs` (Phase B, #3453).
 
 #![allow(clippy::expect_used, clippy::unwrap_used)]
+
+#[allow(dead_code)]
+mod doc_lint_support;
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -115,74 +111,8 @@ fn read_sweep_md() -> String {
 }
 
 // ===========================================================================
-// Extract-and-execute helpers (same shape as PR #8024's doc_lint_support)
+// Extract-and-execute helpers
 // ===========================================================================
-
-/// Returns the `n`-th (0-based) fenced block tagged ```` ```<lang> ```` that
-/// starts **after** `anchor` in `content`, with the fence delimiters stripped.
-///
-/// This is the "locate" half of locate → extract → execute. It deliberately
-/// anchors on a *heading* (structure) rather than on the block's contents, so
-/// the block's own text is free to change.
-fn nth_fenced_block_after(content: &str, anchor: &str, lang: &str, n: usize) -> String {
-    let anchor_at = content.find(anchor).unwrap_or_else(|| {
-        panic!(
-            "sweep skill docs are missing the `{anchor}` anchor — the Stage -1 \
-             doc-lint cannot locate the fenced block it extracts. If the section \
-             was intentionally renamed, update the anchor in this test."
-        )
-    });
-    let open = format!("```{lang}");
-    let mut blocks = Vec::new();
-    let mut current: Option<Vec<&str>> = None;
-    for line in content[anchor_at..].lines() {
-        match current.as_mut() {
-            None => {
-                if line.trim_end() == open {
-                    current = Some(Vec::new());
-                }
-            }
-            Some(buf) => {
-                if line.trim_end() == "```" {
-                    blocks.push(buf.join("\n"));
-                    current = None;
-                } else {
-                    buf.push(line);
-                }
-            }
-        }
-        if blocks.len() > n {
-            break;
-        }
-    }
-    blocks.into_iter().nth(n).unwrap_or_else(|| {
-        panic!(
-            "sweep skill docs have no ```{lang} block #{n} after the `{anchor}` \
-             anchor — #7994 requires this block stay extractable so its behaviour \
-             (not its wording) can be asserted"
-        )
-    })
-}
-
-/// Convenience wrapper for the common "the first fenced block after this
-/// heading" case. Named to match PR #8024's helper of the same shape.
-fn first_fenced_block_after(content: &str, anchor: &str, lang: &str) -> String {
-    nth_fenced_block_after(content, anchor, lang, 0)
-}
-
-/// Writes `body` as an executable script at `dir/name`. Used to stub the
-/// OS-tool boundary (`git`, `df`) so an extracted block runs deterministically
-/// against the **real** Loom shell libraries. Named to match PR #8024's helper.
-fn write_executable_stub(dir: &Path, name: &str, body: &str) {
-    fs::create_dir_all(dir).expect("create stub bin dir");
-    let path = dir.join(name);
-    fs::write(&path, body).expect("write stub");
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).expect("chmod stub");
-    }
-}
 
 /// The result of running an extracted shell block.
 struct BashRun {
@@ -514,7 +444,12 @@ fn sweep_md_documents_all_three_probe_sections() {
 #[test]
 fn stage_minus_one_decision_tree_routes_by_contract() {
     let content = read_sweep_md();
-    let block = first_fenced_block_after(&content, "### Decision tree (the contract)", "text");
+    let block = doc_lint_support::nth_fenced_block_after(
+        &content,
+        "### Decision tree (the contract)",
+        "text",
+        0,
+    );
     let branches = parse_branches(&block, "DECIDE");
 
     assert!(
@@ -568,10 +503,11 @@ fn stage_minus_one_decision_tree_routes_by_contract() {
 #[test]
 fn stage_minus_one_probe_daemon_short_circuits_before_any_mcp_call() {
     let content = read_sweep_md();
-    let block = first_fenced_block_after(
+    let block = doc_lint_support::nth_fenced_block_after(
         &content,
         "#### PROBE_DAEMON — is the loom-daemon reachable?",
         "text",
+        0,
     );
 
     let guard = block
@@ -633,10 +569,11 @@ fn stage_minus_one_probe_daemon_short_circuits_before_any_mcp_call() {
 #[test]
 fn stage_minus_one_probe_daemon_timeout_is_500ms() {
     let content = read_sweep_md();
-    let block = first_fenced_block_after(
+    let block = doc_lint_support::nth_fenced_block_after(
         &content,
         "#### PROBE_DAEMON — is the loom-daemon reachable?",
         "text",
+        0,
     );
 
     let timeout = block
@@ -721,10 +658,11 @@ fn write_account_keys(path: &Path, count: usize) {
 /// synthetic account layout, returning what it decided.
 fn run_probe_pool(case: &PoolCase) -> BashRun {
     let content = read_sweep_md();
-    let block = first_fenced_block_after(
+    let block = doc_lint_support::nth_fenced_block_after(
         &content,
         "#### PROBE_POOL — does a multi-account token pool exist?",
         "bash",
+        0,
     );
 
     let tmp = tempfile::tempdir().expect("tempdir");
@@ -972,8 +910,8 @@ fn stage_minus_one_probe_pool_warns_only_when_configured_but_not_bootstrapped() 
 fn run_wave_size(decide: &str, cand: u32, df_mode: &str, avail_gb: u64) -> BashRun {
     let content = read_sweep_md();
     let anchor = "### Resolve auto wave size";
-    let probe_block = nth_fenced_block_after(&content, anchor, "bash", 0);
-    let resolve_block = nth_fenced_block_after(&content, anchor, "bash", 1);
+    let probe_block = doc_lint_support::nth_fenced_block_after(&content, anchor, "bash", 0);
+    let resolve_block = doc_lint_support::nth_fenced_block_after(&content, anchor, "bash", 1);
 
     let tmp = tempfile::tempdir().expect("tempdir");
     let root = tmp.path();
@@ -991,12 +929,11 @@ fn run_wave_size(decide: &str, cand: u32, df_mode: &str, avail_gb: u64) -> BashR
 
     // Stub only the OS-tool boundary.
     let stub_bin = root.join("stubbin");
-    write_executable_stub(
-        &stub_bin,
-        "git",
+    fs::create_dir_all(&stub_bin).expect("create stub bin dir");
+    doc_lint_support::write_executable_stub(
+        &stub_bin.join("git"),
         &format!(
-            "#!/usr/bin/env bash\n\
-             if [[ \"$1\" == rev-parse && \"$2\" == --show-toplevel ]]; then\n\
+            "if [[ \"$1\" == rev-parse && \"$2\" == --show-toplevel ]]; then\n\
              \x20 printf '%s\\n' '{}'\n\
              \x20 exit 0\n\
              fi\n\
@@ -1004,11 +941,9 @@ fn run_wave_size(decide: &str, cand: u32, df_mode: &str, avail_gb: u64) -> BashR
             root.display()
         ),
     );
-    write_executable_stub(
-        &stub_bin,
-        "df",
-        "#!/usr/bin/env bash\n\
-         if [[ \"${LOOM_TEST_DF_MODE:-ok}\" == fail ]]; then\n\
+    doc_lint_support::write_executable_stub(
+        &stub_bin.join("df"),
+        "if [[ \"${LOOM_TEST_DF_MODE:-ok}\" == fail ]]; then\n\
          \x20 echo 'df: stub failure' >&2\n\
          \x20 exit 1\n\
          fi\n\
