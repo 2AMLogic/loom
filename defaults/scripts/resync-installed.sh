@@ -4151,16 +4151,29 @@ collect_resync_dirt() {
     RESYNC_RETIRED_PATHS=()
     RESYNC_FOREIGN_DIRT=0
 
-    local status line path src
-    status="$(git -C "$WRITE_ROOT" status --porcelain 2>/dev/null)"
-    [[ -z "$status" ]] && return 0
+    # NUL-delimited status (#15519 review): the default porcelain form
+    # C-quotes a path with a non-ASCII byte
+    # (`".loom/docs/caf\303\251.md"`), which no longer equals the literal
+    # path `remove_retired_files()` recorded. `-z` emits every path verbatim.
+    local line path src
+    local -a status_records=()
+    while IFS= read -r -d '' line; do
+        status_records+=("$line")
+    done < <(git -C "$WRITE_ROOT" status --porcelain=v1 -z 2>/dev/null)
+    [[ "${#status_records[@]}" -eq 0 ]] && return 0
 
-    while IFS= read -r line; do
+    local i=0
+    while [[ "$i" -lt "${#status_records[@]}" ]]; do
+        line="${status_records[$i]}"
+        i=$((i + 1))
         [[ -z "$line" ]] && continue
         path="${line:3}"
-        [[ "$path" == *" -> "* ]] && path="${path##* -> }"
-        path="${path%\"}"
-        path="${path#\"}"
+        # A rename/copy record is followed by its source path as its own
+        # NUL-terminated record; the destination (the record's own path) is
+        # what the recipe stages, as before.
+        case "${line:0:2}" in
+            *R*|*C*) i=$((i + 1)) ;;
+        esac
         if _is_loom_pure_copy_surface_path "$path"; then
             # #6613 (mirrored from audit_untracked_loom_paths() above): a path
             # matching the pure-copy-surface *pattern* with no defaults/
@@ -4203,8 +4216,18 @@ collect_resync_dirt() {
                 RESYNC_FOREIGN_DIRT=1
                 ;;
         esac
-    done <<< "$status"
+    done
     return 0
+}
+
+# Join paths as one shell-escaped argument each (#15519 review): a plain
+# `${arr[*]}` splits a path with a space into two pathspecs.
+_resync_quote_paths() {
+    local p out=""
+    for p in "$@"; do
+        out+="${out:+ }$(printf '%q' "$p")"
+    done
+    printf '%s' "$out"
 }
 
 # ---------- hint: stage + commit resync-only dirt (#4332) ----------
@@ -4241,9 +4264,9 @@ suggest_commit_if_resync_only_dirt() {
     echo ""
     if [[ -n "$OUTPUT_DIR" ]]; then
         note "${BLUE}[resync] The staging worktree is dirty with only resync output above — stage and commit it there:${NC}"
-        printf '%b\n' "    ${BOLD}cd $OUTPUT_DIR && git add -- ${RESYNC_DIRT_PATHS[*]} && git commit -m 'chore: resync installed Loom surfaces'${NC}"
+        printf '%b\n' "    ${BOLD}cd $OUTPUT_DIR && git add -- $(_resync_quote_paths "${RESYNC_DIRT_PATHS[@]}") && git commit -m 'chore: resync installed Loom surfaces'${NC}"
     else
-        note "${BLUE}[resync] The tree is dirty with only resync output above (would be: git add -- ${RESYNC_DIRT_PATHS[*]}) — land it so the main-health gate doesn't skip on it. This commits AND pushes (never rebasing or bypass-pushing — see .loom/docs/troubleshooting.md \"Landing a resync commit on the primary clone (#6646)\"):${NC}"
+        note "${BLUE}[resync] The tree is dirty with only resync output above (would be: git add -- $(_resync_quote_paths "${RESYNC_DIRT_PATHS[@]}")) — land it so the main-health gate doesn't skip on it. This commits AND pushes (never rebasing or bypass-pushing — see .loom/docs/troubleshooting.md \"Landing a resync commit on the primary clone (#6646)\"):${NC}"
         printf '%b\n' "    ${BOLD}./.loom/scripts/land-resync-commit.sh${NC}"
     fi
 }
@@ -4284,7 +4307,7 @@ print_output_mode_next_steps() {
     if [[ "${#RESYNC_DIRT_PATHS[@]}" -eq 0 ]]; then
         note "    (nothing to stage — this run left the staging worktree clean)"
     else
-        printf '%b\n' "    ${BOLD}git add -- ${RESYNC_DIRT_PATHS[*]}${NC}"
+        printf '%b\n' "    ${BOLD}git add -- $(_resync_quote_paths "${RESYNC_DIRT_PATHS[@]}")${NC}"
     fi
     printf '%b\n' "    ${BOLD}git commit -m 'chore: resync installed Loom surfaces'${NC}"
     printf '%b\n' "    ${BOLD}git push -u origin HEAD${NC}   # then open a PR"

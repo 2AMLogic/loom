@@ -270,12 +270,16 @@ echo "Test group 9: the printed recipe stages this run's own retirement deletion
 # so a second prefix proves the fix is not specific to .loom/scripts/.
 CONS="$WORKDIR/consumer"
 SRC="$WORKDIR/source"
-mkdir -p "$CONS/.loom/hooks" "$CONS/.loom/scripts/tests" "$SRC/defaults/scripts"
+mkdir -p "$CONS/.loom/hooks" "$CONS/.loom/scripts/tests" "$CONS/.loom/docs" "$SRC/defaults/scripts"
 git -C "$CONS" init -q -b main
 printf 'OLD CARD\n' > "$CONS/.loom/pricing.json"
 printf 'retired tool\n' > "$CONS/.loom/scripts/generate-agents-md.sh"
 printf 'retired test\n' > "$CONS/.loom/scripts/tests/test-guide-unblock-merged-blocker.sh"
 printf 'retired hook\n' > "$CONS/.loom/hooks/old-hook.sh"
+# Retired names git would C-quote or that a space-joined recipe would split
+# (review of #15530): a space, and a non-ASCII byte.
+printf 'retired doc\n' > "$CONS/.loom/docs/old guide.md"
+printf 'retired doc\n' > "$CONS/.loom/docs/café.md"
 # Two retirements the run must hold back (group 10): a pinned fork, and a
 # path whose installed copy is a symlink.
 printf 'pinned fork\n' > "$CONS/.loom/scripts/pinned-tool.sh"
@@ -290,7 +294,7 @@ printf '{\n  "version": "9.9.9"\n}\n' > "$SRC/package.json"
 printf 'NEW CARD\n' > "$SRC/defaults/pricing.json"
 printf 'shipped\n' > "$SRC/defaults/scripts/shipped.sh"
 printf '%s\n' "scripts/generate-agents-md.sh" "scripts/tests/test-guide-unblock-merged-blocker.sh" \
-    "hooks/old-hook.sh" "scripts/pinned-tool.sh" "scripts/linked-tool.sh" > "$SRC/defaults/.loom-retired.list"
+    "hooks/old-hook.sh" "docs/old guide.md" "docs/café.md" "scripts/pinned-tool.sh" "scripts/linked-tool.sh" > "$SRC/defaults/.loom-retired.list"
 git -C "$SRC" add -A >/dev/null 2>&1
 git -C "$SRC" commit -qm "source" >/dev/null 2>&1
 STAGING9="$WORKDIR/staging9"
@@ -335,10 +339,12 @@ if [[ -n "$RECIPE9" ]] && ( cd "$STAGING9" && eval "$RECIPE9" ); then
 else
     fail "(#15519) the printed recipe could not be applied (recipe='$RECIPE9')"
 fi
-STAGED9="$(git -C "$STAGING9" diff --cached --name-status | tr '\t' ' ')"
+STAGED9="$(git -C "$STAGING9" -c core.quotepath=false diff --cached --name-status | tr '\t' ' ')"
 for expected in "D .loom/scripts/generate-agents-md.sh" \
                 "D .loom/scripts/tests/test-guide-unblock-merged-blocker.sh" \
                 "D .loom/hooks/old-hook.sh" \
+                "D .loom/docs/old guide.md" \
+                "D .loom/docs/café.md" \
                 "M .loom/pricing.json"; do
     if grep -qxF -- "$expected" <<<"$STAGED9"; then
         pass "(#15519) applying the recipe stages: $expected"
