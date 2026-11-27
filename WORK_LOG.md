@@ -18,6 +18,9 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 ### 2026-11-27
 
+- **PR #15585**: fix: mark weekly/monthly API-key exhaustion account-wide
+- **Issue #15572** (closed): API-key pool: a weekly/monthly exhaustion mark under one model class does not stop another class from re-selecting the account
+- **Issue #15596** (closed): config-resolver.sh: a defaults.json over 128 KiB makes every sourcing script exit 126 (jq --argjson exceeds MAX_ARG_STRLEN)
 - **PR #15590**: refactor: consolidate directory-size walkers into fs_util::dir_size_bytes/tree_size_bytes
 - **PR #15587**: refactor: route the four self_spawn_log::track timeout runners through proc_exec (#15580)
 - **PR #15579**: refactor: share the guarded stack replay between both reconcilers
