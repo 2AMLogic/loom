@@ -4171,9 +4171,11 @@ collect_resync_dirt() {
         # A rename/copy record is followed by its source path as its own
         # NUL-terminated record; the destination (the record's own path) is
         # what the recipe stages, as before.
-        case "${line:0:2}" in
-            *R*|*C*) i=$((i + 1)) ;;
-        esac
+        # (A `[[ ]]` test, not a `case`: loom-daemon's surface-parity test
+        # reads the FIRST `case` in this function as the managed-path list.)
+        if [[ "${line:0:2}" == *R* || "${line:0:2}" == *C* ]]; then
+            i=$((i + 1))
+        fi
         if _is_loom_pure_copy_surface_path "$path"; then
             # #6613 (mirrored from audit_untracked_loom_paths() above): a path
             # matching the pure-copy-surface *pattern* with no defaults/
