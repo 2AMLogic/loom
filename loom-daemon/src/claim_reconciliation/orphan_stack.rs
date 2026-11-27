@@ -88,9 +88,9 @@
 use std::collections::BTreeSet;
 use std::path::Path;
 
-use super::open_pr_listing::{self, RestPull};
+use super::open_pr_listing::RestPull;
 use super::orphan_stack_git as git;
-use super::stack_reconcile;
+use super::stack_reconcile::{self, GhStackForge, StackForgeOps};
 use crate::branch_update::Strategy;
 use crate::merge_pr::stacked_children::is_stackable_parent_branch;
 
@@ -924,6 +924,14 @@ fn flag(
     );
 }
 
+/// The telemetry names the orphan pass's shared forge calls are booked under.
+static STACK_FORGE_OPS: StackForgeOps = StackForgeOps {
+    parent_lookup: "orphan_stack.parent_lookup",
+    comments: "orphan_stack.comments",
+    retarget: "orphan_stack.retarget",
+    comment: "orphan_stack.comment",
+};
+
 /// The live forge, through the claim-reconciliation `gh` facade.
 pub struct GhOrphanForge<'a> {
     pub gh_bin: &'a Path,
@@ -931,18 +939,8 @@ pub struct GhOrphanForge<'a> {
 }
 
 impl GhOrphanForge<'_> {
-    fn api_write(&self, op: &'static str, args: &[&str]) -> Result<(), String> {
-        let out = super::gh_call::output(
-            super::gh_call::write(op, self.gh_bin, self.root)
-                .args(["api"])
-                .args(args),
-        )
-        .map_err(|e| e.to_string())?;
-        if out.status.success() {
-            Ok(())
-        } else {
-            Err(super::gh_call::stderr(&out))
-        }
+    fn shared(&self) -> GhStackForge<'_> {
+        GhStackForge::new(self.gh_bin, self.root, &STACK_FORGE_OPS)
     }
 }
 
@@ -991,73 +989,44 @@ pub fn parse_newest_closed(body: &[u8], branch: &str) -> Result<Option<ParentPr>
 
 impl OrphanForge for GhOrphanForge<'_> {
     fn newest_closed_pr_for_head(&self, branch: &str) -> Result<Option<ParentPr>, String> {
-        let path = format!(
-            "repos/{{owner}}/{{repo}}/pulls?head={{owner}}:{branch}&state=closed&per_page=100"
-        );
-        let out = super::gh_call::output(
-            super::gh_call::read("orphan_stack.parent_lookup", self.gh_bin, self.root)
-                .args(["api", &path]),
-        )
-        .map_err(|e| e.to_string())?;
-        if !out.status.success() {
-            return Err(super::gh_call::stderr(&out));
-        }
-        parse_newest_closed(&out.stdout, branch)
+        self.shared().newest_closed_pr_for_head(branch)
     }
 
     fn trusted_comments(&self, pr: u32) -> Option<Vec<String>> {
-        crate::merge_pr::sequence::fetch_trusted_bodies_as(
-            "orphan_stack.comments",
-            &self.gh_bin.to_string_lossy(),
-            self.root,
-            "{owner}/{repo}",
-            pr,
-        )
+        self.shared().trusted_comments(pr)
     }
 
     fn issue_lease_fresh(&self, issue: u32) -> Option<bool> {
-        use super::forge::LeaseProbe;
-        match super::forge::fetch_freshest_lease_updated_at(self.gh_bin, self.root, issue) {
-            LeaseProbe::Found(at) => Some(super::lease_is_fresh(
-                at,
-                chrono::Utc::now(),
-                super::resolve_lease_ttl_minutes(),
-            )),
-            LeaseProbe::NotFound => Some(false),
-            LeaseProbe::ReadFailed => None,
-        }
+        self.shared().issue_lease_fresh(issue)
     }
 
     fn strategy(&self) -> Strategy {
-        let nwo = std::env::var("LOOM_REPO").ok();
-        crate::branch_update::resolve(Some(self.root), nwo.as_deref(), true).strategy
+        self.shared().strategy()
     }
 
     fn repository(&self) -> Option<String> {
-        crate::worktree_ops::gh::resolve_owner_repo(self.root).map(|(o, r)| format!("{o}/{r}"))
+        self.shared().repository()
     }
 
     fn retarget(&self, pr: u32, base: &str) -> Result<(), String> {
-        let path = format!("repos/{{owner}}/{{repo}}/pulls/{pr}");
-        let field = format!("base={base}");
-        self.api_write("orphan_stack.retarget", &["-X", "PATCH", &path, "-f", &field])
+        self.shared().retarget(pr, base)
     }
 
     fn add_label(&self, pr: u32, label: &str) -> Result<(), String> {
         let path = format!("repos/{{owner}}/{{repo}}/issues/{pr}/labels");
         let field = format!("labels[]={label}");
-        self.api_write("orphan_stack.label", &["-X", "POST", &path, "-f", &field])
+        self.shared()
+            .api_write("orphan_stack.label", &["-X", "POST", &path, "-f", &field])
     }
 
     fn remove_label(&self, pr: u32, label: &str) -> Result<(), String> {
         let path = label_delete_path(pr, label);
-        self.api_write("orphan_stack.label", &["-X", "DELETE", &path])
+        self.shared()
+            .api_write("orphan_stack.label", &["-X", "DELETE", &path])
     }
 
     fn comment(&self, pr: u32, body: &str) -> Result<(), String> {
-        let path = format!("repos/{{owner}}/{{repo}}/issues/{pr}/comments");
-        let field = format!("body={body}");
-        self.api_write("orphan_stack.comment", &["-X", "POST", &path, "-f", &field])
+        self.shared().comment(pr, body)
     }
 }
 
@@ -1071,34 +1040,12 @@ pub(super) fn reconcile(
     if !orphan_stack_enabled() {
         return OrphanStats::default();
     }
-    // One host per workspace writes (#10634's shard, as the merge-sequence
-    // pass uses): two daemons racing the same orphan would both read, and the
-    // loser's lease would fail, but both would comment.
-    if !crate::role_shard::decide(root).admits_role_tick() {
-        return OrphanStats::default();
-    }
-    let Some(default_branch) = crate::worktree_cli::default_branch::resolve(root) else {
-        log::debug!(
-            "claim_reconciliation (orphan stack): {}: default branch unknown — pass skipped",
-            root.display()
-        );
+    let Some((default_branch, open)) =
+        stack_reconcile::prepare_reconcile("orphan stack", gh_bin, root, prefetched)
+    else {
         return OrphanStats::default();
     };
-    let listed;
-    let open = match prefetched {
-        Some(rows) => rows,
-        None => match open_pr_listing::list_open_prs(gh_bin, root) {
-            Ok(rows) => {
-                listed = rows;
-                &listed[..]
-            }
-            Err(e) => {
-                log::warn!("claim_reconciliation (orphan stack): {}: {e}", root.display());
-                return OrphanStats::default();
-            }
-        },
-    };
-    let stats = reconcile_with(&GhOrphanForge { gh_bin, root }, root, &default_branch, open);
+    let stats = reconcile_with(&GhOrphanForge { gh_bin, root }, root, &default_branch, &open);
     if stats != OrphanStats::default() {
         log::info!(
             "claim_reconciliation (orphan stack): {}: {} orphan(s), {} retargeted, {} cascaded, \

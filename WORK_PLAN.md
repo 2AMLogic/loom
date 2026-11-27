@@ -7,7 +7,7 @@ The body below is a snapshot of GitHub label state as of the last merged docs-ma
 <!-- Maintained automatically by the Guide triage agent. Manual edits are fine but may be overwritten. -->
 
 <!-- guide:plan-body:start -->
-_Generated: 2026-11-27T17:07:37Z (snapshot; compare against live labels)_
+_Generated: 2026-11-27T22:14:00Z (snapshot; compare against live labels)_
 ## Operator Attention: Merge-Risk-Hold Pileup
 
 Judge-approved PRs under a hold (`loom:blocked` or `loom:operator`) — a human merge decision, or the prerequisite shown, is missing.
@@ -23,6 +23,7 @@ Judge-approved PRs under a hold (`loom:blocked` or `loom:operator`) — a human 
 - **#15066**: feat: reap agent per-ticket scratch roots on the worktree volume *(held: champion merge-risk hold)*
 - **#15071**: feat: relay private-seat preparation Git reads through the fleet gateway *(held: champion merge-risk hold)*
 - **#15099**: feat: share codex account holds across fleet hosts on the heartbeat *(held: champion merge-risk hold)*
+- **#15101**: fix: refuse writer seat jobs before lease when no writer is published *(held: champion merge-risk hold)*
 - **#15133**: feat: read Builder claim and split-parent evidence from Gitea *(held: champion merge-risk hold)*
 - **#15224**: fix: scan rm targets behind function-definition and group openers in rm-scope guard *(held: Local worktree pr-15224 holding feature/issue-15221 is dirty at b680d5547 behind PR head ccbf98811; preserved untouched per dirty-worktree refusal policy)*
 - **#15307**: refactor(prompts): load-gate the docs-only fast path bodies (#15236) *(held: champion merge-risk hold)*
@@ -62,7 +63,6 @@ _None._
 - **#12993**: Shadow evaluation of the new Champion (2026-10-20): 1/95 holds cleared — ranked remaining causes + fixtures *(held)*
 - **#14112**: Private-clone session image follows the daemon release tag; recreate idle private sessions at a daemon roll
 - **#14465**: Serve hold diagnostics, curation labels and blocker notifications from loom-tools *(held)*
-- **#14474**: Expose worktree operations through the shared Rust CLI
 - **#14566**: Telemetry: about 40% of OpenCode (GLM) runs on 0.19.1316 emit no loom.runtime.usage row *(held)*
 - **#15308**: main CI red since 11:10Z: install-compat (session-exec claude-seat vs requires_daemon 0.20.5) and E0308 in daemon tests
 - **#15553**: test flake: nextest discovery stalls inside the Run tests step (lib binary --list) on Rust Unit Tests (5/5) — sixth occurrence, first after #15378
@@ -71,7 +71,7 @@ _None._
 
 Human-approved issues (`loom:issue`) ready for implementation — excluding held (`loom:blocked`/`loom:operator`/`loom:frozen`), `loom:building`, and issues with an open linked PR (native admission `OPEN_PR`; listed under Issues with Open PRs).
 
-- **#15620**: Consolidate 8 hand-rolled libc::flock file-lock wrappers in loom-daemon onto a shared fs_util::FileLock
+- **#15650**: worktree-closed-pr-branch: tools-mode config error exits 1, which the shell reads as a branch refusal
 
 ## Issues with Open PRs (Not Dispatchable)
 
@@ -80,7 +80,6 @@ Human-approved issues (`loom:issue`) ready for implementation — excluding held
 - **#13820**: Remove the loom-api crate: reads a database the daemon does not write, 3 of 5 endpoints query tables nothing creates — open PR #14046 (held)
 - **#13957**: Shrink always-read core of judge.md (173 KB) into on-demand sub-skills — open PR #13997 (held)
 - **#14455**: Codex Curator steps are dispatched to stopped, unprovisioned seats and end SANDBOX_UNAVAILABLE every time — open PR #14498 (held)
-- **#14474**: Expose worktree operations through the shared Rust CLI — open PR #14514 (approved)
 - **#14626**: Private-clone admission contains the winning seat twice per admission — open PR #14696 (held)
 - **#14712**: resync: a no-op resync warns that it stamped the canonical loom_source_remote, but leaves the stale one — open PR #14769 (approved)
 - **#14714**: Held Doctor repairs leave stale approvals outside the Judge queue — open PR #14715 (held)
@@ -94,6 +93,7 @@ Issues currently being built (`loom:building`).
 - **#14112**: Private-clone session image follows the daemon release tag; recreate idle private sessions at a daemon roll
 - **#14376**: Refuse a peer-owned claim before handing a new worktree to a Builder
 - **#14460**: held_back residue: install-loom.sh's "already installed" gate still reads the stamp alone, and three install_compat doc comments are stale
+- **#14476**: Verify the installed create, enter and remove workflow without a daemon
 - **#14560**: Work-finder completion gaps leave the Fleet queue stale
 - **#14935**: Fetch private-seat clones through the configured fleet Git read relay
 - **#14936**: Diagnose writer renewal and refuse private-seat write jobs before leasing when credentials are missing
@@ -126,6 +126,11 @@ Issues currently being built (`loom:building`).
 - **#15588**: Make pr-worktree.sh stop when worktree root config resolution fails
 - **#15605**: Consolidate duplicated PR file-list pagination and head-content plumbing across the four forge PR-diff verbs
 - **#15617**: Retire sweep_registry::reaper::output_with_timeout and route its 13 remaining callers onto proc_exec::run_bounded
+- **#15638**: Share live Gh*Forge adapter methods and reconcile() preamble between orphan_stack and merged_stack in stack_reconcile.rs
+- **#15640**: Share gh api adapter, pagination, target-runner, and report helpers between labels_migrate and labels_migrate_holds
+- **#15641**: Share post_merge_bookkeeping::SystemHost with merge_observation::GhForge instead of duplicating six live Host methods
+- **#15645**: install_compat_harness tests still write-then-exec a fixture script, so plain cargo test hits ETXTBSY (#15013 class)
+- **#15647**: Map merged_stack.* telemetry names in gh_call::forge_op_for so the merged-stack pass books inventoried operations
 
 ## PRs Awaiting Review
 
@@ -134,6 +139,7 @@ PRs waiting on Judge (`loom:review-requested`).
 - **#12969**: feat: age-bound Codex rollout history in live profiles *(held)*
 - **#14612**: fix: launch eager reclaim detached so it cannot hold back a work-finder tick *(held)*
 - **#15047**: refactor: drop superseded zero-caller pub helpers from loom-daemon *(held)*
+- **#15648**: refactor: share stack passes' gh forge adapter in stack_reconcile
 
 ## Approved (Awaiting Merge)
 
@@ -144,7 +150,6 @@ PRs that passed review (`loom:pr`); unmarked PRs are queued for Champion auto-me
 - **#14108**: fix(private_workspace): forward the freshest owner token, not a fixed primary-first one — closes #13933 *(held: champion merge-risk hold)*
 - **#14384**: fix: require native ownership before handing a fresh worktree to a Builder — closes #14376 *(held: champion merge-risk hold)*
 - **#14498**: fix: pass over unprovisioned and sandbox-held Codex seats before a draw — closes #14455 *(held: champion merge-risk hold)*
-- **#14514**: feat(tools): share worktree CLI operations and read routing — closes #14474
 - **#14696**: fix(dispatch): admit on the containment proof the walk already took — closes #14626 *(held: champion merge-risk hold)*
 - **#14715**: fix: send verified Champion-held Doctor repairs back to Judge — closes #14714 *(held: champion merge-risk hold)*
 - **#14769**: fix: skip source-remote lookup on no-op resyncs — closes #14712
@@ -152,6 +157,7 @@ PRs that passed review (`loom:pr`); unmarked PRs are queued for Champion auto-me
 - **#15066**: feat: reap agent per-ticket scratch roots on the worktree volume — closes #14952 *(held: champion merge-risk hold)*
 - **#15071**: feat: relay private-seat preparation Git reads through the fleet gateway — closes #14935 *(held: champion merge-risk hold)*
 - **#15099**: feat: share codex account holds across fleet hosts on the heartbeat — closes #15091 *(held: champion merge-risk hold)*
+- **#15101**: fix: refuse writer seat jobs before lease when no writer is published — closes #14936 *(held: champion merge-risk hold)*
 - **#15133**: feat: read Builder claim and split-parent evidence from Gitea — closes #14938 *(held: champion merge-risk hold)*
 - **#15224**: fix: scan rm targets behind function-definition and group openers in rm-scope guard — closes #15221 *(held: Local worktree pr-15224 holding feature/issue-15221 is dirty at b680d5547 behind PR head ccbf98811; preserved untouched per dirty-worktree refusal policy)*
 - **#15307**: refactor(prompts): load-gate the docs-only fast path bodies (#15236) — closes #15236 *(held: champion merge-risk hold)*
@@ -236,7 +242,6 @@ Issues carrying `loom:curated`.
 - **#14461**: Serve the remaining forge actions through the shared loom-tools dispatcher *(curated)* *(held)*
 - **#14464**: Expose park records and operator decisions through loom-tools *(curated)* *(held)*
 - **#14465**: Serve hold diagnostics, curation labels and blocker notifications from loom-tools *(curated)* *(held)*
-- **#14474**: Expose worktree operations through the shared Rust CLI *(curated)*
 - **#14530**: Live-verify the admitted loom-tools forge writes against a controlled repository *(curated)* *(held)*
 - **#14534**: recover --publish: CLI discovers the daemon's workspace root without an exported variable (AC1 of #14433) *(curated)* *(held)*
 - **#14553**: Live-verify the migrated merge-queue actions in tools-only session mode (#14520 AC3 remainder) *(curated)* *(held)*
@@ -296,6 +301,10 @@ Issues carrying `loom:curated`.
 - **#15553**: test flake: nextest discovery stalls inside the Run tests step (lib binary --list) on Rust Unit Tests (5/5) — sixth occurrence, first after #15378 *(curated)*
 - **#15588**: Make pr-worktree.sh stop when worktree root config resolution fails *(curated)*
 - **#15605**: Consolidate duplicated PR file-list pagination and head-content plumbing across the four forge PR-diff verbs *(curated)*
+- **#15644**: The daemon floor check ignores verbs called from role prompts, so REQUIRES_DAEMON drifts below them *(curated)* *(held)*
+- **#15645**: install_compat_harness tests still write-then-exec a fixture script, so plain cargo test hits ETXTBSY (#15013 class) *(curated)*
+- **#15647**: Map merged_stack.* telemetry names in gh_call::forge_op_for so the merged-stack pass books inventoried operations *(curated)*
+- **#15650**: worktree-closed-pr-branch: tools-mode config error exits 1, which the shell reads as a branch refusal *(curated)*
 
 ## Proposed (Architect / Hermit)
 
@@ -321,15 +330,15 @@ Issues carrying `loom:curated`.
 
 | Bucket | Count |
 |------|-------|
-| Operator merge-risk holds | 34 |
+| Operator merge-risk holds | 35 |
 | Very important | 0 |
-| Important | 9 |
+| Important | 8 |
 | Ready (`loom:issue`, net of holds/building/open-linked-PRs) | 1 |
-| In Progress (`loom:building`) | 36 |
+| In Progress (`loom:building`) | 42 |
 | Held, no other bucket | 80 |
-| PRs awaiting review | 3 |
+| PRs awaiting review | 4 |
 | Approved PRs awaiting merge | 38 |
-| Curated | 114 |
+| Curated | 117 |
 | Architect / Hermit proposals | 7 |
 | Active epics | 7 |
 <!-- guide:plan-body:end -->
