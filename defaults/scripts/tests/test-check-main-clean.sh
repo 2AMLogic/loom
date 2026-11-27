@@ -1295,6 +1295,93 @@ else
 fi
 rm -rf "${REPO:?}"
 
+# ========================================================================
+# Operator stop requests: owned despite a stale managed block (#15545)
+# ========================================================================
+# `signal.sh stop` writes .loom/signals/stop-<name> and the daemon's
+# check_stop_signals only tests that it exists. It is operator-written, so it is
+# not in DAEMON_RUNTIME_PATTERNS, yet in a consumer repo whose managed
+# .gitignore block predates the `.loom/signals/` rule it showed as
+# `?? .loom/signals/`: exit 3 naming the stop as builder contamination, and
+# `--quarantine` stashed it, so the operator's stop was silently consumed
+# instead of honoured. The real signal.sh drives the write and the check.
+
+SIGNAL_SH="$(dirname "$SCRIPT")/signal.sh"
+
+echo "Test 15545: operator stop request is Loom-owned (stale .gitignore)"
+REPO=$(make_repo_stale_gitignore)
+SNAP="$REPO/.loom/sweep-checkpoint/main-clean-baseline-15545.txt"
+( cd "$REPO" && "$SCRIPT" --snapshot "$SNAP" >/dev/null 2>&1 ); RC=$?
+if [[ "$RC" -ne 0 ]]; then fail "Test 15545 setup: --snapshot expected 0, got $RC"; fi
+
+# The operator's stop lands AFTER the baseline: new dirt, the dangerous case.
+( cd "$REPO" && "$SIGNAL_SH" stop terminal-1 >/dev/null 2>&1 )
+STOP_FILE="$REPO/.loom/signals/stop-terminal-1"
+STOP_CONTENT=$(cat "$STOP_FILE" 2>/dev/null || true)
+
+# Sanity: git sees the directory as untracked dirt and the stop is active.
+if ! grep -qF '?? .loom/signals/' <<<"$(git -C "$REPO" status --porcelain)"; then
+    fail "Test 15545 setup: expected an untracked .loom/signals/ in a stale-gitignore repo"
+fi
+if ! ( cd "$REPO" && "$SIGNAL_SH" check terminal-1 >/dev/null 2>&1 ); then
+    fail "Test 15545 setup: signal.sh check expected 0 after stop"
+fi
+
+# No `issue=` field in the label: nothing here may reach the forge.
+out=$( cd "$REPO" && "$SCRIPT" --baseline "$SNAP" --quarantine \
+       --label "run=RUNID-15545" 2>&1 ); RC=$?
+STASH_COUNT=$(git -C "$REPO" stash list | wc -l | tr -d ' ')
+if [[ "$RC" -eq 0 ]] \
+   && [[ -f "$STOP_FILE" ]] \
+   && [[ "$(cat "$STOP_FILE")" == "$STOP_CONTENT" ]] \
+   && [[ "$STASH_COUNT" -eq 0 ]] \
+   && ( cd "$REPO" && "$SIGNAL_SH" check terminal-1 >/dev/null 2>&1 ) \
+   && ! grep -qF '.loom/signals' <<<"$out"; then
+    pass "--quarantine reports clean and leaves the stop request active"
+else
+    fail "expected rc=0, stop intact and active, no stash; got rc=$RC exists=$([[ -f "$STOP_FILE" ]] && echo y || echo n) stashes=$STASH_COUNT out=$out"
+fi
+
+# Plain detection (no baseline, no quarantine) must agree.
+[[ -f "$STOP_FILE" ]] || ( cd "$REPO" && "$SIGNAL_SH" stop terminal-1 >/dev/null 2>&1 )
+( cd "$REPO" && "$SCRIPT" >/dev/null 2>&1 ); RC=$?
+if [[ "$RC" -eq 0 && -f "$STOP_FILE" ]]; then
+    pass "plain detection treats .loom/signals/ as Loom-owned (exit 0)"
+else
+    fail "expected 0 from plain detection with the stop still present, got rc=$RC"
+fi
+
+# A lookalike sibling is real dirt: only it is reported, only it is stashed.
+mkdir -p "$REPO/.loom/signals-old"
+echo "stray" > "$REPO/.loom/signals-old/stray"
+out=$( cd "$REPO" && "$SCRIPT" 2>&1 ); RC=$?
+if [[ "$RC" -eq 3 ]] \
+   && grep -qF '.loom/signals-old' <<<"$out" \
+   && ! grep -qE '\.loom/signals/|stop-terminal-1' <<<"$out"; then
+    pass "a .loom/signals-old/ stray is flagged (exit 3), the stop is not"
+else
+    fail "expected 3 naming only .loom/signals-old, got rc=$RC; out=$out"
+fi
+
+out=$( cd "$REPO" && "$SCRIPT" --baseline "$SNAP" --quarantine \
+       --label "run=RUNID-15545" 2>&1 ); RC=$?
+STASH_COUNT=$(git -C "$REPO" stash list | wc -l | tr -d ' ')
+STASH_FILES=$( for r in 'stash@{0}' 'stash@{0}^2' 'stash@{0}^3'; do
+    git -C "$REPO" ls-tree -r --name-only "$r" 2>/dev/null || true
+done )
+if [[ "$RC" -eq 4 ]] \
+   && [[ "$STASH_COUNT" -eq 1 ]] \
+   && grep -qF '.loom/signals-old/stray' <<<"$STASH_FILES" \
+   && ! grep -qF 'stop-terminal-1' <<<"$STASH_FILES" \
+   && [[ -f "$STOP_FILE" ]] \
+   && [[ "$(cat "$STOP_FILE")" == "$STOP_CONTENT" ]] \
+   && ( cd "$REPO" && "$SIGNAL_SH" check terminal-1 >/dev/null 2>&1 ); then
+    pass "quarantine exits 4, stashes only the stray, stop request still readable"
+else
+    fail "expected rc=4 with only the stray stashed; got rc=$RC stashes=$STASH_COUNT stash_files=$STASH_FILES out=$out"
+fi
+rm -rf "${REPO:?}"
+
 # -------- Test: --quarantine never stashes a cargo target tree (#11075) --------
 echo "Test 11075: --quarantine excludes CACHEDIR.TAG trees from refs/stash"
 REPO=$(make_repo_with_source)

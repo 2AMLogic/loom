@@ -230,6 +230,16 @@ LOOM_OWNED_PREFIXES=(
     # so filtering it cannot mask contamination. Independent of the .gitignore
     # fix, which only reaches a consumer repo after a resync.
     ".loom-local/"
+    # Operator stop requests (#15545). `signal.sh stop` writes
+    # `.loom/signals/stop-<name>`; the daemon only tests it exists
+    # (`check_stop_signals` in agent_session/spawn.rs). It is operator-written,
+    # so it is not in DAEMON_RUNTIME_PATTERNS, but in a consumer repo whose
+    # managed .gitignore block predates the `.loom/signals/` rule it surfaces as
+    # `?? .loom/signals/`: exit 3 naming the operator's stop as builder
+    # contamination, and `--quarantine` stashes it, silently consuming the stop
+    # request. The trailing slash matches the directory git reports and any
+    # child path, and not a lookalike such as `.loom/signals-old/`.
+    ".loom/signals/"
     # Daemon-written token-pool runtime files (#15479): the per-repo health
     # cache and its sibling lock (#5014), and the ranking the refresh tick
     # rewrites every cycle (#14584). The daemon writes them into every
