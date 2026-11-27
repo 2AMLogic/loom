@@ -299,13 +299,15 @@
 # creates (and then auto-removes) the staging worktree, so a preview never
 # leaves any residue.
 #
-# Staging mode never touches user-scope (host) paths either (#15518): the two
-# user-scope steps a real run ends with -- the #10238 dispatcher + skill/agent
+# Staging mode skips Loom's user-scope (host) provisioning steps too (#15518):
+# the two steps a real run ends with -- the #10238 dispatcher + skill/agent
 # link (re)provisioning (from whatever checkout the run synced from) and the
 # #12121 retired presence-wiring strip, which write ~/.local/bin,
 # ~/.local/share and ~/.claude -- are skipped under --output. Neither would
 # land in the staging worktree: both write the HOST, and --dry-run never
-# previewed them. A non-staging real run still does both.
+# previewed them. This covers only those Loom steps, not every byte under
+# $HOME (tools the run invokes may create their own state). A non-staging
+# real run still does both.
 #
 # Local-override convention: list a relative path (e.g. `hooks/guard-destructive.sh`,
 # `scripts/foo.sh`, `roles/custom-role.md`, `docs/notes.md`, `bin/loom`,
@@ -4368,8 +4370,8 @@ clear_resync_marker
 # ~/.claude/commands/loom and ~/.claude/agents/loom-* links) -- the staging
 # worktree has no surface for it, so a real staging run used to write the HOST
 # instead, from whatever checkout --source named, and --dry-run (which skips
-# the step) never previewed it. A staging run makes no user-scope write at
-# all: the #12121 strip below is skipped there for the same reason.
+# the step) never previewed it. A staging run makes no Loom user-scope write
+# at all: the #12121 strip below is skipped there for the same reason.
 if [[ "$DRY_RUN" -eq 0 && -z "$OUTPUT_DIR" && "${LOOM_RESYNC_SKIP_USER_SCOPE:-0}" != "1" \
       && -d "$SOURCE_ROOT/.git" && -r "$SOURCE_ROOT/scripts/install/provision-skills.sh" \
       && -r "$SOURCE_ROOT/scripts/install/provision-dispatcher.sh" ]]; then

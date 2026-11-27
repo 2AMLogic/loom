@@ -55,8 +55,11 @@ export GIT_AUTHOR_NAME="test" GIT_AUTHOR_EMAIL="test@example.com"
 export GIT_COMMITTER_NAME="test" GIT_COMMITTER_EMAIL="test@example.com"
 # Each case below must see only the switches it sets itself: an ambient
 # LOOM_RESYNC_OUTPUT would silently turn the non-staging control into a
-# staging run.
-unset LOOM_RESYNC_OUTPUT LOOM_RESYNC_SKIP_USER_SCOPE LOOM_HOME
+# staging run. LOOM_DAEMON_BIN_DIR is unset too: provision_loom_dispatcher
+# prefers it over $HOME/.local/bin, so on a host that exports its real bin dir
+# the non-staging control would install the fixture dispatcher there instead of
+# into the temporary HOME (and the HOME-relative assertions would miss it).
+unset LOOM_RESYNC_OUTPUT LOOM_RESYNC_SKIP_USER_SCOPE LOOM_HOME LOOM_DAEMON_BIN_DIR
 # provision-skills.sh refuses a reference tree under a temporary root; these
 # fixtures live under mktemp, so no root counts as temporary here (the same
 # override test-provision-skills.sh uses).
