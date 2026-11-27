@@ -18,6 +18,8 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 ### 2026-11-27
 
+- **PR #15593**: docs: correct sum_entries comment on symlink size accounting
+- **Issue #15592** (closed): fs_util::sum_entries comment misstates DirEntry::metadata() symlink behavior
 - **PR #15600**: refactor: share stack cascade walk and marker helpers
 - **PR #15598**: refactor: share one SessionFilter between Codex and OpenCode usage readers
 - **Issue #15597** (closed): Share the descendant cascade walk and marker helpers between orphan_stack and merged_stack
