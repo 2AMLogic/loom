@@ -1,11 +1,14 @@
-//! Shared descendant-cascade walk, issue-lease check, and comment-marker
-//! helpers for [`super::orphan_stack`] and [`super::merged_stack`] (#15597).
+//! Shared descendant-cascade walk, issue-lease check, comment-marker, live
+//! `gh` forge-adapter and `reconcile()` preamble helpers for
+//! [`super::orphan_stack`] and [`super::merged_stack`] (#15597, #15638).
 
+use std::borrow::Cow;
 use std::path::{Path, PathBuf};
 
 use super::open_pr_listing::RestPull;
 use super::orphan_stack::{self as orphan, HeadOwner, Skip};
 use super::orphan_stack_git as git;
+use crate::branch_update::Strategy;
 
 /// How many stack levels above a restacked child are replayed in one pass.
 pub(super) const MAX_CASCADE_DEPTH: usize = 8;
@@ -227,6 +230,151 @@ fn cascade_at(
             git::ReplayOutcome::Transient(e) => (spec.on_flag)(&step, CascadeFlag::Refused(e)),
         }
     }
+}
+
+/// The telemetry names a stack pass's shared forge calls are booked under.
+/// Each pass keeps its own, so sharing one adapter moves no call from one
+/// pass's operation to the other's.
+pub(super) struct StackForgeOps {
+    pub parent_lookup: &'static str,
+    pub comments: &'static str,
+    pub retarget: &'static str,
+    pub comment: &'static str,
+}
+
+/// The live forge plumbing both stack passes share, through the
+/// claim-reconciliation `gh` facade.
+pub(super) struct GhStackForge<'a> {
+    gh_bin: &'a Path,
+    root: &'a Path,
+    ops: &'static StackForgeOps,
+}
+
+impl<'a> GhStackForge<'a> {
+    pub(super) fn new(gh_bin: &'a Path, root: &'a Path, ops: &'static StackForgeOps) -> Self {
+        Self { gh_bin, root, ops }
+    }
+
+    /// `gh api` with write intent; any non-zero exit is its trimmed stderr.
+    pub(super) fn api_write(&self, op: &'static str, args: &[&str]) -> Result<(), String> {
+        let out = super::gh_call::output(
+            super::gh_call::write(op, self.gh_bin, self.root)
+                .args(["api"])
+                .args(args),
+        )
+        .map_err(|e| e.to_string())?;
+        if out.status.success() {
+            Ok(())
+        } else {
+            Err(super::gh_call::stderr(&out))
+        }
+    }
+
+    /// The newest closed PR whose head is `branch` (`Ok(None)` = none),
+    /// read under the pass's `parent_lookup` op.
+    pub(super) fn newest_closed_pr_for_head(
+        &self,
+        branch: &str,
+    ) -> Result<Option<orphan::ParentPr>, String> {
+        let path = format!(
+            "repos/{{owner}}/{{repo}}/pulls?head={{owner}}:{branch}&state=closed&per_page=100"
+        );
+        let out = super::gh_call::output(
+            super::gh_call::read(self.ops.parent_lookup, self.gh_bin, self.root)
+                .args(["api", &path]),
+        )
+        .map_err(|e| e.to_string())?;
+        if !out.status.success() {
+            return Err(super::gh_call::stderr(&out));
+        }
+        orphan::parse_newest_closed(&out.stdout, branch)
+    }
+
+    /// Trusted comment bodies on PR `pr`, oldest first; `None` = unreadable.
+    pub(super) fn trusted_comments(&self, pr: u32) -> Option<Vec<String>> {
+        crate::merge_pr::sequence::fetch_trusted_bodies_as(
+            self.ops.comments,
+            &self.gh_bin.to_string_lossy(),
+            self.root,
+            "{owner}/{repo}",
+            pr,
+        )
+    }
+
+    /// Is issue `issue`'s lease fresh? `None` = could not tell.
+    pub(super) fn issue_lease_fresh(&self, issue: u32) -> Option<bool> {
+        use super::forge::LeaseProbe;
+        match super::forge::fetch_freshest_lease_updated_at(self.gh_bin, self.root, issue) {
+            LeaseProbe::Found(at) => Some(super::lease_is_fresh(
+                at,
+                chrono::Utc::now(),
+                super::resolve_lease_ttl_minutes(),
+            )),
+            LeaseProbe::NotFound => Some(false),
+            LeaseProbe::ReadFailed => None,
+        }
+    }
+
+    /// The repository's branch-update strategy.
+    pub(super) fn strategy(&self) -> Strategy {
+        let nwo = std::env::var("LOOM_REPO").ok();
+        crate::branch_update::resolve(Some(self.root), nwo.as_deref(), true).strategy
+    }
+
+    /// This repository's `owner/name`. `None` = could not tell.
+    pub(super) fn repository(&self) -> Option<String> {
+        crate::worktree_ops::gh::resolve_owner_repo(self.root).map(|(o, r)| format!("{o}/{r}"))
+    }
+
+    /// Change PR `pr`'s base to `base`.
+    pub(super) fn retarget(&self, pr: u32, base: &str) -> Result<(), String> {
+        let path = format!("repos/{{owner}}/{{repo}}/pulls/{pr}");
+        let field = format!("base={base}");
+        self.api_write(self.ops.retarget, &["-X", "PATCH", &path, "-f", &field])
+    }
+
+    /// Post `body` on PR `pr`.
+    pub(super) fn comment(&self, pr: u32, body: &str) -> Result<(), String> {
+        let path = format!("repos/{{owner}}/{{repo}}/issues/{pr}/comments");
+        let field = format!("body={body}");
+        self.api_write(self.ops.comment, &["-X", "POST", &path, "-f", &field])
+    }
+}
+
+/// The setup both `reconcile()` entry points share after their enabled
+/// check: the role-shard write gate, the default branch, and the open-PR
+/// listing — the one the preceding pass handed down, else a fresh one.
+/// `None` = the pass is skipped for this tick (`pass` names it in the log).
+pub(super) fn prepare_reconcile<'a>(
+    pass: &'static str,
+    gh_bin: &Path,
+    root: &Path,
+    prefetched: Option<&'a [RestPull]>,
+) -> Option<(String, Cow<'a, [RestPull]>)> {
+    // One host per workspace writes (#10634's shard, as the merge-sequence
+    // pass uses): two daemons racing the same stack would both read, and the
+    // loser's lease would fail, but both would comment.
+    if !crate::role_shard::decide(root).admits_role_tick() {
+        return None;
+    }
+    let Some(default_branch) = crate::worktree_cli::default_branch::resolve(root) else {
+        log::debug!(
+            "claim_reconciliation ({pass}): {}: default branch unknown — pass skipped",
+            root.display()
+        );
+        return None;
+    };
+    let open = match prefetched {
+        Some(rows) => Cow::Borrowed(rows),
+        None => match super::open_pr_listing::list_open_prs(gh_bin, root) {
+            Ok(rows) => Cow::Owned(rows),
+            Err(e) => {
+                log::warn!("claim_reconciliation ({pass}): {}: {e}", root.display());
+                return None;
+            }
+        },
+    };
+    Some((default_branch, open))
 }
 
 #[cfg(test)]

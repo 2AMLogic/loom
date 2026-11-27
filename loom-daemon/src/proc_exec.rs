@@ -320,6 +320,21 @@ fn spawn(cmd: &mut Command) -> io::Result<Child> {
     }
 }
 
+/// [`Command::output`] under [`spawn`]'s test-build wait, for an exec that is
+/// not bounded but still runs a fixture a sibling test thread may just have
+/// written: `lease ensure`'s publish and renew scripts (#15635), the same
+/// #15013 window `run_bounded` already waits out. Production keeps `output`.
+pub(crate) fn output(cmd: &mut Command) -> io::Result<Output> {
+    #[cfg(test)]
+    {
+        crate::exec_test_support::retry_while_executable_busy(|| cmd.output())
+    }
+    #[cfg(not(test))]
+    {
+        cmd.output()
+    }
+}
+
 fn run_bounded_inner(
     mut cmd: Command,
     timeout: Duration,

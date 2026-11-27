@@ -38,6 +38,9 @@ fn op_calls(rows: &[ForgeOperationCounts], operation: &str) -> u64 {
 
 /// Every name the mapping covers resolves to an inventoried constant (and so,
 /// by `every_named_operation_is_inventoried`, to an active inventory row).
+/// The merged-stack pass's names each resolve to the exact operation their
+/// REST call serves, so a swapped pair cannot hide behind another inventoried
+/// row (#15647).
 #[test]
 fn every_mapped_claim_name_is_an_inventoried_op() {
     let mapped = [
@@ -108,10 +111,25 @@ fn every_mapped_claim_name_is_an_inventoried_op() {
         "post_merge.issue_kind",
         "post_merge.timeline",
         "post_merge.issue_close",
+        "merged_stack.parent_lookup",
+        "merged_stack.comments",
+        "merged_stack.issue_labels",
+        "merged_stack.retarget",
+        "merged_stack.comment",
     ];
     for name in mapped {
         let op = gh_call::forge_op_for(name).unwrap_or_else(|| panic!("{name} is unmapped"));
         assert!(ops::ALL_INVENTORIED.contains(&op), "{name} -> {op:?} not inventoried");
+    }
+    let exact = [
+        ("merged_stack.parent_lookup", ops::PR_LIST_BY_HEAD),
+        ("merged_stack.comments", ops::COMMENT_LIST),
+        ("merged_stack.issue_labels", ops::ISSUE_VIEW_STATE),
+        ("merged_stack.retarget", ops::PR_EDIT_BASE),
+        ("merged_stack.comment", ops::COMMENT_CREATE),
+    ];
+    for (name, expected) in exact {
+        assert_eq!(gh_call::forge_op_for(name), Some(expected), "{name}");
     }
     for deliberate in ["claim.issue_state", "claim.issue_labels", "star.api"] {
         assert_eq!(gh_call::forge_op_for(deliberate), None, "{deliberate}");

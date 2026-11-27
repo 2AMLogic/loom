@@ -85,12 +85,9 @@
 //!
 //! # Command selection
 //!
-//! Mirrors [`super::closed_pr_branch::forge_probe`] and
-//! [`super::branch_landed::forge_probe`]: `loom-daemon forge` when one is on
-//! `PATH` (the Gitea passthrough), else `gh`. We *are* loom-daemon, and
-//! calling the in-process forge client would be the obvious shortcut — not
-//! taken, for the same reason those two record: which credential path a probe
-//! uses is observable forge behaviour, not an implementation detail.
+//! Uses the same transport as the merged and closed-PR probes. The daemon
+//! keeps its legacy command selection. Tools use the configured forge read
+//! route and preserve the four-way answer below.
 //!
 //! # Exit-code contract (the CLI wrapper, not this module)
 //!
@@ -104,7 +101,7 @@
 //! creates a genuinely NEW branch, so a hard dependency would strand that
 //! path on any host running a daemon that predates this slice.
 
-use crate::fs_util::is_on_path;
+use super::pr_list::{PrList, Read};
 use std::path::Path;
 use std::process::Command;
 
@@ -219,24 +216,20 @@ fn could_be_forge(url: &str) -> bool {
 /// `Err`.
 #[must_use]
 pub fn query(repo: &Path, branch: &str) -> Probe {
+    query_with(repo, branch, PrList::Legacy).expect("legacy reads do not resolve tools mode")
+}
+
+fn query_with(repo: &Path, branch: &str, pr_list: PrList) -> Result<Probe, String> {
     if branch.is_empty() {
-        return Probe::status_only(Status::Unavailable);
+        return Ok(Probe::status_only(Status::Unavailable));
     }
     if !has_forge_remote(repo) {
-        return Probe::status_only(Status::NoForgeRemote);
+        return Ok(Probe::status_only(Status::NoForgeRemote));
     }
-    let (program, leading): (&str, &[&str]) = if is_on_path("loom-daemon") {
-        ("loom-daemon", &["forge"])
-    } else if is_on_path("gh") {
-        ("gh", &[])
-    } else {
-        return Probe::status_only(Status::Unavailable);
-    };
-    let out = Command::new(program)
-        .args(leading)
-        .args([
-            "pr",
-            "list",
+    let read = pr_list.fetch(
+        repo,
+        repo,
+        &[
             "--state",
             "open",
             "--head",
@@ -245,16 +238,12 @@ pub fn query(repo: &Path, branch: &str) -> Probe {
             "number,isCrossRepository,headRepository,headRefName,url",
             "--limit",
             "5",
-        ])
-        .current_dir(repo)
-        .output();
-    let Ok(out) = out else {
-        return Probe::status_only(Status::Unavailable);
-    };
-    if !out.status.success() {
-        return Probe::status_only(classify_failure(&String::from_utf8_lossy(&out.stderr)));
-    }
-    parse_probe(&String::from_utf8_lossy(&out.stdout))
+        ],
+    )?;
+    Ok(match read {
+        Read::Answered(text) => parse_probe(&text),
+        Read::Unanswered(error) => Probe::status_only(classify_failure(&error)),
+    })
 }
 
 /// Classify a failed forge call's stderr. Mirrors the shell's two `grep -qi`
@@ -341,9 +330,13 @@ fn parse_probe(text: &str) -> Probe {
 
 /// Run the query and print the `TOKEN<TAB>text` record stream
 /// `lib/worktree-forge-pr-check.sh` replays into its `_WT_OPEN_PR_*` globals.
-/// Always exits 0 — see the module doc's exit-code contract.
+/// Exits 0 for probe results — see the module doc's exit-code contract.
 pub fn run(repo: &Path, branch: &str) -> i32 {
-    let probe = query(repo, branch);
+    run_with(repo, branch, PrList::Legacy).expect("legacy reads do not resolve tools mode")
+}
+
+pub(crate) fn run_with(repo: &Path, branch: &str, pr_list: PrList) -> Result<i32, String> {
+    let probe = query_with(repo, branch, pr_list)?;
     println!("STATUS\t{}", probe.status.as_str());
     if let Some(pr) = probe.pr {
         println!("NUMBER\t{}", pr.number);
@@ -352,7 +345,7 @@ pub fn run(repo: &Path, branch: &str) -> i32 {
         println!("HEAD_REF\t{}", pr.head_ref);
         println!("URL\t{}", pr.url);
     }
-    0
+    Ok(0)
 }
 
 #[cfg(test)]
