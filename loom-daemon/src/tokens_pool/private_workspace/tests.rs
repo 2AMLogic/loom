@@ -2810,3 +2810,127 @@ fn status_running_is_false_while_the_seat_is_restarting() {
     )));
     assert!(!lifecycle::reports_running(None));
 }
+
+#[test]
+fn save_writes_pretty_private_json_atomically_and_requires_existing_parent_dir() {
+    let td = tempfile::tempdir().unwrap();
+    let dir = td.path().join("seat");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt as _;
+        std::fs::DirBuilder::new().mode(0o700).create(&dir).unwrap();
+    }
+    #[cfg(not(unix))]
+    std::fs::create_dir(&dir).unwrap();
+
+    let make_config = |base: &str| Config {
+        schema_version: 2,
+        account: "seat".into(),
+        container: "c".into(),
+        engine: "e".into(),
+        docker_desktop: false,
+        repository: "https://forge.example/owner/repo".into(),
+        base: base.into(),
+        repositories: Vec::new(),
+        volume: "v".into(),
+        profile: PathBuf::from("/nonexistent"),
+        gh_config: None,
+        session_image: None,
+        extra_mounts: Vec::new(),
+        mirror_binds: Vec::new(),
+    };
+
+    let path = dir.join("workspace.json");
+    let first = make_config("main");
+    save(&path, &first).unwrap();
+    assert_eq!(load(&dir).unwrap(), first);
+    assert_eq!(std::fs::read(&path).unwrap(), serde_json::to_vec_pretty(&first).unwrap());
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        assert_eq!(
+            std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777,
+            0o700,
+            "0700 session directory mode must be preserved"
+        );
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600,
+            "saved state file must be owner-only (0600)"
+        );
+        // Loosen existing file mode to verify atomic replacement restores 0600.
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+    }
+
+    let second = make_config("next");
+    save(&path, &second).unwrap();
+    assert_eq!(load(&dir).unwrap(), second);
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600,
+            "overwritten state file must remain owner-only (0600)"
+        );
+    }
+
+    let entries: Vec<String> = std::fs::read_dir(&dir)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    assert!(
+        !entries
+            .iter()
+            .any(|name| crate::fs_util::is_staging_name(name)),
+        "staging residue left in state directory: {entries:?}"
+    );
+    assert_eq!(entries, vec!["workspace.json".to_string()]);
+
+    #[cfg(unix)]
+    {
+        // A host-level symlinked ancestor prefix (e.g. macOS `/var -> /private/var`)
+        // must still be accepted when the resolved parent directory exists.
+        use std::os::unix::fs::{DirBuilderExt as _, PermissionsExt as _};
+        let real_root = td.path().join("real");
+        let real_seat = real_root.join("seat");
+        std::fs::create_dir(&real_root).unwrap();
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&real_seat)
+            .unwrap();
+        let link_root = td.path().join("link");
+        std::os::unix::fs::symlink(&real_root, &link_root).unwrap();
+        let via_link = link_root.join("seat/workspace.json");
+        save(&via_link, &second).unwrap();
+        assert_eq!(load(&real_seat).unwrap(), second);
+        assert_eq!(
+            std::fs::metadata(real_seat.join("workspace.json"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+    }
+
+    // Missing parent directory must error without creating directories under ambient umask.
+    let missing_root = td.path().join("absent");
+    let missing_path = missing_root.join("nested/workspace.json");
+    assert!(save(&missing_path, &first).is_err());
+    assert!(!missing_root.exists(), "save must not create missing parent directories");
+
+    // Non-directory parent must error.
+    let regular_file = td.path().join("not-a-dir");
+    std::fs::write(&regular_file, b"file").unwrap();
+    assert!(save(&regular_file.join("workspace.json"), &first).is_err());
+
+    // Missing (`None`) or empty (`""`) parent must error without writing to cwd.
+    assert!(save(Path::new(""), &first).is_err());
+    let bare = Path::new("loom-test-bare-save-15611.json");
+    let bare_res = save(bare, &first);
+    let _ = std::fs::remove_file(bare);
+    assert!(bare_res.is_err(), "bare filename with empty parent must be rejected");
+}

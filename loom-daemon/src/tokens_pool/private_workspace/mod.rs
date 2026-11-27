@@ -538,11 +538,25 @@ fn load(dir: &Path) -> Result<Config> {
 }
 
 fn save<T: Serialize>(path: &Path, value: &T) -> Result<()> {
-    use std::io::Write;
-    let mut file = tempfile::NamedTempFile::new_in(path.parent().context("state parent")?)?;
-    file.write_all(&serde_json::to_vec_pretty(value)?)?;
-    file.as_file().sync_all()?;
-    file.persist(path).map_err(|error| error.error)?;
+    let parent = path
+        .parent()
+        .filter(|d| !d.as_os_str().is_empty())
+        .context("state parent")?;
+    let meta = std::fs::metadata(parent)
+        .with_context(|| format!("private workspace state directory {}", parent.display()))?;
+    anyhow::ensure!(
+        meta.is_dir(),
+        "private workspace state parent is not a directory: {}",
+        parent.display()
+    );
+    crate::fs_util::write_atomic(
+        path,
+        &serde_json::to_vec_pretty(value)?,
+        crate::fs_util::AtomicOpts {
+            private: true,
+            sync_dir: true,
+        },
+    )?;
     Ok(())
 }
 
