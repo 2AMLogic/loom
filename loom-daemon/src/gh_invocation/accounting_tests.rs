@@ -34,6 +34,8 @@ fn static_pool_follows_the_argv() {
         (&["api", "-i", "graphql", "-f", "query=q"], Pool::Graphql),
         (&["api", "rate_limit"], Pool::Other),
         (&["api", "search/issues?q=x"], Pool::Search),
+        (&["--hostname", "ghe.example.com", "api", "/graphql"], Pool::Graphql),
+        (&["-q", "api", "api", "search/issues"], Pool::Search),
         (&["pr", "view", "1", "--json", "files"], Pool::Graphql),
         (&["issue", "list", "--label", "x"], Pool::Graphql),
         (&["search", "issues", "x"], Pool::Search),
@@ -168,6 +170,18 @@ fn origin_uses_the_last_hostname_option() {
         ),
         (&["api", "user", "-f", "--hostname", "ghe.example.com"], "github.com"),
         (&["api", "user", "--", "--hostname", "ghe.example.com"], "github.com"),
+        (&["--hostname", "ghe.example.com", "api", "user"], "ghe.example.com"),
+        (
+            &[
+                "--hostname=first.example.com",
+                "api",
+                "--hostname",
+                "last.example.com",
+                "user",
+            ],
+            "last.example.com",
+        ),
+        (&["-H", "--hostname", "api", "user"], "github.com"),
     ] {
         let id = resolved_identity_with(&bare("api.rest", args), None, None);
         assert_eq!(id.origin.as_deref(), Some(origin), "{args:?}");

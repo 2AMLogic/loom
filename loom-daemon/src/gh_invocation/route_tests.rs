@@ -94,6 +94,24 @@ fn flag_values_are_never_read_as_the_endpoint() {
 }
 
 #[test]
+fn api_options_on_either_side_of_the_command_keep_their_order() {
+    let request = api_invocation(&["-XPOST", "--include", "api", "-XGET", "user"])
+        .expect("api command after options");
+    assert_eq!(request.method, "GET");
+    assert!(request.include);
+
+    for args in [
+        &["-q", "--include", "api", "user"][..],
+        &["-i", "api", "user", "--include=false"],
+        &["--silent", "api", "user", "--", "--include"],
+    ] {
+        let request = api_invocation(args).expect("api command after options");
+        assert_eq!(request.endpoint, Some("user"));
+        assert!(!request.include, "{args:?}");
+    }
+}
+
+#[test]
 fn the_method_follows_ghs_rule() {
     assert_eq!(method(&["api", "repos/a/b/issues"]), Some("GET"));
     assert_eq!(method(&["api", "-X", "patch", "repos/a/b/issues/1"]), Some("PATCH"));

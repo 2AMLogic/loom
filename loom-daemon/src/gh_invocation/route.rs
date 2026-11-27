@@ -42,7 +42,9 @@ pub const COMMAND_OTHER: &str = "other";
 
 #[path = "route_table.rs"]
 mod table;
-use table::{API_VALUE_FLAGS, GROUPS, LEAVES, METHODS, ROUTE_TABLE, VALUE_FLAGS, VERBS};
+use table::{
+    API_BOOL_FLAGS, API_VALUE_FLAGS, GROUPS, LEAVES, METHODS, ROUTE_TABLE, VALUE_FLAGS, VERBS,
+};
 
 /// What a span records about the endpoint (see the module docs).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -105,13 +107,11 @@ pub(super) fn split_with<'a>(
         } else {
             tok.get(..2).unwrap_or(tok)
         };
-        let mut value = None;
+        let mut value = tok.split_once('=').map(|(_, v)| v);
         if value_flags.contains(&name) {
-            if long && tok.contains('=') {
-                value = tok.split_once('=').map(|(_, v)| v);
-            } else if !long && tok.len() > 2 {
+            if !long && tok.len() > 2 {
                 value = tok.get(2..).map(|v| v.strip_prefix('=').unwrap_or(v));
-            } else if i < args.len() {
+            } else if value.is_none() && i < args.len() {
                 value = Some(args[i].as_ref());
                 i += 1;
             }
@@ -184,6 +184,7 @@ fn api_method(flags: &[Flag<'_>]) -> &'static str {
 pub(crate) struct ApiRequest<'a> {
     pub(super) endpoint: Option<&'a str>,
     pub(super) hostname: Option<&'a str>,
+    pub(super) include: bool,
     /// Reader credentials are for github.com. A missing host is ambiguous too.
     pub(super) has_foreign_hostname: bool,
     pub(crate) method: &'static str,
@@ -194,7 +195,33 @@ pub(crate) struct ApiRequest<'a> {
 /// Parse the same option forms as the facade's route and method telemetry.
 pub(crate) fn api_request(args: &[impl AsRef<str>]) -> ApiRequest<'_> {
     let (pos, flags) = split_with(args, API_VALUE_FLAGS);
-    let endpoint = pos.first().copied();
+    request_from_parts(pos.first().copied(), &flags)
+}
+
+/// Recognize `api` in a full gh argv. If options precede the command, they
+/// must belong to `gh api`: in `--repo api pr diff`, `api` is a flag value.
+pub(super) fn api_invocation(args: &[impl AsRef<str>]) -> Option<ApiRequest<'_>> {
+    let (first, rest) = args.split_first()?;
+    match first.as_ref() {
+        "api" => Some(api_request(rest)),
+        opt if opt.starts_with('-') => {
+            let (pos, flags) = split_with(args, API_VALUE_FLAGS);
+            let ["api", rest @ ..] = pos.as_slice() else {
+                return None;
+            };
+            if flags
+                .iter()
+                .any(|f| !API_VALUE_FLAGS.contains(&f.name) && !API_BOOL_FLAGS.contains(&f.name))
+            {
+                return None;
+            }
+            Some(request_from_parts(rest.first().copied(), &flags))
+        }
+        _ => None,
+    }
+}
+
+fn request_from_parts<'a>(endpoint: Option<&'a str>, flags: &[Flag<'a>]) -> ApiRequest<'a> {
     let mut hosts = flags.iter().filter(|f| f.name == "--hostname");
     let hostname = hosts.clone().next_back().and_then(|f| f.value);
     let has_foreign_hostname = hosts.any(|f| {
@@ -212,8 +239,14 @@ pub(crate) fn api_request(args: &[impl AsRef<str>]) -> ApiRequest<'_> {
     ApiRequest {
         endpoint,
         hostname,
+        include: flags
+            .iter()
+            .rfind(|f| matches!(f.name, "-i" | "--include"))
+            .is_some_and(|f| {
+                matches!(f.value, None | Some("1" | "t" | "T" | "TRUE" | "true" | "True"))
+            }),
         has_foreign_hostname,
-        method: api_method(&flags),
+        method: api_method(flags),
         graphql,
         query,
     }

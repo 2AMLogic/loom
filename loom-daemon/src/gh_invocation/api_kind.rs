@@ -63,8 +63,7 @@ const VALUE_FLAGS: &[&str] = &[
 /// Classify a `gh` argument vector (without the `gh` program itself).
 #[must_use]
 pub fn classify(args: &[String]) -> ApiKind {
-    if args.first().is_some_and(|cmd| cmd == "api") {
-        let request = super::route::api_request(&args[1..]);
+    if let Some(request) = super::route::api_invocation(args) {
         return if request.graphql {
             ApiKind::Graphql
         } else if request.endpoint.is_some() {
@@ -133,6 +132,17 @@ mod tests {
         // A flag value equal to "graphql" is not the endpoint.
         assert_eq!(kind(&["api", "-H", "graphql", "repos/acme/w"]), "rest");
         assert_eq!(kind(&["api"]), "unknown");
+    }
+
+    #[test]
+    fn api_options_may_precede_the_command() {
+        assert_eq!(kind(&["--method", "GET", "api", "rate_limit"]), "rest");
+        assert_eq!(kind(&["--hostname=github.com", "api", "graphql"]), "graphql");
+        assert_eq!(kind(&["-H", "api", "api", "-q", "graphql", "/graphql"]), "graphql");
+        assert_eq!(kind(&["--jq", "api", "pr", "list"]), "graphql");
+        assert_eq!(kind(&["--repo", "api", "pr", "diff"]), "mixed");
+        assert_eq!(kind(&["--dir", "api", "release", "download", "v1"]), "mixed");
+        assert_eq!(kind(&["--hostname=github.com", "api"]), "unknown");
     }
 
     /// Regression (#10344 review): these were labelled `graphql`.

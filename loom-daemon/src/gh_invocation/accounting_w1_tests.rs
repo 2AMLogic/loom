@@ -378,7 +378,7 @@ fn a_rate_limit_probe_through_the_facade_is_never_charged() {
     let sink = tempfile::tempdir().unwrap();
     crate::forge_call_stats::set_test_sink_dir(Some(sink.path().to_path_buf()));
     let _ = inv("api.rate_limit", &["api", "--include", "rate_limit"], &rl).run();
-    let _ = inv("api.rate_limit", &["api", "--include", "/rate_limit"], &rl).run();
+    let _ = inv("api.rate_limit", &["--include", "api", "/rate_limit"], &rl).run();
     let _ = inv("issue.get", &["api", "--include", "repos/o/r/issues/1"], &real).run();
     crate::forge_call_stats::set_test_sink_dir(None);
 

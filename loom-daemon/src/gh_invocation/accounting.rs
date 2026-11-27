@@ -52,6 +52,7 @@
 //! guarantees that.
 
 use super::billing::{self, Billing};
+use super::route::{api_invocation, ApiRequest};
 use super::telemetry::Outcome as InvokeOutcome;
 use super::GhInvocation;
 use crate::forge_call_stats::{self, CallIdentity, Outcome, Pool};
@@ -72,8 +73,13 @@ pub use attribution::{
 /// or the free `rate_limit` endpoint; `gh search …` spends the search pool.
 #[must_use]
 pub fn static_pool(args: &[OsString]) -> Pool {
-    if let Some(rest) = api_args(args) {
-        return api_pool(&rest);
+    let words = argv_words(args);
+    pool_for(args, api_invocation(&words).as_ref())
+}
+
+fn pool_for(args: &[OsString], request: Option<&ApiRequest<'_>>) -> Pool {
+    if let Some(request) = request {
+        return api_pool(request);
     }
     match args.first().and_then(|a| a.to_str()) {
         Some("issue" | "pr" | "repo" | "project") => Pool::Graphql,
@@ -85,14 +91,11 @@ pub fn static_pool(args: &[OsString]) -> Pool {
     }
 }
 
-/// The arguments after `gh api`, in the string form the shared parser takes.
-fn api_args(args: &[OsString]) -> Option<Vec<Cow<'_, str>>> {
-    let (cmd, rest) = args.split_first()?;
-    (cmd == "api").then(|| rest.iter().map(|arg| arg.to_string_lossy()).collect())
+fn argv_words(args: &[OsString]) -> Vec<Cow<'_, str>> {
+    args.iter().map(|arg| arg.to_string_lossy()).collect()
 }
 
-fn api_pool(rest: &[impl AsRef<str>]) -> Pool {
-    let request = super::route::api_request(rest);
+fn api_pool(request: &ApiRequest<'_>) -> Pool {
     let Some(path) = request.endpoint.map(|p| p.trim_start_matches('/')) else {
         return Pool::Other;
     };
@@ -107,23 +110,17 @@ fn api_pool(rest: &[impl AsRef<str>]) -> Pool {
     }
 }
 
-/// The REST path of a `gh api` argv (`args[0] == "api"`), leading `/`
-/// dropped; `None` for any other command.
+/// The REST path of a `gh api` argv, leading `/` dropped.
 #[must_use]
 pub(crate) fn api_endpoint(args: &[OsString]) -> Option<String> {
-    super::route::api_request(&api_args(args)?)
+    api_invocation(&argv_words(args))?
         .endpoint
         .map(|p| p.trim_start_matches('/').to_owned())
 }
 
-/// Whether the invocation asked `gh api` to print the response headers.
-fn wants_headers(args: &[OsString]) -> bool {
-    args.first().is_some_and(|a| a == "api") && args.iter().any(|a| a == "-i" || a == "--include")
-}
-
 /// The value of `--hostname` in a `gh api` argv, if any.
 fn hostname_arg(args: &[OsString]) -> Option<String> {
-    super::route::api_request(&api_args(args)?)
+    api_invocation(&argv_words(args))?
         .hostname
         .map(str::to_owned)
 }
@@ -202,11 +199,6 @@ fn resolve_with(
     (id.with_role(super::reader_route::role_of(inv).as_str()), ro)
 }
 
-/// Whether the argv is the free `gh api rate_limit` endpoint.
-fn is_rate_limit_probe(args: &[OsString]) -> bool {
-    args.first().is_some_and(|a| a == "api") && static_pool(args) == Pool::Other
-}
-
 /// Whether a read was sent on the writer credential without saying so
 /// (#12394): a read the router never moved onto a reader, that no caller
 /// pinned with `GhInvocation::writer_identity` and that no caller gave a
@@ -259,11 +251,13 @@ pub(super) fn record(
     let caller = inv.operation.as_str();
     let (identity, ro) =
         resolve_with(inv, std::env::var("GH_HOST").ok(), std::env::var("LOOM_REPO").ok());
-    let static_p = static_pool(&inv.args);
+    let words = argv_words(&inv.args);
+    let api = api_invocation(&words);
+    let static_p = pool_for(&inv.args, api.as_ref());
     let stderr = captured.map(|(_, e)| String::from_utf8_lossy(e).into_owned());
     let stderr = stderr.as_deref().unwrap_or_default();
-    let include = wants_headers(&inv.args);
-    let probe = is_rate_limit_probe(&inv.args);
+    let include = api.as_ref().is_some_and(|r| r.include);
+    let probe = api.is_some() && static_p == Pool::Other;
 
     // `gh api --include`: the status line and the free `x-ratelimit-*`
     // headers are on stdout — the most precise classification available
