@@ -18,6 +18,15 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 ### 2026-11-27
 
+- **PR #15571**: refactor: dedupe re-entrant env locks into env_test_support
+- **PR #15567**: fix: treat a resynced .loom/pricing.json as ignorable gate dirt
+- **PR #15563**: fix: stream duplicate-scan candidates and report incomplete pools
+- **PR #15535**: docs: record the live agy verification of the pinned read-only policy on 1.5.18
+- **PR #15550**: Remove retired Safehouse completion usage readers
+- **Issue #15544** (closed): Consolidate triplicated re-entrant env-var locks in tokens_pool/*_env.rs onto env_test_support (~350 LOC)
+- **Issue #15554** (closed): main_health_gate: a modified .loom/pricing.json is non-ignorable dirt (no INSTALLED_SURFACE_PREFIXES entry for the single-file rate card)
+- **Issue #15561** (closed): check-duplicate reports ordinary matches after a full temporary filesystem drops the merged-PR pool
+- **Issue #15522** (closed): Remove orphaned Safehouse completion-envelope token and runtime readers (~950 LOC)
 - **PR #15565**: test: scope IPC daemon-status env overrides with EnvGuard
 - **PR #15562**: docs: replace the step usage fallback with per-runtime cases
 - **PR #15555**: fix: treat .loom/signals/ as Loom-owned so quarantine never stashes a stop request
