@@ -1402,14 +1402,7 @@ pub(super) fn parse_pr_resweep_state(
 /// comment is recognised exactly as before, whichever spelling the fleet
 /// matcher is given.
 ///
-/// # Errors
-/// The body is not a comment array.
-pub fn parse_comments(body: &str) -> Result<Vec<extract::Comment>> {
-    parse_comments_with(body, None)
-}
-
-/// [`parse_comments`], also stamping each comment's `trusted` flag from
-/// `policy` (#13889). Without a policy nothing is trusted.
+/// A comment is marked `trusted` only when `policy` trusts its author (#13889).
 ///
 /// # Errors
 /// The body is not a comment array.

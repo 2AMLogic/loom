@@ -236,6 +236,69 @@ pub fn resolve(root: &std::path::Path, selection: &Selection) -> Result<Resolved
     })
 }
 
+/// Resolve the mandatory pooled credential a tier-3 pilot runtime launches
+/// on (#14945, the Antigravity `agy` adapter). Deliberately NOT the native
+/// ladder above: the pilot's spend control is the selected account's
+/// `maxConcurrent` cap, shared with OpenCode through the same pool
+/// namespace, so there is no environment escape at all —
+///
+/// * a pool with no accounts registered refuses (78) with the
+///   `api-keys add` remediation, **even when an ambient `GEMINI_API_KEY` (or
+///   a cached CLI login, which the adapter's isolated HOME already keeps
+///   away from the child) exists**;
+/// * an unreadable, all-disabled, exhausted or at-cap pool refuses the same
+///   way — the selection ladder's own fail-closed tiers;
+/// * a healthy pool's key is the ONLY value that reaches the child, under
+///   the declaration's own variable name; the caller replaces whatever the
+///   launching environment carried.
+///
+/// The in-flight lease is registered against THIS process by
+/// [`api_keys_pool::select_api_key_for`] and dropped, not released:
+/// `worker_spawn::run` `exec`s the runner immediately after, so this PID
+/// becomes the run the lease names and the cap frees when the CLI exits —
+/// never when a short-lived helper would have.
+pub(super) fn resolve_tier3(
+    root: &std::path::Path,
+    runtime: &str,
+    declaration: &crate::runtime_launch::PooledTier3,
+    model: Option<&str>,
+) -> Result<api_keys_pool::select::SelectedApiKey, LaunchError> {
+    let provider = declaration.provider.as_str();
+    let env_var = declaration.env_var.as_str();
+    let refuse = |detail: String| {
+        LaunchError::config(format!(
+            "runtime {runtime} requires a usable account from the {provider} API-key pool \
+             (manifest credentialPool, #14945); an ambient {env_var} cannot substitute for \
+             it.\n{detail}"
+        ))
+    };
+    // A pool directory that does not exist is NOT the native ladder's "this
+    // host never opted in, harness keeps its own auth store" case: the
+    // declaration made the pool mandatory, so missing is a provisioning gap
+    // the remediation names.
+    match api_keys_pool::is_pooled(root, provider) {
+        Ok(true) => {}
+        Ok(false) => {
+            return Err(refuse(format!(
+                "no {provider} API-key pool is registered on this host. Register one with \
+                 `loom-daemon api-keys add {provider} <account> --key-file <path>`."
+            )));
+        }
+        Err(error) => {
+            return Err(refuse(format!("the {provider} API-key pool could not be read: {error}")));
+        }
+    }
+    let mut selected =
+        api_keys_pool::select_api_key_for(root, provider, Some(env_var), model, None)
+            .map_err(|error| refuse(error.to_string()))?;
+    // The lease is reaped when this PID — which becomes the CLI — dies (see
+    // the module's `resolve` for the identical contract); clearing it to
+    // `None` keeps the account facts alive for the caller the way `resolve`'s
+    // `drop` keeps its `Resolved`.
+    selected.lease = None;
+    Ok(selected)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

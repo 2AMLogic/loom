@@ -904,11 +904,50 @@ the explicit repository before projecting points. `notify-cleared-blockers`
 checks the scan's repository and sends each eligible label edit and comment
 to the discovered dependent. These GitHub handlers decline Gitea with exit 3.
 
-Fleet diagnostics and previews require a usable fleet reader. Fleet mutations
-remain pending on #14465. The scoped broker grants the fleet role issue creation
-and commit-status posting. Its label policy also excludes the curation and
-unpark transitions. Until a scoped operation is available, the tools entry
-point refuses these writes before contacting GitHub.
+**Fleet routing (the operator's `scoped` ruling of 2026-11-23, 2am#8390 /
+2am#8397).** In fleet mode the writes do not run on an ambient `gh`
+credential — the fleet writer Apps hold no label or conversation scope.
+`curation-complete` routes its label projection to the broker's
+`POST /v1/complete_curation` (`{repo, number, points, idempotency_key}`;
+points are resolved locally from trusted sources first, so an invalid
+estimate is refused before the broker is contacted), and
+`notify-cleared-blockers` sends `POST /v1/notify_cleared_blocker`
+(`{repo, number, closed, idempotency_key}`) once per (dependent, cited
+closed blocker) — a resweep sends the cited numbers the evidence shows
+resolved. The reads and discovery stay on the fleet reader. There is no
+write-scope probe on this route: it would consult the reader for a
+credential that never carries the write. The broker verifies the caller
+(`fleet-roles` profile), the repository (`curation-policy.json`) and the
+target server-side before its first mutation, performs the eligible issue's
+`loom:blocked` → `loom:curated` transition itself (label edit first; a
+failed edit posts no comment), and deduplicates the marker comment by
+loom's own `<!-- loom:blocker-cleared:#N -->` marker — so a comment posted
+locally and one posted through the broker suppress each other, under any
+idempotency key. Loom's idempotency keys are stable per projection: one
+hash per `(repo, issue, points)` and per `(repo, dependent, closed)`, so a
+retry replays (or finishes a partial cleanup) instead of double-posting.
+
+Fail closed, no fallback: a missing caller key, an unreachable broker, or
+a refusal fails `curation-complete` and is reported per dependent by
+`notify-cleared-blockers` (whose best-effort exit-0 contract is unchanged);
+nothing ever retries as a local `gh` write. Provisioning uses the names the
+merge-queue status poster already uses (#12679): `GITHUB_WRITE_BROKER_URL`
+(default `https://bot-issues.2amlogic.com`) and the `fleet-roles` key by
+`FLEET_ROLES_GITHUB_WRITE_KEY` or its 0600 key file
+(`FLEET_ROLES_GITHUB_WRITE_KEY_FILE`, default
+`~/.config/2am/github-write-fleet-roles.key`); the key travels only in the
+`Authorization` header. The key resolves before any forge read, so its
+absence is the actionable error.
+
+Documented divergences from the local writer, all forced by the scoped op
+contract: the broker's comment carries the shared opening line and Unparked
+wording but not loom's per-reason bullets; the broker's transition gate
+(`loom:blocked` and none of `loom:operator`/`loom:frozen`/`external`) is
+looser than loom's `unpark_eligible`, so a fleet notification may unpark an
+issue a local run would leave held; and one comment lands per closed
+blocker rather than one comment carrying several markers. Everything else —
+`loom-tools`-only mode resolution, the four read-only hold verbs, the
+dry-run preview — is unchanged.
 
 ## 14. Phase 3b: park records and operator decisions (#14464)
 

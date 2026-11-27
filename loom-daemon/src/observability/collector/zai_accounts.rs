@@ -29,7 +29,10 @@ fn zai_seats_with(
     use crate::api_keys_pool::{paths, select, Ineligible};
     let provider = zai::ZAI_PROVIDER;
     let roots = paths::pool_roots(workspace_root);
-    let Ok(accounts) = select::list_accounts_in(&roots, Some(provider)) else {
+    // Limits as selection would enforce them (#14932): this read decides
+    // which seats are pollable, so it must see the same eligibility.
+    let configured = crate::api_keys_pool::limits::ConfiguredLimits::from_workspace(workspace_root);
+    let Ok(accounts) = select::list_accounts_in(&roots, Some(provider), &configured) else {
         return Vec::new();
     };
     let Ok(provider_root) = paths::resolve_provider_root_in(&roots, provider) else {

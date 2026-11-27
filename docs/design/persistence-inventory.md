@@ -23,10 +23,49 @@ operator's explicit approval of its diff before it lands (epic #9908).
 This is a repo-local design doc under `docs/design/`. It is never installed
 into consumer repos.
 
-**Source SHA.** Every citation is `path:line` against
+**Source SHA.** Unless otherwise dated, citations are `path:line` against
 `febfc4335d0554865fadbecba718245cd88c6678` (`febfc4335`, `main`,
 2026-10-10). Paths without a prefix are under `loom-daemon/src/`. Paths under
 `defaults/`, `mcp-loom/`, `loom-api/` and `docs/` are written in full.
+
+**Writer recount (2026-11-25, `main` at `dd56506cc`).** The stores in §13’s
+“Before” column have **22 distinct write/recovery implementations**. Each table
+row below counts once. Stores that delegate persistence to the same writer share
+a row. Independently maintained writers count separately, even when they perform
+the same filesystem operations. A writer’s rotation, replay or cleanup is part
+of that implementation. Of the 11 JSON writers migrated by #15336, the sweep
+journal and the PR-less sidecar writer appear in this recount. The citations
+below and in E1, E9 and T11 use this revision.
+
+| Inventory rows | What the writer does | Source at `dd56506cc` |
+| --- | --- | --- |
+| E1, E9 (both sidecars), C6, C7, H1 | All use `fs_util::write_atomic`. C6 and C7 go through the fleet-store wrapper. H1 performs its own best-effort directory sync after the shared write. | `sweep_journal.rs:156`, `sweep_registry/prless_retry/durable.rs:142`, `fleet_store/pending_restart.rs:83`, `fleet_sync.rs:926`, `fleet_store/fetch.rs:441`, `auto_update/persisted_state.rs:216-225` |
+| E2 | Acquires the lock directory and writes the owner JSON directly. | `sweep_registry/locks.rs:337-351` |
+| E3 | Stages the checkpoint in a named temporary file, syncs it, replaces the target and syncs the directory. | `cli/sweep_checkpoint.rs:278-291` |
+| E4, E5, E10 | The worktree checkpoint, claim record and recovery-event array all use `script_helpers::write_json_file`. | `script_helpers/checkpoints.rs:230`, `script_helpers/claim.rs:185`, `script_helpers/validate_phase.rs:369`, `script_helpers/mod.rs:178-197` |
+| E6 | The claim IPC handler still inserts into SQLite’s `issue_claims` table. | `ipc.rs:2717`, `activity/claims.rs:45` |
+| E7 (registry) | Replaces each run’s JSON entry on registration and heartbeat. | `defaults/scripts/sweep-run-registry.sh:445`, `defaults/scripts/sweep-run-registry.sh:480` |
+| E7 (main-clean baseline) | A separate script snapshots working-tree status to the run’s text file. | `defaults/scripts/check-main-clean.sh:612` |
+| E8 | Rotates the outcome log to a single backup, then appends the record. | `sweep_outcomes.rs:327-335`, `sweep_outcomes.rs:357` |
+| E11 | The wrapper overwrites retry JSON and removes it on exit. | `defaults/scripts/claude-wrapper.sh:317-333` |
+| E12 | The wrapper writes the numeric exit code to its own sidecar. | `defaults/scripts/claude-wrapper.sh:203` |
+| T1, T2 | Both call `append_telemetry_envelope`, which checks age and size before appending. Each caller supplies its size limit. | `sweep_outcomes.rs:435`, `sweep_outcomes.rs:455-462`, `sweep_outcomes.rs:476-490`, `sweep_outcomes.rs:625` |
+| T3 | Appends a rework event and prunes oversized logs by rewriting the newest lines. | `rework_events.rs:206-215`, `rework_events.rs:226-245` |
+| T4 (log and seen set) | One operation creates the event’s deduplication marker, appends the log and removes the marker if the append fails. | `forge_merge_queue/events.rs:162-184` |
+| T5 (guide) | The guide script appends its telemetry line. | `defaults/scripts/guide-docs-telemetry.sh:209` |
+| T5 (merge admission) | The merge-admission script has its own append. | `defaults/scripts/merge-admission-telemetry.sh:231` |
+| T6 | Appends one model-statistics record to the experiment log. | `script_helpers/sweep_experiment.rs:320-341` |
+| T7 | Repairs the CI journal’s torn tail on open and rotates according to the export cursor. | `ci_telemetry/journal.rs:47-49`, `ci_telemetry/export.rs:515-546` |
+| T8 | Commits units to the durable ledger, replays missing envelopes and compacts the ledger. | `ci_telemetry/ledger.rs:720`, `ci_telemetry/poll.rs:628-636`, `ci_telemetry/ledger.rs:965` |
+| T9 (export cursor only) | Stages the cursor, syncs the file, renames it and syncs the directory. | `ci_telemetry/export.rs:124-140` |
+| T10 | The queue appends on enqueue and rewrites the live entries on acknowledgement or compaction. | `observability/queue.rs:295-320`, `observability/queue.rs:472-488` |
+| T11 | Replaces the backfill cursor using a PID-suffixed temporary file. | `observability/backfill.rs:155-163` |
+| H2 | Writes the artifact-roll record directly and falls back to its in-memory guard on write failure. | `auto_update.rs:703-720` |
+
+Two execution stores in §13 have retired writers and contribute zero. E13’s
+spawn-loop writer was removed in v0.11.0 (`worktree_ops/liveness.rs:62-63`).
+E14’s daemon-state file retired with the daemon-brain state (`init/post_init.rs:92-95`).
+C8 was a proposed snapshot and had no store in the “Before” column.
 
 **Contents**
 
@@ -48,7 +87,7 @@ into consumer repos.
 
 ## 1. Coverage method and search receipts
 
-Every search ran from the repository root at the SHA above. Counts are the
+Every search ran from the repository root at `febfc4335`. Counts are the
 exact output at that SHA.
 
 | # | Command | Result |
@@ -124,7 +163,7 @@ The disposition column uses five values:
 
 | ID | Store | Path / format | Writer | Readers | Authority today | Schema / version | Recovery behaviour | Disposition |
 |----|-------|---------------|--------|---------|-----------------|------------------|--------------------|-------------|
-| E1 | Sweep liveness journal | `~/.loom/sweeps.json` (`LOOM_SWEEPS_JOURNAL_PATH`), JSON `{version, entries[{repo,issue,pid,started_at}]}`; machine-level (`sweep_journal.rs:104`) | `sweep_journal::record_sweep` (`sweep_journal.rs:243`) from dispatch; removal on reap | `live_claim.rs:481`, `claim_reconciliation.rs:2325`, `claim_reconciliation/pass_loop/building_heal.rs:55`, `startup_adoption.rs:113`, `worktree_ops/orphan_recovery.rs:215`, `sweep_registry/locks.rs:1214`, `cli/status.rs:574` | Authoritative for host-level liveness across daemon restarts and across instances | `version` = `JOURNAL_VERSION` 1 (`sweep_journal.rs:62`); missing version defaults to 1 | Missing, empty or corrupt file reads as an empty journal (`sweep_journal.rs:122`). Writes go to `json.tmp.<pid>` then rename (`sweep_journal.rs:153`), with no fsync. Dead PIDs are pruned on every read and write. | **PROJECTION → DELETE**: rebuilt from J1 `claim.*`/`sweep.terminal` (§10) |
+| E1 | Sweep liveness journal | `~/.loom/sweeps.json` (`LOOM_SWEEPS_JOURNAL_PATH`), JSON `{version, entries[{repo,issue,pid,started_at}]}`; machine-level (`sweep_journal.rs:104`) | Dispatch calls `sweep_journal::record_sweep_at` (`sweep_registry/dispatch.rs:1608`), and reap calls `remove_sweep_at` (`sweep_registry/outcome_journal.rs:121`) | `live_claim.rs:483`, `claim_reconciliation.rs:2291`, `claim_reconciliation/pass_loop/building_heal.rs:68`, `startup_adoption.rs:137`, `worktree_ops/orphan_recovery.rs:187`, `sweep_registry/locks.rs:1177`, `cli/status.rs:561` | Authoritative for host-level liveness across daemon restarts and across instances | `version` = `JOURNAL_VERSION` 1 (`sweep_journal.rs:62`); missing version defaults to 1 | Missing, empty or corrupt file reads as an empty journal (`sweep_journal.rs:122`). `save` calls `fs_util::write_atomic` (`sweep_journal.rs:156`). The helper writes a unique sibling `.tmpXXXXXX`, calls `sync_all` on the file, renames it into place and attempts to sync the parent directory. A write, file-sync or rename error drops the temporary file (`fs_util.rs:62-79`). Upsert and startup adoption prune dead PIDs (`sweep_journal.rs:187`, `startup_adoption.rs:138`). | **PROJECTION → DELETE**: rebuilt from J1 `claim.*`/`sweep.terminal` (§10) |
 | E2 | Claim-lock owner record | `<ws>/.loom/locks/issue-<N>/owner.json` and `pr-<N>`; JSON `LockOwner` (`sweep_registry/locks.rs:158`). The directory is the mutex. | `acquire_lock` (`sweep_registry/locks.rs:348`) writes at `:368`; also `:510` (PR) and `:791` (mid-build). `record_child_pid_in_lock` (`:408`) | `reconstruct` (`sweep_registry/locks.rs:883`), `live_claim.rs:264`, `worktree_ops/liveness.rs:148`, `disk_footprint.rs:411` | Authoritative for "which sweep owns this lock". This is the only place `pgid`, `model`, `scope_unit` and `resume_handle` survive a restart (`sweep_registry/resume_handle.rs:15-20`). | Unversioned. Additive `Option` + `serde(default)` fields (`sweep_registry/locks.rs:170-181`). | Plain `fs::write`: **not atomic**, so a torn write leaves unparseable JSON. Readers treat it as no owner. | Lock directory stays (it is a mutex, not data). `owner.json` becomes a **PROJECTION** of J1 `claim.*`. **FIX**: atomic write. |
 | E3 | Sweep phase checkpoint | `<root>/.loom/sweep-checkpoint/issue-<N>.json`, JSON (phase, attempt, model, pr_number, task_id, jev) | `loom-daemon sweep-checkpoint write` (`cli/sweep_checkpoint.rs:69`, persist `:295`), invoked by `defaults/scripts/sweep-checkpoint.sh` from the sweep prompts | Reaper progress check (`sweep_registry/mod.rs:352`), `claim_reconciliation.rs:1730`, `jev_tier.rs:539`, `sweep_registry/outcome_journal.rs:128`, `tokens_pool/private_workspace/export.rs:220`, `activity/session_context.rs:220`, `worktree_ops/clean.rs:2574`, and the role prompts through the CLI `read/phase` | Authoritative for sweep resume (`/loom:sweep N` restarts from the last completed phase) | Unversioned. 64 KiB cap. | NamedTempFile, fsync, persist, then a directory fsync (`cli/sweep_checkpoint.rs:295-310`). Oversize or unparseable records are errors to the CLI caller. | **J1** `checkpoint.completed`. File becomes a **PROJECTION**, then **DELETE** once the CLI `read/phase` answers from J1. |
 | E4 | Builder worktree checkpoint | `<worktree>/.loom-checkpoint` (`script_helpers/checkpoints.rs:38`) | `script_helpers/checkpoints.rs:230` through `write_json_file` (`script_helpers/mod.rs:201`) | `checkpoint.sh` / `loom-checkpoint` in the same worktree | Worktree-scoped builder progress. Dies with the worktree. | Stage enum; unversioned | Absent or invalid → `None` (`script_helpers/checkpoints.rs:175-177`) | **RETAIN**: scratch tied to the worktree's lifetime, not shared state |
@@ -132,7 +171,7 @@ The disposition column uses five values:
 | E6 | `issue_claims` SQLite table | `~/.loom/activity.db`, table at `activity/schema.rs:325` | IPC `Request::ClaimIssue` (`types.rs:80`, handled `ipc.rs:2625`) | `activity/claims.rs` only | A fourth claim registry. `rg ClaimIssue` finds **no in-repo client** in `mcp-loom/`, `defaults/` or the CLI. | `CREATE TABLE IF NOT EXISTS`; no user_version | SQLite's own | **DELETE** (Phase 4a): unused endpoint and table |
 | E7 | Sweep-run registry | `<root>/.loom/sweep-run/` entries; `main-clean-baseline-<RUN>.txt` beside the checkpoints (`defaults/scripts/sweep-run-registry.sh:3`) | `sweep-run-registry.sh new/cleanup` | `sweep-run-registry.sh peers` (non-blocking peer warning) | Advisory, in-session `/loom:sweep` identity | Shell format | Dead PIDs pruned on `peers` | **RETAIN** for now. Candidate J1 `sweep_run.registered` (Q8). |
 | E8 | Terminal outcome journal | `<ws>/.loom/logs/sweep-outcomes.jsonl` (`sweep_outcomes.rs:131`), JSONL `OutcomeRecord` | `sweep_outcomes::append_outcome` (`sweep_outcomes.rs:329`) ← `sweep_registry/outcome_journal.rs:249` | `sweep_outcome_summary.rs:341`, `observability/overhead.rs:196` | Authoritative "how did this sweep die" history | Unversioned record | Append without fsync. Rotates to one `.1` file at 5 MiB or 30 days (`sweep_outcomes.rs:135`, `:140`). Unparseable lines are skipped by `read_all` (`sweep_outcomes.rs:393`). | **J1** `sweep.terminal` → **DELETE** |
-| E9 | PR-less tally sidecars | `<outcome-telemetry-journal>.prless-clears.json` and `.prless-counted.json` (`sweep_registry/prless_retry/durable.rs:104-124`) | `sweep_registry/prless_retry/durable.rs:146-147` (tmp then rename) | Same module: a floor recomputed from the `sweep.outcome` journal | A projection over E8/T1 plus clear marks | Unversioned map | Missing or unreadable → empty, so the floor falls back to the time window | **J1** `prless.counted`/`prless.cleared` → **DELETE** |
+| E9 | PR-less tally sidecars | `<outcome-telemetry-journal>.prless-clears.json` and `.prless-counted.json` (`sweep_registry/prless_retry/durable.rs:104-124`) | `write_marks` calls `fs_util::write_atomic` for both sidecars (`sweep_registry/prless_retry/durable.rs:142`) | Same module: a floor recomputed from the `sweep.outcome` journal | A projection over E8/T1 plus clear marks | Unversioned map | Missing or unreadable → empty, so the floor falls back to the time window | **J1** `prless.counted`/`prless.cleared` → **DELETE** |
 | E10 | Recovery events | `<root>/.loom/metrics/recovery-events.json`, bounded JSON array | `script_helpers/validate_phase.rs:311-355` | Operator / `validate_phase` | Write-mostly audit | Unversioned | Corrupt → reset to an empty array | **J1** `recovery.event` → **DELETE** |
 | E11 | Wrapper retry state | `<ws>/.loom/retry-state/<TERMINAL_ID>.json` (`defaults/scripts/claude-wrapper.sh:179`) | `claude-wrapper.sh` | **None found**. Its consumers, `agent-wait-bg.sh` and the shepherd, are retired. | Write-only | — | — | **DELETE** (Phase 4a) |
 | E12 | Wrapper exit-code sidecar | `<ws>/.loom/exit-codes/<TERMINAL_ID>.exit` (`defaults/scripts/claude-wrapper.sh:191`) | `claude-wrapper.sh` | **None found**. Only `.gitignore` and the main-clean allowlist reference it. | Write-only | — | — | **DELETE** (Phase 4a) |
@@ -160,7 +199,7 @@ prove a claim *dead on this host* (`worktree_ops/orphan_recovery.rs:15-18`).
 | T8 | CI dedupe ledger | `<root>/.loom/state/ci-telemetry/seen.jsonl` (`ci_telemetry/poll.rs:420`) | `ci_telemetry/ledger.rs:382` | The poller | **Commit point**: a unit's fsynced ledger line, including its full envelopes, comes before the journal write | Six line types | Replays only what the journal lacks. Compaction at `ci_telemetry/ledger.rs:763`. | **PROJECTION** (keys and watermarks only; Q4) |
 | T9 | CI poller bookkeeping | `<root>/.loom/state/ci-telemetry/{status.json, discovery-cache.json, poll.lock, export-cursor.json}` (`ci_telemetry/state.rs:146`, `:327`, `:351`; `ci_telemetry/export.rs:46`) | `ci_telemetry/state.rs:158` (temp, fsync, rename) | `ci-telemetry status`, `health` | Status, cache, lock, cursor | Unversioned | Load falls back to the default | `status`/`discovery-cache`/`poll.lock`: **RETAIN**. `export-cursor`: merges into the J2 per-exporter cursor. |
 | T10 | Observability export queue | `<ws>/.loom/logs/observability-queue.jsonl` and `observability-queue.<exporter>.jsonl` (`observability/queue.rs:43`, `:58`) | `DurableQueue`. The **whole file is rewritten** on every push or ack (`observability/queue.rs:334-335`, no fsync). | `observability/sender.rs` | A full **copy** of envelopes already held in T1/T2/T7 | Envelope | Replayed at open. Bounded drop-oldest. | **PROJECTION → DELETE**: the export reads J2 from a cursor |
-| T11 | Backfill cursor | `<ws>/.loom/logs/observability-backfill-state.json` (`observability/backfill.rs:92`, `:98`) | `observability/backfill.rs:156` (tmp then rename) | Backfill pass | Cursor over T1 by `emitted_at` timestamp (`observability/backfill.rs:115`) | Unversioned | Corrupt → reprocess everything (the backend is idempotent) | Merges into the J2 per-exporter byte cursor |
+| T11 | Backfill cursor | `<ws>/.loom/logs/observability-backfill-state.json` (`observability/backfill.rs:92`, `:98`) | `save_state` writes `json.tmp-<pid>` and renames it without a file or directory sync (`observability/backfill.rs:155-163`) | Backfill pass | Cursor over T1 by `emitted_at` timestamp (`observability/backfill.rs:117`) | Unversioned | Corrupt → reprocess everything (the backend is idempotent) | Merges into the J2 per-exporter byte cursor |
 | T12 | Forge call stats sink | `<host tmp>/loom-forge-call-stats/calls-<hour>.jsonl` (`forge_call_stats.rs:804`, `forge_call_stats_sink.rs:11`) | `forge_call_stats_sink.rs:23` | `forge_call_stats_ingest.rs` | Per-host and owner-only by design | Row schema | Pruned after `RETAIN_HOURS` (`forge_call_stats.rs:93`) | **RETAIN** (Q3: high volume, deliberately in host tmp) |
 | T13 | `gh` invocation failures | `<host tmp>/loom-gh-invocations/failures-<hour>.jsonl` (`gh_invocation/telemetry.rs:526`, `:549`) | `gh_invocation/telemetry.rs:561` | Ingest | Per-host | Row | Hourly files | **RETAIN** (with T12) |
 | T14 | Pick journal | `<host tmp>/loom-pick-journal/<role>-<n>.jsonl` (`observability/pick_journal.rs:103`) | `observability/pick_journal.rs:237` | Ingest | Per-tick diagnostics | Row | Tmp | **RETAIN** |

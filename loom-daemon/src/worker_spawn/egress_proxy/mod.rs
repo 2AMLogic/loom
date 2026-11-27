@@ -59,6 +59,9 @@
 //! `loom-daemon worker proxy-rotate`, [`rotate_client`]). The native path
 //! installs nothing, and every rotation request there is refused.
 
+#[cfg(test)]
+#[path = "contained_tests.rs"]
+mod contained_tests;
 pub mod exec;
 #[cfg(test)]
 #[path = "native_tests.rs"]
@@ -244,6 +247,32 @@ impl Prepared {
         &self.base_url
     }
 
+    /// The worker argv for the contained re-exec of this launch: `args`
+    /// unchanged, plus the required `--egress-proxy-base-url <url>` handoff
+    /// (#15527) exactly when the in-container copy has to patch the provider
+    /// config — an OpenCode launch whose profile declares `baseUrlConfig`.
+    /// The argument is required, not advisory: a worker that predates it
+    /// exits 78 on the unknown option, so an old image cannot produce a
+    /// launch that looks proxied but is not.
+    #[must_use]
+    pub fn contained_worker_args(
+        &self,
+        selection: &Selection,
+        runtime: &str,
+        args: &[std::ffi::OsString],
+    ) -> Vec<std::ffi::OsString> {
+        let mut out = args.to_vec();
+        let config_redirect = selection
+            .credential_proxy
+            .as_ref()
+            .is_some_and(|proxy| proxy.base_url_config.is_some());
+        if runtime == "opencode" && config_redirect {
+            out.push(BASE_URL_ARG.into());
+            out.push(self.base_url.clone().into());
+        }
+        out
+    }
+
     /// Secret-free one-line record for the per-sweep log, mirroring
     /// [`containment::Profile::dispatch_marker`]'s shape.
     #[must_use]
@@ -337,6 +366,109 @@ fn patch_opencode_provider_base_url(
     value.insert(option.to_string(), Value::String(base_url.to_string()));
     command.env("OPENCODE_CONFIG_CONTENT", config.to_string());
     Ok(())
+}
+
+/// The internal worker argument carrying the host proxy's container-reachable
+/// base URL to the in-container copy of a contained OpenCode launch (#15527).
+pub const BASE_URL_ARG: &str = "--egress-proxy-base-url";
+
+/// The `--egress-proxy-base-url` handoff, validated inside the container.
+///
+/// The host cannot patch the `OPENCODE_CONFIG_CONTENT` a contained launch
+/// provisions (it is assembled in the container), so the in-container copy
+/// applies the patch itself. Every check here runs before the harness is
+/// built, and each failure is a configuration error (exit 78): an invalid or
+/// conflicting handoff must never degrade into a launch that sends the
+/// placeholder to the real upstream.
+#[derive(Debug)]
+pub struct ContainedRedirect {
+    base_url: String,
+    option: String,
+}
+
+impl ContainedRedirect {
+    /// Validate the handoff against this launch.
+    ///
+    /// * `containerized` — this process is the re-exec'd in-container copy.
+    /// * `gateway_routed` — the launch resolved an LLM-gateway route.
+    /// * `credential` — the credential this launch resolved; every mapped
+    ///   target must still carry the host's placeholder, because a proxy URL
+    ///   paired with anything else is a conflicting handoff.
+    ///
+    /// # Errors
+    ///
+    /// A handoff on an uncontained launch, a runtime other than `opencode`, a
+    /// profile with no `credentialProxy.baseUrlConfig`, a gateway-routed
+    /// launch, a malformed URL, or a credential that is not the placeholder.
+    pub fn resolve(
+        raw: &str,
+        selection: &Selection,
+        runtime: &str,
+        containerized: bool,
+        gateway_routed: bool,
+        credential: &credential::Resolved,
+    ) -> Result<Self, LaunchError> {
+        let refuse = |why: &str| {
+            LaunchError::config(format!("{BASE_URL_ARG} is not a valid proxy handoff: {why}"))
+        };
+        if !containerized {
+            return Err(refuse("it is an internal argument of the contained re-exec"));
+        }
+        if runtime != "opencode" {
+            return Err(refuse("only the opencode harness is re-pointed through config"));
+        }
+        if gateway_routed {
+            return Err(refuse("a gateway-routed launch has no credential proxy"));
+        }
+        let option = selection
+            .credential_proxy
+            .as_ref()
+            .and_then(|proxy| proxy.base_url_config.clone())
+            .ok_or_else(|| {
+                refuse("the selected profile declares no credentialProxy.baseUrlConfig")
+            })?;
+        let base_url = validated_base_url(raw).ok_or_else(|| {
+            refuse("expected http://<host>:<port> with no userinfo, path, query or fragment")
+        })?;
+        for (_, target) in &selection.credentials {
+            let carries_placeholder = credential
+                .value_for(target)
+                .and_then(|value| value.to_str())
+                .is_some_and(|value| value.starts_with(PLACEHOLDER_PREFIX));
+            if !carries_placeholder {
+                return Err(refuse(&format!(
+                    "{target} does not carry the credential placeholder, so the proxy could not \
+                     substitute it"
+                )));
+            }
+        }
+        Ok(Self { base_url, option })
+    }
+
+    /// Point the provider the launch selected at the proxy, inside the
+    /// `OPENCODE_CONFIG_CONTENT` the harness provisioning already put on
+    /// `command`. Call after `harness.command(...)`.
+    ///
+    /// # Errors
+    ///
+    /// A provisioned `OPENCODE_CONFIG_CONTENT` that is not a JSON object.
+    pub fn apply(&self, command: &mut Command, provider_id: &str) -> Result<(), LaunchError> {
+        patch_opencode_provider_base_url(command, provider_id, &self.option, &self.base_url)
+    }
+}
+
+/// `http://<host>:<port>` and nothing else: the shape [`arm`] formats.
+fn validated_base_url(raw: &str) -> Option<String> {
+    let authority = raw.strip_prefix("http://")?;
+    let (host, port) = authority.rsplit_once(':')?;
+    let host_ok = !host.is_empty()
+        && host
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-'));
+    let port_ok = !port.is_empty()
+        && port.bytes().all(|b| b.is_ascii_digit())
+        && port.parse::<u16>().is_ok_and(|p| p != 0);
+    (host_ok && port_ok).then(|| raw.to_string())
 }
 
 /// Hand-written, NOT derived: this struct reaches both the placeholder (inside
@@ -445,25 +577,26 @@ fn prepare_scoped(
         return Ok(None);
     };
     let upstream = declared.validate()?;
-    // Where the armed proxy may re-point the harness. The container provisions
-    // its config INSIDE, where this launcher never runs: a config-side base
-    // URL override is patched on the host, into a command the launcher builds
-    // itself, so it is uncontained-native only (#11300 slice 3). Gated on
-    // `enabled` here so a flag-off launch stays plain env-passthrough — a
-    // profile may DECLARE config-side redirection for its opencode binding
-    // while other bindings launch unproxied (#11714).
-    if scope == Scope::Contained && declared.base_url_config.is_some() {
-        return Err(LaunchError::config(
-            "model profile credentialProxy.baseUrlConfig is only supported on uncontained \
-             native launches; a contained launch is re-pointed with baseUrlEnv instead",
-        ));
-    }
+    // Where the armed proxy may re-point the harness. A config-side base URL
+    // override (`baseUrlConfig`) is patched into the command the process
+    // launching the harness builds. Uncontained, that is this launcher. A
+    // contained OpenCode launch provisions its config INSIDE the container,
+    // so the host hands the proxy URL to the in-container copy as the
+    // required internal `--egress-proxy-base-url` worker argument
+    // ([`ContainedRedirect`], #15527); an in-container binary that predates
+    // it refuses the unknown argument (exit 78), so a stale worker can never
+    // produce a launch that only looks proxied. Gated on `enabled` above so a
+    // flag-off launch stays plain env-passthrough — a profile may DECLARE
+    // config-side redirection for its opencode binding while other bindings
+    // launch unproxied (#11714).
+    //
     // A proxy the armed harness would not follow substitutes the placeholder
     // while the traffic still goes to the real upstream: fail closed rather
-    // than half-proxy. OpenCode is re-pointed through its provisioned config;
-    // every other harness only through baseUrlEnv (#11714).
+    // than half-proxy. OpenCode is re-pointed through its provisioned config
+    // (here or in the container); every other harness only through
+    // baseUrlEnv (#11714).
     let redirected = !declared.base_url_env.is_empty()
-        || (scope == Scope::NativeLoopback && declared.base_url_config.is_some());
+        || (declared.base_url_config.is_some() && runtime == "opencode");
     if !redirected {
         return Err(LaunchError::config(format!(
             "credentialProxy is enabled for this profile but nothing re-points the {runtime} \

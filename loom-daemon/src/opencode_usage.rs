@@ -42,9 +42,7 @@
 //! than directory+window — and #14048 delivers exactly that for the consumers
 //! that have the stream: a step's log holds its launch's whole event output,
 //! so [`crate::usage_source::native_session_ids`] parses the ids out of it,
-//! [`tokens_by_model_for_ids`] selects the rows by identity for the step-close
-//! telemetry record, and [`tokens_by_session_ids`] does the same for a
-//! step-dispatched completion (#14018). This matters
+//! and [`tokens_by_model_for_ids`] selects the rows by identity. This matters
 //! most where directory+window provably cannot separate work: two concurrent
 //! same-role steps dispatched in one workspace overlap in time by
 //! construction. Directory+window remains the key for consumers without a
@@ -709,23 +707,6 @@ pub fn tokens_by_model_for_ids(
     home: Option<&Path>,
 ) -> Option<Vec<ModelUsageTotals>> {
     fold_sessions(sessions_for_ids(ids, home))
-}
-
-/// Per-model token totals for exactly the sessions named in `ids`, across every
-/// installed OpenCode version's store (#14018) — [`tokens_by_model`] keyed on
-/// session id. The attribution a step-dispatched completion needs: a step's
-/// log names the sessions it ran, and the session store's `directory` is the
-/// workspace root shared by every session in the repo, so directory + window
-/// would fold in whichever neighbour overlapped. `None` — never
-/// `Some(vec![])` — when `ids` is empty, no store was found, or no named
-/// session recorded usage.
-#[must_use]
-pub fn tokens_by_session_ids(ids: &[String], home: Option<&Path>) -> Option<Vec<ModelUsageTotals>> {
-    // An empty id set is the empty filter: [`sessions_selected`] returns for it
-    // before any store discovery, so this is `None` without a separate guard,
-    // and shares that function's cross-store dedupe with
-    // [`tokens_by_model_for_ids`].
-    tokens_by_model_for_ids(ids, home)
 }
 
 /// The usage rows or the reason a by-id read could not produce them.

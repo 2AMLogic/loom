@@ -112,6 +112,16 @@ ALLOWED_HOST_SUFFIXES=(
   sf.net
 )
 
+# Hosts allowed by EXACT match only — no subdomains. `storage.googleapis.com`
+# is Google's public object-storage host, which serves the Antigravity CLI
+# (`agy`) release archive pinned in `defaults/docs/runtime-adapters.md`
+# (#15059). The manifest comes from the updater host. Bucket-style hostnames
+# (`<bucket>.storage.googleapis.com`) can identify an operator's deployment, so
+# it must NOT be a suffix entry.
+ALLOWED_HOSTS_EXACT=(
+  storage.googleapis.com
+)
+
 # Dotted identifiers that are NOT hostnames: config-key paths whose last
 # segment happens to spell a TLD (e.g. `autonomous.ciTelemetry.org`, the
 # `org` field of a config block — #8981). Matched EXACTLY below, never as a
@@ -160,6 +170,9 @@ host_allowed() {
   host="$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')"
   for s in "${ALLOWED_HOST_SUFFIXES[@]}"; do
     [[ "$host" == "$s" || "$host" == *".$s" ]] && return 0
+  done
+  for s in "${ALLOWED_HOSTS_EXACT[@]}"; do
+    [[ "$host" == "$s" ]] && return 0
   done
   return 1
 }
@@ -354,6 +367,22 @@ EOF
     fails=1
   fi
 
+  # Exact-only host (#15059): the bare Google object-storage host passes, a
+  # bucket-specific hostname under it is still rejected.
+  mkdir -p "$tmp/gcs-ok/docs" "$tmp/gcs-bad/docs"
+  printf 'Archive: https://storage.googleapis.com/vendor-public/cli.tar.gz\n' > "$tmp/gcs-ok/docs/a.md"
+  printf 'Archive: https://sample-tenant-bucket.storage.googleapis.com/cli.tar.gz\n' > "$tmp/gcs-bad/docs/a.md"
+  gcs_bad_out="$(scan_tree "$tmp/gcs-bad" || true)"
+  if scan_tree "$tmp/gcs-ok" >/dev/null \
+     && ! scan_tree "$tmp/gcs-bad" >/dev/null \
+     && grep -q 'sample-tenant-bucket.storage.googleapis.com' <<<"$gcs_bad_out"; then
+    echo "self-test: OK — storage.googleapis.com passes while a bucket-specific subdomain fails"
+  else
+    echo "self-test: FAIL — storage.googleapis.com exact-match did not discriminate. Got:" >&2
+    echo "$gcs_bad_out" >&2
+    fails=1
+  fi
+
   # Repeatable --root (#7814): the check now scans several trees in one run
   # (defaults/ plus the daemon's fleet module), so a violation in ANY scanned
   # root must fail the whole run, and a clean run must name every root it
@@ -436,7 +465,9 @@ fi
   echo "For daemon code, an operator-specific value belongs in an operator-supplied"
   echo "input (a required flag / an overlay), not a compiled-in default."
   echo ""
-  echo "If an identifier is genuinely public and belongs here, add it to"
-  echo "ALLOWED_OWNERS / ALLOWED_HOST_SUFFIXES at the top of this script."
+  echo "If an identifier is genuinely public and belongs here: prefer adding a"
+  echo "single repository to ALLOWED_REPOS over widening owner-wide"
+  echo "ALLOWED_OWNERS for it; a whole public owner goes in ALLOWED_OWNERS and"
+  echo "a public host in ALLOWED_HOST_SUFFIXES, at the top of this script."
 } >&2
 exit 1

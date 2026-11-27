@@ -43,9 +43,8 @@
 //! by a fuzzy de-duplication after the fact:
 //!
 //! - a marker records only rework the worktree reflog *cannot* show — a
-//!   forge-side branch update (`merge-pr.sh`'s `forge_update_branch`, which
-//!   never touches the local worktree), a merge refusal, a CI rerun, a
-//!   rejudge;
+//!   forge-side branch update (which never touches the local worktree), a
+//!   merge refusal, a CI rerun, a rejudge;
 //! - a rebase or merge performed with local git in the sweep's worktree is
 //!   **never** marked: the reflog already reports it, and a marker would
 //!   count it twice.

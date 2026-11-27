@@ -1207,6 +1207,9 @@ fn non_date_shaped_children_of_sessions_are_never_descended_into() {
 #[serial_test::serial(codex_home_env)]
 #[test]
 fn codex_home_prefers_the_loom_override_then_codex_own_then_the_default() {
+    // Crate-wide codex-home lock (#15174): this test mutates the variable
+    // directly, so it must not race the isolation helpers clearing it.
+    let _codex_home_lock = crate::tokens_pool::codex_home_env::lock();
     clear_home_env();
     assert_eq!(codex_home(Some(Path::new("/h"))), Some(PathBuf::from("/h/.codex")));
     std::env::set_var(CODEX_NATIVE_HOME_ENV, "/native/codex");
@@ -1227,16 +1230,24 @@ fn codex_home_prefers_the_loom_override_then_codex_own_then_the_default() {
 
 /// `LOOM_CODEX_PROFILE_ROOT` cleared too, so an injected `home` decides the
 /// profile root and the operator's real pool is never reached. The returned
-/// guard holds the crate-wide profile-root lock and restores it on drop (#9964).
-fn clear_all_home_env() -> crate::tokens_pool::profile_root_env::ProfileRootEnv {
-    clear_home_env();
-    crate::tokens_pool::profile_root_env::ProfileRootEnv::unset()
+/// guard holds the crate-wide profile-root lock and restores it on drop
+/// (#9964), plus the crate-wide codex-home lock for the `LOOM_CODEX_HOME`
+/// removal (#15174) — codex-home first, profile-root inner, per
+/// `codex_home_env`'s documented lock order.
+fn clear_all_home_env() -> (
+    crate::tokens_pool::profile_root_env::ProfileRootEnv,
+    crate::tokens_pool::codex_home_env::CodexHomeEnv,
+) {
+    let codex_home = crate::tokens_pool::codex_home_env::CodexHomeEnv::unset();
+    let profile_root = crate::tokens_pool::profile_root_env::ProfileRootEnv::unset();
+    std::env::remove_var(CODEX_NATIVE_HOME_ENV);
+    (profile_root, codex_home)
 }
 
 #[serial_test::serial(codex_home_env)]
 #[test]
 fn codex_homes_is_the_ambient_home_plus_every_pooled_profile_unless_pinned() {
-    let _profile_root = clear_all_home_env();
+    let _home_env = clear_all_home_env();
     let tmp = tempfile::tempdir().unwrap();
     let profiles = tmp.path().join(".loom/codex-profiles");
     std::fs::create_dir_all(profiles.join("work-b")).unwrap();
@@ -1271,7 +1282,7 @@ fn codex_homes_is_the_ambient_home_plus_every_pooled_profile_unless_pinned() {
 #[serial_test::serial(codex_home_env)]
 #[test]
 fn profile_rollouts_are_read_and_a_symlinked_shared_tree_is_counted_once() {
-    let _profile_root = clear_all_home_env();
+    let _home_env = clear_all_home_env();
     let tmp = tempfile::tempdir().unwrap();
     // The default account's home, holding one session.
     let default_home = seed_codex_home(
@@ -1322,8 +1333,12 @@ fn profile_rollouts_are_read_and_a_symlinked_shared_tree_is_counted_once() {
 /// process per test — see `lib.rs`'s "Test isolation convention"), and every
 /// caller additionally carries `#[serial_test::serial(codex_home_env)]` so a
 /// plain `cargo test` run is safe too: the same discipline
-/// `opencode_usage`'s tests apply to `LOOM_OPENCODE_DB`.
+/// `opencode_usage`'s tests apply to `LOOM_OPENCODE_DB`. The pin also holds
+/// the crate-wide codex-home lock for its whole scope (#15174), so it cannot
+/// race the runtime-isolation helpers that clear the variable under other
+/// `serial_test` keys.
 fn with_codex_home<T>(home: &Path, f: impl FnOnce() -> T) -> T {
+    let _codex_home_lock = crate::tokens_pool::codex_home_env::lock();
     clear_home_env();
     std::env::set_var(CODEX_HOME_ENV, home);
     let out = f();
@@ -1339,7 +1354,7 @@ fn clear_home_env() {
 #[serial_test::serial(codex_home_env)]
 #[test]
 fn an_unused_profile_does_not_poison_a_readable_home() {
-    let _profile_root = clear_all_home_env();
+    let _home_env = clear_all_home_env();
     let tmp = tempfile::tempdir().unwrap();
     let _ambient = seed_codex_home(
         tmp.path(),

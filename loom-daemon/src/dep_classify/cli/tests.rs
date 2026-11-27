@@ -8,49 +8,11 @@
 //! weaker copy of the same evidence.
 //!
 //! What IS here is the one thing those suites never exercise: they all pass
-//! `--repo` explicitly, so repo resolution never runs.
+//! `--repo` explicitly, so repo resolution never runs. The remote-URL parsing
+//! that resolution leans on is covered once, beside the shared parser, in
+//! `forge_cmd`'s tests (issue #15372).
 
 use super::*;
-
-#[test]
-fn an_ssh_remote_yields_owner_repo() {
-    assert_eq!(
-        nwo_from_remote_url("git@github.com:acme/widgets.git"),
-        Some("acme/widgets".to_string())
-    );
-}
-
-#[test]
-fn an_https_remote_yields_owner_repo() {
-    assert_eq!(
-        nwo_from_remote_url("https://github.com/acme/widgets.git"),
-        Some("acme/widgets".to_string())
-    );
-}
-
-#[test]
-fn the_git_suffix_is_optional() {
-    assert_eq!(
-        nwo_from_remote_url("https://github.com/acme/widgets"),
-        Some("acme/widgets".to_string())
-    );
-}
-
-#[test]
-fn a_self_hosted_host_with_a_port_path_still_yields_the_last_two_segments() {
-    assert_eq!(
-        nwo_from_remote_url("https://git.example.com/acme/widgets.git"),
-        Some("acme/widgets".to_string())
-    );
-}
-
-#[test]
-fn a_url_that_cannot_name_both_halves_is_none_not_a_guess() {
-    // Falls through to `gh repo view` rather than inventing an owner.
-    assert_eq!(nwo_from_remote_url("widgets"), None);
-    assert_eq!(nwo_from_remote_url(""), None);
-    assert_eq!(nwo_from_remote_url("https://github.com/"), None);
-}
 
 #[test]
 fn a_checkout_with_an_origin_remote_resolves_without_asking_the_forge() {

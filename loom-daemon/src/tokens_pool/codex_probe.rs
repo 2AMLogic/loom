@@ -40,16 +40,16 @@
 //!
 //! Nothing secret is read or emitted: no token, no email, no raw reply body.
 
-use std::io::Read;
 use std::path::Path;
 use std::process::{Command, Stdio};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use anyhow::Result;
 use chrono::{DateTime, Utc};
 
 use super::codex_check::{epoch_to_datetime, slot_by_duration, RateLimitWindow, UsageSnapshot};
 use super::session_lifecycle::{self, ContainerRunner, ExecOutput, ProcessContainerRunner};
+use crate::proc_exec::{Completion, ExecError};
 
 /// Seconds stdin stays open after the requests are written. The app-server
 /// answers in about a second; this is the ceiling before EOF ends it.
@@ -70,14 +70,27 @@ const NOT_STARTED_TOLERANCE_SECS: i64 = 180;
 /// environment. stderr is discarded: it carries only diagnostics.
 #[must_use]
 pub fn probe_script() -> String {
+    script("{}")
+}
+
+/// [`probe_script`] for the daemon's background sampling (#15292): the
+/// rate-limit read asks Codex to leave out the per-credit detail rows, which
+/// are never kept, so only the available count crosses the wire.
+#[must_use]
+pub fn background_probe_script() -> String {
+    script("{\"excludeResetCreditDetails\":true}")
+}
+
+fn script(rate_limit_params: &str) -> String {
     format!(
         "(printf '%s\\n' \
          '{{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{{\"clientInfo\":{{\"name\":\"loom-daemon-probe\",\"version\":\"{version}\"}}}}}}' \
          '{{\"jsonrpc\":\"2.0\",\"method\":\"initialized\",\"params\":{{}}}}' \
          '{{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"account/read\",\"params\":{{}}}}' \
-         '{{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"account/rateLimits/read\",\"params\":{{}}}}'; \
+         '{{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"account/rateLimits/read\",\"params\":{rate}}}'; \
          sleep {hold}) | codex -s read-only -a never app-server 2>/dev/null",
         version = env!("CARGO_PKG_VERSION"),
+        rate = rate_limit_params,
         hold = STDIN_HOLD_SECS,
     )
 }
@@ -120,21 +133,7 @@ impl ProbeOutcome {
     pub(super) fn diagnostic(&self) -> Option<String> {
         match self {
             Self::RuntimeUnavailable(kind) => {
-                let search = match std::env::var_os("PATH") {
-                    Some(path) => {
-                        let dirs: Vec<_> = std::env::split_paths(&path)
-                            .map(|dir| {
-                                if dir.as_os_str().is_empty() {
-                                    ".".into()
-                                } else {
-                                    dir
-                                }
-                            })
-                            .collect();
-                        format!("searched PATH directories {dirs:?}")
-                    }
-                    None => "PATH is unset (system default search)".into(),
-                };
+                let search = crate::docker_bin::search_description();
                 Some(format!(
                     "container_runtime_unavailable: docker could not start ({kind:?}), {search}"
                 ))
@@ -190,6 +189,11 @@ pub trait ProbeTransport {
     /// Run the probe inside `container`. `Ok(None)` = no probe was possible
     /// (the container is missing or stopped). Spawn errors remain typed.
     fn container(&self, container: &str) -> Result<Option<ExecOutput>>;
+    /// [`Self::container`] for the daemon's background sampling (#15292),
+    /// which asks for reset-credit counts without their detail rows.
+    fn container_background(&self, container: &str) -> Result<Option<ExecOutput>> {
+        self.container(container)
+    }
 }
 
 /// The real transport: `sh -c` on the host, `docker exec` via the session
@@ -204,28 +208,35 @@ impl ProbeTransport for ProcessProbeTransport {
     }
 
     fn host(&self, profile: &Path) -> Result<ExecOutput> {
-        run_bounded(
-            Command::new("sh")
-                .args(["-c", &probe_script()])
-                .env("CODEX_HOME", profile),
-        )
+        let mut command = Command::new("sh");
+        command
+            .args(["-c", &probe_script()])
+            .env("CODEX_HOME", profile);
+        run_bounded(command)
     }
 
     fn container(&self, container: &str) -> Result<Option<ExecOutput>> {
-        let runner = ProcessContainerRunner;
-        match runner.inspect(container)? {
-            Some(state) if state.running => {}
-            _ => return Ok(None),
-        }
-        let script = probe_script();
-        let out = runner.exec_capture(container, &["sh", "-c", &script], PROBE_TIMEOUT)?;
-        if out.unavailable {
-            // exec_capture sets this bit when spawning Docker returned ENOENT,
-            // including if the executable disappeared after the initial check.
-            return Err(std::io::Error::from(std::io::ErrorKind::NotFound).into());
-        }
-        Ok(Some(out))
+        exec_in_container(container, &probe_script())
     }
+
+    fn container_background(&self, container: &str) -> Result<Option<ExecOutput>> {
+        exec_in_container(container, &background_probe_script())
+    }
+}
+
+fn exec_in_container(container: &str, script: &str) -> Result<Option<ExecOutput>> {
+    let runner = ProcessContainerRunner;
+    match runner.inspect(container)? {
+        Some(state) if state.running => {}
+        _ => return Ok(None),
+    }
+    let out = runner.exec_capture(container, &["sh", "-c", script], PROBE_TIMEOUT)?;
+    if out.unavailable {
+        // exec_capture sets this bit when spawning Docker returned ENOENT,
+        // including if the executable disappeared after the initial check.
+        return Err(std::io::Error::from(std::io::ErrorKind::NotFound).into());
+    }
+    Ok(Some(out))
 }
 
 /// Probe one account, honoring ADR-0017's ownership rule.
@@ -259,7 +270,30 @@ pub fn probe_account<T: ProbeTransport + ?Sized>(
 /// Interpret the app-server's replies. Pure, for the tests.
 #[must_use]
 pub fn parse_probe_output(text: &str, now: DateTime<Utc>) -> ProbeOutcome {
-    let mut account_null = false;
+    parse_probe_replies(text, now).outcome
+}
+
+/// What the replies establish about one seat, each part independently of the
+/// others (#15292). Only verdicts and numbers: no account payload, reset-credit
+/// detail row or raw reply text is kept.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SeatReading {
+    /// `account/read`'s verdict: `Some(true)` a valid account object,
+    /// `Some(false)` an explicit `account: null`, `None` no usable reply.
+    pub login: Option<bool>,
+    /// `rateLimitResetCredits.availableCount` when the reply carries it,
+    /// whatever the windows say. Older CLIs omit it.
+    pub reset_credits: Option<u64>,
+    /// The quota outcome, as `accounts check --live` reads it.
+    pub outcome: ProbeOutcome,
+}
+
+/// [`parse_probe_output`] with the login verdict and reset-credit count kept.
+/// Pure, for the tests.
+#[must_use]
+pub fn parse_probe_replies(text: &str, now: DateTime<Utc>) -> SeatReading {
+    let mut login: Option<bool> = None;
+    let mut reset_credits: Option<u64> = None;
     let mut limits: Option<serde_json::Value> = None;
     let mut capability_absent = false;
     for line in text.lines() {
@@ -268,11 +302,12 @@ pub fn parse_probe_output(text: &str, now: DateTime<Utc>) -> ProbeOutcome {
         };
         match message.get("id").and_then(serde_json::Value::as_i64) {
             Some(2) => {
-                if message
-                    .get("result")
-                    .is_some_and(|r| r.get("account").is_some_and(serde_json::Value::is_null))
-                {
-                    account_null = true;
+                if let Some(account) = message.get("result").and_then(|r| r.get("account")) {
+                    if account.is_null() {
+                        login = Some(false);
+                    } else if account.is_object() {
+                        login = Some(true);
+                    }
                 }
             }
             Some(3) => {
@@ -282,13 +317,33 @@ pub fn parse_probe_output(text: &str, now: DateTime<Utc>) -> ProbeOutcome {
                     .and_then(serde_json::Value::as_i64)
                 {
                     capability_absent = code == -32600 || code == -32601;
-                } else if let Some(rl) = message.get("result").and_then(|r| r.get("rateLimits")) {
-                    limits = Some(rl.clone());
+                } else if let Some(result) = message.get("result") {
+                    reset_credits = result
+                        .get("rateLimitResetCredits")
+                        .and_then(|c| c.get("availableCount"))
+                        .and_then(serde_json::Value::as_u64);
+                    if let Some(rl) = result.get("rateLimits") {
+                        limits = Some(rl.clone());
+                    }
                 }
             }
             _ => {}
         }
     }
+    let outcome = quota_outcome(login == Some(false), capability_absent, limits.as_ref(), now);
+    SeatReading {
+        login,
+        reset_credits,
+        outcome,
+    }
+}
+
+fn quota_outcome(
+    account_null: bool,
+    capability_absent: bool,
+    limits: Option<&serde_json::Value>,
+    now: DateTime<Utc>,
+) -> ProbeOutcome {
     // An unauthenticated home answers `account: null` *and* -32600 on the
     // rate-limit call; the null account is the real finding.
     if account_null {
@@ -310,6 +365,23 @@ pub fn parse_probe_output(text: &str, now: DateTime<Utc>) -> ProbeOutcome {
         primary,
         secondary,
     })
+}
+
+/// One bounded in-container round trip for a session seat's background
+/// sampling (#15292): login, live limits and the reset-credit count from one
+/// `codex app-server`. Never host-direct: the container owns the seat's
+/// `auth.json` (ADR-0017). `None` when no reading was possible (container
+/// missing or stopped, docker or the CLI unavailable, the probe timed out).
+pub fn probe_seat<T: ProbeTransport + ?Sized>(
+    transport: &T,
+    container: &str,
+    now: DateTime<Utc>,
+) -> Option<SeatReading> {
+    let run = transport.container_background(container).ok()??;
+    if run.unavailable || run.timed_out {
+        return None;
+    }
+    Some(parse_probe_replies(&run.output, now))
 }
 
 fn parse_live_window(value: &serde_json::Value, now: DateTime<Utc>) -> Option<RateLimitWindow> {
@@ -355,55 +427,45 @@ pub fn window_not_started(
     used_percent == 0.0 && (reset - expected).num_seconds().abs() <= NOT_STARTED_TOLERANCE_SECS
 }
 
-/// Run a host command to completion under [`PROBE_TIMEOUT`], reading stdout on
-/// a thread so a chatty child can never deadlock on a full pipe.
-fn run_bounded(command: &mut Command) -> Result<ExecOutput> {
-    let mut child = match command
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-    {
-        Ok(child) => child,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return Ok(ExecOutput {
+/// Run a host command to completion under [`PROBE_TIMEOUT`].
+fn run_bounded(command: Command) -> Result<ExecOutput> {
+    run_bounded_within(command, PROBE_TIMEOUT)
+}
+
+fn run_bounded_within(mut command: Command, timeout: Duration) -> Result<ExecOutput> {
+    command.stdin(Stdio::null());
+    let output = match crate::proc_exec::run_bounded(command, timeout) {
+        Ok(Completion::Exited(output)) => ExecOutput {
+            success: output.status.success(),
+            unavailable: false,
+            timed_out: false,
+            exit_code: output.status.code(),
+            output: probe_text(&output.stdout),
+        },
+        Ok(Completion::TimedOut { stdout, .. }) => ExecOutput {
+            success: false,
+            unavailable: false,
+            timed_out: true,
+            exit_code: None,
+            output: probe_text(&stdout),
+        },
+        Err(ExecError::Spawn(error)) if error.kind() == std::io::ErrorKind::NotFound => {
+            ExecOutput {
                 success: false,
                 unavailable: true,
                 timed_out: false,
                 exit_code: None,
                 output: String::new(),
-            });
+            }
         }
-        Err(error) => return Err(error.into()),
+        Err(ExecError::Spawn(error) | ExecError::Collect(error)) => return Err(error.into()),
     };
-    let stdout = child.stdout.take();
-    let reader = std::thread::spawn(move || {
-        let mut bytes = Vec::new();
-        if let Some(stdout) = stdout {
-            let _ = stdout.take(MAX_OUTPUT_BYTES).read_to_end(&mut bytes);
-        }
-        bytes
-    });
-    let started = Instant::now();
-    let status = loop {
-        if let Some(status) = child.try_wait()? {
-            break Some(status);
-        }
-        if started.elapsed() >= PROBE_TIMEOUT {
-            let _ = child.kill();
-            let _ = child.wait();
-            break None;
-        }
-        std::thread::sleep(Duration::from_millis(50));
-    };
-    let bytes = reader.join().unwrap_or_default();
-    Ok(ExecOutput {
-        success: status.is_some_and(|s| s.success()),
-        unavailable: false,
-        timed_out: status.is_none(),
-        exit_code: status.and_then(|s| s.code()),
-        output: String::from_utf8_lossy(&bytes).into_owned(),
-    })
+    Ok(output)
+}
+
+fn probe_text(bytes: &[u8]) -> String {
+    let cut = bytes.len().min(MAX_OUTPUT_BYTES as usize);
+    String::from_utf8_lossy(&bytes[..cut]).into_owned()
 }
 
 #[cfg(test)]

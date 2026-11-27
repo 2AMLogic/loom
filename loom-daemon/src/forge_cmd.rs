@@ -50,7 +50,10 @@
 //!
 //! For **Gitea** the subcommands *decline* with [`EX_FORGE_DECLINED`] so the
 //! caller's existing shell fallback carries the query path (the read scripts
-//! degrade to `gh`). `auto-merge` has no Gitea implementation at all: the
+//! degrade to `gh`), with one exception: a numeric `view --json` is served
+//! from the Gitea API (`forge_gitea_view`, #14939), because neither
+//! the decline's shell path nor `gh` can read a Gitea remote. `auto-merge`
+//! has no Gitea implementation at all: the
 //! shell `forge_auto_merge` Gitea poll-and-merge it used to decline to was
 //! retired by #8427, and a pre-#8410 installed `merge-pr.sh` still carries
 //! its own copy in its own `lib/forge-helpers.sh`. This keeps the daemon's zero-HTTP-client house style
@@ -850,6 +853,15 @@ pub enum ForgeCmd {
 /// a child process cannot be spawned.
 pub fn dispatch(cmd: ForgeCmd) -> Result<()> {
     match cmd {
+        // #14939: on a Gitea checkout a numeric `view --json` is served from
+        // the Gitea API. Every other `forge <issue|pr>` read on Gitea still
+        // declines (exit 3) to the caller's shell path.
+        ForgeCmd::Issue(args) if crate::forge_gitea_view::serves(&args) => {
+            crate::forge_gitea_view::handle("issue", &args)
+        }
+        ForgeCmd::Pr(args) if crate::forge_gitea_view::serves(&args) => {
+            crate::forge_gitea_view::handle("pr", &args)
+        }
         // `forge <issue|pr> list --cached …` routes to the agent-facing ETag
         // cache (#5056); it serves-and-exits(0) or declines-and-exits(3) so the
         // caller falls back to plain `gh`. Everything else is the byte-identical
@@ -1352,6 +1364,19 @@ mod tests {
             Some("acme/widgets")
         );
         assert_eq!(parse_nwo_from_remote_url("not-a-remote"), None);
+        // #15372: the unique URL cases `dep_classify`'s local copy of this
+        // parser used to pin — now covered once, beside the shared parser.
+        // A self-hosted remote with a port still yields the last two
+        // segments.
+        assert_eq!(
+            parse_nwo_from_remote_url("https://git.example.com/acme/widgets.git").as_deref(),
+            Some("acme/widgets")
+        );
+        // A URL that cannot name both halves is `None`, not a guess — the
+        // caller falls through to `gh repo view` rather than inventing an
+        // owner.
+        assert_eq!(parse_nwo_from_remote_url(""), None);
+        assert_eq!(parse_nwo_from_remote_url("https://github.com/"), None);
     }
 
     // ===== #5589: is_head_mismatch_response() classifier =====

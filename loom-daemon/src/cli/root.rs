@@ -1844,7 +1844,8 @@ pub enum TokensAction {
         #[arg(long, value_name = "MODEL")]
         model: Option<String>,
 
-        /// Spawning role name — the second half of the prompt-cache affinity
+        /// Spawning role name. Narrows guarded Codex roles to hook-ready seats.
+        /// For Claude this is the second half of the prompt-cache affinity
         /// key (issue #8146). Read from the `LOOM_ROLE` env var (already in
         /// every spawner's environment, no shell-side passing needed) rather
         /// than requiring `--role` on the command line, so an older daemon
@@ -1862,6 +1863,17 @@ pub enum TokensAction {
         /// that just failed.
         #[arg(long, value_name = "ROLE", env = "LOOM_ROLE")]
         role: Option<String>,
+
+        /// Select exactly this Claude account (issue #14981): a seat-stored
+        /// session resume only works in the account whose `CLAUDE_CONFIG_DIR`
+        /// holds the transcript. Never a draw: when the account is missing,
+        /// empty, bad-marked or ranked exhausted/blocked the command exits
+        /// non-zero (78) and selects nothing. Deliberately NOT env-backed: a
+        /// stray exported value must not re-pin `claude-wrapper.sh`'s
+        /// post-failure rotation. Claude only; ignored with `--provider codex`
+        /// (Codex pins through `LOOM_CODEX_HOME`).
+        #[arg(long, value_name = "ACCOUNT")]
+        pin_account: Option<String>,
     },
 
     /// Materialize `.loom/tokens/` from `ACCOUNT_*_N` triples, merging by email

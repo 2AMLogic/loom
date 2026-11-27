@@ -46,8 +46,8 @@
 //! merge, the #3486 UNSTABLE fallback), or informational with something else
 //! still pending (keep waiting, unchanged). The `comm -12` overlap test
 //! becomes a set intersection; both input lists (`failing`/`pending` from the
-//! check-runs rollup, `required` from `forge_get_required_status_check_contexts`,
-//! which also covers Gitea)
+//! check-runs rollup, `required` from the shell's retired two-source lookup,
+//! which also covered Gitea)
 //! stay forge reads in the shell.
 //!
 //! [`check_runs_rollup`] is the READ both of those classifications start

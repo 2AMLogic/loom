@@ -11,10 +11,7 @@
 //! on the public fleet feed, which is what #8507 reported for the GLM-5.3
 //! trial's 46 merged PRs.
 //!
-//! Three call sites need the same decision — the sweep outcome journal, the
-//! role-tick journal, and safehouse's `completion-v1` narration — so the
-//! decision lives here once rather than as three copies of a
-//! `runtime == "opencode"` test that could drift apart.
+//! Sweep and role-tick outcomes share this mapping from launch runtime to usage store.
 //!
 //! # The contract every source keeps
 //!
@@ -280,10 +277,10 @@ pub struct NativeSessionIds {
 /// Parse the native session ids a log region names (#14048). Pure: every
 /// unrecognized line is skipped, never guessed at. A JSON line contributes
 /// its `sessionID` when it carries a non-empty string one (OpenCode's
-/// `--format json` event stream); a line containing Codex's
-/// `session id: <token>` banner contributes the token when it is at least 8
-/// hex/dash characters — the same shape `spawn-codex.sh`'s own transcript
-/// join greps for.
+/// `--format json` event stream); a line that IS Codex's `session id: <token>`
+/// banner ([`codex_session_banner`]) contributes the token — the same
+/// line-anchored, ≥8 hex/dash shape `spawn-codex.sh`'s own transcript join
+/// greps for.
 #[must_use]
 pub fn native_session_ids(log_region: &str) -> NativeSessionIds {
     let mut ids = NativeSessionIds::default();
@@ -303,10 +300,7 @@ pub fn native_session_ids(log_region: &str) -> NativeSessionIds {
                 continue;
             }
         }
-        let Some(at) = line.find("session id:") else {
-            continue;
-        };
-        if let Some(token) = codex_session_token(&line[at + "session id:".len()..]) {
+        if let Some(token) = codex_session_banner(line) {
             ids.codex.push(token);
         }
     }
@@ -328,14 +322,29 @@ pub(crate) fn role_tick_codex_session_id(output: &str) -> Option<String> {
         .skip_while(|line| !line.starts_with(HEADER))
         .skip(1)
         .take_while(|line| !line.contains(HEADER))
-        .find_map(|line| {
-            line.trim_start()
-                .strip_prefix("session id:")
-                .and_then(codex_session_token)
-        })
+        .find_map(codex_session_banner)
 }
 
-fn codex_session_token(after_prefix: &str) -> Option<String> {
+/// The token of a Codex `session id: <token>` banner **line** (#15023): the
+/// line, after leading whitespace, must *start* with the prefix. A banner
+/// quoted mid-line — an agent's text, a runner's echo, an event string — is
+/// data about a launch, not evidence of one. The one anchoring rule every
+/// Codex banner reader shares ([`native_session_ids`],
+/// [`role_tick_codex_session_id`], and the roll-pause capture).
+/// `spawn-codex.sh`'s transcript join greps for the same
+/// `^[[:space:]]*session id:` line.
+pub(crate) fn codex_session_banner(line: &str) -> Option<String> {
+    line.trim_start()
+        .strip_prefix("session id:")
+        .and_then(codex_session_token)
+}
+
+/// The uuid-shaped token of a Codex `session id:` banner: the run of
+/// hex/dash characters after the prefix, when it is at least 8 characters —
+/// the same shape `spawn-codex.sh`'s own transcript join greps for. Reached
+/// through [`codex_session_banner`], so every Codex banner reader shares it
+/// and the vocabulary cannot drift between them.
+pub(crate) fn codex_session_token(after_prefix: &str) -> Option<String> {
     let token: String = after_prefix
         .trim_start()
         .chars()
@@ -401,118 +410,6 @@ pub fn sweep_tokens_by_model(
             )
         }
     }
-}
-
-/// Whether a merged PR's work ran as dispatched **steps** on this host
-/// (#14018): at least one of its [`crate::launch_record::merge_step_logs`]
-/// exists. `false` means a legacy `/loom:sweep` (or a step that ran only on
-/// other hosts), which the sweep-keyed readers above already serve.
-#[must_use]
-pub fn has_merge_step_logs(workspace_root: &Path, issue: u32, pr: u32) -> bool {
-    !crate::launch_record::merge_step_logs(workspace_root, issue, pr).is_empty()
-}
-
-/// Per-`(model, speed, service_tier)` token totals for a **step-dispatched**
-/// merge of `pr` (closing `issue`), on this host only (#14018).
-///
-/// Two sources, summed, because the steps of one PR can run on different
-/// runtimes (an OpenCode Builder, a Claude Judge):
-///
-/// - **Claude transcripts** whose first message names the issue-keyed Builder
-///   or the PR-keyed Judge/Doctor/`champion --pr` command
-///   ([`crate::transcript_tokens::sum_item_tokens_by_model`]); `window` narrows
-///   these by file mtime, as for a sweep.
-/// - **OpenCode sessions** named by the `sessionID`s in the step logs
-///   ([`crate::opencode_usage::tokens_by_session_ids`]) — never directory +
-///   window, since the store's `directory` is shared repo-wide. No window
-///   applies: a session id already names exactly one session. The Builder
-///   log (issue-keyed) is read from its last dispatch only, so an abandoned
-///   retry is not charged to the PR; the PR-keyed Doctor/Judge/`champion_merge`
-///   logs are read whole, as each dispatch there is a completed round (#14210).
-///
-/// A step that ran on another host left no log or transcript here, so its usage
-/// is absent and the total stays partial. `None` — never `Some(vec![])` — when
-/// neither source found anything.
-#[must_use]
-pub fn merge_step_tokens_by_model(
-    workspace_root: &Path,
-    issue: u32,
-    pr: u32,
-    window: Option<(DateTime<Utc>, DateTime<Utc>)>,
-) -> Option<Vec<ModelUsageTotals>> {
-    let claude = crate::transcript_tokens::claude_projects_dir().and_then(|projects| {
-        crate::transcript_tokens::sum_item_tokens_by_model(
-            &projects,
-            workspace_root,
-            issue,
-            Some(pr),
-            window,
-        )
-    });
-    let session_ids: Vec<String> = crate::launch_record::merge_step_logs(workspace_root, issue, pr)
-        .into_iter()
-        .filter_map(|(role, path)| Some((role, std::fs::read_to_string(path).ok()?)))
-        .flat_map(|(role, contents)| {
-            use crate::step_role::StepRole;
-            // Spelled out, no catch-all: a role added to `merge_step_logs`
-            // must be filed under its keying here before this compiles.
-            match role {
-                // Issue-keyed: an earlier dispatch is an abandoned retry.
-                StepRole::Builder | StepRole::Curator | StepRole::ChampionPromote => {
-                    crate::launch_record::opencode_session_ids_last_dispatch(&contents)
-                }
-                // PR-keyed: an earlier dispatch is a completed round on this PR.
-                StepRole::Doctor | StepRole::Judge | StepRole::ChampionMerge => {
-                    crate::launch_record::opencode_session_ids(&contents)
-                }
-            }
-        })
-        .collect();
-    let opencode = crate::opencode_usage::tokens_by_session_ids(&session_ids, None);
-    combine_model_totals(claude.into_iter().chain(opencode).flatten())
-}
-
-/// Merge rows by `(model, speed, service_tier)`, summing every counter, sorted
-/// by that key. `None` when there are no rows.
-fn combine_model_totals(
-    rows: impl IntoIterator<Item = ModelUsageTotals>,
-) -> Option<Vec<ModelUsageTotals>> {
-    let mut merged: std::collections::BTreeMap<(String, String, String), ModelUsageTotals> =
-        std::collections::BTreeMap::new();
-    for row in rows {
-        let entry = merged
-            .entry((row.model.clone(), row.speed.clone(), row.service_tier.clone()))
-            .or_insert_with(|| ModelUsageTotals {
-                model: row.model.clone(),
-                speed: row.speed.clone(),
-                service_tier: row.service_tier.clone(),
-                ..ModelUsageTotals::default()
-            });
-        entry.input = entry.input.saturating_add(row.input);
-        entry.cache_read = entry.cache_read.saturating_add(row.cache_read);
-        entry.cache_write_5m = entry.cache_write_5m.saturating_add(row.cache_write_5m);
-        entry.cache_write_1h = entry.cache_write_1h.saturating_add(row.cache_write_1h);
-        entry.output = entry.output.saturating_add(row.output);
-    }
-    (!merged.is_empty()).then(|| merged.into_values().collect())
-}
-
-/// The flat token total of `rows`: every counter summed, the same figure
-/// [`crate::transcript_tokens::sum_sweep_tokens`] reports for the same
-/// transcripts. `None` for a zero total, so an absent figure omits the key
-/// rather than publishing `0`.
-#[must_use]
-pub fn total_tokens(rows: &[ModelUsageTotals]) -> Option<u64> {
-    let total = rows.iter().fold(0_u64, |acc, row| {
-        let sum = row
-            .input
-            .saturating_add(row.cache_read)
-            .saturating_add(row.cache_write_5m)
-            .saturating_add(row.cache_write_1h)
-            .saturating_add(row.output);
-        acc.saturating_add(u64::try_from(sum).unwrap_or(0))
-    });
-    (total > 0).then_some(total)
 }
 
 /// Per-`(model, speed, service_tier)` token totals for one sweep, split across
@@ -817,8 +714,8 @@ mod tests {
             opencode: vec![id.to_string()],
             codex: Vec::new(),
         };
-        let _db =
-            crate::env_test_support::EnvGuard::set(crate::opencode_usage::OPENCODE_DB_ENV, &db);
+        // Crate-wide `LOOM_OPENCODE_DB` lock (#15204), held for the whole pin.
+        let _db = crate::tokens_pool::opencode_db_env::OpencodeDbEnv::set(&db);
         let close = |runtime, ids: &NativeSessionIds| {
             native_close_usage(Some(runtime), tmp.path(), Some((42, false)), &db, None, ids)
         };
@@ -950,6 +847,7 @@ mod tests {
         let close = |ids: &NativeSessionIds| {
             native_close_usage(Some("codex"), tmp.path(), None, &log, window, ids)
         };
+        let _codex_home_lock = crate::tokens_pool::codex_home_env::lock();
         let _guard =
             crate::env_test_support::EnvGuard::set(crate::codex_usage::CODEX_HOME_ENV, &home);
 
@@ -988,6 +886,7 @@ mod tests {
 
         // A store that does not exist at all.
         let absent = tmp.path().join("no-such-codex-home");
+        let _codex_home_lock = crate::tokens_pool::codex_home_env::lock();
         let _absent =
             crate::env_test_support::EnvGuard::set(crate::codex_usage::CODEX_HOME_ENV, &absent);
         assert_eq!(close(&ids("11111111-2222-3333-4444-555555555555")), Err(M::StoreUnreadable));
@@ -1013,6 +912,7 @@ mod tests {
                 &[(500, 0, 50)],
             ),
         );
+        let _codex_home_lock = crate::tokens_pool::codex_home_env::lock();
         let _guard =
             crate::env_test_support::EnvGuard::set(crate::codex_usage::CODEX_HOME_ENV, &home);
         let window = Some((at("2026-09-21T01:00:00Z"), at("2026-09-21T03:00:00Z")));
@@ -1179,6 +1079,51 @@ mod tests {
         assert_eq!(native_session_ids(""), NativeSessionIds::default());
     }
 
+    /// #15023: a `session id:` banner quoted mid-line — in prose, or inside an
+    /// event string — is data about a launch, not evidence of one. Only a line
+    /// that IS a banner contributes, the rule every Codex banner reader shares.
+    #[test]
+    fn native_session_ids_refuse_a_banner_quoted_mid_line() {
+        let quoted = concat!(
+            "the runner echoed: session id: 11111111-2222-3333-4444-555555555555\n",
+            r#"{"type":"text","part":{"text":"session id: deadbeef-aaaa-bbbb-cccc-dddddddddddd"}}"#,
+            "\n",
+        );
+        assert_eq!(native_session_ids(quoted).codex, Vec::<String>::new());
+    }
+
+    /// #15023: the one anchoring rule every Codex banner reader shares. A line
+    /// that IS the banner yields its token, leading whitespace and all; a
+    /// banner quoted mid-line, a look-alike prefix, and a too-short token are
+    /// data, not launches.
+    #[test]
+    fn codex_session_banner_is_line_anchored() {
+        const ID: &str = "3f2a9c1e-77b2-4d0a-9c1e-2f6a8b4d5e01";
+        let banner = format!("session id: {ID}");
+        assert_eq!(codex_session_banner(&banner).as_deref(), Some(ID));
+        assert_eq!(codex_session_banner(&format!(" \t session id: {ID}")).as_deref(), Some(ID));
+        assert_eq!(codex_session_banner(&format!("the runner echoed: session id: {ID}")), None);
+        assert_eq!(codex_session_banner(&format!("cosession id: {ID}")), None);
+        assert_eq!(codex_session_banner("session id: abc"), None);
+    }
+
+    /// #15023: the edge shapes a real capture can have — a CRLF line ending,
+    /// and a banner that is the last line of an unterminated capture — still
+    /// read as the banner they are.
+    #[test]
+    fn native_session_ids_read_a_crlf_or_unterminated_banner() {
+        const ID: &str = "3f2a9c1e-77b2-4d0a-9c1e-2f6a8b4d5e01";
+        let expected = NativeSessionIds {
+            opencode: Vec::new(),
+            codex: vec![ID.to_string()],
+        };
+        assert_eq!(
+            native_session_ids(&format!("OpenAI Codex v0.160\r\nsession id: {ID}\r\n")),
+            expected
+        );
+        assert_eq!(native_session_ids(&format!("tokens used\nsession id: {ID}")), expected);
+    }
+
     #[test]
     fn source_names_cover_every_variant_and_stay_stable_for_logs() {
         for (source, name) in [
@@ -1232,8 +1177,7 @@ mod tests {
         assert_eq!(attribution.runtime, "kimi");
         assert_eq!(attribution.provider.as_deref(), Some("moonshot"));
         assert_eq!(attribution.profile.as_deref(), Some("example-kimi-subscription"));
-        // …and the SAME `runtime` string is what selects the store, so a
-        // completion's labels and its numbers can never describe two runtimes.
+        // The outcome's runtime label also selects its token store.
         assert_eq!(
             UsageSource::for_runtime(Some(attribution.runtime.as_str())),
             UsageSource::KimiSessionStore
@@ -1395,6 +1339,7 @@ mod tests {
         )
         .unwrap();
 
+        let _codex_home_lock = crate::tokens_pool::codex_home_env::lock();
         std::env::remove_var(crate::codex_usage::CODEX_HOME_ENV);
         std::env::set_var(crate::codex_usage::CODEX_NATIVE_HOME_ENV, &ambient);
         let _profile_root = crate::tokens_pool::profile_root_env::ProfileRootEnv::set(&profiles);

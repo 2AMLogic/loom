@@ -21,6 +21,7 @@ mod profile_check;
 pub(crate) mod profiles;
 mod prompt;
 pub(crate) mod rejection;
+pub mod sccache_server;
 
 pub use profile_check::{cli as profile_cli, WorkerArgs as WorkerCommand};
 // #11360: the mixed-sweep accounting fixture builds its escalated-Doctor log
@@ -55,6 +56,11 @@ pub struct Options {
     pub effort: Option<String>,
     pub log: Option<PathBuf>,
     pub skip_permissions: bool,
+    /// Internal (#15527): the host proxy's container-reachable base URL, set
+    /// only by the host launcher on a contained OpenCode re-exec. Validated
+    /// by [`egress_proxy::ContainedRedirect::resolve`]; an older worker
+    /// rejects it as an unsupported option, which is the compatibility check.
+    pub egress_proxy_base_url: Option<String>,
 }
 impl Options {
     fn parse(args: &[std::ffi::OsString]) -> Result<Self, LaunchError> {
@@ -81,6 +87,7 @@ impl Options {
                 "--profile",
                 "--effort",
                 "--log",
+                egress_proxy::BASE_URL_ARG,
             ]
             .contains(&flag)
             {
@@ -99,6 +106,11 @@ impl Options {
                 "--profile" => out.profile = Some(value.into()),
                 "--effort" => out.effort = Some(value.into()),
                 "--log" => out.log = Some(value.into()),
+                egress_proxy::BASE_URL_ARG => {
+                    if out.egress_proxy_base_url.replace(value.into()).is_some() {
+                        return Err(LaunchError::config(format!("{flag} may be given only once")));
+                    }
+                }
                 _ => unreachable!(),
             }
         }
@@ -174,6 +186,9 @@ impl LaunchError {
 /// reaches span attributes, the step log's rejection marker, and — prefixed
 /// with `preflight_` — the step ledger's outcome reason. Never carries
 /// free-form diagnostic text: the message stays on local stderr only.
+/// A detail of a boundary keeps the boundary's token as its prefix
+/// (`profile_selection_effort`), so a search for the boundary still finds
+/// every detail.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LaunchStage {
     /// The runtime name could not be resolved or validated (workspace
@@ -184,8 +199,18 @@ pub enum LaunchStage {
     WorkerOptions,
     /// Role admission refused this runtime/profile/role pairing.
     RoleAdmission,
-    /// Model-profile selection failed for this launch.
+    /// Model-profile selection failed for this launch: everything that is
+    /// wrong with the profile itself or with the request's shape (an unknown
+    /// or malformed profile, no provider binding for this harness, an invalid
+    /// credential mapping). The two launch-argument conflicts have their own
+    /// variants below.
     ProfileSelection,
+    /// Model-profile selection failed because the launch's reasoning effort
+    /// is outside the selected profile's `allowedEfforts`.
+    ProfileSelectionEffort,
+    /// Model-profile selection failed because the launch's bare model differs
+    /// from the selected profile's own model.
+    ProfileSelectionModel,
     /// The selected model profile excludes this role (`excludedRoles`).
     ProfileRoleExcluded,
     /// The LLM gateway refused, or could not plan, this launch.
@@ -212,6 +237,11 @@ pub enum LaunchStage {
     /// (the OpenCode major guard, #8438/#11283): the probe answered with an
     /// unsupported or canary-unverified version.
     CliQualification,
+    /// The caller's `LOOM_PROMPT_MODIFIER` cannot be applied to this launch:
+    /// malformed, not registered, no entry for the runtime, or no prompt
+    /// argument to modify (#15017). The run never proceeds plain under the
+    /// modifier's name.
+    PromptModifier,
 }
 
 impl LaunchStage {
@@ -222,6 +252,8 @@ impl LaunchStage {
             Self::WorkerOptions => "worker_options",
             Self::RoleAdmission => "role_admission",
             Self::ProfileSelection => "profile_selection",
+            Self::ProfileSelectionEffort => "profile_selection_effort",
+            Self::ProfileSelectionModel => "profile_selection_model",
             Self::ProfileRoleExcluded => "profile_role_excluded",
             Self::GatewayPlan => "gateway_plan",
             Self::Containment => "containment",
@@ -233,6 +265,7 @@ impl LaunchStage {
             Self::LogWrite => "log_write",
             Self::LaunchPrep => "launch_prep",
             Self::CliQualification => "cli_qualification",
+            Self::PromptModifier => "prompt_modifier",
         }
     }
 
@@ -246,6 +279,8 @@ impl LaunchStage {
             "worker_options" => Self::WorkerOptions,
             "role_admission" => Self::RoleAdmission,
             "profile_selection" => Self::ProfileSelection,
+            "profile_selection_effort" => Self::ProfileSelectionEffort,
+            "profile_selection_model" => Self::ProfileSelectionModel,
             "profile_role_excluded" => Self::ProfileRoleExcluded,
             "gateway_plan" => Self::GatewayPlan,
             "containment" => Self::Containment,
@@ -257,6 +292,7 @@ impl LaunchStage {
             "log_write" => Self::LogWrite,
             "launch_prep" => Self::LaunchPrep,
             "cli_qualification" => Self::CliQualification,
+            "prompt_modifier" => Self::PromptModifier,
             _ => return None,
         })
     }
@@ -286,6 +322,8 @@ fn stage_reason(stage: LaunchStage) -> &'static str {
         LaunchStage::WorkerOptions => "preflight_worker_options",
         LaunchStage::RoleAdmission => "preflight_role_admission",
         LaunchStage::ProfileSelection => "preflight_profile_selection",
+        LaunchStage::ProfileSelectionEffort => "preflight_profile_selection_effort",
+        LaunchStage::ProfileSelectionModel => "preflight_profile_selection_model",
         LaunchStage::ProfileRoleExcluded => "preflight_profile_role_excluded",
         LaunchStage::GatewayPlan => "preflight_gateway_plan",
         LaunchStage::Containment => "preflight_containment",
@@ -297,6 +335,7 @@ fn stage_reason(stage: LaunchStage) -> &'static str {
         LaunchStage::LogWrite => "preflight_log_write",
         LaunchStage::LaunchPrep => "preflight_launch_prep",
         LaunchStage::CliQualification => "preflight_cli_qualification",
+        LaunchStage::PromptModifier => "preflight_prompt_modifier",
     }
 }
 
@@ -631,6 +670,7 @@ fn rejection_attributes(
     if let Some(resolution) = resolution {
         let runtime = match resolution.runtime.as_str() {
             "aider" => "aider",
+            "agy" => "agy",
             "claude" => "claude",
             "codex" => "codex",
             "gemini" => "gemini",
@@ -740,6 +780,26 @@ fn record_resolved_runtime(
         .map_err(|e| LaunchError::config(e.to_string()).with_stage(LaunchStage::LogWrite))
 }
 
+/// The single-step caller's prompt modifier as a transform for `runtime`
+/// (#15017), `None` when the caller named none.
+///
+/// A name the launch cannot honor is a `prompt_modifier` preflight rejection:
+/// the run must never proceed plain under the modifier's name.
+fn resolve_prompt_modifier(
+    config: &serde_json::Value,
+    runtime: &str,
+) -> Result<Option<crate::prompt_modifier::Transform>, LaunchError> {
+    let Some(name) = crate::prompt_modifier::current() else {
+        return Ok(None);
+    };
+    crate::prompt_modifier::resolve(config, runtime, name)
+        .map(Some)
+        .map_err(|rejection| {
+            LaunchError::config(rejection.describe(name, runtime))
+                .with_stage(LaunchStage::PromptModifier)
+        })
+}
+
 fn run_preflight(
     args: WorkerArgs,
     root: &Path,
@@ -805,6 +865,9 @@ fn run_preflight(
             &runtime,
             source,
         )?;
+        // #15017: checked here, on the host, before admission, containment and
+        // credentials — a contained launch's re-exec'd copy re-resolves it.
+        let prompt_modifier = resolve_prompt_modifier(&config, &runtime)?;
         // A role-tagged invocation must meet the same capabilities as daemon dispatch.
         // Free-form prompts remain available for controlled, isolated experiments.
         let role = nonempty_env("LOOM_ROLE");
@@ -834,6 +897,19 @@ fn run_preflight(
         }
         let mut selection = profiles::select(&runtime, &options, &config)
             .map_err(|e| e.or_stage(LaunchStage::ProfileSelection))?;
+        // #15527: the proxy handoff is the host launcher's own argument to the
+        // contained re-exec. Anything else supplying it (a hand-built argv, a
+        // stale wrapper) is refused before any listener, container or harness.
+        if options.egress_proxy_base_url.is_some()
+            && nonempty_env("LOOM_SPAWN_CONTAINERIZED").is_none()
+        {
+            return Err(LaunchError::config(format!(
+                "{} is an internal argument of the contained re-exec and is not accepted on the \
+                 host",
+                egress_proxy::BASE_URL_ARG
+            ))
+            .with_stage(LaunchStage::WorkerOptions));
+        }
         // #11400: the profile actually selected (an explicit `--profile` may
         // differ from the one admission judged) must not exclude this role.
         if let Some(name) = selection.profile.as_deref() {
@@ -911,12 +987,20 @@ fn run_preflight(
             // feature is off or the profile opts out.
             let prepared = egress_proxy::prepare(root, &selection, &config, &runtime)
                 .map_err(|e| e.or_stage(LaunchStage::EgressProxy))?;
+            // #15527: a config-side redirect (`baseUrlConfig`) is applied by the
+            // in-container copy, which provisions the OpenCode config; it gets
+            // the proxy URL as a REQUIRED argument (see
+            // `Prepared::contained_worker_args`).
+            let worker_args = match &prepared {
+                Some(prepared) => prepared.contained_worker_args(&selection, &runtime, &args.args),
+                None => args.args.clone(),
+            };
             let mut command = containment::docker_command(
                 &profile,
                 root,
                 &std::env::current_dir().map_err(|e| LaunchError::config(e.to_string()))?,
                 options.log.as_deref(),
-                &args.args,
+                &worker_args,
                 &credentials,
                 prepared.as_ref().map(|p| &p.injection),
             )
@@ -968,6 +1052,24 @@ fn run_preflight(
             (None, None) => credential::resolve(root, &selection)
                 .map_err(|e| e.or_stage(LaunchStage::Credential))?,
         };
+        // #15527: the contained OpenCode proxy handoff, validated before the
+        // prompt is expanded or the harness provisioned. Any invalid or
+        // conflicting handoff stops the launch here.
+        let contained_redirect = options
+            .egress_proxy_base_url
+            .as_deref()
+            .map(|raw| {
+                egress_proxy::ContainedRedirect::resolve(
+                    raw,
+                    &selection,
+                    &runtime,
+                    nonempty_env("LOOM_SPAWN_CONTAINERIZED").is_some(),
+                    gateway.is_some(),
+                    &credential,
+                )
+            })
+            .transpose()
+            .map_err(|e| e.or_stage(LaunchStage::EgressProxy))?;
         // #10749: how this launch is billed, from the profile's declared class
         // and the credential source actually resolved. Enumerated vocabulary
         // plus the profile name only; never a key, account or path.
@@ -978,7 +1080,24 @@ fn run_preflight(
             .as_deref()
             .map(|p| prompt::expand(root, p))
             .transpose()
-            .map_err(|e| e.or_stage(LaunchStage::PromptExpansion))?;
+            .map_err(|e| e.or_stage(LaunchStage::PromptExpansion))?
+            // #15017: the one application site for a native harness — after
+            // role expansion, so the text follows the whole role prompt.
+            .map(|text| match &prompt_modifier {
+                Some(transform) => transform.apply(&text),
+                None => text,
+            });
+        // A resolved modifier with no prompt to modify must not launch plain
+        // under the modifier's name (provenance and the digest would record a
+        // modified run). Same refusal as the legacy arm (#15017).
+        if prompt_modifier.is_some() && expanded.is_none() {
+            return Err(LaunchError::config(format!(
+                "prompt modifier {:?} needs a prompt to modify; refusing to run without it \
+                 (#15017)",
+                crate::prompt_modifier::current().unwrap_or_default()
+            ))
+            .with_stage(LaunchStage::PromptModifier));
+        }
         let mut command = harness
             .command(
                 &options,
@@ -1003,6 +1122,14 @@ fn run_preflight(
                 .and_then(|proxy| proxy.base_url_config.as_deref());
             prepared
                 .apply_native_env(&mut command, &selection.provider, config_option)
+                .map_err(|e| e.or_stage(LaunchStage::EgressProxy))?;
+        }
+        // After provisioning, so the patch lands on the config the harness
+        // will read — guarded role or free-form, with or without a provider
+        // block in the profile.
+        if let Some(redirect) = &contained_redirect {
+            redirect
+                .apply(&mut command, &selection.provider)
                 .map_err(|e| e.or_stage(LaunchStage::EgressProxy))?;
         }
         log = attach_log(&mut command, options.log.as_deref())
@@ -1043,6 +1170,20 @@ fn run_preflight(
         command
     } else {
         record_resolved_runtime(log.as_mut(), &runtime, source)?;
+        // #15017: the one application site for a legacy adapter — its `-p` /
+        // `--prompt` value, so `spawn-<runtime>.sh` and the CLI behind it see
+        // the modified prompt and nothing else about the argv changes.
+        let mut adapter_args = args.args.clone();
+        if let Some(transform) = resolve_prompt_modifier(&config, &runtime)? {
+            if !crate::prompt_modifier::apply_to_args(&mut adapter_args, &transform) {
+                return Err(LaunchError::config(format!(
+                    "prompt modifier {:?} needs a -p/--prompt argument to modify; refusing to run \
+                     without it (#15017)",
+                    crate::prompt_modifier::current().unwrap_or_default()
+                ))
+                .with_stage(LaunchStage::PromptModifier));
+            }
+        }
         let runner = scripts.join(format!("spawn-{runtime}.sh"));
         if !runner.is_file() {
             let available = fs::read_dir(&scripts)
@@ -1061,7 +1202,63 @@ fn run_preflight(
                 .with_stage(LaunchStage::RunnerMissing));
         }
         let mut command = Command::new(runner);
-        command.args(&args.args);
+        command.args(&adapter_args);
+        // #14945: a tier-3 runtime whose manifest declares `credentialPool`
+        // (the Antigravity `agy` pilot) draws its key from the API-key pool
+        // HERE, in the worker process that exec's the runner — the process
+        // the in-flight lease names, so the account's shared concurrency cap
+        // frees exactly when the CLI run ends. A short-lived helper would
+        // count the lease against the wrong PID. See
+        // `credential::resolve_tier3` for why the pool is mandatory (no
+        // ambient-key escape) and what refuses.
+        match crate::runtime_launch::pooled_tier3(root, &runtime) {
+            Err(detail) => {
+                return Err(LaunchError::config(format!(
+                    "runtime {runtime} has a malformed credential-pool declaration: {detail}"
+                ))
+                .with_stage(LaunchStage::Credential));
+            }
+            Ok(None) => {}
+            Ok(Some(declaration)) => {
+                // env > manifest, the tier-3 precedence: an operator's
+                // LOOM_MODEL wins and is forwarded once (spawn-generic.sh's
+                // modelFlag); the manifest default is set only when the
+                // environment did not supply one, so the CLI sees exactly
+                // one --model.
+                let env_model = nonempty_env("LOOM_MODEL");
+                let model = env_model.clone().or_else(|| declaration.model.clone());
+                let selected =
+                    credential::resolve_tier3(root, &runtime, &declaration, model.as_deref())
+                        .map_err(|e| e.or_stage(LaunchStage::Credential))?;
+                // The pool's selection is the ONLY value that reaches the
+                // child: `Command::env` overrides the inherited one, so an
+                // ambient GEMINI_API_KEY neither wins nor rides along. The
+                // value never touches argv, and the record below names the
+                // account, never the key.
+                command.env(&declaration.env_var, &selected.credential.value);
+                if env_model.is_none() {
+                    if let Some(model) = &model {
+                        command.env("LOOM_MODEL", model);
+                    }
+                }
+                let tap = crate::runtime_preference::Tap::runtime(&runtime).to_string();
+                let launch = serde_json::json!({
+                    "schema": 1,
+                    "runtime": runtime,
+                    "tap": tap,
+                    "model": model,
+                    "credentialSource": "pool",
+                    "credentialProvider": selected.provider,
+                    "credentialAccount": selected.name,
+                    "usage": "none",
+                    "billing": "not-measured",
+                })
+                .to_string();
+                writeln!(log, "# LOOM_LAUNCH {launch}").map_err(|e| {
+                    LaunchError::config(e.to_string()).with_stage(LaunchStage::LogWrite)
+                })?;
+            }
+        }
         // #14167: a legacy adapter's launch facts are the `--model`/`--effort`
         // its documented precedence resolves — exactly what the dispatch step
         // handed this child over and what `loom.step.model_launched` records
@@ -1201,6 +1398,11 @@ fn run_preflight(
     // the build on an empty value instead of reading it as unset.
     cargo_debuginfo::apply(&mut command, &debuginfo, |k| std::env::var_os(k));
     let _ = writeln!(log, "{}", debuginfo.marker);
+    // #15139: a shared `sccache` server started lazily by this worker's own
+    // `cargo` would inherit the per-run TMPDIR the reaper later removes, then
+    // fail every compile on the host. Start (or probe) it now under a stable
+    // root instead; a failure is one log line, never a failed launch.
+    let _ = sccache_server::ensure(&mut log);
     // The other half of #8453, on the same seam and for the same reason
     // (#8458): when the repo opts in (`cargo.perWorktreeTargetDir`), a spawn
     // that OWNS a sweep's claim runs under that issue worktree's own
@@ -1409,6 +1611,8 @@ mod launch_rejection_tests {
             LaunchStage::WorkerOptions,
             LaunchStage::RoleAdmission,
             LaunchStage::ProfileSelection,
+            LaunchStage::ProfileSelectionEffort,
+            LaunchStage::ProfileSelectionModel,
             LaunchStage::ProfileRoleExcluded,
             LaunchStage::GatewayPlan,
             LaunchStage::Containment,
@@ -1420,6 +1624,7 @@ mod launch_rejection_tests {
             LaunchStage::LogWrite,
             LaunchStage::LaunchPrep,
             LaunchStage::CliQualification,
+            LaunchStage::PromptModifier,
         ];
         for stage in all {
             assert_eq!(LaunchStage::parse(stage.as_str()), Some(stage));
@@ -1430,6 +1635,14 @@ mod launch_rejection_tests {
             let reason = stage_reason(stage);
             assert!(reason.starts_with("preflight_"));
             assert_eq!(reason.strip_prefix("preflight_"), Some(stage.as_str()));
+            // One token reaches the ledger whole through the per-spawn report
+            // socket: a longer name would be truncated on the datagram and
+            // read back as no typed reason.
+            assert!(
+                stage.as_str().len() <= super::rejection::REPORT_BYTES,
+                "{} is too long for the report socket",
+                stage.as_str()
+            );
         }
         assert_eq!(LaunchStage::parse("credential "), None, "exact tokens only");
         assert_eq!(LaunchStage::parse("Credential"), None);

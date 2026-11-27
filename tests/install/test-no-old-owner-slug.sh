@@ -51,10 +51,13 @@ SHIPPED_PATHS=(
   CLAUDE.md
   README.md
   .loom/README.md
+  .loom/bin/loom
   .loom/config
   .loom/docs
   .loom/install-metadata.json
+  .loom/runtimes
   .claude/README.md
+  .claude/settings.json
   .github/CONFIGURATION.md
   loom-daemon/src/init/scaffolding.rs
 )
@@ -68,14 +71,20 @@ ALLOWLIST_RE='^loom-daemon/src/init/scaffolding\.rs:[0-9]+:[[:space:]]*"\*\*Loom
 
 # scan_old_slug <repo-root> [allowlist-re]: print "path:line:text" for each
 # non-allowlisted hit. Prints "MISSING: <path>" for a SHIPPED_PATHS entry that
-# does not exist, so a renamed directory cannot turn the guard into a silent
-# no-op. Treats grep exit 1 as "no matches" and propagates fatal errors (> 1)
-# with a diagnostic on stderr.
+# does not exist and "UNTRACKED: <path>" for one that exists but matches zero
+# tracked paths -- git grep reads tracked files only, so such an entry would
+# otherwise read as covered while scanning nothing (#15080). In a non-git tree
+# the ls-files query fails; that case is left to the fatal git grep path below
+# so stdout stays quiet for it. Treats grep exit 1 as "no matches" and
+# propagates fatal errors (> 1) with a diagnostic on stderr.
 scan_old_slug() {
   local root="$1" allowlist_re="${2:-$ALLOWLIST_RE}"
-  local p hits err_file err grep_rc filtered filter_rc
+  local p tracked hits err_file err grep_rc filtered filter_rc
   for p in "${SHIPPED_PATHS[@]}"; do
-    [[ -e "$root/$p" ]] || echo "MISSING: $p"
+    [[ -e "$root/$p" ]] || { echo "MISSING: $p"; continue; }
+    if tracked="$(git -C "$root" ls-files -- "$p" 2>/dev/null)"; then
+      [[ -n "$tracked" ]] || echo "UNTRACKED: $p"
+    fi
   done
 
   err_file="$(mktemp "$TMP_WORK/scan-err.XXXXXX")"
@@ -102,6 +111,25 @@ scan_old_slug() {
   fi
   [[ $filter_rc -eq 0 && -n "$filtered" ]] && printf '%s\n' "$filtered"
   return 0
+}
+
+# make_fixture_tree <root>: materialise every SHIPPED_PATHS entry under <root>
+# in the shape it has in the real tree — a directory becomes a directory (with
+# a placeholder file so git tracks it), a file becomes a file. Shape is read
+# from $REPO_ROOT rather than guessed from the path: `.loom/config` is a
+# directory while the extensionless `.loom/bin/loom` is a file, so neither a
+# `*.*` split nor any basename heuristic can classify them (#14960).
+make_fixture_tree() {
+  local root="$1" p
+  for p in "${SHIPPED_PATHS[@]}"; do
+    if [[ -d "$REPO_ROOT/$p" ]]; then
+      mkdir -p "$root/$p"
+      echo "clean" >"$root/$p/placeholder.md"
+    else
+      mkdir -p "$root/$(dirname "$p")"
+      echo "clean" >"$root/$p"
+    fi
+  done
 }
 
 # ============================================================================
@@ -131,15 +159,38 @@ echo "=== Scanner flags regressions, honours allowlist, and reports fatal errors
 FIXTURE="$TMP_WORK/repo"
 mkdir -p "$FIXTURE"
 git -C "$FIXTURE" init -q
-for p in "${SHIPPED_PATHS[@]}"; do
-  case "$p" in
-    *.*) mkdir -p "$FIXTURE/$(dirname "$p")"; echo "clean" >"$FIXTURE/$p" ;;
-    *)   mkdir -p "$FIXTURE/$p"; echo "clean" >"$FIXTURE/$p/placeholder.md" ;;
-  esac
-done
+make_fixture_tree "$FIXTURE"
 git -C "$FIXTURE" add -A
 
+# Shape mirror: every shipped path must exist in the fixture in the shape the
+# real tree gives it (directory vs file) — the property #14960 fixed; a
+# regression here would otherwise pass the scans silently, as it did before.
+shape_mismatches=""
+for p in "${SHIPPED_PATHS[@]}"; do
+  if [[ -d "$REPO_ROOT/$p" ]]; then
+    [[ -d "$FIXTURE/$p" ]] || shape_mismatches+="dir:$p "
+  else
+    [[ -f "$FIXTURE/$p" ]] || shape_mismatches+="file:$p "
+  fi
+done
+assert_eq "fixture mirrors each shipped path's real shape (dir/file)" \
+  "" \
+  "$shape_mismatches"
+
 assert_eq "clean fixture: no hits" "" "$(scan_old_slug "$FIXTURE")"
+
+# Untracked-but-present: git grep reads tracked files only, so a shipped path
+# that exists on disk but matches zero tracked paths would read as covered
+# while scanning nothing (#15080). Untrack scripts/install in the index only
+# and expect exactly one UNTRACKED diagnostic -- not MISSING, not silence.
+git -C "$FIXTURE" rm -qr --cached -- scripts/install
+assert_eq "untracked shipped path keeps its placeholder on disk" \
+  "true" \
+  "$([[ -f "$FIXTURE/scripts/install/placeholder.md" ]] && echo true || echo false)"
+assert_eq "an untracked-but-present shipped path is reported, not silently unscanned" \
+  "UNTRACKED: scripts/install" \
+  "$(scan_old_slug "$FIXTURE")"
+git -C "$FIXTURE" add -- scripts/install
 
 echo "see https://github.com/$OLD_SLUG/issues/1" >"$FIXTURE/defaults/regressed.md"
 echo "image ghcr.io/$OLD_SLUG-worker:latest" >"$FIXTURE/defaults/ghcr-line.md"
@@ -170,12 +221,7 @@ assert_eq "a vanished shipped path is reported, not silently skipped" \
 # of returning an empty clean scan.
 EXPORTED="$TMP_WORK/exported"
 mkdir -p "$EXPORTED"
-for p in "${SHIPPED_PATHS[@]}"; do
-  case "$p" in
-    *.*) mkdir -p "$EXPORTED/$(dirname "$p")"; echo "clean" >"$EXPORTED/$p" ;;
-    *)   mkdir -p "$EXPORTED/$p"; echo "clean" >"$EXPORTED/$p/placeholder.md" ;;
-  esac
-done
+make_fixture_tree "$EXPORTED"
 echo "see https://github.com/$OLD_SLUG/issues/1" >"$EXPORTED/README.md"
 
 exported_rc=0

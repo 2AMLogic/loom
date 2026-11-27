@@ -1039,6 +1039,79 @@ fn legacy_argv_preserves_non_utf8_bytes() {
     assert!(String::from_utf8_lossy(&out.stdout).contains(&format!("arg={arg:?}")));
 }
 
+/// Above Linux's maximum `pid_max` (2^22), so never a live process: a stale
+/// session pid a caller may have left in the environment.
+const NO_SUCH_PID: &str = "4999999";
+
+/// One tool process the fixture ran under a launch (#15455): the two session
+/// markers it inherited, each with whether the process it named was alive.
+struct ToolCall {
+    runner: u32,
+    /// `(marker, value, alive)`.
+    markers: Vec<(String, String, bool)>,
+    /// Whether the previous tool's process still existed when this one ran.
+    prev_alive: bool,
+}
+
+/// The `tool_*` lines of one launch, in order.
+fn tool_calls(stdout: &str) -> Vec<ToolCall> {
+    let mut calls: Vec<ToolCall> = Vec::new();
+    for line in stdout.lines() {
+        if let Some(rest) = line.strip_prefix("tool_runner pid=") {
+            calls.push(ToolCall {
+                runner: rest.parse().unwrap(),
+                markers: Vec::new(),
+                prev_alive: false,
+            });
+        } else if let Some(rest) = line.strip_prefix("tool_markers ") {
+            let markers = &mut calls
+                .last_mut()
+                .expect("tool_runner precedes tool_markers")
+                .markers;
+            *markers = rest
+                .split(' ')
+                .map(|marker| {
+                    let (key, value) = marker.split_once('=').expect("key=value");
+                    let (pid, alive) = value.rsplit_once(':').expect("pid:alive");
+                    (key.to_string(), pid.to_string(), alive == "true")
+                })
+                .collect();
+        } else if let Some(rest) = line.strip_prefix("tool_prev_alive=") {
+            calls
+                .last_mut()
+                .expect("tool_runner precedes tool_prev_alive")
+                .prev_alive = rest == "true";
+        }
+    }
+    calls
+}
+
+/// The pid of the launch that ran the `tool_*` lines of `stdout`, which
+/// exactly `calls` tool processes saw through both session markers, alive
+/// (#15455). The launcher execs the harness, so the launch pid is the
+/// harness's own.
+fn one_live_launch_owner(stdout: &str, calls: usize) -> String {
+    let launch_pid = stdout
+        .lines()
+        .find_map(|line| line.strip_prefix("pid="))
+        .unwrap()
+        .to_string();
+    let tools = tool_calls(stdout);
+    assert_eq!(tools.len(), calls, "{stdout}");
+    for tool in &tools {
+        assert_ne!(tool.runner.to_string(), launch_pid, "{stdout}");
+        assert_eq!(
+            tool.markers,
+            [
+                ("LOOM_NATIVE_WORKER_PID".to_string(), launch_pid.clone(), true),
+                ("LOOM_AGENT_SESSION_PID".to_string(), launch_pid.clone(), true),
+            ],
+            "{stdout}"
+        );
+    }
+    launch_pid
+}
+
 #[test]
 fn guarded_opencode_pins_auxiliary_models_preserves_provider_and_worker_identity() {
     let d = tempfile::tempdir().unwrap();
@@ -1052,6 +1125,9 @@ fn guarded_opencode_pins_auxiliary_models_preserves_provider_and_worker_identity
             r#"{"small_model":"anthropic/stale","provider":{"private":{"name":"fixture"}}}"#,
         )
         .env("FIXTURE_NATIVE_CONFIG", "1")
+        // #15455: two successive tool processes, under a stale session pid.
+        .env("LOOM_AGENT_SESSION_PID", NO_SUCH_PID)
+        .env("FIXTURE_TOOL_CALLS", "2")
         .args(["-p", "hello"])
         .output()
         .unwrap();
@@ -1068,6 +1144,17 @@ fn guarded_opencode_pins_auxiliary_models_preserves_provider_and_worker_identity
     assert_eq!(config["provider"]["private"]["name"], "fixture");
     assert_eq!(config["permission"]["*"], "deny");
     assert!(text.contains("native_worker_pid_matches=true"));
+    // #15455: the launch pid is the session owner. The launcher execs the
+    // harness, so it is the harness's own pid; it overwrites the stale
+    // caller value in the harness and in every tool process it runs.
+    let launch_pid = one_live_launch_owner(&text, 2);
+    assert_ne!(launch_pid, NO_SUCH_PID);
+    assert!(text.contains(&format!("native_session_pid={launch_pid}")), "{text}");
+    // The first tool's process was gone by the time the second ran, while
+    // the owner both name was still alive.
+    let tools = tool_calls(&text);
+    assert!(!tools[0].prev_alive, "{text}");
+    assert!(!tools[1].prev_alive, "{text}");
 }
 
 /// #8448: a guarded launch whose native JSON stream never actually used a
@@ -1218,14 +1305,163 @@ fn an_unqualified_opencode_cli_refuses_at_the_cli_qualification_stage() {
     assert!(out.stdout.is_empty());
 }
 
+/// #14634: the two launch arguments a native model profile can refuse — a
+/// reasoning effort outside its `allowedEfforts`, and a bare model that
+/// differs from its own — are typed preflight boundaries of their own, so a
+/// recurrence's receipt names the refused argument instead of the coarse
+/// `profile_selection` (every Builder refusal the issue tracked carried the
+/// effort one). Every other selection failure — here an unknown profile name
+/// — keeps the coarse token. The harness never runs, and the marker is the
+/// typed token alone: the free-form diagnostic stays on its own stderr line.
+#[test]
+fn an_effort_or_model_a_profile_refuses_is_a_typed_preflight_boundary() {
+    let d = tempfile::tempdir().unwrap();
+    let cases = [
+        (
+            vec!["--effort", "xhigh"],
+            "profile_selection_effort",
+            "reasoning effort is unsupported by the selected model profile",
+        ),
+        (
+            vec!["--model", "sonnet"],
+            "profile_selection_model",
+            "bare model differs from the selected profile",
+        ),
+        (
+            vec!["--profile", "no-such-profile"],
+            "profile_selection",
+            "unknown model profile `no-such-profile`",
+        ),
+    ];
+    for (args, stage, diagnostic) in cases {
+        let out = worker(d.path(), "opencode")
+            .args(args)
+            .args(["-p", "hello"])
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(78), "{stage}: {stderr}");
+        let marker = format!("# LOOM_LAUNCH_REJECTED code=78 stage={stage}");
+        let line = stderr
+            .lines()
+            .find(|l| l.contains("# LOOM_LAUNCH_REJECTED"))
+            .unwrap_or_else(|| panic!("no rejection marker: {stderr}"));
+        assert_eq!(line, marker, "the marker is the typed token, nothing else");
+        assert!(stderr.contains(diagnostic), "{stage}: the diagnostic stays on stderr");
+        assert!(stderr.contains("# LOOM_RUNTIME_RESOLVED runtime=opencode"), "{stage}: {stderr}");
+        assert!(
+            out.stdout.is_empty(),
+            "{stage}: the harness never ran: {:?}",
+            String::from_utf8_lossy(&out.stdout)
+        );
+    }
+}
+
 #[path = "worker_spawn/cargo_debuginfo.rs"]
 mod cargo_debuginfo;
 #[path = "worker_spawn/excluded_roles.rs"]
 mod excluded_roles;
 #[path = "worker_spawn/native_sweep.rs"]
 mod native_sweep;
+#[path = "worker_spawn/prompt_modifier.rs"]
+mod prompt_modifier;
+// #15455: the self-claim lease lifecycle needs bash and the lease scripts.
+#[cfg(unix)]
+#[path = "worker_spawn/session_lease.rs"]
+mod session_lease;
 
 // Fail this test binary on any spawn of the real `gh` (#10225, extends #10138).
 #[allow(dead_code)]
 #[path = "../src/live_gh_guard.rs"]
 mod live_gh_guard;
+
+/// #15252: a `runtimes.modelProfileOverrides` entry changes the launched model
+/// of a bundled profile with no release, while the bundled `excludedRoles`
+/// still refuses Judge and Curator.
+#[test]
+fn a_model_profile_override_changes_the_launched_model_and_keeps_excluded_roles() {
+    let d = tempfile::tempdir().unwrap();
+    config(
+        d.path(),
+        serde_json::json!({"runtimes": {"modelProfileOverrides": {"zai-full": {"model": "glm-5.4"}}}}),
+    );
+    let out = worker(d.path(), "opencode")
+        .args(["--profile", "zai-full", "-p", "hello"])
+        .env("ZAI_API_KEY", "test-not-a-secret")
+        .env("ZHIPU_API_KEY", "test-not-a-secret")
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{stderr}");
+    assert!(stderr.contains("\"model\":\"glm-5.4\""), "{stderr}");
+    assert!(!stderr.contains("glm-5.3"), "{stderr}");
+
+    // (Judge/Curator refusal under an override: `worker_spawn/excluded_roles.rs`.)
+    let check = profile_check(d.path(), &["zai-full"]);
+    assert!(check.status.success(), "{}", String::from_utf8_lossy(&check.stdout));
+    let text = String::from_utf8_lossy(&check.stdout);
+    assert!(text.contains("model: glm-5.4 (source: committed)"), "{text}");
+}
+
+#[test]
+fn an_invalid_model_profile_override_fails_closed_at_78() {
+    let d = tempfile::tempdir().unwrap();
+    for (bad, expect) in [
+        (
+            serde_json::json!({"zai-full": {"excludedRoles": []}}),
+            "never replaced or reduced",
+        ),
+        (serde_json::json!({"zai-full": {"providers": {}}}), "unknown override key"),
+        (serde_json::json!({"made-up": {"model": "m"}}), "not a bundled model profile"),
+    ] {
+        config(d.path(), serde_json::json!({"runtimes": {"modelProfileOverrides": bad}}));
+        let out = worker(d.path(), "opencode")
+            .args(["--profile", "zai-full", "-p", "hello"])
+            .output()
+            .unwrap();
+        assert_eq!(out.status.code(), Some(78), "{}", String::from_utf8_lossy(&out.stderr));
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(stderr.contains(expect), "{expect}: {stderr}");
+        let check = profile_check(d.path(), &["zai-full"]);
+        assert_eq!(check.status.code(), Some(78));
+    }
+}
+
+/// #15252: `worker profile-check` names the effective model and the tier that
+/// decided it, and a higher tier's override beats a lower one.
+#[test]
+fn profile_check_reports_the_effective_model_and_its_source_tier() {
+    let d = tempfile::tempdir().unwrap();
+    let source_line = |root: &std::path::Path| {
+        let out = profile_check(root, &["zai-full"]);
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stdout));
+        String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .find(|l| l.starts_with("model: "))
+            .unwrap()
+            .to_string()
+    };
+    assert_eq!(source_line(d.path()), "model: glm-5.3 (source: bundled)");
+
+    config(
+        d.path(),
+        serde_json::json!({"runtimes": {"modelProfileOverrides": {"zai-full": {"model": "glm-5.4"}}}}),
+    );
+    assert_eq!(source_line(d.path()), "model: glm-5.4 (source: committed)");
+
+    std::fs::create_dir_all(d.path().join(".loom-local")).unwrap();
+    std::fs::write(
+        d.path().join(".loom-local/local.json"),
+        r#"{"runtimes":{"modelProfileOverrides":{"zai-full":{"model":"glm-5.5"}}}}"#,
+    )
+    .unwrap();
+    assert_eq!(source_line(d.path()), "model: glm-5.5 (source: local)");
+
+    // A higher tier's explicit null clears the field; the lower tier shows through.
+    std::fs::write(
+        d.path().join(".loom-local/local.json"),
+        r#"{"runtimes":{"modelProfileOverrides":{"zai-full":{"model":null}}}}"#,
+    )
+    .unwrap();
+    assert_eq!(source_line(d.path()), "model: glm-5.3 (source: bundled)");
+}

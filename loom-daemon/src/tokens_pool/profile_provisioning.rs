@@ -115,7 +115,7 @@ pub struct ProvisionReport {
 pub fn default_profile_home(rules: &ProviderProfileRules) -> Option<PathBuf> {
     match std::env::var(rules.default_home_env) {
         Ok(value) if value.trim().is_empty() => None,
-        Ok(value) => Some(super::paths::expand_tilde(value.trim())),
+        Ok(value) => Some(crate::fs_util::expand_tilde(value.trim())),
         #[cfg(test)]
         Err(_) => None,
         #[cfg(not(test))]
@@ -605,7 +605,7 @@ fn resolve_hook_bridge(
         if trimmed.is_empty() {
             return None;
         }
-        let path = super::paths::expand_tilde(trimmed);
+        let path = crate::fs_util::expand_tilde(trimmed);
         return path.is_file().then_some(path);
     }
     spec.script_candidates

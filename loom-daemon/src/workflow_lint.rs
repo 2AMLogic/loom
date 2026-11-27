@@ -157,7 +157,22 @@ impl<'de> Deserialize<'de> for Node {
 /// duplicate step ids per job. Each returned line is job/id/key specific but
 /// file-agnostic — the caller prefixes the path.
 fn lint_document(content: &str) -> Vec<String> {
-    let root: Node = match serde_yaml_ng::from_str(content) {
+    // `PassThrough` forwards repeated explicit mapping keys to the visitor
+    // above unchanged (merge keys stay expanded and suppressed), so the
+    // duplicate detection and its error text remain this file's own.
+    //
+    // `strict_booleans` restricts boolean inference to the YAML 1.2 core
+    // spellings (`true`/`false`), matching `serde_yaml_ng`. Without it a plain
+    // `on:` key or a step id like `yes`/`y` is inferred as `Bool(true)`: a
+    // duplicate `on:` is then reported as `'true'`, a quoted `"on":` (a
+    // string) escapes detection against a plain `on:`, and distinct ids
+    // `yes` and `y` collide.
+    let options = serde_saphyr::options! {
+        with_snippet: false,
+        strict_booleans: true,
+        duplicate_keys: serde_saphyr::DuplicateKeyPolicy::PassThrough,
+    };
+    let root: Node = match serde_saphyr::from_str_with_options(content, options) {
         Ok(root) => root,
         Err(err) => return vec![format!("parse error: {err}")],
     };
@@ -394,6 +409,53 @@ jobs:
         assert!(lint_document(content)
             .iter()
             .any(|d| d.contains("duplicate mapping key 'name'")));
+    }
+
+    #[test]
+    fn duplicate_plain_on_key_is_named_on_not_true() {
+        let content = "on: push\non: pull_request\njobs: {}\n";
+        let defects = lint_document(content);
+        assert_eq!(defects.len(), 1, "{defects:?}");
+        assert!(defects[0].contains("duplicate mapping key 'on'"), "{defects:?}");
+    }
+
+    #[test]
+    fn quoted_and_plain_on_keys_are_a_duplicate() {
+        let content = "on: push\n\"on\": pull_request\njobs: {}\n";
+        let defects = lint_document(content);
+        assert_eq!(defects.len(), 1, "{defects:?}");
+        assert!(defects[0].contains("duplicate mapping key 'on'"), "{defects:?}");
+    }
+
+    #[test]
+    fn distinct_boolean_like_step_ids_are_not_duplicates() {
+        let content = "\
+jobs:
+  build:
+    steps:
+      - id: yes
+        run: echo a
+      - id: y
+        run: echo b
+";
+        assert!(lint_document(content).is_empty());
+    }
+
+    #[test]
+    fn repeated_boolean_like_step_id_is_named_verbatim() {
+        let content = "\
+jobs:
+  build:
+    steps:
+      - id: yes
+        run: echo a
+      - id: yes
+        run: echo b
+";
+        assert_eq!(
+            lint_document(content),
+            vec!["job 'build': duplicate step id 'yes'".to_string()]
+        );
     }
 
     #[test]

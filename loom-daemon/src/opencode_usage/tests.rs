@@ -479,6 +479,8 @@ fn time_created_is_decoded_as_epoch_milliseconds_matching_the_live_schema() {
 #[test]
 #[serial_test::serial(opencode_db_env)]
 fn discover_opencode_dbs_finds_every_installed_version() {
+    // Crate-wide `LOOM_OPENCODE_DB` lock (#15204), held for the whole test.
+    let _opencode_db_lock = crate::tokens_pool::opencode_db_env::lock();
     let tmp = tempfile::tempdir().unwrap();
     std::env::remove_var(OPENCODE_DB_ENV);
     std::env::remove_var("XDG_DATA_HOME");
@@ -499,6 +501,8 @@ fn discover_opencode_dbs_finds_every_installed_version() {
 #[test]
 #[serial_test::serial(opencode_db_env)]
 fn discover_opencode_dbs_env_override_short_circuits_the_scan() {
+    // Crate-wide `LOOM_OPENCODE_DB` lock (#15204), held for the whole test.
+    let _opencode_db_lock = crate::tokens_pool::opencode_db_env::lock();
     let tmp = tempfile::tempdir().unwrap();
     let db = tmp.path().join("pinned.db");
     std::fs::write(&db, b"").unwrap();
@@ -512,6 +516,8 @@ fn discover_opencode_dbs_env_override_short_circuits_the_scan() {
 #[test]
 #[serial_test::serial(opencode_db_env)]
 fn discover_opencode_dbs_yields_nothing_for_a_host_with_no_install() {
+    // Crate-wide `LOOM_OPENCODE_DB` lock (#15204), held for the whole test.
+    let _opencode_db_lock = crate::tokens_pool::opencode_db_env::lock();
     std::env::remove_var(OPENCODE_DB_ENV);
     std::env::remove_var("XDG_DATA_HOME");
     let tmp = tempfile::tempdir().unwrap();
@@ -524,6 +530,8 @@ fn discover_opencode_dbs_yields_nothing_for_a_host_with_no_install() {
 #[test]
 #[serial_test::serial(opencode_db_env)]
 fn discover_opencode_dbs_includes_the_xdg_default_store() {
+    // Crate-wide `LOOM_OPENCODE_DB` lock (#15204), held for the whole test.
+    let _opencode_db_lock = crate::tokens_pool::opencode_db_env::lock();
     std::env::remove_var(OPENCODE_DB_ENV);
     std::env::remove_var("XDG_DATA_HOME");
     let tmp = tempfile::tempdir().unwrap();
@@ -543,6 +551,8 @@ fn discover_opencode_dbs_includes_the_xdg_default_store() {
 #[test]
 #[serial_test::serial(opencode_db_env)]
 fn discover_opencode_dbs_honours_xdg_data_home() {
+    // Crate-wide `LOOM_OPENCODE_DB` lock (#15204), held for the whole test.
+    let _opencode_db_lock = crate::tokens_pool::opencode_db_env::lock();
     std::env::remove_var(OPENCODE_DB_ENV);
     let tmp = tempfile::tempdir().unwrap();
     let data = tmp.path().join("xdg-data");
@@ -563,6 +573,8 @@ fn discover_opencode_dbs_honours_xdg_data_home() {
 #[test]
 #[serial_test::serial(opencode_db_env)]
 fn discover_opencode_dbs_reads_a_store_reachable_two_ways_once() {
+    // Crate-wide `LOOM_OPENCODE_DB` lock (#15204), held for the whole test.
+    let _opencode_db_lock = crate::tokens_pool::opencode_db_env::lock();
     std::env::remove_var(OPENCODE_DB_ENV);
     let tmp = tempfile::tempdir().unwrap();
     let managed = tmp.path().join(".loom/opt/opencode-2.0.10/xdg/data");
@@ -584,6 +596,8 @@ fn discover_opencode_dbs_reads_a_store_reachable_two_ways_once() {
 #[test]
 #[serial_test::serial(opencode_db_env)]
 fn discover_opencode_dbs_includes_guarded_per_launch_stores() {
+    // Crate-wide `LOOM_OPENCODE_DB` lock (#15204), held for the whole test.
+    let _opencode_db_lock = crate::tokens_pool::opencode_db_env::lock();
     std::env::remove_var(OPENCODE_DB_ENV);
     std::env::remove_var("XDG_DATA_HOME");
     let tmp = tempfile::tempdir().unwrap();
@@ -610,6 +624,8 @@ fn discover_opencode_dbs_includes_guarded_per_launch_stores() {
 #[test]
 #[serial_test::serial(opencode_db_env)]
 fn per_launch_stores_are_deduplicated_by_canonical_path() {
+    // Crate-wide `LOOM_OPENCODE_DB` lock (#15204), held for the whole test.
+    let _opencode_db_lock = crate::tokens_pool::opencode_db_env::lock();
     std::env::remove_var(OPENCODE_DB_ENV);
     let tmp = tempfile::tempdir().unwrap();
     let data = tmp
@@ -697,6 +713,8 @@ fn a_launch_backlog_over_the_inspection_bound_keeps_the_newest_launches() {
 #[test]
 #[serial_test::serial(opencode_db_env)]
 fn tokens_by_model_reads_a_guarded_per_launch_store() {
+    // Crate-wide `LOOM_OPENCODE_DB` lock (#15204), held for the whole test.
+    let _opencode_db_lock = crate::tokens_pool::opencode_db_env::lock();
     std::env::remove_var(OPENCODE_DB_ENV);
     std::env::remove_var("XDG_DATA_HOME");
     let tmp = tempfile::tempdir().unwrap();
@@ -719,6 +737,8 @@ fn tokens_by_model_reads_a_guarded_per_launch_store() {
 #[test]
 #[serial_test::serial(opencode_db_env)]
 fn tokens_by_model_reads_the_xdg_default_store() {
+    // Crate-wide `LOOM_OPENCODE_DB` lock (#15204), held for the whole test.
+    let _opencode_db_lock = crate::tokens_pool::opencode_db_env::lock();
     std::env::remove_var(OPENCODE_DB_ENV);
     std::env::remove_var("XDG_DATA_HOME");
     let tmp = tempfile::tempdir().unwrap();
@@ -741,6 +761,8 @@ fn tokens_by_model_reads_the_xdg_default_store() {
 #[test]
 #[serial_test::serial(opencode_db_env)]
 fn tokens_by_model_merges_matching_rows_across_every_installed_db() {
+    // Crate-wide `LOOM_OPENCODE_DB` lock (#15204), held for the whole test.
+    let _opencode_db_lock = crate::tokens_pool::opencode_db_env::lock();
     std::env::remove_var(OPENCODE_DB_ENV);
     std::env::remove_var("XDG_DATA_HOME");
     let tmp = tempfile::tempdir().unwrap();
@@ -774,6 +796,8 @@ fn tokens_by_model_merges_matching_rows_across_every_installed_db() {
 #[test]
 #[serial_test::serial(opencode_db_env)]
 fn tokens_by_model_returns_none_when_no_db_is_installed() {
+    // Crate-wide `LOOM_OPENCODE_DB` lock (#15204), held for the whole test.
+    let _opencode_db_lock = crate::tokens_pool::opencode_db_env::lock();
     std::env::remove_var(OPENCODE_DB_ENV);
     std::env::remove_var("XDG_DATA_HOME");
     let tmp = tempfile::tempdir().unwrap();
@@ -818,6 +842,8 @@ fn id_row<'a>(id: &'a str, model: &'a str, directory: &'a str, input: i64) -> Ro
 #[test]
 #[serial_test::serial(opencode_db_env)]
 fn an_exact_id_set_selects_only_the_sessions_it_names() {
+    // Crate-wide `LOOM_OPENCODE_DB` lock (#15204), held for the whole test.
+    let _opencode_db_lock = crate::tokens_pool::opencode_db_env::lock();
     let tmp = tempfile::tempdir().unwrap();
     let db = tmp.path().join("opencode.db");
     seed_db(
@@ -849,6 +875,8 @@ fn an_exact_id_set_selects_only_the_sessions_it_names() {
 #[test]
 #[serial_test::serial(opencode_db_env)]
 fn ids_no_store_holds_answer_none_not_an_empty_breakdown() {
+    // Crate-wide `LOOM_OPENCODE_DB` lock (#15204), held for the whole test.
+    let _opencode_db_lock = crate::tokens_pool::opencode_db_env::lock();
     let tmp = tempfile::tempdir().unwrap();
     let db = tmp.path().join("opencode.db");
     seed_db(
@@ -930,11 +958,6 @@ fn session_id_selection_counts_only_the_named_sessions_not_their_directory_neigh
     assert_eq!(sessions_by_id_in(&db, &ids).unwrap(), Vec::new());
 }
 
-#[test]
-fn no_session_ids_yield_no_totals() {
-    assert_eq!(tokens_by_session_ids(&[], None), None);
-}
-
 // --- Id branch is the whole key (#14278) ---------------------------------
 
 fn raw_row(id: &str, directory: &str, time_created: Option<i64>) -> RawSessionRow {
@@ -972,11 +995,12 @@ fn an_id_keyed_row_without_a_decodable_time_created_is_still_attributed() {
         .is_none());
 }
 
-/// One session id held by two installed stores (a cross-version copy) is one
-/// session: BOTH id-keyed entry points count it once.
+/// A session copied across installed stores contributes usage only once.
 #[test]
 #[serial_test::serial(opencode_db_env)]
-fn one_id_in_two_stores_is_counted_once_by_both_id_entry_points() {
+fn one_id_in_two_stores_is_counted_once() {
+    // Crate-wide `LOOM_OPENCODE_DB` lock (#15204), held for the whole test.
+    let _opencode_db_lock = crate::tokens_pool::opencode_db_env::lock();
     std::env::remove_var(OPENCODE_DB_ENV);
     std::env::remove_var("XDG_DATA_HOME");
     let tmp = tempfile::tempdir().unwrap();
@@ -1003,14 +1027,9 @@ fn one_id_in_two_stores_is_counted_once_by_both_id_entry_points() {
     let ids = ["ses_dup".to_string()];
 
     assert_eq!(sessions_for_ids(&ids, Some(tmp.path())).len(), 1);
-    for totals in [
-        tokens_by_model_for_ids(&ids, Some(tmp.path())),
-        tokens_by_session_ids(&ids, Some(tmp.path())),
-    ] {
-        let totals = totals.unwrap();
-        assert_eq!(totals.len(), 1);
-        assert_eq!(totals[0].input, 10, "the duplicated id must not be summed twice");
-    }
+    let totals = tokens_by_model_for_ids(&ids, Some(tmp.path())).unwrap();
+    assert_eq!(totals.len(), 1);
+    assert_eq!(totals[0].input, 10, "the duplicated id must not be summed twice");
 
     // Directory-keyed reads are unchanged: they are not id-deduped.
     let listed = sessions(&dirs(&["/repo/a"]), None, Some(tmp.path()));
@@ -1020,12 +1039,13 @@ fn one_id_in_two_stores_is_counted_once_by_both_id_entry_points() {
 /// The cross-store dedupe runs over usage-bearing rows only: when the
 /// first-discovered copy of an id is the all-zero creation row OpenCode writes
 /// before any usage lands, it must not claim the id slot and shadow the other
-/// store's copy that holds the usage (#14440). Both id-keyed entry points report
-/// that usage exactly once. The seeded store names sort so the zero row is
-/// discovered first (loom-managed stores are visited in sorted order).
+/// store's copy that holds the usage (#14440). The seeded store names sort so
+/// the zero row is discovered first (loom-managed stores are visited in sorted order).
 #[test]
 #[serial_test::serial(opencode_db_env)]
 fn an_all_zero_first_copy_does_not_shadow_the_usage_bearing_copy() {
+    // Crate-wide `LOOM_OPENCODE_DB` lock (#15204), held for the whole test.
+    let _opencode_db_lock = crate::tokens_pool::opencode_db_env::lock();
     std::env::remove_var(OPENCODE_DB_ENV);
     std::env::remove_var("XDG_DATA_HOME");
     let tmp = tempfile::tempdir().unwrap();
@@ -1052,14 +1072,10 @@ fn an_all_zero_first_copy_does_not_shadow_the_usage_bearing_copy() {
     let listed = sessions_for_ids(&ids, Some(tmp.path()));
     assert_eq!(listed.len(), 1);
     assert_eq!(listed[0].input, 10);
-    for totals in [
-        tokens_by_model_for_ids(&ids, Some(tmp.path())),
-        tokens_by_session_ids(&ids, Some(tmp.path())),
-    ] {
-        let totals = totals.expect("the usage-bearing copy must be counted, not shadowed");
-        assert_eq!(totals.len(), 1);
-        assert_eq!(totals[0].input, 10);
-    }
+    let totals = tokens_by_model_for_ids(&ids, Some(tmp.path()))
+        .expect("the usage-bearing copy must be counted, not shadowed");
+    assert_eq!(totals.len(), 1);
+    assert_eq!(totals[0].input, 10);
 }
 
 /// An empty id set matches nothing through every id-keyed entry point, even
@@ -1067,6 +1083,8 @@ fn an_all_zero_first_copy_does_not_shadow_the_usage_bearing_copy() {
 #[test]
 #[serial_test::serial(opencode_db_env)]
 fn an_empty_id_set_selects_nothing_even_with_a_populated_store() {
+    // Crate-wide `LOOM_OPENCODE_DB` lock (#15204), held for the whole test.
+    let _opencode_db_lock = crate::tokens_pool::opencode_db_env::lock();
     std::env::remove_var(OPENCODE_DB_ENV);
     std::env::remove_var("XDG_DATA_HOME");
     let tmp = tempfile::tempdir().unwrap();
@@ -1090,7 +1108,6 @@ fn an_empty_id_set_selects_nothing_even_with_a_populated_store() {
     );
     assert_eq!(sessions_for_ids(&[], Some(tmp.path())), Vec::new());
     assert_eq!(tokens_by_model_for_ids(&[], Some(tmp.path())), None);
-    assert_eq!(tokens_by_session_ids(&[], Some(tmp.path())), None);
 }
 
 /// #14566: `lookup_ids` says why a by-id read came back empty: no store at
@@ -1098,6 +1115,8 @@ fn an_empty_id_set_selects_nothing_even_with_a_populated_store() {
 #[test]
 #[serial_test::serial(opencode_db_env)]
 fn lookup_ids_tells_no_store_from_not_found_from_no_usage_from_found() {
+    // Crate-wide `LOOM_OPENCODE_DB` lock (#15204), held for the whole test.
+    let _opencode_db_lock = crate::tokens_pool::opencode_db_env::lock();
     std::env::remove_var(OPENCODE_DB_ENV);
     std::env::remove_var("XDG_DATA_HOME");
     let tmp = tempfile::tempdir().unwrap();

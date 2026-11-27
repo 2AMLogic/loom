@@ -30,6 +30,10 @@ pub const PROMPTS_DIGEST: &str = "loom.prompts.digest";
 /// telemetry reproducible from the exact tunables it ran with. Omitted when
 /// the process never ran `hyperparams::startup_init` (CLI subcommands).
 pub const HYPERPARAMS_DIGEST: &str = "loom.hyperparams.digest";
+/// The registered prompt modifier a single-step run was launched under
+/// (Issue #15017). Omitted when none is set, so an unmodified run's spans are
+/// unchanged.
+pub const PROMPT_MODIFIER: &str = crate::prompt_modifier::ATTRIBUTE;
 
 /// The allowlisted provenance attribute keys.
 pub const KEYS: &[&str] = &[
@@ -40,6 +44,7 @@ pub const KEYS: &[&str] = &[
     INSTALL_REVISION,
     PROMPTS_DIGEST,
     HYPERPARAMS_DIGEST,
+    PROMPT_MODIFIER,
 ];
 
 /// Workspace-relative directories whose files are the prompts a sweep runs.
@@ -92,6 +97,13 @@ pub fn stamp(attributes: &mut TraceAttributes) {
         attributes
             .entry(HYPERPARAMS_DIGEST.into())
             .or_insert_with(|| digest.into());
+    }
+    // Issue #15017: the prompt modifier, same never-overwrite contract. Absent
+    // unless the caller named one, and the same value the digest folds in.
+    if let Some(modifier) = crate::prompt_modifier::current() {
+        attributes
+            .entry(PROMPT_MODIFIER.into())
+            .or_insert_with(|| modifier.into());
     }
 }
 

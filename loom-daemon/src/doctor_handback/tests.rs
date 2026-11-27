@@ -374,6 +374,99 @@ fn a_rival_that_already_displaced_the_add_is_reported_not_failed() {
     assert!(f.labels.iter().any(|l| l == CHANGES));
 }
 
+// --- the CI-failure companion (#15020) ---------------------------------------
+
+/// The stall shape this closes: a Doctor treats a CI-failing verdict
+/// (`changes-requested` + `ci-failure`), and the hand-back must not leave the
+/// companion behind — `verdict_gate` refuses to approve that pair and
+/// `ci_gate_recovery` skips it.
+#[test]
+fn a_hand_back_clears_the_ci_failure_companion_with_changes() {
+    let mut f = Fake::new(&[CHANGES, CLAIM, CI_FAILURE], PUSHED);
+    let out = run(&mut f, PUSHED);
+    assert_eq!(out, Outcome::HandedBack);
+    assert_eq!(f.sorted(), names(&[QUEUE]));
+    assert!(f
+        .writes()
+        .contains(&format!("remove {CI_FAILURE}").as_str()));
+    assert_eq!(out.render().1, 0);
+    assert!(out.render().0.contains(CI_FAILURE));
+    // A concurrent pass already took it off: removing an absent label is a
+    // no-op, not an error.
+    let mut f = Fake::new(&[CHANGES, CLAIM, CI_FAILURE], PUSHED);
+    f.after_add_remove = vec![CI_FAILURE];
+    assert_eq!(run(&mut f, PUSHED), Outcome::HandedBack);
+    assert_eq!(f.sorted(), names(&[QUEUE]));
+}
+
+/// The companion without its rejection (a Doctor treating a CI failure whose
+/// `changes-requested` is already gone) is cleared the same way.
+#[test]
+fn a_hand_back_clears_a_lone_ci_failure_label() {
+    let mut f = Fake::new(&[CLAIM, CI_FAILURE], PUSHED);
+    assert_eq!(run(&mut f, PUSHED), Outcome::HandedBack);
+    assert_eq!(f.sorted(), names(&[QUEUE]));
+}
+
+#[test]
+fn a_hand_back_without_ci_failure_writes_no_ci_failure_call() {
+    let mut f = Fake::new(&[CHANGES, CLAIM], PUSHED);
+    assert_eq!(run(&mut f, PUSHED), Outcome::HandedBack);
+    assert!(!f.writes().iter().any(|w| w.contains(CI_FAILURE)), "{:?}", f.writes());
+}
+
+/// The claim-only outcomes never touch the companion: only the full hand-back
+/// write path clears it.
+#[test]
+fn already_advanced_claim_lost_and_head_moved_never_touch_ci_failure() {
+    let mut f = Fake::new(&[CLAIM, QUEUE, CI_FAILURE], PUSHED);
+    assert_eq!(run(&mut f, PUSHED), Outcome::AlreadyAdvanced(vec![QUEUE.into()]));
+    assert!(!f.writes().iter().any(|w| w.contains(CI_FAILURE)));
+    let mut f = Fake::new(&[CHANGES, CI_FAILURE], PUSHED);
+    assert_eq!(run(&mut f, PUSHED), Outcome::ClaimLost);
+    assert!(!f.writes().iter().any(|w| w.contains(CI_FAILURE)));
+    let mut f = Fake::new(&[CHANGES, CLAIM, CI_FAILURE], OTHER);
+    assert_eq!(run(&mut f, PUSHED), Outcome::HeadMoved(OTHER.into()));
+    assert!(!f.writes().iter().any(|w| w.contains(CI_FAILURE)));
+}
+
+/// A fresh rejection is kept, and so is its possible CI companion: the label
+/// may be the new verdict's own.
+#[test]
+fn a_fresh_rejection_keeps_the_ci_failure_companion() {
+    let mut f = Fake::new(&[CHANGES, CLAIM, CI_FAILURE], PUSHED);
+    f.rejected = Some(true);
+    f.precedes_claim = Some(false);
+    let out = run(&mut f, PUSHED);
+    assert_eq!(out, Outcome::Raced(vec![CHANGES.into()]));
+    assert_eq!(f.sorted(), names(&[CHANGES, CI_FAILURE]));
+    assert!(!f
+        .writes()
+        .contains(&format!("remove {CI_FAILURE}").as_str()));
+}
+
+/// A head move during the write stands down and restores what it touched,
+/// the CI companion with the rejection it belongs to.
+#[test]
+fn a_head_move_during_the_write_restores_the_ci_failure_companion() {
+    let mut f = Fake::new(&[CHANGES, CLAIM, CI_FAILURE], PUSHED);
+    f.head_after_add = Some(OTHER);
+    let out = run(&mut f, PUSHED);
+    assert_eq!(out, Outcome::HeadMoved(OTHER.into()));
+    assert_eq!(f.sorted(), names(&[CHANGES, CI_FAILURE]), "pre-state restored minus the claim");
+}
+
+#[test]
+fn a_ci_failure_removal_that_does_not_hold_fails() {
+    let mut f = Fake::new(&[CLAIM, CI_FAILURE], PUSHED);
+    f.fail_remove = vec![CI_FAILURE];
+    let out = run(&mut f, PUSHED);
+    assert!(
+        matches!(&out, Outcome::Failed(why) if why.contains("still carries loom:ci-failure")),
+        "{out:?}"
+    );
+}
+
 #[test]
 fn a_withdrawal_that_fails_is_loud() {
     let mut f = Fake::new(&[CHANGES, CLAIM], PUSHED);

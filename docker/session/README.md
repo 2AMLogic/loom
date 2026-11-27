@@ -26,7 +26,7 @@ This layer adds exactly these things:
 | Node.js + npm | Codex CLI's only distribution channel is npm, so a Node runtime is a genuine transitive dependency — installed from the official upstream tarball (checksum-verified), not `apt-get install nodejs npm`, which pulls Ubuntu's entire Debian-packaged build-from-source dependency chain for a footprint this image never uses. |
 | tmux-server entrypoint | `tini` (PID 1) → a thin entrypoint script that starts (or resumes) a detached tmux session named `session`, then blocks forever. This is what makes the container *persistent* — see "Entrypoint behavior" below. |
 | `CODEX_HOME` convention | `ENV CODEX_HOME=/home/loom/.codex-profile` — an empty, read-write directory owned by uid `1000` at build time. A per-account Codex profile volume binds over this path at container-start time (Phase 2's session lifecycle); it is never baked with content. |
-| `uv` + `UV_PROJECT_ENVIRONMENT` | Pinned static `uv` binary (multi-arch, from `ghcr.io/astral-sh/uv`) so Judge/Auditor sessions can `uv run pytest` a Python repo; `python3` and `git` already come from loom-worker. `UV_PROJECT_ENVIRONMENT=/tmp/loom-uv-venv` (and `UV_CACHE_DIR=/tmp/loom-uv-cache`) keep uv's venv out of the mounted checkout, whose `.venv` may be a macOS one. `/tmp` is chosen because private-workspace containers run `--read-only --user 1000:1000` with only `/tmp` and the workspace volume writable. The env dir is shared by all projects in the container, so uv recreates it when switching repos. |
+| `uv` + `UV_PROJECT_ENVIRONMENT` | Pinned static `uv` binary (multi-arch, from `ghcr.io/astral-sh/uv`) so Judge/Auditor sessions can `uv run pytest` a Python repo; `python3` and `git` already come from loom-worker. `UV_PROJECT_ENVIRONMENT=/tmp/loom-uv-venv` (and `UV_CACHE_DIR=/tmp/loom-uv-cache`) keep uv's venv out of the mounted checkout, whose `.venv` may be a macOS one. `/tmp` is chosen because private-workspace containers run `--read-only --user 1000:1000` with only `/tmp` and the workspace volume writable. The env dir is shared by all projects in the container, so uv recreates it when switching repos. These image defaults serve the non-private shape; a private-workspace seat overrides `UV_CACHE_DIR` (plus `GH_CACHE_DIR` and the Loom state dirs) to `/workspace/cache/*` at container create (#14929) — the seat's 512 MB `/tmp` tmpfs otherwise filled with multi-day caches. Only the per-container venv stays on `/tmp`. |
 
 **Zero secrets in this image**, same guarantee as the base image — verified
 by [`test-image.sh`](test-image.sh)'s `docker history` scan (extended with
@@ -476,8 +476,17 @@ into place only when complete, so an interrupted clone is retried, never
 treated as ready. A repository the fleet roster marks `firewall: true`
 (notebook, corporate) is refused before any clone, and a job for an
 unregistered repository is refused. The account-wide lease still admits one
-job at a time across all of the account's clones. Dispatch admission remains
-primary-repository-only until #10796.
+job at a time across all of the account's clones, and every additional
+registration is HTTPS only (like the primary) and keeps the base chosen when
+it was registered: re-registering an existing repository with a different
+base is refused until its clone is resolved deliberately. Dispatch is no
+longer primary-repository-only (#10796): it resolves the workspace's
+repository exactly as `session job --repository` does, so a seat holding
+several repositories serves each of them. A launch admitted on private-clone
+containment (#8787) draws only accounts whose registrations (primary or
+additional) cover the workspace's repository; when no such account exists,
+the refusal is one line naming the repository and any host-mode accounts,
+which cannot provide containment (#14110).
 
 **Declaring the repositories instead of starting each by hand (#14111).** The
 per-account, per-host `session start --private-clone` step can be replaced by a

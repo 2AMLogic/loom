@@ -148,6 +148,27 @@ pub struct DrainDescriptor {
     pub resume_hold: bool,
 }
 
+/// Why new dispatch is (or is not) currently held (#15300).
+///
+/// One [`DrainState`] flag backs every hold, so the flag alone cannot say
+/// *which* mechanism placed it. Admission refusals use this to name the real
+/// source and its real release path instead of always blaming `restart --drain`.
+/// The `String` payloads are the descriptor's own note, so no hold wording lives
+/// in two places.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DispatchHold {
+    /// Dispatch is open.
+    None,
+    /// A genuine drain (operator `restart --drain`, or an automatic pause roll).
+    Drain,
+    /// The fleet store's `fleet/state.yml` says this host is `paused` (#9598).
+    FleetHold(String),
+    /// A local operator-stop record held this daemon at startup (#9588).
+    OperatorStop(String),
+    /// H5 is resuming paused agents after a roll (#10832); ends by itself.
+    RollResume(String),
+}
+
 /// Outcome of [`DrainState::begin`].
 #[derive(Debug)]
 pub enum DrainBegin {
@@ -438,6 +459,25 @@ impl DrainState {
     #[must_use]
     pub fn generation(&self) -> u64 {
         self.generation.load(Ordering::Relaxed)
+    }
+
+    /// Which mechanism, if any, is holding new dispatch (#15300).
+    #[must_use]
+    pub fn dispatch_hold(&self) -> DispatchHold {
+        let inner = self.inner.lock().expect("Drain mutex poisoned");
+        if !self.flag.load(Ordering::Relaxed) {
+            return DispatchHold::None;
+        }
+        let note = || inner.note.clone().unwrap_or_default();
+        if inner.fleet_hold {
+            DispatchHold::FleetHold(note())
+        } else if inner.resume_hold {
+            DispatchHold::RollResume(note())
+        } else if inner.startup_hold {
+            DispatchHold::OperatorStop(note())
+        } else {
+            DispatchHold::Drain
+        }
     }
 
     /// A snapshot of the descriptor for status rendering.

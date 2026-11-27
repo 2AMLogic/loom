@@ -623,6 +623,13 @@ pub fn check_runtimes_preference_config(config: &Value) -> Vec<String> {
         Err(message) => vec![format!("runtimes preference: {message}")],
     };
     findings.extend(ceiling::check_config(config));
+    // #14932: a `runtimes.apiKeyLimits` block that cannot be understood
+    // withholds accounts at selection time, so name it here first.
+    findings.extend(
+        crate::api_keys_pool::limits::ConfiguredLimits::check_config(config)
+            .into_iter()
+            .map(|offence| format!("runtimes api-key limits: {offence}")),
+    );
     findings
 }
 
@@ -1162,6 +1169,9 @@ mod gateway_tests;
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod launch_failure_hold_tests;
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod pooled_tier3_tests;
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod role_draw_resolve_tests;

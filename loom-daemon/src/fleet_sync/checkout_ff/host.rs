@@ -251,28 +251,36 @@ fn run_live(live: &Live<'_>, roots: &[PathBuf], memory: &mut Memory) -> Checkout
         budget: Some(live.budget),
         elapsed: &|| started.elapsed(),
         clock: &Utc::now,
-        pr_merged: &|root, sha| {
+        pr_head: &|root, sha| {
             if !live.network || crate::rate_limit_breaker::global_skip_pass(CALLER) {
                 return None;
             }
-            pr_head_merged(root, sha)
+            pr_head(root, sha)
         },
     };
     super::run(&env, roots, memory)
 }
 
-/// Does the forge report `sha` as the head of a merged pull request (#13588)?
-/// `None` when the lookup fails for any reason: a caller must not read that as
-/// "not merged" and act on it, only as "unknown".
-fn pr_head_merged(root: &Path, sha: &str) -> Option<bool> {
+/// The jq that answers "does the forge report `sha` as the head of any pull
+/// request, open or merged" (#13588 merged-only; open added by #14973): the
+/// checkout a reviewer leaves behind is parked on an OPEN PR's head, and
+/// `refs/pull/N/head` keeps the commits on the forge either way — the rehome
+/// writes a rescue ref first regardless, so nothing is lost by trusting the
+/// forge copy.
+fn pr_head_jq(sha: &str) -> Option<String> {
+    (!sha.is_empty() && sha.bytes().all(|b| b.is_ascii_hexdigit()))
+        .then(|| format!("any(.[]; .head.sha == \"{sha}\")"))
+}
+
+/// Does the forge report `sha` as the head of any pull request, open or
+/// merged (#13588, #14973)? `None` when the lookup fails for any reason: a
+/// caller must not read that as "no such PR" and act on it, only as "unknown".
+fn pr_head(root: &Path, sha: &str) -> Option<bool> {
     use crate::gh_invocation::{AccessIntent, GhInvocation, GhTarget, Operation};
-    if sha.is_empty() || !sha.bytes().all(|b| b.is_ascii_hexdigit()) {
-        return None;
-    }
+    let jq = pr_head_jq(sha)?;
     let path = format!("repos/{{owner}}/{{repo}}/commits/{sha}/pulls");
-    let jq = format!("any(.[]; .merged_at != null and .head.sha == \"{sha}\")");
     let out = GhInvocation::new(
-        Operation::new("checkout_ff.pr_merged"),
+        Operation::new("checkout_ff.pr_head"),
         AccessIntent::Read,
         GhTarget::None,
         Duration::from_secs(20),
@@ -546,5 +554,23 @@ fn publish(stepped: Stepped, bus: Option<&EventBus>) {
             announce(&found.transitions, bus);
         }
         Stepped::Busy => crate::fleet_sync::publish_checkouts(None, Some(BUSY_NOTE)),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::pr_head_jq;
+
+    /// #14973: the head of an OPEN PR must satisfy the lookup. The jq keeps
+    /// matching on `.head.sha` alone — no `merged_at` filter — so a checkout
+    /// parked on a live PR's head (a reviewer's fetch) is rehomed once every
+    /// local gate has agreed, not held as `wrong-branch` forever.
+    #[test]
+    fn the_pr_head_lookup_accepts_an_open_pr() {
+        let jq = pr_head_jq("0123abcd").unwrap();
+        assert_eq!(jq, "any(.[]; .head.sha == \"0123abcd\")");
+        // A sha that cannot be one is not asked about.
+        assert!(pr_head_jq("").is_none());
+        assert!(pr_head_jq("not-a-sha").is_none());
     }
 }

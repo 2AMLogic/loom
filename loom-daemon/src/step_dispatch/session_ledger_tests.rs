@@ -214,3 +214,81 @@ fn the_resume_prompt_names_the_role_and_item() {
     let p = resume_prompt(&r, StepRole::Judge);
     assert!(p.contains("#7") && p.contains("judge"));
 }
+
+#[test]
+fn a_seat_stored_claude_record_resumes_and_an_unreachable_pin_runs_fresh() {
+    let cfg = on();
+    let mut seat = record(7, StepRole::Judge, HOST, 0, 10);
+    seat.account = Some("beta".into());
+    seat.session_store = Some("/seats/beta/home".into());
+    let seats = ledger(vec![seat]);
+    // The launch pins the seat (#14981), so a reachable seat store resumes...
+    assert_eq!(reason(&run(&seats, StepRole::Judge, 5, &cfg, true)), None);
+    // ...and one that cannot be reached (store gone, or the pinned account
+    // unusable, which `decide_for` folds into `store_reachable`) is Fresh.
+    assert_eq!(
+        reason(&run(&seats, StepRole::Judge, 5, &cfg, false)),
+        Some(FreshReason::StoreUnreachable)
+    );
+    // A host-stored record still resumes.
+    let host = ledger(vec![record(7, StepRole::Judge, HOST, 0, 10)]);
+    assert_eq!(reason(&run(&host, StepRole::Judge, 5, &cfg, true)), None);
+}
+
+#[test]
+#[serial_test::serial]
+fn the_pinned_account_must_be_selectable_for_the_resume() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().join(".loom").join("tokens");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("beta.token"), "key-beta").unwrap();
+    let mut seat = record(7, StepRole::Judge, HOST, 0, 10);
+    seat.account = Some("beta".into());
+    let _env = crate::tokens_pool::paths::SHARED_TOKENS_DIR_ENV;
+    let prior = std::env::var_os(_env);
+    std::env::set_var(_env, "");
+    assert!(pinned_account_usable(tmp.path(), &seat));
+    seat.account = Some("gone".into());
+    assert!(!pinned_account_usable(tmp.path(), &seat));
+    // A host-stored record has no account to pin.
+    seat.account = None;
+    assert!(pinned_account_usable(tmp.path(), &seat));
+    match prior {
+        Some(v) => std::env::set_var(_env, v),
+        None => std::env::remove_var(_env),
+    }
+}
+
+#[test]
+fn claude_session_is_located_in_the_host_dir_or_the_seat_that_wrote_it() {
+    let tmp = tempfile::tempdir().unwrap();
+    let host = tmp.path().join("host");
+    let seats = tmp.path().join("seats");
+    let write = |base: &Path, body: &str| {
+        let dir = base.join("projects").join("-w");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("abc.jsonl"), body).unwrap();
+    };
+    // Seat `beta` is adopted and holds the transcript; `alpha` is not a seat.
+    for name in ["alpha", "beta"] {
+        std::fs::create_dir_all(seats.join(name)).unwrap();
+    }
+    std::fs::write(seats.join("beta/.session-managed.json"), "{}").unwrap();
+    write(&seats.join("beta/home"), "12345");
+    write(&seats.join("alpha/home"), "ignored");
+
+    let seat = locate_claude_session(Some(&host), Some(&seats), "abc");
+    assert_eq!(seat.account.as_deref(), Some("beta"));
+    assert_eq!(seat.store, Some(seats.join("beta/home")));
+    assert_eq!(seat.size, 5);
+
+    // A transcript on the host wins and records no store (host is the default).
+    write(&host, "123");
+    let on_host = locate_claude_session(Some(&host), Some(&seats), "abc");
+    assert_eq!((on_host.store, on_host.account, on_host.size), (None, None, 3));
+
+    assert_eq!(
+        locate_claude_session(Some(&host), Some(&seats), "missing"),
+        LocatedSession::default()
+    );
+}

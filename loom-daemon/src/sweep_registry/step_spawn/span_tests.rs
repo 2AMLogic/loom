@@ -36,6 +36,7 @@ fn close_of(end: StepEnd, line: Option<&StepOutcomeLine>) -> (String, TraceAttri
         None,
         false,
         None,
+        None,
     )
 }
 
@@ -56,6 +57,7 @@ fn a_sized_steps_close_carries_its_story_points() {
             points,
             None,
             false,
+            None,
             None,
         )
         .1
@@ -110,6 +112,7 @@ fn a_close_carries_the_runtime_that_ran_the_step() {
             None,
             None,
             false,
+            None,
             None,
         )
         .1
@@ -490,6 +493,7 @@ fn a_close_carries_the_pr_number_only_when_one_is_known() {
             pr,
             false,
             None,
+            None,
         )
         .1
     };
@@ -518,6 +522,7 @@ fn a_builder_with_no_line_splits_by_whether_it_opened_a_pr() {
             pr,
             false,
             None,
+            None,
         )
         .1[lifecycle::FAILURE_CLASS]
             .clone()
@@ -544,6 +549,7 @@ fn a_provider_exhausted_step_closes_as_provider_exhausted() {
             None,
             None,
             exhausted,
+            None,
             None,
         )
         .1[lifecycle::FAILURE_CLASS]
@@ -595,6 +601,7 @@ mod agrees {
             None,
             exhausted,
             post,
+            None,
         )
         .1
     }
@@ -659,5 +666,231 @@ mod agrees {
         assert_eq!(peek_post(root, "step-judge-1-1"), Some(Some(MOVED)), "peek twice");
         assert_eq!(take_post(root, "step-judge-1-1"), Some(Some(MOVED)));
         assert_eq!(peek_post(root, "step-judge-1-1"), None);
+    }
+}
+
+/// #14898: the Judge verdict of record rides the step's `loom.sweep` close,
+/// beside the raw line class — including when a posted verdict survived a
+/// missing line. The fixture registry has no `gh` on the step's PATH, so a
+/// close that passes this suite made no forge request under the registry
+/// lock.
+mod verdict {
+    use super::*;
+    use crate::observability::pick_journal::{self, JournalEntry};
+    use crate::observability::step_verdict::{judge_verdict_of_record, Projection};
+    use chrono::TimeZone;
+    use serial_test::serial;
+    use std::path::PathBuf;
+
+    const VERDICT: &str = "loom.step.outcome.verdict";
+    const REASON_SET: &str = "loom.step.outcome.reason_set";
+    const HEAD: &str = "loom.step.outcome.head_sha";
+
+    fn projection(reason: &str, set: &'static str, head: Option<&str>) -> Projection {
+        Projection {
+            class: "verdict",
+            reason: reason.to_string(),
+            reason_set: set,
+            head_sha: head.map(str::to_string),
+            ..Projection::default()
+        }
+    }
+
+    fn close_attrs(verdict: Option<&Projection>) -> TraceAttributes {
+        let line = StepOutcomeLine {
+            role: "judge".into(),
+            target: 31,
+            class: StepOutcomeClass::Verdict,
+            reason: "r".into(),
+        };
+        sweep_close(
+            StepEnd::Exited(Some(0)),
+            Some(&line),
+            &RoleTickOutcome::Success,
+            StepRole::Judge,
+            None,
+            None,
+            None,
+            None,
+            None,
+            false,
+            None,
+            verdict,
+        )
+        .1
+    }
+
+    #[test]
+    fn a_verdict_projection_rides_the_close_beside_the_raw_class() {
+        let p = projection("approved", "judge_v1", Some("aaa111"));
+        let c = close_attrs(Some(&p));
+        assert_eq!(c[VERDICT], "approved");
+        assert_eq!(c[REASON_SET], "judge_v1");
+        assert_eq!(c[HEAD], "aaa111");
+        assert_eq!(c["loom.step.outcome.class"], "verdict", "the raw class stays");
+        // A headless verdict carries no head attribute, never a fabricated one.
+        let p = projection("reviewed", "judge_step_v1", None);
+        let c = close_attrs(Some(&p));
+        assert_eq!(c[VERDICT], "reviewed");
+        assert_eq!(c[REASON_SET], "judge_step_v1");
+        assert!(!c.contains_key(HEAD));
+    }
+
+    #[test]
+    fn without_a_projection_no_verdict_attribute_is_fabricated() {
+        let c = close_attrs(None);
+        for key in [VERDICT, REASON_SET, HEAD] {
+            assert!(!c.contains_key(key), "{key} without a verdict");
+        }
+    }
+
+    /// The step's journal file, in a private dir of this test's own.
+    fn journal_file(root: &Path, sweep_id: &str, entries: &[JournalEntry]) -> PathBuf {
+        let dir = tempfile::tempdir().unwrap();
+        std::env::remove_var(pick_journal::PICK_JOURNAL_DIR_ENV);
+        std::env::set_var(pick_journal::PICK_JOURNAL_DIR_ENV, dir.path());
+        let path = pick_journal::step_path(root, sweep_id);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let body = entries
+            .iter()
+            .map(|e| serde_json::to_string(e).unwrap())
+            .collect::<Vec<_>>()
+            .join("\n");
+        std::fs::write(&path, format!("{body}\n")).unwrap();
+        // Keep the dir alive past the return: the journal must survive the
+        // close for the drain to take.
+        std::mem::forget(dir);
+        path
+    }
+
+    fn at(minute: u32) -> chrono::DateTime<Utc> {
+        Utc.with_ymd_and_hms(2026, 11, 21, 3, minute, 0).unwrap()
+    }
+
+    /// One ended judge step with `entries` in its journal and `lines` in its
+    /// log's own dispatch section: the drained close of its `loom.sweep`.
+    fn closed_step(item: u32, entries: &[JournalEntry], lines: &str) -> SpanRecord {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut reg, _) = fixture_registry(dir.path());
+        traced(dir.path());
+        let pid = dead_pid();
+        let id = insert_step(&mut reg, item, StepRole::Judge, pid);
+        let journal = journal_file(dir.path(), &id, entries);
+        let log = reg.compute_step_log_path(item, StepRole::Judge);
+        std::fs::create_dir_all(log.parent().unwrap()).unwrap();
+        std::fs::write(
+            &log,
+            format!(
+                "==== loom-daemon dispatch: t sweep_id={id} item={item} step=judge ====\n{lines}"
+            ),
+        )
+        .unwrap();
+        let span = open_sweep_span(dir.path(), &id, pid);
+
+        reg.end_step(&id, item, StepRole::Judge, Utc::now(), StepEnd::Exited(Some(0)));
+
+        assert!(journal.is_file(), "the close peeked the journal, it never took it");
+        std::env::remove_var(pick_journal::PICK_JOURNAL_DIR_ENV);
+        drop(span);
+        // The closed root is drained from the store, not the live journal.
+        let journal = Journal::for_context(&TraceStore::new(dir.path()).path(dir.path(), &id));
+        drained(&journal)
+            .into_iter()
+            .find(|s| s.name == SpanName::Sweep)
+            .unwrap()
+    }
+
+    fn verdict_write(minute: u32, item: u32, action: &str, sha: &str) -> JournalEntry {
+        JournalEntry::Applied {
+            at: at(minute),
+            number: item,
+            is_pr: true,
+            action: action.to_string(),
+            by: "verdict-labels".to_string(),
+            head_sha: Some(sha.to_string()),
+        }
+    }
+
+    fn reviewed(minute: u32, item: u32, sha: &str) -> JournalEntry {
+        JournalEntry::Reviewed {
+            at: at(minute),
+            number: item,
+            head_sha: sha.to_string(),
+        }
+    }
+
+    const LINE: &str = "LOOM_STEP_OUTCOME role=judge target=31 class=verdict reason=x\n";
+
+    #[test]
+    #[serial]
+    fn an_approval_and_a_changes_request_close_with_their_written_verdicts() {
+        for (action, sha) in [("approved", "aaa111"), ("changes_requested", "bbb222")] {
+            let sweep = closed_step(31, &[verdict_write(1, 31, action, sha)], LINE);
+            assert_eq!(sweep.attributes[VERDICT], action, "{action}");
+            assert_eq!(sweep.attributes[REASON_SET], "judge_v1", "{action}");
+            assert_eq!(sweep.attributes[HEAD], sha, "{action}");
+            assert_eq!(sweep.attributes["loom.step.outcome.class"], "verdict");
+        }
+    }
+
+    /// The line-only fallback names `reviewed` under `judge_step_v1` with the
+    /// head captured at the evaluation — a PR that advanced between the
+    /// evaluation and the capture cannot change it (the close reads no PR
+    /// tip; the journaled head is the only one it can name).
+    #[test]
+    #[serial]
+    fn a_line_only_verdict_closes_reviewed_with_the_evaluated_head() {
+        let sweep = closed_step(31, &[reviewed(1, 31, "ccc333")], LINE);
+        assert_eq!(sweep.attributes[VERDICT], "reviewed");
+        assert_eq!(sweep.attributes[REASON_SET], "judge_step_v1");
+        assert_eq!(sweep.attributes[HEAD], "ccc333");
+    }
+
+    /// A posted verdict that survived a missing line: the raw class stays
+    /// `none` (countable, #13521) with the verdict of record beside it, and
+    /// a step with neither line nor write stays bare `none`.
+    #[test]
+    #[serial]
+    fn a_missing_line_keeps_the_raw_none_class_with_the_verdict_beside_it() {
+        let sweep = closed_step(31, &[verdict_write(1, 31, "approved", "aaa111")], "");
+        assert_eq!(sweep.attributes["loom.step.outcome.class"], "none");
+        assert!(!sweep.attributes.contains_key("loom.step.outcome.reason"));
+        assert_eq!(sweep.attributes[VERDICT], "approved");
+        assert_eq!(sweep.attributes[REASON_SET], "judge_v1");
+        assert_eq!(sweep.attributes[HEAD], "aaa111");
+
+        let sweep = closed_step(31, &[], "");
+        assert_eq!(sweep.attributes["loom.step.outcome.class"], "none");
+        for key in [VERDICT, REASON_SET, HEAD] {
+            assert!(!sweep.attributes.contains_key(key), "{key} with nothing recorded");
+        }
+    }
+
+    /// A judge step with no verdict-class projection (here a noop line)
+    /// closes without the verdict attributes, and a non-Judge role never
+    /// carries them.
+    #[test]
+    #[serial]
+    fn a_non_verdict_judge_step_and_other_roles_close_without_the_verdict() {
+        let sweep = closed_step(
+            31,
+            &[],
+            "LOOM_STEP_OUTCOME role=judge target=31 class=noop reason=already_judged\n",
+        );
+        assert_eq!(sweep.attributes["loom.step.outcome.class"], "noop");
+        for key in [VERDICT, REASON_SET, HEAD] {
+            assert!(!sweep.attributes.contains_key(key), "{key} on a noop");
+        }
+        // A doctor step with judge-shaped evidence projects nothing: the
+        // verdict of record is the Judge projection alone.
+        let root = tempfile::tempdir().unwrap();
+        let staged = crate::observability::step_verdict::StagedStep {
+            sweep_id: "step-doctor-31-1".into(),
+            step: StepRole::Doctor,
+            item: 31,
+            log: root.path().join("none.log"),
+            hold_auth_before: None,
+        };
+        assert_eq!(judge_verdict_of_record(staged, None), None);
     }
 }

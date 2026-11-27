@@ -183,16 +183,23 @@ fn next_utc_month_start(now: u64) -> Option<u64> {
     u64::try_from(midnight.and_utc().timestamp()).ok()
 }
 
-/// The account's configured plan window, or `None` when none is declared or
-/// the limits file cannot be read. Unreadable degrades to the default horizon
-/// rather than refusing the mark: a mark with the default cooldown is still
-/// strictly better than no mark.
+/// The account's configured plan window, or `None` when no source declares
+/// one or neither can be read: the host's `.limits.json`, or the calling
+/// workspace's `runtimes.apiKeyLimits` block (#14932), whose value is the one
+/// used when both declare a window. Unreadable degrades to the default
+/// horizon rather than refusing the mark: a mark with the default cooldown is
+/// still strictly better than no mark.
 #[must_use]
-pub fn configured_window(root: &std::path::Path, provider: &str, account: &str) -> Option<u64> {
-    super::limits::read_limits(root, provider)
+pub fn configured_window(
+    root: &std::path::Path,
+    provider: &str,
+    account: &str,
+    configured: &super::limits::ConfiguredLimits,
+) -> Option<u64> {
+    super::limits::effective_limits(root, provider, configured)
         .ok()?
         .get(account)
-        .and_then(|limits| limits.exhaustion_window_secs)
+        .and_then(|limits| limits.limits.exhaustion_window_secs)
 }
 
 /// The **last** plausible reset instant (Unix seconds) `text` names, or

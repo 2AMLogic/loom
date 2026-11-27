@@ -356,9 +356,9 @@ impl ReapReport {
 // `skip_reason` — the human-readable reason a decision preserved a worktree —
 // moved to the `removal_backoff` sibling module in #7939 (re-exported below as
 // `use removal_backoff::{..., skip_reason}`) purely to make room, because
-// #7939's fix
-// needs a couple of new lines right at `skip_reason`'s one call site. Its
-// logic and doc comment are unchanged — see `removal_backoff::skip_reason`.
+// #7939's fix needs a couple of new lines right at `skip_reason`'s one call
+// site. Its logic and doc comment are unchanged — see
+// `removal_backoff::skip_reason`.
 
 /// Every direct subdirectory of `repo_root`'s worktree root, sorted by path so
 /// a pass's report order is deterministic.
@@ -598,10 +598,10 @@ pub fn try_enter_reclaim(repo_root: &Path) -> Option<ReclaimGuard> {
 // Removal-failure backoff + stuck-worktree health surfacing (#7590)
 //
 // The state machine itself lives in the `removal_backoff` sibling module; only
-// the kind tag, which the
-// reaper's own log lines and classify paths also use, stays here. The names
-// below are re-exported so `crate::worktree_reaper::stuck_worktree_removals`
-// and friends keep resolving exactly as before.
+// the kind tag, which the reaper's own log lines and classify paths also use,
+// stays here. The names below are re-exported so
+// `crate::worktree_reaper::stuck_worktree_removals` and friends keep resolving
+// exactly as before.
 // ============================================================================
 
 mod removal_backoff;
@@ -731,7 +731,7 @@ pub fn reap_worktrees_only(repo_root: &Path, config: &WorktreeReaperConfig) -> R
     // instead — see [`stuck_worktree_removals`].
     let remover = |path: &Path, issue: u32| {
         remove_with_backoff(repo_root, WorktreeKind::Issue, issue, path, || {
-            clean::cleanup_worktree(repo_root, path, issue, false, "worktree_reaper").map(|_| ())
+            clean::cleanup_worktree(repo_root, path, issue, &opts, "worktree_reaper").map(|_| ())
         })
     };
     // #6653: pushes a `loom-quarantine:` stash for a dirty, past-grace,

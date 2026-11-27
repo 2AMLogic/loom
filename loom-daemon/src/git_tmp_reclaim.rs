@@ -47,14 +47,13 @@
 //! `category=git_tmp_pack` ([`GIT_TMP_PACK_CATEGORY`]) with the file count and
 //! bytes freed, so reclaims are attributable in SigNoz (#10985).
 
-use std::collections::BTreeMap;
 use std::path::{Component, Path, PathBuf};
-use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 
 use crate::fs_util::human_size;
+use crate::host_wide_cooldown::{active_since_secs, PerRepoCooldown};
 
 // ============================================================================
 // Constants
@@ -673,34 +672,12 @@ fn production_inputs(repo_root: &Path, dry_run: bool, now: DateTime<Utc>) -> Pas
 // Process-global per-repo cooldown (scheduled + eager tiers only)
 // ============================================================================
 
-static LAST_RUN_AT: OnceLock<Mutex<BTreeMap<PathBuf, DateTime<Utc>>>> = OnceLock::new();
-
-fn last_run_slot() -> &'static Mutex<BTreeMap<PathBuf, DateTime<Utc>>> {
-    LAST_RUN_AT.get_or_init(|| Mutex::new(BTreeMap::new()))
-}
-
-fn last_run_at(repo_root: &Path) -> Option<DateTime<Utc>> {
-    last_run_slot()
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .get(repo_root)
-        .copied()
-}
-
-fn record_run(repo_root: &Path, now: DateTime<Utc>) {
-    last_run_slot()
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .insert(repo_root.to_path_buf(), now);
-}
+static COOLDOWN: PerRepoCooldown = PerRepoCooldown::new();
 
 /// Drop cooldown state. Test-only seam.
 #[doc(hidden)]
 pub fn reset_state_for_test() {
-    last_run_slot()
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .clear();
+    COOLDOWN.reset();
 }
 
 /// Whether a pass that last ran at `last` is still inside its cooldown.
@@ -710,10 +687,7 @@ pub fn in_cooldown(
     now: DateTime<Utc>,
     min_interval_secs: u64,
 ) -> bool {
-    last.is_some_and(|last| {
-        let since = (now - last).num_seconds();
-        since >= 0 && since < i64::try_from(min_interval_secs).unwrap_or(i64::MAX)
-    })
+    active_since_secs(last, now, min_interval_secs).is_some()
 }
 
 /// Production pass for the scheduled reaper and the eager below-floor tier:
@@ -722,7 +696,11 @@ pub fn run_for(repo_root: &Path) -> GitTmpReclaimReport {
     let now = Utc::now();
     let inputs = production_inputs(repo_root, false, now);
     let min_interval = resolve_min_interval_secs(&read_config(repo_root));
-    let report = if inputs.enabled && in_cooldown(last_run_at(repo_root), now, min_interval) {
+    let report = if inputs.enabled
+        && COOLDOWN
+            .active_since_secs(repo_root, now, min_interval)
+            .is_some()
+    {
         GitTmpReclaimReport {
             repo_root: repo_root.to_path_buf(),
             enabled: true,
@@ -734,7 +712,7 @@ pub fn run_for(repo_root: &Path) -> GitTmpReclaimReport {
     } else {
         let r = run_pass(repo_root, &inputs, &resolve_common_dir, &probe_git_liveness);
         if r.enabled {
-            record_run(repo_root, now);
+            COOLDOWN.record(repo_root, now);
         }
         r
     };

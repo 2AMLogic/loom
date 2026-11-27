@@ -371,7 +371,7 @@ async fn collect(window: Duration) -> HealthReport {
         chrono::Utc::now() - chrono::Duration::days(limit_calibration::DEFAULT_LOOKBACK_DAYS);
     let limit_calibration = match limit_calibration::compute_with_fallback(
         &limit_calibration::default_monitor_db_path(),
-        &limit_calibration::default_activity_db_path(),
+        &crate::activity::default_activity_db_path(),
         since,
     ) {
         CalibrationStatus::Unavailable(_) => None,
@@ -402,7 +402,7 @@ async fn collect(window: Duration) -> HealthReport {
     let transcript_ingest_status =
         crate::transcript_tokens::claude_projects_dir().map(|projects_dir| {
             transcript_ingest::collect_health_status(
-                &limit_calibration::default_activity_db_path(),
+                &crate::activity::default_activity_db_path(),
                 &projects_dir,
                 &transcript_ingest_config,
             )
@@ -668,46 +668,40 @@ fn codesign_preflight_capped(identity: &str, cap: Duration) -> (bool, String) {
 /// a blocking SecurityAgent GUI prompt with no flag to suppress it and no
 /// bound on how long it waits — only a wall-clock cap from outside the
 /// `codesign` process can detect that.
+///
+/// Bounding, draining and group termination are [`crate::proc_exec::run_bounded`]'s,
+/// so a wedged `codesign`'s descendants die with it.
 fn codesign_run_capped(args: &[&str], cap: Duration) -> (bool, String) {
-    let mut child = match std::process::Command::new("codesign")
-        .args(args)
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-    {
-        Ok(child) => child,
-        Err(e) => return (false, format!("could not spawn codesign: {e}")),
-    };
+    codesign_run_capped_with("codesign", args, cap)
+}
 
-    let deadline = std::time::Instant::now() + cap;
-    loop {
-        match child.try_wait() {
-            Ok(Some(exit_status)) => {
-                return if exit_status.success() {
-                    (true, String::new())
-                } else {
-                    (false, format!("codesign exited with {exit_status}"))
-                };
+/// [`codesign_run_capped`] against a named binary, so tests can substitute a
+/// script for the real `codesign`.
+fn codesign_run_capped_with(program: &str, args: &[&str], cap: Duration) -> (bool, String) {
+    let mut cmd = std::process::Command::new(program);
+    cmd.args(args);
+    match crate::proc_exec::run_bounded(cmd, cap) {
+        Ok(crate::proc_exec::Completion::Exited(out)) => {
+            if out.status.success() {
+                (true, String::new())
+            } else {
+                (false, format!("codesign exited with {}", out.status))
             }
-            Ok(None) => {
-                if std::time::Instant::now() >= deadline {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    return (
-                        false,
-                        format!(
-                            "timed out after {}s — likely cause: this identity's private key is \
-                             missing '/usr/bin/codesign' from its keychain access control list, \
-                             which raises a blocking Keychain prompt instead of signing \
-                             non-interactively",
-                            cap.as_secs()
-                        ),
-                    );
-                }
-                std::thread::sleep(Duration::from_millis(200));
-            }
-            Err(e) => return (false, format!("error waiting on codesign: {e}")),
         }
+        Ok(crate::proc_exec::Completion::TimedOut { .. }) => (
+            false,
+            format!(
+                "timed out after {}s — likely cause: this identity's private key is \
+                 missing '/usr/bin/codesign' from its keychain access control list, \
+                 which raises a blocking Keychain prompt instead of signing \
+                 non-interactively",
+                cap.as_secs()
+            ),
+        ),
+        Err(crate::proc_exec::ExecError::Spawn(e)) => {
+            (false, format!("could not spawn codesign: {e}"))
+        }
+        Err(e) => (false, format!("error waiting on codesign: {e}")),
     }
 }
 
@@ -1077,4 +1071,67 @@ mod tests {
     // Moved to `health::calibration_section`'s own test module when #8349
     // wired the section through `HealthInputs::limit_calibration` — the
     // rendering it exercised now lives next to `assess_limit_calibration`.
+
+    // -- codesign_run_capped (#15007 slice C) ------------------------------
+    // `codesign_run_capped_with` is the executor-backed body behind
+    // `codesign_run_capped`; these pin its `(bool, reason)` contract and
+    // message mapping (Issue #7605's wall-clock cap).
+
+    #[test]
+    fn codesign_run_reports_success_and_a_nonzero_exit() {
+        let (ok, msg) = codesign_run_capped_with("/bin/true", &[], Duration::from_secs(10));
+        assert!(ok);
+        assert_eq!(msg, "");
+        let (ok, msg) =
+            codesign_run_capped_with("/bin/sh", &["-c", "exit 3"], Duration::from_secs(10));
+        assert!(!ok);
+        assert!(msg.starts_with("codesign exited with"), "{msg}");
+    }
+
+    #[test]
+    fn codesign_run_reports_a_spawn_failure_without_inventing_a_timeout() {
+        let (ok, msg) = codesign_run_capped_with(
+            "/nonexistent/loom-canary-codesign",
+            &[],
+            Duration::from_secs(10),
+        );
+        assert!(!ok);
+        assert!(msg.starts_with("could not spawn codesign:"), "{msg}");
+    }
+
+    #[test]
+    fn codesign_run_times_out_with_the_keychain_prompt_message() {
+        let (ok, msg) = codesign_run_capped_with("/bin/sleep", &["120"], Duration::from_secs(1));
+        assert!(!ok);
+        assert!(
+            msg.starts_with("timed out after 1s — likely cause: this identity's private key is"),
+            "{msg}"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn codesign_run_timeout_kills_the_descendants_too() {
+        let dir = tempfile::tempdir().unwrap();
+        let pidfile = dir.path().join("grandchild.pid");
+        let script =
+            format!("/bin/sleep 120 & echo $! > {}; exec /bin/sleep 120", pidfile.display());
+        let (ok, _msg) =
+            codesign_run_capped_with("/bin/sh", &["-c", &script], Duration::from_millis(400));
+        assert!(!ok);
+
+        std::thread::sleep(Duration::from_millis(300));
+        let pid: i32 = std::fs::read_to_string(&pidfile)
+            .expect("grandchild must have recorded its pid")
+            .trim()
+            .parse()
+            .expect("pid must parse");
+        // SAFETY: signal 0 performs error checking only; it never delivers a signal.
+        let alive = unsafe { libc::kill(pid as libc::pid_t, 0) == 0 };
+        if alive {
+            // SAFETY: cleanup kill of a process this test spawned.
+            unsafe { libc::kill(pid, libc::SIGKILL) };
+        }
+        assert!(!alive, "grandchild {pid} outlived the codesign cap");
+    }
 }

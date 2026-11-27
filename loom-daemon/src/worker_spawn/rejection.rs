@@ -6,6 +6,10 @@ use std::process::Command;
 const REPORT_FD: &str = "LOOM_LAUNCH_REJECTION_FD";
 const UNTYPED: &str = "rejected";
 
+/// The per-spawn report carries one stage token; a longer token would be
+/// truncated on the datagram and read back as no typed reason.
+pub(super) const REPORT_BYTES: usize = 32;
+
 #[cfg(unix)]
 use std::{
     io,
@@ -50,7 +54,7 @@ impl Receiver {
     pub(crate) fn reason(self) -> Option<&'static str> {
         #[cfg(unix)]
         {
-            let mut bytes = [0; 32];
+            let mut bytes = [0; REPORT_BYTES];
             let len = self.0.recv(&mut bytes).ok()?;
             let token = std::str::from_utf8(&bytes[..len]).ok()?;
             reason_for_token(token)
@@ -160,5 +164,21 @@ mod tests {
         Reporter(current_sender).report(Some(LaunchStage::Credential));
         assert_eq!(Receiver(old).reason(), None);
         assert_eq!(Receiver(current).reason(), Some("preflight_credential"));
+    }
+
+    /// #14634: the profile-selection details — the longest tokens in the
+    /// vocabulary — reach the ledger whole through the per-spawn socket.
+    #[test]
+    #[cfg(unix)]
+    fn the_profile_selection_details_reach_the_ledger_whole() {
+        for (stage, reason) in [
+            (LaunchStage::ProfileSelectionEffort, "preflight_profile_selection_effort"),
+            (LaunchStage::ProfileSelectionModel, "preflight_profile_selection_model"),
+        ] {
+            let (receiver, sender) = UnixDatagram::pair().unwrap();
+            receiver.set_nonblocking(true).unwrap();
+            Reporter(sender).report(Some(stage));
+            assert_eq!(Receiver(receiver).reason(), Some(reason));
+        }
     }
 }

@@ -42,6 +42,7 @@ use super::session_ledger;
 use crate::step_role::StepRole;
 use crate::sweep_registry::step_ledger::StepRun;
 use crate::sweep_registry::step_spawn::ended::{self, EndedStep};
+use crate::sweep_registry::step_spawn::{StepRefusal, StepSpawnRequest};
 use crate::sweep_registry::SweepRegistry;
 
 /// The role's post-state from one read of the item: the claim release's own
@@ -150,27 +151,25 @@ pub fn run_of(
         // fast-fail ladder, same release), only the reason names the cause.
         // An agent's line, a verdict, a timeout, a provider exhaustion or a
         // probe failure never reaches this arm.
-        if line.is_none()
-            && outcome.class == outcome_ledger::OutcomeClass::Failed
-            && outcome.reason == outcome_ledger::UNCLASSIFIED
-        {
-            if let Some(reason) = step.launch_rejection {
-                return StepRun {
-                    item: step.item,
-                    step: step.role,
-                    sweep_id: step.sweep_id.clone(),
-                    outcome: outcome_ledger::StepOutcome::new(
-                        outcome_ledger::OutcomeClass::Failed,
-                        reason,
-                    ),
-                    ran_for: step.ran_for,
-                    failure_class: step
-                        .timed_out
-                        .then(|| crate::pr_lease_reap::REASON_TIMEOUT.to_string()),
-                };
+        //
+        // #15413: an untyped fast exit 78 (`never_started_reason`) names the
+        // coarse `launch_rejected`; the typed stage wins when both exist.
+        // Any other unexplained exit keeps `unclassified`.
+        let rejection = step.launch_rejection.or_else(|| {
+            step.attempt
+                .launch_rejected
+                .then_some(crate::pr_lease_reap::REASON_LAUNCH_REJECTED)
+        });
+        match rejection {
+            Some(reason)
+                if line.is_none()
+                    && outcome.class == outcome_ledger::OutcomeClass::Failed
+                    && outcome.reason == outcome_ledger::UNCLASSIFIED =>
+            {
+                outcome_ledger::StepOutcome::new(outcome_ledger::OutcomeClass::Failed, reason)
             }
+            _ => outcome,
         }
-        outcome
     };
     StepRun {
         item: step.item,
@@ -181,11 +180,12 @@ pub fn run_of(
         failure_class: step
             .timed_out
             .then(|| crate::pr_lease_reap::REASON_TIMEOUT.to_string()),
+        attempt: Some(step.attempt.clone()),
     }
 }
 
 /// The ledger's refusal reason for a spawn-time refusal
-/// (`sweep_registry::step_spawn::StepRefusal::reason`): the pool gate and a
+/// (`sweep_registry::step_spawn::StepRefusal::reason`): a child failing token selection and a
 /// claim held elsewhere cool the `(item, step)` down; a lost claim is a
 /// counted redraw. A standing admission refusal (#14032: the runtime will
 /// not take the launch — a rejected runtime, a model/runtime mismatch, or
@@ -197,7 +197,10 @@ pub fn run_of(
 #[must_use]
 pub fn ledger_reason(spawn_reason: &str) -> Option<&'static str> {
     match spawn_reason {
-        "pool_exhausted" | "no_token_pool" | "token_selection_failed" => Some("pool_gate"),
+        // The role mark normally suffices. record_refusal also cools the
+        // item when the probe let a marked role retry or a seat was unavailable.
+        "pool_exhausted" | "no_token_pool" => None,
+        "token_selection_failed" => Some("pool_gate"),
         "claimed" | "claim_unverified" | "backstop_hold" | "peer_active" => Some("claimed"),
         // A failed spawn cools down like a gate, so it is not respawned on
         // every tick. A missing `/loom:<role>` command is refused before the
@@ -215,19 +218,30 @@ pub fn ledger_reason(spawn_reason: &str) -> Option<&'static str> {
     }
 }
 
-fn refusal_ledger_reason(spawn_reason: &str, detail: Option<&str>) -> Option<&'static str> {
+fn refusal_ledger_reason(
+    refusal: Option<&StepRefusal>,
+    retried_pool: bool,
+) -> Option<&'static str> {
+    let Some(refusal) = refusal else {
+        return ledger_reason("spawn_failed");
+    };
+    let spawn_reason = refusal.reason;
+    if matches!(spawn_reason, "pool_exhausted" | "no_token_pool")
+        && (retried_pool || refusal.seat_unavailable)
+    {
+        return Some("pool_gate");
+    }
     // Match the start of the static Codex containment rejection and its
     // preparation cause. A path, diagnostic excerpt or preference summary
     // that mentions the marker is still an ordinary admission refusal.
     if spawn_reason == "runtime_rejected"
-        && detail
-            .and_then(|detail| {
-                detail.strip_prefix(concat!(
-                    "unmet capabilities: worktreeIsolation; ",
-                    "verified private-clone containment could not satisfy it: ",
-                    "private workspace preparation refused: ",
-                ))
-            })
+        && refusal
+            .detail
+            .strip_prefix(concat!(
+                "unmet capabilities: worktreeIsolation; ",
+                "verified private-clone containment could not satisfy it: ",
+                "private workspace preparation refused: ",
+            ))
             .and_then(|cause| cause.strip_prefix(outcome_ledger::SEAT_DIRTY))
             .is_some_and(|detail| detail.starts_with(": private clone/worktree is dirty;"))
     {
@@ -242,21 +256,21 @@ fn refusal_ledger_reason(spawn_reason: &str, detail: Option<&str>) -> Option<&'s
 pub fn record_refusal(
     root: &Path,
     registry: &Arc<Mutex<SweepRegistry>>,
-    item: u32,
-    role: StepRole,
-    spawn_reason: &str,
-    detail: Option<&str>,
+    request: &StepSpawnRequest,
+    refusal: Option<&StepRefusal>,
+    retried_pool: bool,
 ) {
-    let Some(reason) = refusal_ledger_reason(spawn_reason, detail) else {
+    let Some(reason) = refusal_ledger_reason(refusal, retried_pool) else {
         return;
     };
     let run = StepRun {
-        item,
-        step: role,
+        item: request.item,
+        step: request.role,
         sweep_id: String::new(),
         outcome: outcome_ledger::StepOutcome::new(outcome_ledger::OutcomeClass::Refused, reason),
         ran_for: std::time::Duration::ZERO,
         failure_class: None,
+        attempt: None,
     };
     let Ok(mut reg) = registry.lock() else {
         return;
@@ -401,7 +415,8 @@ mod tests {
 
     #[test]
     fn spawn_refusals_map_onto_the_ledgers_reasons() {
-        assert_eq!(ledger_reason("pool_exhausted"), Some("pool_gate"));
+        assert_eq!(ledger_reason("pool_exhausted"), None);
+        assert_eq!(ledger_reason("no_token_pool"), None);
         assert_eq!(ledger_reason("token_selection_failed"), Some("pool_gate"));
         assert_eq!(ledger_reason("backstop_hold"), Some("claimed"));
         // #12105: another actor working the PR cools the Doctor down.
@@ -420,12 +435,23 @@ mod tests {
     }
 
     #[test]
+    fn pool_refusal_after_an_optimistic_probe_cools_the_item() {
+        for reason in ["pool_exhausted", "no_token_pool"] {
+            let refusal = StepRefusal::new(reason, "launch refused");
+            assert_eq!(refusal_ledger_reason(Some(&refusal), false), None);
+            assert_eq!(refusal_ledger_reason(Some(&refusal), true), Some("pool_gate"));
+        }
+    }
+
+    #[test]
     fn only_the_dirty_private_preparation_refusal_gets_the_specific_ledger_reason() {
         let isolation = "unmet capabilities: worktreeIsolation; verified private-clone \
                          containment could not satisfy it: ";
         let dirty = "private workspace preparation refused: seat_dirty: private \
                      clone/worktree is dirty; retain and recover its work before reuse\n  M file";
-        let refusal = |reason, detail: String| refusal_ledger_reason(reason, Some(&detail));
+        let refusal = |reason, detail: String| {
+            refusal_ledger_reason(Some(&StepRefusal::new(reason, detail)), false)
+        };
         assert_eq!(
             refusal("runtime_rejected", format!("{isolation}{dirty}")),
             Some(outcome_ledger::SEAT_DIRTY)
@@ -439,7 +465,7 @@ mod tests {
             Some("admission")
         );
         assert_eq!(refusal("roll_paused", format!("{isolation}{dirty}")), None);
-        assert_eq!(refusal_ledger_reason("spawn_failed", None), Some("pool_gate"));
+        assert_eq!(refusal_ledger_reason(None, false), Some("pool_gate"));
     }
 
     /// #14458: a step that died on its seat's dirty leftover worktree wrote no
@@ -471,6 +497,7 @@ mod tests {
             timed_out: false,
             provider_exhausted: false,
             launch_rejection: None,
+            attempt: ended::AttemptEvidence::default(),
         };
         for (text, evidence, reason) in [
             (
@@ -507,6 +534,7 @@ mod tests {
             timed_out: false,
             provider_exhausted: false,
             launch_rejection: None,
+            attempt: ended::AttemptEvidence::default(),
         };
         std::fs::write(
             &step.log_path,
@@ -540,6 +568,7 @@ mod tests {
             timed_out: false,
             provider_exhausted: false,
             launch_rejection: None,
+            attempt: ended::AttemptEvidence::default(),
         };
         std::fs::write(
             &log,
@@ -600,6 +629,7 @@ mod tests {
             timed_out: false,
             provider_exhausted: false,
             launch_rejection: None,
+            attempt: ended::AttemptEvidence::default(),
         };
         std::fs::write(
             &log,
@@ -645,6 +675,7 @@ mod tests {
                 timed_out: false,
                 provider_exhausted: false,
                 launch_rejection: None,
+                attempt: ended::AttemptEvidence::default(),
             };
             let outcome = outcome_line(&step).unwrap_or_else(|| panic!("no line read: {line}"));
             assert_eq!((outcome.class.as_str(), outcome.reason.as_str()), ("noop", "ci_pending"));
@@ -671,6 +702,7 @@ mod tests {
             timed_out: false,
             provider_exhausted: true,
             launch_rejection: None,
+            attempt: ended::AttemptEvidence::default(),
         };
         // The post-state of a crashed step (claim restored, item unchanged)
         // would classify `failed`; the exhaustion override wins.
@@ -718,6 +750,7 @@ mod tests {
             timed_out: false,
             provider_exhausted: false,
             launch_rejection: None,
+            attempt: ended::AttemptEvidence::default(),
         };
         let run = run_of(&step, None, None);
         assert_eq!(run.outcome.class, OutcomeClass::Failed);
@@ -742,6 +775,7 @@ mod tests {
             timed_out: false,
             provider_exhausted: false,
             launch_rejection: rejection,
+            attempt: ended::AttemptEvidence::default(),
         };
         // The crashed-step shape: claim still held, no outcome line.
         let post = post_state(StepRole::Builder, &labels(&["loom:building"]), false);
@@ -772,6 +806,101 @@ mod tests {
                 outcome_ledger::Effect::FastFailLadder
             );
         }
+        // A profile-selection sub-boundary (the refused launch argument) is a
+        // typed reason of the same family: same class, same ladder.
+        for reason in [
+            "preflight_profile_selection_effort",
+            "preflight_profile_selection_model",
+        ] {
+            let split = run_of(&step(Some(reason)), None, Some(post));
+            assert_eq!(split.outcome.class, OutcomeClass::Failed);
+            assert_eq!(split.outcome.reason, reason);
+            assert_eq!(
+                outcome_ledger::effect_of(
+                    StepRole::Builder,
+                    &split.outcome,
+                    split.ran_for,
+                    &outcome_ledger::LedgerConfig::default(),
+                ),
+                outcome_ledger::Effect::FastFailLadder
+            );
+        }
+    }
+
+    /// #15413: an untyped fast exit 78 with no outcome line reports the coarse
+    /// `launch_rejected`; the typed stage outranks it; an unexplained exit
+    /// keeps `unclassified`; every case carries its termination evidence, and
+    /// the ledger effect is the same fast-fail ladder.
+    #[test]
+    fn an_untyped_fast_exit_78_is_a_coarse_launch_rejection() {
+        let step = |rejection, launch_rejected, termination| EndedStep {
+            sweep_id: "step-builder-15413-1".into(),
+            item: 15413,
+            role: StepRole::Builder,
+            log_path: "/nonexistent".into(),
+            ran_for: std::time::Duration::from_secs(9),
+            timed_out: false,
+            provider_exhausted: false,
+            launch_rejection: rejection,
+            attempt: ended::AttemptEvidence {
+                termination,
+                host: "host-a".into(),
+                ran_for: std::time::Duration::from_secs(9),
+                log: ".loom/logs/step-builder-15413.log".into(),
+                launch_rejected,
+            },
+        };
+        let post = post_state(StepRole::Builder, &labels(&["loom:building"]), false);
+        let status = |n| ended::Termination::Status(n);
+        let coarse = run_of(&step(None, true, status(78)), None, Some(post));
+        assert_eq!(coarse.outcome.reason, "launch_rejected");
+        let typed = run_of(&step(Some("preflight_credential"), true, status(78)), None, Some(post));
+        assert_eq!(typed.outcome.reason, "preflight_credential", "the typed stage wins");
+        // A different unexplained fast exit keeps its fallback reason...
+        let unknown = run_of(&step(None, false, status(1)), None, Some(post));
+        assert_eq!(unknown.outcome.reason, outcome_ledger::UNCLASSIFIED);
+        // ...and an unavailable status is carried as such.
+        let unavailable =
+            run_of(&step(None, false, ended::Termination::StatusUnavailable), None, Some(post));
+        assert_eq!(unavailable.outcome.reason, outcome_ledger::UNCLASSIFIED);
+        for (run, expected) in [
+            (&coarse, status(78)),
+            (&typed, status(78)),
+            (&unknown, status(1)),
+            (&unavailable, ended::Termination::StatusUnavailable),
+        ] {
+            let attempt = run.attempt.as_ref().expect("the evidence rides the run");
+            assert_eq!(attempt.termination, expected);
+            assert_eq!((attempt.host.as_str(), run.ran_for.as_secs()), ("host-a", 9));
+            assert_eq!(run.outcome.class, OutcomeClass::Failed);
+            assert_eq!(
+                outcome_ledger::effect_of(
+                    StepRole::Builder,
+                    &run.outcome,
+                    run.ran_for,
+                    &outcome_ledger::LedgerConfig::default(),
+                ),
+                outcome_ledger::Effect::FastFailLadder
+            );
+        }
+        // An agent's own line, a timeout and a provider exhaustion outrank it.
+        let line = outcome_ledger::StepOutcome::new(OutcomeClass::Failed, "no_pr");
+        let with_line = run_of(&step(None, true, status(78)), Some(&line), Some(post));
+        assert_eq!(with_line.outcome.reason, "no_pr");
+        let mut exhausted = step(None, true, status(78));
+        exhausted.provider_exhausted = true;
+        assert_eq!(
+            run_of(&exhausted, None, Some(post)).outcome.reason,
+            outcome_ledger::PROVIDER_EXHAUSTED
+        );
+        let mut timed_out = step(None, true, ended::Termination::TimedOut);
+        timed_out.timed_out = true;
+        assert_eq!(
+            run_of(&timed_out, None, Some(post))
+                .failure_class
+                .as_deref(),
+            Some(crate::pr_lease_reap::REASON_TIMEOUT)
+        );
     }
 
     /// #14634: the typed signal is spent only on the shape it proves. An
@@ -788,6 +917,7 @@ mod tests {
             timed_out: false,
             provider_exhausted: false,
             launch_rejection: Some("preflight_credential"),
+            attempt: ended::AttemptEvidence::default(),
         };
         // An agent's line outranks: the launcher never rejected a launch the
         // agent ran in.
@@ -871,6 +1001,7 @@ mod tests {
             timed_out: false,
             provider_exhausted: false,
             launch_rejection: None,
+            attempt: ended::AttemptEvidence::default(),
         };
         let line = outcome_ledger::StepOutcome::new(OutcomeClass::Verdict, "approved");
         let approved = post_state(StepRole::Judge, &labels(&["loom:pr"]), false);
@@ -910,6 +1041,7 @@ mod tests {
             timed_out: false,
             provider_exhausted: false,
             launch_rejection: None,
+            attempt: ended::AttemptEvidence::default(),
         };
         // Claude (kicad-tools #9764): the wrapper's markdown tail.
         std::fs::write(

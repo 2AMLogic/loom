@@ -54,21 +54,7 @@ pub fn env_non_empty(name: &str) -> Option<String> {
 /// `command -v <name> >/dev/null 2>&1`.
 #[must_use]
 pub fn have(name: &str) -> bool {
-    std::env::var_os("PATH").is_some_and(|paths| {
-        std::env::split_paths(&paths).any(|dir| {
-            let candidate = dir.join(name);
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                std::fs::metadata(&candidate)
-                    .is_ok_and(|m| !m.is_dir() && m.permissions().mode() & 0o111 != 0)
-            }
-            #[cfg(not(unix))]
-            {
-                candidate.is_file()
-            }
-        })
-    })
+    crate::fs_util::is_on_path(name)
 }
 
 /// `uname -s`, or `unknown` when the tool cannot be run — the script's own
@@ -134,15 +120,6 @@ pub fn realpath(target: &Path) -> String {
         Ok(canon) => format!("{}/{base}", canon.display()),
         Err(_) => cur.display().to_string(),
     }
-}
-
-/// [`realpath`] over a `&str`, with the empty string passing straight through.
-#[must_use]
-pub fn realpath_str(target: &str) -> String {
-    if target.is_empty() {
-        return String::new();
-    }
-    realpath(Path::new(target))
 }
 
 /// `extract_commit` — the first `commit <hex>` in `loom-daemon --version`
@@ -322,6 +299,5 @@ mod tests {
     #[test]
     fn realpath_of_a_nonexistent_path_is_empty_not_the_input() {
         assert_eq!(realpath(Path::new("/definitely/not/here/at/all")), "");
-        assert_eq!(realpath_str(""), "");
     }
 }
