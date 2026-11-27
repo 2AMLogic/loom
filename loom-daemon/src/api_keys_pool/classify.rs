@@ -282,6 +282,46 @@ pub fn is_monthly_spend_cap(text: &str) -> bool {
     text.to_ascii_lowercase().contains(GOOGLE_SPEND_CAP_NEEDLE)
 }
 
+/// The distinguishing text of a Z.ai weekly/monthly refusal (code `1310`,
+/// #15572): a long-horizon allowance that belongs to the **account**, not to
+/// the model class of the launch that happened to hit it. Kept a named const
+/// (not an inline literal in [`PATTERNS`]) so the row and
+/// [`exhaustion_is_account_wide`] cannot drift apart — a test pins that.
+pub const WEEKLY_MONTHLY_EXHAUSTION_NEEDLE: &str = "weekly/monthly limit exhausted";
+
+/// `true` when `provider_text` carries a weekly/monthly exhaustion refusal
+/// ([`WEEKLY_MONTHLY_EXHAUSTION_NEEDLE`]), i.e. the whole account is out until
+/// its reset whatever model it is asked for. The 5-hour refusal
+/// (`usage limit reached for`) is deliberately **not** matched: it keeps the
+/// launch's class scope.
+#[must_use]
+pub fn exhaustion_is_account_wide(provider_text: &str) -> bool {
+    provider_text
+        .to_ascii_lowercase()
+        .contains(WEEKLY_MONTHLY_EXHAUSTION_NEEDLE)
+}
+
+/// The model class a bad mark for `classification` should be scoped to
+/// (#15572): `None` (account-wide) for an `Exhausted` weekly/monthly refusal,
+/// else the launch's own `launch_class`, unchanged.
+///
+/// Both mark writers — the egress proxy and the launch-log ingest — decide
+/// scope through this one function so they cannot disagree. `None` is already
+/// honoured by selection (`bad_marks`: an account-wide mark covers every
+/// class), so no select-side change is needed.
+#[must_use]
+pub fn mark_scope_class<'a>(
+    classification: Classification,
+    provider_text: &str,
+    launch_class: Option<&'a str>,
+) -> Option<&'a str> {
+    if classification == Classification::Exhausted && exhaustion_is_account_wide(provider_text) {
+        None
+    } else {
+        launch_class
+    }
+}
+
 /// The whole pattern table, grouped for readability only — precedence is
 /// decided by [`classify`], not by position (see its docs).
 pub const PATTERNS: &[Pattern] = &[
@@ -359,7 +399,7 @@ pub const PATTERNS: &[Pattern] = &[
     // which `super::reset` reads; neither says "rate limit", so before these
     // rows they fell through to the bare 429 and a 60 s cooldown.
     Pattern {
-        needle: "weekly/monthly limit exhausted",
+        needle: WEEKLY_MONTHLY_EXHAUSTION_NEEDLE,
         classification: Classification::Exhausted,
         provenance: Provenance::LiveCapture(OPENCODE_1_18_31_ZAI),
     },
@@ -1005,6 +1045,53 @@ mod tests {
         assert!(!is_monthly_spend_cap(SYNTHETIC_GOOGLE_PER_MINUTE_EVENT));
         assert!(!is_monthly_spend_cap(SYNTHETIC_GOOGLE_PREPAY_EVENT));
         assert!(!is_monthly_spend_cap("Error: insufficient balance"));
+    }
+
+    /// #15572: a weekly/monthly refusal is account-wide and a 5-hour one is
+    /// not; the row and the predicate share one needle, and
+    /// [`mark_scope_class`] drops the class only for `Exhausted` + weekly.
+    #[test]
+    fn a_weekly_refusal_is_account_wide_and_a_five_hour_refusal_is_not() {
+        let row = PATTERNS
+            .iter()
+            .find(|p| p.needle == WEEKLY_MONTHLY_EXHAUSTION_NEEDLE)
+            .expect("the weekly/monthly Exhausted row must exist");
+        assert_eq!(row.classification, Classification::Exhausted);
+
+        assert!(exhaustion_is_account_wide(CAPTURED_ZAI_WEEKLY_LIMIT_EVENT));
+        assert!(!exhaustion_is_account_wide(CAPTURED_ZAI_FIVE_HOUR_LIMIT_EVENT));
+        assert!(!exhaustion_is_account_wide(CAPTURED_ZAI_RATE_LIMIT_EVENT));
+        assert!(!exhaustion_is_account_wide("Error: insufficient balance"));
+        // Case-insensitive, like the classifier itself.
+        assert!(exhaustion_is_account_wide("WEEKLY/MONTHLY LIMIT EXHAUSTED"));
+
+        let class = Some("glm-5.3-flash");
+        assert_eq!(
+            mark_scope_class(Classification::Exhausted, CAPTURED_ZAI_WEEKLY_LIMIT_EVENT, class),
+            None
+        );
+        // Weekly text with no parsable reset is still account-wide.
+        assert_eq!(
+            mark_scope_class(Classification::Exhausted, "Weekly/Monthly Limit Exhausted.", class),
+            None
+        );
+        // Everything else keeps the launch's class scope.
+        assert_eq!(
+            mark_scope_class(Classification::Exhausted, CAPTURED_ZAI_FIVE_HOUR_LIMIT_EVENT, class),
+            class
+        );
+        assert_eq!(
+            mark_scope_class(Classification::RateLimited, CAPTURED_ZAI_WEEKLY_LIMIT_EVENT, class),
+            class
+        );
+        assert_eq!(
+            mark_scope_class(Classification::Exhausted, "insufficient balance", class),
+            class
+        );
+        assert_eq!(
+            mark_scope_class(Classification::Exhausted, CAPTURED_ZAI_WEEKLY_LIMIT_EVENT, None),
+            None
+        );
     }
 
     /// #8521: the automatic path's prose table must not read the model's own

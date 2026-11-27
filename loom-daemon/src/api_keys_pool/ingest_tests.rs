@@ -476,6 +476,101 @@ fn without_a_usable_model_the_automatic_mark_is_account_wide() {
     }
 }
 
+/// 2026-11-16T16:49:39Z / 11:07:07Z — the captures' own `date` headers, so
+/// the provider-named reset instants are still in the future (#15572).
+const ZAI_WEEKLY_SEEN: u64 = 1_794_847_779;
+const ZAI_FIVE_HOUR_SEEN: u64 = 1_794_827_227;
+
+/// #15572 AC1 through the log path: a weekly/monthly refusal seen on class
+/// `glm-5.3-flash` is the account's, so the mark carries no `modelClass` and
+/// selection skips the account for a *different* class too.
+#[test]
+fn a_weekly_refusal_in_a_launch_log_marks_the_account_wide() {
+    let _clock = bad_marks::test_clock::pin(ZAI_WEEKLY_SEEN);
+    let tmp = workspace(&["alpha", "beta"]);
+    let contents = log(
+        "pool",
+        Some("alpha"),
+        "glm-5.3-flash",
+        crate::api_keys_pool::classify::CAPTURED_ZAI_WEEKLY_LIMIT_EVENT,
+    );
+    let feedback = ingest_launch_log(tmp.path(), &contents, ANCHOR, Some(1)).unwrap();
+    assert_eq!(feedback.classification, Classification::Exhausted);
+    assert_eq!(feedback.model_class, None);
+    assert!(feedback.detail.contains("account-wide"), "{}", feedback.detail);
+    let mark = feedback.mark.expect("marked");
+    assert_eq!(mark.model_class, None, "{mark:?}");
+
+    for class in [None, Some("glm-5.3-flash"), Some("glm-5.4")] {
+        assert!(active(tmp.path(), "alpha", class).is_some(), "{class:?}");
+    }
+    // A launch for the other class no longer re-selects the weekly-capped account.
+    let chosen = select::select_api_key_for(
+        tmp.path(),
+        PROVIDER,
+        Some("LOOM_TEST_KEY_8424"),
+        Some("glm-5.4"),
+        None,
+    )
+    .unwrap();
+    assert_eq!(chosen.name, "beta");
+}
+
+/// #15572 AC2: the 5-hour refusal keeps the launch's class scope (existing
+/// behaviour, pinned), so the account stays selectable for another class.
+#[test]
+fn a_five_hour_refusal_in_a_launch_log_stays_class_scoped() {
+    let _clock = bad_marks::test_clock::pin(ZAI_FIVE_HOUR_SEEN);
+    let tmp = workspace(&["alpha"]);
+    let contents = log(
+        "pool",
+        Some("alpha"),
+        "glm-5.3-flash",
+        crate::api_keys_pool::classify::CAPTURED_ZAI_FIVE_HOUR_LIMIT_EVENT,
+    );
+    let feedback = ingest_launch_log(tmp.path(), &contents, ANCHOR, Some(1)).unwrap();
+    assert_eq!(feedback.classification, Classification::Exhausted);
+    assert_eq!(feedback.model_class.as_deref(), Some("glm-5.3-flash"));
+    assert_eq!(feedback.mark.unwrap().model_class.as_deref(), Some("glm-5.3-flash"));
+    assert!(active(tmp.path(), "alpha", Some("glm-5.3-flash")).is_some());
+    assert!(active(tmp.path(), "alpha", Some("glm-5.4")).is_none());
+}
+
+/// #15572 AC4: a class mark already on the account is not cleared by the new
+/// account-wide weekly mark — both are recorded — and health reports the
+/// account `exhausted`.
+#[test]
+fn a_weekly_mark_coexists_with_an_existing_class_mark() {
+    let _clock = bad_marks::test_clock::pin(ZAI_WEEKLY_SEEN);
+    let tmp = workspace(&["alpha"]);
+    let root = pool_root(tmp.path());
+    bad_marks::mark_bad_for_class(
+        &root,
+        PROVIDER,
+        "alpha",
+        "earlier 5-hour refusal",
+        Some(30 * 86_400),
+        Some("glm-5"),
+    )
+    .unwrap();
+    let contents = log(
+        "pool",
+        Some("alpha"),
+        "glm-5.3-flash",
+        crate::api_keys_pool::classify::CAPTURED_ZAI_WEEKLY_LIMIT_EVENT,
+    );
+    let feedback = ingest_launch_log(tmp.path(), &contents, ANCHOR, Some(1)).unwrap();
+    assert!(feedback.mark.is_some(), "{}", feedback.detail);
+
+    let marks = bad_marks::read_marks(&root, PROVIDER).unwrap();
+    let scopes: Vec<Option<&str>> = marks.iter().map(|m| m.model_class.as_deref()).collect();
+    assert!(scopes.contains(&Some("glm-5")), "class mark was cleared: {scopes:?}");
+    assert!(scopes.contains(&None), "no account-wide mark written: {scopes:?}");
+
+    let health = select::health(tmp.path(), Some(PROVIDER)).unwrap();
+    assert_eq!(health[0].exhausted, 1, "{health:?}");
+}
+
 /// The last launch record in a region wins: a re-dispatch inside one sweep
 /// must mark the account the failing launch actually used.
 #[test]

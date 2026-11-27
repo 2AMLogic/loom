@@ -93,7 +93,7 @@ use std::path::Path;
 use serde_json::Value;
 
 use super::bad_marks::{self, BadMark};
-use super::classify::{classify_launch_region, provider_lines, Classification};
+use super::classify::{classify_launch_region, mark_scope_class, provider_lines, Classification};
 use super::reset;
 
 /// Prefix of the line `worker_spawn::run` writes before handing off to a
@@ -325,10 +325,15 @@ pub fn apply_mark_at(
 ) -> Option<LaunchFeedback> {
     let provider = record.provider?;
     let account = record.account?;
-    let model_class = record
+    let launch_class = record
         .model
         .as_deref()
         .and_then(bad_marks::normalize_model_class);
+    // #15572: a weekly/monthly exhaustion belongs to the account, so it is
+    // marked account-wide whatever class this launch ran; everything else
+    // keeps the launch's class. Same decision as the egress proxy's.
+    let model_class = mark_scope_class(classification, provider_text, launch_class.as_deref())
+        .map(str::to_string);
     let scope = model_class
         .as_deref()
         .map_or_else(|| "account-wide".to_string(), |class| format!("model class {class}"));
