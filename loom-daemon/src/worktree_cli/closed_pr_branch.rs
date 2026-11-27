@@ -82,13 +82,22 @@
 //! |---|---|
 //! | 0 | proceed — reuse `origin/<branch>` exactly as before |
 //! | 1 | refuse — the tip is a closed-unmerged PR's head; a message was printed |
+//! | 2 | could not run — the probe's read route would not resolve; the complaint is on stderr |
 //!
-//! Nothing else is ever returned, and **every** inability to decide returns 0.
-//! That direction is fixed by the arm this guard sits in: the merged check it
-//! follows fails open to reuse on an `unknown` verdict, because a forge outage
-//! must never block worktree creation, and `test-worktree-stale-merged-branch.sh`
-//! pins that. A guard that refused on a failed probe would make every
-//! hermetic/offline clone unable to reuse its own pushed branch.
+//! [`try_run_with`] returns only the first two, and **every** inability to
+//! decide is 0. That direction is fixed by the arm this guard sits in: the
+//! merged check it follows fails open to reuse on an `unknown` verdict,
+//! because a forge outage must never block worktree creation, and
+//! `test-worktree-stale-merged-branch.sh` pins that. A guard that refused on
+//! a failed probe would make every hermetic/offline clone unable to reuse its
+//! own pushed branch.
+//!
+//! The third code belongs to the command, not the decision. A probe that
+//! could not even be *asked* — the tools arm with no resolvable mode — comes
+//! back as `Err`, which the CLI adapter turns into 2 (#15650). It is not 0,
+//! because the operator must learn their routing is broken, and not 1, which
+//! `lib/worktree-forge-pr-check.sh` refuses on and reports as "this branch
+//! heads a closed PR".
 //!
 //! `LOOM_BRANCH_LANDED_OFFLINE=1` skips the probe, the same seam
 //! [`super::branch_landed::forge_probe`] honours.
