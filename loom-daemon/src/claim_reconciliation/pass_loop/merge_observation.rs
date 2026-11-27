@@ -805,13 +805,12 @@ impl RecordStore {
     /// The record could not be persisted; the caller leaves the merge for a
     /// later tick rather than act on an unpinned identity.
     pub fn store(&self, r: &MergeRecord) -> std::io::Result<()> {
-        std::fs::create_dir_all(&self.dir)?;
         let text =
             serde_json::to_string_pretty(r).map_err(|e| std::io::Error::other(e.to_string()))?;
-        std::fs::write(self.dir.join(format!(".pr-{}.json.tmp", r.pr)), text)?;
-        std::fs::rename(
-            self.dir.join(format!(".pr-{}.json.tmp", r.pr)),
-            self.dir.join(format!("pr-{}.json", r.pr)),
+        crate::fs_util::write_atomic(
+            &self.dir.join(format!("pr-{}.json", r.pr)),
+            text.as_bytes(),
+            crate::fs_util::AtomicOpts::default(),
         )
     }
 
