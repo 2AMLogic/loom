@@ -48,7 +48,7 @@ use chrono::Utc;
 
 use crate::generated_artifact::build_tree::{self, BuildRoot};
 
-use crate::fs_util::newest_mtime_and_size;
+use crate::fs_util::tree_size_bytes;
 use crate::target_orphan_reclaim::{
     current_euid, owned_by_us, production_open_handles, vet_path_inside,
 };
@@ -272,14 +272,14 @@ fn root_bytes(worktree: &Path, root: &BuildRoot) -> u64 {
     if root.symlink {
         return 0;
     }
-    newest_mtime_and_size(&worktree.join(&root.rel)).map_or(0, |(_, bytes)| bytes)
+    tree_size_bytes(&worktree.join(&root.rel))
 }
 
 fn measured(meta: &std::fs::Metadata, path: &Path) -> u64 {
     if meta.file_type().is_symlink() {
         return 0;
     }
-    newest_mtime_and_size(path).map_or(0, |(_, bytes)| bytes)
+    tree_size_bytes(path)
 }
 
 /// Phase one over one class of worktree under `repo_root`: record why each

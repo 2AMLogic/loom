@@ -3464,31 +3464,7 @@ pub fn clean_log_files(repo_root: &Path, stats: &mut CleanupStats, dry_run: bool
 }
 
 pub(super) fn dir_size_human(path: &Path) -> String {
-    fn walk(path: &Path, total: &mut u64) {
-        let Ok(entries) = std::fs::read_dir(path) else {
-            return;
-        };
-        for entry in entries.flatten() {
-            if let Ok(ft) = entry.file_type() {
-                if ft.is_dir() {
-                    walk(&entry.path(), total);
-                } else if let Ok(meta) = entry.metadata() {
-                    *total += meta.len();
-                }
-            }
-        }
-    }
-    let mut total = 0u64;
-    walk(path, &mut total);
-    if total >= 1024 * 1024 * 1024 {
-        format!("{:.1}G", total as f64 / (1024.0 * 1024.0 * 1024.0))
-    } else if total >= 1024 * 1024 {
-        format!("{:.1}M", total as f64 / (1024.0 * 1024.0))
-    } else if total >= 1024 {
-        format!("{:.1}K", total as f64 / 1024.0)
-    } else {
-        format!("{total}B")
-    }
+    crate::fs_util::human_size(crate::fs_util::dir_size_bytes(path).unwrap_or(0))
 }
 
 /// The primary checkout's regenerable build-artifact directories — exactly what
