@@ -133,9 +133,11 @@ fn sum_entries(entries: fs::ReadDir) -> u64 {
     for entry in entries.flatten() {
         // `DirEntry::file_type` does NOT follow symlinks, so a symlinked
         // directory lands in the non-dir branch and is never recursed into.
-        // The size there must come from `symlink_metadata` too:
-        // `DirEntry::metadata()` follows the link and would charge a symlink
-        // the size of its target (#5939 review).
+        // Accounting rule: a symlink contributes its own length, and a
+        // symlink to a directory is never traversed. The size is read with
+        // `symlink_metadata` so the non-following stat is explicit and
+        // platform-independent; `DirEntry::metadata()` would also report the
+        // link's own metadata rather than its target's.
         match entry.file_type() {
             Ok(ft) if ft.is_dir() => {
                 if let Ok(children) = fs::read_dir(entry.path()) {
