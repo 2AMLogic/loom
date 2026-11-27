@@ -141,6 +141,20 @@ pub(super) const INSTALLED_SURFACE_PREFIXES: &[(&str, &str)] = &[
     (".claude/commands/loom/", "defaults/.claude/commands/loom/"),
 ];
 
+/// Single-file surfaces of the same installed↔source mapping (#15554):
+/// files `resync-installed.sh` copies one at a time with `sync_one`, which
+/// no directory prefix can describe. Matched by exact path, so
+/// `.loom/pricing.json.bak` is not covered, and classified by the same
+/// byte-match rule as [`INSTALLED_SURFACE_PREFIXES`].
+///
+/// - `.loom/pricing.json` ← `defaults/pricing.json`: the model rate card
+///   (#8177), which a vendor price change reaches on a resync. It was
+///   missing from this mapping the way it was missing from both shell
+///   classifiers at once (#15519), so a resync that refreshed it left the
+///   opt-in gate skipping every tick as `dirty-tree` (#4332's stall).
+pub(super) const INSTALLED_SURFACE_FILES: &[(&str, &str)] =
+    &[(".loom/pricing.json", "defaults/pricing.json")];
+
 #[cfg(test)]
 mod tests {
     use super::*;
