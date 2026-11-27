@@ -51,18 +51,9 @@ pub fn repo_slug(repo_root: &Path) -> Option<String> {
 /// without a checkout.
 #[must_use]
 pub fn slug_from_remote_url(url: &str) -> Option<String> {
-    let rest = url
-        .strip_prefix("git@github.com:")
-        .or_else(|| url.strip_prefix("https://github.com/"))
-        .or_else(|| url.strip_prefix("http://github.com/"))
-        .or_else(|| url.strip_prefix("ssh://git@github.com/"))?;
-    let rest = rest.strip_suffix(".git").unwrap_or(rest);
-    let rest = rest.trim_end_matches('/');
-    // Must name both halves; "owner" alone is not addressable.
-    if rest.split('/').filter(|s| !s.is_empty()).count() != 2 {
-        return None;
-    }
-    Some(rest.to_string())
+    crate::forge_cmd::parse_remote_url(url)
+        .filter(|(host, _)| host == "github.com")
+        .map(|(_, nwo)| nwo)
 }
 
 /// A file's sha256 as lowercase hex, or `None` when it could not be read.

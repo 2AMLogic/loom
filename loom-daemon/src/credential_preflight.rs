@@ -850,28 +850,7 @@ pub fn resolve_github_app_script(root: &Path) -> Option<PathBuf> {
 pub fn nwo_from_git_remote(cwd: &Path) -> Option<String> {
     // Bounded (#9715): a hung `git` must not stall the caller.
     let url = crate::forge_cmd::get_remote_url(cwd)?;
-    let stripped = url.strip_suffix(".git").unwrap_or(url.as_str());
-
-    let path = if let Some(rest) = stripped.strip_prefix("git@") {
-        // SSH: git@host:owner/repo
-        let (_host, p) = rest.split_once(':')?;
-        p
-    } else if let Some(rest) = stripped.strip_prefix("https://") {
-        // HTTPS: https://host/owner/repo
-        let (_host, p) = rest.split_once('/')?;
-        p
-    } else {
-        let rest = stripped.strip_prefix("http://")?;
-        let (_host, p) = rest.split_once('/')?;
-        p
-    };
-
-    let trimmed = path.trim_matches('/');
-    let (owner, repo) = trimmed.split_once('/')?;
-    if owner.is_empty() || repo.is_empty() {
-        return None;
-    }
-    Some(format!("{owner}/{repo}"))
+    crate::forge_cmd::parse_remote_url(&url).map(|(_, nwo)| nwo)
 }
 
 /// The owner segment of a `"owner/repo"` string (everything before the first
@@ -2060,6 +2039,20 @@ mod tests {
         assert!(set_url.success());
 
         assert_eq!(nwo_from_git_remote(path), Some("2AMLogic/klayout-tools".to_string()));
+
+        // #15624: ssh:// and userinfo remotes resolve through the shared parser.
+        for url in [
+            "ssh://git@github.com/o/r.git",
+            "https://token@github.com/o/r",
+        ] {
+            let set_url = Command::new("git")
+                .args(["remote", "set-url", "origin", url])
+                .current_dir(path)
+                .status()
+                .unwrap();
+            assert!(set_url.success());
+            assert_eq!(nwo_from_git_remote(path), Some("o/r".to_string()), "{url}");
+        }
     }
 
     #[test]
