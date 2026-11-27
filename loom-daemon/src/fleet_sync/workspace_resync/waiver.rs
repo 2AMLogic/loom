@@ -192,7 +192,7 @@ impl Kind {
     #[must_use]
     pub fn upstream(self) -> &'static str {
         match self {
-            Self::Loom => "rjwalters/loom",
+            Self::Loom => "2AMLogic/loom",
             Self::RepoSkills => "rjwalters/repo",
         }
     }
