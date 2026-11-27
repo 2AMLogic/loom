@@ -219,27 +219,6 @@ fn candidate_tmp_dirs(repo_root: &Path) -> Vec<PathBuf> {
     out
 }
 
-/// Total size in bytes of everything under `path`, recursively. A read
-/// failure at any level contributes `0` for that subtree rather than
-/// propagating an error — this is an informational figure for the log line,
-/// not a removal decision.
-fn dir_size_bytes(path: &Path) -> u64 {
-    let mut total = 0u64;
-    let Ok(entries) = std::fs::read_dir(path) else {
-        return total;
-    };
-    for entry in entries.flatten() {
-        if let Ok(ft) = entry.file_type() {
-            if ft.is_dir() {
-                total += dir_size_bytes(&entry.path());
-            } else if let Ok(meta) = entry.metadata() {
-                total += meta.len();
-            }
-        }
-    }
-    total
-}
-
 /// Age of `path` in seconds relative to `now`, or `None` if its metadata /
 /// modification time is unreadable (treated as "not reclaimable", never as
 /// "infinitely old").
@@ -278,7 +257,7 @@ fn sweep_scratch(repo_root: &Path, max_age_secs: i64, now: DateTime<Utc>) -> (us
             }
             let is_dir = path.is_dir();
             let size = if is_dir {
-                dir_size_bytes(&path)
+                crate::fs_util::dir_size_bytes(&path).unwrap_or(0)
             } else {
                 std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0)
             };

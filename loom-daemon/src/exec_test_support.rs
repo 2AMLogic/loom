@@ -4,12 +4,14 @@
 //! every one needs the same two steps: write the body, then `chmod 0755`. One
 //! helper here replaces the private per-file copies that had accumulated
 //! under four different names. [`retry_while_executable_busy`] is its
-//! companion for the `ETXTBSY` window writing that fixture opens.
+//! companion for the `ETXTBSY` window writing that fixture opens, and
+//! [`hung_with_grandchild`] with [`grandchild_outlived`] is the pair a
+//! deadline test uses to ask whether a kill reached the whole process group.
 
 use std::fs;
 use std::io;
 use std::path::Path;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// Write `body` to `path` and make it executable (mode 0755).
 ///
@@ -77,6 +79,59 @@ fn retry_while_busy<T>(
         }
     }
     attempt()
+}
+
+/// The body of a script that starts a sleeping grandchild, records its pid in
+/// `pidfile`, then hangs: the fixture for a deadline having to take a whole
+/// process group, not only the child it spawned.
+#[cfg(unix)]
+pub(crate) fn hung_with_grandchild(pidfile: &Path) -> String {
+    format!("/bin/sleep 120 & echo $! > '{}'; exec /bin/sleep 120", pidfile.display())
+}
+
+/// How long [`grandchild_outlived`] waits for the pid file, and then for a
+/// deadline kill still in flight to be reaped, before it reads a survivor.
+#[cfg(unix)]
+const GRANDCHILD_GRACE: Duration = Duration::from_secs(2);
+
+#[cfg(unix)]
+const GRANDCHILD_POLL: Duration = Duration::from_millis(20);
+
+/// Whether the grandchild [`hung_with_grandchild`] recorded in `pidfile` is
+/// still running, checked by pid. A survivor is killed before `true` is
+/// returned, so a failing assertion never leaks it.
+#[cfg(unix)]
+pub(crate) fn grandchild_outlived(pidfile: &Path) -> bool {
+    let deadline = Instant::now() + GRANDCHILD_GRACE;
+    let pid = loop {
+        let recorded = fs::read_to_string(pidfile)
+            .ok()
+            .and_then(|raw| raw.trim().parse::<libc::pid_t>().ok())
+            .filter(|pid| *pid > 0);
+        if let Some(pid) = recorded {
+            break pid;
+        }
+        if Instant::now() >= deadline {
+            panic!(
+                "the fixture's child never recorded its grandchild's pid in {}",
+                pidfile.display()
+            );
+        }
+        std::thread::sleep(GRANDCHILD_POLL);
+    };
+    let deadline = Instant::now() + GRANDCHILD_GRACE;
+    loop {
+        // SAFETY: signal 0 performs error checking only; nothing is delivered.
+        let alive = unsafe { libc::kill(pid, 0) == 0 };
+        if !alive || Instant::now() >= deadline {
+            if alive {
+                // SAFETY: `pid` is the fixture's own grandchild.
+                unsafe { libc::kill(pid, libc::SIGKILL) };
+            }
+            return alive;
+        }
+        std::thread::sleep(GRANDCHILD_POLL);
+    }
 }
 
 #[cfg(test)]

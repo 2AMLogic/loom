@@ -85,7 +85,7 @@
 use crate::fs_util::truncate_tail;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use crate::tokens_pool::round_summary::{self, RoundSummary};
 use crate::workspace_registry::WorkspaceRegistry;
@@ -117,9 +117,6 @@ pub const DEFAULT_TOKEN_RANKING_REFRESH_INTERVAL_SECS: u64 = 600;
 /// generous headroom for a slow network without letting a hung probe wedge the
 /// loop indefinitely.
 const DEFAULT_PROBE_TIMEOUT: Duration = Duration::from_secs(120);
-
-/// Poll granularity while waiting for the probe to finish.
-const PROBE_POLL_INTERVAL: Duration = Duration::from_millis(200);
 
 /// Max bytes of captured probe output retained in a failure log line.
 const MAX_OUTPUT_TAIL_BYTES: usize = 2048;
@@ -315,9 +312,9 @@ fn apply_codex_snapshot_feedback(repo_root: &Path) {
 }
 
 /// Run `bin tokens check --ranking --workspace <repo_root>` with `repo_root`
-/// as both the `--workspace` argument and the child's cwd, capturing combined
-/// output to a temp file (never a pipe — avoids the pipe-buffer deadlock the
-/// health gate's equivalent helper documents) and killing it after `timeout`.
+/// as both the `--workspace` argument and the child's cwd, through
+/// [`crate::proc_exec`] (concurrent pipe draining, and a deadline after
+/// `timeout` that kills the probe's whole process group).
 /// `summary_path` is handed to the child in
 /// [`round_summary::ROUND_SUMMARY_FILE_ENV`].
 fn run_probe_with_timeout(
@@ -326,21 +323,7 @@ fn run_probe_with_timeout(
     timeout: Duration,
     summary_path: &Path,
 ) -> RefreshOutcome {
-    let log_path = std::env::temp_dir()
-        .join(format!("loom-token-ranking-refresh-{}.log", uuid::Uuid::new_v4()));
-    let out_file = match std::fs::File::create(&log_path) {
-        Ok(f) => f,
-        Err(e) => {
-            return RefreshOutcome::Failure(format!("could not create probe output file: {e}"))
-        }
-    };
-    let stderr_file = match out_file.try_clone() {
-        Ok(f) => f,
-        Err(e) => {
-            let _ = std::fs::remove_file(&log_path);
-            return RefreshOutcome::Failure(format!("could not clone probe output handle: {e}"));
-        }
-    };
+    use crate::proc_exec::{Completion, ExecError};
 
     let mut command = Command::new(bin);
     command
@@ -351,55 +334,32 @@ fn run_probe_with_timeout(
         .arg(repo_root)
         .current_dir(repo_root)
         .env(round_summary::ROUND_SUMMARY_FILE_ENV, summary_path)
-        .stdin(Stdio::null())
-        .stdout(Stdio::from(out_file))
-        .stderr(Stdio::from(stderr_file));
-    let mut child = match command.spawn() {
-        Ok(c) => c,
-        Err(e) => {
-            let _ = std::fs::remove_file(&log_path);
-            return RefreshOutcome::Failure(format!("could not spawn `{}`: {e}", bin.display()));
-        }
-    };
+        .stdin(Stdio::null());
     // #14100: the probe is the daemon's own binary; attribute its pid.
-    let tracked = crate::self_spawn_log::track("token_ranking_refresh", &command, child.id());
-
-    let start = Instant::now();
-    let result = loop {
-        match child.try_wait() {
-            Ok(Some(status)) if status.success() => {
-                tracked.finish(status);
-                break RefreshOutcome::Success;
-            }
-            Ok(Some(status)) => {
-                tracked.finish(status);
-                let tail = std::fs::read_to_string(&log_path).unwrap_or_default();
-                break RefreshOutcome::Failure(format!(
-                    "`{}` exited with {status}: {}",
-                    bin.display(),
-                    truncate_tail(&tail, MAX_OUTPUT_TAIL_BYTES)
-                ));
-            }
-            Ok(None) => {
-                if start.elapsed() >= timeout {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    tracked.finish("timed out");
-                    break RefreshOutcome::Failure(format!(
-                        "`{}` timed out after {}s",
-                        bin.display(),
-                        timeout.as_secs()
-                    ));
-                }
-                std::thread::sleep(PROBE_POLL_INTERVAL);
-            }
-            Err(e) => {
-                break RefreshOutcome::Failure(format!("could not poll `{}`: {e}", bin.display()))
-            }
+    match crate::self_spawn_log::run_bounded_tracked("token_ranking_refresh", command, timeout) {
+        Ok(Completion::Exited(out)) if out.status.success() => RefreshOutcome::Success,
+        Ok(Completion::Exited(out)) => {
+            let mut combined = String::from_utf8_lossy(&out.stdout).into_owned();
+            combined.push_str(&String::from_utf8_lossy(&out.stderr));
+            RefreshOutcome::Failure(format!(
+                "`{}` exited with {}: {}",
+                bin.display(),
+                out.status,
+                truncate_tail(&combined, MAX_OUTPUT_TAIL_BYTES)
+            ))
         }
-    };
-    let _ = std::fs::remove_file(&log_path);
-    result
+        Ok(Completion::TimedOut { .. }) => RefreshOutcome::Failure(format!(
+            "`{}` timed out after {}s",
+            bin.display(),
+            timeout.as_secs()
+        )),
+        Err(ExecError::Spawn(e)) => {
+            RefreshOutcome::Failure(format!("could not spawn `{}`: {e}", bin.display()))
+        }
+        Err(ExecError::Collect(e)) => {
+            RefreshOutcome::Failure(format!("could not poll `{}`: {e}", bin.display()))
+        }
+    }
 }
 
 // ============================================================================
@@ -633,6 +593,7 @@ mod tests {
     use super::*;
     use serial_test::serial;
     use std::fs;
+    use std::time::Instant;
 
     fn write_config(root: &Path, contents: &str) {
         fs::create_dir_all(root.join(".loom")).unwrap();
@@ -762,15 +723,29 @@ mod tests {
         let profiles = tempfile::tempdir().unwrap();
         let _profile_root = ProfileRootEnv::set(profiles.path());
         let tmp = tempfile::tempdir().unwrap();
-        let bin = write_fake_bin(tmp.path(), "fake-daemon.sh", "sleep 30");
+        #[cfg(unix)]
+        let pidfile = tmp.path().join("grandchild.pid");
+        // A child that hangs behind a recorded grandchild: the deadline must
+        // take the whole process group, the grandchild included (#15580).
+        #[cfg(unix)]
+        let body = crate::exec_test_support::hung_with_grandchild(&pidfile);
+        #[cfg(not(unix))]
+        let body = "sleep 30".to_string();
+        let bin = write_fake_bin(tmp.path(), "fake-daemon.sh", &body);
         let mut runner = ScriptRankingRefreshRunner::new(tmp.path().to_path_buf())
             .with_bin(bin)
-            .with_timeout(Duration::from_millis(300));
+            .with_timeout(Duration::from_millis(600));
         let outcome = runner.refresh();
         let RefreshOutcome::Failure(reason) = outcome else {
             panic!("expected Failure");
         };
-        assert!(reason.contains("timed out"), "{reason}");
+        assert!(reason.contains(" timed out after "), "{reason}");
+        assert_eq!(telemetry::failure_class(&reason), "timeout");
+        #[cfg(unix)]
+        assert!(
+            !crate::exec_test_support::grandchild_outlived(&pidfile),
+            "the probe's grandchild outlived the deadline"
+        );
     }
 
     #[test]
