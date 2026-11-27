@@ -282,7 +282,7 @@ fn reclaim_scratch(
             continue;
         }
         let bytes = if path.is_dir() {
-            tree_bytes(&path)
+            crate::fs_util::dir_size_bytes(&path).unwrap_or(0)
         } else {
             metadata.len()
         };
@@ -306,22 +306,6 @@ fn reclaim_scratch(
             log::debug!("seat_reclaim: could not remove {}: {:?}", path.display(), removed);
         }
     }
-}
-
-fn tree_bytes(path: &Path) -> u64 {
-    let mut total = 0u64;
-    if let Ok(entries) = std::fs::read_dir(path) {
-        for entry in entries.flatten() {
-            if let Ok(file_type) = entry.file_type() {
-                if file_type.is_dir() {
-                    total += tree_bytes(&entry.path());
-                } else if let Ok(meta) = entry.metadata() {
-                    total += meta.len();
-                }
-            }
-        }
-    }
-    total
 }
 
 // ============================================================================
@@ -479,7 +463,7 @@ fn inspect_entry(
                     .push("merged PR grace period not passed".into());
                 return Ok(());
             }
-            let held = tree_bytes(&canonical);
+            let held = crate::fs_util::dir_size_bytes(&canonical).unwrap_or(0);
             if repository::git(repo, &["worktree", "remove", &path.display().to_string()]).is_ok() {
                 outcome.worktrees_removed += 1;
                 outcome.bytes += held;
