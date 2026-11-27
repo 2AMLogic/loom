@@ -56,6 +56,15 @@ pub(super) const LOOM_OWNED_PREFIXES: &[&str] = &[
     // to prevent. Safe to ignore here: the gate's remediation is `git reset
     // --hard <remote>` and never `git clean`, so the overlay survives.
     ".loom-local/",
+    // Operator stop requests (#15545): `signal.sh stop` writes
+    // `.loom/signals/stop-<name>` and the daemon only tests its existence
+    // (`check_stop_signals`), so it is operator-written control state, not
+    // daemon-written, and stays out of `DAEMON_RUNTIME_PATTERNS`. In a repo
+    // whose managed .gitignore block predates the `.loom/signals/` rule it is
+    // untracked dirt; the bash mirror's `--quarantine` would stash the stop
+    // request away mid-sweep. The trailing slash matches the directory git
+    // reports as well as any child path; `.loom/signals-old/` is not matched.
+    ".loom/signals/",
     // Daemon-written token-pool runtime files (#15479): the per-repo health
     // cache and its sibling lock (#5014), and the ranking the refresh tick
     // rewrites every cycle (#14584). Written into every workspace now, while
@@ -69,6 +78,14 @@ pub(super) const LOOM_OWNED_PREFIXES: &[&str] = &[
     ".loom/account-health.json",
     ".loom/account-health.lock",
     ".loom/account-ranking.codex",
+    // The other two daemon-written entries of the audit (#15488), both
+    // directories: `.loom/claims/` (`loom-daemon claim` writes
+    // `issue-<N>.lock/claim.json`) and `.loom/metrics/` (`validate-phase`'s
+    // recovery path writes `recovery-events.json`). Same stale-block hazard
+    // as the three above; listed with their trailing `/` so the subtree
+    // match above covers every file either writer produces.
+    ".loom/claims/",
+    ".loom/metrics/",
 ];
 
 /// Common regenerable lockfile basenames (#3950): a package manager can
@@ -123,6 +140,20 @@ pub(super) const INSTALLED_SURFACE_PREFIXES: &[(&str, &str)] = &[
     (".loom/bin/", "defaults/.loom/bin/"),
     (".claude/commands/loom/", "defaults/.claude/commands/loom/"),
 ];
+
+/// Single-file surfaces of the same installed↔source mapping (#15554):
+/// files `resync-installed.sh` copies one at a time with `sync_one`, which
+/// no directory prefix can describe. Matched by exact path, so
+/// `.loom/pricing.json.bak` is not covered, and classified by the same
+/// byte-match rule as [`INSTALLED_SURFACE_PREFIXES`].
+///
+/// - `.loom/pricing.json` ← `defaults/pricing.json`: the model rate card
+///   (#8177), which a vendor price change reaches on a resync. It was
+///   missing from this mapping the way it was missing from both shell
+///   classifiers at once (#15519), so a resync that refreshed it left the
+///   opt-in gate skipping every tick as `dirty-tree` (#4332's stall).
+pub(super) const INSTALLED_SURFACE_FILES: &[(&str, &str)] =
+    &[(".loom/pricing.json", "defaults/pricing.json")];
 
 #[cfg(test)]
 mod tests {
@@ -247,6 +278,33 @@ mod tests {
             ".loom/account-ranking.codex",
         ] {
             assert!(loom_owned(p), "{p} must stay in LOOM_OWNED_PREFIXES (#15479)");
+        }
+    }
+
+    #[test]
+    fn the_daemon_written_runtime_directories_are_loom_owned() {
+        // #15488: the audit of the remaining EPHEMERAL_PATTERNS candidates
+        // found two more daemon-written entries, both directories —
+        // `loom-daemon claim` writes `.loom/claims/issue-<N>.lock/claim.json`
+        // and `validate-phase`'s recovery path writes
+        // `.loom/metrics/recovery-events.json`. Both are listed with a
+        // trailing `/`, so what the lists must get right is the subtree match
+        // on a child path; the entries themselves are pinned by the parity
+        // test below.
+        for p in [
+            ".loom/claims/issue-42.lock/claim.json",
+            ".loom/metrics/recovery-events.json",
+        ] {
+            assert!(loom_owned(p), "{p} must be Loom-owned (#15488)");
+        }
+        // A sibling that merely extends the directory's name is not Loom
+        // state: the trailing `/` ends the prefix, so a stray there stays
+        // visible as contamination.
+        for p in [
+            ".loom/claims-old/issue-42.lock/claim.json",
+            ".loom/metrics-old/recovery-events.json",
+        ] {
+            assert!(!loom_owned(p), "{p} must not match a directory entry by its name prefix");
         }
     }
 

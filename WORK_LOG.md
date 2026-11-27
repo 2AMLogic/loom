@@ -18,6 +18,45 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 ### 2026-11-27
 
+- **PR #15571**: refactor: dedupe re-entrant env locks into env_test_support
+- **PR #15567**: fix: treat a resynced .loom/pricing.json as ignorable gate dirt
+- **PR #15563**: fix: stream duplicate-scan candidates and report incomplete pools
+- **PR #15535**: docs: record the live agy verification of the pinned read-only policy on 1.5.18
+- **PR #15550**: Remove retired Safehouse completion usage readers
+- **Issue #15544** (closed): Consolidate triplicated re-entrant env-var locks in tokens_pool/*_env.rs onto env_test_support (~350 LOC)
+- **Issue #15554** (closed): main_health_gate: a modified .loom/pricing.json is non-ignorable dirt (no INSTALLED_SURFACE_PREFIXES entry for the single-file rate card)
+- **Issue #15561** (closed): check-duplicate reports ordinary matches after a full temporary filesystem drops the merged-PR pool
+- **Issue #15522** (closed): Remove orphaned Safehouse completion-envelope token and runtime readers (~950 LOC)
+- **PR #15565**: test: scope IPC daemon-status env overrides with EnvGuard
+- **PR #15562**: docs: replace the step usage fallback with per-runtime cases
+- **PR #15555**: fix: treat .loom/signals/ as Loom-owned so quarantine never stashes a stop request
+- **PR #15552**: Route contained OpenCode Z.ai launches through the credential proxy (#15527)
+- **PR #15547**: docs(guide): use parsed issue dependencies for dependency-based unblocks
+- **Issue #15558** (closed): Use EnvGuard to restore registry and token overrides in seven IPC status tests
+- **Issue #15557** (closed): Correct the attribution guide for steps with missing session IDs or logs
+- **Issue #15545** (closed): Protect operator stop signals from quarantine and remove the stale #11284 comment
+- **Issue #15528** (closed): Unblock sweep lifted #8698's blocker-less park twice (2026-11-19 and 2026-11-26), naming closed #8674 as the resolved dependency
+- **Issue #15527** (closed): Contained OpenCode launch of the bundled Z.ai profiles cannot be routed through the credential egress proxy (prerequisite for #8698)
+- **PR #15540**: fix: type effort and model refusals inside profile selection
+- **PR #15549**: fix: read Loom resync waiver tags and blobs from 2AMLogic/loom
+- **PR #15530**: fix: make resync's printed recipe stage its retirements and rate card
+- **PR #15546**: test: assert PR counts in zero-write review-conflict cases
+- **PR #15531**: fix: skip resync-installed user-scope steps in --output staging mode
+- **PR #15524**: fix: ignore daemon-written .loom/claims/ and .loom/metrics/ as dirt
+- **Issue #14634** (closed): Dashboard Builder repeatedly selects OpenCode and exits at preflight on loom-worker-3
+- **Issue #15541** (closed): Resync waiver still reads Loom's release tag from rjwalters/loom
+- **Issue #15519** (closed): resync-installed.sh --output: the printed git add recipe omits the run's own retired-file deletions under .loom/scripts and the .loom/pricing.json update
+- **Issue #15537** (closed): Zero-write review-conflict e2e tests pass when the open-PR listing fails
+- **Issue #15518** (closed): resync-installed.sh --output: the real run rewrites ~/.local/bin/loom via the user-scope #10238 step; --dry-run shows nothing
+- **Issue #15488** (closed): install/hygiene: decide the rest of the daemon-written EPHEMERAL_PATTERNS against both LOOM_OWNED_PREFIXES lists (left out of scope by #15479)
+- **Issue #15521** (closed): native loom_edit refuses with "read the current file first" straight after a full read, oldText matching exactly once
+- **PR #15534**: fix: explain why native edits cannot match oldText
+- **Issue #15517** (closed): Release-tag verification is shed on fleet workers: RELEASE_REPO still names rjwalters/loom, so resync-payload and the workspace resync never apply the payload
+- **PR #15542**: fix: verify release tags against 2AMLogic/loom and name shed lookups
+- **Issue #15471** (closed): verify-output-decl says a producer with an unterminated final line has zero lines
+- **PR #15502**: fix: verify-output-decl counts an unterminated final line (#15471)
+- **Issue #15510** (closed): Reuse the review-conflict fake gh in approved-PR tests
+- **PR #15538**: test: share the review-conflict fake gh with approved-PR tests
 - **Issue #15539** (closed): config-resolver.sh: a config tier over 128 KiB fails with `jq: Argument list too long` (exit 126) and aborts create-pr.sh
 - **Issue #15536** (closed): config-resolver.sh: loom_resolve_config passes each tier as one jq --argjson and dies with "Argument list too long" above 128 KiB
 - **Issue #15512** (closed): tests/hooks: verify the destructive guard harness clears inherited environment variables in CI

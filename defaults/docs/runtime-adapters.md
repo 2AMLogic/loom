@@ -253,13 +253,35 @@ pool check and reports `api_keys:gemini` — the same source a native tap on
 the namespace reports — so `hold_pool_slot` reserves either route against
 the one cap.
 
-- **Supported roles**: read-only roles with no `runtimeRequirements`
-  (Curator, Guide, Auditor). Builder and Doctor (worktreeIsolation +
-  loomControl) and Judge (loomControl) are refused by the manifest's
-  all-`"no"` capabilities, by the same mechanism as every other tier-3
-  runtime.
-- **Pilot invocation**: `LOOM_RUNTIME=agy .loom/scripts/spawn-worker.sh -p
-  "<prompt>"`, or a `runtimes.preference` / role-draw entry naming `agy`.
+- **Supported roles**: none for dispatch; the pilot is **verification-only**.
+  Its one task is a one-shot read-only prompt: read a disposable workspace
+  fixture and return the value in the response. The capability check does not
+  confine it to that. A role that declares no `runtimeRequirements` is
+  admitted without the manifest's capabilities being read:
+  `check-runtime-capabilities.sh` admits it with `role '<role>' declares no
+  runtimeRequirements`, and `runtime_admission` does the same. The
+  all-`"no"` capabilities therefore refuse only Builder and Doctor
+  (worktreeIsolation + loomControl) and Judge (loomControl), as in every
+  other tier-3 runtime. Admission is not completion. Curator, Guide and
+  Auditor each finish by executing a command: Curator through
+  `loom-daemon curation-complete`, Guide through `gh`, Auditor through its
+  checks and `./.loom/scripts/create-issue.sh`. The empty
+  `runtimeRequirements` list is not unique to them (Architect, Champion,
+  Driver, Hermit and `loom` declare none either), and the same applies to
+  any role that needs a command to finish. The pinned policy denies
+  `command(*)` and `mcp(*)`, and the manifest declares `mcp: "no"`, so a
+  role drawn onto `agy` can produce text and nothing else. On build
+  `1.5.18-6386224290725888` a shell write (`run_command`) was refused with
+  `Matches user-configured deny rule` (#15474; see "Permission policy"
+  below). Do not name `agy` in `runtimes.preference`,
+  `runtimes.rolePreference` or `runtimes.roleDraw`. Narrowing `command(*)`
+  would change the containment policy approved in #15474 and needs its own
+  decision.
+- **Pilot invocation**: an explicit
+  `LOOM_RUNTIME=agy .loom/scripts/spawn-worker.sh -p "<prompt>"` carrying a
+  one-shot read-only prompt or a fixture check. Never a
+  `runtimes.preference`, `runtimes.rolePreference` or `runtimes.roleDraw`
+  entry naming `agy`.
 - **Version pin**: a pin is a **recorded build** — the archive URL and the
   release manifest's `sha512` for one build — because the vendor channel is
   latest-only: the installer takes only `--dir` and installs whatever the
@@ -293,14 +315,23 @@ the one cap.
   `antigravity-cli-auto-updater-974169037036.us-central1.run.app`. Treat the
   `1.5.14` canary's updater as enabled until a run establishes otherwise.
   [Recorded observations on #15059](https://github.com/2AMLogic/loom/issues/15059#issuecomment-7198012068)
+
+  The default arm is now observed inside a pooled launch too (#15474,
+  2026-11-27, adapter `60e4ce62b`). Four `loom-daemon spawn-worker` launches
+  of `1.5.18`, each on its own fresh per-launch HOME, where the debounce cannot
+  hide an enabled updater, and with the variable unset in the launching
+  environment, each logged the disabled line and left no updater files. The
+  operator-override arm (`false`) has not been run in a pooled launch.
 - **CLI flags** — On `1.5.18`, `--settings` honored both an inline JSON
   object and a file path outside HOME. At `d83809d46` the adapter's settings
   file was reachable only through the flag. In each case, selecting the Gemini
   provider produced the expected missing-key diagnostic. The verification
   host also logged `Terminal sandbox unavailable: AppArmor restricts
   unprivileged user namespaces`. The vendor documents a fallback to the
-  default mode when the terminal sandbox is unavailable. The effective
-  mode on that host still needs a pooled run.
+  default mode when the terminal sandbox is unavailable. A pooled run on a
+  host with the same restriction (#15474, 2026-11-27) reported
+  `"permission_mode":"request-review"` in the `init` event of
+  `--output-format stream-json`, the value the adapter pins.
 - **Permission policy (#15474)** — `--sandbox` is terminal containment, not a
   permission policy. Since v1.5.7 a headless run starts in `auto` mode
   wherever that mode is available, where workspace file edits and sandboxed
@@ -333,30 +364,67 @@ the one cap.
   `true` refuses the launch at 78 before anything is created or run. Every
   other token follows the guarded argv, ahead of the model and the prompt; a
   bare `--sandbox` in an override is dropped as a duplicate.
+
+  On build `1.5.18-6386224290725888` the policy was observed denying
+  `edit_file`, `write_file` and `run_command` (#15474, 2026-11-27), on the
+  adapter, `loom-daemon` and host configuration recorded under "Live
+  verification status" (terminal sandbox unavailable). MCP enforcement was
+  not exercised.
+  The CLI log shows the rules as written (`CLI settings initialized:
+  permissions=&{Allow:[read_file(<workspace>)] Deny:[write_file(*) command(*)
+  mcp(*)] Ask:[]}, toolPermission=request-review`). The rule names are the
+  CLI's permission categories, not its tool names: the model called
+  `edit_file`, `write_file` and `run_command`, and each was refused with
+  `Permission denied for write_file(<path>). Matches user-configured deny
+  rule.` or, for the shell, `command(<command>)` in place of the path. The
+  workspace was untrusted (`ApplyProjectPermissionGrants: no grants`). During
+  the run the CLI rewrites the settings file at its default location:
+  pretty-printed, with the rules and `agentMode` kept and `toolPermission`
+  not kept. Nothing carries from one launch to the next, because every launch
+  gets a fresh HOME.
 - **Offline policy checks** — The `agy` tests in
   `loom-daemon/tests/worker_spawn_api_keys.rs` check the argv, both settings
   files and refusals against a fake CLI. The adapter leaves
   `trustedWorkspaces` empty because a trusted workspace can supply hooks,
-  plugins and MCP configuration. A guarded read in an untrusted workspace
-  and both write denials still need live verification on the pinned build.
+  plugins and MCP configuration. The live counterpart ran on
+  `1.5.18-6386224290725888`: a guarded read in an untrusted workspace and
+  both write denials, see "Live verification status" below.
 - An on-disk `.loom/runtimes/agy.json` overrides the manifest without
   recompiling.
 - **Effort is not mapped** — `agy models` lists `-low/medium/high/xhigh`
   model variants an operator can pass through explicitly (the canary's
   listing; key-less on `1.5.18` the subcommand refuses without a sign-in).
-  The canary's bare `gemini-4-neon` resolved with an undisclosed effort:
-  unknown.
-- **Live verification status** (#15059, 2026-11-26): the version, the
-  `--settings` argument and the updater control are verified on `1.5.18`
-  without a model call. The pooled launch was attempted through
-  `.loom/scripts/spawn-worker.sh` and refused at 78 (`stage=credential`)
-  because the verification host's `gemini` pool held one account,
-  bad-marked exhausted, so no `agy` process ran. Still open: everything on
-  `1.5.14`, `gemini-4-neon` resolving through the pool (key-less the CLI
-  logged `Model ID gemini-4-neon not in local config`), a guarded read, the
-  file-edit and shell-write denials with before/after fixture digests, and
-  updater suppression inside a pooled `spawn-worker` launch. Run those checks
-  with the policy shipped for #15474. Until then, treat `agy` as write-capable.
+  On `1.5.18` a pooled launch resolved the bare name to `gemini-4-neon-medium`
+  (`Gemini 4 Neon (Medium)` in the CLI log), so a bare `gemini-4-neon` selects
+  the medium effort on that build. The canary's `1.5.14` resolved it with an
+  effort that stays unknown.
+- **Live verification status** (#15059, 2026-11-26; #15474, 2026-11-27): the
+  key-less half (version, the `--settings` argument, the updater control) is
+  verified on `1.5.18` without a model call. The pooled half is verified on
+  build `1.5.18-6386224290725888` with adapter `60e4ce62b`, `loom-daemon`
+  `0.20.43` and the `gemini/pilot` pool account, launched through
+  `LOOM_RUNTIME=agy .loom/scripts/spawn-worker.sh` with
+  `--output-format stream-json`:
+
+  - The `init` event reported `model: gemini-4-neon` and
+    `permission_mode: request-review`.
+  - A guarded `read_file` returned the value of a fixture whose contents were
+    absent from the prompt.
+  - A file edit (`edit_file`), a whole-file write (`write_file`) and a shell
+    write (`run_command`) were each attempted and refused with
+    `Matches user-configured deny rule`. Each fixture's SHA-256 was identical
+    before and after, and every launch still exited 0.
+  - The terminal sandbox was unavailable on that host as well, so none of
+    this depends on `--sandbox`.
+
+  [Recorded observations on #15474](https://github.com/2AMLogic/loom/issues/15474#issuecomment-7206255449).
+  Still open: everything on `1.5.14`; write denial on a host where the
+  terminal sandbox is available; MCP tool enforcement (the run exercised four
+  of the 60 advertised tools); and an operator-exported
+  `AGY_CLI_DISABLE_AUTO_UPDATE=false` inside a pooled launch. Until a host
+  runs the same checks against the build and configuration it has installed,
+  treat that installation as write-capable. This includes
+  `1.5.18-6386224290725888` on any configuration other than the recorded one.
 
 ## The seven contract points
 
@@ -2306,10 +2374,12 @@ stays env-passthrough even with the flag on.
   the only harness with a config contract this writes, so the field is
   **inert on any other runtime** — dropped from the selection at resolution,
   so a profile may declare it for its OpenCode binding while its other
-  bindings keep launching. It is also refused on an armed **contained**
-  launch: that config is provisioned inside the container, where the
-  host-side launcher cannot patch it, so a contained OpenCode launch is
-  re-pointed with `baseUrlEnv`.
+  bindings keep launching. On an armed **contained** OpenCode launch the
+  config is provisioned inside the container, where the host-side launcher
+  cannot patch it, so the host hands the proxy's container-reachable base
+  URL to the in-container copy as a *required* internal worker argument
+  (`--egress-proxy-base-url`, issue #15527) and that copy applies the same
+  patch after provisioning (see "Contained OpenCode launches" below).
 
 The bundled `zai-flash` profile proxies Z.ai's coding-plan endpoint through
 the OpenCode harness this way (`upstream: https://api.z.ai/api/coding/paas/v4`,
@@ -2319,6 +2389,37 @@ operator turns `credentialProxy` on (issue #11300). That profile also binds
 no `baseUrlEnv`, so with the flag on a `pi` launch of it fails closed —
 arming a proxy the harness would not follow would send the placeholder to
 the real upstream — and with the flag off it launches unchanged.
+
+**Contained OpenCode launches (issue #15527).** With both switches on
+(`runtimes.containment.native = "ephemeral"` and `credentialProxy = true`),
+a contained OpenCode launch of a `baseUrlConfig` profile — the bundled
+`zai-flash` and `zai-full` — is armed on the host like any other proxied
+launch: the real credential is resolved on the host, `docker run` carries
+the same per-launch placeholder under every credential name
+(`ZAI_API_KEY` and `ZHIPU_API_KEY`) and forwards neither by name, and the
+listener stays host-side. The launcher then appends
+`--egress-proxy-base-url <http://host:port>` to the worker argv of the
+contained re-exec. Inside the container, before any prompt expansion or
+harness provisioning, the worker validates the handoff and, once the OpenCode
+config is provisioned (guarded role or free-form launch, with or without a
+provider block in the profile), sets
+`provider.<id>.options.<baseUrlConfig>` on the selected provider to that URL;
+the rest of `OPENCODE_CONFIG_CONTENT` is left alone.
+
+The handoff fails closed (exit 78, before the harness starts) when it is:
+given anywhere but the contained re-exec; given for a runtime other than
+`opencode`, a profile with no `baseUrlConfig`, or a gateway-routed launch;
+not exactly `http://<host>:<port>`; or paired with a credential that is not
+the host's placeholder. **Mixed versions:** the argument is required, not
+advisory. A `loom-daemon` inside the image that predates it rejects the
+unknown option (`unsupported worker option`, exit 78) before it reads a
+credential or builds a harness command, so an old image yields an explicit
+configuration error and never a launch that looks proxied but is not. Rebuild
+or republish the worker image alongside the host when enabling this path.
+Unproxied launches, uncontained proxied launches (loopback-bound, patched by
+the launcher itself) and a `pi` selection of the same profiles behave as
+before; `pi` with the proxy on still refuses, because the bundled profiles
+declare no `baseUrlEnv` for it.
 
 **Uncontained native launches.** The same substitution is available without
 containment, on the same switch and the same per-profile opt-in: a native

@@ -699,6 +699,20 @@ a later pass to sort out.
 
 ### Unblocking Logic
 
+For the **issue dependency check** (#15528), run `parse_dependencies "$body"`
+even when working by hand. It reads ordinary declarations such as
+`Depends on #962` and unchecked dependency boxes. For park records it uses
+`loom-daemon park-record parse`. Pass only the printed dependencies to
+`resolve_dep_states`. Proceed through the remaining gates only when the resolver
+reports all dependencies resolved and `deps_fully_resolved` confirms every ref.
+
+If `parse_dependencies` prints nothing, skip the dependency-based label edit
+and “Unblocked” comment for that issue. On #8698, a checked box and two park
+reasons cited closed issue #8674, but neither park declared it as a blocker.
+Never fill an empty result from a checked box, `reason="..."` or other prose.
+Continue the PR evidence check, awaiting-revision conversion and due transient
+park release under their own rules below.
+
 Permanent block (#8742): `<!-- loom:permanent-block -->` (own line; quoted prose
 doesn't count) counts from a trusted comment, or the body **only if its author is trusted** (`--with-body`). Champion
 and `check_and_unblock_prs` check the same. Removing `loom:blocked` ⇒ audit comment.
@@ -965,12 +979,13 @@ convert_awaiting_revision_parks() {
 ### Example Unblocking Flow
 
 ```bash
-# 1. Issue #963 has loom:blocked, body contains "Depends on #962"
-gh issue view 963 --json labels,body
+# 1. Blocked issue #963 has an ordinary dependency declaration, "Depends on #962".
+body=$(gh issue view 963 --json body --jq .body)
+deps=$(parse_dependencies "$body")  # deps is 962
 
-# 2. Check if #962 is closed
-gh issue view 962 --json state
-# → state: CLOSED ✓
+# 2. The dependency check in check_and_unblock verifies that all parsed refs resolved.
+resolve_dep_states "$deps"
+# → true on line 1, #962 on line 2
 
 # 3. Superseding-block gate (#4634): any linked PR still open and blocked?
 has_superseding_block 963
@@ -1014,7 +1029,8 @@ pr_state=$(gh pr view "$pr_number" --json state,mergedAt --jq '.state')
 
 ### When NOT to Unblock
 
-- If no parseable dependencies found → Skip (may need manual review)
+- If `parse_dependencies` prints nothing for an issue, skip only its
+  dependency-based unblock (#15528). Continue the other sweep checks above.
 - If any dependency is still OPEN → Keep blocked
 - **If a linked implementation PR is still OPEN with `loom:changes-requested`,
   `loom:blocked`, or `loom:operator` → Keep blocked, even if every
