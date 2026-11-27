@@ -51,7 +51,7 @@ mod tests {
     use super::{on_stack, try_parse_cli, MAIN_THREAD_STACK};
 
     /// The deepest parse path: `Commands` -> `ForgeAction` ->
-    /// `MergeQueueAction`. Every nested `augment_subcommands` frame is live.
+    /// `MergeQueueCmd`. Every nested `augment_subcommands` frame is live.
     const DEEP_ARGV: &[&str] = &["loom-daemon", "forge", "merge-queue", "mode"];
 
     fn parses_forge(args: &[&str]) -> bool {
