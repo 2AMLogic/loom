@@ -109,10 +109,11 @@ pub(crate) fn forge_op_for(op: &str) -> Option<ForgeOp> {
         | "landed.route_marker"
         | "orphan_stack.comments"
         | "merged_obs.issue_comments"
-        | "merged_obs.comments_trusted" => ops::COMMENT_LIST,
+        | "merged_obs.comments_trusted"
+        | "merged_stack.comments" => ops::COMMENT_LIST,
         "claim.pr_labels" | "sequence.predecessor" => ops::PR_VIEW_STATE,
-        "orphan_stack.parent_lookup" => ops::PR_LIST_BY_HEAD,
-        "orphan_stack.retarget" => ops::PR_EDIT_BASE,
+        "orphan_stack.parent_lookup" | "merged_stack.parent_lookup" => ops::PR_LIST_BY_HEAD,
+        "orphan_stack.retarget" | "merged_stack.retarget" => ops::PR_EDIT_BASE,
         "park_hold.issue_view"
         | "release_veto.issue_labels"
         | "intake.recheck"
@@ -120,7 +121,8 @@ pub(crate) fn forge_op_for(op: &str) -> Option<ForgeOp> {
         | "claim.labels_rest"
         | "merged_obs.issue_read"
         | "merged_obs.issue_kind"
-        | "merged_obs.item_read" => ops::ISSUE_VIEW_STATE,
+        | "merged_obs.item_read"
+        | "merged_stack.issue_labels" => ops::ISSUE_VIEW_STATE,
         "parent_link.marker_children_rest" => ops::ISSUE_SEARCH,
         "park_hold.issue_body" => ops::ISSUE_EDIT_BODY,
         "quarantine.issue_list" => ops::ISSUE_LIST,
@@ -168,6 +170,7 @@ pub(crate) fn forge_op_for(op: &str) -> Option<ForgeOp> {
         | "intake.demote_comment"
         | "landed.comment"
         | "orphan_stack.comment"
+        | "merged_stack.comment"
         | "claim.curating_recuration_comment" => ops::COMMENT_CREATE,
         "roster.delete" | "roster.patch" | "sequence.comment_patch" | "sequence.comment_delete" => {
             ops::COMMENT_EDIT_DELETE
