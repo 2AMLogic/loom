@@ -2,13 +2,14 @@
 //! **is** the act that ratifies a spec or decision record.
 //!
 //! A chip repo's target spec or decision record can say "ratified on merge" /
-//! "ratified only on human merge approval". Merging such a PR decides
-//! something that belongs to the operator, and every mechanical merge
-//! criterion can pass on it (2AMLogic/sky130-dsp-fft#6 would have merged in
-//! the 2026-10-20 shadow run). This module is the mechanical detector plus the
-//! hold's state machine; `champion-ratification-hold.md` is the tick that
-//! applies [`decide`]'s answer, `defaults/docs/ratification-hold.md` the
-//! rationale.
+//! "ratified only on human merge approval", or, with a status line, require the
+//! two reviewer keys and the flip to `Ratified` of its own PR before that PR
+//! merges (#15430). Merging such a PR decides something that belongs to the
+//! operator, and every mechanical merge criterion can pass on it
+//! (2AMLogic/sky130-dsp-fft#6 would have merged in the 2026-10-20 shadow run).
+//! This module is the mechanical detector plus the hold's state machine;
+//! `champion-ratification-hold.md` is the tick that applies [`decide`]'s
+//! answer, `defaults/docs/ratification-hold.md` the rationale.
 //!
 //! # What makes it a *hard* hold
 //!
@@ -140,10 +141,45 @@ pub fn is_candidate(f: &ChangedFile, cfg: &Config) -> bool {
         })
 }
 
-/// Whether `content` declares that merging ratifies it. Markdown emphasis and
-/// code ticks are dropped first (`ratified **on merge**`); a phrase inside a
-/// fence or quote still counts: a false hold costs one operator comment, a
-/// false pass ratifies a spec.
+/// #15430: the reviewer pair a record can require of its own PR — the lane's
+/// two keys, or the "two independent reviews" of the chip repos' rule. A plain
+/// `two reviews` or `two code reviews` is an ordinary review request.
+const KEY_REVIEWS: &str = concat!(
+    r"\b(?:",
+    r"both\s+(?:(?:independent|reviewer|key)\s+)*(?:keys?|reviews?)",
+    r"|two\s+(?:(?:independent|key|reviewer)\s+)+",
+    r"(?:ee\s+and\s+market\s+)?(?:keys?|reviews?|reviewers?)",
+    r"|independent\s+(?:ee\s+and\s+market\s+)?",
+    r"(?:reviewer\s+)?(?:keys?|reviews?|reviewers?)",
+    r")\b",
+);
+
+/// #15430: the record's own PR — its merge, or the PR named as such. A
+/// "separate" or "later" PR is a deferral, not this PR.
+const OWN_PR: &str = concat!(
+    r"\b(?:merges?|merging|merged)\b",
+    r"|\bthis\s+PR\b",
+    r"|\b(?:that|the|its|their|this)\s+(?:same\s+|own\s+|record's\s+own\s+)PR\b",
+);
+
+/// Whether one paragraph of `text` (emphasis already stripped) requires the
+/// reviewer pair of the record's own PR: a ratification word, [`KEY_REVIEWS`]
+/// and [`OWN_PR`] together. Paragraphs, not lines: the policy reads the same
+/// however it is soft-wrapped.
+fn requires_key_reviews(text: &str) -> bool {
+    let ratif = compile(r"ratif\w*");
+    let pair = compile(KEY_REVIEWS);
+    let own_pr = compile(OWN_PR);
+    compile(r"\n\s*\n")
+        .split(text)
+        .any(|p| ratif.is_match(p) && pair.is_match(p) && own_pr.is_match(p))
+}
+
+/// Whether `content` declares that merging ratifies it, or that the record
+/// requires the reviewer pair of its own PR before it merges. Markdown
+/// emphasis and code ticks are dropped first (`ratified **on merge**`); a
+/// phrase inside a fence or quote still counts: a false hold costs one
+/// operator comment, a false pass ratifies a spec.
 #[must_use]
 pub fn declares_ratification(content: &str, cfg: &Config) -> bool {
     let text: String = content
@@ -157,7 +193,8 @@ pub fn declares_ratification(content: &str, cfg: &Config) -> bool {
     if phrases.map(compile).any(|re| re.is_match(&text)) {
         return true;
     }
-    compile(STATUS).is_match(&text) && compile(CLAUSE).is_match(&text)
+    compile(STATUS).is_match(&text)
+        && (requires_key_reviews(&text) || compile(CLAUSE).is_match(&text))
 }
 
 /// Scan a PR's change list. Only files the PR adds, modifies or renames count:
