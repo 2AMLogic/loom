@@ -33,6 +33,18 @@ The two failure modes are not symmetric, so the installer errs toward keeping.
 Every file the installer removes, and every file it preserves under this rule,
 is **named in the installer's output**. Nothing in `.loom/` is deleted silently.
 
+`installed_files` is not a complete list of what Loom owns (#15745). The
+installer writes it, from the release it installed. `resync-installed.sh` only
+ever **removes** entries, those for files retired upstream (#14012); it never
+adds the files a later release ships. Such a file is still Loom's — the current
+`defaults/` tree ships it, the first row above — but unlisted, and
+`verify-install.sh` builds its drift manifest from the same list, so the file
+is not drift-tracked. The daemon's payload resync (`loom-daemon
+resync-payload`) does record the payload files it writes. Because the list can
+lag behind the tree this way, the fleet-sync self-heal does not treat it as the
+only evidence: see [`daemon-reference.md`](daemon-reference.md)
+§"Self-heal of a Loom-only blockage" (#11989).
+
 ### The one place the rule is looser: an explicit `--clean` uninstall
 
 `uninstall-loom.sh --clean` is an operator saying "wipe the managed

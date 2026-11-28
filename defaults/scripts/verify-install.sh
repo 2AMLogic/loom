@@ -46,10 +46,14 @@ EXIT_DANGLING_LINKS=6
 #   v1: whole-file hash of every tracked path; file list derived from a
 #       hard-coded directory walk (captured sibling-installer files).
 #   v2 (issue #3600): file list derived from .loom/install-metadata.json
-#       "installed_files" (Loom's ownership boundary); the top-level CLAUDE.md
-#       entry is hashed over its <!-- BEGIN/END LOOM ORCHESTRATION --> region
+#       "installed_files" (Loom's ownership record, as the installer wrote
+#       it); the top-level CLAUDE.md entry is hashed over its
+#       <!-- BEGIN/END LOOM ORCHESTRATION --> region
 #       only (recorded as "region": "loom-block"), so sibling edits outside
-#       the Loom block no longer report drift.
+#       the Loom block no longer report drift. The list is not complete:
+#       resync-installed.sh prunes retired entries (#14012) but never adds the
+#       files a later release ships, so a file only that script delivered is
+#       Loom-owned, unlisted, and not drift-tracked here (#15745).
 # cmd_verify refuses to compare a manifest whose version != MANIFEST_VERSION
 # and instructs the caller to regenerate, rather than reporting false drift.
 MANIFEST_VERSION=2
@@ -120,11 +124,14 @@ ${BOLD}DESCRIPTION:${NC}
 
 ${BOLD}TRACKED FILE SET:${NC}
     The file list is derived from .loom/install-metadata.json
-    "installed_files" (Loom's ownership boundary) intersected with the
-    files actually present on disk. Files a sibling installer added
-    (e.g. .claude/agents/<other-tool>-*.md) are never tracked. When the
-    metadata file is absent (pre-#3450 installs), a legacy directory
-    walk is used instead, with a stderr warning.
+    "installed_files" (Loom's ownership record, as the installer wrote
+    it) intersected with the files actually present on disk. The list is
+    not complete: resync-installed.sh prunes retired entries (#14012) but
+    never adds the files a later release ships, so a file only that script
+    delivered is Loom-owned, unlisted, and not drift-tracked (#15745). Files a
+    sibling installer added (e.g. .claude/agents/<other-tool>-*.md) are never
+    tracked. When the metadata file is absent (pre-#3450 installs), a legacy
+    directory walk is used instead, with a stderr warning.
 
     The top-level CLAUDE.md and AGENTS.md are hashed over their
     ${LOOM_SECTION_START} ... ${LOOM_SECTION_END}
@@ -317,11 +324,13 @@ collect_tracked_files_walk() {
 # Collect all tracked file paths (relative to repo root), one per line, sorted.
 #
 # Primary path (issue #3600): derive the list from .loom/install-metadata.json
-# "installed_files" (Loom's ownership boundary), intersected with files present
-# on disk and minus the runtime/merge-target denylist. This means files a
-# sibling installer added (e.g. Anvil's .claude/agents/anvil-*.md) never enter
-# the manifest. Falls back to the legacy directory walk (with a warning) when
-# the metadata is absent or yields no usable entries.
+# "installed_files" (Loom's ownership record, as the installer wrote it and
+# not complete -- resync-installed.sh never extends it, #15745), intersected
+# with files present on disk and minus the runtime/merge-target denylist. This
+# means files a sibling installer added (e.g. Anvil's
+# .claude/agents/anvil-*.md) never enter the manifest. Falls back to the legacy
+# directory walk (with a warning) when the metadata is absent or yields no
+# usable entries.
 collect_tracked_files() {
     local root="$1"
     local metadata_path="$root/.loom/install-metadata.json"
