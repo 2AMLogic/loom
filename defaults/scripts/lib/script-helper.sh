@@ -84,7 +84,7 @@ loom_exec_script_helper() {
     # ${BASH_SOURCE[1]:-$0} hardens the caller-frame lookup the same way
     # run_loom_tool did (#3680): every call site is a bash-shebang'd script, so
     # BASH_SOURCE is populated, but the bare bashism would break if that changed.
-    local script_dir repo_root bin
+    local script_dir repo_root bin tools
     script_dir="$(cd "$(dirname "${BASH_SOURCE[1]:-$0}")" && pwd)"
     repo_root="$(_lsh_find_repo_root "$script_dir")" || repo_root=""
 
@@ -152,10 +152,24 @@ loom_exec_script_helper() {
         loom_daemon_exec_checked "${BASH_SOURCE[1]:-$0}" "$bin" "$subcommand" "$@"
     fi
 
+    # No loom-daemon resolved. A subcommand loom-tools backstops (the worktree
+    # family, #14476) runs on loom-tools instead of refusing: the same handler,
+    # on a tools-only install. Like the slice path above it is exec'd directly —
+    # the caller's `# requires-daemon:` floor names a DAEMON version, and
+    # loom-tools has no daemon to be too old for — so the subcommand's own exit
+    # code still reaches the caller unmodified.
+    if loom_tools_backstops "$subcommand" \
+        && tools="$(loom_tools_backstop_bin "$subcommand" "$repo_root")"; then
+        exec "$tools" "$subcommand" "$@"
+    fi
+
     printf '%s\n\n' "[ERROR] loom-daemon not found (needed for '$subcommand')." >&2
     echo "This script is a thin stub over the native \`loom-daemon $subcommand\`" >&2
     echo "subcommand (issue #4275). Provide a binary by either:" >&2
     echo "  - setting LOOM_DAEMON_SELF_BIN=/path/to/loom-daemon (the binary that IMPLEMENTS this subcommand, checked first) or LOOM_DAEMON_BIN=/path/to/loom-daemon, or" >&2
+    if loom_tools_backstops "$subcommand"; then
+        echo "  - installing loom-tools, which serves it too (LOOM_TOOLS_BIN=/path/to/loom-tools, on PATH, or in \${LOOM_DAEMON_BIN_DIR:-\$HOME/.local/bin})," >&2
+    fi
     if [[ -n "$repo_root" && -d "$repo_root/loom-daemon" ]]; then
         echo "  - building it: cargo build --release --manifest-path $repo_root/loom-daemon/Cargo.toml" >&2
     else

@@ -81,6 +81,26 @@ impl ForgeReadCli {
         )
     }
 
+    /// The exit status a MODE refusal takes for a verb whose exit codes are
+    /// data. `check-claim`, `check-open-pr` and `check-branch` answer `0`
+    /// (blocked / exists), `1` (VERIFIED clear) and `EX_PROBE_FAILED` (5, no
+    /// verdict — fail closed). A mode the gate cannot resolve is the last of
+    /// those, not the second: left to `run()`'s generic error exit it would
+    /// wear `1`, and `worktree.sh`'s fresh-branch probe reads `1` as "clear
+    /// to claim" and creates the worktree. So for exactly these verbs the
+    /// refusal exits with the verb's own no-verdict code; every other verb
+    /// keeps the plain command error. An allow-list: a verb not named here
+    /// has no data codes to collide with.
+    #[must_use]
+    pub fn no_verdict_exit(&self) -> Option<i32> {
+        match &self.action {
+            ForgeAction::CheckClaim { .. } => Some(crate::forge_check_claim::EX_PROBE_FAILED),
+            ForgeAction::CheckOpenPr { .. } => Some(crate::forge_check_open_pr::EX_PROBE_FAILED),
+            ForgeAction::CheckBranch { .. } => Some(crate::forge_check_branch::EX_PROBE_FAILED),
+            _ => None,
+        }
+    }
+
     /// The verb as typed, for the refusal message.
     #[must_use]
     pub fn verb(&self) -> &'static str {

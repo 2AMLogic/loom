@@ -683,7 +683,7 @@ _worktree_source_script_helper() {
 # `set -e`: a failed `source` under `set -e` aborts with 1, which is the
 # REFUSAL code, so a partially-resynced `.loom/` would present as "I considered
 # your worktree and declined" rather than "this install is broken".
-# requires-daemon: worktree-remove >= 0.19.340  #8471 (#8195 slice 3) — the removal-verb port; without it the stub exits 2 and the verb refuses
+# requires-daemon: worktree-remove >= 0.19.340  #8471 (#8195 slice 3) — the removal-verb port; without it, and without a loom-tools serving the family (#14476), the stub exits 2 and the verb refuses
 _worktree_remove_verb() {
     _worktree_source_script_helper remove
     LOOM_SCRIPT_HELPER_MISSING_RC=2 \
@@ -866,7 +866,7 @@ _worktree_base() {
 # verb's two ANSWERS, and a caller branches on them, so an unresolvable binary
 # must not be readable as either. 2 is the code every other epic-#7810 stub
 # reserves for "could not run at all".
-# requires-daemon: worktree-check >= 0.19.492  #8195 slice 11 — the `--check` verb execs it and refuses with exit 2 without it. The create path's auto-navigation below probes with `--help` and falls back to its own one-line physical check, so a plain `worktree.sh <N>` still needs no daemon.
+# requires-daemon: worktree-check >= 0.19.492  #8195 slice 11 — the `--check` verb execs it and refuses with exit 2 without it (or without a loom-tools serving it, #14476). The create path's auto-navigation below probes with `--help` and falls back to its own one-line physical check, so a plain `worktree.sh <N>` still needs no daemon.
 _worktree_check_verb() {
     _worktree_source_script_helper --check
     LOOM_SCRIPT_HELPER_MISSING_RC=2 \
@@ -1346,6 +1346,17 @@ fi
 # terms, documented at each one. Script-relative, so the `cd` below cannot
 # change its answer.
 _WT_DAEMON_BIN="$(loom_resolve_self_daemon_bin 2>/dev/null || true)"
+# ...and when that is empty, a `loom-tools` that serves the family (#14476, part
+# of #14397). A tools-only install has no daemon in any locator, and an empty
+# $_WT_DAEMON_BIN means "skip" at every call site below: there, a plain
+# `worktree.sh <N>` reported success with its claim probe, crash cleanup,
+# branch reuse and lease all silently skipped. loom-tools serves each of them
+# through the same handler (design §13.10, §15), so the guards stay in force.
+# Daemon first, as above: a host that has a loom-daemon resolves exactly what
+# it always did, and preferring the tools binary is the wrapper switch-over
+# (#14398). The `--help` probe skips a loom-tools predating the family. Same
+# script-relative root, for the same reason.
+[[ -n "$_WT_DAEMON_BIN" ]] || _WT_DAEMON_BIN="$(loom_tools_backstop_bin worktree-lock "$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)" 2>/dev/null || true)"
 
 # --sparse/--full need `loom-daemon worktree-sparse` (#8195 slice 10): refuse
 # HERE, before the cleanup, lock, lease or fetch below, so a host without one is

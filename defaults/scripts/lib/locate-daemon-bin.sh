@@ -734,6 +734,50 @@ loom_locate_slice_bin() {
 }
 
 # ---------------------------------------------------------------------------
+# DAEMON FIRST, loom-tools AS THE BACKSTOP (#14476, part of #14397)
+# ---------------------------------------------------------------------------
+#
+# The slice order above is tools-first. `worktree.sh` is not on it, on
+# purpose: it delegates to the same family from `loom-daemon worktree-*` on
+# every host that has a daemon, and making the tools binary preferred there is
+# the wrapper switch-over (#14398), which has its own rollout gate (design
+# §7.4). What a tools-only install needs is narrower — the wrapper must not
+# answer NOTHING there. An empty `$_WT_DAEMON_BIN` means "skip" at each of
+# worktree.sh's call sites, so without a backstop `worktree.sh <N>` succeeded
+# with its claim probe, crash cleanup, branch reuse and lease all silently
+# skipped, and `remove` refused outright. That is the same choice
+# `loom_select_lease_bin` made for the lease chain (#14488): a daemon keeps
+# winning exactly as before; loom-tools answers only when none resolves.
+
+# loom_tools_backstops <subcommand> -- whether a wrapper may run
+# <subcommand> on loom-tools when no loom-daemon resolves. The anchors the
+# callers name: `worktree-lock` for worktree.sh's create path (its first
+# delegated call, and the #14474 family's), and the two `loom_exec_script_helper`
+# verbs of that family. `worktree-wip` is NOT here: the snapshot/stash verbs
+# stay on the daemon (design §13.10), so they keep refusing without one.
+loom_tools_backstops() {
+    case "${1:-}" in
+        worktree-lock|worktree-remove|worktree-check) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+# loom_tools_backstop_bin <subcommand> [<repo_root>] -- echo the loom-tools
+# that serves <subcommand>, or nothing and return 1. Resolution is
+# loom_locate_tools_bin's, unchanged ($LOOM_TOOLS_BIN, PATH, the machine-level
+# install, a repo build); the `--help` probe skips a loom-tools predating the
+# family, the way loom_select_lease_bin skips one predating `lease renewer`.
+# Silent by design: on a tools-only host this is the steady state, not a
+# transitional fallback worth a trace line on every call.
+loom_tools_backstop_bin() {
+    local sub="$1" root="${2:-}" bin
+    bin="$(loom_locate_tools_bin "$root")"
+    [[ -n "$bin" ]] || return 1
+    "$bin" "$sub" --help >/dev/null 2>&1 || return 1
+    printf '%s\n' "$bin"
+}
+
+# ---------------------------------------------------------------------------
 # PAYLOAD IDENTITY (#12939): one compatibility answer when two binaries exist
 # ---------------------------------------------------------------------------
 #

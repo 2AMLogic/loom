@@ -37,7 +37,11 @@
 //! publication is reported and removed whatever the mode). No forge call.
 //!
 //! Worktree commands (#14474, §13.10) resolve mode at a nested forge read.
-//! Local worktree operations remain available offline.
+//! Local worktree operations remain available offline. The installed
+//! `worktree.sh` wrapper reaches them with no daemon through a daemon-first
+//! backstop (#14476, §13.11); a mode refusal for `check-claim`, `check-open-pr`
+//! or `check-branch` is their `EX_PROBE_FAILED`, never the `1` that means a
+//! verified clear.
 
 use std::io::Write;
 
@@ -464,7 +468,17 @@ fn run() -> Result<()> {
             // for it; the local verbs (verdict-lock, journal-ci-refusal) are
             // served but never gated.
             if cli.is_served() && cli.reaches_forge() {
-                mode_gate()?;
+                if let Err(err) = mode_gate() {
+                    // `check-claim`, `check-open-pr` and `check-branch` exit 1
+                    // to mean VERIFIED clear. A mode the gate cannot resolve
+                    // is no verdict, so for them the refusal takes the verb's
+                    // own `EX_PROBE_FAILED` instead of the generic error exit
+                    // (#14476): `worktree.sh` reads 1 as "clear to claim".
+                    if let Some(code) = cli.no_verdict_exit() {
+                        exit_with(err, code);
+                    }
+                    return Err(err);
+                }
             }
             handle_forge_read_command(cli)
         }
@@ -576,10 +590,17 @@ fn run() -> Result<()> {
 
 fn main() {
     if let Err(err) = run() {
-        eprintln!("Error: {err:?}");
-        let _ = std::io::stderr().flush();
-        std::process::exit(1);
+        exit_with(err, 1);
     }
+}
+
+/// Report a command error exactly as `main` does and exit with `code`. The
+/// one caller that passes another code does so for a verb whose exit status
+/// is data, so its text must not change with it.
+fn exit_with(err: anyhow::Error, code: i32) -> ! {
+    eprintln!("Error: {err:?}");
+    let _ = std::io::stderr().flush();
+    std::process::exit(code);
 }
 
 #[cfg(test)]
@@ -815,6 +836,54 @@ mod tests {
                     panic!("{argv:?}")
                 };
                 assert_eq!(c.needs_issue_mode_gate(), issue_gate, "{argv:?}");
+            }
+        });
+    }
+
+    /// #14476: a mode refusal takes the verb's own no-verdict code for the
+    /// three `0`/`1`/`5` forge verbs and stays a plain command error for the
+    /// rest. Exit `1` is those verbs' VERIFIED-clear answer, which
+    /// `worktree.sh`'s fresh-branch probe acts on.
+    #[test]
+    fn forge_data_verbs_refuse_a_mode_error_with_their_no_verdict_code() {
+        on_main_sized_stack(|| {
+            for tail in [
+                vec!["check-claim", "42"],
+                vec!["check-claim", "42", "--force-claim"],
+                vec!["check-open-pr", "42"],
+                vec!["check-branch", "42"],
+                vec![
+                    "check-branch",
+                    "42",
+                    "--branch",
+                    "feature/issue-42",
+                    "--closed-pr-head",
+                ],
+            ] {
+                let mut argv = vec!["loom-tools", "forge"];
+                argv.extend(tail);
+                let cli =
+                    ToolsCli::try_parse_from(&argv).unwrap_or_else(|e| panic!("{argv:?}: {e}"));
+                let ToolsCommands::Forge(c) = cli.command else {
+                    panic!("{argv:?}")
+                };
+                assert!(c.is_served() && c.reaches_forge(), "{argv:?}");
+                assert_eq!(c.no_verdict_exit(), Some(5), "{argv:?}");
+            }
+            for tail in [
+                vec!["issue", "view", "42"],
+                vec!["pr", "list"],
+                vec!["wait-checks", "7"],
+            ] {
+                let mut argv = vec!["loom-tools", "forge"];
+                argv.extend(tail);
+                let cli =
+                    ToolsCli::try_parse_from(&argv).unwrap_or_else(|e| panic!("{argv:?}: {e}"));
+                let ToolsCommands::Forge(c) = cli.command else {
+                    panic!("{argv:?}")
+                };
+                assert!(c.reaches_forge(), "{argv:?}");
+                assert_eq!(c.no_verdict_exit(), None, "{argv:?}");
             }
         });
     }
