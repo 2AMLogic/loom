@@ -1,5 +1,5 @@
 use super::*;
-use std::process::Command;
+use crate::test_git_helpers::run;
 
 fn cfg(checks: &[&str], secs: u64) -> Config {
     Config {
@@ -81,33 +81,6 @@ fn run_checks_timeout_is_a_failure_and_env_is_scrubbed() {
     );
 }
 
-fn sh(dir: &Path, args: &[&str]) {
-    let st = Command::new("git")
-        .current_dir(dir)
-        .args(args)
-        .env("GIT_AUTHOR_NAME", "t")
-        .env("GIT_AUTHOR_EMAIL", "t@t")
-        .env("GIT_COMMITTER_NAME", "t")
-        .env("GIT_COMMITTER_EMAIL", "t@t")
-        .status()
-        .unwrap();
-    assert!(st.success(), "git {args:?}");
-}
-
-fn rev(dir: &Path, r: &str) -> String {
-    String::from_utf8(
-        Command::new("git")
-            .current_dir(dir)
-            .args(["rev-parse", r])
-            .output()
-            .unwrap()
-            .stdout,
-    )
-    .unwrap()
-    .trim()
-    .to_string()
-}
-
 /// origin (bare) with main + refs/pull/7/head, and a clone to run from.
 /// Base moves after the PR branched: the PR adds migrations/002_pr.sql, main
 /// adds migrations/002_main.sql — each fine alone, a prefix collision merged.
@@ -116,7 +89,7 @@ fn fixture() -> (tempfile::TempDir, std::path::PathBuf, String) {
     let origin = t.path().join("origin.git");
     let work = t.path().join("work");
     std::fs::create_dir_all(&work).unwrap();
-    sh(
+    run(
         t.path(),
         &[
             "init",
@@ -127,22 +100,22 @@ fn fixture() -> (tempfile::TempDir, std::path::PathBuf, String) {
             origin.to_str().unwrap(),
         ],
     );
-    sh(&work, &["init", "-q", "-b", "main"]);
-    sh(&work, &["remote", "add", "origin", origin.to_str().unwrap()]);
+    run(&work, &["init", "-q", "-b", "main"]);
+    run(&work, &["remote", "add", "origin", origin.to_str().unwrap()]);
     std::fs::create_dir_all(work.join("migrations")).unwrap();
     std::fs::write(work.join("migrations/001.sql"), "a").unwrap();
-    sh(&work, &["add", "."]);
-    sh(&work, &["commit", "-qm", "base"]);
-    sh(&work, &["checkout", "-qb", "pr"]);
+    run(&work, &["add", "."]);
+    run(&work, &["commit", "-qm", "base"]);
+    run(&work, &["checkout", "-qb", "pr"]);
     std::fs::write(work.join("migrations/002_pr.sql"), "p").unwrap();
-    sh(&work, &["add", "."]);
-    sh(&work, &["commit", "-qm", "pr"]);
-    let head = rev(&work, "HEAD");
-    sh(&work, &["checkout", "-q", "main"]);
+    run(&work, &["add", "."]);
+    run(&work, &["commit", "-qm", "pr"]);
+    let head = run(&work, &["rev-parse", "HEAD"]);
+    run(&work, &["checkout", "-q", "main"]);
     std::fs::write(work.join("migrations/002_main.sql"), "m").unwrap();
-    sh(&work, &["add", "."]);
-    sh(&work, &["commit", "-qm", "sibling"]);
-    sh(
+    run(&work, &["add", "."]);
+    run(&work, &["commit", "-qm", "sibling"]);
+    run(
         &work,
         &[
             "push",

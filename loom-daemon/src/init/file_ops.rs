@@ -59,33 +59,7 @@ pub fn copy_dir_with_report_filtered(
     report: &mut InitReport,
     skip: &dyn Fn(&str) -> bool,
 ) -> io::Result<()> {
-    fs::create_dir_all(dst)?;
-
-    for entry in fs::read_dir(src)? {
-        let entry = entry?;
-        let file_type = entry.file_type()?;
-        let src_path = entry.path();
-        let file_name = entry.file_name();
-        let dst_path = dst.join(&file_name);
-        let rel_path = format!("{}/{}", prefix, file_name.to_string_lossy());
-
-        if file_type.is_dir() {
-            copy_dir_with_report_filtered(&src_path, &dst_path, &rel_path, report, skip)?;
-        } else {
-            if skip(&rel_path) {
-                continue;
-            }
-            let existed = dst_path.exists();
-            fs::copy(&src_path, &dst_path)?;
-            if existed {
-                report.updated.push(rel_path);
-            } else {
-                report.added.push(rel_path);
-            }
-        }
-    }
-
-    Ok(())
+    sync_dir_with_report(src, dst, prefix, report, true, false, skip)
 }
 
 /// Merge directory recursively with reporting
@@ -98,51 +72,7 @@ pub fn merge_dir_with_report(
     prefix: &str,
     report: &mut InitReport,
 ) -> io::Result<()> {
-    fs::create_dir_all(dst)?;
-
-    // Collect files in source for comparison
-    let src_files: HashSet<_> = fs::read_dir(src)?
-        .filter_map(std::result::Result::ok)
-        .map(|e| e.file_name())
-        .collect();
-
-    // Check for files in dst that aren't in src (custom files)
-    if dst.exists() {
-        for entry in fs::read_dir(dst)? {
-            let entry = entry?;
-            let file_name = entry.file_name();
-            if !src_files.contains(&file_name) {
-                let rel_path = format!("{}/{}", prefix, file_name.to_string_lossy());
-                // This is a custom file not in defaults - preserved
-                if entry.file_type()?.is_file() {
-                    report.preserved.push(rel_path);
-                }
-            }
-        }
-    }
-
-    // Process source files
-    for entry in fs::read_dir(src)? {
-        let entry = entry?;
-        let file_type = entry.file_type()?;
-        let src_path = entry.path();
-        let file_name = entry.file_name();
-        let dst_path = dst.join(&file_name);
-        let rel_path = format!("{}/{}", prefix, file_name.to_string_lossy());
-
-        if file_type.is_dir() {
-            merge_dir_with_report(&src_path, &dst_path, &rel_path, report)?;
-        } else if dst_path.exists() {
-            // File exists - preserve it (don't overwrite)
-            report.preserved.push(rel_path);
-        } else {
-            // File doesn't exist - add it
-            fs::copy(&src_path, &dst_path)?;
-            report.added.push(rel_path);
-        }
-    }
-
-    Ok(())
+    sync_dir_with_report(src, dst, prefix, report, false, true, &|_| false)
 }
 
 /// Clean a managed directory by removing Loom-owned files before re-copying
@@ -243,30 +173,55 @@ pub fn force_merge_dir_with_report_filtered(
     report: &mut InitReport,
     skip: &dyn Fn(&str) -> bool,
 ) -> io::Result<()> {
+    sync_dir_with_report(src, dst, prefix, report, true, true, skip)
+}
+
+/// The one recursive directory sync behind [`copy_dir_with_report_filtered`],
+/// [`merge_dir_with_report`] and [`force_merge_dir_with_report_filtered`].
+///
+/// Creates `dst`, then for each entry of `src` recurses into subdirectories
+/// and otherwise consults `skip(rel_path)`, which omits the file from both
+/// the copy and the report. A file that already exists in `dst` is
+/// overwritten and recorded in `report.updated` when `overwrite` is set, and
+/// otherwise left untouched and recorded in `report.preserved`; a file that
+/// does not exist yet is copied and recorded in `report.added`. When
+/// `preserve_custom` is set, every directory level is first scanned for
+/// files present in `dst` but not in `src`, which are recorded in
+/// `report.preserved` as custom files.
+fn sync_dir_with_report(
+    src: &Path,
+    dst: &Path,
+    prefix: &str,
+    report: &mut InitReport,
+    overwrite: bool,
+    preserve_custom: bool,
+    skip: &dyn Fn(&str) -> bool,
+) -> io::Result<()> {
     fs::create_dir_all(dst)?;
 
-    // Collect files in source for comparison
-    let src_files: HashSet<_> = fs::read_dir(src)?
-        .filter_map(std::result::Result::ok)
-        .map(|e| e.file_name())
-        .collect();
+    if preserve_custom {
+        // Collect files in source for comparison
+        let src_files: HashSet<_> = fs::read_dir(src)?
+            .filter_map(std::result::Result::ok)
+            .map(|e| e.file_name())
+            .collect();
 
-    // Check for files in dst that aren't in src (custom files) - these are preserved
-    if dst.exists() {
-        for entry in fs::read_dir(dst)? {
-            let entry = entry?;
-            let file_name = entry.file_name();
-            if !src_files.contains(&file_name) {
-                let rel_path = format!("{}/{}", prefix, file_name.to_string_lossy());
-                // This is a custom file not in defaults - preserved
-                if entry.file_type()?.is_file() {
-                    report.preserved.push(rel_path);
+        // Check for files in dst that aren't in src (custom files)
+        if dst.exists() {
+            for entry in fs::read_dir(dst)? {
+                let entry = entry?;
+                let file_name = entry.file_name();
+                if !src_files.contains(&file_name) {
+                    let rel_path = format!("{}/{}", prefix, file_name.to_string_lossy());
+                    // This is a custom file not in defaults - preserved
+                    if entry.file_type()?.is_file() {
+                        report.preserved.push(rel_path);
+                    }
                 }
             }
         }
     }
 
-    // Process source files - overwrite existing files from defaults
     for entry in fs::read_dir(src)? {
         let entry = entry?;
         let file_type = entry.file_type()?;
@@ -276,18 +231,30 @@ pub fn force_merge_dir_with_report_filtered(
         let rel_path = format!("{}/{}", prefix, file_name.to_string_lossy());
 
         if file_type.is_dir() {
-            force_merge_dir_with_report_filtered(&src_path, &dst_path, &rel_path, report, skip)?;
+            sync_dir_with_report(
+                &src_path,
+                &dst_path,
+                &rel_path,
+                report,
+                overwrite,
+                preserve_custom,
+                skip,
+            )?;
         } else {
             if skip(&rel_path) {
                 continue;
             }
             let existed = dst_path.exists();
-            // Always copy from source (overwrite if exists)
-            fs::copy(&src_path, &dst_path)?;
-            if existed {
-                report.updated.push(rel_path);
+            if existed && !overwrite {
+                // File exists - preserve it (don't overwrite)
+                report.preserved.push(rel_path);
             } else {
-                report.added.push(rel_path);
+                fs::copy(&src_path, &dst_path)?;
+                if existed {
+                    report.updated.push(rel_path);
+                } else {
+                    report.added.push(rel_path);
+                }
             }
         }
     }
@@ -393,6 +360,14 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
 
+    /// Report vectors are filled in `fs::read_dir` order, which is
+    /// filesystem-dependent, so compare them as sorted path lists.
+    fn sorted(paths: &[String]) -> Vec<&str> {
+        let mut paths: Vec<&str> = paths.iter().map(String::as_str).collect();
+        paths.sort_unstable();
+        paths
+    }
+
     #[test]
     fn test_force_merge_preserves_custom_files() {
         let temp_dir = TempDir::new().unwrap();
@@ -430,6 +405,110 @@ mod tests {
         assert!(report.updated.contains(&"roles/builder.md".to_string()));
         assert!(report.added.contains(&"roles/judge.md".to_string()));
         assert!(report.preserved.contains(&"roles/designer.md".to_string()));
+    }
+
+    #[test]
+    fn test_merge_dir_with_report_preserves_existing_and_custom_files() {
+        // Non-overwriting merge: an install that already has the file keeps
+        // its copy, whether that file came from an older defaults tree or is
+        // entirely custom. Both are reported as preserved; only files the
+        // install lacks are copied and reported as added.
+        let temp_dir = TempDir::new().unwrap();
+        let src = temp_dir.path().join("src");
+        let dst = temp_dir.path().join("dst");
+
+        // Defaults: at each depth, one file the install already has and one
+        // it lacks.
+        fs::create_dir_all(src.join("commands").join("loom")).unwrap();
+        fs::write(src.join("builder.md"), "v2 builder").unwrap();
+        fs::write(src.join("judge.md"), "v2 judge").unwrap();
+        fs::write(src.join("commands").join("loom").join("builder.md"), "v2 loom builder").unwrap();
+        fs::write(src.join("commands").join("loom").join("release.md"), "v2 release").unwrap();
+
+        // Existing install: a locally modified default at each depth, a
+        // custom file at each depth, and a custom directory.
+        fs::create_dir_all(dst.join("commands").join("loom")).unwrap();
+        fs::create_dir_all(dst.join("custom-notes")).unwrap();
+        fs::write(dst.join("builder.md"), "local builder").unwrap();
+        fs::write(dst.join("designer.md"), "custom designer").unwrap();
+        fs::write(dst.join("commands").join("loom").join("builder.md"), "local loom builder")
+            .unwrap();
+        fs::write(dst.join("commands").join("my-custom.md"), "mine").unwrap();
+        fs::write(dst.join("custom-notes").join("keep.md"), "keep").unwrap();
+
+        let mut report = super::super::InitReport::default();
+        merge_dir_with_report(&src, &dst, "roles", &mut report).unwrap();
+
+        // Existing files keep their local content; new defaults files are
+        // copied.
+        assert_eq!(fs::read_to_string(dst.join("builder.md")).unwrap(), "local builder");
+        assert_eq!(fs::read_to_string(dst.join("designer.md")).unwrap(), "custom designer");
+        assert_eq!(
+            fs::read_to_string(dst.join("commands").join("loom").join("builder.md")).unwrap(),
+            "local loom builder"
+        );
+        assert_eq!(fs::read_to_string(dst.join("commands").join("my-custom.md")).unwrap(), "mine");
+        assert_eq!(fs::read_to_string(dst.join("judge.md")).unwrap(), "v2 judge");
+        assert_eq!(
+            fs::read_to_string(dst.join("commands").join("loom").join("release.md")).unwrap(),
+            "v2 release"
+        );
+        assert_eq!(fs::read_to_string(dst.join("custom-notes").join("keep.md")).unwrap(), "keep");
+
+        // The custom-file scan and the non-overwriting walk both feed
+        // `preserved`. A destination-only directory is not descended into, so
+        // its files are left alone but not reported.
+        assert_eq!(sorted(&report.added), ["roles/commands/loom/release.md", "roles/judge.md"]);
+        assert_eq!(
+            sorted(&report.preserved),
+            [
+                "roles/builder.md",
+                "roles/commands/loom/builder.md",
+                "roles/commands/my-custom.md",
+                "roles/designer.md",
+            ]
+        );
+        assert!(report.updated.is_empty());
+    }
+
+    #[test]
+    fn test_copy_dir_with_report_records_added_then_updated() {
+        // A plain copy has no custom-file scan and always overwrites: the
+        // first pass reports every file as added, a second pass over the same
+        // tree reports the same files as updated, and destination-only files
+        // are left in place without being reported.
+        let temp_dir = TempDir::new().unwrap();
+        let src = temp_dir.path().join("src");
+        let dst = temp_dir.path().join("dst");
+
+        fs::create_dir_all(src.join("commands").join("loom")).unwrap();
+        fs::write(src.join("builder.md"), "v1 builder").unwrap();
+        fs::write(src.join("commands").join("loom").join("judge.md"), "v1 judge").unwrap();
+
+        let mut report = super::super::InitReport::default();
+        copy_dir_with_report(&src, &dst, "roles", &mut report).unwrap();
+
+        assert_eq!(fs::read_to_string(dst.join("builder.md")).unwrap(), "v1 builder");
+        assert_eq!(
+            fs::read_to_string(dst.join("commands").join("loom").join("judge.md")).unwrap(),
+            "v1 judge"
+        );
+        assert_eq!(sorted(&report.added), ["roles/builder.md", "roles/commands/loom/judge.md"]);
+        assert!(report.updated.is_empty());
+        assert!(report.preserved.is_empty());
+
+        // Second pass over the existing install, with changed defaults.
+        fs::write(src.join("builder.md"), "v2 builder").unwrap();
+        fs::write(dst.join("designer.md"), "custom designer").unwrap();
+
+        let mut report = super::super::InitReport::default();
+        copy_dir_with_report(&src, &dst, "roles", &mut report).unwrap();
+
+        assert_eq!(fs::read_to_string(dst.join("builder.md")).unwrap(), "v2 builder");
+        assert_eq!(fs::read_to_string(dst.join("designer.md")).unwrap(), "custom designer");
+        assert_eq!(sorted(&report.updated), ["roles/builder.md", "roles/commands/loom/judge.md"]);
+        assert!(report.added.is_empty());
+        assert!(report.preserved.is_empty());
     }
 
     #[test]

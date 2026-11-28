@@ -193,17 +193,15 @@ fn the_url_names_the_origin_repo_even_when_an_upstream_remote_exists() {
     let dir = tempfile::tempdir().unwrap();
     let origin = format!("fork-owner/key-coherence-{}", std::process::id());
     init_git_repo_with_remote(dir.path(), &origin);
-    assert!(Command::new("git")
-        .args([
+    git(
+        dir.path(),
+        &[
             "remote",
             "add",
             "upstream",
-            "https://github.com/upstream-owner/other.git"
-        ])
-        .current_dir(dir.path())
-        .status()
-        .unwrap()
-        .success());
+            "https://github.com/upstream-owner/other.git",
+        ],
+    );
     let log = dir.path().join("calls.log");
     let gh = write_logging_fake_gh(dir.path(), &log);
 

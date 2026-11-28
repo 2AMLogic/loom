@@ -20,6 +20,7 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use super::*;
+use crate::test_git_helpers::git_out;
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use tempfile::{tempdir, TempDir};
@@ -497,24 +498,7 @@ fn unreadable_compare_responses_are_indeterminate() {
 // ---------------------------------------------------------------------------
 
 /// Run git in `repo`, asserting success.
-pub(super) fn git_ok(repo: &Path, args: &[&str]) -> String {
-    let out = std::process::Command::new("git")
-        .arg("-C")
-        .arg(repo)
-        .args(args)
-        .env("GIT_AUTHOR_NAME", "t")
-        .env("GIT_AUTHOR_EMAIL", "t@example.com")
-        .env("GIT_COMMITTER_NAME", "t")
-        .env("GIT_COMMITTER_EMAIL", "t@example.com")
-        .output()
-        .unwrap();
-    assert!(
-        out.status.success(),
-        "git {args:?} failed: {}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    String::from_utf8(out.stdout).unwrap().trim().to_string()
-}
+pub(super) use crate::test_git_helpers::run as git_ok;
 
 pub(super) fn write(repo: &Path, rel: &str, content: &str) {
     std::fs::write(repo.join(rel), content).unwrap();
@@ -633,12 +617,7 @@ fn a_conflict_resolution_merge_is_refuted() {
         return;
     }
     // Resolve by hand and commit the merge anyway.
-    let _ = std::process::Command::new("git")
-        .arg("-C")
-        .arg(repo)
-        .args(["merge", "--quiet", "--no-ff", "main"])
-        .output()
-        .unwrap();
+    let _ = git_out(repo, &["merge", "--quiet", "--no-ff", "main"]);
     write(repo, "m.txt", "resolved-by-hand\n");
     git_ok(repo, &["add", "-A"]);
     git_ok(repo, &["commit", "--quiet", "-m", "Merge main"]);
@@ -802,12 +781,17 @@ fn a_shallow_clone_is_indeterminate() {
 
     let shallow_dir = tempdir().unwrap();
     let shallow = shallow_dir.path().join("clone");
-    let out = std::process::Command::new("git")
-        .args(["clone", "--quiet", "--depth=1", "--no-local"])
-        .arg(format!("file://{}", repo.display()))
-        .arg(&shallow)
-        .output()
-        .unwrap();
+    let out = git_out(
+        shallow_dir.path(),
+        &[
+            "clone",
+            "--quiet",
+            "--depth=1",
+            "--no-local",
+            &format!("file://{}", repo.display()),
+            shallow.to_str().unwrap(),
+        ],
+    );
     assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
     assert_eq!(
         super::git_objects::is_shallow(&shallow),

@@ -25,9 +25,8 @@
 //! `#[serial] fn t_body()`, that key outside and the default inside (the
 //! order `role_collision` documents).
 
-use crate::test_git_helpers::run as git;
+use crate::test_git_helpers::{git_out, run as git};
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 /// A registered, managed checkout and the fake `gh` that vouches for it.
 pub(crate) struct WritableRoot {
@@ -66,11 +65,9 @@ impl WritableRoot {
             git(root, &["init", "-q"]);
         }
         let url = format!("https://github.com/{repo}.git");
-        let has_origin = Command::new("git")
-            .args(["remote", "get-url", "origin"])
-            .current_dir(root)
-            .output()
-            .is_ok_and(|o| o.status.success());
+        let has_origin = git_out(root, &["remote", "get-url", "origin"])
+            .status
+            .success();
         if has_origin {
             git(root, &["remote", "set-url", "origin", &url]);
         } else {

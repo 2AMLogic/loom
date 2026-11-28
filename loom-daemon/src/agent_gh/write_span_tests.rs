@@ -189,19 +189,7 @@ fn a_spawn_failure_is_a_span_and_exit_127() {
 fn a_pr_create_span_carries_the_checkouts_head_and_drops_a_non_sha() {
     use crate::gh_invocation::telemetry::InvocationSpan;
     let repo = tempfile::tempdir().unwrap();
-    let git = |args: &[&str]| {
-        let out = std::process::Command::new("git")
-            .args(args)
-            .current_dir(repo.path())
-            .env("GIT_AUTHOR_NAME", "t")
-            .env("GIT_AUTHOR_EMAIL", "t@example.com")
-            .env("GIT_COMMITTER_NAME", "t")
-            .env("GIT_COMMITTER_EMAIL", "t@example.com")
-            .output()
-            .unwrap();
-        assert!(out.status.success(), "git {args:?}");
-        String::from_utf8(out.stdout).unwrap().trim().to_string()
-    };
+    let git = |args: &[&str]| crate::test_git_helpers::run(repo.path(), args);
     git(&["init", "-q"]);
     git(&["commit", "-q", "--allow-empty", "-m", "x"]);
     let head = git(&["rev-parse", "HEAD"]);

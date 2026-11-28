@@ -1,30 +1,9 @@
 //! Tests for the Affected-Files preflight classifier (issue #9400).
 
 use std::fs;
-use std::path::Path;
-use std::process::Command;
 
 use super::*;
-
-fn git_ok(root: &Path, args: &[&str]) {
-    let status = Command::new("git")
-        .arg("-C")
-        .arg(root)
-        .args([
-            "-c",
-            "user.name=Test",
-            "-c",
-            "user.email=test@example.com",
-            "-c",
-            "commit.gpgsign=false",
-            "-c",
-            "core.hooksPath=/dev/null",
-        ])
-        .args(args)
-        .status()
-        .unwrap();
-    assert!(status.success(), "git {args:?} failed");
-}
+use crate::test_git_helpers::run as git_ok;
 
 /// A repo whose `HEAD` commits `src/kept.rs`, `README.md` and the symlink
 /// `link -> src`, with `src/draft.rs` left untracked in the working tree.

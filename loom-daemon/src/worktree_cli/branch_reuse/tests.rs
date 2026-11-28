@@ -11,6 +11,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use super::*;
+use crate::test_git_helpers::git_out;
 use crate::worktree_cli::branch_landed::{ForgeProbe, ForgeStatus};
 
 fn git(dir: &Path, args: &[&str]) {
@@ -18,13 +19,9 @@ fn git(dir: &Path, args: &[&str]) {
 }
 
 fn rev(dir: &Path, r: &str) -> String {
-    let out = Command::new("git")
-        .arg("-C")
-        .arg(dir)
-        .args(["rev-parse", r])
-        .output()
-        .expect("git");
-    String::from_utf8_lossy(&out.stdout).trim().to_string()
+    String::from_utf8_lossy(&git_out(dir, &["rev-parse", r]).stdout)
+        .trim()
+        .to_string()
 }
 
 struct Fx {
@@ -290,12 +287,7 @@ fn the_upstream_correction_runs_on_the_reuse_path() {
         ],
     );
     assert_eq!(run_with(&opts(&fx.repo, false), &|_| ForgeProbe::unavailable()), 0);
-    let up = Command::new("git")
-        .arg("-C")
-        .arg(&fx.repo)
-        .args(["rev-parse", "--abbrev-ref", "feature/issue-42@{u}"])
-        .output()
-        .expect("git");
+    let up = git_out(&fx.repo, &["rev-parse", "--abbrev-ref", "feature/issue-42@{u}"]);
     assert_eq!(
         String::from_utf8_lossy(&up.stdout).trim(),
         "origin/feature/issue-42",
@@ -373,12 +365,7 @@ fn linked_worktree(fx: &Fx, managed: bool) -> PathBuf {
 }
 
 fn branch_exists(repo: &Path) -> bool {
-    Command::new("git")
-        .arg("-C")
-        .arg(repo)
-        .args(["rev-parse", "--verify", "-q", "refs/heads/feature/issue-42"])
-        .output()
-        .expect("git")
+    git_out(repo, &["rev-parse", "--verify", "-q", "refs/heads/feature/issue-42"])
         .status
         .success()
 }
@@ -507,6 +494,7 @@ fn a_worktree_mid_rebase_on_the_branch_is_still_the_holder() {
     fs::write(fx.repo.join("slice.txt"), "main\n").unwrap();
     git(&fx.repo, &["add", "slice.txt"]);
     git(&fx.repo, &["commit", "-q", "-m", "conflicting main change"]);
+    // Stays hand-rolled: sets GIT_EDITOR=true, which test_git_helpers::git_out cannot (#15702).
     let rebase = Command::new("git")
         .arg("-C")
         .arg(&wt)
@@ -524,12 +512,7 @@ fn a_worktree_mid_rebase_on_the_branch_is_still_the_holder() {
         .output()
         .expect("git");
     assert!(!rebase.status.success(), "the rebase must stop on a conflict");
-    let porcelain = Command::new("git")
-        .arg("-C")
-        .arg(&fx.repo)
-        .args(["worktree", "list", "--porcelain"])
-        .output()
-        .expect("git");
+    let porcelain = git_out(&fx.repo, &["worktree", "list", "--porcelain"]);
     let porcelain = String::from_utf8_lossy(&porcelain.stdout).into_owned();
     assert!(
         !porcelain.contains("branch refs/heads/feature/issue-42"),
