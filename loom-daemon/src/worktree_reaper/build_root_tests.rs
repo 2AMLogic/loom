@@ -135,12 +135,8 @@ fn unsafe_roots_are_kept_with_an_explicit_reason() {
         &wt.join("vendored-target/CACHEDIR.TAG"),
         crate::generated_artifact::build_tree::tests::SIG.as_bytes(),
     );
-    let ok = std::process::Command::new("git")
-        .arg("-C")
-        .arg(&wt)
-        .args(["add", "vendored-target"])
-        .status()
-        .unwrap()
+    let ok = crate::test_git_helpers::git_out(&wt, &["add", "vendored-target"])
+        .status
         .success();
     assert!(ok);
     cargo_tree(&wt.join("vendored-target"));

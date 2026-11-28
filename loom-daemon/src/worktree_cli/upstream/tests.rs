@@ -20,9 +20,9 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 use super::*;
+use crate::test_git_helpers::git_out;
 use crate::worktree_cli::test_support;
 use crate::worktree_cli::test_support::git;
 
@@ -45,17 +45,11 @@ fn tmpdir(tag: &str) -> PathBuf {
 fn repo(dir: &Path, branch: &str, push_branch: bool) -> PathBuf {
     let origin = dir.join("origin.git");
     let work = dir.join("work");
-    assert!(Command::new("git")
-        .args(["init", "-q", "-b", "main", "--bare"])
-        .arg(&origin)
-        .status()
-        .expect("git init --bare")
+    assert!(git_out(dir, &["init", "-q", "-b", "main", "--bare", "origin.git"])
+        .status
         .success());
-    assert!(Command::new("git")
-        .args(["init", "-q", "-b", "main"])
-        .arg(&work)
-        .status()
-        .expect("git init")
+    assert!(git_out(dir, &["init", "-q", "-b", "main", "work"])
+        .status
         .success());
     git(&work, &["config", "user.name", "Loom Test"]);
     git(&work, &["config", "user.email", "t@example.invalid"]);
@@ -75,12 +69,7 @@ fn repo(dir: &Path, branch: &str, push_branch: bool) -> PathBuf {
 }
 
 fn upstream_of(work: &Path, branch: &str) -> String {
-    let out = Command::new("git")
-        .arg("-C")
-        .arg(work)
-        .args(["rev-parse", "--abbrev-ref", &format!("{branch}@{{u}}")])
-        .output()
-        .expect("git rev-parse");
+    let out = git_out(work, &["rev-parse", "--abbrev-ref", &format!("{branch}@{{u}}")]);
     String::from_utf8_lossy(&out.stdout).trim().to_string()
 }
 
