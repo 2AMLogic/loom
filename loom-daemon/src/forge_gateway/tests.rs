@@ -538,6 +538,7 @@ fn a_cli_routes_only_through_a_checked_gh_and_outside_an_outage() {
             .as_bytes(),
     )
     .unwrap();
+    set_mode(&base.join("gh-ok"), 0o600);
     let env = Some(base.clone().into_os_string());
     let now = SystemTime::now();
     let gh_s = gh.to_str().unwrap();
@@ -585,6 +586,7 @@ fn a_cli_under_the_front_checks_the_gh_the_front_execs() {
             .as_bytes(),
     )
     .unwrap();
+    set_mode(&base.join("gh-ok"), 0o600);
     let env = Some(base.clone().into_os_string());
     let now = SystemTime::now();
     let via_front = shim.join("gh");
@@ -624,6 +626,7 @@ fn published(root: &std::path::Path, gh: &std::path::Path) -> PathBuf {
             .as_bytes(),
     )
     .unwrap();
+    set_mode(&base.join("gh-ok"), 0o600);
     base
 }
 
