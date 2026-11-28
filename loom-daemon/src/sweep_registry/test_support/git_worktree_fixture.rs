@@ -90,31 +90,7 @@ pub(crate) fn make_dirty_git_worktree(ws: &Path, issue: u32) -> PathBuf {
         .join("worktrees")
         .join(format!("issue-{issue}"));
     std::fs::create_dir_all(&wt).unwrap();
-    let git = |args: &[&str]| {
-        let out = Command::new("git")
-            .arg("-C")
-            .arg(&wt)
-            .args(args)
-            .env("GIT_AUTHOR_NAME", "t")
-            .env("GIT_AUTHOR_EMAIL", "t@t")
-            .env("GIT_COMMITTER_NAME", "t")
-            .env("GIT_COMMITTER_EMAIL", "t@t")
-            // Ignore ~/.gitconfig and /etc/gitconfig for the fixture's own
-            // commands (#8170) — `init.templateDir` hooks, `commit.gpgsign`,
-            // `core.excludesFile` and friends are host state these tests must
-            // not depend on. `GIT_CONFIG_NOSYSTEM` is the portable belt to
-            // `GIT_CONFIG_SYSTEM`'s braces (the latter needs git >= 2.32).
-            .env("GIT_CONFIG_GLOBAL", "/dev/null")
-            .env("GIT_CONFIG_SYSTEM", "/dev/null")
-            .env("GIT_CONFIG_NOSYSTEM", "1")
-            .output()
-            .unwrap();
-        assert!(
-            out.status.success(),
-            "git {args:?} failed: {}",
-            String::from_utf8_lossy(&out.stderr)
-        );
-    };
+    let git = |args: &[&str]| crate::test_git_helpers::run(&wt, args);
     git(&["init", "-q"]);
     // Written straight into `.git/config` rather than via N `git config`
     // subprocesses: same effect, and every subprocess this fixture does not

@@ -285,6 +285,7 @@ pub fn run(worktree: &Path, issue: u32, base: Option<&str>) -> Outcome {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_git_helpers::run as git;
 
     fn pr(n: u32, base: &str, created: &str) -> RestPull {
         RestPull {
@@ -411,24 +412,6 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let out = run(dir.path(), 1, None);
         assert_eq!(out.decision, Decision::None(NoneReason::Disabled));
-    }
-
-    fn git(dir: &Path, args: &[&str]) -> String {
-        let o = std::process::Command::new("git")
-            .current_dir(dir)
-            .args([
-                "-c",
-                "user.name=t",
-                "-c",
-                "user.email=t@t",
-                "-c",
-                "commit.gpgsign=false",
-            ])
-            .args(args)
-            .output()
-            .unwrap();
-        assert!(o.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&o.stderr));
-        String::from_utf8_lossy(&o.stdout).trim().to_string()
     }
 
     fn commit_file(dir: &Path, name: &str, body: &str) {

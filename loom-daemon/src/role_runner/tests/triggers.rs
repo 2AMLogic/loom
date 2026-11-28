@@ -10,6 +10,7 @@ use crate::role_runner::concurrent_dispatch::{
     admit_root_tick, DecideFn, QueueProbe, RoleDispatcher, RunnerFactory,
 };
 use crate::role_runner::triggers::*;
+use crate::test_git_helpers::run as git;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
@@ -331,18 +332,6 @@ fn env_overrides_config_both_ways() {
 }
 
 // -- probes -------------------------------------------------------------------
-
-fn git(dir: &Path, args: &[&str]) {
-    let ok = std::process::Command::new("git")
-        .args(["-c", "user.name=t", "-c", "user.email=t@example.com"])
-        .args(args)
-        .current_dir(dir)
-        .output()
-        .unwrap()
-        .status
-        .success();
-    assert!(ok, "git {args:?}");
-}
 
 #[test]
 fn origin_main_probe_reads_the_local_ref_and_fails_open_without_it() {

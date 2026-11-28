@@ -881,6 +881,7 @@ fn abort(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_git_helpers::run as git;
 
     /// #10089: the CLI's gh spawns go through the facade, so each is one
     /// counted `forge_call_stats` row under its operation name.
@@ -906,16 +907,6 @@ mod tests {
         let n = |op: &str| text.lines().filter(|l| l.contains(op)).count();
         assert_eq!(n("cli_consolidate.default_branch"), 1, "{text}");
         assert_eq!(n("cli_consolidate.base_sha"), 1, "{text}");
-    }
-
-    fn git(dir: &std::path::Path, args: &[&str]) -> String {
-        let out = std::process::Command::new("git")
-            .args(args)
-            .current_dir(dir)
-            .output()
-            .expect("git run");
-        assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
-        String::from_utf8_lossy(&out.stdout).trim().to_string()
     }
 
     fn comp(number: u32, head: &str) -> cons::ComponentState {

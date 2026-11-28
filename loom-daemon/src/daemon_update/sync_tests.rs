@@ -9,37 +9,14 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 use tempfile::TempDir;
 
 use super::*;
+use crate::test_git_helpers::{git_out, run as git};
 
 const BRANCH: &str = "main";
 const ACCOUNTS: &str = ".loom/accounts.json";
-
-fn git_in(dir: &Path, args: &[&str]) -> std::process::Output {
-    Command::new("git")
-        .arg("-C")
-        .arg(dir)
-        .args(args)
-        .env_remove("GIT_DIR")
-        .env_remove("GIT_WORK_TREE")
-        .env_remove("GIT_INDEX_FILE")
-        .output()
-        .unwrap()
-}
-
-fn git(dir: &Path, args: &[&str]) -> String {
-    let out = git_in(dir, args);
-    assert!(
-        out.status.success(),
-        "git {args:?} in {}: {}",
-        dir.display(),
-        String::from_utf8_lossy(&out.stderr)
-    );
-    String::from_utf8_lossy(&out.stdout).trim().to_string()
-}
 
 fn write(path: &Path, contents: &str) {
     fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -123,7 +100,7 @@ impl Fixture {
     /// the abort path at all.
     fn assert_ff_refuses(&self) {
         let out =
-            git_in(&self.host, &["merge", "--ff-only", &format!("origin/{BRANCH}"), "--quiet"]);
+            git_out(&self.host, &["merge", "--ff-only", &format!("origin/{BRANCH}"), "--quiet"]);
         assert!(!out.status.success(), "fixture bug: the fast-forward applied");
     }
 

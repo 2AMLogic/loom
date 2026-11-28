@@ -1,5 +1,9 @@
 //! Hermetic git helpers shared by the in-crate tests that drive real
-//! repositories (orphan-stack replacement and the orphaned-stacked-child pass).
+//! repositories. [`git_out`] scrubs the `GIT_DIR`-family variables, reads no
+//! host git config (global or system), and fixes the author and committer
+//! identity, so a test cannot inherit `~/.gitconfig`, `/etc/gitconfig` or a
+//! hook's environment (#8170, #11116). A host `init.defaultBranch` is ignored
+//! with the rest: pass `-b <branch>` to `git init` when the name matters.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -15,6 +19,12 @@ pub fn git_out(dir: &Path, args: &[&str]) -> std::process::Output {
         .env_remove("GIT_WORK_TREE")
         .env_remove("GIT_INDEX_FILE")
         .env_remove("GIT_REFLOG_ACTION")
+        // No host ~/.gitconfig or /etc/gitconfig (#8170). GIT_CONFIG_NOSYSTEM
+        // is the portable belt to GIT_CONFIG_SYSTEM's braces (git >= 2.32).
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_SYSTEM", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("LC_ALL", "C")
         .env("GIT_AUTHOR_NAME", "Loom Test")
         .env("GIT_AUTHOR_EMAIL", "loom@example.com")
         .env("GIT_COMMITTER_NAME", "Loom Test")
@@ -142,5 +152,45 @@ impl StackFixture {
         run(&self.origin, &["rev-list", "--count", range])
             .parse()
             .unwrap()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::env_test_support::EnvGuard;
+    use serial_test::serial;
+
+    fn host_config(file: &Path) -> EnvGuard {
+        EnvGuard::set("GIT_CONFIG_GLOBAL", file)
+            .and_set("GIT_CONFIG_SYSTEM", Some(file.as_os_str()))
+    }
+
+    #[test]
+    #[serial]
+    fn host_config_is_not_read() {
+        let tmp = tempfile::tempdir().unwrap();
+        let file = tmp.path().join("host-gitconfig");
+        std::fs::write(&file, "[user]\n\tname = Host Leak\n").unwrap();
+        let _env = host_config(&file);
+
+        let out = git_out(tmp.path(), &["config", "--get", "user.name"]);
+
+        assert!(!out.status.success(), "host user.name leaked: {:?}", out.stdout);
+    }
+
+    #[test]
+    #[serial]
+    fn host_init_default_branch_is_not_honoured() {
+        let tmp = tempfile::tempdir().unwrap();
+        let file = tmp.path().join("host-gitconfig");
+        std::fs::write(&file, "[init]\n\tdefaultBranch = host-default\n").unwrap();
+        let _env = host_config(&file);
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+
+        run(&repo, &["init", "-q"]);
+
+        assert_ne!(run(&repo, &["symbolic-ref", "HEAD"]), "refs/heads/host-default");
     }
 }

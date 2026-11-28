@@ -21,12 +21,12 @@
 use super::*;
 use crate::env_test_support::EnvGuard;
 use crate::merge_pr::post_merge_cleanup as cleanup;
+use crate::test_git_helpers::run as git;
 use crate::worktree_ops::clean;
 use crate::worktree_reaper::{self, WorktreeReaperConfig};
 use serial_test::serial;
 use std::collections::BTreeSet;
 use std::os::unix::fs::PermissionsExt;
-use std::process::Command;
 
 const BRANCH: &str = "feature/issue-42";
 const ISSUE_WT: &str = ".loom/worktrees/issue-42";
@@ -40,30 +40,6 @@ fn clean_env() -> EnvGuard {
         "LOOM_WORKTREE_ROOT",
         "LOOM_PRESERVE_WORKTREE",
     ])
-}
-
-fn git(dir: &Path, args: &[&str]) -> String {
-    let out = Command::new("git")
-        .args([
-            "-c",
-            "user.name=Loom Test",
-            "-c",
-            "user.email=loom@example.com",
-            "-c",
-            "commit.gpgsign=false",
-            "-C",
-        ])
-        .arg(dir)
-        .args(args)
-        .output()
-        .unwrap();
-    assert!(
-        out.status.success(),
-        "git {args:?} in {} failed: {}",
-        dir.display(),
-        String::from_utf8_lossy(&out.stderr)
-    );
-    String::from_utf8_lossy(&out.stdout).trim().to_string()
 }
 
 /// A bare `origin.git`, the merged PR's head and merge commit, and the `gh`

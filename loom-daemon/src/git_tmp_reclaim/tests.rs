@@ -1,28 +1,10 @@
 use super::*;
+use crate::test_git_helpers::run as git;
 use serial_test::serial;
 use std::process::{Command, Stdio};
 use std::time::SystemTime;
 
 const HOUR: i64 = 3600;
-
-fn git(dir: &Path, args: &[&str]) {
-    let status = Command::new("git")
-        .args([
-            "-c",
-            "user.name=loom-test",
-            "-c",
-            "user.email=loom-test@example.invalid",
-            "-c",
-            "commit.gpgsign=false",
-        ])
-        .args(args)
-        .current_dir(dir)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .unwrap();
-    assert!(status.success(), "git {args:?} failed");
-}
 
 /// A real repository with one commit, repacked so `objects/pack` holds a
 /// genuine `pack-*.pack`/`.idx` pair alongside whatever debris a test adds.

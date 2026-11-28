@@ -1,18 +1,7 @@
 #![allow(clippy::unwrap_used)]
 
 use super::*;
-
-pub(in crate::observability) fn git(dir: &Path, args: &[&str]) -> String {
-    let out = Command::new("git")
-        .arg("-C")
-        .arg(dir)
-        .args(["-c", "user.name=t", "-c", "user.email=t@example.com"])
-        .args(args)
-        .output()
-        .unwrap();
-    assert!(out.status.success(), "git {args:?}: {out:?}");
-    String::from_utf8(out.stdout).unwrap().trim().to_owned()
-}
+pub(in crate::observability) use crate::test_git_helpers::run as git;
 
 /// A repo whose `origin/main` and `feature/issue-42` tips differ.
 pub(in crate::observability) fn repo_with_branch() -> (tempfile::TempDir, String, String) {

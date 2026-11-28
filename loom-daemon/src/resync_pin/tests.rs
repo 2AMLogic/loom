@@ -6,27 +6,10 @@
 //! re-evaluation must be a plain `git diff A B -- <path>`.
 
 use super::*;
+use crate::test_git_helpers::run as run_git;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use tempfile::TempDir;
-
-fn run_git(dir: &Path, args: &[&str]) -> String {
-    let out = Command::new("git")
-        .arg("-C")
-        .arg(dir)
-        .args(["-c", "user.name=t", "-c", "user.email=t@example.invalid"])
-        .args([
-            "-c",
-            "commit.gpgsign=false",
-            "-c",
-            "init.defaultBranch=main",
-        ])
-        .args(args)
-        .output()
-        .expect("run git");
-    assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
-    String::from_utf8_lossy(&out.stdout).trim().to_string()
-}
 
 fn write(path: &Path, body: &str) {
     fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -48,7 +31,7 @@ const ROLE_B: &str = "line 1\nline 2 upstream fix\nline 3\nline 4 new\n";
 fn source_repo() -> (TempDir, String) {
     let tmp = TempDir::new().unwrap();
     let s = tmp.path();
-    run_git(s, &["init", "-q"]);
+    run_git(s, &["init", "-q", "-b", "main"]);
     write(&s.join(ROLE_SRC), ROLE_A);
     fs::create_dir_all(s.join("defaults/roles")).unwrap();
     std::os::unix::fs::symlink(
@@ -475,7 +458,7 @@ fn repeated_real_resync_preserves_pin_and_recorded_base() {
     };
     let src = TempDir::new().unwrap();
     let s = src.path();
-    run_git(s, &["init", "-q"]);
+    run_git(s, &["init", "-q", "-b", "main"]);
     write(&s.join("defaults/scripts/noop.sh"), "true\n");
     write(&s.join("defaults/roles/curator.md"), ROLE_A);
     write(&s.join("defaults/roles/builder.md"), "B1\n");
@@ -484,7 +467,7 @@ fn repeated_real_resync_preserves_pin_and_recorded_base() {
 
     let ws = TempDir::new().unwrap();
     let w = ws.path();
-    run_git(w, &["init", "-q"]);
+    run_git(w, &["init", "-q", "-b", "main"]);
     write(&w.join(".loom/scripts/noop.sh"), "true\n");
     write(&w.join(".loom/roles/curator.md"), &format!("{ROLE_A}local patch\n"));
     write(&w.join(".loom/roles/builder.md"), "B1\n");

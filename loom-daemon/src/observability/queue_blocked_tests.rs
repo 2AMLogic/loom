@@ -1,6 +1,7 @@
 //! Snapshot-or-list choice (Issue #12307).
 
 use super::{snapshot_rows, Rows};
+use crate::test_git_helpers::run as git;
 
 /// #12307: in mirror mode the rows come from the tick's snapshot; the listing
 /// is not made, and a repo the snapshot has not read adds no rows.
@@ -21,15 +22,6 @@ fn mirror_mode_reads_the_tick_snapshot() {
 
     let standalone = tempfile::tempdir().unwrap();
     assert!(matches!(snapshot_rows(standalone.path(), "acme/widgets", None), Rows::Skip));
-}
-
-fn git(root: &std::path::Path, args: &[&str]) {
-    assert!(std::process::Command::new("git")
-        .args(args)
-        .current_dir(root)
-        .status()
-        .unwrap()
-        .success());
 }
 
 fn authority(host: &str, configured: &str, canonical: &str) -> crate::forge_repo_facts::Fact {

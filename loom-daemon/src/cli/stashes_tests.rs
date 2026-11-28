@@ -2,10 +2,9 @@
 //! run keeps its exit status. Real `git` in a tempdir, a fake forge.
 
 use std::collections::HashMap;
-use std::path::Path;
-use std::process::Command;
 
 use crate::stash_retirement::{list_quarantine_stashes, IssueStateLookup};
+use crate::test_git_helpers::run as git;
 
 use super::{run_with, RunOptions};
 
@@ -23,19 +22,6 @@ impl IssueStateLookup for OpenFor {
         self.1 += 1;
         self.0.get(&issue).copied()
     }
-}
-
-fn git(repo: &Path, args: &[&str]) {
-    let status = Command::new("git")
-        .current_dir(repo)
-        .args(["-c", "user.name=t", "-c", "user.email=t@example.invalid"])
-        .args(["-c", "commit.gpgsign=false"])
-        .args(args)
-        .env("GIT_CONFIG_GLOBAL", "/dev/null")
-        .env("GIT_CONFIG_NOSYSTEM", "1")
-        .output()
-        .unwrap();
-    assert!(status.status.success(), "git {args:?}: {status:?}");
 }
 
 /// A repo with one quarantine stash per label, newest last.
