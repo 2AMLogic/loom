@@ -43,7 +43,7 @@
 //!   the outermost frame. A helper holding a named key can be called from
 //!   inside the default group — the reverse order.
 //! * Rule B: on one function's attribute stack, a bare `#[serial]` /
-//!   `#[parallel]` (the default group, no keys) must sit textually BELOW every
+//!   `#[parallel]` (the default group, no keys) must sit textually ABOVE every
 //!   attribute that names a key — it then expands innermost, so the default
 //!   group is INNER there, as at every named-outer site.
 //! * Rule C: the keys of the named attributes on one function's attribute
@@ -347,7 +347,7 @@ fn loom_config_env_is_only_ever_the_outer_lock() {
          be a test (`#[test]` / `#[tokio::test]`) — a helper holding the key can be reached \
          from inside the default group, which is a lock cycle that hangs the test binary \
          instead of failing it; (2) on one function's attribute stack, a bare `#[serial]` / \
-         `#[parallel]` must sit textually BELOW every attribute naming a key — \
+         `#[parallel]` must sit textually ABOVE every attribute naming a key — \
          `serial_test_derive` expands the textually LAST attribute outermost, so a named \
          attribute stacked above the bare one takes the default group OUTER and the named \
          key INNER (#15674); (3) the named attributes on one function's attribute stack must \
