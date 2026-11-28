@@ -788,15 +788,6 @@ fn force_without_safe_removes_but_counts_it_as_forced() {
 fn repo_with_squash_merged_then_moved_branch() -> (tempfile::TempDir, String, String) {
     let dir = tempfile::tempdir().unwrap();
     let p = dir.path();
-    let rev = |args: &[&str]| -> String {
-        let out = Command::new("git")
-            .args(args)
-            .current_dir(p)
-            .output()
-            .unwrap();
-        assert!(out.status.success(), "git {args:?} failed");
-        String::from_utf8_lossy(&out.stdout).trim().to_string()
-    };
     git(p, &["init", "-q", "--initial-branch=main"]);
     git(p, &["config", "user.email", "loom@example.com"]);
     git(p, &["config", "user.name", "Loom Test"]);
@@ -806,7 +797,7 @@ fn repo_with_squash_merged_then_moved_branch() -> (tempfile::TempDir, String, St
     std::fs::write(p.join("merged.txt"), "the work the PR merged\n").unwrap();
     git(p, &["add", "-A"]);
     git(p, &["commit", "-q", "-m", "work"]);
-    let merged_head = rev(&["rev-parse", "HEAD"]);
+    let merged_head = git(p, &["rev-parse", "HEAD"]);
 
     // Squash-merge: a brand-new commit on main with the same content.
     git(p, &["checkout", "-q", "main"]);
@@ -819,7 +810,7 @@ fn repo_with_squash_merged_then_moved_branch() -> (tempfile::TempDir, String, St
     std::fs::write(p.join("after-merge.txt"), "work that only exists here\n").unwrap();
     git(p, &["add", "-A"]);
     git(p, &["commit", "-q", "-m", "more work after the merge"]);
-    let moved_tip = rev(&["rev-parse", "HEAD"]);
+    let moved_tip = git(p, &["rev-parse", "HEAD"]);
     git(p, &["checkout", "-q", "main"]);
 
     (dir, merged_head, moved_tip)
