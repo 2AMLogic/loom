@@ -179,9 +179,57 @@ assert_allow_in_worktree() {
     fi
 }
 
+# --- Which engine answers the merge-redirect question? (#12236, #15525) -------
+# The rule asks `loom-daemon command-analysis gh-pr-merge` what a command would
+# EXECUTE and trusts its exit 0/1; with no usable answer it scans a shell-masked
+# copy of the text instead. The two engines agree on every command that runs the
+# merge, and deliberately differ on a few that only MENTION it (the shell copy
+# cannot prove confinement, so it denies; the lexer can, so it allows). The suite
+# runs in either mode and pins each disputed row to its mode's exact verdict.
+# Set LOOM_REQUIRE_NATIVE_DAEMON=1 (CI does) to fail instead of silently falling
+# back when the pinned binary does not answer.
+MERGE_DAEMON_BIN="${LOOM_DAEMON_SELF_BIN:-loom-daemon}"
+merge_daemon_answers() {
+    local rc=0
+    "$MERGE_DAEMON_BIN" command-analysis gh-pr-merge --command 'gh pr merge 1' >/dev/null 2>&1 || rc=$?
+    [[ $rc -eq 0 ]] || return 1
+    rc=0
+    "$MERGE_DAEMON_BIN" command-analysis gh-pr-merge --command 'ls' >/dev/null 2>&1 || rc=$?
+    [[ $rc -eq 1 ]]
+}
+if merge_daemon_answers; then
+    MERGE_MODE=native
+elif [[ "${LOOM_REQUIRE_NATIVE_DAEMON:-0}" == "1" ]]; then
+    echo -e "${RED}LOOM_REQUIRE_NATIVE_DAEMON=1 but '$MERGE_DAEMON_BIN command-analysis gh-pr-merge' does not answer${NC}" >&2
+    exit 2
+else
+    MERGE_MODE=fallback
+fi
+
+# A command that only MENTIONS the merge, where the engines differ on purpose:
+# the lexer (native) allows it with no denial at all; the shell-masked fallback
+# denies it through the merge-redirect rule (reason matches $3, default
+# merge-pr.sh).
+assert_merge_native_allow_fallback_deny() {
+    local description="$1"
+    local cmd="$2"
+    local fallback_pattern="${3:-merge-pr\.sh}"
+    if [[ "$MERGE_MODE" == native ]]; then
+        assert_allow "$description [native: allowed, no denial]" "$cmd"
+    else
+        assert_deny_reason_matches "$description [fallback: denied]" "$cmd" "$fallback_pattern"
+    fi
+}
+
+# A command whose merge cannot be proven confined: BOTH engines deny, and the
+# denial must come from the merge-redirect rule, not another rule.
+assert_merge_denied_by_redirect() {
+    assert_deny_reason_matches "$1" "$2" "merge-pr\.sh"
+}
+
 # =========================================================================
 echo ""
-echo -e "${YELLOW}=== Testing guard-loom-workflow.sh ===${NC}"
+echo -e "${YELLOW}=== Testing guard-loom-workflow.sh (merge-redirect engine: $MERGE_MODE) ===${NC}"
 echo ""
 
 # =========================================================================
@@ -304,9 +352,12 @@ GH_7773_HEREDOC_FILE_CMD='cat > /tmp/loom-test-7773.md <<'"'"'DELIM'"'"'
 Some prose that quotes '"'"''"$PHRASE_CMD"''"'"' as documentation.
 DELIM
 gh issue edit 1234 --body-file /tmp/loom-test-7773.md'
-assert_deny "Still block gh pr merge quoted in a heredoc parked in a file for --body-file (#7773)" \
+assert_merge_native_allow_fallback_deny "Heredoc parked in a file used only as a --body-file message body (#7773)" \
     "$GH_7773_HEREDOC_FILE_CMD"
-assert_deny_reason_matches "Heredoc-to-file deny reason hints at the non-Bash-tool workaround (#7773)" \
+# Fallback only: the shell copy treats a heredoc redirected to a file
+# conservatively and keeps the workaround hint in its reason. Native: allowed with
+# no denial reason (asserted just above), the file is only passed to a data consumer.
+assert_merge_native_allow_fallback_deny "Heredoc-to-file reason hints at the non-Bash-tool workaround (#7773)" \
     "$GH_7773_HEREDOC_FILE_CMD" "heredoc body being written to a file"
 
 # The `<<-` (dash) heredoc variant (strips leading tabs from the body) must
@@ -364,7 +415,7 @@ assert_allow "Allow git commit -a -F - heredoc quoting the phrase as prose (#532
 GH_5328_UNQUOTED_DELIM_CMD='git commit -F - <<EOF
 '"$PHRASE_CMD"' 123
 EOF'
-assert_deny "Still block git commit -F - <<EOF with an UNQUOTED delimiter (#5328)" \
+assert_merge_native_allow_fallback_deny "Still block git commit -F - <<EOF with an UNQUOTED delimiter (#5328)" \
     "$GH_5328_UNQUOTED_DELIM_CMD"
 
 # Regression guard: a heredoc feeding an INTERPRETER, not `git commit -F -`,
@@ -394,7 +445,7 @@ assert_deny "Still block a real gh pr merge invocation after the #5328 fix" \
 # the command is denied/scanned exactly as before.
 GH_5328_UNTERMINATED_CMD='git commit -F - <<'"'"'EOF'"'"'
 '"$PHRASE_CMD"' 123 mentioned but the heredoc never closes'
-assert_deny "Still block an UNTERMINATED git commit -F - heredoc opener (#5087 rule, #5328)" \
+assert_merge_denied_by_redirect "Still block an UNTERMINATED git commit -F - heredoc opener (#5087 rule, #5328)" \
     "$GH_5328_UNTERMINATED_CMD"
 
 # Security regression (#5333, Judge finding): the #5328 `commit_stdin_re`
@@ -418,7 +469,7 @@ assert_deny "Still block gh pr merge in a bash -s heredoc with a git commit -F -
 GH_5333_ECHO_DECOY_CMD='echo git commit -F - <<'"'"'EOF'"'"'
 '"$PHRASE_CMD"' 887 --admin
 EOF'
-assert_deny "Still block gh pr merge behind an echo git commit -F - decoy prefix (#5333)" \
+assert_merge_native_allow_fallback_deny "Still block gh pr merge behind an echo git commit -F - decoy prefix (#5333)" \
     "$GH_5333_ECHO_DECOY_CMD"
 
 # Positive control (#5333): a genuine `git commit -F -` chained after a real
@@ -537,7 +588,7 @@ assert_allow "Allow git commit -F - on its own line after a prior statement line
 GH_5333_QUOTED_PREFIX_NARROWING_CMD='echo "staged" ; git commit -F - <<'"'"'EOF'"'"'
 Document the rule: never `'"$PHRASE_CMD"'` directly, use merge-pr.sh instead.
 EOF'
-assert_deny "Fail-safe narrowing: a QUOTED token in the prefix is unprovable, so deny (#5333)" \
+assert_merge_native_allow_fallback_deny "Fail-safe narrowing: a QUOTED token in the prefix is unprovable, so deny (#5333)" \
     "$GH_5333_QUOTED_PREFIX_NARROWING_CMD"
 
 # --- False-positive regression tests (issue #5155) -----------------------
@@ -610,13 +661,13 @@ assert_allow "Allow a positional arg with an escaped backtick followed by the ph
 # keep the whole argument -- including the phrase later in it -- visible, so
 # this must still DENY.
 GH_7558_LIVE_DOLLARPAREN_CMD="./.loom/scripts/check-duplicate.sh \"Title\" \"see \$(x) then '$PHRASE_CMD'\""
-assert_deny "Still block a positional arg with a genuinely unescaped \$(...) (live substitution, #7558)" \
+assert_merge_native_allow_fallback_deny "Still block a positional arg with a genuinely unescaped \$(...) (live substitution, #7558)" \
     "$GH_7558_LIVE_DOLLARPAREN_CMD"
 
 # Regression guard: a genuinely unescaped backtick earlier in the same
 # positional argument must likewise still DENY.
 GH_7558_LIVE_BACKTICK_CMD="./.loom/scripts/check-duplicate.sh \"Title\" \"see \`x\` then '$PHRASE_CMD'\""
-assert_deny "Still block a positional arg with a genuinely unescaped backtick (live substitution, #7558)" \
+assert_merge_native_allow_fallback_deny "Still block a positional arg with a genuinely unescaped backtick (live substitution, #7558)" \
     "$GH_7558_LIVE_BACKTICK_CMD"
 
 echo ""
@@ -763,12 +814,12 @@ assert_deny "Still block gh pr merge after a \$((...)) arithmetic sibling inside
 # 11. A `)` that is merely part of a QUOTED string inside the substitution --
 #     not shell syntax at all, so it must not close anything either.
 GH_6400_QUOTED_PAREN_CMD='eval "$( echo "a)b" ; echo "'"$PHRASE_CMD"' 123" )"'
-assert_deny "Still block gh pr merge after a quoted \")\" inside one \$(...) (#6400)" \
+assert_merge_denied_by_redirect "Still block gh pr merge after a quoted \")\" inside one \$(...) (#6400)" \
     "$GH_6400_QUOTED_PAREN_CMD"
 
 # 12. Same, with the stray `)` inside SINGLE quotes.
 GH_6400_SQ_PAREN_CMD='eval "$( echo '"'"'a)b'"'"'; echo "'"$PHRASE_CMD"' 123" )"'
-assert_deny "Still block gh pr merge after a single-quoted \")\" inside one \$(...) (#6400)" \
+assert_merge_denied_by_redirect "Still block gh pr merge after a single-quoted \")\" inside one \$(...) (#6400)" \
     "$GH_6400_SQ_PAREN_CMD"
 
 # 13. An unpaired apostrophe earlier in the buffer (a `#` comment line, where
@@ -881,7 +932,7 @@ GH_6408_HEREDOC_BODY_CMD='eval "$( cat <<'"'"'E6408'"'"'
 )
 E6408
 echo "'"$PHRASE_CMD"' 123" )"'
-assert_deny "Still block gh pr merge after a \")\" inside a here-document body in one \$(...) (#6408)" \
+assert_merge_denied_by_redirect "Still block gh pr merge after a \")\" inside a here-document body in one \$(...) (#6408)" \
     "$GH_6408_HEREDOC_BODY_CMD"
 
 # 21. The `<<-` tab-stripping heredoc variant of the same shape.
@@ -889,7 +940,7 @@ GH_6408_HEREDOC_DASH_CMD='eval "$( cat <<-'"'"'E6408B'"'"'
 	)
 	E6408B
 echo "'"$PHRASE_CMD"' 123" )"'
-assert_deny "Still block gh pr merge after a \")\" inside a <<- here-document body (#6408)" \
+assert_merge_denied_by_redirect "Still block gh pr merge after a \")\" inside a <<- here-document body (#6408)" \
     "$GH_6408_HEREDOC_DASH_CMD"
 
 # 22. An UNQUOTED-delimiter here-document body: the body is expanded by bash,
@@ -899,7 +950,7 @@ GH_6408_HEREDOC_UNQUOTED_CMD='eval "$( cat <<E6408C
 )
 E6408C
 echo "'"$PHRASE_CMD"' 123" )"'
-assert_deny "Still block gh pr merge after a \")\" inside an unquoted-delimiter heredoc body (#6408)" \
+assert_merge_denied_by_redirect "Still block gh pr merge after a \")\" inside an unquoted-delimiter heredoc body (#6408)" \
     "$GH_6408_HEREDOC_UNQUOTED_CMD"
 
 # 23. Monotonicity proof for the pop floor: it withholds POPS, it never
@@ -1222,7 +1273,7 @@ assert_deny "Still block an unquoted-delimiter --body heredoc whose body contain
 GH_5672_COMMIT_STDIN_UNQUOTED_STILL_DENIES_CMD='git commit -F - <<EOF6
 Document the rule: never '"$PHRASE_CMD"' directly, use merge-pr.sh instead.
 EOF6'
-assert_deny "Still block git commit -F - with an UNQUOTED delimiter, unaffected by the #5672 cat-only relaxation" \
+assert_merge_native_allow_fallback_deny "Still block git commit -F - with an UNQUOTED delimiter, unaffected by the #5672 cat-only relaxation" \
     "$GH_5672_COMMIT_STDIN_UNQUOTED_STILL_DENIES_CMD"
 
 # Regression guard: an unquoted-delimiter cat-heredoc piped into a shell must
@@ -1295,7 +1346,7 @@ assert_deny "Still block a for-loop variable with one safe and one unsafe refere
 GH_6866_ZERO_REF_CMD='for q in "alpha" "'"$PHRASE_CMD"' redirect"; do
   echo "no reference to the loop variable here"
 done'
-assert_deny "Still block a for-loop item list whose variable has zero detected references (#6866)" \
+assert_merge_native_allow_fallback_deny "Still block a for-loop item list whose variable has zero detected references (#6866)" \
     "$GH_6866_ZERO_REF_CMD"
 
 # Regression guard: echo/printf's OWN extra restrictions (nested-in-substitution,
@@ -1372,7 +1423,7 @@ assert_deny "Still block a real gh pr merge invocation with no for-loop involved
 GH_6866_UNQUOTED_ITEM_CMD='for q in alpha "'"$PHRASE_CMD"' redirect"; do
   gh issue list --search "$q"
 done'
-assert_deny "Still block a for-loop item list mixing unquoted and quoted words (unrecognized shape, #6866)" \
+assert_merge_native_allow_fallback_deny "Still block a for-loop item list mixing unquoted and quoted words (unrecognized shape, #6866)" \
     "$GH_6866_UNQUOTED_ITEM_CMD"
 
 echo ""

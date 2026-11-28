@@ -45,6 +45,14 @@
 //! built from variables is not seen either. Those limits are stated in
 //! `guard-hooks.md`; over-denying an obfuscated command is preferred to
 //! under-denying a plain one, never the reverse.
+//!
+//! The limits above bind the ROLE capabilities. [`executes_gh_pr_merge`] (the
+//! merge-redirect guard's question, #12236) is stricter, because a miss there
+//! is a silent allow: it also looks through a line assembled at run time and
+//! handed to an interpreter — a pipe into a shell reading stdin, `eval` / `-c`
+//! of a substitution's output, a variable expanded as the command word,
+//! an expanding heredoc's `$( )` — and treats an incomplete construct (an
+//! unterminated heredoc) as unconfined. See "Generated text" below (#15525).
 
 /// Prefix of every deny answer `role-tool-policy check` prints. The hooks
 /// match on it, so an exit 1 from something else is never mistaken for a
@@ -129,6 +137,7 @@ impl Hit {
 /// used to recognize an absolute path into the home directory.
 #[must_use]
 pub fn command_hits(command: &str, home: Option<&str>) -> Vec<Hit> {
+    reset_generated_text_budget();
     let mut hits = Vec::new();
     analyze_str(command, home, 0, &mut hits);
     hits.retain(|h| h.capability != GH_PR_MERGE);
@@ -144,6 +153,7 @@ const GH_PR_MERGE: &str = "gh-pr-merge";
 /// inert heredoc body does not count.
 #[must_use]
 pub fn executes_gh_pr_merge(command: &str) -> bool {
+    reset_generated_text_budget();
     let mut hits = Vec::new();
     analyze_str(command, None, 0, &mut hits);
     hits.iter().any(|h| h.capability == GH_PR_MERGE)
@@ -172,12 +182,22 @@ enum WordKind {
 struct Word {
     text: String,
     kind: WordKind,
+    /// Bodies of the `$(…)` / backtick substitutions inside this word. The
+    /// word's `text` omits them; their OUTPUT is what the shell splices in.
+    subs: Vec<String>,
 }
 
 struct Lexed {
     segments: Vec<Vec<Word>>,
     /// Bodies of `$(…)`, backticks and `<(…)`/`>(…)`: commands of their own.
     nested: Vec<String>,
+    /// Parallel to `segments`: the segment's stdin is the previous segment's
+    /// stdout (`|`, `|&`).
+    piped: Vec<bool>,
+    /// Every heredoc body, with the index of the segment closing its line.
+    heredocs: Vec<(usize, String)>,
+    /// Bodies of heredocs that never reach their delimiter line.
+    unterminated: Vec<String>,
 }
 
 /// Split a command line into simple commands (word lists).
@@ -188,12 +208,19 @@ fn lex(input: &str) -> Lexed {
     let mut out = Lexed {
         segments: Vec::new(),
         nested: Vec::new(),
+        piped: Vec::new(),
+        heredocs: Vec::new(),
+        unterminated: Vec::new(),
     };
     let mut seg: Vec<Word> = Vec::new();
     let mut cur = String::new();
+    let mut cur_subs: Vec<String> = Vec::new();
     let mut in_word = false;
     let mut pending = WordKind::Plain;
-    let mut heredocs: Vec<(String, bool)> = Vec::new();
+    // `(delimiter, strip_tabs, quoted)` of each heredoc opened on this line.
+    let mut heredocs: Vec<(String, bool, bool)> = Vec::new();
+    // The next segment's stdin is the one just ended (`|`, `|&`).
+    let mut pipe_pending = false;
     let mut i = 0;
 
     macro_rules! end_word {
@@ -202,6 +229,7 @@ fn lex(input: &str) -> Lexed {
                 seg.push(Word {
                     text: std::mem::take(&mut cur),
                     kind: pending,
+                    subs: std::mem::take(&mut cur_subs),
                 });
                 pending = WordKind::Plain;
                 in_word = false;
@@ -214,8 +242,18 @@ fn lex(input: &str) -> Lexed {
             pending = WordKind::Plain;
             if !seg.is_empty() {
                 out.segments.push(std::mem::take(&mut seg));
+                out.piped.push(std::mem::take(&mut pipe_pending));
             }
         };
+    }
+    // A substitution inside the current word: a command of its own, and text
+    // the word splices in.
+    macro_rules! add_sub {
+        ($body:expr) => {{
+            let body: String = $body;
+            cur_subs.push(body.clone());
+            out.nested.push(body);
+        }};
     }
 
     while i < c.len() {
@@ -255,7 +293,7 @@ fn lex(input: &str) -> Lexed {
                         }
                         '$' if c.get(i + 1) == Some(&'(') => {
                             let (body, end) = take_balanced(&c, i + 2);
-                            out.nested.push(body);
+                            add_sub!(body);
                             i = end;
                             continue;
                         }
@@ -267,7 +305,7 @@ fn lex(input: &str) -> Lexed {
                         }
                         '`' => {
                             let (body, end) = take_backtick(&c, i + 1);
-                            out.nested.push(body);
+                            add_sub!(body);
                             i = end;
                             continue;
                         }
@@ -279,7 +317,7 @@ fn lex(input: &str) -> Lexed {
             }
             '$' if next == Some('(') => {
                 let (body, end) = take_balanced(&c, i + 2);
-                out.nested.push(body);
+                add_sub!(body);
                 in_word = true;
                 i = end;
                 continue;
@@ -317,7 +355,7 @@ fn lex(input: &str) -> Lexed {
             }
             '`' => {
                 let (body, end) = take_backtick(&c, i + 1);
-                out.nested.push(body);
+                add_sub!(body);
                 in_word = true;
                 i = end;
                 continue;
@@ -335,8 +373,19 @@ fn lex(input: &str) -> Lexed {
                 // or the body is written to a file that may be run later.
                 let live = seg_runs_shell(&seg) || seg.iter().any(is_file_redirect);
                 i += 1;
-                for (delim, strip_tabs) in std::mem::take(&mut heredocs) {
-                    let body = take_heredoc_body(&c, &mut i, &delim, strip_tabs);
+                // The segment this line ends is the one that will be pushed next.
+                let at = out.segments.len();
+                for (delim, strip_tabs, quoted) in std::mem::take(&mut heredocs) {
+                    let (body, terminated) = take_heredoc_body(&c, &mut i, &delim, strip_tabs);
+                    if !terminated {
+                        out.unterminated.push(body.clone());
+                    }
+                    // An unquoted delimiter leaves the body expanding: `$( )` and
+                    // backticks in it run, whatever consumes the text.
+                    if !quoted {
+                        out.nested.extend(heredoc_substitutions(&body));
+                    }
+                    out.heredocs.push((at, body.clone()));
                     if live {
                         out.nested.push(body);
                     }
@@ -356,7 +405,20 @@ fn lex(input: &str) -> Lexed {
                 }
                 end_segment!();
             }
-            '\n' | ';' | '&' | '|' | '(' | ')' => {
+            '|' if next == Some('|') => {
+                // `||` is an or-list, not a pipe.
+                end_segment!();
+                i += 2;
+                continue;
+            }
+            '|' => {
+                end_segment!();
+                pipe_pending = true;
+                if next == Some('&') {
+                    i += 1;
+                }
+            }
+            '\n' | ';' | '&' | '(' | ')' => {
                 end_segment!();
             }
             '<' | '>' if next == Some('(') => {
@@ -374,11 +436,12 @@ fn lex(input: &str) -> Lexed {
                 }
                 if ch == '<' && run == 2 {
                     let strip_tabs = c.get(i + 2) == Some(&'-');
-                    let (delim, end) = take_heredoc_delimiter(&c, i + 2 + usize::from(strip_tabs));
+                    let (delim, end, quoted) =
+                        take_heredoc_delimiter(&c, i + 2 + usize::from(strip_tabs));
                     // Not a redirect (`<<=` shift-assign, `<< 3` shift): keep lexing
                     // the following lines as commands rather than swallow them.
                     if is_heredoc_opener(&c, i + 2 + usize::from(strip_tabs), &delim) {
-                        heredocs.push((delim, strip_tabs));
+                        heredocs.push((delim, strip_tabs, quoted));
                         i = end;
                         continue;
                     }
@@ -421,19 +484,23 @@ fn is_heredoc_opener(c: &[char], start: usize, delim: &str) -> bool {
 }
 
 /// The delimiter word of a `<<` heredoc starting at `start` (quotes and
-/// backslashes removed), and the index just past it.
-fn take_heredoc_delimiter(c: &[char], start: usize) -> (String, usize) {
+/// backslashes removed), the index just past it, and whether any quoting was
+/// present (a quoted delimiter makes the body literal; an unquoted one leaves
+/// it expanding).
+fn take_heredoc_delimiter(c: &[char], start: usize) -> (String, usize, bool) {
     let mut i = start;
     while matches!(c.get(i), Some(' ' | '\t')) {
         i += 1;
     }
     let mut delim = String::new();
+    let mut quoted = false;
     while i < c.len()
         && !c[i].is_whitespace()
         && !matches!(c[i], ';' | '&' | '|' | '(' | ')' | '<' | '>')
     {
         match c[i] {
             q @ ('\'' | '"') => {
+                quoted = true;
                 i += 1;
                 while i < c.len() && c[i] != q {
                     delim.push(c[i]);
@@ -441,6 +508,7 @@ fn take_heredoc_delimiter(c: &[char], start: usize) -> (String, usize) {
                 }
             }
             '\\' => {
+                quoted = true;
                 i += 1;
                 if let Some(&n) = c.get(i) {
                     delim.push(n);
@@ -450,13 +518,13 @@ fn take_heredoc_delimiter(c: &[char], start: usize) -> (String, usize) {
         }
         i += 1;
     }
-    (delim, i)
+    (delim, i, quoted)
 }
 
 /// Consume heredoc body lines from `*i` up to and including the line equal to
 /// `delim` (leading tabs ignored for `<<-`). An unterminated heredoc runs to
-/// the end of input, like bash.
-fn take_heredoc_body(c: &[char], i: &mut usize, delim: &str, strip_tabs: bool) -> String {
+/// the end of input, like bash; the flag says whether the delimiter was found.
+fn take_heredoc_body(c: &[char], i: &mut usize, delim: &str, strip_tabs: bool) -> (String, bool) {
     let mut body = String::new();
     while *i < c.len() {
         let end = c[*i..]
@@ -471,28 +539,91 @@ fn take_heredoc_body(c: &[char], i: &mut usize, delim: &str, strip_tabs: bool) -
             line.as_str()
         };
         if cmp == delim {
-            break;
+            return (body, true);
         }
         body.push_str(&line);
         body.push('\n');
     }
-    body
+    (body, false)
 }
 
-/// The body of a `(`-opened region starting at `start` (just past the `(`),
-/// and the index just past its matching `)`. Quotes inside are skipped so a
-/// `)` in a string does not close it. An unterminated region runs to the end.
-fn take_balanced(c: &[char], start: usize) -> (String, usize) {
-    let mut depth = 1usize;
-    let mut i = start;
+/// The `$( )`, backtick and `${ }`-embedded substitution bodies of an
+/// EXPANDING heredoc body (unquoted delimiter): bash runs them.
+fn heredoc_substitutions(body: &str) -> Vec<String> {
+    let c: Vec<char> = body.chars().collect();
+    let mut subs = Vec::new();
+    let mut i = 0;
     while i < c.len() {
         match c[i] {
-            '\\' => i += 1,
+            '\\' => i += 2,
+            '$' if c.get(i + 1) == Some(&'(') => {
+                let (sub, end) = take_balanced(&c, i + 2);
+                subs.push(sub);
+                i = end;
+            }
+            '$' if c.get(i + 1) == Some(&'{') => i = take_brace(&c, i + 2, &mut subs),
+            '`' => {
+                let (sub, end) = take_backtick(&c, i + 1);
+                subs.push(sub);
+                i = end;
+            }
+            _ => i += 1,
+        }
+    }
+    subs
+}
+
+/// Where a `case … esac` is inside [`take_balanced`].
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CaseState {
+    /// Between `case` and `in`.
+    Header,
+    /// Reading a pattern list, up to its `)`.
+    Pattern,
+    /// Reading the commands of one arm, up to `;;`.
+    Body,
+}
+
+/// One open construct inside [`take_balanced`].
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Frame {
+    Paren,
+    Case(CaseState),
+}
+
+/// Characters that end an unquoted word inside [`take_balanced`].
+const WORD_BREAKS: [char; 14] = [
+    ';', '&', '|', '(', ')', '{', '}', '<', '>', '"', '\'', '`', '$', '\\',
+];
+
+/// Words after which another command word may start.
+const COMMAND_STARTERS: [&str; 8] = ["do", "then", "else", "elif", "if", "while", "until", "time"];
+
+/// The body of a `(`-opened region starting at `start` (just past the `(`),
+/// and the index just past its matching `)`. Quotes, comments, `${…}`
+/// expansions, heredoc bodies and `case` patterns inside are skipped, so a `)`
+/// that is not syntax does not close it. An unterminated region runs to the end.
+fn take_balanced(c: &[char], start: usize) -> (String, usize) {
+    let mut frames = vec![Frame::Paren];
+    let mut heredocs: Vec<(String, bool)> = Vec::new();
+    // A command word may start here; `case` and `esac` count only then.
+    let mut cmd_start = true;
+    let mut i = start;
+    while i < c.len() {
+        let ch = c[i];
+        let next = c.get(i + 1).copied();
+        match ch {
+            '\\' => {
+                i += 2;
+                cmd_start = false;
+                continue;
+            }
             '\'' => {
                 i += 1;
                 while i < c.len() && c[i] != '\'' {
                     i += 1;
                 }
+                cmd_start = false;
             }
             '"' => {
                 i += 1;
@@ -502,15 +633,124 @@ fn take_balanced(c: &[char], start: usize) -> (String, usize) {
                     }
                     i += 1;
                 }
+                cmd_start = false;
             }
-            '(' => depth += 1,
-            ')' => {
-                depth -= 1;
-                if depth == 0 {
-                    return (c[start..i].iter().collect(), i + 1);
+            '$' if next == Some('{') => {
+                i = take_brace(c, i + 2, &mut Vec::new());
+                cmd_start = false;
+                continue;
+            }
+            '#' if i == start || matches!(c[i - 1], ' ' | '\t' | '\n' | ';' | '&' | '|' | '(') => {
+                while i < c.len() && c[i] != '\n' {
+                    i += 1;
                 }
+                continue;
             }
-            _ => {}
+            '<' if next == Some('<') && c.get(i + 2) == Some(&'<') => {
+                i += 3;
+                cmd_start = false;
+                continue;
+            }
+            '<' if next == Some('<') => {
+                let strip_tabs = c.get(i + 2) == Some(&'-');
+                let at = i + 2 + usize::from(strip_tabs);
+                let (delim, end, _) = take_heredoc_delimiter(c, at);
+                if is_heredoc_opener(c, at, &delim) {
+                    heredocs.push((delim, strip_tabs));
+                    i = end;
+                } else {
+                    i += 2;
+                }
+                cmd_start = false;
+                continue;
+            }
+            '\n' => {
+                i += 1;
+                for (delim, strip_tabs) in std::mem::take(&mut heredocs) {
+                    take_heredoc_body(c, &mut i, &delim, strip_tabs);
+                }
+                cmd_start = true;
+                continue;
+            }
+            ';' => {
+                // `;;` / `;;&` / `;&` end a case arm: a pattern list follows.
+                let ends_arm = next == Some(';')
+                    || (next == Some('&') && frames.last() == Some(&Frame::Case(CaseState::Body)));
+                if ends_arm {
+                    if let Some(Frame::Case(state)) = frames.last_mut() {
+                        *state = CaseState::Pattern;
+                    }
+                    i += 2;
+                    if c.get(i) == Some(&'&') && next == Some(';') {
+                        i += 1;
+                    }
+                } else {
+                    i += 1;
+                }
+                cmd_start = true;
+                continue;
+            }
+            '(' => {
+                // The optional `(` before a case pattern opens nothing.
+                if frames.last() != Some(&Frame::Case(CaseState::Pattern)) {
+                    frames.push(Frame::Paren);
+                }
+                cmd_start = true;
+            }
+            ')' => {
+                loop {
+                    match frames.last_mut() {
+                        Some(Frame::Case(state @ CaseState::Pattern)) => {
+                            *state = CaseState::Body;
+                            break;
+                        }
+                        // `case` was an argument, not a keyword, or the arm is
+                        // malformed: the `)` belongs to the frame below.
+                        Some(Frame::Case(_)) => {
+                            frames.pop();
+                        }
+                        Some(Frame::Paren) => {
+                            frames.pop();
+                            if frames.is_empty() {
+                                return (c[start..i].iter().collect(), i + 1);
+                            }
+                            break;
+                        }
+                        None => break,
+                    }
+                }
+                cmd_start = true;
+            }
+            '|' | '&' | '{' => cmd_start = true,
+            _ if ch.is_whitespace() => {}
+            '$' | '<' | '>' | '`' | '}' => cmd_start = false,
+            _ => {
+                let mut j = i;
+                while j < c.len() && !c[j].is_whitespace() && !WORD_BREAKS.contains(&c[j]) {
+                    j += 1;
+                }
+                let word: String = c[i..j].iter().collect();
+                match (word.as_str(), frames.last().copied()) {
+                    ("case", _) if cmd_start => {
+                        frames.push(Frame::Case(CaseState::Header));
+                        cmd_start = false;
+                    }
+                    ("in", Some(Frame::Case(CaseState::Header))) => {
+                        frames.pop();
+                        frames.push(Frame::Case(CaseState::Pattern));
+                        cmd_start = false;
+                    }
+                    ("esac", Some(Frame::Case(CaseState::Pattern | CaseState::Body)))
+                        if cmd_start =>
+                    {
+                        frames.pop();
+                        cmd_start = false;
+                    }
+                    (w, _) => cmd_start = COMMAND_STARTERS.contains(&w),
+                }
+                i = j;
+                continue;
+            }
         }
         i += 1;
     }
@@ -618,6 +858,310 @@ fn analyze_str(command: &str, home: Option<&str>, depth: usize, hits: &mut Vec<H
     }
     for body in &lexed.nested {
         analyze_str(body, home, depth + 1, hits);
+    }
+    // Text an interpreter reads that no static scan of the command words sees:
+    // see the "Generated text" section below. It speaks only to `gh pr merge`.
+    for body in &lexed.unterminated {
+        merge_only(body, depth + 1, hits);
+    }
+    consume_generated_text(&lexed, depth, hits);
+}
+
+// ---------------------------------------------------------------------------
+// Generated text (#15525)
+// ---------------------------------------------------------------------------
+//
+// A command can ASSEMBLE the line an interpreter then runs: `echo "gh pr merge
+// 1" | bash`, `eval "$(cat <<'EOF' … EOF)"`, `X=$(…); $X`, `for q in "…"; do
+// eval "$q"; done`. Nothing in the assembling command is itself a command word,
+// so the lexer above never sees the merge. Wherever a segment hands text to an
+// interpreter — a pipe into a shell reading stdin, `eval`, a `-c` payload, a
+// here-string, a variable expanded as the command word — every string that text
+// can be built from (an argument, a heredoc body, a substitution's body, the
+// values of the variables it names) is analyzed as a script too. That
+// over-denies only a command that routes a quoted phrase INTO an interpreter;
+// the same phrase going to `echo`, `gh issue edit --body` or a `--search` stays
+// data. The scan answers `gh pr merge` alone: the role-capability matcher keeps
+// its documented limits (a command assembled at run time is out of reach).
+
+/// Upper bound on generated-text scans per top-level query. Past it the answer
+/// fails closed for `gh pr merge`: a command this tangled is denied.
+const GENERATED_TEXT_BUDGET: usize = 20_000;
+
+thread_local! {
+    static GENERATED_TEXT_LEFT: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(GENERATED_TEXT_BUDGET) };
+}
+
+fn reset_generated_text_budget() {
+    GENERATED_TEXT_LEFT.with(|left| left.set(GENERATED_TEXT_BUDGET));
+}
+
+/// Spend one scan from the budget; false once it is spent.
+fn spend_generated_text_budget() -> bool {
+    GENERATED_TEXT_LEFT.with(|left| {
+        let n = left.get();
+        left.set(n.saturating_sub(1));
+        n > 0
+    })
+}
+
+/// Analyze `text` as a script, keeping only a `gh pr merge` finding.
+fn merge_only(text: &str, depth: usize, hits: &mut Vec<Hit>) {
+    let mut scratch = Vec::new();
+    analyze_str(text, None, depth, &mut scratch);
+    hits.extend(scratch.into_iter().filter(|h| h.capability == GH_PR_MERGE));
+}
+
+/// Variable name → the texts assigned to it anywhere in one command line (an
+/// assignment word's value and substitution bodies, a `for` loop's items).
+/// Flow-insensitive on purpose: a later reassignment does not hide an earlier
+/// value.
+type Vars = std::collections::HashMap<String, Vec<String>>;
+
+fn collect_vars(lexed: &Lexed) -> Vars {
+    let mut vars = Vars::new();
+    for seg in &lexed.segments {
+        if let [first, name, keyword, items @ ..] = seg.as_slice() {
+            if first.text == "for" && keyword.text == "in" {
+                let values = vars.entry(name.text.clone()).or_default();
+                for item in items.iter().filter(|w| w.kind == WordKind::Plain) {
+                    values.push(item.text.clone());
+                    values.extend(item.subs.iter().cloned());
+                }
+            }
+        }
+        for w in seg.iter().filter(|w| w.kind == WordKind::Plain) {
+            if let Some((name, value)) = w.text.split_once('=').filter(|_| is_assignment(&w.text)) {
+                let values = vars.entry(name.to_string()).or_default();
+                values.push(value.to_string());
+                values.extend(w.subs.iter().cloned());
+            }
+        }
+    }
+    vars
+}
+
+/// Variable names a word expands (`$x`, `${x}`, `${x:0:9}`, `${x#}`), and for
+/// an indirect `${!r}` the name `r` points at.
+fn referenced_names(text: &str, vars: &Vars) -> Vec<String> {
+    let c: Vec<char> = text.chars().collect();
+    let mut names = Vec::new();
+    for (i, _) in c.iter().enumerate().filter(|(_, ch)| **ch == '$') {
+        let mut j = i + 1;
+        if c.get(j) == Some(&'{') {
+            j += 1;
+        }
+        let indirect = c.get(j) == Some(&'!');
+        if indirect {
+            j += 1;
+        }
+        let name: String = c[j.min(c.len())..]
+            .iter()
+            .take_while(|ch| ch.is_ascii_alphanumeric() || **ch == '_')
+            .collect();
+        if name.is_empty() {
+            continue;
+        }
+        if indirect {
+            let pointed = vars.get(&name).into_iter().flatten();
+            names.extend(pointed.map(|v| v.trim().to_string()));
+        }
+        names.push(name);
+    }
+    names.sort();
+    names.dedup();
+    names
+}
+
+/// How many argument tails of one segment are scanned joined (`echo gh pr merge
+/// 1` prints one line, however many words the lexer split it into).
+const JOINED_TAILS: usize = 8;
+
+/// The state of one generated-text scan.
+struct Generated<'a> {
+    vars: &'a Vars,
+    /// Variables being expanded right now, so a self-referencing value ends.
+    active: Vec<String>,
+    /// Texts already scanned, with the shallowest depth each was reached at. A
+    /// text is scanned again only from a shallower depth, which can see further
+    /// before [`MAX_DEPTH`] cuts it off.
+    seen: std::collections::HashMap<String, usize>,
+}
+
+impl Generated<'_> {
+    /// Analyze `text` as a script and every string it can be built from.
+    fn scan(&mut self, text: &str, depth: usize, hits: &mut Vec<Hit>) {
+        if depth > MAX_DEPTH || self.seen.get(text).is_some_and(|&d| d <= depth) {
+            return;
+        }
+        self.seen.insert(text.to_string(), depth);
+        if !spend_generated_text_budget() {
+            hits.push(Hit::new(GH_PR_MERGE, GH_PR_MERGE));
+            return;
+        }
+        merge_only(text, depth, hits);
+        let lexed = lex(text);
+        for seg in &lexed.segments {
+            let words: Vec<&Word> = seg
+                .iter()
+                .filter(|w| w.kind != WordKind::Redirect)
+                .collect();
+            for w in &words {
+                self.scan_word(w, text, depth, hits);
+            }
+            // A producer such as `echo` prints its arguments as one line.
+            for from in 1..words.len().min(JOINED_TAILS + 1) {
+                let tail: Vec<&str> = words[from..].iter().map(|w| w.text.as_str()).collect();
+                self.scan(&tail.join(" "), depth + 1, hits);
+            }
+        }
+        for (_, body) in &lexed.heredocs {
+            self.scan(body, depth + 1, hits);
+        }
+    }
+
+    /// `parent` is the text the word was lexed from; a word that is the whole
+    /// text (nothing to unquote) is not scanned again.
+    fn scan_word(&mut self, w: &Word, parent: &str, depth: usize, hits: &mut Vec<Hit>) {
+        if w.text != parent {
+            self.scan(&w.text, depth + 1, hits);
+        }
+        for sub in &w.subs {
+            self.scan(sub, depth + 1, hits);
+        }
+        for name in referenced_names(&w.text, self.vars) {
+            if self.active.contains(&name) {
+                continue;
+            }
+            let Some(values) = self.vars.get(&name) else {
+                continue;
+            };
+            self.active.push(name);
+            for value in values {
+                self.scan(value, depth + 1, hits);
+            }
+            self.active.pop();
+        }
+    }
+}
+
+/// Index of the command word among a segment's plain words: past assignments,
+/// reserved words and the wrappers that only prefix another command.
+fn command_word_index(words: &[&Word]) -> Option<usize> {
+    let mut i = 0;
+    while i < words.len() {
+        let t = words[i].text.as_str();
+        if is_assignment(t) || KEYWORDS.contains(&t) {
+            i += 1;
+        } else if PLAIN_WRAPPERS.contains(&basename(t))
+            || matches!(basename(t), "env" | "command" | "nice")
+        {
+            i += 1;
+            while i < words.len() && words[i].text.starts_with('-') {
+                i += 1;
+            }
+        } else {
+            return Some(i);
+        }
+    }
+    None
+}
+
+/// Whether the shell whose words are `args` (after the shell's own name) reads
+/// its script from stdin: no `-c`, and either `-s`, `-`, `/dev/stdin` or no
+/// script operand at all.
+fn shell_reads_stdin(args: &[&Word]) -> bool {
+    let mut j = 0;
+    while j < args.len() {
+        let w = args[j].text.as_str();
+        if w == "-s" {
+            return true;
+        }
+        if matches!(w, "-o" | "+o" | "-O" | "+O") {
+            j += 2;
+            continue;
+        }
+        if w.starts_with('-') && w != "-" {
+            if !w.starts_with("--") && w[1..].contains('c') {
+                return false;
+            }
+            j += 1;
+            continue;
+        }
+        return w == "-" || w == "/dev/stdin";
+    }
+    true
+}
+
+/// The `-c` payload word of a shell whose words after its name are `args`.
+fn shell_c_payload<'a>(args: &[&'a Word]) -> Option<&'a Word> {
+    let mut j = 0;
+    while j < args.len() {
+        let w = args[j].text.as_str();
+        if matches!(w, "-o" | "+o" | "-O" | "+O") {
+            j += 2;
+            continue;
+        }
+        if w.starts_with('-') && !w.starts_with("--") && w[1..].contains('c') {
+            return args.get(j + 1).copied();
+        }
+        if !w.starts_with('-') && !w.starts_with('+') {
+            return None;
+        }
+        j += 1;
+    }
+    None
+}
+
+/// Scan the text each segment of `lexed` hands to an interpreter.
+fn consume_generated_text(lexed: &Lexed, depth: usize, hits: &mut Vec<Hit>) {
+    let vars = collect_vars(lexed);
+    let mut scan = Generated {
+        vars: &vars,
+        active: Vec::new(),
+        seen: std::collections::HashMap::new(),
+    };
+    for (i, seg) in lexed.segments.iter().enumerate() {
+        let words: Vec<&Word> = seg.iter().filter(|w| w.kind == WordKind::Plain).collect();
+        let command = command_word_index(&words);
+        // `eval <words>`: the arguments are joined and run.
+        if let Some(p) = words.iter().position(|w| w.text == "eval") {
+            for w in &words[p + 1..] {
+                scan.scan_word(w, "", depth + 1, hits);
+            }
+        }
+        if let Some(c) = command {
+            let program = basename(&words[c].text);
+            // `$X args…`: the variable's value is the command.
+            if words[c].text.starts_with('$') {
+                scan.scan_word(words[c], "", depth + 1, hits);
+            }
+            if SHELLS.contains(&program) {
+                // `bash -c "$(…)"`.
+                if let Some(payload) = shell_c_payload(&words[c + 1..]) {
+                    scan.scan_word(payload, "", depth + 1, hits);
+                }
+                // `bash <<< "$(…)"` / a heredoc fed to it.
+                for w in seg.iter().filter(|w| w.kind == WordKind::HereString) {
+                    scan.scan_word(w, "", depth + 1, hits);
+                }
+                // `… | bash`: everything the pipeline's earlier stages print.
+                if lexed.piped[i] && shell_reads_stdin(&words[c + 1..]) {
+                    let start = (0..i).rev().find(|&k| !lexed.piped[k]).unwrap_or(0);
+                    for stage in &lexed.segments[start..i] {
+                        for w in stage.iter().filter(|w| w.kind != WordKind::Redirect) {
+                            scan.scan_word(w, "", depth + 1, hits);
+                        }
+                    }
+                    for (at, body) in &lexed.heredocs {
+                        if (start..=i).contains(at) {
+                            scan.scan(body, depth + 1, hits);
+                        }
+                    }
+                }
+            }
+        }
     }
 }
 

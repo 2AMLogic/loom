@@ -7,7 +7,10 @@
 //! [`crate::role_tool_policy::command_match`], which lexes the command
 //! line, recurses into `$( )`, backticks, `bash -c`/`eval` payloads and
 //! wrappers, and treats a heredoc body as data unless a shell reads it or it is
-//! written to a file.
+//! written to a file. A line ASSEMBLED and handed to an interpreter (`echo "gh pr
+//! merge 1" | bash`, `eval "$(…)"`, `$X`) counts as executing it too (#15525): exit
+//! 1 is a verdict the hook trusts, so the lexer must not miss a spelling the
+//! hook's shell fallback catches. The full-suite CI run pins this binary to prove it.
 //!
 //! ```text
 //! loom-daemon command-analysis gh-pr-merge --command "$COMMAND"

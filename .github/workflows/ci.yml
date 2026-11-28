@@ -1608,6 +1608,31 @@ jobs:
       - name: classify-error native delegation + parity (#11208)
         if: ${{ !cancelled() && steps.daemon-bin.outcome == 'success' }}
         run: LOOM_DAEMON_SELF_BIN="$PWD/target/debug/loom-daemon" bash defaults/scripts/tests/test-classify-error.sh
+      # #15525: the merge-redirect rule of guard-loom-workflow.sh trusts the
+      # daemon's `command-analysis gh-pr-merge` exit 1 as "would not execute it".
+      # The shell-suite run of tests/hooks/test-guard-loom-workflow.sh (ci-wired.txt)
+      # has no daemon on PATH, so it only ever witnesses the shell-masked fallback;
+      # the native Rust corpus covers a subset of rows. This step runs the WHOLE
+      # suite with the built daemon pinned, so a spelling the lexer misses (and the
+      # fallback catches) fails CI instead of passing on every host that has a
+      # daemon. The suite is mode-aware: it passes in both modes, with each
+      # disputed row pinned to its mode's exact verdict.
+      - name: guard-loom-workflow full suite, native merge-redirect (#15525)
+        if: ${{ !cancelled() && steps.daemon-bin.outcome == 'success' }}
+        env:
+          LOOM_DAEMON_SELF_BIN: ${{ github.workspace }}/target/debug/loom-daemon
+          # The suite exits 2 rather than silently falling back when the pinned
+          # binary does not answer.
+          LOOM_REQUIRE_NATIVE_DAEMON: "1"
+        run: |
+          # Confirm the binary answers before the suite runs: exit 0 for a live
+          # merge, exit 1 for a command that is not one. Anything else is "no
+          # answer", which would make the suite measure the fallback instead.
+          rc=0; "$LOOM_DAEMON_SELF_BIN" command-analysis gh-pr-merge --command 'gh pr merge 1' || rc=$?
+          [ "$rc" -eq 0 ] || { echo "daemon did not answer 'gh pr merge 1' with exit 0 (got $rc)"; exit 1; }
+          rc=0; "$LOOM_DAEMON_SELF_BIN" command-analysis gh-pr-merge --command 'ls' || rc=$?
+          [ "$rc" -eq 1 ] || { echo "daemon did not answer 'ls' with exit 1 (got $rc)"; exit 1; }
+          bash tests/hooks/test-guard-loom-workflow.sh
       - name: detect-dependency-cycle (#5671)
         if: ${{ !cancelled() && steps.daemon-bin.outcome == 'success' }}
         run: bash defaults/scripts/tests/test-detect-dependency-cycle.sh

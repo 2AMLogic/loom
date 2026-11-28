@@ -39,6 +39,17 @@ const ALLOWED: &[(&str, &str)] = &[
     ("other gh pr verb", "gh pr view 12 --comments"),
     ("merge-pr.sh", "./.loom/scripts/merge-pr.sh 12"),
     ("gh pr list searching for merged", "gh pr list --search 'merge'"),
+    // #15525: text that is only carried, never handed to an interpreter.
+    ("echo piped into cat", "echo \"gh pr merge 12\" | cat"),
+    ("variable echoed", "X=\"gh pr merge 12\"; echo \"$X\""),
+    (
+        "loop item used only as a search query",
+        "for q in alpha \"gh pr merge redirect\"; do\n  gh issue list --search \"$q\"\ndone",
+    ),
+    (
+        "unquoted commit-message heredoc with no substitution",
+        "git commit -F - <<EOF\ngh pr merge 12\nEOF",
+    ),
 ];
 
 /// Commands that would execute it, however they are dressed.
@@ -59,6 +70,31 @@ const DENIED: &[(&str, &str)] = &[
     ("sudo wrapper", "sudo -u bob gh pr merge 12"),
     ("xargs wrapper", "echo 12 | xargs gh pr merge"),
     ("heredoc fed to a shell", "bash <<'EOF'\ngh pr merge 12\nEOF"),
+    // #15525: the line is ASSEMBLED, then handed to an interpreter.
+    ("echo piped into bash", "echo \"gh pr merge 12\" | bash"),
+    ("jq literal piped into sh", "jq -n -r '\"gh pr merge 12\"' | sh"),
+    ("eval of $(echo …)", "eval \"$(echo \"gh pr merge 12\")\""),
+    (
+        "eval of a heredoc captured by $( )",
+        "eval \"$(cat <<'EOF'\ngh pr merge 12\nEOF\n)\"",
+    ),
+    (
+        "heredoc-assigned variable as the command word",
+        "X=\"$(cat <<'EOF'\ngh pr merge 12\nEOF\n)\"; $X",
+    ),
+    ("for-loop item eval'd", "for q in \"gh pr merge 12\"; do eval \"$q\"; done"),
+    (
+        "live $( ) in an unquoted heredoc body",
+        "gh pr comment 5 --body \"$(cat <<EOF\nsee $(gh pr merge 12)\nEOF\n)\"",
+    ),
+    (
+        "case pattern inside the substitution",
+        "eval \"$( case x in x) :;; esac; echo \"gh pr merge 12\" )\"",
+    ),
+    (
+        "unterminated commit-message heredoc",
+        "git commit -F - <<'EOF'\ngh pr merge 12 and the heredoc never closes",
+    ),
     (
         "heredoc written to a file (#7773)",
         "cat > /tmp/x.sh <<'EOF'\ngh pr merge 12\nEOF\nbash /tmp/x.sh",
