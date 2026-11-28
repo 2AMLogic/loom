@@ -5,9 +5,9 @@ use super::*;
 use crate::forge_etag_store::{
     cache_key, disk_cache_path, read_disk_entry, repo_scope, resolve_target,
 };
+use crate::test_git_helpers::run as git;
 use std::cell::RefCell;
 use std::path::PathBuf;
-use std::process::Command;
 
 thread_local! {
     /// Test hook run by `list_issues_cached_once` between the request and the
@@ -471,23 +471,16 @@ esac
 /// `git init` + an `origin` remote pointing at `owner_repo`, so
 /// [`crate::credential_preflight::nwo_from_git_remote`] resolves it.
 fn init_git_repo_with_remote(dir: &Path, owner_repo: &str) {
-    assert!(Command::new("git")
-        .args(["init", "-q"])
-        .current_dir(dir)
-        .status()
-        .unwrap()
-        .success());
-    assert!(Command::new("git")
-        .args([
+    git(dir, &["init", "-q"]);
+    git(
+        dir,
+        &[
             "remote",
             "add",
             "origin",
-            &format!("https://github.com/{owner_repo}.git")
-        ])
-        .current_dir(dir)
-        .status()
-        .unwrap()
-        .success());
+            &format!("https://github.com/{owner_repo}.git"),
+        ],
+    );
 }
 
 #[test]
@@ -805,24 +798,17 @@ fn a_registered_workspace_404_forces_one_refresh_and_retries_successfully() {
     crate::credential_preflight::register_primary_workspace_root(workspace_root.path());
 
     let repo_root = tempfile::tempdir().unwrap();
-    assert!(Command::new("git")
-        .args(["init", "-q"])
-        .current_dir(repo_root.path())
-        .status()
-        .unwrap()
-        .success());
+    git(repo_root.path(), &["init", "-q"]);
     let owner_repo = format!("test-owner-{}/retry-repo", std::process::id());
-    assert!(Command::new("git")
-        .args([
+    git(
+        repo_root.path(),
+        &[
             "remote",
             "add",
             "origin",
-            &format!("https://github.com/{owner_repo}.git")
-        ])
-        .current_dir(repo_root.path())
-        .status()
-        .unwrap()
-        .success());
+            &format!("https://github.com/{owner_repo}.git"),
+        ],
+    );
 
     let calls_log = repo_root.path().join("calls.log");
     let fake_gh = repo_root.path().join("fake-gh-then-recovers.sh");
@@ -886,17 +872,15 @@ fn a_registered_workspace_404_forces_one_refresh_and_retries_successfully() {
     std::fs::write(&calls_log, "").unwrap();
     let root = repo_root.path().to_path_buf();
     set_after_send_hook(Some(Box::new(move || {
-        assert!(Command::new("git")
-            .args([
+        git(
+            &root,
+            &[
                 "remote",
                 "set-url",
                 "origin",
-                "https://github.com/other-owner/retargeted"
-            ])
-            .current_dir(&root)
-            .status()
-            .unwrap()
-            .success());
+                "https://github.com/other-owner/retargeted",
+            ],
+        );
     })));
     let result = list_issues_cached_all_for_target_as(
         "t",
@@ -1023,21 +1007,16 @@ fn a_pinned_listing_keeps_its_host_and_repo_after_a_mid_walk_retarget() {
     crate::forge_repo_facts::set_test_enabled(true);
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
-    let git = |args: &[&str]| {
-        assert!(Command::new("git")
-            .args(args)
-            .current_dir(root)
-            .status()
-            .unwrap()
-            .success());
-    };
-    git(&["init", "-q"]);
-    git(&[
-        "remote",
-        "add",
-        "origin",
-        "https://forge-one.invalid/acme/pinned-listing",
-    ]);
+    git(root, &["init", "-q"]);
+    git(
+        root,
+        &[
+            "remote",
+            "add",
+            "origin",
+            "https://forge-one.invalid/acme/pinned-listing",
+        ],
+    );
     let pin = resolve_target(Some(root), None);
     assert_eq!(pin.host.as_deref(), Some("forge-one.invalid"));
     assert_eq!(pin.repo.as_deref(), Some("acme/pinned-listing"));
@@ -1047,17 +1026,15 @@ fn a_pinned_listing_keeps_its_host_and_repo_after_a_mid_walk_retarget() {
     let mut to_move = Some(root.to_path_buf());
     set_after_send_hook(Some(Box::new(move || {
         if let Some(root) = to_move.take() {
-            assert!(Command::new("git")
-                .args([
+            git(
+                &root,
+                &[
                     "remote",
                     "set-url",
                     "origin",
-                    "https://forge-two.invalid/other/retargeted"
-                ])
-                .current_dir(root)
-                .status()
-                .unwrap()
-                .success());
+                    "https://forge-two.invalid/other/retargeted",
+                ],
+            );
         }
     })));
     let rows = list_issues_cached_all_for_target_as("t", &gh, root, &pin, "loom:triage", "open");
