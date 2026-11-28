@@ -22,6 +22,12 @@
 # sourced, so the functions under test are eval'd in isolation (same pattern
 # as tests/install/test-pnpm-runnable-check.sh).
 #
+# Source-tree-only by design (#15761): the source-pattern extractors read the
+# REAL loom-daemon/src/init/post_init.rs, which does not ship into an
+# installed consumer repo -- without it _gitignore_warn_if_stale returns
+# before emitting the stand-down note and group 3 reports a false FAIL -- so
+# the suite SKIPs (exit 0) outside Loom's own checkout.
+#
 # Usage:
 #   bash defaults/scripts/tests/test-resync-installed-gitignore-stub.sh
 
@@ -31,6 +37,12 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 HELPERS_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 SCRIPT="$HELPERS_DIR/resync-installed.sh"
 REPO_ROOT="$(cd "$HELPERS_DIR/../.." && pwd)"
+
+POST_INIT="$REPO_ROOT/loom-daemon/src/init/post_init.rs"
+if [[ ! -f "$POST_INIT" ]]; then
+    echo "SKIP: source-tree-only test, $POST_INIT not found (not shipped into an installed repo)" >&2
+    exit 0
+fi
 
 source "$SCRIPT_DIR/lib/assert.sh"
 
