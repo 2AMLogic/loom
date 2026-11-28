@@ -326,10 +326,7 @@ pub fn resolve_github_app_mint_timeout(repo_root: &Path) -> Duration {
 
 /// [`GITHUB_APP_MINT_TIMEOUT_ENV`] as seconds, filtered to `> 0`.
 fn env_github_app_mint_timeout_secs() -> Option<u64> {
-    std::env::var(GITHUB_APP_MINT_TIMEOUT_ENV)
-        .ok()
-        .and_then(|v| v.trim().parse::<u64>().ok())
-        .filter(|&s| s > 0)
+    crate::env_flag::env_positive(GITHUB_APP_MINT_TIMEOUT_ENV)
 }
 
 /// `forge.githubApp.mintTimeoutSeconds` from config, filtered to `> 0`.
@@ -740,10 +737,7 @@ pub(crate) fn reset_forge_credential_streaks() {
 /// would be ambiguous about which repo's value wins.
 #[must_use]
 pub fn resolve_forge_credential_stale_grace() -> Duration {
-    std::env::var(FORGE_CREDENTIAL_STALE_GRACE_ENV)
-        .ok()
-        .and_then(|v| v.trim().parse::<u64>().ok())
-        .filter(|&s| s > 0)
+    crate::env_flag::env_positive(FORGE_CREDENTIAL_STALE_GRACE_ENV)
         .map_or(DEFAULT_FORGE_CREDENTIAL_STALE_GRACE, Duration::from_secs)
 }
 

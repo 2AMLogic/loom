@@ -585,6 +585,22 @@ fn resolve_gate_max_defer_precedence() {
 }
 
 #[test]
+#[serial]
+fn resolve_interval_env_override_is_trimmed() {
+    std::env::remove_var(MAIN_HEALTH_GATE_INTERVAL_ENV);
+    assert_eq!(resolve_interval(), Duration::from_secs(DEFAULT_MAIN_HEALTH_GATE_INTERVAL_SECS));
+    std::env::set_var(MAIN_HEALTH_GATE_INTERVAL_ENV, "45");
+    assert_eq!(resolve_interval(), Duration::from_secs(45));
+    std::env::set_var(MAIN_HEALTH_GATE_INTERVAL_ENV, " 45 ");
+    assert_eq!(resolve_interval(), Duration::from_secs(45));
+    std::env::set_var(MAIN_HEALTH_GATE_INTERVAL_ENV, "0");
+    assert_eq!(resolve_interval(), Duration::from_secs(DEFAULT_MAIN_HEALTH_GATE_INTERVAL_SECS));
+    std::env::set_var(MAIN_HEALTH_GATE_INTERVAL_ENV, "notanumber");
+    assert_eq!(resolve_interval(), Duration::from_secs(DEFAULT_MAIN_HEALTH_GATE_INTERVAL_SECS));
+    std::env::remove_var(MAIN_HEALTH_GATE_INTERVAL_ENV);
+}
+
+#[test]
 fn resolve_gate_fast_command_defaults_to_env_prefixed_base() {
     let tmp = tempfile::tempdir().unwrap();
     // No `fastCommand` ⇒ prefix the base command with the tier env var so

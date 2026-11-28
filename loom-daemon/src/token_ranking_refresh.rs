@@ -425,10 +425,7 @@ pub fn resolve_enabled(config: &TokenRankingRefreshConfig) -> bool {
 /// than producing a busy loop.
 #[must_use]
 pub fn resolve_interval(config: &TokenRankingRefreshConfig) -> Duration {
-    std::env::var(TOKEN_RANKING_REFRESH_INTERVAL_ENV)
-        .ok()
-        .and_then(|v| v.parse::<u64>().ok())
-        .filter(|&s| s > 0)
+    crate::env_flag::env_positive(TOKEN_RANKING_REFRESH_INTERVAL_ENV)
         .or(config.interval_secs)
         .map_or_else(
             || Duration::from_secs(DEFAULT_TOKEN_RANKING_REFRESH_INTERVAL_SECS),

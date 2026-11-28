@@ -182,10 +182,7 @@ pub fn resolve_staleness_secs(config: &TmpfsReclaimConfig) -> u64 {
 /// default**.
 #[must_use]
 pub fn resolve_min_interval_secs(config: &TmpfsReclaimConfig) -> u64 {
-    std::env::var(TMPFS_RECLAIM_MIN_INTERVAL_ENV)
-        .ok()
-        .and_then(|v| v.trim().parse::<u64>().ok())
-        .filter(|&s| s > 0)
+    crate::env_flag::env_positive(TMPFS_RECLAIM_MIN_INTERVAL_ENV)
         .or(config.min_interval_secs)
         .unwrap_or(DEFAULT_MIN_INTERVAL_SECS)
 }

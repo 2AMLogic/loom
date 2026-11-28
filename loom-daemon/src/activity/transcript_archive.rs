@@ -636,10 +636,7 @@ fn env_enabled_override() -> Option<bool> {
 }
 
 fn env_interval_secs() -> Option<u64> {
-    std::env::var("LOOM_TRANSCRIPT_ARCHIVE_INTERVAL")
-        .ok()
-        .and_then(|v| v.parse::<u64>().ok())
-        .filter(|v| *v > 0)
+    crate::env_flag::env_positive("LOOM_TRANSCRIPT_ARCHIVE_INTERVAL")
 }
 
 fn env_min_age_hours() -> Option<i64> {

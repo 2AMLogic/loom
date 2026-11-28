@@ -345,10 +345,7 @@ pub fn resolve_enabled(config: &AutoUpdateConfig) -> bool {
 /// producing a busy loop.
 #[must_use]
 pub fn resolve_interval(config: &AutoUpdateConfig) -> Duration {
-    std::env::var(AUTO_UPDATE_INTERVAL_ENV)
-        .ok()
-        .and_then(|v| v.parse::<u64>().ok())
-        .filter(|&s| s > 0)
+    crate::env_flag::env_positive(AUTO_UPDATE_INTERVAL_ENV)
         .or(config.interval_secs)
         .map_or_else(|| Duration::from_secs(DEFAULT_AUTO_UPDATE_INTERVAL_SECS), Duration::from_secs)
 }
@@ -356,10 +353,7 @@ pub fn resolve_interval(config: &AutoUpdateConfig) -> Duration {
 /// Resolve the settle window with precedence **env > config > default**.
 #[must_use]
 pub fn resolve_settle(config: &AutoUpdateConfig) -> Duration {
-    std::env::var(AUTO_UPDATE_SETTLE_ENV)
-        .ok()
-        .and_then(|v| v.parse::<u64>().ok())
-        .filter(|&s| s > 0)
+    crate::env_flag::env_positive(AUTO_UPDATE_SETTLE_ENV)
         .or(config.settle_secs)
         .map_or_else(|| Duration::from_secs(DEFAULT_AUTO_UPDATE_SETTLE_SECS), Duration::from_secs)
 }
@@ -371,10 +365,7 @@ pub fn resolve_settle(config: &AutoUpdateConfig) -> Duration {
 /// load, set a very large value.
 #[must_use]
 pub fn resolve_defer_deadline(config: &AutoUpdateConfig) -> Duration {
-    std::env::var(AUTO_UPDATE_DEFER_DEADLINE_ENV)
-        .ok()
-        .and_then(|v| v.parse::<u64>().ok())
-        .filter(|&s| s > 0)
+    crate::env_flag::env_positive(AUTO_UPDATE_DEFER_DEADLINE_ENV)
         .or(config.defer_deadline_secs)
         .map_or_else(
             || Duration::from_secs(DEFAULT_AUTO_UPDATE_DEFER_DEADLINE_SECS),

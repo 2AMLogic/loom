@@ -165,13 +165,7 @@ pub fn is_held_here() -> bool {
 
 /// Resolve a positive-seconds env knob, falling back to `default`.
 fn resolve_secs(var: &str, default: u64) -> Duration {
-    Duration::from_secs(
-        std::env::var(var)
-            .ok()
-            .and_then(|v| v.trim().parse::<u64>().ok())
-            .filter(|&s| s > 0)
-            .unwrap_or(default),
-    )
+    Duration::from_secs(crate::env_flag::env_positive(var).unwrap_or(default))
 }
 
 /// Resolve the bounded wait from [`FILING_LOCK_WAIT_SECS_ENV`].

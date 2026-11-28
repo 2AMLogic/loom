@@ -307,10 +307,7 @@ pub fn resolve_keep_last_n(config: &DockerRetentionConfig) -> usize {
 /// Resolve the cooldown — precedence **env > config > default**.
 #[must_use]
 pub fn resolve_min_interval_secs(config: &DockerRetentionConfig) -> u64 {
-    std::env::var(DOCKER_RETENTION_MIN_INTERVAL_ENV)
-        .ok()
-        .and_then(|v| v.trim().parse::<u64>().ok())
-        .filter(|&s| s > 0)
+    crate::env_flag::env_positive(DOCKER_RETENTION_MIN_INTERVAL_ENV)
         .or(config.min_interval_secs)
         .unwrap_or(DEFAULT_MIN_INTERVAL_SECS)
 }

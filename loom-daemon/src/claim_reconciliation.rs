@@ -350,10 +350,7 @@ pub const DEFAULT_SAFEHOUSE_RECONCILE_INTERVAL_SECS: u64 = 1800;
 /// should prefer.
 #[must_use]
 pub fn resolve_reconcile_interval() -> Duration {
-    let secs = std::env::var(RECONCILE_INTERVAL_ENV)
-        .ok()
-        .and_then(|s| s.parse::<u64>().ok())
-        .filter(|&v| v > 0)
+    let secs = crate::env_flag::env_positive(RECONCILE_INTERVAL_ENV)
         .unwrap_or(DEFAULT_RECONCILE_INTERVAL_SECS);
     Duration::from_secs(secs.max(MIN_RECONCILE_INTERVAL_SECS))
 }
@@ -372,11 +369,7 @@ pub fn resolve_reconcile_interval() -> Duration {
 /// Always clamped up to [`MIN_RECONCILE_INTERVAL_SECS`] regardless of source.
 #[must_use]
 pub fn resolve_reconcile_interval_for(root: &Path) -> Duration {
-    if let Some(secs) = std::env::var(RECONCILE_INTERVAL_ENV)
-        .ok()
-        .and_then(|s| s.parse::<u64>().ok())
-        .filter(|&v| v > 0)
-    {
+    if let Some(secs) = crate::env_flag::env_positive::<u64>(RECONCILE_INTERVAL_ENV) {
         return Duration::from_secs(secs.max(MIN_RECONCILE_INTERVAL_SECS));
     }
     let safehouse_enabled = crate::safehouse::resolve_config(root).enabled;

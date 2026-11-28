@@ -230,10 +230,7 @@ pub fn resolve_enabled(config: &WorktreeReaperConfig) -> bool {
 /// unparseable env value falls through rather than producing a busy loop.
 #[must_use]
 pub fn resolve_interval(config: &WorktreeReaperConfig) -> Duration {
-    std::env::var(WORKTREE_REAPER_INTERVAL_ENV)
-        .ok()
-        .and_then(|v| v.trim().parse::<u64>().ok())
-        .filter(|&s| s > 0)
+    crate::env_flag::env_positive(WORKTREE_REAPER_INTERVAL_ENV)
         .or(config.interval_secs)
         .map_or_else(
             || Duration::from_secs(DEFAULT_WORKTREE_REAPER_INTERVAL_SECS),

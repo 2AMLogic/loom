@@ -176,10 +176,7 @@ pub fn resolve_enabled(config: &HeartbeatConfig) -> bool {
 /// than producing a busy loop.
 #[must_use]
 pub fn resolve_interval(config: &HeartbeatConfig) -> Duration {
-    std::env::var(HEARTBEAT_INTERVAL_ENV)
-        .ok()
-        .and_then(|v| v.parse::<u64>().ok())
-        .filter(|&s| s > 0)
+    crate::env_flag::env_positive(HEARTBEAT_INTERVAL_ENV)
         .or(config.interval_secs)
         .map_or_else(|| Duration::from_secs(DEFAULT_HEARTBEAT_INTERVAL_SECS), Duration::from_secs)
 }

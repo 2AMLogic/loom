@@ -186,11 +186,7 @@ pub const STALE_WARN_HOURS_ENV: &str = "LOOM_SELF_UPDATE_STALE_WARN_HOURS";
 /// the default rather than warning on every single stale commit.
 #[must_use]
 pub fn resolve_stale_warn_commits() -> u32 {
-    std::env::var(STALE_WARN_COMMITS_ENV)
-        .ok()
-        .and_then(|v| v.parse::<u32>().ok())
-        .filter(|&n| n > 0)
-        .unwrap_or(DEFAULT_STALE_WARN_COMMITS)
+    crate::env_flag::env_positive(STALE_WARN_COMMITS_ENV).unwrap_or(DEFAULT_STALE_WARN_COMMITS)
 }
 
 /// Resolve the elapsed-hours warn threshold: env override, else
@@ -198,11 +194,7 @@ pub fn resolve_stale_warn_commits() -> u32 {
 /// the default.
 #[must_use]
 pub fn resolve_stale_warn_hours() -> u32 {
-    std::env::var(STALE_WARN_HOURS_ENV)
-        .ok()
-        .and_then(|v| v.parse::<u32>().ok())
-        .filter(|&n| n > 0)
-        .unwrap_or(DEFAULT_STALE_WARN_HOURS)
+    crate::env_flag::env_positive(STALE_WARN_HOURS_ENV).unwrap_or(DEFAULT_STALE_WARN_HOURS)
 }
 
 /// Pure warning-formatting logic (Issue #6261's staleness surface), split out

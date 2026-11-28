@@ -216,10 +216,7 @@ fn resolve_enabled_from(env: Option<&str>, config: &SessionReconcileConfig) -> b
 /// env > config > default; a zero/unparseable env value falls through.
 #[must_use]
 pub fn resolve_interval(config: &SessionReconcileConfig) -> Duration {
-    let secs = std::env::var(SESSION_RECONCILE_INTERVAL_ENV)
-        .ok()
-        .and_then(|v| v.trim().parse::<u64>().ok())
-        .filter(|&s| s > 0)
+    let secs = crate::env_flag::env_positive(SESSION_RECONCILE_INTERVAL_ENV)
         .or(config.interval_secs)
         .unwrap_or(DEFAULT_SESSION_RECONCILE_INTERVAL_SECS);
     Duration::from_secs(secs)

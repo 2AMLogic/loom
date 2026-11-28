@@ -155,10 +155,7 @@ pub fn resolve_grace_minutes(config: &GitTmpReclaimConfig) -> u64 {
 /// unparseable env value falls through rather than disabling the gate.
 #[must_use]
 pub fn resolve_min_interval_secs(config: &GitTmpReclaimConfig) -> u64 {
-    std::env::var(GIT_TMP_RECLAIM_MIN_INTERVAL_ENV)
-        .ok()
-        .and_then(|v| v.trim().parse::<u64>().ok())
-        .filter(|&s| s > 0)
+    crate::env_flag::env_positive(GIT_TMP_RECLAIM_MIN_INTERVAL_ENV)
         .or(config.min_interval_secs)
         .unwrap_or(DEFAULT_MIN_INTERVAL_SECS)
 }

@@ -200,10 +200,7 @@ pub fn resolve_enabled(config: &OrphanProcessReaperConfig) -> bool {
 /// or unparseable env value falls through rather than disabling the age gate.
 #[must_use]
 pub fn resolve_min_age_secs(config: &OrphanProcessReaperConfig) -> u64 {
-    std::env::var(ORPHAN_PROCESS_REAPER_MIN_AGE_ENV)
-        .ok()
-        .and_then(|v| v.trim().parse::<u64>().ok())
-        .filter(|&s| s > 0)
+    crate::env_flag::env_positive(ORPHAN_PROCESS_REAPER_MIN_AGE_ENV)
         .or(config.min_age_secs)
         .unwrap_or(DEFAULT_MIN_ORPHAN_AGE_SECS)
 }

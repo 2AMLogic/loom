@@ -153,11 +153,7 @@ pub fn resolve_wait() -> Duration {
 #[must_use]
 pub fn resolve_stale() -> Duration {
     Duration::from_secs(
-        std::env::var(BUILD_SLOT_STALE_SECS_ENV)
-            .ok()
-            .and_then(|v| v.trim().parse::<u64>().ok())
-            .filter(|&s| s > 0)
-            .unwrap_or(DEFAULT_STALE_SLOT_SECS),
+        crate::env_flag::env_positive(BUILD_SLOT_STALE_SECS_ENV).unwrap_or(DEFAULT_STALE_SLOT_SECS),
     )
 }
 

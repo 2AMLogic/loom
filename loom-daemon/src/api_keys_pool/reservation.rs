@@ -121,11 +121,7 @@ pub enum Reserve {
 
 #[must_use]
 fn resolve_stale() -> u64 {
-    std::env::var(RESERVATION_STALE_SECS_ENV)
-        .ok()
-        .and_then(|raw| raw.trim().parse::<u64>().ok())
-        .filter(|secs| *secs > 0)
-        .unwrap_or(DEFAULT_STALE_SECS)
+    crate::env_flag::env_positive(RESERVATION_STALE_SECS_ENV).unwrap_or(DEFAULT_STALE_SECS)
 }
 
 fn reserved_dir(root: &Path, provider: &str) -> PathBuf {

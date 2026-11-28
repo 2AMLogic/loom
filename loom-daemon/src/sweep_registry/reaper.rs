@@ -91,10 +91,7 @@ pub(crate) fn wrapper_dispatch_enabled() -> bool {
 /// [`REAP_GH_TIMEOUT_ENV`] override (whole seconds, must be > 0) or the
 /// [`REAP_GH_TIMEOUT`] default.
 pub(crate) fn reap_gh_timeout() -> Duration {
-    std::env::var(REAP_GH_TIMEOUT_ENV)
-        .ok()
-        .and_then(|s| s.trim().parse::<u64>().ok())
-        .filter(|&n| n > 0)
+    crate::env_flag::env_positive(REAP_GH_TIMEOUT_ENV)
         .map(Duration::from_secs)
         .unwrap_or(REAP_GH_TIMEOUT)
 }

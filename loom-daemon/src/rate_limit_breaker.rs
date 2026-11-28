@@ -135,10 +135,7 @@ fn env_enabled() -> Option<bool> {
 }
 
 fn env_fallback_cooldown_secs() -> Option<u64> {
-    std::env::var(RATE_LIMIT_BREAKER_FALLBACK_COOLDOWN_ENV)
-        .ok()
-        .and_then(|v| v.trim().parse::<u64>().ok())
-        .filter(|&n| n > 0)
+    crate::env_flag::env_positive(RATE_LIMIT_BREAKER_FALLBACK_COOLDOWN_ENV)
 }
 
 /// Resolve the full [`RateLimitBreakerConfig`] with precedence **env > config

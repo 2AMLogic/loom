@@ -234,11 +234,7 @@ pub fn store_dir() -> Option<PathBuf> {
 /// Resolve the staleness threshold with precedence **env > default**.
 #[must_use]
 pub fn resolve_stale() -> Duration {
-    let secs = std::env::var(INFLIGHT_STALE_SECS_ENV)
-        .ok()
-        .and_then(|v| v.trim().parse::<u64>().ok())
-        .filter(|&s| s > 0)
-        .unwrap_or(DEFAULT_STALE_SECS);
+    let secs = crate::env_flag::env_positive(INFLIGHT_STALE_SECS_ENV).unwrap_or(DEFAULT_STALE_SECS);
     Duration::from_secs(secs)
 }
 

@@ -1008,10 +1008,7 @@ pub fn resolve_repair(config: &InstallSelfCheckConfig) -> bool {
 /// Resolve the check cadence — **env > config > default**.
 #[must_use]
 pub fn resolve_interval(config: &InstallSelfCheckConfig) -> Duration {
-    std::env::var(INSTALL_SELF_CHECK_INTERVAL_ENV)
-        .ok()
-        .and_then(|v| v.parse::<u64>().ok())
-        .filter(|&s| s > 0)
+    crate::env_flag::env_positive(INSTALL_SELF_CHECK_INTERVAL_ENV)
         .or(config.interval_secs)
         .map_or_else(|| Duration::from_secs(DEFAULT_INTERVAL_SECS), Duration::from_secs)
 }
@@ -1019,10 +1016,7 @@ pub fn resolve_interval(config: &InstallSelfCheckConfig) -> Duration {
 /// Resolve the token-ranking staleness threshold — **env > config > default**.
 #[must_use]
 pub fn resolve_ranking_max_age(config: &InstallSelfCheckConfig) -> Duration {
-    std::env::var(INSTALL_SELF_CHECK_RANKING_MAX_AGE_ENV)
-        .ok()
-        .and_then(|v| v.parse::<u64>().ok())
-        .filter(|&s| s > 0)
+    crate::env_flag::env_positive(INSTALL_SELF_CHECK_RANKING_MAX_AGE_ENV)
         .or(config.ranking_max_age_secs)
         .map_or_else(|| Duration::from_secs(DEFAULT_RANKING_MAX_AGE_SECS), Duration::from_secs)
 }
