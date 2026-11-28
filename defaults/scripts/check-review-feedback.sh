@@ -96,7 +96,8 @@
 #                         evidence of repair or disposition — NOT an automatic
 #                         dismissal because the head moved.
 #   UNKNOWN               The read itself did not complete (failure, or a
-#                         wall-clock timeout — #13927). Never evidence of
+#                         wall-clock timeout — #13927), or its findings could
+#                         not be written (#15778). Never evidence of
 #                         "no blockers".
 #
 # Exit codes:
@@ -104,7 +105,8 @@
 #   10 BLOCKING
 #   11 NEEDS_RECONCILIATION
 #   12 UNKNOWN (read failure / incomplete pagination / missing dependency /
-#       read timeout #13927 — with REVIEW_FEEDBACK_TIMED_OUT=1)
+#       read timeout #13927 — with REVIEW_FEEDBACK_TIMED_OUT=1 — or the
+#       findings file could not be written #15778)
 #   2  usage error
 #
 # All reads are live and plain (`gh`, never gh-cached): this gates a verdict,
@@ -118,7 +120,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 _usage() {
     # Keep this range in sync with the header block above ("Usage:" through
     # the exit-code table).
-    sed -n '45,111p' "$0" | sed 's/^# \{0,1\}//'
+    sed -n '45,113p' "$0" | sed 's/^# \{0,1\}//'
 }
 
 _die() {
@@ -178,7 +180,6 @@ if [[ -z "$FINDINGS_FILE" ]]; then
     # the caller reads it.
     FINDINGS_FILE="${TMPDIR:-/tmp}/loom-review-feedback-${NUMBER}.txt"
 fi
-: > "$FINDINGS_FILE"
 
 # --- State accumulators ----------------------------------------------------
 STATE="UNKNOWN"
@@ -263,7 +264,12 @@ _emit_and_exit() {
 _fail_unknown() {
     FAILURE_REASON="$1"
     STATE="UNKNOWN"
-    echo "UNKNOWN: $1" >> "$FINDINGS_FILE"
+    # Best effort, never through _append_findings: the findings file may be the
+    # thing that failed, and that path ends here. When the file cannot take the
+    # reason it still reaches the caller on stderr. `2>/dev/null` leads because
+    # bash reports a failed redirect before a later one applies.
+    echo "UNKNOWN: $1" 2>/dev/null >> "$FINDINGS_FILE" \
+        || echo "$SCRIPT_NAME: UNKNOWN: $1" >&2
     _emit_and_exit
 }
 
@@ -276,6 +282,27 @@ _fail_timeout() {
     TIMED_OUT=1
     _fail_unknown "$1"
 }
+
+# Appends stdin to the findings file and reports the WRITE's status. Every
+# finding append goes through here: as an unchecked redirect it let a full or
+# unwritable sink exit 10/11 over an empty file (#15778). Last stage of a
+# pipeline, so it runs in a subshell — it returns a status for the caller's
+# `|| _fail_findings_write`; calling _fail_unknown here would exit only the
+# subshell.
+_append_findings() {
+    cat >> "$FINDINGS_FILE"
+}
+
+_fail_findings_write() {
+    _fail_unknown "could not write the findings file $FINDINGS_FILE — re-run with a writable --findings-file"
+}
+
+# --- Findings file ----------------------------------------------------------
+# Truncated before anything can be reported into it: a repeat run overwrites
+# the file, so the caller-read copy cannot accumulate (#9896). An unwritable
+# destination is reported at once — never a later CLEAR over a file that does
+# not exist.
+: > "$FINDINGS_FILE" || _fail_findings_write
 
 # --- Dependencies ----------------------------------------------------------
 command -v jq > /dev/null 2>&1 || _fail_unknown "jq is not installed — review state could not be established"
@@ -372,7 +399,8 @@ REVIEWS_UNKNOWN_STATE=$(printf '%s' "$REVIEW_SUMMARY" | jq -r '.unknown_state')
 BLOCKING_CURRENT=$(printf '%s' "$REVIEW_SUMMARY" | jq -r '.blocking_current | length')
 BLOCKING_OLDER=$(printf '%s' "$REVIEW_SUMMARY" | jq -r '.blocking_older | length')
 BLOCKING_IDS=$(printf '%s' "$REVIEW_SUMMARY" | jq -r '(.current_ids + .older_ids) | join(" ")')
-printf '%s' "$REVIEW_SUMMARY" | jq -r '(.current_findings + .older_findings + .unknown_findings)[]' >> "$FINDINGS_FILE"
+printf '%s' "$REVIEW_SUMMARY" | jq -r '(.current_findings + .older_findings + .unknown_findings)[]' | _append_findings \
+    || _fail_findings_write
 
 # --- 1b. Comment verdicts (#12475) -----------------------------------------
 # The fleet's normal verdict channel is a PR COMMENT (post-verdict.sh), not a
@@ -447,7 +475,8 @@ BLOCKING_OLDER=$((BLOCKING_OLDER + $(printf '%s' "$VERDICT_SUMMARY" | jq -r '.ol
 VERDICT_IDS=$(printf '%s' "$VERDICT_SUMMARY" | jq -r '.ids | join(" ")')
 BLOCKING_IDS="${BLOCKING_IDS:+$BLOCKING_IDS }$VERDICT_IDS"
 BLOCKING_IDS="${BLOCKING_IDS% }"
-printf '%s' "$VERDICT_SUMMARY" | jq -r '(.current_findings + .older_findings)[]' >> "$FINDINGS_FILE"
+printf '%s' "$VERDICT_SUMMARY" | jq -r '(.current_findings + .older_findings)[]' | _append_findings \
+    || _fail_findings_write
 
 # --- 2. Inline review threads and their ACTUAL resolution state ------------
 THREADS_NDJSON=$(forge_get_pr_review_threads "$NWO" "$NUMBER" 2>/dev/null)
@@ -473,7 +502,8 @@ if [[ $THREADS_RC -eq 0 ]]; then
     INLINE_UNRESOLVED=$(printf '%s' "$THREAD_SUMMARY" | jq -r '.unresolved | length')
     INLINE_UNRESOLVED_OUTDATED=$(printf '%s' "$THREAD_SUMMARY" | jq -r '.unresolved_outdated | length')
     INLINE_BLOCKING_IDS=$(printf '%s' "$THREAD_SUMMARY" | jq -r '.blocking_ids | join(" ")')
-    printf '%s' "$THREAD_SUMMARY" | jq -r '.findings[]' >> "$FINDINGS_FILE"
+    printf '%s' "$THREAD_SUMMARY" | jq -r '.findings[]' | _append_findings \
+        || _fail_findings_write
 else
     # GraphQL is unavailable (exhausted, unsupported forge, or an error — a
     # #13927 timeout behaves the same way: no resolution state was read). Fall
@@ -508,7 +538,8 @@ else
     INLINE_UNRESOLVED=$(printf '%s' "$INLINE_SUMMARY" | jq -r '.current | length')
     INLINE_UNRESOLVED_OUTDATED=$(printf '%s' "$INLINE_SUMMARY" | jq -r '.outdated | length')
     INLINE_BLOCKING_IDS=$(printf '%s' "$INLINE_SUMMARY" | jq -r '.blocking_ids | join(" ")')
-    printf '%s' "$INLINE_SUMMARY" | jq -r '.findings[]' >> "$FINDINGS_FILE"
+    printf '%s' "$INLINE_SUMMARY" | jq -r '.findings[]' | _append_findings \
+        || _fail_findings_write
 fi
 
 # --- 3. Reconcile ----------------------------------------------------------

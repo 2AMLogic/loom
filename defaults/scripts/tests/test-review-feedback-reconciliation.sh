@@ -26,6 +26,8 @@
 #     T11 changes-requested verdicts posted as PR COMMENTS (#12475) are read:
 #         older head -> exit 11, current head -> exit 10, untrusted author
 #         ignored, superseded only by a later reconciled approval
+#     T13 a findings file that cannot be written is UNKNOWN (exit 12), never
+#         an advertised empty file (#15778)
 #
 # Black-box: both subjects are full CLI scripts, so `gh` is stubbed on PATH and
 # the real scripts run as subprocesses (same pattern as test-post-verdict.sh).
@@ -974,6 +976,112 @@ rm -f "$FIX_DIR"/hang-*
 run_gate --number 5369 --head-sha "$HEAD_SHA"
 assert_eq "0" "$GATE_RC" "a fast stub still yields CLEAR with a 1s budget in force"
 unset LOOM_FORGE_REVIEW_READ_TIMEOUT
+
+# --- T13: a findings file that cannot be written is UNKNOWN (#15778) ---------
+# REVIEW_FEEDBACK_FINDINGS_FILE names the caller's only copy of what blocks.
+# Every append was an unchecked `>> "$FINDINGS_FILE"` under `set -uo pipefail`,
+# so a full tmpfs still exited 11 over a real older-head finding and advertised
+# a ZERO-BYTE file: the reader following the path found nothing to reconcile.
+echo ""
+echo "T13: an unwritable findings sink is UNKNOWN, never an advertised empty file (#15778)"
+
+older_head_review() {
+  cat > "$FIX_DIR/reviews-page-1.json" << JSON
+[{"id":3003,"state":"CHANGES_REQUESTED","commit_id":"$OLD_SHA","submitted_at":"2026-09-13T10:00:00Z","user":{"login":"alice"},"body":"missing test for the failure path"}]
+JSON
+}
+
+# Control: the reported fixture with a WRITABLE sink keeps its verdict, its
+# finding text and its advertised path.
+reset_fixtures
+older_head_review
+WRITABLE_FINDINGS="$WORK_DIR/findings.txt"
+run_gate --number 5369 --head-sha "$HEAD_SHA" --findings-file "$WRITABLE_FINDINGS"
+assert_eq "11" "$GATE_RC" "control: a writable --findings-file keeps the older-head verdict (exit 11)"
+assert_contains "$GATE_OUT" "REVIEW_FEEDBACK_FINDINGS_FILE=$WRITABLE_FINDINGS" "control: the caller-supplied path is the one advertised"
+assert_grep 'review 3003 CHANGES_REQUESTED .*OLDER HEAD' "$WRITABLE_FINDINGS" "control: the finding text is in the file"
+
+# An unwritable --findings-file is an operational failure even with NOTHING to
+# write: the caller would otherwise read CLEAR over a file that does not exist.
+UNWRITABLE_FINDINGS="$WORK_DIR/no-such-dir/findings.txt"
+reset_fixtures
+run_gate --number 5369 --head-sha "$HEAD_SHA" --findings-file "$UNWRITABLE_FINDINGS"
+assert_eq "12" "$GATE_RC" "an unwritable --findings-file with no findings -> exit 12 (UNKNOWN), never CLEAR"
+assert_contains "$GATE_OUT" "REVIEW_FEEDBACK_STATE=UNKNOWN" "the unwritable destination is reported as UNKNOWN"
+assert_not_contains "$GATE_OUT" "REVIEW_FEEDBACK_STATE=CLEAR" "no CLEAR over a file that was never created"
+assert_contains "$GATE_OUT" "UNKNOWN: could not write the findings file $UNWRITABLE_FINDINGS" "the reason reaches the caller on stderr and names the findings file"
+
+run_gate --json --number 5369 --head-sha "$HEAD_SHA" --findings-file "$UNWRITABLE_FINDINGS"
+assert_eq "12" "$GATE_RC" "--json: an unwritable --findings-file is exit 12 too"
+assert_contains "$GATE_OUT" '"state": "UNKNOWN"' "--json: the state is UNKNOWN"
+assert_contains "$GATE_OUT" 'could not write the findings file' "--json: failure_reason carries the reason"
+
+# The same with a finding to write: UNKNOWN, never the exit 11 it used to be.
+reset_fixtures
+older_head_review
+run_gate --number 5369 --head-sha "$HEAD_SHA" --findings-file "$UNWRITABLE_FINDINGS"
+assert_eq "12" "$GATE_RC" "an unwritable --findings-file over an older-head finding -> exit 12 (UNKNOWN)"
+assert_contains "$GATE_OUT" "REVIEW_FEEDBACK_STATE=UNKNOWN" "the finding is not reported over a file that was never written"
+assert_not_contains "$GATE_OUT" "REVIEW_FEEDBACK_STATE=NEEDS_RECONCILIATION" "no NEEDS_RECONCILIATION over a file that was never written"
+
+# /dev/full takes the open and fails every write with ENOSPC — the full-tmpfs
+# shape with no disk to fill. Linux-only: probe it, so a host where the device
+# is missing (or accepts writes) skips rather than passing vacuously.
+FULL_SINK=""
+if [[ -e /dev/full ]] && ! echo probe > /dev/full 2> /dev/null; then
+  FULL_SINK=/dev/full
+fi
+
+if [[ -z "$FULL_SINK" ]]; then
+  echo -e "  ${YELLOW}SKIP${NC}: /dev/full is not a failing sink on this host (Linux-only ENOSPC fixtures, #15778)"
+else
+  assert_sink_unknown() { # <label>
+    assert_eq "12" "$GATE_RC" "$1: a failing findings sink -> exit 12 (UNKNOWN)"
+    assert_contains "$GATE_OUT" "REVIEW_FEEDBACK_STATE=UNKNOWN" "$1: state is UNKNOWN"
+    assert_not_contains "$GATE_OUT" "REVIEW_FEEDBACK_STATE=BLOCKING" "$1: never BLOCKING over an unwritten file"
+    assert_not_contains "$GATE_OUT" "REVIEW_FEEDBACK_STATE=NEEDS_RECONCILIATION" "$1: never NEEDS_RECONCILIATION over an unwritten file"
+    assert_contains "$GATE_OUT" "UNKNOWN: could not write the findings file $FULL_SINK" "$1: the reason names the findings file"
+  }
+
+  # Append site 1, formal reviews — the reported case: an older-head
+  # CHANGES_REQUESTED that used to exit 11 over a zero-byte file.
+  reset_fixtures
+  older_head_review
+  run_gate --number 5369 --head-sha "$HEAD_SHA" --findings-file "$FULL_SINK"
+  assert_sink_unknown "formal review, older head"
+
+  reset_fixtures
+  cat > "$FIX_DIR/reviews-page-1.json" << JSON
+[{"id":5202931719,"state":"CHANGES_REQUESTED","commit_id":"$HEAD_SHA","submitted_at":"2026-09-14T21:10:12Z","user":{"login":"alice"},"body":"DFM-analysis coverage is explicitly required before this is ready."}]
+JSON
+  run_gate --number 5369 --head-sha "$HEAD_SHA" --findings-file "$FULL_SINK"
+  assert_sink_unknown "formal review, current head"
+
+  # Append site 2, comment verdicts.
+  reset_fixtures
+  printf '[%s]\n' "$(cr_comment 9001 judge MEMBER "$OLD_SHA")" > "$FIX_DIR/comments-page-1.json"
+  run_gate --number 12465 --head-sha "$HEAD_SHA" --findings-file "$FULL_SINK"
+  assert_sink_unknown "comment verdict"
+
+  # Append site 3, unresolved inline threads (GraphQL).
+  reset_fixtures
+  cat > "$FIX_DIR/graphql-threads.json" << 'JSON'
+{"data":{"repository":{"pullRequest":{"reviewThreads":{"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[
+  {"id":"PRRT_open","isResolved":false,"isOutdated":false,"comments":{"nodes":[{"path":"src/dfm.py","author":{"login":"alice"},"body":"this branch is never exercised by a test"}]}}
+]}}}}}
+JSON
+  run_gate --number 5369 --head-sha "$HEAD_SHA" --findings-file "$FULL_SINK"
+  assert_sink_unknown "inline thread (GraphQL)"
+
+  # Append site 4, inline comments through the REST fallback.
+  reset_fixtures
+  touch "$FIX_DIR/fail-graphql"
+  cat > "$FIX_DIR/inline-page-1.json" << JSON
+[{"id":4004,"pull_request_review_id":2001,"in_reply_to_id":null,"commit_id":"$HEAD_SHA","original_commit_id":"$HEAD_SHA","path":"src/dfm.py","position":7,"user":{"login":"alice"},"body":"still not covered"}]
+JSON
+  run_gate --number 5369 --head-sha "$HEAD_SHA" --findings-file "$FULL_SINK"
+  assert_sink_unknown "inline comment (REST fallback)"
+fi
 
 # --- Summary ---
 echo ""
