@@ -18,6 +18,18 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 ### 2026-11-28
 
+- **Issue #15762** (closed): config-resolver: jq --argjson dies with E2BIG (exit 126) when a config tier exceeds 128 KiB, blocking create-issue.sh entirely
+- **Issue #15760** (closed): resync: manifest prune skips retired .claude/commands/loom/* entries
+- **Issue #15759** (closed): config-resolver.sh dies with E2BIG when the host-wide defaults.json exceeds 128 KiB (create-issue.sh exits 126)
+- **Issue #15755** (closed): config-resolver.sh: a config tier over 128 KiB exceeds MAX_ARG_STRLEN, so every --argjson merged-config read fails with 'Argument list too long'
+- **Issue #15753** (closed): config-resolver.sh: loom_resolve_config fails with jq: Argument list too long once a config tier exceeds 128 KiB (defaults.json is 141,879 bytes) - create-pr.sh exits 126, create-issue.sh and operator-decision apply --new fail
+- **PR #15747**: chore: resync installed Loom surfaces
+- **Issue #15746** (closed): config-resolver.sh: a >128KB config tier breaks every caller with jq 'Argument list too long' (E2BIG)
+- **Issue #15744** (closed): resync manifest prune (#14012) cannot clear stale .claude/commands/loom/ entries
+- **PR #15742**: test: pin gh-ok marker mode to 0600 in forge_gateway fixtures
+- **PR #15740**: refactor: consolidate init directory-sync loops into one helper
+- **Issue #15732** (closed): test: 4 forge_gateway tests fail under umask 0002 because the fixture's gh-ok marker is written group-writable
+- **Issue #15730** (closed): Consolidate triplicated recursive directory-sync loops in init/file_ops.rs
 - **PR #15738**: test: route worktree_cli test git calls through test_git_helpers
 - **PR #15737**: test: delegate six hand-rolled test git calls to test_git_helpers
 - **PR #15736**: test: delegate remaining hand-rolled git calls to test_git_helpers
