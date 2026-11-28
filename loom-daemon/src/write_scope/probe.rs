@@ -484,6 +484,38 @@ pub(crate) fn gitea_get(
     cfg: &crate::forge_cmd::GiteaConfig,
     path: &str,
 ) -> Result<(u16, String), String> {
+    gitea_get_formatted(cfg, path, "\n%{http_code}")
+}
+
+/// Include Gitea's optional advertised listing size so a reader can detect a
+/// truncated listing even when the server answers the next page with HTTP 200.
+pub(crate) fn gitea_get_counted(
+    cfg: &crate::forge_cmd::GiteaConfig,
+    path: &str,
+) -> Result<(u16, String, Option<usize>), String> {
+    let (status, response) =
+        gitea_get_formatted(cfg, path, "\n%header{x-total-count}\n%{http_code}")?;
+    let (body, total) = response
+        .rsplit_once('\n')
+        .ok_or("missing Gitea response metadata")?;
+    let total = if total.is_empty() {
+        None
+    } else {
+        Some(
+            total
+                .trim()
+                .parse()
+                .map_err(|_| "invalid Gitea X-Total-Count")?,
+        )
+    };
+    Ok((status, body.to_owned(), total))
+}
+
+fn gitea_get_formatted(
+    cfg: &crate::forge_cmd::GiteaConfig,
+    path: &str,
+    write_out: &str,
+) -> Result<(u16, String), String> {
     let auth = match &cfg.username {
         // base64 of `user:password`, computed here so the credential
         // still never reaches argv (curl's own `-u` would put it there).
@@ -506,7 +538,7 @@ pub(crate) fn gitea_get(
         .arg("-o")
         .arg("-")
         .arg("-w")
-        .arg("\n%{http_code}")
+        .arg(write_out)
         .arg("-H")
         .arg("@-")
         .arg(format!("{}/api/v1/{path}", cfg.base_url))

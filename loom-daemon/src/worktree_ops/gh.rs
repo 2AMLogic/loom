@@ -969,9 +969,16 @@ fn filter_after_repromotion(
         };
         promoted = Some(promoted.map_or(dt, |p| p.max(dt)));
     }
+    merged_since(candidates, promoted)
+}
+
+pub(crate) fn merged_since(
+    candidates: &[(u32, String)],
+    promoted: Option<chrono::DateTime<chrono::Utc>>,
+) -> MergedBranchPrProbe {
     let mut lowest: Option<u32> = None;
     for (number, merged_at) in candidates {
-        let Some(merged) = parse(merged_at) else {
+        let Ok(merged) = chrono::DateTime::parse_from_rfc3339(merged_at) else {
             return MergedBranchPrProbe::ProbeFailed;
         };
         if promoted.is_some_and(|p| merged < p) {

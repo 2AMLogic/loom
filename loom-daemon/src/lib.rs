@@ -267,6 +267,7 @@ pub mod gh_state_probe;
 pub mod git_ff_identical;
 pub mod git_tmp_reclaim;
 pub mod git_utils;
+mod gitea_builder;
 pub(crate) mod gitea_read;
 pub mod guard_wiring;
 pub mod guards_status;

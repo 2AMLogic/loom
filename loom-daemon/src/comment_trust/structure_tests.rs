@@ -90,6 +90,12 @@ const MARKER_FILES: &[(&str, &str)] = &[
     ),
     ("worktree_ops/gh.rs", "linked-PR probe (FETCH_SITES)"),
     (
+        "gitea_builder.rs",
+        "Gitea claim-probe lease + yield reader in lease (FETCH_SITES, #14938); authors are \
+         filtered by TrustedAuthors (allowlist or repository write access), the Gitea stand-in \
+         for author_association",
+    ),
+    (
         "work_finder/landed_prefilter.rs",
         "writer + reader of loom:landed-route in read_route_marked; closes-graph counts MERGED PRs \
          only, which an outsider cannot produce (FETCH_SITES, #11853)",
@@ -230,6 +236,9 @@ const FETCH_SITES: &[(&str, &str, &str)] = &[
         "TrustPolicy::for_root(&forge.root)",
     ),
     ("stale_blocked/batch.rs", "parse_closing_refs", ""),
+    // #14938: Gitea claim-probe lease reader; every marker row must pass the
+    // Gitea trusted-author check before it can block a claim.
+    ("gitea_builder.rs", "lease", "trust.contains("),
 ];
 
 /// Production code of a source file: inline test modules cut off, comment

@@ -346,12 +346,12 @@ pub(crate) enum ForgeAction {
     /// lease (`LOOM_LEASE_TTL_MINUTES`), remote `feature/issue-N` branch.
     ///
     /// Exits `0` BLOCKED with the reason token on stdout (`OPEN_PR #X` /
-    /// `TARGET_IS_PR #N` / `CLOSED` / `FROZEN` / `OPERATOR` / `BUILDING` /
+    /// `MERGED_PR #X` / `TARGET_IS_PR #N` / `CLOSED` / `FROZEN` / `OPERATOR` / `TRIAGE` / `BUILDING` /
     /// `LEASE_ALREADY_HELD <host> <sweep-id>` /
     /// `BRANCH_EXISTS feature/issue-N`), `1` verified safe to claim, `5`
-    /// fail closed (a leg could not answer — NOT an all-clear), `3` Gitea
-    /// decline. `--force-claim` overrides the label/lease/branch legs only —
-    /// it never overrides `OPEN_PR`, `TARGET_IS_PR`, `CLOSED`, `FROZEN` or
+    /// when the probe cannot establish a verdict. GitHub and Gitea use the
+    /// same verdicts. `--force-claim` overrides the label/lease/branch legs only —
+    /// it never overrides `OPEN_PR`, `MERGED_PR`, `TARGET_IS_PR`, `CLOSED`, `FROZEN` or
     /// `OPERATOR`.
     #[command(name = "check-claim")]
     CheckClaim {

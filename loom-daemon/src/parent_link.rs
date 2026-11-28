@@ -192,6 +192,18 @@ pub fn classify_children(children: &[(u32, bool)]) -> SplitState {
     }
 }
 
+/// Consult the parent body only when a rescope marker could change an all-closed verdict.
+pub(crate) fn split_state_from_children<B: AsRef<str>>(
+    children: &[(u32, bool)],
+    parent_body: impl FnOnce() -> Result<B>,
+) -> Result<SplitState> {
+    let state = classify_children(children);
+    if matches!(state, SplitState::AllClosed(_)) && has_split_rescoped(parent_body()?.as_ref()) {
+        return Ok(SplitState::NoChildren);
+    }
+    Ok(state)
+}
+
 /// Parse `"<number> <STATE>"` lines (as emitted by the `--jq` filters below).
 fn parse_child_lines(text: &str) -> Option<Vec<(u32, bool)>> {
     let mut out = Vec::new();
@@ -303,17 +315,10 @@ fn split_state_with_gh(gh: &Path, root: &Path, slug: &str, parent: u32) -> Resul
         Some(_) => anyhow::bail!("could not search marker children of #{parent}"),
     };
     all.extend(rows.into_iter().filter(|&(n, _)| n != parent));
-    let state = classify_children(&all);
-    // Only an all-closed verdict can be flipped by the marker, so only then
-    // is the body read (and its failure fatal).
-    if matches!(state, SplitState::AllClosed(_)) {
-        let body = fetch_parent_body_with_gh(gh, root, slug, parent)
-            .ok_or_else(|| anyhow::anyhow!("could not read the body of #{parent}"))?;
-        if has_split_rescoped(&body) {
-            return Ok(SplitState::NoChildren);
-        }
-    }
-    Ok(state)
+    split_state_from_children(&all, || {
+        fetch_parent_body_with_gh(gh, root, slug, parent)
+            .ok_or_else(|| anyhow::anyhow!("could not read the body of #{parent}"))
+    })
 }
 
 #[derive(serde::Deserialize)]
