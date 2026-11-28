@@ -180,6 +180,15 @@
 //! are reported only once they have held for [`TRANSIENT_AFTER`] passes in a
 //! row. A skipped checkout whose missing commits change an installed Loom
 //! file is reported at ERROR.
+//!
+//! A fast-forward the pass performs is also one `checkout.fast_forward`
+//! record (#15729): the checkout, the full commit before and after, and the
+//! time git wrote the reflog entry, so the pass's own move can be found in
+//! the store beside the external ones `checkout.external_change` reports.
+//! The reads it needs are local, best-effort and made only around a merge,
+//! and a merge whose entry cannot be found moves the checkout just the same.
+//! The startup pass runs before the OTLP exporter starts, so a record made
+//! there is held in [`Memory`] and emitted by the first pass that exports.
 
 pub(crate) mod external_change;
 mod freshness;
@@ -196,6 +205,7 @@ use chrono::{DateTime, SecondsFormat, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::telemetry::kinds::checkout_external_change::CheckoutExternalChangeRecord;
+use crate::telemetry::kinds::checkout_fast_forward::CheckoutFastForwardRecord;
 
 #[cfg(test)]
 pub(in crate::fleet_sync) use host::note_remote_head_at;
@@ -224,6 +234,10 @@ pub const UNREACHABLE_STOP: u32 = 3;
 
 /// Passes in a row a transient state must hold before it is reported.
 pub const TRANSIENT_AFTER: u32 = 3;
+
+/// How many fast-forward records wait for an exporter at most (#15729). A
+/// host that never gets one keeps only the newest.
+const HELD_FAST_FORWARDS: usize = 64;
 
 // ============================================================================
 // What a pass reports
@@ -470,9 +484,23 @@ pub struct Memory {
     /// starve the workspaces at the end of the list.
     cursor: usize,
     escalated: self_heal::Ledger,
+    /// Fast-forward records no exporter could take when the pass made the
+    /// move (#15729): the startup pass runs before the OTLP exporter starts,
+    /// and a daemon that has just rolled moves its checkouts there. Emitted
+    /// by the first pass that exports. In memory only.
+    held: Vec<CheckoutFastForwardRecord>,
 }
 
 impl Memory {
+    /// Keep a fast-forward record for the first pass that exports, dropping
+    /// the oldest past [`HELD_FAST_FORWARDS`].
+    fn hold_fast_forward(&mut self, record: CheckoutFastForwardRecord) {
+        self.held.push(record);
+        if self.held.len() > HELD_FAST_FORWARDS {
+            self.held.remove(0);
+        }
+    }
+
     /// Record what this pass found for `root`, and push the transition it
     /// amounts to, if any.
     fn record(
@@ -687,6 +715,10 @@ struct Net {
     /// The remote head the checkout being attempted was compared with (#12509),
     /// for its `checkout.freshness` record. Reset before each attempt.
     last_head: Option<String>,
+    /// The reflog entry the attempt's own merge added (#15729), for its
+    /// `checkout.fast_forward` record: `None` when it moved nothing or the
+    /// entry could not be found. Reset before each attempt.
+    fast_forward: Option<external_change::Entry>,
     repairs: Vec<self_heal::Repair>,
     /// The self-heal's reasons for declining, one per declined checkout
     /// (#14059): copied into the pass result by [`run`].
@@ -700,6 +732,13 @@ pub fn run(env: &Env<'_>, roots: &[PathBuf], memory: &mut Memory) -> CheckoutPas
     memory.reflogs.retain(|root, _| roots.contains(root));
     let mut net = Net::default();
     let exporting = crate::observability::ops::records_exported();
+    // A move made before anything could export it goes out now. That is the
+    // startup pass's case: it runs before the OTLP exporter does.
+    if exporting {
+        for record in memory.held.drain(..) {
+            external_change::publish_fast_forward(&record);
+        }
+    }
     let start = memory.cursor % roots.len().max(1);
     let mut reached = 0;
     for root in roots.iter().cycle().skip(start).take(roots.len()) {
@@ -707,12 +746,28 @@ pub fn run(env: &Env<'_>, roots: &[PathBuf], memory: &mut Memory) -> CheckoutPas
             break;
         }
         net.last_head = None;
+        net.fast_forward = None;
         let low_before = net.low_disk;
         let found = attempt(env, root, &mut net);
         let now = (env.clock)();
+        let fast_forward = net.fast_forward.take();
         let report = memory.record(root, found, now, &mut pass.transitions);
         self_heal::after(env, memory, &mut net, &report, &mut pass.transitions);
         watch_reflog(root, report.branch.as_deref(), now, memory, &mut pass);
+        if let (Some(entry), Some(branch)) = (fast_forward, report.branch.as_deref()) {
+            let record = external_change::fast_forward_record(
+                root,
+                &external_change::host(),
+                now,
+                branch,
+                &entry,
+            );
+            if exporting {
+                external_change::publish_fast_forward(&record);
+            } else {
+                memory.hold_fast_forward(record);
+            }
+        }
         if exporting {
             let branch = report.branch.as_deref();
             let head = net
@@ -993,6 +1048,9 @@ fn attempt(env: &Env<'_>, root: &Path, net: &mut Net) -> Decided {
         }
     }
     let old = found.head.clone().unwrap_or_else(|| "unknown".to_string());
+    // The HEAD reflog as it stands, to find this attempt's own entry after the
+    // merge (#15729).
+    let before = external_change::before_merge(root);
     let mut attempt = git::fast_forward(root, &branch);
     // #13580: a file in the way that is byte-identical to what the merge would
     // write holds nothing. Remove it and retry once; any doubt keeps the hold.
@@ -1006,6 +1064,9 @@ fn attempt(env: &Env<'_>, root: &Path, net: &mut Net) -> Decided {
     match attempt {
         Ok(()) => {
             found.head = git::head(root, local());
+            if let Some(before) = before {
+                net.fast_forward = external_change::fast_forwarded(root, &before);
+            }
             let new = found.head.clone().unwrap_or_else(|| "unknown".to_string());
             found.behind = Some(0);
             found.installed_files_behind = false;

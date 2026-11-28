@@ -45,6 +45,9 @@ pub const KIND_SILENCE: &[(&str, Option<i64>)] = &[
     ("pass.verdict", None),
     ("token_ranking.refresh", None),
     ("checkout.external_change", None),
+    // Only when a default branch actually advances (#15729): a host whose
+    // repos are quiet legitimately emits none.
+    ("checkout.fast_forward", None),
     ("roster.change", None),
     ("issue.estimate", None),
     ("stage.work_started", None),

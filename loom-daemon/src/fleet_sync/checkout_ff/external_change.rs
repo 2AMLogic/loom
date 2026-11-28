@@ -30,6 +30,19 @@
 //! The discarded commits are the ones reachable from the old tip and from no
 //! ref now (`git rev-list <from> --not --all`), counted at the time the pass
 //! reads the entry.
+//!
+//! # The pass's own move
+//!
+//! The pass's `merge --ff-only` is the one Loom write that moves a managed
+//! checkout forward, and until #15729 nothing in the store said so: its entry
+//! is `loom:`-tagged, so it is never an external change, and
+//! `checkout.freshness` shows only where HEAD was per pass. A merge that
+//! succeeds is followed by a lookup of the `loom:ff` entry the attempt added
+//! to `logs/HEAD` ([`fast_forwarded`]) and one `checkout.fast_forward` record
+//! for it, stamped at the entry's time. The lookup is bounded to the lines the
+//! attempt added and to the commit the merge began from, so a stale entry, an
+//! external move or a merge git had nothing to do cannot claim credit. A
+//! reflog that cannot be read emits nothing.
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -43,8 +56,9 @@ use sha2::{Digest, Sha256};
 use crate::cmd_out::{run_command, CmdOutcome};
 use crate::telemetry::kinds::checkout_external_change::{
     is_loom_reflog_message, loom_reflog_action, CheckoutExternalChangeRecord, DiscardedCommits,
-    MAX_DISCARDED_SUBJECTS,
+    MAX_DISCARDED_SUBJECTS, REFLOG_ACTION_SEPARATOR,
 };
+use crate::telemetry::kinds::checkout_fast_forward::CheckoutFastForwardRecord;
 use crate::telemetry::provenance::Provenance;
 use crate::telemetry::{RepoVisibility, TelemetryRecord};
 
@@ -53,6 +67,11 @@ const TIMEOUT: Duration = Duration::from_secs(15);
 
 /// How many citations per root the hold-clear path can name.
 const KEEP_CITED: usize = 8;
+
+/// The operation the pass's own merge runs under
+/// ([`crate::fleet_sync::checkout_ff::git`]): the reflog entry it writes is
+/// the one [`fast_forwarded`] looks for.
+pub(super) const FF_OP: &str = "ff";
 
 /// The value of `GIT_REFLOG_ACTION` for a Loom git operation `op`.
 #[must_use]
@@ -345,6 +364,109 @@ pub(super) fn records(ctx: &Context<'_>, scan: Scan) -> Vec<CheckoutExternalChan
             loom: Provenance::current(),
         })
         .collect()
+}
+
+// ============================================================================
+// The pass's own fast-forward (#15729)
+// ============================================================================
+
+/// Whether `entry` is the one the pass's merge writes: Loom's [`FF_OP`] tag,
+/// on a ref that moved.
+fn is_own_fast_forward(entry: &Entry) -> bool {
+    entry.from != entry.to
+        && entry
+            .message
+            .strip_prefix(&tag(FF_OP))
+            .is_some_and(|rest| rest.starts_with(REFLOG_ACTION_SEPARATOR))
+}
+
+/// The text of `logs/HEAD` in `root`; `None` when it cannot be read.
+fn head_log(root: &Path) -> Option<String> {
+    read_logs(root, None)
+        .into_iter()
+        .next()
+        .map(|(_, text)| text)
+}
+
+/// The HEAD reflog as it stood immediately before the pass's merge, and the
+/// commit HEAD was at then.
+#[derive(Debug)]
+pub(super) struct Before {
+    mark: Mark,
+    head: String,
+}
+
+/// Read [`Before`] in `root`. The reflog is read first and HEAD after, so a
+/// move that lands between the two is a line after the mark and not a stale
+/// `head`. `None` when either cannot be read: the move then emits no record,
+/// and nothing else changes.
+pub(super) fn before_merge(root: &Path) -> Option<Before> {
+    let text = head_log(root)?;
+    let head = git(root, &["rev-parse", "--verify", "HEAD"])?;
+    let is_sha = |s: &str| s.len() >= 40 && s.bytes().all(|b| b.is_ascii_hexdigit());
+    is_sha(&head).then(|| {
+        let lines: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
+        Before {
+            mark: Mark::of(&lines),
+            head,
+        }
+    })
+}
+
+/// The entry the pass's merge added to `root`'s HEAD reflog since `before`
+/// was read: the one Loom `ff` entry that starts at the commit the merge
+/// began from.
+///
+/// `None` when the reflog cannot be read or no longer extends what was read
+/// before the merge; when git wrote no such entry, because the checkout was
+/// already at the tip and the merge had nothing to move; or when more than
+/// one could be the pass's, as when another Loom pass moved the same checkout
+/// meanwhile. Which entry is the pass's is then not known, and unknown is not
+/// a fact.
+pub(super) fn fast_forwarded(root: &Path, before: &Before) -> Option<Entry> {
+    let text = head_log(root)?;
+    let (added, _) = since(&text, Some(&before.mark));
+    let mut own = added?
+        .into_iter()
+        .filter_map(parse_line)
+        .filter(|entry| is_own_fast_forward(entry) && entry.from == before.head);
+    let entry = own.next()?;
+    own.next().is_none().then_some(entry)
+}
+
+/// The `checkout.fast_forward` record for the move `entry` describes.
+pub(super) fn fast_forward_record(
+    root: &Path,
+    host: &str,
+    now: DateTime<Utc>,
+    branch: &str,
+    entry: &Entry,
+) -> CheckoutFastForwardRecord {
+    CheckoutFastForwardRecord {
+        change_id: change_id(root, entry),
+        repo: repo_slug(root),
+        visibility: RepoVisibility::Private,
+        root: root.display().to_string(),
+        host: host.to_string(),
+        ref_name: format!("refs/heads/{branch}"),
+        from_sha: entry.from.clone(),
+        to_sha: entry.to.clone(),
+        at: entry.at,
+        observed_at: now,
+        loom: Provenance::current(),
+    }
+}
+
+/// Emit one `checkout.fast_forward` record. Best-effort: a record without
+/// valid provenance is dropped, and nothing about the move depends on it.
+pub(super) fn publish_fast_forward(record: &CheckoutFastForwardRecord) {
+    if record.has_provenance() {
+        crate::observability::ops::emit_record(TelemetryRecord::CheckoutFastForward(
+            record.clone(),
+        ));
+    } else {
+        log::warn!("checkout_ff: dropped checkout.fast_forward record: invalid provenance");
+    }
 }
 
 // ============================================================================

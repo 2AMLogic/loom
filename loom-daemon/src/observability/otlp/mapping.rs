@@ -6,6 +6,7 @@ mod alert_transition;
 mod auto_update;
 mod champion_run;
 mod checkout_external_change;
+mod checkout_fast_forward;
 mod checkout_freshness;
 mod ci;
 mod completion_narrated;
@@ -658,6 +659,7 @@ fn log_record_for(envelope: &TelemetryEnvelope) -> Option<LogRecord> {
         | TelemetryRecord::TokenRankingRefresh(_)
         | TelemetryRecord::HostExport(_)
         | TelemetryRecord::CheckoutExternalChange(_)
+        | TelemetryRecord::CheckoutFastForward(_)
         | TelemetryRecord::RosterChange(_)
         | TelemetryRecord::PassVerdict(_)
         | TelemetryRecord::PickDecision(_)
@@ -680,6 +682,7 @@ fn log_record_for(envelope: &TelemetryEnvelope) -> Option<LogRecord> {
                 .or_else(|| token_ranking::log_parts(r))
                 .or_else(|| host_export::log_parts(r))
                 .or_else(|| checkout_external_change::log_parts(r))
+                .or_else(|| checkout_fast_forward::log_parts(r))
                 .or_else(|| roster_change::log_parts(r))
                 .or_else(|| pass::log_parts(r))
                 .or_else(|| pick_decision::log_parts(r))

@@ -1,6 +1,8 @@
-//! Tests for out-of-band checkout changes (#11566). Real git in temp dirs; the
+//! Tests for out-of-band checkout changes (#11566), and for the record the
+//! pass emits for its own fast-forward (#15729). Real git in temp dirs; the
 //! 2am reflog is a faithful synthetic fixture (see `FIXTURE`).
 
+use std::cell::Cell;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -9,8 +11,12 @@ use std::time::Duration;
 use chrono::{TimeZone, Utc};
 use tempfile::TempDir;
 
-use super::super::{watch_reflog, CheckoutPass, Env, Memory, MoveHold};
+use super::super::{watch_reflog, CheckoutPass, CheckoutState, Env, Memory, MoveHold};
 use super::*;
+use crate::observability::ops::capture::{capture, without_global_sink, Captured};
+use crate::telemetry::kinds::checkout_fast_forward::CheckoutFastForwardRecord;
+use crate::telemetry::provenance::Provenance;
+use crate::telemetry::TelemetryRecord;
 use crate::test_git_helpers::run as git;
 use crate::workspace_hold::{HeldCopy, HoldKind, WorkspaceHold};
 
@@ -235,6 +241,350 @@ fn loom_own_fast_forward_emits_nothing_and_logs_the_loom_tag() {
     // The same checkout, reset by hand afterwards, is reported.
     git(&host, &["reset", "--quiet", "--hard", "HEAD~1"]);
     assert_eq!(watch(&host, &mut memory).external_changes.len(), 1);
+}
+
+// ------------------------------------------------ the pass's own fast-forward
+
+/// A host clone one commit behind its origin, which it has already fetched.
+fn behind() -> (TempDir, PathBuf, PathBuf) {
+    let (tmp, host, seed) = with_origin();
+    git(&host, &["fetch", "--quiet", "origin"]);
+    (tmp, host, seed)
+}
+
+/// One pass over `root` on a host with `fleet.autoApply` on and no network,
+/// so the checkout is compared with the clone's own `origin/main`.
+fn apply_pass(
+    root: &PathBuf,
+    memory: &mut Memory,
+    held: &dyn Fn() -> Option<&'static str>,
+) -> CheckoutPass {
+    let env = Env {
+        write: true,
+        held,
+        gate_in_flight: &|_| false,
+        hold: &|_| Some(MoveHold::free()),
+        network: false,
+        backing_off: &|_| false,
+        confirmed: &|_, _| None,
+        breaker_open: &|| false,
+        budget: None,
+        elapsed: &|| Duration::ZERO,
+        clock: &Utc::now,
+        pr_head: &|_, _| None,
+    };
+    super::super::run(&env, std::slice::from_ref(root), memory)
+}
+
+fn fast_forwards(captured: &Captured) -> Vec<CheckoutFastForwardRecord> {
+    captured
+        .records
+        .iter()
+        .filter_map(|r| match r {
+            TelemetryRecord::CheckoutFastForward(f) => Some(f.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// The last line of `root`'s HEAD reflog, split by hand rather than with the
+/// parser under test: the commit before, the commit after, when git wrote it
+/// (epoch seconds), and its message.
+fn last_reflog_line(root: &Path) -> (String, String, i64, String) {
+    let log = fs::read_to_string(root.join(".git/logs/HEAD")).unwrap();
+    let line = log.lines().last().unwrap();
+    let (head, message) = line.split_once('\t').unwrap();
+    let words: Vec<&str> = head.split_whitespace().collect();
+    (
+        words[0].to_string(),
+        words[1].to_string(),
+        words[words.len() - 2].parse().unwrap(),
+        message.trim().to_string(),
+    )
+}
+
+fn own_tag() -> String {
+    format!("{}:", tag(FF_OP))
+}
+
+#[test]
+fn a_fast_forward_on_the_first_pass_emits_one_record_that_matches_the_reflog() {
+    let (_t, host, _seed) = behind();
+    let old = git(&host, &["rev-parse", "HEAD"]);
+    let tip = git(&host, &["rev-parse", "refs/remotes/origin/main"]);
+    // A GitHub-shaped origin with a credential the record must not carry. The
+    // pass has no network, so it is never asked.
+    git(
+        &host,
+        &[
+            "remote",
+            "set-url",
+            "origin",
+            "https://user:ghp_FAKE@github.com/o/r.git",
+        ],
+    );
+
+    let mut memory = Memory::default();
+    let began = Utc::now();
+    let (pass, captured) = capture(|| apply_pass(&host, &mut memory, &|| None));
+    let ended = Utc::now();
+    assert_eq!(pass.checkouts[0].state, CheckoutState::FastForwarded, "{pass:?}");
+    assert_eq!(git(&host, &["rev-parse", "HEAD"]), tip, "the checkout moved");
+    let records = fast_forwards(&captured);
+    assert_eq!(records.len(), 1, "{records:?}");
+    let r = &records[0];
+    let (from, to, epoch, message) = last_reflog_line(&host);
+    assert_eq!((from.as_str(), to.as_str()), (old.as_str(), tip.as_str()));
+    assert_eq!(
+        (r.from_sha.as_str(), r.to_sha.as_str()),
+        (from.as_str(), to.as_str()),
+        "the full shas are the reflog entry's"
+    );
+    assert_eq!(r.at.timestamp(), epoch, "the record time is the reflog entry's");
+    assert!(began <= r.observed_at && r.observed_at <= ended, "{}", r.observed_at);
+    assert!(message.starts_with(&own_tag()), "{message}");
+    assert_eq!(r.root, host.display().to_string());
+    assert!(!r.host.is_empty());
+    assert_eq!(r.repo.as_deref(), Some("o/r"));
+    assert_eq!(r.ref_name, "refs/heads/main");
+    assert!(r.has_provenance());
+    let json = serde_json::to_string(r).unwrap();
+    for leak in ["ghp_", "user:", "https://"] {
+        assert!(!json.contains(leak), "{leak} in {json}");
+    }
+    let back: CheckoutFastForwardRecord = serde_json::from_str(&json).unwrap();
+    assert_eq!(back, *r);
+
+    // The same tip on a later pass: nothing moved, so nothing is said.
+    let (_, again) = capture(|| apply_pass(&host, &mut memory, &|| None));
+    assert!(fast_forwards(&again).is_empty(), "{:?}", again.records);
+
+    // Reset by hand afterwards: the next pass reports the reset as the
+    // external change it always was, and its own repair as a fast-forward.
+    git(&host, &["reset", "--quiet", "--hard", "HEAD~1"]);
+    let (pass, after) = capture(|| apply_pass(&host, &mut memory, &|| None));
+    assert_eq!(pass.external_changes.len(), 1, "{:?}", pass.external_changes);
+    assert_eq!(pass.external_changes[0].move_kind, "reset");
+    let repair = fast_forwards(&after);
+    assert_eq!(repair.len(), 1, "{repair:?}");
+    assert_eq!(
+        (repair[0].from_sha.as_str(), repair[0].to_sha.as_str()),
+        (old.as_str(), tip.as_str())
+    );
+}
+
+#[test]
+fn a_fast_forward_that_needs_the_collision_retry_emits_one_record() {
+    let (_t, host, _seed) = behind();
+    let old = git(&host, &["rev-parse", "HEAD"]);
+    // Untracked, in the way of the incoming commit and byte-identical to what
+    // it writes (#13580): the first merge refuses, and the retry moves.
+    fs::write(host.join("second"), "second").unwrap();
+    let mut memory = Memory::default();
+    let (pass, captured) = capture(|| apply_pass(&host, &mut memory, &|| None));
+    let report = &pass.checkouts[0];
+    assert_eq!(report.state, CheckoutState::FastForwarded, "{report:?}");
+    let detail = report.detail.as_deref().unwrap();
+    assert!(
+        detail.contains("removed untracked files identical to origin: second"),
+        "{detail}"
+    );
+    let records = fast_forwards(&captured);
+    assert_eq!(records.len(), 1, "{records:?}");
+    let (from, to, epoch, _) = last_reflog_line(&host);
+    assert_eq!(from, old, "one merge moved it: the refused one wrote no entry");
+    assert_eq!(
+        (
+            records[0].from_sha.as_str(),
+            records[0].to_sha.as_str(),
+            records[0].at.timestamp()
+        ),
+        (from.as_str(), to.as_str(), epoch)
+    );
+}
+
+#[test]
+fn a_checkout_the_pass_did_not_move_emits_no_fast_forward_record() {
+    // Already at the tip, because anything else pulled it there.
+    let (_t, host, _seed) = behind();
+    let tip = git(&host, &["rev-parse", "refs/remotes/origin/main"]);
+    git(&host, &["pull", "--quiet", "--ff-only", "origin", "main"]);
+    let (_, pulled) = capture(|| apply_pass(&host, &mut Memory::default(), &|| None));
+    assert!(fast_forwards(&pulled).is_empty(), "{:?}", pulled.records);
+    assert_eq!(git(&host, &["rev-parse", "HEAD"]), tip);
+
+    // Behind and clean, but held.
+    let (_t, host, _seed) = behind();
+    let old = git(&host, &["rev-parse", "HEAD"]);
+    let (held_pass, held) =
+        capture(|| apply_pass(&host, &mut Memory::default(), &|| Some("roll pending")));
+    assert_eq!(held_pass.checkouts[0].state, CheckoutState::Behind, "{held_pass:?}");
+    assert!(fast_forwards(&held).is_empty(), "{:?}", held.records);
+    assert_eq!(git(&host, &["rev-parse", "HEAD"]), old, "nothing written");
+
+    // A merge refused by a local file of its own.
+    let (_t, host, _seed) = behind();
+    fs::write(host.join("second"), "second, but mine").unwrap();
+    let (refused, refused_records) =
+        capture(|| apply_pass(&host, &mut Memory::default(), &|| None));
+    assert_eq!(refused.checkouts[0].state, CheckoutState::WouldOverwrite, "{refused:?}");
+    assert!(fast_forwards(&refused_records).is_empty(), "{:?}", refused_records.records);
+    assert_eq!(fs::read_to_string(host.join("second")).unwrap(), "second, but mine");
+}
+
+#[test]
+fn a_merge_git_had_nothing_left_to_do_emits_nothing() {
+    let (_t, host, _seed) = behind();
+    let tip = git(&host, &["rev-parse", "refs/remotes/origin/main"]);
+    // Someone else pulls between the pass's checks and its write. `held` is
+    // asked right before the write, so that is when the pull lands.
+    let asks = Cell::new(0);
+    let held = || -> Option<&'static str> {
+        asks.set(asks.get() + 1);
+        git(&host, &["merge", "--quiet", "--ff-only", "refs/remotes/origin/main"]);
+        None
+    };
+    let (pass, captured) = capture(|| apply_pass(&host, &mut Memory::default(), &held));
+    assert_eq!(asks.get(), 1);
+    // git's `Already up to date` is exit 0, so the pass still says it moved.
+    assert_eq!(pass.checkouts[0].state, CheckoutState::FastForwarded, "{pass:?}");
+    assert_eq!(git(&host, &["rev-parse", "HEAD"]), tip);
+    assert!(fast_forwards(&captured).is_empty(), "{:?}", captured.records);
+    assert!(
+        !last_reflog_line(&host).3.starts_with(&own_tag()),
+        "the pull's entry is not Loom's"
+    );
+}
+
+// ------------------------------------------- which entry is the pass's own
+
+#[test]
+fn a_move_before_any_exporter_exists_is_held_until_one_does() {
+    let (_t, host, _seed) = behind();
+    let old = git(&host, &["rev-parse", "HEAD"]);
+    let tip = git(&host, &["rev-parse", "refs/remotes/origin/main"]);
+    let mut memory = Memory::default();
+    // As at startup, where the pass runs before the OTLP exporter does: the
+    // move is made and goes nowhere yet.
+    let pass = without_global_sink(|| apply_pass(&host, &mut memory, &|| None));
+    assert_eq!(pass.checkouts[0].state, CheckoutState::FastForwarded, "{pass:?}");
+    assert_eq!(git(&host, &["rev-parse", "HEAD"]), tip);
+    let (from, to, epoch, _) = last_reflog_line(&host);
+    assert_eq!((from.as_str(), to.as_str()), (old.as_str(), tip.as_str()));
+
+    // The first pass that exports emits it, though the checkout stands still.
+    let (_, captured) = capture(|| apply_pass(&host, &mut memory, &|| None));
+    let records = fast_forwards(&captured);
+    assert_eq!(records.len(), 1, "{records:?}");
+    assert_eq!(
+        (
+            records[0].from_sha.as_str(),
+            records[0].to_sha.as_str(),
+            records[0].at.timestamp()
+        ),
+        (from.as_str(), to.as_str(), epoch)
+    );
+
+    // And then it is said no more.
+    let (_, again) = capture(|| apply_pass(&host, &mut memory, &|| None));
+    assert!(fast_forwards(&again).is_empty(), "{:?}", again.records);
+}
+
+#[test]
+fn the_hold_keeps_the_newest_records_and_empties_on_the_first_exporting_pass() {
+    let sample = |n: usize| CheckoutFastForwardRecord {
+        change_id: n.to_string(),
+        repo: None,
+        visibility: Default::default(),
+        root: String::new(),
+        host: String::new(),
+        ref_name: String::new(),
+        from_sha: String::new(),
+        to_sha: String::new(),
+        at: Utc::now(),
+        observed_at: Utc::now(),
+        loom: Provenance::current(),
+    };
+    let mut memory = Memory::default();
+    for n in 0..65 {
+        memory.hold_fast_forward(sample(n));
+    }
+    let ids: Vec<&str> = memory.held.iter().map(|r| r.change_id.as_str()).collect();
+    assert_eq!((ids.len(), ids[0], ids[63]), (64, "1", "64"), "the oldest is dropped");
+
+    let (_t, dir) = repo();
+    let (_, captured) = capture(|| apply_pass(&dir, &mut memory, &|| None));
+    assert!(memory.held.is_empty());
+    assert_eq!(fast_forwards(&captured).len(), 64);
+}
+
+#[test]
+fn an_external_pull_after_the_mark_is_not_the_pass_s_fast_forward() {
+    let (_t, host, _seed) = behind();
+    let before = before_merge(&host).unwrap();
+    // From the very commit, to the very tip: but not Loom's.
+    git(&host, &["pull", "--quiet", "--ff-only", "origin", "main"]);
+    assert_eq!(fast_forwarded(&host, &before), None);
+}
+
+#[test]
+fn a_stale_tagged_line_is_not_the_merge_and_the_merge_is_found_after_an_external_one() {
+    let (_t, host, seed) = behind();
+    // An earlier pass's tagged entry, then behind again.
+    super::super::git::fast_forward(&host, "main").unwrap();
+    commit(&seed, "third");
+    git(&seed, &["push", "--quiet", "origin", "HEAD:main"]);
+    git(&host, &["fetch", "--quiet", "origin"]);
+    assert!(
+        last_reflog_line(&host).3.starts_with(&own_tag()),
+        "the last line of the log is a tagged entry"
+    );
+
+    // Nothing has been added since the mark: that stale line is no merge's.
+    let before = before_merge(&host).unwrap();
+    assert_eq!(fast_forwarded(&host, &before), None);
+
+    // An external entry lands after the mark, and moves nothing.
+    git(&host, &["reset", "--quiet", "--hard", "HEAD"]);
+    assert_eq!(fast_forwarded(&host, &before), None);
+
+    // Then the pass's own merge, after that external entry: found by where it
+    // started, and by being the one tagged line the attempt added.
+    let start = git(&host, &["rev-parse", "HEAD"]);
+    let tip = git(&host, &["rev-parse", "refs/remotes/origin/main"]);
+    super::super::git::fast_forward(&host, "main").unwrap();
+    let (from, to, epoch, _) = last_reflog_line(&host);
+    assert_eq!((from.as_str(), to.as_str()), (start.as_str(), tip.as_str()));
+    let entry = fast_forwarded(&host, &before).unwrap();
+    assert_eq!(
+        (entry.from.as_str(), entry.to.as_str(), entry.at.timestamp()),
+        (from.as_str(), to.as_str(), epoch)
+    );
+}
+
+#[test]
+fn two_tagged_moves_from_the_same_commit_are_attributed_to_neither() {
+    let (_t, host, _seed) = behind();
+    let before = before_merge(&host).unwrap();
+    let back = || git(&host, &["reset", "--quiet", "--hard", "HEAD~1"]);
+    for _ in 0..2 {
+        super::super::git::fast_forward(&host, "main").unwrap();
+        back();
+    }
+    super::super::git::fast_forward(&host, "main").unwrap();
+    assert_eq!(fast_forwarded(&host, &before), None);
+}
+
+#[test]
+fn a_reflog_that_cannot_be_read_is_unknown_not_a_fact() {
+    let (_t, host, _seed) = behind();
+    let before = before_merge(&host).unwrap();
+    super::super::git::fast_forward(&host, "main").unwrap();
+    // The entry was written; the log is gone by the time of the lookup.
+    fs::remove_file(host.join(".git/logs/HEAD")).unwrap();
+    assert_eq!(fast_forwarded(&host, &before), None);
+    let nowhere = host.parent().unwrap().join("nowhere");
+    assert!(before_merge(&nowhere).is_none());
 }
 
 /// `land-resync-commit.sh`, the one installed script that moves the default
