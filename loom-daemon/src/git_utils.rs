@@ -306,6 +306,38 @@ mod tests {
 
     #[test]
     #[parallel(loom_config_env)]
+    fn diff_rows_against_mainline_reports_the_post_image_path_of_a_rename() {
+        let dir = tempfile::tempdir().unwrap();
+        git(dir.path(), &["init", "-q", "--initial-branch=main"]);
+        // The production call runs a plain `git diff`, which reads the host
+        // config: pin rename detection so the row cannot turn into a
+        // delete/add pair on a host that disabled it.
+        git(dir.path(), &["config", "diff.renames", "true"]);
+        std::fs::create_dir_all(dir.path().join("src/loom_ui_alerts")).unwrap();
+        std::fs::write(dir.path().join("src/loom_ui_alerts/ledger.rs"), "pub fn ledger() {}\n")
+            .unwrap();
+        git(dir.path(), &["add", "-A"]);
+        git(dir.path(), &["commit", "-q", "-m", "seed"]);
+        git(dir.path(), &["checkout", "-q", "-b", "feature"]);
+        std::fs::create_dir_all(dir.path().join("src/alerts")).unwrap();
+        git(dir.path(), &["mv", "src/loom_ui_alerts/ledger.rs", "src/alerts/ledger.rs"]);
+        git(dir.path(), &["commit", "-q", "-m", "move the ledger"]);
+        // Under `-z` git frames the pure rename as
+        // `0\t0\t\0src/loom_ui_alerts/ledger.rs\0src/alerts/ledger.rs\0`.
+        let rows =
+            diff_rows_against_mainline(dir.path()).expect("bare `main` fallback must resolve");
+        assert_eq!(
+            rows,
+            vec![GitDiffRow {
+                added: 0,
+                deleted: 0,
+                path: "src/alerts/ledger.rs".to_string(),
+            }]
+        );
+    }
+
+    #[test]
+    #[parallel(loom_config_env)]
     fn diff_stat_since_merge_base_counts_added_and_removed_lines() {
         let dir = feature_branch_repo();
         let stats = diff_stat_since_merge_base(dir.path(), "main")
