@@ -18,6 +18,19 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 ### 2026-11-28
 
+- **PR #15720**: test: use test_git_helpers for worktree_cli test git calls
+- **PR #15712**: test: isolate cross-host lease tests from ambient LOOM_LEASE_HOST_ID
+- **PR #15706**: docs: fix inverted lock-acquisition comment in lock_order_tests
+- **PR #15694**: test: isolate git config in test_git_helpers, retire 21 git helpers
+- **Issue #15727** (closed): config-resolver.sh: a defaults tier over 128 KiB makes every config merge fail with "jq: Argument list too long" (create-issue.sh exit 126)
+- **Issue #15722** (closed): config-resolver.sh passes a 208 KB defaults tier to jq as one argument: "Argument list too long", exit 126 from create-issue.sh and create-pr.sh
+- **Issue #15717** (closed): config-resolver passes each config tier as one jq argument: a defaults.json over 128 KiB fails with E2BIG and create-pr.sh exits 126 after the push
+- **Issue #15716** (closed): config-resolver.sh passes each config tier as one jq --argjson argument: dies with 'Argument list too long' once defaults.json exceeds 128 KiB
+- **Issue #15703** (closed): Delegate hand-rolled test git calls to test_git_helpers: worktree_cli (2/2)
+- **Issue #15700** (closed): config-resolver.sh: a config tier over 128 KiB fails jq --argjson with E2BIG (exit 126)
+- **Issue #15693** (closed): lease_cross_host_tests fail on a host that exports LOOM_LEASE_HOST_ID
+- **Issue #15691** (closed): lock_order_tests: a_multi_key_attribute_is_judged_on_its_sorted_keys comment inverts the acquisition direction it tests
+- **Issue #15687** (closed): Harden test_git_helpers::git_out with git-config isolation and consolidate 21 remaining test git helpers
 - **PR #15688**: test: fix serial lock-order gate; stacked attrs take default inner
 - **PR #15689**: test: use shared git helper for raw Command blocks in clean tests
 - **PR #15686**: test: wait out ETXTBSY in the live_gh_guard self-test's fake exec
