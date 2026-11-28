@@ -536,8 +536,8 @@ fn stage_tick_env(
 /// and "what did it do?" **without touching any other file** — no
 /// `sweep-outcomes.jsonl` join, no transcript re-read by the consumer.
 #[test]
-#[serial_test::serial(opencode_db_env, codex_home_env)]
 #[serial_test::serial]
+#[serial_test::serial(opencode_db_env, codex_home_env)]
 fn a_successful_tick_writes_a_self_sufficient_journal_record() {
     let dir = tempdir().unwrap();
     let root = dir.path().join("repo");
@@ -585,8 +585,8 @@ fn a_successful_tick_writes_a_self_sufficient_journal_record() {
 /// The counterpart: a pre-spawn skip writes a record too — the skip class is
 /// the point — but must not borrow the neighbouring transcript's numbers.
 #[test]
-#[serial_test::serial(opencode_db_env, codex_home_env)]
 #[serial_test::serial]
+#[serial_test::serial(opencode_db_env, codex_home_env)]
 fn a_pool_exhausted_skip_writes_a_record_without_borrowing_tokens() {
     let dir = tempdir().unwrap();
     let root = dir.path().join("repo");
@@ -657,8 +657,8 @@ fn write_role_log(root: &Path, role: &str, body: &str) {
 }
 
 #[test]
-#[serial_test::serial(opencode_db_env, codex_home_env)]
 #[serial_test::serial]
+#[serial_test::serial(opencode_db_env, codex_home_env)]
 fn a_successful_tick_carries_runtime_provider_and_profile_from_its_own_log() {
     let dir = tempdir().unwrap();
     let root = dir.path().join("repo");
@@ -682,8 +682,8 @@ fn a_successful_tick_carries_runtime_provider_and_profile_from_its_own_log() {
 }
 
 #[test]
-#[serial_test::serial(opencode_db_env, codex_home_env)]
 #[serial_test::serial]
+#[serial_test::serial(opencode_db_env, codex_home_env)]
 fn a_tick_with_no_launch_record_leaves_runtime_provider_profile_absent() {
     let dir = tempdir().unwrap();
     let root = dir.path().join("repo");
@@ -704,8 +704,8 @@ fn a_tick_with_no_launch_record_leaves_runtime_provider_profile_absent() {
 /// PREVIOUS tick's launch record still sits in the role log — mirroring the
 /// module's own never-borrow-a-neighbour's-transcript contract for tokens.
 #[test]
-#[serial_test::serial(opencode_db_env, codex_home_env)]
 #[serial_test::serial]
+#[serial_test::serial(opencode_db_env, codex_home_env)]
 fn a_pre_spawn_skip_never_borrows_a_previous_ticks_runtime_attribution() {
     let dir = tempdir().unwrap();
     let root = dir.path().join("repo");
@@ -725,8 +725,8 @@ fn a_pre_spawn_skip_never_borrows_a_previous_ticks_runtime_attribution() {
 /// and the tick's own window — not from (in this test, absent) Claude
 /// transcripts.
 #[test]
-#[serial_test::serial(opencode_db_env, codex_home_env)]
 #[serial_test::serial]
+#[serial_test::serial(opencode_db_env, codex_home_env)]
 fn an_opencode_tick_sources_tokens_by_model_from_the_session_db() {
     let dir = tempdir().unwrap();
     let root = dir.path().join("repo");
@@ -895,8 +895,8 @@ fn a_pool_skip_record_names_the_pool_that_gated_it() {
 /// `loom-daemon logs`. Tier `0` (nothing fell through) is reported as `0`, not
 /// elided.
 #[test]
-#[serial_test::serial(opencode_db_env, codex_home_env)]
 #[serial_test::serial]
+#[serial_test::serial(opencode_db_env, codex_home_env)]
 fn a_preference_resolved_tick_records_the_chosen_tier_and_tap() {
     let dir = tempdir().unwrap();
     let root = dir.path().join("repo");
@@ -934,8 +934,8 @@ fn a_preference_resolved_tick_records_the_chosen_tier_and_tap() {
 /// skipped before resolving a launch) reports no tier at all — absent, never a
 /// fabricated `0`, which would read as "chose the most-preferred tap".
 #[test]
-#[serial_test::serial(opencode_db_env, codex_home_env)]
 #[serial_test::serial]
+#[serial_test::serial(opencode_db_env, codex_home_env)]
 fn an_unconfigured_tick_records_no_preference_tier() {
     let dir = tempdir().unwrap();
     let root = dir.path().join("repo");
@@ -961,8 +961,8 @@ fn an_unconfigured_tick_records_no_preference_tier() {
 /// pre-spawn skip included, which is the case only this export makes
 /// visible — with a non-slug repo read as `repo_unresolved`, never a path.
 #[test]
-#[serial_test::serial(opencode_db_env, codex_home_env)]
 #[serial_test::serial]
+#[serial_test::serial(opencode_db_env, codex_home_env)]
 fn a_tick_record_is_exported_without_a_local_path() {
     let dir = tempdir().unwrap();
     let root = dir.path().join("repo");
@@ -1076,8 +1076,8 @@ fn emit_one_step(
 /// the STEP'S OWN log — not the per-role log, which this test plants with a
 /// decoy launch record of the same role to prove it is never consulted.
 #[test]
-#[serial_test::serial(opencode_db_env, codex_home_env)]
 #[serial_test::serial]
+#[serial_test::serial(opencode_db_env, codex_home_env)]
 fn a_steps_record_reads_stage_and_launch_attribution_from_its_own_log() {
     let dir = tempdir().unwrap();
     let root = dir.path().join("repo");
@@ -1107,8 +1107,8 @@ fn a_steps_record_reads_stage_and_launch_attribution_from_its_own_log() {
 /// `stage = champion_merge` (the lifecycle stage a per-stage usage query
 /// splits on).
 #[test]
-#[serial_test::serial(opencode_db_env, codex_home_env)]
 #[serial_test::serial]
+#[serial_test::serial(opencode_db_env, codex_home_env)]
 fn a_champion_merge_steps_stage_is_finer_than_its_role() {
     let dir = tempdir().unwrap();
     let root = dir.path().join("repo");
@@ -1138,8 +1138,8 @@ fn a_champion_merge_steps_stage_is_finer_than_its_role() {
 /// every launch-sourced field absent — runtime, provider, profile AND
 /// `tokens_by_model` — never zeroed, never guessed.
 #[test]
-#[serial_test::serial(opencode_db_env, codex_home_env)]
 #[serial_test::serial]
+#[serial_test::serial(opencode_db_env, codex_home_env)]
 fn a_step_with_an_unreadable_log_leaves_every_launch_field_absent() {
     let dir = tempdir().unwrap();
     let root = dir.path().join("repo");
@@ -1165,8 +1165,8 @@ fn a_step_with_an_unreadable_log_leaves_every_launch_field_absent() {
 /// sessions in the same workspace directory, created in the same window, of
 /// which only one is this step's.
 #[test]
-#[serial_test::serial(opencode_db_env, codex_home_env)]
 #[serial_test::serial]
+#[serial_test::serial(opencode_db_env, codex_home_env)]
 fn an_opencode_step_selects_tokens_by_the_session_ids_its_log_names() {
     let dir = tempdir().unwrap();
     let root = dir.path().join("repo");
@@ -1228,8 +1228,8 @@ fn an_opencode_step_selects_tokens_by_the_session_ids_its_log_names() {
 /// log carries (#14048) — same indistinguishable-by-directory+window shape
 /// as the OpenCode test above, against the rollout store.
 #[test]
-#[serial_test::serial(opencode_db_env, codex_home_env)]
 #[serial_test::serial]
+#[serial_test::serial(opencode_db_env, codex_home_env)]
 fn a_codex_step_selects_tokens_by_the_session_id_its_log_names() {
     let dir = tempdir().unwrap();
     let root = dir.path().join("repo");
@@ -1331,8 +1331,8 @@ fn a_codex_step_selects_tokens_by_the_session_id_its_log_names() {
 /// launch record and no native store), and the record carries its stage and
 /// resolved model beside them — the Claude row of #14048's per-runtime set.
 #[test]
-#[serial_test::serial(opencode_db_env, codex_home_env)]
 #[serial_test::serial]
+#[serial_test::serial(opencode_db_env, codex_home_env)]
 fn a_claude_step_keeps_the_transcript_scan_and_carries_its_stage() {
     let dir = tempdir().unwrap();
     let root = dir.path().join("repo");
@@ -1392,8 +1392,8 @@ fn a_claude_step_keeps_the_transcript_scan_and_carries_its_stage() {
 }
 
 #[test]
-#[serial_test::serial(opencode_db_env, codex_home_env)]
 #[serial_test::serial]
+#[serial_test::serial(opencode_db_env, codex_home_env)]
 fn opencode_step_close_preserves_launch_runtime_and_writes_newly_available_tokens() {
     use crate::telemetry::trace::journal::Journal;
     use crate::telemetry::trace::store::TraceStore;

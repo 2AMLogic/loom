@@ -306,8 +306,8 @@ fn an_unwritable_temp_dir_refuses_preparation_naming_the_cause_without_touching_
 }
 
 #[test]
-#[serial_test::serial(private_workspace_fork)]
 #[serial_test::serial]
+#[serial_test::serial(private_workspace_fork)]
 fn unpushed_and_detached_commits_survive_refused_reuse() {
     let _fork = fork_guard();
     let mut f = RepoFixture::new();
@@ -365,8 +365,8 @@ fn linked_worktree_holding(repo: &Path, worktree: &Path, branch: &str) {
 }
 
 #[test]
-#[serial_test::serial(private_workspace_fork)]
 #[serial_test::serial]
+#[serial_test::serial(private_workspace_fork)]
 fn a_clean_linked_worktree_holding_the_branch_refuses_and_names_the_cure() {
     let _fork = fork_guard();
     let mut f = RepoFixture::new();
@@ -400,8 +400,8 @@ fn a_clean_linked_worktree_holding_the_branch_refuses_and_names_the_cure() {
 }
 
 #[test]
-#[serial_test::serial(private_workspace_fork)]
 #[serial_test::serial]
+#[serial_test::serial(private_workspace_fork)]
 fn a_published_branch_held_by_a_worktree_names_the_hand_cure() {
     let _fork = fork_guard();
     let mut f = RepoFixture::new();
@@ -440,8 +440,8 @@ fn a_published_branch_held_by_a_worktree_names_the_hand_cure() {
 }
 
 #[test]
-#[serial_test::serial(private_workspace_fork)]
 #[serial_test::serial]
+#[serial_test::serial(private_workspace_fork)]
 fn unpublished_commits_in_one_clone_do_not_block_another_clone_or_branch() {
     let _fork = fork_guard();
     let mut f = RepoFixture::new();
@@ -532,8 +532,8 @@ fn two_unpublished_branches() -> (RepoFixture, PathBuf, String, String) {
 }
 
 #[test]
-#[serial_test::serial(private_workspace_fork)]
 #[serial_test::serial]
+#[serial_test::serial(private_workspace_fork)]
 fn recover_lists_unpublished_branches_and_stranded_detached_work() {
     let _fork = fork_guard();
     let (f, repo, issue3, issue4) = two_unpublished_branches();
@@ -571,8 +571,8 @@ fn recover_lists_unpublished_branches_and_stranded_detached_work() {
 }
 
 #[test]
-#[serial_test::serial(private_workspace_fork)]
 #[serial_test::serial]
+#[serial_test::serial(private_workspace_fork)]
 fn recover_publishes_scoped_branches_and_leaves_others_unpublished() {
     let _fork = fork_guard();
     let (f, repo, issue3, issue4) = two_unpublished_branches();
@@ -600,8 +600,8 @@ fn recover_publishes_scoped_branches_and_leaves_others_unpublished() {
 }
 
 #[test]
-#[serial_test::serial(private_workspace_fork)]
 #[serial_test::serial]
+#[serial_test::serial(private_workspace_fork)]
 fn recover_discard_requires_a_scope_and_only_touches_named_branches() {
     let _fork = fork_guard();
     let (f, repo, _issue3, issue4) = two_unpublished_branches();
@@ -628,8 +628,8 @@ fn recover_discard_requires_a_scope_and_only_touches_named_branches() {
 }
 
 #[test]
-#[serial_test::serial(private_workspace_fork)]
 #[serial_test::serial]
+#[serial_test::serial(private_workspace_fork)]
 fn recover_discard_moves_the_checkout_and_removes_a_holding_worktree() {
     let _fork = fork_guard();
     let f = RepoFixture::new();
@@ -690,8 +690,8 @@ fn recover_discard_moves_the_checkout_and_removes_a_holding_worktree() {
 }
 
 #[test]
-#[serial_test::serial(private_workspace_fork)]
 #[serial_test::serial]
+#[serial_test::serial(private_workspace_fork)]
 fn recover_discard_refuses_a_dirty_main_checkout_holding_the_branch() {
     let _fork = fork_guard();
     let f = RepoFixture::new();
@@ -717,8 +717,8 @@ fn recover_discard_refuses_a_dirty_main_checkout_holding_the_branch() {
 }
 
 #[test]
-#[serial_test::serial(private_workspace_fork)]
 #[serial_test::serial]
+#[serial_test::serial(private_workspace_fork)]
 fn recover_discard_resolves_the_base_before_mutating_any_holder() {
     let _fork = fork_guard();
     let (f, repo, _issue3, _issue4) = two_unpublished_branches();
@@ -757,8 +757,8 @@ fn recover_discard_resolves_the_base_before_mutating_any_holder() {
 /// recover listing: the shadowed branch keeps its true name and ahead
 /// count, and the residue refs are left exactly where they were (#15027).
 #[test]
-#[serial_test::serial(private_workspace_fork)]
 #[serial_test::serial]
+#[serial_test::serial(private_workspace_fork)]
 fn recover_lists_residue_shadowed_branches_by_their_true_names() {
     let _fork = fork_guard();
     let (f, repo, issue3, issue4) = two_unpublished_branches();
@@ -780,8 +780,8 @@ fn recover_lists_residue_shadowed_branches_by_their_true_names() {
 /// A branch literally named `heads/topic` is reported (and scoped) as
 /// `heads/topic` under `refs/topic` residue, never shortened further (#15027).
 #[test]
-#[serial_test::serial(private_workspace_fork)]
 #[serial_test::serial]
+#[serial_test::serial(private_workspace_fork)]
 fn a_literal_heads_prefixed_branch_keeps_its_name_under_residue() {
     let _fork = fork_guard();
     let f = RepoFixture::new();
@@ -812,8 +812,8 @@ fn a_literal_heads_prefixed_branch_keeps_its_name_under_residue() {
 /// A scoped `--publish` must reach the shadowed branch instead of ignoring
 /// it, and never disturb the residue refs (#15027).
 #[test]
-#[serial_test::serial(private_workspace_fork)]
 #[serial_test::serial]
+#[serial_test::serial(private_workspace_fork)]
 fn recover_publishes_a_residue_shadowed_scoped_branch() {
     let _fork = fork_guard();
     let (f, repo, issue3, _issue4) = two_unpublished_branches();
@@ -833,8 +833,8 @@ fn recover_publishes_a_residue_shadowed_scoped_branch() {
 /// checkout: the holder is found by the branch's true name, moved to the
 /// base, and the branch deleted — while the residue refs survive (#15027).
 #[test]
-#[serial_test::serial(private_workspace_fork)]
 #[serial_test::serial]
+#[serial_test::serial(private_workspace_fork)]
 fn recover_discards_a_residue_shadowed_branch_held_by_the_main_checkout() {
     let _fork = fork_guard();
     let f = RepoFixture::new();
@@ -860,8 +860,8 @@ fn recover_discards_a_residue_shadowed_branch_held_by_the_main_checkout() {
 /// is removed by its branch's true name, and a dirty one is reported under
 /// that name and still refuses the discard before any mutation (#15027).
 #[test]
-#[serial_test::serial(private_workspace_fork)]
 #[serial_test::serial]
+#[serial_test::serial(private_workspace_fork)]
 fn recover_discards_a_residue_shadowed_holder_and_reports_dirty_ones_by_true_name() {
     let _fork = fork_guard();
     let f = RepoFixture::new();
@@ -904,8 +904,8 @@ fn recover_discards_a_residue_shadowed_holder_and_reports_dirty_ones_by_true_nam
 /// `prepare` must find — and reap — a finished-PR worktree whose branch is
 /// residue-shadowed, passing the true branch name to the PR lookup (#15027).
 #[test]
-#[serial_test::serial(private_workspace_fork)]
 #[serial_test::serial]
+#[serial_test::serial(private_workspace_fork)]
 fn prepare_reaps_a_finished_pr_worktree_on_a_residue_shadowed_branch() {
     let _fork = fork_guard();
     let f = RepoFixture::new();
@@ -932,8 +932,8 @@ fn prepare_reaps_a_finished_pr_worktree_on_a_residue_shadowed_branch() {
 /// `holding_worktree` resolves a residue-shadowed holder by the branch's
 /// true name, so a preparation refusing on it names the cure (#15027).
 #[test]
-#[serial_test::serial(private_workspace_fork)]
 #[serial_test::serial]
+#[serial_test::serial(private_workspace_fork)]
 fn holding_worktree_finds_a_residue_shadowed_holder() {
     let _fork = fork_guard();
     let f = RepoFixture::new();
@@ -949,8 +949,8 @@ fn holding_worktree_finds_a_residue_shadowed_holder() {
 /// `current_branch` reads the true name of a residue-shadowed checkout and
 /// answers `None` exactly when detached (#15027).
 #[test]
-#[serial_test::serial(private_workspace_fork)]
 #[serial_test::serial]
+#[serial_test::serial(private_workspace_fork)]
 fn current_branch_reads_true_names_under_residue() {
     let _fork = fork_guard();
     let f = RepoFixture::new();
@@ -971,8 +971,8 @@ fn current_branch_reads_true_names_under_residue() {
 }
 
 #[test]
-#[serial_test::serial(private_workspace_fork)]
 #[serial_test::serial]
+#[serial_test::serial(private_workspace_fork)]
 fn recover_refuses_an_unknown_clone_identity() {
     let _fork = fork_guard();
     let (f, _repo, _issue3, _issue4) = two_unpublished_branches();
@@ -2173,8 +2173,8 @@ fn linked_worktree(f: &RepoFixture, name: &str) -> PathBuf {
 }
 
 #[test]
-#[serial_test::serial(private_workspace_fork)]
 #[serial_test::serial]
+#[serial_test::serial(private_workspace_fork)]
 fn untracked_tool_caches_do_not_refuse_preparation_but_other_dirt_does() {
     let _fork = fork_guard();
     let f = RepoFixture::new();
@@ -2198,8 +2198,8 @@ fn untracked_tool_caches_do_not_refuse_preparation_but_other_dirt_does() {
 }
 
 #[test]
-#[serial_test::serial(private_workspace_fork)]
 #[serial_test::serial]
+#[serial_test::serial(private_workspace_fork)]
 fn recover_lists_dirty_worktrees_with_counts_when_nothing_is_unpublished() {
     let _fork = fork_guard();
     let f = RepoFixture::new();
@@ -2235,8 +2235,8 @@ fn recover_lists_dirty_worktrees_with_counts_when_nothing_is_unpublished() {
 }
 
 #[test]
-#[serial_test::serial(private_workspace_fork)]
 #[serial_test::serial]
+#[serial_test::serial(private_workspace_fork)]
 fn discard_worktree_removes_only_the_named_dirty_worktree_and_keeps_its_branch() {
     let _fork = fork_guard();
     let f = RepoFixture::new();
@@ -2265,8 +2265,8 @@ fn discard_worktree_removes_only_the_named_dirty_worktree_and_keeps_its_branch()
 }
 
 #[test]
-#[serial_test::serial(private_workspace_fork)]
 #[serial_test::serial]
+#[serial_test::serial(private_workspace_fork)]
 fn discard_worktree_refuses_unpublished_commits_main_checkout_and_unknown_paths() {
     let _fork = fork_guard();
     let f = RepoFixture::new();
@@ -2538,8 +2538,8 @@ fn mixed_branch_and_worktree_discard_changes_nothing() {
 }
 
 #[test]
-#[serial_test::serial(private_workspace_fork)]
 #[serial_test::serial]
+#[serial_test::serial(private_workspace_fork)]
 fn a_dirty_worktree_in_one_clone_does_not_refuse_the_seats_other_clone() {
     let _fork = fork_guard();
     let f = RepoFixture::new();
