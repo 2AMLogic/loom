@@ -30,12 +30,10 @@ use std::collections::{BTreeSet, HashMap};
 use std::future::Future;
 use std::path::PathBuf;
 use std::pin::Pin;
-use std::sync::{Arc, OnceLock};
 
 use chrono::{DateTime, Utc};
 
 use super::collector::run_owned_blocking;
-use super::queue::{DurableQueue, FanoutQueue, QueueSink};
 use super::queue_blocked::{snapshot_rows, Rows};
 use crate::forge_etag_store::{host_scope, Target};
 use crate::forge_listing::RestIssue;
@@ -43,50 +41,11 @@ use crate::telemetry::kinds::stage_occupancy::{
     OccupancyScope, StageOccupancyRecord, StageStats, STAGES, STAGE_APPROVAL_WAIT,
     STAGE_OCCUPANCY_SCHEMA_VERSION, STAGE_TRIAGE_WAIT,
 };
-use crate::telemetry::{RepoVisibility, TelemetryEnvelope, TelemetryRecord};
+use crate::telemetry::{RepoVisibility, TelemetryRecord};
 use crate::workspace_pool::WorkspacePool;
 
 /// `forge_call_stats` caller name for this gauge's listings.
 pub const CALLER: &str = "stage_occupancy";
-
-/// Offers `eta.stage_occupancy` envelopes, stamped with this daemon's host id,
-/// to the OTLP exporters' queues.
-#[derive(Clone)]
-pub struct StageOccupancySink {
-    queue: Arc<dyn QueueSink>,
-    host_id: String,
-}
-
-impl StageOccupancySink {
-    #[must_use]
-    pub fn new(queue: Arc<dyn QueueSink>, host_id: impl Into<String>) -> Self {
-        StageOccupancySink {
-            queue,
-            host_id: host_id.into(),
-        }
-    }
-
-    /// Enqueue one record.
-    pub fn push(&self, record: StageOccupancyRecord) {
-        self.queue.offer(TelemetryEnvelope::new(
-            self.host_id.clone(),
-            TelemetryRecord::StageOccupancy(record),
-        ));
-    }
-}
-
-static GLOBAL_SINK: OnceLock<StageOccupancySink> = OnceLock::new();
-
-/// Register the OTLP queues (called once from [`super::spawn_task`]). With no
-/// OTLP exporter nothing is registered, and [`prepare`] returns before doing any
-/// work.
-pub fn register_sink(otlp_queues: Vec<Arc<DurableQueue>>, host_id: &str) {
-    if otlp_queues.is_empty() {
-        return;
-    }
-    let _ =
-        GLOBAL_SINK.set(StageOccupancySink::new(Arc::new(FanoutQueue::new(otlp_queues)), host_id));
-}
 
 /// The label whose listing holds `stage`'s population.
 #[must_use]
@@ -321,14 +280,14 @@ pub(super) fn prepare(
     workspace_pool: &WorkspacePool,
     slug_cache: &HashMap<String, String>,
 ) -> Option<Scan> {
-    let sink = GLOBAL_SINK.get()?;
+    let sink = super::ops::global_ops_sink()?;
     let roots = super::collector::provisioned_roots(workspace_pool);
     let slug_cache = slug_cache.clone();
     Some(Box::pin(async move {
         let now = Utc::now();
         let (repos, discovered) = collect(roots, slug_cache, now).await;
-        for record in build_records(&sink.host_id, now, &repos) {
-            sink.push(record);
+        for record in build_records(sink.host_id(), now, &repos) {
+            sink.emit_record(TelemetryRecord::StageOccupancy(record));
         }
         discovered
     }))

@@ -37,9 +37,9 @@ use std::path::Path;
 use chrono::{DateTime, Utc};
 use serde::Deserialize;
 
-use super::records::{ShardInfo, ShardKind};
-use crate::telemetry::trace::{SpanName, SpanRecord, SpanStatus, TraceContext};
-use crate::telemetry::{RepoVisibility, TelemetryEnvelope, TelemetryRecord};
+use super::records::{JobSpanTarget, ShardInfo, ShardKind};
+use crate::telemetry::trace::{SpanName, SpanStatus};
+use crate::telemetry::TelemetryEnvelope;
 
 /// The schema tag `run-ci-suites.sh` writes and the poller requires. A record
 /// with any other value is skipped, so a future incompatible revision can be
@@ -306,22 +306,6 @@ pub fn window(
     Some((start, end))
 }
 
-/// Everything a suite span needs about its job, resolved once by the caller.
-#[derive(Debug, Clone)]
-pub struct SuiteSpanTarget<'a> {
-    pub repo: &'a str,
-    pub visibility: RepoVisibility,
-    pub run_id: u64,
-    pub attempt: u32,
-    pub job_id: u64,
-    pub job: &'a str,
-    pub workflow: &'a str,
-    pub shard: ShardInfo,
-    pub job_context: TraceContext,
-    pub job_started: DateTime<Utc>,
-    pub job_ended: DateTime<Utc>,
-}
-
 /// The `loom.ci.suite` spans of one shard, each a child of that shard's job
 /// span.
 ///
@@ -335,7 +319,7 @@ pub struct SuiteSpanTarget<'a> {
 /// instead.
 #[must_use]
 pub fn suite_envelopes(
-    target: &SuiteSpanTarget<'_>,
+    target: &JobSpanTarget<'_>,
     timings: &SuiteTimings,
     host_id: &str,
 ) -> Vec<TelemetryEnvelope> {
@@ -361,33 +345,18 @@ pub fn suite_envelopes(
             target.job_id,
             &name,
         );
-        let span = SpanRecord {
-            context: ctx.clone(),
-            parent_span_id: Some(target.job_context.span_id.clone()),
-            name: SpanName::CiSuite,
-            started_at,
-            ended_at,
-            status: outcome_status(outcome),
-            attributes: super::records::span_attributes(vec![
-                ("loom.repo", Some(target.repo.to_string())),
-                ("loom.repo.visibility", Some(target.visibility.as_str().to_string())),
-                ("loom.ci.run_id", Some(target.run_id.to_string())),
-                ("loom.ci.job_id", Some(target.job_id.to_string())),
-                ("loom.ci.workflow", Some(target.workflow.to_string())),
-                ("loom.ci.job", Some(target.job.to_string())),
+        envelopes.push(target.child_span_envelope(
+            SpanName::CiSuite,
+            ctx,
+            (started_at, ended_at),
+            outcome_status(outcome),
+            vec![
                 ("loom.ci.suite", Some(name)),
                 ("loom.ci.suite.outcome", Some(outcome.to_string())),
                 ("loom.ci.suite.retried", Some(entry.retried.to_string())),
-                ("loom.ci.shard.index", target.shard.index.map(|i| i.to_string())),
-                ("loom.ci.shard.total", target.shard.total.map(|t| t.to_string())),
-                ("loom.ci.shard.kind", Some(target.shard.kind.as_str().to_string())),
-            ]),
-            events: Vec::new(),
-            links: Vec::new(),
-        };
-        let mut envelope = TelemetryEnvelope::new(host_id, TelemetryRecord::Span(span));
-        envelope.trace_context = Some(ctx);
-        envelopes.push(envelope);
+            ],
+            host_id,
+        ));
     }
     envelopes
 }
