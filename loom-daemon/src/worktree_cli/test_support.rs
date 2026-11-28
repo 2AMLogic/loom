@@ -7,7 +7,7 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::Output;
 
 /// A fresh, canonicalized scratch directory under the system temp dir.
 ///
@@ -29,19 +29,7 @@ pub fn tmpdir(prefix: &str, tag: &str) -> PathBuf {
 /// config, fixed author and committer, `LC_ALL=C`). Panics, naming the
 /// directory and stderr, unless git succeeds.
 pub fn git(dir: &Path, args: &[&str]) -> Output {
-    let out = Command::new("git")
-        .arg("-C")
-        .arg(dir)
-        .args(args)
-        .env("GIT_CONFIG_GLOBAL", "/dev/null")
-        .env("GIT_CONFIG_SYSTEM", "/dev/null")
-        .env("GIT_AUTHOR_NAME", "Loom Test")
-        .env("GIT_AUTHOR_EMAIL", "t@example.invalid")
-        .env("GIT_COMMITTER_NAME", "Loom Test")
-        .env("GIT_COMMITTER_EMAIL", "t@example.invalid")
-        .env("LC_ALL", "C")
-        .output()
-        .expect("run git");
+    let out = crate::test_git_helpers::git_out(dir, args);
     assert!(
         out.status.success(),
         "git {args:?} in {} failed: {}",

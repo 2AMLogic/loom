@@ -472,7 +472,8 @@ pub mod telemetry;
 pub mod telemetry_join;
 pub mod terminal;
 pub mod terminal_restore;
-/// Test-only hermetic git helpers shared by the orphan-stack test modules.
+/// Test-only hermetic git helpers shared by every in-crate test module that
+/// drives real repositories (see the module docs for what "hermetic" pins).
 #[cfg(test)]
 pub mod test_git_helpers;
 /// Test-only capturing logger (see module docs) — single-sourced so the crate's

@@ -6,7 +6,7 @@
 //! inherits through `use super::*`).
 
 use super::*;
-use std::process::Command;
+use crate::test_git_helpers::run as git;
 
 // ===================================================================
 // Idle open items (#12458)
@@ -275,27 +275,6 @@ fn test_config_reads_idle_open_secs() {
 // ===================================================================
 // End to end: a real worktree, the real backup, the real remover
 // ===================================================================
-
-fn git(dir: &Path, args: &[&str]) -> String {
-    let out = Command::new("git")
-        .arg("-C")
-        .arg(dir)
-        .args(args)
-        .env("GIT_CONFIG_GLOBAL", "/dev/null")
-        .env("GIT_CONFIG_SYSTEM", "/dev/null")
-        .env("GIT_AUTHOR_NAME", "Loom Test")
-        .env("GIT_AUTHOR_EMAIL", "t@example.invalid")
-        .env("GIT_COMMITTER_NAME", "Loom Test")
-        .env("GIT_COMMITTER_EMAIL", "t@example.invalid")
-        .output()
-        .expect("run git");
-    assert!(
-        out.status.success(),
-        "git {args:?} failed: {}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    String::from_utf8_lossy(&out.stdout).trim().to_string()
-}
 
 /// A primary checkout `repo` with a bare `origin`, and a Loom-managed worktree
 /// at `.loom/worktrees/issue-900` on `feature/issue-900`, pushed — plus one

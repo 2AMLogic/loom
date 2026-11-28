@@ -291,9 +291,9 @@ pub fn worktree_entry_is_restorable(worktree: &Path, rel: &str) -> Option<OnDisk
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_git_helpers::{git_out, run as git};
     use std::fs;
     use std::path::Path;
-    use std::process::Command;
 
     #[test]
     fn porcelain_z_records_are_exact_and_renames_carry_two_paths() {
@@ -396,23 +396,6 @@ mod tests {
     }
 
     // ── Real git ──────────────────────────────────────────────────────────
-
-    fn git_out(dir: &Path, args: &[&str]) -> std::process::Output {
-        Command::new("git")
-            .arg("-C")
-            .arg(dir)
-            .args(args)
-            .env_remove("GIT_DIR")
-            .env_remove("GIT_WORK_TREE")
-            .env_remove("GIT_INDEX_FILE")
-            .output()
-            .unwrap()
-    }
-
-    fn git(dir: &Path, args: &[&str]) {
-        let out = git_out(dir, args);
-        assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
-    }
 
     /// A repo at commit 1 with `refs/remotes/origin/main` one commit ahead,
     /// where `files` hold `"two\n"` (each was `"one\n"` at commit 1).

@@ -41,14 +41,7 @@ impl Repo {
     }
 
     fn git(&self, args: &[&str]) -> String {
-        let out = Cmd::new("git")
-            .arg("-C")
-            .arg(self.dir.path())
-            .args(args)
-            .output()
-            .expect("git runs");
-        assert!(out.status.success(), "git {args:?} failed: {out:?}");
-        String::from_utf8_lossy(&out.stdout).trim().to_string()
+        crate::test_git_helpers::run(self.dir.path(), args)
     }
 
     /// A branch off `main` carrying one new file. Returns its tip.

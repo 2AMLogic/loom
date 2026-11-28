@@ -319,17 +319,7 @@ impl Fixture {
     }
 
     fn git(&self, args: &[&str]) {
-        let out = Command::new("git")
-            .arg("-C")
-            .arg(self.path())
-            .args(args)
-            .output()
-            .expect("git runs");
-        assert!(
-            out.status.success(),
-            "git {args:?} failed: {}",
-            String::from_utf8_lossy(&out.stderr)
-        );
+        crate::test_git_helpers::run(self.path(), args);
     }
 
     fn write(&self, rel: &str, body: &str) {
