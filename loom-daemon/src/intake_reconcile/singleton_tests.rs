@@ -698,23 +698,16 @@ fn with_readers_out_of_budget_the_live_walk_makes_no_writer_call() {
     // The root must resolve to its repo, as every root in the captain's set
     // does (an unresolved one has no reader pool and is never listed).
     let slug = format!("acme/shed-{}", std::process::id());
-    let git = |args: &[&str]| {
-        let ok = std::process::Command::new("git")
-            .args(args)
-            .current_dir(dir.path())
-            .output()
-            .unwrap()
-            .status
-            .success();
-        assert!(ok, "git {args:?}");
-    };
-    git(&["init", "-q"]);
-    git(&[
-        "remote",
-        "add",
-        "origin",
-        &format!("https://github.com/{slug}.git"),
-    ]);
+    crate::test_git_helpers::run(dir.path(), &["init", "-q"]);
+    crate::test_git_helpers::run(
+        dir.path(),
+        &[
+            "remote",
+            "add",
+            "origin",
+            &format!("https://github.com/{slug}.git"),
+        ],
+    );
     let _route = store::install_test_route(|_| RouteDecision::Exhausted {
         until: std::time::SystemTime::now() + Duration::from_secs(600),
         cause: ExhaustCause::Budget,

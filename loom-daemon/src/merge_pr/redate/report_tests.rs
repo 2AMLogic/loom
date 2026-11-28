@@ -2,6 +2,7 @@
 
 use super::*;
 use crate::merge_pr::redate::commit_message;
+use crate::test_git_helpers::run;
 
 const SUBJ: &str = " (#8248 guard, automated by #8508)";
 
@@ -126,23 +127,7 @@ fn the_report_reads_back_what_the_retired_producer_wrote() {
     let dir = std::env::temp_dir().join(format!("loom-redate-report-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).expect("tmp dir");
-    let git = |args: &[&str]| {
-        let out = std::process::Command::new("git")
-            .arg("-C")
-            .arg(&dir)
-            .args([
-                "-c",
-                "user.name=t",
-                "-c",
-                "user.email=t@t",
-                "-c",
-                "commit.gpgsign=false",
-            ])
-            .args(args)
-            .output()
-            .expect("git runs");
-        assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
-    };
+    let git = |args: &[&str]| run(&dir, args);
     git(&["init", "-q", "-b", "main"]);
     let trailers = "Stale-Check: Structural Checks (Role Prompt Prefix Ratchet)\n\
 Stale-Clause: the base move and this PR both touch this check's coupled inputs\n\

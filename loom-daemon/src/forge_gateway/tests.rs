@@ -743,13 +743,7 @@ fn a_profile_path_is_never_committable() {
     assert!(crate::init::is_credential_path(&path), "{path}");
     assert!(crate::init::is_credential_path(&format!(".loom/{DIR_NAME}/")));
     let tmp = tempfile::tempdir().unwrap();
-    let git = |args: &[&str]| {
-        std::process::Command::new("git")
-            .args(args)
-            .current_dir(tmp.path())
-            .output()
-            .unwrap()
-    };
+    let git = |args: &[&str]| crate::test_git_helpers::git_out(tmp.path(), args);
     assert!(git(&["init", "-q"]).status.success());
     crate::init::update_gitignore(tmp.path()).unwrap();
     for p in [path.as_str(), &format!(".loom/{DIR_NAME}/gh-ok")] {

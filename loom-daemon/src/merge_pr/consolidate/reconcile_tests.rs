@@ -22,7 +22,6 @@ use serial_test::serial;
 use std::ffi::OsString;
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
-use std::process::Command;
 
 /// `LOOM_GH_BIN` pointed at the stub while alive; the prior value is restored
 /// on drop, so a panicking assertion cannot leak the stub into a later test.
@@ -119,15 +118,7 @@ impl Fixture {
         let state = tmp.path().join("state");
         std::fs::create_dir_all(&repo).unwrap();
         std::fs::create_dir_all(&state).unwrap();
-        let git = |args: &[&str]| {
-            let out = Command::new("git")
-                .args(args)
-                .current_dir(&repo)
-                .output()
-                .unwrap();
-            assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
-            String::from_utf8_lossy(&out.stdout).trim().to_string()
-        };
+        let git = |args: &[&str]| crate::test_git_helpers::run(&repo, args);
         git(&["init", "-q", "-b", "main"]);
         git(&["config", "user.email", "t@t"]);
         git(&["config", "user.name", "t"]);
