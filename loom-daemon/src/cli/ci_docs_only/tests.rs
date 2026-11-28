@@ -7,6 +7,7 @@ use serde_json::{json, Value};
 use tempfile::TempDir;
 
 use super::{classify, proof::Forge, CiDocsOnlyArgs, Event};
+use crate::test_git_helpers::run as git;
 
 const REPO: &str = "acme/workspace";
 const WORKFLOW: u64 = 18;
@@ -152,26 +153,6 @@ impl Fixture {
         }).to_string());
         self.commit("trusted queue adoption")
     }
-}
-
-fn git(root: &Path, args: &[&str]) -> String {
-    let output = Command::new("git")
-        .current_dir(root)
-        .args([
-            "-c",
-            "user.name=Fixture",
-            "-c",
-            "user.email=fixture@example.com",
-            "-c",
-            "commit.gpgSign=false",
-            "-c",
-            "core.hooksPath=/dev/null",
-        ])
-        .args(args)
-        .output()
-        .unwrap();
-    assert!(output.status.success(), "{args:?}: {}", String::from_utf8_lossy(&output.stderr));
-    String::from_utf8(output.stdout).unwrap().trim().to_string()
 }
 
 fn green_run(head: &str) -> Value {

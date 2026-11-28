@@ -226,13 +226,7 @@ fn clean_repo_has_no_findings() {
 }
 
 fn git_out(dir: &Path, args: &[&str]) -> Vec<u8> {
-    Command::new("git")
-        .arg("-C")
-        .arg(dir)
-        .args(args)
-        .output()
-        .unwrap()
-        .stdout
+    crate::test_git_helpers::git_out(dir, args).stdout
 }
 
 #[test]

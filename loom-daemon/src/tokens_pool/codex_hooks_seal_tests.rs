@@ -3,6 +3,7 @@
 //! ready only when the caller opted in, in a session container.
 
 use super::*;
+use crate::test_git_helpers::run as git;
 use crate::tokens_pool::codex_hooks::{Check, Registration};
 use serde_json::json;
 use std::path::{Path, PathBuf};
@@ -42,17 +43,6 @@ fn sealed(dir: &Path) -> (PathBuf, PathBuf) {
 fn write_hooks(profile: &Path, hooks: &serde_json::Value) {
     std::fs::write(profile.join("hooks.json"), serde_json::to_string_pretty(hooks).unwrap())
         .unwrap();
-}
-
-fn git(dir: &Path, args: &[&str]) {
-    let status = std::process::Command::new("git")
-        .arg("-C")
-        .arg(dir)
-        .args(args)
-        .env("GIT_CONFIG_GLOBAL", "/dev/null")
-        .status()
-        .unwrap();
-    assert!(status.success(), "git {args:?}");
 }
 
 fn session_check(profile: &Path, repo: &Path, request: Option<Request>) -> Check {
