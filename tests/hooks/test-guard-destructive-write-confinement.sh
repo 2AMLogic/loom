@@ -80,6 +80,126 @@ assert_allow "write-confinement: echo > target in /tmp allows" \
 assert_allow "write-confinement: cd <worktree> && echo > relative target allows" \
     "cd $WT_DIR && echo x > f.sh" "$WT_REPO"
 
+# The colon suffix of each quoted loop word fixes the label used by tr (#15417).
+# Keep the command as shell source. The fixture only asks the hook for a verdict.
+label_loop=$(cat <<'CMD'
+for g in "$W/layout/utmi_stub.gds:OLD(committed)" "$W/flow/build/trial/.klt/place-and-route/utmi_stub.gds:NEW(with PDN)"; do
+  f="${g%%:*}"; label="${g##*:}"
+  klt erc "$f" /tmp/issue59-erc-spec.json --top utmi_stub --pdk sky130 --format json > "/tmp/erc-$(echo $label|tr -d '()').json" 2>/tmp/erc.err || true
+done
+CMD
+)
+assert_allow "write-confinement (#15417): fixed loop labels name scratch files" "$label_loop" "$WT_REPO"
+assert_allow "write-confinement (#15417): fixed labels with --flag=value arguments" \
+    "${label_loop/--pdk sky130/--pdk=sky130 --format-map=a:b,c}" "$WT_REPO"
+label_setup=$(cat <<'CMD'
+cat > /tmp/issue59-erc-spec.json <<'JSON'
+{}
+JSON
+export PATH=/opt/klayout/bin:$PATH
+W=/tmp/issue-59
+CMD
+)
+assert_allow "write-confinement (#15417): reported scratch setup followed by loop" \
+    "$label_setup
+$label_loop" "$WT_REPO"
+assert_deny "write-confinement (#15417): relative stdout stays in checkout" \
+    "${label_loop/\/tmp\/erc-/erc-}" "$WT_REPO"
+assert_deny "write-confinement (#15417): absolute checkout stdout" \
+    "${label_loop/\/tmp\/erc-/$WT_REPO/erc-}" "$WT_REPO"
+assert_deny_reason_matches "write-confinement (#15417): stderr checked separately" \
+    "${label_loop/2>\/tmp\/erc.err/2>$WT_REPO/checkout.err}" 'checkout\.err' "$WT_REPO"
+assert_deny_reason_matches "write-confinement (#15417): later checkout write" \
+    "$label_loop
+echo x > $WT_REPO/after.txt" 'after\.txt' "$WT_REPO"
+# Only the second concrete destination resolves into the primary checkout.
+label_scratch=$(mktemp -d /tmp/loom-loop-XXXXXXXX)
+ln -s "$WT_REPO" "$label_scratch/erc-NEWwith PDN.json"
+assert_deny_reason_matches "write-confinement (#15417): second destination checked" \
+    "${label_loop/\/tmp\/erc-/$label_scratch/erc-}" 'erc-NEWwith PDN\.json' "$WT_REPO"
+rm -rf "$label_scratch"
+for label_cwd in "$WT_REPO" "$WT_DIR"; do
+    assert_deny "write-confinement (#15417): unresolved loop label" \
+        "${label_loop/OLD(committed)/\$unknown}" "$label_cwd"
+    assert_deny "write-confinement (#15417): every loop word needs a literal label" \
+        "${label_loop/NEW(with PDN)/\$unknown}" "$label_cwd"
+    assert_deny "write-confinement (#15417): standalone redirect has no loop binding" \
+        "$(printf '%s\n' "$label_loop" | sed -n '/klt erc/p')" "$label_cwd"
+    assert_deny "write-confinement (#15417): dynamic directory" \
+        "${label_loop/\/tmp\/erc-/\/tmp\/\$dir\/erc-}" "$label_cwd"
+    assert_deny "write-confinement (#15417): modified substitution is still live" \
+        "${label_loop/echo \$label/echo \$label > $WT_REPO/inner}" "$label_cwd"
+done
+
+# Keep ordinary filename substitutions subject to the destination's usual
+# confinement check, including the cwd established by a preceding cd.
+assert_allow "write-confinement (#15417): timestamped scratch redirect" \
+    'echo x > "/tmp/x-$(date +%s).log"' "$WT_REPO"
+assert_allow "write-confinement (#15417): timestamped append in the managed worktree" \
+    "echo x >> \"$WT_DIR/out-\$(date +%s).log\"" "$WT_REPO"
+assert_allow "write-confinement (#15417): timestamped relative redirect after cd" \
+    "cd \"$WT_DIR\" && echo x > \"out-\$(date +%s).log\"" "$WT_REPO"
+assert_allow "write-confinement (#15417): numeric UTC date as relative basename" \
+    'echo x > "$(date -u +%Y%m%d).log"' "$WT_DIR"
+assert_allow "write-confinement (#15417): hostname and user in attached stderr filename" \
+    'echo x > /tmp/a.log 2>"/tmp/$(hostname)-$(id -un).err"' "$WT_REPO"
+assert_deny "write-confinement (#15417): timestamped checkout filename" \
+    "echo x > \"$WT_REPO/out-\$(date +%s).log\"" "$WT_DIR"
+assert_deny_reason_matches "write-confinement (#15417): timestamped stdout still checks stderr" \
+    "echo x > \"/tmp/x-\$(date +%s).log\" 2>$WT_REPO/checkout.err" 'checkout\.err' "$WT_DIR"
+assert_deny "write-confinement (#15417): timestamp in an unresolved directory" \
+    'echo x > "/tmp/$dir/x-$(date +%s).log"' "$WT_DIR"
+assert_deny "write-confinement (#15417): command substitution in a directory component" \
+    'echo x > "/tmp/x-$(date +%s)/out.log"' "$WT_DIR"
+assert_deny "write-confinement (#15417): date conversion can produce separators" \
+    'echo x > "/tmp/x-$(date +%D).log"' "$WT_DIR"
+assert_deny "write-confinement (#15417): complete substitution with unknown filename output" \
+    'echo x > "/tmp/x-$(cat labels.txt).log"' "$WT_DIR"
+
+# A same-command literal directory binding composes with the bounded filename
+# substitution; an unbound or checkout-bound directory keeps its usual verdict.
+assert_allow "write-confinement (#15417): bound scratch directory with timestamp" \
+    'OUT=/tmp; echo ok > "$OUT/report-$(date +%s).log"' "$WT_REPO"
+assert_allow "write-confinement (#15417): bound scratch directory with timestamp, append" \
+    'OUT=/tmp; echo ok >> "$OUT/report-$(date +%s).log"' "$WT_REPO"
+assert_allow "write-confinement (#15417): bound scratch directory with attached stderr" \
+    'OUT=/tmp; echo ok 2>"$OUT/report-$(date +%s).log"' "$WT_REPO"
+assert_allow "write-confinement (#15417): bound managed-worktree directory with timestamp" \
+    "OUT=$WT_DIR; echo ok > \"\$OUT/report-\$(date +%s).log\"" "$WT_REPO"
+assert_deny "write-confinement (#15417): bound checkout directory with timestamp" \
+    "OUT=$WT_REPO; echo ok > \"\$OUT/report-\$(date +%s).log\"" "$WT_DIR"
+assert_deny "write-confinement (#15417): unbound directory with timestamp" \
+    'echo ok > "$OUT/report-$(date +%s).log"' "$WT_DIR"
+assert_deny "write-confinement (#15417): bound directory, unknown filename output" \
+    'OUT=/tmp; echo ok > "$OUT/report-$(cat labels.txt).log"' "$WT_DIR"
+
+# Common timestamp conversions stay within one filename component.
+assert_allow "write-confinement (#15417): two-digit year conversion" \
+    'echo ok > "/tmp/report-$(date +%y%m%d).log"' "$WT_REPO"
+assert_allow "write-confinement (#15417): ISO-style stamp with literal T and Z" \
+    'echo ok > "/tmp/report-$(date -u +%Y-%m-%dT%H%M%SZ).log"' "$WT_REPO"
+assert_deny "write-confinement (#15417): other literal letters are not admitted" \
+    'echo ok > "/tmp/report-$(date +%Y/x).log"' "$WT_DIR"
+
+# The redirect operand may be the last token before an enclosing construct's
+# closing paren; that paren must not defeat the quoted-operand check.
+assert_allow "write-confinement (#15417): timestamped scratch redirect inside a capture" \
+    'out=$(printf ok > "/tmp/report-$(date +%s).log")' "$WT_REPO"
+assert_allow "write-confinement (#15417): timestamped scratch stderr redirect inside a capture" \
+    'out=$(printf ok 2>"/tmp/report-$(date +%s).log")' "$WT_REPO"
+assert_allow "write-confinement (#15417): timestamped scratch redirect nested in two captures" \
+    'a=$(b=$(printf ok > "/tmp/r-$(date +%s).log"))' "$WT_REPO"
+assert_allow "write-confinement (#15417): timestamped scratch redirect inside a plain subshell" \
+    '(printf ok > "/tmp/r-$(date +%s).log")' "$WT_REPO"
+assert_allow "write-confinement (#15417): bound scratch directory, timestamped, inside a capture" \
+    'OUT=/tmp; out=$(printf ok 2>"$OUT/report-$(date +%s).log")' "$WT_REPO"
+assert_allow "write-confinement (#15417): relative timestamped file in a managed worktree, inside a capture" \
+    'out=$(printf ok > "r-$(date +%s).log")' "$WT_DIR"
+assert_deny "write-confinement (#15417): checkout destination inside a capture still denies" \
+    "out=\$(printf ok > \"$WT_REPO/r-\$(date +%s).log\")" "$WT_DIR"
+assert_deny "write-confinement (#15417): unknown filename output inside a capture still denies" \
+    'out=$(printf ok > "/tmp/r-$(cat labels.txt).log")' "$WT_DIR"
+
 # --- #7415: a git worktree NESTED under the main checkout, created by a plain
 # `git worktree add` (so carrying no `.loom-managed` sentinel), was
 # indistinguishable from the main checkout: the sentinel walk-up found nothing
