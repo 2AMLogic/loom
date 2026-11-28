@@ -3633,25 +3633,26 @@ if command -v jq >/dev/null 2>&1; then
     fail "fresh --quick: user-scope settings.json missing the /defaults/hooks/ marker"
   fi
   # Every wired project-level entry must resolve to a real executable script —
-  # a dangling command is not coverage.
+  # a dangling command is not coverage. Since #15741 an entry is a launcher
+  # command that NAMES its scripts (`.loom/hooks/hook-wiring.sh` plus the hook
+  # itself) rather than being a bare path, so every entry must name at least
+  # one, and every script named must be an executable copy (the extraction
+  # defaults/scripts/check-guards-installed.sh performs).
+  Q_FRESH_SETTINGS="$Q_FRESH/.claude/settings.json"
+  Q_PROJECT_CMDS='[(.hooks // {}) | to_entries[] | .value[]? | .hooks[]? | .command // ""
+                    | select(contains(".loom/hooks/")) | select(contains("defaults/hooks/") | not) ]'
+  Q_ENTRIES=$(jq "$Q_PROJECT_CMDS | length" "$Q_FRESH_SETTINGS" 2>/dev/null)
+  Q_NAMED=$(jq -r "$Q_PROJECT_CMDS | .[]" "$Q_FRESH_SETTINGS" 2>/dev/null | grep -c '\.loom/hooks/[A-Za-z0-9._-]*\.sh' || true)
   Q_DANGLING=0
-  while IFS= read -r _cmd; do
-    [[ -n "$_cmd" ]] || continue
-    # #6544: project-level entries are now quoted
-    # ("${CLAUDE_PROJECT_DIR}/...") to avoid word-splitting on a project path
-    # containing a space, so strip a matching pair of surrounding double
-    # quotes before the prefix strip below. `#`/`%` no-op when unmatched, so
-    # this handles both the quoted and legacy unquoted form.
-    _unquoted="${_cmd#\"}"; _unquoted="${_unquoted%\"}"
-    _rel="${_unquoted#\$\{CLAUDE_PROJECT_DIR\}/}"
+  while IFS= read -r _rel; do
+    [[ -n "$_rel" ]] || continue
     [[ -x "$Q_FRESH/$_rel" ]] || Q_DANGLING=$((Q_DANGLING + 1))
-  done < <(jq -r '[ (.hooks // {}) | to_entries[] | .value[]? | .hooks[]? | .command // ""
-                    | select(contains(".loom/hooks/")) | select(contains("defaults/hooks/") | not) ] | .[]' \
-                 "$Q_FRESH/.claude/settings.json" 2>/dev/null)
-  if [[ "$Q_DANGLING" -eq 0 ]]; then
-    pass "fresh --quick: every wired project-level entry points at an executable hook script"
+  done < <(jq -r "$Q_PROJECT_CMDS | .[]" "$Q_FRESH_SETTINGS" 2>/dev/null \
+             | grep -o '\.loom/hooks/[A-Za-z0-9._-]*\.sh' | sort -u || true)
+  if [[ "$Q_DANGLING" -eq 0 && "$Q_ENTRIES" -eq "$Q_NAMED" ]]; then
+    pass "fresh --quick: every wired project-level entry names only executable hook scripts"
   else
-    fail "fresh --quick: $Q_DANGLING wired entr(ies) point at a missing/non-executable script"
+    fail "fresh --quick: $Q_DANGLING named script(s) are missing/non-executable, $((Q_ENTRIES - Q_NAMED)) wired entr(ies) name none"
   fi
   echo ""
 
