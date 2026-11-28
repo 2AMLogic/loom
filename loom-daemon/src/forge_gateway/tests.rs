@@ -137,6 +137,68 @@ fn a_valid_block_parses_owners_lowercased_and_accepts_key_refs() {
 }
 
 #[test]
+fn git_key_refs_parse_apart_from_the_relay_keys_and_feed_the_fingerprint() {
+    // #14935: the Git-enabled profile's key is a separate ref block; the
+    // relay API keys of `keyRefs` have no Git access and stay unchanged.
+    let v = json!({"forge": {"gateway": {"origin": "gw.example.com",
+        "keyRefs": {"acme": "file:/k/api"},
+        "git": {"keyRefs": {"2AMLogic": "file:/k/git", "rjwalters": "ssm:///gp/r/git"}}}}});
+    let (c, w) = parse(&v);
+    let c = c.unwrap();
+    assert!(w.is_empty(), "{w:?}");
+    assert!(!c.git_key_refs.contains_key("acme"), "relay API keys do not gain git access");
+    assert_eq!(c.git_key_refs["2amlogic"], KeyRef::File("/k/git".into()));
+    assert_eq!(c.git_key_refs["rjwalters"], KeyRef::Ssm("/gp/r/git".into()));
+
+    let alias = json!({"forge": {"gateway": {"origin": "gw.example.com",
+        "keyRefs": {"acme": "file:/k/api"}, "git": {"key_refs": {"acme": "file:/k/git"}}}}});
+    assert_eq!(parse(&alias).0.unwrap().git_key_refs.len(), 1);
+
+    // The fingerprint covers the git refs: a rotated git key republishes.
+    let without = parse(&cfg(&[("acme", "file:/k/api")])).0.unwrap();
+    assert_ne!(c.fingerprint(), without.fingerprint());
+
+    // A git block that names no usable owner keeps the gateway on for API
+    // reads and every owner on the direct Git path.
+    for (block, warnings) in [
+        (
+            json!({"git": {"keyRefs": {"bad owner": "file:/k"}}}),
+            vec!["forge.gateway.git.keyRefs: bad owner is not an owner; dropped".to_owned(),
+                 "forge.gateway.git.keyRefs names no usable owner; Git reads keep today's direct path".to_owned()],
+        ),
+        (
+            json!({"git": {"keyRefs": {"acme": "vault:x"}}}),
+            vec!["forge.gateway.git.keyRefs.acme: use file:<path> or ssm://<parameter>; dropped".to_owned(),
+                 "forge.gateway.git.keyRefs names no usable owner; Git reads keep today's direct path".to_owned()],
+        ),
+        (
+            json!({"git": "nope"}),
+            vec!["forge.gateway.git must be an object, not \"nope\"; Git reads keep today's direct path".to_owned()],
+        ),
+        (
+            json!({"git": {"keyRefs": "nope"}}),
+            vec!["forge.gateway.git.keyRefs must map owner -> key ref; Git reads keep today's direct path".to_owned()],
+        ),
+    ] {
+        let v = json!({"forge": {"gateway": {"origin": "gw.example.com",
+            "keyRefs": {"acme": "file:/k/api"}}}});
+        let v = {
+            let mut forge = v["forge"]["gateway"].clone();
+            forge["git"] = block["git"].clone();
+            json!({"forge": {"gateway": forge}})
+        };
+        let (c, w) = parse(&v);
+        let c = c.unwrap();
+        assert!(c.git_key_refs.is_empty(), "the git block stays empty");
+        assert_eq!(w, warnings, "{block}");
+    }
+
+    // No git block at all: nothing warns, nothing routes.
+    let (c, w) = parse(&cfg(&[("acme", "file:/k/api")]));
+    assert!(c.unwrap().git_key_refs.is_empty() && w.is_empty(), "{w:?}");
+}
+
+#[test]
 fn an_origin_that_could_send_a_key_elsewhere_is_refused() {
     for bad in [
         "http://gw.example.com",

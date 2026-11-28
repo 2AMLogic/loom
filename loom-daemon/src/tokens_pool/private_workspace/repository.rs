@@ -1,3 +1,4 @@
+use super::git_relay::RelayRead;
 use super::*;
 use serde_json::json;
 use std::io::Read;
@@ -237,7 +238,21 @@ fn helper_cause(stderr: &[u8]) -> Option<&'static str> {
 }
 
 pub(super) fn git(root: &Path, args: &[&str]) -> Result<String> {
-    let result = Command::new("git")
+    git_envs(root, args, &[], &[])
+}
+
+/// [`git`] with variables added on and removed from the child (#14935): a
+/// relay-routed read adds its `GIT_CONFIG_*` route and strips the exec's
+/// installation token, so the credential class of the Git process is the
+/// route's alone.
+fn git_envs(
+    root: &Path,
+    args: &[&str],
+    add: &[(String, String)],
+    strip: &[&str],
+) -> Result<String> {
+    let mut command = Command::new("git");
+    command
         .arg("-C")
         .arg(root)
         .args([
@@ -248,9 +263,14 @@ pub(super) fn git(root: &Path, args: &[&str]) -> Result<String> {
         ])
         .args(args)
         .env("GIT_TERMINAL_PROMPT", "0")
-        .stdin(Stdio::null())
-        .output()
-        .context("start workspace Git operation")?;
+        .stdin(Stdio::null());
+    for (name, value) in add {
+        command.env(name, value);
+    }
+    for name in strip {
+        command.env_remove(name);
+    }
+    let result = command.output().context("start workspace Git operation")?;
     if !result.status.success() {
         // Neither URLs nor Git's stderr are emitted: a configured helper may
         // include a secret in its own diagnostic. Preserve the clone in place.
@@ -266,6 +286,20 @@ pub(super) fn git(root: &Path, args: &[&str]) -> Result<String> {
         );
     }
     String::from_utf8(result.stdout).context("workspace Git returned invalid text")
+}
+
+/// The Git child shape a relay-routed preparation read uses (#14935): the
+/// same argv and helper contract as [`git`], over the route's environment
+/// (see `git_relay::git_read`). The canonical-origin check and every other
+/// invocation stay unwritten by the route, so they keep seeing the clone as
+/// it is recorded.
+pub(super) fn git_routed(
+    root: &Path,
+    args: &[&str],
+    env: &[(String, String)],
+    strip: &[&str],
+) -> Result<String> {
+    git_envs(root, args, env, strip)
 }
 
 /// What one `prepare` resolved, plus the finished-PR linked worktrees its
@@ -324,8 +358,31 @@ pub(super) fn prepare_with_pr_lookup(
     has_finished_pr: &dyn Fn(&Path, &str, &str, &str) -> bool,
     temp_base: &Path,
 ) -> Result<PrepareOutcome, PrepareFailure> {
+    // #14935: the exec's relay route, adopted only when the daemon proved
+    // one. A violated contract is a refusal, never a silent direct fetch.
+    let relay = match RelayRead::from_env_for(&args.repository, &|name| std::env::var_os(name)) {
+        Ok(relay) => relay,
+        Err(error) => {
+            return Err(PrepareFailure {
+                error: anyhow::Error::msg(error),
+                reaped: Vec::new(),
+            });
+        }
+    };
+    prepare_with_relay(root, args, has_finished_pr, temp_base, relay.as_ref())
+}
+
+/// [`prepare_with_pr_lookup`] with the relay route injected (tests); the
+/// production path adopts it from the exec's environment.
+pub(super) fn prepare_with_relay(
+    root: &Path,
+    args: &PrepareArgs,
+    has_finished_pr: &dyn Fn(&Path, &str, &str, &str) -> bool,
+    temp_base: &Path,
+    relay: Option<&RelayRead>,
+) -> Result<PrepareOutcome, PrepareFailure> {
     let mut reaped = Vec::new();
-    match prepare_revision(root, args, has_finished_pr, temp_base, &mut reaped) {
+    match prepare_revision(root, args, has_finished_pr, temp_base, &mut reaped, relay) {
         Ok(revision) => Ok(PrepareOutcome { revision, reaped }),
         Err(error) => Err(PrepareFailure { error, reaped }),
     }
@@ -362,6 +419,7 @@ fn prepare_revision(
     has_finished_pr: &dyn Fn(&Path, &str, &str, &str) -> bool,
     temp_base: &Path,
     reaped: &mut Vec<String>,
+    relay: Option<&RelayRead>,
 ) -> Result<String> {
     valid_base(&args.base)?;
     require_writable_temp(temp_base)?;
@@ -428,12 +486,22 @@ fn prepare_revision(
             // no work and is safe to discard (a ready clone is never staged).
             discard_staging(staging)?;
             let relative = staging.strip_prefix(&root)?.to_string_lossy().into_owned();
-            git(&root, &clone_args(&args.repository, &relative, args.mirror_objects.as_deref())?)?;
+            git_relay::git_read(
+                &root,
+                &clone_args(&args.repository, &relative, args.mirror_objects.as_deref())?,
+                relay,
+                &args.repository,
+            )?;
             // The ready path appears only once the clone is complete.
             std::fs::rename(staging, &repo)?;
         }
     } else if !repo.exists() {
-        git(&root, &clone_args(&args.repository, "repo", args.mirror_objects.as_deref())?)?;
+        git_relay::git_read(
+            &root,
+            &clone_args(&args.repository, "repo", args.mirror_objects.as_deref())?,
+            relay,
+            &args.repository,
+        )?;
     }
     let borrow = args.mirror_objects.clone();
     if !repo.join(".git").is_dir()
@@ -457,7 +525,7 @@ fn prepare_revision(
     if let Some(objects) = borrow {
         borrow_published(&repo, &objects, fresh_clone)?;
     }
-    git(&repo, &["fetch", "--prune", "origin"])?;
+    git_relay::git_read(&repo, &["fetch", "--prune", "origin"], relay, &args.repository)?;
     reap_finished_worktrees(&root, &repo, &args.repository, has_finished_pr, reaped)?;
     clean_worktrees(&root, &repo, &args.account)?;
     // Unpublished commits are only stranded when no branch names them:

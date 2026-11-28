@@ -565,6 +565,11 @@ silently, so it would send the key to GitHub instead.
   "keyRefs": {
     "example-org": "ssm:///github-proxy/profiles/relay-host-example-org/key",
     "other-org":   "ssm:///github-proxy/profiles/relay-host-other-org/key"
+  },
+  "git": {
+    "keyRefs": {
+      "example-org": "ssm:///github-proxy/profiles/loom-fleet-git-example-org/key"
+    }
   }
 } }
 ```
@@ -592,6 +597,23 @@ silently, so it would send the key to GitHub instead.
   default credential chain. A failed read logs the exit code and the CLI's first stderr line. `file:<path>` must be an
   owner-only file outside every checkout. An owner with no ref keeps
   today's routing.
+- **`git.keyRefs`** (`git.key_refs` accepted too, #14935): owner → where
+  that owner's **Git-read** key is read, for private-seat preparation
+  clones and fetches through the relay's git transport. This is a
+  *separate* key from `keyRefs`: the relay serves `git-upload-pack` only to
+  a Git-enabled read profile — a routed `read` profile on the Worker with a
+  `repos` list naming the repositories — while every relay API profile
+  (`mode: relay`, no `repos`) has no Git access, and the Worker refuses
+  `git-receive-pack` for every profile, so pushes always stay on the direct
+  owner-authorized path. Rollout is therefore: a manifest profile edit on
+  the relay (`{profile, backend, permission: "read", repos: [...]}` with
+  its own key), then the external key reference here. With an entry for
+  the repository's owner, the daemon hands each `prepare` exec the relay's
+  `/<owner>/<repo>.git` URL and the key's Bearer header (never in argv,
+  repository configuration or logs); the Git processes carry no
+  installation token, and a refused profile, repository or key is an
+  actionable refusal, never a silent switch to a direct fetch. An owner
+  with no entry — or no `git` block at all — keeps today's direct Git path.
 
 The daemon re-reads this block every minute. When it is set and `gh` is new
 enough, it publishes `.loom/gh-config-gateway/<owner>/` and rewrites it
