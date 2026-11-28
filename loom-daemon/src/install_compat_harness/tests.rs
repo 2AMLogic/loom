@@ -1103,7 +1103,8 @@ fn the_shipped_prompts_resolve_against_this_daemon() {
         "prompt-calls-tree",
         crate::cli::whole_cli_parse::MAIN_THREAD_STACK,
         move || prompt_calls::scan(&prompts, &CommandTree::loom_daemon()),
-    );
+    )
+    .unwrap();
     let found: BTreeSet<String> = calls.pairs.iter().map(|(_, p)| p.clone()).collect();
     for path in [
         "forge workflow-secrets-check",
@@ -1127,4 +1128,41 @@ fn the_shipped_prompts_resolve_against_this_daemon() {
             .any(|p| p.starts_with("forge issue ") || p.starts_with("forge pr ")),
         "a passthrough's tail was probed: {found:?}"
     );
+}
+
+// ---- #15667 review: blockquoted fences, parent options, unreadable prompts ----
+
+#[test]
+fn a_fence_inside_a_blockquote_is_read() {
+    let t = tree(&["affected-files check"]);
+    let text = "> ```bash\n> git fetch origin --quiet\n> loom-daemon affected-files check --body-file \"$B\"; rc=$?\n> ```\n";
+    assert_eq!(paths(&t, text), BTreeSet::from(["affected-files check".to_string()]));
+    // A `>` line inside an ordinary fence is a redirect, not a quote marker.
+    let plain = "```bash\n> out\nloom-daemon affected-files check\n```\n";
+    assert_eq!(paths(&t, plain), BTreeSet::from(["affected-files check".to_string()]));
+}
+
+#[test]
+fn a_parent_option_does_not_hide_the_child_command() {
+    let mut t = tree(&["accounts list"]);
+    t.insert_option("accounts", "--workspace", true);
+    t.insert_option("accounts", "--json", false);
+    let want = BTreeSet::from(["accounts list".to_string()]);
+    for text in [
+        "`loom-daemon accounts --workspace . list`",
+        "`loom-daemon accounts --workspace=. list`",
+        "`loom-daemon accounts --json list`",
+        "`loom-daemon accounts list --workspace .`",
+    ] {
+        assert_eq!(paths(&t, text), want, "{text}");
+    }
+}
+
+#[test]
+fn an_unreadable_prompt_fails_the_scan_naming_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("bad.md");
+    std::fs::write(&file, b"<!-- \xff -->\n`loom-daemon affected-files check`\n").unwrap();
+    let err = prompt_calls::scan(&[file], &tree(&["affected-files check"])).unwrap_err();
+    assert!(format!("{err:#}").contains("bad.md"), "{err:#}");
 }

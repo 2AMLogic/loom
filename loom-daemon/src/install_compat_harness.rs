@@ -425,7 +425,7 @@ fn direction_b(
     record_absent_files(&label, &invoked, new_tree, report);
     report.notes.push(gaps.summary(&label, scripts.len()));
     if !prompts.is_empty() {
-        let calls = prompt_calls::scan(prompts, &opts.command_tree);
+        let calls = prompt_calls::scan(prompts, &opts.command_tree)?;
         let gaps = probe.gaps(&daemon, calls.pairs.clone());
         record_gaps(&label, &daemon, &gaps, new_tree, report);
         report.notes.push(calls.summary(&label, &gaps));

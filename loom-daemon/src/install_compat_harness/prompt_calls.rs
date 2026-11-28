@@ -84,6 +84,9 @@ struct Node {
     /// forwards to `gh`): every word after it is that argument's data, not a
     /// deeper command.
     passthrough: bool,
+    /// The command's own options (and propagated globals), by `--long` and
+    /// `-s` spelling: whether each takes a value.
+    options: BTreeMap<String, bool>,
 }
 
 /// One invocation of the daemon: for each word after the executable, the
@@ -107,6 +110,17 @@ impl CommandTree {
         Self {
             root: Node::of(cmd),
         }
+    }
+
+    /// Give the command at `path` an option `flag` (`--workspace`), taking a
+    /// value or not. For fixtures.
+    #[cfg(test)]
+    pub(super) fn insert_option(&mut self, path: &str, flag: &str, takes_value: bool) {
+        let mut node = &mut self.root;
+        for word in path.split_whitespace() {
+            node = node.children.get_mut(word).expect("path inserted first");
+        }
+        node.options.insert(flag.to_string(), takes_value);
     }
 
     /// Add `path` (space-separated words). `passthrough` marks its last word
@@ -134,14 +148,30 @@ impl CommandTree {
     /// the first word is no command of this daemon.
     pub(super) fn resolve(&self, call: &Call) -> Vec<String> {
         let mut done: Vec<String> = Vec::new();
-        let mut frontier: Vec<(&Node, String)> = vec![(&self.root, String::new())];
+        // `skip`: the previous word was an option of this node that takes a
+        // value, so this word is that value.
+        let mut frontier: Vec<(&Node, String, bool)> = vec![(&self.root, String::new(), false)];
         for alternatives in call {
             if alternatives.is_empty() {
                 break;
             }
             let mut next = Vec::new();
-            for (node, path) in &frontier {
+            for (node, path, skip) in &frontier {
                 for alternative in alternatives {
+                    if *skip {
+                        next.push((*node, path.clone(), false));
+                        continue;
+                    }
+                    if alternative.starts_with('-') {
+                        let (flag, inline) = match alternative.split_once('=') {
+                            Some((f, _)) => (f, true),
+                            None => (alternative.as_str(), false),
+                        };
+                        if let Some(&takes) = node.options.get(flag) {
+                            next.push((*node, path.clone(), takes && !inline));
+                            continue;
+                        }
+                    }
                     match node.children.get(alternative) {
                         Some(child) => {
                             let extended = if path.is_empty() {
@@ -152,7 +182,7 @@ impl CommandTree {
                             if child.passthrough {
                                 done.push(extended);
                             } else {
-                                next.push((child, extended));
+                                next.push((child, extended, false));
                             }
                         }
                         None => done.push(path.clone()),
@@ -161,7 +191,7 @@ impl CommandTree {
             }
             frontier = next;
         }
-        done.extend(frontier.into_iter().map(|(_, path)| path));
+        done.extend(frontier.into_iter().map(|(_, path, _)| path));
         done.retain(|path| !path.is_empty());
         done.sort();
         done.dedup();
@@ -181,10 +211,29 @@ impl Node {
                 children.insert(name.to_string(), node.clone());
             }
         }
+        let mut options = BTreeMap::new();
+        for arg in cmd.get_arguments().filter(|a| !a.is_positional()) {
+            let takes = arg.get_action().takes_values();
+            let longs = arg
+                .get_long()
+                .into_iter()
+                .chain(arg.get_all_aliases().into_iter().flatten());
+            for long in longs {
+                options.insert(format!("--{long}"), takes);
+            }
+            let shorts = arg
+                .get_short()
+                .into_iter()
+                .chain(arg.get_all_short_aliases().into_iter().flatten());
+            for short in shorts {
+                options.insert(format!("-{short}"), takes);
+            }
+        }
         Self {
             name: cmd.get_name().to_string(),
             children,
             passthrough,
+            options,
         }
     }
 }
@@ -215,12 +264,15 @@ impl PromptCalls {
 
 /// The calls in `prompts` (from [`super::shipped_prompts`]) that `commands`
 /// resolves.
-pub(super) fn scan(prompts: &[PathBuf], commands: &CommandTree) -> PromptCalls {
+///
+/// A prompt that cannot be read fails the scan, naming the file: a skipped
+/// prompt would read as a prompt with no calls.
+pub(super) fn scan(prompts: &[PathBuf], commands: &CommandTree) -> anyhow::Result<PromptCalls> {
+    use anyhow::Context as _;
     let mut out = PromptCalls::default();
     for file in prompts {
-        let Ok(text) = std::fs::read_to_string(file) else {
-            continue;
-        };
+        let text = std::fs::read_to_string(file)
+            .with_context(|| format!("reading prompt {}", file.display()))?;
         out.files += 1;
         for call in markdown(&text) {
             for path in commands.resolve(&call) {
@@ -229,7 +281,7 @@ pub(super) fn scan(prompts: &[PathBuf], commands: &CommandTree) -> PromptCalls {
             }
         }
     }
-    out
+    Ok(out)
 }
 
 /// Every daemon invocation in one Markdown document.
@@ -249,7 +301,12 @@ fn read_markdown(text: &str, depth: usize) -> Vec<Call> {
     let mut calls = Vec::new();
     let mut block: Vec<&str> = Vec::new();
     let mut fence: Option<Fence> = None;
-    for line in text.lines() {
+    for raw in text.lines() {
+        let (unquoted, quoted) = unquote(raw);
+        let line = match &fence {
+            Some(open) if !open.quoted => raw,
+            _ => unquoted,
+        };
         if let Some(mut open) = fence.take() {
             if closes_fence(line, open.marker, open.len) {
                 calls.extend(read_fence(&open, depth));
@@ -267,6 +324,7 @@ fn read_markdown(text: &str, depth: usize) -> Vec<Call> {
                 len,
                 info: info.to_string(),
                 body: String::new(),
+                quoted,
             });
             continue;
         }
@@ -291,6 +349,20 @@ struct Fence {
     len: usize,
     info: String,
     body: String,
+    /// Opened inside a blockquote, so its lines carry the `>` prefix.
+    quoted: bool,
+}
+
+/// `line` without its blockquote markers (`> `, `> > `), and whether it had
+/// any.
+fn unquote(line: &str) -> (&str, bool) {
+    let mut rest = line;
+    let mut quoted = false;
+    while let Some(after) = dedent(rest).strip_prefix('>') {
+        rest = after.strip_prefix(' ').unwrap_or(after);
+        quoted = true;
+    }
+    (rest, quoted)
 }
 
 /// The calls in a fence. Shell when it says so or says nothing; Markdown when
