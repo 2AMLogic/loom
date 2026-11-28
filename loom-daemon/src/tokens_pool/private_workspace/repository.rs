@@ -25,6 +25,15 @@ pub enum WorkerCommand {
         #[arg(long)]
         issue: Option<u64>,
     },
+    /// Report this binary's launch-path capabilities as read-only JSON
+    /// (#15397): today, whether it can run the sealed-registration trust
+    /// path. A host asks the RUNNING container this before admitting
+    /// `Trust::Sealed` for it, because a private session's image does not
+    /// roll with the host daemon (#14112); an older image's binary refuses
+    /// the unknown subcommand, which the host reads as unsupported.
+    /// `bundle::Report` and `CONTROL_VERSION` stay unchanged, so older hosts
+    /// and healthy `recorded`-trust v2 containers are unaffected.
+    Capabilities,
     /// Refuse unsupported host execution from private workers.
     CheckHostJob,
     /// Validate direct adapter entry before any host Codex probe or launch.
@@ -53,6 +62,25 @@ pub enum WorkerCommand {
     Credential {
         operation: String,
     },
+}
+
+/// The capability report `private-workspace capabilities` prints (#15397).
+/// Field-shaped for forward compatibility: a host reads the fields it knows
+/// and treats anything it cannot parse — or a binary that refuses the
+/// subcommand outright — as absent, which fails closed to "unsupported".
+#[derive(Serialize)]
+struct Capabilities {
+    /// This binary runs the sealed-registration launch path (#14181): it
+    /// vets the profile's controls and the clone's project layers
+    /// in-container and passes Codex the trust waiver, so a host may admit
+    /// `Trust::Sealed` for a guarded role on this image.
+    sealed_trust: bool,
+}
+
+/// This binary's own capabilities. Nothing here probes the environment:
+/// the answer is a property of the code the container is already running.
+fn capabilities() -> Capabilities {
+    Capabilities { sealed_trust: true }
 }
 
 #[derive(clap::Args)]
@@ -166,6 +194,9 @@ impl WorkerCommand {
             }
             Self::Snapshot { issue } => {
                 println!("{}", serde_json::to_string(&export::snapshot(issue)?)?)
+            }
+            Self::Capabilities => {
+                println!("{}", serde_json::to_string(&capabilities())?)
             }
             Self::CheckHostJob => worker_setup::check_host_job()?,
             Self::CheckAdapter { profile } => {
@@ -1694,5 +1725,35 @@ mod helper_cause_tests {
             helper_cause(b"fatal: unable to access 'https://x:ghs_SECRET@github.com/a/b/'"),
             None
         );
+    }
+}
+
+/// #15397: the capabilities report is read-only JSON a host parses with
+/// serde, so its shape is pinned here — including that it is NOT part of
+/// `bundle::Report` (whose `deny_unknown_fields` an older host would reject).
+#[cfg(test)]
+mod capabilities_tests {
+    use super::*;
+
+    #[test]
+    fn the_report_names_sealed_trust_and_the_control_version_is_unchanged() {
+        let report = serde_json::to_value(capabilities()).unwrap();
+        assert_eq!(report, serde_json::json!({"sealed_trust": true}));
+        // The compatibility contract of the probe: the report is a NEW
+        // endpoint, not a field on the existing control report.
+        let control: serde_json::Value = serde_json::to_value(bundle::Report {
+            protocol: bundle::CONTROL_PROTOCOL.into(),
+            control_version: bundle::CONTROL_VERSION,
+            status: bundle::Status::Ready,
+            codex_cli: "codex 0.146.0".into(),
+            identity: "a".repeat(64),
+            profile: Default::default(),
+            managed: true,
+        })
+        .unwrap();
+        assert_eq!(control["control_version"], 2);
+        assert!(control.get("sealed_trust").is_none());
+        // And the shape an older host's strict parser accepts stays intact.
+        assert!(serde_json::from_str::<bundle::Report>(&control.to_string()).is_ok());
     }
 }

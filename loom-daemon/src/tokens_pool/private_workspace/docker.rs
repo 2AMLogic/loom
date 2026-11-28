@@ -1019,6 +1019,31 @@ fn observe_control(id: &str) -> Result<bundle::Report> {
         .context("private control endpoint is not the supported protocol; update the session image")
 }
 
+/// Whether the RUNNING container's own `loom-daemon` supports the
+/// sealed-registration launch path (#15397). A private session container is
+/// not recreated when the host daemon rolls (#14112), so its image may
+/// predate sealed support; this asks the binary that would have to run it,
+/// addressed by immutable ID like every other worker probe. Fails closed:
+/// an exec that cannot run — including the unknown-subcommand refusal of an
+/// older image — unparseable output, or anything but an explicit `true`
+/// reads as unsupported, so the host never admits `Trust::Sealed` on the
+/// container's behalf.
+pub(super) fn supports_sealed_trust(id: &str) -> bool {
+    let Ok(output) = command(&[
+        "exec",
+        id,
+        "loom-daemon",
+        "private-workspace",
+        "capabilities",
+    ]) else {
+        return false;
+    };
+    serde_json::from_str::<Value>(&output)
+        .ok()
+        .and_then(|report| report["sealed_trust"].as_bool())
+        .unwrap_or(false)
+}
+
 /// Verify the session's versioned control boundary and return the identity to
 /// bind to the account lease. Every claim in the report is re-derived inside
 /// the container from the image-owned bundle, and its view of the account
@@ -1321,6 +1346,62 @@ mod prepare_tests {
             assert_eq!(error.to_string(), "private workspace preparation refused: seat_dirty");
             assert_eq!(reported, paths.unwrap_or_default());
         }
+    }
+}
+
+/// #15397: the sealed-trust capability probe fails closed on anything but an
+/// explicit `true` from the RUNNING container's own binary — including the
+/// nonzero exit an older image's clap produces for the unknown subcommand —
+/// and addresses the container by its immutable ID.
+#[cfg(test)]
+mod capabilities_probe_tests {
+    use super::*;
+
+    const ID: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+
+    fn with_fake(
+        handler: impl FnMut(&[&str]) -> anyhow::Result<String> + 'static,
+    ) -> docker::fake::Guard {
+        docker::fake::install(Box::new(handler))
+    }
+
+    #[test]
+    fn the_probe_addresses_the_container_id_and_reads_sealed_trust() {
+        let _fake = with_fake(|args| {
+            assert_eq!(
+                args,
+                [
+                    "exec",
+                    ID,
+                    "loom-daemon",
+                    "private-workspace",
+                    "capabilities"
+                ],
+                "the probe must address the immutable container id"
+            );
+            Ok("{\"sealed_trust\":true}".into())
+        });
+        assert!(supports_sealed_trust(ID));
+    }
+
+    #[test]
+    fn the_probe_fails_closed_on_everything_but_true() {
+        for body in [
+            "{\"sealed_trust\":false}",
+            "not json at all",
+            "{\"sealed_trust\":null}",
+            "{\"sealed_trust\":\"true\"}",
+            "",
+        ] {
+            let _fake = with_fake(move |_| Ok(body.to_owned()));
+            assert!(!supports_sealed_trust(ID), "{body}");
+        }
+        // A failed exec — the unknown-subcommand refusal of a pre-#15397
+        // image included — reads as unsupported, never as an error.
+        let _failed = with_fake(|_| bail!("fake Docker: unknown subcommand"));
+        assert!(!supports_sealed_trust(ID));
+        // No engine reachable at all: still unsupported, not an error.
+        assert!(!supports_sealed_trust(ID));
     }
 }
 

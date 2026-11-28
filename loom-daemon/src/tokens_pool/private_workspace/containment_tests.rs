@@ -88,8 +88,10 @@ fn report(managed: bool, profile: &Path) -> bundle::Report {
 /// Whether the profile passes on a RECORDED trust decision — the rule the
 /// shipped `verify` shares. A sealable profile is also admitted (#14105), so
 /// the trust-rule tests ask for the recorded kind, not for any admission.
+/// The probe verdict is `false` on purpose: recorded trust must win without
+/// any image capability at all (#15397).
 fn recorded(report: &bundle::Report, profile: &Path) -> bool {
-    matches!(enforcing(report, profile), Ok(Trust::Recorded))
+    matches!(enforcing(report, profile, || false), Ok(Trust::Recorded))
 }
 
 /// Make the registration something the seal refuses (an extra event), without
@@ -208,9 +210,9 @@ fn the_rust_trust_gate_agrees_with_the_shipped_provisioner() {
 fn an_unmanaged_clone_is_refused_even_when_the_boundary_is_ready() {
     let dir = tempfile::tempdir().unwrap();
     let profile = profile(dir.path(), Some(&[]), &["fresh"]);
-    let error = enforcing(&report(false, &profile), &profile).unwrap_err();
+    let error = enforcing(&report(false, &profile), &profile, || true).unwrap_err();
     assert!(error.to_string().contains("no Loom hook provisioner"), "{error}");
-    assert!(enforcing(&report(true, &profile), &profile).is_ok());
+    assert!(enforcing(&report(true, &profile), &profile, || false).is_ok());
 }
 
 /// Obligation strings reach host logs: they must be fixed text that names the
@@ -221,8 +223,8 @@ fn refusals_are_fixed_secret_free_obligation_text() {
     let untrusted = profile(dir.path(), Some(&["old"]), &["old"]);
     unsealable(&untrusted);
     for error in [
-        enforcing(&report(false, &untrusted), &untrusted).unwrap_err(),
-        enforcing(&report(true, &untrusted), &untrusted).unwrap_err(),
+        enforcing(&report(false, &untrusted), &untrusted, || true).unwrap_err(),
+        enforcing(&report(true, &untrusted), &untrusted, || true).unwrap_err(),
     ] {
         let text = error.to_string();
         assert!(!text.is_empty());
@@ -323,13 +325,14 @@ fn malformed_or_absent_identity_is_refused() {
         ("non-hex container", job("not-a-container", &"c".repeat(64), &"b".repeat(40))),
         ("symbolic revision", job(&"a".repeat(64), &"c".repeat(64), "HEAD")),
     ] {
-        assert!(host_proof(&config, &ok, &job, &config.primary()).is_err(), "{what}");
+        assert!(host_proof(&config, &ok, &job, &config.primary(), || false).is_err(), "{what}");
     }
     let proof = host_proof(
         &config,
         &ok,
         &job(&"a".repeat(64), &"c".repeat(64), &"b".repeat(40)),
         &config.primary(),
+        || false,
     )
     .unwrap();
     assert_eq!(proof.runtime(), "codex");
@@ -396,11 +399,14 @@ fn a_proof_is_bound_to_the_clone_it_was_measured_against() {
     let other = config.target(Some(&second.url)).unwrap();
 
     // The lease of one clone never certifies the other, in either direction.
-    assert!(host_proof(&config, &ok, &job(""), &other).is_err());
-    assert!(host_proof(&config, &ok, &job(&second.url), &primary).is_err());
-    assert!(host_proof(&config, &ok, &job("https://example.invalid/o/third"), &other).is_err());
+    assert!(host_proof(&config, &ok, &job(""), &other, || false).is_err());
+    assert!(host_proof(&config, &ok, &job(&second.url), &primary, || false).is_err());
+    assert!(
+        host_proof(&config, &ok, &job("https://example.invalid/o/third"), &other, || false)
+            .is_err()
+    );
 
-    let proof = host_proof(&config, &ok, &job(&second.url), &other).unwrap();
+    let proof = host_proof(&config, &ok, &job(&second.url), &other, || false).unwrap();
     proof
         .require_repository("https://example.invalid/o/second.git")
         .unwrap();
@@ -414,7 +420,7 @@ fn a_proof_is_bound_to_the_clone_it_was_measured_against() {
         .summary()
         .contains("repository=example.invalid/o/second"));
 
-    let primary_proof = host_proof(&config, &ok, &job(""), &primary).unwrap();
+    let primary_proof = host_proof(&config, &ok, &job(""), &primary, || false).unwrap();
     assert_eq!(primary_proof.provenance(vec![], Default::default()).clone, REPO);
 }
 
@@ -537,7 +543,7 @@ fn hook_trust_is_proven_at_the_session_key_for_every_selected_clone() {
     for (what, text) in &wrong {
         std::fs::write(profile.join("config.toml"), text).unwrap();
         for target in [&primary, &other] {
-            let error = host_proof(&config, &ok, &job(target), target).unwrap_err();
+            let error = host_proof(&config, &ok, &job(target), target, || true).unwrap_err();
             let text = error.to_string();
             assert!(
                 text.contains("protected remote operations"),
@@ -551,7 +557,11 @@ fn hook_trust_is_proven_at_the_session_key_for_every_selected_clone() {
     // No trust anywhere: the same refusal for both clones.
     std::fs::write(profile.join("config.toml"), "model = \"fixture\"\n").unwrap();
     for target in [&primary, &other] {
-        assert!(host_proof(&config, &ok, &job(target), target).is_err(), "{}", target.path);
+        assert!(
+            host_proof(&config, &ok, &job(target), target, || true).is_err(),
+            "{}",
+            target.path
+        );
     }
 
     // Trust at the session key admits each clone — bound to that clone, never
@@ -562,13 +572,13 @@ fn hook_trust_is_proven_at_the_session_key_for_every_selected_clone() {
     )
     .unwrap();
     for target in [&primary, &other] {
-        let proof = host_proof(&config, &ok, &job(target), target).unwrap();
+        let proof = host_proof(&config, &ok, &job(target), target, || false).unwrap();
         let provenance = proof.provenance(vec![], Default::default());
         assert_eq!(provenance.clone, target.path);
         assert_eq!(provenance.policy, POLICY);
         assert!(provenance.policy.contains("managed-hook-trusted"), "{}", provenance.policy);
     }
-    let proof = host_proof(&config, &ok, &job(&other), &other).unwrap();
+    let proof = host_proof(&config, &ok, &job(&other), &other, || false).unwrap();
     assert!(proof.require_repository(&config.repository).is_err());
     proof.require_repository(&second.url).unwrap();
 
@@ -576,7 +586,7 @@ fn hook_trust_is_proven_at_the_session_key_for_every_selected_clone() {
     // clone is refused exactly as the primary is.
     let unmanaged = report(false, &profile);
     for target in [&primary, &other] {
-        let error = host_proof(&config, &unmanaged, &job(target), target).unwrap_err();
+        let error = host_proof(&config, &unmanaged, &job(target), target, || true).unwrap_err();
         assert!(error.to_string().contains("no Loom hook provisioner"), "{error}");
     }
 }
@@ -593,7 +603,7 @@ fn sealable(dir: &Path) -> PathBuf {
 
 /// The enforcing refusal, whichever way it was reached.
 fn refused(profile: &Path) -> String {
-    let error = enforcing(&report(true, profile), profile)
+    let error = enforcing(&report(true, profile), profile, || true)
         .unwrap_err()
         .to_string();
     assert!(error.contains("protected remote operations"), "{error}");
@@ -605,12 +615,12 @@ fn refused(profile: &Path) -> String {
 fn a_sealable_profile_is_admitted_without_recorded_trust() {
     let dir = tempfile::tempdir().unwrap();
     let profile = sealable(dir.path());
-    assert_eq!(enforcing(&report(true, &profile), &profile).unwrap(), Trust::Sealed);
+    assert_eq!(enforcing(&report(true, &profile), &profile, || true).unwrap(), Trust::Sealed);
     // Recorded trust keeps working, and wins.
     let trusted = self::profile(&dir.path().join("t"), Some(&[]), &["fresh"]);
-    assert_eq!(enforcing(&report(true, &trusted), &trusted).unwrap(), Trust::Recorded);
+    assert_eq!(enforcing(&report(true, &trusted), &trusted, || false).unwrap(), Trust::Recorded);
     // The seal only adds a path to the managed registration, never replaces it.
-    let error = enforcing(&report(false, &profile), &profile).unwrap_err();
+    let error = enforcing(&report(false, &profile), &profile, || true).unwrap_err();
     assert!(error.to_string().contains("no Loom hook provisioner"), "{error}");
     assert!(POLICY.contains("sealed"), "{POLICY}");
 }
@@ -686,13 +696,88 @@ fn the_host_proof_admits_a_sealed_clone_and_names_the_policy() {
         control: "c".repeat(64),
         repository: dispatch::job_repository(&primary),
     };
-    let proof = host_proof(&config, &report(true, &profile), &job, &primary).unwrap();
+    let proof = host_proof(&config, &report(true, &profile), &job, &primary, || true).unwrap();
     assert!(proof
         .provenance(vec![], Default::default())
         .policy
         .contains("sealed"));
     unsealable(&profile);
-    assert!(host_proof(&config, &report(true, &profile), &job, &primary).is_err());
+    assert!(host_proof(&config, &report(true, &profile), &job, &primary, || true).is_err());
+}
+
+// ---------------------------------------------------------------------------
+// #15397: the sealed path needs the RUNNING container's own binary.
+// ---------------------------------------------------------------------------
+
+/// Recorded trust never asks the image anything: a healthy `recorded` seat
+/// spends zero Docker execs on the capability probe.
+#[test]
+fn recorded_trust_admits_without_querying_the_image() {
+    let dir = tempfile::tempdir().unwrap();
+    let profile = self::profile(dir.path(), Some(&[]), &["fresh"]);
+    let mut queried = false;
+    let trust = enforcing(&report(true, &profile), &profile, || {
+        queried = true;
+        false
+    })
+    .unwrap();
+    assert_eq!(trust, Trust::Recorded);
+    assert!(!queried, "a recorded seat must not spend a Docker exec on the capability probe");
+}
+
+/// A sealable profile on an image that supports sealed registrations is
+/// admitted; on one that does not, it is refused with the stale-image
+/// refusal — fixed, secret-free text naming the remedy.
+#[test]
+fn a_sealed_profile_is_gated_on_the_running_image() {
+    let dir = tempfile::tempdir().unwrap();
+    let profile = sealable(dir.path());
+    assert_eq!(enforcing(&report(true, &profile), &profile, || true).unwrap(), Trust::Sealed);
+    let error = enforcing(&report(true, &profile), &profile, || false).unwrap_err();
+    let text = error.to_string();
+    assert!(text.contains("sealed registration is unsupported"), "{text}");
+    assert!(text.contains("recreate the session on a current image"), "{text}");
+    assert!(!text.contains(&*profile.to_string_lossy()), "{text}");
+}
+
+/// The host proof asks the running container before admitting a sealed
+/// profile, and refuses with the same stale-image diagnostic when it
+/// answers no.
+#[test]
+fn host_proof_probes_the_running_container_for_a_sealed_profile() {
+    let dir = tempfile::tempdir().unwrap();
+    let profile = sealable(dir.path());
+    let (config, _) = multi_clone_config(&profile);
+    let primary = config.primary();
+    let job = lease::Job {
+        owner: "fixture".into(),
+        kind: JobKind::Role,
+        issue: None,
+        branch: None,
+        container_id: "a".repeat(64),
+        base_revision: "b".repeat(40),
+        host_pid: 1,
+        control: "c".repeat(64),
+        repository: dispatch::job_repository(&primary),
+    };
+    let mut queried = 0;
+    let probe = || {
+        queried += 1;
+        true
+    };
+    let proof = host_proof(&config, &report(true, &profile), &job, &primary, probe).unwrap();
+    assert!(proof
+        .provenance(vec![], Default::default())
+        .policy
+        .contains("sealed"));
+    assert_eq!(queried, 1, "a sealed seat probes exactly once");
+    let error = host_proof(&config, &report(true, &profile), &job, &primary, || false).unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("sealed registration is unsupported"),
+        "{error}"
+    );
 }
 
 fn args(list: &[&str]) -> Vec<String> {

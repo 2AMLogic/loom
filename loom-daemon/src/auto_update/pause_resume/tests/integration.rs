@@ -461,6 +461,19 @@ fn a_resumed_sweeps_liveness_is_read_from_its_child_and_its_own_log_region() {
     };
     assert_eq!(reason, REASON_SESSION_DOWN);
 
+    // A worker that ran and refused hook trust is not a container fault.
+    std::fs::write(
+        &log,
+        "==== dispatch sweep_id=new ====\n# LOOM_SESSION_REFUSAL v=1 category=HOOKS_UNTRUSTED\n",
+    )
+    .unwrap();
+    let Liveness::Died { reason, .. } =
+        host::sweep_liveness(ResumeChild::Exited(Some(78)), &launched, &it)
+    else {
+        panic!("a hooks-untrusted refusal is a failed resume");
+    };
+    assert_eq!(reason, "session-resume-failed");
+
     std::fs::write(
         &log,
         "==== dispatch sweep_id=new ====\n[INFO] spawn-codex: sandbox=danger-full-access source=x\n",

@@ -103,7 +103,8 @@ impl MarkReason {
             | TerminalClassification::ModelRefusal
             | TerminalClassification::SandboxUnavailable
             | TerminalClassification::SessionDown
-            | TerminalClassification::SessionMountStale => None,
+            | TerminalClassification::SessionMountStale
+            | TerminalClassification::HooksUntrusted => None,
         }
     }
 

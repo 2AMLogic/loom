@@ -119,6 +119,15 @@ pub enum TerminalClassification {
     /// `SessionDown` it records **no** account hold and is not a success: the
     /// container is stale, the account is fine.
     SessionMountStale,
+    /// The private session's guard hook could not be proven for this launch:
+    /// in-container admission or hook-trust vetting (`worker_setup::execute`)
+    /// refused the role (#15397). Announced by the worker with the shared
+    /// refusal marker and applied by the terminal-record parser, like
+    /// `SessionDown`. It records **no** account hold and is not a success:
+    /// the account's credentials are fine, and the dispatch draw — which
+    /// skips such a seat before launching — is where the unusable seat is
+    /// routed around, never the account pool.
+    HooksUntrusted,
 }
 
 impl std::str::FromStr for TerminalClassification {
@@ -139,6 +148,7 @@ impl std::str::FromStr for TerminalClassification {
             "SANDBOX_UNAVAILABLE" => Self::SandboxUnavailable,
             "SESSION_DOWN" => Self::SessionDown,
             "SESSION_MOUNT_STALE" => Self::SessionMountStale,
+            "HOOKS_UNTRUSTED" => Self::HooksUntrusted,
             other => bail!("unknown terminal classification {other:?}"),
         })
     }
@@ -642,6 +652,7 @@ pub fn record_terminal_for_class_with_reset_at(
                 | TerminalClassification::SandboxUnavailable
                 | TerminalClassification::SessionDown
                 | TerminalClassification::SessionMountStale
+                | TerminalClassification::HooksUntrusted
         ) {
             return Ok(());
         }
@@ -753,7 +764,8 @@ pub fn record_terminal_for_class_with_reset_at(
             | TerminalClassification::ModelRefusal
             | TerminalClassification::SandboxUnavailable
             | TerminalClassification::SessionDown
-            | TerminalClassification::SessionMountStale => unreachable!(),
+            | TerminalClassification::SessionMountStale
+            | TerminalClassification::HooksUntrusted => unreachable!(),
         }
         state.accounts.push(entry);
         state

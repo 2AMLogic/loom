@@ -1392,3 +1392,54 @@ fn weekly_preference_never_resurrects_an_ineligible_seat() {
         assert_eq!(pick(tmp.path(), &accounts), "b");
     }
 }
+
+/// #15397: a `HOOKS_UNTRUSTED` terminal record records no hold — the seat,
+/// not the credential, is at fault — and never adds a `TransientFailure`
+/// hold the re-draw would treat as backoff. Like `SessionDown` and
+/// `SessionMountStale`, it neither creates an entry nor disturbs one.
+#[test]
+fn a_hooks_untrusted_refusal_records_no_hold() {
+    assert_eq!(
+        "HOOKS_UNTRUSTED".parse::<TerminalClassification>().unwrap(),
+        TerminalClassification::HooksUntrusted
+    );
+    let tmp = tempfile::tempdir().unwrap();
+    let account = descriptor(AccountProvider::Codex, "a");
+    record_terminal_at(
+        tmp.path(),
+        &account.id,
+        TerminalClassification::HooksUntrusted,
+        "adapter_v1",
+        100,
+    )
+    .unwrap();
+    assert!(
+        account_health(tmp.path(), &account.id).unwrap().is_none(),
+        "no entry is written for a hooks-untrusted refusal"
+    );
+    // An existing hold is neither cleared nor stacked: the refusal says
+    // nothing about the account's credentials.
+    record_terminal_at(
+        tmp.path(),
+        &account.id,
+        TerminalClassification::TokenExhausted,
+        "adapter_v1",
+        100,
+    )
+    .unwrap();
+    record_terminal_at(
+        tmp.path(),
+        &account.id,
+        TerminalClassification::HooksUntrusted,
+        "adapter_v1",
+        200,
+    )
+    .unwrap();
+    let entry = account_health(tmp.path(), &account.id).unwrap().unwrap();
+    assert_eq!(entry.reason, HealthReason::PlanExhausted);
+    assert_eq!(
+        entry.cooldown_until,
+        Some(100 + DEFAULT_EXHAUSTED_COOLDOWN_SECS),
+        "the exhaustion hold is left exactly as it was"
+    );
+}

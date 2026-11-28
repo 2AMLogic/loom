@@ -223,7 +223,21 @@ pub(super) fn execute(command: Vec<String>) -> Result<()> {
     control::audit_args(&command)?;
     let role = std::env::var("LOOM_ROLE").unwrap_or_default();
     if !role.is_empty() {
-        admit_role(&role)?;
+        // #15397: an admission the worker cannot prove is a seat-configuration
+        // fact, not a transient failure. Announce the category and exit with
+        // the refusal code so the tick's terminal record is relabelled
+        // HOOKS_UNTRUSTED instead of RECOVERABLE — a RECOVERABLE mark would
+        // put a bogus transient hold on the account and re-draw this same
+        // unusable seat after every backoff window.
+        if let Err(cause) = admit_role(&role) {
+            // Only a failed containment proof is a hook-trust refusal; a
+            // static rejection (missing adapter, bad manifest, unknown role)
+            // keeps its ordinary error so the clone or adapter gets repaired.
+            match admission_failure(cause) {
+                AdmissionFailure::Refuse(refusal) => refusal.emit_and_exit(),
+                AdmissionFailure::Error(cause) => return Err(cause),
+            }
+        }
     }
     let (bin, args) = command.split_first().context("private command missing")?;
     let mut child = Command::new(bin);
@@ -235,7 +249,11 @@ pub(super) fn execute(command: Vec<String>) -> Result<()> {
         .file_name()
         .is_some_and(|name| name == "codex")
     {
-        containment::waiver_args(&role, args, &clone)?
+        // Same refusal semantics as admission above (#15397).
+        match containment::waiver_args(&role, args, &clone) {
+            Ok(waiver) => waiver,
+            Err(cause) => HooksRefusal::new(&cause).emit_and_exit(),
+        }
     } else {
         Vec::new()
     };
@@ -249,6 +267,80 @@ pub(super) fn execute(command: Vec<String>) -> Result<()> {
     control_boundary(&mut child)?;
     let error = child.exec();
     Err(error.into())
+}
+
+/// Marks an admission error as a containment-proof / hook-trust failure, as
+/// opposed to a static admission rejection.
+#[derive(Debug)]
+struct HooksUntrustedCause(String);
+
+impl std::fmt::Display for HooksUntrustedCause {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for HooksUntrustedCause {}
+
+fn hooks_untrusted(message: String) -> anyhow::Error {
+    anyhow::Error::new(HooksUntrustedCause(message))
+}
+
+fn is_hooks_untrusted(cause: &anyhow::Error) -> bool {
+    cause.is::<HooksUntrustedCause>()
+}
+
+/// What the worker does with a failed role admission.
+enum AdmissionFailure {
+    /// A hook-trust / containment refusal: announce the category and exit 78.
+    Refuse(HooksRefusal),
+    /// A static rejection: an ordinary error, no marker, exit 1.
+    Error(anyhow::Error),
+}
+
+/// Decide, at the worker entry, whether an admission error is a hook-trust
+/// refusal or an ordinary static rejection.
+fn admission_failure(cause: anyhow::Error) -> AdmissionFailure {
+    if is_hooks_untrusted(&cause) {
+        AdmissionFailure::Refuse(HooksRefusal::new(&cause))
+    } else {
+        AdmissionFailure::Error(cause)
+    }
+}
+
+/// The in-container admission or hook-trust vetting refused this launch
+/// (#15397): the cause text, the refusal-category announcement for stderr,
+/// and the shared refusal exit code. The announce line reaches the tick's log
+/// through the adapter's stderr pass-through, and the daemon's terminal-record
+/// parser relabels the generic `RECOVERABLE` the adapter's classifier writes
+/// for this exit code to [`TerminalClassification::HooksUntrusted`] — the
+/// same contract `SESSION_DOWN` and `SESSION_MOUNT_STALE` already ride. The
+/// cause text is a fixed, secret-free obligation string by construction.
+#[derive(Debug)]
+struct HooksRefusal {
+    diagnostic: String,
+    marker: Option<String>,
+    exit_code: i32,
+}
+
+impl HooksRefusal {
+    fn new(cause: &anyhow::Error) -> Self {
+        Self {
+            diagnostic: format!("private-workspace execute: {cause:#}"),
+            marker: crate::session_exec::refusal::marker_line(
+                crate::tokens_pool::health::TerminalClassification::HooksUntrusted,
+            ),
+            exit_code: crate::session_exec::refusal::REFUSAL_EXIT_CODE,
+        }
+    }
+
+    fn emit_and_exit(self) -> ! {
+        eprintln!("{}", self.diagnostic);
+        if let Some(marker) = &self.marker {
+            eprintln!("{marker}");
+        }
+        std::process::exit(self.exit_code)
+    }
 }
 
 /// The worker's own, independent admission of the role it is about to exec —
@@ -278,10 +370,10 @@ fn admit_role(role: &str) -> Result<()> {
             let account = std::env::var("LOOM_ACCOUNT_NAME").unwrap_or_default();
             containment::in_container(&account, &bound, &revision, &repository, &clone_text)
                 .map_err(|error| {
-                    anyhow::anyhow!(
+                    hooks_untrusted(format!(
                         "role {role} requires Loom's guard hook, but it is not \
                          proven for this private session: {error}"
-                    )
+                    ))
                 })?;
             return Ok(());
         }
@@ -298,12 +390,11 @@ fn admit_role(role: &str) -> Result<()> {
     let account = std::env::var("LOOM_ACCOUNT_NAME").unwrap_or_default();
     let proof = containment::in_container(&account, &bound, &revision, &repository, &clone_text)
         .map_err(|error| {
-            anyhow::anyhow!(
-                "{}",
+            hooks_untrusted(
                 rejection
                     .clone()
                     .with_containment_failure(&error.to_string())
-                    .diagnostic()
+                    .diagnostic(),
             )
         })?;
     let admitted = containment::admit_with(&clone, role, Some("codex"), &proof)
@@ -352,4 +443,39 @@ pub(super) fn check_host_job() -> Result<()> {
         bail!("run-job host/SSH/Docker executors are unsupported in private-clone v1; run supported build commands directly in the owned clone");
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod hooks_untrusted_tests {
+    use super::*;
+
+    const MARKER: &str = "# LOOM_SESSION_REFUSAL v=1 category=HOOKS_UNTRUSTED";
+
+    /// The worker-entry decision: status and marker for a failed admission.
+    fn entry(cause: anyhow::Error) -> Result<(i32, String), anyhow::Error> {
+        match admission_failure(cause) {
+            AdmissionFailure::Refuse(r) => Ok((r.exit_code, r.marker.unwrap_or_default())),
+            AdmissionFailure::Error(e) => Err(e),
+        }
+    }
+
+    #[test]
+    fn a_containment_failure_exits_78_with_the_marker() {
+        let (code, marker) = entry(hooks_untrusted("proof missing".into())).expect("refusal");
+        assert_eq!(code, 78);
+        assert_eq!(marker, MARKER);
+    }
+
+    #[test]
+    fn a_static_admission_rejection_stays_an_ordinary_error_without_the_marker() {
+        let cause = entry(anyhow::anyhow!("adapter spawn-codex.sh is missing"))
+            .expect_err("static rejection is not a refusal");
+        assert!(format!("{cause:#}").contains("is missing"));
+    }
+
+    #[test]
+    fn an_unknown_role_through_admission_is_an_ordinary_error() {
+        let cause = admit_role("no-such-role-15397").expect_err("unknown role is refused");
+        assert!(entry(cause).is_err(), "unknown role must not be marked");
+    }
 }

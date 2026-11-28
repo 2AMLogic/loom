@@ -183,6 +183,41 @@ fn every_unverified_private_shape_is_refused_for_a_mutable_role() {
         assert_eq!(static_refusal.reason, "unmet capabilities: worktreeIsolation");
     }
 
+    // A direct worker entry lacks the control identity normally bound by the host.
+    // Judge checks its guard after static admission. Builder retries with containment.
+    let refusal = Some("# LOOM_SESSION_REFUSAL v=1 category=HOOKS_UNTRUSTED");
+    for (role, code, diagnostic, marker) in [
+        ("judge", 78, "requires Loom's guard hook", refusal),
+        ("builder", 78, "verified private-clone containment could not satisfy", refusal),
+        ("no-such-role", 1, "unknown role", None),
+    ] {
+        let output = Command::new("docker")
+            .args([
+                "exec",
+                "--env",
+                "LOOM_PRIVATE_WORKSPACE=1",
+                "--env",
+                "LOOM_PRIVATE_CONTROL=",
+                "--env",
+                &format!("LOOM_ROLE={role}"),
+                &format!("loom-codex-session-{name}"),
+                "loom-daemon",
+                "private-workspace",
+                "execute",
+                "--",
+                "true",
+            ])
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8(output.stderr).unwrap();
+        assert_eq!(output.status.code(), Some(code), "{role}: {stderr}");
+        assert!(stderr.contains(diagnostic), "{role}: {stderr}");
+        let markers = stderr
+            .lines()
+            .filter(|line| line.starts_with("# LOOM_SESSION_REFUSAL"));
+        assert!(markers.eq(marker), "{role}: {stderr}");
+    }
+
     // ---- 2. a managed session with NO established hook trust --------------
     // The boundary is ready and managed. The profile has neither a recorded
     // trust decision nor a sealable registration.

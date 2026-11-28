@@ -758,10 +758,11 @@ pub(crate) fn sweep_liveness(
     let region = sweep_resume::dispatch_region(&log, anchor);
     let died = |detail: String| {
         // `session-exec host` announces a refused container in the log.
-        let reason = if crate::session_exec::refusal::announced(region).is_some() {
-            REASON_SESSION_DOWN
-        } else {
-            REASON_RESUME_FAILED
+        use crate::tokens_pool::health::TerminalClassification as Class;
+        let reason = match crate::session_exec::refusal::announced(region) {
+            Some(Class::SessionDown | Class::SessionMountStale) => REASON_SESSION_DOWN,
+            // The worker ran and refused admission: not a container-availability fault.
+            Some(_) | None => REASON_RESUME_FAILED,
         };
         Liveness::Died {
             reason: reason.to_string(),

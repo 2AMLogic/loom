@@ -58,6 +58,11 @@ struct Engine {
     /// What the sealed-bundle probe of a configured override image prints
     /// (#14451); `None` fails the probe.
     probe_output: Option<String>,
+    /// Per-container `private-workspace capabilities` answers (#15397): a
+    /// container (by name or id) absent here reports the current-image
+    /// answer (`sealed_trust` true); `false` simulates a session image that
+    /// predates sealed support.
+    sealed_trust: BTreeMap<String, bool>,
     calls: Vec<Vec<String>>,
     created: u32,
 }
@@ -221,6 +226,16 @@ impl Engine {
                     managed: true,
                 };
                 Ok(serde_json::to_string(&report)?)
+            }
+            ["exec", target, "loom-daemon", "private-workspace", "capabilities"] => {
+                // #15397: addressed by immutable id like the control probe,
+                // and the default answer is a current image.
+                assert_eq!(target.len(), 64, "capabilities probe must address the container id");
+                let supported = self
+                    .find_name(target)
+                    .map(|name| self.sealed_trust.get(&name).copied().unwrap_or(true))
+                    .unwrap_or(true);
+                Ok(json!({"sealed_trust": supported}).to_string())
             }
             ["exec", rest @ ..] if rest.contains(&"prepare") => {
                 Ok(json!({"protocol": PROTOCOL, "revision": "a".repeat(40)}).to_string())
@@ -2828,9 +2843,25 @@ fn concurrent_judge_draws_share_one_idle_seat() {
             "{case}: {record:?}"
         );
     };
-    let assert_falls_through = |case: &str| assert_falls_through_with(case, "no idle seat");
-
-    assert_falls_through("hook trust unproven");
+    // #15397: junk profile controls are neither recorded nor sealable, so
+    // the seat is `missing` and excluded from the guarded draw before any
+    // Docker work — the pool itself reports the unproven hook trust, not a
+    // launch that fails in-container seconds later.
+    let assert_falls_through_unavailable = |case: &str| {
+        let (runtime, record, selection) = draw(case.to_owned());
+        assert_eq!(runtime, "claude", "{case}: {record:?}");
+        assert!(selection.is_none(), "{case}");
+        let passed = record
+            .passed_over
+            .iter()
+            .find(|reason| reason.starts_with("codex: unavailable(codex_accounts"))
+            .expect("the pool names the unproven hook trust");
+        assert!(
+            passed.contains("guard hook not ready on Codex profile(s) alice"),
+            "{case}: {passed}"
+        );
+    };
+    assert_falls_through_unavailable("hook trust unproven");
     let controls = tempfile::tempdir().unwrap();
     let trusted = super::containment_tests::profile(controls.path(), Some(&[]), &["fresh"]);
     for name in bundle::PROFILE_CONTROLS {
@@ -2852,7 +2883,18 @@ fn concurrent_judge_draws_share_one_idle_seat() {
     crate::test_git_helpers::run(root, &["remote", "set-url", "origin", &env.config.repository]);
 
     env.seed_container(CONTAINER_ID, false);
-    assert_falls_through("container stopped");
+    // A stopped session is a failed seat, not contention: the walk reports
+    // its own refusal (#15397) instead of masking it as "no idle seat".
+    let (runtime, record, selection) = draw("container stopped".into());
+    assert_eq!(runtime, "claude");
+    assert!(selection.is_none());
+    assert!(
+        record.passed_over.iter().any(|passed| passed.starts_with(
+            "codex: not-admitted(no eligible seat could be prepared (1 of 1 eligible \
+                 seats idle): alice failed: private account session is not running"
+        )),
+        "{record:?}"
+    );
     env.seed_container(CONTAINER_ID, true);
 
     let barrier = Barrier::new(2);
@@ -2974,6 +3016,9 @@ fn concurrent_judge_draws_share_one_idle_seat() {
 /// so a draw can pass a busy seat over (#14578).
 struct Seat {
     dir: PathBuf,
+    /// The seat's account profile, so a test can reshape its trust state
+    /// after seeding (#15397).
+    profile: PathBuf,
 }
 
 fn seed_seat(env: &Env, name: &str, id: &str, trusted: bool) -> Seat {
@@ -3046,7 +3091,7 @@ fn seed_seat(env: &Env, name: &str, id: &str, trusted: bool) -> Seat {
         e.volumes
             .insert(config.volume.clone(), volume_json(&config.volume, &labels));
     });
-    Seat { dir }
+    Seat { dir, profile }
 }
 
 /// The `concurrent_judge_draws_share_one_idle_seat` fixture, with a Builder
@@ -3059,6 +3104,14 @@ fn builder_draw_env(env: &Env, trusted: bool) -> Seat {
         &env.config.container,
     )
     .unwrap();
+    // A healthy primary seat: recorded trust, so the draw offers it (a
+    // private profile whose trust is `missing` is excluded before the walk
+    // walks at all, #15397) and its containment needs no image probe.
+    let controls = tempfile::tempdir().unwrap();
+    let recorded = super::containment_tests::profile(controls.path(), Some(&[]), &["fresh"]);
+    for file in bundle::PROFILE_CONTROLS {
+        std::fs::copy(recorded.join(file), env.config.profile.join(file)).unwrap();
+    }
     let bob = seed_seat(env, "bob", OTHER_ID, trusted);
     let root = env.workspace.path();
     crate::test_git_helpers::run(root, &["init", "-q"]);
@@ -3423,7 +3476,19 @@ fn an_idle_seat_that_cannot_prove_containment_is_never_counted_as_busy() {
     ]);
     let _probe = crate::env_test_support::EnvGuard::set("LOOM_CODEX_SESSION_PROBE", "0");
     let env = setup();
-    let bob = builder_draw_env(&env, false);
+    let bob = builder_draw_env(&env, true);
+    // Bob is idle but his proof fails: a sealed registration on an image
+    // without sealed support (#15397) — the modern shape of an idle seat
+    // that cannot prove containment. A merely-unsealable profile is now
+    // `missing`, excluded from the draw before the walk ever runs.
+    let controls = tempfile::tempdir().unwrap();
+    let sealed = super::containment_tests::profile(controls.path(), Some(&[]), &[]);
+    for file in bundle::PROFILE_CONTROLS {
+        std::fs::copy(sealed.join(file), bob.profile.join(file)).unwrap();
+    }
+    env.with(|e| {
+        e.sealed_trust.insert(container_name("bob"), false);
+    });
     let tokens = tempfile::tempdir().unwrap();
     std::fs::write(tokens.path().join("fixture.token"), "sk-ant-oat-fixture\n").unwrap();
     let _tokens_env = crate::env_test_support::EnvGuard::set(
@@ -3433,7 +3498,7 @@ fn an_idle_seat_that_cannot_prove_containment_is_never_counted_as_busy() {
     let root = env.workspace.path();
     let held = lease::Lease::acquire(&env.dir).unwrap();
 
-    // Bob is idle but untrusted: the walk reports his own containment
+    // Bob is idle but unprovable: the walk reports his own containment
     // refusal, never "busy", and counts his seat idle (#14578).
     let mut draw = builder_draw(root);
     let (_, record, selection, seat_unavailable) = draw("builder-10".into());
@@ -3450,9 +3515,305 @@ fn an_idle_seat_that_cannot_prove_containment_is_never_counted_as_busy() {
     );
     assert!(passed.contains("alice busy"), "{passed}");
     assert!(passed.contains("bob failed: "), "{passed}");
+    // The draw record's wording is capped at SUMMARY_DETAIL_MAX, so the
+    // stale-image refusal is named by its opening words.
+    assert!(passed.contains("bob failed: sealed regist"), "{passed}");
     assert!(!passed.contains("bob busy"), "{passed}");
     drop(super::tests::reacquire(&bob.dir));
     drop(held);
+    drop(super::tests::reacquire(&env.dir));
+}
+
+// ---------------------------------------------------------------------------
+// #15397: a sealed seat on a session image that predates sealed support is
+// skipped in the bounded walk — the host refuses it before launching, and a
+// recorded seat is selected instead.
+// ---------------------------------------------------------------------------
+
+/// Make the fixture's own seat (`alice`) the incident's shape: a sealable
+/// registration on a container whose image predates sealed support.
+fn seal_alice_on_a_stale_image(env: &Env) {
+    let controls = tempfile::tempdir().unwrap();
+    let sealed = super::containment_tests::profile(controls.path(), Some(&[]), &[]);
+    for file in bundle::PROFILE_CONTROLS {
+        std::fs::copy(sealed.join(file), env.config.profile.join(file)).unwrap();
+    }
+    env.with(|e| {
+        e.sealed_trust.insert(env.config.container.clone(), false);
+    });
+}
+
+/// Whether the engine saw a capabilities probe for one specific container id.
+fn probed_capabilities(engine: &Engine, id: &str) -> bool {
+    engine.calls.iter().any(|call| {
+        let call: Vec<&str> = call.iter().map(String::as_str).collect();
+        call.as_slice()
+            == [
+                "exec",
+                id,
+                "loom-daemon",
+                "private-workspace",
+                "capabilities",
+            ]
+    })
+}
+
+/// The bounded Contained walk (Builder/Doctor) skips a `sealed` seat whose
+/// container reports no sealed support and admits the recorded seat instead
+/// — and the recorded seat is never probed at all.
+#[test]
+#[serial]
+fn a_builder_walk_skips_a_stale_image_seat_and_admits_the_recorded_one() {
+    // Crate-wide `LOOM_CODEX_HOME` lock (#15174): the clear-list below takes it
+    // so it cannot race the `codex_home_env`-keyed tests that pin the variable.
+    let _codex_home_lock = crate::tokens_pool::codex_home_env::lock();
+    let _runtime_env = crate::env_test_support::EnvGuard::clear(&[
+        "CODEX_HOME",
+        "LOOM_CODEX_HOME",
+        "LOOM_CODEX_PROFILE",
+        "LOOM_CODEX_NO_EXEC",
+        "LOOM_CODEX_SESSION_EXEC",
+        "LOOM_RUNTIME",
+        "LOOM_RUNTIME_BUILDER",
+        "LOOM_SPAWN_NO_EXPORT",
+    ]);
+    let _probe = crate::env_test_support::EnvGuard::set("LOOM_CODEX_SESSION_PROBE", "0");
+    let env = setup();
+    let bob = builder_draw_env(&env, true);
+    env.seed_volume();
+    env.seed_container(CONTAINER_ID, true);
+    seal_alice_on_a_stale_image(&env);
+    let tokens = tempfile::tempdir().unwrap();
+    std::fs::write(tokens.path().join("fixture.token"), "sk-ant-oat-fixture\n").unwrap();
+    let _tokens_env = crate::env_test_support::EnvGuard::set(
+        crate::tokens_pool::paths::SHARED_TOKENS_DIR_ENV,
+        tokens.path(),
+    );
+    let root = env.workspace.path();
+
+    let mut draw = builder_draw(root);
+    let (runtime, _, selection, seat_unavailable) = draw("builder-12".into());
+    assert_eq!(runtime, "codex");
+    assert!(!seat_unavailable, "a stale image is not a busy pool");
+    assert_eq!(selection.as_ref().unwrap().name, "bob");
+    // The stale seat was probed for sealed support by its container id; the
+    // recorded seat spent zero extra Docker execs.
+    assert!(
+        probed_capabilities(&env.engine(), CONTAINER_ID),
+        "the sealed seat was asked for its image's capabilities"
+    );
+    assert!(!probed_capabilities(&env.engine(), OTHER_ID), "a recorded seat is never probed");
+    drop(selection);
+    drop(super::tests::reacquire(&bob.dir));
+    drop(super::tests::reacquire(&env.dir));
+}
+
+/// The fixture for the guarded Idle walk (Champion/Judge): a Judge draw table
+/// over the fixture's own seat, plus the same environment guards the other
+/// draw tests use.
+fn judge_draw_env(env: &Env) {
+    crate::tokens_pool::session_lifecycle::mark_session_managed(
+        &env.config.profile,
+        &env.config.container,
+    )
+    .unwrap();
+    env.seed_volume();
+    env.seed_container(CONTAINER_ID, true);
+    let root = env.workspace.path();
+    crate::test_git_helpers::run(root, &["init", "-q"]);
+    crate::test_git_helpers::run(root, &["remote", "add", "origin", &env.config.repository]);
+    let shipped = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap()
+        .join("defaults");
+    for file in [
+        "roles/judge.json",
+        "runtimes/codex.json",
+        "runtimes/claude.json",
+    ] {
+        let dest = root.join(".loom").join(file);
+        std::fs::create_dir_all(dest.parent().unwrap()).unwrap();
+        std::fs::copy(shipped.join(file), dest).unwrap();
+    }
+    for runtime in ["codex", "claude"] {
+        let dest = root.join(format!(".loom/scripts/spawn-{runtime}.sh"));
+        std::fs::create_dir_all(dest.parent().unwrap()).unwrap();
+        std::fs::write(&dest, "#!/bin/sh\n").unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(dest, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    save(
+        &root.join(".loom/config.json"),
+        &json!({"runtimes":{"roleDraw":{"judge":{"1":{"codex":1000,"claude":1}}}}}),
+    )
+    .unwrap();
+}
+
+/// One Judge draw over [`judge_draw_env`]'s table, reporting the runtime it
+/// chose, the draw record, the held selection and the preparer's
+/// seat-availability verdict.
+fn judge_draw(
+    root: &Path,
+) -> impl FnMut(
+    String,
+) -> (
+    String,
+    std::boxed::Box<crate::runtime_preference::role_draw::RoleDrawRecord>,
+    Option<dispatch::Selection>,
+    bool,
+) + '_ {
+    let draw = |owner: String| {
+        let mut preparer =
+            containment::Preparer::new(root, JobKind::Role, None, owner, Box::new(|_, _| None));
+        let result = crate::runtime_preference::role_draw::with_seed(1, || {
+            crate::runtime_preference::resolve_runtime_contained(
+                root,
+                "judge",
+                None,
+                1_800_000_000,
+                crate::runtime_preference::DispatchContext {
+                    intent: crate::runtime_preference::Intent::Dispatch,
+                    role_tick: true,
+                },
+                &mut preparer,
+            )
+        });
+        let crate::runtime_preference::Decision::Preference {
+            resolution, draw, ..
+        } = result.unwrap()
+        else {
+            panic!("expected the role draw");
+        };
+        let held = preparer.take().map(|(selection, _)| selection);
+        (
+            resolution.chosen.unwrap().admitted.runtime,
+            draw.unwrap(),
+            held,
+            preparer.seat_unavailable(),
+        )
+    };
+    move |owner| draw(owner)
+}
+
+/// The guarded Idle walk (Champion/Judge) skips a `sealed` seat on a stale
+/// image and reserves the recorded one instead.
+#[test]
+#[serial]
+fn a_judge_draw_skips_a_stale_image_seat_and_reserves_the_recorded_one() {
+    let _codex_home_lock = crate::tokens_pool::codex_home_env::lock();
+    let _runtime_env = crate::env_test_support::EnvGuard::clear(&[
+        "CODEX_HOME",
+        "LOOM_CODEX_HOME",
+        "LOOM_CODEX_PROFILE",
+        "LOOM_CODEX_NO_EXEC",
+        "LOOM_CODEX_SESSION_EXEC",
+        "LOOM_RUNTIME",
+        "LOOM_RUNTIME_JUDGE",
+        "LOOM_SPAWN_NO_EXPORT",
+    ]);
+    let _probe = crate::env_test_support::EnvGuard::set("LOOM_CODEX_SESSION_PROBE", "0");
+    let env = setup();
+    judge_draw_env(&env);
+    let bob = seed_seat(&env, "bob", OTHER_ID, true);
+    seal_alice_on_a_stale_image(&env);
+    let tokens = tempfile::tempdir().unwrap();
+    std::fs::write(tokens.path().join("fixture.token"), "sk-ant-oat-fixture\n").unwrap();
+    let _tokens_env = crate::env_test_support::EnvGuard::set(
+        crate::tokens_pool::paths::SHARED_TOKENS_DIR_ENV,
+        tokens.path(),
+    );
+    let root = env.workspace.path();
+
+    let mut draw = judge_draw(root);
+    let (runtime, _, selection, seat_unavailable) = draw("judge-12".into());
+    assert_eq!(runtime, "codex");
+    assert!(!seat_unavailable, "a stale image is not a busy pool");
+    assert_eq!(selection.as_ref().unwrap().name, "bob");
+    assert!(
+        probed_capabilities(&env.engine(), CONTAINER_ID),
+        "the sealed seat was asked for its image's capabilities"
+    );
+    assert!(!probed_capabilities(&env.engine(), OTHER_ID), "a recorded seat is never probed");
+    drop(selection);
+    drop(super::tests::reacquire(&bob.dir));
+    drop(super::tests::reacquire(&env.dir));
+}
+
+/// When every seat a guarded Idle role could use fails its own preparation —
+/// the incident's all-`sealed`-on-stale-images fleet — the walk reports each
+/// refusal by name instead of masking them as "no idle seat", the draw falls
+/// through to the next tap, and the pool is never counted as busy.
+#[test]
+#[serial]
+fn a_judge_draw_with_only_stale_image_seats_names_each_refusal() {
+    let _codex_home_lock = crate::tokens_pool::codex_home_env::lock();
+    let _runtime_env = crate::env_test_support::EnvGuard::clear(&[
+        "CODEX_HOME",
+        "LOOM_CODEX_HOME",
+        "LOOM_CODEX_PROFILE",
+        "LOOM_CODEX_NO_EXEC",
+        "LOOM_CODEX_SESSION_EXEC",
+        "LOOM_RUNTIME",
+        "LOOM_RUNTIME_JUDGE",
+        "LOOM_SPAWN_NO_EXPORT",
+    ]);
+    let _probe = crate::env_test_support::EnvGuard::set("LOOM_CODEX_SESSION_PROBE", "0");
+    let env = setup();
+    judge_draw_env(&env);
+    seal_alice_on_a_stale_image(&env);
+    let tokens = tempfile::tempdir().unwrap();
+    std::fs::write(tokens.path().join("fixture.token"), "sk-ant-oat-fixture\n").unwrap();
+    let _tokens_env = crate::env_test_support::EnvGuard::set(
+        crate::tokens_pool::paths::SHARED_TOKENS_DIR_ENV,
+        tokens.path(),
+    );
+    let root = env.workspace.path();
+
+    // The walk itself: a NoEligibleSeat naming the stale image, never the
+    // pool-level "no idle seat".
+    let error = match dispatch::Selection::prepare_idle(
+        root,
+        None,
+        JobKind::Role,
+        None,
+        "judge-13",
+        "judge",
+    ) {
+        Ok(_) => panic!("a walk with only stale-image seats must refuse"),
+        Err(error) => error,
+    };
+    let exhausted = error
+        .downcast_ref::<dispatch::NoEligibleSeat>()
+        .expect("the walk's own refusal, not the pool's");
+    assert!(!exhausted.all_busy);
+    assert!(!error.to_string().contains(dispatch::NO_IDLE_SEAT), "{error}");
+    assert!(
+        error
+            .to_string()
+            .contains("no eligible seat could be prepared (1 of 1 eligible seats idle)"),
+        "{error}"
+    );
+    assert!(
+        error
+            .to_string()
+            .contains("alice failed: sealed registration is unsupported"),
+        "{error}"
+    );
+
+    // The draw falls through to the next tap with the same diagnosis, and
+    // never counts the failed seat as a busy pool.
+    let mut draw = judge_draw(root);
+    let (runtime, record, selection, seat_unavailable) = draw("judge-14".into());
+    assert_eq!(runtime, "claude");
+    assert!(selection.is_none());
+    assert!(!seat_unavailable, "a proof failure is not a busy pool");
+    assert!(
+        record.passed_over.iter().any(|passed| passed.starts_with(
+            "codex: not-admitted(no eligible seat could be prepared (1 of 1 eligible \
+                 seats idle): alice failed: sealed registration is unsupported"
+        )),
+        "{record:?}"
+    );
     drop(super::tests::reacquire(&env.dir));
 }
 

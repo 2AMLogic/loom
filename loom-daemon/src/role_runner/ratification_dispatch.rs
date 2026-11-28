@@ -301,6 +301,7 @@ pub const LAUNCH_REFUSAL_CLASSES: &[&str] = &[
     "preflight-mcp-failed",
     "session-down",
     "session-mount-stale",
+    "hooks-untrusted",
 ];
 
 /// Whether a session's captured output is the launcher's own refusal: it

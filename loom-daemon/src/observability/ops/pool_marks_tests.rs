@@ -39,6 +39,11 @@ fn codex_classifications_map_to_a_reason_only_when_health_records_a_hold() {
         T::Fatal,
         T::CwdDeleted,
         T::ModelRefusal,
+        T::SessionDown,
+        T::SessionMountStale,
+        // #15397: the seat is at fault, not the account's standing in the
+        // pool, so no mark is written.
+        T::HooksUntrusted,
     ] {
         assert_eq!(MarkReason::from_codex(none), None, "{none:?}");
     }
