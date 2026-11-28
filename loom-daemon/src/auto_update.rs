@@ -245,9 +245,6 @@ const SETTLE_CEILING_MULTIPLIER: u32 = 6;
 /// letting a wedged build pin the loop forever.
 const DEFAULT_REBUILD_TIMEOUT: Duration = Duration::from_secs(1800);
 
-/// Poll granularity while waiting for the rebuild subprocess.
-const REBUILD_POLL_INTERVAL: Duration = Duration::from_millis(500);
-
 /// The clean-tree gate's base refusal reason (Issue #7608), shared between
 /// [`AutoUpdateState::decide`] (which has no path detail) and [`run_tick`]
 /// (which appends the offending paths from [`AutoUpdateProbe::tree_dirty_paths`]
@@ -1051,28 +1048,12 @@ fn run_update_script_with(
     extra_args: &[&str],
     repo: Option<&str>,
 ) -> RebuildOutcome {
-    let log_path =
-        std::env::temp_dir().join(format!("loom-auto-update-{}.log", uuid::Uuid::new_v4()));
-    let out_file = match std::fs::File::create(&log_path) {
-        Ok(f) => f,
-        Err(e) => return RebuildOutcome::Retryable(format!("could not create output file: {e}")),
-    };
-    let stderr_file = match out_file.try_clone() {
-        Ok(f) => f,
-        Err(e) => {
-            let _ = std::fs::remove_file(&log_path);
-            return RebuildOutcome::Retryable(format!("could not clone output handle: {e}"));
-        }
-    };
-
     let mut command = Command::new(script);
     command
         .arg("--no-restart")
         .args(extra_args)
         .current_dir(cwd)
-        .stdin(Stdio::null())
-        .stdout(Stdio::from(out_file))
-        .stderr(Stdio::from(stderr_file));
+        .stdin(Stdio::null());
     if let Some(repo) = repo {
         command.env("LOOM_DAEMON_UPDATE_GH_REPO", repo);
     }
@@ -1086,43 +1067,24 @@ fn run_update_script_with(
     // #10869: the script verifies its build against this checkout's HEAD, so
     // fleet-sync's fast-forward must not move it until the script has exited.
     let _checkout = crate::fleet_sync::checkout_ff::hold_for_self_update(cwd);
-    let mut child = match command.spawn() {
-        Ok(c) => c,
-        Err(e) => {
-            let _ = std::fs::remove_file(&log_path);
-            return RebuildOutcome::Retryable(format!(
-                "could not spawn `{}`: {e}",
-                script.display()
-            ));
-        }
-    };
-
-    let start = Instant::now();
-    let outcome = loop {
-        match child.try_wait() {
-            Ok(Some(status)) => break classify_exit(status.code(), &log_path),
-            Ok(None) => {
-                if start.elapsed() >= timeout {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    break RebuildOutcome::Retryable(format!(
-                        "`{}` timed out after {}s",
-                        script.display(),
-                        timeout.as_secs()
-                    ));
-                }
-                std::thread::sleep(REBUILD_POLL_INTERVAL);
+    match crate::proc_exec::run_bounded_to_file(command, timeout, "loom-auto-update-") {
+        Ok(out) => match out.completion() {
+            crate::proc_exec::FileCompletion::Exited(status) => {
+                classify_exit(status.code(), out.path())
             }
-            Err(e) => {
-                break RebuildOutcome::Retryable(format!(
-                    "could not poll `{}`: {e}",
-                    script.display()
-                ))
-            }
+            crate::proc_exec::FileCompletion::TimedOut => RebuildOutcome::Retryable(format!(
+                "`{}` timed out after {}s",
+                script.display(),
+                timeout.as_secs()
+            )),
+        },
+        Err(crate::proc_exec::ExecError::Spawn(e)) => {
+            RebuildOutcome::Retryable(format!("could not spawn `{}`: {e}", script.display()))
         }
-    };
-    let _ = std::fs::remove_file(&log_path);
-    outcome
+        Err(crate::proc_exec::ExecError::Collect(e)) => {
+            RebuildOutcome::Retryable(format!("could not poll `{}`: {e}", script.display()))
+        }
+    }
 }
 
 /// Map a `loom-daemon-update.sh` exit code to a [`RebuildOutcome`], attaching a

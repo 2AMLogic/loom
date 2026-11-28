@@ -34,9 +34,9 @@
 //! checkout that runs the merge (loom-ui#1042).
 
 use std::fs::File;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::{Command, Stdio};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 /// The sentinel printed on stdout when every check passed (or none declared).
 pub const CLEAN: &str = "LOOM-TREE-CHECKS-CLEAN";
@@ -272,25 +272,10 @@ fn tail(s: &str) -> String {
 /// Run the checks in order in `tree`; first failure wins.
 pub fn run_checks(tree: &Path, cfg: &Config) -> Outcome {
     for check in &cfg.checks {
-        let log: PathBuf = tree.join("..").join(format!(
-            "{}.log",
-            tree.file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or("loom-tree")
-        ));
-        let (out, err) = match File::create(&log).and_then(|f| Ok((f.try_clone()?, f))) {
-            Ok(p) => p,
-            Err(e) => return Outcome::Unknown(format!("could not capture output: {e}")),
-        };
         let path = std::env::var("PATH").unwrap_or_else(|_| "/usr/bin:/bin".into());
         let home = std::env::var("HOME").unwrap_or_default();
         let mut cmd = Command::new("sh");
-        // Own process group, so a timeout kills the check's descendants
-        // (e.g. `node` under `npm run`), not just `sh`.
-        #[cfg(unix)]
-        std::os::unix::process::CommandExt::process_group(&mut cmd, 0);
-        let mut child = match cmd
-            .arg("-c")
+        cmd.arg("-c")
             .arg(check)
             .current_dir(tree)
             .env_clear()
@@ -298,47 +283,28 @@ pub fn run_checks(tree: &Path, cfg: &Config) -> Outcome {
             .env("HOME", home)
             .env("CI", "1")
             .env("LOOM_MERGE_TREE_CHECK", "1")
-            .stdin(Stdio::null())
-            .stdout(Stdio::from(out))
-            .stderr(Stdio::from(err))
-            .spawn()
+            .stdin(Stdio::null());
+
+        let out = match crate::proc_exec::run_bounded_to_file(cmd, cfg.timeout, "loom-tree-checks-")
         {
-            Ok(c) => c,
-            Err(e) => {
-                let _ = std::fs::remove_file(&log);
+            Ok(o) => o,
+            Err(crate::proc_exec::ExecError::Spawn(e)) => {
                 return Outcome::Unknown(format!("could not start check `{check}`: {e}"));
             }
-        };
-        let started = Instant::now();
-        let status = loop {
-            match child.try_wait() {
-                Ok(Some(s)) => break Ok(s),
-                Ok(None) if started.elapsed() >= cfg.timeout => {
-                    #[cfg(unix)]
-                    if let Ok(pid) = i32::try_from(child.id()) {
-                        // SAFETY: kill(2) on our own child's process group.
-                        unsafe {
-                            libc::kill(-pid, libc::SIGKILL);
-                        }
-                    }
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    break Err(());
-                }
-                Ok(None) => std::thread::sleep(Duration::from_millis(20)),
-                Err(e) => {
-                    let _ = std::fs::remove_file(&log);
-                    return Outcome::Unknown(format!("could not wait on check `{check}`: {e}"));
-                }
+            Err(crate::proc_exec::ExecError::Collect(e)) => {
+                return Outcome::Unknown(format!("could not wait on check `{check}`: {e}"));
             }
         };
-        let text = std::fs::read(&log)
-            .map(|b| String::from_utf8_lossy(&b).into_owned())
-            .unwrap_or_default();
-        let _ = std::fs::remove_file(&log);
-        match status {
-            Ok(s) if s.success() => {}
-            Ok(s) => {
+
+        let read_output = || {
+            std::fs::read(out.path())
+                .map(|b| String::from_utf8_lossy(&b).into_owned())
+                .unwrap_or_default()
+        };
+        match out.completion() {
+            crate::proc_exec::FileCompletion::Exited(s) if s.success() => {}
+            crate::proc_exec::FileCompletion::Exited(s) => {
+                let text = read_output();
                 let code = s
                     .code()
                     .map_or("a signal".to_string(), |c| format!("exit {c}"));
@@ -347,7 +313,8 @@ pub fn run_checks(tree: &Path, cfg: &Config) -> Outcome {
                     output: format!("{}\n(terminated by {code})", tail(&text)),
                 };
             }
-            Err(()) => {
+            crate::proc_exec::FileCompletion::TimedOut => {
+                let text = read_output();
                 return Outcome::Failed {
                     check: check.clone(),
                     output: format!(
@@ -355,7 +322,7 @@ pub fn run_checks(tree: &Path, cfg: &Config) -> Outcome {
                         tail(&text),
                         cfg.timeout.as_secs()
                     ),
-                }
+                };
             }
         }
     }

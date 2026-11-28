@@ -180,9 +180,6 @@ pub const DEFAULT_GATE_MAX_DEFER_SECS: u64 = 1800;
 /// #3749 schema example).
 pub const DEFAULT_BUILD_GATE_TIMEOUT_SECS: u64 = 600;
 
-/// Poll granularity while waiting for the gate command to finish.
-const GATE_POLL_INTERVAL: Duration = Duration::from_millis(200);
-
 /// Max bytes of captured gate-command output retained for the red-detail log
 /// line (the *tail* is kept — the failing assertion is usually last).
 const MAX_OUTPUT_TAIL_BYTES: usize = 4096;
@@ -2604,92 +2601,47 @@ fn run_command_with_timeout(
     timeout: Duration,
     build_slot_held: bool,
 ) -> GateOutcome {
-    use std::fs::File;
-
-    let log_path =
-        std::env::temp_dir().join(format!("loom-main-health-gate-{}.log", uuid::Uuid::new_v4()));
-    let out_file = match File::create(&log_path) {
-        Ok(f) => f,
-        Err(e) => {
-            return GateOutcome::unevaluated(
-                UnevaluatedClass::SpawnFailure,
-                format!(
-                    "failed to create gate output file {}: {e}; main was NOT evaluated",
-                    log_path.display()
-                ),
-            );
-        }
-    };
-    let err_file = match out_file.try_clone() {
-        Ok(f) => f,
-        Err(e) => {
-            let _ = std::fs::remove_file(&log_path);
-            return GateOutcome::unevaluated(
-                UnevaluatedClass::SpawnFailure,
-                format!("failed to clone gate output file handle: {e}; main was NOT evaluated"),
-            );
-        }
-    };
-
-    let mut child = match Command::new("sh")
-        .arg("-c")
+    let mut cmd = Command::new("sh");
+    cmd.arg("-c")
         .arg(command)
         .current_dir(cwd)
         .env(crate::build_slot::BUILD_SLOT_HELD_ENV, if build_slot_held { "1" } else { "0" })
-        .stdin(Stdio::null())
-        .stdout(Stdio::from(out_file))
-        .stderr(Stdio::from(err_file))
-        .spawn()
-    {
-        Ok(c) => c,
-        Err(e) => {
-            let _ = std::fs::remove_file(&log_path);
-            return GateOutcome::unevaluated(
-                UnevaluatedClass::SpawnFailure,
-                format!("failed to spawn gate command '{command}': {e}; main was NOT evaluated"),
-            );
-        }
-    };
+        .stdin(Stdio::null());
 
     let start = Instant::now();
-    let outcome = loop {
-        match child.try_wait() {
-            Ok(Some(status)) => {
+    match crate::proc_exec::run_bounded_to_file(cmd, timeout, "loom-main-health-gate-") {
+        Ok(out) => match out.completion() {
+            crate::proc_exec::FileCompletion::Exited(status) => {
                 if status.success() {
-                    break GateOutcome::Green {
+                    GateOutcome::Green {
                         elapsed: start.elapsed(),
-                    };
+                    }
+                } else {
+                    let tail = read_output_tail(out.path());
+                    classify_failed_exit(command, &status, &tail)
                 }
-                let tail = read_output_tail(&log_path);
-                break classify_failed_exit(command, &status, &tail);
             }
-            Ok(None) => {
-                if start.elapsed() >= timeout {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    let tail = read_output_tail(&log_path);
-                    break GateOutcome::unevaluated(
-                        UnevaluatedClass::Timeout,
-                        format!(
-                            "gate command '{command}' timed out after {}s and was killed; main was NOT evaluated{}",
-                            timeout.as_secs(),
-                            format_tail(&tail)
-                        ),
-                    );
-                }
-                std::thread::sleep(GATE_POLL_INTERVAL);
+            crate::proc_exec::FileCompletion::TimedOut => {
+                let tail = read_output_tail(out.path());
+                GateOutcome::unevaluated(
+                    UnevaluatedClass::Timeout,
+                    format!(
+                        "gate command '{command}' timed out after {}s and was killed; main was NOT evaluated{}",
+                        timeout.as_secs(),
+                        format_tail(&tail)
+                    ),
+                )
             }
-            Err(e) => {
-                break GateOutcome::unevaluated(
-                    UnevaluatedClass::SpawnFailure,
-                    format!("failed to poll gate command '{command}': {e}; main was NOT evaluated"),
-                );
-            }
-        }
-    };
-
-    let _ = std::fs::remove_file(&log_path);
-    outcome
+        },
+        Err(crate::proc_exec::ExecError::Spawn(e)) => GateOutcome::unevaluated(
+            UnevaluatedClass::SpawnFailure,
+            format!("failed to spawn gate command '{command}': {e}; main was NOT evaluated"),
+        ),
+        Err(crate::proc_exec::ExecError::Collect(e)) => GateOutcome::unevaluated(
+            UnevaluatedClass::SpawnFailure,
+            format!("failed to poll gate command '{command}': {e}; main was NOT evaluated"),
+        ),
+    }
 }
 
 /// Read the last [`MAX_OUTPUT_TAIL_BYTES`] of the gate's captured output.

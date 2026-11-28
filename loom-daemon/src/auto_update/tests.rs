@@ -729,9 +729,41 @@ fn test_run_update_script_exit_5_is_terminal() {
 #[test]
 fn test_run_update_script_timeout_is_retryable() {
     let tmp = tempfile::tempdir().unwrap();
-    let s = write_fake_script(tmp.path(), "sleep 30");
-    let o = run_update_script(&s, tmp.path(), Duration::from_millis(300), false);
+    let pidfile = tmp.path().join("grandchild.pid");
+    let s = write_fake_script(
+        tmp.path(),
+        &format!("/bin/sleep 120 & echo $! > '{}'; exec /bin/sleep 120", pidfile.display()),
+    );
+    let o = run_update_script(&s, tmp.path(), Duration::from_millis(600), false);
     assert!(matches!(o, RebuildOutcome::Retryable(m) if m.contains("timed out")));
+
+    #[cfg(unix)]
+    {
+        let pid: i32 = fs::read_to_string(&pidfile)
+            .expect("grandchild must have recorded its pid")
+            .trim()
+            .parse()
+            .expect("pid must parse");
+        assert!(pid > 0, "fixture must capture a real pid");
+        let mut alive = true;
+        let reap_deadline = Instant::now() + Duration::from_secs(1);
+        while Instant::now() < reap_deadline {
+            // SAFETY: signal 0 performs error checking only; it never delivers a signal.
+            if unsafe { libc::kill(pid as libc::pid_t, 0) } != 0 {
+                alive = false;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        if alive {
+            // Do not leak the process if the assertion is about to fail.
+            unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) };
+        }
+        assert!(
+            !alive,
+            "grandchild pid {pid} outlived the deadline — timeout killed only the immediate child"
+        );
+    }
 }
 
 #[test]

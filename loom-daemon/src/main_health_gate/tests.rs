@@ -915,8 +915,10 @@ fn test_command_runner_red_on_nonzero_exit_captures_output() {
 #[test]
 #[serial]
 fn test_command_runner_timeout_is_unevaluated_not_red() {
+    let tmp = tempfile::tempdir().unwrap();
+    let pidfile = tmp.path().join("grandchild.pid");
     let cfg = BuildGateConfig {
-        command: "sleep 10".to_string(),
+        command: format!("/bin/sleep 120 & echo $! > '{}'; exec /bin/sleep 120", pidfile.display()),
         timeout: Duration::from_secs(1),
         ..Default::default()
     };
@@ -934,6 +936,34 @@ fn test_command_runner_timeout_is_unevaluated_not_red() {
         "timeout detail expected, got: {}",
         outcome.detail()
     );
+
+    #[cfg(unix)]
+    {
+        let pid: i32 = std::fs::read_to_string(&pidfile)
+            .expect("grandchild must have recorded its pid")
+            .trim()
+            .parse()
+            .expect("pid must parse");
+        assert!(pid > 0, "fixture must capture a real pid");
+        let mut alive = true;
+        let reap_deadline = Instant::now() + Duration::from_secs(1);
+        while Instant::now() < reap_deadline {
+            // SAFETY: signal 0 performs error checking only; it never delivers a signal.
+            if unsafe { libc::kill(pid as libc::pid_t, 0) } != 0 {
+                alive = false;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        if alive {
+            // Do not leak the process if the assertion is about to fail.
+            unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) };
+        }
+        assert!(
+            !alive,
+            "grandchild pid {pid} outlived the deadline — timeout killed only the immediate child"
+        );
+    }
 }
 
 #[test]

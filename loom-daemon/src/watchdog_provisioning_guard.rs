@@ -56,7 +56,7 @@
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 // ============================================================================
 // Constants (env overrides + built-in defaults)
@@ -83,9 +83,6 @@ pub const DEFAULT_INTERVAL_SECS: u64 = 600;
 /// over the script's real runtime (a few `launchctl`/`systemctl` calls) without
 /// letting a hung pass wedge the loop indefinitely.
 const DEFAULT_HEAL_TIMEOUT: Duration = Duration::from_secs(60);
-
-/// Poll granularity while waiting for the heal subprocess to finish.
-const PROBE_POLL_INTERVAL: Duration = Duration::from_millis(200);
 
 /// Max bytes of captured subprocess output retained in a failure log line.
 const MAX_OUTPUT_TAIL_BYTES: usize = 2048;
@@ -268,62 +265,33 @@ pub fn run_pass_with_marker(
 /// exit; `Err(reason)` (with an output tail) otherwise. Shape mirrors
 /// `install_self_check::run_with_timeout` / `auto_update::run_update_script`.
 fn run_heal_watchdog_only(script: &Path, cwd: &Path, timeout: Duration) -> Result<(), String> {
-    let log_path = std::env::temp_dir()
-        .join(format!("loom-watchdog-provisioning-guard-{}.log", uuid::Uuid::new_v4()));
-    let out_file = std::fs::File::create(&log_path)
-        .map_err(|e| format!("could not create output file: {e}"))?;
-    let stderr_file = match out_file.try_clone() {
-        Ok(f) => f,
-        Err(e) => {
-            let _ = std::fs::remove_file(&log_path);
-            return Err(format!("could not clone output handle: {e}"));
-        }
-    };
-
-    let mut child = match Command::new(script)
-        .arg("--heal-watchdog-only")
+    let mut cmd = Command::new(script);
+    cmd.arg("--heal-watchdog-only")
         .current_dir(cwd)
-        .stdin(Stdio::null())
-        .stdout(Stdio::from(out_file))
-        .stderr(Stdio::from(stderr_file))
-        .spawn()
-    {
-        Ok(c) => c,
-        Err(e) => {
-            let _ = std::fs::remove_file(&log_path);
-            return Err(format!("could not spawn `{}`: {e}", script.display()));
-        }
-    };
+        .stdin(Stdio::null());
 
-    let start = Instant::now();
-    let result = loop {
-        match child.try_wait() {
-            Ok(Some(status)) if status.success() => break Ok(()),
-            Ok(Some(status)) => {
-                let tail = std::fs::read_to_string(&log_path).unwrap_or_default();
-                break Err(format!(
+    match crate::proc_exec::run_bounded_to_file(cmd, timeout, "loom-watchdog-provisioning-guard-") {
+        Ok(out) => match out.completion() {
+            crate::proc_exec::FileCompletion::Exited(status) if status.success() => Ok(()),
+            crate::proc_exec::FileCompletion::Exited(status) => {
+                let tail = std::fs::read_to_string(out.path()).unwrap_or_default();
+                Err(format!(
                     "`{}` exited with {status}: {}",
                     script.display(),
                     truncate_tail(&tail)
-                ));
+                ))
             }
-            Ok(None) => {
-                if start.elapsed() >= timeout {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    break Err(format!(
-                        "`{}` timed out after {}s",
-                        script.display(),
-                        timeout.as_secs()
-                    ));
-                }
-                std::thread::sleep(PROBE_POLL_INTERVAL);
+            crate::proc_exec::FileCompletion::TimedOut => {
+                Err(format!("`{}` timed out after {}s", script.display(), timeout.as_secs()))
             }
-            Err(e) => break Err(format!("could not poll `{}`: {e}", script.display())),
+        },
+        Err(crate::proc_exec::ExecError::Spawn(e)) => {
+            Err(format!("could not spawn `{}`: {e}", script.display()))
         }
-    };
-    let _ = std::fs::remove_file(&log_path);
-    result
+        Err(crate::proc_exec::ExecError::Collect(e)) => {
+            Err(format!("could not poll `{}`: {e}", script.display()))
+        }
+    }
 }
 
 /// Truncate captured output to the last [`MAX_OUTPUT_TAIL_BYTES`] bytes,
@@ -700,20 +668,52 @@ mod tests {
         let socket = tmp.path().join("loom-daemon.sock");
         std::env::set_var("LOOM_SOCKET_PATH", &socket);
         fs::write(tmp.path().join("autonomy-desired"), "started_at=x\n").unwrap();
+        let pidfile = tmp.path().join("grandchild.pid");
         write_executable_script(
             &tmp.path().join(".loom/scripts/cli/loom-daemon-start.sh"),
-            "#!/bin/sh\nsleep 5\nexit 0\n",
+            &format!(
+                "#!/bin/sh\n/bin/sleep 120 & echo $! > '{}'\nexec /bin/sleep 120\n",
+                pidfile.display()
+            ),
         );
         let start = StdInstant::now();
-        let outcome = run_pass(tmp.path(), Duration::from_millis(100));
+        let outcome = run_pass(tmp.path(), Duration::from_millis(500));
         std::env::remove_var("LOOM_SOCKET_PATH");
         assert!(
             start.elapsed() < Duration::from_secs(4),
-            "should time out promptly, not wait for sleep 5"
+            "should time out promptly, not wait for sleep 120"
         );
         match outcome {
             HealPassOutcome::Failed(reason) => assert!(reason.contains("timed out")),
             other => panic!("expected Failed(timed out), got {other:?}"),
+        }
+
+        #[cfg(unix)]
+        {
+            let pid: i32 = fs::read_to_string(&pidfile)
+                .expect("grandchild must have recorded its pid")
+                .trim()
+                .parse()
+                .expect("pid must parse");
+            assert!(pid > 0, "fixture must capture a real pid");
+            let mut alive = true;
+            let reap_deadline = StdInstant::now() + Duration::from_secs(1);
+            while StdInstant::now() < reap_deadline {
+                // SAFETY: signal 0 performs error checking only; it never delivers a signal.
+                if unsafe { libc::kill(pid as libc::pid_t, 0) } != 0 {
+                    alive = false;
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            if alive {
+                // Do not leak the process if the assertion is about to fail.
+                unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) };
+            }
+            assert!(
+                !alive,
+                "grandchild pid {pid} outlived the deadline — timeout killed only the immediate child"
+            );
         }
     }
 

@@ -40,7 +40,8 @@
 //! is created here rather than reusing whatever the child inherited.
 
 use std::io;
-use std::process::{Child, Command, Output, Stdio};
+use std::path::Path;
+use std::process::{Child, Command, ExitStatus, Output, Stdio};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
@@ -150,6 +151,105 @@ impl std::fmt::Display for ExecError {
 }
 
 impl std::error::Error for ExecError {}
+
+/// What a file-backed bounded execution did, when it got far enough to say.
+///
+/// Mirrors [`Completion`] for [`run_bounded_to_file`], where combined stdout
+/// and stderr stream directly into a temporary log file instead of in-memory
+/// pipe buffers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FileCompletion {
+    /// The child ran to completion inside the deadline.
+    Exited(ExitStatus),
+    /// The deadline elapsed. The child's process group was terminated.
+    TimedOut,
+}
+
+/// Output handle returned by [`run_bounded_to_file`].
+///
+/// Keeps the temporary combined-log file alive while the caller inspects
+/// [`Self::path`] and unlinks it automatically on [`Drop`].
+#[derive(Debug)]
+pub struct BoundedFileOutput {
+    completion: FileCompletion,
+    log_file: tempfile::NamedTempFile,
+}
+
+impl BoundedFileOutput {
+    /// Whether the child exited on its own or hit the deadline.
+    #[must_use]
+    pub fn completion(&self) -> FileCompletion {
+        self.completion
+    }
+
+    /// Path to the combined stdout+stderr log file (valid until `self` drops).
+    #[must_use]
+    pub fn path(&self) -> &Path {
+        self.log_file.path()
+    }
+}
+
+/// Run `cmd` to completion under `timeout`, streaming combined stdout and
+/// stderr into a unique temporary `.log` file instead of in-memory pipes.
+///
+/// Intended for long build/gate logs whose output should stay off the daemon
+/// heap and preserve chronological stdout/stderr interleaving while retaining
+/// [`run_bounded`]'s process-group teardown on timeout and `ETXTBSY` test
+/// fixture retry. `stdin` is left to the caller; `stdout` and `stderr` are
+/// redirected to cloned handles of the temporary file.
+///
+/// # Errors
+///
+/// [`ExecError::Spawn`] if creating/cloning the temp file or spawning the child
+/// failed (nothing ran); [`ExecError::Collect`] if polling the spawned child
+/// failed (the process group is terminated before returning).
+pub fn run_bounded_to_file(
+    mut cmd: Command,
+    timeout: Duration,
+    log_prefix: &str,
+) -> Result<BoundedFileOutput, ExecError> {
+    let log_file = tempfile::Builder::new()
+        .prefix(log_prefix)
+        .suffix(".log")
+        .tempfile()
+        .map_err(ExecError::Spawn)?;
+    let stdout_file = log_file.as_file().try_clone().map_err(ExecError::Spawn)?;
+    let stderr_file = log_file.as_file().try_clone().map_err(ExecError::Spawn)?;
+
+    cmd.stdout(Stdio::from(stdout_file))
+        .stderr(Stdio::from(stderr_file));
+    place_in_own_process_group(&mut cmd);
+
+    let mut child = spawn(&mut cmd).map_err(ExecError::Spawn)?;
+    let pid = child.id();
+
+    let deadline = Instant::now() + timeout;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                return Ok(BoundedFileOutput {
+                    completion: FileCompletion::Exited(status),
+                    log_file,
+                });
+            }
+            Ok(None) => {}
+            Err(e) => {
+                terminate_group(pid);
+                let _ = child.wait();
+                return Err(ExecError::Collect(e));
+            }
+        }
+        if Instant::now() >= deadline {
+            terminate_group(pid);
+            let _ = child.wait();
+            return Ok(BoundedFileOutput {
+                completion: FileCompletion::TimedOut,
+                log_file,
+            });
+        }
+        std::thread::sleep(POLL_INTERVAL);
+    }
+}
 
 /// Run `cmd` to completion under `timeout`.
 ///
