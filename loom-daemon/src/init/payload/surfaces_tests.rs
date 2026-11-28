@@ -720,7 +720,10 @@ fn hook_wiring_surface_wires_idempotently_and_skips_non_json() {
     stage_extras(defaults.path(), stage.path(), stage.path(), &mut shipped, &mut skipped).unwrap();
     assert!(shipped.contains(".claude/settings.json"), "{shipped:?}");
     let first = read(&settings);
-    assert!(first.contains("${CLAUDE_PROJECT_DIR}/.loom/hooks/gh-front-env.sh"));
+    // #15741: the launcher form resolves the root at run time (`$W`), never
+    // embedding `${CLAUDE_PROJECT_DIR}/` as text.
+    assert!(first.contains("G=$W/.loom/hooks/gh-front-env.sh"), "{first}");
+    assert!(!first.contains("${CLAUDE_PROJECT_DIR}/"), "bare form must not be emitted");
     assert!(!first.contains("skill-router.sh"), "absent script must not be wired");
 
     let (mut shipped, mut skipped) = (BTreeSet::new(), Vec::new());
