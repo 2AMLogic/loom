@@ -18,6 +18,28 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 ### 2026-11-28
 
+- **PR #15738**: test: route worktree_cli test git calls through test_git_helpers
+- **PR #15737**: test: delegate six hand-rolled test git calls to test_git_helpers
+- **PR #15736**: test: delegate remaining hand-rolled git calls to test_git_helpers
+- **PR #15733**: test: serialize the step-child env test against lease host id mutators
+- **PR #15728**: test: use test_git_helpers for health-gate and forge test git calls
+- **PR #15726**: test: delegate seven hand-rolled git test calls to test_git_helpers
+- **PR #15725**: test: delegate merge_pr test git calls to test_git_helpers
+- **PR #15724**: test: route hand-rolled test git calls through test_git_helpers::git_out
+- **PR #15723**: test: route worktree test git calls through test_git_helpers
+- **PR #15715**: chore: resync installed Loom surfaces
+- **Issue #15743** (closed): config-resolver.sh: loom_resolve_config passes each config tier as one jq --argjson argument; a large private defaults.json hits the 128 KiB per-argument limit and create-issue.sh exits 126 silently
+- **Issue #15702** (closed): Delegate hand-rolled test git calls to test_git_helpers: worktree_cli (1/2)
+- **Issue #15709** (closed): Delegate hand-rolled test git calls to test_git_helpers: activity, agent_gh, cli, dep_classify, git_tmp_reclaim, init
+- **Issue #15711** (closed): Delegate hand-rolled test git calls to test_git_helpers: secret_scan, stale_token_retry, verdict_equivalence, work_finder, write_scope_test_support
+- **Issue #15721** (closed): a_step_child_lists_its_leases_and_a_curator_names_its_launch is not #[serial] but reads process-global host-identity env twice
+- **Issue #15705** (closed): Delegate hand-rolled test git calls to test_git_helpers: main_health_gate and forge listing/bucket/gateway
+- **Issue #15710** (closed): Delegate hand-rolled test git calls to test_git_helpers: intake_reconcile, lock_order, observability, premise_check, rebase_guard, release_resolve, role_tick_telemetry
+- **Issue #15707** (closed): Delegate hand-rolled test git calls to test_git_helpers: merge_pr
+- **Issue #15708** (closed): Delegate hand-rolled test git calls to test_git_helpers: sweep_registry, step_dispatch, claim_reconciliation
+- **Issue #15735** (closed): config-resolver: loom_resolve_config passes tier files as one argv string — jq E2BIG once defaults.json exceeds 128 KB
+- **Issue #15734** (closed): config-resolver.sh passes a 208 KB defaults tier as one jq argv string: E2BIG at MAX_ARG_STRLEN (128 KiB), create-issue.sh exits 126
+- **Issue #15704** (closed): Delegate hand-rolled test git calls to test_git_helpers: worktree_ops, worktree_reaper, worktree_state
 - **PR #15720**: test: use test_git_helpers for worktree_cli test git calls
 - **PR #15712**: test: isolate cross-host lease tests from ambient LOOM_LEASE_HOST_ID
 - **PR #15706**: docs: fix inverted lock-acquisition comment in lock_order_tests

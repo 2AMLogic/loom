@@ -7,7 +7,7 @@ The body below is a snapshot of GitHub label state as of the last merged docs-ma
 <!-- Maintained automatically by the Guide triage agent. Manual edits are fine but may be overwritten. -->
 
 <!-- guide:plan-body:start -->
-_Generated: 2026-11-28T04:10:05Z (snapshot; compare against live labels)_
+_Generated: 2026-11-28T06:21:38Z (snapshot; compare against live labels)_
 ## Operator Attention: Merge-Risk-Hold Pileup
 
 Judge-approved PRs under a hold (`loom:blocked` or `loom:operator`) — a human merge decision, or the prerequisite shown, is missing.
@@ -129,8 +129,12 @@ Issues currently being built (`loom:building`).
 - **#15605**: Consolidate duplicated PR file-list pagination and head-content plumbing across the four forge PR-diff verbs
 - **#15617**: Retire sweep_registry::reaper::output_with_timeout and route its 13 remaining callers onto proc_exec::run_bounded
 - **#15652**: Retire unreferenced SweepRegistry::spawn_step / begin_step_spawn and wire check_role_command into spawn_step_unlocked_timed
-- **#15691**: lock_order_tests: a_multi_key_attribute_is_judged_on_its_sorted_keys comment inverts the acquisition direction it tests
-- **#15693**: lease_cross_host_tests fail on a host that exports LOOM_LEASE_HOST_ID
+- **#15714**: resync: attended merge-pr.sh skips post-merge reconciliation; manifest keeps retired command files
+- **#15718**: Consumer installs keep rjwalters/loom in install-time files: resync-installed.sh never refreshes .loom/README.md or the dated guides, and nothing migrates or flags .loom/config
+- **#15729**: checkout_ff: emit a record per fast-forward it performs, so a managed checkout's mover is attributable from the store
+- **#15730**: Consolidate triplicated recursive directory-sync loops in init/file_ops.rs
+- **#15732**: test: 4 forge_gateway tests fail under umask 0002 because the fixture's gh-ok marker is written group-writable
+- **#15741**: Restore launcher wiring for project hooks during resync and install
 
 ## PRs Awaiting Review
 
@@ -140,6 +144,7 @@ PRs waiting on Judge (`loom:review-requested`).
 - **#14612**: fix: launch eager reclaim detached so it cannot hold back a work-finder tick *(held)*
 - **#15047**: refactor: drop superseded zero-caller pub helpers from loom-daemon *(held)*
 - **#15679**: fix: run role-command check on live step spawn; retire locked spawn *(held)*
+- **#15742**: test: pin gh-ok marker mode to 0600 in forge_gateway fixtures
 
 ## Approved (Awaiting Merge)
 
@@ -183,6 +188,7 @@ PRs that passed review (`loom:pr`); unmarked PRs are queued for Champion auto-me
 - **#15616**: refactor: share PR-diff file-list transport across Champion carve-out verbs — closes #15605 *(held: champion merge-risk hold)*
 - **#15619**: refactor: route remaining output_with_timeout callers onto proc_exec::run_bounded — closes #15617 *(held: champion merge-risk hold)*
 - **#15660**: fix: keep worktree.sh's guards in force on a tools-only install — closes #14476 *(held: champion merge-risk hold)*
+- **#15740**: refactor: consolidate init directory-sync loops into one helper — closes #15730
 
 ## Proposed
 
@@ -300,8 +306,16 @@ Issues carrying `loom:curated`.
 - **#15553**: test flake: nextest discovery stalls inside the Run tests step (lib binary --list) on Rust Unit Tests (5/5) — sixth occurrence, first after #15378 *(curated)*
 - **#15588**: Make pr-worktree.sh stop when worktree root config resolution fails *(curated)*
 - **#15605**: Consolidate duplicated PR file-list pagination and head-content plumbing across the four forge PR-diff verbs *(curated)*
-- **#15691**: lock_order_tests: a_multi_key_attribute_is_judged_on_its_sorted_keys comment inverts the acquisition direction it tests *(curated)*
-- **#15693**: lease_cross_host_tests fail on a host that exports LOOM_LEASE_HOST_ID *(curated)*
+- **#15692**: Triage remaining hand-rolled Command::new("git") sites in test code after the test_git_helpers consolidation *(curated)* *(held)*
+- **#15713**: resync: prune_stale_manifest_entries() cannot prune retired .claude/commands/loom/* entries (#14012 gap) *(curated)* *(held)*
+- **#15714**: resync: attended merge-pr.sh skips post-merge reconciliation; manifest keeps retired command files *(curated)*
+- **#15718**: Consumer installs keep rjwalters/loom in install-time files: resync-installed.sh never refreshes .loom/README.md or the dated guides, and nothing migrates or flags .loom/config *(curated)*
+- **#15719**: resync manifest prune misses retired .claude/commands/loom/* entries (classifier narrower than the synced surface map) *(curated)* *(held)*
+- **#15729**: checkout_ff: emit a record per fast-forward it performs, so a managed checkout's mover is attributable from the store *(curated)*
+- **#15732**: test: 4 forge_gateway tests fail under umask 0002 because the fixture's gh-ok marker is written group-writable *(curated)*
+- **#15741**: Restore launcher wiring for project hooks during resync and install *(curated)*
+- **#15744**: resync manifest prune (#14012) cannot clear stale .claude/commands/loom/ entries *(curated)*
+- **#15745**: resync: installed_files is pruned but never extended — manifest under-claims newly shipped payload files (36 → 80 unlisted across one resync) *(curated)*
 
 ## Proposed (Architect / Hermit)
 
@@ -331,11 +345,11 @@ Issues carrying `loom:curated`.
 | Very important | 0 |
 | Important | 8 |
 | Ready (`loom:issue`, net of holds/building/open-linked-PRs) | 0 |
-| In Progress (`loom:building`) | 40 |
+| In Progress (`loom:building`) | 44 |
 | Held, no other bucket | 80 |
-| PRs awaiting review | 4 |
-| Approved PRs awaiting merge | 38 |
-| Curated | 114 |
+| PRs awaiting review | 5 |
+| Approved PRs awaiting merge | 39 |
+| Curated | 122 |
 | Architect / Hermit proposals | 7 |
 | Active epics | 7 |
 <!-- guide:plan-body:end -->
