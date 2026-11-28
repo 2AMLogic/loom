@@ -1007,10 +1007,7 @@ pub fn resolve_gate_load_threshold(repo_root: &Path) -> f64 {
 /// Env override for [`BUILD_GATE_MAX_DEFER_ENV`] — `None` unless set to a
 /// parseable value `> 0`.
 fn env_gate_max_defer_secs() -> Option<u64> {
-    std::env::var(BUILD_GATE_MAX_DEFER_ENV)
-        .ok()
-        .and_then(|v| v.trim().parse::<u64>().ok())
-        .filter(|&s| s > 0)
+    crate::env_flag::env_positive(BUILD_GATE_MAX_DEFER_ENV)
 }
 
 /// `buildGate.maxDeferSeconds` from config, filtered to `> 0`.
@@ -2980,14 +2977,10 @@ pub fn effective_enabled(repo_root: &Path) -> bool {
 /// falls back to the default.
 #[must_use]
 pub fn resolve_interval() -> Duration {
-    std::env::var(MAIN_HEALTH_GATE_INTERVAL_ENV)
-        .ok()
-        .and_then(|v| v.parse::<u64>().ok())
-        .filter(|&s| s > 0)
-        .map_or_else(
-            || Duration::from_secs(DEFAULT_MAIN_HEALTH_GATE_INTERVAL_SECS),
-            Duration::from_secs,
-        )
+    crate::env_flag::env_positive(MAIN_HEALTH_GATE_INTERVAL_ENV).map_or_else(
+        || Duration::from_secs(DEFAULT_MAIN_HEALTH_GATE_INTERVAL_SECS),
+        Duration::from_secs,
+    )
 }
 
 // ============================================================================

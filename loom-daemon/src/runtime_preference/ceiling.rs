@@ -285,11 +285,7 @@ fn resolve_stale(attached: bool) -> u64 {
     if !attached {
         return DEFAULT_RESERVATION_STALE_SECS;
     }
-    std::env::var(LEASE_STALE_SECS_ENV)
-        .ok()
-        .and_then(|raw| raw.trim().parse::<u64>().ok())
-        .filter(|secs| *secs > 0)
-        .unwrap_or(DEFAULT_LEASE_STALE_SECS)
+    crate::env_flag::env_positive(LEASE_STALE_SECS_ENV).unwrap_or(DEFAULT_LEASE_STALE_SECS)
 }
 
 /// The machine-wide lease directory, or `None` when neither

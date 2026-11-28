@@ -1572,19 +1572,13 @@ pub fn tick_multi_with_build_backoff<S: WorkSource, D: WorkDispatcher>(
 /// Env override for the tick interval — `None` when unset, zero, or
 /// unparseable (a zero-interval busy loop is never useful).
 fn env_interval_secs() -> Option<u64> {
-    std::env::var(WORK_FINDER_INTERVAL_ENV)
-        .ok()
-        .and_then(|v| v.parse::<u64>().ok())
-        .filter(|&s| s > 0)
+    crate::env_flag::env_positive(WORK_FINDER_INTERVAL_ENV)
 }
 
 /// Env override for the max-concurrency ceiling — `None` when unset, zero, or
 /// unparseable (a zero cap would dispatch nothing, defeating the loop).
 fn env_max_concurrent() -> Option<usize> {
-    std::env::var(WORK_FINDER_MAX_CONCURRENT_ENV)
-        .ok()
-        .and_then(|v| v.parse::<usize>().ok())
-        .filter(|&n| n > 0)
+    crate::env_flag::env_positive(WORK_FINDER_MAX_CONCURRENT_ENV)
 }
 
 /// Resolve the tick interval from [`WORK_FINDER_INTERVAL_ENV`], falling back to

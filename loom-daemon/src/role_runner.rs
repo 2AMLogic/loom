@@ -2088,11 +2088,7 @@ pub fn resolve_interval_for_role_with_source(
     spec: &RoleSpec,
     config: &RoleRunnerConfig,
 ) -> (Duration, IntervalSource) {
-    if let Some(secs) = std::env::var(ROLE_RUNNER_INTERVAL_ENV)
-        .ok()
-        .and_then(|v| v.parse::<u64>().ok())
-        .filter(|&s| s > 0)
-    {
+    if let Some(secs) = crate::env_flag::env_positive(ROLE_RUNNER_INTERVAL_ENV) {
         return (Duration::from_secs(secs), IntervalSource::Env);
     }
     if let Some(secs) = config.interval_secs {
@@ -2209,10 +2205,7 @@ pub fn log_role_runner_disabled(repo_root: &Path, config: &RoleRunnerConfig) {
 /// forbidden from producing anything.
 #[must_use]
 pub fn resolve_architect_max_proposals(config: &RoleRunnerConfig) -> u64 {
-    std::env::var(ARCHITECT_MAX_PROPOSALS_ENV)
-        .ok()
-        .and_then(|v| v.trim().parse::<u64>().ok())
-        .filter(|&n| n > 0)
+    crate::env_flag::env_positive(ARCHITECT_MAX_PROPOSALS_ENV)
         .or(config.architect_max_proposals)
         .unwrap_or(DEFAULT_ARCHITECT_MAX_PROPOSALS)
 }
@@ -2261,10 +2254,7 @@ pub fn default_max_concurrent() -> usize {
 /// alone, bound how many agents this daemon can have running.
 #[must_use]
 pub fn resolve_max_concurrent(config: &RoleRunnerConfig) -> usize {
-    std::env::var(ROLE_RUNNER_MAX_CONCURRENT_ENV)
-        .ok()
-        .and_then(|v| v.trim().parse::<usize>().ok())
-        .filter(|&n| n > 0)
+    crate::env_flag::env_positive(ROLE_RUNNER_MAX_CONCURRENT_ENV)
         .or(config.max_concurrent)
         .unwrap_or_else(default_max_concurrent)
 }

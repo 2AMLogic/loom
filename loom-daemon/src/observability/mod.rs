@@ -663,10 +663,7 @@ pub fn resolve_exporters(config: &ObservabilityConfig) -> Vec<ExporterEntry> {
             })
             .collect()
     };
-    let env_max_batch_bytes = std::env::var(MAX_BATCH_BYTES_ENV)
-        .ok()
-        .and_then(|value| value.parse::<usize>().ok())
-        .filter(|value| *value > 0);
+    let env_max_batch_bytes = crate::env_flag::env_positive(MAX_BATCH_BYTES_ENV);
     let mut resolved: Vec<ExporterEntry> = Vec::with_capacity(raw.len());
     for entry in raw {
         match ExporterKind::parse_lenient(&entry.kind) {

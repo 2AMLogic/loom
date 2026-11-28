@@ -3157,11 +3157,7 @@ pub const STEP_LOG_REQUIRE_ARCHIVE_ENV: &str = "LOOM_STEP_LOG_REQUIRE_ARCHIVE";
 /// pass never becomes a silent no-op from a config typo.
 #[must_use]
 pub fn resolve_log_retention_days(repo_root: &Path) -> u64 {
-    if let Some(days) = std::env::var(LOG_RETENTION_DAYS_ENV)
-        .ok()
-        .and_then(|v| v.trim().parse::<u64>().ok())
-        .filter(|&d| d > 0)
-    {
+    if let Some(days) = crate::env_flag::env_positive(LOG_RETENTION_DAYS_ENV) {
         return days;
     }
     let effective = crate::config_resolver::resolve_effective_config(repo_root);

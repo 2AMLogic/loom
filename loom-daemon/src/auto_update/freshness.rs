@@ -101,19 +101,13 @@ impl Thresholds {
     /// falls through to the next tier.
     #[must_use]
     pub fn resolve(config: &super::AutoUpdateConfig, interval: Duration, settle: Duration) -> Self {
-        let env = |name: &str| {
-            std::env::var(name)
-                .ok()
-                .and_then(|v| v.parse::<u64>().ok())
-                .filter(|&s| s > 0)
-        };
         let base = Self::from_defaults(interval, settle);
         Self {
             interval,
-            overdue_after: env(OVERDUE_ENV)
+            overdue_after: crate::env_flag::env_positive(OVERDUE_ENV)
                 .or(config.overdue_secs)
                 .map_or(base.overdue_after, Duration::from_secs),
-            converge_deadline: env(CONVERGE_DEADLINE_ENV)
+            converge_deadline: crate::env_flag::env_positive(CONVERGE_DEADLINE_ENV)
                 .or(config.converge_deadline_secs)
                 .map_or(base.converge_deadline, Duration::from_secs),
         }

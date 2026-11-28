@@ -664,10 +664,7 @@ pub const DEFAULT_EMPTY_POOL_BREAKER_WINDOW_SECS: i64 = 1800;
 /// Resolve the distinct-issue threshold (env > default, #6614).
 #[must_use]
 pub fn resolve_empty_pool_breaker_threshold() -> usize {
-    std::env::var(EMPTY_POOL_BREAKER_THRESHOLD_ENV)
-        .ok()
-        .and_then(|v| v.trim().parse::<usize>().ok())
-        .filter(|&n| n > 0)
+    crate::env_flag::env_positive(EMPTY_POOL_BREAKER_THRESHOLD_ENV)
         .unwrap_or(DEFAULT_EMPTY_POOL_BREAKER_THRESHOLD)
 }
 

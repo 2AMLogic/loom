@@ -175,10 +175,7 @@ pub fn resolve_enabled(config: &TargetOrphanConfig) -> bool {
 /// matching dir eligible the moment its build paused.
 #[must_use]
 pub fn resolve_max_age_hours(config: &TargetOrphanConfig) -> u64 {
-    std::env::var(MAX_AGE_HOURS_ENV)
-        .ok()
-        .and_then(|v| v.trim().parse::<u64>().ok())
-        .filter(|&h| h > 0)
+    crate::env_flag::env_positive(MAX_AGE_HOURS_ENV)
         .or(config.max_age_hours)
         .unwrap_or(DEFAULT_MAX_AGE_HOURS)
 }
@@ -187,10 +184,7 @@ pub fn resolve_max_age_hours(config: &TargetOrphanConfig) -> u64 {
 /// age: a 0-minute grace would race a dying run's last writes.
 #[must_use]
 pub fn resolve_dead_owner_grace_minutes(config: &TargetOrphanConfig) -> u64 {
-    std::env::var(DEAD_OWNER_GRACE_ENV)
-        .ok()
-        .and_then(|v| v.trim().parse::<u64>().ok())
-        .filter(|&m| m > 0)
+    crate::env_flag::env_positive(DEAD_OWNER_GRACE_ENV)
         .or(config.dead_owner_grace_minutes)
         .unwrap_or(DEFAULT_DEAD_OWNER_GRACE_MINUTES)
 }
@@ -225,10 +219,7 @@ pub fn resolve_ages(config: &TargetOrphanConfig) -> AgeGates {
 
 #[must_use]
 pub fn resolve_min_interval_secs(config: &TargetOrphanConfig) -> u64 {
-    std::env::var(MIN_INTERVAL_ENV)
-        .ok()
-        .and_then(|v| v.trim().parse::<u64>().ok())
-        .filter(|&s| s > 0)
+    crate::env_flag::env_positive(MIN_INTERVAL_ENV)
         .or(config.min_interval_secs)
         .unwrap_or(DEFAULT_MIN_INTERVAL_SECS)
 }

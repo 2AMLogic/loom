@@ -622,10 +622,7 @@ fn env_enabled_override() -> Option<bool> {
 }
 
 fn env_interval_secs() -> Option<u64> {
-    std::env::var("LOOM_TRANSCRIPT_INGEST_INTERVAL")
-        .ok()
-        .and_then(|v| v.parse::<u64>().ok())
-        .filter(|v| *v > 0)
+    crate::env_flag::env_positive("LOOM_TRANSCRIPT_INGEST_INTERVAL")
 }
 
 fn env_window_hours() -> Option<i64> {

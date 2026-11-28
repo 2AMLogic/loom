@@ -151,11 +151,7 @@ pub(super) fn opencode_schema_only(working: &str, head: &str) -> bool {
 /// hourly, and a checkout it keeps current is never behind for long. Days-old
 /// detached checkouts are the ones this is for.
 pub(super) fn detached_after() -> Duration {
-    let minutes = std::env::var(DETACHED_ENV)
-        .ok()
-        .and_then(|v| v.trim().parse::<u64>().ok())
-        .filter(|n| *n > 0)
-        .unwrap_or(DEFAULT_DETACHED_MINUTES);
+    let minutes = crate::env_flag::env_positive(DETACHED_ENV).unwrap_or(DEFAULT_DETACHED_MINUTES);
     Duration::from_secs(minutes * 60)
 }
 

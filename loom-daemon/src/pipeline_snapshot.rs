@@ -626,10 +626,7 @@ pub const DEFAULT_FETCH_CONCURRENCY: usize = 4;
 /// The per-root fan-out bound: `LOOM_PIPELINE_FETCH_CONCURRENCY` when it is a
 /// positive integer, else [`DEFAULT_FETCH_CONCURRENCY`].
 fn fetch_concurrency() -> usize {
-    std::env::var("LOOM_PIPELINE_FETCH_CONCURRENCY")
-        .ok()
-        .and_then(|v| v.trim().parse::<usize>().ok())
-        .filter(|n| *n > 0)
+    crate::env_flag::env_positive("LOOM_PIPELINE_FETCH_CONCURRENCY")
         .unwrap_or(DEFAULT_FETCH_CONCURRENCY)
 }
 

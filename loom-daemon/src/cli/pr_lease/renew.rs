@@ -294,11 +294,7 @@ pub(crate) fn spawn(
     watch_pid: u32,
     leased_at: DateTime<Utc>,
 ) -> String {
-    let interval = std::env::var(INTERVAL_ENV)
-        .ok()
-        .and_then(|v| v.trim().parse::<u64>().ok())
-        .filter(|v| *v > 0)
-        .unwrap_or(DEFAULT_INTERVAL_SECS);
+    let interval = crate::env_flag::env_positive(INTERVAL_ENV).unwrap_or(DEFAULT_INTERVAL_SECS);
     let exe = match std::env::current_exe() {
         Ok(e) => e,
         Err(e) => return format!("renewer not started ({e}); the lease ages out at the TTL"),

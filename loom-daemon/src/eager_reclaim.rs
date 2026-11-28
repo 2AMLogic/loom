@@ -220,10 +220,7 @@ pub fn resolve_enabled(config: &EagerReclaimConfig) -> bool {
 /// anti-thrash gate.
 #[must_use]
 pub fn resolve_min_interval_secs(config: &EagerReclaimConfig) -> u64 {
-    std::env::var(EAGER_RECLAIM_MIN_INTERVAL_ENV)
-        .ok()
-        .and_then(|v| v.trim().parse::<u64>().ok())
-        .filter(|&s| s > 0)
+    crate::env_flag::env_positive(EAGER_RECLAIM_MIN_INTERVAL_ENV)
         .or(config.min_interval_secs)
         .unwrap_or(DEFAULT_EAGER_MIN_INTERVAL_SECS)
 }

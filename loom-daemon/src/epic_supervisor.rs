@@ -1119,10 +1119,7 @@ pub fn supervisor_enabled() -> bool {
 /// value falls back to the default (a zero-interval busy loop is never useful).
 #[must_use]
 pub fn resolve_supervisor_interval() -> Duration {
-    std::env::var(SUPERVISOR_INTERVAL_ENV)
-        .ok()
-        .and_then(|v| v.parse::<u64>().ok())
-        .filter(|&s| s > 0)
+    crate::env_flag::env_positive(SUPERVISOR_INTERVAL_ENV)
         .map_or_else(|| Duration::from_secs(DEFAULT_SUPERVISOR_INTERVAL_SECS), Duration::from_secs)
 }
 

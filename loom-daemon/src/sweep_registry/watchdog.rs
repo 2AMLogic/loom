@@ -590,10 +590,7 @@ pub fn resolve_watchdog_enabled(config: &StartupRaceConfig) -> bool {
 /// default** (Issue #3887).
 #[must_use]
 pub fn resolve_watchdog_timeout(config: &StartupRaceConfig) -> Duration {
-    let secs = std::env::var(WATCHDOG_TIMEOUT_ENV)
-        .ok()
-        .and_then(|v| v.trim().parse::<u64>().ok())
-        .filter(|&s| s > 0)
+    let secs = crate::env_flag::env_positive(WATCHDOG_TIMEOUT_ENV)
         .or(config.watchdog_timeout_secs)
         .unwrap_or(DEFAULT_WATCHDOG_TIMEOUT_SECS);
     Duration::from_secs(secs)
@@ -603,10 +600,7 @@ pub fn resolve_watchdog_timeout(config: &StartupRaceConfig) -> Duration {
 /// (Issue #3887).
 #[must_use]
 pub fn resolve_watchdog_interval(config: &StartupRaceConfig) -> Duration {
-    let secs = std::env::var(WATCHDOG_INTERVAL_ENV)
-        .ok()
-        .and_then(|v| v.trim().parse::<u64>().ok())
-        .filter(|&s| s > 0)
+    let secs = crate::env_flag::env_positive(WATCHDOG_INTERVAL_ENV)
         .or(config.watchdog_interval_secs)
         .unwrap_or(DEFAULT_WATCHDOG_INTERVAL_SECS);
     Duration::from_secs(secs)
@@ -629,10 +623,7 @@ pub fn resolve_review_stall_enabled(config: &StartupRaceConfig) -> bool {
 /// config > default** (Issue #3910).
 #[must_use]
 pub fn resolve_review_stall_timeout(config: &StartupRaceConfig) -> Duration {
-    let secs = std::env::var(REVIEW_STALL_TIMEOUT_ENV)
-        .ok()
-        .and_then(|v| v.trim().parse::<u64>().ok())
-        .filter(|&s| s > 0)
+    let secs = crate::env_flag::env_positive(REVIEW_STALL_TIMEOUT_ENV)
         .or(config.review_stall_timeout_secs)
         .unwrap_or(DEFAULT_REVIEW_STALL_TIMEOUT_SECS);
     Duration::from_secs(secs)
@@ -642,10 +633,7 @@ pub fn resolve_review_stall_timeout(config: &StartupRaceConfig) -> Duration {
 /// config > default** (Issue #4003).
 #[must_use]
 pub fn resolve_startup_proof_grace(config: &StartupRaceConfig) -> Duration {
-    let secs = std::env::var(STARTUP_PROOF_GRACE_ENV)
-        .ok()
-        .and_then(|v| v.trim().parse::<u64>().ok())
-        .filter(|&s| s > 0)
+    let secs = crate::env_flag::env_positive(STARTUP_PROOF_GRACE_ENV)
         .or(config.startup_proof_grace_secs)
         .unwrap_or(DEFAULT_STARTUP_PROOF_GRACE_SECS);
     Duration::from_secs(secs)
@@ -669,10 +657,7 @@ pub fn resolve_stale_sweep_enabled(config: &StartupRaceConfig) -> bool {
 /// default** (Issue #7529).
 #[must_use]
 pub fn resolve_stale_sweep_age(config: &StartupRaceConfig) -> Duration {
-    let secs = std::env::var(STALE_SWEEP_AGE_ENV)
-        .ok()
-        .and_then(|v| v.trim().parse::<u64>().ok())
-        .filter(|&s| s > 0)
+    let secs = crate::env_flag::env_positive(STALE_SWEEP_AGE_ENV)
         .or(config.stale_sweep_age_secs)
         .unwrap_or(DEFAULT_STALE_SWEEP_AGE_SECS);
     Duration::from_secs(secs)

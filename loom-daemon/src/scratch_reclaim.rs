@@ -148,10 +148,7 @@ pub fn resolve_max_age_hours(config: &ScratchReclaimConfig) -> u64 {
 /// anti-thrash gate.
 #[must_use]
 pub fn resolve_min_interval_secs(config: &ScratchReclaimConfig) -> u64 {
-    std::env::var(SCRATCH_RECLAIM_MIN_INTERVAL_ENV)
-        .ok()
-        .and_then(|v| v.trim().parse::<u64>().ok())
-        .filter(|&s| s > 0)
+    crate::env_flag::env_positive(SCRATCH_RECLAIM_MIN_INTERVAL_ENV)
         .or(config.min_interval_secs)
         .unwrap_or(DEFAULT_SCRATCH_MIN_INTERVAL_SECS)
 }

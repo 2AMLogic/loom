@@ -375,10 +375,7 @@ pub fn resolve_detection_enabled(repo_root: &Path) -> bool {
 /// reaching back into unrelated backlog churn.
 #[must_use]
 pub fn resolve_window(repo_root: &Path, role_interval: Duration) -> Duration {
-    let from_env = std::env::var(ROLE_COLLISION_WINDOW_ENV)
-        .ok()
-        .and_then(|v| v.trim().parse::<u64>().ok())
-        .filter(|&s| s > 0);
+    let from_env = crate::env_flag::env_positive(ROLE_COLLISION_WINDOW_ENV);
     let secs = match from_env {
         Some(s) => Some(s),
         None => {
