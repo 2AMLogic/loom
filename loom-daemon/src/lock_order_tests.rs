@@ -272,12 +272,7 @@ fn repo_root() -> PathBuf {
 }
 
 fn tracked_files(root: &Path) -> Option<Vec<String>> {
-    let out = std::process::Command::new("git")
-        .arg("-C")
-        .arg(root)
-        .arg("ls-files")
-        .output()
-        .ok()?;
+    let out = crate::test_git_helpers::git_out(root, &["ls-files"]);
     if !out.status.success() {
         return None;
     }

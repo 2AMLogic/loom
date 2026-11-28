@@ -28,6 +28,7 @@ const ENV: &[(&str, &str)] = &[
 ];
 
 fn raw(repo: &Path, args: &[&str]) -> (bool, String) {
+    // Hand-rolled on purpose: must share the verb's `ENV` (identity, GIT_EDITOR), not git_out's.
     let out = Command::new("git")
         .arg("-C")
         .arg(repo)

@@ -24,20 +24,16 @@ fn terminal_records_resolve_a_path_shaped_repo_from_the_git_remote() {
     // the repo still emits `owner/name` — resolved locally from the path's
     // git remote, never the path itself.
     let dir = tempfile::tempdir().unwrap();
-    let run = |args: &[&str]| {
-        std::process::Command::new("git")
-            .args(args)
-            .current_dir(dir.path())
-            .output()
-            .unwrap()
-    };
-    run(&["init", "-q"]);
-    run(&[
-        "remote",
-        "add",
-        "origin",
-        "https://github.com/owner/name-from-remote.git",
-    ]);
+    crate::test_git_helpers::git_out(dir.path(), &["init", "-q"]);
+    crate::test_git_helpers::git_out(
+        dir.path(),
+        &[
+            "remote",
+            "add",
+            "origin",
+            "https://github.com/owner/name-from-remote.git",
+        ],
+    );
 
     let mut dispatches = HashMap::new();
     let records = map_event_to_records(

@@ -3,8 +3,8 @@
 
 use super::*;
 use crate::forge_identity::IdentityRole;
+use crate::test_git_helpers::run as git;
 use std::os::unix::fs::PermissionsExt;
-use std::process::Command;
 use std::time::{Duration, SystemTime};
 
 fn headers(reset: i64) -> RateLimitHeaders {
@@ -199,17 +199,8 @@ fn write_sidecar(dir: &Path, app_id: &str, expires: chrono::DateTime<chrono::Utc
 #[test]
 fn probe_all_probes_each_published_dir_once_under_its_own_credential() {
     let ws = tempfile::tempdir().unwrap();
-    let git = |args: &[&str]| {
-        assert!(Command::new("git")
-            .args(args)
-            .current_dir(ws.path())
-            .output()
-            .unwrap()
-            .status
-            .success());
-    };
-    git(&["init", "-q"]);
-    git(&["remote", "add", "origin", "https://github.com/acme/ws"]);
+    git(ws.path(), &["init", "-q"]);
+    git(ws.path(), &["remote", "add", "origin", "https://github.com/acme/ws"]);
     let loom = ws.path().join(".loom");
     let primary = loom.join("gh-config");
     let owner = loom.join("gh-config-by-owner/acme");

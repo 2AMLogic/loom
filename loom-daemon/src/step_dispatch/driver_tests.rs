@@ -276,12 +276,8 @@ fn fleet_capacity_tick(case: FleetCapacityCase) -> (TickReport, HeartbeatRequest
         );
         let repo = &repos[idx];
         let git = |args: &[&str]| {
-            assert!(std::process::Command::new("git")
-                .args(args)
-                .current_dir(root)
-                .status()
-                .unwrap()
-                .success());
+            let out = crate::test_git_helpers::git_out(root, args);
+            assert!(out.status.success());
         };
         git(&["-c", "init.templateDir=", "init", "-q"]);
         git(&[
