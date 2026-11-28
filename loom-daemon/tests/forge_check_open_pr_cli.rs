@@ -245,6 +245,46 @@ fn an_unresolvable_repo_fails_closed() {
     assert!(!stderr.contains("safe to claim"), "stderr: {stderr}");
 }
 
+/// An unresolvable cwd is a failure to answer too (#15664): it used to leave
+/// as an `Err` through `main`'s generic error exit, whose `1` is the
+/// verified-absence code. The shell starts in its private, empty cwd, removes
+/// it, then `exec`s the binary, which inherits a deleted cwd.
+#[cfg(unix)]
+#[test]
+fn an_unresolvable_cwd_fails_closed() {
+    let dir = tempfile::tempdir().unwrap();
+    let out = Command::new("sh")
+        .args([
+            "-c",
+            r#"rmdir "$1" && exec "$2" forge check-open-pr "$3""#,
+            "sh",
+        ])
+        .arg(dir.path())
+        .arg(env!("CARGO_BIN_EXE_loom-daemon"))
+        .arg("42")
+        .current_dir(dir.path())
+        .env("LOOM_GH_BIN", dir.path().join("gh"))
+        .env("LOOM_FORGE_TYPE", "github")
+        .env("LOOM_CONFIG_DEFAULTS_FILE", "")
+        .env("LOOM_WORKSPACES_PATH", dir.path().join("workspaces.json"))
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(5), "stderr: {stderr}");
+    assert_ne!(
+        out.status.code(),
+        Some(1),
+        "an unresolvable cwd must not reuse the verified-absence exit code"
+    );
+    assert!(stdout.is_empty(), "stdout: {stdout}");
+    assert!(
+        !stderr.contains("safe to claim"),
+        "an unresolvable cwd must never read as an all-clear: {stderr}"
+    );
+    assert!(stderr.contains("NOT a verified absence"), "stderr: {stderr}");
+}
+
 /// Unparseable GraphQL with an unparseable timeline is also a failure, not an
 /// absence.
 #[test]
