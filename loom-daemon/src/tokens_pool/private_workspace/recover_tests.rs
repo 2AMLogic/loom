@@ -2901,8 +2901,8 @@ fn concurrent_judge_draws_share_one_idle_seat() {
             other => panic!("unexpected runtime {other}"),
         }
     }
-    // With no fallback and the same sole seat busy, both step entrypoints
-    // return their captain grant before taking a local lock or calling the forge.
+    // With no fallback and the same sole seat busy, the step spawn returns its
+    // captain grant before taking a local lock or calling the forge.
     use crate::fleet_dispatch::{proto, test_server::TestServer, worker};
     use crate::step_role::StepRole;
     use crate::sweep_registry::step_spawn::{StepRefusal, StepSpawnRequest};
@@ -2944,16 +2944,15 @@ fn concurrent_judge_draws_share_one_idle_seat() {
     let registry = Arc::new(Mutex::new(SweepRegistry::new(config)));
     let held = lease::Lease::acquire(&env.dir).expect("the abandoned selection is released");
     let request = StepSpawnRequest::new(7, StepRole::Judge);
-    let first = registry.lock().unwrap().spawn_step(&request).unwrap_err();
-    let second = SweepRegistry::spawn_step_unlocked(&registry, &request).unwrap_err();
-    for error in [first, second] {
-        let refusal = error.downcast_ref::<StepRefusal>().unwrap();
-        assert_eq!(refusal.reason, "runtime_rejected");
-        assert!(refusal.detail.contains("no idle seat"), "{refusal}");
-        assert_eq!(refusal.assignment_id.as_deref(), Some("judge-7"));
-    }
-    let refusals = captain.wait_for(proto::REFUSE_PATH, 2);
-    assert_eq!(refusals.len(), 2);
+    let refusal = SweepRegistry::spawn_step_unlocked(&registry, &request)
+        .unwrap_err()
+        .downcast::<StepRefusal>()
+        .unwrap();
+    assert_eq!(refusal.reason, "runtime_rejected");
+    assert!(refusal.detail.contains("no idle seat"), "{refusal}");
+    assert_eq!(refusal.assignment_id.as_deref(), Some("judge-7"));
+    let refusals = captain.wait_for(proto::REFUSE_PATH, 1);
+    assert_eq!(refusals.len(), 1);
     for sent in refusals {
         assert_eq!(sent["assignment_id"], "judge-7");
         assert_eq!(sent["reason"], crate::session_exec::refusal::SEAT_BUSY_REASON);

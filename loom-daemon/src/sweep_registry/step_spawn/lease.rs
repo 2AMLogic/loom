@@ -241,16 +241,6 @@ impl SweepRegistry {
         Some(cmd)
     }
 
-    /// B1: pre-take a non-Builder step's role-keyed lease, and only that.
-    pub(super) fn pre_claim_step_lease(
-        &self,
-        item: u32,
-        role: StepRole,
-        sweep_id: &str,
-    ) -> std::result::Result<ClaimFacts, StepRefusal> {
-        run_step_claim(self.step_claim_command(item, role, sweep_id))
-    }
-
     /// The pre-claim's `lease pr claim` command, built under the lock and
     /// run by [`run_step_claim`] with it released (#11909).
     pub(super) fn step_claim_command(

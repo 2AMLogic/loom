@@ -1,14 +1,14 @@
 //! A step spawn that releases the registry lock around its slow parts
 //! (#11909, the #11961 review): the work finder's step tick calls this.
 //!
-//! [`SweepRegistry::spawn_step`] holds `&mut self` from the role's resolvers
-//! to the recorded child. Two of its parts can take seconds: the runtime
-//! admission's private-clone containment (#8787, Docker) and a non-Builder
-//! step's pre-claim (`lease pr claim`, forge reads and a write). Run under the
-//! lock they would stall every other registry user: the reaper, IPC, the
-//! status surface. So, as `private_dispatch::prepare` does for sweeps:
+//! Two parts of a step spawn can take seconds: the runtime admission's
+//! private-clone containment (#8787, Docker) and a non-Builder step's
+//! pre-claim (`lease pr claim`, forge reads and a write). Run under the
+//! registry lock they would stall every other registry user: the reaper, IPC,
+//! the status surface. So, as `private_dispatch::prepare` does for sweeps:
 //!
-//! 1. **locked**: the roll gate, and a copy of the configuration;
+//! 1. **locked**: the role command (#12048), the roll gate, and a copy of the
+//!    configuration;
 //! 2. **unlocked**: the captain's claim when fleet dispatch is on
 //!    ([`captain_claim`], #12450: a refusal ends here, with no forge call),
 //!    a Builder step's landed check ([`landed_at_spawn`],
@@ -135,7 +135,11 @@ impl SweepRegistry {
         };
         let (item, role, kind) = (request.item, request.role, request.kind());
         let config = {
-            let reg = locked(registry);
+            let mut reg = locked(registry);
+            if let Err(refusal) = reg.check_role_command(role) {
+                drop(reg);
+                return Err(refuse(refusal));
+            }
             if let Err(e) = reg.roll_gate.admit(&kind) {
                 drop(reg);
                 return Err(refuse(StepRefusal::new("roll_paused", e)));
@@ -221,7 +225,7 @@ impl SweepRegistry {
             }
             if role == StepRole::Builder {
                 lap(&mut timings.launch);
-                let claimed = reg.pre_claim_step(item, role, &sweep_id);
+                let claimed = reg.pre_claim_builder_step(item, &sweep_id);
                 lap(&mut timings.claim);
                 if let Err(refusal) = claimed {
                     reg.unwind_step_claim(item, role, &sweep_id, false);
@@ -262,11 +266,11 @@ mod tests {
     use serial_test::serial;
     use tempfile::tempdir;
 
-    /// The unlocked path launches and tracks a step exactly as `spawn_step`
-    /// does, and a held item is refused before anything runs.
+    /// The step spawn launches and tracks a step, and a held item is refused
+    /// before anything runs.
     #[test]
     #[serial]
-    fn the_unlocked_spawn_launches_and_refuses_like_the_locked_one() {
+    fn the_spawn_launches_a_step_and_refuses_a_held_item() {
         let dir = tempdir().unwrap();
         let (reg, record) = fixture_registry(dir.path());
         crate::sweep_registry::test_support::write_lock_owner(

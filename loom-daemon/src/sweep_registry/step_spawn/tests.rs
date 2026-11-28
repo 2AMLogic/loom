@@ -26,6 +26,13 @@ fn cancel_all(reg: &mut SweepRegistry) {
     }
 }
 
+/// [`cancel_all`] on a shared registry, the lock released before it returns:
+/// a later `spawn_step_unlocked` on the same thread must not find it held.
+fn cancel_all_shared(registry: &Arc<Mutex<SweepRegistry>>) {
+    let mut reg = registry.lock().unwrap();
+    cancel_all(&mut reg);
+}
+
 fn step_span_reason(spans: &[crate::telemetry::trace::SpanRecord]) -> Vec<(String, String)> {
     spans
         .iter()
@@ -47,19 +54,21 @@ fn step_span_reason(spans: &[crate::telemetry::trace::SpanRecord]) -> Vec<(Strin
 #[serial]
 fn a_step_launches_its_roles_prompt_and_is_tracked_as_a_step() {
     let dir = tempdir().unwrap();
-    let (mut reg, record) = fixture_registry(dir.path());
+    let (reg, record) = fixture_registry(dir.path());
+    let registry = Arc::new(Mutex::new(reg));
     let request = StepSpawnRequest {
         draw_attempt: 2,
         age_source: "events".into(),
         ..StepSpawnRequest::new(9_100, StepRole::Judge)
     };
-    let (outcome, signals) = capture(|| reg.spawn_step(&request));
+    let (outcome, signals) = capture(|| SweepRegistry::spawn_step_unlocked(&registry, &request));
     let outcome = outcome.unwrap();
     assert!(outcome.sweep_id.starts_with("step-judge-9100-"), "{}", outcome.sweep_id);
     let recorded = assert_child_wrote(&record, &format!("LOOM_SWEEP_ID={}", outcome.sweep_id));
     assert!(recorded.contains("arg: /loom:judge 9100"), "{recorded}");
     // A PR step's item is a PR, never an issue claim (`build-gate.sh`).
     assert!(recorded.contains("LOOM_SWEEP_CLAIM_OWNED=unset"), "{recorded}");
+    let mut reg = registry.lock().unwrap();
     let info = &reg.entries[&outcome.sweep_id];
     assert_eq!(
         info.kind,
@@ -85,13 +94,16 @@ fn a_step_launches_its_roles_prompt_and_is_tracked_as_a_step() {
 #[serial]
 fn a_champion_merge_step_runs_the_targeted_pr_mode() {
     let dir = tempdir().unwrap();
-    let (mut reg, record) = fixture_registry(dir.path());
-    let outcome = reg
-        .spawn_step(&StepSpawnRequest::new(9_101, StepRole::ChampionMerge))
-        .unwrap();
+    let (reg, record) = fixture_registry(dir.path());
+    let registry = Arc::new(Mutex::new(reg));
+    let outcome = SweepRegistry::spawn_step_unlocked(
+        &registry,
+        &StepSpawnRequest::new(9_101, StepRole::ChampionMerge),
+    )
+    .unwrap();
     let recorded = assert_child_wrote(&record, &format!("LOOM_SWEEP_ID={}", outcome.sweep_id));
     assert!(recorded.contains("arg: /loom:champion --pr 9101"), "{recorded}");
-    cancel_all(&mut reg);
+    cancel_all_shared(&registry);
 }
 
 /// The role's resolvers: `roleModels` / `roleEfforts` for that role, never
@@ -100,17 +112,21 @@ fn a_champion_merge_step_runs_the_targeted_pr_mode() {
 #[serial]
 fn a_step_runs_with_its_roles_model_and_effort() {
     let dir = tempdir().unwrap();
-    let (mut reg, record) = fixture_registry(dir.path());
+    let (reg, record) = fixture_registry(dir.path());
+    let registry = Arc::new(Mutex::new(reg));
     write_config(
         dir.path(),
         r#"{"autonomous":{"roleRunner":{"roleModels":{"doctor":"claude-doctor-pin"},"roleEfforts":{"doctor":"high"}}}}"#,
     );
-    let outcome = reg
-        .spawn_step(&StepSpawnRequest::new(9_102, StepRole::Doctor))
-        .unwrap();
+    let outcome = SweepRegistry::spawn_step_unlocked(
+        &registry,
+        &StepSpawnRequest::new(9_102, StepRole::Doctor),
+    )
+    .unwrap();
     let recorded = assert_child_wrote(&record, &format!("LOOM_SWEEP_ID={}", outcome.sweep_id));
     assert!(recorded.contains("arg: --model\narg: claude-doctor-pin"), "{recorded}");
     assert!(recorded.contains("arg: --effort\narg: high"), "{recorded}");
+    let mut reg = registry.lock().unwrap();
     assert_eq!(reg.entries[&outcome.sweep_id].model.as_deref(), Some("claude-doctor-pin"));
     cancel_all(&mut reg);
 }
@@ -121,18 +137,23 @@ fn a_step_runs_with_its_roles_model_and_effort() {
 #[serial]
 fn a_held_item_is_refused_as_claimed() {
     let dir = tempdir().unwrap();
-    let (mut reg, _) = fixture_registry(dir.path());
+    let (reg, _) = fixture_registry(dir.path());
     crate::sweep_registry::test_support::write_lock_owner(
         &reg,
         9_103,
         "sweep-issue-9103-1",
         std::process::id(),
     );
-    let (result, signals) =
-        capture(|| reg.spawn_step(&StepSpawnRequest::new(9_103, StepRole::Curator)));
+    let registry = Arc::new(Mutex::new(reg));
+    let (result, signals) = capture(|| {
+        SweepRegistry::spawn_step_unlocked(
+            &registry,
+            &StepSpawnRequest::new(9_103, StepRole::Curator),
+        )
+    });
     let refusal = result.unwrap_err().downcast::<StepRefusal>().unwrap();
     assert_eq!(refusal.reason, "claimed");
-    assert!(reg.entries.is_empty());
+    assert!(registry.lock().unwrap().entries.is_empty());
     assert_eq!(step_span_reason(&signals.spans), vec![("refused".into(), "claimed".into())]);
 }
 
@@ -182,7 +203,7 @@ fn a_pool_or_runtime_gate_refuses_with_its_own_reason() {
 
 /// #14026 acceptance criterion 3, at the refusal boundary: a preference-path
 /// exhaustion longer than the marker's 160-char cap reaches the step refusal
-/// — the text `begin_step_spawn` logs after its `sweep_registry:` prefix —
+/// — the text `spawn_step_unlocked` logs after its `sweep_registry:` prefix —
 /// as ONE line carrying the full untruncated reason, never the multi-line
 /// operator diagnostic.
 #[test]
@@ -958,15 +979,20 @@ fn a_step_found_dead_at_startup_runs_its_end() {
 #[serial]
 fn only_a_builder_step_names_its_item_as_the_owned_claim() {
     let dir = tempdir().unwrap();
-    let (mut reg, record) = fixture_registry(dir.path());
-    let builder = reg
-        .spawn_step(&StepSpawnRequest::new(9_105, StepRole::Builder))
-        .unwrap();
+    let (reg, record) = fixture_registry(dir.path());
+    let registry = Arc::new(Mutex::new(reg));
+    let builder = SweepRegistry::spawn_step_unlocked(
+        &registry,
+        &StepSpawnRequest::new(9_105, StepRole::Builder),
+    )
+    .unwrap();
     let recorded = assert_child_wrote(&record, &format!("LOOM_SWEEP_ID={}", builder.sweep_id));
     assert!(recorded.contains("LOOM_SWEEP_CLAIM_OWNED=9105"), "{recorded}");
-    let curator = reg
-        .spawn_step(&StepSpawnRequest::new(9_106, StepRole::Curator))
-        .unwrap();
+    let curator = SweepRegistry::spawn_step_unlocked(
+        &registry,
+        &StepSpawnRequest::new(9_106, StepRole::Curator),
+    )
+    .unwrap();
     let recorded = assert_child_wrote(&record, &format!("LOOM_SWEEP_ID={}", curator.sweep_id));
     // This launch's own record: from its `argv:` line to its sweep id.
     let block = recorded[..recorded
@@ -976,7 +1002,7 @@ fn only_a_builder_step_names_its_item_as_the_owned_claim() {
         .next()
         .unwrap_or_default();
     assert!(block.contains("LOOM_SWEEP_CLAIM_OWNED=unset"), "{block}");
-    cancel_all(&mut reg);
+    cancel_all_shared(&registry);
 }
 
 // ---- workspace role command (#12048) ----------------------------------------
@@ -989,23 +1015,31 @@ fn a_step_without_its_role_command_is_refused_before_any_lock() {
     let dir = tempdir().unwrap();
     let (mut reg, _record) = fixture_registry(dir.path());
     reg.config.skip_label_flip = false;
+    let registry = Arc::new(Mutex::new(reg));
     let request = StepSpawnRequest::new(9_200, StepRole::Judge);
 
-    let (result, signals) = capture(|| reg.spawn_step(&request));
+    let (result, signals) = capture(|| SweepRegistry::spawn_step_unlocked(&registry, &request));
     let refusal = result.unwrap_err();
     let refusal = refusal.downcast_ref::<StepRefusal>().unwrap();
     assert_eq!(refusal.reason, "workspace_commands_missing");
-    assert!(!reg.config.locks_dir().join("pr-9200").exists(), "no lock may be left behind");
-    assert!(reg.entries.is_empty());
+    {
+        let reg = registry.lock().unwrap();
+        assert!(!reg.config.locks_dir().join("pr-9200").exists(), "no lock may be left behind");
+        assert!(reg.entries.is_empty());
+    }
     assert_eq!(
         step_span_reason(&signals.spans),
         vec![("refused".into(), "workspace_commands_missing".into())]
     );
 
     // A second refusal records the span again but does not WARN again.
-    assert!(reg.missing_command_warned.contains("judge"));
-    let _ = reg.spawn_step(&request).unwrap_err();
-    assert_eq!(reg.missing_command_warned.len(), 1);
+    assert!(registry
+        .lock()
+        .unwrap()
+        .missing_command_warned
+        .contains("judge"));
+    let _ = SweepRegistry::spawn_step_unlocked(&registry, &request).unwrap_err();
+    assert_eq!(registry.lock().unwrap().missing_command_warned.len(), 1);
 
     let commands = dir.path().join(".claude").join("commands").join("loom");
     std::fs::create_dir_all(&commands).unwrap();
@@ -1013,10 +1047,11 @@ fn a_step_without_its_role_command_is_refused_before_any_lock() {
     // The non-hermetic fixture has no credential pool, so the step may still be
     // refused further on; the guard owns only that it is no longer refused for
     // the missing command and that its WARN re-arms.
-    if let Err(err) = reg.spawn_step(&request) {
+    if let Err(err) = SweepRegistry::spawn_step_unlocked(&registry, &request) {
         let refusal = err.downcast_ref::<StepRefusal>().unwrap();
         assert_ne!(refusal.reason, "workspace_commands_missing");
     }
+    let mut reg = registry.lock().unwrap();
     assert!(reg.missing_command_warned.is_empty(), "the WARN re-arms once the file is seen");
     cancel_all(&mut reg);
 }
@@ -1039,10 +1074,9 @@ const BUILDER_ITEM: u32 = 12133;
 const PEER_LEASE: &str = "<!-- loom:lease host=peer-host sweep=sweep-peer -->";
 
 fn builder_claim(reg: &mut SweepRegistry, sweep: &str) -> std::result::Result<(), StepRefusal> {
-    // A Builder's claim is a label flip and a lease comment: it has no
-    // `lease pr claim` facts to carry (#12183).
-    reg.pre_claim_step(BUILDER_ITEM, StepRole::Builder, sweep)
-        .map(|claim| assert!(claim.is_none(), "a Builder claim carries no facts"))
+    // A Builder's claim is a label flip and a lease comment, not a
+    // `lease pr claim` run (#12133).
+    reg.pre_claim_builder_step(BUILDER_ITEM, sweep)
 }
 
 /// Make the fake `gh`'s `arm` (e.g. the comment read) exit 1 straight away.
@@ -1794,40 +1828,68 @@ mod captain {
     }
 
     /// A refused claim is a pass with ZERO forge calls: no landed check, no
-    /// label flip, no lease comment, no lock left behind. Both spawn paths.
+    /// label flip, no lease comment, no lock left behind.
     #[test]
     #[serial]
     fn a_captain_refusal_makes_no_forge_call() {
         crate::fleet_dispatch::worker::reset_for_test();
         let dir = tempdir().unwrap();
-        let (mut reg, gh_log) = forge_registry(dir.path(), &[]);
+        let (reg, gh_log) = forge_registry(dir.path(), &[]);
         let server = held();
         enable(dir.path(), &server.url());
         let request = StepSpawnRequest::new(BUILDER_ITEM, StepRole::Builder);
-        let (result, signals) = capture(|| reg.spawn_step(&request));
+        let registry = Arc::new(Mutex::new(reg));
+        let (result, signals) = capture(|| SweepRegistry::spawn_step_unlocked(&registry, &request));
         let refusal = result.unwrap_err().downcast::<StepRefusal>().unwrap();
         assert_eq!(refusal.reason, "captain_held");
         assert_eq!(gh_calls(&gh_log), "", "a refusal makes no forge call");
-        assert!(reg.entries.is_empty());
-        assert!(!reg
-            .config
-            .locks_dir()
-            .join(format!("issue-{BUILDER_ITEM}"))
-            .exists());
+        {
+            let reg = registry.lock().unwrap();
+            assert!(reg.entries.is_empty());
+            assert!(!reg
+                .config
+                .locks_dir()
+                .join(format!("issue-{BUILDER_ITEM}"))
+                .exists());
+        }
         assert_eq!(
             step_span_reason(&signals.spans),
             vec![("refused".into(), "captain_held".into())]
         );
         assert_eq!(server.requests_to(CLAIM_PATH).len(), 1);
 
-        let registry = Arc::new(Mutex::new(reg));
         let refusal = SweepRegistry::spawn_step_unlocked(&registry, &request)
             .unwrap_err()
             .downcast::<StepRefusal>()
             .unwrap();
         assert_eq!(refusal.reason, "captain_held");
-        assert_eq!(gh_calls(&gh_log), "", "nor on the unlocked path");
+        assert_eq!(gh_calls(&gh_log), "", "a second refusal makes no forge call either");
         assert!(server.requests_to(REFUSE_PATH).is_empty(), "nothing was granted to give back");
+    }
+
+    /// #12048 on the live path: a workspace without the role's command is
+    /// refused before the captain is asked, so the missing file costs no
+    /// claim and no forge call.
+    #[test]
+    #[serial]
+    fn a_missing_role_command_is_refused_before_the_captain_is_asked() {
+        crate::fleet_dispatch::worker::reset_for_test();
+        let dir = tempdir().unwrap();
+        let (reg, gh_log, ..) =
+            crate::sweep_registry::test_support::lease_order_dispatch_registry(dir.path(), &[]);
+        let server = held();
+        enable(dir.path(), &server.url());
+        let registry = Arc::new(Mutex::new(reg));
+        let request = StepSpawnRequest::new(BUILDER_ITEM, StepRole::Builder);
+        let (result, signals) = capture(|| SweepRegistry::spawn_step_unlocked(&registry, &request));
+        let refusal = result.unwrap_err().downcast::<StepRefusal>().unwrap();
+        assert_eq!(refusal.reason, "workspace_commands_missing");
+        assert!(server.requests().is_empty(), "the captain is never asked");
+        assert_eq!(gh_calls(&gh_log), "", "no forge call");
+        assert_eq!(
+            step_span_reason(&signals.spans),
+            vec![("refused".into(), "workspace_commands_missing".into())]
+        );
     }
 
     /// A grant runs today's path unchanged: the forge is asked as before.
@@ -1839,7 +1901,7 @@ mod captain {
         crate::fleet_dispatch::worker::reset_for_test();
         let dir = tempdir().unwrap();
         // A peer's earlier lease: today's forge claim loses the race.
-        let (mut reg, gh_log) = forge_registry(dir.path(), &[PEER_LEASE]);
+        let (reg, gh_log) = forge_registry(dir.path(), &[PEER_LEASE]);
         // A per-repo credential pool, so the launch resolves on any host and
         // the step reaches the forge pre-claim (without one, a host with no
         // pool is refused `no_token_pool` before the claim is ever made).
@@ -1847,7 +1909,8 @@ mod captain {
         let server = granted();
         enable(dir.path(), &server.url());
         let request = StepSpawnRequest::new(BUILDER_ITEM, StepRole::Builder);
-        let (result, signals) = capture(|| reg.spawn_step(&request));
+        let registry = Arc::new(Mutex::new(reg));
+        let (result, signals) = capture(|| SweepRegistry::spawn_step_unlocked(&registry, &request));
         let refusal = result.unwrap_err().downcast::<StepRefusal>().unwrap();
         assert_ne!(gh_calls(&gh_log), "", "a grant runs the forge path");
         assert_eq!(refusal.assignment_id.as_deref(), Some("a-12450"));
@@ -1873,11 +1936,16 @@ mod captain {
     fn a_granted_step_names_its_assignment_and_releases_it() {
         crate::fleet_dispatch::worker::reset_for_test();
         let dir = tempdir().unwrap();
-        let (mut reg, _) = fixture_registry(dir.path());
+        let (reg, _) = fixture_registry(dir.path());
         let server = granted();
         enable(dir.path(), &server.url());
-        let (outcome, signals) =
-            capture(|| reg.spawn_step(&StepSpawnRequest::new(9_450, StepRole::Judge)));
+        let registry = Arc::new(Mutex::new(reg));
+        let (outcome, signals) = capture(|| {
+            SweepRegistry::spawn_step_unlocked(
+                &registry,
+                &StepSpawnRequest::new(9_450, StepRole::Judge),
+            )
+        });
         let outcome = outcome.unwrap();
         let span = signals
             .spans
@@ -1886,6 +1954,7 @@ mod captain {
             .unwrap();
         assert_eq!(span.attributes["loom.dispatch.admission_result"], "spawned");
         assert_eq!(span.attributes["loom.assignment.id"], "a-12450");
+        let mut reg = registry.lock().unwrap();
         let _ = reg.end_step(
             &outcome.sweep_id,
             9_450,
@@ -1908,7 +1977,7 @@ mod captain {
     fn the_host_tier_flag_reaches_a_step_in_another_repo() {
         crate::fleet_dispatch::worker::reset_for_test();
         let (host, dir) = (tempdir().unwrap(), tempdir().unwrap());
-        let (mut reg, _) = fixture_registry(dir.path());
+        let (reg, _) = fixture_registry(dir.path());
         let server = granted();
         let local = host.path().join(crate::config_resolver::LOCAL_CONFIG_REL);
         std::fs::create_dir_all(local.parent().unwrap()).unwrap();
@@ -1917,9 +1986,14 @@ mod captain {
             json!({"fleetDispatch": {"enabled": true, "url": server.url()}}).to_string(),
         )
         .unwrap();
+        let registry = Arc::new(Mutex::new(reg));
         crate::fleet_dispatch::worker::set_host_root(host.path());
-        let (outcome, signals) =
-            capture(|| reg.spawn_step(&StepSpawnRequest::new(9_452, StepRole::Judge)));
+        let (outcome, signals) = capture(|| {
+            SweepRegistry::spawn_step_unlocked(
+                &registry,
+                &StepSpawnRequest::new(9_452, StepRole::Judge),
+            )
+        });
         outcome.unwrap();
         let claims = server.requests_to(CLAIM_PATH);
         assert_eq!(claims.len(), 1, "the host's flag must reach this repo's claim");
@@ -1930,18 +2004,22 @@ mod captain {
             .find(|s| s.name.as_str() == "loom.dispatch.step")
             .unwrap();
         assert_eq!(span.attributes["loom.assignment.id"], "a-12450");
-        cancel_all(&mut reg);
+        cancel_all_shared(&registry);
 
         std::fs::write(
             &local,
             json!({"fleetDispatch": {"enabled": false, "url": server.url()}}).to_string(),
         )
         .unwrap();
-        let (outcome, _) =
-            capture(|| reg.spawn_step(&StepSpawnRequest::new(9_453, StepRole::Judge)));
+        let (outcome, _) = capture(|| {
+            SweepRegistry::spawn_step_unlocked(
+                &registry,
+                &StepSpawnRequest::new(9_453, StepRole::Judge),
+            )
+        });
         outcome.unwrap();
         assert_eq!(server.requests_to(CLAIM_PATH).len(), 1, "host tier off: no new claim");
-        cancel_all(&mut reg);
+        cancel_all_shared(&registry);
         crate::fleet_dispatch::worker::reset_for_test();
     }
 
@@ -1951,14 +2029,19 @@ mod captain {
     fn with_the_flag_off_the_server_is_never_asked() {
         crate::fleet_dispatch::worker::reset_for_test();
         let dir = tempdir().unwrap();
-        let (mut reg, _) = fixture_registry(dir.path());
+        let (reg, _) = fixture_registry(dir.path());
         let server = held();
         write_config(
             dir.path(),
             &json!({"fleetDispatch": {"enabled": false, "url": server.url()}}).to_string(),
         );
-        let (outcome, signals) =
-            capture(|| reg.spawn_step(&StepSpawnRequest::new(9_451, StepRole::Judge)));
+        let registry = Arc::new(Mutex::new(reg));
+        let (outcome, signals) = capture(|| {
+            SweepRegistry::spawn_step_unlocked(
+                &registry,
+                &StepSpawnRequest::new(9_451, StepRole::Judge),
+            )
+        });
         outcome.unwrap();
         assert!(server.requests().is_empty());
         let span = signals
@@ -1967,7 +2050,7 @@ mod captain {
             .find(|s| s.name.as_str() == "loom.dispatch.step")
             .unwrap();
         assert!(!span.attributes.contains_key("loom.assignment.id"));
-        cancel_all(&mut reg);
+        cancel_all_shared(&registry);
     }
 }
 
@@ -2073,7 +2156,8 @@ fn a_no_line_builder_that_opened_a_pr_has_its_own_step_class() {
 #[serial]
 fn a_step_falls_back_a_model_rung_when_the_configured_class_is_exhausted() {
     let dir = tempdir().unwrap();
-    let (mut reg, record) = fixture_registry(dir.path());
+    let (reg, record) = fixture_registry(dir.path());
+    let registry = Arc::new(Mutex::new(reg));
     write_config(
         dir.path(),
         r#"{"autonomous": {"roleRunner": {"roleModels": {"judge": "fable"}},
@@ -2095,7 +2179,7 @@ fn a_step_falls_back_a_model_rung_when_the_configured_class_is_exhausted() {
     std::fs::write(tokens.join(".bad_tokens"), marks).unwrap();
 
     let request = StepSpawnRequest::new(9_101, StepRole::Judge);
-    let (outcome, signals) = capture(|| reg.spawn_step(&request));
+    let (outcome, signals) = capture(|| SweepRegistry::spawn_step_unlocked(&registry, &request));
     let outcome = outcome.unwrap();
     let recorded = assert_child_wrote(&record, "--model");
     let lines: Vec<&str> = recorded.lines().collect();
@@ -2115,7 +2199,7 @@ fn a_step_falls_back_a_model_rung_when_the_configured_class_is_exhausted() {
     assert_eq!(span.attributes["loom.step.model_fallback_from"], "fable");
     assert_eq!(span.attributes["loom.step.model_fallback_reason"], "no-account-for-class");
     assert_eq!(span.attributes["loom.dispatch.admission_result"], "spawned");
-    cancel_all(&mut reg);
+    cancel_all_shared(&registry);
     let _ = outcome;
 }
 
@@ -2127,7 +2211,8 @@ fn a_step_falls_back_a_model_rung_when_the_configured_class_is_exhausted() {
 #[serial]
 fn a_step_without_the_fallback_block_launches_the_configured_model() {
     let dir = tempdir().unwrap();
-    let (mut reg, record) = fixture_registry(dir.path());
+    let (reg, record) = fixture_registry(dir.path());
+    let registry = Arc::new(Mutex::new(reg));
     write_config(
         dir.path(),
         r#"{"autonomous": {"roleRunner": {"roleModels": {"judge": "fable"}}}}"#,
@@ -2145,7 +2230,7 @@ fn a_step_without_the_fallback_block_launches_the_configured_model() {
     std::fs::write(tokens.join(".bad_tokens"), marks).unwrap();
 
     let request = StepSpawnRequest::new(9_102, StepRole::Judge);
-    let (outcome, signals) = capture(|| reg.spawn_step(&request));
+    let (outcome, signals) = capture(|| SweepRegistry::spawn_step_unlocked(&registry, &request));
     outcome.unwrap();
     let recorded = assert_child_wrote(&record, "--model");
     let lines: Vec<&str> = recorded.lines().collect();
@@ -2163,7 +2248,7 @@ fn a_step_without_the_fallback_block_launches_the_configured_model() {
     assert!(!span
         .attributes
         .contains_key("loom.step.model_fallback_from"));
-    cancel_all(&mut reg);
+    cancel_all_shared(&registry);
 }
 
 /// #15413: the observed end maps onto the evidence the failed-Builder notice

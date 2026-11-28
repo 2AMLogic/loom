@@ -208,9 +208,10 @@ fn cancel_all(reg: &mut SweepRegistry) {
 fn a_spawned_builder_step_starts_sweep_builder_with_source_step() {
     std::env::set_var("LOOM_REPO", REPO);
     let dir = tempdir().unwrap();
-    let (mut reg, _rec) = fixture_registry(dir.path());
+    let (reg, _rec) = fixture_registry(dir.path());
+    let registry = Arc::new(Mutex::new(reg));
     let request = StepSpawnRequest::new(1_290_401, StepRole::Builder);
-    let (outcome, captured) = capture(|| reg.spawn_step(&request));
+    let (outcome, captured) = capture(|| SweepRegistry::spawn_step_unlocked(&registry, &request));
     std::env::remove_var("LOOM_REPO");
     let sweep_id = outcome.unwrap().sweep_id;
     let started = starts(captured.records);
@@ -222,6 +223,7 @@ fn a_spawned_builder_step_starts_sweep_builder_with_source_step() {
     assert_eq!(r.role, "builder");
     assert_eq!(r.sweep_id, sweep_id);
     assert_eq!(r.source, "step");
+    let mut reg = registry.lock().unwrap();
     cancel_all(&mut reg);
 }
 
@@ -230,18 +232,22 @@ fn a_spawned_builder_step_starts_sweep_builder_with_source_step() {
 fn a_pr_acting_or_promote_step_emits_no_step_start() {
     std::env::set_var("LOOM_REPO", REPO);
     let dir = tempdir().unwrap();
-    let (mut reg, _rec) = fixture_registry(dir.path());
+    let (reg, _rec) = fixture_registry(dir.path());
+    let registry = Arc::new(Mutex::new(reg));
     for (item, role) in [
         (1_290_411, StepRole::Judge),
         (1_290_412, StepRole::Doctor),
         (1_290_413, StepRole::ChampionMerge),
         (1_290_414, StepRole::ChampionPromote),
     ] {
-        let (outcome, captured) = capture(|| reg.spawn_step(&StepSpawnRequest::new(item, role)));
+        let (outcome, captured) = capture(|| {
+            SweepRegistry::spawn_step_unlocked(&registry, &StepSpawnRequest::new(item, role))
+        });
         outcome.unwrap();
         assert!(starts(captured.records).is_empty(), "{role:?}");
     }
     std::env::remove_var("LOOM_REPO");
+    let mut reg = registry.lock().unwrap();
     cancel_all(&mut reg);
 }
 
@@ -250,15 +256,20 @@ fn a_pr_acting_or_promote_step_emits_no_step_start() {
 fn a_refused_step_emits_no_start() {
     std::env::set_var("LOOM_REPO", REPO);
     let dir = tempdir().unwrap();
-    let (mut reg, _rec) = fixture_registry(dir.path());
+    let (reg, _rec) = fixture_registry(dir.path());
     crate::sweep_registry::test_support::write_lock_owner(
         &reg,
         1_290_421,
         "sweep-issue-1290421-1",
         std::process::id(),
     );
-    let (result, captured) =
-        capture(|| reg.spawn_step(&StepSpawnRequest::new(1_290_421, StepRole::Builder)));
+    let registry = Arc::new(Mutex::new(reg));
+    let (result, captured) = capture(|| {
+        SweepRegistry::spawn_step_unlocked(
+            &registry,
+            &StepSpawnRequest::new(1_290_421, StepRole::Builder),
+        )
+    });
     std::env::remove_var("LOOM_REPO");
     assert!(result.is_err());
     assert!(starts(captured.records).is_empty());

@@ -267,7 +267,7 @@ pub(crate) struct StepLaunch {
 /// A spawned step awaiting its account-selection poll, which the caller runs
 /// with the registry lock released ([`poll_and_classify_spawned_child`]),
 /// then hands back to [`SweepRegistry::finish_step_spawn`] (#6592's split).
-pub struct PreparedStep {
+pub(super) struct PreparedStep {
     pub child: Child,
     pub header_anchor: String,
     pub log_path: PathBuf,
@@ -325,101 +325,6 @@ pub(crate) fn refusal_of(outcome: &crate::role_runner::RoleTickOutcome) -> StepR
 }
 
 impl SweepRegistry {
-    /// Spawn one step: resolve, claim, launch, poll and record. Holds `&mut
-    /// self` across the account-selection poll; a caller that must not do
-    /// that runs [`Self::begin_step_spawn`], the poll and
-    /// [`Self::finish_step_spawn`] itself.
-    ///
-    /// # Errors
-    /// A [`StepRefusal`] (downcastable) naming why nothing ran.
-    pub fn spawn_step(&mut self, request: &StepSpawnRequest) -> Result<DispatchOutcome> {
-        let mut prepared = self.begin_step_spawn(request)?;
-        let (token_name, runtime, death) = poll_and_classify_spawned_child(
-            &mut prepared.child,
-            &prepared.log_path,
-            &prepared.header_anchor,
-        );
-        self.finish_step_spawn(prepared, token_name, runtime, death)
-    }
-
-    /// Resolve, claim and launch a step, up to a live child.
-    ///
-    /// # Errors
-    /// A [`StepRefusal`]: every side effect taken so far is undone.
-    pub fn begin_step_spawn(&mut self, request: &StepSpawnRequest) -> Result<PreparedStep> {
-        self.begin_step_spawn_inner(request).map_err(|refusal| {
-            self.record_step_dispatch(
-                request,
-                dispatch_step::RESULT_REFUSED,
-                refusal.reason,
-                None,
-                refusal.claim.as_deref(),
-                refusal.assignment_id.as_deref(),
-                refusal.captain.as_deref(),
-            );
-            log::info!(
-                "sweep_registry: {} step on #{} not spawned — {refusal}",
-                request.role,
-                request.item
-            );
-            anyhow::Error::new(refusal)
-        })
-    }
-
-    fn begin_step_spawn_inner(
-        &mut self,
-        request: &StepSpawnRequest,
-    ) -> std::result::Result<PreparedStep, StepRefusal> {
-        let (item, role, kind) = (request.item, request.role, request.kind());
-        self.check_role_command(role)?;
-        self.roll_gate
-            .admit(&kind)
-            .map_err(|e| StepRefusal::new("roll_paused", e))?;
-        let grant = captain_claim(&self.config.workspace_root, item, role)?;
-        match self.begin_granted_step(request) {
-            Ok(mut prepared) => {
-                prepared.assignment = grant;
-                Ok(prepared)
-            }
-            Err(refusal) => Err(give_back(grant.as_ref(), refusal)),
-        }
-    }
-
-    /// [`Self::begin_step_spawn_inner`] past the captain: today's path.
-    fn begin_granted_step(
-        &mut self,
-        request: &StepSpawnRequest,
-    ) -> std::result::Result<PreparedStep, StepRefusal> {
-        let (item, role, kind) = (request.item, request.role, request.kind());
-        if role == StepRole::Builder {
-            if let Some(pr) = self
-                .open_pr_listing_target()
-                .and_then(|t| landed_at_spawn(&t, item))
-            {
-                self.hold_landed_builder(item);
-                return Err(landed_refusal(item, pr));
-            }
-        }
-        let launch = Self::resolve_step_launch(&self.config, role, &kind)?;
-        let sweep_id = generate_sweep_id(&kind);
-        let locked = if role.acts_on_pr() {
-            self.acquire_pr_lock(item, &sweep_id)
-        } else {
-            self.acquire_lock(item, &sweep_id)
-        };
-        locked.map_err(|e| StepRefusal::new("claimed", format!("{e:#}")))?;
-        let claim = match self.pre_claim_step(item, role, &sweep_id) {
-            Ok(claim) => claim,
-            Err(refusal) => {
-                self.unwind_step_claim(item, role, &sweep_id, false);
-                return Err(refusal);
-            }
-        };
-        let mut prepared = self.spawn_prepared_step(request, &sweep_id, launch, false)?;
-        prepared.claim = claim;
-        Ok(prepared)
-    }
-
     /// Refuse a step whose `/loom:<role>` command is not installed in the
     /// workspace (#12048, the step-dispatch counterpart of #4027/#6440): the
     /// child would die on `Unknown command` and cool the item down as a failed
@@ -554,28 +459,6 @@ impl SweepRegistry {
         }
     }
 
-    /// Take the step's claim on the forge (B1, module docs).
-    fn pre_claim_step(
-        &mut self,
-        item: u32,
-        role: StepRole,
-        sweep_id: &str,
-    ) -> std::result::Result<Option<lease::ClaimFacts>, StepRefusal> {
-        if self.config.skip_label_flip {
-            return Ok(None);
-        }
-        match role {
-            // The Builder's claim is a label flip and a lease comment, not a
-            // `lease pr claim` run: no claim facts to record.
-            StepRole::Builder => self.pre_claim_builder_step(item, sweep_id).map(|()| None),
-            StepRole::Curator
-            | StepRole::ChampionPromote
-            | StepRole::Judge
-            | StepRole::Doctor
-            | StepRole::ChampionMerge => self.pre_claim_step_lease(item, role, sweep_id).map(Some),
-        }
-    }
-
     /// A Builder step's claim, claim-then-verify and FAIL CLOSED (#12133). The
     /// label flip is idempotent, so every host "wins" it; the lease comment's
     /// forge order is the only cross-host mutex. So after the flip and the
@@ -595,6 +478,9 @@ impl SweepRegistry {
         sweep_id: &str,
     ) -> std::result::Result<(), StepRefusal> {
         use builder_rollback::Loss;
+        if self.config.skip_label_flip {
+            return Ok(());
+        }
         let episode_start = Utc::now();
         self.flip_label_to_building(item)
             .map_err(|e| StepRefusal::new("label_flip_failed", format!("{e:#}")))?;
@@ -670,7 +556,7 @@ impl SweepRegistry {
     /// # Errors
     /// A [`StepRefusal`] when the child died in its token-selection preflight;
     /// its claim is undone.
-    pub fn finish_step_spawn(
+    pub(super) fn finish_step_spawn(
         &mut self,
         prepared: PreparedStep,
         token_name: String,
