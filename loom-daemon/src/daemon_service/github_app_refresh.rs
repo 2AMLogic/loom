@@ -55,6 +55,8 @@ struct PrimaryState {
     cross_owner_retry: credential_preflight::cross_owner::CrossOwnerRetry,
     drift_watch: credential_preflight::owner_drift::DriftWatch,
     ticks: u32,
+    /// #14936: one diagnostic per continuous failure of this source.
+    diagnostics: credential_preflight::RefreshDiagnostics,
 }
 
 /// Primary (workspace-root owner) refresh tick.
@@ -103,6 +105,7 @@ pub(super) fn spawn_primary_refresh(
         // every tick compares the checkouts' current remotes against.
         drift_watch: credential_preflight::owner_drift::DriftWatch::new(startup_roots),
         ticks: 0,
+        diagnostics: credential_preflight::RefreshDiagnostics::default(),
     }));
     let interval = credential_preflight::GITHUB_APP_REFRESH_INTERVAL;
     // #15327: the loop is a long-running task like the self-update loop: it
@@ -233,6 +236,9 @@ async fn refresh_mint(ctx: &Arc<PrimaryCtx>, state: &mut PrimaryState) -> bool {
                     Ok(()) => {
                         state.current_token = Some(token.clone());
                         primary_token::record_published(&ctx.owner_repo, expires_at); // #15327
+                        state
+                            .diagnostics
+                            .success(credential_preflight::CREDENTIAL_SOURCE_PRIMARY);
                         log::info!(
                             "credential_preflight: github-app refresh tick rotated the \
                              primary writer token (app {app_id} installation {installation_id}, \
@@ -247,6 +253,12 @@ async fn refresh_mint(ctx: &Arc<PrimaryCtx>, state: &mut PrimaryState) -> bool {
                             credential_preflight::CREDENTIAL_SOURCE_PRIMARY,
                             &format!("could not publish the minted token: {e}"),
                         );
+                        state.diagnostics.failure(
+                            &ctx.pass_workspace,
+                            credential_preflight::CREDENTIAL_SOURCE_PRIMARY,
+                            &ctx.config_dir,
+                            &format!("could not publish the minted token: {e}"),
+                        );
                         log::warn!(
                             "credential_preflight: github-app refresh tick failed to \
                              publish token to {} ({e}); GH_CONFIG_DIR left unchanged \
@@ -256,6 +268,9 @@ async fn refresh_mint(ctx: &Arc<PrimaryCtx>, state: &mut PrimaryState) -> bool {
                     }
                 }
             } else {
+                state
+                    .diagnostics
+                    .success(credential_preflight::CREDENTIAL_SOURCE_PRIMARY);
                 log::debug!(
                     "credential_preflight: github-app refresh tick cache hit, \
                      GH_TOKEN unchanged (app {app_id} installation {installation_id}) \
@@ -294,6 +309,12 @@ async fn refresh_mint(ctx: &Arc<PrimaryCtx>, state: &mut PrimaryState) -> bool {
                 credential_preflight::CREDENTIAL_SOURCE_PRIMARY,
                 &reason,
             );
+            state.diagnostics.failure(
+                &ctx.pass_workspace,
+                credential_preflight::CREDENTIAL_SOURCE_PRIMARY,
+                &ctx.config_dir,
+                &reason,
+            );
             log::warn!(
                 "credential_preflight: github-app refresh tick failed ({reason}); \
                  GH_TOKEN left unchanged — main-health gate verdicts are held for up \
@@ -306,6 +327,12 @@ async fn refresh_mint(ctx: &Arc<PrimaryCtx>, state: &mut PrimaryState) -> bool {
             // the credential is just as un-refreshed as an Error arm.
             credential_preflight::record_forge_credential_failure(
                 credential_preflight::CREDENTIAL_SOURCE_PRIMARY,
+                &format!("github-app refresh task join error: {e}"),
+            );
+            state.diagnostics.failure(
+                &ctx.pass_workspace,
+                credential_preflight::CREDENTIAL_SOURCE_PRIMARY,
+                &ctx.config_dir,
                 &format!("github-app refresh task join error: {e}"),
             );
             log::warn!("credential_preflight: github-app refresh task join error: {e} — #4430");
@@ -370,14 +397,18 @@ pub(super) fn spawn_owner_refresh(script_path: PathBuf, sweep_workspace: PathBuf
     // workspace) is picked up automatically, without a second task to spawn.
     // An empty registry makes a tick a cheap no-op loop, same cost as the
     // pre-#6171 early return.
-    let cwd = sweep_workspace;
+    //
+    // #14936: each source's continuous failure gets one diagnostic, by the
+    // same latch the primary tick keeps.
+    let workspace = sweep_workspace;
+    let mut diagnostics = credential_preflight::RefreshDiagnostics::default();
     tokio::spawn(async move {
         loop {
             tokio::time::sleep(credential_preflight::GITHUB_APP_REFRESH_INTERVAL).await;
             let owners = credential_preflight::owner_refresh_sources();
             for (owner_repo, config_dir) in &owners {
                 let script_path = script_path.clone();
-                let cwd = cwd.clone();
+                let cwd = workspace.clone();
                 let owner_repo_for_mint = owner_repo.clone();
                 let outcome = tokio::task::spawn_blocking(move || {
                     let minter = credential_preflight::RealGithubAppMinter { script_path, cwd };
@@ -400,6 +431,12 @@ pub(super) fn spawn_owner_refresh(script_path: PathBuf, sweep_workspace: PathBuf
                                 &source,
                                 &format!("could not publish the minted token: {e}"),
                             );
+                            diagnostics.failure(
+                                &workspace,
+                                &source,
+                                config_dir,
+                                &format!("could not publish the minted token: {e}"),
+                            );
                             log::warn!(
                                 "credential_preflight: per-owner github-app refresh could \
                                      not publish the token for {owner_repo} to {} ({e}); its \
@@ -408,13 +445,28 @@ pub(super) fn spawn_owner_refresh(script_path: PathBuf, sweep_workspace: PathBuf
                             );
                         } else {
                             credential_preflight::record_forge_credential_success(&source);
+                            diagnostics.success(&source);
                         }
                     }
                     Ok(credential_preflight::GithubAppOutcome::NotConfigured) => {
-                        // Cheap no-op — nothing to refresh for this owner.
+                        // Nothing to refresh for this owner. A source is only
+                        // registered once its owner's writer was minted, so
+                        // an App that no longer mints is an inactive
+                        // publisher: the credential on disk ages with no
+                        // renewal and nothing else says so (#14936). Diagnosed
+                        // once per streak; the health-gate tracker is left
+                        // alone, as before.
+                        diagnostics.failure(
+                            &workspace,
+                            &source,
+                            config_dir,
+                            "the GitHub App is not configured, so this owner's writer is not \
+                             being renewed",
+                        );
                     }
                     Ok(credential_preflight::GithubAppOutcome::Error(reason)) => {
                         credential_preflight::record_forge_credential_failure(&source, &reason);
+                        diagnostics.failure(&workspace, &source, config_dir, &reason);
                         log::warn!(
                             "credential_preflight: per-owner github-app refresh for \
                                  {owner_repo} failed ({reason}); its credential left \
@@ -426,6 +478,12 @@ pub(super) fn spawn_owner_refresh(script_path: PathBuf, sweep_workspace: PathBuf
                     Err(e) => {
                         credential_preflight::record_forge_credential_failure(
                             &source,
+                            &format!("per-owner refresh task join error: {e}"),
+                        );
+                        diagnostics.failure(
+                            &workspace,
+                            &source,
+                            config_dir,
                             &format!("per-owner refresh task join error: {e}"),
                         );
                         log::warn!(
@@ -482,6 +540,7 @@ mod tests {
             ),
             drift_watch: credential_preflight::owner_drift::DriftWatch::default(),
             ticks: 0,
+            diagnostics: credential_preflight::RefreshDiagnostics::default(),
         }
     }
 

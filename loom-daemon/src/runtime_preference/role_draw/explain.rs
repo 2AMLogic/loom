@@ -16,6 +16,7 @@ use super::{DrawConfig, Layer};
 use crate::runtime_preference::resolve::{SkipReason, Tap};
 use serde_json::{json, Value};
 use std::path::Path;
+use std::time::SystemTime;
 
 /// The stages a table can name, in display order.
 pub const STAGES: &[&str] = &[
@@ -146,6 +147,25 @@ pub(crate) type AdmissionProbe<'a> =
 /// admit and serve that candidate on this host, with the walk's own skip
 /// reason when not and the selected account when admitted.
 pub(crate) fn explain_json_with(root: &Path, probe: &mut AdmissionProbe<'_>) -> Value {
+    explain_doc(root, probe, writer_of(root, SystemTime::now()))
+}
+
+/// The seat writer state the view reports (#14936): by the same lookup a
+/// seat preparation runs, so a row's refusal and the view's writer line
+/// cannot disagree.
+fn writer_of(
+    root: &Path,
+    now: SystemTime,
+) -> crate::tokens_pool::private_workspace::dispatch::WriterView {
+    crate::tokens_pool::private_workspace::dispatch::writer_state(root, now)
+}
+
+/// The view's document over an already-measured writer state.
+fn explain_doc(
+    root: &Path,
+    probe: &mut AdmissionProbe<'_>,
+    writer: crate::tokens_pool::private_workspace::dispatch::WriterView,
+) -> Value {
     let config = DrawConfig::load(root);
     let effective = crate::config_resolver::resolve_effective_config(root);
     let mut stages = Vec::new();
@@ -236,6 +256,9 @@ pub(crate) fn explain_json_with(root: &Path, probe: &mut AdmissionProbe<'_>) -> 
         "excludeProviders": config.exclude,
         "excludeLayer": config.exclude_layer.map(Layer::as_str),
         "warnings": config.warnings,
+        // #14936: which writer a seat of this workspace would carry, and
+        // where the refresh should have published it.
+        "writer": writer.to_json(),
         "stages": stages,
     })
 }
@@ -251,7 +274,11 @@ pub fn explain_text(root: &Path) -> String {
 /// [`explain_text`] with the per-candidate admission question injected
 /// (tests), mirroring [`explain_json_with`].
 pub(crate) fn explain_text_with(root: &Path, probe: &mut AdmissionProbe<'_>) -> String {
-    let doc = explain_json_with(root, probe);
+    explain_text_of(explain_doc(root, probe, writer_of(root, SystemTime::now())))
+}
+
+/// The text view of an already-built document.
+fn explain_text_of(doc: Value) -> String {
     let mut out = format!("Role draw tables for {}\n", doc["workspace"].as_str().unwrap_or(""));
     let excluded: Vec<&str> = doc["excludeProviders"]
         .as_array()
@@ -265,6 +292,17 @@ pub(crate) fn explain_text_with(root: &Path, probe: &mut AdmissionProbe<'_>) -> 
             excluded.join(", "),
             doc["excludeLayer"].as_str().unwrap_or("?")
         ));
+    }
+    // #14936: the writer a seat of this workspace would carry, measured by
+    // the lookup a launch runs. A Builder or Doctor row refused below names
+    // this state; an admitted writer is described with its age.
+    if let Some(detail) = doc["writer"]["detail"].as_str() {
+        let admitted = if doc["writer"]["admitted"].as_bool() == Some(true) {
+            "a writer job can be admitted"
+        } else {
+            "a Builder or Doctor seat cannot be admitted until this is resolved"
+        };
+        out.push_str(&format!("{detail} ({admitted})\n"));
     }
     for stage in doc["stages"].as_array().into_iter().flatten() {
         let name = stage["stage"].as_str().unwrap_or("?");

@@ -66,6 +66,7 @@ pub fn run(mut args: crate::session_exec::HostArgs) -> Result<i32> {
                 JobKind::Role,
                 None,
                 &format!("manual-{}", uuid::Uuid::new_v4()),
+                dispatch::ForgeNeed::of_role(&std::env::var("LOOM_ROLE").unwrap_or_default()),
             )?
             .context("private profile was not selected")?,
         )

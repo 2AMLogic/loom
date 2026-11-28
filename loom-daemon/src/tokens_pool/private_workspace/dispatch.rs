@@ -5,6 +5,9 @@ use std::os::fd::AsRawFd;
 use std::os::unix::process::CommandExt;
 use std::process::Command;
 
+/// The seat writer state `roles draw --explain` reports (#14936).
+pub(crate) use super::forge_auth::WriterView;
+
 /// Every matching seat is busy or could not be prepared; self-heals as seats free.
 pub(super) const NO_IDLE_SEAT: &str = "no idle seat";
 /// The resolved repository is served by no inventoried account: a routing
@@ -16,6 +19,69 @@ pub(super) const WRONG_ACCOUNT: &str =
 /// The one descriptor a private dispatch hands its account lease down on.
 /// Also the only value `roll_pause::resume::release_inherited_lease` accepts.
 pub(crate) const LEASE_FD: i32 = 198;
+
+/// What the launch a seat is prepared for does on the forge (#14936).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ForgeNeed {
+    /// Pushes and attributed writes as the fleet's writer: Builder, Doctor,
+    /// and the sweeps and steps that host them. A GitHub target with no
+    /// usable writer is refused before the lease.
+    Writer,
+    /// No push of its own: admission keeps its earlier path and refuses only
+    /// a provably expired credential.
+    Any,
+}
+
+impl ForgeNeed {
+    /// The need of a launch for `role`, in any spelling [`canonical_role`]
+    /// accepts.
+    ///
+    /// Only the roles whose job IS a push (Builder, Doctor, the sweep
+    /// lifecycle) need the writer. Judge and Guide do push in some lanes (a
+    /// branch update or conflict resolution, a docs PR branch), but those are
+    /// conditional, and most of their launches only read: refusing them
+    /// without a writer would change admission for seats that are mostly
+    /// fine (#14936 scopes itself to Builder and Doctor). They are admitted
+    /// on the earlier rule and fail at push time if the lane is reached.
+    ///
+    /// [`canonical_role`]: crate::runtime_admission::canonical_role
+    #[must_use]
+    pub fn of_role(role: &str) -> Self {
+        match crate::runtime_admission::canonical_role(role) {
+            Some("builder" | "doctor" | "sweep-lifecycle") => Self::Writer,
+            _ => Self::Any,
+        }
+    }
+
+    /// The need a job kind alone implies: a sweep hosts the Builder and
+    /// Doctor steps, so it pushes; a role job's need is its role's, which the
+    /// kind does not name.
+    #[must_use]
+    pub fn of_kind(kind: JobKind) -> Self {
+        match kind {
+            JobKind::Sweep => Self::Writer,
+            JobKind::Role | JobKind::Interactive => Self::Any,
+        }
+    }
+}
+
+/// The seat writer state of `workspace` for its logical repository, as
+/// `roles draw --explain` reports it (#14936).
+pub(crate) fn writer_state(
+    workspace: &Path,
+    now: std::time::SystemTime,
+) -> super::forge_auth::WriterView {
+    let repository = logical_repository(workspace);
+    super::forge_auth::writer_view(
+        workspace,
+        repository.as_deref(),
+        &|name| std::env::var_os(name),
+        &|dir| super::forge_auth::read_token(dir, None),
+        crate::credential_preflight::primary_workspace_root().as_deref(),
+        &crate::cli::common::primary_workspace_root_from_daemon,
+        now,
+    )
+}
 
 pub struct Selection {
     pub name: String,
@@ -204,10 +270,26 @@ impl Selection {
         issue: Option<u64>,
         owner: &str,
     ) -> Result<Option<Self>> {
-        let role = std::env::var("LOOM_ROLE").ok();
-        Self::prepare_for_role(root, runtime, model, kind, issue, owner, role.as_deref())
+        Self::prepare_as(root, runtime, model, kind, issue, owner, ForgeNeed::of_kind(kind))
     }
 
+    /// [`Self::prepare`] for a launch whose forge need is known beyond its
+    /// job kind — a role job's need is its role's (#14936). The role for seat
+    /// selection is the process's `LOOM_ROLE`.
+    pub fn prepare_as(
+        root: &Path,
+        runtime: &str,
+        model: Option<&str>,
+        kind: JobKind,
+        issue: Option<u64>,
+        owner: &str,
+        need: ForgeNeed,
+    ) -> Result<Option<Self>> {
+        let role = std::env::var("LOOM_ROLE").ok();
+        Self::prepare_for_role(root, runtime, model, kind, issue, owner, role.as_deref(), need)
+    }
+
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn prepare_for_role(
         root: &Path,
         runtime: &str,
@@ -216,8 +298,18 @@ impl Selection {
         issue: Option<u64>,
         owner: &str,
         role: Option<&str>,
+        need: ForgeNeed,
     ) -> Result<Option<Self>> {
-        Self::prepare_with(root, runtime, model, kind, issue, owner, SeatPolicy::Existing { role })
+        Self::prepare_with(
+            root,
+            runtime,
+            model,
+            kind,
+            issue,
+            owner,
+            SeatPolicy::Existing { role },
+            need,
+        )
     }
 
     /// Reserve a seat for a host-admitted read-only launch. Try each eligible
@@ -229,8 +321,18 @@ impl Selection {
         issue: Option<u64>,
         owner: &str,
         role: &str,
+        need: ForgeNeed,
     ) -> Result<Option<Self>> {
-        Self::prepare_with(root, "codex", model, kind, issue, owner, SeatPolicy::Idle { role })
+        Self::prepare_with(
+            root,
+            "codex",
+            model,
+            kind,
+            issue,
+            owner,
+            SeatPolicy::Idle { role },
+            need,
+        )
     }
 
     /// Prepare a selection for containment admission (#8787, #14578): the
@@ -245,8 +347,18 @@ impl Selection {
         issue: Option<u64>,
         owner: &str,
         role: &str,
+        need: ForgeNeed,
     ) -> Result<Option<Self>> {
-        Self::prepare_with(root, "codex", model, kind, issue, owner, SeatPolicy::Contained { role })
+        Self::prepare_with(
+            root,
+            "codex",
+            model,
+            kind,
+            issue,
+            owner,
+            SeatPolicy::Contained { role },
+            need,
+        )
     }
 
     /// Prepare only the account already resolved by transport (#14627).
@@ -258,10 +370,12 @@ impl Selection {
         kind: JobKind,
         issue: Option<u64>,
         owner: &str,
+        need: ForgeNeed,
     ) -> Result<Option<Self>> {
-        Self::prepare_with(root, "codex", None, kind, issue, owner, SeatPolicy::Named(config))
+        Self::prepare_with(root, "codex", None, kind, issue, owner, SeatPolicy::Named(config), need)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn prepare_with(
         root: &Path,
         runtime: &str,
@@ -270,6 +384,7 @@ impl Selection {
         issue: Option<u64>,
         owner: &str,
         policy: SeatPolicy<'_>,
+        need: ForgeNeed,
     ) -> Result<Option<Self>> {
         export::check_runtime(root, issue, runtime)?;
         if runtime == "codex" {
@@ -315,7 +430,7 @@ impl Selection {
                     bail!("{WRONG_ACCOUNT}");
                 }
             }
-            let selection = Self::prepare_profile(root, name, profile, kind, issue, owner)?;
+            let selection = Self::prepare_profile(root, name, profile, kind, issue, owner, need)?;
             match policy {
                 // A guarded read-only reservation must already prove
                 // containment for its own seat (#14481).
@@ -447,6 +562,7 @@ impl Selection {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn prepare_profile(
         root: &Path,
         name: String,
@@ -454,6 +570,7 @@ impl Selection {
         kind: JobKind,
         issue: Option<u64>,
         owner: &str,
+        need: ForgeNeed,
     ) -> Result<Self> {
         let mut selection = Self {
             name,
@@ -473,16 +590,17 @@ impl Selection {
         export::check_failover(root, issue, &selection.name)?;
         let target = select_target(root, &config)?;
         // Refuse BEFORE the lease, the container exec and the claim when the
-        // only forge credential this owner has is provably expired (#14435).
-        // Preparing would `git fetch` with a dead token, exit 128 and strand a
-        // step the seat was already handed; refusing here lets the draw fall
-        // through to a runtime that can serve it.
-        if forge_auth::ExecAuth::resolve(root, &target.repository).expired() {
-            bail!(
-                "private workspace forge credential for {} is expired and no fresher one is \
-                 published; the credential refresh has not renewed it",
-                target.repository
-            );
+        // forge credential this job needs is not there (#14435, #14936):
+        // a provably expired one, and — for a job that pushes — a missing
+        // one too. Preparing would `git fetch` with a dead or absent token,
+        // exit 128 and strand a step the seat was already handed; refusing
+        // here lets the draw fall through to a runtime that can serve it.
+        // The two refusals are worded apart, so the cause reaches the
+        // operator before any seat is reserved.
+        if let Some(refusal) = forge_auth::ExecAuth::resolve(root, &target.repository)
+            .refusal(&target.repository, need)
+        {
+            bail!("{refusal}");
         }
         let lease = lease::Lease::acquire(&dir)?;
         let state = docker::inspect(&config.container)?
@@ -1157,10 +1275,18 @@ mod tests {
         std::fs::create_dir_all(&manifests).unwrap();
         std::fs::write(manifests.join("codex.json"), r#"{"accountProvider":"codex"}"#).unwrap();
         let refusal = || {
-            Selection::prepare_contained(ws.path(), None, JobKind::Role, None, "fixture", "builder")
-                .err()
-                .expect("containment requires a matching private clone")
-                .to_string()
+            Selection::prepare_contained(
+                ws.path(),
+                None,
+                JobKind::Role,
+                None,
+                "fixture",
+                "builder",
+                ForgeNeed::of_role("builder"),
+            )
+            .err()
+            .expect("containment requires a matching private clone")
+            .to_string()
         };
         assert_eq!(refusal(), contained_refusal(Some(missing), 2));
         for name in ["clone-here", "clone-other"] {

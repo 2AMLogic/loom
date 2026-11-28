@@ -158,6 +158,7 @@ pub(super) fn run_role_with_timeout(
             None,
             &format!("role-{role}-{}", uuid::Uuid::new_v4()),
             Some(role),
+            crate::tokens_pool::private_workspace::dispatch::ForgeNeed::of_role(role),
         ),
     };
     let selection = match prepared {

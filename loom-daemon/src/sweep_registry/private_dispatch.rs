@@ -119,6 +119,7 @@ pub(crate) fn prepare(
                 issue,
                 &owner,
                 Some("sweep-lifecycle"),
+                crate::tokens_pool::private_workspace::dispatch::ForgeNeed::of_kind(JobKind::Sweep),
             )?;
             (selection, resolved)
         };
