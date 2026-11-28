@@ -46,6 +46,15 @@
 //! token, and the `optional` skip matches a path's first token, the level
 //! the marker grammar floors.
 //!
+//! Direction B also covers the shipped Markdown prompts (#15644,
+//! `prompt_calls`): the role and command prompts under
+//! `defaults/.claude/commands/loom/` call `loom-daemon <verb>` directly, in
+//! prose examples as much as in pasted shell, and the shell detector cannot
+//! see them. Every call they make is resolved against the NEW daemon's
+//! command tree and the resolved path is probed on the floor binary through
+//! the same cache, so a prompt that adopts a verb newer than
+//! `REQUIRES_DAEMON` fails direction B and names the prompt.
+//!
 //! A violated claim is a [`Report::violations`] entry, and the CLI exits 1.
 //!
 //! A sibling of [`crate::install_compat`], not a child of it, on purpose:
@@ -60,6 +69,9 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::time::Duration;
+
+mod prompt_calls;
+pub use prompt_calls::CommandTree;
 
 /// Where the release's own copy of this module lives, for reading an old
 /// daemon's invoked-file list out of git.
@@ -86,6 +98,9 @@ pub struct CheckOptions {
     pub requires_daemon: Version,
     /// The installed files the new daemon executes.
     pub invoked_files: Vec<String>,
+    /// The new daemon's command tree. It decides how deep a prompt's
+    /// `loom-daemon …` call goes before the floor binary is probed (#15644).
+    pub command_tree: CommandTree,
 }
 
 /// Where direction B's old daemon comes from.
@@ -233,11 +248,12 @@ pub fn run(opts: &CheckOptions) -> Result<Report> {
 
     let new_tree = opts.repo_root.join("defaults");
     let new_scripts = installed_shell_files(&new_tree)?;
+    let new_prompts = shipped_prompts(&new_tree)?;
     check_claims(opts, ships_as, &new_tree, &new_scripts, &mut report);
 
     let mut probe = Probe::default();
     direction_a(opts, version, &mut probe, &mut report)?;
-    direction_b(opts, &new_tree, &new_scripts, &mut probe, &mut report)?;
+    direction_b(opts, &new_tree, &new_scripts, &new_prompts, &mut probe, &mut report)?;
     Ok(report)
 }
 
@@ -329,6 +345,7 @@ fn direction_b(
     opts: &CheckOptions,
     new_tree: &Path,
     scripts: &[PathBuf],
+    prompts: &[PathBuf],
     probe: &mut Probe,
     report: &mut Report,
 ) -> Result<()> {
@@ -407,6 +424,12 @@ fn direction_b(
     record_gaps(&label, &daemon, &gaps, new_tree, report);
     record_absent_files(&label, &invoked, new_tree, report);
     report.notes.push(gaps.summary(&label, scripts.len()));
+    if !prompts.is_empty() {
+        let calls = prompt_calls::scan(prompts, &opts.command_tree)?;
+        let gaps = probe.gaps(&daemon, calls.pairs.clone());
+        record_gaps(&label, &daemon, &gaps, new_tree, report);
+        report.notes.push(calls.summary(&label, &gaps));
+    }
     Ok(())
 }
 
@@ -613,8 +636,14 @@ struct Gaps {
 
 impl Gaps {
     fn summary(&self, label: &str, scripts: usize) -> String {
-        let line =
-            format!("{label}: {scripts} shell files, {} subcommand gaps", self.missing.len());
+        self.with_probes(format!(
+            "{label}: {scripts} shell files, {} subcommand gaps",
+            self.missing.len()
+        ))
+    }
+
+    /// `line` with the probes that proved nothing counted after it.
+    fn with_probes(&self, line: String) -> String {
         if self.broken.is_empty() {
             line
         } else {
@@ -831,6 +860,38 @@ pub fn installed_shell_files(tree: &Path) -> Result<Vec<PathBuf>> {
                     stack.push(path);
                 }
             } else if kind.is_file() && path.extension().is_some_and(|e| e == "sh") {
+                out.push(path);
+            }
+        }
+    }
+    out.sort();
+    Ok(out)
+}
+
+/// The shipped Markdown prompts under `tree` (a `defaults/` directory): the
+/// command prompts, which `defaults/roles/*.md` symlink to and which call the
+/// daemon directly (#15644). Sorted; symlinks are not followed. Empty where
+/// none ship.
+///
+/// # Errors
+/// A directory under the prompt directory could not be read.
+pub fn shipped_prompts(tree: &Path) -> Result<Vec<PathBuf>> {
+    let root = tree.join(prompt_calls::PROMPT_DIR);
+    let mut out = Vec::new();
+    if !root.is_dir() {
+        return Ok(out);
+    }
+    let mut stack = vec![root];
+    while let Some(dir) = stack.pop() {
+        for entry in
+            std::fs::read_dir(&dir).with_context(|| format!("reading {}", dir.display()))?
+        {
+            let entry = entry?;
+            let kind = entry.file_type()?;
+            let path = entry.path();
+            if kind.is_dir() {
+                stack.push(path);
+            } else if kind.is_file() && path.extension().is_some_and(|e| e == "md") {
                 out.push(path);
             }
         }
