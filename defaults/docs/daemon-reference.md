@@ -2534,10 +2534,12 @@ blocker is Loom-owned:
 - **What counts as Loom-owned.** The `installed_files` of
   `.loom/install-metadata.json` at HEAD, at the branch tip and at
   `origin/<default>`, plus the metadata file. Missing or unparseable metadata
-  on any side means nothing is repaired. Because only the installer writes
-  `installed_files`, a file a later release added is missing from it, so a
-  path also counts (#11989) when the payload embedded in the daemon ships a
-  file at that destination. A repo-local file the resync never touches
+  on any side means nothing is repaired. Because `resync-installed.sh` never
+  adds to `installed_files`, a file a later release added is missing from it
+  (the daemon's payload resync does record the payload files it writes, #10717,
+  but a workspace the script resynced, or one predating #10717, does not have
+  it), so a path also counts (#11989) when the payload embedded in the daemon
+  ships a file at that destination. A repo-local file the resync never touches
   (a repo-local role file under `.loom/roles/` or a repo-local command under
   `.claude/commands/loom/`) does not,
   and a `.agents/skills/` file also needs the generation marker. A path pinned in `.loom/resync-ignore` (also as
