@@ -181,35 +181,51 @@ pub fn diff_rows_against_mainline(working_dir: &Path) -> Option<Vec<GitDiffRow>>
     diff_rows_between(working_dir, &merge_base, "HEAD")
 }
 
-/// Parse `git diff --numstat` stdout into one [`GitDiffRow`] per row.
+/// Parse `git diff --numstat -z` stdout into one [`GitDiffRow`] per row.
+///
+/// `-z` NUL-terminates every field and prints paths verbatim, so a rename is
+/// framed rather than spelled: a plain row is `added\tdeleted\t<path>\0` and
+/// a rename row is `added\tdeleted\t\0<old>\0<new>\0` — an empty path column
+/// followed by both unabbreviated paths. No row carries git's human-readable
+/// `old => new` or `{a => b}` text, which a path holding those characters is
+/// indistinguishable from (Issue #15810).
 ///
 /// A row is skipped, never unwrapped, when it carries no usable counts:
-/// binary rows (`-\t-\tpath`), rows with fewer than three tab-separated
-/// columns, and rows whose count columns are not numbers.
+/// binary rows (`-` in either count column), rows with fewer than three
+/// tab-separated columns, and a rename missing one of its two path fields.
 #[must_use]
 fn parse_numstat_rows(stdout: &str) -> Vec<GitDiffRow> {
-    stdout
-        .lines()
-        .filter_map(|line| {
-            let parts: Vec<&str> = line.split('\t').collect();
-            if parts.len() < 3 {
-                return None;
-            }
-            // Renames render as `added\tdeleted\told => new` (or with a
-            // `{prefix => suffix}` brace form); classify the post-image
-            // path, which is what a landing diff reports.
-            let added = parts[0].parse::<i64>().ok()?;
-            let deleted = parts[1].parse::<i64>().ok()?;
-            Some(GitDiffRow {
-                added,
-                deleted,
-                path: normalize_diff_path(parts[2]),
-            })
-        })
-        .collect()
+    let mut rows = Vec::new();
+    let mut fields = stdout.split('\0');
+    while let Some(counts) = fields.next() {
+        let mut columns = counts.splitn(3, '\t');
+        let (Some(added), Some(deleted), Some(path)) =
+            (columns.next(), columns.next(), columns.next())
+        else {
+            continue;
+        };
+        let post_image = if path.is_empty() {
+            fields.nth(1)
+        } else {
+            Some(path)
+        };
+        let (Some(path), Ok(added), Ok(deleted)) = (
+            post_image.filter(|path| !path.is_empty()),
+            added.parse::<i64>(),
+            deleted.parse::<i64>(),
+        ) else {
+            continue;
+        };
+        rows.push(GitDiffRow {
+            added,
+            deleted,
+            path: path.to_string(),
+        });
+    }
+    rows
 }
 
-/// Local `git diff --numstat <before> <after>` for `working_dir`, parsed
+/// Local `git diff --numstat -z <before> <after>` for `working_dir`, parsed
 /// through [`parse_numstat_rows`].
 ///
 /// `None` when `git` cannot be run, exits non-zero (an unknown ref, or a
@@ -217,7 +233,7 @@ fn parse_numstat_rows(stdout: &str) -> Vec<GitDiffRow> {
 #[must_use]
 fn diff_rows_between(working_dir: &Path, before: &str, after: &str) -> Option<Vec<GitDiffRow>> {
     let output = Command::new("git")
-        .args(["diff", "--numstat", before, after])
+        .args(["diff", "--numstat", "-z", before, after])
         .current_dir(working_dir)
         .output()
         .ok()?;
@@ -235,48 +251,6 @@ fn diff_rows_between(working_dir: &Path, before: &str, after: &str) -> Option<Ve
 fn sum_diff_rows(rows: &[GitDiffRow]) -> (i64, i64) {
     rows.iter()
         .fold((0, 0), |(added, deleted), row| (added + row.added, deleted + row.deleted))
-}
-
-/// The post-image path of a numstat path column: plain paths pass through;
-/// `old => new` renames keep `new`; `{a => b}/rest` brace forms reassemble
-/// to `b/rest`.
-#[must_use]
-fn normalize_diff_path(raw: &str) -> String {
-    if let Some((head, new)) = raw.rsplit_once(" => ") {
-        if let Some(path) = brace_form_post_image(head, new) {
-            return path;
-        }
-        return new.to_string();
-    }
-    raw.to_string()
-}
-
-/// The post-image path of the brace form git writes for a rename whose old
-/// and new path share a leading and/or trailing part, `pfx{a => b}sfx`, given
-/// the row's two halves around ` => `: `head` is `pfx{a` and `new` is `b}sfx`.
-///
-/// `None` when the pair is not that form, which a plain rename resembles when
-/// a file name itself holds a brace (`a{b.txt => c}d.txt`): git's braces sit
-/// on path-component boundaries, so the prefix is empty or ends in `/` and
-/// the suffix is empty or starts with `/`.
-fn brace_form_post_image(head: &str, new: &str) -> Option<String> {
-    let open = head.rfind('{')?;
-    let close = new.find('}')?;
-    let prefix = &head[..open];
-    let new_mid = &new[..close];
-    let suffix = &new[close + 1..];
-    if !(prefix.is_empty() || prefix.ends_with('/')) {
-        return None;
-    }
-    if !(suffix.is_empty() || suffix.starts_with('/')) {
-        return None;
-    }
-    if new_mid.is_empty() {
-        // `pfx{a => }sfx`: the prefix and the suffix share one slash.
-        let suffix = suffix.strip_prefix('/').unwrap_or(suffix);
-        return Some(format!("{prefix}{suffix}"));
-    }
-    Some(format!("{prefix}{new_mid}{suffix}"))
 }
 
 #[cfg(test)]
@@ -348,7 +322,8 @@ mod tests {
         std::fs::create_dir_all(dir.path().join("src/alerts")).unwrap();
         git(dir.path(), &["mv", "src/loom_ui_alerts/ledger.rs", "src/alerts/ledger.rs"]);
         git(dir.path(), &["commit", "-q", "-m", "move the ledger"]);
-        // git prints the pure rename as `src/{loom_ui_alerts => alerts}/ledger.rs`.
+        // Under `-z` git frames the pure rename as
+        // `0\t0\t\0src/loom_ui_alerts/ledger.rs\0src/alerts/ledger.rs\0`.
         let rows =
             diff_rows_against_mainline(dir.path()).expect("bare `main` fallback must resolve");
         assert_eq!(
@@ -359,47 +334,6 @@ mod tests {
                 path: "src/alerts/ledger.rs".to_string(),
             }]
         );
-    }
-
-    // --- normalize_diff_path ---
-
-    #[test]
-    fn normalize_diff_path_passes_a_plain_path_through() {
-        assert_eq!(normalize_diff_path("src/lib.rs"), "src/lib.rs");
-    }
-
-    #[test]
-    fn normalize_diff_path_keeps_the_new_side_of_a_plain_rename() {
-        assert_eq!(normalize_diff_path("old/name.rs => new/name.rs"), "new/name.rs");
-    }
-
-    #[test]
-    fn normalize_diff_path_reassembles_a_brace_form_rename() {
-        assert_eq!(normalize_diff_path("src/{a => b}/mod.rs"), "src/b/mod.rs");
-        assert_eq!(normalize_diff_path("{a => b}"), "b");
-        assert_eq!(normalize_diff_path("src/{top.txt => moved.txt}"), "src/moved.txt");
-    }
-
-    #[test]
-    fn normalize_diff_path_reassembles_this_repositorys_ledger_rename() {
-        // `git diff --numstat -M bd0efeb6f^ bd0efeb6f` in this repository.
-        assert_eq!(
-            normalize_diff_path("loom-daemon/src/{loom_ui_alerts => alerts}/ledger.rs"),
-            "loom-daemon/src/alerts/ledger.rs"
-        );
-    }
-
-    #[test]
-    fn normalize_diff_path_handles_an_empty_brace_side() {
-        assert_eq!(normalize_diff_path("src/{ => b}/mod.rs"), "src/b/mod.rs");
-        // The prefix and the suffix share the slash before `mod.rs`.
-        assert_eq!(normalize_diff_path("src/{a => }/mod.rs"), "src/mod.rs");
-    }
-
-    #[test]
-    fn normalize_diff_path_keeps_a_stray_brace_in_a_plain_rename() {
-        assert_eq!(normalize_diff_path("a{b}c.txt => d.txt"), "d.txt");
-        assert_eq!(normalize_diff_path("a{b.txt => c}d.txt"), "c}d.txt");
     }
 
     #[test]
@@ -452,14 +386,50 @@ mod tests {
         assert_eq!(diff_stat_against_mainline(dir.path()), Some((0, 0)));
     }
 
+    #[test]
+    #[parallel(loom_config_env)]
+    fn diff_rows_against_mainline_reports_a_brace_path_rename_under_its_post_image() {
+        let dir = tempfile::tempdir().unwrap();
+        git(dir.path(), &["init", "-q", "--initial-branch=main"]);
+        git(dir.path(), &["config", "user.email", "loom@example.com"]);
+        git(dir.path(), &["config", "user.name", "Loom Test"]);
+        // Rename detection is a git config default; pin it in the scratch
+        // repo so a host `~/.gitconfig` cannot turn the rename into a
+        // delete + add pair.
+        git(dir.path(), &["config", "diff.renames", "true"]);
+        std::fs::create_dir_all(dir.path().join("src/{e.txt")).unwrap();
+        std::fs::write(dir.path().join("src/{e.txt/g.txt"), "a\n").unwrap();
+        git(dir.path(), &["add", "-A"]);
+        git(dir.path(), &["commit", "-q", "-m", "seed"]);
+        git(dir.path(), &["checkout", "-q", "-b", "feature"]);
+        std::fs::create_dir_all(dir.path().join("src/f}")).unwrap();
+        git(dir.path(), &["mv", "src/{e.txt/g.txt", "src/f}/g.txt"]);
+        git(dir.path(), &["commit", "-q", "-m", "rename"]);
+        let rows =
+            diff_rows_against_mainline(dir.path()).expect("bare `main` fallback must resolve");
+        // Plain rename `src/{e.txt/g.txt` -> `src/f}/g.txt`. Without `-z` git
+        // renders it `src/{{e.txt => f}}/g.txt`, which the old `old => new`
+        // text parse turned into the non-existent `f}}/g.txt`.
+        assert_eq!(
+            rows,
+            vec![GitDiffRow {
+                added: 0,
+                deleted: 0,
+                path: "src/f}/g.txt".to_string(),
+            }]
+        );
+    }
+
     // --- parse_numstat_rows / sum_diff_rows ---
     //
     // Pure functions over captured numstat text: no `git` subprocess is
-    // forked, so the `loom_config_env` fencing above does not apply.
+    // forked, so the `loom_config_env` fencing above does not apply. Every
+    // fixture is `--numstat -z` framed (Issue #15810): one NUL-terminated
+    // record per row, one string literal per record.
 
     #[test]
     fn parse_numstat_rows_yields_one_row_per_path() {
-        let rows = parse_numstat_rows("10\t5\tsrc/main.rs\n3\t1\tsrc/lib.rs\n");
+        let rows = parse_numstat_rows(concat!("10\t5\tsrc/main.rs\0", "3\t1\tsrc/lib.rs\0"));
         assert_eq!(
             rows,
             vec![
@@ -480,7 +450,7 @@ mod tests {
     #[test]
     fn parse_numstat_rows_skips_binary_and_malformed_rows() {
         // A binary file carries `-` in both count columns.
-        let rows = parse_numstat_rows("-\t-\timage.png\n10\t5\tsrc/main.rs\n");
+        let rows = parse_numstat_rows(concat!("-\t-\timage.png\0", "10\t5\tsrc/main.rs\0"));
         assert_eq!(
             rows,
             vec![GitDiffRow {
@@ -489,15 +459,19 @@ mod tests {
                 path: "src/main.rs".to_string(),
             }]
         );
-        // Fewer than three tab-separated columns is not a numstat row, and a
-        // three-column row still needs numeric counts.
-        assert!(parse_numstat_rows("1\t2\n").is_empty());
-        assert!(parse_numstat_rows("x\ty\tsrc/main.rs\n").is_empty());
+        // Fewer than three tab-separated columns is not a numstat row, a
+        // three-column row still needs numeric counts, and a rename missing
+        // one of its two path fields is not a row either.
+        assert!(parse_numstat_rows("1\t2\0").is_empty());
+        assert!(parse_numstat_rows("x\ty\tsrc/main.rs\0").is_empty());
+        assert!(parse_numstat_rows("1\t1\t\0").is_empty());
+        assert!(parse_numstat_rows("1\t1\t\0old.rs\0").is_empty());
+        assert!(parse_numstat_rows("1\t1\t\0old.rs").is_empty());
     }
 
     #[test]
     fn parse_numstat_rows_reports_renames_under_the_post_image_path() {
-        let rows = parse_numstat_rows("1\t1\told.rs => new.rs\n2\t0\tsrc/main.rs\n");
+        let rows = parse_numstat_rows(concat!("1\t1\t\0old.rs\0new.rs\0", "2\t0\tsrc/main.rs\0"));
         assert_eq!(
             rows,
             vec![
@@ -516,13 +490,74 @@ mod tests {
     }
 
     #[test]
+    fn parse_numstat_rows_keeps_braces_in_a_renamed_path_verbatim() {
+        // A plain rename whose paths hold `{`/`}` on component boundaries,
+        // framed exactly as `--numstat -z` emits it (git 2.43.0): the real
+        // post-image path keeps its `}`.
+        let rows = parse_numstat_rows("0\t0\t\0src/{e.txt/g.txt\0src/f}/g.txt\0");
+        assert_eq!(
+            rows,
+            vec![GitDiffRow {
+                added: 0,
+                deleted: 0,
+                path: "src/f}/g.txt".to_string(),
+            }]
+        );
+        // A brace-form rename whose renamed middle itself contains a brace.
+        let rows = parse_numstat_rows("0\t0\t\0src/{{a}/x.rs\0src/b}/x.rs\0");
+        assert_eq!(
+            rows,
+            vec![GitDiffRow {
+                added: 0,
+                deleted: 0,
+                path: "src/b}/x.rs".to_string(),
+            }]
+        );
+    }
+
+    #[test]
+    fn parse_numstat_rows_advances_past_a_skipped_rename() {
+        // A binary rename takes the rename framing too: it is skipped for its
+        // `-` counts, and the row after it is still read as a row rather than
+        // as one of its path fields.
+        let rows = parse_numstat_rows(concat!("-\t-\t\0old.bin\0new.bin\0", "1\t0\tnext.txt\0"));
+        assert_eq!(
+            rows,
+            vec![GitDiffRow {
+                added: 1,
+                deleted: 0,
+                path: "next.txt".to_string(),
+            }]
+        );
+    }
+
+    #[test]
+    fn parse_numstat_rows_splits_only_the_two_count_columns() {
+        // `-z` prints a path verbatim, so a tab inside it stays in the path.
+        let rows = parse_numstat_rows("1\t0\tweird\tname.txt\0");
+        assert_eq!(
+            rows,
+            vec![GitDiffRow {
+                added: 1,
+                deleted: 0,
+                path: "weird\tname.txt".to_string(),
+            }]
+        );
+    }
+
+    #[test]
     fn parse_numstat_rows_is_empty_for_empty_output() {
         assert!(parse_numstat_rows("").is_empty());
+        assert!(parse_numstat_rows("\0").is_empty());
     }
 
     #[test]
     fn sum_diff_rows_totals_every_rows_counts() {
-        let rows = parse_numstat_rows("10\t5\tsrc/main.rs\n-\t-\timage.png\n3\t1\tsrc/lib.rs\n");
+        let rows = parse_numstat_rows(concat!(
+            "10\t5\tsrc/main.rs\0",
+            "-\t-\timage.png\0",
+            "3\t1\tsrc/lib.rs\0",
+        ));
         // The binary row is absent from `rows`, so it adds nothing.
         assert_eq!(sum_diff_rows(&rows), (13, 6));
         assert_eq!(sum_diff_rows(&[]), (0, 0));
