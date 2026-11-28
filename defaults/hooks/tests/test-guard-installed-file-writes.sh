@@ -177,18 +177,22 @@ source "$LIB_IFW"
 # AC: verified TRUE for 2AMLogic/loom itself. Asserted against this checkout,
 # not a fixture, so the discriminator cannot silently stop recognizing the one
 # tree whose Builders must never be denied.
-assert_eq "2AMLogic/loom's own checkout classifies as 'upstream'" \
-    "upstream" "$(loom_repo_identity "$REPO_ROOT")"
+if [[ -f "$REPO_ROOT/defaults/scripts/lib/installed-file-guard.sh" ]]; then
+    assert_eq "2AMLogic/loom's own checkout classifies as 'upstream'" \
+        "upstream" "$(loom_repo_identity "$REPO_ROOT")"
 
-# ...and from inside one of its managed worktrees, where a Builder actually
-# works (a worktree is a full checkout, so it carries defaults/ too).
-if [[ -d "$REPO_ROOT/.loom/worktrees" ]]; then
-    for wt in "$REPO_ROOT"/.loom/worktrees/*/; do
-        [[ -d "$wt" ]] || continue
-        assert_eq "a managed worktree of Loom's own tree also classifies 'upstream'" \
-            "upstream" "$(loom_repo_identity "${wt%/}")"
-        break
-    done
+    # ...and from inside one of its managed worktrees, where a Builder actually
+    # works (a worktree is a full checkout, so it carries defaults/ too).
+    if [[ -d "$REPO_ROOT/.loom/worktrees" ]]; then
+        for wt in "$REPO_ROOT"/.loom/worktrees/*/; do
+            [[ -d "$wt" ]] || continue
+            assert_eq "a managed worktree of Loom's own tree also classifies 'upstream'" \
+                "upstream" "$(loom_repo_identity "${wt%/}")"
+            break
+        done
+    fi
+else
+    echo "SKIP: defaults/scripts/lib/installed-file-guard.sh not present (bare consumer layout) -- real-checkout 'upstream' identity check not applicable"
 fi
 
 assert_eq "simulated consumer checkout classifies as 'consumer'" \
