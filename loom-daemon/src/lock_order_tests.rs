@@ -531,11 +531,11 @@ fn stacked_named_keys_in_lexicographic_order_pass() {
 
 #[test]
 fn a_multi_key_attribute_is_judged_on_its_sorted_keys() {
-    // `serial_test_derive` sorts the keys inside one attribute, so
-    // `#[serial(b, a)]` takes `a` then `b`: in order under a textually
-    // earlier `#[serial(c)]`, which wraps it (`c` outermost) — not under a
-    // textually earlier `#[serial(a)]`, which takes `a` outer and `a` again
-    // inside.
+    // The textually last `#[serial(b, a)]` is the outer lock (module docs),
+    // and `serial_test_derive` sorts the keys inside one attribute, so it
+    // takes `a` then `b`: in order over a textually earlier `#[serial(c)]`,
+    // which it wraps (`c` innermost) — not over a textually earlier
+    // `#[serial(a)]`, which re-takes `a` inside.
     let src = "#[test]\n#[serial(c)]\n#[serial(b, a)]\nfn t() {}\n";
     let scan = scan_source(src);
     assert_eq!(scan.attributes, 2);
