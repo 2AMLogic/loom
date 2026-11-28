@@ -57,12 +57,14 @@
 # because they all post through this one script — first runs
 # `check-review-feedback.sh`, which ingests the PR's formal reviews
 # (`pulls/{n}/reviews`, fully paginated) and inline review threads
-# (`pulls/{n}/comments` + GraphQL `reviewThreads`). If anything is outstanding
-# — or if the read did not complete — the approval comment is REFUSED (exit 3)
-# unless the caller supplies `--reviews-reconciled TEXT` explaining which
-# findings were fixed, superseded, or remain blocking. That text, and the
-# gate's own counts, are appended to the posted comment, so a reconciliation is
-# always auditable on the forge rather than asserted in a transcript.
+# (`pulls/{n}/comments` + GraphQL `reviewThreads`). If anything is outstanding,
+# the approval comment is REFUSED (exit 3) unless the caller supplies
+# `--reviews-reconciled TEXT` explaining which findings were fixed, superseded,
+# or remain blocking. That text, and the gate's own counts, are appended to the
+# posted comment, so a reconciliation is always auditable on the forge rather
+# than asserted in a transcript. If the read did not complete — gate state
+# UNKNOWN, whatever the cause — the approval is refused outright and NO text
+# dispositions it (#15781; see "EVERY UNKNOWN IS NON-DISPOSITIONABLE" below).
 #
 # This is the mechanism half of #7647: reading `pulls/reviews` before approving
 # stops being something an agent must remember (kicad-tools#5369 approved a PR
@@ -81,9 +83,14 @@
 # budget (LOOM_FORGE_REVIEW_READ_TIMEOUT, default 60s; 0 disables) — on a
 # loaded multi-sweep host a fraction of `gh` invocations block indefinitely
 # rather than erroring, and an unbounded read inside a command substitution
-# wedged this script (and the Judge behind it) forever. A timed-out gate is an
-# UNKNOWN that `--reviews-reconciled` CANNOT clear (nothing was read, so there
-# is nothing to disposition): retry the verdict, or park the PR.
+# wedged this script (and the Judge behind it) forever.
+#
+# EVERY UNKNOWN IS NON-DISPOSITIONABLE (#13927, #15781): a gate state of
+# UNKNOWN — a wall-clock timeout, a failed or truncated read, an exit code
+# that disagrees with the printed state, a missing dependency, any cause — is
+# a review state nobody read, so there are no findings to disposition.
+# `--reviews-reconciled` CANNOT clear it, however long the text: retry the
+# verdict, or park the PR.
 #
 # The direct `gh api` calls this script itself makes — the final head compare
 # (#10485) and the loom:pr-withdrawal DELETE (#10581) — run under the same
@@ -123,7 +130,9 @@
 #
 #   --reviews-reconciled TEXT   Explicit disposition of the outstanding formal
 #       reviews / inline threads that check-review-feedback.sh reported. Must
-#       cite every blocking review id it named. On `changes-requested` the
+#       cite every blocking review id it named, and it never clears an UNKNOWN
+#       gate state (#15781: nothing was read, so there is nothing to
+#       disposition). On `changes-requested` the
 #       gate does not run, so the text is not checked; it is appended to the
 #       posted comment as a "Review reconciliation" note (#14392) rather than
 #       silently dropped.
@@ -164,8 +173,9 @@
 #   2 - invalid arguments (bad PR number, verdict token, or SHA; missing body,
 #       or one forge verdict-body-check refuses: empty, -, @-, @path, too short)
 #   3 - approval refused by the formal-review reconciliation gate (#7647),
-#       including a gate read that TIMED OUT (#13927: retry or park;
-#       --reviews-reconciled cannot clear a timeout)
+#       including ANY gate state UNKNOWN — a read that TIMED OUT (#13927) or
+#       that failed, truncated or mismatched for any other reason (#15781):
+#       retry or park; --reviews-reconciled cannot clear an UNKNOWN
 #   5 - approval refused, CI not settled or unverifiable on <sha> (#10485):
 #       pending, head moved, reader error/absent. Post nothing approving,
 #       leave loom:review-requested, retry on a later pass.
@@ -401,29 +411,48 @@ if [[ "$VERDICT" == "approved" && "${GATE_SKIPPED:-false}" != "true" ]]; then
   # the common case and worked only when the PR had problems (#7783).
   GATE_ALL_BLOCKING_IDS="${_gate_all_ids[*]+${_gate_all_ids[*]}}"
 
-  # A wall-clock timeout (#13927) is an UNKNOWN with a difference: nothing was
-  # read, so there are no findings to disposition — `--reviews-reconciled`
-  # must NOT be able to wave it through the way it can a read that completed
-  # with outstanding findings. The Judge retries (a wedge is load-bound and
-  # usually transient) or parks the PR; it never asserts anything about an
-  # unread review state.
-  if [[ "$GATE_TIMED_OUT" == "1" ]]; then
-    {
-      echo "post-verdict.sh: REFUSING to post an approval — the review-feedback read TIMED OUT (#13927): the gate's forge reads did not complete within their wall-clock budget."
-      printf '%s\n' "$GATE_OUT" | sed 's/^/  /'
-      echo
-      echo "Nothing was posted. Retry the verdict once host load subsides (the wedge is transient),"
-      echo "or park the PR rather than blocking on it. --reviews-reconciled cannot disposition a read"
-      echo "that never completed. If timeouts persist, raise LOOM_FORGE_REVIEW_READ_TIMEOUT (default 60s)."
-    } >&2
+  # EVERY UNKNOWN is non-dispositionable (#13927, #15781): nothing was read,
+  # so there are no findings to disposition — `--reviews-reconciled` must NOT
+  # be able to wave it through the way it can a read that completed with
+  # outstanding findings. That holds for a wall-clock timeout and for every
+  # other cause alike (a failed read, truncated pagination, an exit code that
+  # disagrees with the printed state, a missing dependency): an UNKNOWN
+  # reports no blocking ids, so the citation check below would have nothing to
+  # demand and any 40-character sentence would carry an approval over a review
+  # state nobody read. The Judge retries or parks the PR; it never asserts
+  # anything about an unread review state.
+  if [[ "$GATE_TIMED_OUT" == "1" || "$GATE_STATE" == "UNKNOWN" ]]; then
+    if [[ "$GATE_TIMED_OUT" == "1" ]]; then
+      {
+        echo "post-verdict.sh: REFUSING to post an approval — the review-feedback read TIMED OUT (#13927): the gate's forge reads did not complete within their wall-clock budget."
+        printf '%s\n' "$GATE_OUT" | sed 's/^/  /'
+        echo
+        echo "Nothing was posted. Retry the verdict once host load subsides (the wedge is transient),"
+        echo "or park the PR rather than blocking on it. --reviews-reconciled cannot disposition a read"
+        echo "that never completed. If timeouts persist, raise LOOM_FORGE_REVIEW_READ_TIMEOUT (default 60s)."
+      } >&2
+    else
+      {
+        echo "post-verdict.sh: REFUSING to post an approval — the review-feedback gate state is UNKNOWN (#7647): the read did not complete, so the review state was not established."
+        printf '%s\n' "$GATE_OUT" | sed 's/^/  /'
+        if [[ -n "$GATE_FINDINGS_FILE" && -r "$GATE_FINDINGS_FILE" ]]; then
+          sed 's/^/  /' "$GATE_FINDINGS_FILE"
+        fi
+        echo
+        echo "Nothing was posted. Retry the verdict once the read completes, or park the PR"
+        echo "rather than blocking on it. --reviews-reconciled cannot disposition a review"
+        echo "state that was not read (#15781)."
+      } >&2
+    fi
     exit 3
   fi
 
   if [[ "$GATE_STATE" == "CLEAR" ]]; then
     RECONCILIATION_MARKER="<!-- loom:review-reconciliation state=clear reviews=${GATE_REVIEWS:-0} blocking_current=0 blocking_older=0 inline_unresolved=0 source=${GATE_SOURCE:-none} reconciled=n/a -->"
   else
-    # Something is outstanding, or the read did not complete. Either way this
-    # is NOT evidence of "no blockers" — refuse unless the caller dispositions
+    # Something a COMPLETED read found is outstanding (BLOCKING or
+    # NEEDS_RECONCILIATION — an incomplete read was refused above). This is
+    # NOT evidence of "no blockers" — refuse unless the caller dispositions
     # it explicitly.
     if [[ -z "$RECONCILED" ]]; then
       {
