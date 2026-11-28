@@ -1126,9 +1126,6 @@ async fn sample_snapshots(
     // Memory/swap/worktree-volume gauges (Issue #8860), same cadence, through
     // the OTLP-only ops sink — a no-op when no OTLP exporter is running.
     super::ops::host::record(worktree_volume).await;
-    // Merge-chain re-date pressure (Issue #10163), OTLP-only: local `git log`
-    // reads, no forge call; a no-op without the ops sink.
-    super::ops::redate_chain::record(workspace_pool).await;
     // Resolve disposition repo references at the existing snapshot cadence,
     // and offer rows if the faster sample has not consumed this summary yet.
     super::ops::disposition::record(disposition_sampler, Some(slug_cache)).await;

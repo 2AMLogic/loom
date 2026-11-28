@@ -747,14 +747,11 @@ The fleet-captain gauge producer (`fleet.captainGauges`, `loom.captain.*`) was
 removed in #11406: every host reads the snapshot's `loom:blocked` listing itself.
 Details are in [`telemetry-schema.md`](telemetry-schema.md#metricpoints).
 
-**Merge-chain re-date pressure (#10163).** Three gauges track the #8508
-re-date remedy over a trailing 24 h (retired by #12063; the gauges stay to show
-it reaching zero, #10888): `loom.merge.redate_prs{state}`
-(`landed`, `pending`, `stuck`), `loom.merge.redates_max{state}` and
-`loom.merge.time_to_land_max`. They are read from local `git log` on the
-`host.health` cadence, with no forge call. A non-zero `stuck` series is a
-merge-chain head that `main` keeps moving under. Details are in
-[`telemetry-schema.md`](telemetry-schema.md#metricpoints).
+**Merge-chain re-date pressure (#10163).** The `loom.merge.redate_prs{state}`,
+`loom.merge.redates_max{state}` and `loom.merge.time_to_land_max` gauges that
+tracked the #8508 re-date remedy were removed in #15776: the remedy was retired
+by #12063 and the #10888 before/after measurement is closed, so no host samples
+them any more.
 
 **Retried fleet dispatches (#12875).** When the fleet-dispatch captain
 grants an item and step again after an earlier assignment of the same repo,

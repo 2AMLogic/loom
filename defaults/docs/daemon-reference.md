@@ -4418,60 +4418,20 @@ merges of `main`, two rebases — all six with byte-identical patches.
 tree-identical verb (`TREE_UNCHANGED=1|0`, exit 0; exit 1 = no answer);
 `forge verdict-equivalent` is its superset and is what the shell guard now calls.
 
-#### Attributing re-dates: commit trailers and `merge-pr redate-report` (#9746)
+#### Re-date commits: history only (#8508, #9746, #10163)
 
-On 2026-09-30, 52% of merged PRs needed at least one #8508 re-date, and each one
-cost a full PR CI cycle. `loom-daemon merge-pr redate-checks` recorded *which*
-check and *which* paths forced it in the re-date commit's body as git trailers.
-#12063 slice 1 deleted `redate-checks` (no new re-date commits are made);
-`redate-report` stays, read-only, to measure the after (#10888). The subject is
-byte-identical, so `is_redate_commit_subject` and the CI telemetry's
-`stale_main_bump` attribution still read the history:
-
-```text
-Stale-Check: Structural Checks (Role Prompt Prefix Ratchet)
-Stale-Clause: the base move and this PR both touch this check's coupled inputs
-Coupled-Base-Path: CLAUDE.md
-Coupled-PR-Path: defaults/docs/guard-hooks.md
-```
-
-`loom-daemon merge-pr redate-report [--since 24h] [--ref origin/main] [--json]`
-reads them back. It is **read-only**: it runs one local `git log` over `--ref`
-(not fetched, so run `git fetch` first) and makes no forge call and no write.
-For every commit whose subject is exactly the automated re-date subject, it
-prints counts by check × clause × base path × PR path (most frequent first),
-subtotals by check and by clause, and the number of **untrailered** re-dates
-(pre-#9746 history, or a verdict that could not be recomputed). Hand-made
-re-dates with a different subject (such as `… (#8248 guard, operator release)`)
-are counted separately and are not in the table. `--since` takes seconds or
-`<n>[smhd]`.
-
-The trailers reach `main` only because this repo merges PRs with **merge
-commits**, which keep the PR branch's re-date commits reachable (verified
-2026-09-30). A repo that squash-merges drops them, and the report then
-undercounts.
-
-#### Re-dates per PR and time to land (#10163)
-
-On 2026-10-04 chain head #9832 was re-dated three times in about 40 minutes
-while `main` kept moving under it, and 31 approved PRs waited behind it. The
-per-check table above says *why* re-dates happen. It does not say *which PR*
-keeps being re-dated or how long that PR waited, so the livelock did not show
-on the dashboard. `merge_pr::redate::chain_telemetry` adds the per-PR view.
-
-| Surface | What it shows |
-|---------|---------------|
-| `merge-pr redate-report` | A `Per PR` section in the text output and `chains` in `--json`. Each row has the PR, its re-date count, the first and last re-date times, the landing merge's time, `time_to_land_secs` (first re-date to landing), and `stuck` (not landed after at least the default re-date budget of 3). |
-| `metric.points` (OTLP) | `loom.merge.redate_prs{state=landed\|pending\|stuck}`, `loom.merge.redates_max{state=landed\|pending}` and `loom.merge.time_to_land_max` (seconds). These are trailing-24 h gauges sampled on the `host.health` cadence by `observability::ops::redate_chain`. They are never labelled by PR. Every host that manages the repo reports it, so read them with `max` across hosts. A non-zero `stuck`, or a rising `redates_max{state=pending}`, is the livelock signature. |
-
-Unlike the per-check table, these rows also read every local
-**remote-tracking** ref (`git log <ref> --remotes`). A re-date commit only
-reaches `main` when its PR merges, so a PR that is still livelocked has all of
-its re-dates on its own branch. Everything is read from local git: nothing is
-fetched and no forge call is made. A PR is therefore seen as of the clone's last
-fetch. A remote branch whose PR closed unmerged reads as not landed until it is
-pruned, and the window bounds that error. Landing lookups are capped at 64 PRs
-per pass, most re-dated first. Telemetry only observes the livelock.
+The #8508 re-date remedy was deleted by #12063 slice 1. The read-only
+measurement that stayed behind for one release to show the re-dates reaching
+zero (#10888) went with it in #15776 (#12063 slice 4): the
+`loom-daemon merge-pr redate-report` verb and the `loom.merge.redate_prs`,
+`loom.merge.redates_max` and `loom.merge.time_to_land_max` gauges no longer
+exist. Re-date commits already on `main` keep their shape — the subject
+`chore: re-date required checks for PR #N (#8248 guard, automated by #8508)` and,
+from #9746 on, `Stale-Check` / `Stale-Clause` / `Coupled-Base-Path` /
+`Coupled-PR-Path` trailers — but only the CI telemetry poller still reads them:
+a first-attempt run whose head commit carries that subject is classified
+`stale_main_bump` (`merge_pr::redate::is_redate_commit_subject`). The trailers
+have no reader.
 
 #### Anchoring an unmarked verdict (#6319)
 

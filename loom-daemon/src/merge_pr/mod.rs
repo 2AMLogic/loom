@@ -30,7 +30,8 @@
 //! its no-op-push remedy (#8508); #12063 slice 1 deleted both, with the
 //! CI-run conclusion gate (#10444): required checks at the head are GitHub's
 //! to enforce. [`stale_checks`] keeps only the shared check-run reads, and
-//! [`redate`] only the commit vocabulary `redate-report` measures.
+//! [`redate`] only the commit vocabulary the CI telemetry poller still
+//! classifies (`stale_main_bump`).
 //!
 //! [`zero_checks`] is not a port either — it is #9091's narrowing of the
 //! #6169 zero-row settle guard inside `_wait_for_checks_then_sync_merge`:

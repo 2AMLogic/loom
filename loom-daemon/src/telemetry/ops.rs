@@ -663,20 +663,6 @@ pub enum MetricName {
     /// `repo_facts.resolver_disagree`): signals that are not forge calls.
     #[serde(rename = "loom.forge.facade.events")]
     ForgeFacadeEvents,
-    // ---- Merge-chain re-date pressure (Issue #10163) ----------------------
-    /// PRs with at least one #8508 re-date commit in the trailing window,
-    /// labelled `state` = `landed` / `pending` / `stuck` (pending with at
-    /// least the default re-date budget spent). Never labelled by PR.
-    #[serde(rename = "loom.merge.redate_prs")]
-    MergeRedatePrs,
-    /// Most re-dates any one PR took in the trailing window, labelled `state`
-    /// = `landed` / `pending`.
-    #[serde(rename = "loom.merge.redates_max")]
-    MergeRedatesMax,
-    /// Longest first-re-date-to-landing time among PRs that landed in the
-    /// trailing window.
-    #[serde(rename = "loom.merge.time_to_land_max")]
-    MergeTimeToLandMax,
     // ---- Egress proxy observe mode (Issue #11300) -------------------------
     /// Provider requests the egress proxy observed since the previous point,
     /// labelled `provider`, `account` (the seat), `model`, `role`, `outcome`
@@ -971,9 +957,6 @@ impl MetricName {
             Self::GithubRateLimitBreakerSkips => "github.ratelimit.breaker_skips",
             Self::ForgeCalls => "loom.forge.calls",
             Self::ForgeFacadeEvents => "loom.forge.facade.events",
-            Self::MergeRedatePrs => "loom.merge.redate_prs",
-            Self::MergeRedatesMax => "loom.merge.redates_max",
-            Self::MergeTimeToLandMax => "loom.merge.time_to_land_max",
             Self::EgressRequests => "loom.egress.requests",
             Self::EgressTokens => "loom.egress.tokens",
             Self::EgressLatency => "loom.egress.latency",
@@ -1123,9 +1106,6 @@ impl MetricName {
             Self::GithubRateLimitBreakerSkips => "{pass}",
             Self::ForgeCalls => "{request}",
             Self::ForgeFacadeEvents => "{event}",
-            Self::MergeRedatePrs => "{pull_request}",
-            Self::MergeRedatesMax => "{redate}",
-            Self::MergeTimeToLandMax => "s",
             Self::EgressRequests => "{request}",
             Self::EgressTokens => "{token}",
             Self::EgressLatency | Self::EgressTtft => "s",
@@ -1263,11 +1243,6 @@ impl MetricName {
             }
             Self::ForgeFacadeEvents => {
                 "Named gh-facade events that are not forge calls, by reason (counter name)."
-            }
-            Self::MergeRedatePrs => "PRs re-dated in the trailing window, by landing state.",
-            Self::MergeRedatesMax => "Most re-dates on one PR in the trailing window, by state.",
-            Self::MergeTimeToLandMax => {
-                "Longest first-re-date-to-landing time of a PR landed in the window."
             }
             Self::DaemonTaskAlive => "1 while a long-running daemon loop is beating, by task.",
             Self::EgressRequests => "Provider requests observed by the egress proxy, by seat.",

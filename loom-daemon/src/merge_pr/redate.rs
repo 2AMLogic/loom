@@ -1,26 +1,14 @@
-//! The re-date commit's vocabulary, kept for the read-only measurement.
+//! The re-date commit's subject vocabulary, kept for the CI telemetry poller.
 //!
 //! The re-date remedy itself (#8508: a tree-identical no-op push when the
 //! #8248 freshness guard refused a merge, its per-head budget, back-off and
 //! sync hand-off) was deleted by #12063 slice 1 together with the guard: a PR
 //! whose head and green checks are unchanged is no longer re-dated because the
 //! base moved. What stays is what still reads commits the remedy already
-//! wrote: `merge-pr redate-report` ([`report`], [`chain_telemetry`]; the
-//! #10888 before/after measurement, removed in slice 4) and the CI telemetry
-//! poller's `stale_main_bump` trigger reason (#9337), via
-//! [`is_redate_commit_subject`].
-
-pub mod chain_telemetry;
-pub mod report;
-
-/// The trailer keys a re-date commit carried (#9746), in the order written.
-pub const TRAILER_CHECK: &str = "Stale-Check";
-pub const TRAILER_CLAUSE: &str = "Stale-Clause";
-pub const TRAILER_BASE_PATH: &str = "Coupled-Base-Path";
-pub const TRAILER_PR_PATH: &str = "Coupled-PR-Path";
-
-/// The value written for an absent trailer path.
-pub const NONE: &str = "none";
+//! wrote: the CI telemetry poller's `stale_main_bump` trigger reason (#9337),
+//! via [`is_redate_commit_subject`]. The read-only measurement that read them
+//! too — `merge-pr redate-report` and the `loom.merge.redate_*` gauges, the
+//! #10888 before/after measurement — was removed in slice 4 (#15776).
 
 /// The commit message every re-date commit carries — deterministic and
 /// greppable, so a later pass (or a human) can tell "this is an automated

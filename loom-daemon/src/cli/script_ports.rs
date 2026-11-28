@@ -696,11 +696,6 @@ pub(crate) enum MergePrCommand {
     /// comment. Exit 0 = clean/bypassed, 1 = refuse, 2 = forge unreadable.
     RequiredChecks(super::merge_pr_required_checks::RequiredChecksArgs),
 
-    /// Read-only report of which required checks and paths forced the #8508
-    /// re-dates (#9746), from the trailers on the re-date commits reachable
-    /// from `--ref` (default origin/main) within `--since` (default 24h).
-    RedateReport(super::merge_pr_redate_report::RedateReportArgs),
-
     /// The pre-merge `loom:pr` review-signal guard (#7419): refuse a merge
     /// whose current head does not carry `loom:pr`, unless
     /// `--allow-unapproved` asserts responsibility. Exit 0 = present or
@@ -1008,7 +1003,6 @@ impl MergePrCommand {
             MergePrCommand::ReleaseHold(args) => args.run(),
             MergePrCommand::TreeChecks(args) => args.run(),
             MergePrCommand::RequiredChecks(args) => args.run(),
-            MergePrCommand::RedateReport(args) => args.run(),
             MergePrCommand::LoomPrGuard(args) => args.run(),
             MergePrCommand::LoomPrOverrideComment(args) => args.run(),
             MergePrCommand::HoldState(args) => args.run(),

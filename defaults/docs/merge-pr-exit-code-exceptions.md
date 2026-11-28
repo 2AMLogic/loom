@@ -83,8 +83,8 @@ re-queue. `--redate-stale-checks` and the `stale-checks`, `ci-result` and
 `redate-checks` verbs are removed outright, with no deprecated stand-in: a
 Champion prompt or `merge-pr.sh` that still uses them refuses the merge
 (fails closed) until its repo resyncs `.loom/`.
-`loom-daemon merge-pr redate-report` and the `loom.merge.redate_*` gauges
-remain for the #10888 before/after measurement.
+The `redate-report` verb and the `loom.merge.redate_*` gauges that stayed for
+the #10888 before/after measurement were removed in #15776.
 
 ## Exit 5 — a required check is pending or red (#12063)
 
