@@ -14,9 +14,11 @@
 //! [`SpanName`](super::trace::SpanName): free text can never become a metric
 //! name, and each name fixes its own [`MetricKind`], unit and description, so
 //! two emitters cannot disagree about whether `loom.dispatch.decisions` is a
-//! gauge or a counter. Adding a metric means adding a variant (and, when it
-//! needs a new label key, extending [`OPS_METRIC_LABEL_KEYS`] together with
-//! the gateway collector's `keep_keys` — contract-tested).
+//! gauge or a counter. Adding a metric means adding one row to the
+//! `metric_name_table` (and, when it needs a new label key, extending
+//! [`OPS_METRIC_LABEL_KEYS`] together with the gateway collector's
+//! `keep_keys` — contract-tested): the variant, its Serde rename, `as_str`
+//! and the variant list the round-trip test visits all come from that row.
 //!
 //! # Bounded labels
 //!
@@ -438,594 +440,517 @@ pub enum MetricKind {
     DeltaCounter,
 }
 
-/// Every metric name `metric.points` can carry.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
-pub enum MetricName {
-    /// Work-finder candidate outcomes for one tick, labelled `reason`.
-    #[serde(rename = "loom.dispatch.decisions")]
-    DispatchDecisions,
-    /// Ready candidates the work finder saw in one tick.
-    #[serde(rename = "loom.dispatch.candidates")]
-    DispatchCandidates,
-    /// Items the work finder can draw right now, labelled `repo` and `step`
-    /// (#12734): the canonical "dispatchable depth".
-    #[serde(rename = "loom.dispatch.pool_items")]
-    DispatchPoolItems,
-    /// Items the work finder weighed to zero, labelled `repo` and `reason`
-    /// (#12734).
-    #[serde(rename = "loom.dispatch.excluded_items")]
-    DispatchExcludedItems,
-    /// The dynamic concurrency cap the tick ran under.
-    #[serde(rename = "loom.dispatch.max_concurrent")]
-    DispatchMaxConcurrent,
-    /// The terms the tick's cap is the minimum of, labelled `kind`
-    /// (`configured`, `disk`, `ram`; #11858). A headroom term that was not
-    /// measured is not emitted.
-    #[serde(rename = "loom.dispatch.cap_term")]
-    DispatchCapTerm,
-    /// The subset of `loom.dispatch.decisions{reason=pr_open}` the open-PR
-    /// pre-filter skipped with no `dispatch()` attempt (#11858).
-    #[serde(rename = "loom.dispatch.pr_open_prefiltered")]
-    DispatchPrOpenPrefiltered,
-    /// Age of the oldest waiting ready-queue row, labelled `state` (#8856).
-    #[serde(rename = "loom.queue.oldest_wait")]
-    QueueOldestWait,
-    /// Waiting ready-queue rows older than the starvation threshold,
-    /// labelled `state` (#8856).
-    #[serde(rename = "loom.queue.starved")]
-    QueueStarved,
-    /// Starved rows per queue disposition, labelled `reason` (#8856).
-    #[serde(rename = "loom.queue.starved.by_reason")]
-    QueueStarvedByReason,
-    /// Summed queue dwell of the issues dispatched in one tick (#8856).
-    #[serde(rename = "loom.queue.dispatch_wait")]
-    QueueDispatchWait,
-    /// Issues contributing to `loom.queue.dispatch_wait` (#8856).
-    #[serde(rename = "loom.queue.dispatch_wait.samples")]
-    QueueDispatchWaitSamples,
-    /// Memory available for new allocations without swapping.
-    #[serde(rename = "loom.host.memory.available_bytes")]
-    HostMemoryAvailableBytes,
-    /// Physical memory installed.
-    #[serde(rename = "loom.host.memory.total_bytes")]
-    HostMemoryTotalBytes,
-    /// Swap in use.
-    #[serde(rename = "loom.host.swap.used_bytes")]
-    HostSwapUsedBytes,
-    /// Swap configured.
-    #[serde(rename = "loom.host.swap.total_bytes")]
-    HostSwapTotalBytes,
-    /// Free space on the worktree-root volume.
-    #[serde(rename = "loom.host.worktree_volume.free_bytes")]
-    HostWorktreeVolumeFreeBytes,
-    /// Capacity of the worktree-root volume.
-    #[serde(rename = "loom.host.worktree_volume.total_bytes")]
-    HostWorktreeVolumeTotalBytes,
-    /// Allocated bytes on a measured Codex private workspace volume, by account.
-    #[serde(rename = "loom.host.codex_workspace_volume.used_bytes")]
-    HostCodexWorkspaceVolumeUsedBytes,
-    /// Allocated bytes across all discovered Codex private workspace volumes.
-    #[serde(rename = "loom.host.codex_workspace_volume.total_used_bytes")]
-    HostCodexWorkspaceVolumeTotalUsedBytes,
-    // Ready-queue depth (Issue #8852, phase 2) — one contiguous block.
-    /// Ready issues on the last work-finder tick, labelled `state` and
-    /// `reason` (the queue disposition). Never labelled by issue or repo.
-    #[serde(rename = "loom.queue.issues")]
-    QueueIssues,
-    /// Repos whose ready-issue listing failed on the last tick: a non-zero
-    /// value means `loom.queue.issues` is missing their backlog.
-    #[serde(rename = "loom.queue.listing_failed_repos")]
-    QueueListingFailedRepos,
-    /// Repos whose ready-issue listing came back partial on the last tick
-    /// (#11139: a later page failed, the page cap, a mid-walk change): a
-    /// non-zero value means `loom.queue.issues` holds only part of their
-    /// backlog.
-    #[serde(rename = "loom.queue.listing_incomplete_repos")]
-    QueueListingIncompleteRepos,
-    /// Ready issues the last work-finder tick listed (`queue.snapshot`'s
-    /// `seen`).
-    #[serde(rename = "loom.queue.seen")]
-    QueueSeen,
-    /// `already_landed` rows on the last tick by evidence, labelled `reason`
-    /// (`forge_closed`, `forge_closed_not_planned`, `journal_landed`,
-    /// `unknown`; #11858).
-    #[serde(rename = "loom.queue.already_landed")]
-    QueueAlreadyLanded,
-    /// This host's shard index on the last work-finder tick's dispatch plan,
-    /// labelled `shard_count` (#12827). Emitted only when sharding is
-    /// configured and the index is known.
-    #[serde(rename = "loom.queue.host_shard")]
-    QueueHostShard,
-    // ---- Quota burn and pool state (Issue #8857) ------------------------
-    /// Uncached input tokens consumed since the previous sample.
-    #[serde(rename = "loom.llm.tokens.input")]
-    LlmTokensInput,
-    /// Output tokens produced since the previous sample.
-    #[serde(rename = "loom.llm.tokens.output")]
-    LlmTokensOutput,
-    /// Cache-read input tokens since the previous sample.
-    #[serde(rename = "loom.llm.tokens.cache_read")]
-    LlmTokensCacheRead,
-    /// Cache-write input tokens since the previous sample.
-    #[serde(rename = "loom.llm.tokens.cache_write")]
-    LlmTokensCacheWrite,
-    /// Model API responses (distinct message ids) since the previous sample.
-    #[serde(rename = "loom.llm.requests")]
-    LlmRequests,
-    /// Accounts in a provider's pool, labelled `state` = `usable`/`exhausted`.
-    #[serde(rename = "loom.pool.accounts")]
-    PoolAccounts,
-    /// 1 when a provider's pool has exhausted accounts and none usable.
-    #[serde(rename = "loom.pool.exhausted")]
-    PoolExhausted,
-    /// Accounts that became exhausted since the previous sample.
-    #[serde(rename = "loom.pool.exhaustions")]
-    PoolExhaustions,
-    /// Seconds since the previous sample the pool read as exhausted.
-    #[serde(rename = "loom.pool.exhausted_seconds")]
-    PoolExhaustedSeconds,
-    /// One pool account's state (Issue #11286): `1` for the state it is in,
-    /// `0` otherwise, labelled `provider`, `account` and `state` =
-    /// `usable`/`exhausted`.
-    #[serde(rename = "loom.pool.account_state")]
-    PoolAccountState,
-    /// An API-key seat's declared plan token allowance per window (Issue
-    /// #11286), labelled `provider` + `account`. Only where declared.
-    #[serde(rename = "loom.pool.plan_token_limit")]
-    PoolPlanTokenLimit,
-    /// An API-key seat's declared plan window in seconds (Issue #11286),
-    /// labelled `provider` + `account`. Only where declared.
-    #[serde(rename = "loom.pool.plan_window_seconds")]
-    PoolPlanWindowSeconds,
-    // ---- Reason-classified account marks (Issue #8931) -------------------
-    /// Pool accounts marked out of selection since the previous point,
-    /// labelled `provider` and `reason` (a closed set — see
-    /// `observability::ops::pool_marks::MarkReason`). Never an account name.
-    #[serde(rename = "loom.pool.account_marks")]
-    PoolAccountMarks,
-    // ---- Worker turnaround and forge stage dwell (Issue #8929) ----------
-    /// Seconds from an issue-sweep slot freeing to its refill, summed.
-    #[serde(rename = "loom.dispatch.slot_turnaround")]
-    DispatchSlotTurnaround,
-    /// Refills counted in `loom.dispatch.slot_turnaround`.
-    #[serde(rename = "loom.dispatch.slot_turnaround.samples")]
-    DispatchSlotTurnaroundSamples,
-    /// Concurrency slots left idle at the end of a work-finder tick.
-    #[serde(rename = "loom.dispatch.idle_slots")]
-    DispatchIdleSlots,
-    /// Slot-seconds left idle while dispatchable ready work waited.
-    #[serde(rename = "loom.dispatch.idle_slot_seconds")]
-    DispatchIdleSlotSeconds,
-    /// Busy agent slots, labelled `role` (#11847): `sweep` for the work
-    /// finder's issue sweeps, the role name for role-runner agents.
-    #[serde(rename = "loom.dispatch.busy_slots")]
-    DispatchBusySlots,
-    /// The role-runner agent ceiling (`autonomous.roleRunner.maxConcurrent`).
-    #[serde(rename = "loom.dispatch.role_max_concurrent")]
-    DispatchRoleMaxConcurrent,
-    /// Role-runner agent slots idle: the ceiling minus agents in flight.
-    #[serde(rename = "loom.dispatch.role_idle_slots")]
-    DispatchRoleIdleSlots,
-    /// Seconds the oldest live step of a role has been running, labelled
-    /// `role` and `pool="step"` (#12873). No point for a role with none.
-    #[serde(rename = "loom.dispatch.running_oldest_age_sec")]
-    DispatchRunningOldestAgeSec,
-    /// Live steps per running-age bucket, labelled `role`, `pool="step"`
-    /// and `age` (`lt_15m` / `15m_1h` / `1h_4h` / `ge_4h`), #12873.
-    #[serde(rename = "loom.dispatch.running_by_age")]
-    DispatchRunningByAge,
-    /// Live steps per story-point class, labelled `role`, `pool="step"` and
-    /// `points` (`1|2|3|5|8|13|unsized`), #12957. A count, never a sum.
-    #[serde(rename = "loom.dispatch.running_by_points")]
-    DispatchRunningByPoints,
-    /// Items the step tick could draw (weight > 0, after the live claims),
-    /// labelled `repo`, sampled every work-finder tick (#11909).
-    #[serde(rename = "loom.step.actionable")]
-    StepActionable,
-    /// Open items carrying a hold or park label, labelled `repo`,
-    /// `artifact`, `hold`, `basis` (#12038, #12369).
-    #[serde(rename = "loom.forge.hold_items")]
-    ForgeHoldItems,
-    /// Seconds held (from `labels_at`), labelled `repo`, `artifact`,
-    /// `hold`, `stat` (#12038, #12369).
-    #[serde(rename = "loom.forge.hold_age_seconds")]
-    ForgeHoldAgeSeconds,
-    /// Ready-queue rows dropped from a `loom.dispatch.disposition` export
-    /// pass, labelled `reason` = `unresolved` (no forge slug) or `truncated`
-    /// (over the per-call row cap) — Issue #9222.
-    #[serde(rename = "loom.queue.disposition_rows_dropped")]
-    QueueDispositionRowsDropped,
-    // ---- GitHub rate limit (Issue #10022) --------------------------------
-    /// Requests left in a GitHub rate-limit pool, labelled `resource` and
-    /// `account` (the non-secret credential identity).
-    #[serde(rename = "github.ratelimit.remaining")]
-    GithubRateLimitRemaining,
-    /// Requests spent this window in a pool, labelled `resource`/`account`.
-    #[serde(rename = "github.ratelimit.used")]
-    GithubRateLimitUsed,
-    /// When a pool's window resets (Unix epoch seconds), `resource`/`account`.
-    #[serde(rename = "github.ratelimit.reset")]
-    GithubRateLimitReset,
-    /// Job passes skipped because the rate-limit breaker was suppressing,
-    /// labelled `reason` = the job (a closed set — see
-    /// `observability::ops::ratelimit::Job`).
-    #[serde(rename = "github.ratelimit.breaker_skips")]
-    GithubRateLimitBreakerSkips,
-    /// Requests the `gh` facade spent since the previous point (W1),
-    /// labelled `caller`, `op`, `role`, `account`, `cred_owner`,
-    /// `target_owner`, `resource` and `outcome`; a paginated call counts its
-    /// pages when known.
-    #[serde(rename = "loom.forge.calls")]
-    ForgeCalls,
-    /// The `gh` facade's named event counters since the previous point
-    /// (`crate::forge_call_stats::counters`), labelled `reason` = the
-    /// counter (`facade.cwd_route.disagree`, `repo_facts.redirected`,
-    /// `repo_facts.resolver_disagree`): signals that are not forge calls.
-    #[serde(rename = "loom.forge.facade.events")]
-    ForgeFacadeEvents,
-    // ---- Merge-chain re-date pressure (Issue #10163) ----------------------
-    /// PRs with at least one #8508 re-date commit in the trailing window,
-    /// labelled `state` = `landed` / `pending` / `stuck` (pending with at
-    /// least the default re-date budget spent). Never labelled by PR.
-    #[serde(rename = "loom.merge.redate_prs")]
-    MergeRedatePrs,
-    /// Most re-dates any one PR took in the trailing window, labelled `state`
-    /// = `landed` / `pending`.
-    #[serde(rename = "loom.merge.redates_max")]
-    MergeRedatesMax,
-    /// Longest first-re-date-to-landing time among PRs that landed in the
-    /// trailing window.
-    #[serde(rename = "loom.merge.time_to_land_max")]
-    MergeTimeToLandMax,
-    // ---- Egress proxy observe mode (Issue #11300) -------------------------
-    /// Provider requests the egress proxy observed since the previous point,
-    /// labelled `provider`, `account` (the seat), `model`, `role`, `outcome`
-    /// (`ok` / `error`) and `reason` (a classified code on an error).
-    #[serde(rename = "loom.egress.requests")]
-    EgressRequests,
-    /// Tokens the proxy read off provider responses, labelled as
-    /// `loom.egress.requests` plus `kind` = `input` / `output` / `cache_read`
-    /// / `cache_write`.
-    #[serde(rename = "loom.egress.tokens")]
-    EgressTokens,
-    /// Summed request latency (send to last byte), seconds.
-    #[serde(rename = "loom.egress.latency")]
-    EgressLatency,
-    /// Summed time to first response byte, seconds.
-    #[serde(rename = "loom.egress.ttft")]
-    EgressTtft,
-    // ---- Long-running task liveness (Issue #10414) -----------------------
-    /// 1 while a long-running daemon loop beat within its staleness window,
-    /// 0 once it went silent or marked itself dead, labelled `task`
-    /// (`crate::task_liveness`). Never labelled by repo or issue.
-    #[serde(rename = "loom.daemon.task_alive")]
-    DaemonTaskAlive,
-    /// Faults a long-running loop survived or died of since the previous
-    /// point, labelled `task` and `reason` = `panic` / `overrun` / `exit`.
-    #[serde(rename = "loom.daemon.task_faults")]
-    DaemonTaskFaults,
-    // ---- Primary writer token freshness (Issue #15327) -------------------
-    /// Seconds since the daemon last published its primary writer token,
-    /// labelled `owner` (the installation owner). Climbs past ~600 s only
-    /// when rotation has stopped.
-    #[serde(rename = "loom.daemon.forge_token_age")]
-    DaemonForgeTokenAge,
-    /// Seconds until the published primary writer token's `expires_at`
-    /// (negative once past), labelled `owner`. Absent when the minter gave
-    /// no parseable expiry.
-    #[serde(rename = "loom.daemon.forge_token_remaining")]
-    DaemonForgeTokenRemaining,
-    /// Unix time of the last primary writer token publication, labelled
-    /// `owner`.
-    #[serde(rename = "loom.daemon.forge_token_last_rotation")]
-    DaemonForgeTokenLastRotation,
-    // ---- IPC request latency (Issue #10765) -------------------------------
-    /// Slowest IPC request answered in the interval, seconds from the request
-    /// line being read to the response written, labelled `kind` (the
-    /// request's wire `type` tag, or `invalid`).
-    #[serde(rename = "loom.daemon.ipc.latency_max")]
-    DaemonIpcLatencyMax,
-    /// Summed IPC request latency since the previous point, by `kind`.
-    #[serde(rename = "loom.daemon.ipc.latency")]
-    DaemonIpcLatency,
-    /// IPC requests answered since the previous point, by `kind`.
-    #[serde(rename = "loom.daemon.ipc.requests")]
-    DaemonIpcRequests,
-    /// `DaemonStatus` builds finished since the previous point, by `outcome`
-    /// (`ok` / `panic` / `join_error`). Concurrent status requests share one
-    /// build (Issue #10861), so `requests / status_builds` is the coalescing
-    /// ratio.
-    #[serde(rename = "loom.daemon.ipc.status_builds")]
-    DaemonIpcStatusBuilds,
-    // ---- Codex session containers (Issue #10455) ---------------------------
-    /// Per session-managed Codex account, one point per `state` ∈ `running`,
-    /// `stopped`, `restarting`, `missing`, `stale_mounts`: 1 for the container's current
-    /// state, 0 for the rest. Labelled `account` and `container`.
-    #[serde(rename = "loom.codex_session.state")]
-    CodexSessionState,
-    /// Per session-managed Codex account, one point per `kind` ∈ `hold`,
-    /// `drift_removal`: 1 while that on-disk record stands (an operator
-    /// `stop`; the reconciler's fail-closed removal for a denied mount),
-    /// else 0. Labelled `account` and `container` (#10600).
-    #[serde(rename = "loom.codex_session.record")]
-    CodexSessionRecord,
-    /// Per session-managed Codex account with a drift verdict, one point per
-    /// `kind` ∈ `missing`, `extra`, `denied`: how many workspace paths drift
-    /// that way (`extra` excludes `denied`). Labelled `account` and
-    /// `container` (#10600).
-    #[serde(rename = "loom.codex_session.mount_drift")]
-    CodexSessionMountDrift,
-    /// Per session-managed Codex account whose login was read this pass: 1
-    /// signed in, 0 signed out. Absent while unknown (container stopped,
-    /// docker or the probe unreadable). Labelled `account` and `container`
-    /// (#15292).
-    #[serde(rename = "loom.codex_session.login")]
-    CodexSessionLogin,
-    /// Age in seconds of the operator hold on a held account, by `reason` ∈
-    /// `operator_stop`, `other`. Absent when the account is not held or the
-    /// hold record cannot be decoded (#15292).
-    #[serde(rename = "loom.codex_session.hold_age")]
-    CodexSessionHoldAge,
-    /// Per account whose profile hook trust could be assessed, one point per
-    /// `state` ∈ `recorded`, `sealed`, `missing`: 1 for the current verdict,
-    /// 0 for the rest (#15292).
-    #[serde(rename = "loom.codex_session.hook_trust")]
-    CodexSessionHookTrust,
-    /// Latest rate-limit utilisation (0–1 fraction) per account, by `kind` ∈
-    /// `5h`, `7d`. Absent for a window with no current measurement (#15292).
-    #[serde(rename = "loom.codex_session.quota_used")]
-    CodexSessionQuotaUsed,
-    /// When the window in `loom.codex_session.quota_used` resets (Unix
-    /// seconds), by `kind` ∈ `5h`, `7d`. Absent when the window reports none
-    /// (#15292).
-    #[serde(rename = "loom.codex_session.quota_resets_at")]
-    CodexSessionQuotaResetsAt,
-    /// When the rate-limit reading behind the quota points was taken (Unix
-    /// seconds): now for a live probe, the rollout line's time for a local
-    /// snapshot (#15292).
-    #[serde(rename = "loom.codex_session.quota_observed_at")]
-    CodexSessionQuotaObservedAt,
-    /// Unused limit resets the account holds (`availableCount`). Absent when
-    /// the Codex CLI does not report it (#15292).
-    #[serde(rename = "loom.codex_session.reset_credits")]
-    CodexSessionResetCredits,
-    /// Peak memory (`memory.peak`) of one finished agent scope, by `repo`
-    /// (#11094).
-    #[serde(rename = "loom.agent_scope.peak_memory_bytes")]
-    AgentScopePeakMemoryBytes,
-    /// Processes OOM-killed inside finished agent scopes (`memory.events`
-    /// `oom_kill`), by `repo` and `role` (#12241). One point per finished
-    /// scope that had a kill.
-    #[serde(rename = "loom.agent_scope.oom_kills")]
-    AgentScopeOomKills,
-    // ---- The GitHub state mirror (2am#4367 P5) ----------------------------
-    /// Discovery listings and change-stream pulls that asked the mirror, by
-    /// `caller`, `repo` and `outcome` (`hit`, `stale`, `unknown`, `error`,
-    /// `skipped`; every non-`hit` listing fell back to the forge).
-    #[serde(rename = "loom.forge.mirror.reads")]
-    ForgeMirrorReads,
-    /// Changes the mirror's change stream delivered, by `repo` and `kind`.
-    #[serde(rename = "loom.forge.mirror.changes")]
-    ForgeMirrorChanges,
-    /// Rechecks the daemon asked the mirror for after a claim refusal showed
-    /// a stale draw (#12318), by `reason` and `outcome`.
-    #[serde(rename = "loom.discovery.recheck")]
-    DiscoveryRecheck,
-    /// Summed seconds from a change at the mirror to the pull that saw it,
-    /// by `repo` (mean = this / `loom.forge.mirror.changes`).
-    #[serde(rename = "loom.forge.mirror.wake_latency")]
-    ForgeMirrorWakeLatency,
-    /// Stage-entry answers by `repo` and `kind`, the answering source
-    /// (`mirror`, `events`, `created`, `none`), #11897: the step engine's stage-age coverage.
-    #[serde(rename = "loom.stage_entry.lookups")]
-    StageEntryLookups,
-    /// Public-feed `completion` envelopes the narration sink built, by
-    /// `kind` (the trigger: `sweep_exit`, `step`, `reconcile`) and `outcome`
-    /// (`narrated`, or `seeded` for a fresh host's silent first pass), #12152.
-    #[serde(rename = "loom.feed.completions")]
-    FeedCompletions,
-    /// Merge-reconciliation passes, by `outcome` (`ran`, `deferred` while the
-    /// rate-limit breaker cools, `failed` when the forge read failed), #12152.
-    #[serde(rename = "loom.feed.reconcile_passes")]
-    FeedReconcilePasses,
-    /// Workflow runs sitting `queued` for a runner in a repo's CI poll window
-    /// at the end of a poll, by `repo` (#11993). A gauge: fleet CI contention
-    /// at that instant, the complement of the per-run `loom.ci.queued_ms`.
-    #[serde(rename = "loom.ci.queue_depth")]
-    CiQueueDepth,
-    /// Step ticks a fleet-dispatch worker ran in fallback, by `reason` (why
-    /// fallback began), #12450. Host-level: the resource names the host.
-    #[serde(rename = "loom.fleet_dispatch.fallback_ticks")]
-    FleetDispatchFallbackTicks,
-    /// The captain's published token-probe cycle (#13942): one point per
-    /// account per distinct probe instant, by `account` and `state` (the
-    /// probe's verdict) — the fleet-side record of what every worker was
-    /// told to converge on.
-    #[serde(rename = "loom.tokens.fleet_probe_accounts")]
-    TokensFleetProbeAccounts,
-    /// Age of the fleet token-probe snapshot a worker host has applied
-    /// (#13942): sample time minus the captain's probe instant. The
-    /// fleet-convergence drift signal — equal ages across hosts mean every
-    /// worker is reading the same probe.
-    #[serde(rename = "loom.tokens.fleet_probe_age")]
-    TokensFleetProbeAge,
-    // ---- Fleet dispatch, captain side (Issue #12449) ----------------------
-    /// Fleet-dispatch refusals since the previous point, by `kind` (`claim`
-    /// for a claim the captain refused, `refuse` for a worker's `refuse`
-    /// call) and `reason` (the refusal reason or the `refuse` token).
-    #[serde(rename = "loom.fleet_dispatch.refusals")]
-    FleetDispatchRefusals,
-    /// Captain rows that hit their TTL since the previous point, by `kind`
-    /// (`assignment` for a granted or live row, `hold` for a `claim_lost`
-    /// hold).
-    #[serde(rename = "loom.fleet_dispatch.expired")]
-    FleetDispatchExpired,
-    /// Granted items whose worker then lost the forge order (`refuse` with
-    /// `claim_lost`): the split-brain and attended-claim measure.
-    #[serde(rename = "loom.fleet_dispatch.claim_lost_after_grant")]
-    FleetDispatchClaimLostAfterGrant,
-    /// The captain's rows by `state` (`granted` / `live` per `host`; `held`
-    /// with no host), sampled every server sweep (#12873).
-    #[serde(rename = "loom.fleet_dispatch.rows")]
-    FleetDispatchRows,
-    /// Free slots a host reported in its last fresh heartbeat, by `host`.
-    #[serde(rename = "loom.fleet_dispatch.free_slots_reported")]
-    FleetDispatchFreeSlotsReported,
-    /// Steps a host listed in its last fresh heartbeat, by `host`.
-    #[serde(rename = "loom.fleet_dispatch.live_reported")]
-    FleetDispatchLiveReported,
-    /// Seconds the oldest step in a host's last fresh heartbeat has been
-    /// running, by `host`; no point when the heartbeat carried no start.
-    #[serde(rename = "loom.fleet_dispatch.oldest_live_age_sec")]
-    FleetDispatchOldestLiveAgeSec,
-    // ---- CI telemetry poller cycles (Issue #12793) ------------------------
-    /// CI telemetry poll cycles finished since the previous point, by
-    /// `outcome` (`ok`, `busy`, `backing_off`, `rate_limited`,
-    /// `credential_rejected`, `discovery_failed`, `io_failed`, `panicked`).
-    #[serde(rename = "loom.ci_telemetry.cycles")]
-    CiTelemetryCycles,
-    /// What finished CI telemetry cycles did since the previous point, by
-    /// `kind` (`repos_polled`, `runs_emitted`, `jobs_emitted`,
-    /// `recovered_units`).
-    #[serde(rename = "loom.ci_telemetry.cycle_items")]
-    CiTelemetryCycleItems,
-    /// Wall time of the last finished CI telemetry cycle, by `outcome`.
-    #[serde(rename = "loom.ci_telemetry.cycle_duration")]
-    CiTelemetryCycleDuration,
-    /// Size of the CI telemetry local journal.
-    #[serde(rename = "loom.ci_telemetry.journal_bytes")]
-    CiTelemetryJournalBytes,
-    /// Journal byte offset of the first line the exporter has not yet offered.
-    #[serde(rename = "loom.ci_telemetry.export_cursor_offset")]
-    CiTelemetryExportCursorOffset,
-    /// Age of the oldest journal line not yet exported; `0` when caught up.
-    #[serde(rename = "loom.ci_telemetry.export_lag")]
-    CiTelemetryExportLag,
+/// The metric-name table — **the single registration site for a
+/// `metric.points` metric name** (#15797).
+///
+/// A push-down/callback macro, like `telemetry_kind_table!`: it expands to
+/// nothing itself and hands its rows to a `$callback` macro. Each row
+/// declares a variant and its wire name exactly once; from the same rows
+/// `declare_metric_name` emits the enum (wire name as Serde rename) and
+/// [`as_str`](MetricName::as_str), and `declare_metric_name_list` emits the
+/// test-only [`ALL_METRIC_NAMES`]. The Serde rename and the `as_str` name
+/// cannot drift apart, and no variant can be left out of the round-trip test.
+///
+/// The wire names stay string literals in this file on purpose: the SigNoz
+/// alert tests `include_str!` it to check that every name their rules read
+/// is one the daemon emits.
+macro_rules! metric_name_table {
+    ($callback:ident) => {
+        $callback! {
+            /// Work-finder candidate outcomes for one tick, labelled `reason`.
+            DispatchDecisions = "loom.dispatch.decisions",
+
+            /// Ready candidates the work finder saw in one tick.
+            DispatchCandidates = "loom.dispatch.candidates",
+
+            /// Items the work finder can draw right now, labelled `repo` and `step`
+            /// (#12734): the canonical "dispatchable depth".
+            DispatchPoolItems = "loom.dispatch.pool_items",
+
+            /// Items the work finder weighed to zero, labelled `repo` and `reason`
+            /// (#12734).
+            DispatchExcludedItems = "loom.dispatch.excluded_items",
+
+            /// The dynamic concurrency cap the tick ran under.
+            DispatchMaxConcurrent = "loom.dispatch.max_concurrent",
+
+            /// The terms the tick's cap is the minimum of, labelled `kind`
+            /// (`configured`, `disk`, `ram`; #11858). A headroom term that was not
+            /// measured is not emitted.
+            DispatchCapTerm = "loom.dispatch.cap_term",
+
+            /// The subset of `loom.dispatch.decisions{reason=pr_open}` the open-PR
+            /// pre-filter skipped with no `dispatch()` attempt (#11858).
+            DispatchPrOpenPrefiltered = "loom.dispatch.pr_open_prefiltered",
+
+            /// Age of the oldest waiting ready-queue row, labelled `state` (#8856).
+            QueueOldestWait = "loom.queue.oldest_wait",
+
+            /// Waiting ready-queue rows older than the starvation threshold,
+            /// labelled `state` (#8856).
+            QueueStarved = "loom.queue.starved",
+
+            /// Starved rows per queue disposition, labelled `reason` (#8856).
+            QueueStarvedByReason = "loom.queue.starved.by_reason",
+
+            /// Summed queue dwell of the issues dispatched in one tick (#8856).
+            QueueDispatchWait = "loom.queue.dispatch_wait",
+
+            /// Issues contributing to `loom.queue.dispatch_wait` (#8856).
+            QueueDispatchWaitSamples = "loom.queue.dispatch_wait.samples",
+
+            /// Memory available for new allocations without swapping.
+            HostMemoryAvailableBytes = "loom.host.memory.available_bytes",
+
+            /// Physical memory installed.
+            HostMemoryTotalBytes = "loom.host.memory.total_bytes",
+
+            /// Swap in use.
+            HostSwapUsedBytes = "loom.host.swap.used_bytes",
+
+            /// Swap configured.
+            HostSwapTotalBytes = "loom.host.swap.total_bytes",
+
+            /// Free space on the worktree-root volume.
+            HostWorktreeVolumeFreeBytes = "loom.host.worktree_volume.free_bytes",
+
+            /// Capacity of the worktree-root volume.
+            HostWorktreeVolumeTotalBytes = "loom.host.worktree_volume.total_bytes",
+
+            /// Allocated bytes on a measured Codex private workspace volume, by account.
+            HostCodexWorkspaceVolumeUsedBytes = "loom.host.codex_workspace_volume.used_bytes",
+
+            /// Allocated bytes across all discovered Codex private workspace volumes.
+            HostCodexWorkspaceVolumeTotalUsedBytes =
+                "loom.host.codex_workspace_volume.total_used_bytes",
+
+            // Ready-queue depth (Issue #8852, phase 2) — one contiguous block.
+            /// Ready issues on the last work-finder tick, labelled `state` and
+            /// `reason` (the queue disposition). Never labelled by issue or repo.
+            QueueIssues = "loom.queue.issues",
+
+            /// Repos whose ready-issue listing failed on the last tick: a non-zero
+            /// value means `loom.queue.issues` is missing their backlog.
+            QueueListingFailedRepos = "loom.queue.listing_failed_repos",
+
+            /// Repos whose ready-issue listing came back partial on the last tick
+            /// (#11139: a later page failed, the page cap, a mid-walk change): a
+            /// non-zero value means `loom.queue.issues` holds only part of their
+            /// backlog.
+            QueueListingIncompleteRepos = "loom.queue.listing_incomplete_repos",
+
+            /// Ready issues the last work-finder tick listed (`queue.snapshot`'s
+            /// `seen`).
+            QueueSeen = "loom.queue.seen",
+
+            /// `already_landed` rows on the last tick by evidence, labelled `reason`
+            /// (`forge_closed`, `forge_closed_not_planned`, `journal_landed`,
+            /// `unknown`; #11858).
+            QueueAlreadyLanded = "loom.queue.already_landed",
+
+            /// This host's shard index on the last work-finder tick's dispatch plan,
+            /// labelled `shard_count` (#12827). Emitted only when sharding is
+            /// configured and the index is known.
+            QueueHostShard = "loom.queue.host_shard",
+
+            // ---- Quota burn and pool state (Issue #8857) ------------------------
+            /// Uncached input tokens consumed since the previous sample.
+            LlmTokensInput = "loom.llm.tokens.input",
+
+            /// Output tokens produced since the previous sample.
+            LlmTokensOutput = "loom.llm.tokens.output",
+
+            /// Cache-read input tokens since the previous sample.
+            LlmTokensCacheRead = "loom.llm.tokens.cache_read",
+
+            /// Cache-write input tokens since the previous sample.
+            LlmTokensCacheWrite = "loom.llm.tokens.cache_write",
+
+            /// Model API responses (distinct message ids) since the previous sample.
+            LlmRequests = "loom.llm.requests",
+
+            /// Accounts in a provider's pool, labelled `state` = `usable`/`exhausted`.
+            PoolAccounts = "loom.pool.accounts",
+
+            /// 1 when a provider's pool has exhausted accounts and none usable.
+            PoolExhausted = "loom.pool.exhausted",
+
+            /// Accounts that became exhausted since the previous sample.
+            PoolExhaustions = "loom.pool.exhaustions",
+
+            /// Seconds since the previous sample the pool read as exhausted.
+            PoolExhaustedSeconds = "loom.pool.exhausted_seconds",
+
+            /// One pool account's state (Issue #11286): `1` for the state it is in,
+            /// `0` otherwise, labelled `provider`, `account` and `state` =
+            /// `usable`/`exhausted`.
+            PoolAccountState = "loom.pool.account_state",
+
+            /// An API-key seat's declared plan token allowance per window (Issue
+            /// #11286), labelled `provider` + `account`. Only where declared.
+            PoolPlanTokenLimit = "loom.pool.plan_token_limit",
+
+            /// An API-key seat's declared plan window in seconds (Issue #11286),
+            /// labelled `provider` + `account`. Only where declared.
+            PoolPlanWindowSeconds = "loom.pool.plan_window_seconds",
+
+            // ---- Reason-classified account marks (Issue #8931) -------------------
+            /// Pool accounts marked out of selection since the previous point,
+            /// labelled `provider` and `reason` (a closed set — see
+            /// `observability::ops::pool_marks::MarkReason`). Never an account name.
+            PoolAccountMarks = "loom.pool.account_marks",
+
+            // ---- Worker turnaround and forge stage dwell (Issue #8929) ----------
+            /// Seconds from an issue-sweep slot freeing to its refill, summed.
+            DispatchSlotTurnaround = "loom.dispatch.slot_turnaround",
+
+            /// Refills counted in `loom.dispatch.slot_turnaround`.
+            DispatchSlotTurnaroundSamples = "loom.dispatch.slot_turnaround.samples",
+
+            /// Concurrency slots left idle at the end of a work-finder tick.
+            DispatchIdleSlots = "loom.dispatch.idle_slots",
+
+            /// Slot-seconds left idle while dispatchable ready work waited.
+            DispatchIdleSlotSeconds = "loom.dispatch.idle_slot_seconds",
+
+            /// Busy agent slots, labelled `role` (#11847): `sweep` for the work
+            /// finder's issue sweeps, the role name for role-runner agents.
+            DispatchBusySlots = "loom.dispatch.busy_slots",
+
+            /// The role-runner agent ceiling (`autonomous.roleRunner.maxConcurrent`).
+            DispatchRoleMaxConcurrent = "loom.dispatch.role_max_concurrent",
+
+            /// Role-runner agent slots idle: the ceiling minus agents in flight.
+            DispatchRoleIdleSlots = "loom.dispatch.role_idle_slots",
+
+            /// Seconds the oldest live step of a role has been running, labelled
+            /// `role` and `pool="step"` (#12873). No point for a role with none.
+            DispatchRunningOldestAgeSec = "loom.dispatch.running_oldest_age_sec",
+
+            /// Live steps per running-age bucket, labelled `role`, `pool="step"`
+            /// and `age` (`lt_15m` / `15m_1h` / `1h_4h` / `ge_4h`), #12873.
+            DispatchRunningByAge = "loom.dispatch.running_by_age",
+
+            /// Live steps per story-point class, labelled `role`, `pool="step"` and
+            /// `points` (`1|2|3|5|8|13|unsized`), #12957. A count, never a sum.
+            DispatchRunningByPoints = "loom.dispatch.running_by_points",
+
+            /// Items the step tick could draw (weight > 0, after the live claims),
+            /// labelled `repo`, sampled every work-finder tick (#11909).
+            StepActionable = "loom.step.actionable",
+
+            /// Open items carrying a hold or park label, labelled `repo`,
+            /// `artifact`, `hold`, `basis` (#12038, #12369).
+            ForgeHoldItems = "loom.forge.hold_items",
+
+            /// Seconds held (from `labels_at`), labelled `repo`, `artifact`,
+            /// `hold`, `stat` (#12038, #12369).
+            ForgeHoldAgeSeconds = "loom.forge.hold_age_seconds",
+
+            /// Ready-queue rows dropped from a `loom.dispatch.disposition` export
+            /// pass, labelled `reason` = `unresolved` (no forge slug) or `truncated`
+            /// (over the per-call row cap) — Issue #9222.
+            QueueDispositionRowsDropped = "loom.queue.disposition_rows_dropped",
+
+            // ---- GitHub rate limit (Issue #10022) --------------------------------
+            /// Requests left in a GitHub rate-limit pool, labelled `resource` and
+            /// `account` (the non-secret credential identity).
+            GithubRateLimitRemaining = "github.ratelimit.remaining",
+
+            /// Requests spent this window in a pool, labelled `resource`/`account`.
+            GithubRateLimitUsed = "github.ratelimit.used",
+
+            /// When a pool's window resets (Unix epoch seconds), `resource`/`account`.
+            GithubRateLimitReset = "github.ratelimit.reset",
+
+            /// Job passes skipped because the rate-limit breaker was suppressing,
+            /// labelled `reason` = the job (a closed set — see
+            /// `observability::ops::ratelimit::Job`).
+            GithubRateLimitBreakerSkips = "github.ratelimit.breaker_skips",
+
+            /// Requests the `gh` facade spent since the previous point (W1),
+            /// labelled `caller`, `op`, `role`, `account`, `cred_owner`,
+            /// `target_owner`, `resource` and `outcome`; a paginated call counts its
+            /// pages when known.
+            ForgeCalls = "loom.forge.calls",
+
+            /// The `gh` facade's named event counters since the previous point
+            /// (`crate::forge_call_stats::counters`), labelled `reason` = the
+            /// counter (`facade.cwd_route.disagree`, `repo_facts.redirected`,
+            /// `repo_facts.resolver_disagree`): signals that are not forge calls.
+            ForgeFacadeEvents = "loom.forge.facade.events",
+
+            // ---- Merge-chain re-date pressure (Issue #10163) ----------------------
+            /// PRs with at least one #8508 re-date commit in the trailing window,
+            /// labelled `state` = `landed` / `pending` / `stuck` (pending with at
+            /// least the default re-date budget spent). Never labelled by PR.
+            MergeRedatePrs = "loom.merge.redate_prs",
+
+            /// Most re-dates any one PR took in the trailing window, labelled `state`
+            /// = `landed` / `pending`.
+            MergeRedatesMax = "loom.merge.redates_max",
+
+            /// Longest first-re-date-to-landing time among PRs that landed in the
+            /// trailing window.
+            MergeTimeToLandMax = "loom.merge.time_to_land_max",
+
+            // ---- Egress proxy observe mode (Issue #11300) -------------------------
+            /// Provider requests the egress proxy observed since the previous point,
+            /// labelled `provider`, `account` (the seat), `model`, `role`, `outcome`
+            /// (`ok` / `error`) and `reason` (a classified code on an error).
+            EgressRequests = "loom.egress.requests",
+
+            /// Tokens the proxy read off provider responses, labelled as
+            /// `loom.egress.requests` plus `kind` = `input` / `output` / `cache_read`
+            /// / `cache_write`.
+            EgressTokens = "loom.egress.tokens",
+
+            /// Summed request latency (send to last byte), seconds.
+            EgressLatency = "loom.egress.latency",
+
+            /// Summed time to first response byte, seconds.
+            EgressTtft = "loom.egress.ttft",
+
+            // ---- Long-running task liveness (Issue #10414) -----------------------
+            /// 1 while a long-running daemon loop beat within its staleness window,
+            /// 0 once it went silent or marked itself dead, labelled `task`
+            /// (`crate::task_liveness`). Never labelled by repo or issue.
+            DaemonTaskAlive = "loom.daemon.task_alive",
+
+            /// Faults a long-running loop survived or died of since the previous
+            /// point, labelled `task` and `reason` = `panic` / `overrun` / `exit`.
+            DaemonTaskFaults = "loom.daemon.task_faults",
+
+            // ---- Primary writer token freshness (Issue #15327) -------------------
+            /// Seconds since the daemon last published its primary writer token,
+            /// labelled `owner` (the installation owner). Climbs past ~600 s only
+            /// when rotation has stopped.
+            DaemonForgeTokenAge = "loom.daemon.forge_token_age",
+
+            /// Seconds until the published primary writer token's `expires_at`
+            /// (negative once past), labelled `owner`. Absent when the minter gave
+            /// no parseable expiry.
+            DaemonForgeTokenRemaining = "loom.daemon.forge_token_remaining",
+
+            /// Unix time of the last primary writer token publication, labelled
+            /// `owner`.
+            DaemonForgeTokenLastRotation = "loom.daemon.forge_token_last_rotation",
+
+            // ---- IPC request latency (Issue #10765) -------------------------------
+            /// Slowest IPC request answered in the interval, seconds from the request
+            /// line being read to the response written, labelled `kind` (the
+            /// request's wire `type` tag, or `invalid`).
+            DaemonIpcLatencyMax = "loom.daemon.ipc.latency_max",
+
+            /// Summed IPC request latency since the previous point, by `kind`.
+            DaemonIpcLatency = "loom.daemon.ipc.latency",
+
+            /// IPC requests answered since the previous point, by `kind`.
+            DaemonIpcRequests = "loom.daemon.ipc.requests",
+
+            /// `DaemonStatus` builds finished since the previous point, by `outcome`
+            /// (`ok` / `panic` / `join_error`). Concurrent status requests share one
+            /// build (Issue #10861), so `requests / status_builds` is the coalescing
+            /// ratio.
+            DaemonIpcStatusBuilds = "loom.daemon.ipc.status_builds",
+
+            // ---- Codex session containers (Issue #10455) ---------------------------
+            /// Per session-managed Codex account, one point per `state` ∈ `running`,
+            /// `stopped`, `restarting`, `missing`, `stale_mounts`: 1 for the container's current
+            /// state, 0 for the rest. Labelled `account` and `container`.
+            CodexSessionState = "loom.codex_session.state",
+
+            /// Per session-managed Codex account, one point per `kind` ∈ `hold`,
+            /// `drift_removal`: 1 while that on-disk record stands (an operator
+            /// `stop`; the reconciler's fail-closed removal for a denied mount),
+            /// else 0. Labelled `account` and `container` (#10600).
+            CodexSessionRecord = "loom.codex_session.record",
+
+            /// Per session-managed Codex account with a drift verdict, one point per
+            /// `kind` ∈ `missing`, `extra`, `denied`: how many workspace paths drift
+            /// that way (`extra` excludes `denied`). Labelled `account` and
+            /// `container` (#10600).
+            CodexSessionMountDrift = "loom.codex_session.mount_drift",
+
+            /// Per session-managed Codex account whose login was read this pass: 1
+            /// signed in, 0 signed out. Absent while unknown (container stopped,
+            /// docker or the probe unreadable). Labelled `account` and `container`
+            /// (#15292).
+            CodexSessionLogin = "loom.codex_session.login",
+
+            /// Age in seconds of the operator hold on a held account, by `reason` ∈
+            /// `operator_stop`, `other`. Absent when the account is not held or the
+            /// hold record cannot be decoded (#15292).
+            CodexSessionHoldAge = "loom.codex_session.hold_age",
+
+            /// Per account whose profile hook trust could be assessed, one point per
+            /// `state` ∈ `recorded`, `sealed`, `missing`: 1 for the current verdict,
+            /// 0 for the rest (#15292).
+            CodexSessionHookTrust = "loom.codex_session.hook_trust",
+
+            /// Latest rate-limit utilisation (0–1 fraction) per account, by `kind` ∈
+            /// `5h`, `7d`. Absent for a window with no current measurement (#15292).
+            CodexSessionQuotaUsed = "loom.codex_session.quota_used",
+
+            /// When the window in `loom.codex_session.quota_used` resets (Unix
+            /// seconds), by `kind` ∈ `5h`, `7d`. Absent when the window reports none
+            /// (#15292).
+            CodexSessionQuotaResetsAt = "loom.codex_session.quota_resets_at",
+
+            /// When the rate-limit reading behind the quota points was taken (Unix
+            /// seconds): now for a live probe, the rollout line's time for a local
+            /// snapshot (#15292).
+            CodexSessionQuotaObservedAt = "loom.codex_session.quota_observed_at",
+
+            /// Unused limit resets the account holds (`availableCount`). Absent when
+            /// the Codex CLI does not report it (#15292).
+            CodexSessionResetCredits = "loom.codex_session.reset_credits",
+
+            /// Peak memory (`memory.peak`) of one finished agent scope, by `repo`
+            /// (#11094).
+            AgentScopePeakMemoryBytes = "loom.agent_scope.peak_memory_bytes",
+
+            /// Processes OOM-killed inside finished agent scopes (`memory.events`
+            /// `oom_kill`), by `repo` and `role` (#12241). One point per finished
+            /// scope that had a kill.
+            AgentScopeOomKills = "loom.agent_scope.oom_kills",
+
+            // ---- The GitHub state mirror (2am#4367 P5) ----------------------------
+            /// Discovery listings and change-stream pulls that asked the mirror, by
+            /// `caller`, `repo` and `outcome` (`hit`, `stale`, `unknown`, `error`,
+            /// `skipped`; every non-`hit` listing fell back to the forge).
+            ForgeMirrorReads = "loom.forge.mirror.reads",
+
+            /// Changes the mirror's change stream delivered, by `repo` and `kind`.
+            ForgeMirrorChanges = "loom.forge.mirror.changes",
+
+            /// Rechecks the daemon asked the mirror for after a claim refusal showed
+            /// a stale draw (#12318), by `reason` and `outcome`.
+            DiscoveryRecheck = "loom.discovery.recheck",
+
+            /// Summed seconds from a change at the mirror to the pull that saw it,
+            /// by `repo` (mean = this / `loom.forge.mirror.changes`).
+            ForgeMirrorWakeLatency = "loom.forge.mirror.wake_latency",
+
+            /// Stage-entry answers by `repo` and `kind`, the answering source (`mirror`, `events`,
+            /// `created`, `none`), #11897: the step engine's stage-age coverage.
+            StageEntryLookups = "loom.stage_entry.lookups",
+
+            /// Public-feed `completion` envelopes the narration sink built, by
+            /// `kind` (the trigger: `sweep_exit`, `step`, `reconcile`) and `outcome`
+            /// (`narrated`, or `seeded` for a fresh host's silent first pass), #12152.
+            FeedCompletions = "loom.feed.completions",
+
+            /// Merge-reconciliation passes, by `outcome` (`ran`, `deferred` while the
+            /// rate-limit breaker cools, `failed` when the forge read failed), #12152.
+            FeedReconcilePasses = "loom.feed.reconcile_passes",
+
+            /// Workflow runs sitting `queued` for a runner in a repo's CI poll window
+            /// at the end of a poll, by `repo` (#11993). A gauge: fleet CI contention
+            /// at that instant, the complement of the per-run `loom.ci.queued_ms`.
+            CiQueueDepth = "loom.ci.queue_depth",
+
+            /// Step ticks a fleet-dispatch worker ran in fallback, by `reason` (why
+            /// fallback began), #12450. Host-level: the resource names the host.
+            FleetDispatchFallbackTicks = "loom.fleet_dispatch.fallback_ticks",
+
+            /// The captain's published token-probe cycle (#13942): one point per
+            /// account per distinct probe instant, by `account` and `state` (the
+            /// probe's verdict) — the fleet-side record of what every worker was
+            /// told to converge on.
+            TokensFleetProbeAccounts = "loom.tokens.fleet_probe_accounts",
+
+            /// Age of the fleet token-probe snapshot a worker host has applied
+            /// (#13942): sample time minus the captain's probe instant. The
+            /// fleet-convergence drift signal — equal ages across hosts mean every
+            /// worker is reading the same probe.
+            TokensFleetProbeAge = "loom.tokens.fleet_probe_age",
+
+            // ---- Fleet dispatch, captain side (Issue #12449) ----------------------
+            /// Fleet-dispatch refusals since the previous point, by `kind` (`claim`
+            /// for a claim the captain refused, `refuse` for a worker's `refuse`
+            /// call) and `reason` (the refusal reason or the `refuse` token).
+            FleetDispatchRefusals = "loom.fleet_dispatch.refusals",
+
+            /// Captain rows that hit their TTL since the previous point, by `kind`
+            /// (`assignment` for a granted or live row, `hold` for a `claim_lost`
+            /// hold).
+            FleetDispatchExpired = "loom.fleet_dispatch.expired",
+
+            /// Granted items whose worker then lost the forge order (`refuse` with
+            /// `claim_lost`): the split-brain and attended-claim measure.
+            FleetDispatchClaimLostAfterGrant = "loom.fleet_dispatch.claim_lost_after_grant",
+
+            /// The captain's rows by `state` (`granted` / `live` per `host`; `held`
+            /// with no host), sampled every server sweep (#12873).
+            FleetDispatchRows = "loom.fleet_dispatch.rows",
+
+            /// Free slots a host reported in its last fresh heartbeat, by `host`.
+            FleetDispatchFreeSlotsReported = "loom.fleet_dispatch.free_slots_reported",
+
+            /// Steps a host listed in its last fresh heartbeat, by `host`.
+            FleetDispatchLiveReported = "loom.fleet_dispatch.live_reported",
+
+            /// Seconds the oldest step in a host's last fresh heartbeat has been
+            /// running, by `host`; no point when the heartbeat carried no start.
+            FleetDispatchOldestLiveAgeSec = "loom.fleet_dispatch.oldest_live_age_sec",
+
+            // ---- CI telemetry poller cycles (Issue #12793) ------------------------
+            /// CI telemetry poll cycles finished since the previous point, by
+            /// `outcome` (`ok`, `busy`, `backing_off`, `rate_limited`,
+            /// `credential_rejected`, `discovery_failed`, `io_failed`, `panicked`).
+            CiTelemetryCycles = "loom.ci_telemetry.cycles",
+
+            /// What finished CI telemetry cycles did since the previous point, by
+            /// `kind` (`repos_polled`, `runs_emitted`, `jobs_emitted`,
+            /// `recovered_units`).
+            CiTelemetryCycleItems = "loom.ci_telemetry.cycle_items",
+
+            /// Wall time of the last finished CI telemetry cycle, by `outcome`.
+            CiTelemetryCycleDuration = "loom.ci_telemetry.cycle_duration",
+
+            /// Size of the CI telemetry local journal.
+            CiTelemetryJournalBytes = "loom.ci_telemetry.journal_bytes",
+
+            /// Journal byte offset of the first line the exporter has not yet offered.
+            CiTelemetryExportCursorOffset = "loom.ci_telemetry.export_cursor_offset",
+
+            /// Age of the oldest journal line not yet exported; `0` when caught up.
+            CiTelemetryExportLag = "loom.ci_telemetry.export_lag",
+        }
+    };
 }
 
-impl MetricName {
-    /// The OTLP metric name.
-    #[must_use]
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::DispatchDecisions => "loom.dispatch.decisions",
-            Self::DispatchCandidates => "loom.dispatch.candidates",
-            Self::DispatchPoolItems => "loom.dispatch.pool_items",
-            Self::DispatchExcludedItems => "loom.dispatch.excluded_items",
-            Self::DispatchMaxConcurrent => "loom.dispatch.max_concurrent",
-            Self::DispatchCapTerm => "loom.dispatch.cap_term",
-            Self::DispatchPrOpenPrefiltered => "loom.dispatch.pr_open_prefiltered",
-            Self::QueueOldestWait => "loom.queue.oldest_wait",
-            Self::QueueStarved => "loom.queue.starved",
-            Self::QueueStarvedByReason => "loom.queue.starved.by_reason",
-            Self::QueueDispatchWait => "loom.queue.dispatch_wait",
-            Self::QueueDispatchWaitSamples => "loom.queue.dispatch_wait.samples",
-            Self::HostMemoryAvailableBytes => "loom.host.memory.available_bytes",
-            Self::HostMemoryTotalBytes => "loom.host.memory.total_bytes",
-            Self::HostSwapUsedBytes => "loom.host.swap.used_bytes",
-            Self::HostSwapTotalBytes => "loom.host.swap.total_bytes",
-            Self::HostWorktreeVolumeFreeBytes => "loom.host.worktree_volume.free_bytes",
-            Self::HostWorktreeVolumeTotalBytes => "loom.host.worktree_volume.total_bytes",
-            Self::HostCodexWorkspaceVolumeUsedBytes => {
-                "loom.host.codex_workspace_volume.used_bytes"
-            }
-            Self::HostCodexWorkspaceVolumeTotalUsedBytes => {
-                "loom.host.codex_workspace_volume.total_used_bytes"
-            }
-            Self::QueueIssues => "loom.queue.issues",
-            Self::QueueListingFailedRepos => "loom.queue.listing_failed_repos",
-            Self::QueueListingIncompleteRepos => "loom.queue.listing_incomplete_repos",
-            Self::QueueSeen => "loom.queue.seen",
-            Self::QueueAlreadyLanded => "loom.queue.already_landed",
-            Self::QueueHostShard => "loom.queue.host_shard",
-            Self::LlmTokensInput => "loom.llm.tokens.input",
-            Self::LlmTokensOutput => "loom.llm.tokens.output",
-            Self::LlmTokensCacheRead => "loom.llm.tokens.cache_read",
-            Self::LlmTokensCacheWrite => "loom.llm.tokens.cache_write",
-            Self::LlmRequests => "loom.llm.requests",
-            Self::PoolAccounts => "loom.pool.accounts",
-            Self::PoolExhausted => "loom.pool.exhausted",
-            Self::PoolExhaustions => "loom.pool.exhaustions",
-            Self::PoolExhaustedSeconds => "loom.pool.exhausted_seconds",
-            Self::PoolAccountState => "loom.pool.account_state",
-            Self::PoolPlanTokenLimit => "loom.pool.plan_token_limit",
-            Self::PoolPlanWindowSeconds => "loom.pool.plan_window_seconds",
-            Self::PoolAccountMarks => "loom.pool.account_marks",
-            Self::DispatchSlotTurnaround => "loom.dispatch.slot_turnaround",
-            Self::DispatchSlotTurnaroundSamples => "loom.dispatch.slot_turnaround.samples",
-            Self::DispatchIdleSlots => "loom.dispatch.idle_slots",
-            Self::DispatchIdleSlotSeconds => "loom.dispatch.idle_slot_seconds",
-            Self::DispatchBusySlots => "loom.dispatch.busy_slots",
-            Self::DispatchRoleMaxConcurrent => "loom.dispatch.role_max_concurrent",
-            Self::DispatchRoleIdleSlots => "loom.dispatch.role_idle_slots",
-            Self::DispatchRunningOldestAgeSec => "loom.dispatch.running_oldest_age_sec",
-            Self::DispatchRunningByAge => "loom.dispatch.running_by_age",
-            Self::DispatchRunningByPoints => "loom.dispatch.running_by_points",
-            Self::StepActionable => "loom.step.actionable",
-            Self::ForgeHoldItems => "loom.forge.hold_items",
-            Self::ForgeHoldAgeSeconds => "loom.forge.hold_age_seconds",
-            Self::QueueDispositionRowsDropped => "loom.queue.disposition_rows_dropped",
-            Self::GithubRateLimitRemaining => "github.ratelimit.remaining",
-            Self::GithubRateLimitUsed => "github.ratelimit.used",
-            Self::GithubRateLimitReset => "github.ratelimit.reset",
-            Self::GithubRateLimitBreakerSkips => "github.ratelimit.breaker_skips",
-            Self::ForgeCalls => "loom.forge.calls",
-            Self::ForgeFacadeEvents => "loom.forge.facade.events",
-            Self::MergeRedatePrs => "loom.merge.redate_prs",
-            Self::MergeRedatesMax => "loom.merge.redates_max",
-            Self::MergeTimeToLandMax => "loom.merge.time_to_land_max",
-            Self::EgressRequests => "loom.egress.requests",
-            Self::EgressTokens => "loom.egress.tokens",
-            Self::EgressLatency => "loom.egress.latency",
-            Self::EgressTtft => "loom.egress.ttft",
-            Self::DaemonTaskAlive => "loom.daemon.task_alive",
-            Self::DaemonTaskFaults => "loom.daemon.task_faults",
-            Self::DaemonForgeTokenAge => "loom.daemon.forge_token_age",
-            Self::DaemonForgeTokenRemaining => "loom.daemon.forge_token_remaining",
-            Self::DaemonForgeTokenLastRotation => "loom.daemon.forge_token_last_rotation",
-            Self::DaemonIpcLatencyMax => "loom.daemon.ipc.latency_max",
-            Self::DaemonIpcLatency => "loom.daemon.ipc.latency",
-            Self::DaemonIpcRequests => "loom.daemon.ipc.requests",
-            Self::DaemonIpcStatusBuilds => "loom.daemon.ipc.status_builds",
-            Self::CodexSessionState => "loom.codex_session.state",
-            Self::CodexSessionRecord => "loom.codex_session.record",
-            Self::CodexSessionMountDrift => "loom.codex_session.mount_drift",
-            Self::CodexSessionLogin => "loom.codex_session.login",
-            Self::CodexSessionHoldAge => "loom.codex_session.hold_age",
-            Self::CodexSessionHookTrust => "loom.codex_session.hook_trust",
-            Self::CodexSessionQuotaUsed => "loom.codex_session.quota_used",
-            Self::CodexSessionQuotaResetsAt => "loom.codex_session.quota_resets_at",
-            Self::CodexSessionQuotaObservedAt => "loom.codex_session.quota_observed_at",
-            Self::CodexSessionResetCredits => "loom.codex_session.reset_credits",
-            Self::AgentScopePeakMemoryBytes => "loom.agent_scope.peak_memory_bytes",
-            Self::AgentScopeOomKills => "loom.agent_scope.oom_kills",
-            Self::ForgeMirrorReads => "loom.forge.mirror.reads",
-            Self::ForgeMirrorChanges => "loom.forge.mirror.changes",
-            Self::DiscoveryRecheck => "loom.discovery.recheck",
-            Self::ForgeMirrorWakeLatency => "loom.forge.mirror.wake_latency",
-            Self::StageEntryLookups => "loom.stage_entry.lookups",
-            Self::FeedCompletions => "loom.feed.completions",
-            Self::FeedReconcilePasses => "loom.feed.reconcile_passes",
-            Self::CiQueueDepth => "loom.ci.queue_depth",
-            Self::CiTelemetryCycles => "loom.ci_telemetry.cycles",
-            Self::CiTelemetryCycleItems => "loom.ci_telemetry.cycle_items",
-            Self::CiTelemetryCycleDuration => "loom.ci_telemetry.cycle_duration",
-            Self::CiTelemetryJournalBytes => "loom.ci_telemetry.journal_bytes",
-            Self::CiTelemetryExportCursorOffset => "loom.ci_telemetry.export_cursor_offset",
-            Self::CiTelemetryExportLag => "loom.ci_telemetry.export_lag",
-            Self::FleetDispatchFallbackTicks => "loom.fleet_dispatch.fallback_ticks",
-            Self::TokensFleetProbeAccounts => "loom.tokens.fleet_probe_accounts",
-            Self::TokensFleetProbeAge => "loom.tokens.fleet_probe_age",
-            Self::FleetDispatchRefusals => "loom.fleet_dispatch.refusals",
-            Self::FleetDispatchExpired => "loom.fleet_dispatch.expired",
-            Self::FleetDispatchClaimLostAfterGrant => "loom.fleet_dispatch.claim_lost_after_grant",
-            Self::FleetDispatchRows => "loom.fleet_dispatch.rows",
-            Self::FleetDispatchFreeSlotsReported => "loom.fleet_dispatch.free_slots_reported",
-            Self::FleetDispatchLiveReported => "loom.fleet_dispatch.live_reported",
-            Self::FleetDispatchOldestLiveAgeSec => "loom.fleet_dispatch.oldest_live_age_sec",
+/// Expands the `metric_name_table` rows into [`MetricName`] and
+/// [`as_str`](MetricName::as_str): one variant and one match arm per row,
+/// both naming the row's own wire string.
+macro_rules! declare_metric_name {
+    ($( $(#[$attr:meta])* $variant:ident = $wire:literal, )+) => {
+        /// Every metric name `metric.points` can carry.
+        #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+        pub enum MetricName {
+            $(
+                $(#[$attr])*
+                #[serde(rename = $wire)]
+                $variant,
+            )+
         }
-    }
 
+        impl MetricName {
+            /// The OTLP metric name.
+            #[must_use]
+            pub fn as_str(self) -> &'static str {
+                match self {
+                    $(Self::$variant => $wire,)+
+                }
+            }
+        }
+    };
+}
+
+metric_name_table!(declare_metric_name);
+
+impl MetricName {
     /// Gauge or delta counter.
     #[must_use]
     pub fn kind(self) -> MetricKind {
@@ -1399,6 +1324,19 @@ impl MetricName {
         }
     }
 }
+
+/// Expands the `metric_name_table` rows into [`ALL_METRIC_NAMES`], the
+/// declaration-order list the round-trip test visits, so a new row joins
+/// that test by itself.
+macro_rules! declare_metric_name_list {
+    ($( $(#[$attr:meta])* $variant:ident = $wire:literal, )+) => {
+        /// Every [`MetricName`] variant, in declaration order.
+        #[cfg(test)]
+        pub(crate) const ALL_METRIC_NAMES: &[MetricName] = &[$(MetricName::$variant,)+];
+    };
+}
+
+metric_name_table!(declare_metric_name_list);
 
 /// One data point's value.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
