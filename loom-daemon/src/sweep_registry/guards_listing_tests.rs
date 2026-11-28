@@ -165,13 +165,7 @@ fn a_fork_clone_lists_the_resolved_repo_not_origin() {
     let dir = tempdir().unwrap();
     let ws = dir.path();
     let git = |args: &[&str]| {
-        let ok = std::process::Command::new("git")
-            .args(args)
-            .current_dir(ws)
-            .output()
-            .unwrap()
-            .status
-            .success();
+        let ok = crate::test_git_helpers::git_out(ws, args).status.success();
         assert!(ok, "git {args:?}");
     };
     git(&["init", "-q"]);
