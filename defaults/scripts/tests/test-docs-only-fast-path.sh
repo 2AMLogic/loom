@@ -446,10 +446,6 @@ gh() {
                 diff) printf '%s' "${WL_DIFF:-}"; return "${WL_DIFF_RC:-0}" ;;
             esac ;;
         api)
-            case "$2" in
-                'repos/{owner}/{repo}/pulls/'*)
-                    printf '%s' "${WL_BASE_OUT-owner/mine}"; return "${WL_BASE_RC:-0}" ;;
-            esac
             printf '%s\n' "$2" >> "$WL_CALL_LOG"
             [[ "${FAIL_LOOKUP:-}" == 1 ]] && return 1
             case "$2" in
