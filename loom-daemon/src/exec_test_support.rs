@@ -8,6 +8,7 @@
 //! [`hung_with_grandchild`] with [`grandchild_outlived`] is the pair a
 //! deadline test uses to ask whether a kill reached the whole process group.
 
+use std::cell::Cell;
 use std::fs;
 use std::io;
 use std::path::Path;
@@ -74,11 +75,40 @@ fn retry_while_busy<T>(
 ) -> io::Result<T> {
     for _ in 1..attempts {
         match attempt() {
-            Err(error) if error.kind() == io::ErrorKind::ExecutableFileBusy => pause(),
+            Err(error) if error.kind() == io::ErrorKind::ExecutableFileBusy => {
+                REFUSED_EXECS.with(|count| count.set(count.get() + 1));
+                pause();
+            }
             outcome => return outcome,
         }
     }
     attempt()
+}
+
+thread_local! {
+    /// Execs [`retry_while_busy`] refused on this thread since the last
+    /// [`take_refused_execs`].
+    static REFUSED_EXECS: Cell<usize> = const { Cell::new(0) };
+}
+
+/// Forget the refusals recorded on the calling thread so far. Call it just
+/// before an exec whose wait a test wants witnessed, so that
+/// [`take_refused_execs`] afterwards speaks for that exec alone.
+pub(crate) fn reset_refused_execs() {
+    REFUSED_EXECS.with(|count| count.set(0));
+}
+
+/// How many execs [`retry_while_executable_busy`] refused with `ETXTBSY` on
+/// the calling thread since this was last called, starting the count over.
+///
+/// The witness for a "waited for, not failed" test (#15668). A duration only
+/// says the call took long, which a loaded host or a slow preamble produces
+/// with no wait at all; a refusal is the wait's own cause, so zero means the
+/// wait was never exercised however long the call took. Per thread: a sibling
+/// test's refusals vouch for nothing here.
+#[must_use]
+pub(crate) fn take_refused_execs() -> usize {
+    REFUSED_EXECS.with(|count| count.replace(0))
 }
 
 /// The body of a script that starts a sleeping grandchild, records its pid in
@@ -202,5 +232,45 @@ mod tests {
             calls: 0,
         };
         assert_eq!(retry_while_executable_busy(|| flaky.attempt()).unwrap(), 2);
+    }
+
+    #[test]
+    fn every_refused_attempt_is_counted_once_on_the_calling_thread() {
+        reset_refused_execs();
+        let mut flaky = Flaky {
+            busy_left: 2,
+            calls: 0,
+        };
+        assert_eq!(retry_while_executable_busy(|| flaky.attempt()).unwrap(), 3);
+        assert_eq!(take_refused_execs(), 2, "one per refused attempt");
+        assert_eq!(take_refused_execs(), 0, "taking starts the count over");
+
+        let mut prompt = Flaky {
+            busy_left: 0,
+            calls: 0,
+        };
+        retry_while_executable_busy(|| prompt.attempt()).unwrap();
+        assert_eq!(take_refused_execs(), 0, "an exec never refused is no wait");
+    }
+
+    #[test]
+    fn a_sibling_threads_refusals_are_not_mine() {
+        reset_refused_execs();
+        let theirs = std::thread::spawn(|| {
+            let mut flaky = Flaky {
+                busy_left: 2,
+                calls: 0,
+            };
+            retry_while_busy(|| flaky.attempt(), 10, || {}).unwrap();
+            take_refused_execs()
+        })
+        .join()
+        .unwrap();
+        assert_eq!(theirs, 2, "the thread that was refused sees its own count");
+        assert_eq!(
+            take_refused_execs(),
+            0,
+            "a sibling test's wait must not vouch for this thread's exec"
+        );
     }
 }

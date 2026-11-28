@@ -107,12 +107,19 @@ fn a_program_still_open_for_writing_is_waited_for_not_a_spawn_error() {
         std::thread::sleep(Duration::from_millis(30));
         drop(writer);
     });
+    crate::exec_test_support::reset_refused_execs();
 
     let completion = run_bounded(Command::new(&program), GENEROUS)
         .expect("the writer closes long before the deadline");
     let waited = started.elapsed();
     releaser.join().unwrap();
 
+    // The refusal is the witness, not the duration: a spawn landing after the
+    // writer closed is never refused, yet can still read >= 30 ms (#15668).
+    assert!(
+        crate::exec_test_support::take_refused_execs() >= 1,
+        "the spawn was never refused, so no wait was exercised"
+    );
     assert!(
         waited >= Duration::from_millis(30),
         "the program ran before its writer closed: {waited:?}"
