@@ -27,8 +27,8 @@ judge_section() {
 }
 
 check() {
-    local J="$1" D="$2" where="$3"
-    for f in "$J" "$D"; do
+    local J="$1" D="$2" where="$3" detail="$4"
+    for f in "$J" "$D" "$detail"; do
         [[ -f "$f" ]] || { echo -e "${RED}FAIL${NC}: missing $f" >&2; exit 1; }
     done
 
@@ -78,7 +78,8 @@ check() {
     assert_contains "$paths" 'class=noop reason=ci_pending' "$where judge: daemon handback ends with ci_pending"
     assert_grep 'Attended / manual single-PR invocation \(no .*step-judge-' <(printf '%s\n' "$paths") \
         "$where judge: foreground path is limited to attended single-PR invocations"
-    assert_contains "$paths" 'forge wait-checks <PR_NUMBER> --timeout 1800 --settle-red' \
+    assert_contains "$paths" '[judge-ci-pending.md]' "$where judge: attended foreground wait links to its procedure"
+    assert_contains "$(judge_section "$detail" '### Attended foreground wait')" 'forge wait-checks <PR_NUMBER> --timeout 1800 --settle-red' \
         "$where judge: bounded attended foreground wait is retained"
 
     # No-checks PRs (#13883): -NONE is not "safe to approve" on its own; Judge
@@ -145,8 +146,8 @@ check() {
 
 C="$REPO_ROOT/defaults/.claude/commands/loom"
 S="$REPO_ROOT/defaults/.agents/skills"
-check "$C/judge.md" "$C/doctor.md" "commands"
-check "$S/loom-judge/SKILL.md" "$S/loom-doctor/SKILL.md" "skills"
+check "$C/judge.md" "$C/doctor.md" "commands" "$C/judge-ci-pending.md"
+check "$S/loom-judge/SKILL.md" "$S/loom-doctor/SKILL.md" "skills" "$S/loom-judge-ci-pending/SKILL.md"
 
 echo ""
 echo "================================"

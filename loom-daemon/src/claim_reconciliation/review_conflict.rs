@@ -2,7 +2,7 @@
 //! (issue #8922).
 //!
 //! Before this pass, `loom:merge-conflict` was only ever applied *beside* a
-//! Judge verdict (judge.md's "If DIRTY" fallback) or stripped by
+//! Judge verdict (judge-merge-conflicts.md's "If DIRTY" fallback) or stripped by
 //! [`super::forge::reconcile_pr_verdicts`] as a per-tree companion of a stale
 //! verdict. Nothing applied it to a `loom:review-requested` PR whose **base**
 //! moved underneath it, so a PR that could not land looked exactly like one

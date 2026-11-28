@@ -1197,7 +1197,7 @@ behavior with no inferred mechanism attached.]
   `$ENHANCED` whenever `$CURRENT` is not empty.
 - Add clear section headers to show what you added
 - **Separate observed from inferred, the same way Judge-filed follow-ups
-  must** (see `judge.md` "Observed vs. inferred"): a Curator's own read of the
+  must** (see “Observed vs. inferred” in [judge-followups.md](../loom-judge-followups/SKILL.md#creating-follow-up-issues)): a Curator's own read of the
   code is evidence of *that* something is wrong, not proof of *why*. Never
   write a guessed mechanism under a bare `### Root Cause` heading — use
   `### Suspected Cause (unverified)` and phrase it as a hypothesis, so a

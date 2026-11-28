@@ -46,6 +46,12 @@ else
     PROMPT_DIR="$(cd "$SCRIPTS_DIR/../.claude/commands/loom" && pwd)"
 fi
 JUDGE_MD="$PROMPT_DIR/judge.md"
+# #13957 split judge.md into an always-read core plus on-demand sub-skills. The
+# docs-only fast path is trigger-gated (it applies only to a WORK_LOG /
+# WORK_PLAN / README diff), so its eligibility code now ships in
+# judge-fast-paths.md. Every code pin below reads that file; the core is pinned
+# separately for the load trigger that routes a Judge to it.
+JUDGE_FAST_MD="$PROMPT_DIR/judge-fast-paths.md"
 CHAMPION_MD="$PROMPT_DIR/champion-pr-merge.md"
 GUIDE_MD="$PROMPT_DIR/guide.md"
 
@@ -60,7 +66,7 @@ source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/assert.sh"
 
 # =====================================================================
 # The docs-only fast-path eligibility check, mirrored verbatim from BOTH
-# judge.md's "Docs-Only Fast Path" section and champion-pr-merge.md's
+# judge-fast-paths.md's "Docs-Only Fast Path" section and champion-pr-merge.md's
 # "Docs-only fast path" subsection of the merge-risk criterion — the two shipped copies
 # are intentionally identical, and the doc pins below confirm both actually
 # match this mirror.
@@ -195,13 +201,13 @@ echo
 echo "--- closing-reference condition (#14182): a docs-only diff that closes an issue is ineligible ---"
 
 # Mirror of the shipped docs_only_fast_path_closing_check(), extracted from
-# judge.md so this suite exercises the documented code, not a hand copy. `gh`
+# judge-fast-paths.md so this suite exercises the documented code, not a hand copy. `gh`
 # is stubbed: GH_STUB_OUT is its stdout, GH_STUB_RC its exit status.
 gh() { printf '%s' "${GH_STUB_OUT-}"; return "${GH_STUB_RC:-0}"; }
 closing_fn_block() {
     awk '/^docs_only_fast_path_closing_check\(\) \{/{p=1} p{print} p && /^}$/{exit}' "$1"
 }
-eval "$(closing_fn_block "$JUDGE_MD")"
+eval "$(closing_fn_block "$JUDGE_FAST_MD")"
 
 GH_STUB_RC=0 GH_STUB_OUT='closers=' out="$(docs_only_fast_path_closing_check 1)"
 assert_eq "ELIGIBLE" "$out" "a PR with an empty closing set stays eligible"
@@ -226,19 +232,19 @@ assert_eq "NOT ELIGIBLE: closing-reference read returned no proof" "$out" \
 
 unset -f gh
 
-JUDGE_CLOSING="$(closing_fn_block "$JUDGE_MD" | grep -v '^[[:space:]]*#')"
+JUDGE_CLOSING="$(closing_fn_block "$JUDGE_FAST_MD" | grep -v '^[[:space:]]*#')"
 CHAMPION_CLOSING="$(closing_fn_block "$CHAMPION_MD" | grep -v '^[[:space:]]*#')"
-assert_contains "$JUDGE_CLOSING" "docs_only_fast_path_closing_check() {" "judge.md ships docs_only_fast_path_closing_check()"
+assert_contains "$JUDGE_CLOSING" "docs_only_fast_path_closing_check() {" "judge-fast-paths.md ships docs_only_fast_path_closing_check()"
 assert_eq "$JUDGE_CLOSING" "$CHAMPION_CLOSING" \
-    "judge.md and champion-pr-merge.md closing-check code is identical (comments aside)"
+    "judge-fast-paths.md and champion-pr-merge.md closing-check code is identical (comments aside)"
 
-assert_doc_contains "$JUDGE_MD" \
+assert_doc_contains "$JUDGE_FAST_MD" \
     'ELIGIBILITY=$(docs_only_fast_path_closing_check "$PR_NUMBER")' \
-    "judge.md folds the closing check into ELIGIBILITY"
+    "judge-fast-paths.md folds the closing check into ELIGIBILITY"
 assert_doc_contains "$CHAMPION_MD" \
     'FAST_PATH_RESULT=$(docs_only_fast_path_closing_check "$PR_NUMBER")' \
     "champion-pr-merge.md folds the closing check into FAST_PATH_RESULT"
-assert_doc_contains "$JUDGE_MD" "closingIssuesReferences" "judge.md reads closingIssuesReferences"
+assert_doc_contains "$JUDGE_FAST_MD" "closingIssuesReferences" "judge-fast-paths.md reads closingIssuesReferences"
 assert_doc_contains "$CHAMPION_MD" "closingIssuesReferences" "champion-pr-merge.md reads closingIssuesReferences"
 
 # Inline PROSE restatements of the eligibility condition (#14321). The LLM
@@ -250,7 +256,7 @@ assert_doc_contains "$CHAMPION_MD" \
     "and the PR has no closing-issue" \
     "champion-pr-merge.md fast-path lead-in states the no-closing-issue condition (#14182)"
 assert_doc_contains "$JUDGE_MD" \
-    "and the PR has no closing-issue reference" \
+    "the PR must have no closing-issue reference" \
     "judge.md Primary Queue step 4b states the no-closing-issue condition (#14182)"
 
 echo
@@ -261,38 +267,55 @@ fast_path_block() {
     awk '/^DOCS_FAST_PATH_ALLOWLIST=/{p=1} p{print} p && /^}$/{exit}' "$1" \
         | grep -v '^[[:space:]]*#'
 }
-JUDGE_BLOCK="$(fast_path_block "$JUDGE_MD")"
+JUDGE_BLOCK="$(fast_path_block "$JUDGE_FAST_MD")"
 CHAMPION_BLOCK="$(fast_path_block "$CHAMPION_MD")"
 assert_eq "$JUDGE_BLOCK" "$CHAMPION_BLOCK" \
-    "judge.md and champion-pr-merge.md allowlist+check code is identical (comments aside)"
+    "judge-fast-paths.md and champion-pr-merge.md allowlist+check code is identical (comments aside)"
 
 ARCHIVE_RE_LINE="DOCS_FAST_PATH_ARCHIVE_RE='^(work_log/WORK_LOG|work_plan/WORK_PLAN)_[0-9]{4}-(0[1-9]|1[0-2])\\.md\$'"
-assert_doc_contains "$JUDGE_MD" "$ARCHIVE_RE_LINE" "judge.md pins the narrow archive regex"
+assert_doc_contains "$JUDGE_FAST_MD" "$ARCHIVE_RE_LINE" "judge-fast-paths.md pins the narrow archive regex"
 assert_doc_contains "$CHAMPION_MD" "$ARCHIVE_RE_LINE" "champion-pr-merge.md pins the narrow archive regex"
 assert_doc_contains "$0" "$ARCHIVE_RE_LINE" "this suite's mirror uses the same archive regex"
 
 echo
-echo "--- Doc pins: judge.md ships the mechanical, marker-independent eligibility check ---"
+echo "--- Doc pins: judge-fast-paths.md ships the mechanical, marker-independent eligibility check ---"
 
-assert_doc_contains "$JUDGE_MD" \
+assert_doc_contains "$JUDGE_FAST_MD" \
     'DOCS_FAST_PATH_ALLOWLIST=("WORK_LOG.md" "WORK_PLAN.md" "README.md")' \
-    "judge.md defines the exact 3-file allowlist"
+    "judge-fast-paths.md defines the exact 3-file allowlist"
 
-assert_doc_contains "$JUDGE_MD" \
+assert_doc_contains "$JUDGE_FAST_MD" \
     'FILES=$(gh api "repos/{owner}/{repo}/pulls/$PR_NUMBER/files" --paginate --jq '"'"'.[].filename'"'"')' \
-    "judge.md fetches the changed-file list via the paginated REST endpoint (not the truncating gh pr view --json files)"
+    "judge-fast-paths.md fetches the changed-file list via the paginated REST endpoint (not the truncating gh pr view --json files)"
 
-assert_doc_contains "$JUDGE_MD" \
+assert_doc_contains "$JUDGE_FAST_MD" \
     'docs_only_fast_path_check() {' \
-    "judge.md defines docs_only_fast_path_check()"
+    "judge-fast-paths.md defines docs_only_fast_path_check()"
 
-assert_doc_contains "$JUDGE_MD" \
+assert_doc_contains "$JUDGE_FAST_MD" \
     "loom:docs-fast-path-evaluation" \
-    "judge.md's fast-path approval carries the loom:docs-fast-path-evaluation marker"
+    "judge-fast-paths.md's fast-path approval carries the loom:docs-fast-path-evaluation marker"
 
-assert_doc_contains "$JUDGE_MD" \
+assert_doc_contains "$JUDGE_FAST_MD" \
     "#6134" \
-    "judge.md documents the #6134 fast path"
+    "judge-fast-paths.md documents the #6134 fast path"
+
+echo
+echo "--- Doc pins: the always-read judge.md core routes a docs-only diff to judge-fast-paths.md (#13957) ---"
+
+# The code moving out of the core must not strand it: step 4b has to name the
+# trigger in terms a Judge can evaluate WITHOUT the sub-skill loaded, name the
+# sub-skill, and defer to its mechanical check rather than re-deriving
+# eligibility from the prose.
+JUDGE_STEP_4B="$(grep -F '4b. **Check docs-only fast-path eligibility**' "$JUDGE_MD" || true)"
+for needle in '#6134' '`WORK_LOG.md`' '`WORK_PLAN.md`' '`README.md`' \
+    '[judge-fast-paths.md](judge-fast-paths.md)' '`docs_only_fast_path_check`'; do
+    if [[ "$JUDGE_STEP_4B" == *"$needle"* ]]; then
+        pass "judge.md step 4b names $needle"
+    else
+        fail "judge.md step 4b names $needle (the core no longer routes a docs-only diff to the fast-path sub-skill)"
+    fi
+done
 
 echo
 echo "--- Doc pins: champion-pr-merge.md independently re-derives eligibility, never trusts Judge's marker ---"
@@ -323,9 +346,11 @@ echo "--- Doc pins: neither Judge nor Champion gates eligibility on a label/mark
 # Regression guard for AC2 ("verify the diff's file list server-side... not
 # just trust the PR's stated intent"): the fast path must never be phrased
 # as "if the marker/label is present, skip verification".
-assert_doc_lacks "$JUDGE_MD" \
-    'if grep -q "loom:docs-only-fast-path"' \
-    "judge.md never short-circuits eligibility on a grep for the marker alone"
+for f in "$JUDGE_MD" "$JUDGE_FAST_MD"; do
+    assert_doc_lacks "$f" \
+        'if grep -q "loom:docs-only-fast-path"' \
+        "$(basename "$f") never short-circuits eligibility on a grep for the marker alone"
+done
 
 assert_doc_lacks "$CHAMPION_MD" \
     'if grep -q "loom:docs-only-fast-path"' \
@@ -397,16 +422,16 @@ assert_eq "$(extract_docs_pr_region "$GUIDE_MD")" \
 echo
 echo "--- WORK_LOG record gate (#13760): new records verify against the base repository ---"
 
-# Extract the shipped function from judge.md so this suite exercises the
+# Extract the shipped function from judge-fast-paths.md so this suite exercises the
 # documented code, not a hand copy (same extraction the closing check above
 # uses). No column-0 `}` may appear inside the function before its end.
 worklog_fn_block() {
     awk '/^docs_only_fast_path_worklog_check\(\) \{/{p=1} p{print} p && /^\}$/{exit}' "$1"
 }
-WL_FN="$(worklog_fn_block "$JUDGE_MD")"
-[[ -n "$WL_FN" ]] || { echo "FATAL: docs_only_fast_path_worklog_check() not found in judge.md"; exit 1; }
+WL_FN="$(worklog_fn_block "$JUDGE_FAST_MD")"
+[[ -n "$WL_FN" ]] || { echo "FATAL: docs_only_fast_path_worklog_check() not found in judge-fast-paths.md"; exit 1; }
 assert_contains "$(printf '%s\n' "$WL_FN" | grep -v '^[[:space:]]*#')" "docs_only_fast_path_worklog_check() {" \
-    "judge.md ships docs_only_fast_path_worklog_check()"
+    "judge-fast-paths.md ships docs_only_fast_path_worklog_check()"
 
 # Stub `gh`: the PR's base repository is owner/mine (a second, foreign repo
 # owner/other exists but the gate must NEVER query it), reached through
@@ -810,49 +835,49 @@ done
 unset -f gh
 
 echo
-echo "--- Doc pins: judge.md wires the record gate into the fast path (#13760) ---"
+echo "--- Doc pins: judge-fast-paths.md wires the record gate into the fast path (#13760) ---"
 
-assert_doc_contains "$JUDGE_MD" \
+assert_doc_contains "$JUDGE_FAST_MD" \
     'docs_only_fast_path_worklog_check() {' \
-    "judge.md defines docs_only_fast_path_worklog_check()"
-assert_doc_contains "$JUDGE_MD" \
+    "judge-fast-paths.md defines docs_only_fast_path_worklog_check()"
+assert_doc_contains "$JUDGE_FAST_MD" \
     'ELIGIBILITY=$(docs_only_fast_path_worklog_check "$PR_NUMBER")' \
-    "judge.md folds the WORK_LOG record check into ELIGIBILITY"
-assert_doc_contains "$JUDGE_MD" \
+    "judge-fast-paths.md folds the WORK_LOG record check into ELIGIBILITY"
+assert_doc_contains "$JUDGE_FAST_MD" \
     "#13760" \
-    "judge.md documents the #13760 record gate"
+    "judge-fast-paths.md documents the #13760 record gate"
 assert_doc_contains "$JUDGE_MD" \
     "and every WORK_LOG record the diff adds verifies against the base repository" \
     "judge.md Primary Queue step 4b states the record-verification condition"
-assert_doc_contains "$JUDGE_MD" \
+assert_doc_contains "$JUDGE_FAST_MD" \
     'gh pr diff --repo "$repo" "$pr"' \
-    "judge.md reads the exact reviewed diff against the PR's base repository (not the cwd remote, not Guide's receipts or the PR prose)"
+    "judge-fast-paths.md reads the exact reviewed diff against the PR's base repository (not the cwd remote, not Guide's receipts or the PR prose)"
 # #15005: gh has no `baseRepository` field, so the target comes from the PR's
 # own URL; a URL of any other shape derives nothing and the fail-closed
 # `[ -z "$out" ]` guard on that read fires.
-assert_doc_contains "$JUDGE_MD" \
+assert_doc_contains "$JUDGE_FAST_MD" \
     '--json url --jq '"'"'.url | capture("^https://[^/]+/(?<r>[^/]+/[^/]+)/pull/[0-9]+/?$").r'"'"'' \
-    "judge.md derives the target repository from the PR's own URL (#15005)"
-assert_doc_lacks "$JUDGE_MD" \
+    "judge-fast-paths.md derives the target repository from the PR's own URL (#15005)"
+assert_doc_lacks "$JUDGE_FAST_MD" \
     "baseRepository" \
-    "judge.md no longer reads the nonexistent baseRepository field (#15005)"
-assert_doc_contains "$JUDGE_MD" \
+    "judge-fast-paths.md no longer reads the nonexistent baseRepository field (#15005)"
+assert_doc_contains "$JUDGE_FAST_MD" \
     "NOT ELIGIBLE: ENVIRONMENT: base repository read failed" \
-    "judge.md's base-repository read failure says ENVIRONMENT, not a content verdict (#15048)"
-assert_doc_contains "$JUDGE_MD" \
+    "judge-fast-paths.md's base-repository read failure says ENVIRONMENT, not a content verdict (#15048)"
+assert_doc_contains "$JUDGE_FAST_MD" \
     "do NOT treat this as a passed or waived #13760 content check" \
-    "judge.md's environment refusals tell the Judge not to waive the #13760 content check"
+    "judge-fast-paths.md's environment refusals tell the Judge not to waive the #13760 content check"
 
 # The judge SKILL copy ships the same recipe — both must carry the identical
-# edit (#15048 AC: judge.md and SKILL.md stay in lockstep). Mirror of the
+# edit (#15048 AC: judge-fast-paths.md and SKILL.md stay in lockstep). Mirror of the
 # PROMPT_DIR probe above (#6725).
 if [[ -d "$SCRIPTS_DIR/../../.claude/commands/loom" ]]; then
-    JUDGE_SKILL_MD="$SCRIPTS_DIR/../../.agents/skills/loom-judge/SKILL.md"
+    JUDGE_FAST_SKILL_MD="$SCRIPTS_DIR/../../.agents/skills/loom-judge-fast-paths/SKILL.md"
 else
-    JUDGE_SKILL_MD="$SCRIPTS_DIR/../.agents/skills/loom-judge/SKILL.md"
+    JUDGE_FAST_SKILL_MD="$SCRIPTS_DIR/../.agents/skills/loom-judge-fast-paths/SKILL.md"
 fi
-assert_eq "$(worklog_fn_block "$JUDGE_MD")" "$(worklog_fn_block "$JUDGE_SKILL_MD")" \
-    "judge.md and loom-judge SKILL.md ship a byte-identical worklog gate (#15048)"
+assert_eq "$(worklog_fn_block "$JUDGE_FAST_MD")" "$(worklog_fn_block "$JUDGE_FAST_SKILL_MD")" \
+    "judge-fast-paths.md and loom-judge-fast-paths SKILL.md ship a byte-identical worklog gate (#15048)"
 
 # The Guide-side gate is the counterpart — guide.md must ship it and wire it.
 assert_doc_contains "$GUIDE_MD" \
@@ -865,7 +890,7 @@ assert_doc_contains "$GUIDE_MD" \
 echo
 echo "--- WORK_PLAN plan-body region gate (#15220): a changed region needs the machine receipt ---"
 
-# Extract BOTH shipped functions (region helper + gate) from judge.md so this
+# Extract BOTH shipped functions (region helper + gate) from judge-fast-paths.md so this
 # suite exercises the documented code, not a hand copy — the same extraction
 # discipline as the worklog gate above. No column-0 `}` may appear inside
 # either function before its end.
@@ -875,10 +900,10 @@ plan_fn_block() {
          p{print}
          q && /^\}$/{exit}' "$1"
 }
-PLAN_FN="$(plan_fn_block "$JUDGE_MD")"
-[[ -n "$PLAN_FN" ]] || { echo "FATAL: docs_only_fast_path_plan_check() not found in judge.md"; exit 1; }
+PLAN_FN="$(plan_fn_block "$JUDGE_FAST_MD")"
+[[ -n "$PLAN_FN" ]] || { echo "FATAL: docs_only_fast_path_plan_check() not found in judge-fast-paths.md"; exit 1; }
 assert_contains "$(printf '%s\n' "$PLAN_FN" | grep -v '^[[:space:]]*#')" "docs_only_fast_path_plan_check() {" \
-    "judge.md ships docs_only_fast_path_plan_check()"
+    "judge-fast-paths.md ships docs_only_fast_path_plan_check()"
 
 # Stub `gh`: PP_URL is the PR URL (answered for `--json url` and run through
 # the caller's --jq filter with real jq, exactly as gh does); PP_DIFF /
@@ -1146,20 +1171,20 @@ assert_eq "ELIGIBLE" "$out" "a WORK_LOG-only diff stays eligible even when the b
 unset -f gh
 
 echo
-echo "--- Doc pins: judge.md and champion-pr-merge.md wire the plan-body gate (#15220) ---"
+echo "--- Doc pins: judge-fast-paths.md and champion-pr-merge.md wire the plan-body gate (#15220) ---"
 
-assert_doc_contains "$JUDGE_MD" \
+assert_doc_contains "$JUDGE_FAST_MD" \
     'docs_only_fast_path_plan_check() {' \
-    "judge.md defines docs_only_fast_path_plan_check()"
-assert_doc_contains "$JUDGE_MD" \
+    "judge-fast-paths.md defines docs_only_fast_path_plan_check()"
+assert_doc_contains "$JUDGE_FAST_MD" \
     'docs_only_fast_path_plan_region() {' \
-    "judge.md defines docs_only_fast_path_plan_region()"
-assert_doc_contains "$JUDGE_MD" \
+    "judge-fast-paths.md defines docs_only_fast_path_plan_region()"
+assert_doc_contains "$JUDGE_FAST_MD" \
     'ELIGIBILITY=$(docs_only_fast_path_plan_check "$PR_NUMBER")' \
-    "judge.md folds the plan-body gate into ELIGIBILITY"
-assert_doc_contains "$JUDGE_MD" \
+    "judge-fast-paths.md folds the plan-body gate into ELIGIBILITY"
+assert_doc_contains "$JUDGE_FAST_MD" \
     "#15220" \
-    "judge.md documents the #15220 plan-body gate"
+    "judge-fast-paths.md documents the #15220 plan-body gate"
 assert_doc_contains "$JUDGE_MD" \
     'guide:plan-body` region carries the machine-rendered `written` receipt' \
     "judge.md Primary Queue step 4b states the plan-body receipt condition (#15220)"
@@ -1179,15 +1204,15 @@ assert_doc_contains "$CHAMPION_MD" \
 
 # The two shipped copies are intentionally identical (comments aside) — the
 # same mirror discipline as the allowlist and closing check above.
-assert_eq "$(plan_fn_block "$JUDGE_MD" | grep -v '^[[:space:]]*#')" \
+assert_eq "$(plan_fn_block "$JUDGE_FAST_MD" | grep -v '^[[:space:]]*#')" \
           "$(plan_fn_block "$CHAMPION_MD" | grep -v '^[[:space:]]*#')" \
-          "judge.md and champion-pr-merge.md plan-body gate code is identical (comments aside)"
+          "judge-fast-paths.md and champion-pr-merge.md plan-body gate code is identical (comments aside)"
 
 # The judge SKILL copy ships the same gate — both must carry the identical
-# edit (JUDGE_SKILL_MD is the #6725-layout probe from the worklog section
+# edit (JUDGE_FAST_SKILL_MD is the #6725-layout probe from the worklog section
 # above).
-assert_eq "$(plan_fn_block "$JUDGE_MD")" "$(plan_fn_block "$JUDGE_SKILL_MD")" \
-    "judge.md and loom-judge SKILL.md ship a byte-identical plan-body gate (#15220)"
+assert_eq "$(plan_fn_block "$JUDGE_FAST_MD")" "$(plan_fn_block "$JUDGE_FAST_SKILL_MD")" \
+    "judge-fast-paths.md and loom-judge-fast-paths SKILL.md ship a byte-identical plan-body gate (#15220)"
 
 echo
 echo "Results: $TESTS_PASSED/$TESTS_RUN passed, $TESTS_FAILED failed"

@@ -393,7 +393,7 @@ compromised or buggy Judge pass claiming "docs only" must not be sufficient
 to skip Champion's own check.
 
 ```bash
-# Mirrors judge.md's "Docs-Only Fast Path" allowlist exactly (mirrored, not
+# Mirrors judge-fast-paths.md's "Docs-Only Fast Path" allowlist exactly (mirrored, not
 # shared — a divergence between the two copies is a visible drift, not a
 # silent gap; see test-docs-only-fast-path.sh which pins both).
 DOCS_FAST_PATH_ALLOWLIST=("WORK_LOG.md" "WORK_PLAN.md" "README.md")
@@ -434,7 +434,7 @@ docs_only_fast_path_check() {
 FAST_PATH_FILES=$(gh api "repos/{owner}/{repo}/pulls/$PR_NUMBER/files" --paginate --jq '.[].filename')
 FAST_PATH_RESULT=$(printf '%s\n' "$FAST_PATH_FILES" | docs_only_fast_path_check)
 
-# Closing-link condition (#14182), mirrored from judge.md Step 3 (mirrored, not
+# Closing-link condition (#14182), mirrored from judge-fast-paths.md Step 3 (mirrored, not
 # shared; test-docs-only-fast-path.sh pins both copies). A docs-only diff that
 # auto-closes an issue on merge is not a docs-only change. Fails closed: a read
 # that errored or returned no "closers=" proof is NOT ELIGIBLE, never "no closers".
@@ -465,7 +465,7 @@ if [ "$FAST_PATH_RESULT" = "ELIGIBLE" ]; then
   FAST_PATH_RESULT=$(docs_only_fast_path_closing_check "$PR_NUMBER")
 fi
 
-# WORK_PLAN plan-body region gate (#15220), mirrored from judge.md Step 5
+# WORK_PLAN plan-body region gate (#15220), mirrored from judge-fast-paths.md Step 5
 # (mirrored, not shared; test-docs-only-fast-path.sh pins both copies). A
 # Guide tick once hand-wrote the `guide:plan-body` region and put free prose
 # where the `WORK_PLAN check:` receipt line belongs; this gate re-derives the
@@ -3908,7 +3908,7 @@ which answers "which tree does this verdict describe"; this one answers **"was
 the out-of-band step actually performed, and against which tree"**.
 
 - **Who posts it**: whoever performed the step — the Builder, the operator, or
-  the Judge who witnessed a recorded live run (`judge.md` → "Live Verification
+  the Judge who witnessed a recorded live run (`judge-live-verification.md` → "Live Verification
   and the Circular-Fixture Smell", form (b)) — and it counts only from a
   **trusted author** (#9548: an outsider's marker is prose).
 - **Where**: a comment on the linked issue or the PR, or the PR body when the
@@ -3964,7 +3964,7 @@ out-of-band requirement stated only in the issue's **prose** rather than as a
 checklist item; one phrased in vocabulary nobody anticipated ("watch it for a
 fortnight"); or a criterion that is CI-checkable **as written** but whose test
 fabricates the external payload it asserts on — that last one is Judge's
-"circular fixture" smell (`judge.md` → "Live Verification and the
+"circular fixture" smell (`judge-live-verification.md` → "Live Verification and the
 Circular-Fixture Smell"), and the two
 mechanisms are complements, not substitutes. Do not extend the vocabulary to
 chase semantic cases (cf. `sweep.md` → "What this scan does NOT catch"): a
