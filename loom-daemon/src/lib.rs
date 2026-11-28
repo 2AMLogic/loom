@@ -246,6 +246,7 @@ pub mod forge_merge_queue;
 pub mod forge_mirror;
 pub mod forge_parser;
 pub mod forge_pr_congestion;
+pub(crate) mod forge_pr_diff;
 pub mod forge_priority_labels;
 pub mod forge_probe;
 pub mod forge_pull_listing;

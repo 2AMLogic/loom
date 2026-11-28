@@ -48,7 +48,10 @@ use std::path::Path;
 use anyhow::Result;
 use regex::Regex;
 
-use crate::forge_additive_migrations::{decode_contents, gh_head_sha, safe_path};
+use crate::forge_pr_diff::{self, FindError, PrHeadReader, RepoError};
+
+/// The `forge_call_stats` operation label of this verb's forge reads.
+const OP: &str = "forge.suspect_critical_diff";
 
 /// Dependency-ish `Cargo.toml` table-name segments.
 const CARGO_SUSPECT_SEGMENTS: [&str; 6] = [
@@ -578,27 +581,6 @@ where
     Ok(())
 }
 
-/// The PR-head contents of `file`, via the shared path-traversal guard, SHA
-/// lookup and base64 decoder. The contents read keeps this verb's own
-/// `forge.suspect_critical_diff` op label; the SHA read inside `gh_head_sha`
-/// carries `forge.additive_migrations` (the same trade
-/// `forge_locked_deps_only` already makes).
-fn gh_head_file(gh_bin: &Path, repo: &str, pr: u32, file: &str) -> Result<String, String> {
-    if !safe_path(file) {
-        return Err("unsafe file path".into());
-    }
-    let read = |path: &str| {
-        crate::verdict_equivalence::gh_api_checked(
-            "forge.suspect_critical_diff",
-            gh_bin,
-            None,
-            path,
-        )
-    };
-    let sha = gh_head_sha(gh_bin, repo, pr)?;
-    decode_contents(&read(&format!("repos/{repo}/contents/{file}?ref={sha}"))?)
-}
-
 /// Parsed `forge suspect-critical-diff` arguments.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Args {
@@ -615,32 +597,28 @@ pub struct Args {
 /// otherwise 1 (`SUSPECT_LINE=`/`SUSPECT_SECTION=` on stdout for a match, the
 /// reason on stderr).
 pub fn handle(args: &Args) -> Result<()> {
-    use crate::forge_version_only_diff::{find_patch, gh_fetch_page, resolve_repo, valid_repo};
     let (pr, file) = (args.pr, args.file.as_str());
     let repo = args.repo.as_deref();
     let verdict = match repo {
-        Some(r) if !valid_repo(r) => Err(Reason::InvalidRepo),
+        Some(r) if !forge_pr_diff::valid_repo(r) => Err(Reason::InvalidRepo),
         _ if kind_for(file).is_none() => Err(Reason::NotApplicable),
-        _ => {
-            let gh = crate::forge_cmd::gh_bin();
-            match resolve_repo(repo, &gh) {
-                Err(why) => Err(Reason::FetchFailed(why)),
-                Ok(repo) => {
-                    let gh = Path::new(&gh);
-                    match find_patch(file, |page| gh_fetch_page(gh, &repo, pr, page)) {
-                        Ok(patch) => {
-                            classify(file, patch.as_deref(), || gh_head_file(gh, &repo, pr, file))
-                        }
-                        Err(r) => Err(match r {
-                            crate::forge_version_only_diff::Reason::FileNotInList => {
-                                Reason::FileNotInList
-                            }
-                            other => Reason::FetchFailed(other.to_string()),
-                        }),
-                    }
+        _ => match forge_pr_diff::resolve_gh_repo(repo) {
+            Err(RepoError::Invalid) => Err(Reason::InvalidRepo),
+            Err(RepoError::Unresolved(why)) => Err(Reason::FetchFailed(why)),
+            Ok((gh, repo)) => {
+                let gh = Path::new(&gh);
+                let mut head = PrHeadReader::new(OP, gh, &repo, pr);
+                match forge_pr_diff::find_patch(file, |page| {
+                    forge_pr_diff::gh_fetch_page(OP, gh, &repo, pr, page)
+                }) {
+                    Ok(patch) => classify(file, patch.as_deref(), || head.read(file)),
+                    Err(FindError::NotInList) => Err(Reason::FileNotInList),
+                    Err(FindError::Fetch(why)) => Err(Reason::FetchFailed(format!(
+                        "could not read the PR's file list: {why}"
+                    ))),
                 }
             }
-        }
+        },
     };
     match verdict {
         Ok(()) => {
@@ -990,23 +968,6 @@ mod tests {
             "Cargo.toml",
             "@@ -1,2 +1,3 @@\r\n [[bin]]\r\n+name = \"x\"\r\n+path = \"src/x.rs\"\r\n\\ No newline at end of file",
         );
-    }
-
-    #[test]
-    fn safe_path_rejects_traversal_and_query() {
-        assert!(safe_path("loom-daemon/Cargo.toml"));
-        for bad in ["", "/a", "a/../b", "a//b", "a?ref=x", "a b", "./a"] {
-            assert!(!safe_path(bad), "{bad}");
-        }
-    }
-
-    #[test]
-    fn contents_body_decodes_base64_with_newlines() {
-        let body =
-            serde_json::json!({"encoding": "base64", "content": "W3BhY2thZ2Vd\nCg=="}).to_string();
-        assert_eq!(decode_contents(body.as_bytes()).unwrap(), "[package]\n");
-        assert!(decode_contents(br#"{"encoding":"none","content":""}"#).is_err());
-        assert!(decode_contents(b"nope").is_err());
     }
 
     #[test]
