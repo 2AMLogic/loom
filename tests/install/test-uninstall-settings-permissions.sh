@@ -34,6 +34,12 @@
 #   4. Whole file becomes `{}` after permissions removal (no hooks, no other
 #      keys): the file itself is deleted, matching the "entirely Loom
 #      content" branch used elsewhere in Step 6.
+#   5. A hook entry with no `command` string (`"type": "prompt"`) next to a
+#      Loom command hook (#15777): uninstall exits 0, the Loom entry is
+#      stripped, the prompt entry is kept, no stray settings.json.tmp.
+#   6. The guard does not loosen the strip: new AND legacy Loom prefixes are
+#      still removed, foreign command / non-command entries are kept.
+#   7. A prompt-only `.hooks` block survives intact (not deleted).
 #
 # Exit code 0 = all tests pass, 1 = failures detected.
 
@@ -227,6 +233,136 @@ assert_eq "entirely-Loom: settings.json removed" \
   "no" "$([[ -f "$TARGET4/.claude/settings.json" ]] && echo yes || echo no)"
 assert_eq "entirely-Loom: removal is named in the script's output" \
   "yes" "$(printf '%s' "$OUT4" | grep -qF '.claude/settings.json removed' && echo yes || echo no)"
+
+# ============================================================================
+# Test 5 (#15777): a hook entry with no `command` string sits next to a Loom
+# command hook. Claude Code also allows `"type": "prompt"` / `"http"` /
+# `"agent"` entries, which carry no `command` field. Before the fix the Step 6
+# jq predicate read `.command` unguarded, `startswith()` raised "requires
+# string inputs", and under `set -e` the whole uninstall aborted at Smart
+# Remove -- Loom hook left in place AND a stray settings.json.tmp behind.
+# ============================================================================
+echo ""
+echo "=== non-command hook entry next to a Loom hook: uninstall completes ==="
+
+TARGET5="$WORK/target5"
+make_target "$TARGET5"
+jq -n '{
+  hooks: {
+    Stop: [{
+      matcher: "",
+      hooks: [
+        {type: "command", command: "${CLAUDE_PROJECT_DIR}/.loom/hooks/guard-uncommitted-work.sh"},
+        {type: "prompt", prompt: "Review the completed work before stopping."}
+      ]
+    }]
+  }
+}' > "$TARGET5/.claude/settings.json"
+commit_target "$TARGET5"
+
+OUT5="$("$UNINSTALL_SH" --yes --local "$TARGET5" 2>&1)"
+RC5=$?
+
+assert_eq "non-command hook: uninstall exits 0 (no abort at Smart Remove)" \
+  "0" "$RC5"
+assert_eq "non-command hook: no stray settings.json.tmp left behind" \
+  "no" "$([[ -e "$TARGET5/.claude/settings.json.tmp" ]] && echo yes || echo no)"
+assert_eq "non-command hook: settings.json still exists (prompt entry survives)" \
+  "yes" "$([[ -f "$TARGET5/.claude/settings.json" ]] && echo yes || echo no)"
+
+if [[ -f "$TARGET5/.claude/settings.json" ]]; then
+  assert_eq "non-command hook: Loom command hook entry removed" \
+    "0" "$(jq '[.hooks.Stop[]?.hooks[]? | select(.type == "command" and (.command | startswith("${CLAUDE_PROJECT_DIR}/.loom/hooks/")))] | length' "$TARGET5/.claude/settings.json")"
+  assert_eq "non-command hook: prompt hook entry survives untouched" \
+    "1" "$(jq '[.hooks.Stop[]?.hooks[]? | select(.type == "prompt" and .prompt == "Review the completed work before stopping.")] | length' "$TARGET5/.claude/settings.json")"
+fi
+
+assert_eq "non-command hook: no jq failure warning emitted" \
+  "no" "$(printf '%s' "$OUT5" | grep -qF 'Failed to process .claude/settings.json' && echo yes || echo no)"
+assert_eq "non-command hook: no 'Uninstall failed' error emitted" \
+  "no" "$(printf '%s' "$OUT5" | grep -qF 'Uninstall failed at step' && echo yes || echo no)"
+
+# ============================================================================
+# Test 6 (#15777): the guard must not loosen the strip. Command entries with
+# EITHER Loom prefix (new `${CLAUDE_PROJECT_DIR}/.loom/hooks/` or legacy
+# bare-relative `.loom/hooks/`) are still removed, while a non-command entry
+# next to the legacy one and a consumer-authored command hook are kept.
+# ============================================================================
+echo ""
+echo "=== new + legacy Loom prefixes still stripped; foreign entries kept ==="
+
+TARGET6="$WORK/target6"
+make_target "$TARGET6"
+jq -n '{
+  hooks: {
+    Stop: [{
+      matcher: "",
+      hooks: [
+        {type: "command", command: "${CLAUDE_PROJECT_DIR}/.loom/hooks/guard-uncommitted-work.sh"},
+        {type: "command", command: ".loom/hooks/guard-destructive.sh"},
+        {type: "prompt", prompt: "Review the completed work before stopping."},
+        {type: "command", command: "${CLAUDE_PROJECT_DIR}/.githooks/my-own-stop.sh"}
+      ]
+    }]
+  }
+}' > "$TARGET6/.claude/settings.json"
+commit_target "$TARGET6"
+
+"$UNINSTALL_SH" --yes --local "$TARGET6" >/dev/null 2>&1
+RC6=$?
+
+assert_eq "prefixes: uninstall exits 0" \
+  "0" "$RC6"
+assert_eq "prefixes: no stray settings.json.tmp left behind" \
+  "no" "$([[ -e "$TARGET6/.claude/settings.json.tmp" ]] && echo yes || echo no)"
+
+if [[ -f "$TARGET6/.claude/settings.json" ]]; then
+  assert_eq "prefixes: new-prefix Loom hook entry removed" \
+    "0" "$(jq '[.hooks.Stop[]?.hooks[]? | select((.command // "") | startswith("${CLAUDE_PROJECT_DIR}/.loom/hooks/"))] | length' "$TARGET6/.claude/settings.json")"
+  assert_eq "prefixes: legacy-prefix Loom hook entry removed" \
+    "0" "$(jq '[.hooks.Stop[]?.hooks[]? | select((.command // "") | startswith(".loom/hooks/"))] | length' "$TARGET6/.claude/settings.json")"
+  assert_eq "prefixes: prompt hook entry survives" \
+    "1" "$(jq '[.hooks.Stop[]?.hooks[]? | select(.type == "prompt")] | length' "$TARGET6/.claude/settings.json")"
+  assert_eq "prefixes: consumer-authored command hook survives" \
+    "1" "$(jq '[.hooks.Stop[]?.hooks[]? | select((.command // "") == "${CLAUDE_PROJECT_DIR}/.githooks/my-own-stop.sh")] | length' "$TARGET6/.claude/settings.json")"
+fi
+
+# ============================================================================
+# Test 7 (#15777): the ONLY hook is a non-command entry. Nothing is Loom's, so
+# `.hooks` survives intact (not deleted by the "no hooks left" cleanup) and
+# the file itself is kept.
+# ============================================================================
+echo ""
+echo "=== prompt-only hooks: .hooks kept intact ==="
+
+TARGET7="$WORK/target7"
+make_target "$TARGET7"
+jq -n '{
+  hooks: {
+    Stop: [{
+      matcher: "",
+      hooks: [{type: "prompt", prompt: "Review the completed work before stopping."}]
+    }]
+  }
+}' > "$TARGET7/.claude/settings.json"
+commit_target "$TARGET7"
+
+"$UNINSTALL_SH" --yes --local "$TARGET7" >/dev/null 2>&1
+RC7=$?
+
+assert_eq "prompt-only: uninstall exits 0" \
+  "0" "$RC7"
+assert_eq "prompt-only: no stray settings.json.tmp left behind" \
+  "no" "$([[ -e "$TARGET7/.claude/settings.json.tmp" ]] && echo yes || echo no)"
+assert_eq "prompt-only: settings.json still exists" \
+  "yes" "$([[ -f "$TARGET7/.claude/settings.json" ]] && echo yes || echo no)"
+
+if [[ -f "$TARGET7/.claude/settings.json" ]]; then
+  assert_eq "prompt-only: .hooks key survives" \
+    "true" "$(jq 'has("hooks")' "$TARGET7/.claude/settings.json")"
+  assert_eq "prompt-only: prompt hook entry survives untouched" \
+    "1" "$(jq '[.hooks.Stop[]?.hooks[]? | select(.type == "prompt" and .prompt == "Review the completed work before stopping.")] | length' "$TARGET7/.claude/settings.json")"
+fi
 
 # ============================================================================
 # Summary

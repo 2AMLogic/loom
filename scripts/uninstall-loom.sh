@@ -1660,6 +1660,10 @@ if [[ -f "$WORKTREE_ABS/.claude/settings.json" ]]; then
     #         prefix (.loom/hooks/) from pre-3265 installs. Both must be
     #         stripped so uninstall is clean regardless of when Loom was first
     #         installed.
+    #         `.command` is read as "" when absent: a non-command hook entry
+    #         (`type: prompt` / `http` / `agent`) is not Loom's and is kept.
+    #         An unguarded read raises under `set -e` and aborts the whole
+    #         uninstall (#15777).
     # Step 2: Clean up empty matcher entries and hook types
     # Step 3: Remove Loom-specific permissions
     LOOM_PERMS=$(jq -r '.permissions.allow // [] | .[]' "$LOOM_DEFAULTS_SETTINGS" 2>/dev/null)
@@ -1712,8 +1716,8 @@ if [[ -f "$WORKTREE_ABS/.claude/settings.json" ]]; then
         .hooks |= with_entries(
           .value |= map(
             .hooks |= map(select(
-              (.command | startswith(\$hook_prefix))
-              or (.command | startswith(\$legacy_hook_prefix))
+              ((.command // \"\") | startswith(\$hook_prefix))
+              or ((.command // \"\") | startswith(\$legacy_hook_prefix))
               | not
             ))
           )
