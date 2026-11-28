@@ -64,17 +64,7 @@ fn worktree(root: &Path, name: &str) -> PathBuf {
     fs::write(wt.join("Cargo.lock"), "lock\n").unwrap();
     fs::write(wt.join(".loom-managed"), "").unwrap();
     // The fixed-name path asks git whether anything under a directory is tracked.
-    let git = |args: &[&str]| {
-        assert!(std::process::Command::new("git")
-            .arg("-C")
-            .arg(&wt)
-            .args(args)
-            .output()
-            .unwrap()
-            .status
-            .success());
-    };
-    git(&["init", "-q"]);
+    crate::test_git_helpers::run(&wt, &["init", "-q"]);
     wt.canonicalize().unwrap()
 }
 
@@ -466,12 +456,7 @@ fn a_gc_rewritten_reflog_no_longer_pins_an_idle_worktrees_target() {
         fs::create_dir_all(gitdir.join("logs")).unwrap();
         fs::write(gitdir.join("HEAD"), "ref: refs/heads/feature/issue-9243\n").unwrap();
         fs::write(wt.join(".git"), format!("gitdir: {}\n", gitdir.display())).unwrap();
-        let read_tree = std::process::Command::new("git")
-            .arg("-C")
-            .arg(&wt)
-            .args(["read-tree", "--empty"])
-            .output()
-            .unwrap();
+        let read_tree = crate::test_git_helpers::git_out(&wt, &["read-tree", "--empty"]);
         assert!(read_tree.status.success());
         fs::write(gitdir.join("logs/HEAD"), reflog_entry(10 * 3600)).unwrap();
         backdate(tmp.path(), 2 * 3600);
@@ -654,12 +639,7 @@ fn a_tracked_artifact_directory_is_kept_with_a_reason() {
     let wt = worktree(tmp.path(), "issue-32");
     fill(&wt.join(".venv"), 1024);
     fill(&wt.join(".pytest_cache"), 1024);
-    let add = std::process::Command::new("git")
-        .arg("-C")
-        .arg(&wt)
-        .args(["add", "-f", ".venv/debug/deps/blob"])
-        .output()
-        .unwrap();
+    let add = crate::test_git_helpers::git_out(&wt, &["add", "-f", ".venv/debug/deps/blob"]);
     assert!(add.status.success());
 
     let report = run(tmp.path(), &open_issue);

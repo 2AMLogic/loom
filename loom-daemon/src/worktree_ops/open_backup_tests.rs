@@ -6,7 +6,6 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 use super::*;
 use crate::test_git_helpers::run as git;
@@ -54,12 +53,8 @@ fn at() -> DateTime<Utc> {
 
 /// The sha `origin` holds at `ref_name`, read from the bare repo itself.
 fn remote_sha(bare: &Path, ref_name: &str) -> Option<String> {
-    let out = Command::new("git")
-        .arg("-C")
-        .arg(bare)
-        .args(["rev-parse", "--verify", "--quiet", ref_name])
-        .output()
-        .ok()?;
+    let out =
+        crate::test_git_helpers::git_out(bare, &["rev-parse", "--verify", "--quiet", ref_name]);
     out.status
         .success()
         .then(|| String::from_utf8_lossy(&out.stdout).trim().to_string())
