@@ -2,6 +2,90 @@
 
 Sections moved byte-for-byte from [WORK_LOG.md](../WORK_LOG.md) by `loom-daemon work-docs archive`.
 
+### 2026-09-28
+
+- **Issue #9392** (closed): role runner / work finder: demand-weighted build/review allocation (Phase 2 of #9391)
+- **PR #9413**: feat(role_runner): demand-weighted width and Champion-first reservation (#9392, Phase 2a)
+- **PR #9159**: chore(deps): bump actions/github-script from 7.1.0 to 9.0.0
+- **PR #9147**: feat(worktree): port the sparse-checkout family to `loom-daemon worktree-sparse` (#8195 slice 10)
+- **Issue #9133** (closed): pre-commit: scan staged content for credential shapes (no path-based defence covers an unpredicted path)
+- **PR #9148**: security: refuse credential-shaped content on commit, push and in CI (#9133)
+- **Issue #9391** (closed): role runner: one active instance per (repository, role) for every role, concurrent across repositories (Phase 1; demand-weighting split to #9392)
+- **PR #9403**: Role runner: one instance per (repository, role), concurrent across repositories (Phase 1 of #9391)
+- **Issue #8840** (closed): Investigate daemon dispatch superseding a freshly renewed in-session sweep lease
+- **PR #8853**: fix(dispatch): admit a renewed lease into the claim-episode comparison
+- **PR #9402**: feat(ci-telemetry): per-job queue wait, shard attributes and step spans (#9089)
+- **Issue #9092** (closed): Flaky: integration_startup_reconciliation_gate asserts a wall-clock fraction of STUB_DELAY (failed once on main after #9069)
+- **PR #9393**: test(daemon): replace the startup-gate test's wall-clock margin with a rendezvous
+- **Issue #9382** (closed): watchdog suite: dead-pid fixtures can race the tick via orphaned zombies (CI flake seen on #9261)
+- **Issue #9083** (closed): worktree.sh silently reuses origin/feature/issue-N whose tip is a CLOSED unmerged PR's head (the #5657 guard covers merged only)
+- **PR #9384**: fix(worktree): refuse reuse of a closed-unmerged PR's branch tip (#9083)
+- **PR #9385**: fix(merge-pr): narrow the PR side of the ci.yml freshness scope too (#9065 item 5)
+- **PR #9361**: chore(gitignore): ignore .claude/handoff.md, Repo Skills' one-shot note
+- **PR #9363**: fix(merge-pr): stop false-stale refusals from resync stamps and unrelated ci.yml edits (#9065 item 5)
+- **Issue #9337** (closed): feat(telemetry): attribute CI re-run trigger (new_commit vs stale_main_bump vs flaky_retry) on story.ci.run spans
+- **PR #9348**: feat(ci-telemetry): attribute each CI run's trigger on loom.ci.run (#9337)
+- **Issue #9370** (closed): Build failure on main (11e5ff1e0): eta.rs:589 calls queue_blocked::list_open with 2 args after #9261 made it 3 — every open PR is red
+- **PR #9371**: fix(observability): pass the missing caller arg at eta.rs's list_open call site
+- **Issue #9252** (closed): forge_listing ETag cache: key by resolved owner/repo (not cwd) and persist across daemon restarts
+- **Issue #9251** (closed): forge-call accounting: per-caller 200/304/pool counts on loom-daemon status (ADR-0021 amendment step 0)
+- **PR #9261**: feat(daemon): forge-call accounting + identity-keyed, disk-backed listing cache (#9251, #9252)
+- **Issue #9289** (closed): feat: ETA as a Loom primitive — versioned start/finish/land estimates, logged to SigNoz and scored against outcomes
+- **PR #9355**: feat(eta): tracker, eager stage journal, eta.estimate/eta.outcome (#9289 slice 1b)
+- **Issue #9067** (closed): flake: private_workspace_docker adapter_chain_pushes_private_branch fixture SIGTERMed (exit 143) in Codex Adapter Smoke
+- **PR #9358**: fix(session-exec): ride out lease-channel stalls instead of cancelling dispatches (#9067)
+- **Issue #9233** (closed): accounts probe: live Codex rate limits via app-server (in-container for session-managed accounts) + #8963 snapshot fixes
+- **Issue #8963** (closed): accounts check misreads Codex rate-limit snapshots: weekly primary reported as 5h, integer resets_at ignored, older rollouts skipped
+- **Issue #8959** (closed): Harden the pi_usage / codex_usage source-scan tests against missed read idioms
+- **Issue #8943** (closed): Unify the two wildcard rules in the per-role tool restriction: spawn-claude's substring test fails open where spawn-codex's exact match fails closed
+- **PR #9236**: feat(accounts): live Codex rate limits via app-server (accounts check --live) + snapshot fixes
+- **PR #9175**: check-duplicate: match cross-reference repo case-insensitively
+- **PR #9163**: test(usage): close the read idioms the pi/codex source scans missed
+- **PR #9119**: fix(role-tool-policy): one wildcard rule — fail closed on a glob-shaped capability (#8943)
+- **PR #9080**: feat(dashboard): Live tab — perpetually-updating status board (#9077)
+- **Issue #9077** (closed): dashboard: add a Live tab — perpetually-updating status board
+- **PR #9351**: train: L1 (#9080, #9119, #9163, #9175, #9236)
+- **Issue #9336** (closed): feat(telemetry): add sequential attempt index (loom.attempt: N) and transition reason tags to repeating lifecycle spans
+- **Issue #9335** (closed): feat(telemetry): emit dedicated story.operator_hold span to isolate human decision duration from queue dwell
+- **Issue #9334** (closed): feat(telemetry): emit story.doctor and story.remediation spans for Judge changes-requested repair loops
+- **Issue #9223** (closed): story trace: add D32 story.ci kind and refresh story_vectors_d32_v1.json from 2am vectors.json
+- **PR #9346**: fix(daemon): D32 story-kind parity with the 2026-09-28 amendment (#9223)
+- **Issue #8509** (closed): peer-claim coordination is DEGRADED on robb-studio (#6157 Layer 3)
+- **PR #9339**: feat(eta): pure ETA core — finish-v1/land-v1, explanation, scoring (#9289 slice 1a)
+- **Issue #9244** (closed): feat: loom:operator-priority — the one 'land this ASAP' label (retires loom:urgent)
+- **Issue #9301** (closed): [#9244 C] liveness contract (landing state, needs-operator escalation, watchdog, blocker inheritance) + loom-ui star intents
+- **PR #9320**: feat(daemon): starred-issue liveness contract and loom-ui star intents (#9244 C)
+- **Issue #9134** (closed): CREDENTIAL_PATTERNS: a sibling-renamed credential dir (.loom/tokens.<suffix>/) escapes all four mirrored defences at once
+- **PR #9332**: fix(credential-patterns): sibling-renamed credential dirs no longer escape the class
+- **Issue #9288** (closed): feat: one dispatch_plan() that owns the order Loom will work in, published fleet-wide (so dashboards never re-derive candidate_cmp)
+- **PR #9316**: feat(work_finder): publish the dispatch plan — shaped position, plan_state, gate and slots
+- **Issue #9300** (closed): [#9244 B] roles: starred-first rules in Curator/Champion/Judge/Doctor/Builder; retire loom:urgent (prompts, docs, shell)
+- **PR #9305**: feat(roles): operator-priority handling in roles; retire loom:urgent (#9244 B)
+- **Issue #9303** (closed): feat(telemetry): token usage + USD cost for every attempt — in-session sweeps, role runner, per role_attempt (folds in #9204)
+- **Issue #9204** (closed): feat(telemetry): per-model token breakdown (and optional cost attribute) on loom.runtime.usage
+- **PR #9313**: feat(telemetry): per-attempt, per-model token usage + USD on every execution path (#9303, #9204)
+- **Issue #9299** (closed): [#9244 A] daemon core: loom:operator-priority ordering, starred listing, overflow slot, red-main-fix lane, telemetry
+- **PR #9306**: feat(daemon): loom:operator-priority dispatch core (#9244 A)
+- **Issue #9048** (closed): post_init: add regression test asserting .loom/tokens.*/ and .loom/tokens-*/ appear in the generated .gitignore
+- **PR #9309**: test(post_init): assert token-pool sibling globs are emitted and actually match
+- **Issue #8818** (closed): Account rotation for proxied Claude containers: bad-mark and swap at the egress proxy (follow-up to #8697)
+- **PR #9302**: feat(egress-proxy): host-side account rotation for proxied Claude containers
+- **Issue #8699** (closed): Per-launch usage attribution and 429 bad-marking at the credential egress proxy (follow-up to #8674)
+- **PR #9296**: feat(egress-proxy): per-launch usage attribution and 429 bad-marking at the proxy
+- **Issue #9021** (closed): flake: dashboard redaction.test.ts asserts publicText lacks "214" (lines_added) but ingestedAt millis can be .214
+- **PR #9269**: test: anchor redaction leak assertions against timestamp digits
+- **PR #9298**: fix(observability): keep SigNoz ClickHouse self-telemetry expirable under the 2 GiB cap
+- **Issue #8912** (closed): noopCooldown is host-local (peer host re-dispatches inside the window), and the same release is also counted as a prless failure
+- **PR #9295**: fix(sweep-registry): exempt a self-reported no-op release from the failure classifiers
+- **Issue #9268** (closed): Repo merge-method contradiction: main ruleset allows only squash, repo flags allow only merge — API merges 405 both ways
+- **Issue #9239** (closed): prless-retry hold posts a comment but usually does not apply loom:blocked, so dispatch continues — 2,641 claims across 55 issues
+- **PR #9293**: fix(prless-retry): the hold's loom:blocked write is the deliverable, not its comment (#9239)
+- **PR #9285**: feat(observability): isolate the SigNoz backup-restore rehearsal in its own project
+- **Issue #9254** (closed): gh-cached: conditional-request (ETag/304) path for gh issue view / gh pr view single-object reads
+- **PR #9275**: feat(gh-cached): conditional ETag reads for issue view / pr view (#9254)
+- **Issue #9281** (closed): Repo-wide merge blocker: branch ruleset requires squash+linear-history but repo settings allow only merge commits
+- **PR #9272**: feat(merge-pr): port the failing-check overlap classification to Rust (#8191 slice)
+
 ### 2026-09-27
 
 - **PR #9246**: feat(merge-pr): port the pre-merge partial-increment close-conflict decision to Rust (#8191 slice)

@@ -7,7 +7,7 @@ The body below is a snapshot of GitHub label state as of the last merged docs-ma
 <!-- Maintained automatically by the Guide triage agent. Manual edits are fine but may be overwritten. -->
 
 <!-- guide:plan-body:start -->
-_Generated: 2026-11-27T22:14:00Z (snapshot; compare against live labels)_
+_Generated: 2026-11-28T04:10:05Z (snapshot; compare against live labels)_
 ## Operator Attention: Merge-Risk-Hold Pileup
 
 Judge-approved PRs under a hold (`loom:blocked` or `loom:operator`) — a human merge decision, or the prerequisite shown, is missing.
@@ -32,6 +32,7 @@ Judge-approved PRs under a hold (`loom:blocked` or `loom:operator`) — a human 
 - **#15411**: Gate private-clone sealed admission on the session image's own capabilities *(held: champion merge-risk hold)*
 - **#15429**: fix: recognize explicit merge-ratification denials and deferrals *(held: champion merge-risk hold)*
 - **#15434**: Share the live-sweep and checkpoint checks for issue and step logs *(held: champion merge-risk hold)*
+- **#15451**: fix: hold records that require both reviewer keys before their PR merges *(held: champion merge-risk hold)*
 - **#15459**: fix: make the installer's same-version gate report held-back paths *(held: champion merge-risk hold)*
 - **#15480**: fix: prune stale manifest entries for commands, agents and skills *(held: champion merge-risk hold)*
 - **#15485**: fix: sweep abandoned agy per-launch HOMEs at the next launch *(held: champion critical-file hold)*
@@ -47,6 +48,8 @@ Judge-approved PRs under a hold (`loom:blocked` or `loom:operator`) — a human 
 - **#15584**: refactor: add proc_exec::run_bounded_to_file for combined-log runners *(held: champion merge-risk hold)*
 - **#15589**: fix(worktree-root): propagate config lookup failure status *(held: champion merge-risk hold)*
 - **#15616**: refactor: share PR-diff file-list transport across Champion carve-out verbs *(held: champion merge-risk hold)*
+- **#15619**: refactor: route remaining output_with_timeout callers onto proc_exec::run_bounded *(held: champion merge-risk hold)*
+- **#15660**: fix: keep worktree.sh's guards in force on a tools-only install *(held: champion merge-risk hold)*
 
 ## Very Important
 
@@ -71,7 +74,7 @@ _None._
 
 Human-approved issues (`loom:issue`) ready for implementation — excluding held (`loom:blocked`/`loom:operator`/`loom:frozen`), `loom:building`, and issues with an open linked PR (native admission `OPEN_PR`; listed under Issues with Open PRs).
 
-- **#15650**: worktree-closed-pr-branch: tools-mode config error exits 1, which the shell reads as a branch refusal
+_None._
 
 ## Issues with Open PRs (Not Dispatchable)
 
@@ -81,7 +84,6 @@ Human-approved issues (`loom:issue`) ready for implementation — excluding held
 - **#13957**: Shrink always-read core of judge.md (173 KB) into on-demand sub-skills — open PR #13997 (held)
 - **#14455**: Codex Curator steps are dispatched to stopped, unprovisioned seats and end SANDBOX_UNAVAILABLE every time — open PR #14498 (held)
 - **#14626**: Private-clone admission contains the winning seat twice per admission — open PR #14696 (held)
-- **#14712**: resync: a no-op resync warns that it stamped the canonical loom_source_remote, but leaves the stale one — open PR #14769 (approved)
 - **#14714**: Held Doctor repairs leave stale approvals outside the Judge queue — open PR #14715 (held)
 - **#14876**: clean: stale-branch pass deletes a mis-prefixed 'heads/<name>' branch and fails permanently on PR-fetch ref residue — open PR #14916 (held)
 
@@ -126,11 +128,9 @@ Issues currently being built (`loom:building`).
 - **#15588**: Make pr-worktree.sh stop when worktree root config resolution fails
 - **#15605**: Consolidate duplicated PR file-list pagination and head-content plumbing across the four forge PR-diff verbs
 - **#15617**: Retire sweep_registry::reaper::output_with_timeout and route its 13 remaining callers onto proc_exec::run_bounded
-- **#15638**: Share live Gh*Forge adapter methods and reconcile() preamble between orphan_stack and merged_stack in stack_reconcile.rs
-- **#15640**: Share gh api adapter, pagination, target-runner, and report helpers between labels_migrate and labels_migrate_holds
-- **#15641**: Share post_merge_bookkeeping::SystemHost with merge_observation::GhForge instead of duplicating six live Host methods
-- **#15645**: install_compat_harness tests still write-then-exec a fixture script, so plain cargo test hits ETXTBSY (#15013 class)
-- **#15647**: Map merged_stack.* telemetry names in gh_call::forge_op_for so the merged-stack pass books inventoried operations
+- **#15652**: Retire unreferenced SweepRegistry::spawn_step / begin_step_spawn and wire check_role_command into spawn_step_unlocked_timed
+- **#15691**: lock_order_tests: a_multi_key_attribute_is_judged_on_its_sorted_keys comment inverts the acquisition direction it tests
+- **#15693**: lease_cross_host_tests fail on a host that exports LOOM_LEASE_HOST_ID
 
 ## PRs Awaiting Review
 
@@ -139,7 +139,7 @@ PRs waiting on Judge (`loom:review-requested`).
 - **#12969**: feat: age-bound Codex rollout history in live profiles *(held)*
 - **#14612**: fix: launch eager reclaim detached so it cannot hold back a work-finder tick *(held)*
 - **#15047**: refactor: drop superseded zero-caller pub helpers from loom-daemon *(held)*
-- **#15648**: refactor: share stack passes' gh forge adapter in stack_reconcile
+- **#15679**: fix: run role-command check on live step spawn; retire locked spawn *(held)*
 
 ## Approved (Awaiting Merge)
 
@@ -152,7 +152,6 @@ PRs that passed review (`loom:pr`); unmarked PRs are queued for Champion auto-me
 - **#14498**: fix: pass over unprovisioned and sandbox-held Codex seats before a draw — closes #14455 *(held: champion merge-risk hold)*
 - **#14696**: fix(dispatch): admit on the containment proof the walk already took — closes #14626 *(held: champion merge-risk hold)*
 - **#14715**: fix: send verified Champion-held Doctor repairs back to Judge — closes #14714 *(held: champion merge-risk hold)*
-- **#14769**: fix: skip source-remote lookup on no-op resyncs — closes #14712
 - **#14916**: fix: enumerate cleanup branch candidates by full ref under residue refs — closes #14876 *(held: champion merge-risk hold)*
 - **#15066**: feat: reap agent per-ticket scratch roots on the worktree volume — closes #14952 *(held: champion merge-risk hold)*
 - **#15071**: feat: relay private-seat preparation Git reads through the fleet gateway — closes #14935 *(held: champion merge-risk hold)*
@@ -166,7 +165,7 @@ PRs that passed review (`loom:pr`); unmarked PRs are queued for Champion auto-me
 - **#15411**: Gate private-clone sealed admission on the session image's own capabilities — closes #15397 *(held: champion merge-risk hold)*
 - **#15429**: fix: recognize explicit merge-ratification denials and deferrals — closes #15377 *(held: champion merge-risk hold)*
 - **#15434**: Share the live-sweep and checkpoint checks for issue and step logs — closes #15421 *(held: champion merge-risk hold)*
-- **#15451**: fix: hold records that require both reviewer keys before their PR merges — closes #15430
+- **#15451**: fix: hold records that require both reviewer keys before their PR merges — closes #15430 *(held: champion merge-risk hold)*
 - **#15459**: fix: make the installer's same-version gate report held-back paths — closes #14460 *(held: champion merge-risk hold)*
 - **#15480**: fix: prune stale manifest entries for commands, agents and skills — closes #15475 *(held: champion merge-risk hold)*
 - **#15485**: fix: sweep abandoned agy per-launch HOMEs at the next launch — closes #15109 *(held: champion critical-file hold)*
@@ -182,7 +181,8 @@ PRs that passed review (`loom:pr`); unmarked PRs are queued for Champion auto-me
 - **#15584**: refactor: add proc_exec::run_bounded_to_file for combined-log runners — closes #15581 *(held: champion merge-risk hold)*
 - **#15589**: fix(worktree-root): propagate config lookup failure status — closes #15588 *(held: champion merge-risk hold)*
 - **#15616**: refactor: share PR-diff file-list transport across Champion carve-out verbs — closes #15605 *(held: champion merge-risk hold)*
-- **#15619**: refactor: route remaining output_with_timeout callers onto proc_exec::run_bounded — closes #15617
+- **#15619**: refactor: route remaining output_with_timeout callers onto proc_exec::run_bounded — closes #15617 *(held: champion merge-risk hold)*
+- **#15660**: fix: keep worktree.sh's guards in force on a tools-only install — closes #14476 *(held: champion merge-risk hold)*
 
 ## Proposed
 
@@ -251,7 +251,6 @@ Issues carrying `loom:curated`.
 - **#14626**: Private-clone admission contains the winning seat twice per admission *(curated)*
 - **#14665**: Live verification: post-fix Codex usage-missing breakdown and the 17 unaccounted runs (#14664) *(curated)* *(held)*
 - **#14685**: Live-verify Docker retention per-evaluation summaries on a containerd-store worker (#14679 follow-up) *(curated)* *(held)*
-- **#14712**: resync: a no-op resync warns that it stamped the canonical loom_source_remote, but leaves the stale one *(curated)*
 - **#14714**: Held Doctor repairs leave stale approvals outside the Judge queue *(curated)*
 - **#14741**: pricing: gpt-6.2-astra is not on the pricing card; every Codex step is costed at the Sonnet fallback *(curated)* *(held)*
 - **#14765**: Live verification: session_reconcile creates an App-only private-clone seat after #14744 *(curated)* *(held)*
@@ -301,10 +300,8 @@ Issues carrying `loom:curated`.
 - **#15553**: test flake: nextest discovery stalls inside the Run tests step (lib binary --list) on Rust Unit Tests (5/5) — sixth occurrence, first after #15378 *(curated)*
 - **#15588**: Make pr-worktree.sh stop when worktree root config resolution fails *(curated)*
 - **#15605**: Consolidate duplicated PR file-list pagination and head-content plumbing across the four forge PR-diff verbs *(curated)*
-- **#15644**: The daemon floor check ignores verbs called from role prompts, so REQUIRES_DAEMON drifts below them *(curated)* *(held)*
-- **#15645**: install_compat_harness tests still write-then-exec a fixture script, so plain cargo test hits ETXTBSY (#15013 class) *(curated)*
-- **#15647**: Map merged_stack.* telemetry names in gh_call::forge_op_for so the merged-stack pass books inventoried operations *(curated)*
-- **#15650**: worktree-closed-pr-branch: tools-mode config error exits 1, which the shell reads as a branch refusal *(curated)*
+- **#15691**: lock_order_tests: a_multi_key_attribute_is_judged_on_its_sorted_keys comment inverts the acquisition direction it tests *(curated)*
+- **#15693**: lease_cross_host_tests fail on a host that exports LOOM_LEASE_HOST_ID *(curated)*
 
 ## Proposed (Architect / Hermit)
 
@@ -330,15 +327,15 @@ Issues carrying `loom:curated`.
 
 | Bucket | Count |
 |------|-------|
-| Operator merge-risk holds | 35 |
+| Operator merge-risk holds | 38 |
 | Very important | 0 |
 | Important | 8 |
-| Ready (`loom:issue`, net of holds/building/open-linked-PRs) | 1 |
-| In Progress (`loom:building`) | 42 |
+| Ready (`loom:issue`, net of holds/building/open-linked-PRs) | 0 |
+| In Progress (`loom:building`) | 40 |
 | Held, no other bucket | 80 |
 | PRs awaiting review | 4 |
 | Approved PRs awaiting merge | 38 |
-| Curated | 117 |
+| Curated | 114 |
 | Architect / Hermit proposals | 7 |
 | Active epics | 7 |
 <!-- guide:plan-body:end -->
