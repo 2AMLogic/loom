@@ -57,10 +57,8 @@ use crate::repo_root::{find_repo_root_from_cwd, find_worktree_root_from_cwd};
 /// exceed this.
 ///
 /// Jev's documented input limit is 32k **tokens**; this is a deliberately
-/// conservative 32k-**byte** proxy (no tokenizer is available here, the same
-/// rough-proxy stance `check-markdown-token-budget.sh` already takes in this
-/// repo), so a state that fits this budget always fits the real limit with
-/// room to spare.
+/// conservative 32k-**byte** proxy (no tokenizer is available here), so a
+/// state that fits this budget always fits the real limit with room to spare.
 pub const STATE_BUDGET_BYTES: usize = 32_000;
 
 /// Per-request timeout. Jev is documented at ~100-600ms; this is a hang

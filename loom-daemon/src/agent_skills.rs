@@ -46,10 +46,8 @@ pub struct GeneratedSkill {
 }
 
 /// Discover role/sub-skill names from `<defaults_dir>/roles/*.md`, excluding
-/// `README.md` (a docs index, not a role prompt) — the same set
-/// `scripts/check-markdown-token-budget.sh` already measures as agent-facing
-/// markdown, so the two surfaces never disagree on what counts. Sorted for
-/// deterministic output.
+/// `README.md` (a docs index, not a role prompt). Sorted for deterministic
+/// output.
 pub fn discover_names(defaults_dir: &Path) -> std::io::Result<Vec<String>> {
     let roles_dir = defaults_dir.join("roles");
     let mut names = Vec::new();

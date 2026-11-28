@@ -8,7 +8,7 @@
 //! test that does not observe the argv observes nothing.
 
 use super::*;
-use crate::exec_test_support::write_executable;
+use crate::exec_test_support::{reset_refused_execs, take_refused_execs, write_executable};
 use crate::worktree_ops::gh::OpenPrProbe;
 use std::fs;
 use std::time::Instant;
@@ -958,10 +958,15 @@ fn a_publish_script_a_sibling_is_still_writing_is_waited_for() {
         drop(writer);
     });
 
+    reset_refused_execs();
     let outcome = args(&dir).ensure(&in_session());
     let waited = started.elapsed();
     releaser.join().unwrap();
 
+    assert!(
+        take_refused_execs() >= 1,
+        "the publish script was never refused, so no wait was exercised"
+    );
     assert!(
         waited >= std::time::Duration::from_millis(30),
         "the script ran before its writer closed: {waited:?}"

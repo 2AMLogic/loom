@@ -150,7 +150,9 @@ extern "C" fn check_at_exit() {
 mod tests {
     use super::*;
     use serial_test::serial;
+    use std::io;
     use std::process::Command;
+    use std::time::Duration;
 
     // `#[serial]` below: a few `release_fetch` tests briefly replace `PATH`
     // with `<dir>:/usr/bin:/bin` under `#[serial]`. A bare `gh` looked up in
@@ -186,6 +188,37 @@ mod tests {
             "bare gh must resolve to the guard"
         );
         expected
+    }
+
+    /// How often [`retry_while_executable_busy`] tries again while the program
+    /// stays busy, and the pause between two attempts: about two seconds in
+    /// total, far past any scheduler latency a loaded host shows.
+    const BUSY_ATTEMPTS: usize = 1_000;
+    const BUSY_PAUSE: Duration = Duration::from_millis(2);
+
+    /// Run `attempt` again while it fails with
+    /// [`io::ErrorKind::ExecutableFileBusy`] (#15676).
+    ///
+    /// Under plain `cargo test` every test is a thread of one process, so a
+    /// sibling's `fork` can copy the write fd `fs::write` opened a moment ago
+    /// on the very file `attempt` execs, and Linux refuses to exec an inode
+    /// that still has a writer until that copy's `execve` closes it. A refused
+    /// exec ran nothing, so repeating `attempt` has no side effect. Any other
+    /// outcome is returned at once.
+    ///
+    /// Local, not `crate::exec_test_support::retry_while_executable_busy`:
+    /// this file is `#[path]`-included into every integration crate, where it
+    /// cannot reach `crate::`.
+    fn retry_while_executable_busy<T>(mut attempt: impl FnMut() -> io::Result<T>) -> io::Result<T> {
+        for _ in 1..BUSY_ATTEMPTS {
+            match attempt() {
+                Err(error) if error.kind() == io::ErrorKind::ExecutableFileBusy => {
+                    std::thread::sleep(BUSY_PAUSE)
+                }
+                outcome => return outcome,
+            }
+        }
+        attempt()
     }
 
     #[test]
@@ -230,9 +263,62 @@ mod tests {
         std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
         let path = prepend_path(scratch.path(), std::env::var_os("PATH")).unwrap();
         assert_eq!(resolve_bare(&path), Some(fake.clone()));
-        let out = Command::new(&fake).env("PATH", path).output().unwrap();
+        let out = retry_while_executable_busy(|| Command::new(&fake).env("PATH", &path).output())
+            .unwrap();
         assert!(out.status.success());
         assert_eq!(String::from_utf8_lossy(&out.stdout), "fake\n");
+    }
+
+    /// #15676's refusal, forced. A write fd still open on the fake is what
+    /// makes Linux refuse to exec it; in the wild that fd is the copy a
+    /// sibling test thread's `fork` took of `fs::write`'s. Here one is held
+    /// on purpose and closed only once a refusal has been seen, so the retry
+    /// is certain to meet one without depending on timing.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_fake_refused_while_a_writer_holds_it_is_executed_once_released() {
+        let scratch = tempfile::tempdir().unwrap();
+        let fake = scratch.path().join("gh");
+        std::fs::write(&fake, "#!/bin/sh\necho fake\n").unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        // Opened for writing without truncation, so the script survives.
+        let writer = std::fs::OpenOptions::new().write(true).open(&fake).unwrap();
+        let (refused_tx, refused_rx) = std::sync::mpsc::channel::<()>();
+        std::thread::spawn(move || {
+            let _ = refused_rx.recv();
+            drop(writer);
+        });
+
+        let refusals = std::cell::Cell::new(0);
+        let out = retry_while_executable_busy(|| {
+            let result = Command::new(&fake).output();
+            if result
+                .as_ref()
+                .is_err_and(|e| e.kind() == io::ErrorKind::ExecutableFileBusy)
+            {
+                refusals.set(refusals.get() + 1);
+                let _ = refused_tx.send(());
+            }
+            result
+        })
+        .unwrap();
+        assert!(refusals.get() > 0, "the held write fd must have refused an exec");
+        assert!(out.status.success());
+        assert_eq!(String::from_utf8_lossy(&out.stdout), "fake\n");
+    }
+
+    #[test]
+    fn an_exec_error_other_than_busy_is_returned_at_once() {
+        let mut calls = 0;
+        let attempt = || -> io::Result<()> {
+            calls += 1;
+            Err(io::Error::from(io::ErrorKind::NotFound))
+        };
+        let error = retry_while_executable_busy(attempt).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::NotFound);
+        assert_eq!(calls, 1, "only a busy exec is tried again");
     }
 
     /// Set only by [`a_leaking_test_fails_its_binary_naming_argv`] for its

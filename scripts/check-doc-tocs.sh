@@ -28,10 +28,10 @@
 # defaults/roles/*.md (other than README.md, a docs index) are NOT globbed
 # separately: every one of them is a symlink into
 # defaults/.claude/commands/loom/ (confirmed structurally, not by name list —
-# see check-markdown-token-budget.sh, #7724/#7725), so generating on the
-# commands/loom/ side is automatically visible through the symlink. Writing
-# through defaults/roles/<name>.md instead would replace the symlink with a
-# standalone file via `mv` and desynchronize the pair.
+# see #7725), so generating on the commands/loom/ side is automatically
+# visible through the symlink. Writing through defaults/roles/<name>.md
+# instead would replace the symlink with a standalone file via `mv` and
+# desynchronize the pair.
 #
 # Usage:
 #   check-doc-tocs.sh           Fail if any doc's TOC is missing or stale.
