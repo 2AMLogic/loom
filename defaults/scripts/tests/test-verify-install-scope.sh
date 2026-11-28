@@ -375,6 +375,125 @@ rm -rf "$REPO"
 echo ""
 
 # ---------------------------------------------------------------------------
+# Case 6: an install-metadata entry for a Loom-shipped path with no file on
+# disk fails `verify` (issue #15714).
+#
+# verify-install.sh derives its checksum file set from installed_files
+# intersected with the files present, so an entry whose file is gone was
+# skipped in silence: neither tracked nor reported. A consumer that resynced
+# past a retirement (commands/loom/loom-iteration.md and loom-parent.md)
+# kept both in installed_files and `verify` still said ALL FILES MATCH.
+#
+# Only Loom-shipped paths count (what resync re-copies): an install-once file
+# the consumer deleted on purpose, and the runtime denylist, stay unflagged.
+# ---------------------------------------------------------------------------
+echo "Case 6: an installed_files entry with no file fails verify (#15714)"
+
+seed_repo_shipped() {
+    local tmp
+    tmp=$(seed_repo)
+    (
+        cd "$tmp" || exit 1
+        mkdir -p .loom/docs .loom/scripts .claude/commands/loom
+        echo "shipped doc" > .loom/docs/kept.md
+        echo "#!/usr/bin/env bash" > .loom/scripts/kept.sh
+        echo "shipped command" > .claude/commands/loom/kept.md
+    )
+    echo "$tmp"
+}
+
+# 6a: two Loom-shipped entries with no file -> exit 1, each path named.
+REPO=$(seed_repo_shipped)
+cat > "$REPO/.loom/install-metadata.json" <<'EOF'
+{
+  "loom_version": "0.10.9",
+  "loom_commit": "deadbee",
+  "installed_files": [".claude/agents/loom-builder.md",".claude/settings.json","CLAUDE.md",".loom/config.json",".loom/docs/kept.md",".loom/scripts/kept.sh",".claude/commands/loom/kept.md",".claude/commands/loom/loom-iteration.md",".claude/commands/loom/loom-parent.md",".loom/docs/gone.md"]
+}
+EOF
+( cd "$REPO" && bash "$VERIFY_SCRIPT" generate --quiet )
+( cd "$REPO" && bash "$VERIFY_SCRIPT" verify --quiet )
+assert_eq "1" "$?" "Case 6a: Loom-shipped entries with no file -> verify exit 1"
+HUMAN_OUT=$( cd "$REPO" && bash "$VERIFY_SCRIPT" verify 2>&1 )
+assert_contains "$HUMAN_OUT" ".claude/commands/loom/loom-iteration.md" "Case 6a: human output names the retired command entry"
+assert_contains "$HUMAN_OUT" ".claude/commands/loom/loom-parent.md" "Case 6a: human output names the second retired command entry"
+assert_contains "$HUMAN_OUT" ".loom/docs/gone.md" "Case 6a: human output names every such entry"
+assert_contains "$HUMAN_OUT" "DRIFT DETECTED" "Case 6a: reported as drift"
+assert_contains "$HUMAN_OUT" "resync-installed.sh" "Case 6a: names the remedy"
+JSON_OUT=$( cd "$REPO" && bash "$VERIFY_SCRIPT" verify --json 2>&1 )
+assert_contains "$JSON_OUT" '"status": "drift"' "Case 6a: json status is drift"
+assert_contains "$JSON_OUT" '"uninstalled": [' "Case 6a: json output carries an uninstalled array"
+TESTS_RUN=$((TESTS_RUN + 1))
+UNINSTALLED_COUNT=$(echo "$JSON_OUT" | jq '(.uninstalled // []) | length' 2>/dev/null || echo "?")
+if [[ "$UNINSTALLED_COUNT" == "3" ]]; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "  ${GREEN}PASS${NC}: Case 6a: json uninstalled lists exactly the three absent shipped entries"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "  ${RED}FAIL${NC}: Case 6a: json uninstalled has $UNINSTALLED_COUNT entries, expected 3"
+fi
+TESTS_RUN=$((TESTS_RUN + 1))
+if echo "$JSON_OUT" | jq -e . >/dev/null 2>&1; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "  ${GREEN}PASS${NC}: Case 6a: json output stays well-formed"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "  ${RED}FAIL${NC}: Case 6a: json output is not valid JSON"
+fi
+rm -rf "$REPO"
+echo ""
+
+# 6b: install-once and runtime-denylist entries with no file are never flagged.
+REPO=$(seed_repo_shipped)
+cat > "$REPO/.loom/install-metadata.json" <<'EOF'
+{
+  "loom_version": "0.10.9",
+  "loom_commit": "deadbee",
+  "installed_files": [".claude/agents/loom-builder.md",".claude/settings.json","CLAUDE.md",".loom/config.json",".loom/docs/kept.md",".loom/scripts/kept.sh",".claude/commands/loom/kept.md",".github/workflows/ci.yml",".codex/config.toml",".claude/README.md",".loom/daemon-state.json",".loom/worktrees/issue-1/.loom-managed"]
+}
+EOF
+( cd "$REPO" && bash "$VERIFY_SCRIPT" generate --quiet )
+( cd "$REPO" && bash "$VERIFY_SCRIPT" verify --quiet )
+assert_eq "0" "$?" "Case 6b: absent install-once (.github/workflows, .codex, .claude/README.md) and runtime-denylist entries -> verify exit 0"
+JSON_OUT=$( cd "$REPO" && bash "$VERIFY_SCRIPT" verify --json 2>&1 )
+assert_contains "$JSON_OUT" '"uninstalled": []' "Case 6b: json uninstalled array is empty"
+assert_not_contains "$JSON_OUT" "ci.yml" "Case 6b: an absent install-once workflow is not named"
+rm -rf "$REPO"
+echo ""
+
+# 6c: verify-install.sh's Loom-shipped classifier and resync-installed.sh's
+# prune agree on every surface: the prune restores a still-shipped file or
+# drops an entry retired upstream for exactly these paths, which is what makes
+# "entry, no file" a defect worth failing on.
+RESYNC_SCRIPT="$REPO_ROOT/.loom/scripts/resync-installed.sh"
+[[ -f "$RESYNC_SCRIPT" ]] || RESYNC_SCRIPT="$REPO_ROOT/defaults/scripts/resync-installed.sh"
+if [[ -f "$RESYNC_SCRIPT" ]]; then
+    eval "$(awk '/^is_loom_shipped_path\(\) \{/ { grab=1 } grab { print } grab && /^}/ { exit }' "$VERIFY_SCRIPT")"
+    # The arm line of resync's classifier: one `|`-separated pattern per copy
+    # surface, each turned into a sample path by replacing its `*` with `x`
+    # (noglob: the arms are patterns, not filenames to expand against the cwd).
+    SURFACE_ARMS="$(awk '/^_is_loom_pure_copy_surface_path\(\) \{/ { on=1; next } on && /case/ { getline; print; exit }' "$RESYNC_SCRIPT" | tr -d ' \t')"
+    SURFACE_ARMS="${SURFACE_ARMS%)}"
+    set -f
+    for arm in ${SURFACE_ARMS//|/ }; do
+        sample="${arm//\*/x}"
+        assert_eq "0" "$(is_loom_shipped_path "$sample" && echo 0 || echo 1)" \
+            "Case 6c: '$sample' (a resync copy surface) is Loom-shipped for verify"
+    done
+    set +f
+    assert_eq "0" "$(is_loom_shipped_path .claude/commands/loom/x.md && echo 0 || echo 1)" \
+        "Case 6c: .claude/commands/loom/* is Loom-shipped (the #15714 surface)"
+    assert_eq "1" "$(is_loom_shipped_path .github/workflows/ci.yml && echo 0 || echo 1)" \
+        "Case 6c: an install-once workflow is not Loom-shipped"
+    assert_eq "1" "$(is_loom_shipped_path CLAUDE.md && echo 0 || echo 1)" \
+        "Case 6c: the merge-target CLAUDE.md is not Loom-shipped"
+    assert_eq "1" "$(is_loom_shipped_path .claude/settings.json && echo 0 || echo 1)" \
+        "Case 6c: .claude/settings.json is not Loom-shipped"
+else
+    echo "  SKIP: Case 6c: resync-installed.sh not found beside verify-install.sh"
+fi
+
+# ---------------------------------------------------------------------------
 # Summary
 # ---------------------------------------------------------------------------
 echo "==============================="

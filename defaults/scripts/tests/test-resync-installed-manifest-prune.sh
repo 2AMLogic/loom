@@ -22,6 +22,11 @@
 #   - touching an install-once entry (.github/workflows/*) prunes a file
 #     resync does not own and cannot re-verify.
 #
+# #15714: the same four-way classification now also covers
+# .claude/commands/loom/* entries. The prune used to skip that directory
+# outright, so a resync that removed the retired loom-iteration.md and
+# loom-parent.md left both listed (groups 5 and 6).
+#
 # Usage:
 #   ./.loom/scripts/tests/test-resync-installed-manifest-prune.sh
 
@@ -218,6 +223,118 @@ if ! has_entry "$REPO4" ".loom/hooks/retired.sh" && [[ "$(entry_count "$REPO4")"
     pass "(#14012) the apply dropped exactly the previewed entry"
 else
     fail "(#14012) the apply did not drop exactly the previewed entry"
+fi
+
+# --- (5) retired .claude/commands/loom files (#15714) -------------------------
+#
+# The prune only ever classified the pure-copy surfaces under .loom/, so a
+# resync that removed the retired `commands/loom/loom-iteration.md` and
+# `loom-parent.md` left both in installed_files: the manifest claimed paths
+# absent from the tree.
+#
+# make_commands_fixture <name> -> make_fixture's repo plus, in the source
+# checkout, a still-shipped command and a .loom-retired.list naming the two
+# retired ones; in the consumer, the two retired files on disk, the
+# still-shipped one deleted locally, and four more manifest entries.
+make_commands_fixture() {
+    local consumer src cf
+    consumer="$(make_fixture "$1")"
+    src="$WORKDIR/$1-src"
+    mkdir -p "$src/defaults/.claude/commands/loom"
+    printf 'KEPT\n' > "$src/defaults/.claude/commands/loom/kept-command.md"
+    printf 'commands/loom/loom-iteration.md\ncommands/loom/loom-parent.md\n' > "$src/defaults/.loom-retired.list"
+    git -C "$src" add -A >/dev/null 2>&1
+    git -C "$src" commit -qm "retire two commands" >/dev/null 2>&1
+
+    mkdir -p "$consumer/.claude/commands/loom"
+    for cf in loom-iteration.md loom-parent.md; do
+        printf 'RETIRED\n' > "$consumer/.claude/commands/loom/$cf"
+    done
+    jq '.installed_files += [".claude/commands/loom/loom-iteration.md", ".claude/commands/loom/loom-parent.md", ".claude/commands/loom/kept-command.md", ".claude/settings.json"]' \
+        "$consumer/$META_REL" > "$consumer/$META_REL.tmp" \
+        && mv "$consumer/$META_REL.tmp" "$consumer/$META_REL"
+    git -C "$consumer" add -A >/dev/null 2>&1
+    git -C "$consumer" commit -q --amend --no-edit >/dev/null 2>&1
+    echo "$consumer"
+}
+
+echo ""
+echo "Test group 5: a resync that removes retired commands/loom files prunes their entries too (#15714)"
+REPO5="$(make_commands_fixture commands-prune)"
+OUT5="$(cd "$REPO5" && bash "$SCRIPT" 2>&1)"
+RC5=$?
+if [[ $RC5 -eq 0 ]]; then
+    pass "(#15714) the resync run exits 0"
+else
+    fail "(#15714) the resync run exited $RC5 (out=$OUT5)"
+fi
+for cf in loom-iteration.md loom-parent.md; do
+    if grep -q "removed   commands/loom/$cf" <<<"$OUT5"; then
+        pass "(#15714) the resync removes the retired commands/loom/$cf"
+    else
+        fail "(#15714) the retired commands/loom/$cf was not removed (out=$OUT5)"
+    fi
+    if grep -q "pruned    manifest entry .claude/commands/loom/$cf" <<<"$OUT5"; then
+        pass "(#15714) the prune is logged for .claude/commands/loom/$cf"
+    else
+        fail "(#15714) no prune was logged for .claude/commands/loom/$cf (out=$OUT5)"
+    fi
+    if ! has_entry "$REPO5" ".claude/commands/loom/$cf"; then
+        pass "(#15714) .claude/commands/loom/$cf is gone from installed_files"
+    else
+        fail "(#15714) .claude/commands/loom/$cf survived the prune"
+    fi
+done
+if has_entry "$REPO5" ".claude/commands/loom/kept-command.md" && [[ -f "$REPO5/.claude/commands/loom/kept-command.md" ]]; then
+    pass "(#15714) a still-shipped command file deleted locally keeps its entry (the restore case)"
+else
+    fail "(#15714) the still-shipped command entry was pruned or its file was not restored"
+fi
+if has_entry "$REPO5" ".claude/settings.json"; then
+    pass "(#15714) an absent install-once entry outside the copy surfaces is left untouched"
+else
+    fail "(#15714) an install-once entry was pruned"
+fi
+if has_entry "$REPO5" ".loom/hooks/keeper.sh"; then
+    pass "(#15714) the .loom/ copy surfaces keep their entries"
+else
+    fail "(#15714) a .loom/ copy-surface entry was pruned"
+fi
+# 5 base + 4 command-era entries, minus .loom/hooks/retired.sh and the two
+# retired commands.
+if [[ "$(entry_count "$REPO5")" == "6" ]]; then
+    pass "(#15714) exactly the three stale entries were dropped (9 -> 6)"
+else
+    fail "(#15714) installed_files length is '$(entry_count "$REPO5")', expected 6"
+fi
+
+echo ""
+echo "Test group 6: --dry-run previews the command prunes and writes nothing (#15714)"
+REPO6="$(make_commands_fixture commands-dry-run)"
+BEFORE6="$(cat "$REPO6/$META_REL")"
+OUT6="$(cd "$REPO6" && bash "$SCRIPT" --dry-run 2>&1)"
+RC6=$?
+for cf in loom-iteration.md loom-parent.md; do
+    if grep -q "would remove commands/loom/$cf" <<<"$OUT6" && grep -q "would prune manifest entry .claude/commands/loom/$cf" <<<"$OUT6"; then
+        pass "(#15714) --dry-run previews both the removal and the prune for commands/loom/$cf"
+    else
+        fail "(#15714) --dry-run did not preview removal + prune for commands/loom/$cf (out=$OUT6)"
+    fi
+    if [[ -f "$REPO6/.claude/commands/loom/$cf" ]]; then
+        pass "(#15714) --dry-run left commands/loom/$cf on disk"
+    else
+        fail "(#15714) --dry-run REMOVED commands/loom/$cf"
+    fi
+done
+if [[ "$(cat "$REPO6/$META_REL")" == "$BEFORE6" ]]; then
+    pass "(#15714) --dry-run left the manifest byte-identical"
+else
+    fail "(#15714) --dry-run MODIFIED the manifest"
+fi
+if [[ $RC6 -eq 2 ]]; then
+    pass "(#15714) the pending prunes are reported as drift (exit 2)"
+else
+    fail "(#15714) --dry-run with pending command prunes exited $RC6, expected 2 (out=$OUT6)"
 fi
 
 # --- summary -----------------------------------------------------------------

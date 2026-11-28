@@ -309,6 +309,7 @@ hold-state open -
 stacked-children open -
 retarget-children open -
 version-policy open -
+post-merge-bookkeeping open -
 partial-reset open -
 partial-comment open -
 loom-pr-override-comment open -
@@ -319,6 +320,9 @@ merge-route open -
 workflow-scope open -
 post-merge-cleanup open -
 release-hold open -"
+# post-merge-bookkeeping (#15714) is `open`: it runs only on a host with no
+# live daemon, after the merge, and a binary without the verb changes no
+# issue and names the manual remedy.
 
 # Shared comparison, so the controls below exercise the SAME logic the real
 # assertion does rather than a paraphrase of it. `sort -V` over a here-string
@@ -541,17 +545,20 @@ awk '
 assert_contains "$(cat "$GATE_FILE")" "_post_merge_cleanup" "the cleanup gate block was extracted from merge-pr.sh"
 
 # The sourced gate block consumes FORGE_TYPE / WORKTREE_PATH_OVERRIDE /
-# REMOVE_IGNORED / CLEANUP_WORKTREE; shellcheck cannot follow the dynamic
-# `source "$GATE_FILE"` and sees dead assignments. A directive placed before the
-# function covers its whole body. The two opt-outs ($4 / $5, defaulting to
-# merge-pr.sh's own defaults) are always assigned, so an ambient value can never
-# stand in for a flag a case did not pass.
+# REMOVE_IGNORED / CLEANUP_WORKTREE / DAEMON_FOLLOWS_UP; shellcheck cannot
+# follow the dynamic `source "$GATE_FILE"` and sees dead assignments. A
+# directive placed before the function covers its whole body. The opt-outs
+# ($4 / $5, defaulting to merge-pr.sh's own defaults) are always assigned, so
+# an ambient value can never stand in for a flag a case did not pass.
+# $6 is DAEMON_FOLLOWS_UP (default true: a daemon is live), which
+# _post_merge_follow_up sets at the confirmed-merge choke point.
 # shellcheck disable=SC2034
-_gate_run() { # <FORGE_TYPE|-> <WORKTREE_PATH_OVERRIDE> <REMOVE_IGNORED> [CLEANUP_WORKTREE] [CLEANUP_PRIMARY_CHECKOUT]
+_gate_run() { # <FORGE_TYPE|-> <WORKTREE_PATH_OVERRIDE> <REMOVE_IGNORED> [CLEANUP_WORKTREE] [CLEANUP_PRIMARY_CHECKOUT] [DAEMON_FOLLOWS_UP]
     (
         if [[ "$1" == "-" ]]; then unset FORGE_TYPE; else FORGE_TYPE="$1"; fi
         WORKTREE_PATH_OVERRIDE="$2"; REMOVE_IGNORED="$3"
         CLEANUP_WORKTREE="${4:-true}"; CLEANUP_PRIMARY_CHECKOUT="${5:-true}"
+        DAEMON_FOLLOWS_UP="${6:-true}"
         _post_merge_cleanup() { echo "INLINE-CLEANUP"; }
         info() { echo "DAEMON-HANDLED"; }
         # shellcheck disable=SC1090
@@ -565,18 +572,32 @@ assert_eq "INLINE-CLEANUP" "$(_gate_run github /tmp/x false)" "github: explicit 
 assert_eq "INLINE-CLEANUP" "$(_gate_run github "" true)" "github: --remove-ignored still cleans inline"
 
 # #15258: the two opt-outs on the DEFAULT GitHub path pin CURRENT behaviour, so
-# that a later change to either arm is deliberate rather than accidental. The
-# gate block reads only CLEANUP_WORKTREE and on this path never reaches
-# _post_merge_cleanup, so neither opt-out is honoured: the daemon's
-# merge-observation pass owns cleanup (#14905) and has no channel for them.
-# --no-cleanup-worktree: CLEANUP_WORKTREE=false makes the elif false too, so
-# the gate is silent -- neither arm runs.
+# that a later change to either arm is deliberate rather than accidental. On
+# that path WITH a daemon live the gate block reads only CLEANUP_WORKTREE and
+# never reaches _post_merge_cleanup, so neither opt-out is honoured: the
+# daemon's merge-observation pass owns cleanup (#14905) and has no channel for
+# them. --no-cleanup-worktree: CLEANUP_WORKTREE=false makes the elif false too,
+# so the gate is silent -- neither arm runs.
 assert_eq "" "$(_gate_run github "" false false true)" \
   "github: --no-cleanup-worktree alone reaches neither arm (pins current behaviour, #15258)"
 # --no-cleanup-primary: CLEANUP_WORKTREE is still true, so the daemon-handled
 # advisory still fires; the primary opt-out itself changes nothing.
 assert_eq "DAEMON-HANDLED" "$(_gate_run github "" false true false)" \
   "github: --no-cleanup-primary alone still prints the daemon-handled advisory (pins current behaviour, #15258)"
+
+# #15714: with no live loom-daemon on the host nothing observes the merge, so
+# the same gate runs the cleanup inline, and the two opt-outs the daemon's
+# pass cannot see are honoured again on that path (by _post_merge_cleanup).
+assert_eq "INLINE-CLEANUP" "$(_gate_run github "" false - - false)" \
+  "github, no daemon: default cleanup runs inline (#15714)"
+assert_eq "INLINE-CLEANUP" "$(_gate_run github "" false false true false)" \
+  "github, no daemon: --no-cleanup-worktree still reaches _post_merge_cleanup, which honours it (#15714)"
+assert_eq "INLINE-CLEANUP" "$(_gate_run github "" false true false false)" \
+  "github, no daemon: --no-cleanup-primary still reaches _post_merge_cleanup, which honours it (#15714)"
+assert_eq "INLINE-CLEANUP" "$(_gate_run gitea "" false - - true)" \
+  "gitea with a daemon live: nothing changes (the merge-observation pass is GitHub-only)"
+assert_contains "$(cat "$GATE_FILE")" 'DAEMON_FOLLOWS_UP' \
+  "the cleanup gate reads the decision _post_merge_follow_up recorded (#15714)"
 
 echo ""
 echo "Testing the CI gate agrees merge-pr.sh's dependencies are declared…"

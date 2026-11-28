@@ -1342,6 +1342,12 @@ N_REMOVED=0
 # collect_resync_dirt() cannot tell its deletion from a stray it must never
 # commit (#6613) by looking at defaults/ alone -- it asks this list instead.
 RESYNC_REMOVED_PATHS=()
+# #15714: the target-relative paths remove_retired_files() took out, or in a
+# --dry-run WOULD take out. The manifest prune runs after it and drops an
+# entry only once its file is gone; a dry run leaves the retired file on disk,
+# so without this list its preview would name no prune for an entry the real
+# run then drops -- a preview that under-reports what the apply does.
+RETIRED_THIS_RUN=()
 # #4669: files that could not be staged/renamed into place. A non-empty list
 # means the refresh is PARTIAL and must be reported as such (exit 1), never
 # swallowed into a "success" summary.
@@ -2311,12 +2317,14 @@ remove_retired_files() {
         if [[ "$DRY_RUN" -eq 1 ]]; then
             printf '%b\n' "  ${BOLD}would remove${NC} $rel ${YELLOW}(retired from defaults/, #5981)${NC}"
             N_REMOVED=$((N_REMOVED + 1))
+            RETIRED_THIS_RUN+=("${dst#"$WRITE_ROOT"/}")
             continue
         fi
 
         if rm -f "$dst" 2>/dev/null; then
             printf '%b\n' "  ${GREEN}removed${NC}   $rel ${YELLOW}(retired from defaults/, #5981)${NC}"
             N_REMOVED=$((N_REMOVED + 1))
+            RETIRED_THIS_RUN+=("${dst#"$WRITE_ROOT"/}")
             # #15519: remember the deletion in the form `git status` reports
             # it, so collect_resync_dirt() can stage it. A pinned or
             # symlink-skipped entry never gets here, so it has nothing to stage.
@@ -2976,6 +2984,22 @@ _loom_pure_copy_surface_source_path() {
 #      and its entry stays so a later run can restore the file.
 # the entry is dropped from the manifest and logged.
 #
+# Two refinements (#15714):
+#   * `.claude/commands/loom/*` entries meet condition 1 like the .loom/
+#     surfaces, with $DEFAULTS_DIR/.claude/commands/loom/<name> as the
+#     counterpart. The prune used to skip that directory, so a resync that
+#     removed the retired loom-iteration.md and loom-parent.md left both
+#     listed. The surface is classified HERE, not by widening
+#     _is_loom_pure_copy_surface_path(): collect_resync_dirt() gives
+#     .claude/commands/loom/* its own arm (always resync output, no
+#     retired-but-unlisted test), and loom-daemon's
+#     init/resync_surface_parity_tests.rs holds that classifier's list equal
+#     to land-resync-commit.sh's, so widening it changes that script and its
+#     Rust parity test too.
+#   * for condition 2, a file this run's retirement pass took out -- or would
+#     take out under --dry-run -- counts as absent (RETIRED_THIS_RUN), so the
+#     dry-run preview names the same prunes the real run performs.
+#
 # Reconciling against the live source tree rather than
 # defaults/.loom-retired.list is deliberate: the list already trails reality
 # (#6613), and the consumer evidence included retirements that were never
@@ -2986,6 +3010,19 @@ _loom_pure_copy_surface_source_path() {
 # treats a pruned manifest as a changed install and re-stamps it; a run with
 # nothing to prune leaves the file byte-identical. --dry-run only previews
 # ("would prune"), never writes.
+
+# _retired_this_run <target-relative-path> -> succeeds when the retirement
+# pass removed that path in THIS run, or reported that it would (#15714).
+# Linear membership test rather than `declare -A`, for bash 3.2 (#7749); the
+# empty array is expanded the `set -u`-safe way (see _pin_was_hit()).
+_retired_this_run() {
+    local needle="$1" e
+    for e in ${RETIRED_THIS_RUN[@]+"${RETIRED_THIS_RUN[@]}"}; do
+        [[ "$e" == "$needle" ]] && return 0
+    done
+    return 1
+}
+
 prune_stale_manifest_entries() {
     local meta="$WRITE_ROOT/.loom/install-metadata.json"
     [[ -f "$meta" ]] || return 0
@@ -3008,9 +3045,16 @@ if isinstance(arr, list):
     fi
     while IFS= read -r p; do
         [[ -z "$p" ]] && continue
-        _is_loom_pure_copy_surface_path "$p" || continue
-        [[ -e "$WRITE_ROOT/$p" || -L "$WRITE_ROOT/$p" ]] && continue
-        src="$(_loom_pure_copy_surface_source_path "$p" 2>/dev/null)"
+        if _is_loom_pure_copy_surface_path "$p"; then
+            src="$(_loom_pure_copy_surface_source_path "$p" 2>/dev/null)"
+        elif [[ "$p" == .claude/commands/loom/* ]]; then
+            src="$DEFAULTS_DIR/.claude/commands/loom/${p#.claude/commands/loom/}"
+        else
+            continue
+        fi
+        if [[ -e "$WRITE_ROOT/$p" || -L "$WRITE_ROOT/$p" ]] && ! _retired_this_run "$p"; then
+            continue
+        fi
         [[ -n "$src" && ! -e "$src" && ! -L "$src" ]] || continue
         prunable+=("$p")
     done <<<"$entries"

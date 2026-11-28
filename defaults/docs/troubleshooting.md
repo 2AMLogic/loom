@@ -1910,10 +1910,12 @@ carries `assessment_failed` / `assessment_errors` for automation.
 The above covers a stuck OPEN issue. A different, purely cosmetic case: a
 **closed** issue that still carries `loom:building` — `gh issue list --label
 loom:building` without `--state open` returns these as noise. The daemon's
-merge-observation pass (since #14905; `merge-pr.sh` used to) strips the label
+merge-observation pass (since #14905) strips the label
 from any issue a merge closes (`Closes #N` / `Fixes #N` / `Resolves #N`) —
 whoever made the merge, within one reconciliation tick, provided the host's
-`loom-daemon` is >= 0.20.29 — but issues closed by other means (manually, as a
+`loom-daemon` is >= 0.20.29. On a host with no live daemon, `merge-pr.sh`
+itself strips it (and resets a `Part of #N` issue) inline after its own
+merge (#15714) — but issues closed by other means (manually, as a
 duplicate, or `--reason "not planned"`) are not covered automatically —
 run `./.loom/scripts/clean-stale-building-labels.sh [--repo OWNER/NAME]
 [--dry-run]` to sweep those (idempotent, safe to re-run).

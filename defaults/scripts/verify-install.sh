@@ -136,6 +136,11 @@ ${BOLD}TRACKED FILE SET:${NC}
     hash comparison, so a missing, duplicated, or malformed marker pair is
     always flagged -- even one baked into the manifest at generate time.
 
+    verify also fails on an installed_files entry for a Loom-shipped path
+    (.loom/{hooks,scripts,roles,docs,runtimes,bin}/*, .claude/commands/loom/*,
+    the biome configs) that has no file on disk. Install-once files and the
+    runtime denylist below are never flagged for being absent.
+
 ${BOLD}NOT TRACKED (runtime/user/merge-target files):${NC}
     .loom/config.json              Local terminal config
     .loom/daemon-state.json        Daemon runtime state
@@ -148,7 +153,7 @@ ${BOLD}NOT TRACKED (runtime/user/merge-target files):${NC}
 
 ${BOLD}EXIT CODES:${NC}
     0    generate succeeded, or verify found no drift
-    1    verify found modified, missing, or marker-malformed files
+    1    verify found modified, missing, marker-malformed, or listed-but-absent files
     2    Invalid arguments
     3    Manifest not found (verify mode)
     4    Environment error (not a git repo, no SHA command)
@@ -201,6 +206,26 @@ is_untracked_runtime_file() {
         .gitignore) return 0 ;;
         package.json) return 0 ;;
         *) return 1 ;;
+    esac
+}
+
+# Loom-shipped paths: the surfaces resync-installed.sh re-copies from defaults/
+# and whose installed_files entries its manifest prune reconciles (its
+# pure-copy surfaces, plus .claude/commands/loom/ -- #15714). An entry for one
+# of these with no file on disk is a defect that tooling repairs -- resync
+# restores a file still shipped and prunes an entry retired upstream -- so
+# `verify` fails on it (#15714). Everything else (install-once files such as
+# .github/workflows/*, .codex/config.toml, .claude/settings.json, root
+# CLAUDE.md) is the consumer's to keep or delete after install and resync
+# never touches those entries, so their absence is never flagged. The runtime
+# denylist above is honored by the caller.
+is_loom_shipped_path() {
+    case "$1" in
+        .loom/hooks/*|.loom/scripts/*|.loom/roles/*|.loom/docs/*|.loom/runtimes/*|.loom/bin/*|.loom/biome.jsonc|.claude/biome.jsonc|.claude/commands/loom/*)
+            return 0
+            ;;
+        *) return 1
+            ;;
     esac
 }
 
@@ -337,6 +362,8 @@ collect_tracked_files() {
         while IFS= read -r rel; do
             [[ -z "$rel" ]] && continue
             is_untracked_runtime_file "$rel" && continue
+            # Nothing to hash for an entry with no file; `verify` reports
+            # those separately when the path is Loom-shipped (#15714).
             [[ -f "$root/$rel" ]] || continue
             files+=("$rel")
         done <<< "$installed"
@@ -833,13 +860,34 @@ cmd_verify() {
         fi
     done <<< "$file_paths"
 
+    # Installed-but-absent entries (#15714). The loop above can only compare
+    # what `generate` tracked, and `generate` skips an installed_files entry
+    # whose file is missing -- so a manifest still listing a retired
+    # .claude/commands/loom/*.md verified as ALL FILES MATCH. Read the
+    # ownership manifest directly: a Loom-shipped entry with no file on disk
+    # is drift (is_loom_shipped_path; the runtime denylist and install-once
+    # files are exempt). An install with no metadata is not checked.
+    local uninstalled=()
+    local metadata_path="$root/.loom/install-metadata.json"
+    if [[ -f "$metadata_path" ]]; then
+        local shipped_rel
+        while IFS= read -r shipped_rel; do
+            [[ -z "$shipped_rel" ]] && continue
+            is_untracked_runtime_file "$shipped_rel" && continue
+            is_loom_shipped_path "$shipped_rel" || continue
+            [[ -f "$root/$shipped_rel" ]] && continue
+            uninstalled+=("$shipped_rel")
+        done < <(parse_installed_files "$metadata_path")
+    fi
+
     local modified_count=${#modified_files[@]}
     local missing_count=${#missing_files[@]}
     local marker_integrity_count=${#marker_integrity_failures[@]}
+    local uninstalled_count=${#uninstalled[@]}
     local status="ok"
     local exit_code=$EXIT_OK
 
-    if [[ $modified_count -gt 0 ]] || [[ $missing_count -gt 0 ]] || [[ $marker_integrity_count -gt 0 ]]; then
+    if [[ $modified_count -gt 0 ]] || [[ $missing_count -gt 0 ]] || [[ $marker_integrity_count -gt 0 ]] || [[ $uninstalled_count -gt 0 ]]; then
         status="drift"
         exit_code=$EXIT_DRIFT
     fi
@@ -919,6 +967,26 @@ cmd_verify() {
                 done
                 printf '\n  '
             fi
+            printf '],\n'
+
+            # Uninstalled entries array (#15714): installed_files entries
+            # for Loom-shipped paths with no file on disk.
+            printf '  "uninstalled": ['
+            if [[ $uninstalled_count -gt 0 ]]; then
+                local first=true
+                for entry in "${uninstalled[@]}"; do
+                    if [[ "$first" == "true" ]]; then
+                        first=false
+                        printf '\n'
+                    else
+                        printf ',\n'
+                    fi
+                    printf '    {\n'
+                    printf '      "path": "%s"\n' "$entry"
+                    printf '    }'
+                done
+                printf '\n  '
+            fi
             printf ']\n'
             printf '}\n'
             ;;
@@ -941,6 +1009,9 @@ cmd_verify() {
             fi
             if [[ $marker_integrity_count -gt 0 ]]; then
                 echo -e "  MARKERS:   ${RED}$marker_integrity_count managed-block marker issue(s)${NC}"
+            fi
+            if [[ $uninstalled_count -gt 0 ]]; then
+                echo -e "  UNINSTALLED: ${RED}$uninstalled_count installed_files entries name no file${NC}"
             fi
 
             if [[ $modified_count -gt 0 ]]; then
@@ -976,11 +1047,21 @@ cmd_verify() {
                 done
             fi
 
+            if [[ $uninstalled_count -gt 0 ]]; then
+                echo ""
+                echo "install-metadata.json entries with no file (Loom-shipped paths, absent on disk):"
+                local entry
+                for entry in "${uninstalled[@]}"; do
+                    echo -e "  ${RED}$entry${NC}"
+                done
+                echo "Fix: ./.loom/scripts/resync-installed.sh restores a file still shipped and prunes an entry retired upstream."
+            fi
+
             echo ""
             if [[ "$status" == "ok" ]]; then
                 echo -e "Status: ${GREEN}ALL FILES MATCH${NC}"
             else
-                echo -e "Status: ${RED}DRIFT DETECTED${NC} ($modified_count modified, $missing_count missing, $marker_integrity_count marker issue(s))"
+                echo -e "Status: ${RED}DRIFT DETECTED${NC} ($modified_count modified, $missing_count missing, $marker_integrity_count marker issue(s), $uninstalled_count uninstalled)"
             fi
             ;;
 
