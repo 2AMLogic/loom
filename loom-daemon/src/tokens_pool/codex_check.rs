@@ -790,7 +790,7 @@ fn apply_health_feedback(
                 if until <= now_epoch {
                     continue;
                 }
-                AvailabilityOutcome::Exhausted { until }
+                AvailabilityOutcome::Exhausted { until, observed_at }
             }
             None if snapshot.has_headroom_at(now) => AvailabilityOutcome::Available { observed_at },
             None => continue,

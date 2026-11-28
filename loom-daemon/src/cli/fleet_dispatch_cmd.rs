@@ -308,6 +308,10 @@ async fn serve(
         // #13942: every heartbeat answer publishes the captain's own pool
         // probe, so fleet workers converge on one probe result.
         .with_token_probe(crate::tokens_pool::paths::resolve_tokens_dir(&root))
+        // #15091: the captain's own Codex holds ride the same answer, merged
+        // with what workers report upward, so a hold learned on any host
+        // blocks the account fleet-wide within one heartbeat.
+        .with_codex_health(root.clone())
         // #13943: and a `tokens refresh --fleet` request makes the captain
         // produce that probe on demand instead of waiting for the next tick.
         .with_token_refresh(probe),

@@ -56,11 +56,22 @@ pub fn is_staging_name(name: &str) -> bool {
 /// # Errors
 /// Any I/O failure creating, writing, syncing or renaming the file.
 pub fn write_atomic(path: &Path, bytes: &[u8], opts: AtomicOpts) -> io::Result<()> {
-    let dir = match path.parent() {
-        Some(d) if !d.as_os_str().is_empty() => d,
-        _ => Path::new("."),
-    };
-    fs::create_dir_all(dir)?;
+    if let Some(dir) = path.parent() {
+        fs::create_dir_all(dir)?;
+    }
+    write_atomic_in_existing_dir(path, bytes, opts)
+}
+
+/// As [`write_atomic`], but a parent removed during an operation stays removed.
+pub(crate) fn write_atomic_in_existing_dir(
+    path: &Path,
+    bytes: &[u8],
+    opts: AtomicOpts,
+) -> io::Result<()> {
+    let dir = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
     let mut tmp = tempfile::Builder::new()
         .prefix(STAGING_PREFIX)
         .rand_bytes(STAGING_RAND_LEN)

@@ -2,7 +2,7 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-use super::super::test_server::TestServer;
+use super::super::test_server::{RegistryEnv, TestServer};
 use super::*;
 use serde_json::json;
 use serial_test::serial;
@@ -611,7 +611,7 @@ fn a_snapshot_on_the_heartbeat_answer_becomes_the_fleet_sidecar() {
     on_reaper_tick(root.path(), &[]);
     server.wait_for(proto::HEARTBEAT_PATH, 1);
 
-    // The answer is applied on the client's runtime thread; the sidecar
+    // The answer is applied asynchronously; the sidecar
     // appears within one heartbeat round-trip.
     let sidecar = root
         .path()
@@ -662,4 +662,251 @@ fn an_answer_without_the_snapshot_writes_nothing() {
             .exists(),
         "no snapshot on the wire, no sidecar on disk"
     );
+}
+
+// -----------------------------------------------------------------
+// #15091: the heartbeat's Codex-hold round trip — the worker reports
+// its holds upward and merges the fleet's back.
+// -----------------------------------------------------------------
+
+/// A captain that answers with one live Codex hold. The deadline is pinned
+/// past the wall now at answer time, the clock the merge weighs.
+fn hold_answering() -> TestServer {
+    TestServer::start(|path, _| match path {
+        proto::HEARTBEAT_PATH => {
+            let until = chrono::Utc::now().timestamp() + 3600;
+            (
+                200,
+                json!({
+                    "server_epoch": "e1",
+                    "grace": false,
+                    "codex_holds": [
+                        {"name": "agent-9", "reason": "plan_exhausted",
+                         "cooldown_until": until}
+                    ]
+                }),
+            )
+        }
+        _ => (200, json!({"server_epoch": "e1"})),
+    })
+}
+
+/// Poll `account-health.json` for `name`'s record, the client-side
+/// application's landing point.
+fn held_record(root: &Path, name: &str) -> Option<crate::tokens_pool::health::AccountHealth> {
+    crate::tokens_pool::health::account_health(
+        root,
+        &crate::tokens_pool::account_registry::AccountId {
+            provider: crate::tokens_pool::AccountProvider::Codex,
+            name: name.to_string(),
+        },
+    )
+    .unwrap()
+}
+
+/// A hold on the heartbeat answer lands in the worker's account-health
+/// within one round trip and blocks the account until its deadline
+/// (#15091 AC1).
+#[test]
+#[serial]
+fn a_hold_on_the_heartbeat_answer_lands_in_account_health() {
+    reset_for_test();
+    let root = rooted_pool();
+    let _registry = RegistryEnv::empty(root.path());
+    let server = hold_answering();
+    enable(root.path(), &server.url(), true);
+    note_capacity(1, &roles_ok(&BTreeSet::new()));
+    on_reaper_tick(root.path(), &[]);
+    server.wait_for(proto::HEARTBEAT_PATH, 1);
+
+    let mut seen = None;
+    for _ in 0..50 {
+        if let Some(entry) = held_record(root.path(), "agent-9") {
+            seen = Some(entry);
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let entry = seen.expect("the fleet hold never landed in account-health.json");
+    assert_eq!(entry.reason, crate::tokens_pool::health::HealthReason::PlanExhausted);
+    assert!(entry
+        .cooldown_until
+        .is_some_and(|until| until > now_epoch()));
+    assert_eq!(entry.signal_provenance, "fleet-heartbeat");
+    // The account-wide question every gate asks: blocked until the deadline.
+    assert!(!entry.is_eligible_at(now_epoch()));
+    assert!(entry.is_eligible_at(entry.cooldown_until.unwrap()));
+}
+
+/// An old captain's answer (no `codex_holds` field) writes nothing: worker
+/// behaviour with the field absent is byte-for-byte today's (#15091 AC3).
+#[test]
+#[serial]
+fn an_answer_without_holds_writes_nothing() {
+    reset_for_test();
+    let root = rooted_pool();
+    let _registry = RegistryEnv::empty(root.path());
+    let server = granting(); // answers carry no codex_holds field
+    enable(root.path(), &server.url(), true);
+    note_capacity(1, &roles_ok(&BTreeSet::new()));
+    on_reaper_tick(root.path(), &[]);
+    server.wait_for(proto::HEARTBEAT_PATH, 1);
+    std::thread::sleep(Duration::from_millis(200));
+    assert!(
+        !root
+            .path()
+            .join(".loom")
+            .join("account-health.json")
+            .exists(),
+        "no holds on the wire, no health entries on disk"
+    );
+}
+
+/// The wall-clock epoch now, the domain hold deadlines live in.
+fn now_epoch() -> u64 {
+    u64::try_from(chrono::Utc::now().timestamp()).unwrap_or(0)
+}
+
+/// The worker's own live holds ride the heartbeat upward (#15091): a host
+/// that learned an exhaustion tells the captain, an old captain just sees an
+/// unknown field.
+#[test]
+#[serial]
+fn the_workers_own_holds_ride_the_heartbeat() {
+    reset_for_test();
+    let root = rooted_pool();
+    let _registry = RegistryEnv::empty(root.path());
+    let server = granting();
+    enable(root.path(), &server.url(), true);
+    let until = now_epoch() + 7200;
+    crate::tokens_pool::health::record_terminal_for_class_with_reset_at(
+        root.path(),
+        &crate::tokens_pool::account_registry::AccountId {
+            provider: crate::tokens_pool::AccountProvider::Codex,
+            name: "agent-3".to_string(),
+        },
+        crate::tokens_pool::health::TerminalClassification::TokenExhausted,
+        None,
+        Some(until),
+        "adapter_v1",
+        now_epoch() - 60,
+    )
+    .unwrap();
+    note_capacity(1, &roles_ok(&BTreeSet::new()));
+    on_reaper_tick(root.path(), &[]);
+    let beats = server.wait_for(proto::HEARTBEAT_PATH, 1);
+    let holds = beats[0]["codex_holds"]
+        .as_array()
+        .expect("the holds ride upward");
+    assert_eq!(holds.len(), 1);
+    assert_eq!(holds[0]["name"], "agent-3");
+    assert_eq!(holds[0]["reason"], "plan_exhausted");
+    assert_eq!(holds[0]["cooldown_until"], json!(until));
+}
+
+/// The case production always runs (#15091): `host_root` is the daemon's own
+/// workspace — not a registered root — and the roots a draw reads
+/// `account-health.json` at are the registered ones. A received hold must
+/// reach those, and a hold learned there must ride upward.
+#[test]
+#[serial]
+fn holds_fan_out_over_registered_roots_not_the_host_root() {
+    reset_for_test();
+    let host = rooted_pool();
+    let ws_a = tempdir().unwrap();
+    let ws_b = tempdir().unwrap();
+    let reg_dir = tempdir().unwrap();
+    let reg_file = reg_dir.path().join("workspaces.json");
+    let mut registry = crate::workspace_registry::WorkspaceRegistry::default();
+    registry.add(ws_a.path(), None).unwrap();
+    registry.add(ws_b.path(), None).unwrap();
+    registry.save(&reg_file).unwrap();
+    let _registry = RegistryEnv::set(&reg_file);
+    set_host_root(host.path());
+
+    // Upward: a hold learned at a registered root is reported.
+    let until = now_epoch() + 7200;
+    crate::tokens_pool::health::record_terminal_for_class_with_reset_at(
+        ws_b.path(),
+        &crate::tokens_pool::account_registry::AccountId {
+            provider: crate::tokens_pool::AccountProvider::Codex,
+            name: "agent-3".to_string(),
+        },
+        crate::tokens_pool::health::TerminalClassification::TokenExhausted,
+        None,
+        Some(until),
+        "adapter_v1",
+        now_epoch() - 60,
+    )
+    .unwrap();
+
+    // Downward: the answer's hold lands in every registered root.
+    let server = hold_answering();
+    enable(host.path(), &server.url(), true);
+    let lock = crate::tokens_pool::locking::MkdirLock::acquire(
+        &ws_b.path().join(".loom/account-health.lock"),
+    )
+    .unwrap();
+    note_capacity(1, &roles_ok(&BTreeSet::new()));
+    on_reaper_tick(host.path(), &[]);
+    let beats = server.wait_for(proto::HEARTBEAT_PATH, 1);
+    assert_eq!(beats[0]["codex_holds"][0]["name"], "agent-3");
+
+    let wait_for_hold = |root: &Path| {
+        for _ in 0..100 {
+            if held_record(root, "agent-9").is_some() {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        panic!("fleet hold did not reach {}", root.display());
+    };
+    wait_for_hold(ws_a.path());
+    assert!(held_record(ws_b.path(), "agent-9").is_none());
+    let ack: AckResponse =
+        client::post_blocking(&server.url(), proto::RELEASE_PATH, &json!({})).unwrap();
+    assert_eq!(ack.server_epoch, "e1", "RPCs complete while the second workspace is locked");
+    drop(lock);
+    wait_for_hold(ws_b.path());
+    assert!(
+        held_record(host.path(), "agent-9").is_none(),
+        "the unregistered host root is not a root any draw reads"
+    );
+}
+
+#[test]
+#[serial]
+fn a_moved_registered_workspace_stays_missing_after_a_heartbeat_merge() {
+    use crate::tokens_pool::health::{
+        codex_health_roots, merge_codex_holds_across, CodexAccountHold,
+    };
+    use crate::workspace_registry::{filter_missing_roots, WorkspaceRegistry};
+
+    let host = tempdir().unwrap();
+    let old = host.path().join("registered");
+    std::fs::create_dir(&old).unwrap();
+    let mut registry = WorkspaceRegistry::default();
+    registry.add(&old, None).unwrap();
+    let file = host.path().join("workspaces.json");
+    registry.save(&file).unwrap();
+    let _env = RegistryEnv::set(&file);
+
+    let before_move = codex_health_roots(host.path());
+    std::fs::rename(&old, host.path().join("moved")).unwrap();
+    let after_move = codex_health_roots(host.path());
+    assert!(after_move.is_empty());
+    let holds = [CodexAccountHold {
+        name: "agent-9".into(),
+        reason: "plan_exhausted".into(),
+        cooldown_until: 1000,
+        learned_at: Some(100),
+    }];
+    // Even a tick which enumerated roots just before the move cannot recreate it.
+    assert_eq!(merge_codex_holds_across(&before_move, &holds, 101), 0);
+    assert!(!old.exists());
+    assert!(
+        filter_missing_roots(registry.effective_roots(host.path()), &mut Default::default())
+            .is_empty()
+    );
+    assert!(held_record(host.path(), "agent-9").is_none());
 }

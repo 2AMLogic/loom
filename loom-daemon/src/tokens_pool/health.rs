@@ -41,6 +41,20 @@
 //!   broken for every class, so the sticky-reauth arm swallows class-scoped
 //!   feedback exactly as it swallows every other terminal signal.
 //!
+//! # Fleet sharing (#15091)
+//!
+//! Codex exhaustion is learned per host: a host that newly seats the pool has
+//! no `account-health.json` entries, so every account reads as spawnable and
+//! the host pays the failed-dispatch cost the fleet already paid elsewhere.
+//! [`CodexAccountHold`] carries a host's live account-wide holds over the
+//! fleet-dispatch heartbeat — workers report theirs upward, the captain
+//! republishes the aggregate — and [`merge_codex_holds`] lands them in this
+//! file under the same never-narrows rule the module already holds: a remote
+//! deadline applies only when it is later than the local one, a local hold is
+//! never cleared or shortened, and a `ReauthRequired` entry is never touched.
+//! A reauth hold itself never rides the wire: it has no deadline, and the
+//! verification that releases it ([`clear_reauth`]) is a host-local fact.
+//!
 //! [`is_bad`]: super::bad_tokens::is_bad
 
 use crate::script_helpers::now_epoch_secs;
@@ -171,6 +185,8 @@ pub struct AccountHealth {
     pub provider: AccountProvider,
     pub name: String,
     pub reason: HealthReason,
+    /// Observation time of the evidence for the account-wide reason. A probe or
+    /// class-scoped update that leaves a live account-wide hold intact preserves it.
     pub updated_at: u64,
     pub signal_provenance: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -205,6 +221,10 @@ pub struct AccountHealth {
     /// the new reader.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub class_cooldowns: HashMap<String, u64>,
+    /// Most recent observation of plan headroom. Only plan-exhaustion
+    /// evidence can be superseded by this reading.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quota_released_at: Option<u64>,
 }
 
 impl AccountHealth {
@@ -213,6 +233,53 @@ impl AccountHealth {
             provider: self.provider,
             name: self.name.clone(),
         }
+    }
+
+    /// Merge a timed observation without shortening a live cooldown or refreshing
+    /// its evidence with an unrelated record's update time.
+    fn apply_timed_hold(
+        &mut self,
+        reason: HealthReason,
+        until: u64,
+        observed_at: Option<u64>,
+        provenance: &str,
+        now: u64,
+    ) -> bool {
+        let observed_at = observed_at.map(|at| at.min(now));
+        let learned = observed_at.unwrap_or(now);
+        if self.reason == HealthReason::ReauthRequired
+            || self.last_success.is_some_and(|at| at > learned)
+            || (reason == HealthReason::PlanExhausted
+                && self.quota_released_at.is_some_and(|at| at > learned))
+        {
+            return false;
+        }
+
+        let mut deadline = until;
+        let mut evidence = learned;
+        if let Some(held) = self.cooldown_until.filter(|held| *held > now) {
+            if self.reason == reason {
+                deadline = held.max(until);
+                // Legacy reports without a timestamp can establish or extend a
+                // hold. Replaying one gives no fresh confirmation.
+                evidence = if until > held {
+                    self.updated_at.max(learned)
+                } else {
+                    self.updated_at.max(observed_at.unwrap_or(0))
+                };
+                if (deadline, evidence) == (held, self.updated_at) {
+                    return false;
+                }
+            } else if (until, observed_at) <= (held, Some(self.updated_at)) {
+                return false;
+            }
+        }
+
+        self.reason = reason;
+        self.cooldown_until = Some(deadline);
+        self.updated_at = evidence;
+        self.signal_provenance = provenance.to_string();
+        true
     }
 
     /// Whether this account is usable **at all** at `now`.
@@ -456,7 +523,11 @@ fn read_state(workspace: &Path) -> Result<HealthFile> {
 fn write_state(workspace: &Path, state: &HealthFile) -> Result<()> {
     let path = state_path(workspace);
     let bytes = serde_json::to_vec_pretty(state)?;
-    crate::fs_util::write_atomic(&path, &bytes, crate::fs_util::AtomicOpts::default())?;
+    crate::fs_util::write_atomic_in_existing_dir(
+        &path,
+        &bytes,
+        crate::fs_util::AtomicOpts::default(),
+    )?;
     Ok(())
 }
 
@@ -657,12 +728,20 @@ pub fn record_terminal_for_class_with_reset_at(
                 last_success: None,
                 last_probe: None,
                 class_cooldowns: HashMap::new(),
+                quota_released_at: None,
             },
             |index| state.accounts.remove(index),
         );
         let mut entry = entry;
-        entry.updated_at = now;
-        entry.signal_provenance = provenance.to_string();
+        // Class credit feedback can update class_cooldowns without confirming
+        // the live account-wide hold that this record publishes.
+        let only_class = classification == TerminalClassification::ModelCreditsExhausted
+            && model_class.is_some()
+            && entry.cooldown_until.is_some_and(|until| until > now);
+        if !only_class {
+            entry.updated_at = now;
+            entry.signal_provenance = provenance.to_string();
+        }
         match classification {
             // Once authentication has expired, ordinary runtime feedback cannot
             // verify that credentials were repaired. Keep the hold sticky until
@@ -823,6 +902,7 @@ pub fn record_probe_at(
                 last_success: None,
                 last_probe: None,
                 class_cooldowns: HashMap::new(),
+                quota_released_at: None,
             },
             |index| state.accounts.remove(index),
         );
@@ -870,9 +950,9 @@ pub fn record_probe_at(
 /// evidence and must never reach this API.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AvailabilityOutcome {
-    /// The subscription is at (or over) its plan ceiling until `until`
-    /// (epoch seconds) — the instant the binding window rolls over.
-    Exhausted { until: u64 },
+    /// The reading taken at `observed_at` found the plan exhausted until the
+    /// binding window resets at `until`. Both times are epoch seconds.
+    Exhausted { until: u64, observed_at: u64 },
     /// The subscription measurably had headroom when the reading was taken at
     /// `observed_at` (epoch seconds).
     Available { observed_at: u64 },
@@ -887,7 +967,7 @@ pub enum AvailabilityEffect {
     /// A plan-exhaustion cooldown was released by a *newer* reading showing
     /// headroom.
     ClearedExhaustionHold,
-    /// Health already agreed with the reading; only the probe stamp moved.
+    /// The reading left the account-wide hold and its deadline unchanged.
     Unchanged,
 }
 
@@ -937,6 +1017,7 @@ pub fn record_availability_at(
                 last_success: None,
                 last_probe: None,
                 class_cooldowns: HashMap::new(),
+                quota_released_at: None,
             },
             |index| state.accounts.remove(index),
         );
@@ -945,21 +1026,24 @@ pub fn record_availability_at(
             AvailabilityEffect::Unchanged
         } else {
             match outcome {
-                AvailabilityOutcome::Exhausted { until } => {
-                    let deadline = entry.cooldown_until.map_or(until, |held| held.max(until));
-                    let changed = entry.reason != HealthReason::PlanExhausted
-                        || entry.cooldown_until != Some(deadline);
-                    entry.reason = HealthReason::PlanExhausted;
-                    entry.cooldown_until = Some(deadline);
-                    entry.updated_at = now;
-                    entry.signal_provenance = provenance.to_string();
-                    if changed {
+                AvailabilityOutcome::Exhausted { until, observed_at } => {
+                    let previous = (entry.reason, entry.cooldown_until);
+                    entry.apply_timed_hold(
+                        HealthReason::PlanExhausted,
+                        until,
+                        Some(observed_at),
+                        provenance,
+                        now,
+                    );
+                    if previous != (entry.reason, entry.cooldown_until) {
                         AvailabilityEffect::MarkedExhausted
                     } else {
                         AvailabilityEffect::Unchanged
                     }
                 }
                 AvailabilityOutcome::Available { observed_at } => {
+                    let observed_at = observed_at.min(now);
+                    entry.quota_released_at = entry.quota_released_at.max(Some(observed_at));
                     if entry.reason == HealthReason::PlanExhausted
                         && entry.cooldown_until.is_some()
                         && observed_at > entry.updated_at
@@ -1000,6 +1084,295 @@ pub fn clear_reauth(workspace: &Path, id: &AccountId, provenance: &str) -> Resul
         entry.updated_at = now_epoch_secs();
         entry.signal_provenance = provenance.to_string();
         Ok(())
+    })
+}
+
+// -----------------------------------------------------------------
+// #15091: the fleet heartbeat's Codex account holds
+// -----------------------------------------------------------------
+
+/// The `signal_provenance` a remotely learned hold records, so an operator
+/// reading `account-health.json` can tell a fleet-reported hold from a local
+/// dispatch failure (#15091).
+pub const FLEET_HOLD_PROVENANCE: &str = "fleet-heartbeat";
+
+/// The longest account name a fleet hold may carry (#15091). Account names
+/// are short (`a-z0-9-`); anything longer is a misbehaving peer, not a pool.
+const MAX_FLEET_HOLD_NAME_LEN: usize = 128;
+
+/// The most holds one [`merge_codex_holds`] applies, and the most the
+/// captain's aggregate keeps, per heartbeat and in total (#15091). A fleet
+/// pool has a handful of accounts; the bound exists so a hostile or buggy
+/// peer cannot grow the state file or the answer without limit.
+pub const MAX_FLEET_HOLDS: usize = 256;
+
+/// One Codex account-wide hold as it rides the fleet-dispatch heartbeat
+/// (#15091): exactly the account-wide fields of [`AccountHealth`] the wire
+/// needs — account name, reason, deadline. No credential material, and never
+/// a `ReauthRequired` (sticky, no deadline — see the module docs).
+///
+/// `reason` is a plain string, deliberately not a [`HealthReason`]: a later
+/// captain may know a reason this build does not, and an unknown reason must
+/// read as "ignore that hold", never as a malformed heartbeat (the
+/// mixed-version contract [`super::fleet_probe`] holds for `token_probe`).
+/// The vocabulary is the snake_case text [`HealthReason`] serializes to.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CodexAccountHold {
+    /// Account name (the health record's `name`).
+    pub name: String,
+    /// The hold's reason (`plan_exhausted`, `transient_failure`,
+    /// `session_limit`, `model_credits_exhausted`).
+    pub reason: String,
+    /// When the hold ends, Unix epoch seconds.
+    pub cooldown_until: u64,
+    /// When the originating host *learned* this hold (its record's
+    /// `updated_at`), Unix epoch seconds. A merge stamps this — not "now" —
+    /// into `updated_at` so `record_availability_at`'s "release requires
+    /// strictly newer evidence" guardrail still compares like quantities.
+    /// Absent from an old peer ⇒ the receiver falls back to `now`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub learned_at: Option<u64>,
+}
+
+/// The wire text of a reason a heartbeat may carry: the **timed,
+/// account-wide** holds only (#15091). `Healthy` is not a hold, and
+/// `ReauthRequired` is sticky and deadline-less — neither ever rides.
+fn timed_reason_wire(reason: HealthReason) -> Option<&'static str> {
+    match reason {
+        HealthReason::PlanExhausted => Some("plan_exhausted"),
+        HealthReason::TransientFailure => Some("transient_failure"),
+        HealthReason::SessionLimit => Some("session_limit"),
+        HealthReason::ModelCreditsExhausted => Some("model_credits_exhausted"),
+        HealthReason::Healthy | HealthReason::ReauthRequired => None,
+    }
+}
+
+/// The [`HealthReason`] a wire reason names, when it is one a merge applies.
+/// Unknown text — a newer peer's vocabulary — is `None`, i.e. ignored.
+fn timed_reason_of(wire: &str) -> Option<HealthReason> {
+    match wire {
+        "plan_exhausted" => Some(HealthReason::PlanExhausted),
+        "transient_failure" => Some(HealthReason::TransientFailure),
+        "session_limit" => Some(HealthReason::SessionLimit),
+        "model_credits_exhausted" => Some(HealthReason::ModelCreditsExhausted),
+        _ => None,
+    }
+}
+
+impl CodexAccountHold {
+    /// The one relay rule for two reports of the same account (#15091): the
+    /// later deadline wins wholesale (an earlier report never shortens a
+    /// later one); on an equal deadline the freshly learned report wins; and
+    /// reports of the same reason preserve its freshest observation. Evidence
+    /// of a different reason cannot refresh the winning hold.
+    #[must_use]
+    pub fn relayed(self, other: Self) -> Self {
+        let same_reason = self.reason == other.reason;
+        let learned_at = self.learned_at.max(other.learned_at);
+        let mut winner =
+            if (other.cooldown_until, other.learned_at) > (self.cooldown_until, self.learned_at) {
+                other
+            } else {
+                self
+            };
+        if same_reason {
+            winner.learned_at = learned_at;
+        }
+        winner
+    }
+
+    /// Whether this hold is one the wire may carry and a merge may apply at
+    /// `now`: a sane name, a timed reason, a deadline that is strictly in the
+    /// future and no further out than [`MAX_EXHAUSTION_RESET_HORIZON_SECS`].
+    ///
+    /// The horizon ceiling is the same #8539 judgement a locally recorded
+    /// reset horizon passes: a deadline months out is far more likely a
+    /// misparse than a real reset, and too *long* a hold idles a working
+    /// account with nothing scheduled to notice. An implausible remote hold
+    /// is dropped, not clamped — there is no trusted fact left to clamp to.
+    #[must_use]
+    pub fn is_carriable(&self, now: u64) -> bool {
+        !self.name.is_empty()
+            && self.name.len() <= MAX_FLEET_HOLD_NAME_LEN
+            && timed_reason_of(&self.reason).is_some()
+            && self.cooldown_until > now
+            && self.cooldown_until <= now.saturating_add(MAX_EXHAUSTION_RESET_HORIZON_SECS)
+    }
+}
+
+/// This workspace's live Codex account-wide holds, as a heartbeat reports
+/// them upward (#15091): every Codex record under a timed hold whose
+/// deadline has not passed, sorted by name for a stable wire order.
+///
+/// The wire vocabulary deliberately includes the short `transient_failure` /
+/// `session_limit` holds: their deadlines (`now + 60s` / `now + 30s`) normally
+/// expire before a heartbeat delivers them and are then dropped by
+/// [`CodexAccountHold::is_carriable`]; one that does land only propagates a
+/// host-local blip for under a minute.
+///
+/// `None` when there is nothing to report — the state file is unreadable
+/// (a read failure publishes nothing; the field is omitted, exactly what an
+/// old worker sends) or no hold is live. A `ReauthRequired` entry never
+/// rides (see [`CodexAccountHold`]).
+#[must_use]
+pub fn live_codex_holds(workspace: &Path, now: u64) -> Option<Vec<CodexAccountHold>> {
+    let state = read_state(workspace).ok()?;
+    let mut holds: Vec<CodexAccountHold> = state
+        .accounts
+        .into_iter()
+        .filter(|entry| entry.provider == AccountProvider::Codex)
+        .filter_map(|entry| {
+            let reason = timed_reason_wire(entry.reason)?;
+            let cooldown_until = entry.cooldown_until.filter(|until| *until > now)?;
+            Some(CodexAccountHold {
+                name: entry.name,
+                reason: reason.to_string(),
+                cooldown_until,
+                learned_at: Some(entry.updated_at),
+            })
+        })
+        .collect();
+    holds.sort_by(|a, b| a.name.cmp(&b.name));
+    (!holds.is_empty()).then_some(holds)
+}
+
+/// The workspace roots whose `account-health.json` a draw actually reads
+/// (#15091): the registered roots the role runner ticks, or `fallback` when
+/// the registry is empty or unreadable (the single-workspace shape).
+///
+/// `account-health.json` is per-workspace and every consumer reads it at the
+/// root it was handed, so a fleet hold must be applied to — and reported
+/// from — each of these, never the daemon's own (usually unregistered)
+/// host root.
+#[must_use]
+pub fn codex_health_roots(fallback: &Path) -> Vec<PathBuf> {
+    crate::workspace_registry::WorkspaceRegistry::load_default()
+        .unwrap_or_default()
+        .effective_roots(fallback)
+        .into_iter()
+        .filter(|root| root.is_dir())
+        .collect()
+}
+
+/// The union of [`live_codex_holds`] over `roots` (#15091): per account the
+/// later deadline wins, name-sorted; `None` when no root has a live hold.
+#[must_use]
+pub fn live_codex_holds_across(roots: &[PathBuf], now: u64) -> Option<Vec<CodexAccountHold>> {
+    let mut merged: std::collections::BTreeMap<String, CodexAccountHold> =
+        std::collections::BTreeMap::new();
+    for root in roots {
+        for hold in live_codex_holds(root, now).into_iter().flatten() {
+            let next = match merged.remove(&hold.name) {
+                Some(current) => current.relayed(hold),
+                None => hold,
+            };
+            merged.insert(next.name.clone(), next);
+        }
+    }
+    (!merged.is_empty()).then(|| merged.into_values().collect())
+}
+
+/// [`merge_codex_holds`] into every root of `roots`; returns the total applied.
+pub fn merge_codex_holds_across(roots: &[PathBuf], holds: &[CodexAccountHold], now: u64) -> usize {
+    roots
+        .iter()
+        .map(|root| merge_codex_holds(root, holds, now))
+        .sum()
+}
+
+/// Merge holds received on a heartbeat answer into this workspace's state
+/// (#15091), and return how many were applied.
+///
+/// **Never narrows** — the module's rule, applied to a remote fact:
+///
+/// * The later deadline wins. Equal deadlines prefer the newer observation.
+///   Same-reason evidence can refresh a hold without shortening it.
+/// * A local hold is never cleared or shortened; `class_cooldowns`,
+///   `last_success`, transient-failure counters and cursors are untouched.
+/// * A `ReauthRequired` entry is never touched — a remote timed hold never
+///   converts it, and reauth never rides the wire to be merged back.
+/// * A hold is stamped with when it was *learned* (`learned_at`, else
+///   `now`). A newer dispatch success supersedes any timed hold; newer
+///   measured headroom supersedes only a plan-exhaustion hold.
+/// * A hold that is expired, implausibly far out, or names an unknown
+///   reason is ignored, never an error.
+///
+/// Failures never propagate: a worker that cannot merge keeps its local
+/// evidence and retries on the next heartbeat (the same contract
+/// [`super::fleet_probe::apply_snapshot`] holds).
+pub fn merge_codex_holds(workspace: &Path, holds: &[CodexAccountHold], now: u64) -> usize {
+    let valid: Vec<&CodexAccountHold> = holds.iter().filter(|h| h.is_carriable(now)).collect();
+    if valid.is_empty() {
+        return 0;
+    }
+    let result = (|| -> Result<usize> {
+        // A registered checkout may have moved since the registry was read.
+        // Create only its state directory, never the workspace itself.
+        match fs::create_dir(workspace.join(".loom")) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+            Err(e) => return Err(e.into()),
+        }
+        let _lock = MkdirLock::acquire(&lock_path(workspace)).map_err(anyhow::Error::msg)?;
+        let mut state = read_state(workspace)?;
+        let mut applied = 0;
+        for hold in valid.iter().take(MAX_FLEET_HOLDS) {
+            let Some(reason) = timed_reason_of(&hold.reason) else {
+                continue;
+            };
+            let id = AccountId {
+                provider: AccountProvider::Codex,
+                name: hold.name.clone(),
+            };
+            // When the fact was learned, never in the future.
+            let learned = hold.learned_at.map_or(now, |at| at.min(now));
+            match state.accounts.iter().position(|entry| entry.id() == id) {
+                None => {
+                    state.accounts.push(AccountHealth {
+                        provider: AccountProvider::Codex,
+                        name: hold.name.clone(),
+                        reason,
+                        updated_at: learned,
+                        signal_provenance: FLEET_HOLD_PROVENANCE.to_string(),
+                        cooldown_until: Some(hold.cooldown_until),
+                        consecutive_transient_failures: 0,
+                        last_success: None,
+                        last_probe: None,
+                        class_cooldowns: HashMap::new(),
+                        quota_released_at: None,
+                    });
+                    applied += 1;
+                }
+                Some(index) => {
+                    let entry = &mut state.accounts[index];
+                    if entry.apply_timed_hold(
+                        reason,
+                        hold.cooldown_until,
+                        hold.learned_at,
+                        FLEET_HOLD_PROVENANCE,
+                        now,
+                    ) {
+                        applied += 1;
+                    }
+                }
+            }
+        }
+        if applied > 0 {
+            state
+                .accounts
+                .sort_by(|a, b| (a.provider as u8, &a.name).cmp(&(b.provider as u8, &b.name)));
+            write_state(workspace, &state)?;
+        }
+        Ok(applied)
+    })();
+    result.unwrap_or_else(|error| {
+        log::warn!(
+            "tokens_pool: could not merge the fleet's codex holds into {}: {error}; keeping \
+             local evidence",
+            state_path(workspace).display()
+        );
+        0
     })
 }
 
@@ -1160,6 +1533,7 @@ pub fn select_healthy_for_class_at(
             if entry.class_cooldowns.len() != expired
                 && entry.class_cooldowns.is_empty()
                 && entry.reason == HealthReason::ModelCreditsExhausted
+                && entry.cooldown_until.is_none_or(|until| until <= now)
             {
                 entry.reason = HealthReason::Healthy;
                 entry.updated_at = now;

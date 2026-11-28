@@ -161,6 +161,34 @@ fn serve(stream: TcpStream, handler: &Handler, seen: &Mutex<Vec<Recorded>>) {
     );
 }
 
+/// Points the workspace registry at `file` (default: a path that does not
+/// exist, i.e. an empty registry) for the guard's lifetime, so the Codex-hold
+/// fan-out (#15091) never reads the real `~/.loom/workspaces.json`. Callers
+/// must be `#[serial]`.
+pub(crate) struct RegistryEnv(Option<std::ffi::OsString>);
+
+impl RegistryEnv {
+    pub(crate) fn set(file: &std::path::Path) -> Self {
+        let prior = std::env::var_os(crate::workspace_registry::REGISTRY_PATH_ENV);
+        std::env::set_var(crate::workspace_registry::REGISTRY_PATH_ENV, file);
+        Self(prior)
+    }
+
+    /// An empty registry: the single-workspace fallback shape.
+    pub(crate) fn empty(dir: &std::path::Path) -> Self {
+        Self::set(&dir.join("no-workspaces.json"))
+    }
+}
+
+impl Drop for RegistryEnv {
+    fn drop(&mut self) {
+        match &self.0 {
+            Some(v) => std::env::set_var(crate::workspace_registry::REGISTRY_PATH_ENV, v),
+            None => std::env::remove_var(crate::workspace_registry::REGISTRY_PATH_ENV),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

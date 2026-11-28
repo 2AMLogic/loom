@@ -30,6 +30,7 @@ fn hb(host: &str, live: Vec<LiveStep>, free: u32) -> HeartbeatRequest {
         live,
         free_slots: free,
         roles_ok: ALL_ROLES.iter().map(|r| (*r).to_string()).collect(),
+        codex_holds: None,
     }
 }
 

@@ -64,6 +64,11 @@
 //! that, every later heartbeat would renew its steps and the captain would
 //! keep their items `held` fleet-wide until this daemon restarts: the
 //! captain's TTL backstop (spec §5.4, §6) only fires on rows nobody renews.
+//!
+//! The heartbeat also carries this host's live Codex account holds upward,
+//! and merges the fleet's back into `account-health.json` under a
+//! never-narrows rule (#15091) — same host-root resolution as the snapshot,
+//! same absent-field tolerance on an old peer.
 
 use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
@@ -488,7 +493,7 @@ fn send_detached_then<Req, Resp>(
     path: &str,
     body: Req,
     facts: CallFacts,
-    on_ok: impl FnOnce(&Resp) + Send + 'static,
+    on_ok: impl FnOnce(Resp) + Send + 'static,
 ) where
     Req: serde::Serialize + Send + Sync + 'static,
     Resp: serde::de::DeserializeOwned + Send + 'static + Epoch,
@@ -497,11 +502,11 @@ fn send_detached_then<Req, Resp>(
         let mut facts = CallFacts { latency, ..facts };
         match answer {
             Ok(resp) => {
-                on_ok(&resp);
-                observe(true, None);
                 facts.status = Some(200);
                 facts.result = client::RESULT_OK;
                 facts.server_epoch = Some(resp.epoch().to_string());
+                on_ok(resp);
+                observe(true, None);
             }
             Err(e) => {
                 observe(false, Some(&e));
@@ -691,6 +696,15 @@ pub(crate) fn local_role_holds(root: &Path, now: Instant) -> BTreeSet<&'static s
 /// nothing was ever granted.
 pub fn on_reaper_tick(root: &Path, live: &[(String, u32, StepRole, DateTime<Utc>)]) {
     let url = host_endpoint(root);
+    // #13942: the probe sidecar a heartbeat stores is a host-level fact, so
+    // it resolves from the daemon workspace (`host_root`) the same way the
+    // endpoint does, falling back to the ticking repo's root before one is
+    // named. (#15091: the Codex holds are NOT — `account-health.json` is
+    // per-workspace, so they fan out over the registered roots instead.)
+    let probe_root = state()
+        .host_root
+        .clone()
+        .unwrap_or_else(|| root.to_path_buf());
     let (vanished, heartbeat) = {
         let mut s = state();
         if url.is_none() && s.assignments.is_empty() && s.live_by_root.is_empty() {
@@ -749,6 +763,7 @@ pub fn on_reaper_tick(root: &Path, live: &[(String, u32, StepRole, DateTime<Utc>
                         .collect(),
                     free_slots: *free_slots,
                     roles_ok: roles_ok.clone(),
+                    codex_holds: None,
                 };
                 s.last_heartbeat = Some(now);
                 Some((url.clone(), request))
@@ -760,30 +775,47 @@ pub fn on_reaper_tick(root: &Path, live: &[(String, u32, StepRole, DateTime<Utc>
     for grant in &vanished {
         send_release(grant, "failed", None);
     }
-    if let Some((url, request)) = heartbeat {
+    if let Some((url, mut request)) = heartbeat {
+        // Read registered workspaces outside the worker state mutex.
+        let roots = crate::tokens_pool::health::codex_health_roots(&probe_root);
+        request.codex_holds = crate::tokens_pool::health::live_codex_holds_across(
+            &roots,
+            u64::try_from(Utc::now().timestamp()).unwrap_or(0),
+        );
         let facts = CallFacts {
             endpoint: proto::HEARTBEAT_PATH,
             ..CallFacts::default()
         };
-        // #13942: the pool the snapshot lands in is a host-level fact, so it
-        // resolves from the daemon workspace (`host_root`) the same way the
-        // endpoint does, falling back to the ticking repo's root before one
-        // is named.
-        let probe_root = state()
-            .host_root
-            .clone()
-            .unwrap_or_else(|| root.to_path_buf());
         send_detached_then::<_, HeartbeatResponse>(
             &url,
             proto::HEARTBEAT_PATH,
             request,
             facts,
             move |resp| {
-                let Some(snapshot) = &resp.token_probe else {
+                if resp.token_probe.is_none() && resp.codex_holds.is_none() {
                     return;
-                };
-                let dir = crate::tokens_pool::paths::resolve_tokens_dir(&probe_root);
-                crate::tokens_pool::fleet_probe::apply_snapshot(&dir, snapshot, Utc::now());
+                }
+                // Workspace lock acquisition and file syncs can take seconds.
+                // Keep the fleet client's single network thread available for RPCs.
+                tokio::task::spawn_blocking(move || {
+                    if let Some(snapshot) = &resp.token_probe {
+                        // Overlapping answers must compare and replace the host's
+                        // probe sidecar serially, so the freshest probe stays on disk.
+                        static SIDECAR_WRITE: Mutex<()> = Mutex::new(());
+                        let _guard = SIDECAR_WRITE
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        let dir = crate::tokens_pool::paths::resolve_tokens_dir(&probe_root);
+                        crate::tokens_pool::fleet_probe::apply_snapshot(&dir, snapshot, Utc::now());
+                    }
+                    if let Some(holds) = &resp.codex_holds {
+                        crate::tokens_pool::health::merge_codex_holds_across(
+                            &crate::tokens_pool::health::codex_health_roots(&probe_root),
+                            holds,
+                            u64::try_from(Utc::now().timestamp()).unwrap_or(0),
+                        );
+                    }
+                });
             },
         );
     }
