@@ -2564,13 +2564,19 @@ resync_agent_skills "$DEFAULTS_DIR/.agents/skills" "$WRITE_ROOT/.agents/skills"
 # to #5264, were never covered by this script's surface map — a fix to either
 # file landed on main but never reached an already-installed repo. Both are
 # single files (not directories), so resync_tree doesn't apply; sync_one
-# handles them directly, each gated on the destination already existing so a
-# consumer that never received the file (or deliberately removed it) is not
-# force-populated.
-if [[ -f "$WRITE_ROOT/.claude/README.md" ]]; then
+# handles them directly, each gated on BOTH the source and the destination
+# existing. The destination half keeps a consumer that never received the
+# file (or deliberately removed it) from being force-populated. The source
+# half (#15765) is the same gate the Biome-config and rate-card blocks below
+# use: once the file is retired from defaults/, the copy would fail and the
+# run would be reported PARTIAL (exit 1) with a "failed to copy" for a file
+# that remove_retired_files() then deletes anyway. Source gone is a clean
+# no-op here — a listed file is removed by the retirement pass below, and an
+# unlisted one is simply left alone.
+if [[ -f "$DEFAULTS_DIR/.claude/README.md" && -f "$WRITE_ROOT/.claude/README.md" ]]; then
     sync_one "$DEFAULTS_DIR/.claude/README.md" "$WRITE_ROOT/.claude/README.md" ".claude/README.md"
 fi
-if [[ -f "$WRITE_ROOT/.github/CONFIGURATION.md" ]]; then
+if [[ -f "$DEFAULTS_DIR/.github/CONFIGURATION.md" && -f "$WRITE_ROOT/.github/CONFIGURATION.md" ]]; then
     sync_one "$DEFAULTS_DIR/.github/CONFIGURATION.md" "$WRITE_ROOT/.github/CONFIGURATION.md" ".github/CONFIGURATION.md"
 fi
 

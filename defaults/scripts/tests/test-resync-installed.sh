@@ -56,6 +56,9 @@
 #       "removed" verb; --dry-run previews it (exit 2, "would remove") without
 #       deleting; .loom/resync-ignore can pin it against removal exactly like
 #       an update; a retired entry with no installed counterpart is a no-op
+#   (x2) the single-file consumer-install docs (#5264) with their defaults/
+#       source gone are not copied: listed -> a clean removal (exit 0, no
+#       "failed to copy", no PARTIAL REFRESH); unlisted -> left on disk (#15765)
 # Untracked-.loom/-path remedy classification (#5983, #6613):
 #   (y) an untracked-and-unignored path under a pure-copy surface
 #       (.loom/hooks|scripts|roles|docs|runtimes|bin/) that still exists under
@@ -2232,6 +2235,110 @@ if [[ $RC -eq 0 ]] && grep -q "Already in sync" <<<"$OUT"; then
     pass "(x) a retired entry with no installed counterpart is a silent no-op"
 else
     fail "(x) a retired entry with no installed counterpart was not a clean no-op (rc=$RC)"
+fi
+
+# The single-file consumer-install docs (#5264) reach the installed tree through
+# their own sync_one calls, not the scripts walk, so a RETIRED one exercises a
+# different path than retired-tool.sh above: on disk, no defaults/ counterpart.
+# The sync must not attempt the copy (#15765) -- before the source-exists gate
+# it printed "failed to copy" and reported PARTIAL REFRESH (exit 1) for a file
+# the retirement pass then removed anyway. The commit subject is a routine
+# install subject so the local-fix guard (#7864) does not mask the copy path.
+make_retired_single_file_docs_repo() { # <repo> ; writes NO retired list
+    rm -rf "$1"
+    mkdir -p "$1/defaults/scripts" "$1/.loom/scripts" "$1/.claude" "$1/.github"
+    git -C "$1" init -q
+    printf 'CLAUDE-README-OLD\n' > "$1/.claude/README.md"
+    printf 'CONFIGURATION-OLD\n' > "$1/.github/CONFIGURATION.md"
+    printf '{\n  "loom_version": "0.0.0",\n  "loom_commit": "old",\n  "install_date": "2020-01-01",\n  "loom_source": "%s",\n  "installed_files": []\n}\n' \
+        "$1" > "$1/.loom/install-metadata.json"
+    git -C "$1" add -A >/dev/null 2>&1
+    git -C "$1" commit -qm "chore: install Loom v0.0.0" >/dev/null 2>&1
+}
+
+# listed in defaults/.loom-retired.list -> a clean removal, nothing "failed".
+RETIRED_REPO4="$WORKDIR/retired-repo-single-file-docs"
+make_retired_single_file_docs_repo "$RETIRED_REPO4"
+printf '.claude/README.md\n.github/CONFIGURATION.md\n' > "$RETIRED_REPO4/defaults/.loom-retired.list"
+git -C "$RETIRED_REPO4" add -A >/dev/null 2>&1
+git -C "$RETIRED_REPO4" commit -qm "chore: retire the single-file docs" >/dev/null 2>&1
+
+# --dry-run: the plan names the removal only -- no "would update" for a file
+# whose source is gone (a plan that says both is self-contradictory).
+OUT="$(cd "$RETIRED_REPO4" && bash "$SCRIPT" --dry-run 2>&1)"
+RC=$?
+if [[ $RC -eq 2 ]] && grep -q "would remove.*\.claude/README\.md" <<<"$OUT" && grep -q "would remove.*\.github/CONFIGURATION\.md" <<<"$OUT"; then
+    pass "(#15765) --dry-run previews both retired single-file docs as 'would remove' (exit 2)"
+else
+    fail "(#15765) --dry-run did not preview both retired single-file docs (rc=$RC)"
+fi
+if ! grep -q "would update.*\.claude/README\.md" <<<"$OUT" && ! grep -q "would update.*\.github/CONFIGURATION\.md" <<<"$OUT"; then
+    pass "(#15765) --dry-run does not plan an update of a single-file doc whose source is gone"
+else
+    fail "(#15765) --dry-run planned an update of a retired single-file doc: $(grep "would update" <<<"$OUT")"
+fi
+if [[ -f "$RETIRED_REPO4/.claude/README.md" && -f "$RETIRED_REPO4/.github/CONFIGURATION.md" ]]; then
+    pass "(#15765) --dry-run left both single-file docs on disk"
+else
+    fail "(#15765) --dry-run deleted a single-file doc (preview only)"
+fi
+
+# apply: removed, exit 0, and not one "failed to copy" / PARTIAL REFRESH line.
+OUT="$(cd "$RETIRED_REPO4" && bash "$SCRIPT" 2>&1)"
+RC=$?
+if [[ $RC -eq 0 ]]; then
+    pass "(#15765) apply with a listed retired single-file doc exits 0"
+else
+    fail "(#15765) apply with a listed retired single-file doc did not exit 0 (got $RC)"
+fi
+if [[ ! -e "$RETIRED_REPO4/.claude/README.md" && ! -e "$RETIRED_REPO4/.github/CONFIGURATION.md" ]]; then
+    pass "(#15765) apply removed both retired single-file docs"
+else
+    fail "(#15765) apply left a retired single-file doc on disk"
+fi
+if grep -q "removed.*\.claude/README\.md" <<<"$OUT" && grep -q "removed.*\.github/CONFIGURATION\.md" <<<"$OUT"; then
+    pass "(#15765) apply reports both single-file docs with the 'removed' verb"
+else
+    fail "(#15765) apply did not report the single-file docs as removed (out=$OUT)"
+fi
+if ! grep -q "failed to copy" <<<"$OUT"; then
+    pass "(#15765) no spurious 'failed to copy' for a retired single-file doc"
+else
+    fail "(#15765) a retired single-file doc was reported as 'failed to copy': $(grep "failed to copy" <<<"$OUT")"
+fi
+if ! grep -q "PARTIAL REFRESH" <<<"$OUT"; then
+    pass "(#15765) a clean retirement is not reported as PARTIAL REFRESH"
+else
+    fail "(#15765) the run was reported as PARTIAL REFRESH: $(grep "PARTIAL REFRESH" <<<"$OUT")"
+fi
+
+# NOT listed -> the retirement pass never sees them; the sync walk must still
+# not attempt the copy, and the files are left exactly where they are.
+RETIRED_REPO5="$WORKDIR/retired-repo-single-file-docs-unlisted"
+make_retired_single_file_docs_repo "$RETIRED_REPO5"
+
+OUT="$(cd "$RETIRED_REPO5" && bash "$SCRIPT" 2>&1)"
+RC=$?
+if [[ $RC -eq 0 ]]; then
+    pass "(#15765) apply with an UNLISTED single-file doc whose source is gone exits 0"
+else
+    fail "(#15765) apply with an unlisted single-file doc did not exit 0 (got $RC)"
+fi
+if ! grep -q "failed to copy" <<<"$OUT"; then
+    pass "(#15765) no spurious 'failed to copy' for an unlisted single-file doc"
+else
+    fail "(#15765) an unlisted single-file doc was reported as 'failed to copy': $(grep "failed to copy" <<<"$OUT")"
+fi
+if ! grep -q "PARTIAL REFRESH" <<<"$OUT"; then
+    pass "(#15765) an unlisted single-file doc is not reported as PARTIAL REFRESH"
+else
+    fail "(#15765) the run was reported as PARTIAL REFRESH: $(grep "PARTIAL REFRESH" <<<"$OUT")"
+fi
+if [[ "$(cat "$RETIRED_REPO5/.claude/README.md" 2>/dev/null)" == "CLAUDE-README-OLD" && \
+      "$(cat "$RETIRED_REPO5/.github/CONFIGURATION.md" 2>/dev/null)" == "CONFIGURATION-OLD" ]]; then
+    pass "(#15765) an unlisted single-file doc is left on disk, untouched"
+else
+    fail "(#15765) an unlisted single-file doc was removed or modified"
 fi
 
 # --- (#5980) crash-detection marker -------------------------------------------
