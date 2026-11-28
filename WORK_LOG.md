@@ -18,6 +18,7 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 ### 2026-11-28
 
+- **Issue #15772** (closed): config-resolver.sh dies with jq E2BIG on Linux once defaults.json exceeds 128 KiB compact (MAX_ARG_STRLEN, not ARG_MAX)
 - **Issue #15762** (closed): config-resolver: jq --argjson dies with E2BIG (exit 126) when a config tier exceeds 128 KiB, blocking create-issue.sh entirely
 - **Issue #15760** (closed): resync: manifest prune skips retired .claude/commands/loom/* entries
 - **Issue #15759** (closed): config-resolver.sh dies with E2BIG when the host-wide defaults.json exceeds 128 KiB (create-issue.sh exits 126)
