@@ -104,18 +104,7 @@ fn command_substitution_strips_only_trailing_newlines() {
 /// working clone carrying the repo's own checker.
 mod stale_base {
     use super::*;
-    use std::process::Command;
-
-    fn sh(dir: &Path, args: &[&str]) -> String {
-        let out = Command::new("git")
-            .current_dir(dir)
-            .args(["-c", "user.email=t@example.com", "-c", "user.name=t"])
-            .args(args)
-            .output()
-            .expect("git runs");
-        assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
-        String::from_utf8_lossy(&out.stdout).trim().to_string()
-    }
+    use crate::test_git_helpers::run as git;
 
     fn write_manifest(w: &Path, version: &str, dep: &str) {
         std::fs::write(w.join("VERSION"), format!("{version}\n")).unwrap();
@@ -134,7 +123,7 @@ mod stale_base {
         let tmp = tempfile::tempdir().unwrap();
         let origin = tmp.path().join("origin.git");
         let w = tmp.path().join("w");
-        sh(
+        git(
             tmp.path(),
             &[
                 "init",
@@ -145,8 +134,8 @@ mod stale_base {
                 origin.to_str().unwrap(),
             ],
         );
-        sh(tmp.path(), &["clone", "-q", origin.to_str().unwrap(), w.to_str().unwrap()]);
-        sh(&w, &["checkout", "-q", "-b", "main"]);
+        git(tmp.path(), &["clone", "-q", origin.to_str().unwrap(), w.to_str().unwrap()]);
+        git(&w, &["checkout", "-q", "-b", "main"]);
         std::fs::create_dir_all(w.join("defaults/scripts")).unwrap();
         std::fs::create_dir_all(w.join("mcp-loom")).unwrap();
         let src = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -156,20 +145,20 @@ mod stale_base {
         std::fs::copy(&src, &dst).unwrap();
         std::fs::set_permissions(&dst, std::fs::Permissions::from_mode(0o755)).unwrap();
         write_manifest(&w, "1176", "1.0.0");
-        sh(&w, &["add", "-A"]);
-        sh(&w, &["commit", "-q", "-m", "base"]);
-        sh(&w, &["push", "-q", "origin", "main"]);
+        git(&w, &["add", "-A"]);
+        git(&w, &["commit", "-q", "-m", "base"]);
+        git(&w, &["push", "-q", "origin", "main"]);
 
-        sh(&w, &["checkout", "-q", "-b", "feat"]);
+        git(&w, &["checkout", "-q", "-b", "feat"]);
         edit(&w);
-        sh(&w, &["commit", "-q", "-am", "feat"]);
-        sh(&w, &["push", "-q", "origin", "feat"]);
-        let head = sh(&w, &["rev-parse", "feat"]);
+        git(&w, &["commit", "-q", "-am", "feat"]);
+        git(&w, &["push", "-q", "origin", "feat"]);
+        let head = git(&w, &["rev-parse", "feat"]);
 
-        sh(&w, &["checkout", "-q", "main"]);
+        git(&w, &["checkout", "-q", "main"]);
         write_manifest(&w, "1198", "1.0.0");
-        sh(&w, &["commit", "-q", "-am", "post-merge version bump"]);
-        sh(&w, &["push", "-q", "origin", "main"]);
+        git(&w, &["commit", "-q", "-am", "post-merge version bump"]);
+        git(&w, &["push", "-q", "origin", "main"]);
         (tmp, w, head)
     }
 
