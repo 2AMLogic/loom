@@ -1507,11 +1507,18 @@ fn landed_from_answer(a: crate::worktree_cli::branch_landed::Answer) -> cleanup:
 /// like the shell passes it replays (the bookkeeping wrapper is
 /// `FORGE_TYPE == github`-gated there); on another forge the reads fail and
 /// the pass stays idle.
+///
+/// The bookkeeping passes' own forge and shell I/O — the issue reads, the
+/// timeline, the commit messages, the helper writers and the close — is
+/// `post_merge_bookkeeping::SystemHost`, the same host the
+/// `merge-pr post-merge-bookkeeping` verb runs on (#15641), bound to this
+/// pass's `gh` and root by [`bookkeeping::SystemHost::for_merge_observation`].
 pub struct GhForge<'a> {
     gh_bin: &'a Path,
     root: &'a Path,
     nwo: Option<String>,
     commits: std::cell::RefCell<std::collections::HashMap<String, String>>,
+    bookkeeping: bookkeeping::SystemHost,
 }
 
 impl<'a> GhForge<'a> {
@@ -1522,6 +1529,7 @@ impl<'a> GhForge<'a> {
             root,
             nwo: None,
             commits: std::cell::RefCell::new(std::collections::HashMap::new()),
+            bookkeeping: bookkeeping::SystemHost::for_merge_observation(gh_bin, root),
         }
     }
 
@@ -1567,42 +1575,14 @@ impl Forge for GhForge<'_> {
     }
 
     fn read_issue(&self, repo: &str, issue: &str) -> String {
-        let path = format!("repos/{repo}/issues/{issue}");
-        let o = gh_call::output(
-            gh_call::read("merged_obs.issue_read", self.gh_bin, self.root).args(["api", &path]),
-        );
-        // `$(gh api … 2>/dev/null || echo '{}')`: on failure the error body
-        // is followed by `{}` — the shell capture this pass replays.
-        let mut s = match &o {
-            Ok(o) => String::from_utf8_lossy(&o.stdout).into_owned(),
-            Err(_) => String::new(),
-        };
-        if !matches!(&o, Ok(o) if o.status.success()) {
-            s.push_str("{}\n");
-        }
-        s.trim_end_matches('\n').to_string()
+        self.bookkeeping.read_issue(repo, issue)
     }
 
     fn commit_messages(&self, repo: &str, pr: &str) -> String {
         if let Some(hit) = self.commits.borrow().get(pr) {
             return hit.clone();
         }
-        let path = format!("repos/{repo}/pulls/{pr}/commits");
-        let msgs = self
-            .ok_json("merged_obs.commits", &["api", &path, "--paginate"])
-            .map(|raw| {
-                let mut msgs = Vec::new();
-                for doc in serde_json::Deserializer::from_str(&raw).into_iter::<Value>() {
-                    let Ok(Value::Array(items)) = doc else { break };
-                    for c in items {
-                        if let Some(m) = c.pointer("/commit/message").and_then(Value::as_str) {
-                            msgs.push(m.to_string());
-                        }
-                    }
-                }
-                msgs.join("\n")
-            })
-            .unwrap_or_default();
+        let msgs = self.bookkeeping.commit_messages(repo, pr);
         self.commits
             .borrow_mut()
             .insert(pr.to_string(), msgs.clone());
@@ -1610,19 +1590,7 @@ impl Forge for GhForge<'_> {
     }
 
     fn issue_kind(&self, repo: &str, issue: &str) -> String {
-        let path = format!("repos/{repo}/issues/{issue}");
-        let Some(raw) = self.ok_json("merged_obs.issue_kind", &["api", &path]) else {
-            return String::new();
-        };
-        match serde_json::from_str::<Value>(&raw) {
-            Ok(v) if v.get("pull_request").is_some() => "pr".to_string(),
-            Ok(v) => v
-                .get("state")
-                .and_then(Value::as_str)
-                .unwrap_or_default()
-                .to_string(),
-            Err(_) => String::new(),
-        }
+        self.bookkeeping.issue_kind(repo, issue)
     }
 
     fn close_targets(&self, repo: &str, pr: &str) -> Option<String> {
@@ -1678,8 +1646,7 @@ impl Forge for GhForge<'_> {
     }
 
     fn label_events(&self, repo: &str, issue: &str) -> Option<String> {
-        let path = format!("repos/{repo}/issues/{issue}/timeline?per_page=100");
-        self.ok_json("merged_obs.timeline", &["api", &path, "--paginate"])
+        self.bookkeeping.label_events(repo, issue)
     }
 
     fn merge_commit_message(&self, repo: &str, sha: &str) -> String {
@@ -1775,35 +1742,11 @@ impl Forge for GhForge<'_> {
     }
 
     fn helper(&self, func: &str, args: &[&str]) -> bool {
-        let lib = self.root.join(".loom/scripts/lib/forge-helpers.sh");
-        std::process::Command::new("bash")
-            .arg("-c")
-            .arg(r#"source "$1" || exit 127; shift; "$@""#)
-            .arg("_")
-            .arg(&lib)
-            .arg(func)
-            .args(args)
-            .current_dir(self.root)
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .is_ok_and(|s| s.success())
+        self.bookkeeping.helper(func, args)
     }
 
     fn close_issue(&self, repo: &str, issue: &str, comment: &str) -> bool {
-        gh_call::output(gh_call::write("merged_obs.issue_close", self.gh_bin, self.root).args([
-            "issue",
-            "close",
-            issue,
-            "--repo",
-            repo,
-            "--reason",
-            "completed",
-            "--comment",
-            comment,
-        ]))
-        .is_ok_and(|o| o.status.success())
+        self.bookkeeping.close_issue(repo, issue, comment)
     }
 
     fn add_label(&self, repo: &str, issue: &str, label: &str) -> bool {
