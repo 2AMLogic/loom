@@ -103,6 +103,13 @@ fn fixture(
     let inner = registry.config.gh_bin.clone().unwrap();
     let ws = crate::write_scope_test_support::WritableRoot::register_with_gh(root, &inner);
     registry.config.gh_bin = Some(ws.gh.clone());
+    // The registry is non-hermetic: a Judge step spawn is refused
+    // `workspace_commands_missing` without its command file (#12048).
+    let command = registry
+        .config
+        .role_command_path(crate::step_role::StepRole::Judge);
+    fs::create_dir_all(command.parent().unwrap()).unwrap();
+    fs::write(&command, "# Fixture Judge\n").unwrap();
     let defaults = Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .unwrap()

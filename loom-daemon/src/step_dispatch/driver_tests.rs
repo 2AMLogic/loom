@@ -215,6 +215,11 @@ esac
     config.journal_path = Some(root.join("sweeps.json"));
     config.outcomes_journal_path = Some(root.join("outcomes.jsonl"));
     config.outcome_telemetry_path = Some(root.join("outcomes-telemetry.jsonl"));
+    // The registry is non-hermetic: a Champion step spawn is refused
+    // `workspace_commands_missing` without its command file (#12048).
+    let command = config.role_command_path(crate::step_role::StepRole::ChampionMerge);
+    std::fs::create_dir_all(command.parent().unwrap()).unwrap();
+    std::fs::write(&command, "# Fixture Champion\n").unwrap();
     SweepRegistry::new(config)
 }
 

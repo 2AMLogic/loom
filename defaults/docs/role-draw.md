@@ -137,7 +137,7 @@ with the role draw's attempt.
 | Launch path | Drawn model |
 |---|---|
 | Role tick (role runner) | Pinned with `--model`, below only the runner's own override. |
-| Daemon stage step (`begin_step_spawn`): Curator, Judge, Doctor, Champion, **Builder** | Pinned with `--model`: the same draw → reconcile with the admitted runtime → refuse a provable runtime conflict (`model_runtime_mismatch`) path for every role. With no drawn model the role's own resolver (Builder: experiment/default) applies unchanged. |
+| Daemon stage step (`spawn_step_unlocked`): Curator, Judge, Doctor, Champion, **Builder** | Pinned with `--model`: the same draw → reconcile with the admitted runtime → refuse a provable runtime conflict (`model_runtime_mismatch`) path for every role. With no drawn model the role's own resolver (Builder: experiment/default) applies unchanged. |
 | Private Codex containment (step and role tick) | Account selection is made for the drawn candidate's model, and the launch uses that same model. A selection held for a different model is released and re-made, never reused. |
 | Issue sweep (`/loom:sweep` dispatch) | Draws the runtime and profile only; it uses its own model resolution and does not pin `/<model>` (`loom.role_draw.model_pinned` stays `false`). |
 | `worker run --role builder\|doctor` | Takes an explicit tap (runtime + profile) and passes no `--model`; a drawn `/<model>` is not applied. Inspected for #12748 and left unchanged: no current path needs it. |
