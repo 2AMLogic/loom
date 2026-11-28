@@ -287,6 +287,12 @@ pub mod host_status;
 /// single-sourced (#14861). Each pass owns its own instance — a shared
 /// timestamp would let one pass suppress the other two.
 pub(crate) mod host_wide_cooldown;
+/// The daemon's one bridge from synchronous code to async HTTP (#15661): the
+/// runtime that synchronous callers of its outbound HTTP clients (fleet
+/// dispatch, the forge mirror) spawn their requests onto, and the class those
+/// clients log a transport error under. It is only built and spawned onto,
+/// never entered with `block_on`.
+pub(crate) mod http_bridge;
 pub mod hyperparams;
 pub mod idle_exit;
 pub mod inflight;

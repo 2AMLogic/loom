@@ -443,20 +443,17 @@ fn a_daemon_still_open_for_writing_is_waited_for_not_broken_or_unknown() {
 
     let (started, releaser) = held_writer(&daemon, Duration::from_millis(30));
     crate::exec_test_support::reset_refused_execs();
-    assert_eq!(
-        Probe::default().probe(&daemon, "forge"),
-        Probed::Present,
-        "a busy daemon is waited for, not broken"
-    );
+    let probed = Probe::default().probe(&daemon, "forge");
+    let waited = started.elapsed();
     releaser.join().unwrap();
+    assert_eq!(probed, Probed::Present, "a busy daemon is waited for, not broken");
     assert!(
         crate::exec_test_support::take_refused_execs() >= 1,
         "the probe's exec was never refused, so no wait was exercised"
     );
     assert!(
-        started.elapsed() >= Duration::from_millis(30),
-        "the probe ran before its writer closed: {:?}",
-        started.elapsed()
+        waited >= Duration::from_millis(30),
+        "the probe ran before its writer closed: {waited:?}"
     );
 
     // `run` execs `git` before direction B reaches the given daemon, so this
@@ -466,16 +463,13 @@ fn a_daemon_still_open_for_writing_is_waited_for_not_broken_or_unknown() {
     let (started, releaser) = held_writer(&daemon, hold);
     crate::exec_test_support::reset_refused_execs();
     let report = run(&opts(repo.path(), "0.19.893", OldDaemon::Given(daemon))).unwrap();
+    let waited = started.elapsed();
     releaser.join().unwrap();
     assert!(
         crate::exec_test_support::take_refused_execs() >= 1,
         "the daemon was never refused: the preamble outlasted the hold, so no wait was exercised"
     );
-    assert!(
-        started.elapsed() >= hold,
-        "the daemon ran before its writer closed: {:?}",
-        started.elapsed()
-    );
+    assert!(waited >= hold, "the daemon ran before its writer closed: {waited:?}");
     assert!(report.violations.is_empty(), "{:?}", report.violations);
     assert!(
         report

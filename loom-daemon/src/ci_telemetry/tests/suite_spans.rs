@@ -440,7 +440,7 @@ fn a_hostile_record_is_capped_sanitized_and_vocabulary_bounded() {
     .to_string();
     let timings = suites::parse(&text, 1001).unwrap();
 
-    let target = suites::SuiteSpanTarget {
+    let target = crate::ci_telemetry::records::JobSpanTarget {
         repo: "fixture-org/alpha",
         visibility: crate::telemetry::RepoVisibility::Public,
         run_id: 1001,

@@ -952,14 +952,15 @@ fn a_publish_script_a_sibling_is_still_writing_is_waited_for() {
         .write(true)
         .open(dir.path().join(".loom/scripts/sweep-lease-publish.sh"))
         .unwrap();
+    let started = Instant::now();
     let releaser = std::thread::spawn(move || {
         std::thread::sleep(std::time::Duration::from_millis(30));
         drop(writer);
     });
 
     reset_refused_execs();
-    let started = Instant::now();
     let outcome = args(&dir).ensure(&in_session());
+    let waited = started.elapsed();
     releaser.join().unwrap();
 
     assert!(
@@ -967,9 +968,8 @@ fn a_publish_script_a_sibling_is_still_writing_is_waited_for() {
         "the publish script was never refused, so no wait was exercised"
     );
     assert!(
-        started.elapsed() >= std::time::Duration::from_millis(30),
-        "the script ran before its writer closed: {:?}",
-        started.elapsed()
+        waited >= std::time::Duration::from_millis(30),
+        "the script ran before its writer closed: {waited:?}"
     );
     assert!(
         matches!(&outcome, Outcome::Renewing { loop_pid: Some(pid), .. } if pid == "424242"),
