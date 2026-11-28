@@ -243,16 +243,40 @@ fn sum_diff_rows(rows: &[GitDiffRow]) -> (i64, i64) {
 #[must_use]
 fn normalize_diff_path(raw: &str) -> String {
     if let Some((head, new)) = raw.rsplit_once(" => ") {
-        if let Some(open) = head.rfind('{') {
-            if let Some(close) = head[open..].find('}') {
-                let prefix = &head[..open];
-                let suffix = &head[open + close + 1..];
-                return format!("{prefix}{new}{suffix}");
-            }
+        if let Some(path) = brace_form_post_image(head, new) {
+            return path;
         }
         return new.to_string();
     }
     raw.to_string()
+}
+
+/// The post-image path of the brace form git writes for a rename whose old
+/// and new path share a leading and/or trailing part, `pfx{a => b}sfx`, given
+/// the row's two halves around ` => `: `head` is `pfx{a` and `new` is `b}sfx`.
+///
+/// `None` when the pair is not that form, which a plain rename resembles when
+/// a file name itself holds a brace (`a{b.txt => c}d.txt`): git's braces sit
+/// on path-component boundaries, so the prefix is empty or ends in `/` and
+/// the suffix is empty or starts with `/`.
+fn brace_form_post_image(head: &str, new: &str) -> Option<String> {
+    let open = head.rfind('{')?;
+    let close = new.find('}')?;
+    let prefix = &head[..open];
+    let new_mid = &new[..close];
+    let suffix = &new[close + 1..];
+    if !(prefix.is_empty() || prefix.ends_with('/')) {
+        return None;
+    }
+    if !(suffix.is_empty() || suffix.starts_with('/')) {
+        return None;
+    }
+    if new_mid.is_empty() {
+        // `pfx{a => }sfx`: the prefix and the suffix share one slash.
+        let suffix = suffix.strip_prefix('/').unwrap_or(suffix);
+        return Some(format!("{prefix}{suffix}"));
+    }
+    Some(format!("{prefix}{new_mid}{suffix}"))
 }
 
 #[cfg(test)]
@@ -304,6 +328,78 @@ mod tests {
         git(dir.path(), &["add", "-A"]);
         git(dir.path(), &["commit", "-q", "-m", "feature work"]);
         dir
+    }
+
+    #[test]
+    #[parallel(loom_config_env)]
+    fn diff_rows_against_mainline_reports_the_post_image_path_of_a_rename() {
+        let dir = tempfile::tempdir().unwrap();
+        git(dir.path(), &["init", "-q", "--initial-branch=main"]);
+        // The production call runs a plain `git diff`, which reads the host
+        // config: pin rename detection so the row cannot turn into a
+        // delete/add pair on a host that disabled it.
+        git(dir.path(), &["config", "diff.renames", "true"]);
+        std::fs::create_dir_all(dir.path().join("src/loom_ui_alerts")).unwrap();
+        std::fs::write(dir.path().join("src/loom_ui_alerts/ledger.rs"), "pub fn ledger() {}\n")
+            .unwrap();
+        git(dir.path(), &["add", "-A"]);
+        git(dir.path(), &["commit", "-q", "-m", "seed"]);
+        git(dir.path(), &["checkout", "-q", "-b", "feature"]);
+        std::fs::create_dir_all(dir.path().join("src/alerts")).unwrap();
+        git(dir.path(), &["mv", "src/loom_ui_alerts/ledger.rs", "src/alerts/ledger.rs"]);
+        git(dir.path(), &["commit", "-q", "-m", "move the ledger"]);
+        // git prints the pure rename as `src/{loom_ui_alerts => alerts}/ledger.rs`.
+        let rows =
+            diff_rows_against_mainline(dir.path()).expect("bare `main` fallback must resolve");
+        assert_eq!(
+            rows,
+            vec![GitDiffRow {
+                added: 0,
+                deleted: 0,
+                path: "src/alerts/ledger.rs".to_string(),
+            }]
+        );
+    }
+
+    // --- normalize_diff_path ---
+
+    #[test]
+    fn normalize_diff_path_passes_a_plain_path_through() {
+        assert_eq!(normalize_diff_path("src/lib.rs"), "src/lib.rs");
+    }
+
+    #[test]
+    fn normalize_diff_path_keeps_the_new_side_of_a_plain_rename() {
+        assert_eq!(normalize_diff_path("old/name.rs => new/name.rs"), "new/name.rs");
+    }
+
+    #[test]
+    fn normalize_diff_path_reassembles_a_brace_form_rename() {
+        assert_eq!(normalize_diff_path("src/{a => b}/mod.rs"), "src/b/mod.rs");
+        assert_eq!(normalize_diff_path("{a => b}"), "b");
+        assert_eq!(normalize_diff_path("src/{top.txt => moved.txt}"), "src/moved.txt");
+    }
+
+    #[test]
+    fn normalize_diff_path_reassembles_this_repositorys_ledger_rename() {
+        // `git diff --numstat -M bd0efeb6f^ bd0efeb6f` in this repository.
+        assert_eq!(
+            normalize_diff_path("loom-daemon/src/{loom_ui_alerts => alerts}/ledger.rs"),
+            "loom-daemon/src/alerts/ledger.rs"
+        );
+    }
+
+    #[test]
+    fn normalize_diff_path_handles_an_empty_brace_side() {
+        assert_eq!(normalize_diff_path("src/{ => b}/mod.rs"), "src/b/mod.rs");
+        // The prefix and the suffix share the slash before `mod.rs`.
+        assert_eq!(normalize_diff_path("src/{a => }/mod.rs"), "src/mod.rs");
+    }
+
+    #[test]
+    fn normalize_diff_path_keeps_a_stray_brace_in_a_plain_rename() {
+        assert_eq!(normalize_diff_path("a{b}c.txt => d.txt"), "d.txt");
+        assert_eq!(normalize_diff_path("a{b.txt => c}d.txt"), "c}d.txt");
     }
 
     #[test]
