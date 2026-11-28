@@ -3316,23 +3316,34 @@ fn clean_log_files_with(
             continue;
         }
         let path = entry.path();
-        let Some(issue) = log_file_issue_number(&name) else {
-            if env.step_log_retention {
-                if let Some(item) = step_log_file_item(&name) {
-                    clean_step_log_file(&path, item, env, stats, dry_run);
-                }
+        // Issue-log precedence first; a step-log candidate only counts when
+        // the opt-in is enabled (a disabled gate contributes zero to the
+        // counters).
+        let (item, is_step_log) = if let Some(issue) = log_file_issue_number(&name) {
+            (issue, false)
+        } else if env.step_log_retention {
+            match step_log_file_item(&name) {
+                Some(item) => (item, true),
+                None => continue,
             }
+        } else {
             continue;
         };
 
-        if env.live_issues.contains(&issue) {
+        // Protections shared by both log types.
+        if env.live_issues.contains(&item) {
             println!("  Keeping log of in-flight sweep: {name}");
             stats.kept_log_files += 1;
             continue;
         }
-        if (env.checkpoint_exists)(issue) {
+        if (env.checkpoint_exists)(item) {
             println!("  Keeping log with a live checkpoint: {name}");
             stats.kept_log_files += 1;
+            continue;
+        }
+
+        if is_step_log {
+            clean_step_log_file(&path, &name, env, stats, dry_run);
             continue;
         }
 
@@ -3353,8 +3364,9 @@ fn clean_log_files_with(
 /// One archive-gated `step-<role>-<item>.log` candidate (#14177).
 ///
 /// Requires everything the issue-log branch above requires (no live sweep for
-/// the item, no `.loom/sweep-checkpoint/issue-<item>.json`, mtime past the
-/// retention window) PLUS the two archive-gate proofs, so a completed step's
+/// the item, no `.loom/sweep-checkpoint/issue-<item>.json` — both checked once
+/// by the caller before this runs — and mtime past the retention window) PLUS
+/// the two archive-gate proofs, so a completed step's
 /// durable outcome history can never be discarded before confirmed off-host
 /// archival:
 ///
@@ -3372,27 +3384,11 @@ fn clean_log_files_with(
 /// case means keep.
 fn clean_step_log_file(
     path: &Path,
-    item: u32,
+    name: &str,
     env: &LogRetentionEnv,
     stats: &mut CleanupStats,
     dry_run: bool,
 ) {
-    let name = path
-        .file_name()
-        .unwrap_or_default()
-        .to_string_lossy()
-        .to_string();
-
-    if env.live_issues.contains(&item) {
-        println!("  Keeping log of in-flight sweep: {name}");
-        stats.kept_log_files += 1;
-        return;
-    }
-    if (env.checkpoint_exists)(item) {
-        println!("  Keeping log with a live checkpoint: {name}");
-        stats.kept_log_files += 1;
-        return;
-    }
     let sidecar = archived_sidecar_path(path);
     if !sidecar.exists() {
         println!("  Keeping unarchived step log: {name}");
