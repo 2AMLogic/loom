@@ -8,53 +8,17 @@
 //! a stage has an unknown arrival and emits nothing.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::Mutex;
 
 use chrono::{DateTime, Utc};
 
-use super::queue::{DurableQueue, FanoutQueue, QueueSink};
 use crate::discovery::{RepoSnapshot, RepoStatus, TickSnapshot};
 use crate::telemetry::kinds::stage_entry::{
     EnteredAtSource, StageEntryRecord, STAGE_ENTRY_SCHEMA_VERSION, STAGE_LABELS,
 };
-use crate::telemetry::{RepoVisibility, TelemetryEnvelope, TelemetryRecord};
+use crate::telemetry::{RepoVisibility, TelemetryRecord};
 
-/// Offers `eta.stage_entry` envelopes, stamped with this daemon's host id, to
-/// the OTLP exporters' queues.
-#[derive(Clone)]
-pub struct StageEntrySink {
-    queue: Arc<dyn QueueSink>,
-    host_id: String,
-}
-
-impl StageEntrySink {
-    #[must_use]
-    pub fn new(queue: Arc<dyn QueueSink>, host_id: impl Into<String>) -> Self {
-        StageEntrySink {
-            queue,
-            host_id: host_id.into(),
-        }
-    }
-
-    pub fn push(&self, record: StageEntryRecord) {
-        self.queue.offer(TelemetryEnvelope::new(
-            self.host_id.clone(),
-            TelemetryRecord::StageEntry(record),
-        ));
-    }
-}
-
-static GLOBAL_SINK: OnceLock<StageEntrySink> = OnceLock::new();
 static TRACKER: Mutex<Option<ArrivalTracker>> = Mutex::new(None);
-
-/// Register the OTLP queues (called once from [`super::spawn_task`]). With no
-/// OTLP exporter nothing is registered and [`observe`] does no work.
-pub fn register_sink(otlp_queues: Vec<Arc<DurableQueue>>, host_id: &str) {
-    if otlp_queues.is_empty() {
-        return;
-    }
-    let _ = GLOBAL_SINK.set(StageEntrySink::new(Arc::new(FanoutQueue::new(otlp_queues)), host_id));
-}
 
 /// One arrival the diff found.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -130,7 +94,7 @@ impl ArrivalTracker {
 
 /// Emit this tick's arrivals. A no-op without the OTLP sink.
 pub fn observe(snapshot: &TickSnapshot) {
-    let Some(sink) = GLOBAL_SINK.get() else {
+    let Some(sink) = super::ops::global_ops_sink() else {
         return;
     };
     let now = Utc::now();
@@ -151,7 +115,7 @@ pub fn observe(snapshot: &TickSnapshot) {
         let visibility = crate::telemetry::visibility::cached_visibility(&repo.slug)
             .unwrap_or(RepoVisibility::Private);
         for a in arrivals {
-            sink.push(StageEntryRecord {
+            sink.emit_record(TelemetryRecord::StageEntry(StageEntryRecord {
                 schema_version: STAGE_ENTRY_SCHEMA_VERSION,
                 repo: repo.slug.clone(),
                 issue: a.issue,
@@ -160,7 +124,7 @@ pub fn observe(snapshot: &TickSnapshot) {
                 entered_at_source: a.source,
                 observed_at: now,
                 visibility,
-            });
+            }));
         }
     }
 }

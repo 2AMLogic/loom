@@ -1,6 +1,7 @@
 //! Pure builder and tracker tests for `dispatch_eligibility` (Issue #12790).
-//! `record`'s impure wrapper is exercised only for its early return (no OTLP
-//! sink is registered in this test binary), exactly like `ops::disposition`.
+//! `record`'s impure wrapper is exercised only for its early return, with the
+//! process-global ops sink pinned absent on the thread, exactly like
+//! `ops::disposition`.
 
 use chrono::{Duration, TimeZone, Utc};
 
@@ -262,7 +263,9 @@ fn build_record_maps_every_field() {
 
 #[test]
 fn record_without_a_sink_is_a_noop() {
-    // No sink registered in this binary: the wrapper returns before touching
-    // the tracker or the (absent) work-finder summary.
-    record();
+    // The sink is the process-global ops sink, which any test starting an OTLP
+    // exporter registers for the rest of the binary, so pin it absent on this
+    // thread: the wrapper returns before touching the tracker or the (absent)
+    // work-finder summary, whatever the test order.
+    crate::observability::ops::capture::without_global_sink(record);
 }
