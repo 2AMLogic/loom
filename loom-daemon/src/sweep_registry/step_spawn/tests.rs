@@ -1535,12 +1535,8 @@ if [[ "$1" == api && "$2" == */issues/12133 && "$*" == *'.pull_request != null'*
                 "https://github.com/rjwalters/loom",
             ],
         ] {
-            assert!(Command::new("git")
-                .current_dir(dir.path())
-                .args(args)
-                .status()
-                .unwrap()
-                .success());
+            let out = crate::test_git_helpers::git_out(dir.path(), args);
+            assert!(out.status.success());
         }
         builder_claim(&mut reg, MINE).unwrap();
         // The ordinary reaper restores the label before attempting the yield.

@@ -11,7 +11,6 @@ use crate::inflight::{self, ClaimOutcome, Registration};
 use crate::sweep_registry::test_support::*;
 use serial_test::serial;
 use std::path::Path;
-use std::process::Command;
 use std::time::Duration;
 use tempfile::tempdir;
 
@@ -35,12 +34,7 @@ fn claim_tree(store: &Path, command: &str, tree: &Path, pid: u32) {
 }
 
 fn git_stdout(wt: &Path, args: &[&str]) -> String {
-    let out = Command::new("git")
-        .arg("-C")
-        .arg(wt)
-        .args(args)
-        .output()
-        .unwrap();
+    let out = crate::test_git_helpers::git_out(wt, args);
     String::from_utf8_lossy(&out.stdout).to_string()
 }
 
@@ -189,12 +183,7 @@ fn a_performed_reset_leaves_a_recoverable_quarantine_stash() {
         .trim()
         .to_string();
     assert!(!sha.is_empty(), "the quarantine stash has a commit sha to log");
-    let applied = Command::new("git")
-        .arg("-C")
-        .arg(&wt)
-        .args(["stash", "apply", &sha])
-        .output()
-        .unwrap();
+    let applied = crate::test_git_helpers::git_out(&wt, &["stash", "apply", &sha]);
     assert!(
         applied.status.success(),
         "`git stash apply <sha>` must restore the discarded work: {}",
