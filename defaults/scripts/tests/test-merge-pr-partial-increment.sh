@@ -106,8 +106,11 @@ source "$HELPERS_DIR/lib/forge-helpers.sh"
 #      depends on.
 #      Stopping at the INVOCATION line keeps the top-level call out of the
 #      sourced file (we drive the guard explicitly from the tests).
-#   (The post-merge reset/reopen pass was a second span until #14905 retired it:
-#   it is the daemon's merge-observation pass now.)
+#   (The post-merge reset/reopen pass was a second span until #14905 retired
+#   it: it is the daemon's merge-observation pass now. On a host with no live
+#   daemon `_post_merge_follow_up` runs it inline (#15714) — driven end to
+#   end, with this same guard publishing the two facts it consumes, by
+#   test-merge-pr-no-daemon-reconcile.sh.)
 # The span contains only function definitions plus comments (harmless when
 # sourced).
 #
@@ -314,8 +317,8 @@ echo "Testing the post-merge partial-increment reset (RETIRED by #14905)..."
 # the shell wrapper against a stub gh; the same decisions are pinned below.
 retired "T1/T5/T6: Part of / Contributes to #N, open + loom:building -> swap to loom:issue + one comment (repo-scoped; case-insensitive; several refs)" \
     "a still-open partial-increment issue returns to the ready queue with an audit comment" \
-    "the wrapper that ran the reset is gone from merge-pr.sh; the stub-gh transcript cannot be produced by a script that no longer makes the calls" \
-    "partial_reset::tests::t1_open_and_building_swaps and post_merge_bookkeeping::tests::partial_reset_swaps_and_comments (decision + order), merge_observation_tests::an_open_partial_increment_is_swapped_and_commented_once (the daemon tick, one comment), and tests/merge_pr_partial_reset_differential.rs (Rust plan == frozen shell on the whole corpus)"
+    "the reset is no longer wired into merge-pr.sh's daemon path (#14905); the inline path a host with no live daemon takes (#15714) is driven end to end by test-merge-pr-no-daemon-reconcile.sh" \
+    "partial_reset::tests::t1_open_and_building_swaps and post_merge_bookkeeping::tests::partial_reset_swaps_and_comments (decision + order), merge_observation_tests::an_open_partial_increment_is_swapped_and_commented_once (the daemon tick, one comment), tests/merge_pr_partial_reset_differential.rs (Rust plan == frozen shell on the whole corpus), and test-merge-pr-no-daemon-reconcile.sh M1 (the inline one-shot against a stub gh: the same swap and comment)"
 retired "T2/T2b/T10: Closes/Fixes/Resolves #N is not a partial ref; a mixed body resets only the partial ref" \
     "the auto-close path is untouched and only declared partial increments are reset" \
     "same: no script-side call remains" \
@@ -926,18 +929,20 @@ echo ""
 echo "Testing the post-merge premature-close revert (RETIRED by #14905)..."
 retired "T18/T19/T20: conflicted + closed after the merge -> reopen, comment, then swap; open-before but unattributed -> warn only; closed before the merge -> untouched" \
     "only an issue THIS merge closed against its declared intent is reopened; a deliberate human close inside the window is never reverted" \
-    "the wrapper is gone; the daemon re-derives 'closed by THIS merge' from close events instead of reading script globals" \
-    "partial_reset::tests::t18_t27_conflicted_and_closed_reopens_then_swaps, t19_open_before_but_unattributed_warns_and_does_not_reopen, t3_t20_closed_and_untracked_is_a_logged_skip; merge_observation_tests::a_preventive_reopens_only_what_this_merge_closed (closed_by_merge verdicts)"
+    "the wrapper left merge-pr.sh's daemon path in #14905; the daemon re-derives 'closed by THIS merge' from close events instead of reading script globals, while the inline path a host with no live daemon takes (#15714) still consumes the guard's two globals" \
+    "partial_reset::tests::t18_t27_conflicted_and_closed_reopens_then_swaps, t19_open_before_but_unattributed_warns_and_does_not_reopen, t3_t20_closed_and_untracked_is_a_logged_skip; merge_observation_tests::a_preventive_reopens_only_what_this_merge_closed (closed_by_merge verdicts); test-merge-pr-no-daemon-reconcile.sh R1/R2 (the inline one-shot: reopen-then-swap, and the unattributed close left alone)"
 retired "T29/T30/T31(audit bodies)/T31b/T32: daemon-verb absent or off-protocol -> nothing mutated + manual remedy; a failed reopen stops the pass; comment bodies rendered by partial-comment; a held remainder swaps to loom:operator" \
     "the pass is fail-closed, stops after a failed reopen, posts the byte-frozen audit bodies, and honors loom:remainder-hold" \
-    "the 'daemon without the verb' wrapper warning is gone with the wrapper; the old-daemon case is now the advisory _warn_if_daemon_lacks_merge_observation (asserted in test-merge-pr-daemon-version-floor.sh)" \
-    "post_merge_bookkeeping::tests::partial_reset_stops_when_the_reopen_fails, partial_reset_failed_swap_warns_and_posts_no_comment, partial_reset_comment_failure_is_a_warning_after_the_swap; partial_reset::tests::a_marker_swaps_to_operator_and_quotes_the_reason, a_conflicted_close_with_a_marker_reopens_then_holds; merge_observation_tests::a_held_remainder_swaps_to_the_operator_label; tests/merge_pr_partial_comment_differential.rs (bodies byte-for-byte)"
+    "the 'daemon without the verb' wrapper warning left the daemon path with the wrapper; the old-daemon case is the advisory _warn_if_daemon_lacks_merge_observation (asserted in test-merge-pr-daemon-version-floor.sh), and on the inline no-daemon path (#15714) the warning itself is asserted again in test-merge-pr-no-daemon-reconcile.sh V1/V2" \
+    "post_merge_bookkeeping::tests::partial_reset_stops_when_the_reopen_fails, partial_reset_failed_swap_warns_and_posts_no_comment, partial_reset_comment_failure_is_a_warning_after_the_swap; partial_reset::tests::a_marker_swaps_to_operator_and_quotes_the_reason, a_conflicted_close_with_a_marker_reopens_then_holds; merge_observation_tests::a_held_remainder_swaps_to_the_operator_label; tests/merge_pr_partial_comment_differential.rs (bodies byte-for-byte); test-merge-pr-no-daemon-reconcile.sh V1/V2 (the inline path's own 'verb did not run' warning, merge unaffected, remedy named)"
 
 echo ""
 echo "Testing merge-pr.sh source guards..."
 src="$(cat "$MERGE_PR_SRC")"
 assert_not_contains "$src" "_reset_partial_increment_labels ||" \
   "merge-pr.sh no longer calls the retired post-merge partial-increment reset (#14905)"
+assert_contains "$src" "_post_merge_bookkeeping partial-reset || true" \
+  "merge-pr.sh runs the reset inline on a host with no live daemon (#15714); the daemon path is unchanged (#14905)"
 retired "merge-pr.sh's source contains the (Part of|Contributes to) alternation" \
     "the non-closing partial-increment vocabulary must not be silently narrowed or dropped by a refactor -- a dropped keyword means a declared partial increment is read as a plain close" \
     "the alternation is no longer in this file; it is a Rust pattern in loom-daemon/src/merge_pr/refs.rs, so no grep of merge-pr.sh can pass" \
