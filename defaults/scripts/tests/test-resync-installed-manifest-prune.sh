@@ -22,6 +22,13 @@
 #   - touching an install-once entry (.github/workflows/*) prunes a file
 #     resync does not own and cannot re-verify.
 #
+# Groups 5-7 (#15475) extend the same reconcile to the three copy surfaces
+# OUTSIDE the pure-copy classifier -- .claude/commands/loom/, .claude/agents/
+# and the marker-gated .agents/skills/ -- where a retirement used to remove
+# the file and keep the entry. The eligibility stays local to the prune: the
+# shared classifier also decides which tracked deletions the commit advice
+# stages, and a retired command's deletion must still be staged.
+#
 # Usage:
 #   ./.loom/scripts/tests/test-resync-installed-manifest-prune.sh
 
@@ -102,6 +109,149 @@ make_fixture() {
     git -C "$consumer" add -A >/dev/null 2>&1
     git -C "$consumer" commit -qm "chore: install Loom v0.19.100" >/dev/null 2>&1
     echo "$consumer"
+}
+
+# --- the copy surfaces outside .loom/ (#15475) --------------------------------
+#
+# resync also copies three surfaces the pure-copy classifier does not cover:
+# .claude/commands/loom/ and .claude/agents/ (resync_tree) and the
+# marker-gated .agents/skills/ (resync_agent_skills). A retirement there
+# removed the installed file and kept its manifest entry -- the #14012
+# over-claim, on the surfaces that classifier never reached. Each surface
+# retires by its own rule, so the layered fixture carries one stale entry per
+# rule next to every control that must NOT be pruned:
+#
+#   commands -- retired through defaults/.loom-retired.list
+#     .claude/commands/loom/loom-iteration.md   on disk (tracked), retired  -> removed + PRUNE
+#     .claude/commands/loom/loom-parent.md      already absent, retired     -> PRUNE
+#     .claude/commands/loom/shipped.md          absent, still shipped       -> restored, keep
+#     .claude/commands/loom/pinned.md           on disk, retired, pinned     -> keep
+#     .claude/commands/loom/linked.md           a symlink                    -> keep
+#   agents -- copied recursively, no retirement-list mapping
+#     .claude/agents/retired-agent.md           absent, gone upstream        -> PRUNE
+#     .claude/agents/shipped-missing.md         absent, still shipped        -> restored, keep
+#   skills -- retire_agent_skills(), ownership proven by the marker
+#     .agents/skills/loom-retired/SKILL.md      marked, no source            -> removed + PRUNE
+#     .agents/skills/loom-gone/SKILL.md         absent before the run        -> keep (*)
+#     .agents/skills/loom-detached/SKILL.md     no marker                    -> keep
+#     .agents/skills/loom-pinned/SKILL.md       marked, pinned               -> keep
+#     .agents/skills/loom-linkfile/SKILL.md     a symlink                    -> keep
+#     .agents/skills/custom/SKILL.md             marked, but not a loom-* dir -> keep
+#
+#   (*) Nothing proves a pre-absent skill entry was Loom's: the marker lived
+#       in the file, so only a removal this run is evidence.
+SKILL_MARK="<!-- loom-managed-skill -->"
+EXTRA_ENTRIES=(
+    ".claude/commands/loom/loom-iteration.md"
+    ".claude/commands/loom/loom-parent.md"
+    ".claude/commands/loom/shipped.md"
+    ".claude/commands/loom/pinned.md"
+    ".claude/commands/loom/linked.md"
+    ".claude/agents/retired-agent.md"
+    ".claude/agents/shipped-agent.md"
+    ".claude/agents/shipped-missing.md"
+    ".agents/skills/loom-foo/SKILL.md"
+    ".agents/skills/loom-retired/SKILL.md"
+    ".agents/skills/loom-gone/SKILL.md"
+    ".agents/skills/loom-detached/SKILL.md"
+    ".agents/skills/loom-pinned/SKILL.md"
+    ".agents/skills/loom-linkfile/SKILL.md"
+    ".agents/skills/custom/SKILL.md"
+)
+# What one apply run must leave in installed_files: the four entries
+# make_fixture() keeps, plus every control above.
+SURVIVORS=(
+    ".claude/commands/loom/shipped.md"
+    ".claude/commands/loom/pinned.md"
+    ".claude/commands/loom/linked.md"
+    ".claude/agents/shipped-agent.md"
+    ".claude/agents/shipped-missing.md"
+    ".agents/skills/loom-foo/SKILL.md"
+    ".agents/skills/loom-gone/SKILL.md"
+    ".agents/skills/loom-detached/SKILL.md"
+    ".agents/skills/loom-pinned/SKILL.md"
+    ".agents/skills/loom-linkfile/SKILL.md"
+    ".agents/skills/custom/SKILL.md"
+    ".github/workflows/x.yml"
+    ".loom/docs/pinned-doc.md"
+    ".loom/docs/restored-doc.md"
+    ".loom/hooks/keeper.sh"
+)
+# What it must drop: the two reported commands, the agent, the skill, and
+# make_fixture()'s own stale hook.
+STALE_ENTRIES=(
+    ".claude/commands/loom/loom-iteration.md"
+    ".claude/commands/loom/loom-parent.md"
+    ".claude/agents/retired-agent.md"
+    ".agents/skills/loom-retired/SKILL.md"
+    ".loom/hooks/retired.sh"
+)
+# The stale entries already absent before the run: for these the prune is the
+# only pending change, so a --dry-run has to preview each one.
+PENDING_PRUNES=(
+    ".claude/commands/loom/loom-parent.md"
+    ".claude/agents/retired-agent.md"
+    ".loom/hooks/retired.sh"
+)
+SURVIVORS_SORTED="$(printf '%s\n' "${SURVIVORS[@]}" | sort)"
+STALE_SORTED="$(printf '%s\n' "${STALE_ENTRIES[@]}" | sort)"
+
+# add_extra_surfaces <consumer>
+#   Layers the three surfaces onto a make_fixture() consumer (its source
+#   checkout is read back from the sidecar make_fixture() wrote) and amends
+#   the install commit, so the tree starts clean and the retired command is a
+#   TRACKED file -- the deletion the commit advice has to stage.
+add_extra_surfaces() {
+    local consumer="$1" src cmd ag sk
+    src="$(cat "$consumer/.loom/loom-source-path")"
+    cmd="$consumer/.claude/commands/loom"
+    ag="$consumer/.claude/agents"
+    sk="$consumer/.agents/skills"
+
+    mkdir -p "$src/defaults/.claude/commands/loom" "$src/defaults/.claude/agents" \
+             "$src/defaults/.agents/skills/loom-foo"
+    printf 'SHIPPED\n' > "$src/defaults/.claude/commands/loom/shipped.md"
+    printf 'SHIPPED\n' > "$src/defaults/.claude/agents/shipped-agent.md"
+    printf 'SHIPPED\n' > "$src/defaults/.claude/agents/shipped-missing.md"
+    printf -- '---\n%s\nSHIPPED\n' "$SKILL_MARK" > "$src/defaults/.agents/skills/loom-foo/SKILL.md"
+    printf '%s\n' commands/loom/loom-iteration.md commands/loom/loom-parent.md \
+        commands/loom/pinned.md commands/loom/linked.md > "$src/defaults/.loom-retired.list"
+    git -C "$src" add -A >/dev/null 2>&1
+    git -C "$src" commit -qm "extra surfaces" >/dev/null 2>&1
+
+    mkdir -p "$cmd" "$ag" "$sk/loom-foo" "$sk/loom-retired" "$sk/loom-detached" \
+             "$sk/loom-pinned" "$sk/loom-linkfile" "$sk/custom"
+    printf 'ITERATION\n' > "$cmd/loom-iteration.md"
+    printf 'PINNED\n' > "$cmd/pinned.md"
+    ln -s ../../.claude/agents/shipped-agent.md "$cmd/linked.md"
+    printf 'SHIPPED\n' > "$ag/shipped-agent.md"
+    cp "$src/defaults/.agents/skills/loom-foo/SKILL.md" "$sk/loom-foo/SKILL.md"
+    printf -- '---\n%s\n' "$SKILL_MARK" > "$sk/loom-retired/SKILL.md"
+    printf 'mine\n' > "$sk/loom-detached/SKILL.md"
+    printf -- '---\n%s\n' "$SKILL_MARK" > "$sk/loom-pinned/SKILL.md"
+    ln -s "$sk/loom-retired/SKILL.md" "$sk/loom-linkfile/SKILL.md"
+    printf -- '---\n%s\n' "$SKILL_MARK" > "$sk/custom/SKILL.md"
+    printf '%s\n' commands/loom/pinned.md agents-skills/loom-pinned/SKILL.md >> "$consumer/.loom/resync-ignore"
+    jq --argjson extra "$(printf '%s\n' "${EXTRA_ENTRIES[@]}" | jq -R . | jq -s .)" \
+        '.installed_files += $extra' "$consumer/$META_REL" > "$consumer/$META_REL.extra"
+    mv "$consumer/$META_REL.extra" "$consumer/$META_REL"
+    git -C "$consumer" add -A >/dev/null 2>&1
+    git -C "$consumer" commit -q --amend -m "chore: install Loom v0.19.100" >/dev/null 2>&1
+}
+
+# listed_entries <repo>  -- installed_files, one per line, sorted
+listed_entries() {
+    jq -r '.installed_files[]' "$1/$META_REL" 2>/dev/null | sort
+}
+
+# prune_paths <resync output>  -- every manifest entry the run pruned, sorted
+prune_paths() {
+    sed -n 's/^  .*pruned[^ ]* *manifest entry \([^ ]*\).*/\1/p' <<<"$1" | sort
+}
+
+# would_prune_paths <resync output>  -- the --dry-run counterpart
+would_prune_paths() {
+    sed -n 's/^  .*would prune[^ ]* manifest entry \([^ ]*\).*/\1/p' <<<"$1" | sort
 }
 
 # --- (1) the prune itself -----------------------------------------------------
@@ -218,6 +368,170 @@ if ! has_entry "$REPO4" ".loom/hooks/retired.sh" && [[ "$(entry_count "$REPO4")"
     pass "(#14012) the apply dropped exactly the previewed entry"
 else
     fail "(#14012) the apply did not drop exactly the previewed entry"
+fi
+
+# --- (5) the copy surfaces outside .loom/: one apply run ----------------------
+echo ""
+echo "Test group 5: one apply run reconciles retired commands, agents and generated skills, and keeps every control (#15475)"
+REPO5="$(make_fixture extra-apply)"
+add_extra_surfaces "$REPO5"
+OUT5="$(cd "$REPO5" && bash "$SCRIPT" 2>&1)"
+RC5=$?
+if [[ $RC5 -eq 0 ]]; then
+    pass "(#15475) the resync run exits 0"
+else
+    fail "(#15475) the resync run exited $RC5 (out=$OUT5)"
+fi
+# Both reported entries go in ONE run: one deletes the retired command, the
+# other only finds it already absent.
+if [[ ! -e "$REPO5/.claude/commands/loom/loom-iteration.md" ]] \
+   && grep -q "removed.*commands/loom/loom-iteration\.md" <<<"$OUT5"; then
+    pass "(#15475) the retired command still on disk is removed and reported"
+else
+    fail "(#15475) the retired command on disk was not removed (out=$OUT5)"
+fi
+if [[ "$(prune_paths "$OUT5")" == "$STALE_SORTED" ]]; then
+    pass "(#15475) the run prunes exactly the stale command, agent and skill entries"
+else
+    fail "(#15475) pruned entries are: $(prune_paths "$OUT5" | tr '\n' ' ')"
+fi
+if [[ "$(listed_entries "$REPO5")" == "$SURVIVORS_SORTED" ]]; then
+    pass "(#15475) installed_files is exactly the survivor list"
+else
+    fail "(#15475) installed_files differs: $(diff <(printf '%s\n' "$SURVIVORS_SORTED") <(listed_entries "$REPO5") | tr '\n' ' ')"
+fi
+# A still-shipped file missing locally is a copy gap, not a retirement: the
+# walk restores it before the prune runs, and the entry stays.
+if [[ "$(cat "$REPO5/.claude/commands/loom/shipped.md" 2>/dev/null)" == "SHIPPED" \
+      && "$(cat "$REPO5/.claude/agents/shipped-missing.md" 2>/dev/null)" == "SHIPPED" ]]; then
+    pass "(#15475) a still-shipped command and agent missing locally are restored, not pruned"
+else
+    fail "(#15475) a still-shipped file missing locally was not restored (out=$OUT5)"
+fi
+if [[ "$(cat "$REPO5/.claude/commands/loom/pinned.md" 2>/dev/null)" == "PINNED" \
+      && -L "$REPO5/.claude/commands/loom/linked.md" ]]; then
+    pass "(#15475) a pinned and a symlinked retired command are left in place"
+else
+    fail "(#15475) a pinned or symlinked retired command was removed (out=$OUT5)"
+fi
+# Generated skills: the marker-aware retirement pass is the only ownership
+# evidence, so the removal and the prune travel together.
+if [[ ! -e "$REPO5/.agents/skills/loom-retired" ]] \
+   && grep -q "removed.*agents-skills/loom-retired/SKILL\.md.*retired generated skill" <<<"$OUT5"; then
+    pass "(#15475) a marked retired skill is removed together with its now-empty dir"
+else
+    fail "(#15475) the marked retired skill was not removed (out=$OUT5)"
+fi
+if [[ "$(cat "$REPO5/.agents/skills/loom-detached/SKILL.md" 2>/dev/null)" == "mine" \
+      && -f "$REPO5/.agents/skills/loom-pinned/SKILL.md" \
+      && -L "$REPO5/.agents/skills/loom-linkfile/SKILL.md" \
+      && -f "$REPO5/.agents/skills/custom/SKILL.md" ]]; then
+    pass "(#15475) a detached, pinned, symlinked and non-loom-* skill are left in place"
+else
+    fail "(#15475) a skill the retirement pass does not own was removed (out=$OUT5)"
+fi
+if has_entry "$REPO5" ".agents/skills/loom-gone/SKILL.md"; then
+    pass "(#15475) a skill entry already absent before the run is kept: no marker is left to prove it was Loom's"
+else
+    fail "(#15475) a pre-absent skill entry was pruned without ownership evidence"
+fi
+
+# --- (6) preview, apply, and a second apply on those surfaces -----------------
+echo ""
+echo "Test group 6: --dry-run previews the reconcile and changes nothing, the apply matches it, a second apply is a no-op (#15475)"
+REPO6="$(make_fixture extra-preview)"
+add_extra_surfaces "$REPO6"
+BEFORE6="$(cat "$REPO6/$META_REL")"
+OUT6="$(cd "$REPO6" && bash "$SCRIPT" --dry-run 2>&1)"
+RC6=$?
+if [[ $RC6 -eq 2 ]]; then
+    pass "(#15475) a pending reconcile is drift: --dry-run exits 2"
+else
+    fail "(#15475) --dry-run exited $RC6, expected 2 (out=$OUT6)"
+fi
+if [[ "$(cat "$REPO6/$META_REL")" == "$BEFORE6" && -z "$(git -C "$REPO6" status --porcelain)" ]]; then
+    pass "(#15475) --dry-run leaves the manifest and the whole tree byte-identical"
+else
+    fail "(#15475) --dry-run modified the tree: $(git -C "$REPO6" status --porcelain | tr '\n' ' ')"
+fi
+# Entries already absent before the run: the prune is the ONLY change pending
+# for them, so the preview has to announce each one.
+PREVIEW6="$(would_prune_paths "$OUT6")"
+pending_seen=0
+for entry in "${PENDING_PRUNES[@]}"; do
+    grep -qxF -- "$entry" <<<"$PREVIEW6" && pending_seen=$((pending_seen + 1))
+done
+if [[ "$pending_seen" -eq "${#PENDING_PRUNES[@]}" ]]; then
+    pass "(#15475) --dry-run previews the prune of every entry already absent before the run"
+else
+    fail "(#15475) --dry-run would prune: $(tr '\n' ' ' <<<"$PREVIEW6") (out=$OUT6)"
+fi
+if grep -q "would remove.*commands/loom/loom-iteration\.md" <<<"$OUT6" \
+   && grep -q "would remove.*agents-skills/loom-retired/SKILL\.md" <<<"$OUT6"; then
+    pass "(#15475) --dry-run previews both file removals"
+else
+    fail "(#15475) --dry-run did not preview the removals (out=$OUT6)"
+fi
+OUT6B="$(cd "$REPO6" && bash "$SCRIPT" 2>&1)"
+# Everything the preview named must land, and the apply must drop exactly the
+# stale set. The preview is not expected to name that whole set: an entry
+# whose file the run would remove is still on disk at prune time under
+# --dry-run (#15478).
+if [[ -z "$(comm -23 <(printf '%s\n' "$PREVIEW6") <(prune_paths "$OUT6B"))" \
+      && "$(prune_paths "$OUT6B")" == "$STALE_SORTED" ]]; then
+    pass "(#15475) the apply prunes everything the preview named, and exactly the stale set"
+else
+    fail "(#15475) preview='$(tr '\n' ' ' <<<"$PREVIEW6")' apply='$(prune_paths "$OUT6B" | tr '\n' ' ')'"
+fi
+if [[ "$(listed_entries "$REPO6")" == "$SURVIVORS_SORTED" \
+      && ! -e "$REPO6/.claude/commands/loom/loom-iteration.md" \
+      && ! -e "$REPO6/.agents/skills/loom-retired/SKILL.md" ]]; then
+    pass "(#15475) the apply lands it: the survivor list, with both files removed"
+else
+    fail "(#15475) the apply did not land what the preview described (out=$OUT6B)"
+fi
+BEFORE6B="$(cat "$REPO6/$META_REL")"
+OUT6C="$(cd "$REPO6" && bash "$SCRIPT" 2>&1)"
+if [[ "$(cat "$REPO6/$META_REL")" == "$BEFORE6B" && -z "$(prune_paths "$OUT6C")" ]] \
+   && ! grep -q "retired from defaults/, #5981\|retired generated skill" <<<"$OUT6C"; then
+    pass "(#15475) a second apply leaves the manifest byte-identical and removes nothing"
+else
+    fail "(#15475) a second apply was not a no-op (out=$OUT6C)"
+fi
+
+# --- (7) the commit advice keeps staging a tracked command deletion -----------
+#
+# collect_resync_dirt() sends a pure-copy-surface path whose defaults/
+# counterpart is gone to RESYNC_RETIRED_PATHS, which the advice never stages
+# (#6613). That is right for an unlisted orphan under .loom/ and wrong for a
+# retired command: its deletion IS resync output a consumer must commit. So
+# the new eligibility lives in the prune alone and never in the shared
+# classifier -- this pins that.
+echo ""
+echo "Test group 7: the --output commit advice still stages the tracked deletion of a retired command (#15475)"
+REPO7="$(make_fixture extra-staging)"
+add_extra_surfaces "$REPO7"
+STAGE7="$WORKDIR/extra-staging-output"
+OUT7="$(cd "$REPO7" && bash "$SCRIPT" --output "$STAGE7" 2>&1)"
+RC7=$?
+if [[ $RC7 -eq 0 ]]; then
+    pass "(#15475) the --output apply exits 0"
+else
+    fail "(#15475) the --output apply exited $RC7 (out=$OUT7)"
+fi
+if [[ -f "$REPO7/.claude/commands/loom/loom-iteration.md" && ! -e "$STAGE7/.claude/commands/loom/loom-iteration.md" ]]; then
+    pass "(#15475) the staged resync deleted the retired command in the staging worktree only"
+else
+    fail "(#15475) the staged deletion landed in the wrong tree (out=$OUT7)"
+fi
+# Every `git add --` recipe the run printed (bold/reset codes stripped), with
+# spaces around each path so the first and last are matched like the rest.
+RECIPES7="$(sed -e $'s/\033\\[[0-9;]*m//g' <<<"$OUT7" | grep -o 'git add -- .*' | tr '\n' ' ')"
+if [[ -n "$RECIPES7" ]] \
+   && grep -qF -- " .claude/commands/loom/loom-iteration.md " <<<" $RECIPES7 "; then
+    pass "(#15475) the staging recipe names the tracked command deletion"
+else
+    fail "(#15475) the staging recipe dropped the command deletion (recipe='$RECIPES7' out=$OUT7)"
 fi
 
 # --- summary -----------------------------------------------------------------
