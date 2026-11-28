@@ -3,10 +3,10 @@
 //!
 //! Every request has a short deadline ([`CALL_TIMEOUT`]), follows no
 //! redirect and uses no proxy (the server is on the tailnet). The calls run
-//! on a small runtime of their own, the same bridge the forge mirror client
-//! uses for its synchronous callers: it is only built and spawned onto, never
-//! entered with `block_on`, so a call is safe from any thread, inside a tokio
-//! runtime or not.
+//! on the daemon's shared HTTP bridge ([`crate::http_bridge`]), the one the
+//! forge mirror client uses for its synchronous callers too: it is only built
+//! and spawned onto, never entered with `block_on`, so a call is safe from
+//! any thread, inside a tokio runtime or not.
 //!
 //! A claim waits for its answer ([`post_blocking`]). `refuse`, `release` and
 //! the heartbeat do not ([`post_detached`]): the step path never waits on
@@ -19,6 +19,7 @@ use chrono::{DateTime, Utc};
 use serde::de::DeserializeOwned;
 use serde::Serialize;
 
+use crate::http_bridge::{self, BridgeError, TransportClass};
 use crate::step_role::StepRole;
 use crate::telemetry::trace::{SpanName, SpanRecord, SpanStatus, TraceAttributes, TraceContext};
 
@@ -75,9 +76,11 @@ impl std::fmt::Display for CallError {
     }
 }
 
+/// The client every call shares: no redirect, no proxy. It carries no timeout
+/// of its own — [`post`] bounds each request — so one client serves both
+/// [`CALL_TIMEOUT`] and [`PROBE_WAIT_TIMEOUT`].
 fn build_http() -> Result<reqwest::Client, String> {
     reqwest::Client::builder()
-        .timeout(CALL_TIMEOUT)
         .connect_timeout(CALL_TIMEOUT)
         .redirect(reqwest::redirect::Policy::none())
         .no_proxy()
@@ -85,34 +88,34 @@ fn build_http() -> Result<reqwest::Client, String> {
         .map_err(|e| format!("could not construct the fleet-dispatch HTTP client: {e}"))
 }
 
-fn runtime() -> Option<&'static (tokio::runtime::Runtime, reqwest::Client)> {
-    static RT: OnceLock<Option<(tokio::runtime::Runtime, reqwest::Client)>> = OnceLock::new();
-    RT.get_or_init(|| {
-        let rt = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(1)
-            .thread_name("loom-fleet-dispatch")
-            .enable_all()
-            .build()
-            .map_err(|e| log::warn!("fleet_dispatch: no runtime for the client ({e})"))
-            .ok()?;
-        let http = build_http()
+fn http() -> Option<&'static reqwest::Client> {
+    static HTTP: OnceLock<Option<reqwest::Client>> = OnceLock::new();
+    HTTP.get_or_init(|| {
+        build_http()
             .map_err(|e| log::warn!("fleet_dispatch: {e}"))
-            .ok()?;
-        Some((rt, http))
+            .ok()
     })
     .as_ref()
 }
 
-/// `POST <base><path>` with `body`, and parse the JSON answer.
+/// The error of a call the bridge could not take.
+fn no_runtime() -> CallError {
+    CallError::Transport(BridgeError::NoRuntime.to_string())
+}
+
+/// `POST <base><path>` with `body`, bounded by `timeout`, and parse the JSON
+/// answer.
 async fn post<Req: Serialize + ?Sized, Resp: DeserializeOwned>(
     http: &reqwest::Client,
     base: &str,
     path: &str,
     body: &Req,
+    timeout: Duration,
 ) -> Result<Resp, CallError> {
     let url = format!("{}{path}", base.trim_end_matches('/'));
     let res = http
         .post(url)
+        .timeout(timeout)
         .header(reqwest::header::ACCEPT, "application/json")
         .json(body)
         .send()
@@ -129,29 +132,36 @@ async fn post<Req: Serialize + ?Sized, Resp: DeserializeOwned>(
     serde_json::from_slice(&bytes).map_err(|e| CallError::Malformed(e.to_string()))
 }
 
-/// A transport error's class, never its URL.
+/// A transport error's class, never its URL. This client reads the answer as
+/// raw bytes, and reqwest reports a failed read of them as a decode error:
+/// for this client both are the answer's body.
 fn classify(e: &reqwest::Error) -> String {
-    if e.is_timeout() {
-        "timeout".into()
-    } else if e.is_connect() {
-        "connect".into()
-    } else if e.is_body() || e.is_decode() {
-        "body".into()
-    } else {
-        "request".into()
+    match http_bridge::classify_reqwest_error(e) {
+        TransportClass::Decode | TransportClass::Body => "body".to_owned(),
+        class => class.to_string(),
     }
 }
 
-/// Wait for `rx`, telling a multi-thread tokio runtime the worker is about
-/// to block; a current-thread runtime simply blocks, bounded by `deadline`.
-fn wait<T>(rx: &std::sync::mpsc::Receiver<T>, deadline: Duration) -> Option<T> {
-    let multi = tokio::runtime::Handle::try_current()
-        .is_ok_and(|h| h.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread);
-    if multi {
-        tokio::task::block_in_place(|| rx.recv_timeout(deadline).ok())
-    } else {
-        rx.recv_timeout(deadline).ok()
-    }
+/// [`post`] from synchronous code, bounded by `timeout` (plus a little)
+/// whatever the network does.
+fn post_blocking_bounded_by<Req, Resp>(
+    base: &str,
+    path: &str,
+    body: &Req,
+    timeout: Duration,
+) -> Result<Resp, CallError>
+where
+    Req: Serialize + Clone + Send + Sync + 'static,
+    Resp: DeserializeOwned + Send + 'static,
+{
+    let (http, base, path, body) = match http() {
+        Some(http) => (http.clone(), base.to_string(), path.to_string(), body.clone()),
+        None => return Err(no_runtime()),
+    };
+    http_bridge::run_blocking(timeout + Duration::from_millis(500), async move {
+        post::<Req, Resp>(&http, &base, &path, &body, timeout).await
+    })
+    .unwrap_or_else(|e| Err(CallError::Transport(e.to_string())))
 }
 
 /// [`post`] from synchronous code, bounded by [`CALL_TIMEOUT`] (plus a
@@ -165,20 +175,11 @@ where
     Req: Serialize + Clone + Send + Sync + 'static,
     Resp: DeserializeOwned + Send + 'static,
 {
-    let Some((rt, http)) = runtime() else {
-        return Err(CallError::Transport("no runtime".into()));
-    };
-    let (tx, rx) = std::sync::mpsc::sync_channel(1);
-    let (http, base, path, body) = (http.clone(), base.to_string(), path.to_string(), body.clone());
-    rt.spawn(async move {
-        let _ = tx.send(post::<Req, Resp>(&http, &base, &path, &body).await);
-    });
-    wait(&rx, CALL_TIMEOUT + Duration::from_millis(500))
-        .unwrap_or_else(|| Err(CallError::Transport("deadline".into())))
+    post_blocking_bounded_by(base, path, body, CALL_TIMEOUT)
 }
 
 /// [`post`] without waiting: `done` gets the answer and the call's latency
-/// on the client's runtime.
+/// on the bridge runtime.
 pub fn post_detached<Req, Resp>(
     base: &str,
     path: &str,
@@ -188,33 +189,16 @@ pub fn post_detached<Req, Resp>(
     Req: Serialize + Send + Sync + 'static,
     Resp: DeserializeOwned + Send + 'static,
 {
-    let Some((rt, http)) = runtime() else {
-        done(Err(CallError::Transport("no runtime".into())), Duration::ZERO);
+    let (Some(rt), Some(http)) = (http_bridge::runtime(), http()) else {
+        done(Err(no_runtime()), Duration::ZERO);
         return;
     };
     let (http, base, path) = (http.clone(), base.to_string(), path.to_string());
     rt.spawn(async move {
         let started = Instant::now();
-        let answer = post::<Req, Resp>(&http, &base, &path, &body).await;
+        let answer = post::<Req, Resp>(&http, &base, &path, &body, CALL_TIMEOUT).await;
         done(answer, started.elapsed());
     });
-}
-
-/// The probe-wait HTTP client ([`PROBE_WAIT_TIMEOUT`]), built once beside
-/// [`runtime`]'s own: the same no-redirect, no-proxy posture.
-fn probe_wait_http() -> Option<&'static reqwest::Client> {
-    static SLOW: OnceLock<Option<reqwest::Client>> = OnceLock::new();
-    SLOW.get_or_init(|| {
-        reqwest::Client::builder()
-            .timeout(PROBE_WAIT_TIMEOUT)
-            .connect_timeout(CALL_TIMEOUT)
-            .redirect(reqwest::redirect::Policy::none())
-            .no_proxy()
-            .build()
-            .map_err(|e| log::warn!("fleet_dispatch: no probe-wait client: {e}"))
-            .ok()
-    })
-    .as_ref()
 }
 
 /// [`post_blocking`] for a call whose answer legitimately arrives minutes
@@ -234,19 +218,7 @@ where
     Req: Serialize + Clone + Send + Sync + 'static,
     Resp: DeserializeOwned + Send + 'static,
 {
-    let Some((rt, _)) = runtime() else {
-        return Err(CallError::Transport("no runtime".into()));
-    };
-    let Some(http) = probe_wait_http() else {
-        return Err(CallError::Transport("no probe-wait client".into()));
-    };
-    let (tx, rx) = std::sync::mpsc::sync_channel(1);
-    let (http, base, path, body) = (http.clone(), base.to_string(), path.to_string(), body.clone());
-    rt.spawn(async move {
-        let _ = tx.send(post::<Req, Resp>(&http, &base, &path, &body).await);
-    });
-    wait(&rx, PROBE_WAIT_TIMEOUT + Duration::from_millis(500))
-        .unwrap_or_else(|| Err(CallError::Transport("deadline".into())))
+    post_blocking_bounded_by(base, path, body, PROBE_WAIT_TIMEOUT)
 }
 
 // ---------------------------------------------------------------------------
@@ -471,6 +443,62 @@ mod tests {
                 .unwrap();
         assert!(answer.probed_at.is_some(), "{answer:?}");
         assert!(!answer.coalesced);
+    }
+
+    /// A detached call has no bridge bound of its own to lean on: the
+    /// request's own [`CALL_TIMEOUT`] is what brings `done` its answer.
+    #[test]
+    fn a_detached_call_is_bounded_by_the_request_timeout() {
+        let silent = TestServer::silent();
+        let (tx, rx) = std::sync::mpsc::channel();
+        post_detached::<serde_json::Value, ClaimResponse>(
+            &silent.url(),
+            CLAIM_PATH,
+            json!({}),
+            move |answer, _latency| tx.send(answer.map(|_| ())).unwrap(),
+        );
+        let e = rx
+            .recv_timeout(CALL_TIMEOUT + Duration::from_secs(10))
+            .expect("the detached call never answered")
+            .unwrap_err();
+        assert_eq!(e, CallError::Transport("timeout".into()));
+    }
+
+    /// Answer one request with `raw` bytes, then close the connection.
+    fn answer_once(raw: &'static str) -> String {
+        use std::io::{Read, Write};
+        use std::net::Shutdown;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut head = Vec::new();
+            let mut b = [0u8; 1];
+            while !head.ends_with(b"\r\n\r\n") {
+                stream.read_exact(&mut b).unwrap();
+                head.push(b[0]);
+            }
+            let len: usize = String::from_utf8_lossy(&head)
+                .lines()
+                .find_map(|l| l.strip_prefix("content-length: "))
+                .map_or(0, |v| v.parse().unwrap());
+            let mut body = vec![0u8; len];
+            stream.read_exact(&mut body).unwrap();
+            stream.write_all(raw.as_bytes()).unwrap();
+            stream.shutdown(Shutdown::Write).unwrap();
+        });
+        format!("http://{addr}")
+    }
+
+    /// A `2xx` whose body stops short of its `Content-Length` is a failure
+    /// of the answer's body (never a malformed answer, never a `decode`).
+    #[test]
+    fn a_truncated_body_is_a_body_transport_error() {
+        let url = answer_once(
+            "HTTP/1.1 200 OK\r\nContent-Length: 100\r\nConnection: close\r\n\r\n{\"a\":1}",
+        );
+        let e = post_blocking::<_, ClaimResponse>(&url, CLAIM_PATH, &json!({})).unwrap_err();
+        assert_eq!(e, CallError::Transport("body".into()));
     }
 
     #[test]
