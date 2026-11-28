@@ -180,12 +180,7 @@ fn git_common_dir_is_absolute_even_though_git_answers_relatively() {
     let repo = tree.path();
     init_repo(repo);
 
-    let raw = Command::new("git")
-        .current_dir(repo)
-        .args(["rev-parse", "--git-common-dir"])
-        .output()
-        .expect("git runs");
-    let raw = String::from_utf8_lossy(&raw.stdout).trim().to_string();
+    let raw = git(repo, &["rev-parse", "--git-common-dir"]);
     assert!(
         !Path::new(&raw).is_absolute(),
         "precondition: git is expected to answer relatively at a repo root, got {raw:?}"
@@ -203,6 +198,7 @@ fn git_common_dir_is_none_outside_a_repo() {
     // A bare directory with no repo above it in the temp root. If the temp
     // root itself were inside a repo this would resolve, so assert the
     // precondition rather than the conclusion.
+    // Hand-rolled on purpose: it must see the ambient env production's git_common_dir inherits.
     let answered = Command::new("git")
         .current_dir(tree.path())
         .args(["rev-parse", "--git-common-dir"])
