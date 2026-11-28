@@ -1,6 +1,7 @@
 //! Tests for combined-PR candidate preparation (#9688, contract ADR-0023).
 
 use super::*;
+use crate::test_git_helpers::run;
 
 // --- Identity -----------------------------------------------------------
 
@@ -377,15 +378,7 @@ fn the_mapping_carries_the_rationale_for_the_independent_review() {
 
 /// A scratch repo with a base commit and two branch heads, via real `git`.
 fn fixture_repo(dir: &std::path::Path) -> (String, String, String) {
-    let git = |args: &[&str]| {
-        let out = std::process::Command::new("git")
-            .args(args)
-            .current_dir(dir)
-            .output()
-            .expect("git run");
-        assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
-        String::from_utf8_lossy(&out.stdout).trim().to_string()
-    };
+    let git = |args: &[&str]| run(dir, args);
     git(&["init", "-q", "-b", "main"]);
     git(&["config", "user.email", "t@t"]);
     git(&["config", "user.name", "t"]);
@@ -430,15 +423,7 @@ fn a_construction_conflict_aborts_naming_the_component() {
     let tmp = std::env::temp_dir().join(format!("conf-test-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&tmp);
     std::fs::create_dir_all(&tmp).unwrap();
-    let git = |args: &[&str]| {
-        let out = std::process::Command::new("git")
-            .args(args)
-            .current_dir(&tmp)
-            .output()
-            .unwrap();
-        assert!(out.status.success());
-        String::from_utf8_lossy(&out.stdout).trim().to_string()
-    };
+    let git = |args: &[&str]| run(&tmp, args);
     git(&["init", "-q", "-b", "main"]);
     git(&["config", "user.email", "t@t"]);
     git(&["config", "user.name", "t"]);
@@ -508,15 +493,7 @@ fn inclusion_verification_uses_real_ancestry() {
     let tmp = std::env::temp_dir().join(format!("incl-test-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&tmp);
     std::fs::create_dir_all(&tmp).unwrap();
-    let git = |args: &[&str]| {
-        let out = std::process::Command::new("git")
-            .args(args)
-            .current_dir(&tmp)
-            .output()
-            .unwrap();
-        assert!(out.status.success());
-        String::from_utf8_lossy(&out.stdout).trim().to_string()
-    };
+    let git = |args: &[&str]| run(&tmp, args);
     git(&["init", "-q", "-b", "main"]);
     git(&["config", "user.email", "t@t"]);
     git(&["config", "user.name", "t"]);

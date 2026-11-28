@@ -1,6 +1,7 @@
 use std::cell::RefCell;
 
 use super::*;
+use crate::test_git_helpers::run;
 
 fn attempt(ok: bool, output: &str) -> Attempt {
     Attempt {
@@ -144,29 +145,9 @@ fn a_real_worktree_is_removed_and_a_bogus_path_is_reported() {
     let tmp = tempfile::tempdir().unwrap();
     let repo = tmp.path().join("repo");
     std::fs::create_dir_all(&repo).unwrap();
-    let git = |args: &[&str]| {
-        let st = Command::new("git")
-            .arg("-C")
-            .arg(&repo)
-            .args(args)
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .unwrap();
-        assert!(st.success(), "git {args:?}");
-    };
+    let git = |args: &[&str]| run(&repo, args);
     git(&["init", "-q"]);
-    git(&[
-        "-c",
-        "user.email=t@e",
-        "-c",
-        "user.name=t",
-        "commit",
-        "-q",
-        "--allow-empty",
-        "-m",
-        "i",
-    ]);
+    git(&["commit", "-q", "--allow-empty", "-m", "i"]);
     let wt = tmp.path().join("wt one");
     git(&[
         "worktree",

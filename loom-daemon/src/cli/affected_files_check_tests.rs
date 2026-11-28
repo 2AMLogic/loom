@@ -1,7 +1,6 @@
 //! Tests for the `affected-files check` argument surface (issue #9400).
 
 use std::fs;
-use std::process::Command;
 
 use crate::work_finder::affected_files::check::{
     EXIT_CLEAR, EXIT_COULD_NOT_RUN, EXIT_UNCOMMITTED, EXIT_UNKNOWN,
@@ -38,23 +37,7 @@ fn fixture() -> tempfile::TempDir {
         &["add", "-A"],
         &["commit", "-q", "-m", "fixture"],
     ] {
-        let status = Command::new("git")
-            .arg("-C")
-            .arg(root)
-            .args([
-                "-c",
-                "user.name=Test",
-                "-c",
-                "user.email=test@example.com",
-                "-c",
-                "commit.gpgsign=false",
-                "-c",
-                "core.hooksPath=/dev/null",
-            ])
-            .args(args)
-            .status()
-            .unwrap();
-        assert!(status.success(), "git {args:?} failed");
+        crate::test_git_helpers::run(root, args);
     }
     fs::write(root.join("src/draft.rs"), "fn draft() {}\n").unwrap();
     dir

@@ -86,6 +86,7 @@ fn text_rendering_names_the_livelock() {
 /// Run git in `dir` with a fixed identity and committer/author time `at`.
 fn git(dir: &std::path::Path, at: DateTime<Utc>, args: &[&str]) -> String {
     let date = at.to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    // Hand-rolled on purpose: per-call GIT_*_DATE is the timing under test; git_out takes no env.
     let out = std::process::Command::new("git")
         .arg("-C")
         .arg(dir)

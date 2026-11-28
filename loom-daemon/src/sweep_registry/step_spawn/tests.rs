@@ -139,6 +139,7 @@ fn a_held_item_is_refused_as_claimed() {
 /// The step child's own environment: its lease file (so its leases are
 /// reaped), and the Curator's curation provenance.
 #[test]
+#[serial]
 fn a_step_child_lists_its_leases_and_a_curator_names_its_launch() {
     let root = Path::new("/ws");
     let env = |cmd: &Command, key: &str| {
@@ -1535,12 +1536,8 @@ if [[ "$1" == api && "$2" == */issues/12133 && "$*" == *'.pull_request != null'*
                 "https://github.com/rjwalters/loom",
             ],
         ] {
-            assert!(Command::new("git")
-                .current_dir(dir.path())
-                .args(args)
-                .status()
-                .unwrap()
-                .success());
+            let out = crate::test_git_helpers::git_out(dir.path(), args);
+            assert!(out.status.success());
         }
         builder_claim(&mut reg, MINE).unwrap();
         // The ordinary reaper restores the label before attempting the yield.

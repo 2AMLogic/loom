@@ -736,6 +736,7 @@ fn is_exec(path: &Path) -> bool {
 #[test]
 fn embedded_payload_is_the_tracked_defaults_tree() {
     let repo = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
+    // Hand-rolled on purpose: skips without git; `git_out` panics when git cannot be spawned.
     let Ok(out) = std::process::Command::new("git")
         .arg("-C")
         .arg(repo)

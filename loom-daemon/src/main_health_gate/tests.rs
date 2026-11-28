@@ -1440,17 +1440,7 @@ fn advance_origin_main(origin: &Path) {
 }
 
 fn head_commit(dir: &Path) -> String {
-    String::from_utf8(
-        Command::new("git")
-            .args(["rev-parse", "HEAD"])
-            .current_dir(dir)
-            .output()
-            .unwrap()
-            .stdout,
-    )
-    .unwrap()
-    .trim()
-    .to_string()
+    git(dir, &["rev-parse", "HEAD"])
 }
 
 #[test]
@@ -1979,24 +1969,12 @@ fn test_prepare_ignores_loom_owned_transient_dirt() {
     // subtree), which no single ignore-list prefix matches.
     std::fs::create_dir_all(clone.path().join(".loom")).unwrap();
     std::fs::write(clone.path().join(".loom/config.json"), "{}\n").unwrap();
-    Command::new("git")
-        .args(["add", ".loom/config.json"])
-        .current_dir(clone.path())
-        .status()
-        .unwrap();
-    Command::new("git")
-        .args(["commit", "-m", "add .loom/config.json"])
-        .current_dir(clone.path())
-        .status()
-        .unwrap();
+    git(clone.path(), &["add", ".loom/config.json"]);
+    git(clone.path(), &["commit", "-m", "add .loom/config.json"]);
     // Push so this commit is on `origin/main` too — otherwise the clone
     // would be (correctly) skipped as "ahead of origin" by step 4,
     // unrelated to the dirty-tree behavior this test targets.
-    Command::new("git")
-        .args(["push", "origin", "main"])
-        .current_dir(clone.path())
-        .status()
-        .unwrap();
+    git(clone.path(), &["push", "origin", "main"]);
 
     std::fs::create_dir_all(clone.path().join(".loom/logs")).unwrap();
     std::fs::write(clone.path().join(".loom/logs/sweep-issue-1.log"), "log\n").unwrap();
@@ -2015,24 +1993,12 @@ fn test_prepare_ignores_loom_owned_transient_dirt() {
 fn test_prepare_ignores_lockfile_only_dirt() {
     let (_origin, clone) = make_origin_and_clone();
     std::fs::write(clone.path().join("package-lock.json"), "{}\n").unwrap();
-    Command::new("git")
-        .args(["add", "package-lock.json"])
-        .current_dir(clone.path())
-        .status()
-        .unwrap();
-    Command::new("git")
-        .args(["commit", "-m", "add lockfile"])
-        .current_dir(clone.path())
-        .status()
-        .unwrap();
+    git(clone.path(), &["add", "package-lock.json"]);
+    git(clone.path(), &["commit", "-m", "add lockfile"]);
     // Push so the lockfile-add commit is on `origin/main` too — otherwise
     // the clone would be (correctly) skipped as "ahead of origin" by step
     // 4, unrelated to the dirty-tree behavior this test targets.
-    Command::new("git")
-        .args(["push", "origin", "main"])
-        .current_dir(clone.path())
-        .status()
-        .unwrap();
+    git(clone.path(), &["push", "origin", "main"]);
     // Now mutate it — a benign build-side-effect regen, no real change.
     std::fs::write(clone.path().join("package-lock.json"), "{ \"regen\": true }\n").unwrap();
     let outcome = prepare_workspace_to_origin_main(clone.path());
@@ -2054,42 +2020,18 @@ fn test_prepare_ignores_resync_shaped_installed_surface_dirt() {
     std::fs::create_dir_all(clone.path().join(".loom/docs")).unwrap();
     std::fs::write(clone.path().join("defaults/docs/foo.md"), "old content\n").unwrap();
     std::fs::write(clone.path().join(".loom/docs/foo.md"), "old content\n").unwrap();
-    Command::new("git")
-        .args(["add", "defaults/docs/foo.md", ".loom/docs/foo.md"])
-        .current_dir(clone.path())
-        .status()
-        .unwrap();
-    Command::new("git")
-        .args(["commit", "-m", "seed installed surface"])
-        .current_dir(clone.path())
-        .status()
-        .unwrap();
-    Command::new("git")
-        .args(["push", "origin", "main"])
-        .current_dir(clone.path())
-        .status()
-        .unwrap();
+    git(clone.path(), &["add", "defaults/docs/foo.md", ".loom/docs/foo.md"]);
+    git(clone.path(), &["commit", "-m", "seed installed surface"]);
+    git(clone.path(), &["push", "origin", "main"]);
 
     // Simulate a resync: the source under `defaults/` changed upstream
     // (already committed) and the installed copy is refreshed to match —
     // exactly what `resync-installed.sh` does, and exactly the dirt this
     // issue is about.
     std::fs::write(clone.path().join("defaults/docs/foo.md"), "new content\n").unwrap();
-    Command::new("git")
-        .args(["add", "defaults/docs/foo.md"])
-        .current_dir(clone.path())
-        .status()
-        .unwrap();
-    Command::new("git")
-        .args(["commit", "-m", "update defaults/docs/foo.md"])
-        .current_dir(clone.path())
-        .status()
-        .unwrap();
-    Command::new("git")
-        .args(["push", "origin", "main"])
-        .current_dir(clone.path())
-        .status()
-        .unwrap();
+    git(clone.path(), &["add", "defaults/docs/foo.md"]);
+    git(clone.path(), &["commit", "-m", "update defaults/docs/foo.md"]);
+    git(clone.path(), &["push", "origin", "main"]);
     // The installed copy is now stale relative to the freshly-committed
     // source — resync rewrites it to match, leaving it dirty (tracked,
     // modified) but byte-identical to `defaults/docs/foo.md`.
@@ -2306,17 +2248,7 @@ fn test_decide_gate_run_changed_sha_glob_diff_matches() {
     // for the diff — mirrors what `resolve_remote_main_sha` + the
     // subsequent fetch inside `diff_touches_globs` do in production.
     git(clone.path(), &["fetch", "origin", "main"]);
-    let after = String::from_utf8(
-        Command::new("git")
-            .args(["rev-parse", "origin/main"])
-            .current_dir(clone.path())
-            .output()
-            .unwrap()
-            .stdout,
-    )
-    .unwrap()
-    .trim()
-    .to_string();
+    let after = git(clone.path(), &["rev-parse", "origin/main"]);
     let globs = vec!["*.rs".to_string()];
     assert_eq!(
         decide_gate_run(Some(&before), &after, &globs, clone.path()),
@@ -2331,17 +2263,7 @@ fn test_decide_gate_run_changed_sha_glob_diff_does_not_match() {
     let before = head_commit(clone.path());
     push_file_change(origin.path(), "README.md", "docs only\n");
     git(clone.path(), &["fetch", "origin", "main"]);
-    let after = String::from_utf8(
-        Command::new("git")
-            .args(["rev-parse", "origin/main"])
-            .current_dir(clone.path())
-            .output()
-            .unwrap()
-            .stdout,
-    )
-    .unwrap()
-    .trim()
-    .to_string();
+    let after = git(clone.path(), &["rev-parse", "origin/main"]);
     let globs = vec!["*.rs".to_string(), "*.toml".to_string()];
     assert_eq!(
         decide_gate_run(Some(&before), &after, &globs, clone.path()),

@@ -658,6 +658,7 @@ fn children_spawned_by_a_commit(repo: &Path, trace: &Path) -> Vec<String> {
     let _ = fs::remove_file(trace);
     fs::write(repo.join("tracked.txt"), "traced commit\n").unwrap();
     git(repo, &["add", "tracked.txt"]);
+    // Stays hand-rolled: sets GIT_TRACE2_EVENT, which test_git_helpers::git_out cannot (#15702).
     let out = Command::new("git")
         .arg("-C")
         .arg(repo)

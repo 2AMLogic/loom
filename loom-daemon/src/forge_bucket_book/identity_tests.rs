@@ -4,7 +4,6 @@
 
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
-use std::process::Command;
 use std::time::SystemTime;
 
 use super::super::{
@@ -14,6 +13,7 @@ use super::super::{
 use super::*;
 use crate::forge_identity::sidecar::write_sidecar;
 use crate::forge_identity::{Sidecar, SidecarRole};
+use crate::test_git_helpers::run as git;
 
 /// A git workspace whose `origin` is `github.com/<owner>/ws`, with a roster
 /// writer App `roster_app` when given.
@@ -21,14 +21,7 @@ fn workspace(owner: &str, roster_app: Option<&str>) -> tempfile::TempDir {
     let ws = tempfile::tempdir().unwrap();
     let url = format!("https://github.com/{owner}/ws");
     for args in [vec!["init", "-q"], vec!["remote", "add", "origin", &url]] {
-        let ok = Command::new("git")
-            .args(&args)
-            .current_dir(ws.path())
-            .output()
-            .unwrap()
-            .status
-            .success();
-        assert!(ok, "git {args:?}");
+        git(ws.path(), &args);
     }
     if let Some(app) = roster_app {
         std::fs::create_dir_all(ws.path().join(".loom")).unwrap();

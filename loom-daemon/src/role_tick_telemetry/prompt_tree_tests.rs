@@ -4,24 +4,10 @@
 //! correctly, a foreign origin) and injects the "heard" head.
 
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 use super::remote::{classify_origin, fill, Expected};
 use super::*;
-
-fn run(dir: &Path, args: &[&str]) -> String {
-    let out = Command::new("git")
-        .arg("-C")
-        .arg(dir)
-        .args(args)
-        .env_remove("GIT_DIR")
-        .env_remove("GIT_WORK_TREE")
-        .env_remove("GIT_INDEX_FILE")
-        .output()
-        .unwrap();
-    assert!(out.status.success(), "{args:?}: {}", String::from_utf8_lossy(&out.stderr));
-    String::from_utf8_lossy(&out.stdout).trim().to_string()
-}
+use crate::test_git_helpers::run;
 
 fn commit(dir: &Path, msg: &str) {
     run(
