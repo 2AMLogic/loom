@@ -84,6 +84,7 @@ use crate::tokens_pool::bad_tokens;
 use crate::tokens_pool::{self, AccountId, AccountProvider, TerminalClassification};
 use crate::types::{Event, SweepId, SweepInfo, SweepKind, SweepOutcome, SweepState};
 use crate::{quarantine_reconciliation, sweep_journal, sweep_outcomes};
+use brake_knobs::*;
 
 use anyhow::{anyhow, Context, Result};
 use chrono::{DateTime, Utc};
@@ -114,6 +115,7 @@ pub use crate::telemetry::DispatchOrigin;
 // `generate_sweep_id` lives with the `SweepKind` it names (model.rs) — moved out
 // of this file; re-exported for the existing callers.
 pub use model::generate_sweep_id;
+mod brake_knobs;
 mod config_paths;
 mod decline_cooldown;
 mod dispatch;

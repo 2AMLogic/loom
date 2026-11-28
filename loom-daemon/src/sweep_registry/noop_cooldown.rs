@@ -145,75 +145,31 @@ pub(crate) struct NoopCooldownState {
     pub(crate) released_by_sweep: Option<String>,
 }
 
-/// The subset of `.loom/config.json → autonomous.workFinder.noopCooldown`
-/// this module consumes (Issue #6670). Mirrors [`DispatchBackoffFileConfig`]'s
-/// shape: every field is `Option` so an absent key falls through to the
-/// env-var / built-in-default resolution — precedence **env > config >
-/// default**.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct NoopCooldownFileConfig {
-    /// `autonomous.workFinder.noopCooldown.enabled`.
-    pub enabled: Option<bool>,
-    /// `autonomous.workFinder.noopCooldown.cooldownSecs` (zero/invalid dropped).
-    pub cooldown_secs: Option<u64>,
-    /// `autonomous.workFinder.noopCooldown.holdThreshold` (`0` disables).
-    pub hold_threshold: Option<u32>,
-}
-
-/// Read `.loom/config.json → autonomous.workFinder.noopCooldown` (Issue
-/// #6670), soft-failing every field to `None` on a missing file, malformed
-/// JSON, or an absent block — mirrors [`read_dispatch_backoff_file_config`].
-#[must_use]
-pub fn read_noop_cooldown_file_config(repo_root: &Path) -> NoopCooldownFileConfig {
-    let effective = crate::config_resolver::resolve_effective_config(repo_root);
-    let Some(c) =
-        crate::config_resolver::get_path(&effective, "autonomous.workFinder.noopCooldown")
-    else {
-        return NoopCooldownFileConfig::default();
-    };
-    NoopCooldownFileConfig {
-        enabled: c.get("enabled").and_then(serde_json::Value::as_bool),
-        cooldown_secs: c
-            .get("cooldownSecs")
-            .and_then(serde_json::Value::as_u64)
-            .filter(|&s| s > 0),
-        hold_threshold: c
-            .get("holdThreshold")
-            .and_then(serde_json::Value::as_u64)
-            .and_then(|n| u32::try_from(n).ok()),
-    }
-}
-
 /// Resolve the full [`NoopCooldownConfig`] for `repo_root` with precedence
 /// **env > config > default** for every knob (Issue #6670), mirroring
-/// [`resolve_dispatch_backoff_config`].
+/// [`resolve_dispatch_backoff_config`]: the
+/// `autonomous.workFinder.noopCooldown` block is read once, then each knob
+/// layers its env override on top. `holdThreshold` alone keeps zero — it
+/// disables the hold (#10156).
 #[must_use]
 pub fn resolve_noop_cooldown_config(repo_root: &Path) -> NoopCooldownConfig {
-    let file = read_noop_cooldown_file_config(repo_root);
-
-    let enabled = if let Ok(v) = std::env::var(NOOP_COOLDOWN_ENABLE_ENV) {
-        matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on")
-    } else {
-        file.enabled.unwrap_or(true)
-    };
-
-    let cooldown_secs = std::env::var(NOOP_COOLDOWN_SECS_ENV)
-        .ok()
-        .and_then(|v| v.trim().parse::<u64>().ok())
-        .filter(|&s| s > 0)
-        .or(file.cooldown_secs)
-        .unwrap_or(DEFAULT_NOOP_COOLDOWN_SECS);
-
-    let hold_threshold = std::env::var(NOOP_HOLD_THRESHOLD_ENV)
-        .ok()
-        .and_then(|v| v.trim().parse::<u32>().ok())
-        .or(file.hold_threshold)
-        .unwrap_or(DEFAULT_NOOP_HOLD_THRESHOLD);
+    let effective = crate::config_resolver::resolve_effective_config(repo_root);
+    let block = crate::config_resolver::get_path(&effective, "autonomous.workFinder.noopCooldown");
 
     NoopCooldownConfig {
-        enabled,
-        cooldown: Duration::from_secs(cooldown_secs),
-        hold_threshold,
+        enabled: env_or_config_bool(block, NOOP_COOLDOWN_ENABLE_ENV, "enabled", true),
+        cooldown: Duration::from_secs(env_or_config_positive_u64(
+            block,
+            NOOP_COOLDOWN_SECS_ENV,
+            "cooldownSecs",
+            DEFAULT_NOOP_COOLDOWN_SECS,
+        )),
+        hold_threshold: env_or_config_u32(
+            block,
+            NOOP_HOLD_THRESHOLD_ENV,
+            "holdThreshold",
+            DEFAULT_NOOP_HOLD_THRESHOLD,
+        ),
     }
 }
 
@@ -485,15 +441,11 @@ impl SweepRegistry {
     /// [`Self::dispatch_backoff_remaining`].
     #[must_use]
     pub fn noop_cooldown_remaining(&self, issue: u32, now: DateTime<Utc>) -> Option<Duration> {
-        if !self.noop_cooldown_config.enabled {
-            return None;
-        }
-        let state = self.noop_cooldown.get(&issue)?;
-        let remaining = state.until - now;
-        if remaining <= chrono::Duration::zero() {
-            return None;
-        }
-        remaining.to_std().ok().filter(|d| !d.is_zero())
+        cooldown_window_remaining(
+            self.noop_cooldown_config.enabled,
+            self.noop_cooldown.get(&issue).map(|s| s.until),
+            now,
+        )
     }
 
     /// Absolute no-op-cooldown expiry for `issue` at `now` (Issue #9311), or
@@ -502,11 +454,11 @@ impl SweepRegistry {
     /// than the duration until it.
     #[must_use]
     pub fn noop_cooldown_until(&self, issue: u32, now: DateTime<Utc>) -> Option<DateTime<Utc>> {
-        if !self.noop_cooldown_config.enabled {
-            return None;
-        }
-        let state = self.noop_cooldown.get(&issue)?;
-        (state.until > now).then_some(state.until)
+        cooldown_window_until(
+            self.noop_cooldown_config.enabled,
+            self.noop_cooldown.get(&issue).map(|s| s.until),
+            now,
+        )
     }
 
     /// Every issue whose no-op cooldown is still in effect at `now` (Issue
@@ -515,14 +467,9 @@ impl SweepRegistry {
     ///
     #[must_use]
     pub fn noop_cooldown_issues(&self, now: DateTime<Utc>) -> HashSet<u32> {
-        if !self.noop_cooldown_config.enabled {
-            return HashSet::new();
-        }
-        self.noop_cooldown
-            .iter()
-            .filter(|(_, s)| s.until > now)
-            .map(|(issue, _)| *issue)
-            .collect()
+        active_cooldown_issues(self.noop_cooldown_config.enabled, &self.noop_cooldown, |s| {
+            s.until > now
+        })
     }
 }
 

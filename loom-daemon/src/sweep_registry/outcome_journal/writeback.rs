@@ -98,47 +98,22 @@ pub struct SweepOutcomeWritebackConfig {
     pub enabled: bool,
 }
 
-/// The subset of `.loom/config.json -> autonomous.sweepOutcomeWriteback` this
-/// module consumes (Issue #9056). Mirrors
-/// `crate::sweep_registry::NoopCooldownFileConfig`'s shape: the field is
-/// `Option` so an absent key falls through to the env-var / built-in-default
-/// resolution.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct SweepOutcomeWritebackFileConfig {
-    /// `autonomous.sweepOutcomeWriteback.enabled`.
-    pub enabled: Option<bool>,
-}
-
-/// Read `.loom/config.json -> autonomous.sweepOutcomeWriteback` (Issue
-/// #9056), soft-failing to [`SweepOutcomeWritebackFileConfig::default`] on a
-/// missing file, malformed JSON, or an absent block — mirrors
-/// `crate::sweep_registry::read_noop_cooldown_file_config`.
-#[must_use]
-pub fn read_sweep_outcome_writeback_file_config(
-    repo_root: &Path,
-) -> SweepOutcomeWritebackFileConfig {
-    let effective = crate::config_resolver::resolve_effective_config(repo_root);
-    let Some(c) = crate::config_resolver::get_path(&effective, "autonomous.sweepOutcomeWriteback")
-    else {
-        return SweepOutcomeWritebackFileConfig::default();
-    };
-    SweepOutcomeWritebackFileConfig {
-        enabled: c.get("enabled").and_then(serde_json::Value::as_bool),
-    }
-}
-
 /// Resolve [`SweepOutcomeWritebackConfig`] for `repo_root` with precedence
 /// **env > config > default(false)** (Issue #9056), mirroring
-/// `crate::sweep_registry::resolve_noop_cooldown_config`.
+/// `crate::sweep_registry::resolve_noop_cooldown_config`. A set
+/// [`SWEEP_OUTCOME_WRITEBACK_ENABLE_ENV`] is answered before any config tier
+/// is read (#15663): this resolver runs on every terminal sweep, and with the
+/// override in place the tiers cannot change the verdict.
 #[must_use]
 pub fn resolve_sweep_outcome_writeback_config(repo_root: &Path) -> SweepOutcomeWritebackConfig {
-    let file = read_sweep_outcome_writeback_file_config(repo_root);
-    let enabled = if let Ok(v) = std::env::var(SWEEP_OUTCOME_WRITEBACK_ENABLE_ENV) {
-        matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on")
-    } else {
-        file.enabled.unwrap_or(false)
-    };
-    SweepOutcomeWritebackConfig { enabled }
+    if let Some(enabled) = env_bool_override(SWEEP_OUTCOME_WRITEBACK_ENABLE_ENV) {
+        return SweepOutcomeWritebackConfig { enabled };
+    }
+    let effective = crate::config_resolver::resolve_effective_config(repo_root);
+    let block = crate::config_resolver::get_path(&effective, "autonomous.sweepOutcomeWriteback");
+    SweepOutcomeWritebackConfig {
+        enabled: env_or_config_bool(block, SWEEP_OUTCOME_WRITEBACK_ENABLE_ENV, "enabled", false),
+    }
 }
 
 /// `Xh Ym` / `Ym Zs` / `Zs` — the coarsest two units that cover `secs`,
