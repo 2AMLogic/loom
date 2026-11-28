@@ -5,7 +5,6 @@
 use std::cell::Cell;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::time::{Duration, Instant};
 
 use anyhow::anyhow;
@@ -77,12 +76,7 @@ fn git_repo_with_remote(owner_repo: &str) -> tempfile::TempDir {
             &format!("https://github.com/{owner_repo}.git"),
         ],
     ] {
-        assert!(Command::new("git")
-            .args(&args)
-            .current_dir(dir.path())
-            .status()
-            .unwrap()
-            .success());
+        crate::test_git_helpers::run(dir.path(), &args);
     }
     dir
 }

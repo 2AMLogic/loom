@@ -6,7 +6,6 @@
 
 use super::*;
 use crate::test_git_helpers::run as git;
-use std::process::Command;
 
 /// `sk-ant-<kind>-` + 93 varied characters + `AA`: the real length and alphabet.
 fn fake_anthropic(kind: &str) -> String {
@@ -28,23 +27,11 @@ fn scanner() -> Scanner {
 
 fn repo() -> tempfile::TempDir {
     let dir = tempfile::tempdir().unwrap();
-    let git = |args: &[&str]| {
-        let ok = Command::new("git")
-            .arg("-C")
-            .arg(dir.path())
-            .args(args)
-            .status()
-            .unwrap();
-        assert!(ok.success(), "git {args:?}");
-    };
-    git(&["init", "-q", "-b", "main"]);
-    git(&["config", "user.email", "test@example.invalid"]);
-    git(&["config", "user.name", "test"]);
-    git(&["config", "commit.gpgsign", "false"]);
-    git(&["config", "core.hooksPath", "/dev/null"]);
-    std::fs::write(dir.path().join("README"), "seed\n").unwrap();
-    git(&["add", "README"]);
-    git(&["commit", "-q", "-m", "seed"]);
+    let root = dir.path();
+    git(root, &["init", "-q", "-b", "main"]);
+    std::fs::write(root.join("README"), "seed\n").unwrap();
+    git(root, &["add", "README"]);
+    git(root, &["commit", "-q", "-m", "seed"]);
     dir
 }
 

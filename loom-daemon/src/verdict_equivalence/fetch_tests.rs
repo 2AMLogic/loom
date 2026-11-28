@@ -20,6 +20,7 @@
 
 use super::tests::{fake_gh, git_ok, merge_tree_available, write, BASE_MAIN};
 use super::*;
+use crate::test_git_helpers::git_out;
 use std::path::PathBuf;
 use tempfile::{tempdir, TempDir};
 
@@ -72,12 +73,16 @@ fn fixture() -> Fixture {
 
     let host_dir = tempdir().unwrap();
     let host = host_dir.path().join("clone");
-    let out = std::process::Command::new("git")
-        .args(["clone", "--quiet", "--no-local"])
-        .arg(format!("file://{}", forge.display()))
-        .arg(&host)
-        .output()
-        .unwrap();
+    let out = git_out(
+        host_dir.path(),
+        &[
+            "clone",
+            "--quiet",
+            "--no-local",
+            &format!("file://{}", forge.display()),
+            host.to_str().unwrap(),
+        ],
+    );
     assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
 
     Fixture {
