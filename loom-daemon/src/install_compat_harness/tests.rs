@@ -8,6 +8,7 @@
 //! note that names a release still uploading, and the bounded download retry
 //! (the download is a closure too).
 
+use super::prompt_calls::{self, CommandTree};
 use super::*;
 use crate::test_git_helpers::run as git;
 use std::time::Instant;
@@ -194,6 +195,7 @@ fn opts(root: &Path, req: &str, old_daemon: OldDaemon) -> CheckOptions {
         supports_installed: v("0.19.0"),
         requires_daemon: v(req),
         invoked_files: Vec::new(),
+        command_tree: CommandTree::default(),
     }
 }
 
@@ -643,4 +645,529 @@ esac"#,
         Probed::Present,
         "a verb the daemon has, reached through the path, is present"
     );
+}
+
+// ---- #15644: the daemon calls in shipped Markdown prompts ----
+
+/// A command tree from space-separated paths. A trailing `*` marks the path a
+/// passthrough (`forge issue*`), whose tail belongs to another program.
+fn tree(paths: &[&str]) -> CommandTree {
+    let mut tree = CommandTree::default();
+    for path in paths {
+        let (path, passthrough) = path.strip_suffix('*').map_or((*path, false), |p| (p, true));
+        tree.insert(path, passthrough);
+    }
+    tree
+}
+
+/// The command paths the calls in `text` (Markdown) resolve to in `tree`.
+fn paths(tree: &CommandTree, text: &str) -> BTreeSet<String> {
+    prompt_calls::markdown(text)
+        .iter()
+        .flat_map(|call| tree.resolve(call))
+        .collect()
+}
+
+/// The shapes #15644 lists, in one prompt: Builder's inline calls and wrapped
+/// span, Guide's nested verb, Champion's quoted executable and passthroughs,
+/// `loom.md`'s brace lists, and the prose, fences and noise around them.
+const PROMPT: &str = r##"---
+name: fixture
+description: Call `loom-daemon preflight --issue N` first.
+---
+
+Park the issue (`loom-daemon park-record apply --issue <number> --by builder`),
+or run `loom-daemon dispatch <N> --workspace "$WORKSPACE_ROOT" [--model M]`.
+The `loom-daemon` binary: loom-daemon is running. Neither `loom-daemon --help`
+nor `loom-daemon-start.sh` is a call, nor are `loom-daemon/src/ipc.rs` and
+`cargo test --bin loom-daemon`.
+
+```bash
+# loom-daemon forge gone-refs: a comment is not a call either
+loom-daemon forge check-claim <number>   # exit 0 PRINTS the blocker token
+command -v loom-daemon >/dev/null 2>&1 || return 0
+out="$(loom-daemon guide work-plan-receipt read --docs-worktree "$DOCS_WT" \
+    --field "$1" 2>/dev/null)"
+LOOM_HOLD="x" loom-daemon park-record apply --pr "$PR_NUMBER" --reason "champion hold" \
+    --by champion >/dev/null 2>&1 || true
+printf '%s' "$body" | "${LOOM_DAEMON_BIN:-loom-daemon}" forge workflow-secrets-check >/dev/null 2>&1 || return 1
+echo "run loom-daemon forge issue create by hand (loom-daemon status)"
+```
+
+- `loom-daemon merge-pr-refs
+  loom-issue-trailer-refs` is the machine-readable link.
+- `loom-daemon tokens {select,bootstrap,check}` and `loom-daemon host {disable,enable,status}`.
+- `loom-daemon forge issue create` and `loom-daemon forge pr view <number> --json state` forward to `gh`.
+- Prose only: loom-daemon is running, and loom-daemon leese ensure is a typo.
+
+```
+loom-daemon cancel --issue <N>        # or: loom-daemon cancel <sweep-id>
+```
+"##;
+
+/// Every command the fixture names, plus decoys for each word that must NOT
+/// become a command path: a decoy that turns up in the result is a leak.
+const PROMPT_TREE: &[&str] = &[
+    "preflight",
+    "park-record",
+    "park-record apply",
+    "dispatch",
+    "forge",
+    "forge check-claim",
+    "forge workflow-secrets-check",
+    "forge issue*",
+    "forge pr*",
+    "forge gone-refs",
+    "forge create",
+    "guide",
+    "guide work-plan-receipt",
+    "guide work-plan-receipt read",
+    "merge-pr-refs",
+    "merge-pr-refs loom-issue-trailer-refs",
+    "tokens select",
+    "tokens bootstrap",
+    "tokens check",
+    "host disable",
+    "host enable",
+    "host status",
+    "cancel",
+    "is",
+    "running",
+    "leese",
+    "leese ensure",
+    "help",
+    "start",
+    "status",
+    "src",
+    "test",
+    "v",
+    "return",
+    "echo",
+    "printf",
+    "gh",
+];
+
+#[test]
+fn prompt_calls_resolve_to_the_exact_command_paths() {
+    let tree = tree(PROMPT_TREE);
+    let got = paths(&tree, PROMPT);
+    let want: BTreeSet<String> = [
+        "preflight",
+        "park-record apply",
+        "dispatch",
+        "forge check-claim",
+        "forge workflow-secrets-check",
+        "guide work-plan-receipt read",
+        "merge-pr-refs loom-issue-trailer-refs",
+        "tokens select",
+        "tokens bootstrap",
+        "tokens check",
+        "host disable",
+        "host enable",
+        "host status",
+        "forge issue",
+        "forge pr",
+        "cancel",
+    ]
+    .into_iter()
+    .map(str::to_string)
+    .collect();
+    assert_eq!(got, want);
+}
+
+#[test]
+fn a_wrapped_inline_command_is_one_call_per_line_pair() {
+    // The span opens on one source line and closes on the next.
+    let got = paths(
+        &tree(&["lease", "lease pr", "lease pr release"]),
+        "- `loom-daemon lease pr\n  release <n> --role judge` loses the claim.",
+    );
+    assert_eq!(
+        got,
+        ["lease pr release"]
+            .into_iter()
+            .map(str::to_string)
+            .collect::<BTreeSet<_>>()
+    );
+}
+
+#[test]
+fn a_code_span_stays_inside_its_own_block() {
+    // An unclosed backtick never swallows the next block's span: a heading is
+    // its own block, so is each list item, and a blank line ends a paragraph.
+    let text = "# Run `loom-daemon status\nThen `loom-daemon cancel --issue <N>`.\n- `loom-daemon dispatch <N>\n- and `loom-daemon preflight --issue N`\n\n`loom-daemon quarantine clear <issue>`";
+    let got = paths(
+        &tree(&[
+            "status",
+            "cancel",
+            "dispatch",
+            "preflight",
+            "quarantine clear",
+        ]),
+        text,
+    );
+    assert_eq!(
+        got,
+        ["cancel", "preflight", "quarantine clear"]
+            .into_iter()
+            .map(str::to_string)
+            .collect::<BTreeSet<_>>()
+    );
+}
+
+#[test]
+fn a_fence_in_another_language_is_not_read() {
+    let text = "```json\n{\"cmd\": \"loom-daemon status\"}\n```\n\n```python\nsubprocess.run(['loom-daemon', 'status'])\n```\n\n```markdown\n- [ ] Passes (`loom-daemon preflight --issue N`)\n```\n\n```typescript\nconst x = `loom-daemon cancel`;\n```\n";
+    let got = paths(&tree(&["status", "preflight", "cancel"]), text);
+    assert_eq!(
+        got,
+        ["preflight"]
+            .into_iter()
+            .map(str::to_string)
+            .collect::<BTreeSet<_>>()
+    );
+}
+
+#[test]
+fn a_word_the_new_daemon_does_not_know_ends_the_path() {
+    let tree = tree(&["forge", "guide"]);
+    // `gone-refs` is no verb of this daemon: the path stops at `forge`.
+    assert_eq!(
+        paths(&tree, "`loom-daemon forge gone-refs --x`"),
+        ["forge"]
+            .into_iter()
+            .map(str::to_string)
+            .collect::<BTreeSet<_>>()
+    );
+    // A first word it does not know names nothing, so nothing is probed —
+    // however the floor would have answered.
+    assert!(paths(&tree, "```\nloom-daemon is running\n```\n").is_empty());
+    assert!(paths(&tree, "`loom-daemon not-a-command`").is_empty());
+    // The bare executable, or one followed by a flag, names no command.
+    assert!(paths(&tree, "`loom-daemon` and `loom-daemon --help`").is_empty());
+}
+
+#[test]
+fn the_tree_comes_from_clap_and_stops_at_a_trailing_catch_all() {
+    use clap::{arg, Command};
+    let cli = Command::new("loom-daemon")
+        .subcommand(
+            Command::new("forge")
+                .alias("gh-shim")
+                .subcommand(
+                    Command::new("issue").arg(
+                        arg!(<args> ... "gh passthrough")
+                            .trailing_var_arg(true)
+                            .allow_hyphen_values(true),
+                    ),
+                )
+                .subcommand(Command::new("rerun").alias("re-run")),
+        )
+        .subcommand(Command::new("status").arg(arg!(--pipeline)));
+    let tree = CommandTree::from_clap(&cli);
+    let call = |words: &[&str]| {
+        words
+            .iter()
+            .map(|w| vec![(*w).to_string()])
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(tree.resolve(&call(&["forge", "issue", "create"])), ["forge issue"]);
+    assert_eq!(tree.resolve(&call(&["gh-shim", "re-run", "--failed"])), ["forge rerun"]);
+    assert_eq!(tree.resolve(&call(&["status", "--pipeline"])), ["status"]);
+    assert!(tree.resolve(&call(&["leese"])).is_empty());
+}
+
+/// A checkout whose only prompt is `prompt`, under the directory the harness
+/// scans.
+fn prompt_repo(prompt: &str) -> tempfile::TempDir {
+    let dir = checkout("0.19.899", &["v0.19.891", "v0.19.895"]);
+    let prompts = dir.path().join("defaults/.claude/commands/loom");
+    std::fs::create_dir_all(&prompts).unwrap();
+    std::fs::write(prompts.join("champion-pr-merge.md"), prompt).unwrap();
+    dir
+}
+
+/// The shipped Champion prompt's call, the one #15639 found above the floor.
+const SECRETS_CHECK: &str = r#"printf '%s' "$body" | "${LOOM_DAEMON_BIN:-loom-daemon}" forge workflow-secrets-check >/dev/null 2>&1 || return 1"#;
+
+/// A floor daemon reporting `version` that logs every invocation to `log`,
+/// answers `forge` and its `issue` passthrough, and knows
+/// `forge workflow-secrets-check` only when `has_verb`. Anything else is
+/// clap's refusal.
+fn floor_daemon(dir: &Path, version: &str, has_verb: bool, log: &Path) -> PathBuf {
+    let answer = if has_verb {
+        "exit 0 ;;".to_string()
+    } else {
+        r#"echo "error: unrecognized subcommand 'workflow-secrets-check'" >&2; exit 2 ;;"#
+            .to_string()
+    };
+    script(
+        dir,
+        &format!("floor-{version}"),
+        &format!(
+            r#"printf '%s\n' "$*" >> '{}'
+case "${{1:-}}" in
+  --version) echo 'loom-daemon {version}'; exit 0 ;;
+  forge)
+    case "${{2:-}}" in
+      --help | issue) exit 0 ;;
+      workflow-secrets-check) {answer}
+      *) echo "error: unrecognized subcommand '${{2:-}}'" >&2; exit 2 ;;
+    esac ;;
+  *) echo "error: unrecognized subcommand '${{1:-}}'" >&2; exit 2 ;;
+esac"#,
+            log.display()
+        ),
+    )
+}
+
+fn secrets_check_report(has_verb: bool) -> (Report, String) {
+    let repo = prompt_repo(&format!("Merge it:\n\n```bash\n{SECRETS_CHECK}\n```\n"));
+    let scratch = tempfile::tempdir().unwrap();
+    let log = scratch.path().join("probes.log");
+    let mut o = opts(
+        repo.path(),
+        "0.19.893",
+        OldDaemon::Given(floor_daemon(scratch.path(), "0.19.895", has_verb, &log)),
+    );
+    o.command_tree = tree(&["forge", "forge workflow-secrets-check"]);
+    let report = run(&o).unwrap();
+    let probes = std::fs::read_to_string(&log).unwrap_or_default();
+    (report, probes)
+}
+
+#[test]
+fn a_prompt_verb_missing_from_the_old_daemon_is_a_violation_naming_both() {
+    let (report, probes) = secrets_check_report(false);
+    assert_eq!(report.violations.len(), 1, "{:?}", report.violations);
+    let v = &report.violations[0];
+    assert!(
+        v.contains("defaults/.claude/commands/loom/champion-pr-merge.md"),
+        "names the prompt: {v}"
+    );
+    assert!(v.contains("`forge workflow-secrets-check`"), "names the full path: {v}");
+    assert!(v.contains("floor-0.19.895"), "names the daemon: {v}");
+    // The tree of the NEW daemon decided the depth, so the floor was asked
+    // about the child although it knows the parent.
+    assert_eq!(
+        probes
+            .lines()
+            .filter(|l| *l == "forge workflow-secrets-check --help")
+            .count(),
+        1,
+        "{probes}"
+    );
+}
+
+#[test]
+fn a_prompt_verb_present_in_the_old_daemon_passes() {
+    let (report, probes) = secrets_check_report(true);
+    assert!(report.violations.is_empty(), "{:?}", report.violations);
+    assert!(probes.contains("forge workflow-secrets-check --help"), "{probes}");
+    assert!(
+        report
+            .notes
+            .iter()
+            .any(|n| n.contains("1 prompt files, 1 command paths, 0 subcommand gaps")),
+        "{:?}",
+        report.notes
+    );
+}
+
+#[test]
+fn a_broken_probe_stays_apart_from_a_missing_verb() {
+    // The daemon dies on the probe: one violation, worded as a crash, never
+    // as "has no `forge workflow-secrets-check` subcommand".
+    let repo = prompt_repo(&format!("```bash\n{SECRETS_CHECK}\n```\n"));
+    let scratch = tempfile::tempdir().unwrap();
+    let daemon = script(
+        scratch.path(),
+        "floor-dying",
+        r#"case "${1:-}" in
+  --version) echo 'loom-daemon 0.19.895'; exit 0 ;;
+  forge) kill -KILL $$ ;;
+esac"#,
+    );
+    let mut o = opts(repo.path(), "0.19.893", OldDaemon::Given(daemon));
+    o.command_tree = tree(&["forge", "forge workflow-secrets-check"]);
+    let report = run(&o).unwrap();
+    assert_eq!(report.violations.len(), 1, "{:?}", report.violations);
+    let v = &report.violations[0];
+    assert!(v.contains("forge workflow-secrets-check --help"), "{v}");
+    assert!(v.contains("was killed"), "{v}");
+    assert!(!v.contains("has no"), "{v}");
+}
+
+#[test]
+fn repeated_mentions_share_a_probe_and_keep_every_prompt_in_the_gap() {
+    let repo = checkout("0.19.899", &["v0.19.891", "v0.19.895"]);
+    let prompts = repo.path().join("defaults/.claude/commands/loom");
+    std::fs::create_dir_all(&prompts).unwrap();
+    std::fs::write(
+        prompts.join("doctor.md"),
+        "```bash\nloom-daemon forge wait-checks <number> --timeout 20\n```\n",
+    )
+    .unwrap();
+    std::fs::write(
+        prompts.join("judge.md"),
+        "Then `loom-daemon forge wait-checks --settle-red`.\n\nAnd `loom-daemon forge wait-checks` again.\n",
+    )
+    .unwrap();
+    let scratch = tempfile::tempdir().unwrap();
+    let log = scratch.path().join("probes.log");
+    let daemon = script(
+        scratch.path(),
+        "floor-0.19.895",
+        &format!(
+            r#"printf '%s\n' "$*" >> '{}'
+case "${{1:-}}" in
+  --version) echo 'loom-daemon 0.19.895'; exit 0 ;;
+  forge)
+    case "${{2:-}}" in
+      --help) exit 0 ;;
+    esac ;;
+esac
+echo "error: unrecognized subcommand" >&2
+exit 2"#,
+            log.display()
+        ),
+    );
+    let mut o = opts(repo.path(), "0.19.893", OldDaemon::Given(daemon));
+    o.command_tree = tree(&["forge", "forge wait-checks"]);
+    let report = run(&o).unwrap();
+    let probes = std::fs::read_to_string(&log).unwrap();
+    assert_eq!(
+        probes
+            .lines()
+            .filter(|l| *l == "forge wait-checks --help")
+            .count(),
+        1,
+        "three mentions, one probe: {probes}"
+    );
+    assert_eq!(report.violations.len(), 1, "{:?}", report.violations);
+    let v = &report.violations[0];
+    assert!(v.contains("loom/doctor.md") && v.contains("loom/judge.md"), "names both: {v}");
+    assert!(
+        report
+            .notes
+            .iter()
+            .any(|n| n.contains("2 prompt files, 1 command paths, 1 subcommand gaps")),
+        "{:?}",
+        report.notes
+    );
+}
+
+#[test]
+fn passthrough_arguments_and_prose_never_reach_the_probe() {
+    let repo = prompt_repo(
+        "```bash\nloom-daemon forge issue view 42 --json state\n```\n\nRun loom-daemon gone-refs by hand, or `loom-daemon gone-refs --x`.\n",
+    );
+    let scratch = tempfile::tempdir().unwrap();
+    let log = scratch.path().join("probes.log");
+    let daemon = floor_daemon(scratch.path(), "0.19.895", false, &log);
+    let mut o = opts(repo.path(), "0.19.893", OldDaemon::Given(daemon));
+    o.command_tree = tree(&["forge", "forge issue*"]);
+    let report = run(&o).unwrap();
+    let probes = std::fs::read_to_string(&log).unwrap();
+    assert_eq!(
+        probes
+            .lines()
+            .filter(|l| !l.contains("--version"))
+            .collect::<Vec<_>>(),
+        ["forge issue --help"],
+        "the passthrough itself, and nothing after it: {probes}"
+    );
+    assert!(report.violations.is_empty(), "{:?}", report.violations);
+}
+
+#[test]
+fn a_tree_without_prompts_reports_no_prompt_summary() {
+    // No prompt directory (a consumer repo's fixture): nothing to report.
+    let repo = checkout("0.19.893", &["v0.19.890", "v0.19.891"]);
+    let mut o = opts(repo.path(), "0.19.893", OldDaemon::Absent);
+    o.command_tree = tree(PROMPT_TREE);
+    let report = run(&o).unwrap();
+    assert!(report.violations.is_empty(), "{:?}", report.violations);
+    assert!(
+        !report.notes.iter().any(|n| n.contains("prompt files")),
+        "no prompt summary without prompts: {:?}",
+        report.notes
+    );
+}
+
+/// The real prompts against the real command tree, on an 8 MiB thread like
+/// the binary's main thread: the tree build needs more than libtest's 2 MiB
+/// in a debug build (#10616). Every call #15644 found by hand is among the
+/// pairs direction B probes.
+#[test]
+fn the_shipped_prompts_resolve_against_this_daemon() {
+    let defaults = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../defaults");
+    let prompts = shipped_prompts(&defaults).unwrap();
+    assert!(prompts.len() > 40, "found {} prompts", prompts.len());
+    let calls = crate::cli::whole_cli_parse::on_stack(
+        "prompt-calls-tree",
+        crate::cli::whole_cli_parse::MAIN_THREAD_STACK,
+        move || prompt_calls::scan(&prompts, &CommandTree::loom_daemon()),
+    )
+    .unwrap();
+    let found: BTreeSet<String> = calls.pairs.iter().map(|(_, p)| p.clone()).collect();
+    for path in [
+        "forge workflow-secrets-check",
+        "guide work-plan-receipt read",
+        "guide work-plan-splice",
+        "merge-pr-refs loom-issue-trailer-refs",
+        "host disable",
+        "host enable",
+        "host status",
+        "tokens select",
+        "forge issue",
+        "forge pr",
+        "lease pr claim",
+        "park-record decision",
+    ] {
+        assert!(found.contains(path), "{path} not probed; found {found:#?}");
+    }
+    assert!(
+        !found
+            .iter()
+            .any(|p| p.starts_with("forge issue ") || p.starts_with("forge pr ")),
+        "a passthrough's tail was probed: {found:?}"
+    );
+}
+
+// ---- #15667 review: blockquoted fences, parent options, unreadable prompts ----
+
+#[test]
+fn a_fence_inside_a_blockquote_is_read() {
+    let t = tree(&["affected-files check"]);
+    let text = "> ```bash\n> git fetch origin --quiet\n> loom-daemon affected-files check --body-file \"$B\"; rc=$?\n> ```\n";
+    assert_eq!(paths(&t, text), BTreeSet::from(["affected-files check".to_string()]));
+    // A `>` line inside an ordinary fence is a redirect, not a quote marker.
+    let plain = "```bash\n> out\nloom-daemon affected-files check\n```\n";
+    assert_eq!(paths(&t, plain), BTreeSet::from(["affected-files check".to_string()]));
+}
+
+#[test]
+fn a_parent_option_does_not_hide_the_child_command() {
+    let mut t = tree(&["accounts list"]);
+    t.insert_option("accounts", "--workspace", true);
+    t.insert_option("accounts", "--json", false);
+    let want = BTreeSet::from(["accounts list".to_string()]);
+    for text in [
+        "`loom-daemon accounts --workspace . list`",
+        "`loom-daemon accounts --workspace=. list`",
+        "`loom-daemon accounts --json list`",
+        "`loom-daemon accounts list --workspace .`",
+    ] {
+        assert_eq!(paths(&t, text), want, "{text}");
+    }
+}
+
+#[test]
+fn an_unreadable_prompt_fails_the_scan_naming_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("bad.md");
+    std::fs::write(&file, b"<!-- \xff -->\n`loom-daemon affected-files check`\n").unwrap();
+    let err = prompt_calls::scan(&[file], &tree(&["affected-files check"])).unwrap_err();
+    assert!(format!("{err:#}").contains("bad.md"), "{err:#}");
 }
