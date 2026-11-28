@@ -25,6 +25,8 @@
 //!
 //! The marker strings are a wire format: they live in comments on open PRs.
 
+use std::sync::LazyLock;
+
 use regex::Regex;
 use serde_json::Value;
 
@@ -62,6 +64,23 @@ pub const DEFAULT_PHRASES: [&str; 3] = [
 pub(crate) const STATUS: &str = r"status:\s*(proposed|ratified)\b";
 /// "ratif…" within one clause of a merge / approval / operator.
 const CLAUSE: &str = r"ratif\w*[^.\n]{0,80}\b(merge|merging|merged|approv\w*|operator)\b";
+
+/// Complete denials and deferrals in proposed decision records. Both anchors
+/// matter: a qualifier or a second declaration makes the passage ambiguous.
+static EXPLICIT_DEFERRAL: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(concat!(
+        r"(?i)\A(?:",
+        r"(?:it\s+is\s+)?not\s+ratified\s+by\s+merging\s+this\s+pr",
+        r"|(?:this\s+pr\s+)?does\s+not\s+ratify\s+on\s+merge",
+        r"|(?:it\s+is\s+not\s+ratified,\s+and\s+)?",
+        r"merging\s+(?:this\s+pr|the\s+pr\s+that\s+carries\s+it)\s+does\s+not\s+ratify\s+it",
+        r"(?:\s+or\s+complete\s+t[0-9]+\s+item\s+[0-9]+)?",
+        r"|ratification\s+is\s+a\s+separate(?:,\s+operator-approved)?\s+pr",
+        r"(?:\s+that\s+flips\s+this\s+status\s+line)?",
+        r")\z",
+    ))
+    .expect("static deferral regex")
+});
 
 /// The repo's additions to the detector (`champion.ratificationPaths`,
 /// `champion.ratificationPhrases`). Additive only.
@@ -123,6 +142,16 @@ fn compile(pat: &str) -> Regex {
         .expect("an escaped literal is always a valid regex")
 }
 
+/// The text immediately before a period can end in a Markdown list marker.
+/// Allow indentation, block quotes and enclosing list markers on the same line.
+fn ends_in_list_ordinal(passage: &str) -> bool {
+    let line = passage.rsplit(['\r', '\n']).next().unwrap_or(passage);
+    line.ends_with(|c: char| c.is_ascii_digit())
+        && line.bytes().all(|b| {
+            b.is_ascii_digit() || matches!(b, b' ' | b'\t' | b'>' | b'-' | b'+' | b'.' | b')')
+        })
+}
+
 /// Whether the file (or the name it was renamed from) is a spec/decision path.
 #[must_use]
 pub fn is_candidate(f: &ChangedFile, cfg: &Config) -> bool {
@@ -157,7 +186,48 @@ pub fn declares_ratification(content: &str, cfg: &Config) -> bool {
     if phrases.map(compile).any(|re| re.is_match(&text)) {
         return true;
     }
-    compile(STATUS).is_match(&text) && compile(CLAUSE).is_match(&text)
+    let status = compile(STATUS);
+    if !status.is_match(&text) {
+        return false;
+    }
+    let clause = compile(CLAUSE);
+    let holds = |previous: &str, passage: &str| {
+        if !clause.is_match(passage) {
+            return false;
+        }
+        if !EXPLICIT_DEFERRAL.is_match(passage.trim()) {
+            return true;
+        }
+        // A word-final dot can belong to an abbreviation ("Acme Inc. this PR ...").
+        // An ordered list marker ("1. This PR ...") can likewise separate a
+        // denial from the condition introducing the list.
+        let previous = previous.trim();
+        (previous.ends_with(char::is_alphabetic) || ends_in_list_ordinal(previous))
+            && !status
+                .find_iter(previous)
+                .any(|m| m.end() == previous.len())
+            && !EXPLICIT_DEFERRAL.is_match(previous)
+    };
+    let mut previous = "";
+    let mut start = 0;
+    for (dot, _) in text.match_indices('.') {
+        let before = &text[start..dot];
+        let after = &text[dot + 1..];
+        // Keep ellipses (including spaced ones) and dots inside tokens such
+        // as item 5.1 in the passage, so a condition on either side survives.
+        if before.trim_end().ends_with('.')
+            || after.trim_start().starts_with('.')
+            || !(after.is_empty() || after.starts_with(char::is_whitespace))
+        {
+            continue;
+        }
+        if holds(previous, before) {
+            return true;
+        }
+        previous = before;
+        start = dot + 1;
+    }
+    holds(previous, &text[start..])
 }
 
 /// Scan a PR's change list. Only files the PR adds, modifies or renames count:
