@@ -835,12 +835,7 @@ fn a_worktree_session_carries_the_repo_slug_issue_pr_and_sweep_trace() {
             "git@github.com:apache/superset.git",
         ],
     ] {
-        let status = std::process::Command::new("git")
-            .args(&args)
-            .current_dir(&root)
-            .status()
-            .unwrap();
-        assert!(status.success(), "git {args:?}");
+        crate::test_git_helpers::run(&root, &args);
     }
     let worktree = root.join(".loom/worktrees/issue-9445");
     std::fs::create_dir_all(&worktree).unwrap();

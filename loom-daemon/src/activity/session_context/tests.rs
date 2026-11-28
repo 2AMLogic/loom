@@ -3,7 +3,6 @@
 use super::*;
 use crate::activity::transcript_parse::ParsedTranscript;
 use std::path::PathBuf;
-use std::process::Command;
 
 /// A parse carrying only the fields the join keys are derived from.
 fn parsed(
@@ -25,14 +24,7 @@ fn parsed(
 /// given). Local only — no config writes outside the repo, no network.
 fn checkout(dir: &Path, remote: Option<&str>) {
     std::fs::create_dir_all(dir).unwrap();
-    let git = |args: &[&str]| {
-        let status = Command::new("git")
-            .args(args)
-            .current_dir(dir)
-            .status()
-            .unwrap();
-        assert!(status.success(), "git {args:?}");
-    };
+    let git = |args: &[&str]| crate::test_git_helpers::run(dir, args);
     git(&["init", "-q"]);
     if let Some(remote) = remote {
         git(&["remote", "add", "origin", remote]);
