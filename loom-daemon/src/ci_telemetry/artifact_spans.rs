@@ -22,7 +22,9 @@ use super::api::{ApiError, GithubApi};
 use super::ledger::{Ledger, UnitKey};
 use super::nextest;
 use super::poll::{is_credential_rejection, paginate, CycleContext, CycleReport};
-use super::records::{parse_shard, JobJson, RepoJson, RunJson, ShardInfo, ShardKind};
+use super::records::{
+    job_context, parse_shard, JobJson, JobSpanTarget, RepoJson, RunJson, ShardInfo, ShardKind,
+};
 use super::state_dir;
 use super::suites::{self, ArtifactsPage};
 use crate::telemetry::TelemetryEnvelope;
@@ -290,28 +292,7 @@ fn test_envelopes_from_text(
         .collect();
     let job_id = nextest::match_job(&identity, &named)?;
     let cases = nextest::parse(text)?;
-    let job = jobs
-        .iter()
-        .find(|job| job.id == job_id)
-        .expect("match_job only returns a job id taken from this run's own jobs");
-    // The same window `job_envelopes` gives the job span, so a test span is
-    // always inside its parent even when the runner's clock disagrees.
-    let job_started = job.started_at.unwrap_or(run.created_at);
-    let job_ended = job.completed_at.unwrap_or(job_started).max(job_started);
-    let workflow = run.workflow();
-    let target = nextest::TestSpanTarget {
-        repo: &repo.full_name,
-        visibility: repo.visibility(),
-        run_id: run.id,
-        attempt: job.run_attempt,
-        job_id: job.id,
-        job: &job.name,
-        workflow: &workflow,
-        shard: parse_shard(&job.name),
-        job_context: super::records::job_context(&repo.full_name, run.id, job.run_attempt, job.id),
-        job_started,
-        job_ended,
-    };
+    let target = job_span_target(repo, run, jobs, job_id);
     Ok((job_id, nextest::test_envelopes(&target, &cases, host_id)))
 }
 
@@ -327,28 +308,38 @@ fn suite_envelopes_from_text(
 ) -> Result<(u64, Vec<TelemetryEnvelope>), suites::RejectReason> {
     let timings = suites::parse(text, run.id)?;
     let job_id = suites::match_job(&timings, shards)?;
+    let target = job_span_target(repo, run, jobs, job_id);
+    Ok((job_id, suites::suite_envelopes(&target, &timings, host_id)))
+}
+
+/// The job an artifact was matched to, resolved into everything its child
+/// spans need about it. `job_id` is what the family's `match_job` returned, so
+/// it always names one of this run's own jobs.
+fn job_span_target<'a>(
+    repo: &'a RepoJson,
+    run: &'a RunJson,
+    jobs: &'a [JobJson],
+    job_id: u64,
+) -> JobSpanTarget<'a> {
     let job = jobs
         .iter()
         .find(|job| job.id == job_id)
         .expect("match_job only returns a job id taken from this run's own jobs");
-    let shard = parse_shard(&job.name);
-    // The same window `job_envelopes` gives the job span, so a suite span is
+    // The same window `job_envelopes` gives the job span, so a child span is
     // always inside its parent even when the runner's clock disagrees.
     let job_started = job.started_at.unwrap_or(run.created_at);
     let job_ended = job.completed_at.unwrap_or(job_started).max(job_started);
-    let workflow = run.workflow();
-    let target = suites::SuiteSpanTarget {
+    JobSpanTarget {
         repo: &repo.full_name,
         visibility: repo.visibility(),
         run_id: run.id,
         attempt: job.run_attempt,
         job_id: job.id,
         job: &job.name,
-        workflow: &workflow,
-        shard,
-        job_context: super::records::job_context(&repo.full_name, run.id, job.run_attempt, job.id),
+        workflow: run.workflow_name(),
+        shard: parse_shard(&job.name),
+        job_context: job_context(&repo.full_name, run.id, job.run_attempt, job.id),
         job_started,
         job_ended,
-    };
-    Ok((job_id, suites::suite_envelopes(&target, &timings, host_id)))
+    }
 }
