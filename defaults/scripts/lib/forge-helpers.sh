@@ -94,6 +94,27 @@ _forge_config_root() {
   echo "."
 }
 
+# _forge_resolve_config <root> -> the resolved effective config JSON, or the
+# resolver's own status with one diagnostic line on stderr (#15793).
+#
+# loom_resolve_config fails only when jq itself does (a missing jq soft-fails
+# to '{}'), and jq's raw stderr ("Argument list too long") names neither the
+# failed step nor the root: create-issue.sh exited 126 with nothing to act on.
+# The explicit `|| rc=$?` + `return` is what keeps the failure fatal: a command
+# substitution drops `set -e` in its subshell, and a caller may run
+# forge_detect in an `||`/`if` context (errexit suspended), where a bare
+# assignment let it carry on with an empty config. Fail closed -- never fall
+# back to '{}' or "auto".
+_forge_resolve_config() {
+  local root="$1" cfg rc=0
+  cfg=$(loom_resolve_config "$root") || rc=$?
+  if [[ "$rc" -ne 0 ]]; then
+    echo "forge-helpers: config resolution failed (rc=$rc) for $root; resync .loom/scripts or check jq" >&2
+    return "$rc"
+  fi
+  printf '%s\n' "$cfg"
+}
+
 # Detect forge type from environment, config, or remote URL.
 # Sets FORGE_TYPE to "github" or "gitea".
 # For Gitea, also sets _GITEA_BASE_URL and _GITEA_TOKEN.
@@ -110,7 +131,7 @@ forge_detect() {
     env_lower=$(echo "$env_val" | tr '[:upper:]' '[:lower:]')
     case "$env_lower" in
       github) FORGE_TYPE="github"; return 0 ;;
-      gitea)  FORGE_TYPE="gitea"; _load_gitea_config; return 0 ;;
+      gitea)  _load_gitea_config || return $?; FORGE_TYPE="gitea"; return 0 ;;
     esac
   fi
 
@@ -120,7 +141,7 @@ forge_detect() {
   # key within a single call.
   local _forge_root _forge_cfg
   _forge_root=$(_forge_config_root)
-  _forge_cfg=$(loom_resolve_config "$_forge_root")
+  _forge_cfg=$(_forge_resolve_config "$_forge_root") || return $?
 
   # 2. Resolved config — forge.type (if not "auto")
   if command -v jq >/dev/null 2>&1; then
@@ -130,7 +151,7 @@ forge_detect() {
     config_lower=$(echo "$config_type" | tr '[:upper:]' '[:lower:]')
     case "$config_lower" in
       github) FORGE_TYPE="github"; return 0 ;;
-      gitea)  FORGE_TYPE="gitea"; _load_gitea_config; return 0 ;;
+      gitea)  _load_gitea_config || return $?; FORGE_TYPE="gitea"; return 0 ;;
     esac
   fi
 
@@ -152,8 +173,8 @@ forge_detect() {
         local gitea_host
         gitea_host=$(_extract_host "$gitea_url")
         if [[ "$host" == "$gitea_host" ]]; then
+          _load_gitea_config || return $?
           FORGE_TYPE="gitea"
-          _load_gitea_config
           return 0
         fi
       fi
@@ -197,7 +218,7 @@ _load_gitea_config() {
   if [[ -z "$_GITEA_TOKEN" || -z "$_GITEA_BASE_URL" || -z "$_GITEA_USERNAME" ]] && command -v jq >/dev/null 2>&1; then
     local _forge_root _forge_cfg
     _forge_root=$(_forge_config_root)
-    _forge_cfg=$(loom_resolve_config "$_forge_root")
+    _forge_cfg=$(_forge_resolve_config "$_forge_root") || return $?
 
     if [[ -z "$_GITEA_TOKEN" ]]; then
       _GITEA_TOKEN=$(echo "$_forge_cfg" | jq -r '.forge.gitea.token // ""' 2>/dev/null || echo "")
