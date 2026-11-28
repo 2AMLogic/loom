@@ -16,8 +16,39 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 ## Entries
 
+### 2026-11-28
+
+- **PR #15672**: fix(daemon): fail closed on an unresolvable cwd in check-open-pr
+- **PR #15670**: refactor: share one blocking HTTP bridge and error classes
+- **PR #15669**: test: sample ETXTBSY wait elapsed before joining the releaser
+- **PR #15667**: fix: probe the shipped prompts' daemon calls in install-compat check
+- **PR #15666**: refactor: unify ci_telemetry job-child span targets and builders
+- **PR #15665**: refactor(observability): emit eta.* records via the shared OpsSink
+- **Issue #15673** (closed): config-resolver.sh: loom_resolve_config fails with E2BIG (Argument list too long) once a config tier exceeds 128 KiB; create-pr.sh exits 126
+- **Issue #15664** (closed): forge check-open-pr: an unresolvable cwd leaves through the generic exit 1, which is its VERIFIED-clear code
+- **Issue #15662** (closed): Consolidate the four duplicate eta.* OTLP *Sink wrappers and OnceLocks onto observability::ops::OpsSink
+- **Issue #15661** (closed): Consolidate duplicated blocking HTTP runtime bridge and error classification in fleet_dispatch/client.rs and forge_mirror/client.rs
+- **Issue #15657** (closed): install_compat ETXTBSY test: both `started.elapsed() >= hold` assertions are vacuous (join() guarantees them)
+- **Issue #15654** (closed): Consolidate ci_telemetry's duplicated TestSpanTarget/SuiteSpanTarget structs and job-child span builders into records::JobSpanTarget
+- **Issue #15644** (closed): The daemon floor check ignores verbs called from role prompts, so REQUIRES_DAEMON drifts below them
+
 ### 2026-11-27
 
+- **PR #15658**: fix: exit 2 when worktree-closed-pr-branch cannot resolve its mode
+- **PR #15656**: refactor: route GhForge bookkeeping I/O through shared SystemHost
+- **PR #15655**: fix: wait out ETXTBSY at install-compat's daemon exec sites
+- **PR #15653**: fix: map merged_stack.* names to inventoried forge ops in forge_op_for
+- **PR #15649**: refactor: share labels migrate's gh api, pagination and fleet-loop helpers with --holds
+- **PR #15648**: refactor: share stack passes' gh forge adapter in stack_reconcile
+- **PR #14769**: fix: skip source-remote lookup on no-op resyncs
+- **Issue #15659** (closed): config-resolver.sh: jq "Argument list too long" once a config tier exceeds 131072 bytes; create-pr.sh exits 126
+- **Issue #15650** (closed): worktree-closed-pr-branch: tools-mode config error exits 1, which the shell reads as a branch refusal
+- **Issue #15647** (closed): Map merged_stack.* telemetry names in gh_call::forge_op_for so the merged-stack pass books inventoried operations
+- **Issue #15645** (closed): install_compat_harness tests still write-then-exec a fixture script, so plain cargo test hits ETXTBSY (#15013 class)
+- **Issue #15641** (closed): Share post_merge_bookkeeping::SystemHost with merge_observation::GhForge instead of duplicating six live Host methods
+- **Issue #15640** (closed): Share gh api adapter, pagination, target-runner, and report helpers between labels_migrate and labels_migrate_holds
+- **Issue #15638** (closed): Share live Gh*Forge adapter methods and reconcile() preamble between orphan_stack and merged_stack in stack_reconcile.rs
+- **Issue #14712** (closed): resync: a no-op resync warns that it stamped the canonical loom_source_remote, but leaves the stale one
 - **Issue #15639** (closed): Resync payload: install-metadata requires_daemon (0.20.5) is below the verbs the Guide calls; two tests use declare -A (Bash 3.2)
 - **PR #15646**: fix: raise REQUIRES_DAEMON to 0.20.34; make two suites Bash 3.2-safe
 - **Issue #14474** (closed): Expose worktree operations through the shared Rust CLI

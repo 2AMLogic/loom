@@ -239,91 +239,40 @@ pub(crate) struct PrlessRetryState {
     pub(crate) reason: String,
 }
 
-/// The subset of `.loom/config.json → autonomous.workFinder.prlessRetry` this
-/// module consumes (Issue #7972). Mirrors [`NoopCooldownFileConfig`]'s shape:
-/// every field is `Option` so an absent key falls through to the env-var /
-/// built-in-default resolution — precedence **env > config > default**.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct PrlessRetryFileConfig {
-    /// `autonomous.workFinder.prlessRetry.enabled`.
-    pub enabled: Option<bool>,
-    /// `autonomous.workFinder.prlessRetry.threshold` (zero/invalid dropped).
-    pub threshold: Option<u32>,
-    /// `autonomous.workFinder.prlessRetry.backoffSecs` (zero/invalid dropped).
-    pub backoff_secs: Option<u64>,
-    /// `autonomous.workFinder.prlessRetry.maxBackoffSecs` (zero/invalid
-    /// dropped).
-    pub max_backoff_secs: Option<u64>,
-}
-
-/// Read `.loom/config.json → autonomous.workFinder.prlessRetry` (Issue #7972),
-/// soft-failing every field to `None` on a missing file, malformed JSON, or an
-/// absent block — mirrors [`read_noop_cooldown_file_config`].
-#[must_use]
-pub fn read_prless_retry_file_config(repo_root: &Path) -> PrlessRetryFileConfig {
-    let effective = crate::config_resolver::resolve_effective_config(repo_root);
-    let Some(c) = crate::config_resolver::get_path(&effective, "autonomous.workFinder.prlessRetry")
-    else {
-        return PrlessRetryFileConfig::default();
-    };
-    PrlessRetryFileConfig {
-        enabled: c.get("enabled").and_then(serde_json::Value::as_bool),
-        threshold: c
-            .get("threshold")
-            .and_then(serde_json::Value::as_u64)
-            .filter(|&n| n > 0)
-            .and_then(|n| u32::try_from(n).ok()),
-        backoff_secs: c
-            .get("backoffSecs")
-            .and_then(serde_json::Value::as_u64)
-            .filter(|&s| s > 0),
-        max_backoff_secs: c
-            .get("maxBackoffSecs")
-            .and_then(serde_json::Value::as_u64)
-            .filter(|&s| s > 0),
-    }
-}
-
 /// Resolve the full [`PrlessRetryConfig`] for `repo_root` with precedence
 /// **env > config > default** for every knob (Issue #7972), mirroring
-/// [`resolve_noop_cooldown_config`].
+/// [`resolve_noop_cooldown_config`]: the
+/// `autonomous.workFinder.prlessRetry` block is read once, then each knob
+/// layers its env override on top.
 #[must_use]
 pub fn resolve_prless_retry_config(repo_root: &Path) -> PrlessRetryConfig {
-    let file = read_prless_retry_file_config(repo_root);
+    let effective = crate::config_resolver::resolve_effective_config(repo_root);
+    let block = crate::config_resolver::get_path(&effective, "autonomous.workFinder.prlessRetry");
 
-    let enabled = if let Ok(v) = std::env::var(PRLESS_RETRY_ENABLE_ENV) {
-        matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on")
-    } else {
-        file.enabled.unwrap_or(true)
-    };
-
-    let threshold = std::env::var(PRLESS_RETRY_THRESHOLD_ENV)
-        .ok()
-        .and_then(|v| v.trim().parse::<u32>().ok())
-        .filter(|&n| n > 0)
-        .or(file.threshold)
-        .unwrap_or(DEFAULT_PRLESS_RETRY_THRESHOLD);
-
-    let backoff_secs = std::env::var(PRLESS_RETRY_BACKOFF_SECS_ENV)
-        .ok()
-        .and_then(|v| v.trim().parse::<u64>().ok())
-        .filter(|&s| s > 0)
-        .or(file.backoff_secs)
-        .unwrap_or(DEFAULT_PRLESS_RETRY_BACKOFF_SECS);
-
-    let max_backoff_secs = std::env::var(PRLESS_RETRY_MAX_BACKOFF_SECS_ENV)
-        .ok()
-        .and_then(|v| v.trim().parse::<u64>().ok())
-        .filter(|&s| s > 0)
-        .or(file.max_backoff_secs)
-        .unwrap_or(DEFAULT_PRLESS_RETRY_MAX_BACKOFF_SECS)
-        // A ceiling below the base would make `backoff_delay` return the
-        // ceiling immediately; clamp rather than silently inverting the ladder.
-        .max(backoff_secs);
+    let backoff_secs = env_or_config_positive_u64(
+        block,
+        PRLESS_RETRY_BACKOFF_SECS_ENV,
+        "backoffSecs",
+        DEFAULT_PRLESS_RETRY_BACKOFF_SECS,
+    );
+    // A ceiling below the base would make `backoff_delay` return the
+    // ceiling immediately; clamp rather than silently inverting the ladder.
+    let max_backoff_secs = env_or_config_positive_u64(
+        block,
+        PRLESS_RETRY_MAX_BACKOFF_SECS_ENV,
+        "maxBackoffSecs",
+        DEFAULT_PRLESS_RETRY_MAX_BACKOFF_SECS,
+    )
+    .max(backoff_secs);
 
     PrlessRetryConfig {
-        enabled,
-        threshold,
+        enabled: env_or_config_bool(block, PRLESS_RETRY_ENABLE_ENV, "enabled", true),
+        threshold: env_or_config_positive_u32(
+            block,
+            PRLESS_RETRY_THRESHOLD_ENV,
+            "threshold",
+            DEFAULT_PRLESS_RETRY_THRESHOLD,
+        ),
         backoff: Duration::from_secs(backoff_secs),
         max_backoff: Duration::from_secs(max_backoff_secs),
     }
@@ -711,15 +660,11 @@ impl SweepRegistry {
     /// [`Self::noop_cooldown_remaining`].
     #[must_use]
     pub fn prless_retry_remaining(&self, issue: u32, now: DateTime<Utc>) -> Option<Duration> {
-        if !self.prless_retry_config.enabled {
-            return None;
-        }
-        let state = self.prless_retry.get(&issue)?;
-        let remaining = state.until - now;
-        if remaining <= chrono::Duration::zero() {
-            return None;
-        }
-        remaining.to_std().ok().filter(|d| !d.is_zero())
+        cooldown_window_remaining(
+            self.prless_retry_config.enabled,
+            self.prless_retry.get(&issue).map(|s| s.until),
+            now,
+        )
     }
 
     /// Absolute PR-less-retry expiry for `issue` at `now` (Issue #9311), or
@@ -728,11 +673,11 @@ impl SweepRegistry {
     /// than the duration until it.
     #[must_use]
     pub fn prless_retry_until(&self, issue: u32, now: DateTime<Utc>) -> Option<DateTime<Utc>> {
-        if !self.prless_retry_config.enabled {
-            return None;
-        }
-        let state = self.prless_retry.get(&issue)?;
-        (state.until > now).then_some(state.until)
+        cooldown_window_until(
+            self.prless_retry_config.enabled,
+            self.prless_retry.get(&issue).map(|s| s.until),
+            now,
+        )
     }
 
     /// Consecutive PR-less releases recorded for `issue` (Issue #7972). `0` when
@@ -762,14 +707,9 @@ impl SweepRegistry {
     ///
     #[must_use]
     pub fn prless_retry_issues(&self, now: DateTime<Utc>) -> HashSet<u32> {
-        if !self.prless_retry_config.enabled {
-            return HashSet::new();
-        }
-        self.prless_retry
-            .iter()
-            .filter(|(_, s)| s.until > now)
-            .map(|(issue, _)| *issue)
-            .collect()
+        active_cooldown_issues(self.prless_retry_config.enabled, &self.prless_retry, |s| {
+            s.until > now
+        })
     }
 }
 

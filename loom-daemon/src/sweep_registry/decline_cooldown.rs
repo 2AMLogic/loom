@@ -138,77 +138,31 @@ pub(crate) struct DeclineCooldownState {
     pub(crate) rule: String,
 }
 
-/// The subset of `.loom/config.json → autonomous.workFinder.declineCooldown`
-/// this module consumes (Issue #7528). Every field is `Option` so an absent
-/// key falls through to the env-var / built-in-default resolution —
-/// precedence **env > config > default**, mirroring
-/// [`NoopCooldownFileConfig`].
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct DeclineCooldownFileConfig {
-    /// `autonomous.workFinder.declineCooldown.enabled`.
-    pub enabled: Option<bool>,
-    /// `autonomous.workFinder.declineCooldown.cooldownSecs` (zero/invalid dropped).
-    pub cooldown_secs: Option<u64>,
-    /// `autonomous.workFinder.declineCooldown.warnThreshold` (zero/invalid dropped).
-    pub warn_threshold: Option<u32>,
-}
-
-/// Read `.loom/config.json → autonomous.workFinder.declineCooldown` (Issue
-/// #7528), soft-failing every field to `None` on a missing file, malformed
-/// JSON, or an absent block — mirrors [`read_noop_cooldown_file_config`].
-#[must_use]
-pub fn read_decline_cooldown_file_config(repo_root: &Path) -> DeclineCooldownFileConfig {
-    let effective = crate::config_resolver::resolve_effective_config(repo_root);
-    let Some(c) =
-        crate::config_resolver::get_path(&effective, "autonomous.workFinder.declineCooldown")
-    else {
-        return DeclineCooldownFileConfig::default();
-    };
-    DeclineCooldownFileConfig {
-        enabled: c.get("enabled").and_then(serde_json::Value::as_bool),
-        cooldown_secs: c
-            .get("cooldownSecs")
-            .and_then(serde_json::Value::as_u64)
-            .filter(|&s| s > 0),
-        warn_threshold: c
-            .get("warnThreshold")
-            .and_then(serde_json::Value::as_u64)
-            .filter(|&s| s > 0)
-            .and_then(|s| u32::try_from(s).ok()),
-    }
-}
-
 /// Resolve the full [`DeclineCooldownConfig`] for `repo_root` with precedence
 /// **env > config > default** for every knob (Issue #7528), mirroring
-/// [`resolve_noop_cooldown_config`].
+/// [`resolve_noop_cooldown_config`]: the
+/// `autonomous.workFinder.declineCooldown` block is read once, then each knob
+/// layers its env override on top.
 #[must_use]
 pub fn resolve_decline_cooldown_config(repo_root: &Path) -> DeclineCooldownConfig {
-    let file = read_decline_cooldown_file_config(repo_root);
-
-    let enabled = if let Ok(v) = std::env::var(DECLINE_COOLDOWN_ENABLE_ENV) {
-        matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on")
-    } else {
-        file.enabled.unwrap_or(true)
-    };
-
-    let cooldown_secs = std::env::var(DECLINE_COOLDOWN_SECS_ENV)
-        .ok()
-        .and_then(|v| v.trim().parse::<u64>().ok())
-        .filter(|&s| s > 0)
-        .or(file.cooldown_secs)
-        .unwrap_or(DEFAULT_DECLINE_COOLDOWN_SECS);
-
-    let warn_threshold = std::env::var(DECLINE_WARN_THRESHOLD_ENV)
-        .ok()
-        .and_then(|v| v.trim().parse::<u32>().ok())
-        .filter(|&s| s > 0)
-        .or(file.warn_threshold)
-        .unwrap_or(DEFAULT_DECLINE_WARN_THRESHOLD);
+    let effective = crate::config_resolver::resolve_effective_config(repo_root);
+    let block =
+        crate::config_resolver::get_path(&effective, "autonomous.workFinder.declineCooldown");
 
     DeclineCooldownConfig {
-        enabled,
-        cooldown: Duration::from_secs(cooldown_secs),
-        warn_threshold,
+        enabled: env_or_config_bool(block, DECLINE_COOLDOWN_ENABLE_ENV, "enabled", true),
+        cooldown: Duration::from_secs(env_or_config_positive_u64(
+            block,
+            DECLINE_COOLDOWN_SECS_ENV,
+            "cooldownSecs",
+            DEFAULT_DECLINE_COOLDOWN_SECS,
+        )),
+        warn_threshold: env_or_config_positive_u32(
+            block,
+            DECLINE_WARN_THRESHOLD_ENV,
+            "warnThreshold",
+            DEFAULT_DECLINE_WARN_THRESHOLD,
+        ),
     }
 }
 
@@ -298,15 +252,11 @@ impl SweepRegistry {
     /// [`Self::noop_cooldown_remaining`].
     #[must_use]
     pub fn decline_cooldown_remaining(&self, issue: u32, now: DateTime<Utc>) -> Option<Duration> {
-        if !self.decline_cooldown_config.enabled {
-            return None;
-        }
-        let state = self.decline_cooldown.get(&issue)?;
-        let remaining = state.until - now;
-        if remaining <= chrono::Duration::zero() {
-            return None;
-        }
-        remaining.to_std().ok().filter(|d| !d.is_zero())
+        cooldown_window_remaining(
+            self.decline_cooldown_config.enabled,
+            self.decline_cooldown.get(&issue).map(|s| s.until),
+            now,
+        )
     }
 
     /// Absolute decline-cooldown expiry for `issue` at `now` (Issue #9311), or
@@ -315,11 +265,11 @@ impl SweepRegistry {
     /// rather than the duration until it.
     #[must_use]
     pub fn decline_cooldown_until(&self, issue: u32, now: DateTime<Utc>) -> Option<DateTime<Utc>> {
-        if !self.decline_cooldown_config.enabled {
-            return None;
-        }
-        let state = self.decline_cooldown.get(&issue)?;
-        (state.until > now).then_some(state.until)
+        cooldown_window_until(
+            self.decline_cooldown_config.enabled,
+            self.decline_cooldown.get(&issue).map(|s| s.until),
+            now,
+        )
     }
 
     /// Consecutive declines recorded for `issue` (Issue #7528). `0` when no
@@ -349,14 +299,9 @@ impl SweepRegistry {
     /// window to advertise.
     #[must_use]
     pub fn decline_cooldown_issues(&self, now: DateTime<Utc>) -> HashSet<u32> {
-        if !self.decline_cooldown_config.enabled {
-            return HashSet::new();
-        }
-        self.decline_cooldown
-            .iter()
-            .filter(|(_, s)| s.until > now)
-            .map(|(issue, _)| *issue)
-            .collect()
+        active_cooldown_issues(self.decline_cooldown_config.enabled, &self.decline_cooldown, |s| {
+            s.until > now
+        })
     }
 }
 

@@ -2299,19 +2299,18 @@ fn resolve_dispatch_backoff_config_env_overrides() {
     assert_eq!(resolved.max, Duration::from_secs(30), "max clamped up to base");
 }
 
-/// Config-file parsing of `autonomous.workFinder.dispatchBackoff` (#4485),
-/// including the all-`None` (absent block) case that preserves env/default
-/// resolution for repos that never configure it.
+/// Config-file resolution of `autonomous.workFinder.dispatchBackoff` (#4485):
+/// the resolver folds a configured block in, knob for knob, and an absent
+/// block leaves the shipped defaults — the case for every repo that never
+/// configures it.
 #[test]
 #[serial]
-fn read_dispatch_backoff_file_config_parses_block() {
-    for var in [
+fn resolve_dispatch_backoff_config_reads_block() {
+    let _env = EnvGuard::clear(&[
         DISPATCH_BACKOFF_ENABLE_ENV,
         DISPATCH_BACKOFF_BASE_ENV,
         DISPATCH_BACKOFF_MAX_ENV,
-    ] {
-        std::env::remove_var(var);
-    }
+    ]);
 
     let dir = tempdir().unwrap();
     let loom = dir.path().join(".loom");
@@ -2322,19 +2321,13 @@ fn read_dispatch_backoff_file_config_parses_block() {
         )
         .unwrap();
 
-    let file = read_dispatch_backoff_file_config(dir.path());
-    assert_eq!(file.enabled, Some(false));
-    assert_eq!(file.base_secs, Some(15));
-    assert_eq!(file.max_secs, Some(300));
-
     let resolved = resolve_dispatch_backoff_config(dir.path());
     assert!(!resolved.enabled);
     assert_eq!(resolved.base, Duration::from_secs(15));
     assert_eq!(resolved.max, Duration::from_secs(300));
 
     let empty = tempdir().unwrap();
-    let absent = read_dispatch_backoff_file_config(empty.path());
-    assert_eq!(absent, DispatchBackoffFileConfig::default());
+    assert_eq!(resolve_dispatch_backoff_config(empty.path()), DispatchBackoffConfig::default());
 }
 
 /// The headline #4556 guard: a lock whose owner PID is **live** refuses a

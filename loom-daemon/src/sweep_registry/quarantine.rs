@@ -211,51 +211,28 @@ impl Default for PreflightTripwireConfig {
     }
 }
 
-/// Read `.loom/config.json → autonomous.workFinder.preflightTripwire.threshold`
-/// (Issue #4386), soft-failing to `None` on a missing file, malformed JSON, or
-/// an absent block — mirrors [`read_quarantine_file_config`].
-#[must_use]
-pub(crate) fn read_preflight_tripwire_file_threshold(repo_root: &Path) -> Option<u32> {
-    let effective = crate::config_resolver::resolve_effective_config(repo_root);
-    crate::config_resolver::get_path(&effective, "autonomous.workFinder.preflightTripwire")
-        .and_then(|c| c.get("threshold"))
-        .and_then(serde_json::Value::as_u64)
-        .filter(|&n| n > 0)
-        .and_then(|n| u32::try_from(n).ok())
-}
-
-/// Read `.loom/config.json → autonomous.workFinder.preflightTripwire.probeCooldownSecs`
-/// (Issue #5030), soft-failing to `None` — mirrors
-/// [`read_preflight_tripwire_file_threshold`].
-#[must_use]
-pub(crate) fn read_preflight_probe_cooldown_secs(repo_root: &Path) -> Option<u64> {
-    let effective = crate::config_resolver::resolve_effective_config(repo_root);
-    crate::config_resolver::get_path(&effective, "autonomous.workFinder.preflightTripwire")
-        .and_then(|c| c.get("probeCooldownSecs"))
-        .and_then(serde_json::Value::as_u64)
-        .filter(|&n| n > 0)
-}
-
 /// Resolve the full [`PreflightTripwireConfig`] for `repo_root` with
 /// precedence **env > config > default** (Issue #4386), mirroring
-/// [`resolve_quarantine_config`].
+/// [`resolve_quarantine_config`]: `autonomous.workFinder.preflightTripwire`
+/// is read once, then each knob layers its env override on top.
 #[must_use]
 pub fn resolve_preflight_tripwire_config(repo_root: &Path) -> PreflightTripwireConfig {
-    let threshold = std::env::var(PREFLIGHT_TRIPWIRE_THRESHOLD_ENV)
-        .ok()
-        .and_then(|v| v.trim().parse::<u32>().ok())
-        .filter(|&n| n > 0)
-        .or_else(|| read_preflight_tripwire_file_threshold(repo_root))
-        .unwrap_or(DEFAULT_PREFLIGHT_TRIPWIRE_THRESHOLD);
-    let probe_cooldown_secs = std::env::var(PREFLIGHT_PROBE_COOLDOWN_ENV)
-        .ok()
-        .and_then(|v| v.trim().parse::<u64>().ok())
-        .filter(|&n| n > 0)
-        .or_else(|| read_preflight_probe_cooldown_secs(repo_root))
-        .unwrap_or(DEFAULT_PREFLIGHT_PROBE_COOLDOWN_SECS);
+    let effective = crate::config_resolver::resolve_effective_config(repo_root);
+    let block =
+        crate::config_resolver::get_path(&effective, "autonomous.workFinder.preflightTripwire");
     PreflightTripwireConfig {
-        threshold,
-        probe_cooldown: Duration::from_secs(probe_cooldown_secs),
+        threshold: env_or_config_positive_u32(
+            block,
+            PREFLIGHT_TRIPWIRE_THRESHOLD_ENV,
+            "threshold",
+            DEFAULT_PREFLIGHT_TRIPWIRE_THRESHOLD,
+        ),
+        probe_cooldown: Duration::from_secs(env_or_config_positive_u64(
+            block,
+            PREFLIGHT_PROBE_COOLDOWN_ENV,
+            "probeCooldownSecs",
+            DEFAULT_PREFLIGHT_PROBE_COOLDOWN_SECS,
+        )),
     }
 }
 
@@ -263,112 +240,50 @@ pub fn resolve_preflight_tripwire_config(repo_root: &Path) -> PreflightTripwireC
 // Insta-crash quarantine config resolution (Issue #3939)
 // ============================================================================
 
-/// The subset of `.loom/config.json → autonomous.workFinder.quarantine` this
-/// module consumes (Issue #3939). Each field is `Option` so an absent key falls
-/// through to the env-var / built-in-default resolution — precedence
-/// **env > config > default** for every knob, matching the rest of the module.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct QuarantineFileConfig {
-    /// `autonomous.workFinder.quarantine.enabled` — whether quarantine runs.
-    pub enabled: Option<bool>,
-    /// `autonomous.workFinder.quarantine.threshold` — consecutive insta-crashes
-    /// before quarantine (zero/invalid dropped to `None`).
-    pub threshold: Option<u32>,
-    /// `autonomous.workFinder.quarantine.ttlSecs` — quarantine TTL, in seconds
-    /// (zero/invalid dropped to `None`).
-    pub ttl_secs: Option<u64>,
-    /// `autonomous.workFinder.quarantine.instaCrashSecs` — insta-crash window, in
-    /// seconds (zero/invalid dropped to `None`).
-    pub insta_crash_secs: Option<u64>,
-    /// `autonomous.workFinder.quarantine.maxReleaseAttempts` — the release-retry
-    /// ceiling (Issue #8953; zero/invalid dropped to `None`).
-    pub max_release_attempts: Option<u32>,
-}
-
-/// Read `.loom/config.json → autonomous.workFinder.quarantine` (Issue #3939),
-/// soft-failing every field to `None` on a missing file, malformed JSON, or an
-/// absent `autonomous` / `workFinder` / `quarantine` block. Mirrors
-/// [`read_startup_race_config`].
-#[must_use]
-pub fn read_quarantine_file_config(repo_root: &Path) -> QuarantineFileConfig {
-    let effective = crate::config_resolver::resolve_effective_config(repo_root);
-    let Some(q) = crate::config_resolver::get_path(&effective, "autonomous.workFinder.quarantine")
-    else {
-        return QuarantineFileConfig::default();
-    };
-    QuarantineFileConfig {
-        enabled: q.get("enabled").and_then(serde_json::Value::as_bool),
-        threshold: q
-            .get("threshold")
-            .and_then(serde_json::Value::as_u64)
-            .filter(|&n| n > 0)
-            .and_then(|n| u32::try_from(n).ok()),
-        ttl_secs: q
-            .get("ttlSecs")
-            .and_then(serde_json::Value::as_u64)
-            .filter(|&s| s > 0),
-        insta_crash_secs: q
-            .get("instaCrashSecs")
-            .and_then(serde_json::Value::as_u64)
-            .filter(|&s| s > 0),
-        max_release_attempts: q
-            .get("maxReleaseAttempts")
-            .and_then(serde_json::Value::as_u64)
-            .filter(|&n| n > 0)
-            .and_then(|n| u32::try_from(n).ok()),
-    }
-}
-
 /// Resolve the full [`QuarantineConfig`] for `repo_root` with precedence
-/// **env > config > default** for every knob (Issue #3939). Reads the file
-/// config internally, then layers env overrides on top, then the shipped
-/// defaults. Enabled defaults **on** — it is a safety backstop.
+/// **env > config > default** for every knob (Issue #3939): the
+/// `autonomous.workFinder.quarantine` block is read once — by this resolver
+/// and the TTL ceiling alike (#15663) — then each knob layers its env
+/// override on top, then the shipped defaults. Enabled defaults **on** — it
+/// is a safety backstop. `instaCrashSecs` is the one knob typed `i64` (the
+/// window is compared in chrono seconds): a resolved value too large for it
+/// falls back to the default.
 #[must_use]
 pub fn resolve_quarantine_config(repo_root: &Path) -> QuarantineConfig {
-    let file = read_quarantine_file_config(repo_root);
+    let effective = crate::config_resolver::resolve_effective_config(repo_root);
+    let block = crate::config_resolver::get_path(&effective, "autonomous.workFinder.quarantine");
 
-    let enabled = if let Ok(v) = std::env::var(QUARANTINE_ENABLE_ENV) {
-        matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on")
-    } else {
-        file.enabled.unwrap_or(true)
-    };
-
-    let threshold = std::env::var(QUARANTINE_THRESHOLD_ENV)
-        .ok()
-        .and_then(|v| v.trim().parse::<u32>().ok())
-        .filter(|&n| n > 0)
-        .or(file.threshold)
-        .unwrap_or(DEFAULT_QUARANTINE_THRESHOLD);
-
-    let ttl_secs = std::env::var(QUARANTINE_TTL_ENV)
-        .ok()
-        .and_then(|v| v.trim().parse::<u64>().ok())
-        .filter(|&s| s > 0)
-        .or(file.ttl_secs)
-        .unwrap_or(DEFAULT_QUARANTINE_TTL_SECS);
-
-    let insta_crash_secs = std::env::var(QUARANTINE_INSTA_CRASH_ENV)
-        .ok()
-        .and_then(|v| v.trim().parse::<u64>().ok())
-        .filter(|&s| s > 0)
-        .or(file.insta_crash_secs)
-        .and_then(|s| i64::try_from(s).ok())
-        .unwrap_or(DEFAULT_QUARANTINE_INSTA_CRASH_SECS);
-
-    let max_release_attempts = std::env::var(QUARANTINE_MAX_RELEASE_ATTEMPTS_ENV)
-        .ok()
-        .and_then(|v| v.trim().parse::<u32>().ok())
-        .filter(|&n| n > 0)
-        .or(file.max_release_attempts)
-        .unwrap_or(DEFAULT_QUARANTINE_MAX_RELEASE_ATTEMPTS);
+    let ttl_secs = env_or_config_positive_u64(
+        block,
+        QUARANTINE_TTL_ENV,
+        "ttlSecs",
+        DEFAULT_QUARANTINE_TTL_SECS,
+    );
+    let insta_crash_secs = i64::try_from(env_or_config_positive_u64(
+        block,
+        QUARANTINE_INSTA_CRASH_ENV,
+        "instaCrashSecs",
+        u64::try_from(DEFAULT_QUARANTINE_INSTA_CRASH_SECS).unwrap_or_default(),
+    ))
+    .unwrap_or(DEFAULT_QUARANTINE_INSTA_CRASH_SECS);
 
     QuarantineConfig {
-        enabled,
-        threshold,
+        enabled: env_or_config_bool(block, QUARANTINE_ENABLE_ENV, "enabled", true),
+        threshold: env_or_config_positive_u32(
+            block,
+            QUARANTINE_THRESHOLD_ENV,
+            "threshold",
+            DEFAULT_QUARANTINE_THRESHOLD,
+        ),
         ttl: Duration::from_secs(ttl_secs),
-        ttl_max: resolve_quarantine_ttl_max(repo_root, ttl_secs),
+        ttl_max: resolve_quarantine_ttl_max_from_block(block, ttl_secs),
         insta_crash_secs,
-        max_release_attempts,
+        max_release_attempts: env_or_config_positive_u32(
+            block,
+            QUARANTINE_MAX_RELEASE_ATTEMPTS_ENV,
+            "maxReleaseAttempts",
+            DEFAULT_QUARANTINE_MAX_RELEASE_ATTEMPTS,
+        ),
     }
 }
 
@@ -2397,56 +2312,132 @@ exit 0
         assert_eq!(resolved.insta_crash_secs, 30);
     }
 
-    /// Config-file parsing of `autonomous.workFinder.quarantine` (#3939).
+    /// The pre-flight tripwire's knobs resolve env > config > default
+    /// (#4386, #5030): a configured block beats the shipped defaults.
     #[test]
     #[serial]
-    fn read_quarantine_file_config_parses_block() {
-        // Ensure env does not shadow the file values for the resolve assertion.
-        std::env::remove_var(QUARANTINE_THRESHOLD_ENV);
-        std::env::remove_var(QUARANTINE_TTL_ENV);
-        std::env::remove_var(QUARANTINE_INSTA_CRASH_ENV);
-        std::env::remove_var(QUARANTINE_ENABLE_ENV);
+    fn resolve_preflight_tripwire_config_reads_block() {
+        let _env = EnvGuard::clear(&[
+            PREFLIGHT_TRIPWIRE_THRESHOLD_ENV,
+            PREFLIGHT_PROBE_COOLDOWN_ENV,
+        ]);
+        let dir = tempdir().unwrap();
+        let loom = dir.path().join(".loom");
+        std::fs::create_dir_all(&loom).unwrap();
+        std::fs::write(
+            loom.join("config.json"),
+            r#"{"autonomous":{"workFinder":{"preflightTripwire":{"threshold":5,"probeCooldownSecs":60}}}}"#,
+        )
+        .unwrap();
+
+        let resolved = resolve_preflight_tripwire_config(dir.path());
+        assert_eq!(resolved.threshold, 5);
+        assert_eq!(resolved.probe_cooldown, Duration::from_secs(60));
+    }
+
+    /// A set env var beats the tripwire's config block (#4386, #5030).
+    #[test]
+    #[serial]
+    fn resolve_preflight_tripwire_config_env_overrides_block() {
+        let _threshold = EnvGuard::set(PREFLIGHT_TRIPWIRE_THRESHOLD_ENV, "7");
+        let _cooldown = EnvGuard::set(PREFLIGHT_PROBE_COOLDOWN_ENV, "120");
+        let dir = tempdir().unwrap();
+        let loom = dir.path().join(".loom");
+        std::fs::create_dir_all(&loom).unwrap();
+        std::fs::write(
+            loom.join("config.json"),
+            r#"{"autonomous":{"workFinder":{"preflightTripwire":{"threshold":5,"probeCooldownSecs":60}}}}"#,
+        )
+        .unwrap();
+
+        let resolved = resolve_preflight_tripwire_config(dir.path());
+        assert_eq!(resolved.threshold, 7);
+        assert_eq!(resolved.probe_cooldown, Duration::from_secs(120));
+    }
+
+    /// A zero or non-numeric tripwire env value falls through to the shipped
+    /// defaults (#4386, #5030).
+    #[test]
+    #[serial]
+    fn resolve_preflight_tripwire_config_zero_or_invalid_env_falls_through() {
+        let _threshold = EnvGuard::set(PREFLIGHT_TRIPWIRE_THRESHOLD_ENV, "0");
+        let _cooldown = EnvGuard::set(PREFLIGHT_PROBE_COOLDOWN_ENV, "soon");
+        let dir = tempdir().unwrap();
+
+        let resolved = resolve_preflight_tripwire_config(dir.path());
+        assert_eq!(resolved, PreflightTripwireConfig::default());
+    }
+
+    /// Every env var that can shadow the `quarantine` config block (#3939,
+    /// #8953, vibesql#6639) — cleared by the resolver tests below.
+    const QUARANTINE_KNOB_ENV: [&str; 6] = [
+        QUARANTINE_ENABLE_ENV,
+        QUARANTINE_THRESHOLD_ENV,
+        QUARANTINE_TTL_ENV,
+        QUARANTINE_INSTA_CRASH_ENV,
+        QUARANTINE_MAX_RELEASE_ATTEMPTS_ENV,
+        QUARANTINE_TTL_MAX_ENV,
+    ];
+
+    /// Config-file resolution of `autonomous.workFinder.quarantine` (#3939):
+    /// the resolver folds a configured block in, knob for knob, with no env
+    /// set — and a knob the block leaves out still resolves to its default.
+    #[test]
+    #[serial]
+    fn resolve_quarantine_config_reads_block() {
+        let _env = EnvGuard::clear(&QUARANTINE_KNOB_ENV);
 
         let dir = tempdir().unwrap();
         let loom = dir.path().join(".loom");
         std::fs::create_dir_all(&loom).unwrap();
         std::fs::write(
             loom.join("config.json"),
-            r#"{"autonomous":{"workFinder":{"quarantine":{"enabled":true,"threshold":4,"ttlSecs":900,"instaCrashSecs":45}}}}"#,
+            r#"{"autonomous":{"workFinder":{"quarantine":{"enabled":true,"threshold":4,"ttlSecs":900,"instaCrashSecs":45,"maxReleaseAttempts":7}}}}"#,
         )
         .unwrap();
 
-        let file = read_quarantine_file_config(dir.path());
-        assert_eq!(file.enabled, Some(true));
-        assert_eq!(file.threshold, Some(4));
-        assert_eq!(file.ttl_secs, Some(900));
-        assert_eq!(file.insta_crash_secs, Some(45));
-
-        // And the full resolver folds them in (no env set).
         let resolved = resolve_quarantine_config(dir.path());
+        assert!(resolved.enabled);
         assert_eq!(resolved.threshold, 4);
         assert_eq!(resolved.ttl, Duration::from_secs(900));
         assert_eq!(resolved.insta_crash_secs, 45);
+        assert_eq!(resolved.max_release_attempts, 7);
+        assert_eq!(resolved.ttl_max, Duration::from_secs(DEFAULT_QUARANTINE_TTL_MAX_SECS));
     }
 
-    /// A missing `quarantine` block yields all-`None` (env/default resolution) —
-    /// zero behavior change for repos that never configure it.
+    /// A missing `quarantine` block resolves to the shipped defaults — zero
+    /// behavior change for repos that never configure it.
     #[test]
-    fn read_quarantine_file_config_absent_block_is_none() {
+    #[serial]
+    fn resolve_quarantine_config_absent_block_is_default() {
+        let _env = EnvGuard::clear(&QUARANTINE_KNOB_ENV);
+
         let dir = tempdir().unwrap();
         let loom = dir.path().join(".loom");
         std::fs::create_dir_all(&loom).unwrap();
         std::fs::write(loom.join("config.json"), r#"{"autonomous":{"workFinder":{}}}"#).unwrap();
-        let file = read_quarantine_file_config(dir.path());
-        assert_eq!(file, QuarantineFileConfig::default());
+        assert_eq!(resolve_quarantine_config(dir.path()), QuarantineConfig::default());
     }
 
     /// config_resolver migration (#4058): a value set only at the project
     /// tier is honored identically to the legacy file.
+    ///
+    /// Holds `loom_config_env` (it writes `PRIVATE_DEFAULTS_ENV`) around the
+    /// default `#[serial]` lock (the resolver reads the brake's own env vars),
+    /// in that order — the nesting `claim_reconciliation::trusted_comments_tests`
+    /// documents for a test that needs both.
     #[test]
     #[serial(loom_config_env)]
-    fn read_quarantine_file_config_project_tier_only_is_honored_like_legacy() {
-        std::env::set_var(crate::config_resolver::PRIVATE_DEFAULTS_ENV, "");
+    fn resolve_quarantine_config_project_tier_only_is_honored_like_legacy() {
+        resolve_quarantine_config_project_tier_only_is_honored_like_legacy_body();
+    }
+
+    /// The body of [`resolve_quarantine_config_project_tier_only_is_honored_like_legacy`].
+    #[serial]
+    fn resolve_quarantine_config_project_tier_only_is_honored_like_legacy_body() {
+        let _private_defaults = EnvGuard::set(crate::config_resolver::PRIVATE_DEFAULTS_ENV, "");
+        let _env = EnvGuard::clear(&QUARANTINE_KNOB_ENV);
+
         let dir = tempdir().unwrap();
         let project = dir.path().join(crate::config_resolver::PROJECT_CONFIG_REL);
         std::fs::create_dir_all(project.parent().unwrap()).unwrap();
@@ -2456,18 +2447,11 @@ exit 0
         )
         .unwrap();
 
-        let file = read_quarantine_file_config(dir.path());
-        std::env::remove_var(crate::config_resolver::PRIVATE_DEFAULTS_ENV);
-        assert_eq!(
-            file,
-            QuarantineFileConfig {
-                enabled: Some(true),
-                threshold: Some(4),
-                ttl_secs: Some(900),
-                insta_crash_secs: Some(45),
-                max_release_attempts: None,
-            }
-        );
+        let resolved = resolve_quarantine_config(dir.path());
+        assert!(resolved.enabled);
+        assert_eq!(resolved.threshold, 4);
+        assert_eq!(resolved.ttl, Duration::from_secs(900));
+        assert_eq!(resolved.insta_crash_secs, 45);
     }
 
     /// Issue #5431: `apply_quarantine_label`'s forge calls (the
