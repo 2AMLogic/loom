@@ -8,7 +8,7 @@
 //! way.
 
 use super::*;
-use std::process::Command;
+use crate::test_git_helpers::{git_out, run};
 
 fn kid(number: i64, branch: &str) -> Child {
     Child {
@@ -315,17 +315,7 @@ impl Sandbox {
         assert!(git_ok(root, &["add", "base.txt"]));
         assert!(git_ok(root, &["commit", "-q", "-m", "base"]));
         assert!(git_ok(root, &["checkout", "-q", "-b", "feature/issue-100"]));
-        let sha = String::from_utf8_lossy(
-            &Command::new("git")
-                .arg("-C")
-                .arg(root)
-                .args(["rev-parse", "HEAD"])
-                .output()
-                .expect("rev-parse")
-                .stdout,
-        )
-        .trim()
-        .to_string();
+        let sha = run(root, &["rev-parse", "HEAD"]);
         (Self { dir }, sha)
     }
 
@@ -334,12 +324,7 @@ impl Sandbox {
     }
 
     fn pinned(&self, branch: &str) -> Option<String> {
-        let out = Command::new("git")
-            .arg("-C")
-            .arg(self.root())
-            .args(["rev-parse", "--verify", "--quiet", &pin_ref(branch)])
-            .output()
-            .ok()?;
+        let out = git_out(self.root(), &["rev-parse", "--verify", "--quiet", &pin_ref(branch)]);
         if !out.status.success() {
             return None;
         }
@@ -348,12 +333,7 @@ impl Sandbox {
 }
 
 fn git_ok(root: &std::path::Path, args: &[&str]) -> bool {
-    Command::new("git")
-        .arg("-C")
-        .arg(root)
-        .args(args)
-        .output()
-        .is_ok_and(|o| o.status.success())
+    git_out(root, args).status.success()
 }
 
 #[test]
@@ -389,17 +369,7 @@ fn establishing_the_pin_twice_is_idempotent() {
 #[test]
 fn a_non_commit_object_does_not_satisfy_the_pin() {
     let (sb, _sha) = Sandbox::new();
-    let tree = String::from_utf8_lossy(
-        &Command::new("git")
-            .arg("-C")
-            .arg(sb.root())
-            .args(["rev-parse", "HEAD^{tree}"])
-            .output()
-            .expect("rev-parse tree")
-            .stdout,
-    )
-    .trim()
-    .to_string();
+    let tree = run(sb.root(), &["rev-parse", "HEAD^{tree}"]);
     assert!(!establish_pin(sb.root(), "feature/issue-100", &tree));
     assert_eq!(sb.pinned("feature/issue-100"), None);
 }
