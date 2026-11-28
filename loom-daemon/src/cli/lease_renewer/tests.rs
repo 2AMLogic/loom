@@ -199,15 +199,7 @@ fn parse_state_rejects_anything_but_open_or_closed() {
 fn repo_identity_prefers_loom_repo_then_origin_slug() {
     let dir = tempfile::tempdir().unwrap();
     assert_eq!(repo_identity(Some(" Acme/Widget "), dir.path()), "acme/widget");
-    let git = |args: &[&str]| {
-        assert!(Command::new("git")
-            .arg("-C")
-            .arg(dir.path())
-            .args(args)
-            .status()
-            .unwrap()
-            .success());
-    };
+    let git = |args: &[&str]| crate::test_git_helpers::run(dir.path(), args);
     git(&["init", "-q"]);
     git(&["remote", "add", "origin", "git@github.com:Acme/Widget.git"]);
     assert_eq!(repo_identity(None, dir.path()), "acme/widget");

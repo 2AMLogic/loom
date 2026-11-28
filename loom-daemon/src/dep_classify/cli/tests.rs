@@ -28,14 +28,7 @@ fn a_checkout_with_an_origin_remote_resolves_without_asking_the_forge() {
             .unwrap_or(0)
     ));
     std::fs::create_dir_all(&dir).expect("temp dir");
-    let git = |args: &[&str]| {
-        std::process::Command::new("git")
-            .arg("-C")
-            .arg(&dir)
-            .args(args)
-            .output()
-            .expect("git")
-    };
+    let git = |args: &[&str]| crate::test_git_helpers::git_out(&dir, args);
     git(&["init", "-q"]);
     git(&["remote", "add", "origin", "git@github.com:acme/widgets.git"]);
 
