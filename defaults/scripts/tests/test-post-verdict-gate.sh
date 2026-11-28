@@ -11,6 +11,9 @@
 #   - a label write failure after the post exits non-zero with a repair hint
 #   - a head that moved since the changes-requested verdict approves normally
 #   - a second identical verdict at the same head is deduped (no 2nd comment)
+#   - a review-feedback gate state of UNKNOWN posts nothing, even with a
+#     --reviews-reconciled text — for a plain read failure (#15781) as for a
+#     timeout (#13927)
 #
 # test-post-verdict.sh pins the shell wiring with a mock daemon; the decision
 # rules are unit-tested in loom-daemon/src/verdict_gate/tests.rs. This suite is
@@ -64,6 +67,9 @@ if [[ "${1:-}" == "api" ]]; then
   # #13927: a wedged formal-reviews read — the reconciliation gate's fetch
   # never writes and never exits on its own.
   [[ -f "$D/rev-hang" && "$path" == *"/reviews"* ]] && sleep 30
+  # #15781: a FAILED formal-reviews read on both transports (REST here, the
+  # #15009 GraphQL fallback below) — the gate's non-timeout UNKNOWN.
+  [[ -f "$D/rev-fail" && "$path" == *"/reviews"* ]] && { echo "HTTP 502" >&2; exit 1; }
   case "$method $path" in
     "GET repos/owner/repo/issues/"*/comments)
       cat "$D/comments.json"; exit 0 ;;
@@ -99,6 +105,9 @@ if [[ "${1:-}" == "api" ]]; then
     exit 0
   fi
   if [[ "${2:-}" == "graphql" ]]; then
+    # #15781: the #15009 GraphQL reviews fallback failing too (reviewThreads is
+    # a different subject and keeps answering).
+    [[ -f "$D/rev-fail" && "$*" == *"reviews(first"* ]] && { echo "HTTP 502" >&2; exit 1; }
     printf '{"data":{"repository":{"pullRequest":{"reviewThreads":{"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[]}}}}}\n'
   fi
   exit 0
@@ -505,6 +514,64 @@ state "[]" loom:review-requested loom:reviewing
 pv 12614 approved "$HEAD" --body "Approved: covered by the new tests." --review-started "$PAST_T" --issue-body-sha "50=$OLD_HASH"
 check "unreadable PR/issue state fails closed: exit 7" 7 "$RC"
 rm -f "$STUB_DIR/issue-50-read-fail"
+
+echo "== a non-timeout UNKNOWN review-feedback state is refused even with --reviews-reconciled (#15781) =="
+# The T5 shape of test-review-feedback-reconciliation.sh: BOTH formal-review
+# transports fail (REST, then the #15009 GraphQL fallback), so nothing was read
+# and the gate answers a plain UNKNOWN with REVIEW_FEEDBACK_TIMED_OUT=0. No
+# finding exists, so the id-citation check has nothing to demand; before #15781
+# that let any 40+ character --reviews-reconciled text carry an approval over a
+# review state nobody read.
+RECONCILED_TEXT="The review feedback was addressed in an earlier push; nothing outstanding remains to fix."
+state "[]" loom:review-requested loom:reviewing
+touch "$STUB_DIR/rev-fail"
+pv 15781 approved "$HEAD" --body "Approved: covered by the new tests." --reviews-reconciled "$RECONCILED_TEXT"
+rm -f "$STUB_DIR/rev-fail"
+check "exit 3" 3 "$RC"
+contains "the gate reported UNKNOWN" "$OUT" "REVIEW_FEEDBACK_STATE=UNKNOWN"
+contains "not a timeout" "$OUT" "REVIEW_FEEDBACK_TIMED_OUT=0"
+contains "refusal names the UNKNOWN state" "$OUT" "gate state is UNKNOWN"
+contains "refusal says it is not dispositionable" "$OUT" "--reviews-reconciled cannot disposition"
+contains "refusal says to retry or park" "$OUT" "park the PR"
+check "not the timeout wording" "" "$(grep -o "TIMED OUT" <<<"$OUT" || true)"
+check "nothing posted" "" "$POSTED"
+contains "claim labels kept" "$LABELS" "loom:review-requested"
+
+# Without the text the same refusal stands, and it no longer offers the text as
+# the way past an unread state.
+state "[]" loom:review-requested loom:reviewing
+touch "$STUB_DIR/rev-fail"
+pv 15782 approved "$HEAD" --body "Approved: covered by the new tests."
+rm -f "$STUB_DIR/rev-fail"
+check "no text: exit 3" 3 "$RC"
+contains "no text: still not dispositionable" "$OUT" "--reviews-reconciled cannot disposition"
+check "no text: nothing posted" "" "$POSTED"
+contains "no text: claim labels kept" "$LABELS" "loom:review-requested"
+
+echo "== an exit code that disagrees with the gate's printed state is an UNKNOWN too (#15781) =="
+# The exit code is authoritative and the printed state a cross-check; when the
+# two disagree post-verdict.sh derives UNKNOWN itself. No real gate emits the
+# mismatch, so an isolated copy of the script runs against a gate that prints
+# CLEAR and exits 12.
+ISOLATED="$STUB_DIR/isolated"
+mkdir -p "$ISOLATED"
+cp "$POST_VERDICT" "$ISOLATED/post-verdict.sh"
+cp -R "$SCRIPTS_DIR/lib" "$ISOLATED/lib"
+cat > "$ISOLATED/check-review-feedback.sh" <<'MISMATCH'
+#!/usr/bin/env bash
+# A mangled gate answer: exit 12 (UNKNOWN) under a printed CLEAR state.
+echo "REVIEW_FEEDBACK_STATE=CLEAR"
+echo "REVIEW_FEEDBACK_TIMED_OUT=0"
+exit 12
+MISMATCH
+chmod +x "$ISOLATED/check-review-feedback.sh"
+state "[]" loom:review-requested loom:reviewing
+OUT="$("$ISOLATED/post-verdict.sh" 15783 approved "$HEAD" --body "Approved: covered by the new tests." --reviews-reconciled "$RECONCILED_TEXT" 2>&1)"; RC=$?
+check "exit 3" 3 "$RC"
+contains "refusal names the UNKNOWN state" "$OUT" "gate state is UNKNOWN"
+contains "refusal says it is not dispositionable" "$OUT" "--reviews-reconciled cannot disposition"
+check "nothing posted" "" "$(cat "$STUB_DIR/posted.log" 2>/dev/null)"
+contains "claim labels kept" "$(tr '\n' ' ' < "$STUB_DIR/labels.txt")" "loom:review-requested"
 
 echo "== a hung review read refuses with distinct timeout wording (#13927) =="
 # The gate's formal-reviews fetch wedges (never returns). The approval must be
