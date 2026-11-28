@@ -207,13 +207,7 @@ fn run_once_skips_a_shed_walk_without_a_request() {
             "https://github.com/acme/intake-shed.git",
         ][..],
     ] {
-        let ok = std::process::Command::new("git")
-            .args(args)
-            .current_dir(dir.path())
-            .status()
-            .unwrap()
-            .success();
-        assert!(ok, "git {args:?}");
+        crate::test_git_helpers::run(dir.path(), args);
     }
     let _route = crate::forge_etag_store::install_test_route(|_| RouteDecision::Exhausted {
         until: std::time::SystemTime::now() + std::time::Duration::from_secs(600),
