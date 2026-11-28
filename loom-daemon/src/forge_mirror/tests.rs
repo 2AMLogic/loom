@@ -293,10 +293,10 @@ fn serve(responses: Vec<(u16, String)>) -> (SocketAddr, Seen) {
     let seen: Seen = Arc::new(Mutex::new(Vec::new()));
     let seen_t = seen.clone();
     std::thread::spawn(move || {
+        use std::io::Read as _;
         for (i, stream) in listener.incoming().enumerate() {
             let Ok(mut stream) = stream else { break };
             let head = {
-                use std::io::Read as _;
                 let mut buf = Vec::new();
                 let mut b = [0u8; 1];
                 while buf.len() < 16_384 && !buf.ends_with(b"\r\n\r\n") {
@@ -307,6 +307,15 @@ fn serve(responses: Vec<(u16, String)>) -> (SocketAddr, Seen) {
                 }
                 String::from_utf8_lossy(&buf).into_owned()
             };
+            // Drain the request's body, so closing sends a FIN over the
+            // socket and not a reset over unread bytes (a `POST` carries one).
+            let len = head
+                .lines()
+                .find_map(|l| l.strip_prefix("content-length: "))
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0);
+            let mut body = vec![0u8; len];
+            let _ = stream.read_exact(&mut body);
             let mut lines = head.lines();
             let line = lines.next().unwrap_or_default().to_string();
             let auth = lines
@@ -362,6 +371,78 @@ async fn the_client_sends_the_key_as_a_bearer_header_only() {
     assert_eq!(seen[0].1.as_deref(), Some(format!("Bearer {}", a.key()).as_str()));
     // The 401 asked the refresher to re-read the key; consume the flag.
     assert!(KEY_REJECTED.swap(false, std::sync::atomic::Ordering::Relaxed));
+}
+
+/// `get_json`, `post_json` and `get_json_conditional` share one reading of
+/// the status line: `401` / `403` is a refused key (only a `401` asks for it
+/// to be re-read), any other non-2xx a status, and a `304` belongs to the
+/// conditional read alone.
+#[tokio::test]
+#[serial]
+async fn every_call_reads_auth_and_other_statuses_the_same() {
+    let http = client::build_http().unwrap();
+    let q = vec![("repo".to_string(), REPO.to_string())];
+    let refused = vec![
+        (403, "{}".to_string()),
+        (502, "{}".to_string()),
+        (200, "{}".to_string()),
+    ];
+
+    let (addr, _) = serve(refused.clone());
+    let a = Active::for_test(&format!("http://{addr}"), BOUND);
+    assert_eq!(
+        client::get_json(&http, &a, "/v1/changes", &q)
+            .await
+            .unwrap_err(),
+        MirrorError::Auth(403)
+    );
+    assert!(!KEY_REJECTED.load(std::sync::atomic::Ordering::Relaxed));
+    assert_eq!(
+        client::get_json(&http, &a, "/v1/changes", &q)
+            .await
+            .unwrap_err(),
+        MirrorError::Status(502)
+    );
+    assert!(client::get_json(&http, &a, "/v1/changes", &q).await.is_ok());
+
+    let (addr, _) = serve(refused);
+    let a = Active::for_test(&format!("http://{addr}"), BOUND);
+    assert_eq!(
+        client::post_json(&http, &a, "/v1/recheck", &json!({}))
+            .await
+            .unwrap_err(),
+        MirrorError::Auth(403)
+    );
+    assert_eq!(
+        client::post_json(&http, &a, "/v1/recheck", &json!({}))
+            .await
+            .unwrap_err(),
+        MirrorError::Status(502)
+    );
+    assert!(client::post_json(&http, &a, "/v1/recheck", &json!({}))
+        .await
+        .is_ok());
+
+    let statuses = vec![
+        (304, String::new()),
+        (401, "{}".to_string()),
+        (503, "{}".to_string()),
+        (200, "{\"x\":1}".to_string()),
+    ];
+    let (addr, _) = serve(statuses);
+    let a = Active::for_test(&format!("http://{addr}"), BOUND);
+    let read = || client::get_json_conditional(&http, &a, "/v1/mirror/worklist", None, BOUND);
+    assert_eq!(read().await.unwrap(), client::Conditional::NotModified);
+    assert_eq!(read().await.unwrap_err(), MirrorError::Auth(401));
+    assert!(KEY_REJECTED.swap(false, std::sync::atomic::Ordering::Relaxed));
+    assert_eq!(read().await.unwrap_err(), MirrorError::Status(503));
+    assert_eq!(
+        read().await.unwrap(),
+        client::Conditional::Modified {
+            etag: None,
+            body: json!({"x": 1})
+        }
+    );
 }
 
 #[test]

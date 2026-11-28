@@ -965,6 +965,21 @@ tools invocation. They resolve mode when a probe actually needs forge data.
 The daemon keeps its existing executable selection. Both paths supply the
 same branch decision logic, including its handling of unavailable answers.
 
+`worktree-closed-pr-branch` is the one probe whose exit code the shell reads
+as a decision, so its contract is the same in both binaries (#15650):
+
+| Exit | Meaning | `lib/worktree-forge-pr-check.sh` |
+| --- | --- | --- |
+| 0 | Proceed: reuse `origin/<branch>`. Every inability to decide is also 0, including a forge that could not be asked. | Reuses the branch. |
+| 1 | Refuse: the tip is the head of a PR closed without merging. The refusal document went to fd 3. | Exits 1; no worktree is created. |
+| 2 | Could not run: the mode or its fleet route did not resolve. The complaint is on stderr and nothing went to fd 3. | Reuses the branch, as on a forge outage. |
+
+A mode error is 2 and not 1 because the shell refuses on 1 alone. As an
+untyped command error it reached `main` as 1, so an unset `LOOM_MODE` under a
+tools wrapper read as a branch refusal, with no refusal document on the
+channel the script reports from — the probe never decided anything.
+`worktree-open-pr` is unchanged (#15650 leaves it out of scope).
+
 | Other §3.1 worktree command | Caller and disposition |
 | --- | --- |
 | `worktree-reset` | The standalone `lib/worktree-race-rescue.sh` adapter remains on the daemon. `worktree-existing` calls the Rust reset guard in-process. |

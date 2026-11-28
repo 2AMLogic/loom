@@ -15,6 +15,7 @@ use serde::Deserialize;
 use serde_json::Value;
 
 use super::Active;
+use crate::http_bridge::{self, classify_reqwest_error, BridgeError};
 
 /// One request's deadline.
 pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
@@ -293,20 +294,11 @@ pub async fn get_json(
         .header(reqwest::header::ACCEPT, "application/json")
         .send()
         .await
-        .map_err(|e| MirrorError::Transport(classify_transport(&e)))?;
-    let status = res.status().as_u16();
-    if status == 401 || status == 403 {
-        if status == 401 {
-            super::note_key_rejected();
-        }
-        return Err(MirrorError::Auth(status));
-    }
-    if !(200..300).contains(&status) {
-        return Err(MirrorError::Status(status));
-    }
+        .map_err(|e| MirrorError::Transport(classify_reqwest_error(&e).to_string()))?;
+    check_status(res.status().as_u16())?;
     res.json::<Value>()
         .await
-        .map_err(|e| MirrorError::Malformed(classify_transport(&e)))
+        .map_err(|e| MirrorError::Malformed(classify_reqwest_error(&e).to_string()))
 }
 
 /// `POST <base>/<path>` with a JSON `body`; the answer's body is ignored.
@@ -330,18 +322,8 @@ pub async fn post_json(
         .json(body)
         .send()
         .await
-        .map_err(|e| MirrorError::Transport(classify_transport(&e)))?;
-    let status = res.status().as_u16();
-    if status == 401 || status == 403 {
-        if status == 401 {
-            super::note_key_rejected();
-        }
-        return Err(MirrorError::Auth(status));
-    }
-    if !(200..300).contains(&status) {
-        return Err(MirrorError::Status(status));
-    }
-    Ok(())
+        .map_err(|e| MirrorError::Transport(classify_reqwest_error(&e).to_string()))?;
+    check_status(res.status().as_u16())
 }
 
 /// A conditional `GET`'s answer.
@@ -379,11 +361,34 @@ pub async fn get_json_conditional(
     let res = req
         .send()
         .await
-        .map_err(|e| MirrorError::Transport(classify_transport(&e)))?;
+        .map_err(|e| MirrorError::Transport(classify_reqwest_error(&e).to_string()))?;
     let status = res.status().as_u16();
     if status == 304 {
         return Ok(Conditional::NotModified);
     }
+    check_status(status)?;
+    let etag = res
+        .headers()
+        .get(reqwest::header::ETAG)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string);
+    let body = res
+        .json::<Value>()
+        .await
+        .map_err(|e| MirrorError::Malformed(classify_reqwest_error(&e).to_string()))?;
+    Ok(Conditional::Modified { etag, body })
+}
+
+/// The verdict on an answer's status line, shared by every call: a `401` or
+/// `403` refused the key (a `401` also asks the refresher to re-read it), any
+/// other non-2xx is a plain status. A `304` is the conditional read's own and
+/// is decided before this.
+///
+/// # Errors
+///
+/// [`MirrorError::Auth`] for a `401` / `403`, [`MirrorError::Status`] for any
+/// other non-2xx.
+fn check_status(status: u16) -> Result<(), MirrorError> {
     if status == 401 || status == 403 {
         if status == 401 {
             super::note_key_rejected();
@@ -393,32 +398,7 @@ pub async fn get_json_conditional(
     if !(200..300).contains(&status) {
         return Err(MirrorError::Status(status));
     }
-    let etag = res
-        .headers()
-        .get(reqwest::header::ETAG)
-        .and_then(|v| v.to_str().ok())
-        .map(str::to_string);
-    let body = res
-        .json::<Value>()
-        .await
-        .map_err(|e| MirrorError::Malformed(classify_transport(&e)))?;
-    Ok(Conditional::Modified { etag, body })
-}
-
-/// A transport error's class, never its URL (which carries no key, but may
-/// carry repo names an operator did not expect in a log).
-fn classify_transport(e: &reqwest::Error) -> String {
-    if e.is_timeout() {
-        "timeout".into()
-    } else if e.is_connect() {
-        "connect".into()
-    } else if e.is_decode() {
-        "decode".into()
-    } else if e.is_body() {
-        "body".into()
-    } else {
-        "request".into()
-    }
+    Ok(())
 }
 
 /// Parse `value` as `T`.
@@ -436,41 +416,20 @@ pub fn decode<T: serde::de::DeserializeOwned>(value: Value) -> Result<T, MirrorE
 
 /// The discovery listings run synchronously, and some of their callers are
 /// async tasks (the work finder calls its source from its own task). Their
-/// requests run on this small runtime of their own, which is only ever
-/// *built* and spawned onto, never entered with `block_on`, so first use is
-/// safe from any thread, inside a tokio runtime or not; it is never dropped,
-/// and its client's connections live as long as the process.
-fn runtime() -> Option<&'static (tokio::runtime::Runtime, reqwest::Client)> {
-    static RT: OnceLock<Option<(tokio::runtime::Runtime, reqwest::Client)>> = OnceLock::new();
-    RT.get_or_init(|| {
-        let rt = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(1)
-            .thread_name("loom-forge-mirror")
-            .enable_all()
-            .build()
-            .map_err(|e| log::warn!("forge_mirror: no runtime for discovery reads ({e})"))
-            .ok()?;
-        // Building a reqwest client needs no runtime.
-        let http = build_http()
+/// requests run on the daemon's shared HTTP bridge ([`crate::http_bridge`]),
+/// which is only ever *built* and spawned onto, never entered with
+/// `block_on`, so first use is safe from any thread, inside a tokio runtime
+/// or not. The client is built once from [`build_http`] and never dropped, so
+/// its connections live as long as the process.
+fn http() -> Option<&'static reqwest::Client> {
+    static HTTP: OnceLock<Option<reqwest::Client>> = OnceLock::new();
+    // Building a reqwest client needs no runtime.
+    HTTP.get_or_init(|| {
+        build_http()
             .map_err(|e| log::warn!("forge_mirror: {e}"))
-            .ok()?;
-        Some((rt, http))
+            .ok()
     })
     .as_ref()
-}
-
-/// Wait for `rx`, telling a multi-thread tokio runtime the current worker is
-/// about to block (so its other tasks move off it). A current-thread runtime
-/// cannot hand its only worker over; there the wait simply blocks, bounded by
-/// `deadline`, like the `gh` subprocesses the same callers already run.
-fn wait<T>(rx: &std::sync::mpsc::Receiver<T>, deadline: Duration) -> Option<T> {
-    let multi = tokio::runtime::Handle::try_current()
-        .is_ok_and(|h| h.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread);
-    if multi {
-        tokio::task::block_in_place(|| rx.recv_timeout(deadline).ok())
-    } else {
-        rx.recv_timeout(deadline).ok()
-    }
 }
 
 /// [`get_json_conditional`] from synchronous code, bounded by `deadline`
@@ -485,22 +444,18 @@ pub fn get_json_conditional_blocking(
     etag: Option<&str>,
     deadline: Duration,
 ) -> Result<Conditional, MirrorError> {
-    let Some((rt, http)) = runtime() else {
-        return Err(MirrorError::Transport("no runtime".into()));
+    let (http, active, path, etag) = match http() {
+        Some(http) => (http.clone(), active.clone(), path.to_string(), etag.map(str::to_string)),
+        None => return Err(MirrorError::Transport(BridgeError::NoRuntime.to_string())),
     };
-    let (tx, rx) = std::sync::mpsc::sync_channel(1);
-    let (http, active, path, etag) =
-        (http.clone(), active.clone(), path.to_string(), etag.map(str::to_string));
-    rt.spawn(async move {
-        let _ =
-            tx.send(get_json_conditional(&http, &active, &path, etag.as_deref(), deadline).await);
-    });
-    wait(&rx, deadline + Duration::from_secs(1))
-        .unwrap_or_else(|| Err(MirrorError::Transport("deadline".into())))
+    http_bridge::run_blocking(deadline + Duration::from_secs(1), async move {
+        get_json_conditional(&http, &active, &path, etag.as_deref(), deadline).await
+    })
+    .unwrap_or_else(|e| Err(MirrorError::Transport(e.to_string())))
 }
 
 /// [`post_json`] fired off the calling thread: this returns at once, and
-/// `done` runs on the mirror runtime with the result. One attempt, never
+/// `done` runs on the bridge runtime with the result. One attempt, never
 /// retried; the caller never waits on the network.
 pub fn post_json_detached(
     active: &Active,
@@ -508,9 +463,8 @@ pub fn post_json_detached(
     body: Value,
     done: impl FnOnce(Result<(), MirrorError>) + Send + 'static,
 ) {
-    let Some((rt, http)) = runtime() else {
-        done(Err(MirrorError::Transport("no runtime".into())));
-        return;
+    let (Some(rt), Some(http)) = (http_bridge::runtime(), http()) else {
+        return done(Err(MirrorError::Transport(BridgeError::NoRuntime.to_string())));
     };
     let (http, active, path) = (http.clone(), active.clone(), path.to_string());
     rt.spawn(async move {

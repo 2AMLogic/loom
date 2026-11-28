@@ -1052,19 +1052,6 @@ pub fn spawn_task(
     // start an exporter, least of all the managed HTTPS one.
     session_output::register_sink(otlp_queues.clone(), &host_id);
     ops_handles.extend(session_output::spawn_task(bus, workspace_root.clone()));
-    // `eta.dispatch_eligibility` (#12790): the dispatcher's schedulability
-    // decision per waiting ready item, OTLP-only, sampled by the collector
-    // below on the same cadence as `queue.snapshot`.
-    dispatch_eligibility::register_sink(otlp_queues.clone(), &host_id);
-    // `eta.dispatch_state` (#12918): each classified item's dispatch gate and
-    // its release time, OTLP-only, emitted by the step driver's tick.
-    dispatch_state::register_sink(otlp_queues.clone(), &host_id);
-    // `eta.stage_occupancy` (#12866): the pre-ready stage occupancy gauge,
-    // OTLP-only, sampled by the collector on the same cadence.
-    stage_occupancy::register_sink(otlp_queues.clone(), &host_id);
-    // `eta.stage_entry` (#12869): arrivals diffed from the step driver's
-    // per-tick discovery snapshot, OTLP-only.
-    stage_entry_fact::register_sink(otlp_queues.clone(), &host_id);
     if let Some(sink) = ops::sink_for_otlp_queues(otlp_queues, &host_id) {
         ops::register_global_ops_sink(sink);
         // Slot turnaround (#8929): a bus subscriber, OTLP-only like the sink.

@@ -43,7 +43,7 @@
 
 use std::path::PathBuf;
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 
 use crate::forge_cmd::{detect_forge, ForgeType, EX_FORGE_DECLINED};
 use crate::worktree_ops::gh::{probe_open_linked_pr, OpenPrProbe};
@@ -111,9 +111,33 @@ pub fn verdict(issue: u32, probe: OpenPrProbe) -> Verdict {
     }
 }
 
-/// Handle `loom-daemon forge check-open-pr <issue>`. Never returns (exits the
-/// process with the code from [`verdict`]); returns `Err` only when the current
-/// directory cannot be resolved.
+/// Resolve the cwd into the root the probe runs against, or turn an
+/// unresolvable cwd into the no-verdict [`Verdict`] — exit
+/// [`EX_PROBE_FAILED`], empty stdout.
+///
+/// The failure must not travel as an `Err`: [`handle`]'s caller lets a
+/// returned `Err` reach `main`, whose generic error exit is `1` — in this
+/// verb [`EX_NO_OPEN_PR`], the *verified* "safe to claim" answer. Split out
+/// of [`handle`], like [`verdict`], so the mapping is unit-testable without
+/// `std::process::exit`.
+pub fn cwd_verdict(cwd: std::io::Result<PathBuf>) -> Result<PathBuf, Verdict> {
+    cwd.map_err(|err| Verdict {
+        code: EX_PROBE_FAILED,
+        stdout: String::new(),
+        stderr: format!(
+            "loom-daemon forge check-open-pr: could not resolve the current directory ({err}); \
+             run it from inside the repository whose issue you are about to claim. This is \
+             NOT a verified absence — treat the issue as possibly already in flight and check \
+             by hand before claiming it."
+        ),
+    })
+}
+
+/// Handle `loom-daemon forge check-open-pr <issue>`. Never returns: every
+/// outcome, an unresolvable cwd included, exits the process with a code from
+/// the contract table. Nothing here returns `Err`, because the caller's
+/// generic error exit is `1` — in this verb [`EX_NO_OPEN_PR`], the verified
+/// "safe to claim" answer.
 ///
 /// Resolution is cwd-scoped: run it from anywhere inside the repository (a
 /// managed worktree included) and it answers about that repository. Like
@@ -121,10 +145,13 @@ pub fn verdict(issue: u32, probe: OpenPrProbe) -> Verdict {
 /// honor `LOOM_REPO`, so an ambient override pointing at another repo cannot
 /// produce a confident answer from the wrong closes-graph.
 pub fn handle(issue: u32) -> Result<()> {
-    let root: PathBuf = std::env::current_dir().context(
-        "loom-daemon forge check-open-pr: could not resolve the current directory; \
-         run it from inside the repository whose issue you are about to claim",
-    )?;
+    let root = match cwd_verdict(std::env::current_dir()) {
+        Ok(root) => root,
+        Err(no_verdict) => {
+            eprintln!("{}", no_verdict.stderr);
+            std::process::exit(no_verdict.code);
+        }
+    };
 
     // GitHub-only by construction: both transports are GitHub APIs. Declining
     // is honest; silently reporting `NoneOpen` on Gitea would be the exact
@@ -200,5 +227,32 @@ mod tests {
         assert_eq!(sorted.len(), 3, "{codes:?}");
         assert!(!codes.contains(&EX_FORGE_DECLINED), "{codes:?}");
         assert!(!codes.contains(&crate::forge_cmd::EX_FORGE_HEAD_MISMATCH), "{codes:?}");
+    }
+
+    /// An unresolvable cwd answers nothing, so it must leave through
+    /// `EX_PROBE_FAILED` — never through the generic error exit whose `1` is
+    /// `EX_NO_OPEN_PR`, the verified "safe to claim" answer (#15664).
+    #[test]
+    fn unresolvable_cwd_is_probe_failed_and_never_the_verified_absence() {
+        let err = std::io::Error::new(std::io::ErrorKind::NotFound, "No such file or directory");
+        let v = cwd_verdict(Err(err)).expect_err("an unresolvable cwd must not resolve to a root");
+        assert_eq!(v.code, EX_PROBE_FAILED);
+        assert_ne!(
+            v.code, EX_NO_OPEN_PR,
+            "an unresolvable cwd must not share the verified-absence exit code"
+        );
+        assert!(v.stdout.is_empty(), "{:?}", v.stdout);
+        assert!(
+            !v.stderr.contains("safe to claim"),
+            "an unresolvable cwd must never read as an all-clear: {}",
+            v.stderr
+        );
+        assert!(v.stderr.contains("NOT a verified absence"), "{}", v.stderr);
+    }
+
+    #[test]
+    fn resolvable_cwd_is_the_root_unchanged() {
+        let root = PathBuf::from("/repo/with/a/.loom");
+        assert_eq!(cwd_verdict(Ok(root.clone())), Ok(root));
     }
 }

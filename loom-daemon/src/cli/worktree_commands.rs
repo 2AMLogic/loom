@@ -67,9 +67,11 @@ pub enum WorktreeCommands {
     /// head of a PR closed WITHOUT merging carries work somebody decided not
     /// to take, and reusing it silently seeded a worktree with a reverted
     /// slice plus a rejected follow-up, tens of commits behind `main` (the
-    /// #8195 incident). Exit 0 = proceed and reuse as before, 1 = refuse; every
-    /// inability to decide is 0, because a forge outage must never block
-    /// worktree creation.
+    /// #8195 incident). Exit 0 = proceed and reuse as before, 1 = refuse,
+    /// 2 = could not run (the tools arm's mode would not resolve, #15650);
+    /// every inability to decide is 0, because a forge outage must never
+    /// block worktree creation. The shell refuses on 1 alone, so 2 never
+    /// blocks it either.
     WorktreeClosedPrBranch(super::worktree_closed_pr_branch::WorktreeClosedPrBranchArgs),
 
     /// `worktree.sh`'s `--sparse <paths...>` / `--full` family (#8195 slice

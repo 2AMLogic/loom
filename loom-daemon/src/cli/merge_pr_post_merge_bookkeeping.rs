@@ -78,9 +78,7 @@ impl PostMergeBookkeepingArgs {
         let facts = Facts {
             close_targets: self.close_targets,
         };
-        let host = SystemHost {
-            forge_helpers: self.forge_helpers,
-        };
+        let host = SystemHost::for_merge_pr(self.forge_helpers);
         match run(self.step, &inputs, &facts, &host) {
             Outcome::Need(need) => {
                 println!("LOOM-NEED {}", need.token());

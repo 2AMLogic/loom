@@ -28,16 +28,15 @@
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Mutex, OnceLock};
 
 use chrono::{DateTime, Duration, Utc};
 
-use super::queue::{DurableQueue, FanoutQueue, QueueSink};
 use super::repo_ref::cached_repo_ref;
 use crate::telemetry::kinds::dispatch_state::{
     Artifact, DispatchStateRecord, StateTransition, DISPATCH_STATE_SCHEMA_VERSION,
 };
-use crate::telemetry::{RepoVisibility, TelemetryEnvelope, TelemetryRecord};
+use crate::telemetry::{RepoVisibility, TelemetryRecord};
 
 /// Env override for the reconciliation cadence, in seconds.
 pub const REFRESH_SECS_ENV: &str = "LOOM_DISPATCH_STATE_REFRESH_SECS";
@@ -45,50 +44,11 @@ pub const REFRESH_SECS_ENV: &str = "LOOM_DISPATCH_STATE_REFRESH_SECS";
 /// `dispatch_eligibility`).
 pub const DEFAULT_REFRESH_SECS: i64 = 600;
 
-/// Offers `eta.dispatch_state` envelopes, stamped with this daemon's host id,
-/// to the OTLP exporters' queues.
-#[derive(Clone)]
-pub struct DispatchStateSink {
-    queue: Arc<dyn QueueSink>,
-    host_id: String,
-}
-
-impl DispatchStateSink {
-    #[must_use]
-    pub fn new(queue: Arc<dyn QueueSink>, host_id: impl Into<String>) -> Self {
-        DispatchStateSink {
-            queue,
-            host_id: host_id.into(),
-        }
-    }
-
-    /// Enqueue one record.
-    pub fn push(&self, record: DispatchStateRecord) {
-        self.queue.offer(TelemetryEnvelope::new(
-            self.host_id.clone(),
-            TelemetryRecord::DispatchState(record),
-        ));
-    }
-}
-
-static GLOBAL_SINK: OnceLock<DispatchStateSink> = OnceLock::new();
-
-/// Register the OTLP queues (called once from [`super::spawn_task`]). With no
-/// OTLP exporter nothing is registered, and [`observe`] returns before doing
-/// any work.
-pub fn register_sink(otlp_queues: Vec<Arc<DurableQueue>>, host_id: &str) {
-    if otlp_queues.is_empty() {
-        return;
-    }
-    let _ =
-        GLOBAL_SINK.set(DispatchStateSink::new(Arc::new(FanoutQueue::new(otlp_queues)), host_id));
-}
-
 /// Whether an OTLP sink is registered: the step driver builds no rows without
 /// one.
 #[must_use]
 pub fn enabled() -> bool {
-    GLOBAL_SINK.get().is_some()
+    super::ops::global_ops_sink().is_some()
 }
 
 /// One classified item as the step driver reduced it, before the repo is
@@ -323,7 +283,7 @@ static TRACKER: OnceLock<Mutex<StateTracker>> = OnceLock::new();
 /// workspace roots by index. A no-op without the OTLP sink. Makes no forge
 /// call.
 pub fn observe(mut rows: Vec<StateRow>, observed: &BTreeSet<usize>, roots: &[PathBuf]) {
-    let Some(sink) = GLOBAL_SINK.get() else {
+    let Some(sink) = super::ops::global_ops_sink() else {
         return;
     };
     for row in &mut rows {
@@ -346,7 +306,13 @@ pub fn observe(mut rows: Vec<StateRow>, observed: &BTreeSet<usize>, roots: &[Pat
     for (i, transition) in emissions {
         let r = &resolved[i];
         let claimed_since = tracker.claimed_since(&r.slug, r.row.number);
-        sink.push(build_record(r, transition, &sink.host_id, now, claimed_since));
+        sink.emit_record(TelemetryRecord::DispatchState(build_record(
+            r,
+            transition,
+            sink.host_id(),
+            now,
+            claimed_since,
+        )));
     }
 }
 
