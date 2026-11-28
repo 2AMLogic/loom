@@ -465,12 +465,7 @@ fn cleanup_worktree_removes_untracked_orphan_directory() {
 
     // A real git repo so `git worktree remove` produces the genuine
     // "is not a working tree" error rather than "not a git repository".
-    assert!(Command::new("git")
-        .args(["init", "-q"])
-        .current_dir(&repo_root)
-        .status()
-        .unwrap()
-        .success());
+    git(&repo_root, &["init", "-q"]);
 
     // An orphan worktree directory under the resolved (override-aware)
     // managed root, carrying the `.loom-managed` sentinel — but with no
@@ -488,6 +483,15 @@ fn cleanup_worktree_removes_untracked_orphan_directory() {
         "orphan removal should succeed and report Removed: {result:?}"
     );
     assert!(!orphan.exists(), "orphan directory should be gone");
+}
+
+/// A real repo on `branch` holding one commit, so `git worktree add` has
+/// something to branch from.
+fn init_repo_with_commit(dir: &Path, branch: &str) {
+    git(dir, &["init", "-q", "-b", branch]);
+    std::fs::write(dir.join("README.md"), "x").unwrap();
+    git(dir, &["add", "."]);
+    git(dir, &["commit", "-q", "-m", "init"]);
 }
 
 // --- redirected cargo target dir (#7239) ------------------------------
@@ -513,37 +517,12 @@ fn cleanup_worktree_reclaims_a_redirected_cargo_target_dir() {
     let base = tmp.path().canonicalize().unwrap();
     let repo_root = base.join("repo");
     std::fs::create_dir_all(&repo_root).unwrap();
-    for args in [
-        vec!["init", "-q", "-b", "main"],
-        vec!["config", "user.email", "t@t"],
-        vec!["config", "user.name", "t"],
-    ] {
-        assert!(Command::new("git")
-            .args(&args)
-            .current_dir(&repo_root)
-            .status()
-            .unwrap()
-            .success());
-    }
-    std::fs::write(repo_root.join("README.md"), "x").unwrap();
-    for args in [vec!["add", "."], vec!["commit", "-qm", "init"]] {
-        assert!(Command::new("git")
-            .args(&args)
-            .current_dir(&repo_root)
-            .status()
-            .unwrap()
-            .success());
-    }
+    init_repo_with_commit(&repo_root, "main");
 
     let worktree = crate::worktree_root::worktree_root(&repo_root).join("issue-7239");
     std::fs::create_dir_all(worktree.parent().unwrap()).unwrap();
-    assert!(Command::new("git")
-        .args(["worktree", "add", "-q", "-b", "feature/issue-7239"])
-        .arg(&worktree)
-        .current_dir(&repo_root)
-        .status()
-        .unwrap()
-        .success());
+    let wt_str = worktree.to_str().unwrap();
+    git(&repo_root, &["worktree", "add", "-q", "-b", "feature/issue-7239", wt_str]);
     std::fs::write(worktree.join(".loom-managed"), "test").unwrap();
 
     // A minimal cargo workspace inside the worktree whose build output is
@@ -597,27 +576,7 @@ fn cleanup_worktree_keeps_a_target_dir_a_live_worktree_still_shares() {
     let base = tmp.path().canonicalize().unwrap();
     let repo_root = base.join("repo");
     std::fs::create_dir_all(&repo_root).unwrap();
-    for args in [
-        vec!["init", "-q", "-b", "main"],
-        vec!["config", "user.email", "t@t"],
-        vec!["config", "user.name", "t"],
-    ] {
-        assert!(Command::new("git")
-            .args(&args)
-            .current_dir(&repo_root)
-            .status()
-            .unwrap()
-            .success());
-    }
-    std::fs::write(repo_root.join("README.md"), "x").unwrap();
-    for args in [vec!["add", "."], vec!["commit", "-qm", "init"]] {
-        assert!(Command::new("git")
-            .args(&args)
-            .current_dir(&repo_root)
-            .status()
-            .unwrap()
-            .success());
-    }
+    init_repo_with_commit(&repo_root, "main");
 
     // One shared target dir for the whole machine — the host-optimize
     // convention, and the case where an over-eager reclaim is data loss.
@@ -629,19 +588,18 @@ fn cleanup_worktree_keeps_a_target_dir_a_live_worktree_still_shares() {
     for issue in [7239u32, 7240] {
         let wt = crate::worktree_root::worktree_root(&repo_root).join(format!("issue-{issue}"));
         std::fs::create_dir_all(wt.parent().unwrap()).unwrap();
-        assert!(Command::new("git")
-            .args([
+        let wt_str = wt.to_str().unwrap();
+        git(
+            &repo_root,
+            &[
                 "worktree",
                 "add",
                 "-q",
                 "-b",
-                &format!("feature/issue-{issue}")
-            ])
-            .arg(&wt)
-            .current_dir(&repo_root)
-            .status()
-            .unwrap()
-            .success());
+                &format!("feature/issue-{issue}"),
+                wt_str,
+            ],
+        );
         std::fs::write(wt.join(".loom-managed"), "test").unwrap();
         std::fs::create_dir_all(wt.join("src")).unwrap();
         std::fs::write(wt.join("src/lib.rs"), "").unwrap();
@@ -687,12 +645,7 @@ fn cleanup_worktree_keeps_a_target_dir_a_live_worktree_still_shares() {
 fn cleanup_worktree_treats_missing_directory_as_already_gone() {
     let tmp = tempfile::tempdir().unwrap();
     let repo_root = tmp.path().canonicalize().unwrap();
-    assert!(Command::new("git")
-        .args(["init", "-q"])
-        .current_dir(&repo_root)
-        .status()
-        .unwrap()
-        .success());
+    git(&repo_root, &["init", "-q"]);
 
     let gone = crate::worktree_root::worktree_root(&repo_root).join("issue-4525");
     assert!(!gone.exists(), "fixture must not exist on disk");
@@ -717,34 +670,18 @@ fn cleanup_worktree_treats_missing_directory_as_already_gone() {
 fn clean_worktrees_prunes_a_registration_whose_directory_is_already_gone() {
     let tmp = tempfile::tempdir().unwrap();
     let repo_root = tmp.path().canonicalize().unwrap();
-    assert!(Command::new("git")
-        .args(["init", "-q"])
-        .current_dir(&repo_root)
-        .status()
-        .unwrap()
-        .success());
+    git(&repo_root, &["init", "-q"]);
     // CI runners have no global git identity — set one explicitly or
     // `git commit` refuses with "Please tell me who you are."
     git(&repo_root, &["config", "user.email", "loom@example.com"]);
     git(&repo_root, &["config", "user.name", "Loom Test"]);
-    assert!(Command::new("git")
-        .args(["commit", "--allow-empty", "-q", "-m", "init"])
-        .current_dir(&repo_root)
-        .status()
-        .unwrap()
-        .success());
+    git(&repo_root, &["commit", "--allow-empty", "-q", "-m", "init"]);
 
     let worktrees_dir = crate::worktree_root::worktree_root(&repo_root);
     std::fs::create_dir_all(&worktrees_dir).unwrap();
     let wt_path = worktrees_dir.join("issue-777");
-    assert!(Command::new("git")
-        .args(["worktree", "add", "-q"])
-        .arg(&wt_path)
-        .args(["-b", "wt-777-branch"])
-        .current_dir(&repo_root)
-        .status()
-        .unwrap()
-        .success());
+    let wt_str = wt_path.to_str().unwrap();
+    git(&repo_root, &["worktree", "add", "-q", wt_str, "-b", "wt-777-branch"]);
 
     // Removed by something other than `git worktree remove` (a manual
     // `rm -rf`, a reaper that deleted the directory without
@@ -753,15 +690,7 @@ fn clean_worktrees_prunes_a_registration_whose_directory_is_already_gone() {
     // invisible to `clean_worktrees`'s `read_dir`-based enumeration.
     std::fs::remove_dir_all(&wt_path).unwrap();
 
-    let list_before = String::from_utf8_lossy(
-        &Command::new("git")
-            .args(["worktree", "list", "--porcelain"])
-            .current_dir(&repo_root)
-            .output()
-            .unwrap()
-            .stdout,
-    )
-    .to_string();
+    let list_before = git(&repo_root, &["worktree", "list", "--porcelain"]);
     assert!(
         list_before.contains("issue-777"),
         "fixture must still be registered before the run: {list_before}"
@@ -771,15 +700,7 @@ fn clean_worktrees_prunes_a_registration_whose_directory_is_already_gone() {
     let opts = CleanOptions::default();
     clean_worktrees(&repo_root, &mut stats, &opts);
 
-    let list_after = String::from_utf8_lossy(
-        &Command::new("git")
-            .args(["worktree", "list", "--porcelain"])
-            .current_dir(&repo_root)
-            .output()
-            .unwrap()
-            .stdout,
-    )
-    .to_string();
+    let list_after = git(&repo_root, &["worktree", "list", "--porcelain"]);
     assert!(
         !list_after.contains("issue-777"),
         "stale registration should be pruned before enumeration, not left to rot: {list_after}"
@@ -843,44 +764,11 @@ fn cleanup_worktree_does_not_force_remove_on_other_errors() {
 fn cleanup_pr_worktree_deletes_the_worktrees_own_checked_out_branch() {
     let tmp = tempfile::tempdir().unwrap();
     let repo_root = tmp.path().canonicalize().unwrap();
-    assert!(Command::new("git")
-        .args(["init", "-q", "-b", "main"])
-        .current_dir(&repo_root)
-        .status()
-        .unwrap()
-        .success());
-    // A minimal commit so `git worktree add` has something to branch from.
-    std::fs::write(repo_root.join("README.md"), "x").unwrap();
-    assert!(Command::new("git")
-        .args(["add", "."])
-        .current_dir(&repo_root)
-        .status()
-        .unwrap()
-        .success());
-    assert!(Command::new("git")
-        .args([
-            "-c",
-            "user.email=t@example.com",
-            "-c",
-            "user.name=t",
-            "commit",
-            "-q",
-            "-m",
-            "init"
-        ])
-        .current_dir(&repo_root)
-        .status()
-        .unwrap()
-        .success());
+    init_repo_with_commit(&repo_root, "main");
 
     let wt_path = crate::worktree_root::worktree_root(&repo_root).join("pr-777");
-    assert!(Command::new("git")
-        .args(["worktree", "add", "-b", "some-external-fork-branch"])
-        .arg(&wt_path)
-        .current_dir(&repo_root)
-        .status()
-        .unwrap()
-        .success());
+    let wt_str = wt_path.to_str().unwrap();
+    git(&repo_root, &["worktree", "add", "-b", "some-external-fork-branch", wt_str]);
     std::fs::write(wt_path.join(".loom-managed"), "test").unwrap();
 
     // The merged PR's head SHA == the local branch tip: the #4100 safety
@@ -890,13 +778,8 @@ fn cleanup_pr_worktree_deletes_the_worktrees_own_checked_out_branch() {
     assert!(result.is_ok(), "{result:?}");
     assert!(!wt_path.exists());
 
-    let branches = Command::new("git")
-        .args(["branch", "--list", "some-external-fork-branch"])
-        .current_dir(&repo_root)
-        .output()
-        .unwrap();
     assert!(
-        String::from_utf8_lossy(&branches.stdout).trim().is_empty(),
+        git(&repo_root, &["branch", "--list", "some-external-fork-branch"]).is_empty(),
         "the PR worktree's own branch must be deleted, not left behind"
     );
 
@@ -932,48 +815,15 @@ fn cleanup_pr_worktree_deletes_the_worktrees_own_checked_out_branch() {
 fn classify_and_cleanup_pr_worktree_treat_a_detached_head_the_same_as_a_named_branch() {
     let tmp = tempfile::tempdir().unwrap();
     let repo_root = tmp.path().canonicalize().unwrap();
-    assert!(Command::new("git")
-        .args(["init", "-q", "-b", "main"])
-        .current_dir(&repo_root)
-        .status()
-        .unwrap()
-        .success());
-    std::fs::write(repo_root.join("README.md"), "x").unwrap();
-    assert!(Command::new("git")
-        .args(["add", "."])
-        .current_dir(&repo_root)
-        .status()
-        .unwrap()
-        .success());
-    assert!(Command::new("git")
-        .args([
-            "-c",
-            "user.email=t@example.com",
-            "-c",
-            "user.name=t",
-            "commit",
-            "-q",
-            "-m",
-            "init"
-        ])
-        .current_dir(&repo_root)
-        .status()
-        .unwrap()
-        .success());
+    init_repo_with_commit(&repo_root, "main");
 
     // Mirrors pr-worktree.sh's own creation shape: `git worktree add
     // --detach` at a commit, with NO subsequent branch switch — modeling
     // the collision case where `gh pr checkout --force` failed and left
     // the worktree parked on detached HEAD instead of the PR's branch.
     let wt_path = crate::worktree_root::worktree_root(&repo_root).join("pr-888");
-    assert!(Command::new("git")
-        .args(["worktree", "add", "--detach"])
-        .arg(&wt_path)
-        .arg("main")
-        .current_dir(&repo_root)
-        .status()
-        .unwrap()
-        .success());
+    let wt_str = wt_path.to_str().unwrap();
+    git(&repo_root, &["worktree", "add", "--detach", wt_str, "main"]);
     std::fs::write(wt_path.join(".loom-managed"), "test").unwrap();
 
     // Sanity-check the fixture actually reproduces detached HEAD (i.e.
@@ -1036,69 +886,18 @@ fn classify_and_cleanup_pr_worktree_treat_a_detached_head_the_same_as_a_named_br
 fn cleanup_pr_worktree_keeps_a_branch_whose_tip_is_not_the_merged_head() {
     let tmp = tempfile::tempdir().unwrap();
     let repo_root = tmp.path().canonicalize().unwrap();
-    assert!(Command::new("git")
-        .args(["init", "-q", "-b", "main"])
-        .current_dir(&repo_root)
-        .status()
-        .unwrap()
-        .success());
-    std::fs::write(repo_root.join("README.md"), "x").unwrap();
-    assert!(Command::new("git")
-        .args(["add", "."])
-        .current_dir(&repo_root)
-        .status()
-        .unwrap()
-        .success());
-    assert!(Command::new("git")
-        .args([
-            "-c",
-            "user.email=t@example.com",
-            "-c",
-            "user.name=t",
-            "commit",
-            "-q",
-            "-m",
-            "init"
-        ])
-        .current_dir(&repo_root)
-        .status()
-        .unwrap()
-        .success());
+    init_repo_with_commit(&repo_root, "main");
 
     let wt_path = crate::worktree_root::worktree_root(&repo_root).join("pr-4242");
-    assert!(Command::new("git")
-        .args(["worktree", "add", "-b", "contributor/feature"])
-        .arg(&wt_path)
-        .current_dir(&repo_root)
-        .status()
-        .unwrap()
-        .success());
+    let wt_str = wt_path.to_str().unwrap();
+    git(&repo_root, &["worktree", "add", "-b", "contributor/feature", wt_str]);
     std::fs::write(wt_path.join(".loom-managed"), "test").unwrap();
 
     // A local commit that was never pushed — the branch tip now differs
     // from whatever the forge merged.
     std::fs::write(wt_path.join("unpushed.txt"), "work nobody has a copy of").unwrap();
-    assert!(Command::new("git")
-        .args(["add", "."])
-        .current_dir(&wt_path)
-        .status()
-        .unwrap()
-        .success());
-    assert!(Command::new("git")
-        .args([
-            "-c",
-            "user.email=t@example.com",
-            "-c",
-            "user.name=t",
-            "commit",
-            "-q",
-            "-m",
-            "local only"
-        ])
-        .current_dir(&wt_path)
-        .status()
-        .unwrap()
-        .success());
+    git(&wt_path, &["add", "."]);
+    git(&wt_path, &["commit", "-q", "-m", "local only"]);
 
     let result = cleanup_pr_worktree(
         &repo_root,
@@ -1111,13 +910,9 @@ fn cleanup_pr_worktree_keeps_a_branch_whose_tip_is_not_the_merged_head() {
     assert!(result.is_ok(), "{result:?}");
     assert!(!wt_path.exists(), "the worktree itself is still reclaimed");
 
-    let branches = Command::new("git")
-        .args(["branch", "--list", "contributor/feature"])
-        .current_dir(&repo_root)
-        .output()
-        .unwrap();
     assert!(
-        String::from_utf8_lossy(&branches.stdout).contains("contributor/feature"),
+        git(&repo_root, &["branch", "--list", "contributor/feature"])
+            .contains("contributor/feature"),
         "a branch whose tip is not the merged head must survive — it is the only \
              reference to the unpushed commit"
     );
@@ -1160,12 +955,7 @@ fn branch_delete_mode_never_forces_without_a_matching_tip() {
 fn cleanup_pr_worktree_removes_untracked_orphan_directory() {
     let tmp = tempfile::tempdir().unwrap();
     let repo_root = tmp.path().canonicalize().unwrap();
-    assert!(Command::new("git")
-        .args(["init", "-q"])
-        .current_dir(&repo_root)
-        .status()
-        .unwrap()
-        .success());
+    git(&repo_root, &["init", "-q"]);
 
     let orphan = crate::worktree_root::worktree_root(&repo_root).join("pr-999");
     std::fs::create_dir_all(&orphan).unwrap();
@@ -1185,12 +975,7 @@ fn cleanup_pr_worktree_removes_untracked_orphan_directory() {
 fn cleanup_pr_worktree_treats_a_missing_directory_as_an_error() {
     let tmp = tempfile::tempdir().unwrap();
     let repo_root = tmp.path().canonicalize().unwrap();
-    assert!(Command::new("git")
-        .args(["init", "-q"])
-        .current_dir(&repo_root)
-        .status()
-        .unwrap()
-        .success());
+    git(&repo_root, &["init", "-q"]);
 
     let gone = crate::worktree_root::worktree_root(&repo_root).join("pr-4525");
     assert!(!gone.exists(), "fixture must not exist on disk");
@@ -1265,58 +1050,21 @@ fn integration_branches_are_never_deletion_candidates() {
 fn cleanup_pr_worktree_removes_the_worktree_but_spares_an_integration_branch() {
     let tmp = tempfile::tempdir().unwrap();
     let repo_root = tmp.path().canonicalize().unwrap();
-    assert!(Command::new("git")
-        .args(["init", "-q", "-b", "primary"])
-        .current_dir(&repo_root)
-        .status()
-        .unwrap()
-        .success());
-    std::fs::write(repo_root.join("README.md"), "x").unwrap();
-    assert!(Command::new("git")
-        .args(["add", "."])
-        .current_dir(&repo_root)
-        .status()
-        .unwrap()
-        .success());
-    assert!(Command::new("git")
-        .args([
-            "-c",
-            "user.email=t@example.com",
-            "-c",
-            "user.name=t",
-            "commit",
-            "-q",
-            "-m",
-            "init"
-        ])
-        .current_dir(&repo_root)
-        .status()
-        .unwrap()
-        .success());
+    init_repo_with_commit(&repo_root, "primary");
 
     // `develop` exists but is NOT the primary checkout's branch, so git's
     // own "checked out elsewhere" refusal would not save it.
     let wt_path = crate::worktree_root::worktree_root(&repo_root).join("pr-888");
-    assert!(Command::new("git")
-        .args(["worktree", "add", "-b", "develop"])
-        .arg(&wt_path)
-        .current_dir(&repo_root)
-        .status()
-        .unwrap()
-        .success());
+    let wt_str = wt_path.to_str().unwrap();
+    git(&repo_root, &["worktree", "add", "-b", "develop", wt_str]);
     std::fs::write(wt_path.join(".loom-managed"), "test").unwrap();
 
     let result = cleanup_pr_worktree(&repo_root, &wt_path, 888, false, "test", None);
     assert!(result.is_ok(), "{result:?}");
     assert!(!wt_path.exists(), "the worktree itself is still removed");
 
-    let branches = Command::new("git")
-        .args(["branch", "--list", "develop"])
-        .current_dir(&repo_root)
-        .output()
-        .unwrap();
     assert!(
-        String::from_utf8_lossy(&branches.stdout).contains("develop"),
+        git(&repo_root, &["branch", "--list", "develop"]).contains("develop"),
         "an integration branch must survive the pr-<N> worktree that held it"
     );
 }
@@ -2452,17 +2200,10 @@ fn retained_prefix_matches_backup_and_preserve() {
 }
 
 fn local_branch_names(repo_root: &Path) -> Vec<String> {
-    String::from_utf8_lossy(
-        &Command::new("git")
-            .args(["branch", "--format=%(refname:short)"])
-            .current_dir(repo_root)
-            .output()
-            .unwrap()
-            .stdout,
-    )
-    .lines()
-    .map(str::to_string)
-    .collect()
+    git(repo_root, &["branch", "--format=%(refname:short)"])
+        .lines()
+        .map(str::to_string)
+        .collect()
 }
 
 /// Regression lock for issue #5737's own repro + suggested AC: a
@@ -2820,15 +2561,7 @@ fn quarantine_dirty_worktree_stashes_uncommitted_and_untracked_changes() {
     // The stash carries the load-bearing `loom-quarantine:` label so the
     // existing stash_retirement / quarantine_stash_status machinery can
     // find it.
-    let list = String::from_utf8_lossy(
-        &Command::new("git")
-            .args(["log", "-g", "--format=%gs", "refs/stash"])
-            .current_dir(dir.path())
-            .output()
-            .unwrap()
-            .stdout,
-    )
-    .to_string();
+    let list = git(dir.path(), &["log", "-g", "--format=%gs", "refs/stash"]);
     assert!(list.contains("loom-quarantine: issue=6653 reason=test"), "{list}");
 }
 
