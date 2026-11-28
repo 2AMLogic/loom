@@ -20,7 +20,7 @@ use crate::observability::runtime_usage::spans::{append_new, model_usage_spans, 
 use crate::script_helpers::sweep_experiment::ModelUsageTotals;
 use crate::telemetry::trace::journal::Journal;
 use crate::telemetry::trace::store::TraceStore;
-use crate::telemetry::trace::{SpanRecord, TraceAttributes};
+use crate::telemetry::trace::{SpanName, SpanRecord, TraceAttributes};
 
 /// The `loom.runtime` a tick's usage spans carry (2am#4393): the resolved
 /// runtime when one is known, else `claude` when the tokens came from Claude
@@ -47,9 +47,26 @@ pub fn journal_execution(
     billing: Option<&LlmBilling>,
     rows: &[ModelUsageTotals],
 ) {
-    let spans = execution_usage(trace, role, ended_at, runtime, billing, rows, &Pricing::active());
+    let mut spans =
+        execution_usage(trace, role, ended_at, runtime, billing, rows, &Pricing::active());
     let store = TraceStore::new(root);
     let journal = Journal::for_context(&store.path(root, &trace.execution));
+    // #15291: the seat the tick's launches agree on, read off their
+    // `loom.runtime.run` spans (the launcher stamped it there).
+    if let Ok(completed) = journal.completed() {
+        let runs: Vec<&SpanRecord> = completed
+            .iter()
+            .filter(|span| {
+                span.name == SpanName::RuntimeRun && span.context.trace_id == trace.context.trace_id
+            })
+            .collect();
+        for span in &mut spans {
+            crate::observability::codex_seat::stamp_agreed(
+                &mut span.attributes,
+                runs.iter().map(|run| &run.attributes),
+            );
+        }
+    }
     if let Err(error) = append_new(&journal, spans) {
         log::warn!("role_tick_telemetry: {role} tick usage not journalled (#9303): {error}");
     }

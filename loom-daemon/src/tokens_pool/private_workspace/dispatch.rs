@@ -535,9 +535,7 @@ impl Selection {
         model: Option<&str>,
     ) -> Result<Self> {
         let selected =
-            crate::runtime_preference::codex_guard::select(root, model, Some(role), |account| {
-                !crate::tokens_pool::codex_hooks::is_private_clone(&account.credential_reference)
-            })?;
+            crate::runtime_preference::codex_guard::select_shared(root, model, Some(role))?;
         let crate::tokens_pool::AccountBinding::CodexHome { directory } = selected.binding else {
             unreachable!()
         };

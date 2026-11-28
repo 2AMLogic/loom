@@ -1669,3 +1669,43 @@ fn a_step_roots_scope_wins_over_the_workspace_fallback() {
     assert_eq!(begun.record.attributes["loom.repo"], "Org/Repo");
     assert_eq!(begun.record.attributes["loom.pr_number"], "31");
 }
+
+/// #15291: a seat-refused Codex tick names the seat beside its (unchanged)
+/// closed-set reason; a refusal that names no valid seat carries none, and a
+/// non-session outcome never does.
+#[test]
+fn a_session_refusal_carries_its_seat_beside_the_reason() {
+    use crate::role_runner::RoleTickOutcome::{Failure, LoadSkipped};
+    let down = Failure(
+        "session-down: the Codex session container for account agent-2 was not running (#10455)"
+            .into(),
+    );
+    let attrs = admission_attributes(&down);
+    assert_eq!(attrs["loom.admission.reason"], "session-down");
+    assert_eq!(attrs["loom.codex.account"], "agent-2");
+
+    let stale = Failure(
+        "session-mount-stale: the Codex session container for account agent-3 does not mount \
+         this repository"
+            .into(),
+    );
+    let attrs = admission_attributes(&stale);
+    assert_eq!(attrs["loom.admission.reason"], "session-mount-stale");
+    assert_eq!(attrs["loom.codex.account"], "agent-3");
+
+    for reason in [
+        "session-down: no account named",
+        "session-down: the Codex session container for account  was not running",
+        "session-down: the Codex session container for account a;b was not running",
+    ] {
+        let attrs = admission_attributes(&Failure(reason.into()));
+        assert_eq!(attrs["loom.admission.reason"], "session-down");
+        assert!(!attrs.contains_key("loom.codex.account"), "{reason}");
+    }
+
+    let load = LoadSkipped {
+        load_per_core: 1.0,
+        detail: String::new(),
+    };
+    assert!(!admission_attributes(&load).contains_key("loom.codex.account"));
+}

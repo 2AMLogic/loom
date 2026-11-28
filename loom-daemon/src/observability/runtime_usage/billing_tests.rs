@@ -111,3 +111,62 @@ fn a_run_without_billing_states_unknown_on_its_usage_span() {
     assert_eq!(spans[0].attributes["llm.billing"], "unknown");
     assert!(!spans[0].attributes.contains_key("llm.credential.kind"));
 }
+
+/// #15291: the seat on a run reaches its execution usage span; two runs on
+/// different seats, or a non-Codex run, leave the usage span without one.
+#[test]
+fn a_codex_runs_seat_reaches_its_usage_span_only_when_unambiguous() {
+    let seats: [(&[Option<&str>], Option<&str>); 4] = [
+        (&[Some("agent-2")], Some("agent-2")),
+        (&[Some("agent-2"), Some("agent-2")], Some("agent-2")),
+        (&[Some("agent-2"), Some("agent-3")], None),
+        (&[None], None),
+    ];
+    for (i, (runs, expected)) in seats.iter().enumerate() {
+        let tmp = tempfile::tempdir().unwrap();
+        let execution = format!("sweep-seat-{i}");
+        let store = TraceStore::new(tmp.path());
+        let saved = store.load_or_create(tmp.path(), &execution).unwrap();
+        let journal = Journal::for_context(&store.path(tmp.path(), &execution));
+        let t0 = Utc::now() - Duration::minutes(30);
+        for (n, seat) in runs.iter().enumerate() {
+            let mut attributes = TraceAttributes::new();
+            crate::observability::codex_seat::stamp(
+                &mut attributes,
+                if seat.is_some() { "codex" } else { "claude" },
+                *seat,
+            );
+            let started = t0 + Duration::minutes(n as i64 * 5);
+            let run = journal
+                .start(
+                    saved.context.child(),
+                    Some(&saved.context),
+                    SpanName::RuntimeRun,
+                    started,
+                    attributes,
+                )
+                .unwrap();
+            journal
+                .finish(
+                    &run,
+                    started + Duration::minutes(4),
+                    SpanStatus::Ok,
+                    TraceAttributes::new(),
+                )
+                .unwrap();
+        }
+        let window = (Utc::now() - Duration::hours(1), Utc::now());
+        let spans =
+            journal_usage(tmp.path(), &execution, window, Some(&[row()]), Some("codex")).unwrap();
+        assert!(!spans.is_empty());
+        for span in &spans {
+            assert_eq!(
+                span.attributes
+                    .get("loom.codex.account")
+                    .map(String::as_str),
+                *expected,
+                "{runs:?}"
+            );
+        }
+    }
+}

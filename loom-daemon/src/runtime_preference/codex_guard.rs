@@ -105,6 +105,17 @@ pub(crate) fn select(
     })
 }
 
+/// Select a shared profile after the caller has handled private reservations.
+pub(crate) fn select_shared(
+    root: &Path,
+    model: Option<&str>,
+    role: Option<&str>,
+) -> anyhow::Result<crate::tokens_pool::account_registry::SelectedAccount> {
+    select(root, model, role, |account| {
+        !codex_hooks::is_private_clone(&account.credential_reference)
+    })
+}
+
 #[cfg(test)]
 #[path = "codex_guard_tests.rs"]
 mod tests;
