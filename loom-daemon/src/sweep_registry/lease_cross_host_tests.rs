@@ -41,17 +41,23 @@ use tempfile::tempdir;
 
 const ISSUE: u32 = 11112;
 
-/// Restores `LOOM_HOST_ID` (and the raw-hostname opt-in) on drop, so a
-/// failing assertion cannot leak one fake host's identity into later tests.
+/// Restores `LOOM_HOST_ID`, `LOOM_LEASE_HOST_ID` (and the raw-hostname
+/// opt-in) on drop, so a failing assertion cannot leak one fake host's
+/// identity into later tests.
 struct HostIdGuard(Vec<(&'static str, Option<std::ffi::OsString>)>);
 
 impl HostIdGuard {
     fn set(host: &str) -> Self {
-        let saved = [HOST_ID_ENV, LEASE_PUBLISH_HOSTNAME_ENV]
-            .into_iter()
-            .map(|k| (k, std::env::var_os(k)))
-            .collect();
+        let saved = [
+            HOST_ID_ENV,
+            crate::host_identity::LEASE_HOST_ID_ENV,
+            LEASE_PUBLISH_HOSTNAME_ENV,
+        ]
+        .into_iter()
+        .map(|k| (k, std::env::var_os(k)))
+        .collect();
         std::env::set_var(HOST_ID_ENV, host);
+        std::env::set_var(crate::host_identity::LEASE_HOST_ID_ENV, host);
         std::env::remove_var(LEASE_PUBLISH_HOSTNAME_ENV);
         Self(saved)
     }

@@ -117,6 +117,7 @@ pub(crate) fn make_dirty_git_worktree(ws: &Path, issue: u32) -> PathBuf {
     // watchdog test's subject — recover, or refuse to destroy — is gated on
     // this answer being "dirty"; a silent "clean" makes the whole module look
     // like it is failing at something it never got to test.
+    // Hand-rolled on purpose: it must inherit the ambient env (#8170), which `git_out` scrubs.
     let probe = Command::new("git")
         .arg("-C")
         .arg(&wt)

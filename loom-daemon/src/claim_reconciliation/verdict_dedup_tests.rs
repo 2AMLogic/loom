@@ -1119,16 +1119,7 @@ exit 0
     /// `verdict_equivalence::tests`'s: that one is `pub(super)` to its own
     /// module and this is a different subtree.
     fn git_ok(repo: &Path, args: &[&str]) -> String {
-        let out = std::process::Command::new("git")
-            .arg("-C")
-            .arg(repo)
-            .args(args)
-            .env("GIT_AUTHOR_NAME", "t")
-            .env("GIT_AUTHOR_EMAIL", "t@example.com")
-            .env("GIT_COMMITTER_NAME", "t")
-            .env("GIT_COMMITTER_EMAIL", "t@example.com")
-            .output()
-            .unwrap();
+        let out = crate::test_git_helpers::git_out(repo, args);
         assert!(
             out.status.success(),
             "git {args:?} failed: {}",

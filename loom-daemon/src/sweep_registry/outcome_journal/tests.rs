@@ -413,13 +413,7 @@ fn seed_worktree_with_diff(registry: &SweepRegistry, issue: u32) -> PathBuf {
     let wt = registry.worktree_path(issue);
     std::fs::create_dir_all(&wt).unwrap();
     let git = |args: &[&str]| {
-        let ok = Command::new("git")
-            .args(args)
-            .current_dir(&wt)
-            .output()
-            .unwrap()
-            .status
-            .success();
+        let ok = crate::test_git_helpers::git_out(&wt, args).status.success();
         assert!(ok, "git {args:?} failed in {}", wt.display());
     };
     git(&["init", "-q", "--initial-branch=main"]);
