@@ -659,23 +659,7 @@ fn the_body_sha_must_be_a_commit_id() {
 #[test]
 fn the_real_ancestry_check_reads_git() {
     let dir = tempfile::tempdir().unwrap();
-    let git = |args: &[&str]| {
-        let out = std::process::Command::new("git")
-            .current_dir(dir.path())
-            .args([
-                "-c",
-                "user.name=t",
-                "-c",
-                "user.email=t@t",
-                "-c",
-                "commit.gpgsign=false",
-            ])
-            .args(args)
-            .output()
-            .unwrap();
-        assert!(out.status.success(), "{args:?}");
-        String::from_utf8_lossy(&out.stdout).trim().to_string()
-    };
+    let git = |args: &[&str]| crate::test_git_helpers::run(dir.path(), args);
     git(&["init", "-q"]);
     git(&["commit", "-q", "--allow-empty", "-m", "a"]);
     let a = git(&["rev-parse", "HEAD"]);

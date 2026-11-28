@@ -14,6 +14,7 @@
 
 use super::tests::{fake_gh, git_ok, merge_tree_available, write, BASE_MAIN};
 use super::*;
+use crate::test_git_helpers::git_out;
 use tempfile::{tempdir, TempDir};
 
 /// `reviewed` on `feature` (touches `f.txt`); `main` moved once (`m.txt`).
@@ -194,12 +195,7 @@ fn no_ops_around_a_conflict_resolved_merge_refute() {
     assert_ne!(reviewed, reviewed_conflicting);
     let base2 = move_main(repo, "main-2\n");
     redate(repo);
-    let _ = std::process::Command::new("git")
-        .arg("-C")
-        .arg(repo)
-        .args(["merge", "--quiet", "--no-ff", "main"])
-        .output()
-        .unwrap();
+    let _ = git_out(repo, &["merge", "--quiet", "--no-ff", "main"]);
     write(repo, "m.txt", "resolved-by-hand\n");
     git_ok(repo, &["add", "-A"]);
     git_ok(repo, &["commit", "--quiet", "-m", "Merge main"]);
