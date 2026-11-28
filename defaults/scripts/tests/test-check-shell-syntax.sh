@@ -219,6 +219,32 @@ else
     fail "expected the subdirectory script to be ignored, got rc=$RC out=$out"
 fi
 
+# -------- Test 15: every tracked defaults/**/*.sh is committed mode 100755 --------
+echo "Test 15: every tracked defaults/**/*.sh is committed mode 100755 (#15757)"
+PAYLOAD_REPO="$(git -C "$SCRIPT_DIR" rev-parse --show-toplevel 2>/dev/null || true)"
+PAYLOAD_SH_COUNT=0
+PAYLOAD_BAD=()
+if [[ -n "$PAYLOAD_REPO" && "$(cd "$SCRIPT_DIR" && pwd -P)" == "$PAYLOAD_REPO/defaults/scripts/tests" ]]; then
+    while IFS= read -r -d '' rec; do
+        rec_path="${rec#*$'\t'}"
+        [[ "$rec_path" == *.sh ]] || continue
+        PAYLOAD_SH_COUNT=$((PAYLOAD_SH_COUNT + 1))
+        [[ "${rec%% *}" == "100755" ]] || PAYLOAD_BAD+=("${rec%% *} $rec_path")
+    done < <(git -C "$PAYLOAD_REPO" ls-tree -r -z HEAD -- defaults/)
+    if [[ "$PAYLOAD_SH_COUNT" -eq 0 ]]; then
+        fail "found no tracked defaults/**/*.sh in HEAD; refusing to pass on a mode check that saw nothing"
+    elif [[ "${#PAYLOAD_BAD[@]}" -eq 0 ]]; then
+        pass "all $PAYLOAD_SH_COUNT tracked defaults/**/*.sh are committed mode 100755"
+    else
+        fail "${#PAYLOAD_BAD[@]} of $PAYLOAD_SH_COUNT tracked defaults/**/*.sh are not committed mode 100755 (fix each with: chmod +x <path> && git add <path>)"
+        for bad in "${PAYLOAD_BAD[@]}"; do
+            echo "    $bad"
+        done
+    fi
+else
+    echo "  (not applicable: not running from the tracked defaults/scripts/tests/ tree)"
+fi
+
 # -------- Summary --------
 echo ""
 if [[ "$TESTS_FAILED" -eq 0 ]]; then
