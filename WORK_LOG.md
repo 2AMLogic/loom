@@ -18,6 +18,20 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 ### 2026-11-28
 
+- **Issue #15810** (closed): Parse `git diff --numstat -z` so a rename's post-image path is unambiguous
+- **Issue #15815** (closed): config-resolver.sh passes config tiers as jq argv; a defaults.json over MAX_ARG_STRLEN (131072 B) kills create-issue.sh with exit 126
+- **Issue #15812** (closed): config-resolver.sh: a config tier of 131072+ bytes breaks jq (Argument list too long, exit 126)
+- **Issue #15811** (closed): config-resolver.sh: a config tier over 131,072 bytes cannot exec jq ("Argument list too long", exit 126), so create-pr.sh opens no PR on such a host
+- **Issue #15790** (closed): normalize_diff_path truncates git's {a => b} brace-form rename paths in numstat rows
+- **Issue #15809** (closed): config-resolver.sh: a config tier over 128 KB cannot be exec'd into jq (E2BIG); create-issue.sh exits 126, swallowed reads report not-set
+- **Issue #15784** (closed): Remove leftover prompt_changes residue (GitDiffStats, capture_git_changes, parse_numstat_output, is_test_file) from git_utils.rs
+- **Issue #15797** (closed): Declare each MetricName wire name once
+- **Issue #15806** (closed): Consider a clock seam for merge-observation reconciliation (the root fix #15799 deferred)
+- **Issue #15807** (closed): config-resolver.sh: a config tier over 128 KiB fails every script with jq: Argument list too long (rc 126)
+- **Issue #15799** (closed): Catch date-bomb test fixtures at authoring time: TTL-compared stamps pinned to calendar literals
+- **Issue #15805** (closed): config-resolver: a config tier over 128 KiB makes loom_resolve_config fail with jq 'Argument list too long'
+- **Issue #15794** (closed): CI red fleet-wide after 2026-11-28T10:00:00Z: two merge_observation tests pin observed_at exactly 7 days before #15145's INCOMPLETE_RECORD_TTL boundary
+- **Issue #15802** (closed): config-resolver.sh: a >128 KiB config tier makes every loom_resolve_config caller die with 'jq: Argument list too long'
 - **Issue #15798** (closed): config-resolver.sh: a config tier over 128 KiB kills jq with "Argument list too long" (tiers passed as single argv entries; MAX_ARG_STRLEN)
 - **Issue #15791** (closed): config-resolver.sh passes config tiers as argv to jq: a defaults.json over 128 KiB fails with E2BIG and kills create-issue.sh / create-pr.sh (exit 126)
 - **Issue #15786** (closed): config-resolver.sh: jq --argjson exceeds MAX_ARG_STRLEN once defaults.json passes 128 KiB, killing create-issue.sh and create-pr.sh
