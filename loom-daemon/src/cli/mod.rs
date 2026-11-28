@@ -151,7 +151,6 @@ mod merge_pr_post_merge_bookkeeping;
 mod merge_pr_post_merge_cleanup;
 mod merge_pr_pr_state;
 mod merge_pr_reconcile;
-mod merge_pr_redate_report;
 mod merge_pr_refs;
 mod merge_pr_release_hold;
 mod merge_pr_remove_gate;

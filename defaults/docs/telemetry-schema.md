@@ -2123,21 +2123,11 @@ ceiling is re-read from the repos' configs at most every 5 minutes; it is the
 largest enabled repo's, while `loom-daemon status` shows the primary
 workspace's, so on a host whose repos disagree the two can differ.
 
-Merge-chain re-date pressure (Issue #10163, `observability/ops/redate_chain.rs`). The re-date remedy itself is retired (#12063); these gauges remain to measure it reaching zero (#10888).
-These are `Gauge`s over a trailing 24 h window, sampled on the `host.health`
-cadence from local `git log` only, with no forge call. They are never labelled
-by PR or repo. Read them with `max` across hosts:
-
-| Metric | Unit | Labels | Meaning |
-|---|---|---|---|
-| `loom.merge.redate_prs` | `{pull_request}` | `state` ∈ `landed`, `pending`, `stuck` | PRs with at least one #8508 re-date commit. `stuck` is the subset of `pending` that has spent at least the default re-date budget (3). |
-| `loom.merge.redates_max` | `{redate}` | `state` ∈ `landed`, `pending` | the most re-dates any one PR took |
-| `loom.merge.time_to_land_max` | `s` | none | longest time from a PR's first re-date to its landing merge. Omitted when nothing landed. |
-
-`redate_prs` and `redates_max` are emitted every sample, zeros included. The
-per-PR rows are in `loom-daemon merge-pr redate-report --json` (`chains`); see
-[`daemon-reference.md`](daemon-reference.md) §"Re-dates per PR and time to
-land".
+Merge-chain re-date pressure (`loom.merge.redate_prs`, `loom.merge.redates_max`
+and `loom.merge.time_to_land_max`, Issue #10163) is retired: the #8508 re-date
+remedy went in #12063 slice 1 and the gauges that stayed to show it reaching
+zero (#10888) were removed in #15776. No daemon emits these names; they are
+retired, not reused.
 
 Long-running task liveness (Issue #10414, `observability/ops/liveness.rs`).
 `task_alive` is sampled every 60 s on its own ticker, not on the collector's

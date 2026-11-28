@@ -28,9 +28,8 @@
 //! [`disposition`] (#9222) one span per ready-queue row's disposition, on
 //! transition or periodic refresh. [`ratelimit`] (#10022) exports GitHub
 //! rate-limit breaker trips, quota gauges (per bucket since W1) and breaker
-//! skips, [`forge_calls`] (W1) the facade's `loom.forge.calls` counter, and
-//! [`redate_chain`] (#10163) #8508 re-date pressure (re-dated PRs, re-dates
-//! per PR, time to land), [`reader_withdrawal`] (W4-A) one
+//! skips, [`forge_calls`] (W1) the facade's `loom.forge.calls` counter,
+//! [`reader_withdrawal`] (W4-A) one
 //! `forge.reader.withdrawn` span per reader withdrawal, and [`reader_spill`]
 //! (W4-B) one `forge.reader.spill` span per read-pool spill-latch
 //! transition. [`ipc_latency`] (#10765) exports IPC request latency by
@@ -71,7 +70,6 @@ pub mod read_shed;
 pub mod reader_spill;
 pub mod reader_withdrawal;
 pub mod reaper;
-pub mod redate_chain;
 pub mod safehouse_forge_lookup;
 pub mod scope_memory;
 pub mod stage_entry;
