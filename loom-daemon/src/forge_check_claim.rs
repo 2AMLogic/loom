@@ -43,7 +43,7 @@
 //! |---|---|---|---|
 //! | `0` | BLOCKED — reason token: `OPEN_PR #X` / `TARGET_IS_PR #N` / `CLOSED` / `FROZEN` / `OPERATOR` / `BUILDING` / `LEASE_ALREADY_HELD <host> <sweep-id>` / `BRANCH_EXISTS feature/issue-N` / `MERGED_PR #X` / `TRIAGE` | the token | **Hard-abort the claim.** |
 //! | [`EX_SAFE_TO_CLAIM`] (1) | verified safe to claim | empty | Claim. |
-//! | [`EX_PROBE_FAILED`] (5) | no verdict — any leg's read failed | empty | **Fail closed.** Treat as blocked; check by hand. |
+//! | [`EX_PROBE_FAILED`] (5) | no verdict — any leg's read failed, or the current directory could not be resolved | empty | **Fail closed.** Treat as blocked; check by hand. |
 //! | [`EX_FORGE_DECLINED`] (3) | Gitea — legs 1–3 are GitHub-only | empty | Check by hand. |
 //!
 //! `0` is the blocked state on purpose (mirroring `check-open-pr`'s
@@ -51,6 +51,13 @@
 //! on. Every non-zero code other than exactly `1` means **the question was
 //! not answered**, which a caller must treat as blocked — never as an
 //! all-clear.
+//!
+//! An unresolvable cwd takes that same `5` (#15671). The four legs cannot
+//! even start without a root to run against — a shell parked in a
+//! since-reaped worktree is the usual way here — and [`handle`] turns the
+//! failed read into the verdict itself instead of returning an `Err`, because
+//! the caller's generic error exit is `1`, which in this verb is the
+//! all-clear. See [`cwd_verdict`].
 //!
 //! `MERGED_PR #X` (#12615) is leg 1b, one REST read beside `OPEN_PR`: a PR
 //! already **merged** from `feature/issue-N` whose body neither closes nor
@@ -131,7 +138,7 @@
 
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use chrono::{DateTime, Utc};
 
 use crate::comment_trust::{records::AUTHOR_JQ, TrustPolicy};
@@ -369,6 +376,27 @@ fn unanswered(issue: u32, detail: &str) -> Verdict {
              check it by hand."
         ),
     }
+}
+
+/// Resolve the cwd into the root the legs run against, or turn an
+/// unresolvable cwd into the no-verdict [`Verdict`] — exit
+/// [`EX_PROBE_FAILED`], empty stdout.
+///
+/// The failure must not travel as an `Err`: [`handle`]'s caller lets a
+/// returned `Err` reach `main`, whose generic error exit is `1` — in this
+/// verb [`EX_SAFE_TO_CLAIM`], the *verified* "Claim." answer, reported with
+/// nothing probed. Split out of [`handle`], like [`decide_for`], so the mapping
+/// is unit-testable without `std::process::exit`.
+pub(crate) fn cwd_verdict(issue: u32, cwd: std::io::Result<PathBuf>) -> Result<PathBuf, Verdict> {
+    cwd.map_err(|err| {
+        unanswered(
+            issue,
+            &format!(
+                "the current directory could not be resolved ({err}); run it from inside the \
+                 repository whose issue you are about to claim"
+            ),
+        )
+    })
 }
 
 /// Render the aggregated verdict. Pure: every forge read stays in the leg
@@ -990,19 +1018,24 @@ pub(crate) fn remote_branch_leg(git_bin: &Path, root: &Path, issue: u32) -> Bran
     }
 }
 
-/// Handle `loom-daemon forge check-claim <issue>`. Never returns (exits the
-/// process with the code from [`decide`]); returns `Err` only when the
-/// current directory cannot be resolved.
+/// Handle `loom-daemon forge check-claim <issue>`. Never returns: every
+/// outcome, an unresolvable cwd included, exits the process with a code from
+/// the contract table. Nothing here returns `Err`, because the caller's
+/// generic error exit is `1` — in this verb [`EX_SAFE_TO_CLAIM`], the
+/// verified "Claim." answer.
 ///
 /// Resolution is cwd-scoped, like `forge check-open-pr`: run it from inside
 /// the repository (a managed worktree included) and it answers about that
 /// repository. `LOOM_REPO` is honored per leg exactly as each leg's
 /// precedent reader honors it.
 pub fn handle(issue: u32, force_claim: bool) -> Result<()> {
-    let root: PathBuf = std::env::current_dir().context(
-        "loom-daemon forge check-claim: could not resolve the current directory; \
-         run it from inside the repository whose issue you are about to claim",
-    )?;
+    let root = match cwd_verdict(issue, std::env::current_dir()) {
+        Ok(root) => root,
+        Err(no_verdict) => {
+            eprintln!("{}", no_verdict.stderr);
+            std::process::exit(no_verdict.code);
+        }
+    };
 
     // GitHub-only by construction: legs 1-3 are GitHub APIs. Declining is
     // honest; a partial probe (leg 4 alone) reporting "safe to claim" would
@@ -1077,6 +1110,45 @@ mod tests {
             lease,
             branch,
         }
+    }
+
+    // --- Before any leg: the cwd --------------------------------------------
+
+    /// An unresolvable cwd answers nothing, so it must leave through
+    /// `EX_PROBE_FAILED` — never through the generic error exit whose `1` is
+    /// `EX_SAFE_TO_CLAIM`, the verified "Claim." answer (#15671).
+    #[test]
+    fn unresolvable_cwd_is_probe_failed_and_never_the_verified_all_clear() {
+        let err = std::io::Error::new(std::io::ErrorKind::NotFound, "No such file or directory");
+        let v = cwd_verdict(15671, Err(err))
+            .expect_err("an unresolvable cwd must not resolve to a root");
+        assert_eq!(v.code, EX_PROBE_FAILED);
+        assert_ne!(
+            v.code, EX_SAFE_TO_CLAIM,
+            "an unresolvable cwd must not share the verified safe-to-claim exit code"
+        );
+        assert!(v.stdout.is_empty(), "{:?}", v.stdout);
+        assert!(
+            !v.stderr.contains("safe to claim"),
+            "an unresolvable cwd must never read as an all-clear: {}",
+            v.stderr
+        );
+        assert!(v.stderr.contains("NOT an all-clear"), "{}", v.stderr);
+        assert!(v.stderr.contains("#15671"), "{}", v.stderr);
+        let actionable = [
+            "current directory could not be resolved",
+            "No such file or directory",
+            "run it from inside the repository",
+        ];
+        for needle in actionable {
+            assert!(v.stderr.contains(needle), "missing {needle:?}: {}", v.stderr);
+        }
+    }
+
+    #[test]
+    fn resolvable_cwd_is_the_root_unchanged() {
+        let root = PathBuf::from("/repo/with/a/.loom");
+        assert_eq!(cwd_verdict(15671, Ok(root.clone())), Ok(root));
     }
 
     // --- Leg 1: OPEN_PR -----------------------------------------------------
