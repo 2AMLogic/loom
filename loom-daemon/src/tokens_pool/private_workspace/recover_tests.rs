@@ -3282,8 +3282,8 @@ fn a_builder_draw_names_every_tried_seat_when_all_are_busy() {
 /// A marked Builder can retry private containment once a healthy account appears.
 /// The launch alone discovers a busy lease, so its refusal must cool the item.
 #[test]
-#[serial(loom_shared_tokens_dir_env)]
 #[serial]
+#[serial(loom_shared_tokens_dir_env)]
 fn builder_pool_recovery_backs_off_busy_seats_and_excludes_exhausted_accounts() {
     use crate::step_dispatch::{driver::probe_exhausted_roles, step_end::record_refusal};
     use crate::step_role::StepRole;

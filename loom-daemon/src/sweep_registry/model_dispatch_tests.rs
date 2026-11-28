@@ -800,15 +800,15 @@ fn a_configured_role_model_on_claude_and_a_drawn_native_pin_are_forwarded_verbat
 }
 
 #[test]
-#[serial_test::serial(loom_shared_tokens_dir_env)]
 #[serial_test::serial]
+#[serial_test::serial(loom_shared_tokens_dir_env)]
 fn judge_recovers_from_claude_exhaustion_on_codex() {
     judge_pool_recovery("codex");
 }
 
 #[test]
-#[serial_test::serial(loom_shared_tokens_dir_env)]
 #[serial_test::serial]
+#[serial_test::serial(loom_shared_tokens_dir_env)]
 fn judge_recovers_from_claude_exhaustion_on_gemini() {
     judge_pool_recovery("opencode");
 }
