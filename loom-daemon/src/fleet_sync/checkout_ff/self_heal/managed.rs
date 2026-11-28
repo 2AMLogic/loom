@@ -3,14 +3,16 @@
 //!
 //! # Why `installed_files` alone is not enough
 //!
-//! `installed_files` is written by the installer and never by a resync
-//! (`resync-installed.sh` leaves it to the installer). Every file a later
-//! release adds is therefore missing from it until the next full install: a
-//! new `.loom/scripts/tests/*.sh`, a new `.loom/docs/*.md`, and most of the
-//! `.agents/skills/loom-*/SKILL.md` mirror. A stranded `chore: resync installed
-//! Loom surfaces` commit always touches some of them, so a classifier that
-//! read `installed_files` only left every such commit alone, and the
-//! checkouts stayed `diverged` for days (loom-worker-1/2/3, 2026-10-15).
+//! `resync-installed.sh` never adds to `installed_files`. The installer writes
+//! it, and so does the daemon's payload resync, which records the payload
+//! files it writes (#10717, [`crate::init::payload`]). In a workspace that
+//! script resynced, or one that predates #10717, every file a later release
+//! added is therefore still missing from it: a new `.loom/scripts/tests/*.sh`,
+//! a new `.loom/docs/*.md`, and most of the `.agents/skills/loom-*/SKILL.md`
+//! mirror. A stranded `chore: resync installed Loom surfaces` commit from such
+//! a workspace touches some of them, so a classifier that read
+//! `installed_files` only left every such commit alone, and the checkouts
+//! stayed `diverged` for days (loom-worker-1/2/3, 2026-10-15).
 //!
 //! A path is Loom's here only when the payload embedded in this binary ships
 //! a file at that destination. The resync never touches a file with no
