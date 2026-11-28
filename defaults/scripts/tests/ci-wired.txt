@@ -121,6 +121,9 @@ test-filing-lock.sh
 test-fleet-check.sh
 test-forge-helpers.sh
 test-forge-helpers-rate-limit-fallback.sh
+# #15793: forge_detect / _load_gitea_config fail closed with a diagnostic when
+# loom_resolve_config fails. Hermetic: stub jq under mktemp -d, no network.
+test-forge-helpers-resolve-failure.sh
 test-forge-transient-classification.sh
 test-gh-cached.sh
 test-github-app-token.sh
