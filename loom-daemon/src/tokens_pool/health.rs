@@ -104,7 +104,9 @@ pub enum TerminalClassification {
     /// account hold, because the account is not at fault: the sandbox is a
     /// property of the host's session containers. It is also not a success,
     /// so it neither clears a hold nor stamps `last_success`. The runtime-level
-    /// fall-through lives in `runtime_preference::sandbox_hold`.
+    /// fall-through lives in `runtime_preference::sandbox_hold`. A sweep
+    /// step's `SANDBOX_UNAVAILABLE` additionally holds its own seat through
+    /// `sandbox_seat_hold` (#14455), a separate write, not this arm.
     SandboxUnavailable,
     /// The account's Codex session container was not running when the tick
     /// tried to dispatch into it (#10455). Produced by `spawn-codex.sh`. Like
@@ -163,6 +165,9 @@ pub enum HealthReason {
     /// holding a `PlanExhausted`/`TransientFailure`/`SessionLimit` cooldown
     /// keeps it, because the wider hold is the one that decides selection.
     ModelCreditsExhausted,
+    /// A read-only inventory overlay. Re-read this profile's hold on the next draw.
+    #[serde(skip)]
+    SandboxHoldUnreadable,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -208,7 +213,7 @@ pub struct AccountHealth {
 }
 
 impl AccountHealth {
-    fn id(&self) -> AccountId {
+    pub(super) fn id(&self) -> AccountId {
         AccountId {
             provider: self.provider,
             name: self.name.clone(),
@@ -236,7 +241,8 @@ impl AccountHealth {
     /// (`ReauthRequired`, `cooldown_until`) is checked first and identically.
     #[must_use]
     pub fn is_eligible_for_class_at(&self, now: u64, model_class: Option<&str>) -> bool {
-        if self.reason == HealthReason::ReauthRequired {
+        if matches!(self.reason, HealthReason::ReauthRequired | HealthReason::SandboxHoldUnreadable)
+        {
             return false;
         }
         if self.cooldown_until.is_some_and(|deadline| deadline > now) {
@@ -1027,6 +1033,17 @@ pub fn health_snapshot(workspace: &Path) -> Result<HashMap<AccountId, AccountHea
         .collect())
 }
 
+/// Workspace credential health plus any sandbox holds on these shared profiles.
+pub(crate) fn inventory_health_snapshot(
+    workspace: &Path,
+    inventory: &[AccountDescriptor],
+    now: u64,
+) -> Result<HashMap<AccountId, AccountHealth>> {
+    let mut health = health_snapshot(workspace)?;
+    super::sandbox_seat_hold::apply_to_snapshot(&mut health, inventory, now);
+    Ok(health)
+}
+
 /// Select a healthy account for `provider` — the account-wide question, whose
 /// meaning is unchanged by #8058 Phase 2 (a live class-scoped hold still
 /// excludes the account). Callers that know which model they are about to run
@@ -1165,12 +1182,13 @@ pub fn select_healthy_for_class_at(
                 entry.updated_at = now;
             }
         }
-        let health: HashMap<AccountId, AccountHealth> = state
+        let mut health: HashMap<AccountId, AccountHealth> = state
             .accounts
             .iter()
             .cloned()
             .map(|entry| (entry.id(), entry))
             .collect();
+        super::sandbox_seat_hold::apply_to_snapshot(&mut health, inventory, now);
         let mut candidates: Vec<_> = inventory
             .iter()
             .filter(|account| account.id.provider == provider && account.enabled)
@@ -1199,6 +1217,9 @@ pub fn select_healthy_for_class_at(
                     } else if let Some(entry) = health.get(&account.id) {
                         match entry.reason {
                             HealthReason::ReauthRequired => "reauth_required".to_string(),
+                            HealthReason::SandboxHoldUnreadable => {
+                                "sandbox_hold_unreadable".to_string()
+                            }
                             // An account-wide cooldown is reported exactly as
                             // before; only when there is none does a live
                             // class hold get named, so the operator can see
@@ -1248,12 +1269,7 @@ pub fn provider_capacity_at(
     inventory: &[AccountDescriptor],
     now: u64,
 ) -> Result<ProviderCapacity> {
-    let state = read_state(workspace)?;
-    let health: HashMap<_, _> = state
-        .accounts
-        .into_iter()
-        .map(|entry| (entry.id(), entry))
-        .collect();
+    let health = inventory_health_snapshot(workspace, inventory, now)?;
     let accounts: Vec<_> = inventory
         .iter()
         .filter(|account| account.id.provider == provider)
@@ -1275,9 +1291,7 @@ pub fn provider_capacity_at(
         .iter()
         .filter(|account| {
             health.get(&account.id).is_some_and(|entry| {
-                entry.reason != HealthReason::ReauthRequired
-                    && (entry.cooldown_until.is_some_and(|until| until > now)
-                        || entry.blocking_class_cooldown_at(now, None).is_some())
+                entry.reason != HealthReason::ReauthRequired && !entry.is_eligible_at(now)
             })
         })
         .count();

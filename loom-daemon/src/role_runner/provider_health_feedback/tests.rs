@@ -234,6 +234,59 @@ category=SUCCESS exit_code=0 model=none'\n\
     );
 }
 
+/// Model a tick already in flight in another workspace when the hold was set.
+/// Commands from adjacent ticks sharing the log cannot release it.
+#[test]
+#[serial]
+fn only_a_command_from_this_tick_releases_a_shared_sandbox_hold() {
+    use crate::tokens_pool::account_registry::select_codex_account_where;
+    let holder = tempfile::tempdir().unwrap();
+    let runner = tempfile::tempdir().unwrap();
+    let profiles = tempfile::tempdir().unwrap();
+    let _env = EnvGuard::new(profiles.path());
+    codex_judge_workspace(runner.path(), profiles.path());
+    let admission =
+        crate::runtime_admission::resolve_and_admit(runner.path(), "judge", None).unwrap();
+    let seat = codex_id("alice");
+    tokens_pool::sandbox_seat_hold::hold_seat(holder.path(), &seat, 600, epoch_now()).unwrap();
+    let log = runner.path().join("role-judge.log");
+    let header = |anchor| model_resolution::role_log_header(anchor, "judge", "", "", "", "", None);
+    let success = "# LOOM_TERMINAL_RESULT v=2 provider=codex account=alice category=SUCCESS exit_code=0 model=none";
+    let command = "exec\n/bin/sh -c pwd in /w\n succeeded in 2ms:\n/w";
+    for (body, selectable) in [
+        ("codex\nCould not execute a command.", false),
+        (command, true),
+    ] {
+        fs::write(
+            &log,
+            format!(
+                "{}\n{command}\n{}\n# LOOM_ACCOUNT name=alice\n{body}\n{success}\n{}\n{command}\n",
+                header("prior"),
+                header("this"),
+                header("next")
+            ),
+        )
+        .unwrap();
+        apply_role_tick_provider_health_feedback(
+            runner.path(),
+            &log,
+            Some(&admission),
+            "this",
+            Some(0),
+        );
+        let health = tokens_pool::account_health(runner.path(), &seat)
+            .unwrap()
+            .unwrap();
+        assert!(health.last_success.is_some());
+        for workspace in [&holder, &runner] {
+            assert_eq!(
+                select_codex_account_where(workspace.path(), None, |a| a.id == seat).is_ok(),
+                selectable
+            );
+        }
+    }
+}
+
 /// AC4: a terminal record whose `account=` does not match the account the
 /// adapter actually selected is ignored — no health write for either name
 /// — matching the sweep path's own mismatch guard.

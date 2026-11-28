@@ -148,6 +148,35 @@ pub(crate) fn launch_rejection_of(
     reported
 }
 
+/// Resolve the launcher's typed report before consulting the terminal fallback.
+#[must_use]
+pub(crate) fn step_exit_evidence(
+    end: StepEnd,
+    line: Option<&StepOutcomeLine>,
+    reported_rejection: Option<&'static str>,
+    sandbox_unavailable: impl FnOnce() -> bool,
+) -> (Option<&'static str>, bool) {
+    let launch_rejection = launch_rejection_of(end, line, reported_rejection);
+    let sandbox_unavailable = launch_rejection.is_none() && sandbox_unavailable();
+    (launch_rejection, sandbox_unavailable)
+}
+
+/// Whether the step `sweep_id`'s own Codex terminal record in `log` says its
+/// runtime sandbox refused every tool call (`SANDBOX_UNAVAILABLE`, #14455).
+/// The record is the adapter's, read from the step's own region of the log
+/// (anchored on its sweep id, as the provider-health bridge anchors), never
+/// agent prose. An unreadable log is `false`.
+#[must_use]
+pub(crate) fn sandbox_unavailable_in(log: &Path, sweep_id: &str) -> bool {
+    let Ok(text) = std::fs::read_to_string(log) else {
+        return false;
+    };
+    crate::sweep_registry::dispatch_terminal_result(&text, sweep_id).is_some_and(|(result, _)| {
+        result.provider == crate::tokens_pool::AccountProvider::Codex
+            && result.category == crate::tokens_pool::TerminalClassification::SandboxUnavailable
+    })
+}
+
 /// The fast-fail window: the wider of `FAST_FAIL_WINDOW_SECS` and this
 /// host's configured `insta_crash_secs` ([`crate::sweep_registry::is_fast_failure`]'s
 /// own bound).
@@ -572,6 +601,20 @@ impl SweepRegistry {
         let log_path =
             info.map_or_else(|| self.compute_step_log_path(item, role), |i| i.log_path.clone());
         let line = read_outcome_line(&log_path, sweep_id, role, item);
+        let (launch_rejection, sandbox_unavailable) =
+            step_exit_evidence(end, line.as_ref(), rejection, || {
+                sandbox_unavailable_in(&log_path, sweep_id)
+            });
+        let line = if sandbox_unavailable {
+            Some(StepOutcomeLine {
+                role: role.role_name().to_string(),
+                target: item,
+                class: StepOutcomeClass::Failed,
+                reason: crate::step_dispatch::outcome_ledger::SANDBOX_UNAVAILABLE.to_string(),
+            })
+        } else {
+            line
+        };
         // #13966: the exit-time provider feedback (run by the reaper just
         // before this) said the seat was exhausted — the launch died on an
         // empty credential, so the release says so instead of `failed`, and
@@ -621,7 +664,6 @@ impl SweepRegistry {
         // `is_environmental_failure_class`); a progressing release never is,
         // and neither is `provider_exhausted`.
         let ran_for = (Utc::now() - started_at).to_std().unwrap_or_default();
-        let launch_rejection = launch_rejection_of(end, line.as_ref(), rejection);
         // #14951: a step that never reached the model reaps with its own
         // reason, so a Judge's reap writes no no-verdict record for it.
         let never_started = never_started_reason(
@@ -663,6 +705,7 @@ impl SweepRegistry {
                     timed_out: end == StepEnd::TimedOut,
                     provider_exhausted,
                     launch_rejection,
+                    sandbox_unavailable,
                     attempt: super::ended::AttemptEvidence {
                         termination: end.into(),
                         // The id the Builder lease publishes, so an operator can match

@@ -5,8 +5,9 @@
 
 use super::capture::{
     emit_step_capture, launch_rejection_of, never_started_reason, parse_outcome_line,
-    read_outcome_line, release_class_fallback, release_class_of_line, step_failure,
-    step_outcome_projection, tick_outcome, StepCapture, StepEnd, StepOutcomeClass, StepOutcomeLine,
+    read_outcome_line, release_class_fallback, release_class_of_line, sandbox_unavailable_in,
+    step_exit_evidence, step_failure, step_outcome_projection, tick_outcome, StepCapture, StepEnd,
+    StepOutcomeClass, StepOutcomeLine,
 };
 use super::lease::{claim_args, claim_verdict, ClaimRun};
 use super::timeout::timed_out;
@@ -702,6 +703,81 @@ fn a_judge_step_that_never_started_writes_no_no_verdict_record() {
     for r in ["exited", REASON_TIMEOUT] {
         assert!(recorded(r), "{r} must still stamp a record");
     }
+}
+
+#[test]
+fn a_sandbox_unavailable_terminal_record_is_read_from_this_steps_own_region() {
+    let dir = tempdir().unwrap();
+    let log = dir.path().join("step.log");
+    let record = |category: &str| {
+        format!(
+            "# LOOM_TERMINAL_RESULT v=2 provider=codex account=agent-4 category={category} \
+             exit_code=0 model=none\n"
+        )
+    };
+    let header =
+        |id: &str| format!("==== loom-daemon dispatch: t sweep_id={id} item=4 step=curator ====\n");
+    std::fs::write(
+        &log,
+        format!(
+            "{}{}{}{}",
+            header("step-curator-4-1"),
+            record("SANDBOX_UNAVAILABLE"),
+            header("step-curator-4-2"),
+            record("SUCCESS")
+        ),
+    )
+    .unwrap();
+    assert!(!sandbox_unavailable_in(&log, "step-curator-4-2"));
+    assert!(sandbox_unavailable_in(&log, "step-curator-4-1"));
+
+    // A prefix match or a transcript mention of the earlier id cannot lend
+    // it the next dispatch's refusal.
+    std::fs::write(
+        &log,
+        format!(
+            "{}{}sweep_id=step-curator-4-1\n{}",
+            header("step-curator-4-1"),
+            header("step-curator-4-10"),
+            record("SANDBOX_UNAVAILABLE")
+        ),
+    )
+    .unwrap();
+    assert!(!sandbox_unavailable_in(&log, "step-curator-4-1"));
+    assert!(sandbox_unavailable_in(&log, "step-curator-4-10"));
+    // Prose about a sandbox with no record is no verdict, and neither is an
+    // unreadable log.
+    std::fs::write(
+        &log,
+        format!(
+            "{}bwrap: No permissions to create a new namespace\n",
+            header("step-curator-4-1")
+        ),
+    )
+    .unwrap();
+    assert!(!sandbox_unavailable_in(&log, "step-curator-4-1"));
+    assert!(!sandbox_unavailable_in(&dir.path().join("none.log"), "step-curator-4-1"));
+}
+
+#[test]
+fn a_typed_launcher_receipt_skips_the_sandbox_fallback() {
+    let reported = Some("preflight_role_admission");
+    let rejected = StepEnd::Exited(Some(78));
+    let typed = step_exit_evidence(rejected, None, reported, || {
+        panic!("an authoritative launcher report must skip the terminal fallback")
+    });
+    assert_eq!(typed, (reported, false));
+
+    let clean_exit = StepEnd::Exited(Some(0));
+    assert_eq!(step_exit_evidence(clean_exit, None, reported, || true), (None, true));
+
+    let recorded = StepOutcomeLine {
+        role: "curator".into(),
+        target: 2,
+        class: StepOutcomeClass::Noop,
+        reason: "no_changes".into(),
+    };
+    assert_eq!(step_exit_evidence(rejected, Some(&recorded), reported, || false), (None, false));
 }
 
 #[test]

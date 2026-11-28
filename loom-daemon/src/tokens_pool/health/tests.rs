@@ -231,6 +231,8 @@ fn a_credit_exhaustion_without_a_usable_class_stays_account_wide() {
 /// releases only the class it names.
 #[test]
 fn class_holds_are_independent_and_success_clears_only_its_own_class() {
+    let profiles = tempfile::tempdir().unwrap();
+    let _profiles = crate::tokens_pool::profile_root_env::ProfileRootEnv::set(profiles.path());
     let tmp = tempfile::tempdir().unwrap();
     let accounts = vec![descriptor(AccountProvider::Codex, "a")];
     for (model, at) in [("gpt-5-codex", 100), ("gpt-5-mini", 200)] {
@@ -480,6 +482,8 @@ fn pre_phase_two_state_reads_back_unchanged_and_stays_account_wide() {
 
 #[test]
 fn expired_survives_time_and_success_until_explicit_clear() {
+    let profiles = tempfile::tempdir().unwrap();
+    let _profiles = crate::tokens_pool::profile_root_env::ProfileRootEnv::set(profiles.path());
     let tmp = tempfile::tempdir().unwrap();
     let account = descriptor(AccountProvider::Codex, "a");
     record_terminal_at(

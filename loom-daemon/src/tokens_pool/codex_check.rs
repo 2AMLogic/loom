@@ -560,9 +560,11 @@ pub fn assess_account(
         row.error = Some("disabled".to_string());
         return row;
     }
-    if health.is_some_and(|h| h.reason == HealthReason::ReauthRequired) {
+    if let Some(entry) = health.filter(|h| {
+        matches!(h.reason, HealthReason::ReauthRequired | HealthReason::SandboxHoldUnreadable)
+    }) {
         let mut row = AccountResult::new(name, "blocked");
-        row.error = Some("reauth_required".to_string());
+        row.error = Some(health_hold_label(entry.reason).to_string());
         return row;
     }
 
@@ -631,6 +633,7 @@ fn health_hold_label(reason: HealthReason) -> &'static str {
     match reason {
         HealthReason::Healthy => "cooldown",
         HealthReason::ReauthRequired => "reauth_required",
+        HealthReason::SandboxHoldUnreadable => "sandbox_hold_unreadable",
         HealthReason::PlanExhausted => "plan_exhausted",
         HealthReason::TransientFailure => "transient_backoff",
         HealthReason::SessionLimit => "session_limit",
@@ -705,8 +708,13 @@ pub fn run_check_with<T: super::codex_probe::ProbeTransport + ?Sized>(
     } else {
         None
     };
+    let health = health::inventory_health_snapshot(
+        workspace,
+        &inventory,
+        u64::try_from(now.timestamp()).unwrap_or(0),
+    )?;
     for account in &inventory {
-        let stored = health::account_health(workspace, &account.id)?;
+        let stored = health.get(&account.id);
         let live_probe = account.enabled && options.live;
         let (snapshot, probe_detail) = if !account.enabled {
             (None, None)
@@ -733,7 +741,7 @@ pub fn run_check_with<T: super::codex_probe::ProbeTransport + ?Sized>(
         } else {
             (latest_usage_snapshot(&account.credential_reference), None)
         };
-        let mut row = assess_account(account, stored.as_ref(), snapshot.as_ref(), now);
+        let mut row = assess_account(account, stored, snapshot.as_ref(), now);
         // A live probe was attempted for this row (#8972's `probed` key).
         row.probed = live_probe;
         // A live probe that measured nothing says *why* (not logged in, no

@@ -552,9 +552,26 @@ pub(super) fn role_log_header(
         .map(|(tier, source)| format!(" service_tier={tier} (source={source})"))
         .unwrap_or_default();
     format!(
-        "==== loom-daemon role_runner: {timestamp} role={role} model={model_display} \
+        "{ROLE_HEADER_PREFIX}{timestamp} role={role} model={model_display} \
          (source={model_source}) effort={effort_display} (source={effort_source}){service_tier_display} ===="
     )
+}
+
+const ROLE_HEADER_PREFIX: &str = "==== loom-daemon role_runner: ";
+
+/// Read exactly one tick from the append-only role log, even if the next
+/// tick already wrote its header before this tick's feedback was consumed.
+pub(super) fn role_log_section<'a>(contents: &'a str, timestamp: &str) -> Option<&'a str> {
+    let header = format!("{ROLE_HEADER_PREFIX}{timestamp} role=");
+    let (at, _) = contents
+        .match_indices(&header)
+        .find(|(at, _)| *at == 0 || contents[..*at].ends_with('\n'))?;
+    let (_, body) = contents[at..].split_once('\n')?;
+    let end = body
+        .match_indices(ROLE_HEADER_PREFIX)
+        .find(|(at, _)| *at == 0 || body[..*at].ends_with('\n'))
+        .map_or(body.len(), |(at, _)| at);
+    Some(&body[..end])
 }
 
 /// How [`role_log_header`] names a value that was never pinned, so the runtime

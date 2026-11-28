@@ -16,13 +16,9 @@
 //! looked spawnable no matter how many times it had already died on
 //! `TOKEN_EXHAUSTED`.
 //!
-//! This module closes that gap by reusing the sweep path's own log parsers
-//! (`sweep_registry::parse_terminal_result_after` /
-//! `sweep_registry::parse_token_name_after`, both re-exported at the
-//! `sweep_registry` module root via `pub use crash_signals::*;`) rather
-//! than reimplementing terminal-line parsing, with the same
-//! validate-then-write shape as
-//! `sweep_registry::SweepRegistry::apply_provider_health_feedback`.
+//! The account, terminal record and any evidence for releasing a shared
+//! sandbox hold come from the same bounded tick section. The sweep path
+//! uses the same account and terminal-record parsers.
 
 use super::*;
 use crate::tokens_pool::{self, AccountId, AccountProvider};
@@ -38,7 +34,7 @@ use crate::tokens_pool::{self, AccountId, AccountProvider};
 ///
 /// | Runtime | Reads | Writes |
 /// |---|---|---|
-/// | `codex` | `LOOM_TERMINAL_RESULT` | `.loom/account-health.json` (#8443) |
+/// | `codex` | `LOOM_TERMINAL_RESULT` and command results | workspace credential health and the shared profile hold |
 /// | native (`pi`/`opencode`) | `# LOOM_LAUNCH` + the harness's error events | the API-key pool's bad marks (#8424 item 1) |
 ///
 /// Both are post-hoc readers of text a launch already wrote — the only
@@ -80,11 +76,13 @@ pub(super) fn apply_role_tick_provider_health_feedback(
     // record's own self-reported `account=`, so a stale or malformed
     // terminal line can never claim a hold for an account this tick did not
     // actually use.
-    let Some(expected_account) = sweep_registry::parse_token_name_after(&contents, tick_anchor)
-    else {
+    let Some(region) = model_resolution::role_log_section(&contents, tick_anchor) else {
         return;
     };
-    let Some(result) = sweep_registry::parse_terminal_result_after(&contents, tick_anchor) else {
+    let Some(expected_account) = sweep_registry::parse_token_name_in(region) else {
+        return;
+    };
+    let Some(result) = sweep_registry::parse_terminal_result_in(region) else {
         return;
     };
     if result.provider != AccountProvider::Codex
@@ -123,8 +121,8 @@ pub(super) fn apply_role_tick_provider_health_feedback(
     };
     // #8539: the provider's own reset horizon, when its refusal named one —
     // the same gate the sweep path applies, from the one function that owns it.
-    let reset_at =
-        tokens_pool::codex_reset::exhaustion_reset_horizon(&contents, tick_anchor, result.category);
+    let reset_at = tokens_pool::codex_reset::exhaustion_reset_horizon_in(region, result.category);
+    tokens_pool::sandbox_seat_hold::observe_terminal(workspace_root, &id, result.category, region);
     // #9013 item 4: captured *before* the persist call — see
     // `pool_marks::record_codex` for why the sticky `ReauthRequired` hold
     // makes this ordering matter.

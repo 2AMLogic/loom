@@ -32,6 +32,22 @@ fn account(profiles: &Path, name: &str, session_managed: bool) -> AccountDescrip
     }
 }
 
+#[test]
+fn container_boundaries_do_not_depend_on_the_host_sandbox() {
+    let profiles = tempfile::tempdir().unwrap();
+    let session = account(profiles.path(), "session", true);
+    let private = account(profiles.path(), "private", false);
+    let held = profiles.path().join(".private-sessions/private");
+    fs::create_dir_all(&held).unwrap();
+    fs::write(held.join("workspace.json"), "{}").unwrap();
+    let bare = account(profiles.path(), "bare", false);
+    assert!(!bare_sandbox_blocked(&bare));
+    let _blocked = host_sandbox::test_support::block();
+    assert!(bare_sandbox_blocked(&bare));
+    assert!(!bare_sandbox_blocked(&session));
+    assert!(!bare_sandbox_blocked(&private));
+}
+
 /// The mapping from the shared snapshot's states: stopped, restarting and
 /// missing are down; running is not, and neither is a running container with
 /// stale mounts (it still serves the roots it does mount). An unavailable
@@ -131,6 +147,23 @@ fn selection_prefers_a_live_session_account() {
     }
     let unobservable: std::collections::HashSet<_> = (0..4).map(|_| pick()).collect();
     assert_eq!(unobservable.len(), 2, "fail open keeps both accounts in rotation");
+
+    account(profiles.path(), "bare", false);
+    let _live = set(running(&["agent-2"]));
+    let drawable: std::collections::HashSet<_> = (0..4).map(|_| pick()).collect();
+    assert_eq!(drawable, ["agent-2".to_string(), "bare".to_string()].into());
+    let _blocked = host_sandbox::test_support::block();
+    for _ in 0..4 {
+        assert_eq!(pick(), "agent-2");
+    }
+    // A workspace filter may remove every container (e.g. a private clone
+    // bound elsewhere). Even the selector's fallback must reject this seat.
+    let bare_only = crate::tokens_pool::account_registry::select_codex_account_where(
+        workspace.path(),
+        None,
+        |account| account.id.name == "bare",
+    );
+    assert!(bare_only.is_err());
 
     match prior_probe {
         Some(value) => std::env::set_var("LOOM_CODEX_SESSION_PROBE", value),

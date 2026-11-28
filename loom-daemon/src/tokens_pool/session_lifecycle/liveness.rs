@@ -205,6 +205,18 @@ fn selector_read(
     Some(SessionLiveness(Arc::new(snapshot)))
 }
 
+/// A session-managed or private-clone seat uses its container boundary. Only
+/// a host-direct seat depends on the host's Codex sandbox (#14455).
+pub(crate) fn bare_sandbox_blocked(account: &AccountDescriptor) -> bool {
+    account.enabled
+        && !is_session_managed(&account.credential_reference)
+        && !super::super::codex_hooks::is_private_clone(&account.credential_reference)
+        && host_sandbox::blocked()
+}
+
+#[path = "host_sandbox.rs"]
+pub(crate) mod host_sandbox;
+
 /// The accounts in `inventory` the selector should try first: everything
 /// except session-managed accounts whose container is down. `None` when there
 /// is nothing to prefer — cannot observe, no account down, or no account
