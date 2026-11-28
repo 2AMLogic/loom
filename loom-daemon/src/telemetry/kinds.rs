@@ -201,6 +201,9 @@ pub mod write_scope_refused;
 
 /// `checkout.external_change` (#11566) — a managed checkout moved by non-Loom git.
 pub mod checkout_external_change;
+/// `checkout.fast_forward` (#15729) — one fast-forward the checkout pass
+/// itself performed on a managed checkout.
+pub mod checkout_fast_forward;
 pub mod roster_change;
 
 /// `host.export` (#11124).
@@ -598,6 +601,14 @@ macro_rules! telemetry_kind_table {
             /// the arrival (inflow) fact `eta.stage_outcome`'s reconstructed
             /// `entered_at` could not give. OTLP-only. See [`stage_entry`].
             StageEntry = "eta.stage_entry" => $crate::telemetry::kinds::stage_entry::StageEntryRecord,
+                gate: $crate::telemetry::NEW_KIND_SCHEMA_VERSION, otlp: Logs;
+
+            /// One fast-forward the checkout pass itself performed on a
+            /// managed checkout (Issue #15729): the checkout, the full shas
+            /// before and after, and the reflog entry's own time, so the
+            /// pass's own move is attributable from the store beside the
+            /// external ones. OTLP-only. See [`checkout_fast_forward`].
+            CheckoutFastForward = "checkout.fast_forward" => $crate::telemetry::kinds::checkout_fast_forward::CheckoutFastForwardRecord,
                 gate: $crate::telemetry::NEW_KIND_SCHEMA_VERSION, otlp: Logs;
 
             // APPEND NEW KINDS ABOVE THIS LINE (one row; `gate:` stays

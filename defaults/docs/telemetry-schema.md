@@ -191,6 +191,7 @@ cycle) is added only when loom-ui's error tracking shows it is needed.
 | [`host.status`](#hoststatus) | gauges, OTLP only | `host_status.rs` (sampler), `observability/collector.rs`, `observability/otlp/mapping/host_status.rs` |
 | [`checkout.freshness`](#checkoutfreshness) | log, OTLP only | `fleet_sync/checkout_ff` pass → `observability/otlp/mapping/checkout_freshness.rs` |
 | [`checkout.external_change`](#checkoutexternal_change) | log, OTLP only | `fleet_sync/checkout_ff/external_change.rs` |
+| [`checkout.fast_forward`](#checkoutfast_forward) | log, OTLP only | `fleet_sync/checkout_ff` pass → `observability/otlp/mapping/checkout_fast_forward.rs` |
 | [`roster.change`](#rosterchange) | log, OTLP only | `fleet_sync/roster_clone.rs` |
 | [`daemon.run_state_request`](#daemonrun_state_request--who-asked-the-daemon-to-pause-drain-stop-or-restart) | log, OTLP only | `ipc.rs` (`handle_client` run-state verbs), `observability/run_state_request.rs` |
 | [`completion.narrated`](#completionnarrated--a-public-feed-completion-the-narration-sink-built) | log, OTLP only | *none: no longer emitted since #13946; the kind stays defined* |
@@ -3707,6 +3708,98 @@ invoked by a person *through Loom's own tagged environment* (a shell inheriting
 `GIT_REFLOG_ACTION=loom:...`) is indistinguishable from Loom. The `rebase`
 entries other than start/finish/abort are ignored, so one rebase is one or two
 records, not one per picked commit.
+
+### `checkout.fast_forward`
+
+One fast-forward that the daemon's own checkout pass performed on a managed
+checkout (Issue #15729). `checkout.external_change` reports every reflog entry
+that moved a checkout and was **not** Loom's; this is its counterpart for the
+one Loom write that moves a checkout forward, which was indistinguishable
+from a plain `git pull` by anything else. One record per fast-forward,
+emitted by the `checkout_ff` pass right after the merge. Envelopes carry
+`schema_version: 12`. **OTLP-only** (native: `false`), severity `INFO`,
+stamped at the **reflog entry's own time** (`at`), not when the daemon read
+it. The body is the record's JSON; the scalars ride as `loom.checkout.*`
+attributes, the same keys `checkout.external_change` exports
+(`CHECKOUT_FAST_FORWARD_LOG_ATTRIBUTE_KEYS`, which the collector's
+`transform/privacy` allowlists), plus `loom.repo` / `loom.repo.visibility`.
+Finding the entry takes a few local `git` calls around a merge the pass
+performs; it adds no network call and writes nothing.
+
+**Made before the exporter starts.** The startup pass moves a checkout right
+after a roll (the fast-forward runs inside it for that, #10869), and it runs
+before the OTLP exporter does, when nothing can be exported. A record made
+there is held in memory (at most 64, newest kept) and emitted by the first
+pass that exports, with `at` and `observed_at` still the move's own times. A
+daemon that restarts again before any pass exports loses them, as does a host
+that holds more than 64.
+
+**Which entry is the pass's.** The pass's `merge --ff-only` runs under
+`GIT_REFLOG_ACTION=loom:ff`, so git writes `loom:ff: Fast-forward`. Right
+before the merge the pass reads the checkout's `HEAD` reflog and the commit
+HEAD is at; right after a merge that succeeds it takes the one `loom:ff` entry
+**added since** that starts at that commit. So each of these produces no
+record: a stale tagged entry from an earlier pass; an entry something else
+wrote (a pull, a reset); a merge git had nothing to do, because the checkout
+was already at the tip (git writes no entry for it); two tagged entries from
+the same commit (another Loom pass moved the checkout meanwhile); and a
+reflog that cannot be read or was rewritten in between. Unknown is not a fact.
+The lookup is a local read and best-effort: it adds no network call, writes
+nothing, and a merge whose entry is not found moves the checkout just the
+same.
+
+| Field | Type | Notes |
+|---|---|---|
+| `change_id` | string | stable id: a hash of root, from, to and the reflog time, as on `checkout.external_change`; the same entry read twice is the same id |
+| `repo` | string? | `owner/repo` from `origin`, when it parses (`loom.repo`) |
+| `visibility` | `public` \| `private` | `private` until resolved (a missing tag never decodes to public) |
+| `root` | string | the registered root; body only |
+| `host` | string | the host whose pass moved it; also `host.name` on the Resource |
+| `ref` | string | the branch the pass moved, `refs/heads/<default>` (`loom.checkout.ref`). The entry is read from the checkout's `HEAD` reflog, which carries the same line |
+| `from_sha`, `to_sha` | string | the full commit before and after the move (`loom.checkout.from_sha`, `.to_sha`) |
+| `at` | RFC3339 | when git wrote the entry, to the second; the record time |
+| `observed_at` | RFC3339 | when the daemon read it; the log record's observed time |
+| `loom` | object | the observing build's provenance (required; a record without valid provenance is not emitted) |
+
+Attributes: `loom.checkout.change_id`, `.kind` (always `fast-forward`), `.ref`,
+`.from_sha`, `.to_sha`, and the build as `.version`, `.revision`,
+`.tree_state`, `.provenance_complete`.
+
+**Lookup by checkout.** "Who moved this checkout, and when" is one query over
+both kinds: they share `loom.repo`, `loom.checkout.ref`, `loom.checkout.from_sha`
+and `loom.checkout.to_sha`, and a `checkout.fast_forward` row names the host
+whose pass did it while a `checkout.external_change` row says only that the
+move was not Loom's.
+
+```sql
+SELECT timestamp,
+       attributes_string['loom.kind'] AS kind,
+       attributes_string['loom.checkout.kind'] AS move,
+       attributes_string['loom.checkout.from_sha'] AS from_sha,
+       attributes_string['loom.checkout.to_sha'] AS to_sha
+FROM signoz_logs.logs_v2
+WHERE attributes_string['loom.kind'] IN ('checkout.fast_forward', 'checkout.external_change')
+  AND resources_string['host.name'] = 'loom-crew-7'
+  AND JSONExtractString(body, 'root') = '/home/ubuntu/GitHub/loom'
+  AND timestamp >= now() - INTERVAL 1 DAY
+ORDER BY timestamp
+```
+
+To compare a row with the checkout itself: `from_sha` and `to_sha` are the two
+SHAs and `at` the time of one `loom:ff: Fast-forward` line of that checkout's
+`git reflog show HEAD --date=iso`. A checkout that
+`checkout.freshness` reports as `fast-forwarded` (`loom.checkout.state`) with
+no `checkout.fast_forward` row for the same pass moved without a record: it
+was already at the tip when the merge ran (git wrote no entry), or the entry
+could not be read or identified. Read its reflog for what brought it there.
+
+**Limits.** The record covers only a merge this pass performed in this daemon
+build. A checkout moved by the update script (`loom:update`), by a resync
+(`loom:resync`) or by an earlier build has none; the reflog entry is the
+evidence. Git invoked by a person *through Loom's own tagged environment* (a
+shell inheriting `GIT_REFLOG_ACTION=loom:ff`) is indistinguishable from the
+pass. **Zero rows on a host whose repositories did not advance is expected**,
+so the kind is exempt from the export-silence watch (`kind_silence.rs`).
 
 
 ### `roster.change`

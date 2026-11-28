@@ -1473,6 +1473,7 @@ Guards: `kind_producer.rs` fails when a kind loses its last producer; `kind_expo
 | `token_ranking.refresh` | token_ranking_refresh/telemetry.rs | daemon | logs |  |
 | `host.export` | observability/collector.rs | daemon | logs |  |
 | `checkout.external_change` | fleet_sync/checkout_ff/external_change.rs | daemon | logs |  |
+| `checkout.fast_forward` | fleet_sync/checkout_ff.rs, fleet_sync/checkout_ff/external_change.rs | daemon | logs |  |
 | `roster.change` | fleet_sync/roster_clone.rs | daemon | logs |  |
 | `issue.estimate` | telemetry/kinds/issue_estimate/observe.rs | daemon | logs | Observed from curated issues by the intake pass (#12118). |
 | `stage.work_started` | observability/work_started.rs | daemon | logs |  |
