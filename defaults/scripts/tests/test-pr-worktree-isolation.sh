@@ -35,6 +35,9 @@
 #      symlinked LOOM_WORKTREE_ROOT reuses the registered worktree (printing the
 #      logical path on stdout), and an unregistered prefix-colliding directory
 #      (pr-97 beside pr-970) is rejected without running gh pr checkout (#15196).
+#  11. A config-lookup failure in loom_worktree_root returns the lookup status
+#      with empty stdout and preserves stderr, making pr-worktree.sh exit nonzero
+#      before creating or reusing a checkout and without a ready message (#15588).
 #
 # Tests 3-5 run the real pr-worktree.sh against a throwaway git repo with a
 # mocked `gh`, since there is no live forge in CI. Branch-shape classification
@@ -1209,6 +1212,151 @@ run_selection judge missing-managed "$same" absent ready $'PR helper\nentered pr
 run_selection doctor managed "$same" absent ready $'issue helper\ncheckout issue-71\nentered issue-71'
 run_selection judge detached "$ad_hoc" absent detached $'PR helper\nentered pr-71'
 run_selection doctor detached "$ad_hoc" absent detached 'PR helper'
+
+# --- Test 11: config-lookup failure stops loom_worktree_root and pr-worktree.sh (#15588) ---
+echo ""
+echo "Test 11: config-lookup failure returns lookup status and stops pr-worktree.sh (#15588)"
+
+CFG_FAIL="$TMP/cfg-fail"
+mkdir -p "$CFG_FAIL/failbin" "$CFG_FAIL/ghbin" "$CFG_FAIL/ext"
+REAL_JQ="$(command -v jq)"
+cat > "$CFG_FAIL/failbin/jq" <<EOF
+#!/usr/bin/env bash
+if [[ "\$*" == *"reduce .[]"* ]]; then
+    echo "stub jq: config tier merge failed" >&2
+    exit 37
+fi
+exec "$REAL_JQ" "\$@"
+EOF
+chmod +x "$CFG_FAIL/failbin/jq"
+
+cat > "$CFG_FAIL/ghbin/gh" <<'MOCKEOF'
+#!/usr/bin/env bash
+if [[ "$1" == "pr" && "$2" == "view" ]]; then
+    if [[ "$*" == *headRefOid* ]]; then echo "$LOOM_TEST_HEAD_SHA"; else echo "$LOOM_TEST_HEAD_BRANCH"; fi
+    exit 0
+fi
+if [[ "$1" == "pr" && "$2" == "checkout" ]]; then
+    touch "$LOOM_TEST_GH_MARKER"
+    git checkout -q "$LOOM_TEST_HEAD_BRANCH"
+    exit $?
+fi
+exit 0
+MOCKEOF
+chmod +x "$CFG_FAIL/ghbin/gh"
+
+git init -q -b main "$CFG_FAIL/origin.git" --bare
+git init -q -b main "$CFG_FAIL/repo"
+git -C "$CFG_FAIL/repo" config user.email t@t
+git -C "$CFG_FAIL/repo" config user.name t
+git -C "$CFG_FAIL/repo" commit --allow-empty -q -m init
+git -C "$CFG_FAIL/repo" remote add origin "$CFG_FAIL/origin.git"
+git -C "$CFG_FAIL/repo" push -q origin main
+git -C "$CFG_FAIL/repo" checkout -q -b fix/cfg-fail
+git -C "$CFG_FAIL/repo" commit --allow-empty -q -m "pr 960 change"
+SHA_CFG_A="$(git -C "$CFG_FAIL/repo" rev-parse HEAD)"
+git -C "$CFG_FAIL/repo" checkout -q main
+
+# 11a: shared helper propagates lookup status, emits no path, preserves stderr.
+RC11A=0
+WT_OUT11=$(
+    unset LOOM_WORKTREE_ROOT
+    # shellcheck source=../lib/worktree-root.sh
+    source "$SCRIPTS_DIR/lib/worktree-root.sh"
+    PATH="$CFG_FAIL/failbin:$PATH" LOOM_CONFIG_DEFAULTS_FILE="" \
+        loom_worktree_root "$CFG_FAIL/repo" 2>"$CFG_FAIL/err-helper"
+) || RC11A=$?
+assert_eq "37" "$RC11A" "loom_worktree_root returns the config lookup failure status"
+assert_eq "" "$WT_OUT11" "loom_worktree_root emits no path on config lookup failure"
+assert_eq "stub jq: config tier merge failed" "$(cat "$CFG_FAIL/err-helper")" \
+    "loom_worktree_root preserves the lookup diagnostic on stderr"
+
+COND11A=$(
+    unset LOOM_WORKTREE_ROOT
+    # shellcheck source=../lib/worktree-root.sh
+    source "$SCRIPTS_DIR/lib/worktree-root.sh"
+    if got=$(PATH="$CFG_FAIL/failbin:$PATH" LOOM_CONFIG_DEFAULTS_FILE="" \
+        loom_worktree_root "$CFG_FAIL/repo" 2>/dev/null); then
+        echo "ok:$got"
+    else
+        echo "failed:$?"
+    fi
+)
+assert_eq "failed:37" "$COND11A" "loom_worktree_root failure is visible in an if condition"
+
+# Valid LOOM_WORKTREE_ROOT takes precedence and bypasses the failing lookup.
+RC11_OVR=0
+WT_OVR11=$(
+    # shellcheck source=../lib/worktree-root.sh
+    source "$SCRIPTS_DIR/lib/worktree-root.sh"
+    PATH="$CFG_FAIL/failbin:$PATH" LOOM_CONFIG_DEFAULTS_FILE="" \
+        LOOM_WORKTREE_ROOT="$CFG_FAIL/ext" \
+        loom_worktree_root "$CFG_FAIL/repo" 2>"$CFG_FAIL/err-ovr"
+) || RC11_OVR=$?
+assert_eq "0" "$RC11_OVR" "valid LOOM_WORKTREE_ROOT bypasses failing config lookup"
+assert_eq "$CFG_FAIL/ext/repo" "$WT_OVR11" "valid LOOM_WORKTREE_ROOT returns namespaced override path"
+assert_eq "" "$(cat "$CFG_FAIL/err-ovr")" "valid LOOM_WORKTREE_ROOT emits no lookup diagnostic"
+
+# 11b: pr-worktree.sh stops nonzero before creating a checkout and emits no ready message.
+RC11B=0
+PR_OUT11B=$(
+    cd "$CFG_FAIL/repo"
+    unset LOOM_WORKTREE_ROOT
+    PATH="$CFG_FAIL/failbin:$CFG_FAIL/ghbin:$PATH" LOOM_CONFIG_DEFAULTS_FILE="" \
+        LOOM_DEFAULT_BRANCH=main LOOM_TEST_HEAD_BRANCH=fix/cfg-fail \
+        LOOM_TEST_HEAD_SHA="$SHA_CFG_A" LOOM_TEST_GH_MARKER="$CFG_FAIL/gh-960" \
+        "$PR_WORKTREE_SH" 960 2>"$CFG_FAIL/err-960"
+) || RC11B=$?
+ERR11B="$(cat "$CFG_FAIL/err-960")"
+assert_eq "37" "$RC11B" "pr-worktree.sh exits with lookup failure status before creating a checkout"
+assert_eq "" "$PR_OUT11B" "pr-worktree.sh emits nothing on stdout on lookup failure"
+assert_contains "$ERR11B" "stub jq: config tier merge failed" \
+    "pr-worktree.sh preserves the config lookup diagnostic on stderr"
+assert_not_contains "$ERR11B" "PR worktree ready" "pr-worktree.sh emits no ready message on stderr"
+if [[ ! -e "$CFG_FAIL/repo/.loom/worktrees/pr-960" && ! -f "$CFG_FAIL/gh-960" ]] \
+    && [[ "$(git -C "$CFG_FAIL/repo" worktree list --porcelain | grep -c '^worktree ')" -eq 1 ]]; then
+    pass "pr-worktree.sh creates no checkout directory, registers no worktree, and skips gh checkout"
+else
+    fail "pr-worktree.sh created a checkout or invoked gh despite config lookup failure"
+fi
+
+# 11c: normal lookup with no configured root selects <repo>/.loom/worktrees; a
+#      subsequent lookup failure stops pr-worktree.sh before reusing that checkout.
+RC11C_CREATE=0
+PR_OUT11C_CREATE=$(
+    cd "$CFG_FAIL/repo"
+    unset LOOM_WORKTREE_ROOT
+    PATH="$CFG_FAIL/ghbin:$PATH" LOOM_CONFIG_DEFAULTS_FILE="" \
+        LOOM_DEFAULT_BRANCH=main LOOM_TEST_HEAD_BRANCH=fix/cfg-fail \
+        LOOM_TEST_HEAD_SHA="$SHA_CFG_A" LOOM_TEST_GH_MARKER="$CFG_FAIL/gh-960" \
+        "$PR_WORKTREE_SH" 960 2>"$CFG_FAIL/err-960-ok"
+) || RC11C_CREATE=$?
+if [[ "$RC11C_CREATE" -eq 0 && -f "$CFG_FAIL/repo/.loom/worktrees/pr-960/.loom-managed" ]]; then
+    pass "successful lookup with no configured root creates <repo>/.loom/worktrees/pr-960"
+else
+    fail "normal lookup failed to create default pr-960 checkout (rc=$RC11C_CREATE): $PR_OUT11C_CREATE"
+fi
+
+rm -f "$CFG_FAIL/gh-960"
+RC11C_REUSE=0
+PR_OUT11C_REUSE=$(
+    cd "$CFG_FAIL/repo"
+    unset LOOM_WORKTREE_ROOT
+    PATH="$CFG_FAIL/failbin:$CFG_FAIL/ghbin:$PATH" LOOM_CONFIG_DEFAULTS_FILE="" \
+        LOOM_DEFAULT_BRANCH=main LOOM_TEST_HEAD_BRANCH=fix/cfg-fail \
+        LOOM_TEST_HEAD_SHA="$SHA_CFG_A" LOOM_TEST_GH_MARKER="$CFG_FAIL/gh-960" \
+        "$PR_WORKTREE_SH" 960 2>"$CFG_FAIL/err-960-reuse"
+) || RC11C_REUSE=$?
+ERR11C_REUSE="$(cat "$CFG_FAIL/err-960-reuse")"
+assert_eq "37" "$RC11C_REUSE" "pr-worktree.sh exits nonzero before reusing an existing checkout on lookup failure"
+assert_eq "" "$PR_OUT11C_REUSE" "failed lookup on reuse emits no reuse/ready message or path on stdout"
+assert_contains "$ERR11C_REUSE" "stub jq: config tier merge failed" \
+    "failed lookup on reuse preserves diagnostic on stderr"
+if [[ ! -f "$CFG_FAIL/gh-960" ]]; then
+    pass "pr-worktree.sh stops before refreshing/reusing the existing checkout"
+else
+    fail "pr-worktree.sh ran gh pr checkout in the existing checkout despite lookup failure"
+fi
 
 # --- Summary ---
 echo ""

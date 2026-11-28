@@ -115,9 +115,14 @@ loom_worktree_root() {
 
     # 2. Config key override — worktree.root, resolved through the config
     #    tier chain (legacy .loom/config.json, .loom-project/project.json,
-    #    .loom-local/local.json, private defaults).
-    local cfg_root
-    cfg_root=$(loom_config_get "$repo_root" "worktree.root" "")
+    #    .loom-local/local.json, private defaults). Fail closed (#15588): check
+    #    the getter's status explicitly (`set -e` is cleared inside `$(...)`),
+    #    returning a lookup failure immediately with empty stdout.
+    local cfg_root cfg_rc=0
+    cfg_root=$(loom_config_get "$repo_root" "worktree.root" "") || cfg_rc=$?
+    if [[ $cfg_rc -ne 0 ]]; then
+        return "$cfg_rc"
+    fi
     if [[ -n "$cfg_root" ]]; then
         if [[ "$cfg_root" == /* ]]; then
             local cfg_target="${cfg_root%/}/$(basename "$repo_root")"
