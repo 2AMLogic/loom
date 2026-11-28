@@ -158,6 +158,7 @@ test-guide-work-plan-debounce.sh
 test-guide-work-plan-held-approved-reason.sh
 test-guide-work-plan-held-issue-suffix.sh
 test-guide-work-plan-held-unbucketed-count.sh
+test-guide-work-plan-inventory-read-guard.sh
 test-guide-work-plan-operator-hold-exclude.sh
 test-guide-work-plan-provenance.sh
 test-guide-work-plan-ready-open-pr-exclude.sh

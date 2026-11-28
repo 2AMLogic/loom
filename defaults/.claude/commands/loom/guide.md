@@ -2669,6 +2669,9 @@ render_plan_body() {
   pr_inventory=$("$GH_READ" pr list --state open --limit 200 \
     --json number,title,labels,isDraft,headRefName,isCrossRepository,body,closingIssuesReferences \
     --jq 'sort_by(.number)') || { pr_inventory="[]"; inventory_ok=""; }
+  if [ -n "$inventory_ok" ] && ! printf '%s' "$pr_inventory" | jq -e -s 'length == 1 and (.[0] | type == "array")' >/dev/null 2>&1; then
+    pr_inventory="[]"; inventory_ok=""
+  fi
   local inventory_note=""
   if [ -z "$inventory_ok" ]; then
     inventory_note="_Open-PR inventory unreadable — Ready is NOT net of open-PR admission this tick (native admission still applies at claim time)._ <!-- loom:inventory-unreadable -->"
