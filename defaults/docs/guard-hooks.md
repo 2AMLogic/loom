@@ -105,8 +105,10 @@ Both Quick Install call sites now run `wire_quick_install_guard_hooks`, which ca
 The two compose to **exactly one** firing path in either configuration — copies present
 ⇒ project entry runs, wrapper defers; copies absent ⇒ no project entry written, wrapper
 execs the machine hook. It is re-asserted on every install rather than made
-strip-proof: the uninstaller matches on the `.loom/hooks/` command prefix, not on
-provenance, so no project-level entry can survive an uninstall by design.
+strip-proof: the uninstaller matches on the `.loom/hooks/` command prefix (quoted
+or unquoted) and on the launcher commands' own markers, not on provenance, so no
+project-level entry Loom writes can survive an uninstall by design (#15764); a
+hand-written entry that merely names a Loom hook still can.
 
 If you want the machine-level end state (no per-repo copies at all), run
 `loom migrate` (Phase 6 / #4254) — it untracks the legacy copies, after which
