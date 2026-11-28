@@ -7,6 +7,7 @@
 use std::os::unix::fs::symlink;
 
 use super::*;
+use crate::test_git_helpers::run as git;
 
 /// A throwaway directory that removes itself.
 struct TempTree(PathBuf);
@@ -178,19 +179,6 @@ fn unlink_symlink_refuses_a_real_directory() {
 
     assert!(unlink_symlink(&dir).is_err());
     assert!(dir.join("keep.txt").is_file());
-}
-
-fn git(dir: &Path, args: &[&str]) {
-    let status = Command::new("git")
-        .current_dir(dir)
-        .args(args)
-        .env("GIT_AUTHOR_NAME", "t")
-        .env("GIT_AUTHOR_EMAIL", "t@t")
-        .env("GIT_COMMITTER_NAME", "t")
-        .env("GIT_COMMITTER_EMAIL", "t@t")
-        .status()
-        .expect("git");
-    assert!(status.success(), "git {args:?}");
 }
 
 #[test]
