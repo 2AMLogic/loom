@@ -290,12 +290,6 @@ owner = "daemon-landing"
 removal_issue = 9799
 
 [[bypass]]
-path = "loom-daemon/src/merge_pr/post_merge_bookkeeping.rs"
-calls = 4
-owner = "daemon-landing"
-removal_issue = 9799
-
-[[bypass]]
 path = "loom-daemon/src/operator_decision/cli.rs"
 calls = 8
 owner = "daemon-other"
