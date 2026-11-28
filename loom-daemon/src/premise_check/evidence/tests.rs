@@ -3,8 +3,8 @@
 //! a test that greps its own checkout passes or fails on unrelated commits.
 
 use super::*;
+use crate::test_git_helpers::run;
 use std::fs;
-use std::process::Command;
 
 fn root() -> tempfile::TempDir {
     tempfile::tempdir().expect("tempdir")
@@ -64,19 +64,9 @@ fn anchors_are_deduplicated_case_insensitively() {
 fn git_tree() -> tempfile::TempDir {
     let dir = root();
     let p = dir.path();
-    let run = |args: &[&str]| {
-        let ok = Command::new("git")
-            .arg("-C")
-            .arg(p)
-            .args(args)
-            .status()
-            .expect("git")
-            .success();
-        assert!(ok, "git {args:?}");
-    };
-    run(&["init", "-q"]);
-    run(&["config", "user.email", "t@example.com"]);
-    run(&["config", "user.name", "t"]);
+    run(p, &["init", "-q"]);
+    run(p, &["config", "user.email", "t@example.com"]);
+    run(p, &["config", "user.name", "t"]);
     fs::create_dir_all(p.join("src")).unwrap();
     fs::write(
         p.join("src/watchdog.rs"),
@@ -93,8 +83,8 @@ fn git_tree() -> tempfile::TempDir {
     )
     .unwrap();
     fs::write(p.join("src/quiet.rs"), "// CONFIRMED, with no intent claim\n").unwrap();
-    run(&["add", "-A"]);
-    run(&["commit", "-qm", "seed"]);
+    run(p, &["add", "-A"]);
+    run(p, &["commit", "-qm", "seed"]);
     dir
 }
 

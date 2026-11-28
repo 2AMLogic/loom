@@ -26,21 +26,16 @@ fn inputs(root: &Path) -> Inputs<'_> {
 /// exercising [`host::repo_slug`]-backed tiers without touching a real one.
 fn git_checkout_with_origin(slug: &str) -> tempfile::TempDir {
     let dir = tempfile::tempdir().expect("tempdir");
-    let run = |args: &[&str]| {
-        let status = std::process::Command::new("git")
-            .args(args)
-            .current_dir(dir.path())
-            .status()
-            .expect("git");
-        assert!(status.success(), "git {args:?} failed");
-    };
-    run(&["init", "-q"]);
-    run(&[
-        "remote",
-        "add",
-        "origin",
-        &format!("https://github.com/{slug}.git"),
-    ]);
+    crate::test_git_helpers::run(dir.path(), &["init", "-q"]);
+    crate::test_git_helpers::run(
+        dir.path(),
+        &[
+            "remote",
+            "add",
+            "origin",
+            &format!("https://github.com/{slug}.git"),
+        ],
+    );
     dir
 }
 
