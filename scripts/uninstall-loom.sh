@@ -130,6 +130,14 @@ LOOM_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 # shellcheck source=scripts/install/provision-daemon.sh
 source "$LOOM_ROOT/scripts/install/provision-daemon.sh"
 
+# Issue #15764: Step 6's `.claude/settings.json` hook filter recognizes Loom's
+# machine-level launcher command by the SAME marker the writer uses to
+# recognize its own wrappers (`_PHOOK_WRAPPER_MARKER`), so writer and stripper
+# cannot drift apart. Self-contained (functions and variables only), so
+# sourcing it here has no side effects.
+# shellcheck source=scripts/install/provision-hooks.sh
+source "$LOOM_ROOT/scripts/install/provision-hooks.sh"
+
 # ANSI color codes
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -1651,15 +1659,22 @@ if [[ -f "$WORKTREE_ABS/.claude/settings.json" ]]; then
   info "Removing Loom hooks and permissions from .claude/settings.json..."
 
   if command -v jq &> /dev/null && [[ -f "$LOOM_DEFAULTS_SETTINGS" ]]; then
-    # Use jq to selectively remove Loom hooks (command starts with .loom/hooks/)
-    # and Loom permissions (exact matches from defaults)
+    # Use jq to selectively remove Loom hooks (the commands a Loom writer
+    # emits for a project-level entry) and Loom permissions (exact matches
+    # from defaults)
 
     # Build jq filter to remove Loom hooks
-    # Step 1: Remove hooks whose command starts with the new Loom prefix
-    #         (${CLAUDE_PROJECT_DIR}/.loom/hooks/) OR the legacy bare-relative
-    #         prefix (.loom/hooks/) from pre-3265 installs. Both must be
-    #         stripped so uninstall is clean regardless of when Loom was first
-    #         installed.
+    # Step 1: Remove hooks whose command is one of the shapes a Loom writer
+    #         emits, so uninstall is clean regardless of when Loom was first
+    #         installed:
+    #           - the ${CLAUDE_PROJECT_DIR}/.loom/hooks/ prefix, unquoted
+    #             (pre-#6544) or quoted (#6544);
+    #           - the legacy bare-relative prefix (.loom/hooks/) from pre-3265
+    #             installs;
+    #           - a launcher command (a `bash -c '...'` one-liner whose
+    #             .loom/hooks/ path sits mid-body, behind no prefix) -- the
+    #             two forms are recognized by the markers described at the jq
+    #             call below.
     # Step 2: Clean up empty matcher entries and hook types
     # Step 3: Remove Loom-specific permissions
     LOOM_PERMS=$(jq -r '.permissions.allow // [] | .[]' "$LOOM_DEFAULTS_SETTINGS" 2>/dev/null)
@@ -1703,19 +1718,44 @@ if [[ -f "$WORKTREE_ABS/.claude/settings.json" ]]; then
     # --arg so bash does NOT expand the variable -- the shell's
     # $CLAUDE_PROJECT_DIR is unset/empty in this context, and we need the
     # literal string preserved so jq's startswith check matches the
-    # template-installed entries verbatim.
+    # template-installed entries verbatim. $quoted_hook_prefix is that same
+    # value behind the double quote #6544 added.
+    #
+    # A launcher command carries no .loom/hooks/ PREFIX, so the prefix tests
+    # cannot see it -- and a bare `contains(".loom/hooks/")` would take
+    # hand-written entries that merely name a Loom hook with it. It is
+    # recognized the way its writer recognizes its own wrappers instead: by a
+    # marker that occurs only in a Loom-authored command.
+    #   - the machine-level wrapper (`_phook_cmd`): starts with the writer's
+    #     own _PHOOK_WRAPPER_MARKER, and names both a per-repo
+    #     `.loom/hooks/<name>` copy and its `/defaults/hooks/<name>` target;
+    #   - the project-level launcher (the shape `.claude/settings.json`
+    #     carries, #7761): starts with `bash -c '` and carries the rung that
+    #     exec's `.loom/hooks/hook-wiring.sh`, Loom's launcher script.
+    # A hand-written `bash -c` launcher that resolves the project root the
+    # same way but runs the repo's own hook has neither marker and survives.
+    # Both markers are pinned against writer drift by
+    # tests/install/test-uninstall-clean-preserves-unmanaged-hooks.sh, which
+    # generates its launcher fixtures from the writers themselves.
     jq --arg hook_prefix '${CLAUDE_PROJECT_DIR}/.loom/hooks/' \
-       --arg legacy_hook_prefix '.loom/hooks/' "
-      # Remove Loom hooks (commands starting with either the new prefix or
-      # the legacy bare-relative prefix from pre-3265 installs)
+       --arg quoted_hook_prefix '"${CLAUDE_PROJECT_DIR}/.loom/hooks/' \
+       --arg legacy_hook_prefix '.loom/hooks/' \
+       --arg wrapper_marker "${_PHOOK_WRAPPER_MARKER:-}" \
+       --arg launcher_marker 'L=$W/.loom/hooks/hook-wiring.sh; [ -r "$L" ] && LOOM_PROJECT_ROOT=$W exec bash "$L" ' "
+      # Remove Loom hooks: every command shape a Loom writer emits
+      def loom_hook: (.command | startswith(\$hook_prefix))
+                      or (.command | startswith(\$quoted_hook_prefix))
+                      or (.command | startswith(\$legacy_hook_prefix))
+                      or ((.command | startswith(\"bash -c '\"))
+                          and (((\$wrapper_marker | length) > 0
+                                and (.command | startswith(\"bash -c '\" + \$wrapper_marker))
+                                and (.command | contains(\"/.loom/hooks/\"))
+                                and (.command | contains(\"/defaults/hooks/\")))
+                               or (.command | contains(\$launcher_marker))));
       (if .hooks then
         .hooks |= with_entries(
           .value |= map(
-            .hooks |= map(select(
-              (.command | startswith(\$hook_prefix))
-              or (.command | startswith(\$legacy_hook_prefix))
-              | not
-            ))
+            .hooks |= map(select(loom_hook | not))
           )
           | .value |= map(select(.hooks | length > 0))
         )
