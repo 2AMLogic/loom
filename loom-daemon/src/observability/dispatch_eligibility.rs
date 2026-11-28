@@ -38,62 +38,22 @@
 //! [`block_start`]: crate::telemetry::kinds::dispatch_eligibility::DispatchEligibilityRecord::block_start
 
 use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Mutex, OnceLock};
 
 use chrono::{DateTime, Duration, Utc};
 
-use super::queue::{DurableQueue, FanoutQueue, QueueSink};
 use super::repo_ref::cached_repo_ref;
 use crate::telemetry::kinds::dispatch_eligibility::{
     DispatchEligibilityRecord, Eligibility, EligibilityTransition,
     DISPATCH_ELIGIBILITY_SCHEMA_VERSION,
 };
-use crate::telemetry::{RepoVisibility, TelemetryEnvelope, TelemetryRecord};
+use crate::telemetry::{RepoVisibility, TelemetryRecord};
 use crate::types::WorkFinderTickSummary;
 
 /// Env override for the refresh cadence, in seconds.
 pub const REFRESH_SECS_ENV: &str = "LOOM_DISPATCH_ELIGIBILITY_REFRESH_SECS";
 /// Default refresh cadence: ten minutes (matching `ops::disposition`).
 pub const DEFAULT_REFRESH_SECS: i64 = 600;
-
-/// Offers `eta.dispatch_eligibility` envelopes, stamped with this daemon's host
-/// id, to the OTLP exporters' queues.
-#[derive(Clone)]
-pub struct DispatchEligibilitySink {
-    queue: Arc<dyn QueueSink>,
-    host_id: String,
-}
-
-impl DispatchEligibilitySink {
-    #[must_use]
-    pub fn new(queue: Arc<dyn QueueSink>, host_id: impl Into<String>) -> Self {
-        DispatchEligibilitySink {
-            queue,
-            host_id: host_id.into(),
-        }
-    }
-
-    /// Enqueue one record.
-    pub fn push(&self, record: DispatchEligibilityRecord) {
-        self.queue.offer(TelemetryEnvelope::new(
-            self.host_id.clone(),
-            TelemetryRecord::DispatchEligibility(record),
-        ));
-    }
-}
-
-static GLOBAL_SINK: OnceLock<DispatchEligibilitySink> = OnceLock::new();
-
-/// Register the OTLP queues (called once from [`super::spawn_task`]). With no
-/// OTLP exporter nothing is registered, and [`record`] returns before doing any
-/// work.
-pub fn register_sink(otlp_queues: Vec<Arc<DurableQueue>>, host_id: &str) {
-    if otlp_queues.is_empty() {
-        return;
-    }
-    let _ = GLOBAL_SINK
-        .set(DispatchEligibilitySink::new(Arc::new(FanoutQueue::new(otlp_queues)), host_id));
-}
 
 /// One waiting ready item reduced to what the record and the tracker need.
 /// Built by [`build_rows`] from a [`WorkFinderTickSummary`].
@@ -340,7 +300,7 @@ static LAST_SAMPLED_TICK: Mutex<Option<DateTime<Utc>>> = Mutex::new(None);
 /// no-op when the work finder has not ticked since the previous sample. Makes
 /// no forge call: repo roots resolve only through the synchronous cache.
 pub(super) fn record() {
-    let Some(sink) = GLOBAL_SINK.get() else {
+    let Some(sink) = super::ops::global_ops_sink() else {
         return;
     };
     let Some(summary) = crate::work_finder::last_tick_summary() else {
@@ -365,7 +325,12 @@ pub(super) fn record() {
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .diff(&rows, &failed_slugs, summary.at, now, refresh);
     for emission in &emissions {
-        sink.push(build_record(emission, &sink.host_id, now, summary.at));
+        sink.emit_record(TelemetryRecord::DispatchEligibility(build_record(
+            emission,
+            sink.host_id(),
+            now,
+            summary.at,
+        )));
     }
     *LAST_SAMPLED_TICK
         .lock()

@@ -94,7 +94,8 @@ pub(crate) fn forge_op_for(op: &str) -> Option<ForgeOp> {
         | "intake.label_events"
         | "champion.label_events"
         | "verdict.pr_timeline"
-        | "merged_obs.timeline" => ops::TIMELINE_READ,
+        | "merged_obs.timeline"
+        | "post_merge.timeline" => ops::TIMELINE_READ,
         "guard.open_pr_graphql" => ops::PR_CLOSING_ISSUE_REFERENCES,
         "merged_obs.close_targets" => ops::PR_CLOSING_ISSUE_REFERENCES,
         "claim.lease_comments"
@@ -122,7 +123,9 @@ pub(crate) fn forge_op_for(op: &str) -> Option<ForgeOp> {
         | "merged_obs.issue_read"
         | "merged_obs.issue_kind"
         | "merged_obs.item_read"
-        | "merged_stack.issue_labels" => ops::ISSUE_VIEW_STATE,
+        | "merged_stack.issue_labels"
+        | "post_merge.issue_read"
+        | "post_merge.issue_kind" => ops::ISSUE_VIEW_STATE,
         "parent_link.marker_children_rest" => ops::ISSUE_SEARCH,
         "park_hold.issue_body" => ops::ISSUE_EDIT_BODY,
         "quarantine.issue_list" => ops::ISSUE_LIST,
@@ -175,7 +178,7 @@ pub(crate) fn forge_op_for(op: &str) -> Option<ForgeOp> {
         "roster.delete" | "roster.patch" | "sequence.comment_patch" | "sequence.comment_delete" => {
             ops::COMMENT_EDIT_DELETE
         }
-        "merged_obs.issue_close" => ops::ISSUE_CLOSE_WITH_REASON,
+        "merged_obs.issue_close" | "post_merge.issue_close" => ops::ISSUE_CLOSE_WITH_REASON,
         _ => return None,
     })
 }
