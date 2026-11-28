@@ -159,10 +159,13 @@ pub(super) const INSTALLED_SURFACE_PREFIXES: &[(&str, &str)] = &[
 ///   and `.claude/biome.jsonc` ← their `defaults/` counterparts (#15566):
 ///   the remaining `sync_one` copies of the resync surface table, missing
 ///   from this mapping the same way the rate card was.
+/// - `.loom/README.md` ← `defaults/.loom-README.md` (#15718): the third
+///   single-file doc, whose source name differs from its destination's.
 pub(super) const INSTALLED_SURFACE_FILES: &[(&str, &str)] = &[
     (".loom/pricing.json", "defaults/pricing.json"),
     (".claude/README.md", "defaults/.claude/README.md"),
     (".github/CONFIGURATION.md", "defaults/.github/CONFIGURATION.md"),
+    (".loom/README.md", "defaults/.loom-README.md"),
     (".loom/biome.jsonc", "defaults/.loom/biome.jsonc"),
     (".claude/biome.jsonc", "defaults/.claude/biome.jsonc"),
 ];

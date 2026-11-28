@@ -102,6 +102,7 @@ fn source_and_installed_paths_follow_resync_surface_map() {
         ),
         (".loom/pricing.json", "defaults/pricing.json", ".loom/pricing.json"),
         (".claude/README.md", "defaults/.claude/README.md", ".claude/README.md"),
+        (".loom/README.md", "defaults/.loom-README.md", ".loom/README.md"),
     ];
     for (label, src, inst) in cases {
         assert_eq!(default_source_path(label).as_deref(), Some(src), "{label}");

@@ -1786,9 +1786,10 @@ fn test_non_ignorable_dirt_pricing_card_status_line_variants() {
     );
 }
 
-const OTHER_SINGLE_FILE_SURFACES: [(&str, &str); 4] = [
+const OTHER_SINGLE_FILE_SURFACES: [(&str, &str); 5] = [
     (".claude/README.md", "defaults/.claude/README.md"),
     (".github/CONFIGURATION.md", "defaults/.github/CONFIGURATION.md"),
+    (".loom/README.md", "defaults/.loom-README.md"),
     (".loom/biome.jsonc", "defaults/.loom/biome.jsonc"),
     (".claude/biome.jsonc", "defaults/.claude/biome.jsonc"),
 ];

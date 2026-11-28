@@ -62,6 +62,7 @@ const PREFIX_MAP: &[(&str, &str, &str)] = &[
 const EXACT_MAP: &[(&str, &str)] = &[
     (".claude/README.md", "defaults/.claude/README.md"),
     (".github/CONFIGURATION.md", "defaults/.github/CONFIGURATION.md"),
+    (".loom/README.md", "defaults/.loom-README.md"),
     (".loom/biome.jsonc", "defaults/.loom/biome.jsonc"),
     (".claude/biome.jsonc", "defaults/.claude/biome.jsonc"),
     (".loom/pricing.json", "defaults/pricing.json"),

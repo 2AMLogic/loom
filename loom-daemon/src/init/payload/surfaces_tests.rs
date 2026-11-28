@@ -677,6 +677,7 @@ fn retired_targets_map_like_the_script_and_stay_inside_the_export() {
         retired_target(".github/CONFIGURATION.md").as_deref(),
         Some(".github/CONFIGURATION.md")
     );
+    assert_eq!(retired_target(".loom/README.md").as_deref(), Some(".loom/README.md"));
     for bad in ["other/x", "scripts/../x", "../x", "scripts//x", ""] {
         assert_eq!(retired_target(bad), None, "{bad}");
     }

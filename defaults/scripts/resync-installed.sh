@@ -78,6 +78,9 @@
 #                                                              logged, see resync_agent_skills())
 #   .claude/README.md       <- defaults/.claude/README.md      (single file, #5264)
 #   .github/CONFIGURATION.md <- defaults/.github/CONFIGURATION.md (single file, #5264)
+#   .loom/README.md         <- defaults/.loom-README.md        (single file, only when
+#                                                              present; source NAME
+#                                                              differs, #15718)
 #   .loom/biome.jsonc       <- defaults/.loom/biome.jsonc      (single file, BACKFILLED
 #                                                              if absent, #6031)
 #   .claude/biome.jsonc     <- defaults/.claude/biome.jsonc    (single file, BACKFILLED
@@ -185,6 +188,8 @@
 # writes is in neither that table nor its install-time-only list. It covers:
 # every pure-copy surface above, `.agents/skills/` (same marker gate),
 # `.claude/README.md` and `.github/CONFIGURATION.md` (when present),
+# `.loom/README.md` (through its installer step, which writes the file
+# present or not — this script's gate above is the stricter one),
 # `.claude/biome.jsonc`, the managed `.gitignore` block, the Loom-managed
 # block of `.github/labels.yml` (#11033), the retired-payload
 # sweep, and `.loom/CLAUDE.md` / `.loom/AGENTS.md` (re-rendered from the
@@ -2254,9 +2259,10 @@ retire_agent_skills() {
 # path using EXACTLY the same report_prefix -> destination directory mapping
 # the walks above use (hooks -> .loom/hooks, scripts -> .loom/scripts,
 # roles -> .loom/roles, docs -> .loom/docs, runtimes -> .loom/runtimes,
-# bin -> .loom/bin, commands/loom -> .claude/commands/loom, plus the two
-# single-file consumer-install docs, #5264). An entry that matches none of
-# these prefixes maps to "" and is skipped rather than guessed at.
+# bin -> .loom/bin, commands/loom -> .claude/commands/loom, plus the
+# single-file consumer-install docs: the #5264 pair and .loom/README.md,
+# #15718). An entry that matches none of these prefixes maps to "" and is
+# skipped rather than guessed at.
 retired_target_path() {
     local rel="$1"
     case "$rel" in
@@ -2269,6 +2275,7 @@ retired_target_path() {
         commands/loom/*)          printf '%s/.claude/commands/loom/%s' "$WRITE_ROOT" "${rel#commands/loom/}" ;;
         .claude/README.md)        printf '%s/.claude/README.md' "$WRITE_ROOT" ;;
         .github/CONFIGURATION.md) printf '%s/.github/CONFIGURATION.md' "$WRITE_ROOT" ;;
+        .loom/README.md)          printf '%s/.loom/README.md' "$WRITE_ROOT" ;;
         *)                        printf '' ;;
     esac
 }
@@ -2557,7 +2564,7 @@ fi
 # (see resync_agent_skills() above), never a plain resync_tree() call.
 resync_agent_skills "$DEFAULTS_DIR/.agents/skills" "$WRITE_ROOT/.agents/skills"
 
-# ---------- single-file consumer-install docs (#5264) ----------
+# ---------- single-file consumer-install docs (#5264, #15718) ----------
 #
 # .claude/README.md and .github/CONFIGURATION.md are copied verbatim into
 # every consumer repo at install time (scripts/install/manifest.sh) but, prior
@@ -2572,6 +2579,14 @@ if [[ -f "$WRITE_ROOT/.claude/README.md" ]]; then
 fi
 if [[ -f "$WRITE_ROOT/.github/CONFIGURATION.md" ]]; then
     sync_one "$DEFAULTS_DIR/.github/CONFIGURATION.md" "$WRITE_ROOT/.github/CONFIGURATION.md" ".github/CONFIGURATION.md"
+fi
+# .loom/README.md is the third of the same kind (#15718): installed verbatim
+# from defaults/.loom-README.md — note the source NAME differs from the
+# destination's — and already refreshed by the daemon resync, but it had no
+# entry here, so a fix to the template never reached a repo the fleet resync
+# driver refreshes with this script. Same destination gate as the two above.
+if [[ -f "$WRITE_ROOT/.loom/README.md" ]]; then
+    sync_one "$DEFAULTS_DIR/.loom-README.md" "$WRITE_ROOT/.loom/README.md" ".loom/README.md"
 fi
 
 # ---------- single-file nested Biome configs (#6031) ----------
@@ -4228,8 +4243,10 @@ collect_resync_dirt() {
             # is refresh_labels_block()'s output (#11033). `.loom/pricing.json`
             # is the single-file rate card (#8177): it was on no list here,
             # so a run that changed it reported its own output as foreign
-            # dirt (#15519).
-            .claude/commands/loom/*|.claude/agents/*|.claude/README.md|.github/CONFIGURATION.md|.github/labels.yml|.loom/install-metadata.json|.loom/CLAUDE.md|.gitattributes|.gitignore|.agents/skills/*|.loom/pricing.json)
+            # dirt (#15519). `.loom/README.md` is the destination-gated copy
+            # of defaults/.loom-README.md (#15718), a single-file surface of
+            # the same kind as .claude/README.md.
+            .claude/commands/loom/*|.claude/agents/*|.claude/README.md|.github/CONFIGURATION.md|.loom/README.md|.github/labels.yml|.loom/install-metadata.json|.loom/CLAUDE.md|.gitattributes|.gitignore|.agents/skills/*|.loom/pricing.json)
                 RESYNC_DIRT_PATHS+=("$path")
                 ;;
             *)
