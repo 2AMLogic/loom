@@ -2162,15 +2162,31 @@ Builder and Doctor work in `.loom/worktrees/issue-<N>`.
   `refs/review/prN` variant — a `git checkout <target>` whose target is no ref
   git can name and no path at hook time (the ref is created by the same
   compound command, or does not exist at all, as with a `FETCH_HEAD` chained
-  after a fetch) — and `gh pr checkout <N>`, which fetches the PR head and
+  after a fetch) — and `gh [global flags] pr checkout <N>` (including
+  `gh --repo owner/repo pr checkout 7` and the `-R owner/repo` / `-Rowner/repo`
+  / `--repo=owner/repo` forms, #15003), which fetches the PR head and
   moves the checkout onto it. git errors on a pathspec matching no tracked
   file, so denying these costs no working invocation.
+- **Denied, #15003**: `git checkout -` — a bare `-` is the `@{-1}`
+  previous-branch switch even when a file literally named `-` exists in the
+  working tree (restoring that file takes `git checkout -- -`, which stays
+  allowed).
 - **Allowed**: everything inside a linked worktree; checkout/switch whose target
   is `main`/`master` (the Auditor's `git checkout -B main origin/main`);
   `git checkout -- <path>` and `git checkout <path>` file restores (a path
   present in the working tree, or tracked — including one deleted from the
-  worktree); `-h/--help`;
-  read-only git. `worktree.sh`, `check-main-clean.sh --quarantine`,
+  worktree), quoted or unquoted. Quote removal preserves literal characters in
+  filenames, including the dollar sign in `prices$.md`. An unconditional
+  literal assignment (including `export`) can establish the target of the next
+  command, even after an earlier command such as `pwd`. For example,
+  `pwd; BR=main; git checkout "$BR"` is allowed, including when the commands
+  appear on consecutive lines. An intervening command discards earlier
+  bindings. Assignments whose execution or value the guard cannot establish
+  leave the target unknown. Checkout also accepts a path list on stdin through
+  either spelling of `--pathspec-from-file`. The help exception requires a
+  help flag in every possible interpretation of the arguments. For GitHub CLI,
+  the final help value must be known and true. Also allowed are
+  read-only git commands. `worktree.sh`, `check-main-clean.sh --quarantine`,
   `resync-installed.sh`, `merge-pr.sh` and `scripts/version.sh` are unaffected:
   the hook only sees the top-level command text, not their internal git calls.
 - **Decision-log tag**:
