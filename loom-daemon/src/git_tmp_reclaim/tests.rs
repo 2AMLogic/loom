@@ -302,6 +302,7 @@ fn a_real_git_child_with_cwd_in_the_repo_is_detected_and_blocks_reclaim() {
 
     // `git cat-file --batch` blocks reading stdin, so it stays alive with
     // its cwd in the repository until we close stdin.
+    // Hand-rolled on purpose: needs a live child with piped stdin; `git_out`/`run` wait for exit.
     let mut child = Command::new("git")
         .args(["cat-file", "--batch"])
         .current_dir(root)
