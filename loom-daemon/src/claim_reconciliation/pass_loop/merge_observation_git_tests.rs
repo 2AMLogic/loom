@@ -632,7 +632,7 @@ fn a_failed_removal_keeps_the_merge_record_and_writes_no_false_ledger_line() {
         merged_at: MERGED_AT.into(),
         branch: BRANCH.into(),
         body: "Closes #42".into(),
-        observed_at: MERGED_AT.into(),
+        observed_at: now_timestamp(),
         done: [PARTIAL_RESET, CLOSE_CHECK, BRANCH_CLOSE, STRIP]
             .iter()
             .map(ToString::to_string)

@@ -1007,12 +1007,13 @@ fn a_partial_failure_resumes_from_the_last_completed_pass() {
         merged_at: MERGED_AT.into(),
         branch: "feature/issue-42".into(),
         body: f.merged[0].body.clone(),
-        observed_at: MERGED_AT.into(),
+        observed_at: now_timestamp(),
         done: Vec::new(),
     };
     rec.mark(PARTIAL_RESET);
     store.store(&rec).unwrap();
-    run(&f, &store, false);
+    let stats = run(&f, &store, false);
+    assert_eq!(stats.records_expired, 0);
     assert_eq!(f.comment_count("5"), 1);
     assert!(store.load(9).unwrap().complete());
 }
@@ -1945,7 +1946,7 @@ fn records_completed_before_this_pass_get_their_cleanup() {
         merged_at: MERGED_AT.into(),
         branch: "feature/issue-42".into(),
         body: String::new(),
-        observed_at: MERGED_AT.into(),
+        observed_at: now_timestamp(),
         done: vec![
             PARTIAL_RESET.to_string(),
             CLOSE_CHECK.to_string(),
@@ -1961,6 +1962,7 @@ fn records_completed_before_this_pass_get_their_cleanup() {
     let world = world_for(&host, false, &landed);
     let stats = run_pass(&f, &world, &store, false, || false);
     assert_eq!(stats.merges_seen, 0);
+    assert_eq!(stats.records_expired, 0);
     assert_eq!(stats.records_completed, 1);
     assert!(host.gone(ISSUE_WT) && host.gone(JUDGE_WT));
     assert!(store.load(9).unwrap().complete());
