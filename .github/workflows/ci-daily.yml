@@ -727,9 +727,9 @@ jobs:
         run: cargo test -p loom-daemon --test session_exec_docker -- --ignored --nocapture
       - name: Verify account-private clones and exclusive jobs with Docker fixtures
         if: ${{ !cancelled() }}
-        # Builds a small ubuntu:24.04 fixture image (apt from archive.ubuntu.com);
-        # capped so a mirror stall fails here, not at the 30-min job limit (#10822).
-        timeout-minutes: 10
+        # Within the 60-minute job limit, this step's timeout covers staging,
+        # compilation, image preparation, the full fixture suite, and cleanup.
+        timeout-minutes: 20
         # Owner-only synthetic profiles must belong to the session image's UID.
         # Build as runner; execute only this fixture as UID 1000 with Docker access.
         # Stage public inputs outside the runner's owner-only home. Account
