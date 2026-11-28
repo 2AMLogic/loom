@@ -161,12 +161,8 @@ fn a_root_outside_the_write_scope_is_skipped_without_a_forge_call() {
             "https://github.com/acme/widgets.git",
         ],
     ] {
-        assert!(std::process::Command::new("git")
-            .args(args)
-            .current_dir(&fork)
-            .status()
-            .unwrap()
-            .success());
+        let out = crate::test_git_helpers::git_out(&fork, args);
+        assert!(out.status.success());
     }
     let read_only = dir.path().join("read-only-checkout");
     let gh_log = dir.path().join("gh-invocations.log");

@@ -8,8 +8,6 @@
 use super::stop_hook::{decide, write_targets_from_str, Decision, HookPayload};
 use super::*;
 
-use std::process::Command;
-
 // ---------------------------------------------------------------------------
 // Pure classification
 // ---------------------------------------------------------------------------
@@ -420,16 +418,7 @@ fn an_unborn_branch_still_reports_its_branch_name() {
     // FAILS on an unborn branch, so the branch-name field used to render
     // `(detached)` for the one session this guard most needs to describe.
     let dir = tempfile::tempdir().unwrap();
-    let git = |args: &[&str]| {
-        let out = Command::new("git")
-            .arg("-C")
-            .arg(dir.path())
-            .args(args)
-            .output()
-            .expect("git runs");
-        assert!(out.status.success(), "git {args:?} failed");
-    };
-    git(&["init", "-q", "-b", "feature/issue-8267"]);
+    crate::test_git_helpers::run(dir.path(), &["init", "-q", "-b", "feature/issue-8267"]);
     std::fs::write(dir.path().join(MANAGED_SENTINEL), "").unwrap();
     std::fs::write(dir.path().join("probe.sh"), "#!/bin/sh\n").unwrap();
 
@@ -452,19 +441,7 @@ fn the_toggle_is_read_from_the_main_checkout_not_the_worktree() {
         return;
     }
     let main = tempfile::tempdir().unwrap();
-    let git = |args: &[&str]| {
-        let out = Command::new("git")
-            .arg("-C")
-            .arg(main.path())
-            .args(args)
-            .output()
-            .expect("git runs");
-        assert!(
-            out.status.success(),
-            "git {args:?} failed: {}",
-            String::from_utf8_lossy(&out.stderr)
-        );
-    };
+    let git = |args: &[&str]| crate::test_git_helpers::run(main.path(), args);
     git(&["init", "-q", "-b", "main"]);
     git(&["config", "user.email", "t@example.com"]);
     git(&["config", "user.name", "Test"]);
