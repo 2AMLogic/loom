@@ -5106,6 +5106,29 @@ resolve_stash_cwd() {
     END { if (!found) print curcwd }'
 }
 
+# PCM scans one physical line at a time. Exclude complete documentation
+# commands using the original text: comment stripping can change the apparent
+# end of a heredoc. Mixed commands and shell inputs keep the normal scan.
+primary_checkout_document_only() {
+    local cmd="$1" masked word body_command newline=$'\n'
+    [[ "$cmd" == *"$newline"* ]] || return 1
+    if [[ "$cmd" == *"--body"* ]]; then
+        # One gh invocation with literal option words and a single-quoted body.
+        # Only the body can span lines. Match the entire input so an executable
+        # suffix or an interpreter wrapper still goes through the resolver.
+        word="[[:alnum:]_./:@%+=,-]+|'[^'${newline}]*'|\"[[:alnum:][:blank:]_./:@%+=,-]*\""
+        body_command="^[[:blank:]]*gh[[:blank:]]+issue[[:blank:]]+create"
+        body_command+="([[:blank:]]+($word))*[[:blank:]]+--body[[:blank:]]+'[^']*'"
+        body_command+="([[:blank:]]+($word))*[[:blank:]]*$"
+        [[ "$cmd" =~ $body_command ]] && return 0
+    fi
+    [[ "$cmd" == *"<<"* ]] || return 1
+    # A changed buffer proves that the whole command consisted of recognized,
+    # terminated blocks. Leave all other consumers and unquoted bodies visible.
+    masked=$(mask_catastrophic_filesink_heredocs "$cmd" primary-checkout) || return 1
+    [[ -n "$masked" && "$masked" != "$cmd" ]]
+}
+
 # List every `git checkout|switch|commit` segment of a command with the cwd it
 # would run in (#13589), plus `gh pr checkout` segments (#14973). One line per
 # segment: "<cwd>\x1f<subcmd>\x1f<args>" (gh segments carry the subcmd marker
@@ -6440,8 +6463,8 @@ EOF
 }
 
 # Mask the bodies of direct file-write heredocs (`cat > file <<'EOF' ... EOF`)
-# for the catastrophic scan ONLY (#9870). Without this, a fixture, a doc or a
-# note written with a QUOTED-delimiter heredoc hard-denies whenever its body
+# for the catastrophic scan (#9870) and the primary-checkout guard (#15487).
+# A fixture or note written with a QUOTED-delimiter heredoc used to deny when its body
 # merely mentions a catastrophic-tier phrase, even though that text is written
 # to a file and never executed. (The SQL-DDL half of #9870 was already fixed:
 # that check reads COMMAND_ASK_SCAN, which has its own heredoc pass.)
@@ -6525,7 +6548,9 @@ mask_catastrophic_filesink_heredocs() {
         printf '%s' "$1"
         return
     fi
-    printf '%s' "$1" | awk '
+    # The PCM caller also knows the Judge helper reads a verdict from stdin.
+    # Keep that additional sink local to PCM and require its whole invocation.
+    printf '%s' "$1" | awk -v consumer="${2:-}" '
     BEGIN {
         SQ = sprintf("%c", 39)
         DQ = sprintf("%c", 34)
@@ -6536,6 +6561,9 @@ mask_catastrophic_filesink_heredocs() {
         RED = ">>?" WS TGT
         HD = "<<-?" WS DLM
         OPENER = "^" WS "cat[ \t]+(" RED WS HD "|" HD WS RED ")" WS "$"
+        SP = "[ \t]+"
+        VERDICT = "^" WS "[.]/[.]loom/scripts/post-verdict[.]sh" SP "[0-9]+" SP \
+                  "(approved|changes-requested)" SP "[[:xdigit:]]+" SP "--body-file" SP "-" WS HD WS "$"
         buf = ""
     }
     { buf = buf (NR > 1 ? "\n" : "") $0 }
@@ -6546,13 +6574,17 @@ mask_catastrophic_filesink_heredocs() {
         while (i <= nl) {
             line = lines[i]
             if (line ~ /^[ \t]*$/) { i++; continue }
-            if (line !~ OPENER) { printf "%s", buf; exit }
-            # Target: the word after the one `>`/`>>` on the line.
-            tgt = substr(line, index(line, ">"))
-            sub(/^>>?[ \t]*/, "", tgt)
-            if (!match(tgt, "^" TGT)) { printf "%s", buf; exit }
-            tgt = tolower(substr(tgt, 1, RLENGTH))
-            if (tgt ~ /(^|\/)(dev|proc|\.\.)(\/|$)/) { printf "%s", buf; exit }
+            if (line ~ OPENER) {
+                # Target: the word after the one `>`/`>>` on the line.
+                tgt = substr(line, index(line, ">"))
+                sub(/^>>?[ \t]*/, "", tgt)
+                if (!match(tgt, "^" TGT)) { printf "%s", buf; exit }
+                tgt = tolower(substr(tgt, 1, RLENGTH))
+                if (tgt ~ /(^|\/)(dev|proc|\.\.)(\/|$)/) { printf "%s", buf; exit }
+            } else if (consumer != "primary-checkout" || line !~ VERDICT || nblocks > 0) {
+                # Require the verdict first: an earlier file write could replace its script.
+                printf "%s", buf; exit
+            }
             # Delimiter: the quoted word after the one `<<` on the line.
             rest = substr(line, index(line, "<<") + 2)
             dash = 0
@@ -12451,7 +12483,8 @@ primary_checkout_target_is_path() {
 # =============================================================================
 if [[ -n "${LOOM_SWEEP_ID:-}${LOOM_WORKTREE_PATH:-}" ]] \
    && echo "$COMMAND_NO_COMMENT" | grep -qE '(^|[;&|(`{]|[[:space:]])((git[[:space:]].*(checkout|switch|commit))|(gh[[:space:]]+pr[[:space:]]+checkout))' \
-   && primary_checkout_mutation_guard_enabled; then
+   && primary_checkout_mutation_guard_enabled \
+   && ! primary_checkout_document_only "$COMMAND"; then
     while IFS=$'\037' read -r _pcm_cwd _pcm_sub _pcm_args; do
         [[ -z "$_pcm_sub" ]] && continue
         if [[ "$_pcm_cwd" == *"'"* || "$_pcm_cwd" == *'"'* ]]; then

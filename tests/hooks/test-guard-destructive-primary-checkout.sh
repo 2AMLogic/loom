@@ -98,6 +98,46 @@ assert_allow_env "read-only git status is allowed" "$AGENT" "git status" "$PC_RE
 assert_allow_env "read-only git log is allowed" "$AGENT" "git log --oneline" "$PC_REPO"
 assert_allow_env "git commit-tree is not git commit" "$AGENT" "git commit-tree HEAD^{tree} -m x" "$PC_REPO"
 assert_allow_env "quoted text mentioning git commit is inert" "$AGENT" "echo 'git commit -m x'" "$PC_REPO"
+
+# Documentation passed to the hook as command text, never executed (#15487).
+cat_doc="cat > $PC_WT/examples.md <<'EOF'
+git checkout nosuchref
+| gh pr checkout 7 |
+EOF"
+verdict_doc="./.loom/scripts/post-verdict.sh 1 approved abc --body-file - <<'EOF'
+| git commit -m x |
+EOF"
+issue_doc="gh issue create --title t --body 'line one
+git checkout nosuchref
+'"
+assert_allow_env "quoted cat heredoc contains checkout examples" "$AGENT" "$cat_doc" "$PC_REPO"
+assert_allow_env "quoted verdict stdin contains a commit table row" "$AGENT" "$verdict_doc" "$PC_REPO"
+assert_allow_env "single-quoted multiline gh issue body contains a checkout example" "$AGENT" "$issue_doc" "$PC_REPO"
+
+assert_deny_env "checkout after the heredoc terminator" "$AGENT" \
+    "cat > $PC_WT/examples.md <<'EOF'
+literal
+EOF
+git checkout nosuchref" "$PC_REPO"
+assert_deny_env "commit chained after the closing body quote" "$AGENT" \
+    "gh issue create --body 'line one
+line two' && git commit -m x" "$PC_REPO"
+assert_deny_env "PR checkout after a semicolon" "$AGENT" \
+    "gh issue create --body 'line one
+line two'; gh pr checkout 7" "$PC_REPO"
+assert_deny_env "quoted heredoc fed to bash executes" "$AGENT" \
+    "bash <<'EOF'
+git checkout nosuchref
+EOF" "$PC_REPO"
+assert_deny_env "multiline bash -c argument executes" "$AGENT" \
+    "bash -c '
+git checkout nosuchref
+'" "$PC_REPO"
+assert_deny_env "unquoted cat heredoc keeps its existing decision" "$AGENT" \
+    "cat > $PC_WT/examples.md <<EOF
+git checkout nosuchref
+EOF" "$PC_REPO"
+
 assert_allow_env "worktree.sh invocation is allowed" "$AGENT" "./.loom/scripts/worktree.sh 5" "$PC_REPO"
 assert_allow_env "merge-pr.sh invocation is allowed" "$AGENT" "./.loom/scripts/merge-pr.sh 5" "$PC_REPO"
 assert_allow_env "resync-installed.sh invocation is allowed" "$AGENT" "./.loom/scripts/resync-installed.sh" "$PC_REPO"
