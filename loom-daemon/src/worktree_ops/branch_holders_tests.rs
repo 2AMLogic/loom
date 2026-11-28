@@ -3,18 +3,12 @@ use super::super::clean::{
     CleanOptions, CleanupStats,
 };
 use super::*;
+use crate::test_git_helpers::git_out;
 
 // --- worktree-held branches are skipped, not errors (#10766) ----------
 
 fn git_ok(dir: &Path, args: &[&str]) -> bool {
-    Command::new("git")
-        .args(["-c", "user.email=t@example.com", "-c", "user.name=t"])
-        .args(args)
-        .current_dir(dir)
-        .output()
-        .unwrap()
-        .status
-        .success()
+    git_out(dir, args).status.success()
 }
 
 fn branch_exists(repo: &Path, branch: &str) -> bool {
@@ -146,6 +140,7 @@ fn update_refs_branches_are_held() {
     commit_file(&wt, "b.txt", "top\n", "top");
     commit_file(&repo, "a.txt", "main\n", "main change");
 
+    // Stays hand-rolled: pins `GIT_EDITOR=true`, which `git_out` (args only, no env) cannot set.
     let rebase = Command::new("git")
         .args(["-c", "user.email=t@example.com", "-c", "user.name=t"])
         .args(["rebase", "--update-refs", "main"])
@@ -219,11 +214,7 @@ fn bisect_in_linked_worktree_holds_its_start_branch() {
 
     // Precondition: git reports the worktree as detached, so only the
     // `BISECT_START` probe can see that it holds the branch.
-    let porcelain = Command::new("git")
-        .args(["worktree", "list", "--porcelain"])
-        .current_dir(&repo)
-        .output()
-        .unwrap();
+    let porcelain = git_out(&repo, &["worktree", "list", "--porcelain"]);
     let porcelain = String::from_utf8_lossy(&porcelain.stdout).into_owned();
     let block = porcelain
         .split("\n\n")
