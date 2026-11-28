@@ -81,8 +81,9 @@
 #
 # `ensure_project_hook_wiring` closes that hole from the other side: whenever a
 # target still carries per-repo `.loom/hooks/<name>` copies, it (re)asserts the
-# matching project-level `${CLAUDE_PROJECT_DIR}/.loom/hooks/<name>` entries so the
-# copies the quick path just wrote are actually reachable. It is a no-op on a
+# matching project-level entries so the copies the quick path just wrote are
+# actually reachable. Since #15741 an entry is the launcher-form command
+# `_phook_project_cmd` emits. It is a no-op on a
 # post-Phase-6 (migrated, copy-free) repo, where the user-scope wiring is the one
 # true path. Exactly one path fires in either case — never both, never neither.
 #
@@ -229,6 +230,16 @@ _PHOOK_NAMES=(
 # drift test (loom-daemon/src/init/hook_wiring.rs) compares all four.
 _PHOOK_TIMEOUTS=("" "" "" "" "" "" "" "10" "" "" "" "" "")
 
+# PreToolUse hooks that are NOT guards (#15741): a missing copy must allow. Only
+# `roll-pause.sh` (#10830) — it parks a tool call for a roll and is a no-op
+# otherwise, and its entry is match-all, so failing closed there would block
+# every tool call in the checkout. `_phook_project_cmd` exports
+# LOOM_GUARD_WIRING_FAILOPEN=1 inside exactly these hooks' own `bash -c`, the one
+# committed exception hook-wiring.sh's policy allows ("No guard entry may set it
+# this way"). Mirrors `FAIL_OPEN` in loom-daemon/src/init/hook_wiring.rs, whose
+# drift test generates every table row through `_phook_project_cmd`.
+_PHOOK_FAILOPEN=(roll-pause.sh)
+
 # Emit the fail-open, workspace-gated, transition-deferring command wrapper for a
 # single hook script <name>. A single-quoted `bash -c '...'` body with NO
 # embedded single quotes (all internal quoting is double quotes) so it survives
@@ -249,6 +260,77 @@ _phook_cmd() {
     local name="$1"
     # shellcheck disable=SC2016  # literal $-expansions are intentional (per-user, at hook time)
     printf '%s' "bash -c 'ROOT=\$(cd \"\$(git rev-parse --git-common-dir 2>/dev/null)/..\" 2>/dev/null && pwd); [ -n \"\$ROOT\" ] || exit 0; { [ -f \"\$ROOT/.loom-project/project.json\" ] || [ -f \"\$ROOT/.loom/config.json\" ]; } || exit 0; [ -x \"\$ROOT/.loom/hooks/${name}\" ] && [ -f \"\$ROOT/.claude/settings.json\" ] && case \"\$(<\"\$ROOT/.claude/settings.json\")\" in *\".loom/hooks/${name}\"*) exit 0 ;; esac; H=\"\${LOOM_HOOKS_HOME:+\$LOOM_HOOKS_HOME/defaults/hooks/${name}}\"; [ -x \"\$H\" ] || H=\"\${LOOM_HOME:-\$HOME/.local/share/loom}/defaults/hooks/${name}\"; [ -x \"\$H\" ] && LOOM_PROJECT_ROOT=\"\$ROOT\" exec \"\$H\" || exit 0'"
+}
+
+# _phook_project_cmd <event> <name>
+#
+# Emit the PROJECT-level settings.json command for hook script <name> wired
+# under <event> (#15741): the launcher form every Loom hook entry routes
+# through (defaults/hooks/hook-wiring.sh, #7761) — the shape this repo's own
+# .claude/settings.json carries. A single-quoted `bash -c '...'` body with NO
+# embedded single quotes (all internal quoting is double quotes) so it
+# survives JSON round-tripping. Every `$` is expanded by the hook's own shell
+# at hook time, never here. Nothing here depends on a `${CLAUDE_PROJECT_DIR}`
+# text substitution by the client, so a project path containing a space is
+# safe without quoting the path itself (#6544).
+#
+# The body is the ladder hook-wiring.sh documents, plus an inline copy of its
+# fallback for a host whose .loom/hooks/ lags the launcher (#7761 rollout
+# safety):
+#   1. Resolve the worktree-aware MAIN checkout (`git rev-parse
+#      --git-common-dir`/.., tested for emptiness BEFORE the `cd` — an empty
+#      substitution would make `cd /..` succeed at `/`), else
+#      ${CLAUDE_PROJECT_DIR}, else $PWD, as $W.
+#   2. Exec `.loom/hooks/hook-wiring.sh <event> <name>` when the launcher is
+#      readable; it owns every rung from there, stdin passed through.
+#   3. Else run the copy itself — directly when executable, via `bash` when
+#      only readable — so a lost +x bit costs no coverage.
+#   4. Else a workspace with no .loom/hooks/ directory is not a Loom
+#      workspace: allow, silently.
+#   5. Else report the broken install on stderr and allow — except that a
+#      PreToolUse GUARD denies (exit 0 plus a permissionDecision document, the
+#      only channel a PreToolUse hook has), which LOOM_GUARD_WIRING_FAILOPEN=1
+#      downgrades to the same warn-and-allow.
+# The deny document is emitted with printf, not jq: a host missing jq must
+# still get the decision.
+#
+# The command must never carry the substring `defaults/hooks/`: the project
+# dedup below reads that as the MACHINE-level wrapper and would append a
+# second project entry (pinned by test-provision-hooks.sh, Test 21).
+#
+# Keep byte-identical to `project_command` in
+# loom-daemon/src/init/hook_wiring.rs: the daemon's workspace resync writes the
+# same entries, and its drift test generates every table row through this
+# function and compares.
+_phook_project_cmd() {
+    local event="$1" name="$2"
+    # shellcheck disable=SC2016  # every $-expansion runs in the hook's own shell, at hook time
+    local resolve='R=$(git rev-parse --git-common-dir 2>/dev/null); R=${R:+$(cd "$R/.." 2>/dev/null && pwd)}; W=${R:-${CLAUDE_PROJECT_DIR:-$PWD}}; '
+    # shellcheck disable=SC2016
+    local launch='L=$W/.loom/hooks/hook-wiring.sh; [ -r "$L" ] && LOOM_PROJECT_ROOT=$W exec bash "$L" '
+    # shellcheck disable=SC2016
+    local run='; G=$W/.loom/hooks/'
+    # shellcheck disable=SC2016
+    local report='; [ -x "$G" ] && exec "$G"; [ -r "$G" ] && exec bash "$G"; [ -d "$W/.loom/hooks" ] || exit 0; echo "[loom] BROKEN GUARD INSTALL: '
+    # shellcheck disable=SC2016
+    local missing=' is not installed in this Loom workspace ($W/.loom/hooks/'
+    local repair='); re-run scripts/install-loom.sh." >&2; '
+    local failopen='' deny=''
+    if [[ "$event" == "PreToolUse" ]]; then
+        # shellcheck disable=SC2016
+        local decision='[ "${LOOM_GUARD_WIRING_FAILOPEN:-0}" = "1" ] && exit 0; printf %s "{\"hookSpecificOutput\":{\"hookEventName\":\"'
+        local verdict='\",\"permissionDecision\":\"deny\",\"permissionDecisionReason\":\"Loom hook '
+        local absent=' is not installed in this workspace (no .loom/hooks/hook-wiring.sh and no .loom/hooks/'
+        local downgrade='), but .loom/hooks/ exists, so this workspace does carry per-repo hook copies and expects this one. A missing guard is a broken install, not an opt-out, and this session runs without permission prompts. Repair: re-run scripts/install-loom.sh (or .loom/scripts/check-guards-installed.sh), then restart Claude Code. Set LOOM_GUARD_WIRING_FAILOPEN=1 in the environment to downgrade this deny to a warning.\"}}"; '
+        deny="${decision}${event}${verdict}${name}${absent}${name}${downgrade}"
+        local f
+        for f in "${_PHOOK_FAILOPEN[@]}"; do
+            [[ "$f" == "$name" ]] && failopen='export LOOM_GUARD_WIRING_FAILOPEN=1; '
+        done
+    fi
+    local body
+    body="${failopen}${resolve}${launch}${event} ${name}${run}${name}${report}${name}${missing}${name}${repair}${deny}exit 0"
+    printf "bash -c '%s'" "$body"
 }
 
 # ── Operator presence (#11563, #11713, #12121) ────────────────────────────────
@@ -419,8 +501,16 @@ provision_loom_hooks() {
 #     <upgrade_marker> identifies as Loom-authored — so an already-provisioned
 #     install converges to the bound without a duplicate entry. Empty = no
 #     field, and never touches a hand-written duplicate's timeout.
+#   $9 upgrade_exact (optional, #15741): a JSON array of COMPLETE commands that
+#     an earlier Loom writer emitted for this hook. A duplicate whose command is
+#     one of them is treated exactly like an <upgrade_marker> hit — rewritten in
+#     place — and, like the current command, counts as Loom-authored for the
+#     timeout convergence. Where <upgrade_marker> is a wrapper-body SUBSTRING,
+#     this is a whole-command EQUALITY test: it is for writers whose old command
+#     is a bare path, where a substring would also catch an operator's variant
+#     of the same path (a flag appended, or the path under `bash`).
 _phook_merge_one() {
-    local f="$1" htype="$2" matcher="$3" marker="$4" cmd="$5" exclude="${6:-}" upgrade="${7:-}" tmo="${8:-}"
+    local f="$1" htype="$2" matcher="$3" marker="$4" cmd="$5" exclude="${6:-}" upgrade="${7:-}" tmo="${8:-}" upgrade_exact="${9:-[]}"
     local tmp
     tmp="$(mktemp 2>/dev/null)" || return 1
     if jq \
@@ -430,12 +520,14 @@ _phook_merge_one() {
         --arg exclude "$exclude" \
         --arg upgrade "$upgrade" \
         --arg cmd "$cmd" \
-        --arg tmo "$tmo" '
+        --arg tmo "$tmo" \
+        --argjson upgrade_exact "$upgrade_exact" '
         def is_dup($c): ($c | contains($marker))
             and (($exclude | length) == 0 or ($c | contains($exclude) | not));
-        def is_stale_loom_wrapper($c): ($upgrade | length) > 0
-            and ($c != $cmd)
-            and ($c | contains($upgrade));
+        def is_stale_loom_wrapper($c): ($c != $cmd)
+            and ((($upgrade | length) > 0 and ($c | contains($upgrade)))
+                 or (($upgrade_exact | length) > 0 and ($upgrade_exact | index($c)) != null));
+        def loom_authored($c): ($c == $cmd) or is_stale_loom_wrapper($c);
         def new_entry: {type: "command", command: $cmd}
             + (if ($tmo | length) > 0 then {timeout: ($tmo | tonumber)} else {} end);
         .hooks = (.hooks // {})
@@ -449,8 +541,9 @@ _phook_merge_one() {
               then
                 # A duplicate (by dedup_marker) already exists. Rewrite it IN
                 # PLACE only if it is a stale Loom-authored wrapper (recognized
-                # by upgrade_marker) that differs from the current command —
-                # never touch anything else (already-current, or hand-written).
+                # by upgrade_marker / upgrade_exact) that differs from the
+                # current command — never touch anything else (already-current,
+                # or hand-written).
                 # With a timeout set (#13959), a Loom-authored duplicate also
                 # converges to it in place (added when missing, corrected when
                 # stale) — the bound reaches already-provisioned installs, and
@@ -461,8 +554,7 @@ _phook_merge_one() {
                          then .command = $cmd
                          else . end)
                         | (if ($tmo | length) > 0
-                               and (($upgrade | length) > 0)
-                               and ((.command // "") | contains($upgrade))
+                               and loom_authored(.command // "")
                                and ((.timeout // 0) != ($tmo | tonumber))
                            then .timeout = ($tmo | tonumber)
                            else . end)
@@ -493,9 +585,11 @@ _phook_merge_one() {
 #
 # Additive and idempotent: an operator's own hook entries are never touched, and
 # an entry already present (matched by the `.loom/hooks/<name>` substring, which
-# also covers the legacy pre-#3277 bare-relative form) is never duplicated. Uses
-# the `${CLAUDE_PROJECT_DIR}` prefix (#3277) for new entries so the command
-# resolves from the project root regardless of Claude Code's cwd.
+# also covers the legacy pre-#3277 bare-relative form) is never duplicated. A new
+# entry is the launcher command `_phook_project_cmd` emits (#15741), which
+# resolves the project's worktree-aware root itself regardless of Claude Code's
+# cwd; a bare `${CLAUDE_PROJECT_DIR}/.loom/hooks/<name>` entry an earlier Loom
+# writer left is upgraded to it in place, again without a duplicate.
 #
 # Best-effort — never fatal. Returns 1 on a soft failure (jq missing, invalid
 # existing JSON, unwritable path) so the caller can note it without aborting.
@@ -565,37 +659,29 @@ ensure_project_hook_wiring() {
         local htype="${_PHOOK_TYPES[$i]}"
         local matcher="${_PHOOK_MATCHERS[$i]}"
         local tmo="${_PHOOK_TIMEOUTS[$i]}"
+        # The launcher form (#15741) — see `_phook_project_cmd`. Nothing here
+        # embeds the project path as text any more, so #6544's concern (a path
+        # with a space word-split by `sh`) cannot arise: the command resolves
+        # its root inside its own `bash -c` and quotes every use of it.
+        local cmd
+        cmd="$(_phook_project_cmd "$htype" "$name")"
+        # The bare commands earlier Loom writers emitted for <name> — the quoted
+        # form (#6544) and, before it, the unquoted one. They carried no
+        # broken-install signal and, unquoted, broke on a spaced path; both are
+        # upgraded in place to the launcher form. Passed as COMPLETE commands
+        # and matched by equality (`_phook_merge_one`'s $9): anything else that
+        # names the same script — the legacy pre-#3277 bare-relative
+        # `.loom/hooks/<name>`, the path under `bash`, with a flag appended —
+        # is the operator's own entry, recognized as wiring the hook (so never
+        # duplicated) but never rewritten.
+        local bare_quoted bare_unquoted
         # shellcheck disable=SC2016  # ${CLAUDE_PROJECT_DIR} is expanded by Claude Code, not bash
-        # #6544: quoted so a project path containing a space does not get
-        # word-split by `sh` at hook-execution time — ${CLAUDE_PROJECT_DIR} is
-        # substituted by Claude Code into a literal path string BEFORE the
-        # command reaches the shell, so the quotes must be part of the emitted
-        # command text itself, not bash-level quoting here.
-        local cmd='"${CLAUDE_PROJECT_DIR}/.loom/hooks/'"$name"'"'
-        # The pre-#6544 UNQUOTED form of the same command — passed as the
-        # upgrade_marker (7th arg) below so a pre-existing broken entry written
-        # by the old code is recognized as a stale Loom wrapper and rewritten to
-        # the quoted form in place, not left as an already-provisioned no-op
-        # (see _phook_merge_one's upgrade_marker doc, #4806). It is a strict
-        # superset of the dedup_marker (".loom/hooks/$name"), so it can never
-        # match MORE than the existing dedup test already matches, and it
-        # additionally requires the ${CLAUDE_PROJECT_DIR} prefix — so the
-        # legacy pre-#3277 bare-relative form (".loom/hooks/$name" with no
-        # prefix) is correctly left alone, as before. KNOWN LIMITATION: because
-        # `is_stale_loom_wrapper` is a substring `contains` test (shared with the
-        # machine-level upgrade path, which needs it for its much longer
-        # wrapper), a hand-authored entry that happens to embed this exact
-        # unquoted path text verbatim (e.g. with extra flags appended after it)
-        # would also be treated as a stale Loom wrapper and rewritten — unlike
-        # the machine-level marker, which is an internal wrapper-body substring
-        # unlikely to appear in a hand-written command, this one is the entire
-        # legacy command text, which a coincidental hand-written variant is more
-        # likely to share. Accepted: an entry matching this exact unquoted
-        # string is far more likely to be our own pre-#6544 output than a
-        # deliberate customization.
+        bare_quoted='"${CLAUDE_PROJECT_DIR}/.loom/hooks/'"$name"'"'
         # shellcheck disable=SC2016
-        local legacy_cmd='${CLAUDE_PROJECT_DIR}/.loom/hooks/'"$name"
-        if _phook_merge_one "$settings" "$htype" "$matcher" ".loom/hooks/$name" "$cmd" "defaults/hooks/" "$legacy_cmd" "$tmo"; then
+        bare_unquoted='${CLAUDE_PROJECT_DIR}/.loom/hooks/'"$name"
+        local bare_forms
+        bare_forms="$(jq -cn --arg q "$bare_quoted" --arg u "$bare_unquoted" '[$q, $u]')"
+        if _phook_merge_one "$settings" "$htype" "$matcher" ".loom/hooks/$name" "$cmd" "defaults/hooks/" "" "$tmo" "$bare_forms"; then
             wired=$((wired + 1))
         else
             _phook_warn "failed to assert project-level entry for $name in $settings"

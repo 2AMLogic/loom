@@ -20,10 +20,16 @@
 #   - deprovision removes ONLY Loom-owned entries, preserving operator hooks
 #   - #8372: the uncommitted-work consumer canary stub is wired on BOTH Stop and
 #     SubagentStop in both install modes, deduped, deferred, and deprovisioned
-#   - #6544: project-level entries are quoted so a project path containing a
-#     space survives `sh -c` execution, and a pre-existing UNQUOTED entry
-#     self-heals to the quoted form on the next re-provision (not left as an
-#     already-provisioned no-op); the machine-level wrapper is unaffected
+#   - #6544: a project path containing a space survives `sh -c` execution —
+#     since #15741 because the entry is a launcher command that never embeds
+#     the path as text (it was a bare quoted path before), and the pre-#6544
+#     UNQUOTED path-as-text entry is rewritten on the next re-provision
+#   - #15741: project-level entries are the LAUNCHER form (`_phook_project_cmd`,
+#     the shape `.claude/settings.json` carries): they route their event and
+#     script through hook-wiring.sh and signal a broken install; the bare
+#     `${CLAUDE_PROJECT_DIR}/.loom/hooks/<name>` commands earlier writers left
+#     (quoted or not) are upgraded in place, custom commands are never touched,
+#     and a written entry runs its hook / reports a broken install as configured
 #
 # Sandboxed $HOME per case via mktemp -d, matching test-provision-skills.sh.
 #
@@ -337,6 +343,26 @@ count_project_entry() {
     ' "$file" 2>/dev/null
 }
 
+# Project-level commands that are NOT the launcher form (#15741): every
+# `.loom/hooks/<name>` entry must name hook-wiring.sh, the broken-install
+# signal, and `exec bash "$L" <its own event> <name>`. Prints them, one per
+# line, so an empty output means every entry conforms.
+unlaunched_commands() {
+    local file="$1"
+    jq -r '
+        (.hooks // {}) | to_entries[] | .key as $event
+        | .value[]? | .hooks[]? | .command // ""
+        | select(contains(".loom/hooks/")) | select(contains("defaults/hooks/") | not)
+        | [ ., ([ match("\\.loom/hooks/(?<n>[A-Za-z0-9._-]+\\.sh)"; "g") | .captures[0].string
+                 | select(. != "hook-wiring.sh") ][0] // "") ]
+        | select((.[0] | startswith("bash -c \u0027") and endswith("\u0027")
+                  and contains("hook-wiring.sh")
+                  and contains("BROKEN GUARD INSTALL")
+                  and contains("exec bash \"$L\" " + $event + " " + .[1])) | not)
+        | .[0]' "$file" 2>/dev/null
+}
+count_unlaunched() { unlaunched_commands "$1" | grep -c . ; }
+
 # Build a "pre-Phase-6 transition repo" fixture: .loom/hooks/ copies present.
 make_transition_repo() {
     local root="$1"
@@ -371,11 +397,17 @@ assert_eq "$(count_project_entry "$S10" guard-background-subagents.sh)" "1" "gua
 assert_eq "$PROJECT_HOOKS_WIRED" "6" "PROJECT_HOOKS_WIRED reports all six copies (#4053 verifiable-globals contract)"
 assert_eq "$PROJECT_HOOKS_SETTINGS" "$S10" "PROJECT_HOOKS_SETTINGS points at the project settings file"
 assert_eq "$(jq -r '.permissions.allow[0]' "$S10")" "Bash(gh:*)" "existing project permissions preserved"
-# Every written command must be resolvable by Claude Code from the project root
-# AND be quoted (#6544) so a project path containing a space does not get
-# word-split by `sh` at hook-execution time.
-assert_eq "$(jq -r '[(.hooks // {}) | to_entries[] | .value[]? | .hooks[]? | .command | select(startswith("\"${CLAUDE_PROJECT_DIR}/.loom/hooks/") | not)] | length' "$S10")" "0" "all written commands use the quoted \${CLAUDE_PROJECT_DIR} prefix (#3277, #6544)"
-assert_eq "$(jq -r '[(.hooks // {}) | to_entries[] | .value[]? | .hooks[]? | .command | select(endswith("\"") | not)] | length' "$S10")" "0" "all written commands end on the closing quote (#6544)"
+# Every written command is the LAUNCHER form (#15741): it routes its own event
+# and script through hook-wiring.sh and signals a broken install. The bare
+# quoted path it replaces carried neither, and #6544's quoting is now moot —
+# the command never embeds the project path as text (Test 22 runs it from a
+# path with a space).
+assert_eq "$(count_unlaunched "$S10")" "0" "every written command routes its event and script through hook-wiring.sh and signals a broken install (#15741)"
+assert_eq "$(jq -r '[(.hooks // {}) | to_entries[] | .value[]? | .hooks[]? | .command | select(startswith("\"${CLAUDE_PROJECT_DIR}/.loom/hooks/"))] | length' "$S10")" "0" "no written command is the bare quoted path (#15741)"
+assert_eq "$(jq -r '[.hooks.PreToolUse[] | select(.matcher=="Bash") | .hooks[] | .command | select(contains(".loom/hooks/guard-destructive.sh"))][0]' "$S10")" \
+    "$(_phook_project_cmd PreToolUse guard-destructive.sh)" "the written command is exactly _phook_project_cmd's output"
+assert_eq "$(jq -r '[.hooks.Stop[] | .hooks[] | .command | select(contains(".loom/hooks/guard-background-subagents.sh"))][0]' "$S10")" \
+    "$(_phook_project_cmd Stop guard-background-subagents.sh)" "a non-PreToolUse entry gets its own event's launcher command"
 # The referenced script must exist — a dangling entry is not coverage.
 for n in guard-destructive.sh guard-background-subagents.sh; do
     [[ -x "$R10/.loom/hooks/$n" ]] && pass "wired entry for $n points at an executable copy" \
@@ -400,6 +432,7 @@ EOF
 ensure_project_hook_wiring "$R12" >/dev/null 2>&1
 assert_eq "$(count_project_entry "$R12/.claude/settings.json" guard-destructive.sh)" "1" "legacy bare-relative entry recognized (no duplicate added)"
 assert_eq "$(count_project_entry "$R12/.claude/settings.json" guard-loom-workflow.sh)" "1" "the missing sibling entry was still added"
+assert_eq "$(jq -r '.hooks.PreToolUse[0].hooks[0].command' "$R12/.claude/settings.json")" '.loom/hooks/guard-destructive.sh' "the bare-relative entry is recognized but NOT rewritten — it is not a form Loom wrote (#15741)"
 
 # ── Test 13: post-Phase-6 (migrated, copy-free) repo -> no-op ────────────────
 echo "Test 13: a migrated repo with no .loom/hooks/ copies is left alone"
@@ -568,12 +601,14 @@ else
 fi
 
 # ─────────────────────────────────────────────────────────────────────────────
-# #6544: project paths containing a space. `${CLAUDE_PROJECT_DIR}` is expanded
-# by Claude Code into a literal path string BEFORE the command reaches `sh` —
-# so an unquoted emitted command word-splits on any space in the project path.
+# Project paths containing a space (#6544). A project entry used to BE the
+# project path as text — `${CLAUDE_PROJECT_DIR}/.loom/hooks/<name>`, which `sh`
+# word-split on any space until #6544 quoted it. The launcher command (#15741)
+# never embeds the path: it resolves the root inside its own `bash -c` and
+# quotes every use of it.
 # ─────────────────────────────────────────────────────────────────────────────
 
-# ── Test 22: fresh provision into a spaced path survives sh -c (#6544) ───────
+# ── Test 22: fresh provision into a spaced path survives execution (#6544) ──
 echo "Test 22: fresh provision into a project path containing a space survives sh -c execution (#6544)"
 R22_PARENT=$(mktemp -d)
 R22="$R22_PARENT/has a space"
@@ -583,16 +618,19 @@ printf '{}\n' > "$R22/.claude/settings.json"
 ensure_project_hook_wiring "$R22" >/dev/null 2>&1
 S22="$R22/.claude/settings.json"
 CMD22=$(jq -r '[(.hooks // {}) | to_entries[] | .value[]? | .hooks[]? | .command | select(contains("guard-destructive.sh"))][0]' "$S22")
-assert_eq "$CMD22" '"${CLAUDE_PROJECT_DIR}/.loom/hooks/guard-destructive.sh"' "emitted command is quoted"
-# Simulate Claude Code's substitution: ${CLAUDE_PROJECT_DIR} is a literal text
-# replacement into the command string, not a shell-level expansion, so mimic
-# that here rather than exporting the env var and letting sh expand it.
-LITERAL22=${CMD22//\$\{CLAUDE_PROJECT_DIR\}/$R22}
-OUT22=$(sh -c "$LITERAL22" 2>&1); rc22=$?
-assert_eq "$rc22" "0" "quoted command survives sh -c execution against a spaced path"
-assert_eq "$OUT22" "" "no word-split error output from the quoted command"
-# Negative control: confirm the OLD unquoted form really did break on the same
-# path (pins the bug this fixes rather than assuming it).
+assert_eq "$CMD22" "$(_phook_project_cmd PreToolUse guard-destructive.sh)" "emitted command is the launcher form"
+# Run it the way Claude Code does: from inside the project, CLAUDE_PROJECT_DIR
+# exported. No ${CLAUDE_PROJECT_DIR} text substitution is simulated — the
+# command no longer carries the project path as text.
+OUT22=$(cd "$R22" && CLAUDE_PROJECT_DIR="$R22" sh -c "$CMD22" </dev/null 2>&1); rc22=$?
+assert_eq "$rc22" "0" "the command survives sh -c execution against a spaced path"
+assert_eq "$OUT22" "" "no word-split error output from the command"
+# ...and with no CLAUDE_PROJECT_DIR at all, run from the project's own cwd:
+# $PWD is the last resort of the command's root resolution.
+OUT22=$(cd "$R22" && env -u CLAUDE_PROJECT_DIR sh -c "$CMD22" </dev/null 2>&1); rc22=$?
+assert_eq "$rc22|$OUT22" "0|" "the command also runs from a spaced cwd with no CLAUDE_PROJECT_DIR"
+# Negative control: confirm the pre-#6544 UNQUOTED path-as-text form really did
+# break on the same path (pins that bug rather than assuming it).
 LEGACY22='${CLAUDE_PROJECT_DIR}/.loom/hooks/guard-destructive.sh'
 LEGACY_LITERAL22=${LEGACY22//\$\{CLAUDE_PROJECT_DIR\}/$R22}
 sh -c "$LEGACY_LITERAL22" >/dev/null 2>&1
@@ -600,8 +638,8 @@ rc22_legacy=$?
 [[ "$rc22_legacy" != "0" ]] && pass "the pre-#6544 unquoted form fails on the same spaced path (regression pinned)" \
     || fail "expected the unquoted form to fail on a spaced path (word-split), it did not"
 
-# ── Test 23: a pre-existing UNQUOTED entry self-heals to quoted (#6544) ──────
-echo "Test 23: re-provisioning over a pre-existing UNQUOTED entry rewrites it to the quoted form (#6544)"
+# ── Test 23: a pre-existing UNQUOTED entry self-heals (#6544) ────────────────
+echo "Test 23: re-provisioning over a pre-existing UNQUOTED entry rewrites it to the launcher form (#6544, #15741)"
 R23=$(mktemp -d)
 make_transition_repo "$R23"
 cat > "$R23/.claude/settings.json" <<'EOF'
@@ -614,12 +652,12 @@ BEFORE_CMD23=$(jq -r '.hooks.PreToolUse[0].hooks[0].command' "$S23")
 assert_eq "$BEFORE_CMD23" '${CLAUDE_PROJECT_DIR}/.loom/hooks/guard-destructive.sh' "precondition: the unquoted legacy entry is seeded verbatim"
 ensure_project_hook_wiring "$R23" >/dev/null 2>&1
 AFTER_CMD23=$(jq -r '.hooks.PreToolUse[0].hooks[0].command' "$S23")
-assert_eq "$AFTER_CMD23" '"${CLAUDE_PROJECT_DIR}/.loom/hooks/guard-destructive.sh"' "the unquoted entry was rewritten to the quoted form (migration, not a no-op)"
+assert_eq "$AFTER_CMD23" "$(_phook_project_cmd PreToolUse guard-destructive.sh)" "the unquoted entry was rewritten to the launcher form (migration, not a no-op)"
 assert_eq "$(count_project_entry "$S23" guard-destructive.sh)" "1" "rewritten in place — still exactly one entry, not duplicated"
 assert_eq "$(count_project_entry "$S23" guard-loom-workflow.sh)" "1" "the missing sibling entry was also added in the same pass"
-# Idempotent: a second re-provision leaves the now-current quoted entry alone.
+# Idempotent: a second re-provision leaves the now-current launcher entry alone.
 ensure_project_hook_wiring "$R23" >/dev/null 2>&1
-assert_eq "$(jq -r '.hooks.PreToolUse[0].hooks[0].command' "$S23")" '"${CLAUDE_PROJECT_DIR}/.loom/hooks/guard-destructive.sh"' "already-quoted entry left unchanged by a second re-provision"
+assert_eq "$(jq -r '.hooks.PreToolUse[0].hooks[0].command' "$S23")" "$(_phook_project_cmd PreToolUse guard-destructive.sh)" "already-current entry left unchanged by a second re-provision"
 assert_eq "$(count_project_entry "$S23" guard-destructive.sh)" "1" "still exactly one entry after a second re-provision"
 
 # ── Test 24: the machine-level (user-scope) wrapper path is unaffected ───────
@@ -924,8 +962,9 @@ jq -n --arg cmd "$HAND28" \
     > "$H28D/.claude/settings.json"
 provision_loom_hooks "$H28D/.claude" >/dev/null 2>&1
 assert_eq "$(jq -r '[.hooks.SessionStart[] | .hooks[] | select(.command == $h) | .timeout // "none"] | join(",")' --arg h "$HAND28" "$H28D/.claude/settings.json")" "none" "hand-written entry never gains a timeout"
-# 28e: project-level wiring — the emitted ${CLAUDE_PROJECT_DIR} entry carries
-# the timeout, and a pre-timeout Loom entry converges in place.
+# 28e: project-level wiring — the written entry carries the timeout, and a
+# bare pre-#15741 Loom entry is upgraded to the launcher form AND converges in
+# place.
 R28=$(mktemp -d)
 mkdir -p "$R28/.loom/hooks" "$R28/.claude"
 touch "$R28/.loom/hooks/gh-front-env.sh"
@@ -937,6 +976,154 @@ EOF
 ensure_project_hook_wiring "$R28" >/dev/null 2>&1
 assert_eq "$(jq -r '[.hooks.SessionStart[]? | .hooks[]? | select((.command // "") | contains(".loom/hooks/gh-front-env.sh")) | .timeout // "none"] | join(",")' "$R28/.claude/settings.json")" "10" "project-level gh-front-env.sh entry carries timeout 10"
 assert_eq "$(jq -r '[.hooks.SessionStart[]? | .hooks[]? | select((.command // "") | contains(".loom/hooks/gh-front-env.sh"))] | length' "$R28/.claude/settings.json")" "1" "project-level: converged in place, no duplicate"
+assert_eq "$(jq -r '[.hooks.SessionStart[]? | .hooks[]? | select((.command // "") | contains(".loom/hooks/gh-front-env.sh")) | .command][0]' "$R28/.claude/settings.json")" \
+    "$(_phook_project_cmd SessionStart gh-front-env.sh)" "project-level: the bare entry was upgraded to the launcher form in the same pass"
+# 28f: a LAUNCHER-form entry that lost its timeout converges back, command untouched.
+jq --arg cmd "$(_phook_project_cmd SessionStart gh-front-env.sh)" \
+    '.hooks.SessionStart[0].hooks = [{type:"command", command:$cmd}]' "$R28/.claude/settings.json" > "$R28/s28f.json" \
+    && mv "$R28/s28f.json" "$R28/.claude/settings.json"
+ensure_project_hook_wiring "$R28" >/dev/null 2>&1
+assert_eq "$(jq -r '[.hooks.SessionStart[]? | .hooks[]? | .timeout // "none"] | join(",")' "$R28/.claude/settings.json")" "10" "a launcher-form entry seeded without its timeout converges to 10"
+assert_eq "$(jq -r '.hooks.SessionStart[0].hooks[0].command' "$R28/.claude/settings.json")" "$(_phook_project_cmd SessionStart gh-front-env.sh)" "the converged entry's command is untouched"
+# 28g: a hand-written PROJECT entry naming the same script is not Loom's: never
+# rewritten, never given a timeout, never duplicated.
+jq --arg cmd 'bash "${CLAUDE_PROJECT_DIR}/.loom/hooks/gh-front-env.sh"' \
+    '.hooks.SessionStart[0].hooks = [{type:"command", command:$cmd}]' "$R28/.claude/settings.json" > "$R28/s28g.json" \
+    && mv "$R28/s28g.json" "$R28/.claude/settings.json"
+ensure_project_hook_wiring "$R28" >/dev/null 2>&1
+assert_eq "$(jq -r '.hooks.SessionStart[0].hooks[0].command' "$R28/.claude/settings.json")" 'bash "${CLAUDE_PROJECT_DIR}/.loom/hooks/gh-front-env.sh"' "hand-written project entry: command untouched"
+assert_eq "$(jq -r '[.hooks.SessionStart[0].hooks[] | .timeout // "none"] | join(",")' "$R28/.claude/settings.json")" "none" "hand-written project entry: no timeout added"
+assert_eq "$(jq -r '.hooks.SessionStart[0].hooks | length' "$R28/.claude/settings.json")" "1" "hand-written project entry: no duplicate appended beside it"
+
+# ── Test 29 (#15741): bare Loom commands upgrade in place; custom ones survive ─
+echo "Test 29: the bare \${CLAUDE_PROJECT_DIR} commands an earlier Loom writer left are upgraded in place to the launcher form; custom commands, order and unrelated settings survive (#15741)"
+R29=$(mktemp -d)
+make_transition_repo "$R29"
+cat > "$R29/.claude/settings.json" <<'EOF'
+{ "permissions": { "allow": ["Bash(x:*)"] },
+  "env": { "KEEP": "1" },
+  "hooks": {
+    "UserPromptSubmit": [ { "matcher": "", "hooks": [
+      { "type": "command", "command": "\"${CLAUDE_PROJECT_DIR}/.claude/hooks/mine.sh\"" },
+      { "type": "command", "command": "\"${CLAUDE_PROJECT_DIR}/.loom/hooks/skill-router.sh\"" }
+    ] } ],
+    "PreToolUse": [ { "matcher": "Bash", "hooks": [
+      { "type": "command", "command": "\"${CLAUDE_PROJECT_DIR}/.loom/hooks/guard-destructive.sh\"" },
+      { "type": "command", "command": "bash \"${CLAUDE_PROJECT_DIR}/.loom/hooks/guard-loom-workflow.sh\"" }
+    ] } ],
+    "Stop": [ { "matcher": "", "hooks": [
+      { "type": "command", "command": "${CLAUDE_PROJECT_DIR}/.loom/hooks/guard-background-subagents.sh" }
+    ] } ]
+  } }
+EOF
+S29="$R29/.claude/settings.json"
+ensure_project_hook_wiring "$R29" >/dev/null 2>&1
+assert_eq "$(jq -r '.hooks.UserPromptSubmit[0].hooks[0].command' "$S29")" '"${CLAUDE_PROJECT_DIR}/.claude/hooks/mine.sh"' "the operator's own entry is kept, in place (still first)"
+assert_eq "$(jq -r '.hooks.UserPromptSubmit[0].hooks[1].command' "$S29")" "$(_phook_project_cmd UserPromptSubmit skill-router.sh)" "a quoted bare Loom entry is upgraded in place to the launcher form"
+assert_eq "$(jq -r '.hooks.PreToolUse[0].hooks[0].command' "$S29")" "$(_phook_project_cmd PreToolUse guard-destructive.sh)" "the upgrade carries the entry's own event (PreToolUse guard keeps its deny)"
+assert_eq "$(jq -r '.hooks.Stop[0].hooks[0].command' "$S29")" "$(_phook_project_cmd Stop guard-background-subagents.sh)" "an UNQUOTED bare Loom entry is upgraded in place too"
+assert_eq "$(jq -r '.hooks.PreToolUse[0].hooks[1].command' "$S29")" 'bash "${CLAUDE_PROJECT_DIR}/.loom/hooks/guard-loom-workflow.sh"' "a custom command that merely names a Loom hook is never rewritten"
+for n in guard-destructive.sh guard-loom-workflow.sh guard-worktree-paths.sh skill-router.sh methodology-inject.sh guard-background-subagents.sh; do
+    assert_eq "$(count_project_entry "$S29" "$n")" "1" "exactly one project entry for $n after the upgrade pass"
+done
+assert_eq "$(jq -r '.hooks.UserPromptSubmit[0].hooks | length' "$S29")" "3" "the still-missing sibling (methodology-inject.sh) was appended after the surviving entries, in the same pass"
+assert_eq "$(jq -r '.hooks | keys_unsorted | join(",")' "$S29")" "UserPromptSubmit,PreToolUse,Stop" "event order preserved"
+assert_eq "$(jq -r '.permissions.allow[0]' "$S29")" "Bash(x:*)" "project permissions preserved by the upgrade"
+assert_eq "$(jq -r '.env.KEEP' "$S29")" "1" "unrelated settings preserved by the upgrade"
+cp "$S29" "$R29/before29.json"
+ensure_project_hook_wiring "$R29" >/dev/null 2>&1
+cmp -s "$S29" "$R29/before29.json" && pass "a second pass is byte-stable (no duplicate, no rewrite)" \
+    || fail "a second pass changed the settings file"
+
+# ── Test 30 (#15741): a WRITTEN entry runs its hook, and reports a broken install ──
+echo "Test 30: a written project entry runs its hook from a spaced path and reports a broken install without blocking the event (#15741)"
+P30_PARENT=$(mktemp -d); R30="$P30_PARENT/has a space"
+make_transition_repo "$R30"
+# Hooks that prove they ran (they replace the fixture's silent stub where one
+# exists): the launcher, a PreToolUse guard, and three table hooks the
+# transition fixture does not carry.
+cp "$REPO_ROOT/defaults/hooks/hook-wiring.sh" "$R30/.loom/hooks/hook-wiring.sh"
+for n in guard-destructive.sh skill-router.sh guard-uncommitted-work.sh roll-pause.sh gh-front-env.sh; do
+    cat > "$R30/.loom/hooks/$n" <<'HOOK'
+#!/usr/bin/env bash
+printf 'RAN:%s STDIN:%s\n' "$(basename "$0")" "$(cat)"
+HOOK
+    chmod +x "$R30/.loom/hooks/$n"
+done
+printf '{}\n' > "$R30/.claude/settings.json"
+ensure_project_hook_wiring "$R30" >/dev/null 2>&1
+S30="$R30/.claude/settings.json"
+assert_eq "$(count_unlaunched "$S30")" "0" "fixture: every written entry is the launcher form"
+assert_eq "$(jq -r '[.hooks.SessionStart[]? | .hooks[]? | .timeout // "none"] | join(",")' "$S30")" "10" "the written SessionStart gh-front-env.sh entry carries its 10 s timeout"
+O30="$P30_PARENT/out"; E30="$P30_PARENT/err"
+E30_HOME="$P30_PARENT/empty/home"; E30_LOOM="$P30_PARENT/empty/loom"
+mkdir -p "$E30_HOME" "$E30_LOOM"
+PAYLOAD30='{"hook_event_name":"x","payload":1}'
+field30() { printf '%s' "$1" | cut -d'|' -f"$2"; }
+# run_entry <event> <name> [VAR=VALUE...] -> "<exit>|<stdout>|<stderr>": runs the
+# WRITTEN entry the way Claude Code does — from inside the project, with
+# CLAUDE_PROJECT_DIR exported and the hook payload on stdin.
+run_entry() {
+    local event="$1" name="$2" cmd rc=0; shift 2
+    cmd="$(jq -r --arg e "$event" --arg n ".loom/hooks/$name" \
+        '[.hooks[$e][]? | .hooks[]? | .command | select(contains($n)) | select(contains("defaults/hooks/") | not)][0]' "$S30")"
+    [[ -n "$cmd" ]] || { printf 'NOENTRY||'; return 0; }
+    ( cd "$R30" && env -u LOOM_PROJECT_ROOT -u LOOM_GUARD_WIRING_FAILOPEN HOME="$E30_HOME" LOOM_HOME="$E30_LOOM" \
+        CLAUDE_PROJECT_DIR="$R30" "$@" bash -c "$cmd" ) <<<"$PAYLOAD30" >"$O30" 2>"$E30" || rc=$?
+    printf '%s|%s|%s' "$rc" "$(cat "$O30")" "$(cat "$E30")"
+}
+# 30a: launcher present -> each event's written entry runs its hook from a
+# spaced path, stdin passed through untouched.
+for row in "UserPromptSubmit skill-router.sh" "Stop guard-uncommitted-work.sh" "SubagentStop guard-uncommitted-work.sh" \
+           "SessionStart gh-front-env.sh" "PreToolUse roll-pause.sh" "PreToolUse guard-destructive.sh"; do
+    read -r ev30 name30 <<<"$row"
+    R30OUT="$(run_entry "$ev30" "$name30")"
+    assert_eq "$(field30 "$R30OUT" 1)" "0" "$ev30 $name30: exits 0"
+    assert_contains "$(field30 "$R30OUT" 2)" "RAN:$name30 STDIN:$PAYLOAD30" "$ev30 $name30: the written entry runs the installed hook, stdin passed through"
+    assert_eq "$(field30 "$R30OUT" 3)" "" "$ev30 $name30: silent on stderr when everything is installed"
+done
+# 30b: launcher NOT yet resynced -> the inline fallback runs the copy; a copy
+# that lost its +x bit still runs (zero lost coverage).
+rm -f "$R30/.loom/hooks/hook-wiring.sh"
+R30OUT="$(run_entry UserPromptSubmit skill-router.sh)"
+assert_contains "$(field30 "$R30OUT" 2)" "RAN:skill-router.sh" "no launcher: the inline fallback exec's the copy"
+chmod -x "$R30/.loom/hooks/skill-router.sh"
+R30OUT="$(run_entry UserPromptSubmit skill-router.sh)"
+assert_eq "$(field30 "$R30OUT" 1)|$(field30 "$R30OUT" 2)" "0|RAN:skill-router.sh STDIN:$PAYLOAD30" "no launcher, copy not executable: the inline fallback runs it via bash"
+chmod +x "$R30/.loom/hooks/skill-router.sh"
+# 30c: launcher and hook both gone -> a NON-PreToolUse event reports the broken
+# install on stderr and lets the event finish (no stdout, exit 0).
+rm -f "$R30/.loom/hooks/skill-router.sh" "$R30/.loom/hooks/guard-uncommitted-work.sh" "$R30/.loom/hooks/gh-front-env.sh"
+for row in "UserPromptSubmit skill-router.sh" "Stop guard-uncommitted-work.sh" "SessionStart gh-front-env.sh"; do
+    read -r ev30 name30 <<<"$row"
+    R30OUT="$(run_entry "$ev30" "$name30")"
+    assert_eq "$(field30 "$R30OUT" 1)|$(field30 "$R30OUT" 2)" "0|" "$ev30 $name30: broken install still allows the event (exit 0, nothing on stdout)"
+    assert_contains "$(field30 "$R30OUT" 3)" "BROKEN GUARD INSTALL" "$ev30 $name30: broken install is reported on stderr"
+    assert_contains "$(field30 "$R30OUT" 3)" "$name30" "$ev30 $name30: the report names the missing hook"
+done
+# 30d: a PreToolUse GUARD with nothing anywhere denies (exit 0 + a decision
+# document); the fail-open roll-pause entry does not; the escape hatch downgrades.
+rm -f "$R30/.loom/hooks/guard-destructive.sh" "$R30/.loom/hooks/roll-pause.sh"
+R30OUT="$(run_entry PreToolUse guard-destructive.sh)"
+assert_eq "$(field30 "$R30OUT" 1)" "0" "PreToolUse guard, nothing installed: a deny is a decision, never a non-zero exit"
+assert_contains "$(field30 "$R30OUT" 2)" '"permissionDecision":"deny"' "PreToolUse guard, nothing installed: the inline fallback DENIES"
+if printf '%s' "$(field30 "$R30OUT" 2)" | jq -e '.hookSpecificOutput.hookEventName == "PreToolUse"' >/dev/null 2>&1; then
+    pass "PreToolUse guard, nothing installed: the deny document is valid JSON tagged PreToolUse"
+else
+    fail "PreToolUse guard, nothing installed: the deny document is valid JSON tagged PreToolUse ($(field30 "$R30OUT" 2))"
+fi
+assert_contains "$(field30 "$R30OUT" 3)" "BROKEN GUARD INSTALL" "PreToolUse guard, nothing installed: reported on stderr as well"
+R30OUT="$(run_entry PreToolUse roll-pause.sh)"
+assert_eq "$(field30 "$R30OUT" 1)|$(field30 "$R30OUT" 2)" "0|" "PreToolUse roll-pause, nothing installed: no deny (it is not a guard)"
+assert_contains "$(field30 "$R30OUT" 3)" "BROKEN GUARD INSTALL" "PreToolUse roll-pause, nothing installed: still reported on stderr"
+R30OUT="$(run_entry PreToolUse guard-destructive.sh LOOM_GUARD_WIRING_FAILOPEN=1)"
+assert_eq "$(field30 "$R30OUT" 1)|$(field30 "$R30OUT" 2)" "0|" "LOOM_GUARD_WIRING_FAILOPEN=1: the deny is downgraded to an allow"
+assert_contains "$(field30 "$R30OUT" 3)" "BROKEN GUARD INSTALL" "LOOM_GUARD_WIRING_FAILOPEN=1: never silent"
+# 30e: not a Loom workspace -> the same command text allows silently.
+mkdir -p "$P30_PARENT/plain"
+R30OUT="$( cd "$P30_PARENT/plain" && env -u LOOM_PROJECT_ROOT HOME="$E30_HOME" LOOM_HOME="$E30_LOOM" \
+    CLAUDE_PROJECT_DIR="$P30_PARENT/plain" bash -c "$(_phook_project_cmd PreToolUse guard-destructive.sh)" </dev/null 2>&1 )"
+assert_eq "0|$R30OUT" "0|" "a non-Loom repo: the command allows silently, even for a PreToolUse guard"
 
 echo ""
 echo "======================================"

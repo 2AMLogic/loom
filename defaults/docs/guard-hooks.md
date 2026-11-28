@@ -96,9 +96,12 @@ Both Quick Install call sites now run `wire_quick_install_guard_hooks`, which ca
   (`provision_loom_dispatcher` is Full-Install-only), so on a quick-only machine these
   entries stay a silent no-op until a Full Install / `loom update` creates
   `~/.local/share/loom` — or `LOOM_HOME` points at a checkout.
-- **`ensure_project_hook_wiring`** — re-asserts the project-level
-  `${CLAUDE_PROJECT_DIR}/.loom/hooks/<name>` entries for every hook copy actually
-  present on disk. This is the layer that is guaranteed live on the quick path. It is a
+- **`ensure_project_hook_wiring`** — re-asserts a project-level entry for every hook
+  copy actually present on disk. Since #15741 the entry is the launcher command: it
+  routes through `.loom/hooks/hook-wiring.sh`, with an inline fallback that reports a
+  broken install and denies a missing PreToolUse guard. A bare
+  `${CLAUDE_PROJECT_DIR}/.loom/hooks/<name>` entry from an earlier install is upgraded
+  to it in place. This is the layer that is guaranteed live on the quick path. It is a
   **no-op** on a post-Phase-6 (migrated, copy-free) repo, where the machine-level path
   is the one true path.
 
@@ -106,7 +109,7 @@ The two compose to **exactly one** firing path in either configuration — copie
 ⇒ project entry runs, wrapper defers; copies absent ⇒ no project entry written, wrapper
 execs the machine hook. It is re-asserted on every install rather than made
 strip-proof: the uninstaller matches on the `.loom/hooks/` command prefix, not on
-provenance, so no project-level entry can survive an uninstall by design.
+provenance. That prefix match does not yet catch the quoted or launcher forms (#15764).
 
 If you want the machine-level end state (no per-repo copies at all), run
 `loom migrate` (Phase 6 / #4254) — it untracks the legacy copies, after which
