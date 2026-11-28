@@ -9989,7 +9989,8 @@ re-walk `.loom/claude-config/*/tmp` every 60 seconds.
       "scratchReclaim": {
         "enabled": true,
         "maxAgeHours": 24,
-        "minIntervalSecs": 1800
+        "minIntervalSecs": 1800,
+        "dryRun": true
       }
     }
   }
@@ -10001,8 +10002,93 @@ re-walk `.loom/claude-config/*/tmp` every 60 seconds.
 | `LOOM_SCRATCH_RECLAIM` | `autonomous.worktreeReaper.scratchReclaim.enabled` | env > config > default | `true` (on) |
 | `LOOM_SCRATCH_RECLAIM_MAX_AGE_HOURS` | `autonomous.worktreeReaper.scratchReclaim.maxAgeHours` | env > config > default | `24` |
 | `LOOM_SCRATCH_RECLAIM_MIN_INTERVAL_SECS` | `autonomous.worktreeReaper.scratchReclaim.minIntervalSecs` | env > config > default | `1800` (30 min) |
+| `LOOM_SCRATCH_RECLAIM_DRY_RUN` | `autonomous.worktreeReaper.scratchReclaim.dryRun` | env > config > default | `true` (preview for per-ticket scratch roots) |
 
 See `loom-daemon/src/scratch_reclaim.rs`.
+
+#### Per-ticket agent scratch roots (#14952)
+
+**What was leaking.** Agent sessions create per-ticket scratch roots named
+`loom-<ticket>-<role>.<random>` at the top of the worktree volume (plus a few
+in `$HOME` and `~/.cache`) and nothing removes them when the ticket closes —
+on the reporting host ~300/day accumulated to 1.5 TB and filled the volume.
+No existing pass owns them: `scratchReclaim` covers only
+`.loom/claude-config/<agent>/tmp`, `worktreeReaper` only
+`.loom/worktrees/issue-<N>`, `agentResidueReaper` processes/scopes, not
+directories.
+
+**What it removes, and the gates.** Direct children of the mount-volume top
+holding the repo's worktree root, `$HOME`, `$HOME/.cache` and `$TMPDIR` whose
+name matches the pattern above — never deeper, never through symlinks, and a
+candidate that is itself a symlink is preserved. The candidate and every
+entry beneath it must share its parent’s mount. Nested mounts, including
+Linux bind mounts, and unreadable mount identities preserve the candidate
+and exclude its bytes from the preview. A root is
+removed only when **every** gate proves eligibility; any unreadable answer
+preserves (fail closed):
+
+1. the linked ticket is `CLOSED`/`MERGED` on the repo identified by a
+   worktree's `origin` remote. Every discovered origin must match the same
+   registered workspace (or the daemon workspace when the registry is empty).
+   HTTPS, SSH and scp-style origins for the same GitHub repository count
+   as one identity. If a registered peer has the same identity or its
+   GitHub origin cannot be resolved, the pass preserves the root. Only the
+   owning workspace can apply its `scratchReclaim` settings, including
+   when workspaces share a volume, home or temporary directory. The search
+   covers the root and six directory levels below it. A missing worktree,
+   a non-GitHub origin or a failed ticket lookup preserves the root.
+2. the `watch-pid` marker is absent or names a process confirmed dead.
+   An unreadable marker, invalid PID or inconclusive probe preserves the root.
+3. the process scan confirms that no process has its cwd, executable, open file
+   or file-backed mapping under the root. Linux checks procfs, including each
+   userspace process’s memory maps even after it closes the file descriptor.
+   Incomplete process visibility preserves the root. macOS checks the full
+   `lsof` listing against the process table.
+4. the idle walk finds no writes in the last 24 h. An unreadable subtree
+   preserves the root. The walk stops descending after 50,000 directories,
+   so a recent write in an unexamined subtree can be missed.
+5. every git worktree found by the search is clean (`git --no-optional-locks status
+   --porcelain` must succeed — a failed status, e.g. a worktree whose parent
+   repo is gone, is "not safe", never clean — and report no **tracked**
+   change) and its `HEAD` is reachable from a remote ref
+   (`git rev-list --count HEAD --not --remotes` == 0, never `--branches`
+   for a linked worktree whose common Git directory survives). When the
+   common Git directory lies inside the candidate, every registered checkout
+   must be among the worktrees inspected inside it. All commits reachable
+   from local refs, including tags, must be published
+   (`git rev-list --count --all --not --remotes` equals zero), and the store
+   must have no stash.
+6. the root itself is at least `scratchReclaim.maxAgeHours` old.
+
+During live removal the reaper opens each directory without following symlinks,
+rechecks its mount and grants owner write access to read-only directories.
+It unlinks entries relative to the open directory and runs `git worktree prune`
+on each surviving parent repository.
+By default, the pass evaluates the gates and keeps eligible roots on disk.
+For each eligible root it publishes `daemon.scratch_root.reaped` with
+`path`, `bytes`, `ticket`, `repo` and `dry_run: true`. `bytes` is the
+apparent size, the sum of file lengths; sparse files and hard links make it
+differ from the space removal frees. The summary
+includes the planned count and apparent bytes, and the reason for each preserved
+root. A preview that frees no space still counts as an empty eager pass
+when the other reclaim tiers also finish empty.
+
+Live removal requires an explicit `dryRun: false` or
+`LOOM_SCRATCH_RECLAIM_DRY_RUN=0`. The environment override takes
+precedence. It accepts `0`, `false`, `no` or `off` for live removal and
+selects preview for all other values. Live removal events have
+`dry_run: false`. During rollout, review at least one day of fleet preview
+telemetry before enabling deletion in a separate change. The shared
+`scratchReclaim.enabled` switch controls both scratch passes.
+
+**Where it runs.** The scheduled `worktreeReaper` tick and eager tier 1 queue
+the same background scan. Requests for a workspace with a queued or running
+scan coalesce. Workspaces are scanned sequentially, each with its own
+`minIntervalSecs` cooldown (30 minutes by default). Dispatch continues while
+the scan runs. The eager report shows the pending scan. The worker publishes
+each eligible-root event and logs a summary when the scan finishes.
+
+See `loom-daemon/src/scratch_root_reaper.rs`.
 
 #### Aborted-fetch `.git/objects` temp-file reclaim (#10995)
 

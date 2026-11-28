@@ -70,6 +70,10 @@ pub const SCRATCH_RECLAIM_MAX_AGE_HOURS_ENV: &str = "LOOM_SCRATCH_RECLAIM_MAX_AG
 /// Env override for the cooldown between passes (seconds).
 pub const SCRATCH_RECLAIM_MIN_INTERVAL_ENV: &str = "LOOM_SCRATCH_RECLAIM_MIN_INTERVAL_SECS";
 
+/// Env override for the scratch-**root** pass's dry-run mode (#14952). `1`
+/// plans removals and reports them without deleting; `0` runs live.
+pub const SCRATCH_RECLAIM_DRY_RUN_ENV: &str = "LOOM_SCRATCH_RECLAIM_DRY_RUN";
+
 /// Default age floor: 24 hours. Comfortably above any single sweep's
 /// wall-clock duration, so a live or just-finished session's `TMPDIR`
 /// contents are never in the blast radius.
@@ -100,6 +104,11 @@ pub struct ScratchReclaimConfig {
     /// `…scratchReclaim.minIntervalSecs` — cooldown between passes (a
     /// zero/invalid value drops to `None`).
     pub min_interval_secs: Option<u64>,
+    /// `…scratchReclaim.dryRun` defaults to **true**. The scratch-root
+    /// reaper ([`crate::scratch_root_reaper`]) reports eligible roots in
+    /// preview mode. An explicit false enables removal. The TMPDIR pass
+    /// ignores this field.
+    pub dry_run: Option<bool>,
 }
 
 /// Read `.loom/config.json → autonomous.worktreeReaper.scratchReclaim`,
@@ -121,6 +130,7 @@ pub fn read_scratch_reclaim_config(repo_root: &Path) -> ScratchReclaimConfig {
             .get("minIntervalSecs")
             .and_then(serde_json::Value::as_u64)
             .filter(|&s| s > 0),
+        dry_run: block.get("dryRun").and_then(serde_json::Value::as_bool),
     }
 }
 
@@ -154,6 +164,18 @@ pub fn resolve_min_interval_secs(config: &ScratchReclaimConfig) -> u64 {
         .filter(|&s| s > 0)
         .or(config.min_interval_secs)
         .unwrap_or(DEFAULT_SCRATCH_MIN_INTERVAL_SECS)
+}
+
+/// Resolve dry-run mode for [`crate::scratch_root_reaper::run_for`].
+/// The environment overrides config and the default is preview. An invalid
+/// environment value also selects preview.
+#[must_use]
+pub fn resolve_dry_run(config: &ScratchReclaimConfig) -> bool {
+    match std::env::var(SCRATCH_RECLAIM_DRY_RUN_ENV) {
+        Ok(v) => !matches!(v.trim().to_ascii_lowercase().as_str(), "0" | "false" | "no" | "off"),
+        Err(std::env::VarError::NotPresent) => config.dry_run.unwrap_or(true),
+        Err(std::env::VarError::NotUnicode(_)) => true,
+    }
 }
 
 // ============================================================================
@@ -562,10 +584,33 @@ mod tests {
             enabled: Some(false),
             max_age_hours: Some(6),
             min_interval_secs: Some(60),
+            dry_run: None,
         };
         assert!(!resolve_enabled(&config));
         assert_eq!(resolve_max_age_hours(&config), 6);
         assert_eq!(resolve_min_interval_secs(&config), 60);
+    }
+
+    #[test]
+    #[serial]
+    fn test_resolve_dry_run_env_overrides_config() {
+        let _env = crate::env_test_support::EnvGuard::clear(&[SCRATCH_RECLAIM_DRY_RUN_ENV]);
+        let preview = ScratchReclaimConfig::default();
+        let live = ScratchReclaimConfig {
+            dry_run: Some(false),
+            ..ScratchReclaimConfig::default()
+        };
+        assert!(resolve_dry_run(&preview));
+        assert!(!resolve_dry_run(&live));
+
+        for value in ["0", " FaLsE ", "no", "off"] {
+            std::env::set_var(SCRATCH_RECLAIM_DRY_RUN_ENV, value);
+            assert!(!resolve_dry_run(&preview), "explicit live override {value:?}");
+        }
+        for value in ["1", "true", "yes", "on", "", "invalid"] {
+            std::env::set_var(SCRATCH_RECLAIM_DRY_RUN_ENV, value);
+            assert!(resolve_dry_run(&live), "preview with override {value:?}");
+        }
     }
 
     // ===================================================================
