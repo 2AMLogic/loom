@@ -110,12 +110,12 @@ fn a_program_still_open_for_writing_is_waited_for_not_a_spawn_error() {
 
     let completion = run_bounded(Command::new(&program), GENEROUS)
         .expect("the writer closes long before the deadline");
+    let waited = started.elapsed();
     releaser.join().unwrap();
 
     assert!(
-        started.elapsed() >= Duration::from_millis(30),
-        "the program ran before its writer closed: {:?}",
-        started.elapsed()
+        waited >= Duration::from_millis(30),
+        "the program ran before its writer closed: {waited:?}"
     );
     assert!(
         matches!(completion, Completion::Exited(ref output) if output.stdout == b"ready\n"),
