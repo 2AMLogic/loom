@@ -198,6 +198,16 @@ pub(super) fn published_owner_workspace(owner: &str) -> tempfile::TempDir {
     ws
 }
 
+/// Pins the fixture publication time used to select between owner directories.
+#[cfg(test)]
+pub(super) fn stamp_hosts_yml(dir: &Path, at: SystemTime) {
+    let file = std::fs::OpenOptions::new()
+        .append(true)
+        .open(dir.join("hosts.yml"))
+        .expect("open fixture hosts.yml");
+    file.set_modified(at).expect("stamp fixture hosts.yml");
+}
+
 /// The `owner/repo` of a GitHub repository URL, or `None` for any other forge
 /// (a Gitea under a sub-path, a different host).
 pub(super) fn github_slug(repository: &str, gh_host: &str) -> Option<String> {
@@ -249,13 +259,16 @@ fn primary_root(
 /// matched to the owner. There is deliberately no process-`GH_CONFIG_DIR`
 /// fallback: on a daemon host that is the root owner's credential.
 ///
-/// The primary root comes first (#13933, #13937): it is the only copy the
-/// daemon's refresh tick keeps fresh. A managed repository's own
-/// `.loom/gh-config-by-owner/<owner>` is published once and never refreshed,
-/// so preferring it handed the exec an expired installation token (`HTTP 401`)
-/// whenever the process had no daemon registry to consult — every
-/// `session-exec host` and hand-run `accounts session job`. The workspace copy
-/// remains a fallback for a host with no primary root at all.
+/// Of the two published owner dirs — the primary root's and the workspace's
+/// own — the copy whose `hosts.yml` was written last wins, and the primary
+/// root breaks ties: the daemon's refresh tick keeps the primary root's fresh,
+/// while a managed repository's `.loom/gh-config-by-owner/<owner>` is
+/// published once and never refreshed, so the pre-#13963 workspace-first order
+/// handed the exec an expired installation token (`HTTP 401`) whenever the
+/// process had no daemon registry to consult — every `session-exec host` and
+/// hand-run `accounts session job`. A flat primary-first order repeats the
+/// same failure in reverse for a hand-refreshed workspace whose own copy is
+/// newer, so #13933 picks the newest write instead of a fixed winner.
 ///
 /// The root-owner step is what a hand-run `accounts session job` from an SSH
 /// shell needs: that shell has no `GH_CONFIG_DIR`, and the daemon's own
@@ -289,31 +302,29 @@ fn config_dir_for(
             .eq_ignore_ascii_case(owner)
             .then_some(dir)
     };
-    let candidates: [&dyn Fn() -> Option<PathBuf>; 5] = [
-        &|| creds::gh_config_dir_for_owner_slug(slug).filter(|dir| dir.join("hosts.yml").is_file()),
-        &|| primary.and_then(published),
-        &|| published(workspace),
-        &|| primary.and_then(root_owned),
-        &|| root_owned(workspace),
-    ];
-    // The first candidate whose token is not provably dead wins. A directory
-    // that is merely present is NOT enough (#14435): `gh-config-by-owner/
-    // <owner>/hosts.yml` outlives its token whenever nothing refreshes it
-    // (the workspace-root owner's live token is in `.loom/gh-config`), and
-    // `gh auth token` hands back an expired value without complaint.
-    let mut expired = false;
-    for candidate in candidates {
-        let Some(dir) = candidate() else { continue };
-        if token_expired(&dir, now) {
-            expired = true;
-            continue;
-        }
-        return DirChoice {
-            dir: Some(dir),
-            expired: false,
-        };
+    let mut saw_expired = false;
+    let mut live = |dir: &PathBuf| {
+        let expired = token_expired(dir, now);
+        saw_expired |= expired;
+        !expired
+    };
+    let dir = creds::gh_config_dir_for_owner_slug(slug)
+        .filter(|dir| dir.join("hosts.yml").is_file())
+        .filter(&mut live)
+        .or_else(|| {
+            // max_by_key returns the last maximum, so the primary wins a tie.
+            [published(workspace), primary.and_then(published)]
+                .into_iter()
+                .flatten()
+                .filter(&mut live)
+                .max_by_key(|dir| hosts_yml_mtime(dir))
+        })
+        .or_else(|| primary.and_then(root_owned).filter(&mut live))
+        .or_else(|| root_owned(workspace).filter(&mut live));
+    DirChoice {
+        expired: dir.is_none() && saw_expired,
+        dir,
     }
-    DirChoice { dir: None, expired }
 }
 
 /// Which credential directory an exec reads, and whether a matched one was
@@ -336,6 +347,15 @@ fn token_expired(dir: &Path, now: SystemTime) -> bool {
     let exp: SystemTime = exp.with_timezone(&chrono::Utc).into();
     exp.duration_since(now)
         .map_or(true, |left| left < crate::forge_identity::READER_MIN_REMAINING)
+}
+
+/// `hosts.yml`'s mtime under a published owner dir. A metadata error reads as
+/// the oldest instant, so a dir whose mtime cannot be read loses to any
+/// readable one.
+fn hosts_yml_mtime(dir: &Path) -> SystemTime {
+    std::fs::metadata(dir.join("hosts.yml"))
+        .and_then(|meta| meta.modified())
+        .unwrap_or(SystemTime::UNIX_EPOCH)
 }
 
 /// The owner of `root`'s `origin`, only when that remote is on `gh_host`
@@ -485,6 +505,15 @@ mod tests {
     use std::collections::HashMap;
 
     const SECRET: &str = "ghs_0123456789abcdefTESTONLY";
+
+    /// Explicit mtimes for the precedence tests: pinned so the freshest-wins
+    /// selection never leans on write order or filesystem stamp granularity.
+    fn t0() -> SystemTime {
+        SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000)
+    }
+    fn t1() -> SystemTime {
+        SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_060)
+    }
 
     fn env_of(vars: &[(&str, &str)]) -> impl Fn(&str) -> Option<OsString> {
         let map: HashMap<String, String> = vars
@@ -694,6 +723,8 @@ mod tests {
             crate::credential_preflight::github_app_gh_config_dir_for_owner(fresh.path(), owner);
         let stale_dir =
             crate::credential_preflight::github_app_gh_config_dir_for_owner(stale.path(), owner);
+        stamp_hosts_yml(&stale_dir, t0());
+        stamp_hosts_yml(&fresh_dir, t1());
         let checkout = fresh.path().to_str().unwrap().to_owned();
         let env = env_of(&[("LOOM_MACHINE_CHECKOUT", &checkout)]);
         let seen = std::cell::RefCell::new(None);
@@ -714,6 +745,56 @@ mod tests {
         assert_eq!(seen.borrow().as_deref(), Some(stale_dir.as_path()));
     }
 
+    /// #13933: among the owner-matched published dirs, the copy whose
+    /// `hosts.yml` was written last is the one forwarded — the primary root's
+    /// when it is fresher, but the workspace's own when a hand-refresh has
+    /// made it newer than the primary's. Equal mtimes tie to the primary
+    /// root, and a workspace copy with no primary configured is unchanged.
+    #[test]
+    fn the_freshest_hosts_yml_wins_between_workspace_and_primary() {
+        let owner = "acme-mtime-13933";
+        let older = published_owner_workspace(owner);
+        let newer = published_owner_workspace(owner);
+        let dir_of = |root: &tempfile::TempDir| {
+            crate::credential_preflight::github_app_gh_config_dir_for_owner(root.path(), owner)
+        };
+        stamp_hosts_yml(&dir_of(&older), t0());
+        stamp_hosts_yml(&dir_of(&newer), t1());
+        let seen = std::cell::RefCell::new(None);
+        let read = |dir: &Path| {
+            *seen.borrow_mut() = Some(dir.to_path_buf());
+            Some(SECRET.to_owned())
+        };
+        let repo = format!("https://github.com/{owner}/widget");
+
+        // The primary root's copy is fresher: it wins.
+        let checkout = newer.path().to_str().unwrap().to_owned();
+        let env = env_of(&[("LOOM_MACHINE_CHECKOUT", &checkout)]);
+        ExecAuth::resolve_with(older.path(), &repo, &env, &read);
+        assert_eq!(seen.borrow().as_deref(), Some(dir_of(&newer).as_path()));
+
+        // The workspace copy is fresher (a hand-refresh): it wins over a
+        // stale primary root — the flat primary-first order #13963 shipped
+        // would have forwarded the primary's stale token here.
+        let checkout = older.path().to_str().unwrap().to_owned();
+        let env = env_of(&[("LOOM_MACHINE_CHECKOUT", &checkout)]);
+        ExecAuth::resolve_with(newer.path(), &repo, &env, &read);
+        assert_eq!(seen.borrow().as_deref(), Some(dir_of(&newer).as_path()));
+
+        // Equal mtimes tie to the primary root.
+        stamp_hosts_yml(&dir_of(&older), t1());
+        ExecAuth::resolve_with(newer.path(), &repo, &env, &read);
+        assert_eq!(seen.borrow().as_deref(), Some(dir_of(&older).as_path()));
+
+        // The newer primary copy is skipped when its sidecar proves expiry.
+        stamp_hosts_yml(&dir_of(&newer), t0());
+        write_sidecar(&dir_of(&older), "2020-01-01T00:00:00Z");
+        seen.replace(None);
+        let auth = ExecAuth::resolve_with(newer.path(), &repo, &env, &read);
+        assert_eq!(seen.borrow().as_deref(), Some(dir_of(&newer).as_path()));
+        assert!(!auth.expired());
+    }
+
     /// #13965: the dispatch pin is the only source on a pristine fleet worker.
     /// The unit carries no `LOOM_MACHINE_CHECKOUT` (`unit_env_tests::STRUCTURAL`)
     /// and a short-lived `session-exec host` has no registered root of its
@@ -727,6 +808,11 @@ mod tests {
         let fresh = published_owner_workspace(owner);
         let fresh_dir =
             crate::credential_preflight::github_app_gh_config_dir_for_owner(fresh.path(), owner);
+        stamp_hosts_yml(
+            &crate::credential_preflight::github_app_gh_config_dir_for_owner(stale.path(), owner),
+            t0(),
+        );
+        stamp_hosts_yml(&fresh_dir, t1());
         let seen = std::cell::RefCell::new(None);
         let read = |dir: &Path| {
             *seen.borrow_mut() = Some(dir.to_path_buf());
