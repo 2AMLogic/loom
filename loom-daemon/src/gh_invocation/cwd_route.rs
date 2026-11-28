@@ -152,52 +152,6 @@ enum Shape {
     Unroutable,
 }
 
-/// `gh api` flags that take a value (so the value is not the endpoint).
-const API_VALUED: &[&str] = &[
-    "-H",
-    "--header",
-    "-f",
-    "--raw-field",
-    "-F",
-    "--field",
-    "-q",
-    "--jq",
-    "-t",
-    "--template",
-    "-X",
-    "--method",
-    "--hostname",
-    "--input",
-    "--cache",
-    "-p",
-    "--preview",
-];
-
-/// The endpoint of a `gh api` argv (`rest` = the words after `api`).
-fn api_endpoint(rest: &[String]) -> Option<&str> {
-    let mut i = 0;
-    while i < rest.len() {
-        let a = rest[i].as_str();
-        if API_VALUED.contains(&a) {
-            i += 2;
-            continue;
-        }
-        if a.starts_with('-') {
-            i += 1;
-            continue;
-        }
-        return Some(a);
-    }
-    None
-}
-
-/// Whether a `gh api` call carries `--hostname` for a host other than
-/// github.com (a reader App only holds github.com tokens).
-fn foreign_hostname(rest: &[String]) -> bool {
-    rest.windows(2)
-        .any(|w| w[0] == "--hostname" && !w[1].eq_ignore_ascii_case("github.com"))
-}
-
 /// An endpoint whose answer depends on **who** asks: a reader App would
 /// answer for itself. Never derived, whatever the site set.
 #[must_use]
@@ -221,38 +175,6 @@ pub(crate) fn asker_dependent_path(path: &str) -> bool {
         Some("rulesets" | "rules" | "installation") => true,
         _ => false,
     }
-}
-
-/// The HTTP method a `gh api` argv sends: `-X` / `--method` when given,
-/// else `POST` when it carries a body (`-f`, `-F`, `--field`,
-/// `--raw-field`, `--input` — `gh api`'s own default), else `GET`.
-fn api_method(rest: &[String]) -> String {
-    let mut method = None;
-    let mut body = false;
-    let mut i = 0;
-    while i < rest.len() {
-        let a = rest[i].as_str();
-        if a == "-X" || a == "--method" {
-            method = rest.get(i + 1).map(|m| m.to_ascii_uppercase());
-            i += 2;
-            continue;
-        }
-        if let Some(m) = a.strip_prefix("--method=") {
-            method = Some(m.to_ascii_uppercase());
-        } else if let Some(m) = a.strip_prefix("-X").filter(|m| !m.is_empty()) {
-            method = Some(m.to_ascii_uppercase());
-        } else if matches!(a, "-f" | "-F" | "--field" | "--raw-field" | "--input")
-            || a.starts_with("--field=")
-            || a.starts_with("--raw-field=")
-            || a.starts_with("--input=")
-            // Glued short forms: `-fkey=val`, `-Fkey=val`.
-            || (a.len() > 2 && (a.starts_with("-f") || a.starts_with("-F")))
-        {
-            body = true;
-        }
-        i += 1;
-    }
-    method.unwrap_or_else(|| if body { "POST" } else { "GET" }.to_string())
 }
 
 /// `owner/repo` from a `[HOST/]OWNER/REPO` value, when the host (if any) is
@@ -295,78 +217,36 @@ fn placeholder_repos_path(path: &str) -> bool {
     owner == "{owner}" && repo == "{repo}"
 }
 
-/// The value of `-R` / `--repo` (`-R x`, `--repo x`, `--repo=x`, `-Rx`).
-fn repo_flag(rest: &[String]) -> Option<Option<&str>> {
-    let mut found = None;
-    let mut i = 0;
-    while i < rest.len() {
-        let a = rest[i].as_str();
-        if a == "-R" || a == "--repo" {
-            found = Some(rest.get(i + 1).map(String::as_str));
-            i += 2;
-            continue;
-        }
-        if let Some(v) = a.strip_prefix("--repo=") {
-            found = Some(Some(v));
-        } else if let Some(v) = a.strip_prefix("-R").filter(|v| !v.is_empty()) {
-            found = Some(Some(v));
-        }
-        i += 1;
-    }
-    found
-}
-
-/// The positional words after the subcommand pair (flags and their values
-/// skipped as well as an unknown flag set allows: a word starting with `-`
-/// is a flag; `--json`, `--jq`, `-q`, `--template`, `-t`, `-L`, `--limit`,
-/// `-s`, `--state`, `-l`, `--label`, `-A`, `--author`, `-S`, `--search`,
-/// `-B`, `--base`, `-H`, `--head`, `-a`, `--assignee`, `-R`, `--repo` take
-/// a value).
-fn positionals(rest: &[String]) -> Vec<&str> {
-    const VALUED: &[&str] = &[
-        "--json",
-        "--jq",
-        "-q",
-        "--template",
-        "-t",
-        "-L",
-        "--limit",
-        "-s",
-        "--state",
-        "-l",
-        "--label",
-        "-A",
-        "--author",
-        "-S",
-        "--search",
-        "-B",
-        "--base",
-        "-H",
-        "--head",
-        "-a",
-        "--assignee",
-        "-R",
-        "--repo",
-        "--app",
-        "-m",
-        "--milestone",
-        "--mention",
-    ];
-    let mut out = Vec::new();
-    let mut i = 0;
-    while i < rest.len() {
-        let a = rest[i].as_str();
-        if VALUED.contains(&a) {
-            i += 2;
-            continue;
-        }
-        if !a.starts_with('-') {
-            out.push(a);
-        }
-        i += 1;
-    }
-    out
-}
+/// Valued flags of the porcelain read commands handled by `shape`.
+const PORCELAIN_VALUED: &[&str] = &[
+    "--json",
+    "--jq",
+    "-q",
+    "--template",
+    "-t",
+    "-L",
+    "--limit",
+    "-s",
+    "--state",
+    "-l",
+    "--label",
+    "-A",
+    "--author",
+    "-S",
+    "--search",
+    "-B",
+    "--base",
+    "-H",
+    "--head",
+    "-a",
+    "--assignee",
+    "-R",
+    "--repo",
+    "--app",
+    "-m",
+    "--milestone",
+    "--mention",
+];
 
 /// How `gh` resolves the repository for `args`.
 fn shape(args: &[OsString]) -> Shape {
@@ -384,16 +264,14 @@ fn shape(args: &[OsString]) -> Shape {
     }
     match cmd {
         "api" => {
-            if foreign_hostname(rest) {
-                return Shape::Unroutable;
-            }
+            let request = super::route::api_request(rest);
             // A mutation is never a read, whatever intent the site declared
             // (a reader App would refuse it, and the 403 would withdraw the
             // reader for the repo): only GET / HEAD are derived.
-            if !matches!(api_method(rest).as_str(), "GET" | "HEAD") {
+            if request.has_foreign_hostname || !matches!(request.method, "GET" | "HEAD") {
                 return Shape::Unroutable;
             }
-            let Some(path) = api_endpoint(rest) else {
+            let Some(path) = request.endpoint else {
                 return Shape::Unroutable;
             };
             if asker_dependent_path(path) {
@@ -410,9 +288,10 @@ fn shape(args: &[OsString]) -> Shape {
         "issue" | "pr" | "repo" => {
             let sub = rest.first().map(String::as_str).unwrap_or_default();
             let after = rest.get(1..).unwrap_or_default();
+            let (pos, flags) = super::route::split_with(after, PORCELAIN_VALUED);
             // A URL argument names its own repo (gh ignores `-R` / GH_REPO
             // for it): not modelled, so the writer keeps it.
-            if positionals(after).iter().any(|p| p.contains("://")) {
+            if pos.iter().any(|p| p.contains("://")) {
                 return Shape::Unroutable;
             }
             if cmd == "repo" {
@@ -421,7 +300,7 @@ fn shape(args: &[OsString]) -> Shape {
                 if sub != "view" {
                     return Shape::Unroutable;
                 }
-                return match positionals(after).first() {
+                return match pos.first() {
                     Some(arg) => github_nwo(arg)
                         .map_or(Shape::Unroutable, |s| Shape::Named(s, Via::RepoFlag)),
                     None => Shape::FromCheckout,
@@ -434,11 +313,11 @@ fn shape(args: &[OsString]) -> Shape {
             if !matches!(sub, "view" | "list") {
                 return Shape::Unroutable;
             }
-            match repo_flag(after) {
-                Some(Some(v)) => {
-                    github_nwo(v).map_or(Shape::Unroutable, |s| Shape::Named(s, Via::RepoFlag))
-                }
-                Some(None) => Shape::Unroutable,
+            match flags.iter().rfind(|f| matches!(f.name, "-R" | "--repo")) {
+                Some(flag) => flag
+                    .value
+                    .and_then(github_nwo)
+                    .map_or(Shape::Unroutable, |s| Shape::Named(s, Via::RepoFlag)),
                 None => Shape::FromEnv,
             }
         }

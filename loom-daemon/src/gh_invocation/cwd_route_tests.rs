@@ -61,6 +61,39 @@ fn an_explicit_path_a_repo_flag_and_a_lone_origin_placeholder_each_route() {
 }
 
 #[test]
+fn only_parsed_flags_steer_reader_routing() {
+    let path = "repos/acme/widget/issues";
+    for (args, expected) in [
+        (&["api", path, "--hostname=ghe.example.com"][..], None),
+        (
+            &[
+                "api",
+                path,
+                "--hostname=ghe.example.com",
+                "--hostname",
+                "github.com",
+            ],
+            None,
+        ),
+        (&["api", path, "--hostname"], None),
+        (&["api", path, "--hostname=GitHub.COM"], Some("acme/widget")),
+        (&["api", "-q", "-X", path], Some("acme/widget")),
+        (&["api", path, "-f", "a=b", "-H", "-X", "GET"], None),
+        (&["api", path, "--", "-X", "POST"], Some("acme/widget")),
+        (&["issue", "list", "--search", "-R"], Some("acme/checkout")),
+        (&["pr", "list", "--", "-R", "acme/other"], Some("acme/checkout")),
+        (&["issue", "view", "-c", "-R=acme/widget"], Some("acme/widget")),
+    ] {
+        let inv = read_in(Path::new("/checkout"), args);
+        assert_eq!(
+            slug_of(&derive_with(&inv, &env(), &sole("acme/checkout"))),
+            expected,
+            "{args:?}"
+        );
+    }
+}
+
+#[test]
 fn loom_repo_wins_over_the_checkout_for_a_placeholder_read() {
     // The claim_reconciliation `issue_is_confirmed_closed` shape: gh_call::read
     // (GhTarget::None, cwd = root) of a placeholder path, on a host whose
