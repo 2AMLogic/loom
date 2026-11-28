@@ -479,7 +479,7 @@ fn records_round_trip_and_corruption_reads_as_unobserved() {
         merged_at: MERGED_AT.into(),
         branch: "feature/issue-42".into(),
         body: "Part of #5".into(),
-        observed_at: MERGED_AT.into(),
+        observed_at: now_timestamp(),
         done: vec![PARTIAL_RESET.into()],
     };
     assert!(!rec.complete());
@@ -1086,7 +1086,10 @@ fn the_branch_derived_close_defers_on_an_unreadable_reopen_timeline() {
     assert!(store.load(9).unwrap().complete());
 }
 
-fn rec_for(pr: u64, observed_at: &str, done: &[&str]) -> MergeRecord {
+/// A stored record for PR `pr` with the `done` passes marked, first observed
+/// `age` before now: the reclamation sweep compares that stamp with the
+/// clock, so it is derived here rather than passed in as text.
+fn rec_for(pr: u64, age: chrono::Duration, done: &[&str]) -> MergeRecord {
     MergeRecord {
         repo: "o/r".into(),
         pr,
@@ -1095,7 +1098,7 @@ fn rec_for(pr: u64, observed_at: &str, done: &[&str]) -> MergeRecord {
         merged_at: MERGED_AT.into(),
         branch: "feature/issue-42".into(),
         body: String::new(),
-        observed_at: observed_at.to_string(),
+        observed_at: (chrono::Utc::now() - age).to_rfc3339(),
         done: done.iter().map(|s| (*s).to_string()).collect(),
     }
 }
@@ -1105,11 +1108,11 @@ fn an_expired_incomplete_record_is_dropped_and_young_or_complete_survive() {
     let f = FakeForge::default();
     let dir = tempfile::tempdir().unwrap();
     let store = RecordStore::for_root(dir.path());
-    let week_ago = (chrono::Utc::now() - chrono::Duration::days(8)).to_rfc3339();
-    let now = chrono::Utc::now().to_rfc3339();
-    store.store(&rec_for(20, &week_ago, &PASSES)).unwrap();
-    store.store(&rec_for(21, &week_ago, &[])).unwrap();
-    store.store(&rec_for(22, &now, &[])).unwrap();
+    let week_ago = chrono::Duration::days(8);
+    let fresh = chrono::Duration::zero();
+    store.store(&rec_for(20, week_ago, &PASSES)).unwrap();
+    store.store(&rec_for(21, week_ago, &[])).unwrap();
+    store.store(&rec_for(22, fresh, &[])).unwrap();
     let stats = run(&f, &store, false);
     // Only the expired incomplete record is reclaimed (#15145): the
     // complete one keeps making its merge invisible, the young one is
