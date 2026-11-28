@@ -16,9 +16,9 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 use super::*;
+use crate::test_git_helpers::git_out;
 use crate::worktree_cli::test_support;
 use crate::worktree_cli::test_support::git;
 
@@ -38,12 +38,8 @@ fn tmpdir(tag: &str) -> PathBuf {
 /// its own suite).
 fn repo(dir: &Path, name: &str) -> PathBuf {
     let work = dir.join(name);
-    assert!(Command::new("git")
-        .args(["init", "-q", "-b", "main"])
-        .arg(&work)
-        .status()
-        .expect("git init")
-        .success());
+    let init = git_out(dir, &["init", "-q", "-b", "main", work.to_str().expect("utf-8")]);
+    assert!(init.status.success());
     git(&work, &["config", "user.name", "Loom Test"]);
     git(&work, &["config", "user.email", "t@example.invalid"]);
     fs::write(work.join("base.txt"), "base\n").expect("write");
@@ -387,12 +383,7 @@ fn a_dash_prefixed_branch_is_never_a_git_option() {
     // LOOM-REF-SCAN: vector-control — this call site is unseparated ON PURPOSE
     // (tests/git_ref_operand_scan.rs would otherwise report it); without the
     // control the guard assertion below would be vacuous.
-    let _ = Command::new("git")
-        .arg("-C")
-        .arg(&wt)
-        .args(["fetch", "origin", evil.as_str()])
-        .output()
-        .expect("run git");
+    let _ = git_out(&wt, &["fetch", "origin", &evil]);
     assert!(
         marker.exists(),
         "control failed: `git fetch origin {evil}` did not run the payload, so this test would be vacuous"

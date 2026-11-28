@@ -11,14 +11,7 @@ fn repo() -> tempfile::TempDir {
     // A real repo, so `locks_dir` exercises the `--git-common-dir` path rather
     // than its fallback — the fallback is what a test would silently measure
     // otherwise.
-    let ok = std::process::Command::new("git")
-        .arg("-C")
-        .arg(d.path())
-        .args(["init", "-q"])
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false);
-    assert!(ok, "git init must succeed for these tests to mean anything");
+    crate::test_git_helpers::run(d.path(), &["init", "-q"]);
     d
 }
 

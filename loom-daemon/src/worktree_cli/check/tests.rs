@@ -11,9 +11,9 @@
 
 use std::fs;
 use std::path::PathBuf;
-use std::process::Command;
 
 use super::*;
+use crate::test_git_helpers::git_out;
 use crate::worktree_cli::test_support;
 use crate::worktree_cli::test_support::git;
 
@@ -162,16 +162,16 @@ fn a_separate_git_dir_checkout_is_not_a_worktree() {
     let work = root.join("work");
     let gitdir = root.join("elsewhere.git");
     fs::create_dir_all(&work).expect("mkdir work");
-    let out = Command::new("git")
-        .arg("init")
-        .arg("-q")
-        .arg("--initial-branch=main")
-        .arg(format!("--separate-git-dir={}", gitdir.display()))
-        .arg(&work)
-        .env("GIT_CONFIG_GLOBAL", "/dev/null")
-        .env("GIT_CONFIG_SYSTEM", "/dev/null")
-        .output()
-        .expect("run git init");
+    let out = git_out(
+        &root,
+        &[
+            "init",
+            "-q",
+            "--initial-branch=main",
+            &format!("--separate-git-dir={}", gitdir.display()),
+            work.to_str().expect("utf-8"),
+        ],
+    );
     if !out.status.success() {
         return; // git too old for --separate-git-dir on init
     }
