@@ -16,9 +16,9 @@
 use std::ffi::OsString;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 use super::*;
+use crate::test_git_helpers::git_out;
 use crate::worktree_cli::test_support;
 
 // ---------------------------------------------------------------------------
@@ -130,12 +130,7 @@ fn git(dir: &Path, args: &[&str]) -> String {
 
 /// `git config --worktree --get <key>` in `wt`, or `None` when unset.
 fn worktree_config(wt: &Path, key: &str) -> Option<String> {
-    let out = Command::new("git")
-        .arg("-C")
-        .arg(wt)
-        .args(["config", "--get", key])
-        .output()
-        .expect("git config");
+    let out = git_out(wt, &["config", "--get", key]);
     out.status
         .success()
         .then(|| String::from_utf8_lossy(&out.stdout).trim().to_string())

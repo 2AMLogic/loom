@@ -8,6 +8,7 @@
 //! way `worktree.sh` does.
 
 use super::*;
+use crate::test_git_helpers::{git_out, run};
 
 // ---------------------------------------------------------------------------
 // Target grammar
@@ -123,22 +124,10 @@ fn normalisation_folds_dot_and_dotdot_the_way_cd_and_pwd_do() {
 /// this filter guards only shows in a repo that does not ignore the markers,
 /// which is exactly the case the filter exists for.
 fn repo_with_markers(dir: &std::path::Path, extra: &[&str]) {
-    let git = |args: &[&str]| {
-        std::process::Command::new("git")
-            .arg("-C")
-            .arg(dir)
-            .args(args)
-            .env("GIT_AUTHOR_NAME", "t")
-            .env("GIT_AUTHOR_EMAIL", "t@t")
-            .env("GIT_COMMITTER_NAME", "t")
-            .env("GIT_COMMITTER_EMAIL", "t@t")
-            .output()
-            .expect("git runs");
-    };
-    git(&["init", "-q"]);
+    run(dir, &["init", "-q"]);
     std::fs::write(dir.join("real.txt"), "x\n").expect("write");
-    git(&["add", "-A"]);
-    git(&["commit", "-qm", "init"]);
+    run(dir, &["add", "-A"]);
+    run(dir, &["commit", "-qm", "init"]);
     for m in [
         ".loom-managed",
         ".loom-in-use",
@@ -289,13 +278,7 @@ fn worktree_status_sees_intent_to_add_and_untracked_but_not_loom_markers() {
     // it, and report untracked work, while still ignoring Loom's markers.
     let d = tempfile::tempdir().expect("tempdir");
     repo_with_markers(d.path(), &["new.rs", "ita.rs"]);
-    let ok = std::process::Command::new("git")
-        .arg("-C")
-        .arg(d.path())
-        .args(["add", "-N", "ita.rs"])
-        .status()
-        .expect("git runs")
-        .success();
+    let ok = git_out(d.path(), &["add", "-N", "ita.rs"]).status.success();
     assert!(ok, "git add -N must succeed");
 
     let mut seen: Vec<(String, String)> = worktree_status(d.path())
