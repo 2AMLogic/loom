@@ -98,9 +98,9 @@ fn case(binary: &str, name: &str, start: Option<&str>, ms: i64, outcome: TestOut
     }
 }
 
-fn target() -> nextest::TestSpanTarget<'static> {
+fn target() -> crate::ci_telemetry::records::JobSpanTarget<'static> {
     let (job_started, job_ended) = job_window();
-    nextest::TestSpanTarget {
+    crate::ci_telemetry::records::JobSpanTarget {
         repo: "fixture-org/alpha",
         visibility: crate::telemetry::RepoVisibility::Public,
         run_id: 1001,
