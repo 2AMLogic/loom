@@ -210,15 +210,15 @@ is_untracked_runtime_file() {
 }
 
 # Loom-shipped paths: the surfaces resync-installed.sh re-copies from defaults/
-# and whose installed_files entries its manifest prune reconciles (its
-# pure-copy surfaces, plus .claude/commands/loom/ -- #15714). An entry for one
-# of these with no file on disk is a defect that tooling repairs -- resync
-# restores a file still shipped and prunes an entry retired upstream -- so
-# `verify` fails on it (#15714). Everything else (install-once files such as
-# .github/workflows/*, .codex/config.toml, .claude/settings.json, root
-# CLAUDE.md) is the consumer's to keep or delete after install and resync
-# never touches those entries, so their absence is never flagged. The runtime
-# denylist above is honored by the caller.
+# on every run -- its pure-copy surfaces, plus .claude/commands/loom/, the
+# surface the report behind #15714 named. An entry for one of these with no
+# file on disk is a defect that tooling repairs -- resync restores a file
+# still shipped and prunes an entry retired upstream -- so `verify` fails on
+# it (#15714). Everything else (install-once files such as .github/workflows/*,
+# .codex/config.toml, .claude/settings.json, root CLAUDE.md) is the consumer's
+# to keep or delete after install and resync never touches those entries, so
+# their absence is never flagged. The runtime denylist above is honored by the
+# caller.
 is_loom_shipped_path() {
     case "$1" in
         .loom/hooks/*|.loom/scripts/*|.loom/roles/*|.loom/docs/*|.loom/runtimes/*|.loom/bin/*|.loom/biome.jsonc|.claude/biome.jsonc|.claude/commands/loom/*)

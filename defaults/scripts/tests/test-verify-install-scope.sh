@@ -461,10 +461,11 @@ assert_not_contains "$JSON_OUT" "ci.yml" "Case 6b: an absent install-once workfl
 rm -rf "$REPO"
 echo ""
 
-# 6c: verify-install.sh's Loom-shipped classifier and resync-installed.sh's
-# prune agree on every surface: the prune restores a still-shipped file or
-# drops an entry retired upstream for exactly these paths, which is what makes
-# "entry, no file" a defect worth failing on.
+# 6c: verify-install.sh's Loom-shipped classifier covers every surface
+# resync-installed.sh's prune classifies today (its pure-copy surfaces) plus
+# .claude/commands/loom/ (#15714), and nothing else: resync restores a
+# still-shipped file or drops an entry retired upstream for exactly these
+# paths, which is what makes "entry, no file" a defect worth failing on.
 RESYNC_SCRIPT="$REPO_ROOT/.loom/scripts/resync-installed.sh"
 [[ -f "$RESYNC_SCRIPT" ]] || RESYNC_SCRIPT="$REPO_ROOT/defaults/scripts/resync-installed.sh"
 if [[ -f "$RESYNC_SCRIPT" ]]; then
