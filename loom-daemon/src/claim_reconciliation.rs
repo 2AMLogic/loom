@@ -3058,7 +3058,17 @@ pub mod forge {
         crate::comment_trust::TrustPolicy::for_root(root).trusted_bodies(&out)
     }
 
-    fn list_verdict_prs(gh_bin: &Path, root: &Path, kind: VerdictKind) -> Result<Vec<VerdictPr>> {
+    struct ListedVerdict {
+        pr: VerdictPr,
+        held_repair: bool,
+        updated_at: Option<String>,
+    }
+
+    fn list_verdict_prs(
+        gh_bin: &Path,
+        root: &Path,
+        kind: VerdictKind,
+    ) -> Result<Vec<ListedVerdict>> {
         let label = kind.label();
         let rows = super::open_pr_listing::list_with_label(gh_bin, root, label)?;
         Ok(rows
@@ -3131,15 +3141,21 @@ pub mod forge {
                 } else {
                     None
                 };
-                VerdictPr {
-                    number: r.number,
-                    kind,
-                    head_sha: r.head_sha,
-                    marker_sha,
-                    marker_scan_ok,
-                    on_hold,
-                    invalidation_recorded,
-                    operator_send_back,
+                let held_repair = kind == VerdictKind::Approved
+                    && crate::doctor_handback::held_review::candidate(&r.labels);
+                ListedVerdict {
+                    pr: VerdictPr {
+                        number: r.number,
+                        kind,
+                        head_sha: r.head_sha,
+                        marker_sha,
+                        marker_scan_ok,
+                        on_hold,
+                        invalidation_recorded,
+                        operator_send_back,
+                    },
+                    held_repair,
+                    updated_at: r.updated_at,
                 }
             })
             .collect())
@@ -3163,7 +3179,7 @@ pub mod forge {
     /// staleness behavior of every already-marked verdict is untouched; an
     /// unmarked APPROVAL is re-queued instead of anchored (#9258).
     ///
-    /// # Held PRs are NOT covered by this pass (pre-existing, #8900 scope note)
+    /// # Parked PRs retain their hold (#8900, #14714)
     ///
     /// "Runs on the periodic tick regardless" is true of every PR this pass can
     /// *see*, and a PR on an explicit hold (`loom:operator`, `loom:blocked`,
@@ -3180,8 +3196,9 @@ pub mod forge {
     /// `verdict-staleness-guard.sh --clear`, which judge.md / doctor.md /
     /// champion-pr-merge.md do run over held PRs and which shells out to
     /// `loom-daemon forge disable-auto-merge --audit-comment --hold <label>`.
-    /// Do not "fix" this by making the daemon pass write to held PRs without
-    /// deciding that question on its own merits first.
+    /// The separate held Doctor recovery acts only on a recorded, verified
+    /// exact-head repair. It retains the park and leaves ordinary hold behavior
+    /// and preventive disarm to the existing routes.
     ///
     /// Returns [`VerdictReconcileStats`] summed across both verdict labels.
     pub fn reconcile_pr_verdicts(gh_bin: &Path, root: &Path) -> VerdictReconcileStats {
@@ -3223,7 +3240,26 @@ pub mod forge {
             };
             stats.checked += prs.len();
 
-            for pr in prs {
+            for listed in prs {
+                let pr = listed.pr;
+                if let Some(head) = pr.head_sha.as_deref().filter(|_| listed.held_repair) {
+                    use crate::cli::forge_verdict_cmd::held_review::recover;
+                    use crate::doctor_handback::held_review::Outcome;
+                    let key =
+                        super::read_cache::key(root, pr.number, head, listed.updated_at.as_deref());
+                    super::read_cache::NO_HELD_INTENT.get_or(key, || {
+                        match recover(gh_bin, root, pr.number, head) {
+                            Outcome::NoIntent => return Some(()),
+                            Outcome::Requeued => stats.invalidated += 1,
+                            Outcome::Interrupted => log::warn!(
+                                "claim_reconciliation: held Doctor repair for PR #{} remains pending",
+                                pr.number
+                            ),
+                            Outcome::Ineligible => {}
+                        }
+                        None
+                    });
+                }
                 match decide_verdict(&pr) {
                     VerdictAction::Invalidate {
                         marker_sha,

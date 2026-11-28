@@ -66,6 +66,8 @@ pub(super) static HEAD_PUSH: ReadCache<DateTime<Utc>> = ReadCache::new(CLAIM_MAX
 /// Both halves are computed AFTER trusted-author filtering, so a change to
 /// the comment-trust configuration is not seen here until the entry expires.
 pub(super) static VERDICT_SCAN: ReadCache<(Option<String>, bool)> = ReadCache::new(MAX_AGE);
+/// A held approval whose trusted comments contain no repair intent for the listed head.
+pub(super) static NO_HELD_INTENT: ReadCache<()> = ReadCache::new(CLAIM_MAX_AGE);
 /// A would-invalidate `changes-requested` PR's operator send-back scan
 /// (#15068): `Some(evidence)` = a trusted human's label pins the verdict to
 /// the current head. Only a positive answer is cached: the fetch returns
