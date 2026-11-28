@@ -583,6 +583,20 @@ docs_only_fast_path_plan_check() {
   while IFS= read -r l; do
     receipt_lines+=("$l")
   done < <(printf '%s\n' "$body" | grep -E '^- \*\*WORK_PLAN check\*\*: ' || true)
+  # Diagnose a missing producer only from the primary checkout's installed Guide.
+  local primary_entry guide grep_status=0
+  if [ "${#receipt_lines[@]}" -eq 0 ] &&
+     IFS= read -r -d '' primary_entry < <(git worktree list --porcelain -z 2>/dev/null) &&
+     [[ "$primary_entry" == 'worktree '* ]]; then
+    guide="${primary_entry#worktree }/.loom/roles/guide.md"
+    if [ -f "$guide" ]; then
+      grep -Fq 'WORK_PLAN check' "$guide" 2>/dev/null || grep_status=$?
+      if [ "$grep_status" -eq 1 ]; then
+        echo "NOT ELIGIBLE: installed Guide (.loom/roles/guide.md) lacks the #14204 receipt emitter — resync installed surfaces with ./.loom/scripts/resync-installed.sh; do NOT hand-type the receipt (#15220)"
+        return 0
+      fi
+    fi
+  fi
   if [ "${#receipt_lines[@]}" -ne 1 ]; then
     echo "NOT ELIGIBLE: PR body carries ${#receipt_lines[@]} 'WORK_PLAN check:' lines where exactly one is required (#15220)"
     return 0

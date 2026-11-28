@@ -1044,11 +1044,36 @@ out="$(PP_BODY="$PP_WRONGHASH_BODY" docs_only_fast_path_plan_check 1)"
 assert_eq "NOT ELIGIBLE: WORK_PLAN render-hash mismatch — PR body claims '000000000000', the head region recomputes '$(pp_plan_hash "$PP_REGION_HEAD")' (#15220)" "$out" \
     "'written' with a wrong hash is not eligible"
 
-out="$(PP_BODY='### Changes
+# The reviewer may run in a linked worktree with a different installed Guide.
+PP_WORKSPACE="$(mktemp -d)" || exit 1
+trap 'rm -rf "$PP_WORKSPACE"' EXIT
+git init -q "$PP_WORKSPACE/main" || exit 1
+git -C "$PP_WORKSPACE/main" -c user.name=Test -c user.email=test@example.org \
+    -c commit.gpgsign=false commit --allow-empty -qm fixture || exit 1
+git -C "$PP_WORKSPACE/main" worktree add -q --detach "$PP_WORKSPACE/review" || exit 1
+mkdir -p "$PP_WORKSPACE"/{main,review}/.loom/roles
+PP_GUIDE="$PP_WORKSPACE/main/.loom/roles/guide.md"
+printf '%s\n' 'WORK_PLAN check' > "$PP_WORKSPACE/review/.loom/roles/guide.md"
+pp_review_without_receipt() (
+    cd "$PP_WORKSPACE/review" || exit 1
+    PP_BODY='no receipt line at all' docs_only_fast_path_plan_check 1
+)
+PP_NO_RECEIPT="NOT ELIGIBLE: PR body carries 0 'WORK_PLAN check:' lines where exactly one is required (#15220)"
+assert_eq "$PP_NO_RECEIPT" "$(pp_review_without_receipt)" \
+    "a missing primary Guide keeps the generic missing-receipt reason"
+printf '%s\n' 'WORK_PLAN check' > "$PP_GUIDE"
+assert_eq "$PP_NO_RECEIPT" "$(pp_review_without_receipt)" \
+    "a receipt-capable Guide keeps the generic missing-receipt reason"
+printf '%s\n' '# Guide' > "$PP_GUIDE"
+assert_eq "NOT ELIGIBLE: installed Guide (.loom/roles/guide.md) lacks the #14204 receipt emitter — resync installed surfaces with ./.loom/scripts/resync-installed.sh; do NOT hand-type the receipt (#15220)" \
+    "$(pp_review_without_receipt)" "a stale primary Guide names the resync even from a receipt-capable worktree"
 
-no receipt line at all' docs_only_fast_path_plan_check 1)"
-assert_eq "NOT ELIGIBLE: PR body carries 0 'WORK_PLAN check:' lines where exactly one is required (#15220)" "$out" \
-    "a changed region with no receipt line is not eligible"
+# A read error must not be mistaken for grep's successful search with no match.
+chmod 000 "$PP_GUIDE"
+if [[ ! -r "$PP_GUIDE" ]]; then
+    assert_eq "$PP_NO_RECEIPT" "$(pp_review_without_receipt)" \
+        "an unreadable primary Guide keeps the generic missing-receipt reason"
+fi
 
 PP_DUP_BODY="### Changes
 
