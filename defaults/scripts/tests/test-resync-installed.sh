@@ -139,6 +139,9 @@ export GIT_COMMITTER_NAME="test" GIT_COMMITTER_EMAIL="test@example.com"
 #   defaults/.claude/commands/loom/x.md  -> .claude/commands/loom/x.md (drift)
 #   defaults/.claude/README.md           -> .claude/README.md (drift, #5264)
 #   defaults/.github/CONFIGURATION.md    -> .github/CONFIGURATION.md (drift, #5264)
+#   defaults/.loom-README.md             -> .loom/README.md (drift, #15718; note
+#                                            the source name differs from the
+#                                            destination)
 #   .loom/roles/custom-role.md           (repo-specific, no defaults/ counterpart)
 #   package.json ("version": "9.9.9")    (loom_version source for re-stamp)
 #   .loom/install-metadata.json          (re-stamp target; loom_source -> $repo)
@@ -194,6 +197,11 @@ make_fixture() {
     printf 'CLAUDE-README-OLD\n' > "$repo/.claude/README.md"
     printf 'CONFIGURATION-NEW\n' > "$repo/defaults/.github/CONFIGURATION.md"
     printf 'CONFIGURATION-OLD\n' > "$repo/.github/CONFIGURATION.md"
+
+    # `.loom/README.md` (#15718): the same shape, installed from a source whose
+    # name differs from the destination's.
+    printf 'LOOM-README-NEW\n' > "$repo/defaults/.loom-README.md"
+    printf 'LOOM-README-OLD\n' > "$repo/.loom/README.md"
 
     # Version source + metadata re-stamp target.
     printf '{\n  "version": "9.9.9"\n}\n' > "$repo/package.json"
@@ -399,7 +407,7 @@ if [[ $RC -eq 2 ]]; then
 else
     fail "(i) --dry-run did not exit 2 across widened surfaces (got $RC)"
 fi
-for surf in "roles/builder.md" "docs/troubleshooting.md" "bin/loom" "commands/loom/builder.md" ".claude/README.md" ".github/CONFIGURATION.md"; do
+for surf in "roles/builder.md" "docs/troubleshooting.md" "bin/loom" "commands/loom/builder.md" ".claude/README.md" ".github/CONFIGURATION.md" ".loom/README.md"; do
     if grep -q "$surf" <<<"$OUT"; then
         pass "(i) --dry-run reports drift for $surf"
     else
@@ -440,6 +448,11 @@ if [[ "$(cat "$REPO/.github/CONFIGURATION.md")" == "CONFIGURATION-NEW" ]]; then
 else
     fail "(i) .github/CONFIGURATION.md not resynced (#5264)"
 fi
+if [[ "$(cat "$REPO/.loom/README.md")" == "LOOM-README-NEW" ]]; then
+    pass "(i) .loom/README.md resynced from defaults/.loom-README.md (#15718)"
+else
+    fail "(i) .loom/README.md not resynced (#15718)"
+fi
 # second run is a clean no-op across the widened surfaces too
 OUT="$(cd "$REPO" && bash "$SCRIPT" 2>&1)"
 RC=$?
@@ -447,6 +460,11 @@ if [[ $RC -eq 0 ]] && grep -q "Already in sync" <<<"$OUT"; then
     pass "(i) widened surfaces idempotent (second run already in sync)"
 else
     fail "(i) widened surfaces not idempotent (rc=$RC)"
+fi
+if grep -q 'unchanged \.loom/README\.md' <<<"$OUT"; then
+    pass "(i) .loom/README.md in sync on the second run (#15718)"
+else
+    fail "(i) .loom/README.md not reported unchanged on the second run (#15718)"
 fi
 
 # --- (j) local-only custom role survives -------------------------------------
@@ -475,22 +493,23 @@ else
     fail "(k) pinned roles/builder.md was overwritten despite resync-ignore"
 fi
 
-# --- (k2) .claude/README.md / .github/CONFIGURATION.md are gated on the ------
-#          destination already existing (never force-populated, #5264)
+# --- (k2) .claude/README.md / .github/CONFIGURATION.md / .loom/README.md are
+#          gated on the destination already existing (never force-populated,
+#          #5264, #15718)
 echo "Test group 9b: single-file docs are not force-created for a consumer that never had them"
 REPO="$(make_fixture)"
-# make_fixture git-tracks both files (its `git add -A && git commit`), so a bare
-# `rm -f` would NOT simulate "a consumer that never had them" — it leaves a
-# *deleted-but-tracked* path that `git status --porcelain` reports as pending
+# make_fixture git-tracks these files (its `git add -A && git commit`), so a
+# bare `rm -f` would NOT simulate "a consumer that never had them" — it leaves
+# a *deleted-but-tracked* path that `git status --porcelain` reports as pending
 # dirt (` D .claude/README.md`). resync-installed.sh's dirty-tree hint
 # (suggest_commit_if_resync_only_dirt) then lists that path in its `git add`
 # suggestion, which the "not reported at all" assertion below greps for and
 # trips on. Drop the files from the index *and* the worktree and commit the
 # removal, so the fixture is genuinely a repo that never received them.
-git -C "$REPO" rm -q -- .claude/README.md .github/CONFIGURATION.md >/dev/null 2>&1
+git -C "$REPO" rm -q -- .claude/README.md .github/CONFIGURATION.md .loom/README.md >/dev/null 2>&1
 git -C "$REPO" commit -qm "consumer install without the single-file docs" >/dev/null 2>&1
-if [[ -z "$(git -C "$REPO" status --porcelain -- .claude/README.md .github/CONFIGURATION.md)" ]]; then
-    pass "(k2) fixture precondition: both single-file docs are absent AND untracked"
+if [[ -z "$(git -C "$REPO" status --porcelain -- .claude/README.md .github/CONFIGURATION.md .loom/README.md)" ]]; then
+    pass "(k2) fixture precondition: the single-file docs are absent AND untracked"
 else
     fail "(k2) fixture precondition: single-file docs still show as pending git changes"
 fi
@@ -506,10 +525,79 @@ if [[ ! -e "$REPO/.github/CONFIGURATION.md" ]]; then
 else
     fail "(k2) .github/CONFIGURATION.md was force-created despite being absent"
 fi
-if ! grep -q "\.claude/README\.md" <<<"$OUT" && ! grep -q "\.github/CONFIGURATION\.md" <<<"$OUT"; then
+if [[ ! -e "$REPO/.loom/README.md" ]]; then
+    pass "(k2) .loom/README.md not force-created when absent (#15718)"
+else
+    fail "(k2) .loom/README.md was force-created despite being absent (#15718)"
+fi
+if ! grep -q "\.claude/README\.md" <<<"$OUT" && ! grep -q "\.github/CONFIGURATION\.md" <<<"$OUT" && ! grep -q "\.loom/README\.md" <<<"$OUT"; then
     pass "(k2) absent single-file docs are not reported at all"
 else
     fail "(k2) absent single-file docs were unexpectedly reported"
+fi
+
+# --- (k4) .loom/resync-ignore pins .loom/README.md (#15718) ------------------
+echo "Test group 9d: .loom/resync-ignore pins .loom/README.md (#15718)"
+REPO="$(make_fixture)"
+printf 'LOOM-README-PINNED\n' > "$REPO/.loom/README.md"
+printf '.loom/README.md  # a local edit to the .loom guide\n' > "$REPO/.loom/resync-ignore"
+OUT="$(cd "$REPO" && bash "$SCRIPT" 2>&1)"
+RC=$?
+if [[ $RC -eq 0 ]] && grep -q 'skipped   \.loom/README\.md' <<<"$OUT" && grep -qi 'pinned in \.loom/resync-ignore' <<<"$OUT"; then
+    pass "(k4) pinned .loom/README.md reported as skipped"
+else
+    fail "(k4) pinned .loom/README.md not reported skipped (rc=$RC)"
+fi
+if [[ "$(cat "$REPO/.loom/README.md")" == "LOOM-README-PINNED" ]]; then
+    pass "(k4) pinned .loom/README.md NOT overwritten"
+else
+    fail "(k4) pinned .loom/README.md was overwritten despite resync-ignore"
+fi
+
+# --- (k5) a symlinked .loom/README.md is skipped, never clobbered (#15718) ---
+echo "Test group 9e: symlinked .loom/README.md is skipped (dogfood safety, #15718)"
+REPO="$(make_fixture)"
+rm -f "$REPO/.loom/README.md"
+ln -s "../defaults/.loom-README.md" "$REPO/.loom/README.md"
+OUT="$(cd "$REPO" && bash "$SCRIPT" 2>&1)"
+RC=$?
+if [[ $RC -eq 0 ]] && grep -q 'skipped   \.loom/README\.md' <<<"$OUT" && grep -qi "symlink" <<<"$OUT"; then
+    pass "(k5) symlinked .loom/README.md reported as skipped"
+else
+    fail "(k5) symlinked .loom/README.md not reported skipped (rc=$RC)"
+fi
+if [[ -L "$REPO/.loom/README.md" ]]; then
+    pass "(k5) symlinked .loom/README.md left a symlink (not replaced by a copy)"
+else
+    fail "(k5) symlinked .loom/README.md was clobbered"
+fi
+
+# --- (k6) a run whose ONLY output is .loom/README.md is resync dirt, not -----
+#          foreign dirt, in the commit hint's allowlist (#15718)
+echo "Test group 9f: a run touching only .loom/README.md is classified as resync output (#15718)"
+REPO="$(make_fixture)"
+# Bring every surface in sync and commit it, then land a template fix the way
+# main does (a commit on defaults/), so the installed .loom/README.md is the
+# ONE thing the next run rewrites.
+(cd "$REPO" && bash "$SCRIPT" >/dev/null 2>&1) || true
+git -C "$REPO" add -A >/dev/null 2>&1
+git -C "$REPO" commit -qm "chore: resync installed Loom surfaces" >/dev/null 2>&1
+printf 'LOOM-README-V2\n' > "$REPO/defaults/.loom-README.md"
+git -C "$REPO" add -A >/dev/null 2>&1
+git -C "$REPO" commit -qm "docs: fix the .loom README template" >/dev/null 2>&1
+OUT="$(cd "$REPO" && bash "$SCRIPT" 2>&1)"
+RC=$?
+dirty="$(git -C "$REPO" status --porcelain | tr '\n' ' ')"
+if [[ $RC -eq 0 ]] && [[ "$dirty" == *" M .loom/README.md "* ]]; then
+    pass "(k6) the run rewrote .loom/README.md, which is now pending dirt (status='$dirty')"
+else
+    fail "(k6) the run did not leave .loom/README.md as its output (rc=$RC, status='$dirty')"
+fi
+commit_line="$(grep -m1 'would be: git add ' <<<"$OUT")"
+if [[ -n "$commit_line" ]] && grep -qF -- '.loom/README.md' <<<"$commit_line"; then
+    pass "(k6) .loom/README.md is in the commit hint's allowlist (resync output, not foreign dirt)"
+else
+    fail "(k6) .loom/README.md was classified as foreign dirt, so no commit hint named it (rc=$RC)"
 fi
 
 # --- (l) symlinked install target is skipped, not clobbered ------------------

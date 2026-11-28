@@ -679,7 +679,10 @@ pub(super) fn retired_target(entry: &str) -> Option<String> {
     {
         return None;
     }
-    if entry == ".claude/README.md" || entry == ".github/CONFIGURATION.md" {
+    if entry == ".claude/README.md"
+        || entry == ".github/CONFIGURATION.md"
+        || entry == ".loom/README.md"
+    {
         return Some(entry.to_string());
     }
     MOVED

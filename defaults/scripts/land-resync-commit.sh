@@ -302,12 +302,16 @@ fi
 # from BOTH lists at once, so the parity test had nothing to disagree about,
 # while every resync that changed the rate card was refused here as
 # "non-resync dirt".
+#
+# #15718: `.loom/README.md` (the destination-gated copy of
+# `defaults/.loom-README.md`) joins the list with its sibling's own
+# `collect_resync_dirt()` arm, so the parity test keeps the two equal.
 is_resync_surface_path() {
     case "$1" in
         .loom/hooks/* | .loom/scripts/* | .loom/roles/* | .loom/docs/* | \
             .loom/bin/* | .loom/runtimes/* | .agents/skills/* | \
             .claude/commands/loom/* | .claude/agents/* | .claude/README.md | .claude/biome.jsonc | \
-            .github/CONFIGURATION.md | .github/labels.yml | .loom/biome.jsonc | .loom/CLAUDE.md | \
+            .github/CONFIGURATION.md | .loom/README.md | .github/labels.yml | .loom/biome.jsonc | .loom/CLAUDE.md | \
             .loom/install-metadata.json | .gitattributes | .gitignore | .loom/pricing.json)
             return 0
             ;;

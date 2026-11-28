@@ -90,6 +90,8 @@
 #   (r)  the rate card (.loom/pricing.json) -> both land in one commit on
 #        modified, plus tracked scripts      origin; neither is "non-resync
 #        a release retired (deleted)         dirt" any more (#15519)
+#   (s)  .loom/README.md modified alone     -> lands on origin; not "non-resync
+#                                              dirt" (#15718)
 #
 # Usage:
 #   ./.loom/scripts/tests/test-land-resync-commit.sh
@@ -1047,6 +1049,43 @@ if [[ -z "$(git -C "$R" status --porcelain)" ]]; then
     pass "the primary checkout is clean afterwards (nothing was left behind as dirt)"
 else
     fail "the primary checkout is clean afterwards (status=$(git -C "$R" status --porcelain))"
+fi
+
+echo ""
+echo "=== (s) .loom/README.md modified alone lands; it is not \"non-resync dirt\" (#15718) ==="
+gh_stub_reset
+make_origin origin-s
+make_primary origin-s primary-s
+S="$WORKDIR/primary-s"
+# What an install leaves behind: a .loom/README.md a later release changes.
+printf 'OLD README\n' > "$S/.loom/README.md"
+git -C "$S" add -A
+git -C "$S" commit -q -m "scaffold: an installed .loom/README.md"
+git -C "$S" push -q origin main
+# What resync-installed.sh leaves behind when only that file changed: before
+# #15718 the path was on neither surface list, so this script refused its own
+# sibling's output as non-resync dirt.
+printf 'NEW README\n' > "$S/.loom/README.md"
+OUT="$(cd "$S" && "$SCRIPT" --dry-run 2>&1)"; RC=$?
+if [[ $RC -eq 0 ]] && grep -q "Would commit 1 resync-managed path(s)" <<< "$OUT" && \
+   ! grep -qi "non-resync dirt" <<< "$OUT"; then
+    pass "a modified .loom/README.md alone is resync dirt, not a refusal"
+else
+    fail "a modified .loom/README.md alone is resync dirt, not a refusal (rc=$RC, out=$OUT)"
+fi
+OUT="$(cd "$S" && "$SCRIPT" 2>&1)"; RC=$?
+ORIGIN_S="$WORKDIR/origin-s.git"
+if [[ $RC -eq 0 ]] && grep -q "pushed" <<< "$OUT" && \
+   [[ "$(git --git-dir="$ORIGIN_S" log -1 --format='%s' main)" == "chore: resync installed Loom surfaces" ]] && \
+   [[ "$(git --git-dir="$ORIGIN_S" show main:.loom/README.md)" == "NEW README" ]]; then
+    pass "the .loom/README.md update lands on origin under the resync subject"
+else
+    fail "the .loom/README.md update lands on origin under the resync subject (rc=$RC, out=$OUT)"
+fi
+if [[ -z "$(git -C "$S" status --porcelain)" ]]; then
+    pass "the primary checkout is clean afterwards (nothing was left behind as dirt)"
+else
+    fail "the primary checkout is clean afterwards (status=$(git -C "$S" status --porcelain))"
 fi
 
 echo ""

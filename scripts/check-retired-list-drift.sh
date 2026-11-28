@@ -50,6 +50,8 @@
 #   defaults/.claude/commands/loom/<rel>-> commands/loom/<rel>
 #   defaults/.claude/README.md          -> .claude/README.md
 #   defaults/.github/CONFIGURATION.md   -> .github/CONFIGURATION.md
+#   defaults/.loom-README.md            -> .loom/README.md      (source name
+#                                          differs from the target, #15718)
 #
 # Two surfaces resync-installed.sh syncs are deliberately NOT here, because
 # retired_target_path() has no case arm for them and so no entry could ever
@@ -126,6 +128,7 @@ entry_for_defaults_path() {
         .claude/commands/loom/*)   printf 'commands/loom/%s' "${rel#.claude/commands/loom/}" ;;
         .claude/README.md)         printf '.claude/README.md' ;;
         .github/CONFIGURATION.md)  printf '.github/CONFIGURATION.md' ;;
+        .loom-README.md)           printf '.loom/README.md' ;;
         *)                         printf '' ;;
     esac
 }
@@ -143,6 +146,7 @@ defaults_path_for_entry() {
         commands/loom/*)           printf '.claude/commands/loom/%s' "${entry#commands/loom/}" ;;
         .claude/README.md)         printf '.claude/README.md' ;;
         .github/CONFIGURATION.md)  printf '.github/CONFIGURATION.md' ;;
+        .loom/README.md)           printf '.loom-README.md' ;;
         *)                         printf '' ;;
     esac
 }
@@ -443,7 +447,8 @@ self_test() {
             | sed -n 's/^ *\([^ )|]*\)).*/\1/p' | grep -v '^\*$' | LC_ALL=C sort)"
         arms_expected="$(printf '%s\n' \
             'hooks/*' 'scripts/*' 'roles/*' 'docs/*' 'runtimes/*' 'bin/*' \
-            'commands/loom/*' '.claude/README.md' '.github/CONFIGURATION.md' | LC_ALL=C sort)"
+            'commands/loom/*' '.claude/README.md' '.github/CONFIGURATION.md' \
+            '.loom/README.md' | LC_ALL=C sort)"
         if [[ "$arms_actual" == "$arms_expected" ]]; then
             st_pass "resync-installed.sh's retired_target_path() case arms match this gate's expected set (one-directional)"
         else
@@ -455,6 +460,32 @@ $arms_expected"
         fi
     else
         st_fail_msg "could not find defaults/scripts/resync-installed.sh to cross-check the surface map"
+    fi
+
+    # (8) defaults/.loom-README.md is expressible payload (#15718): deleting it
+    # is gated like any other surface's and names the entry to add; with the
+    # entry recorded the same deletion passes (and the entry is not "stale").
+    st_fixture "$tmp/g"
+    printf 'the .loom guide\n' > "$tmp/g/defaults/.loom-README.md"
+    git -C "$tmp/g" add -A >/dev/null 2>&1
+    git -C "$tmp/g" commit -qm "ship the .loom guide" >/dev/null 2>&1
+    base="$(git -C "$tmp/g" rev-parse HEAD)"
+    git -C "$tmp/g" rm -q defaults/.loom-README.md
+    git -C "$tmp/g" commit -qm "retire the .loom guide, no entry" >/dev/null 2>&1
+    out="$(st_run "$tmp/g" "$base")"; rc=$?
+    if [[ $rc -ne 0 ]] && grep -q 'add to defaults/.loom-retired.list:  .loom/README\.md' <<<"$out"; then
+        st_pass "deleting defaults/.loom-README.md with no entry fails and names .loom/README.md"
+    else
+        st_fail_msg "deleting defaults/.loom-README.md with no entry was not gated (rc=$rc): $out"
+    fi
+    printf '\n# #0000 — fixture retirement\n.loom/README.md\n' >> "$tmp/g/defaults/.loom-retired.list"
+    git -C "$tmp/g" add -A >/dev/null 2>&1
+    git -C "$tmp/g" commit -qm "retire the .loom guide, with entry" >/dev/null 2>&1
+    out="$(st_run "$tmp/g" "$base")"; rc=$?
+    if [[ $rc -eq 0 ]]; then
+        st_pass "a recorded .loom-README.md retirement passes"
+    else
+        st_fail_msg "a recorded .loom-README.md retirement did not pass (rc=$rc): $out"
     fi
 
     if [[ $st_fail -eq 0 ]]; then
