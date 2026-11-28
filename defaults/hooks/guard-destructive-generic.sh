@@ -1979,7 +1979,7 @@ function has_live_subst(str,    i, c, bs) {
 # and k+1. Callers that ignore it are unaffected; parse_force_ops() reads it.
 # =============================================================================
 _QSPLIT_AWK="$_HASLIVESUBST_AWK"'
-function qsplit(s,   out, n, i, c, j, qc, ci, inner, SQ, DQ, k, ch, scanfrom, bs, bk) {
+function qsplit(s, join_lines_only,   out, n, i, c, j, qc, ci, inner, SQ, DQ, k, ch, scanfrom, bs, bk) {
     SQ = sprintf("%c", 39)   # single quote
     DQ = sprintf("%c", 34)   # double quote
     out = ""
@@ -2060,8 +2060,9 @@ function qsplit(s,   out, n, i, c, j, qc, ci, inner, SQ, DQ, k, ch, scanfrom, bs
                 continue
             }
             inner = substr(s, i + 1, ci - i - 1)
-            if (!has_live_subst(inner)) {
-                # Inert quoted span: copy verbatim, separators inside are literal.
+            if (join_lines_only || !has_live_subst(inner)) {
+                # Joining lines preserves the entire span. During segmentation,
+                # only an inert span keeps its separators literal.
                 out = out substr(s, i, ci - i + 1)
                 i = ci + 1
                 continue
@@ -2180,6 +2181,9 @@ function qsplit(s,   out, n, i, c, j, qc, ci, inner, SQ, DQ, k, ch, scanfrom, bs
             i += 2
             continue
         }
+        # The rm scanner first joins continued physical lines, then uses the
+        # operators from a separate qsplit call for each logical line.
+        if (join_lines_only) { out = out c; i++; continue }
         if (c == ";") { out = out "\n"; qsplit_op[++qsplit_nops] = ";"; i++; continue }
         if (c == "&") {
             if (i < n && substr(s, i + 1, 1) == "&") { out = out "\n"; qsplit_op[++qsplit_nops] = "&&"; i += 2; continue }
@@ -7737,6 +7741,9 @@ _extract_rm_targets_scan() {
         CDM = sprintf("%c", 31); UNRM = sprintf("%c", 29); RSM = sprintf("%c", 30)
         SQ = sprintf("%c", 39); DQ = sprintf("%c", 34); BS = sprintf("%c", 92)
         BAD = "$`*?[ \t" SQ DQ BS CDM UNRM RSM
+        # SPM stands in for whitespace INSIDE one rm operand so the caller word
+        # split keeps a quoted/escaped filename whole; the caller maps it back.
+        SPM = sprintf("%c", 28)
     }
     # True if `s` has a byte that makes a cd path non-literal (expansion, glob,
     # quote, escape, whitespace) or collides with an output mark.
@@ -7744,6 +7751,11 @@ _extract_rm_targets_scan() {
         for (q = 1; q <= length(BAD); q++)
             if (index(s, substr(BAD, q, 1)) > 0) return 1
         return 0
+    }
+    function push_cwd() {
+        sdepth++
+        st_cwd[sdepth] = curcwd; st_seen[sdepth] = cdseen; st_unres[sdepth] = cdunres
+        st_link[sdepth] = cdlink; st_why[sdepth] = cdwhy
     }
     # Resolve one `cd` segment (toks[1..m]); updates curcwd/cdunres/cdseen.
     function track_cd(   k, arg, cls, bad, wasbroken) {
@@ -7790,12 +7802,16 @@ _extract_rm_targets_scan() {
         }
         curcwd = curcwd "/" cls
     }
-    {
-        # A new input record is a newline boundary, i.e. a `;`: an earlier cd
-        # does not reliably move this record (#15169 review).
+    { buf = buf (NR > 1 ? "\n" : "") $0 }
+    END {
+        if (index(buf, BS "\n")) buf = qsplit(buf, 1)
+        nlines = split(buf, lines, "\n")
+        for (ln = 1; ln <= nlines; ln++) scan_rm_line(lines[ln])
+    }
+    function scan_rm_line(line) {
+        # An uncontinued newline breaks the link to an earlier cd (#15169).
         if (startunres != 1) cdlink = 0
-        $0 = qsplit($0)   # quote-aware segmentation (#3755)
-        n = split($0, segs, "\n")
+        n = split(qsplit(line), segs, "\n")
         # qsplit_op[k] is the operator between segments k and k+1, but a literal
         # newline records none: when the counts disagree the operators cannot be
         # trusted, so every cd below fails closed.
@@ -7808,30 +7824,71 @@ _extract_rm_targets_scan() {
             if (i > 1 && startunres != 1 && (!opsok || (qsplit_op[i - 1] != "&&" &&
                 !(qsplit_op[i - 1] == "&" && segs[i - 1] ~ /[<>][ \t]*$/)))) cdlink = 0
             sub(/^[ \t]+/, "", seg)
+            # FUNCTION-DEFINITION HEADERS AND GROUPING OPENERS BEFORE AN rm
+            # (#15221). qsplit() breaks only on ;/&/|, so `probe() { rm -f
+            # "$X/y"; }` keeps the rm mid-segment behind the definition
+            # header and the ^rm test below never fired: an rm that is the
+            # only statement of a function body (or that sits behind a
+            # leading { group / ( subshell opener in the same segment) was
+            # invisible to every rm-scope check, while the same rm after any
+            # earlier ; statement denied — the fail-open asymmetry #15221
+            # reports. Strip a leading `name [()] {` / `name [()] (` or
+            # `function name [()] {` header (bash function names allow `-`,
+            # `.`, `:`, `/` and other non-metacharacter word chars beyond POSIX
+            # `NAME`, e.g. `loom-daemon() { ... }`) and leading `{ `/`( `
+            # openers, mirroring the cd-tracker opener strip in
+            # extract_write_targets() (#12082) and the
+            # wt_write_tmp_cwd_loop_var_safe() strip (#11975) rather than
+            # inventing a parser. `((` (arithmetic) is never a subshell opener;
+            # `do`/`then`/`else`/`if` openers are deliberately NOT stripped
+            # (out of scope for #15221 — see the #9323/#9601 block comment at
+            # the loop-variable resolver). The strip runs BEFORE the sudo strip
+            # so `( sudo rm ... )` resolves too, and can only ADD rm targets,
+            # never remove one: it deletes shell structure preceding the
+            # command word only, and a segment whose first word already is `rm`
+            # matches none of these shapes.
+            lead = 0   # number of subshells enclosing the command word
+            fname = "" # function whose body this segment starts (its rm runs at CALL time)
+            while (1) {
+                if (seg ~ /^[A-Za-z0-9_./+@%,:?~-]+[ \t]*\(\)[ \t]*[\{(]/) {
+                    fname = seg; sub(/[ \t]*\(\).*$/, "", fname)
+                    if (seg ~ /^[A-Za-z0-9_./+@%,:?~-]+[ \t]*\(\)[ \t]*\(/) lead++
+                    sub(/^[A-Za-z0-9_./+@%,:?~-]+[ \t]*\(\)[ \t]*[\{(][ \t]*/, "", seg)
+                }
+                else if (seg ~ /^function[ \t]+[A-Za-z0-9_./+@%,:?~-]+([ \t]*\(\))?[ \t]*[\{(]/) {
+                    fname = seg; sub(/^function[ \t]+/, "", fname); sub(/[ \t]*(\(\))?[ \t]*[\{(].*$/, "", fname)
+                    if (seg ~ /^function[ \t]+[A-Za-z0-9_./+@%,:?~-]+([ \t]*\(\))?[ \t]*\(/) lead++
+                    sub(/^function[ \t]+[A-Za-z0-9_./+@%,:?~-]+([ \t]*\(\))?[ \t]*[\{(][ \t]*/, "", seg)
+                }
+                else if (seg ~ /^\{[ \t]/)
+                    sub(/^\{[ \t]+/, "", seg)
+                else if (seg ~ /^\(/ && seg !~ /^\(\(/) {
+                    lead++
+                    sub(/^\([ \t]*/, "", seg)
+                }
+                else break
+            }
+            sub(/^[ \t]+/, "", seg)
             sudo = sub(/^sudo[ \t]+/, "", seg)
             sub(/^[ \t]+/, "", seg)
             # Grouping: `{ ` runs in the current shell (stripped); `(` and `$(`
             # open a subshell whose cd never leaks out, so save the state on
             # each open paren and restore it on each close (#12082 analogue).
-            # Quoted spans are blanked before counting.
+            # Consume quoted spans and escaped bytes together so literal parens
+            # cannot change the directory stack. A backslash pair is one literal.
             while (seg ~ /^\{[ \t]/) sub(/^\{[ \t]+/, "", seg)
             pq = segs[i]
-            gsub(/"[^"]*"/, "", pq)
-            gsub(/\047[^\047]*\047/, "", pq)
+            gsub(/\\.|"([^"\\]|\\.)*"|\047[^\047]*\047/, "", pq)
             popen = gsub(/\(/, "", pq)
             pclose = gsub(/\)/, "", pq)
             # A leading `(` encloses this segment, so the state is saved before
             # it; a `$(` later in the segment opens AFTER the segment own
             # command ran in the outer shell, so that save happens after it.
-            lead = (seg ~ /^\(/ && seg !~ /^\(\(/) ? 1 : 0
             npush = (popen - pclose > lead) ? popen - pclose : lead
             if (npush > popen) npush = popen
             npop = pclose - (popen - npush)
             if (lead > npush) lead = npush
-            if (lead) {
-                sdepth++
-                st_cwd[sdepth] = curcwd; st_seen[sdepth] = cdseen; st_unres[sdepth] = cdunres; st_link[sdepth] = cdlink; st_why[sdepth] = cdwhy
-            }
+            for (q = 0; q < lead; q++) push_cwd()
             while (seg ~ /^\([ \t]*/ && seg !~ /^\(\(/) sub(/^\([ \t]*/, "", seg)
             if (!sudo && seg ~ /^cd([ \t]|$)/) {
                 m = split(seg, toks, /[ \t]+/)
@@ -7855,32 +7912,127 @@ _extract_rm_targets_scan() {
             else if (seg ~ /^rm([ \t]|$)/) {
                 emit_rm()
             }
-            for (q = lead; q < npush; q++) {
-                sdepth++
-                st_cwd[sdepth] = curcwd; st_seen[sdepth] = cdseen; st_unres[sdepth] = cdunres; st_link[sdepth] = cdlink; st_why[sdepth] = cdwhy
+            else {
+                # A call to a function defined earlier in this command: its
+                # relative rm operands resolve in THIS directory, not the one
+                # in effect where the body was written.
+                wd = seg; sub(/[ \t].*$/, "", wd)
+                if (wd != "" && (wd in fn_tok)) replay_fn(wd)
             }
+            for (q = lead; q < npush; q++) push_cwd()
             for (q = 0; q < npop && sdepth > 0; q++) {
                 curcwd = st_cwd[sdepth]; cdseen = st_seen[sdepth]; cdunres = st_unres[sdepth]; cdlink = st_link[sdepth]; cdwhy = st_why[sdepth]
                 sdepth--
             }
         }
     }
-    function emit_rm(   j, has_rf) {
-        m = split(seg, toks, /[ \t]+/)
-        has_rf = 0
-        for (j = 2; j <= m; j++)
-            if (toks[j] ~ /^-/ && toks[j] ~ /[rRfF]/) has_rf = 1
-        if (!has_rf) return
-        for (j = 2; j <= m; j++) {
-            if (toks[j] == "") continue
-            if (toks[j] ~ /^-/) continue
-            if (cdlink && !cdunres && curcwd ~ /^\//)
-                print mark CDM curcwd CDM toks[j]
-            else if (cdlink || index(toks[j], CDM) > 0 || index(toks[j], UNRM) > 0)
-                print mark UNRM (cdlink && cdunres && cdwhy != "" ? cdwhy : "c") toks[j]
-            else
-                print mark toks[j]
+    # The grouping openers have already been removed from s. Keep parens
+    # inside quoted/escaped filenames and balanced operand expressions.
+    function rm_command_text(s,   pos, c, quote, depth, args, tail, bdepth, prev, p) {
+        for (pos = 1; pos <= length(s); pos++) {
+            c = substr(s, pos, 1)
+            p = prev; prev = c
+            if (c == BS && quote != SQ) { pos++; prev = ""; continue }
+            if (quote != "") {
+                if (c == quote) quote = ""
+            } else if (c == SQ || c == DQ || c == "`") {
+                quote = c
+            } else if (c == "{" && p == "$") {
+                bdepth++
+            } else if (c == "}" && bdepth > 0) {
+                bdepth--
+            } else if (c == "(") {
+                depth++
+            } else if (c == ")") {
+                if (depth > 0) { depth--; continue }
+                args = substr(s, 1, pos - 1)
+                tail = substr(s, pos)
+                if (tail ~ /^[) \t]+$/) return args
+                # A redirection or comment can follow the subshell. Only
+                # discard that trailer when no unquoted ${...} is still open.
+                if (tail !~ /^[) \t]+(([0-9]+|\{[a-zA-Z_][a-zA-Z0-9_]*\})?[<>]|#)/) continue
+                # Only an unquoted, still-open ${...} could hide this paren;
+                # quoted text was skipped by the scan above.
+                if (bdepth == 0) return args
+            }
         }
+        return s
+    }
+    # Print one operand with the provenance prefix for the directory in effect.
+    function emit_tok(t) {
+        if (cdlink && !cdunres && curcwd ~ /^\//)
+            print mark CDM curcwd CDM t
+        else if (cdlink || index(t, CDM) > 0 || index(t, UNRM) > 0)
+            print mark UNRM (cdlink && cdunres && cdwhy != "" ? cdwhy : "c") t
+        else
+            print mark t
+    }
+    # Replay the operands of a function-body rm at a call site.
+    function replay_fn(name,   k, cnt, parts) {
+        cnt = split(fn_tok[name], parts, " ")
+        for (k = 1; k <= cnt; k++) emit_tok(parts[k])
+    }
+    # Split on unquoted whitespace so a quoted or escaped filename stays one
+    # word (spaces inside it become SPM); toks[1..m] as before.
+    function rm_words(s,   pos, c, w, q, inw, nc) {
+        m = 0; w = ""; q = ""; inw = 0
+        for (pos = 1; pos <= length(s); pos++) {
+            c = substr(s, pos, 1)
+            if (q == "" && (c == " " || c == "\t")) {
+                if (inw) { toks[++m] = w; w = ""; inw = 0 }
+                continue
+            }
+            inw = 1
+            if (c == BS && q != SQ) {
+                nc = substr(s, pos + 1, 1); pos++
+                if (nc == " " || nc == "\t") nc = SPM
+                w = w c nc
+                continue
+            }
+            if (q != "") {
+                if (c == q) q = ""
+                w = w ((c == " " || c == "\t") ? SPM : c)
+                continue
+            }
+            if (c == SQ || c == DQ) q = c
+            w = w c
+        }
+        if (inw) toks[++m] = w
+    }
+    function emit_rm(   j, has_rf, collide, t, rest, nt, tg, k, redir) {
+        if (sdepth && index(seg, ")")) seg = rm_command_text(seg)
+        collide = (index(seg, SPM) > 0)
+        rm_words(seg)
+        redir = "^([0-9]*|&|\\{[a-zA-Z_][a-zA-Z0-9_]*\\})(>>|>\\||>&|<&|<<<|<<|>|<)"
+        has_rf = 0; nt = 0
+        for (j = 2; j <= m; j++) {
+            t = toks[j]
+            if (t ~ /^&?[0-9]*[<>]/ || t ~ redir || t ~ /^&>/) {
+                # A redirection attached to the command is not an operand; a
+                # bare operator takes the following word with it.
+                rest = t; sub(redir, "", rest)
+                if (rest == "" || t ~ /^[0-9]*[<>]+$/) j++
+                continue
+            }
+            if (t ~ /^-/) { if (t ~ /[rRfF]/) has_rf = 1; continue }
+            if (t != "") tg[++nt] = t
+        }
+        if (!has_rf) return
+        for (k = 1; k <= nt; k++) {
+            t = tg[k]
+            if (collide) { print mark UNRM "c" t; continue }
+            if (fname != "") {
+                # Body of a function definition: judge the operand now against the
+                # session verdict (no directory guess) and again, with the
+                # directory in effect, at every call.
+                if (index(t, CDM) > 0 || index(t, UNRM) > 0) print mark UNRM "c" t
+                else print mark t
+                fn_tok[fname] = fn_tok[fname] " " t
+                continue
+            }
+            emit_tok(t)
+        }
+        if (fname != "" && !(fname in fn_tok)) fn_tok[fname] = ""
     }'
 }
 
@@ -9963,6 +10115,10 @@ if echo "$COMMAND_RM_SCAN" | grep -qE 'rm[[:space:]]+-[a-zA-Z]*[rf]'; then
                 target="${target:1}"
                 ;;
         esac
+
+        # Whitespace inside one quoted/escaped operand travels as 0x1C so the
+        # word split above keeps the filename whole; restore it.
+        target="${target//$'\034'/ }"
 
         # Skip empty targets
         [[ -z "$target" ]] && continue
