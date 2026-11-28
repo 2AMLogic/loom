@@ -317,6 +317,10 @@ pub mod launch_record;
 pub mod launchd_env_drift;
 pub mod launchd_reload;
 pub mod limit_calibration;
+/// Test-only: spool `--list` output when stdout is a pipe, so nextest's
+/// discovery never finds the lib test binary stuck on a full pipe (#15553).
+#[cfg(all(test, target_os = "linux"))]
+mod list_pipe_spool;
 pub mod live_claim;
 /// Test-only: a `gh` stand-in prepended to `PATH` before `main`, failing the
 /// run on any spawn of the real `gh` (#10138).
