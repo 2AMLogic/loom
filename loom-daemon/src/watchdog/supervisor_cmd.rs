@@ -121,9 +121,9 @@ fn run_bounded_for(argv: &[String], timeout: Duration) -> Option<i32> {
     let (program, args) = argv.split_first()?;
     let mut cmd = Command::new(program);
     cmd.args(args);
-    crate::sweep_registry::output_with_timeout(cmd, timeout)
+    crate::proc_exec::run_bounded(cmd, timeout)
         .ok()
-        .flatten()
+        .and_then(crate::proc_exec::Completion::output)
         .and_then(|o| o.status.code())
 }
 

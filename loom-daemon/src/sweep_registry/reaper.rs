@@ -67,7 +67,8 @@ pub(crate) const REAP_GH_TIMEOUT: Duration = Duration::from_secs(5);
 /// Env var overriding [`REAP_GH_TIMEOUT`] (whole seconds; zero/invalid ignored).
 pub const REAP_GH_TIMEOUT_ENV: &str = "LOOM_REAP_GH_TIMEOUT_SECS";
 
-/// Poll cadence for [`output_with_timeout`] while waiting on a reaper `gh` call.
+/// Poll cadence for the `try_wait` loop in the detached lease-renewal launcher
+/// (`dispatch.rs`).
 pub(crate) const REAP_GH_POLL_INTERVAL: Duration = Duration::from_millis(20);
 
 /// Whether a daemon-dispatched child should route through `claude-wrapper.sh`'s
@@ -97,41 +98,6 @@ pub(crate) fn reap_gh_timeout() -> Duration {
         .filter(|&n| n > 0)
         .map(Duration::from_secs)
         .unwrap_or(REAP_GH_TIMEOUT)
-}
-
-/// Run `cmd` to completion but abandon (kill) it if it exceeds `timeout`
-/// (Issue #3973).
-///
-/// Returns `Ok(Some(output))` when the child completed within the window,
-/// `Ok(None)` when it was killed for exceeding `timeout`, and `Err` when the
-/// spawn itself failed. Used to bound the best-effort `gh` calls the reaper
-/// makes on the `ListSweeps` / `GetSweepStatus` read path so a wedged `gh`/XPC
-/// cannot block the registry read indefinitely (the 2026-07-26 incident).
-///
-/// stdout/stderr are forced to `piped()` so a completed call's output is always
-/// captured (callers that parse stdout — e.g. the `loom:blocked` probe — depend
-/// on this). The reaper's `gh` invocations emit a tiny payload (a label list or
-/// an edit ack), so the `try_wait` poll loop never risks a full-pipe-buffer
-/// deadlock; the kill-on-timeout path drains the pipe via `wait()` after the
-/// signal.
-pub(crate) fn output_with_timeout(
-    mut cmd: Command,
-    timeout: Duration,
-) -> std::io::Result<Option<std::process::Output>> {
-    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
-    let mut child = cmd.spawn()?;
-    let deadline = Instant::now() + timeout;
-    loop {
-        if child.try_wait()?.is_some() {
-            return child.wait_with_output().map(Some);
-        }
-        if Instant::now() >= deadline {
-            let _ = child.kill();
-            let _ = child.wait();
-            return Ok(None);
-        }
-        std::thread::sleep(REAP_GH_POLL_INTERVAL);
-    }
 }
 
 /// Resolve the configured reaper interval from the environment, falling

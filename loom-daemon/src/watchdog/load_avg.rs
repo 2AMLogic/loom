@@ -28,9 +28,9 @@ pub fn sample() -> String {
 fn run(program: &str, args: &[&str]) -> Option<String> {
     let mut cmd = std::process::Command::new(program);
     cmd.args(args);
-    let out = crate::sweep_registry::output_with_timeout(cmd, std::time::Duration::from_secs(5))
-        .ok()
-        .flatten()?;
+    let out = crate::proc_exec::run_bounded(cmd, std::time::Duration::from_secs(5))
+        .ok()?
+        .output()?;
     out.status
         .success()
         .then(|| String::from_utf8_lossy(&out.stdout).into_owned())

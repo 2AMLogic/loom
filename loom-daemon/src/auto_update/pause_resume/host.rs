@@ -209,8 +209,9 @@ fn docker_container_ready(name: &str, cwd: &str) -> Result<(), String> {
         std::env::var("LOOM_CODEX_SESSION_DOCKER").ok().as_deref(),
     ));
     cmd.args(["inspect", "--type", "container", name]);
-    let out = crate::sweep_registry::reaper::output_with_timeout(cmd, Duration::from_secs(15))
+    let out = crate::proc_exec::run_bounded(cmd, Duration::from_secs(15))
         .map_err(|e| format!("docker inspect {name}: {e}"))?
+        .output()
         .ok_or_else(|| format!("docker inspect {name} timed out"))?;
     let state = serde_json::from_slice::<serde_json::Value>(&out.stdout)
         .ok()

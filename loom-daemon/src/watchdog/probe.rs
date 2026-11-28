@@ -101,7 +101,7 @@ fn run_probe(bin: &Path, args: &[String], socket_path: &Path, timeout: Duration)
     cmd.args(args).env("LOOM_SOCKET_PATH", socket_path);
 
     // #14100: attribute the probe's pid (start line only; the child is
-    // short-lived and awaited below). `output_with_timeout` exposes no pid, so
+    // short-lived and awaited below). `run_bounded` exposes no pid, so
     // use the observed runner.
     let argv = crate::fleet_sync::git_spawn_log::argv_of(&cmd);
     match crate::proc_exec::run_bounded_observed(cmd, timeout, |pid| {

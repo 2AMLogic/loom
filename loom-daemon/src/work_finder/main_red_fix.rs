@@ -360,9 +360,9 @@ fn file_alert(root: &Path, issue: u32, waited: Duration) -> bool {
         if force {
             cmd.arg("--force");
         }
-        crate::sweep_registry::output_with_timeout(cmd, Duration::from_secs(60))
+        crate::proc_exec::run_bounded(cmd, Duration::from_secs(60))
             .ok()
-            .flatten()
+            .and_then(crate::proc_exec::Completion::output)
             .map_or(AlertOutcome::Failed, |o| {
                 classify_alert_run(o.status.code(), &String::from_utf8_lossy(&o.stderr), issue)
             })

@@ -306,9 +306,9 @@ const SUPERVISOR_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_
 fn systemd_show(unit: &str, prop: &str) -> Option<String> {
     let mut cmd = std::process::Command::new("systemctl");
     cmd.args(["--user", "show", "-p", prop, "--value", unit]);
-    let out = crate::sweep_registry::output_with_timeout(cmd, SUPERVISOR_PROBE_TIMEOUT)
-        .ok()
-        .flatten()?;
+    let out = crate::proc_exec::run_bounded(cmd, SUPERVISOR_PROBE_TIMEOUT)
+        .ok()?
+        .output()?;
     if !out.status.success() {
         return None;
     }
@@ -352,9 +352,9 @@ fn supervisor_last_exit(service: &str) -> Option<i64> {
     }
     let mut cmd = std::process::Command::new("launchctl");
     cmd.args(["print", service]);
-    let out = crate::sweep_registry::output_with_timeout(cmd, std::time::Duration::from_secs(5))
-        .ok()
-        .flatten()?;
+    let out = crate::proc_exec::run_bounded(cmd, std::time::Duration::from_secs(5))
+        .ok()?
+        .output()?;
     super::remediation::parse_launchd_last_exit(&String::from_utf8_lossy(&out.stdout))
 }
 

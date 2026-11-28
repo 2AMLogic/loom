@@ -43,7 +43,7 @@ impl SweepRegistry {
     }
 
     /// Run `inv`, shaped like
-    /// [`output_with_timeout`](crate::sweep_registry::reaper::output_with_timeout):
+    /// [`run_bounded`](crate::proc_exec::run_bounded):
     /// `Ok(Some(out))` when `gh` ran (any exit status), `Ok(None)` when it
     /// outlived the deadline (and was killed), `Err` when it could not be
     /// started or collected.
