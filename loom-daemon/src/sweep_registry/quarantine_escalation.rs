@@ -48,21 +48,32 @@ pub fn effective_quarantine_ttl_secs(config: &QuarantineConfig, generation: u32)
 /// Resolve the escalation ceiling for `repo_root` with precedence
 /// **env > config > default** (`autonomous.workFinder.quarantine.ttlMaxSecs`),
 /// then clamp it up to `ttl_secs` — the ceiling may only extend the pause.
+/// Reads the config tiers itself; since #15663 only the escalation tests call
+/// it — [`resolve_quarantine_config`] goes through
+/// `resolve_quarantine_ttl_max_from_block` instead, to share its one read.
 #[must_use]
 pub fn resolve_quarantine_ttl_max(repo_root: &Path, ttl_secs: u64) -> Duration {
-    let from_file = || {
-        let effective = crate::config_resolver::resolve_effective_config(repo_root);
-        crate::config_resolver::get_path(&effective, "autonomous.workFinder.quarantine.ttlMaxSecs")
-            .and_then(serde_json::Value::as_u64)
-            .filter(|&s| s > 0)
-    };
-    let secs = std::env::var(QUARANTINE_TTL_MAX_ENV)
-        .ok()
-        .and_then(|v| v.trim().parse::<u64>().ok())
-        .filter(|&s| s > 0)
-        .or_else(from_file)
-        .unwrap_or(DEFAULT_QUARANTINE_TTL_MAX_SECS);
-    Duration::from_secs(secs.max(ttl_secs))
+    let effective = crate::config_resolver::resolve_effective_config(repo_root);
+    let block = crate::config_resolver::get_path(&effective, "autonomous.workFinder.quarantine");
+    resolve_quarantine_ttl_max_from_block(block, ttl_secs)
+}
+
+/// [`resolve_quarantine_ttl_max`] against an already-read
+/// `autonomous.workFinder.quarantine` block (#15663).
+#[must_use]
+pub(crate) fn resolve_quarantine_ttl_max_from_block(
+    block: Option<&serde_json::Value>,
+    ttl_secs: u64,
+) -> Duration {
+    Duration::from_secs(
+        env_or_config_positive_u64(
+            block,
+            QUARANTINE_TTL_MAX_ENV,
+            "ttlMaxSecs",
+            DEFAULT_QUARANTINE_TTL_MAX_SECS,
+        )
+        .max(ttl_secs),
+    )
 }
 
 impl SweepRegistry {
